@@ -4,3 +4,4 @@ pandas==2.3.0
 pyarrow==20.0.0
 requests==2.32.4
 playwright==1.52.0
+environs==14.2.0
