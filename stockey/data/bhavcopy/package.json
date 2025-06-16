@@ -11,6 +11,8 @@
     "bhavcopy": "ts-node src/downloadBhavcopy.ts"
   },
   "dependencies": {
+    "date-fns": "^4.1.0",
+    "ioredis": "^5.6.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.3"
   },
