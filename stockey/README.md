@@ -1,2 +1,0 @@
-# stockey
-Stock ML techniques
