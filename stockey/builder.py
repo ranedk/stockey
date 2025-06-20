@@ -72,8 +72,8 @@ def setup_env():
     install_requirements(original_dir, "stockey")
     vscode_config(original_dir, "stockey")
     venv_config(original_dir, "stockey" )
-    for service in SERVICES:
-        copy_environment(original_dir, f"{original_dir}/{service}")
+    # for service in SERVICES:
+    #     copy_environment(original_dir, f"{original_dir}/{service}")
 
 
 def main():

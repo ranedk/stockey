@@ -18,7 +18,5 @@ Ubuntu: `/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=
 ## Run the bhavcopy downloader
 
 ```shell
-cd data/bhavcopy
-yarn
-yarn bhavcopy
+python bhavcopy_downloader.py
 ```

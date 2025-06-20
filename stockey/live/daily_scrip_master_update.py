@@ -17,7 +17,7 @@ from environs import Env
 env = Env()
 env.read_env()
 DUCKDB_FILE = Path(env("DUCKDB"))
-SCHEMA = "meta"  # place the table in its own schema
+SCHEMA = env("SCHEMA")  # place the table in its own schema
 
 
 DDL = f"""

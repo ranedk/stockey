@@ -4,4 +4,7 @@ pandas==2.3.0
 pyarrow==20.0.0
 requests==2.32.4
 playwright==1.52.0
+redis==6.2.0
 environs==14.2.0
+ua_generator==2.0.8
+ipython==9.3.0
