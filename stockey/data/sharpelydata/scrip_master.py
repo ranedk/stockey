@@ -1,16 +1,9 @@
 import json
 from utils.http import get_with_retries, get_dynamic_headers
 from utils.duck import upsert_to_duckdb_auto
+from .sharpely_utils import get_sharpely_headers
 import pandas as pd
 from environs import Env
-
-
-def get_access_token():
-    CLIENT_ID = "Li2L9VO1eawEbsgLrHdpZjhmUdW6N8Cm"
-    resp = get_with_retries(
-        f"https://api.mintbox.ai/api/Auth/getToken?clientId={CLIENT_ID}"
-    ).json()
-    return resp["response"]["accessToken"]
 
 
 def get_latest_from_sharpely(headers):
@@ -78,15 +71,7 @@ def update_masters():
     env = Env()
     env.read_env()
 
-    ACCESS_TOKEN = get_access_token()
-    ticker = "SHAKTIPUMP"
-    headers = get_dynamic_headers().update(
-        {
-            "Authorization": f"Bearer {ACCESS_TOKEN}",
-            "Origin": "https://sharpely.in",
-            "Referer": "https://sharpely.in/",
-        }
-    )
+    headers = get_sharpely_headers()
     dfs = get_latest_from_sharpely(headers)
     df_funds = pd.concat([dfs[0], dfs[1]])
     df_funds = df_funds.dropna(subset=["amfi_code"])
