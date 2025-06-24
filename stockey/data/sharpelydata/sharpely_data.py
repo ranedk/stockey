@@ -1,6 +1,6 @@
 import json
 from utils.http import get_with_retries, get_dynamic_headers
-from utils.duck import upsert_to_duckdb_auto, generate_duckdb_schema
+from utils.duck import upsert_to_duckdb_auto
 from . import sharpely_utils as su
 import pandas as pd
 from environs import Env
@@ -142,8 +142,8 @@ def get_financial_statement(ticker):
         upsert_to_duckdb_auto(
             df,
             env('DUCKDB'),
-            schema=env('SCHEMA'),
-            table_name=dbname,
+            env('SCHEMA'),
+            dbname,
             unique_keys=['ticker', 'period_end_date', 'period_length']
         )
 
