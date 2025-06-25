@@ -8,3 +8,5 @@ redis==6.2.0
 environs==14.2.0
 ua_generator==2.0.8
 ipython==9.3.0
+pytest>=7.4.0
+pytest-cov>=4.1.0

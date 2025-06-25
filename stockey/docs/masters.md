@@ -13,4 +13,4 @@ This is the main master which has a list of all assets that being traded. This i
 This is the master from the Sharpely website, from where we will scrap fundamental data for all the scrips.
 The links between all scrips will be via their BSE Ticker or NSE Ticker.
 
-`python data/sharpelydata/scrip_msater.py`
+`python -m data.sharpelydata.scrip_master`

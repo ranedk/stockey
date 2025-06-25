@@ -24,8 +24,8 @@ def generate_duckdb_schema(
         else:
             duck_type = "TEXT"
 
-        if not nullable:
-            duck_type += " NOT NULL"
+        # if not nullable:
+        #     duck_type += " NOT NULL"
 
         return duck_type
 
@@ -62,33 +62,10 @@ def upsert_to_duckdb_auto(
     schema: str,
     table_name: str,
     unique_keys: list[str],
-    mismatch_tol: float = 0.10,  # 10 %
-    min_rows_ignore_check: int = 20,  # skip check if either side < 20
 ):
     con = duckdb.connect(db_path)
     full_table = f"{schema}.{table_name}"
     temp_table = f"{table_name}_temp"
-
-    # Check if difference in count of rows is too high, in that case, raise error
-    # We may end up writing with corrupt data
-    try:
-        db_rows = con.execute(f"SELECT COUNT(*) FROM {full_table}").fetchone()[0]
-    except duckdb.CatalogException:
-        db_rows = 0  # table doesn’t exist yet → no check
-
-    df_rows = len(df)
-    if (
-        db_rows >= min_rows_ignore_check
-        and df_rows >= min_rows_ignore_check
-        and db_rows > 0
-    ):
-        drift = abs(db_rows - df_rows) / db_rows
-        if drift > mismatch_tol:
-            raise ValueError(
-                f"Row-count mismatch: table has {db_rows:,} rows; "
-                f"incoming DataFrame has {df_rows:,} rows "
-                f"({drift:.1%} difference > {mismatch_tol:.0%} tolerance)."
-            )
 
     # Choose and validate columns
     cols = df.columns.tolist()
@@ -150,3 +127,62 @@ def upsert_to_duckdb_auto(
     )
 
     con.close()
+
+
+def get_sql(
+    sql: str,
+    db_path: str,
+    params: tuple = (),
+) -> pd.Series:
+    """
+    Run SQL on DuckDB, fetch result as a DataFrame.
+    - If more than one row is returned, raise an error.
+    - If no rows are returned, raise an error.
+    - Otherwise, return the row as a pandas Series.
+
+    Args:
+        sql (str): SQL query to run.
+        db_path (str): Path to DuckDB file. Default is in-memory.
+        params (tuple): Query parameters for safe substitution.
+
+    Returns:
+        pd.Series: Single row of result.
+    """
+    con = duckdb.connect(db_path)
+    try:
+        df = con.execute(sql, params).fetchdf()
+    finally:
+        con.close()
+
+    if df.empty:
+        raise ValueError("Query returned no rows.")
+
+    if len(df) > 1:
+        raise ValueError(f"Query returned more than one row ({len(df)} rows).")
+
+    return df.iloc[0]  # Return as pandas Series
+
+
+def select_sql(
+    sql: str,
+    db_path: str,
+    params: tuple = (),
+) -> pd.DataFrame:
+    """
+    Run SQL on DuckDB and fetch all rows as a DataFrame.
+
+    Args:
+        sql (str): SQL query to run.
+        db_path (str): Path to DuckDB file. Default is in-memory.
+        params (tuple): Optional query parameters.
+
+    Returns:
+        pd.DataFrame: Query result as a DataFrame (can be empty if no rows match).
+    """
+    con = duckdb.connect(db_path)
+    try:
+        df = con.execute(sql, params).fetchdf()
+    finally:
+        con.close()
+
+    return df

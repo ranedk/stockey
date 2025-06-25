@@ -96,22 +96,5 @@ def update_masters():
     )
 
 
-"""
-resp = requests.get(f"https://pyapiv2.mintbox.ai/api/core/getFinancialStatementsV2/ticker={ticker}", headers=headers).json()
-fin = json.loads(resp['statements'])
-
-from IPython import embed
-embed()
-
-
-Use this to get lseg_instrument_id to
-
-https://pyapiv2.mintbox.ai/api/core/getShareHoldingsDataV1/symbol=SHAKTIPUMP
-https://pyapiv2.mintbox.ai/api/core/getStockProfile/symbol=SHAKTIPUMP
-https://pyapiv2.mintbox.ai/api/core/stock_insights_detailed/ticker=SHAKTIPUMP
-https://pyapiv2.mintbox.ai/api/core/getCorporateActionsV2/lseg_instrument_id=8590071662
-
-"""
-
 if __name__ == "__main__":
     update_masters()

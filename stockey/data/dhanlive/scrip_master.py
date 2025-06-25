@@ -68,6 +68,10 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.dhan_instrument_master (
     valid_to                TIMESTAMP,
     load_ts                 TIMESTAMP
 );
+
+CREATE INDEX idx_active_instruments
+ON {SCHEMA}.dhan_instrument_master (security_id, valid_to);
+
 """
 
 UPDATE_SQL = f"""

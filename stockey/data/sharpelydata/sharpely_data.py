@@ -187,5 +187,5 @@ def parse_consolidated_statement(ticker, data, fccs):
 
 
 if __name__ == "__main__":
-    get_financial_statement("SHAKTIPUMP")
+    get_financial_statement("HDFCBANK")
 
