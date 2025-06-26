@@ -175,7 +175,6 @@ def parse_consolidated_statement(ticker, data, fccs):
 
 Use this to get lseg_instrument_id to
 
-https://pyapiv2.mintbox.ai/api/core/getShareHoldingsDataV1/symbol=SHAKTIPUMP
 https://pyapiv2.mintbox.ai/api/core/getStockProfile/symbol=SHAKTIPUMP
 https://pyapiv2.mintbox.ai/api/core/stock_insights_detailed/ticker=SHAKTIPUMP
 https://pyapiv2.mintbox.ai/api/core/getCorporateActionsV2/lseg_instrument_id=8590071662
