@@ -83,7 +83,7 @@ async def main() -> None:
     days_back = 1  # start with “yesterday”
 
     async with async_playwright() as p:
-        while failures < 7:
+        while failures < 7 and days_back > 365 * 10: # 10 years
             date_obj = datetime.today() - timedelta(days=days_back)
             formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
             display_date = date_obj.strftime("%d-%b-%Y")  # 19-Jun-2025
@@ -99,8 +99,11 @@ async def main() -> None:
             failures = 0 if success else failures + 1
             days_back += 1
 
-    print("📉 Stopped after 7 consecutive failures.")
-    await r.close()
+    if failures >= 7:
+        print("📉 Stopped after 7 consecutive failures.")
+    else:
+        print("All caught up! Done")
+    await r.aclose()
 
 
 if __name__ == "__main__":
