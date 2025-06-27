@@ -101,53 +101,31 @@ async def get_missing_dates(r, dtype, start_date, end_date):
     return [d for d, have in zip(daterange(start_date, end_date), flags) if not have]
 
 
-# Find consecutive ranges of missing dates
-def find_consecutive_date_ranges(dates):
-    if not dates:
-        return []
-    dates = sorted(dates)
-    ranges = []
-    start = dates[0]
-    prev = dates[0]
-
-    for current in dates[1:]:
-        if (current - prev).days == 1:
-            prev = current
-        else:
-            ranges.append((start, prev))
-            start = current
-            prev = current
-    ranges.append((start, prev))
-    return ranges
-
-
-# Split range into 365 day blocks
-def split_range_into_chunks(start_date, end_date, max_days=365):
-    chunks = []
-    current_start = start_date
-    while current_start <= end_date:
-        current_end = min(current_start + timedelta(days=max_days - 1), end_date)
-        chunks.append((current_start, current_end))
-        current_start = current_end + timedelta(days=1)
-    return chunks
-
-
 # Main function to get next block to download
 async def get_next_download_block(r, dtype, global_start, global_end):
     missing = await get_missing_dates(r, dtype, global_start, global_end)
-    ranges = find_consecutive_date_ranges(missing)
-    for r_start, r_end in ranges:
-        chunks = split_range_into_chunks(r_start, r_end)
-        for chunk in chunks:
-            return chunk
-    return None
+    if not missing:
+        return
+
+    missing.sort(reverse=True)
+    # Build the first contiguous run <= 365 days, going backwards
+    start = end = missing[0]
+    count = 1
+    for dt in missing[1:]:
+        if (end - dt).days == 1 and count < 365:
+            start = dt
+            end = end          # unchanged
+            count += 1
+        else:
+            break
+    return start, end
 
 
 async def main() -> None:
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         global_start = datetime.strptime("2013-01-01", "%Y-%m-%d")
-        global_end = datetime.strptime("2025-06-20", "%Y-%m-%d")
+        global_end = datetime.today()
 
         async with async_playwright() as p:
             for dtype in ["block_deals", "bulk_deals", "short_selling"]:
