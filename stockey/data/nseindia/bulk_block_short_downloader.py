@@ -101,24 +101,29 @@ async def get_missing_dates(r, dtype, start_date, end_date):
     return [d for d, have in zip(daterange(start_date, end_date), flags) if not have]
 
 
-# Main function to get next block to download
-async def get_next_download_block(r, dtype, global_start, global_end):
-    missing = await get_missing_dates(r, dtype, global_start, global_end)
+async def get_next_download_block(r, dtype, g_start, g_end):
+    # All missing calendar days for this dtype
+    missing = await get_missing_dates(r, dtype, g_start, g_end)
     if not missing:
-        return
+        return None                      # nothing left to fetch
 
+    # newest-first
     missing.sort(reverse=True)
-    # Build the first contiguous run <= 365 days, going backwards
-    start = end = missing[0]
+
+    end   = missing[0]   # newest day in the gap
+    start = end
+    prev  = end
     count = 1
+
     for dt in missing[1:]:
-        if (end - dt).days == 1 and count < 365:
+        if (prev - dt).days == 1 and count < 365:   # still consecutive
             start = dt
-            end = end          # unchanged
+            prev  = dt            # <-- advance the reference!
             count += 1
         else:
-            break
-    return start, end
+            break                 # gap or 365-day limit reached
+
+    return start, end             # inclusive
 
 
 async def main() -> None:
