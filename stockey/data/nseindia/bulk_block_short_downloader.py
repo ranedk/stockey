@@ -134,16 +134,17 @@ async def main() -> None:
 
         async with async_playwright() as p:
             for dtype in ["block_deals", "bulk_deals", "short_selling"]:
-                block = await get_next_download_block(r, dtype, global_start, global_end)
-                if not block:
-                    print(f"All data downloaded for {dtype} ✅")
-                    continue
-                print(
-                    f"Download {dtype} {block[0].strftime('%d-%m-%Y')} and {block[1].strftime('%d-%m-%Y')}"
-                )
-                success = await download_data(
-                    p, dtype, block[0], block[1], r
-                )
+                while True:
+                    block = await get_next_download_block(r, dtype, global_start, global_end)
+                    if not block:
+                        print(f"All data downloaded for {dtype} ✅")
+                        break
+                    print(
+                        f"Download {dtype} {block[0].strftime('%d-%m-%Y')} and {block[1].strftime('%d-%m-%Y')}"
+                    )
+                    success = await download_data(
+                        p, dtype, block[0], block[1], r
+                    )
     finally:
         await r.aclose()
 
