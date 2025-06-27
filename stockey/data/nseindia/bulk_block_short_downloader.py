@@ -46,11 +46,10 @@ async def download_data(
             "https://www.nseindia.com/report-detail/display-bulk-and-block-deals"
         )
         await page.wait_for_timeout(get_random(1000, 2000))
-
-        await page.get_by_role("tab", name="Archives").click()
+        await page.locator("#segment_dropdown").select_option(dtype)
         await page.wait_for_timeout(get_random(2000, 3000))
 
-        await page.locator("#segment_dropdown").select_option(dtype)
+        await page.get_by_role("link", name="Custom").click()
         await page.wait_for_timeout(get_random(2000, 3000))
 
         js_code = f'$(".startDate-block-deals.dtpicker.form-control").val("{from_date_str}");$(".endDate-block-deals.dtpicker.form-control").val("{to_date_str}");'
