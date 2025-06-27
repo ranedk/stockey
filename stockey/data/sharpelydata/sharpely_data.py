@@ -129,7 +129,7 @@ def get_financial_statement(ticker):
     )
 
     for dbname, df in zip(
-        ["income", "balancesheet", "cashflow"], [income_df, balance_df, cashflow_df]
+        ["stmt_income", "stmt_balancesheet", "stmt_cashflow"], [income_df, balance_df, cashflow_df]
     ):
         upsert_to_duckdb_auto(
             df,
@@ -199,7 +199,7 @@ def get_corporate_actions(ticker):
         df,
         env("DUCKDB"),
         env("SCHEMA"),
-        "capital_change_events",
+        "events_capital_change",
         unique_keys=["ticker", "event_type", "announcement_date"],
     )
 
@@ -219,7 +219,7 @@ def get_corporate_actions(ticker):
         df,
         env("DUCKDB"),
         env("SCHEMA"),
-        "dividend_events",
+        "events_dividend",
         unique_keys=["ticker", "announcement_date", "pay_date"],
     )
 
@@ -241,7 +241,7 @@ def get_corporate_actions(ticker):
         df,
         env("DUCKDB"),
         env("SCHEMA"),
-        "earning_events",
+        "events_earnings",
         unique_keys=["ticker", "report_date", "period_end_date", "period_length", "eps_marker"],
     )
 
@@ -289,4 +289,7 @@ def get_shareholding(ticker):
 
 
 if __name__ == "__main__":
-    get_corporate_actions("HDFCBANK")
+    for ticker in ['SHAKTIPUMP', 'HDFCBANK']:
+        get_financial_statement(ticker)
+        get_shareholding(ticker)
+        get_corporate_actions(ticker)

@@ -23,7 +23,7 @@ SCHEMA = env("SCHEMA")  # place the table in its own schema
 DDL = f"""
 CREATE SCHEMA IF NOT EXISTS {SCHEMA};
 
-CREATE TABLE IF NOT EXISTS {SCHEMA}.dhan_instrument_master (
+CREATE TABLE IF NOT EXISTS {SCHEMA}.master_dhan_instruments (
     exch_id                 VARCHAR,
     segment                 VARCHAR,
     security_id             BIGINT,
@@ -70,13 +70,13 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.dhan_instrument_master (
 );
 
 CREATE INDEX idx_active_instruments
-ON {SCHEMA}.dhan_instrument_master (security_id, valid_to);
+ON {SCHEMA}.master_dhan_instruments (security_id, valid_to);
 
 """
 
 UPDATE_SQL = f"""
 -- STEP 1  : close current version where anything has changed OR disappeared
-UPDATE {SCHEMA}.dhan_instrument_master dst
+UPDATE {SCHEMA}.master_dhan_instruments dst
 SET    valid_to = $load_ts
 FROM   _stage st
 WHERE  dst.security_id = st.security_id
@@ -94,7 +94,7 @@ WHERE  dst.security_id = st.security_id
 
 INSERT_SQL = f"""
 -- STEP 2  : insert brand-new security_id OR changed version
-INSERT INTO {SCHEMA}.dhan_instrument_master
+INSERT INTO {SCHEMA}.master_dhan_instruments
 SELECT
        st.exch_id, st.segment, st.security_id, st.isin, st.instrument,
        st.underlying_security_id, st.underlying_symbol, st.symbol_name, st.display_name,
@@ -114,7 +114,7 @@ SELECT
        NULL                    AS valid_to,
        $load_ts                AS load_ts
 FROM   _stage st
-LEFT   JOIN {SCHEMA}.dhan_instrument_master m
+LEFT   JOIN {SCHEMA}.master_dhan_instruments m
        ON st.security_id = m.security_id
       AND m.valid_to IS NULL
 WHERE  m.security_id IS NULL;

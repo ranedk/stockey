@@ -6,7 +6,7 @@ There are multiple master data pulled from various sources:
 
 This is the main master which has a list of all assets that being traded. This is from Dhan which will be our primary trading account.
 
-`python data/dhanlive/scrip_master.py`
+`python -m data.dhanlive.scrip_master`
 
 ## Sharpely master
 

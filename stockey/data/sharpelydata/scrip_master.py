@@ -84,14 +84,14 @@ def update_masters():
         df_funds,
         env("DUCKDB"),
         env("SCHEMA"),
-        "funds_master",
+        "master_sharpely_funds",
         unique_keys=["amfi_code"],
     )
     upsert_to_duckdb_auto(
         df_equity,
         env("DUCKDB"),
         env("SCHEMA"),
-        "equity_master",
+        "master_sharpely_equity",
         unique_keys=["symbol", "bse_ticker"],
     )
 
