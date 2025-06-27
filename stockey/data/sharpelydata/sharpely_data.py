@@ -129,7 +129,8 @@ def get_financial_statement(ticker):
     )
 
     for dbname, df in zip(
-        ["stmt_income", "stmt_balancesheet", "stmt_cashflow"], [income_df, balance_df, cashflow_df]
+        ["stmt_income", "stmt_balancesheet", "stmt_cashflow"],
+        [income_df, balance_df, cashflow_df],
     ):
         upsert_to_duckdb_auto(
             df,
@@ -172,7 +173,6 @@ def parse_consolidated_statement(ticker, data, fccs):
     return df
 
 
-
 def get_corporate_actions(ticker):
     try:
         row = sdb.get_nse_equity(ticker)
@@ -187,11 +187,11 @@ def get_corporate_actions(ticker):
 
     # Save Capital Change Events
     records = []
-    for row in sts['capital_change_events']:
+    for row in sts["capital_change_events"]:
         entry = row.copy()
-        entry["announcement_date"] = pd.to_datetime(row['announcement_date'])
-        entry["ex_date"] = pd.to_datetime(row['ex_date'])
-        entry['ticker'] = ticker
+        entry["announcement_date"] = pd.to_datetime(row["announcement_date"])
+        entry["ex_date"] = pd.to_datetime(row["ex_date"])
+        entry["ticker"] = ticker
         records.append(entry)
 
     df = pd.DataFrame(records)
@@ -205,13 +205,13 @@ def get_corporate_actions(ticker):
 
     # Save Dividend Events
     records = []
-    for row in sts['dividend_events']:
+    for row in sts["dividend_events"]:
         entry = row.copy()
-        entry["announcement_date"] = pd.to_datetime(row['announcement_date'])
-        entry["ex_date"] = pd.to_datetime(row['ex_date'])
-        entry["pay_date"] = pd.to_datetime(row['pay_date'])
-        entry["record_date"] = pd.to_datetime(row['record_date'])
-        entry['ticker'] = ticker
+        entry["announcement_date"] = pd.to_datetime(row["announcement_date"])
+        entry["ex_date"] = pd.to_datetime(row["ex_date"])
+        entry["pay_date"] = pd.to_datetime(row["pay_date"])
+        entry["record_date"] = pd.to_datetime(row["record_date"])
+        entry["ticker"] = ticker
         records.append(entry)
 
     df = pd.DataFrame(records)
@@ -225,24 +225,38 @@ def get_corporate_actions(ticker):
 
     # Save Earnings Events
     records = []
-    for obj in sts['earning_events']:
+    for obj in sts["earning_events"]:
         for report_date, rows in obj.items():
             for row in rows:
                 entry = row.copy()
                 entry["report_date"] = pd.to_datetime(report_date)
-                entry["period_end_date"] = pd.to_datetime(row['period_end_date'])
-                entry['ticker'] = ticker
+                entry["period_end_date"] = pd.to_datetime(row["period_end_date"])
+                entry["ticker"] = ticker
                 records.append(entry)
 
     df = pd.DataFrame(records)
     # For some reason this has duplicates
-    df = df.drop_duplicates(subset=["ticker", "report_date", "period_end_date", "period_length", "eps_marker"])
+    df = df.drop_duplicates(
+        subset=[
+            "ticker",
+            "report_date",
+            "period_end_date",
+            "period_length",
+            "eps_marker",
+        ]
+    )
     upsert_to_duckdb_auto(
         df,
         env("DUCKDB"),
         env("SCHEMA"),
         "events_earnings",
-        unique_keys=["ticker", "report_date", "period_end_date", "period_length", "eps_marker"],
+        unique_keys=[
+            "ticker",
+            "report_date",
+            "period_end_date",
+            "period_length",
+            "eps_marker",
+        ],
     )
 
 
@@ -288,8 +302,107 @@ def get_shareholding(ticker):
     )
 
 
+def get_bulk_insider_trades(ticker):
+    json_data = {"params": json.dumps({"symbol": "SHAKTIPUMP"})}
+    resp = get_with_retries(
+        "https://pyapiv2.mintbox.ai/api/core/getBulkBlockInsiderTrades",
+        headers=HEADERS,
+        method="POST",
+        json_data=json_data,
+    ).json()
+    deals = json.loads(resp)
+
+    # Bulk deals
+    records = []
+    for report_date, data in deals["bulk_deals"].items():
+        for row in data:
+            entry = row.copy()
+            entry["report_date"] = pd.to_datetime(report_date)
+            entry["date"] = pd.to_datetime(entry["date"])
+            entry["ticker"] = ticker
+            records.append(entry)
+
+    df = pd.DataFrame(records)
+    df = df.drop("symbol", axis=1)
+    upsert_to_duckdb_auto(
+        df,
+        env("DUCKDB"),
+        env("SCHEMA"),
+        "trades_bulk",
+        unique_keys=["ticker", "report_date", "date", "name", "transaction_type"],
+    )
+
+    # Insider Traders
+    records = []
+    for report_date, data in deals["insider_trades"].items():
+        for row in data:
+            entry = row.copy()
+            entry["exchange_broadcast_date"] = pd.to_datetime(
+                entry["exchange_broadcast_date"]
+            )
+            entry["acquisition_date_from"] = pd.to_datetime(
+                entry["acquisition_date_from"]
+            )
+            entry["acquisition_date_to"] = pd.to_datetime(entry["acquisition_date_to"])
+            entry["ticker"] = ticker
+            records.append(entry)
+
+    df = pd.DataFrame(records)
+    df = df.drop("symbol", axis=1)
+    unique_cols = [
+        "ticker",
+        "acquisition_date_from",
+        "acquisition_date_to",
+        "exchange_broadcast_date",
+        "acquirer_name",
+        "security_held_pre_tx_per",
+    ]
+    df = df.drop_duplicates(subset=unique_cols)
+    upsert_to_duckdb_auto(
+        df, env("DUCKDB"), env("SCHEMA"), "trades_insider", unique_keys=unique_cols
+    )
+
+    # Block deals
+    # TODO: Data not available
+
+
+def get_historical_mcap(ticker):
+    json_data = {
+        "stock": ticker,
+        "metric_code": "mcap",
+        "frequency": "D",
+        "start_date": None,
+        "end_date": None,
+    }
+    resp = get_with_retries(
+        "https://pyapiv2.mintbox.ai/api/core/getHistoricalMetricData",
+        headers=HEADERS,
+        method="POST",
+        json_data=json_data,
+    ).json()
+    mcap_data = json.loads(resp)
+
+    records = []
+    for row in mcap_data:
+        entry = row.copy()
+        entry["timestamp"] = pd.to_datetime(entry["timestamp"])
+        entry["ticker"] = ticker
+        records.append(entry)
+
+    df = pd.DataFrame(records)
+    df = df.drop("symbol", axis=1)
+    upsert_to_duckdb_auto(
+        df,
+        env("DUCKDB"),
+        env("SCHEMA"),
+        "historical_mcap",
+        unique_keys=["ticker", "timestamp"],
+    )
+
+
 if __name__ == "__main__":
-    for ticker in ['SHAKTIPUMP', 'HDFCBANK']:
-        get_financial_statement(ticker)
-        get_shareholding(ticker)
-        get_corporate_actions(ticker)
+    # get_historical_mcap("SHAKTIPUMP")
+    # for ticker in ['SHAKTIPUMP', 'HDFCBANK']:
+    #    get_financial_statement(ticker)
+    #    get_shareholding(ticker)
+    #    get_corporate_actions(ticker)

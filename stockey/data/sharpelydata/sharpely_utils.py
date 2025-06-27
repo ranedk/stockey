@@ -11,8 +11,8 @@ def get_access_token():
 
 def get_sharpely_headers():
     ACCESS_TOKEN = get_access_token()
-    ticker = "SHAKTIPUMP"
-    headers = get_dynamic_headers().update(
+    headers = get_dynamic_headers()
+    headers.update(
         {
             "Authorization": f"Bearer {ACCESS_TOKEN}",
             "Origin": "https://sharpely.in",

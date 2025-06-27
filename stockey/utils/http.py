@@ -8,6 +8,7 @@ import datetime as dt
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, unquote
 
+from typing import Any
 from environs import Env
 import ua_generator
 import requests
@@ -118,6 +119,10 @@ def _save_to_cache(base_name: str, text: str) -> None:
 def get_with_retries(
     url: str,
     headers: dict | None = None,
+    *,
+    method: str = "GET",
+    data: Any | None = None,
+    json_data: Any | None = None,
     timeout: int = 10,
     retries: int = 5,
     backoff_factor: float = 0.3,
@@ -129,6 +134,10 @@ def get_with_retries(
 
     See original docstring for parameter meanings.
     """
+    method = method.upper()
+    if method not in ['GET', 'POST']:
+        raise ValueError("Only GET and POST allowed")
+
     # ---------- cache lookup -------------------------------------------------
     base_name, pattern = _build_cache_key(url)
     cached_text = _load_from_cache(pattern, max_age_days)
@@ -154,7 +163,14 @@ def get_with_retries(
     session.mount("https://", adapter)
 
     try:
-        response = session.get(url, headers=headers, timeout=timeout)
+        response = session.request(
+            method,
+            url,
+            headers=headers,
+            timeout=timeout,
+            data=data,
+            json=json_data
+        )
         response.raise_for_status()
         _save_to_cache(base_name, response.text)
         response.headers["X-Cache"] = "MISS"
