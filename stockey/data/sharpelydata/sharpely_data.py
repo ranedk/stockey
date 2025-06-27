@@ -2,6 +2,7 @@ import json
 from utils.http import get_with_retries, get_dynamic_headers
 from utils.duck import upsert_to_duckdb_auto
 from . import sharpely_utils as su
+from . import sharpely_db as sdb
 import pandas as pd
 from environs import Env
 
@@ -171,15 +172,78 @@ def parse_consolidated_statement(ticker, data, fccs):
     return df
 
 
-"""
 
-Use this to get lseg_instrument_id to
+def get_corporate_actions(ticker):
+    try:
+        row = sdb.get_nse_equity(ticker)
+    except ValueError:
+        row = sdb.get_bse_equity(ticker)
 
-https://pyapiv2.mintbox.ai/api/core/getStockProfile/symbol=SHAKTIPUMP
-https://pyapiv2.mintbox.ai/api/core/stock_insights_detailed/ticker=SHAKTIPUMP
-https://pyapiv2.mintbox.ai/api/core/getCorporateActionsV2/lseg_instrument_id=8590071662
+    resp = get_with_retries(
+        f"https://pyapiv2.mintbox.ai/api/core/getCorporateActionsV2/lseg_instrument_id={row.lseg_instrument_id}",
+        headers=HEADERS,
+    ).json()
+    sts = json.loads(resp["statements"])
 
-"""
+    # Save Capital Change Events
+    records = []
+    for row in sts['capital_change_events']:
+        entry = row.copy()
+        entry["announcement_date"] = pd.to_datetime(row['announcement_date'])
+        entry["ex_date"] = pd.to_datetime(row['ex_date'])
+        entry['ticker'] = ticker
+        records.append(entry)
+
+    df = pd.DataFrame(records)
+    upsert_to_duckdb_auto(
+        df,
+        env("DUCKDB"),
+        env("SCHEMA"),
+        "capital_change_events",
+        unique_keys=["ticker", "event_type", "announcement_date"],
+    )
+
+    # Save Dividend Events
+    records = []
+    for row in sts['dividend_events']:
+        entry = row.copy()
+        entry["announcement_date"] = pd.to_datetime(row['announcement_date'])
+        entry["ex_date"] = pd.to_datetime(row['ex_date'])
+        entry["pay_date"] = pd.to_datetime(row['pay_date'])
+        entry["record_date"] = pd.to_datetime(row['record_date'])
+        entry['ticker'] = ticker
+        records.append(entry)
+
+    df = pd.DataFrame(records)
+    upsert_to_duckdb_auto(
+        df,
+        env("DUCKDB"),
+        env("SCHEMA"),
+        "dividend_events",
+        unique_keys=["ticker", "announcement_date", "pay_date"],
+    )
+
+    # Save Earnings Events
+    records = []
+    for obj in sts['earning_events']:
+        for report_date, rows in obj.items():
+            for row in rows:
+                entry = row.copy()
+                entry["report_date"] = pd.to_datetime(report_date)
+                entry["period_end_date"] = pd.to_datetime(row['period_end_date'])
+                entry['ticker'] = ticker
+                records.append(entry)
+
+    df = pd.DataFrame(records)
+    # For some reason this has duplicates
+    df = df.drop_duplicates(subset=["ticker", "report_date", "period_end_date", "period_length", "eps_marker"])
+    upsert_to_duckdb_auto(
+        df,
+        env("DUCKDB"),
+        env("SCHEMA"),
+        "earning_events",
+        unique_keys=["ticker", "report_date", "period_end_date", "period_length", "eps_marker"],
+    )
 
 
 def get_shareholding(ticker):
@@ -225,4 +289,4 @@ def get_shareholding(ticker):
 
 
 if __name__ == "__main__":
-    get_shareholding("HDFCBANK")
+    get_corporate_actions("HDFCBANK")
