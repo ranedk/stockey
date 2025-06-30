@@ -88,3 +88,29 @@ Once you have sample files / API docs in hand, share the field lists and we’ll
 
 **Collect the data first—nothing kills an MVP faster than a half-empty feature matrix.**
 
+## RBI Website:
+
+Link: `https://data.rbi.org.in/#/dbie/dataquery_enhanced`
+
+```
+Daily - FOREX_RATE_AFY_RN
+Daily - YIELD_TB_RN
+Monthly - CPI_RUC_RN
+Monthly - INX_WPI_RN
+Weekly - FR_EXG_RESV_RN
+Monthly - INX_NEER_REER_M_RN
+Quarterly  - IND_EXTRN_DEBT_RN
+Daily - MONEY_MKT_OP_RN
+Daily - SEC_MKT_RN
+Weekly - RMC_W_RN
+Monthly - RMC_M_RN
+Monthly - IIP
+Monthly - WHOLE_PRICE_INDEX_INF_RN
+```
+
+
+Link: `https://data.rbi.org.in/BOE/OpenDocument/2409211437/OpenDocument/opendoc/openDocument.jsp?logonSuccessful=true&shareId=1`
+
+```
+Repo rate and Reverse Repo rate
+```
