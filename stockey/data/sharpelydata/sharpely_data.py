@@ -155,14 +155,12 @@ def parse_consolidated_statement(ticker, data, fccs):
         if fcc_code in fccs:
             values = item[1:]
             for i, period in enumerate(periods):
-                rows.append(
-                    {
-                        "period_end_date": period,
-                        "period_length": headers.get(period),
-                        "metric": fccs[fcc_code],
-                        "value": values[i] if i < len(values) else None,
-                    }
-                )
+                rows.append({
+                    "period_end_date": period,
+                    "period_length": headers.get(period),
+                    "metric": fccs[fcc_code],
+                    "value": values[i] if i < len(values) else None,
+                 })
 
     # Step 4: Convert to DataFrame and pivot
     df_long = pd.DataFrame(rows)

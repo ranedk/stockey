@@ -14,12 +14,30 @@ import ua_generator
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
 
 
 env = Env()
 env.read_env()
 _CACHE_DIR = Path(env("HTTP_CACHE"))
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def hidden_inputs_to_dict(html: str) -> dict[str, str | None]:
+    """
+    Parse HTML and return a dict of all <input type="hidden"> elements,
+    keyed by their 'name' attribute with values from their 'value' attribute.
+    If either attribute is missing, that element is skipped.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    hidden_fields = {}
+    for tag in soup.find_all("input", {"type": "hidden"}):
+        name = tag.get("name")
+        value = tag.get("value")  # returns None if attribute missing
+        if name is not None:      # ignore unnamed inputs
+            hidden_fields[name] = value
+    return hidden_fields
 
 
 def get_dynamic_headers():
@@ -120,8 +138,10 @@ def get_with_retries(
     url: str,
     headers: dict | None = None,
     *,
+    cookies: dict | None = None,
     method: str = "GET",
     data: Any | None = None,
+    params: dict | None = None,
     json_data: Any | None = None,
     timeout: int = 10,
     retries: int = 5,
@@ -167,8 +187,10 @@ def get_with_retries(
             method,
             url,
             headers=headers,
+            cookies=cookies,
             timeout=timeout,
             data=data,
+            params=params,
             json=json_data
         )
         response.raise_for_status()
