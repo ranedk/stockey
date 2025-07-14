@@ -37,6 +37,8 @@ FRED_SERIES: Dict[str, str] = {
     # USD & commodities
     "DTWEXBGS":    "broad_usd_index",     # Trade-weighted dollar (goods only)
     "DCOILWTICO":  "wti_crude_spot",      # WTI crude spot $/bbl
+
+    "NGDPRNSAXDCINQ": "india_gdp",        # India GDP numbers
 }
 
 def fetch_fred_series(
