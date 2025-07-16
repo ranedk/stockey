@@ -1,6 +1,6 @@
 import json
-from utils.http import get_with_retries, get_dynamic_headers
-from utils.duck import upsert_to_duckdb_auto
+from utils.http import get_with_retries
+from utils.db import upsert_to_db
 from . import sharpely_utils as su
 from . import sharpely_db as sdb
 import pandas as pd
@@ -132,10 +132,8 @@ def get_financial_statement(ticker):
         ["stmt_income", "stmt_balancesheet", "stmt_cashflow"],
         [income_df, balance_df, cashflow_df],
     ):
-        upsert_to_duckdb_auto(
+        upsert_to_db(
             df,
-            env("DUCKDB"),
-            env("SCHEMA"),
             dbname,
             unique_keys=["ticker", "period_end_date", "period_length"],
         )
@@ -193,10 +191,8 @@ def get_corporate_actions(ticker):
         records.append(entry)
 
     df = pd.DataFrame(records)
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "events_capital_change",
         unique_keys=["ticker", "event_type", "announcement_date"],
     )
@@ -213,10 +209,8 @@ def get_corporate_actions(ticker):
         records.append(entry)
 
     df = pd.DataFrame(records)
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "events_dividend",
         unique_keys=["ticker", "announcement_date", "pay_date"],
     )
@@ -243,10 +237,8 @@ def get_corporate_actions(ticker):
             "eps_marker",
         ]
     )
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "events_earnings",
         unique_keys=[
             "ticker",
@@ -274,10 +266,8 @@ def get_shareholding(ticker):
 
     df = pd.DataFrame(records)
     df = df.rename(columns={"symbol": "ticker"})
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "shareholding_category",
         unique_keys=["ticker", "report_date", "category_code"],
     )
@@ -291,10 +281,8 @@ def get_shareholding(ticker):
 
     df = pd.DataFrame(records)
     df = df.rename(columns={"symbol": "ticker"})
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "shareholding_top_holders",
         unique_keys=["ticker", "report_date", "holder"],
     )
@@ -322,10 +310,8 @@ def get_bulk_insider_trades(ticker):
 
     df = pd.DataFrame(records)
     df = df.drop("symbol", axis=1)
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "trades_bulk",
         unique_keys=["ticker", "report_date", "date", "name", "transaction_type"],
     )
@@ -356,12 +342,9 @@ def get_bulk_insider_trades(ticker):
         "security_held_pre_tx_per",
     ]
     df = df.drop_duplicates(subset=unique_cols)
-    upsert_to_duckdb_auto(
-        df, env("DUCKDB"), env("SCHEMA"), "trades_insider", unique_keys=unique_cols
+    upsert_to_db(
+        df, "trades_insider", unique_keys=unique_cols
     )
-
-    # Block deals
-    # TODO: Data not available
 
 
 def get_historical_mcap(ticker):
@@ -389,18 +372,16 @@ def get_historical_mcap(ticker):
 
     df = pd.DataFrame(records)
     df = df.drop("symbol", axis=1)
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "historical_mcap",
         unique_keys=["ticker", "timestamp"],
     )
 
 
 if __name__ == "__main__":
-    # get_historical_mcap("SHAKTIPUMP")
-    # for ticker in ['SHAKTIPUMP', 'HDFCBANK']:
-    #    get_financial_statement(ticker)
-    #    get_shareholding(ticker)
-    #    get_corporate_actions(ticker)
+    for ticker in ['SHAKTIPUMP', 'HDFCBANK']:
+        get_historical_mcap(ticker)
+        get_financial_statement(ticker)
+        get_shareholding(ticker)
+        get_corporate_actions(ticker)

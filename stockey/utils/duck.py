@@ -56,7 +56,7 @@ def generate_duckdb_schema(
     return create_stmt.strip()
 
 
-def upsert_to_duckdb_auto(
+def upsert_to_db(
     df,
     db_path: str,
     schema: str,

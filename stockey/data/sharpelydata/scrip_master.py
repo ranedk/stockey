@@ -1,9 +1,9 @@
 import json
-from utils.http import get_with_retries, get_dynamic_headers
-from utils.duck import upsert_to_duckdb_auto
-from .sharpely_utils import get_sharpely_headers
 import pandas as pd
 from environs import Env
+from utils.http import get_with_retries
+from utils.db import upsert_to_db
+from .sharpely_utils import get_sharpely_headers
 
 
 def get_latest_from_sharpely(headers):
@@ -55,7 +55,6 @@ def get_latest_from_sharpely(headers):
             headers=headers,
         ).json()
         data = json.loads(resp)
-        all_keys = data["keys"]
 
         for val in json.loads(data["values"]):
             row = [v for k, v in zip(data["keys"], val) if k in keys_of_interest[i]]
@@ -77,20 +76,15 @@ def update_masters():
     df_funds = df_funds.dropna(subset=["amfi_code"])
 
     df_equity = dfs[2]
-    df_equity[~((df_equity["symbol"].isna()) & (df_equity["bse_ticker"].isna()))]
+    df_equity = df_equity[~((df_equity["symbol"].isna()) & (df_equity["bse_ticker"].isna()))]
 
-
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df_funds,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "master_sharpely_funds",
         unique_keys=["amfi_code"],
     )
-    upsert_to_duckdb_auto(
+    upsert_to_db(
         df_equity,
-        env("DUCKDB"),
-        env("SCHEMA"),
         "master_sharpely_equity",
         unique_keys=["symbol", "bse_ticker"],
     )
