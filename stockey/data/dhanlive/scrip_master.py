@@ -1,29 +1,41 @@
+#!/usr/bin/env python3
 """
-update_dhan_master.py
+update_dhan_master_pg.py
 Usage:
-    python update_dhan_master.py
+    python update_dhan_master_pg.py
 """
 
+from __future__ import annotations
+
+import io
+import csv
 import sys
-from datetime import datetime, timedelta, timezone
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
-import duckdb
+
 import pandas as pd
 import requests
 from environs import Env
 
+from utils.db import get_connection
 
 env = Env()
 env.read_env()
-DUCKDB_FILE = Path(env("DUCKDB"))
-SCHEMA = env("SCHEMA")  # place the table in its own schema
 
+# columns whose *value* we treat as version-defining
+TRACKED_COLS = [
+    "series",
+    "lot_size",
+    "sm_expiry_date",
+    "strike_price",
+    "option_type",
+    "instrument",
+    "expiry_flag",
+]
 
-DDL = f"""
-CREATE SCHEMA IF NOT EXISTS {SCHEMA};
-
-CREATE TABLE IF NOT EXISTS {SCHEMA}.master_dhan_instruments (
+DDL = """
+CREATE TABLE IF NOT EXISTS master_dhan_instruments (
     exch_id                 VARCHAR,
     segment                 VARCHAR,
     security_id             BIGINT,
@@ -35,127 +47,65 @@ CREATE TABLE IF NOT EXISTS {SCHEMA}.master_dhan_instruments (
     display_name            VARCHAR,
     instrument_type         VARCHAR,
     series                  VARCHAR,
-    lot_size                INTEGER,
+    lot_size                DOUBLE PRECISION,
     sm_expiry_date          DATE,
-    strike_price            DOUBLE,
+    strike_price            DOUBLE PRECISION,
     option_type             VARCHAR,
-    tick_size               DOUBLE,
+    tick_size               DOUBLE PRECISION,
     expiry_flag             VARCHAR,
     bracket_flag            VARCHAR,
     cover_flag              VARCHAR,
     asm_gsm_flag            VARCHAR,
     asm_gsm_category        VARCHAR,
     buy_sell_indicator      VARCHAR,
-    buy_co_min_margin_per   DOUBLE,
-    sell_co_min_margin_per  DOUBLE,
-    buy_co_sl_range_max_perc DOUBLE,
-    sell_co_sl_range_max_perc DOUBLE,
-    buy_co_sl_range_min_perc DOUBLE,
-    sell_co_sl_range_min_perc DOUBLE,
-    buy_bo_min_margin_per   DOUBLE,
-    sell_bo_min_margin_per  DOUBLE,
-    buy_bo_sl_range_max_perc DOUBLE,
-    sell_bo_sl_range_max_perc DOUBLE,
-    buy_bo_sl_range_min_perc DOUBLE,
-    sell_bo_sl_min_range    DOUBLE,
-    buy_bo_profit_range_max_perc DOUBLE,
-    sell_bo_profit_range_max_perc DOUBLE,
-    buy_bo_profit_range_min_perc DOUBLE,
-    sell_bo_profit_range_min_perc DOUBLE,
-    mtf_leverage            DOUBLE,
+    buy_co_min_margin_per   DOUBLE PRECISION,
+    sell_co_min_margin_per  DOUBLE PRECISION,
+    buy_co_sl_range_max_perc DOUBLE PRECISION,
+    sell_co_sl_range_max_perc DOUBLE PRECISION,
+    buy_co_sl_range_min_perc DOUBLE PRECISION,
+    sell_co_sl_range_min_perc DOUBLE PRECISION,
+    buy_bo_min_margin_per   DOUBLE PRECISION,
+    sell_bo_min_margin_per  DOUBLE PRECISION,
+    buy_bo_sl_range_max_perc DOUBLE PRECISION,
+    sell_bo_sl_range_max_perc DOUBLE PRECISION,
+    buy_bo_sl_range_min_perc DOUBLE PRECISION,
+    sell_bo_sl_min_range    DOUBLE PRECISION,
+    buy_bo_profit_range_max_perc DOUBLE PRECISION,
+    sell_bo_profit_range_max_perc DOUBLE PRECISION,
+    buy_bo_profit_range_min_perc DOUBLE PRECISION,
+    sell_bo_profit_range_min_perc DOUBLE PRECISION,
+    mtf_leverage            DOUBLE PRECISION,
 
-    valid_from              TIMESTAMP,
+    valid_from              TIMESTAMP NOT NULL,
     valid_to                TIMESTAMP,
-    load_ts                 TIMESTAMP
+    load_ts                 TIMESTAMP NOT NULL,
+
+    PRIMARY KEY (security_id, valid_from)
 );
-
-CREATE INDEX idx_active_instruments
-ON {SCHEMA}.master_dhan_instruments (security_id, valid_to);
-
+CREATE INDEX IF NOT EXISTS idx_master_dhan_active
+    ON master_dhan_instruments (security_id, valid_to);
 """
 
-UPDATE_SQL = f"""
--- STEP 1  : close current version where anything has changed OR disappeared
-UPDATE {SCHEMA}.master_dhan_instruments dst
-SET    valid_to = $load_ts
-FROM   _stage st
-WHERE  dst.security_id = st.security_id
-  AND  dst.valid_to IS NULL
-  AND  (
-        dst.series         IS DISTINCT FROM st.series OR
-        dst.lot_size       IS DISTINCT FROM st.lot_size OR
-        dst.sm_expiry_date IS DISTINCT FROM st.sm_expiry_date OR
-        dst.strike_price   IS DISTINCT FROM st.strike_price OR
-        dst.option_type    IS DISTINCT FROM st.option_type OR
-        dst.instrument     IS DISTINCT FROM st.instrument OR
-        dst.expiry_flag    IS DISTINCT FROM st.expiry_flag
-      );
-"""
-
-INSERT_SQL = f"""
--- STEP 2  : insert brand-new security_id OR changed version
-INSERT INTO {SCHEMA}.master_dhan_instruments
-SELECT
-       st.exch_id, st.segment, st.security_id, st.isin, st.instrument,
-       st.underlying_security_id, st.underlying_symbol, st.symbol_name, st.display_name,
-       st.instrument_type, st.series, st.lot_size, st.sm_expiry_date, st.strike_price,
-       st.option_type, st.tick_size, st.expiry_flag, st.bracket_flag, st.cover_flag,
-       st.asm_gsm_flag, st.asm_gsm_category, st.buy_sell_indicator,
-       st.buy_co_min_margin_per, st.sell_co_min_margin_per,
-       st.buy_co_sl_range_max_perc, st.sell_co_sl_range_max_perc,
-       st.buy_co_sl_range_min_perc, st.sell_co_sl_range_min_perc,
-       st.buy_bo_min_margin_per, st.sell_bo_min_margin_per,
-       st.buy_bo_sl_range_max_perc, st.sell_bo_sl_range_max_perc,
-       st.buy_bo_sl_range_min_perc, st.sell_bo_sl_min_range,
-       st.buy_bo_profit_range_max_perc, st.sell_bo_profit_range_max_perc,
-       st.buy_bo_profit_range_min_perc, st.sell_bo_profit_range_min_perc,
-       st.mtf_leverage,
-       $load_ts                AS valid_from,
-       NULL                    AS valid_to,
-       $load_ts                AS load_ts
-FROM   _stage st
-LEFT   JOIN {SCHEMA}.master_dhan_instruments m
-       ON st.security_id = m.security_id
-      AND m.valid_to IS NULL
-WHERE  m.security_id IS NULL;
-"""
-
-
-def india_today() -> str:
-    """Return YYYYMMDD for 'today' in Asia/Kolkata (UTC+5:30)."""
-    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    return ist_now.strftime("%Y%m%d")
-
-
-def download_latest_scrip_master_csv() -> str:
-    """Download latest script master"""
-    tmpfile = tempfile.NamedTemporaryFile(delete=False)
-    TIMEOUT = 30
-    URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+def download_master_csv(timeout: int = 30) -> Path:
+    url = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
     try:
-        resp = requests.get(URL, timeout=TIMEOUT)
-        resp.raise_for_status()
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
     except Exception as exc:
-        print(" FAILED")
-        sys.exit(f"[ERROR] Request failed: {exc}")
+        sys.exit(f"[ERROR] download failed: {exc}")
 
-    if len(resp.content) < 10_000:  # ~10 KB
-        sys.exit("[ERROR] Downloaded file suspiciously small. Aborting.")
+    if len(r.content) < 10_000:  # sanity check
+        sys.exit("[ERROR] response too small, aborting")
 
-    tmpfile.write(resp.content)
-    tmpfile.close()
-    return tmpfile.name
+    tmp.write(r.content)
+    tmp.close()
+    return Path(tmp.name)
 
 
-def update_scrip_master_from_csv(csv_path: str):
-    """Update the database with new scrip master"""
-    csv_file = Path(csv_path)
-    if not csv_file.exists():
-        sys.exit(f"File {csv_file} not found.")
-
-    # 1. read CSV – duckdb can do it directly, but pandas lets us fix dtypes easily
+def load_csv(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(
-        csv_file,
+        csv_path,
         dtype={
             "EXCH_ID": "string",
             "SEGMENT": "string",
@@ -173,32 +123,112 @@ def update_scrip_master_from_csv(csv_path: str):
             "STRIKE_PRICE": "float64",
             "OPTION_TYPE": "string",
             "TICK_SIZE": "float64",
-            # remaining numeric columns will default to float64
         },
     )
-
-    # parse date columns *after* reading to preserve blanks as NaT
     df["SM_EXPIRY_DATE"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce")
+    df.columns = [c.lower() for c in df.columns]
+    # ‼️ DROP phantom cols created by trailing delimiters
+    df = df.loc[:, ~df.columns.str.contains(r"^unnamed", case=False)]
+    return df.where(pd.notnull(df), None)  # NaN → None
 
-    # 2. connect to DuckDB
-    con = duckdb.connect(DUCKDB_FILE.as_posix())
-    con.execute(DDL)
 
-    # 3. load staging table (temporary)
-    con.register("df", df)
-    con.execute("CREATE OR REPLACE TEMP TABLE _stage AS SELECT * FROM df;")
+def make_update_sql(tracked_cols: list[str]) -> str:
+    diff_cond = " OR ".join(
+        f"dst.{c} IS DISTINCT FROM st.{c}" for c in tracked_cols
+    )
+    return f"""
+    /* close current version where anything changed */
+    UPDATE master_dhan_instruments dst
+    SET    valid_to = %(load_ts)s
+    FROM   _stage st
+    WHERE  dst.security_id = st.security_id
+      AND  dst.valid_to IS NULL
+      AND  ({diff_cond});
+    """
 
-    # 4. run update and insert inside a single transaction
-    load_ts = pd.Timestamp.utcnow()
-    con.execute("BEGIN;")
-    con.execute(UPDATE_SQL, {"load_ts": load_ts})
-    con.execute(INSERT_SQL, {"load_ts": load_ts})
-    con.execute("COMMIT;")
 
-    print(f"{len(df):,} rows ingested.   load_ts = {load_ts}")
+INSERT_SQL = """
+/* insert new or changed version */
+INSERT INTO master_dhan_instruments (
+    exch_id, segment, security_id, isin, instrument,
+    underlying_security_id, underlying_symbol, symbol_name, display_name,
+    instrument_type, series, lot_size, sm_expiry_date, strike_price,
+    option_type, tick_size, expiry_flag, bracket_flag, cover_flag,
+    asm_gsm_flag, asm_gsm_category, buy_sell_indicator,
+    buy_co_min_margin_per, sell_co_min_margin_per,
+    buy_co_sl_range_max_perc, sell_co_sl_range_max_perc,
+    buy_co_sl_range_min_perc, sell_co_sl_range_min_perc,
+    buy_bo_min_margin_per, sell_bo_min_margin_per,
+    buy_bo_sl_range_max_perc, sell_bo_sl_range_max_perc,
+    buy_bo_sl_range_min_perc, sell_bo_sl_min_range,
+    buy_bo_profit_range_max_perc, sell_bo_profit_range_max_perc,
+    buy_bo_profit_range_min_perc, sell_bo_profit_range_min_perc,
+    mtf_leverage,
+    valid_from, valid_to, load_ts
+)
+SELECT st.*,
+       %(load_ts)s AS valid_from,
+       NULL        AS valid_to,
+       %(load_ts)s AS load_ts
+FROM   _stage st
+LEFT   JOIN master_dhan_instruments m
+       ON m.security_id = st.security_id
+       AND m.valid_to IS NULL
+WHERE  m.security_id IS NULL;
+"""
+
+
+def update_database(df: pd.DataFrame) -> None:
+    load_ts = datetime.now(timezone.utc)
+
+    with get_connection() as conn, conn.cursor() as cur:
+        # schema
+        cur.execute(DDL)
+        conn.commit()
+
+        # temp staging table (structure cloned, dropped on COMMIT)
+        cur.execute("""
+            CREATE TEMP TABLE _stage
+            ON COMMIT DROP
+            AS SELECT * FROM master_dhan_instruments WHERE false;
+
+            /* remove the audit/version columns */
+            ALTER TABLE _stage
+                DROP COLUMN valid_from,
+                DROP COLUMN valid_to,
+                DROP COLUMN load_ts;
+        """)
+
+        buf = io.StringIO()
+        df.to_csv(
+            buf,
+            sep="\t",
+            header=False,
+            index=False,
+            na_rep="\\N",          # <- NULL _must_ be \N for COPY text mode
+            quoting=csv.QUOTE_NONE,
+        )
+        buf.seek(0)
+        cur.copy_from(
+            buf,
+            "_stage",
+            sep="\t",
+            null="\\N",
+            columns=df.columns.to_list(),
+        )
+
+        # versioning
+        cur.execute("BEGIN;")
+        cur.execute(make_update_sql(TRACKED_COLS), {"load_ts": load_ts})
+        cur.execute(INSERT_SQL, {"load_ts": load_ts})
+        cur.execute("COMMIT;")
+
+    print(f"{len(df):,} rows processed  |  load_ts = {load_ts.isoformat(timespec='seconds')}")
 
 
 if __name__ == "__main__":
-    csv_path = download_latest_scrip_master_csv()
-    print("Downloaded file at: ", csv_path)
-    update_scrip_master_from_csv(csv_path)
+    # csv_path = download_master_csv()
+    csv_path = Path("/var/folders/dv/gp7kv02j1yb5m928ytjbls380000gn/T/tmpdspujt5p.csv")
+    print(f"downloaded → {csv_path}")
+    df_master = load_csv(csv_path)
+    update_database(df_master)
