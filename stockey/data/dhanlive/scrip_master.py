@@ -227,8 +227,7 @@ def update_database(df: pd.DataFrame) -> None:
 
 
 if __name__ == "__main__":
-    # csv_path = download_master_csv()
-    csv_path = Path("/var/folders/dv/gp7kv02j1yb5m928ytjbls380000gn/T/tmpdspujt5p.csv")
+    csv_path = download_master_csv()
     print(f"downloaded → {csv_path}")
     df_master = load_csv(csv_path)
     update_database(df_master)

@@ -13,6 +13,10 @@ ALTER DATABASE stockey OWNER TO stockey;
 GRANT USAGE ON SCHEMA public TO stockey;
 ```
 
+# Dhan
+
+`python -m data.dhanlive.scrip_master`
+
 # Sharpely master setup
 
 `python -m data.sharpelydata.scrip_master`
@@ -26,3 +30,5 @@ GRANT USAGE ON SCHEMA public TO stockey;
 - Historical MCap: `get_historical_mcap(ticker)`
 
 `python -m data.sharpelydata.sharpely_data`
+
+# TODO: Add loop to get all ticker data for other scrips
