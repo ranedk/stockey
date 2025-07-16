@@ -31,4 +31,8 @@ GRANT USAGE ON SCHEMA public TO stockey;
 
 `python -m data.sharpelydata.sharpely_data`
 
-# TODO: Add loop to get all ticker data for other scrips
+>Note: TODO: Add loop to get all ticker data for other scrips
+
+## US Macro data, ISM Manufacturing and India GDP numbers
+
+`python -m data.fred.us_macro`

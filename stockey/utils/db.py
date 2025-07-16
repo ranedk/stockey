@@ -1,6 +1,6 @@
 import io
-from typing import Tuple
-from typing import List
+from datetime import datetime, date
+from typing import List, Tuple, Union
 from environs import Env
 import pandas as pd
 import psycopg2
@@ -187,3 +187,67 @@ def select_sql(sql: str, params: Tuple = ()) -> pd.DataFrame:
         rows = cur.fetchall()
 
     return pd.DataFrame(rows)
+
+def table_has_date(
+    table: str,
+    column: str,
+    target: Union[date, datetime],
+) -> bool:
+    """
+    Return True if *table.column* contains *target* ignoring any time part.
+
+    Parameters
+    ----------
+    table   : table name (unquoted; will be wrapped safely)
+    column  : column name (unquoted)
+    target  : a datetime.date or datetime.datetime
+
+    Raises
+    ------
+    ValueError if the column is not of type DATE.
+    """
+
+    with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT data_type
+            FROM   information_schema.columns
+            WHERE  table_schema = 'public'
+              AND  table_name   = %s
+              AND  column_name  = %s
+            """,
+            (table, column),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"{table}.{column} does not exist")
+        if row['data_type'] not in ["date", "timestamp", "timestamp with time zone"]:
+            raise ValueError(
+                f"{table}.{column} is {row['data_type'].upper()}, not DATE"
+            )
+
+    date_only = target.date() if isinstance(target, datetime) else target
+
+    query = sql.SQL(
+        """
+        SELECT
+            EXISTS(SELECT 1
+                   FROM   {schema}.{table}
+                   WHERE  {column} = %s
+                   LIMIT  1)                     AS has_target,
+            MAX({column})                       AS latest_date
+        FROM {schema}.{table}
+        """
+    ).format(
+        schema=sql.Identifier('public'),
+        table=sql.Identifier(table),
+        column=sql.Identifier(column),
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(query, (date_only,))
+        has_target, latest_date = cur.fetchone()
+
+    if latest_date and isinstance(latest_date, datetime):
+        latest_date = latest_date.date()
+    return has_target, latest_date

@@ -13,17 +13,17 @@ but pandas-datareader still works anonymously for these series).
 
 from __future__ import annotations
 
-import os
 from datetime import date
-from pathlib import Path
 from typing import Dict
 
 import requests
 import pandas as pd
 from pandas_datareader import data as pdr
 
+from utils.db import upsert_to_db, table_has_date
 
-FRED_SERIES: Dict[str, str] = {
+
+__FRED_SERIES: Dict[str, str] = {
     # Rates & risk-sentiment
     "DGS10":       "ust10y_yield",        # 10-year Treasury constant-maturity
     "EFFR":        "fedfunds_eff",        # Effective Fed-funds rate (daily)
@@ -42,15 +42,26 @@ FRED_SERIES: Dict[str, str] = {
 }
 
 def fetch_fred_series(
-    series: Dict[str, str] = FRED_SERIES,
-    start: str | date = "2010-01-01",
-    end: str | date = date.today(),
+    series: Dict[str, str] = __FRED_SERIES,
     resample: str | None = "D",          # "D"→daily, None→native freq.
 ) -> pd.DataFrame:
     """
     Returns a DataFrame with friendly column names, one column per series.
     Missing values (weekends, holidays) are forward-filled after resampling.
     """
+    today = date.today()
+    found, latest_date = table_has_date("macro_usa", "date", today)
+
+    start = latest_date
+    end = date.today()
+
+    if found:
+        # No need to query further if table has latest data
+        return
+    if latest_date >= today:
+        # latest_date is today, no need to query further
+        return
+
     df = pdr.DataReader(list(series.keys()), "fred", start, end)
     df = df.rename(columns=series)
 
@@ -61,10 +72,25 @@ def fetch_fred_series(
             .ffill()
         )
 
-    return df
+    df = df.reset_index().rename(columns={'DATE': 'date'})
+
+    df_india_gdp = df[['date', 'india_gdp']]
+    df_usa = df.drop(columns=['india_gdp'])
+
+    upsert_to_db(
+        df_usa,
+        "macro_usa",
+        unique_keys=["date"],
+    )
+
+    upsert_to_db(
+        df_india_gdp,
+        "macro_india_gdp",
+        unique_keys=["date"],
+    )
+
 
 def fetch_ism_manufacturing():
-
     headers = {
         'accept': '*/*',
         'accept-language': 'en-US,en;q=0.9,uz;q=0.8',
@@ -83,19 +109,23 @@ def fetch_ism_manufacturing():
     response = requests.get(
         'https://calendar-api.fxsstatic.com/en/api/v1/events/2e1d69f3-8273-4096-b01b-8d2034d4fade/historical',
         headers=headers,
+        timeout=100
     )
     ism = response.json()
     df = pd.DataFrame.from_dict(ism)
-    df = df.drop(columns=['id', 'ratioDeviation'])
+    df = df.drop(columns=['id', 'ratioDeviation']).rename(columns={'dateUtc': 'date'})
+
+    upsert_to_db(
+        df,
+        "macro_usa_ism",
+        unique_keys=["date"],
+    )
     return df
 
 
 
-# ------- 3.  CLI / quick test --------------------------------------- #
 if __name__ == "__main__":
-    macro_df = fetch_fred_series()
-    ism = fetch_ism_manufacturing()
-    from IPython import embed
-    embed()
+    fetch_fred_series()
+    fetch_ism_manufacturing()
 
 
