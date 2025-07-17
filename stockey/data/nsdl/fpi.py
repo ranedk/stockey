@@ -152,9 +152,9 @@ def update_fpi_data():
 
         if not found:
             if year == today.year and month == today.month:
-                get_fpi_data(month, year, day=today.day)
+                get_fpi_data(year, month, day=today.day)
             else:
-                get_fpi_data(month, year, day=None)
+                get_fpi_data(year, month, day=None)
 
         # move to next month
         month += 1
