@@ -5,15 +5,17 @@ from datetime import datetime, timedelta
 
 from playwright.async_api import async_playwright
 import redis.asyncio as redis
+from environs import Env
 
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-CDP_ENDPOINT = (
-    "http://localhost:9222"  # Chrome started with --remote-debugging-port=9222
-)                            # Chromium or webkit won't work with NSE website
+env = Env()
+env.read_env()
+
+
+REDIS_HOST = env("REDIS_HOST")
+REDIS_PORT = env("REDIS_PORT")
+CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:downloaded"
-
 
 def get_random(min_ms: int, max_ms: int) -> int:
     """Return a random int in milliseconds between min_ms and max_ms."""
@@ -24,7 +26,7 @@ async def download_bhavcopy_for_date(
     playwright,
     formatted_date: str,
     display_date: str,
-    r: redis.Redis,
+    rop: redis.Redis,
 ) -> bool:
     """
     Automate NSE 'Archives' tab to download the ZIP for a single day.
@@ -64,7 +66,7 @@ async def download_bhavcopy_for_date(
 
         weekday = datetime.strptime(display_date, "%d-%b-%Y").strftime("%A")
         print(f"✅ Success: {formatted_date} ({weekday})")
-        await r.sadd(REDIS_SET, formatted_date)
+        await rop.sadd(REDIS_SET, formatted_date)
         return True
 
     except Exception as err:
@@ -78,7 +80,7 @@ async def download_bhavcopy_for_date(
 
 
 async def main() -> None:
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     failures = 0
     days_back = 1  # start with “yesterday”
 
@@ -88,13 +90,13 @@ async def main() -> None:
             formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
             display_date = date_obj.strftime("%d-%b-%Y")  # 19-Jun-2025
 
-            if await r.sismember(REDIS_SET, formatted_date):
+            if await rop.sismember(REDIS_SET, formatted_date):
                 print(f"⏩ Already downloaded: {formatted_date}")
                 days_back += 1
                 continue
 
             success = await download_bhavcopy_for_date(
-                p, formatted_date, display_date, r
+                p, formatted_date, display_date, rop
             )
             failures = 0 if success else failures + 1
             days_back += 1
@@ -103,7 +105,7 @@ async def main() -> None:
         print("📉 Stopped after 7 consecutive failures.")
     else:
         print("All caught up! Done")
-    await r.aclose()
+    await rop.aclose()
 
 
 if __name__ == "__main__":

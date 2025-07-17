@@ -1,9 +1,9 @@
-import re
-import time
-from datetime import date
+from datetime import date, datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
+import redis
 import pandas as pd
+from environs import Env
 
 from utils.http import hidden_inputs_to_dict, get_dynamic_headers
 from utils.db import upsert_to_db
@@ -11,11 +11,18 @@ from utils.parsers import table_to_grid
 from . import fpi_utils as futils
 
 
+env = Env()
+env.read_env()
+
+
+REDIS_HOST = env("REDIS_HOST")
+REDIS_PORT = env("REDIS_PORT")
+REDIS_SET = "nsdl:fpi:downloaded"
 HEADERS = get_dynamic_headers()
 
 
-def get_fpi_data(year, month, day=None):
-    print(f"Fetching FPI data for date: {year}/{month}/{day}")
+def get_fpi_data(date: date):
+    print(f"Fetching FPI data for date: {date}")
     session = requests.Session()
     response = session.get(
         "https://www.fpi.nsdl.co.in/web/Reports/Archive.aspx", headers=HEADERS
@@ -23,13 +30,8 @@ def get_fpi_data(year, month, day=None):
     cookies = session.cookies.get_dict()
     hidden = hidden_inputs_to_dict(response.content)
 
-    if day:
-        last_date = date(year, month, day)
-    else:
-        last_date = futils.get_last_date(year, month)
-
     data = {
-        "hdnDate": last_date.strftime("%d-%b-%Y"),
+        "hdnDate": date.strftime("%d-%b-%Y"),
         "HdnValexceldata": "",
         "hdnFlag": "",
         "__EVENTTARGET": "btnSubmit1",
@@ -137,24 +139,30 @@ def parse_html_to_dfs(table_html):
     return fii_investments_df, fii_derivatives_df
 
 
+def mark_till_date(rop, end_date):
+    if end_date and isinstance(end_date, datetime):
+        end_date = end_date.date()
+    start = end_date.replace(day=1)
+    days = (end_date - start).days
+    for i in range(days + 1):
+        rop.sadd(REDIS_SET, (start + timedelta(days=i)).strftime("%Y-%m-%d"))
+
+
 def update_fpi_data():
+    rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     today = date.today()
     year, month = 2014, 1
 
     while (year, month) <= (today.year, today.month):
         last_dom = futils.get_last_date(year, month).day
         target_date = date(year, month, last_dom)
+        target_date = min(target_date, today)
 
-        if target_date > today:
-            target_date = today
-
-        found, _ = futils.downloaded_for(target_date)
+        found = False
 
         if not found:
-            if year == today.year and month == today.month:
-                get_fpi_data(year, month, day=today.day)
-            else:
-                get_fpi_data(year, month, day=None)
+            get_fpi_data(target_date)
+            mark_till_date(rop, target_date)
 
         # move to next month
         month += 1
@@ -164,5 +172,5 @@ def update_fpi_data():
 
 
 if __name__ == "__main__":
-    # get_fpi_data(2014, 1)
+    # get_fpi_data(date(2014, 1, 31))
     update_fpi_data()
