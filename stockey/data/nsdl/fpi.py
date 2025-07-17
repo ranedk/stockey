@@ -96,7 +96,9 @@ def parse_investments_table(table_html):
     df["instrument"] = (
         df["itype"].apply(futils.to_snake) + "_" + df["iroute"].apply(futils.to_snake)
     )
-    df["instrument"] = df["instrument"].apply(lambda x: "total" if x == "debt_total" else x)
+    df["instrument"] = df["instrument"].apply(
+        lambda x: "total" if x == "debt_total" else x
+    )
     df.drop(columns=["itype", "iroute", "usd_inr_rate"], inplace=True)
     df = futils.fix_reporting_date(df)
     return df
@@ -137,54 +139,28 @@ def parse_html_to_dfs(table_html):
 
 def update_fpi_data():
     today = date.today()
-    current_year = today.year
-    current_month = today.month
-    current_day = today.day
+    year, month = 2014, 1
 
-    _, latest_date = futils.downloaded_for(
-        today
-    )  # returns (if_found, latest_date)
+    while (year, month) <= (today.year, today.month):
+        last_dom = futils.get_last_date(year, month).day
+        target_date = date(year, month, last_dom)
 
-    # Case 1: No data in the table
-    if latest_date is None:
-        print("No data found in the table. Fetching from Jan 2014 to current month...")
-        for year in range(2014, current_year + 1):
-            for month in range(1, 13):
-                if year == current_year and month > current_month:
-                    break
-                day = futils.get_last_date(year, month).day
-                get_fpi_data(year, month, day)
-                time.sleep(1)
-        return
+        if target_date > today:
+            target_date = today
 
-    # Case 2: Table has data
-    print(f"Latest date in table: {latest_date}")
-    latest_year = latest_date.year
-    latest_month = latest_date.month
+        found, _ = futils.downloaded_for(target_date)
 
-    # If latest data is in the current month
-    if latest_year == current_year and latest_month == current_month:
-        print("Latest data is from the current month. Fetching today's data...")
-        get_fpi_data(current_year, current_month, day=current_day)
-        return
+        if not found:
+            if year == today.year and month == today.month:
+                get_fpi_data(month, year, day=today.day)
+            else:
+                get_fpi_data(month, year, day=None)
 
-    # If latest data is from a previous month
-    if latest_year < current_year or latest_month < current_month:
-        print(
-            "Latest data is from a previous month. Filling missing months and updating current month..."
-        )
-        # Fill previous months (from latest_date + 1 month till previous month of today)
-        start_year = latest_year
-        start_month = latest_month + 1
-        for year in range(start_year, current_year + 1):
-            for month in range(start_month if year == start_year else 1, 13):
-                if year == current_year and month > current_month:
-                    break
-                day = futils.get_last_date(year, month).day
-                get_fpi_data(year, month, day)
-
-    # Finally, fetch current month's data till today
-    get_fpi_data(current_year, current_month, day=current_day)
+        # move to next month
+        month += 1
+        if month == 13:
+            month = 1
+            year += 1
 
 
 if __name__ == "__main__":
