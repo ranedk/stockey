@@ -36,7 +36,7 @@ The links between all scrips will be via their BSE Ticker or NSE Ticker.
 
 `python -m data.sharpelydata.sharpely_data`
 
->Note: TODO: Add loop to get all ticker data for other scrips
+> TODO: Add loop to get all ticker data for other scrips
 
 ## US Macro data, ISM Manufacturing and India GDP numbers
 
@@ -66,6 +66,39 @@ python data/bhavcopy/downloader.py
 
 This is backed by redis to figure if downloads have been done or not.
 
+# Bulk/Block/Short Deals downloader
+
+This has the bulk, block and short deals from the market
+
+You will have to stop all running instances of chrome to be able to run the new instance in debugging mode. You can use `pkill chrome` to kill all instances.
+OSX: `/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
+
+OR
+
+Ubuntu: `/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
+
+## Run the bhavcopy downloader
+
+```shell
+python data/bhavcopy/bulk_block_short_downloader.py
+```
+
+This is backed by redis to figure if downloads have been done or not.
+
+# RBI Bank rates
+
+For kinds of bank rates set by RBI monetary policy
+
+You will have to stop all running instances of chrome to be able to run the new instance in debugging mode. You can use `pkill chrome` to kill all instances.
+OSX: `/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
+
+OR
+
+Ubuntu: `/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
+
+`python -m data.rbi.download_bank_rates`
+
+This is run daily, but updates rarely. There is no need to figure out last pulled dated since this returns entire data every time.
 
 # TODO
 

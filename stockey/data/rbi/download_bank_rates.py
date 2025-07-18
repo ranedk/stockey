@@ -1,71 +1,14 @@
-# Download data from RBI website
-import asyncio
-import random
-from datetime import datetime, timedelta
-
+# Download data from RBI website – sync version
+from playwright.sync_api import sync_playwright
 import pandas as pd
 import numpy as np
-from playwright.async_api import async_playwright
-import redis.asyncio as redis
+
+from utils.db import upsert_to_db
+
+CDP_ENDPOINT = "http://localhost:9222"
 
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-CDP_ENDPOINT = "http://localhost:9222"  # Chrome started with --remote-debugging-port=9222  # Chromium or webkit won't work with NSE website
-REDIS_SET = "nse:downloaded"
-
-
-def get_random(min_ms: int, max_ms: int) -> int:
-    """Return a random int in milliseconds between min_ms and max_ms."""
-    return int(random.uniform(min_ms, max_ms))
-
-
-async def download_latest_rates(
-    playwright,
-    formatted_date: str,
-    r: redis.Redis,
-) -> bool:
-    """
-    Automate RBI website's download. The site is made in SAP
-    and is complete crap. So, playwright is only alternative
-    """
-    browser = await playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
-    context = browser.contexts[0] if browser.contexts else await browser.new_context()
-    page = await context.new_page()
-
-    try:
-        await page.goto("https://data.rbi.org.in/DBIE/#/dbie/home")
-        await page.wait_for_timeout(10000)
-
-        await page.get_by_role("link", name="Indicators", exact=True).click()
-        await page.wait_for_timeout(2000)
-
-        await page.locator("a").filter(has_text="Financial Sector Indicators").click()
-        await page.wait_for_timeout(2000)
-
-        async with page.expect_popup() as popup_info:
-            await page.get_by_text("Key Rates").click()
-
-        rates_page = await popup_info.value
-        await rates_page.wait_for_timeout(10000)
-        frame = rates_page.frame(name="openDocChildFrame")
-
-        await frame.get_by_role("button", name="Export (Ctrl+E)").click()
-        await rates_page.wait_for_timeout(3000)
-
-        async with rates_page.expect_download(timeout=15_000) as dl_info:
-            await frame.get_by_role("button", name="Export", exact=True).click()
-
-        download = await dl_info.value
-        file_path = f"rbi_rates_{formatted_date}.xlsx"
-        await download.save_as(file_path)
-
-    finally:
-        await page.close()
-        await browser.close()
-
-
-def parse_excel_file(file_path):
+def parse_excel_file(file_path: str) -> pd.DataFrame:
     xls = pd.ExcelFile(file_path)
     sheet_names = xls.sheet_names
 
@@ -80,39 +23,65 @@ def parse_excel_file(file_path):
     data_df.dropna(how="all", inplace=True)
 
     column_index_rename_map = {
-        0: '',
-        1: 'effective_date',
-        2: 'bank_rate',
-        3: 'repo_rate',
-        4: 'reverse_repo_rate',
-        5: 'sdf_rate',
-        6: 'msf_rate',
-        7: 'crr',
-        8: 'slr',
+        0: "",
+        1: "effective_date",
+        2: "bank_rate",
+        3: "repo_rate",
+        4: "reverse_repo_rate",
+        5: "sdf_rate",
+        6: "msf_rate",
+        7: "crr",
+        8: "slr",
     }
 
     data_df = data_df.iloc[:-1]
-    data_df.columns = [column_index_rename_map.get(i, col) for i, col in enumerate(data_df.columns)]
+    data_df.columns = [
+        column_index_rename_map.get(i, col) for i, col in enumerate(data_df.columns)
+    ]
     data_df = data_df.drop(columns=data_df.columns[0])
     data_df.replace("-", np.nan, inplace=True)
     return data_df
 
 
-async def main() -> None:
-    r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+def download_latest_rates(playwright) -> bool:
+    """
+    Automate RBI website's download using the sync Playwright API.
+    """
+    browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+    context = browser.contexts[0] if browser.contexts else browser.new_context()
+    page = context.new_page()
 
-    async with async_playwright() as p:
-        date_obj = datetime.today()
-        formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
+    page.goto("https://data.rbi.org.in/DBIE/#/dbie/home")
+    page.wait_for_timeout(10_000)
 
-        await download_latest_rates(p, formatted_date, r)
+    page.get_by_role("link", name="Indicators", exact=True).click()
+    page.wait_for_timeout(2_000)
 
-    await r.aclose()
+    page.locator("a").filter(has_text="Financial Sector Indicators").click()
+    page.wait_for_timeout(2_000)
+
+    with page.expect_popup() as popup_info:
+        page.get_by_text("Key Rates").click()
+
+    rates_page = popup_info.value
+    rates_page.wait_for_timeout(10_000)
+    frame = rates_page.frame(name="openDocChildFrame")
+
+    frame.click("#__button60")
+    rates_page.wait_for_timeout(3_000)
+
+    with rates_page.expect_download(timeout=15_000) as dl_info:
+        frame.get_by_role("button", name="Export", exact=True).click()
+
+    download = dl_info.value
+    file_path = download.path()               # sync call
+    df = parse_excel_file(file_path)
+    upsert_to_db(df, "rbi_bank_rates", unique_keys=["effective_date"])
+
+    page.close()
+    browser.close()
 
 
 if __name__ == "__main__":
-    # asyncio.run(main())
-    df = parse_excel_file("./data/rbi/rbi_rates_2025-06-30.xlsx")
-    from IPython import embed
-    embed()
-
+    with sync_playwright() as p:
+        download_latest_rates(p)
