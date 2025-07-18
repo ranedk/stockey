@@ -39,6 +39,8 @@ __FRED_SERIES: Dict[str, str] = {
     "DCOILWTICO":  "wti_crude_spot",      # WTI crude spot $/bbl
 
     "NGDPRNSAXDCINQ": "india_gdp",        # India GDP numbers
+
+    "DEXINUS": "inr_usd_spot",            # INR USD Spot price
 }
 
 def fetch_fred_series(
@@ -50,7 +52,11 @@ def fetch_fred_series(
     Missing values (weekends, holidays) are forward-filled after resampling.
     """
     today = date.today()
-    found, latest_date = table_has_date("macro_usa", "date", today)
+    try:
+        found, latest_date = table_has_date("macro_usa", "date", today)
+    except:
+        found = False
+        latest_date = date(2014,1,1)
 
     start = latest_date
     end = date.today()

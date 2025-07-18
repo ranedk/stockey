@@ -40,6 +40,23 @@ The links between all scrips will be via their BSE Ticker or NSE Ticker.
 
 ## US Macro data, ISM Manufacturing and India GDP numbers
 
+In table `macro_usa`
+
+- 10-year Treasury constant-maturity
+- Effective Fed-funds rate (daily)
+- CBOE VIX close
+- Growth & inflation
+- NFP (level, ‘000)
+- CPI SA
+- CPI core SA
+- USD & commodities
+- Trade-weighted dollar (goods only)
+- WTI crude spot $/bbl
+- India GDP numbers
+- INR USD Spot price
+
+In table `macro_usa_ism` - ISM Manufacturing data
+
 `python -m data.fred.us_macro`
 
 This is backed by redis to figure if downloads have been done or not.
