@@ -95,6 +95,7 @@ def download_gsec_data(page,from_date: date, to_date: date):
 
     df = pd.DataFrame(data["data"])
     df["date"] = df["rowDateRaw"].apply(lambda x: datetime.fromtimestamp(int(x)).date())
+    df["date"] = pd.to_datetime(df["date"])
     df = df.iloc[:, 11:]
     df.columns = [
         "last_close",
@@ -104,6 +105,9 @@ def download_gsec_data(page,from_date: date, to_date: date):
         "change_precent",
         "date",
     ]
+    for col in ["last_close", "last_open", "last_max", "last_min", "change_precent"]:
+        df[col] = pd.to_numeric(df[col], errors='ignore')
+
     upsert_to_db(df, "ininvesting_gsec", unique_keys=["date"])
     return df
 
@@ -131,6 +135,7 @@ def sync_gsec_prices(today: date | None = None):
             if not chunk_has_missing_dates(c_start, c_end):
                 continue
 
+            c_start = c_start - timedelta(days=15)   # For safety, data may be empty for today
             download_gsec_data(page, c_start, c_end)
             mark_dates_checked(c_start, c_end)
 
