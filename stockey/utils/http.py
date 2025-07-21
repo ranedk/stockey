@@ -147,6 +147,7 @@ def get_with_retries(
     retries: int = 5,
     backoff_factor: float = 0.3,
     from_cache: bool = True,
+    stream: bool = False,
     max_age_days: int = 10,
 ) -> requests.Response:
     """
@@ -191,7 +192,8 @@ def get_with_retries(
             timeout=timeout,
             data=data,
             params=params,
-            json=json_data
+            json=json_data,
+            stream=stream,
         )
         response.raise_for_status()
         _save_to_cache(base_name, response.text)

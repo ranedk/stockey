@@ -13,7 +13,7 @@ but pandas-datareader still works anonymously for these series).
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Dict
 
 import requests
@@ -58,7 +58,7 @@ def fetch_fred_series(
         found = False
         latest_date = date(2014,1,1)
 
-    start = latest_date
+    start = latest_date - timedelta(days=10)  # Some values like inr_usd get updated later
     end = date.today()
 
     if found:

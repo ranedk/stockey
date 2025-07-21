@@ -1,17 +1,68 @@
-from datetime import date, timedelta
+import calendar
+from datetime import date
+from dateutil.relativedelta import relativedelta
 from io import StringIO
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 import pandas as pd
+from environs import Env
+import redis
 
 from utils.http import hidden_inputs_to_dict, get_dynamic_headers
+from utils.db import upsert_to_db
 
+env = Env()
+env.read_env()
+
+REDIS_HOST = env("REDIS_HOST")
+REDIS_PORT = env("REDIS_PORT")
+REDIS_SET = "cpi:downloaded"
+rdb = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 HEADERS = get_dynamic_headers()
 
 
-def get_cookies_and_data(from_date: date, to_date: date):
+def first_of_month(d: date) -> date:
+    return d.replace(day=1)
+
+
+def last_of_month(d: date) -> date:
+    last_day = calendar.monthrange(d.year, d.month)[1]
+    return d.replace(day=last_day)
+
+
+def month_iter(start: date, stop: date):
+    """Yield first-of-month dates from *start* through *stop* inclusive."""
+    current = start
+    while current <= stop:
+        yield current
+        current += relativedelta(months=1)
+
+
+def chunk_consecutive(months: list[date], max_months: int = 12):
+    """
+    Group an ordered list of month starts into runs that are
+    (1) consecutive and (2) no longer than *max_months*.
+    Yields (run_start, run_end) pairs where run_end is **last day** of month.
+    """
+    i = 0
+    while i < len(months):
+        run_start = months[i]
+        j = i
+        # extend while next month is exactly +1 and length ≤ max_months
+        while (
+            j + 1 < len(months)
+            and months[j + 1] == months[j] + relativedelta(months=1)
+            and (j + 1) - i + 1 <= max_months
+        ):
+            j += 1
+        run_end = last_of_month(months[j])
+        yield run_start, run_end
+        i = j + 1
+
+
+def download_cpi_data(from_date: date, to_date: date):
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     session = requests.Session()
     response = session.get('https://cpi.mospi.gov.in/', headers=HEADERS, verify=False)
@@ -33,7 +84,10 @@ def get_cookies_and_data(from_date: date, to_date: date):
 
     data.update(hidden)
     response = requests.post('https://cpi.mospi.gov.in/TimeSeries_2012.aspx', cookies=cookies, headers=HEADERS, data=data, verify=False)
-    return response.content
+    table_html = response.content
+    df = table_to_df(table_html)
+    upsert_to_db(df, "mospi_cpi", unique_keys=["cpi_for_month", "state", "group", "sub_group"])
+    return df
 
 
 def table_to_df(table_html):
@@ -50,17 +104,43 @@ def table_to_df(table_html):
     df["reported_on"] = df["cpi_for_month"] + pd.DateOffset(months=1)
     df["reported_on"] = df["reported_on"].apply(lambda d: d.replace(day=12))
 
+    df = df.iloc[:, 2:]
+    df.columns = ['state', 'group', 'sub_group', 'description', 'rural', 'urban', 'combined', 'status', 'cpi_for_month', 'reported_on']
     return df
 
-table_html = get_cookies_and_data(date(2024,1,1), date(2025,1,1))
-from IPython import embed
-embed()
-df = table_to_df(table_html)
+
+def sync_cpi_data():
+    """
+    1. Build the list of months from ten years ago up to *last* month.
+    2. Ask Redis which months are missing.
+    3. Download the gaps in ≤12-month chunks.
+    4. Mark the months as present in Redis once the download succeeds.
+    """
+    today = date.today()
+    last_month = first_of_month(today - relativedelta(months=1))
+    start_month = first_of_month(today - relativedelta(years=10))
 
 
+    # Build the complete month list and filter out those already present
+    all_months = list(month_iter(start_month, last_month))
+    month_keys = [m.isoformat() for m in all_months]
+    have = {k for k in month_keys if rdb.sismember(REDIS_SET, k)}
+    missing_months = [m for m in all_months if m.isoformat() not in have]
 
+    if not missing_months:
+        print("CPI data is already up-to-date ✅")
+        return
 
-d = """
+    for run_start, run_end in chunk_consecutive(missing_months):
+        try:
+            print("Downloading CPI %s → %s", run_start, run_end)
+            download_cpi_data(run_start, run_end)
 
-response = requests.post('https://cpi.mospi.gov.in/TimeSeries_2012.aspx', cookies=cookies, headers=headers, data=data)
-"""
+            new_members = [m.isoformat() for m in month_iter(run_start, first_of_month(run_end))]
+            rdb.sadd(REDIS_SET, *new_members)
+        except Exception:
+            print("Failed to download CPI for %s → %s", run_start, run_end)
+            break
+
+if __name__ == "__main__":
+    sync_cpi_data()
