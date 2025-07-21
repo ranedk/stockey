@@ -58,45 +58,53 @@ def find_first_missing(lookback_start: date, today: date) -> date | None:
     return None if cur > today else cur
 
 
-def download_gsec_data(from_date: date, to_date: date):
+def download_gsec_data(page,from_date: date, to_date: date):
     print(f"Downloading GSEC 10y yield data for {from_date} to {to_date}")
-    params = {
-        "start-date": from_date.strftime("%Y-%m-%d"),
-        "end-date": to_date.strftime("%Y-%m-%d"),
-        "time-frame": "Daily",
-        "add-missing-rows": "false",
-    }
 
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(CDP_ENDPOINT)
-        context = browser.new_context()
+    page.goto(
+        "https://in.investing.com/rates-bonds/india-10-year-bond-yield-historical-data",
+        wait_until="domcontentloaded",
+        timeout=5000,
+    )
+    page.wait_for_timeout(5000)
 
-        page = context.new_page()
-        page.goto(
-            "https://in.investing.com/rates-bonds/india-10-year-bond-yield-historical-data",
-            wait_until="domcontentloaded",
-            timeout=5000
-        )
-        page.wait_for_timeout(5000)
+    query_str = f"start-date={from_date.strftime('%Y-%m-%d')}&end-date={to_date.strftime('%Y-%m-%d')}&time-frame=Daily&add-missing-rows=false"
+    url = (
+        f"https://api.investing.com/api/financialdata/historical/24014?{query_str}"
+    )
 
-        response = page.request.get(
-            "https://api.investing.com/api/financialdata/historical/24014",
-            params=params
-        )
-        print(response.status)
-        response_json = response.json()
+    data = page.evaluate(
+        f"""
+        async () => {{
+            const res = await fetch("{url}", {{
+                method: "GET",
+                credentials: "include",
+                headers: {{
+                    "domain-id": "in",
+                    "accept": "*/*",
+                    "origin": "https://in.investing.com",
+                    "referer": "https://in.investing.com/",
+                    "user-agent": navigator.userAgent
+                }}
+            }});
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            return await res.json();
+        }}
+    """
+    )
 
-        browser.close()
-
-    from IPython import embed
-    embed()
-    data = response_json
-    df = pd.DataFrame(data)
-    df["date"] = df["rowDate"].apply(lambda x: datetime.fromtimestamp(x).date())
-    from IPython import embed
-
-    embed()
-    # upsert_to_db(df, "ininvesting_gsec", unique_keys=["date"])
+    df = pd.DataFrame(data["data"])
+    df["date"] = df["rowDateRaw"].apply(lambda x: datetime.fromtimestamp(int(x)).date())
+    df = df.iloc[:, 11:]
+    df.columns = [
+        "last_close",
+        "last_open",
+        "last_max",
+        "last_min",
+        "change_precent",
+        "date",
+    ]
+    upsert_to_db(df, "ininvesting_gsec", unique_keys=["date"])
     return df
 
 
@@ -114,13 +122,19 @@ def sync_gsec_prices(today: date | None = None):
         print("✅ All calendar days in the past already checked.")
         return
 
-    for c_start, c_end in yearly_chunks(first_missing, today):
-        if not chunk_has_missing_dates(c_start, c_end):
-            continue
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(CDP_ENDPOINT)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
 
-        download_gsec_data(c_start, c_end)
-        mark_dates_checked(c_start, c_end)
+        for c_start, c_end in yearly_chunks(first_missing, today):
+            if not chunk_has_missing_dates(c_start, c_end):
+                continue
 
+            download_gsec_data(page, c_start, c_end)
+            mark_dates_checked(c_start, c_end)
+
+        browser.close()
 
 if __name__ == "__main__":
     sync_gsec_prices()
