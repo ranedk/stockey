@@ -27,12 +27,9 @@ def get_connection():
         conn = get_connection()
     """
     return psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        dbname=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD
     )
+
 
 def generate_postgres_schema(
     df: pd.DataFrame,
@@ -98,7 +95,8 @@ def upsert_to_db(
     conflict_cols = sql.SQL(", ").join(sql.Identifier(c) for c in unique_keys)
     set_clause = sql.SQL(", ").join(
         sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
-        for c in cols if c not in unique_keys
+        for c in cols
+        if c not in unique_keys
     )
 
     create_main_sql = generate_postgres_schema(df, table_name, unique_keys)
@@ -116,9 +114,9 @@ def upsert_to_db(
             df.to_csv(copy_buf, header=False, index=False, sep="\t", na_rep="\\N")
             copy_buf.seek(0)
             cur.copy_expert(
-                sql.SQL("COPY {} ({}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')").format(
-                    temp_table, sql.SQL(", ").join(col_identifiers)
-                ),
+                sql.SQL(
+                    "COPY {} ({}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')"
+                ).format(temp_table, sql.SQL(", ").join(col_identifiers)),
                 copy_buf,
             )
 
@@ -126,18 +124,20 @@ def upsert_to_db(
             if unique_keys:
                 idx_name = f"idx_{table_name}_" + "_".join(unique_keys)
                 cur.execute(
-                    sql.SQL('CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})').format(
+                    sql.SQL("CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})").format(
                         sql.Identifier(idx_name), full_table, conflict_cols
                     )
                 )
 
             # 4. UPSERT
             cur.execute(
-                sql.SQL("""
+                sql.SQL(
+                    """
                     INSERT INTO {} ({})
                     SELECT {} FROM {}
                     ON CONFLICT ({}) DO UPDATE SET {};
-                """).format(
+                """
+                ).format(
                     full_table,
                     sql.SQL(", ").join(col_identifiers),
                     sql.SQL(", ").join(col_identifiers),
@@ -166,7 +166,7 @@ def get_sql(sql: str, params: Tuple = ()) -> pd.Series:
     """
     with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(sql, params)
-        rows = cur.fetchall()        # list[dict]
+        rows = cur.fetchall()  # list[dict]
 
     if not rows:
         raise ValueError("Query returned no rows.")
@@ -187,6 +187,7 @@ def select_sql(sql: str, params: Tuple = ()) -> pd.DataFrame:
         rows = cur.fetchall()
 
     return pd.DataFrame(rows)
+
 
 def table_has_date(
     table: str,
@@ -221,7 +222,7 @@ def table_has_date(
         row = cur.fetchone()
         if row is None:
             raise ValueError(f"{table}.{column} does not exist")
-        if row['data_type'] not in ["date", "timestamp", "timestamp with time zone"]:
+        if row["data_type"] not in ["date", "timestamp", "timestamp with time zone"]:
             raise ValueError(
                 f"{table}.{column} is {row['data_type'].upper()}, not DATE"
             )
@@ -239,7 +240,7 @@ def table_has_date(
         FROM {schema}.{table}
         """
     ).format(
-        schema=sql.Identifier('public'),
+        schema=sql.Identifier("public"),
         table=sql.Identifier(table),
         column=sql.Identifier(column),
     )

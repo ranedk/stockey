@@ -84,6 +84,7 @@ def fix_reporting_date(df: pd.DataFrame) -> pd.DataFrame:
     out["reporting_date"] = pd.to_datetime(out["reporting_date"])
     return out
 
+
 def downloaded_for(
     target: date,
 ) -> bool:

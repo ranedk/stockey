@@ -89,7 +89,10 @@ def daterange(start_date, end_date):
 
 
 async def mark_dates_as_downloaded(r, dtype, start_date, end_date):
-    await r.sadd(f"nse:{dtype}", *(dt.strftime("%Y-%m-%d") for dt in daterange(start_date, end_date)))
+    await r.sadd(
+        f"nse:{dtype}",
+        *(dt.strftime("%Y-%m-%d") for dt in daterange(start_date, end_date)),
+    )
 
 
 # Check missing dates
@@ -105,25 +108,25 @@ async def get_next_download_block(r, dtype, g_start, g_end):
     # All missing calendar days for this dtype
     missing = await get_missing_dates(r, dtype, g_start, g_end)
     if not missing:
-        return None                      # nothing left to fetch
+        return None  # nothing left to fetch
 
     # newest-first
     missing.sort(reverse=True)
 
-    end   = missing[0]   # newest day in the gap
+    end = missing[0]  # newest day in the gap
     start = end
-    prev  = end
+    prev = end
     count = 1
 
     for dt in missing[1:]:
-        if (prev - dt).days == 1 and count < 365:   # still consecutive
+        if (prev - dt).days == 1 and count < 365:  # still consecutive
             start = dt
-            prev  = dt            # <-- advance the reference!
+            prev = dt  # <-- advance the reference!
             count += 1
         else:
-            break                 # gap or 365-day limit reached
+            break  # gap or 365-day limit reached
 
-    return start, end             # inclusive
+    return start, end  # inclusive
 
 
 async def main() -> None:
@@ -135,16 +138,16 @@ async def main() -> None:
         async with async_playwright() as p:
             for dtype in ["block_deals", "bulk_deals", "short_selling"]:
                 while True:
-                    block = await get_next_download_block(r, dtype, global_start, global_end)
+                    block = await get_next_download_block(
+                        r, dtype, global_start, global_end
+                    )
                     if not block:
                         print(f"All data downloaded for {dtype} ✅")
                         break
                     print(
                         f"Download {dtype} {block[0].strftime('%d-%m-%Y')} and {block[1].strftime('%d-%m-%Y')}"
                     )
-                    success = await download_data(
-                        p, dtype, block[0], block[1], r
-                    )
+                    success = await download_data(p, dtype, block[0], block[1], r)
     finally:
         await r.aclose()
 

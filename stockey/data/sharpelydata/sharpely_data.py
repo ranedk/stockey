@@ -153,12 +153,14 @@ def parse_consolidated_statement(ticker, data, fccs):
         if fcc_code in fccs:
             values = item[1:]
             for i, period in enumerate(periods):
-                rows.append({
-                    "period_end_date": period,
-                    "period_length": headers.get(period),
-                    "metric": fccs[fcc_code],
-                    "value": values[i] if i < len(values) else None,
-                 })
+                rows.append(
+                    {
+                        "period_end_date": period,
+                        "period_length": headers.get(period),
+                        "metric": fccs[fcc_code],
+                        "value": values[i] if i < len(values) else None,
+                    }
+                )
 
     # Step 4: Convert to DataFrame and pivot
     df_long = pd.DataFrame(rows)
@@ -342,9 +344,7 @@ def get_bulk_insider_trades(ticker):
         "security_held_pre_tx_per",
     ]
     df = df.drop_duplicates(subset=unique_cols)
-    upsert_to_db(
-        df, "trades_insider", unique_keys=unique_cols
-    )
+    upsert_to_db(df, "trades_insider", unique_keys=unique_cols)
 
 
 def get_historical_mcap(ticker):
@@ -380,7 +380,7 @@ def get_historical_mcap(ticker):
 
 
 if __name__ == "__main__":
-    for ticker in ['SHAKTIPUMP', 'HDFCBANK']:
+    for ticker in ["SHAKTIPUMP", "HDFCBANK"]:
         get_historical_mcap(ticker)
         get_financial_statement(ticker)
         get_shareholding(ticker)

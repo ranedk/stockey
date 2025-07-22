@@ -17,6 +17,7 @@ REDIS_PORT = env("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:downloaded"
 
+
 def get_random(min_ms: int, max_ms: int) -> int:
     """Return a random int in milliseconds between min_ms and max_ms."""
     return int(random.uniform(min_ms, max_ms))
@@ -85,7 +86,7 @@ async def main() -> None:
     days_back = 1  # start with “yesterday”
 
     async with async_playwright() as p:
-        while failures < 7 and days_back > 365 * 10: # 10 years
+        while failures < 7 and days_back > 365 * 10:  # 10 years
             date_obj = datetime.today() - timedelta(days=days_back)
             formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
             display_date = date_obj.strftime("%d-%b-%Y")  # 19-Jun-2025

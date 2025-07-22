@@ -5,9 +5,15 @@ import sys
 
 
 def redis_backup(
-    host="localhost", port=6379, db=0, password=None, output_file="redis_global_backup.json"
+    host="localhost",
+    port=6379,
+    db=0,
+    password=None,
+    output_file="redis_global_backup.json",
 ):
-    r = redis.Redis(host=host, port=port, db=db, password=password, decode_responses=True)
+    r = redis.Redis(
+        host=host, port=port, db=db, password=password, decode_responses=True
+    )
     keys = r.keys("*")
     print(f"Found {len(keys)} keys in Redis.")
 
@@ -27,7 +33,10 @@ def redis_backup(
                 backup[key] = {"type": "set", "value": list(r.smembers(key))}
 
             elif key_type == "zset":
-                backup[key] = {"type": "zset", "value": r.zrange(key, 0, -1, withscores=True)}
+                backup[key] = {
+                    "type": "zset",
+                    "value": r.zrange(key, 0, -1, withscores=True),
+                }
 
             elif key_type == "hash":
                 backup[key] = {"type": "hash", "value": r.hgetall(key)}
@@ -45,9 +54,15 @@ def redis_backup(
 
 
 def redis_restore(
-    host="localhost", port=6379, db=0, password=None, input_file="redis_global_backup.json"
+    host="localhost",
+    port=6379,
+    db=0,
+    password=None,
+    input_file="redis_global_backup.json",
 ):
-    r = redis.Redis(host=host, port=port, db=db, password=password, decode_responses=True)
+    r = redis.Redis(
+        host=host, port=port, db=db, password=password, decode_responses=True
+    )
 
     try:
         with open(input_file, "r") as f:
@@ -90,7 +105,9 @@ def redis_restore(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Redis Backup and Restore Script")
-    parser.add_argument("action", choices=["backup", "restore"], help="Action to perform")
+    parser.add_argument(
+        "action", choices=["backup", "restore"], help="Action to perform"
+    )
     parser.add_argument("--host", default="localhost", help="Redis host")
     parser.add_argument("--port", type=int, default=6379, help="Redis port")
     parser.add_argument("--db", type=int, default=0, help="Redis database number")

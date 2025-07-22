@@ -74,7 +74,7 @@ def download_latest_rates(playwright) -> bool:
         frame.get_by_role("button", name="Export", exact=True).click()
 
     download = dl_info.value
-    file_path = download.path()               # sync call
+    file_path = download.path()  # sync call
     df = parse_excel_file(file_path)
     upsert_to_db(df, "rbi_bank_rates", unique_keys=["effective_date"])
 

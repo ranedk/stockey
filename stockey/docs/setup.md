@@ -45,6 +45,17 @@ The state of downloads is stored in redis, which can be updated regularly:
 
 `python utils/redis_bkp_restore.py --host localhost --port 6379 --db 0 --file backups/redis_global_backup.json backup`
 
+# S3 backups
+
+`aws s3 ls s3://stockeydata/`
+
+```
+    PRE bhavcopy/           # bhavcopy dump files
+    PRE nsedeals/           # nse deals dump files
+    PRE pgdump/             # postgres dumps with date marks
+    PRE rdbdump/            # redis dumps with date marks
+```
+
 # Dhan
 
 `python -m data.dhanlive.scrip_master`

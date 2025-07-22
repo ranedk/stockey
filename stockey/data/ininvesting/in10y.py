@@ -58,7 +58,7 @@ def find_first_missing(lookback_start: date, today: date) -> date | None:
     return None if cur > today else cur
 
 
-def download_gsec_data(page,from_date: date, to_date: date):
+def download_gsec_data(page, from_date: date, to_date: date):
     print(f"Downloading GSEC 10y yield data for {from_date} to {to_date}")
 
     page.goto(
@@ -69,9 +69,7 @@ def download_gsec_data(page,from_date: date, to_date: date):
     page.wait_for_timeout(5000)
 
     query_str = f"start-date={from_date.strftime('%Y-%m-%d')}&end-date={to_date.strftime('%Y-%m-%d')}&time-frame=Daily&add-missing-rows=false"
-    url = (
-        f"https://api.investing.com/api/financialdata/historical/24014?{query_str}"
-    )
+    url = f"https://api.investing.com/api/financialdata/historical/24014?{query_str}"
 
     data = page.evaluate(
         f"""
@@ -106,7 +104,7 @@ def download_gsec_data(page,from_date: date, to_date: date):
         "date",
     ]
     for col in ["last_close", "last_open", "last_max", "last_min", "change_precent"]:
-        df[col] = pd.to_numeric(df[col], errors='ignore')
+        df[col] = pd.to_numeric(df[col], errors="ignore")
 
     upsert_to_db(df, "ininvesting_gsec", unique_keys=["date"])
     return df
@@ -135,11 +133,14 @@ def sync_gsec_prices(today: date | None = None):
             if not chunk_has_missing_dates(c_start, c_end):
                 continue
 
-            c_start = c_start - timedelta(days=15)   # For safety, data may be empty for today
+            c_start = c_start - timedelta(
+                days=15
+            )  # For safety, data may be empty for today
             download_gsec_data(page, c_start, c_end)
             mark_dates_checked(c_start, c_end)
 
         browser.close()
+
 
 if __name__ == "__main__":
     sync_gsec_prices()

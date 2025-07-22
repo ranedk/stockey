@@ -25,27 +25,32 @@ HEADERS = get_dynamic_headers()
 def get_wpi_for_year(year):
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     session = requests.Session()
-    response = session.get('https://eaindustry.nic.in/default.asp', headers=HEADERS)
+    response = session.get("https://eaindustry.nic.in/default.asp", headers=HEADERS)
     cookies = session.cookies.get_dict()
 
     data = {
-        'Fopt_wmy': 'M',
-        'Fyear1': year,
-        'Fcomm_name': 'All',
+        "Fopt_wmy": "M",
+        "Fyear1": year,
+        "Fcomm_name": "All",
     }
-    response = requests.post('https://eaindustry.nic.in/choose_item_201112.asp', cookies=cookies, headers=HEADERS, data=data)
+    response = requests.post(
+        "https://eaindustry.nic.in/choose_item_201112.asp",
+        cookies=cookies,
+        headers=HEADERS,
+        data=data,
+    )
 
-    soup = BeautifulSoup(response.content, 'html.parser')
+    soup = BeautifulSoup(response.content, "html.parser")
 
     results = []
-    for li in soup.select('ul.ul-choose-item li'):
-        cname_input = li.find('input', {'name': 'cname'})
-        commname_input = li.find('input', {'name': 'commname'})
+    for li in soup.select("ul.ul-choose-item li"):
+        cname_input = li.find("input", {"name": "cname"})
+        commname_input = li.find("input", {"name": "commname"})
 
         if cname_input and commname_input:
-            cname = cname_input['value']
-            commname = commname_input['value']
-            text = commname_input['value'].strip()
+            cname = cname_input["value"]
+            commname = commname_input["value"]
+            text = commname_input["value"].strip()
             results.append([cname, commname, text])
 
     important_items = [r for r in results if r[2].startswith("(")]
@@ -53,15 +58,20 @@ def get_wpi_for_year(year):
     for item in important_items:
         print(f"Downloading WPI for {year}:  {item[1]}")
         data = {
-            'hfAntiCSRFToken': '',
-            'cname': item[0],
-            'commname': item[1],
+            "hfAntiCSRFToken": "",
+            "cname": item[0],
+            "commname": item[1],
         }
 
-        response = requests.post('https://eaindustry.nic.in/display_data_201112.asp', cookies=cookies, headers=HEADERS, data=data)
+        response = requests.post(
+            "https://eaindustry.nic.in/display_data_201112.asp",
+            cookies=cookies,
+            headers=HEADERS,
+            data=data,
+        )
 
         # Parse HTML
-        soup = BeautifulSoup(response.content, 'html.parser')
+        soup = BeautifulSoup(response.content, "html.parser")
         table = soup.find("table", {"class": "tblWpiIndexWithBorder"})
 
         # Get month names from header row
@@ -85,15 +95,15 @@ def get_wpi_for_year(year):
                 records.append({"date": date, "value": float(value)})
 
         df = pd.DataFrame(records)
-        df['cname'] = item[0]
-        df['name'] = item[1]
+        df["cname"] = item[0]
+        df["name"] = item[1]
         upsert_to_db(df, "eaindustry_wpi", unique_keys=["date", "cname"])
         time.sleep(0.2)
 
 
 def sync_wpi():
     today = date.today()
-    for year in range(2015, today.year+1):
+    for year in range(2015, today.year + 1):
         for month in range(1, 13):
             if year == today.year and month >= today.month:
                 continue
@@ -105,4 +115,3 @@ def sync_wpi():
 
 if __name__ == "__main__":
     sync_wpi()
-

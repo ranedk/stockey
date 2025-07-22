@@ -6,6 +6,7 @@ import subprocess  # nosec B603, B404
 from typing import Optional, Tuple
 import sys
 
+
 def install_requirements(folder, project_name):
     os.chdir(folder)
     venv_path = f".x{project_name}"
@@ -61,22 +62,19 @@ def copy_environment(from_dir, to_dir):
 
 original_dir = os.getcwd()
 project_name = "stockey"
-SERVICES = [
-    "notebooks",
-    "live",
-    "backtest",
-    "data"
-]
+SERVICES = ["notebooks", "live", "backtest", "data"]
+
 
 def setup_env():
     install_requirements(original_dir, "stockey")
     vscode_config(original_dir, "stockey")
-    venv_config(original_dir, "stockey" )
+    venv_config(original_dir, "stockey")
     # for service in SERVICES:
     #     copy_environment(original_dir, f"{original_dir}/{service}")
 
 
 def main():
     setup_env()
+
 
 main()

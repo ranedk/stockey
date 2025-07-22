@@ -65,4 +65,3 @@ def table_to_grid(table_html):
     for r in grid:
         r.extend([None] * (max_len - len(r)))
     return grid
-

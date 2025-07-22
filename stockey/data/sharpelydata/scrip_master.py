@@ -76,7 +76,9 @@ def update_masters():
     df_funds = df_funds.dropna(subset=["amfi_code"])
 
     df_equity = dfs[2]
-    df_equity = df_equity[~((df_equity["symbol"].isna()) & (df_equity["bse_ticker"].isna()))]
+    df_equity = df_equity[
+        ~((df_equity["symbol"].isna()) & (df_equity["bse_ticker"].isna()))
+    ]
 
     upsert_to_db(
         df_funds,

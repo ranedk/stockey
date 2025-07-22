@@ -35,7 +35,7 @@ def hidden_inputs_to_dict(html: str) -> dict[str, str | None]:
     for tag in soup.find_all("input", {"type": "hidden"}):
         name = tag.get("name")
         value = tag.get("value")  # returns None if attribute missing
-        if name is not None:      # ignore unnamed inputs
+        if name is not None:  # ignore unnamed inputs
             hidden_fields[name] = value
     return hidden_fields
 
@@ -156,7 +156,7 @@ def get_with_retries(
     See original docstring for parameter meanings.
     """
     method = method.upper()
-    if method not in ['GET', 'POST']:
+    if method not in ["GET", "POST"]:
         raise ValueError("Only GET and POST allowed")
 
     # ---------- cache lookup -------------------------------------------------

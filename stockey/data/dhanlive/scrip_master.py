@@ -86,6 +86,7 @@ CREATE INDEX IF NOT EXISTS idx_master_dhan_active
     ON master_dhan_instruments (security_id, valid_to);
 """
 
+
 def download_master_csv(timeout: int = 30) -> Path:
     url = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".csv")
@@ -133,9 +134,7 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
 
 
 def make_update_sql(tracked_cols: list[str]) -> str:
-    diff_cond = " OR ".join(
-        f"dst.{c} IS DISTINCT FROM st.{c}" for c in tracked_cols
-    )
+    diff_cond = " OR ".join(f"dst.{c} IS DISTINCT FROM st.{c}" for c in tracked_cols)
     return f"""
     /* close current version where anything changed */
     UPDATE master_dhan_instruments dst
@@ -187,7 +186,8 @@ def update_database(df: pd.DataFrame) -> None:
         conn.commit()
 
         # temp staging table (structure cloned, dropped on COMMIT)
-        cur.execute("""
+        cur.execute(
+            """
             CREATE TEMP TABLE _stage
             ON COMMIT DROP
             AS SELECT * FROM master_dhan_instruments WHERE false;
@@ -197,7 +197,8 @@ def update_database(df: pd.DataFrame) -> None:
                 DROP COLUMN valid_from,
                 DROP COLUMN valid_to,
                 DROP COLUMN load_ts;
-        """)
+        """
+        )
 
         buf = io.StringIO()
         df.to_csv(
@@ -205,7 +206,7 @@ def update_database(df: pd.DataFrame) -> None:
             sep="\t",
             header=False,
             index=False,
-            na_rep="\\N",          # <- NULL _must_ be \N for COPY text mode
+            na_rep="\\N",  # <- NULL _must_ be \N for COPY text mode
             quoting=csv.QUOTE_NONE,
         )
         buf.seek(0)
@@ -223,7 +224,9 @@ def update_database(df: pd.DataFrame) -> None:
         cur.execute(INSERT_SQL, {"load_ts": load_ts})
         cur.execute("COMMIT;")
 
-    print(f"{len(df):,} rows processed  |  load_ts = {load_ts.isoformat(timespec='seconds')}")
+    print(
+        f"{len(df):,} rows processed  |  load_ts = {load_ts.isoformat(timespec='seconds')}"
+    )
 
 
 if __name__ == "__main__":
