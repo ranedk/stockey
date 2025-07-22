@@ -13,6 +13,14 @@ ALTER DATABASE stockey OWNER TO stockey;
 GRANT USAGE ON SCHEMA public TO stockey;
 ```
 
+# Redis
+
+The state of downloads is stored in redis, which can be updated regularly:
+
+**Backup**
+
+`python utils/redis_bkp_restore.py --host localhost --port 6379 --db 0 --file backups/redis_global_backup.json backup`
+
 # Dhan
 
 `python -m data.dhanlive.scrip_master`
