@@ -13,6 +13,30 @@ ALTER DATABASE stockey OWNER TO stockey;
 GRANT USAGE ON SCHEMA public TO stockey;
 ```
 
+# `pg_dump` & `pg_restore`
+
+```sh
+# PG DUMP with a format
+PGPASSWORD=stockey \
+pg_dump \
+  -h localhost \
+  -p 5432 \
+  -U stockey \
+  --format=custom \
+  -f /tmp/full_db_dump.custom \
+  stockey
+
+# PG RESTORE from a format
+PGPASSWORD=stockey \
+pg_restore \
+  --disable-triggers \
+  -h localhost \
+  -p 5432 \
+  -U stockey \
+  -d stockey \
+  /tmp/full_db_dump.custom
+```
+
 # Redis
 
 The state of downloads is stored in redis, which can be updated regularly:
