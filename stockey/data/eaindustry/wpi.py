@@ -1,14 +1,15 @@
 import time
 from datetime import date
+
+import pandas as pd
+import redis
 import requests
 import urllib3
 from bs4 import BeautifulSoup
-import pandas as pd
-import redis
 from environs import Env
 
-from utils.http import get_dynamic_headers
 from utils.db import upsert_to_db
+from utils.http import get_dynamic_headers
 
 env = Env()
 env.read_env()

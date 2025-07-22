@@ -1,4 +1,4 @@
-from utils.http import get_with_retries, get_dynamic_headers
+from utils.http import get_dynamic_headers, get_with_retries
 
 
 def get_access_token():

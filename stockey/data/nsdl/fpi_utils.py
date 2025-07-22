@@ -1,11 +1,12 @@
+import calendar
 import re
 from datetime import date, datetime
-import calendar
+
+import pandas as pd
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
-import pandas as pd
-from utils.db import get_connection
 
+from utils.db import get_connection
 
 MONTH_PAT = re.compile(r"^Total for ([A-Za-z]+)$")
 YEAR_PAT = re.compile(r"^Total for (\d{4})$")
@@ -93,7 +94,7 @@ def downloaded_for(
             """
             SELECT
                 EXISTS(SELECT 1
-                    FROM  "fii_investments" 
+                    FROM  "fii_investments"
                     WHERE  "reporting_date" = %s
                     AND "instrument" = 'equity_sub_total'
                     LIMIT  1)           AS has_target,

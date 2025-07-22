@@ -16,12 +16,11 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Dict
 
-import requests
 import pandas as pd
+import requests
 from pandas_datareader import data as pdr
 
-from utils.db import upsert_to_db, table_has_date
-
+from utils.db import table_has_date, upsert_to_db
 
 __FRED_SERIES: Dict[str, str] = {
     # Rates & risk-sentiment

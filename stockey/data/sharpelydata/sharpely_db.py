@@ -1,5 +1,6 @@
-from utils.db import get_sql
 from environs import Env
+
+from utils.db import get_sql
 
 env = Env()
 env.read_env()

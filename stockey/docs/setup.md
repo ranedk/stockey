@@ -165,4 +165,3 @@ This is run daily, but updates rarely. There is no need to figure out last pulle
 NSE Indices historical data by day
 
 https://www.niftyindices.com/reports/historical-data
-

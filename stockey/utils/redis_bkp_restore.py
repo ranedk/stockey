@@ -1,7 +1,8 @@
-import redis
-import json
 import argparse
+import json
 import sys
+
+import redis
 
 
 def redis_backup(

@@ -1,14 +1,15 @@
 import tempfile
 import time
-from datetime import date, timedelta, datetime
+from datetime import date, datetime, timedelta
+
+import numpy as np
+import pandas as pd
 import redis
 import requests
-import pandas as pd
-import numpy as np
 from environs import Env
+
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers
-
 
 env = Env()
 env.read_env()

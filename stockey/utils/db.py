@@ -1,12 +1,12 @@
 import io
-from datetime import datetime, date
+from datetime import date, datetime
 from typing import List, Tuple, Union
-from environs import Env
+
 import pandas as pd
 import psycopg2
+from environs import Env
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
-
 
 env = Env()
 env.read_env()

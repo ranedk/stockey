@@ -1,5 +1,6 @@
-from utils.duck import get_sql, select_sql
 from environs import Env
+
+from utils.duck import get_sql, select_sql
 
 env = Env()
 env.read_env()

@@ -1,8 +1,11 @@
 import json
+
 import pandas as pd
 from environs import Env
-from utils.http import get_with_retries
+
 from utils.db import upsert_to_db
+from utils.http import get_with_retries
+
 from .sharpely_utils import get_sharpely_headers
 
 

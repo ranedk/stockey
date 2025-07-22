@@ -1,21 +1,20 @@
 """HTTP utilities for the project with retries and caching"""
 
+import datetime as dt
+import glob
+import json
 import os
 import re
-import json
-import glob
-import datetime as dt
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs, unquote
-
 from typing import Any
-from environs import Env
-import ua_generator
+from urllib.parse import parse_qs, unquote, urlparse
+
 import requests
+import ua_generator
+from bs4 import BeautifulSoup
+from environs import Env
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
-
 
 env = Env()
 env.read_env()

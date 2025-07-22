@@ -7,8 +7,8 @@ Usage:
 
 from __future__ import annotations
 
-import io
 import csv
+import io
 import sys
 import tempfile
 from datetime import datetime, timezone

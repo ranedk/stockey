@@ -1,7 +1,7 @@
 # Download data from RBI website – sync version
-from playwright.sync_api import sync_playwright
-import pandas as pd
 import numpy as np
+import pandas as pd
+from playwright.sync_api import sync_playwright
 
 from utils.db import upsert_to_db
 

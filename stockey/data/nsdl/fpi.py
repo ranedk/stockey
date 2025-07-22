@@ -1,15 +1,16 @@
 from datetime import date, datetime, timedelta
+
+import pandas as pd
+import redis
 import requests
 from bs4 import BeautifulSoup
-import redis
-import pandas as pd
 from environs import Env
 
-from utils.http import hidden_inputs_to_dict, get_dynamic_headers
 from utils.db import upsert_to_db
+from utils.http import get_dynamic_headers, hidden_inputs_to_dict
 from utils.parsers import table_to_grid
-from . import fpi_utils as futils
 
+from . import fpi_utils as futils
 
 env = Env()
 env.read_env()

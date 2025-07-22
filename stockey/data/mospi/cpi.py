@@ -1,16 +1,17 @@
 import calendar
 from datetime import date
-from dateutil.relativedelta import relativedelta
 from io import StringIO
+
+import pandas as pd
+import redis
 import requests
 import urllib3
 from bs4 import BeautifulSoup
-import pandas as pd
+from dateutil.relativedelta import relativedelta
 from environs import Env
-import redis
 
-from utils.http import hidden_inputs_to_dict, get_dynamic_headers
 from utils.db import upsert_to_db
+from utils.http import get_dynamic_headers, hidden_inputs_to_dict
 
 env = Env()
 env.read_env()

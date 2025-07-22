@@ -1,10 +1,10 @@
-import platform
 import json
 import os
+import platform
 import shutil
 import subprocess  # nosec B603, B404
-from typing import Optional, Tuple
 import sys
+from typing import Optional, Tuple
 
 
 def install_requirements(folder, project_name):

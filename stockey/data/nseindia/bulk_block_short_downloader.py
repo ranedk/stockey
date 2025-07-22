@@ -3,9 +3,8 @@ import asyncio
 import random
 from datetime import datetime, timedelta
 
-from playwright.async_api import async_playwright
 import redis.asyncio as redis
-
+from playwright.async_api import async_playwright
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379

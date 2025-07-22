@@ -1,7 +1,9 @@
-import pytest
-import pandas as pd
-import duckdb
 from pathlib import Path
+
+import duckdb
+import pandas as pd
+import pytest
+
 from utils.duck import generate_duckdb_schema, upsert_to_db
 
 
