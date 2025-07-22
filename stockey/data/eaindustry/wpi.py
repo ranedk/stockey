@@ -1,12 +1,22 @@
 import time
-from datetime import date, timedelta
-from io import StringIO
+from datetime import date
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 import pandas as pd
+import redis
+from environs import Env
 
-from utils.http import hidden_inputs_to_dict, get_dynamic_headers
+from utils.http import get_dynamic_headers
+from utils.db import upsert_to_db
+
+env = Env()
+env.read_env()
+
+REDIS_HOST = env("REDIS_HOST")
+REDIS_PORT = env("REDIS_PORT")
+REDIS_SET = "wpi:downloaded"
+rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 
 HEADERS = get_dynamic_headers()
@@ -41,6 +51,7 @@ def get_wpi_for_year(year):
     important_items = [r for r in results if r[2].startswith("(")]
 
     for item in important_items:
+        print(f"Downloading WPI for {year}:  {item[1]}")
         data = {
             'hfAntiCSRFToken': '',
             'cname': item[0],
@@ -70,15 +81,28 @@ def get_wpi_for_year(year):
                 # Use 1st of each month as the date
                 date_str = f"{year}-{i+1:02d}-01"
                 date = pd.to_datetime(date_str)
+                rop.sadd(REDIS_SET, date.strftime("%Y-%m-%d"))
                 records.append({"date": date, "value": float(value)})
 
         df = pd.DataFrame(records)
         df['cname'] = item[0]
         df['name'] = item[1]
-        print(df)
-        time.sleep(1)
+        upsert_to_db(df, "eaindustry_wpi", unique_keys=["date", "cname"])
+        time.sleep(0.2)
 
 
-get_wpi_for_year('2015')
+def sync_wpi():
+    today = date.today()
+    for year in range(2015, today.year+1):
+        for month in range(1, 13):
+            if year == today.year and month >= today.month:
+                continue
+            day = date(year, month, 1)
+            if not rop.sismember(REDIS_SET, day.strftime("%Y-%m-%d")):
+                print(f"Checking for {day}")
+                get_wpi_for_year(year)
 
+
+if __name__ == "__main__":
+    sync_wpi()
 
