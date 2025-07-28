@@ -48,7 +48,7 @@
 ### 5. **Preference shares**
 
 * **Typical Tags:**
-* 
+*
 `P@` – non-convertible
 
 `Q@` – fully-convertible

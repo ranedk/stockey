@@ -1,3 +1,4 @@
+import uuid
 import io
 from datetime import date, datetime
 from typing import List, Tuple, Union
@@ -70,86 +71,103 @@ def upsert_to_db(
     unique_keys: List[str],
 ) -> None:
     """
-    Upserts a pandas DataFrame into a PostgreSQL table using psycopg2, ensuring unique constraints.
-
-    Parameters:
-        df (pd.DataFrame): The DataFrame to upsert into the database.
-        table_name (str): The name of the table to upsert into.
-        unique_keys (List[str]): List of column names that uniquely identify rows for upsert conflict resolution.
-
-    Returns:
-        None
-    Raises:
-        ValueError: If any unique key is missing from the DataFrame columns.
+    Upserts a pandas DataFrame into a PostgreSQL table using psycopg2.
     """
+
+    if df.empty:
+        return  # nothing to do
 
     cols = df.columns.tolist()
     missing = [k for k in unique_keys if k not in cols]
     if missing:
         raise ValueError(f"DataFrame missing unique keys: {missing}")
 
-    full_table = sql.Identifier(table_name)
-    temp_table = sql.Identifier(f"{table_name}_temp")
+    # --- helpers ------------------------------------------------------------
+    def ident_from_table(tname: str) -> sql.Identifier:
+        """Return sql.Identifier, handling optional schema-qualified names."""
+        if "." in tname:
+            schema, name = tname.split(".", 1)
+            return sql.Identifier(schema, name)
+        return sql.Identifier(tname)
+
+    # Columns & conflicts
+    full_table = ident_from_table(table_name)
+    temp_table_name = f"{table_name}_temp_{uuid.uuid4().hex[:8]}"
+    temp_table = ident_from_table(temp_table_name)
 
     col_identifiers = [sql.Identifier(c) for c in cols]
-    conflict_cols = sql.SQL(", ").join(sql.Identifier(c) for c in unique_keys)
-    set_clause = sql.SQL(", ").join(
-        sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
-        for c in cols
-        if c not in unique_keys
-    )
+    conflict_identifiers = [sql.Identifier(c) for c in unique_keys]
 
+    update_cols = [c for c in cols if c not in unique_keys]
+    if update_cols:
+        set_clause = sql.SQL(", ").join(
+            sql.Composed(
+                [sql.Identifier(c), sql.SQL(" = EXCLUDED."), sql.Identifier(c)]
+            )
+            for c in update_cols
+        )
+        on_conflict = sql.SQL("DO UPDATE SET {set}").format(set=set_clause)
+    else:
+        on_conflict = sql.SQL("DO NOTHING")
+
+    # --- create table DDLs (yours) -----------------------------------------
     create_main_sql = generate_postgres_schema(df, table_name, unique_keys)
-    create_temp_sql = generate_postgres_schema(df, f"{table_name}_temp", False)
+    create_temp_sql = generate_postgres_schema(df, temp_table_name, False)
 
+    # --- execute ------------------------------------------------------------
     with get_connection() as conn:
         with conn.cursor() as cur:
-            # 1. Create main & temp tables
-            cur.execute(create_main_sql)
-            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
-            cur.execute(create_temp_sql)
+            try:
+                # 1. Ensure main & temp tables
+                cur.execute(create_main_sql)
+                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
+                cur.execute(create_temp_sql)
 
-            # 2. COPY DataFrame into temp
-            copy_buf = io.StringIO()
-            df.to_csv(copy_buf, header=False, index=False, sep="\t", na_rep="\\N")
-            copy_buf.seek(0)
-            cur.copy_expert(
-                sql.SQL(
-                    "COPY {} ({}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')"
-                ).format(temp_table, sql.SQL(", ").join(col_identifiers)),
-                copy_buf,
-            )
+                # 2. COPY data into temp
+                copy_buf = io.StringIO()
+                df.to_csv(copy_buf, header=False, index=False, sep="\t", na_rep="\\N")
+                copy_buf.seek(0)
+                cur.copy_expert(
+                    sql.SQL(
+                        "COPY {} ({}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')"
+                    ).format(temp_table, sql.SQL(", ").join(col_identifiers)),
+                    copy_buf,
+                )
 
-            # 3. Ensure unique index
-            if unique_keys:
-                idx_name = f"idx_{table_name}_" + "_".join(unique_keys)
-                cur.execute(
-                    sql.SQL("CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})").format(
-                        sql.Identifier(idx_name), full_table, conflict_cols
+                # 3. Ensure unique index (optional if you already have a PK/unique)
+                if unique_keys:
+                    idx_name = f"idx_{table_name.replace('.', '_')}_{'_'.join(unique_keys)}"
+                    cur.execute(
+                        sql.SQL(
+                            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})"
+                        ).format(
+                            sql.Identifier(idx_name),
+                            full_table,
+                            sql.SQL(", ").join(conflict_identifiers),
+                        )
                     )
-                )
 
-            # 4. UPSERT
-            cur.execute(
-                sql.SQL(
+                # 4. UPSERT
+                insert_sql = sql.SQL(
                     """
-                    INSERT INTO {} ({})
-                    SELECT {} FROM {}
-                    ON CONFLICT ({}) DO UPDATE SET {};
-                """
+                    INSERT INTO {dest} ({cols})
+                    SELECT {cols} FROM {src}
+                    ON CONFLICT ({conflict_cols}) {on_conflict}
+                    """
                 ).format(
-                    full_table,
-                    sql.SQL(", ").join(col_identifiers),
-                    sql.SQL(", ").join(col_identifiers),
-                    temp_table,
-                    conflict_cols,
-                    set_clause,
+                    dest=full_table,
+                    src=temp_table,
+                    cols=sql.SQL(", ").join(col_identifiers),
+                    conflict_cols=sql.SQL(", ").join(conflict_identifiers),
+                    on_conflict=on_conflict,
                 )
-            )
 
-            # 5. Drop temp table
-            cur.execute(sql.SQL("DROP TABLE {}").format(temp_table))
-        # leaving the with-block commits automatically
+                cur.execute(insert_sql)
+
+            finally:
+                # 5. Drop temp regardless of success
+                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
+            # commit on context exit
 
 
 def get_sql(sql: str, params: Tuple = ()) -> pd.Series:

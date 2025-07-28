@@ -165,3 +165,9 @@ This is run daily, but updates rarely. There is no need to figure out last pulle
 NSE Indices historical data by day
 
 https://www.niftyindices.com/reports/historical-data
+
+# NOTES
+
+1. ISIN is not unique, there can be multiple Symbols with the same ISIN because the same underlying can be traded in different series (e.g. Nifty 50 and Nifty 50 Future).
+2. The same SYMBOL and ISIN can be a part of more than one series e.g. SHAKTIPUMP is traded in series BE and EQ
+3. When company changes its name, symbol also changes but ISIN remains the same

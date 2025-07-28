@@ -1,10 +1,53 @@
+import io
 import tempfile
 import zipfile
 import glob
 import os
 from datetime import datetime
 import pandas as pd
-from utils import upsert_to_db
+from utils.db import upsert_to_db
+
+
+def parse_mcap(path):
+    data = open(path).read()
+    lines = [line.strip().rstrip(".") for line in data.strip().split("\n")]
+    cleaned_data = "\n".join(lines[:-3])
+    df = pd.read_csv(io.StringIO(cleaned_data), skiprows=1)
+    df = df.reset_index(drop=True)
+    df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+    df.columns =[
+        'trade_date',
+        'symbol',
+        'series',
+        'security_name',
+        'category',
+        'last_trade_date',
+        'face_value_rs',
+        'issue_size',
+        'close_price_paid_up_value_rs',
+        'market_cap_rs'
+    ]
+    df['date'] = pd.to_datetime(df['trade_date'], format="%d %b %Y")
+    df = df.drop(columns=["trade_date", "security_name"])
+    df['issue_size'] = pd.to_numeric(df['issue_size'], errors="coerce").astype("Int64")
+    for c in [
+        'face_value_rs',
+        'close_price_paid_up_value_rs',
+        'market_cap_rs'
+    ]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    upsert_to_db(df, "nseindia_mcap", unique_keys=["date", "symbol", "series"])
+    return df
+
+
+def parse_circuit_hit(path):
+    parts = os.path.basename(path)
+    for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
+    df = pd.read_csv(path, usecols=[0, 1, 3])
+    df.columns = ["symbol", "series", "circuit_hit"]
+    df["date"] = for_date
+    upsert_to_db(df, "nseindia_circuit_hit", unique_keys=["date", "symbol", "series", "circuit_hit"])
+    return df
 
 
 def parse_sme_bhavdata(path):
@@ -42,7 +85,7 @@ def parse_sme_bhavdata(path):
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["date"] = for_date
-    upsert_to_db(df, "nseindia_sme_bhavdata", unique_keys=["date", "symbol"])
+    upsert_to_db(df, "nseindia_sme_bhavdata", unique_keys=["date", "symbol", "series"])
     return df
 
 
@@ -83,7 +126,7 @@ def parse_sec_bhavdata(path):
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["date"] = pd.to_datetime(df["date"], format="%d-%b-%Y")
-    upsert_to_db(df, "nseindia_sec_bhavdata", unique_keys=["date", "symbol"])
+    upsert_to_db(df, "nseindia_sec_bhavdata", unique_keys=["date", "symbol", "series"])
     return df
 
 
@@ -244,22 +287,7 @@ def parse_cmvolt(path):
         "annualized_volatility",
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    # upsert_to_db(df, "nseindia_cmvolt", unique_keys=["date", "symbol"])
-    return df
-
-
-def parse_catg(path):
-    with open(path) as f:
-        header = f.readline().strip().split(",")
-        for_month = datetime.strptime(f"01,{header[1]},{header[2]}", "%d,%b,%Y").date()
-    df = pd.read_csv(path, skiprows=1)
-    df = df.reset_index(drop=True)
-    df.columns = ["record_type", "symbol", "series", "isin", "category", "impact_cost"]
-    df = df.drop(columns="record_type")
-    df["category"] = pd.to_numeric(df["category"], errors="coerce").astype("Int64")
-    df["impact_cost"] = pd.to_numeric(df["impact_cost"], errors="coerce")
-    df["for_month"] = pd.to_datetime(for_month)
-    upsert_to_db(df, "nseindia_catg", unique_keys=["for_month", "isin"])
+    upsert_to_db(df, "nseindia_cmvolt", unique_keys=["date", "symbol"])
     return df
 
 
@@ -298,7 +326,7 @@ def parse_var1(path):
 
     df["for_date"] = pd.to_datetime(for_date)
     df["entry_number"] = entry_number
-    upsert_to_db(df, "nseindia_var1", unique_keys=["for_date", "entry_number", "isin"])
+    upsert_to_db(df, "nseindia_var1", unique_keys=["for_date", "entry_number", "series", "symbol", "isin"])
     return df
 
 
@@ -318,6 +346,28 @@ def parse_cat_turnover(path):
         df, "nseindia_cat_turnover", unique_keys=["trade_date", "client_category"]
     )
     return df
+
+
+def parse_catg(path):
+    with open(path) as f:
+        header = f.readline().strip().split(",")
+        for_month = datetime.strptime(f"01,{header[1]},{header[2]}", "%d,%b,%Y").date()
+    df = pd.read_csv(path, skiprows=1)
+    df = df.reset_index(drop=True)
+    df.columns = ["record_type", "symbol", "series", "isin", "category", "impact_cost"]
+    df = df.drop(columns="record_type")
+    df["category"] = pd.to_numeric(df["category"], errors="coerce").astype("Int64")
+    df["impact_cost"] = pd.to_numeric(df["impact_cost"], errors="coerce")
+    df["for_month"] = pd.to_datetime(for_month)
+    
+    # ISIN is not unique, there can be multiple Symbols with the same ISIN because the same underlying
+    # can be traded in different series (e.g. Nifty 50 and Nifty 50 Future)
+    # Also, the same symbol and isin can be a part of more than one series e.g. SHAKTIPUMP is traded in
+    # series BE and EQ
+    # When company changes its name, symbol also changes but ISIN remains the same
+    upsert_to_db(df, "nseindia_catg", unique_keys=["for_month", "series", "symbol", "isin"])
+    return df
+
 
 
 def unzip_and_process(zip_path):
@@ -364,3 +414,20 @@ def unzip_and_process(zip_path):
         sme_bhavdata_files = glob.glob(os.path.join(tmpdir, "sme*.CSV"))
         for file_path in sme_bhavdata_files:
             parse_sme_bhavdata(file_path)
+
+        nested_zips = glob.glob(os.path.join(tmpdir, "PR*.zip"))
+        for nested_zip in nested_zips:
+            with tempfile.TemporaryDirectory() as nested_tmpdir:
+                with zipfile.ZipFile(nested_zip, "r") as nested_ref:
+                    nested_ref.extractall(nested_tmpdir)
+
+                bh_files = glob.glob(os.path.join(nested_tmpdir, "bh*.csv"))
+                for file_path in bh_files:
+                    parse_circuit_hit(file_path)
+
+                mcap_files = glob.glob(os.path.join(nested_tmpdir, "MCAP*.csv"))
+                for file_path in mcap_files:
+                    parse_mcap(file_path)
+
+if __name__ == "__main__":
+    unzip_and_process("/Users/rane/Downloads/bhavcopy/bhavcopy_2024-06-04.zip")
