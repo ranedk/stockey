@@ -17,14 +17,7 @@ GRANT USAGE ON SCHEMA public TO stockey;
 
 ```sh
 # PG DUMP with a format
-PGPASSWORD=stockey \
-pg_dump \
-  -h localhost \
-  -p 5432 \
-  -U stockey \
-  --format=custom \
-  -f /tmp/full_db_dump.custom \
-  stockey
+PGPASSWORD=stockey pg_dump -h localhost -p 5432 -U stockey --format=custom -f /tmp/full_db_dump.custom stockey
 
 # PG RESTORE from a format
 PGPASSWORD=stockey \
