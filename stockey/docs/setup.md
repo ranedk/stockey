@@ -160,6 +160,11 @@ Ubuntu: `/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=
 
 This is run daily, but updates rarely. There is no need to figure out last pulled dated since this returns entire data every time.
 
+# Schema and AI
+
+The schema is generated using `python -m utils.db_schema_dump`
+The definitions are added later using AI
+
 # TODO
 
 NSE Indices historical data by day
