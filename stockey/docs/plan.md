@@ -1,8 +1,3 @@
-Below is the **check-list of data you’ll need to assemble before we write a single line of modelling code.**
-I’ve grouped everything by feature-block and flagged the *bare-minimum* history to support our rolling walk-forward back-tests (train 12 m → val 1 m → test 1 m, stepped monthly).
-
----
-
 ## 1 Price & Microstructure
 
 | Dataset                         | Horizon                                                | Symbols                                        | History to Pull                                           | Mandatory Fields                              | Typical Sources (India)                                                                                     |
@@ -73,7 +68,7 @@ We’ll forward-fill daily so each bar has the *latest known* macro figures, the
 
 ---
 
-## 7 To-Do for You Before Next Call
+## 7 To-Do
 
 1. **Pick vendors** for intraday & fundamentals (TrueData vs. GDFL vs. Refinitiv, etc.).
 2. Verify **licensing/quotas** allow bulk historical download—some APIs throttle to 1 y per call.
@@ -81,12 +76,6 @@ We’ll forward-fill daily so each bar has the *latest known* macro figures, the
 4. Confirm you can export fundamentals with *announcement timestamp*, not just period-end dates.
 
 Once you have sample files / API docs in hand, share the field lists and we’ll:
-
-* Write the `ingestion/` scripts.
-* Define the DuckDB DDL.
-* Plug in the cost model & get our first *dry-run* back-test running.
-
-**Collect the data first—nothing kills an MVP faster than a half-empty feature matrix.**
 
 ## RBI Website:
 
