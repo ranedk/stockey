@@ -17,3 +17,4 @@ pandas-datareader==0.10.0
 beautifulsoup4==4.13.4
 black==25.1.0
 pre-commit==4.2.0
+boto3==1.39.17
