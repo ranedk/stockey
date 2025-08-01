@@ -11,6 +11,8 @@ GRANT ALL PRIVILEGES ON DATABASE stockey TO stockey;
 GRANT ALL ON SCHEMA public TO stockey;
 ALTER DATABASE stockey OWNER TO stockey;
 GRANT USAGE ON SCHEMA public TO stockey;
+
+CREATE EXTENSION IF NOT EXISTS timescaledb;
 ```
 
 # `pg_dump` & `pg_restore`

@@ -69,6 +69,7 @@ def upsert_to_db(
     df: pd.DataFrame,
     table_name: str,
     unique_keys: List[str],
+    timescaledb_column: str | None = None,
 ) -> None:
     """
     Upserts a pandas DataFrame into a PostgreSQL table using psycopg2.
@@ -120,6 +121,13 @@ def upsert_to_db(
             try:
                 # 1. Ensure main & temp tables
                 cur.execute(create_main_sql)
+                # 1a. Promote to TimescaleDB hypertable (optional)
+                if timescaledb_column:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+                    cur.execute(
+                        "SELECT create_hypertable(%s, %s, if_not_exists => TRUE);",
+                        (table_name, timescaledb_column),
+                    )
                 cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
                 cur.execute(create_temp_sql)
 
