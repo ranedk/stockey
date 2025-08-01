@@ -6,6 +6,7 @@ import redis
 from environs import Env
 from playwright.sync_api import sync_playwright
 from utils import store
+from utils.date import reverse_daterange
 
 env = Env()
 env.read_env()
@@ -81,24 +82,22 @@ def download_bhavcopy_for_date(
 def main() -> None:
     rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     failures = 0
-    days_back = 1  # start with “yesterday”
 
     with sync_playwright() as p:
-        while failures < 7 and days_back > 365 * 10:  # 10 years
-            date_obj = datetime.today() - timedelta(days=days_back)
+        for date_obj in reverse_daterange(datetime(2014,1,1), datetime.today() - timedelta(days=1)):
+            if failures >= 7:
+                break
             formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
             display_date = date_obj.strftime("%d-%b-%Y")  # 19-Jun-2025
 
             if rop.sismember(REDIS_SET, formatted_date):
                 print(f"⏩ Already downloaded: {formatted_date}")
-                days_back += 1
                 continue
 
             success = download_bhavcopy_for_date(
                 p, formatted_date, display_date, rop
             )
             failures = 0 if success else failures + 1
-            days_back += 1
 
     if failures >= 7:
         print("📉 Stopped after 7 consecutive failures.")

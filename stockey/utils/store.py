@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import tempfile
 import mimetypes
 from pathlib import Path
 from typing import Union
+from typing import Iterator
 
 import boto3
 from botocore.config import Config
@@ -115,3 +117,44 @@ def save_file(
 
     s3 = _get_client()
     s3.upload_file(str(path), AWS_BUCKET_NAME, key, ExtraArgs=extra_args)
+
+
+def get_file_content(key: str) -> bytes:
+    """ Download a file from S3 and return its content as bytes.  """
+    s3 = _get_client()
+    return s3.get_object(Bucket=AWS_BUCKET_NAME, Key=key)["Body"].read()
+
+
+def get_file_handle(key: str) -> bytes:
+    """ Download a file from S3 and return its content as a file handle. """
+    s3 = _get_client()
+    return s3.get_object(Bucket=AWS_BUCKET_NAME, Key=key)["Body"]
+
+
+def get_as_temp_file(key: str) -> bytes:
+    """ Download a file from S3 and return its content as a temporary file. """
+    s3 = _get_client()
+    f = s3.get_object(Bucket=AWS_BUCKET_NAME, Key=key)["Body"]
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        tmp_file.write(f.read())
+    return tmp_file.name
+
+
+def list_files(prefix: str) -> Iterator[str]:
+    """
+    Lazily iterate over all S3 object keys that start with *prefix*.
+
+    Uses Boto3's paginator under the hood, so it seamlessly handles
+    buckets with more than 1 000 objects without loading everything
+    into memory at once.
+
+    Example:
+        for key in list_files("raw/2025/"):
+            process(key)
+    """
+    s3 = _get_client()
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(Bucket=AWS_BUCKET_NAME, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            yield obj["Key"]

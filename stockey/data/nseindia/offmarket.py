@@ -1,10 +1,11 @@
 # bulk_block_short_downloader.py
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import redis
 from playwright.sync_api import sync_playwright
 from utils import store
+from utils.date import daterange
 
 REDIS_HOST = "localhost"
 REDIS_PORT = 6379
@@ -78,11 +79,6 @@ def download_data(
         browser.close()
 
 
-def daterange(start_date, end_date):
-    for n in range(int((end_date - start_date).days) + 1):
-        yield start_date + timedelta(n)
-
-
 def mark_dates_as_downloaded(r, dtype, start_date, end_date):
     r.sadd(
         f"nse:{dtype}",
@@ -127,7 +123,7 @@ def get_next_download_block(r, dtype, g_start, g_end):
 def main() -> None:
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-        global_start = datetime.strptime("2013-01-01", "%Y-%m-%d")
+        global_start = datetime.strptime("2014-01-01", "%Y-%m-%d")
         global_end = datetime.today()
 
         with sync_playwright() as p:

@@ -1,11 +1,28 @@
+# bhavcopy download from S3 and parse
 import io
 import tempfile
 import zipfile
 import glob
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+
 import pandas as pd
+from environs import Env
+import redis
+
+from utils.date import reverse_daterange
 from utils.db import upsert_to_db
+from utils import store
+
+
+env = Env()
+env.read_env()
+
+REDIS_HOST = env("REDIS_HOST")
+REDIS_PORT = env("REDIS_PORT")
+REDIS_SET = "bhav:parsed"
+
+rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 
 def parse_mcap(path):
@@ -368,8 +385,6 @@ def parse_catg(path):
     upsert_to_db(df, "nseindia_catg", unique_keys=["for_month", "series", "symbol", "isin"])
     return df
 
-
-
 def unzip_and_process(zip_path):
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
@@ -429,5 +444,13 @@ def unzip_and_process(zip_path):
                 for file_path in mcap_files:
                     parse_mcap(file_path)
 
+
 if __name__ == "__main__":
-    unzip_and_process("/Users/rane/Downloads/bhavcopy/bhavcopy_2024-06-04.zip")
+    for f in store.list_files("bhavcopy"):
+        if rop.sismember(REDIS_SET, f):
+            print(f"⏩ Already parsed: {f}")
+            continue
+        file_path = store.get_as_temp_file(f)
+        unzip_and_process(file_path)
+        rop.sadd(REDIS_SET, f)
+    rop.close()
