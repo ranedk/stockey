@@ -159,3 +159,132 @@ sudo apt install redis -y
   ```bash
   sudo systemctl restart ssh
   ```
+
+# Move database disk files to external volume
+
+To ensure **data durability** for both Redis and PostgreSQL by relocating their data directories to `/mnt/database/redis` and `/mnt/database/postgres` respectively, follow these **safe and clean steps** below. These are applicable since your installations are new and empty.
+
+
+## ✅ Step 1: Prepare the Directories
+
+Make sure the destination mount exists and is owned by the correct users.
+
+```bash
+# Create directories
+sudo mkdir -p /mnt/database/redis
+sudo mkdir -p /mnt/database/postgres
+
+# Set correct ownerships (redis:redis and postgres:postgres)
+sudo chown redis:redis /mnt/database/redis
+sudo chown postgres:postgres /mnt/database/postgres
+
+# Optional: permissions
+sudo chmod 700 /mnt/database/postgres
+sudo chmod 770 /mnt/database/redis
+```
+
+---
+
+## ✅ Step 2: Move Redis Data to `/mnt/database/redis`
+
+1. Stop Redis:
+
+   ```bash
+   sudo systemctl stop redis
+   ```
+
+2. Edit Redis config:
+
+   ```bash
+   sudo nano /etc/redis/redis.conf
+   ```
+
+   Change this line (or add if missing):
+
+   ```
+   dir /mnt/database/redis
+   ```
+
+3. Move old dump (optional, if exists):
+
+   ```bash
+   sudo mv /var/lib/redis/dump.rdb /mnt/database/redis/ 2>/dev/null || true
+   ```
+
+4. Restart Redis:
+
+   ```bash
+   sudo systemctl restart redis
+   ```
+
+5. Verify Redis is writing to the new directory:
+
+   ```bash
+   redis-cli CONFIG GET dir
+   ```
+
+---
+
+## ✅ Step 3: Move PostgreSQL 16 Data to `/mnt/database/postgres`
+
+1. Stop PostgreSQL:
+
+   ```bash
+   sudo systemctl stop postgresql
+   ```
+
+2. Confirm current version and location:
+
+   ```bash
+   pg_lsclusters
+   ```
+
+   Expected:
+
+   ```
+   Ver Cluster Port Status Owner    Data directory              Log file
+   16  main    5432  down   postgres /var/lib/postgresql/16/main ...
+   ```
+
+3. Move the cluster directory:
+
+   ```bash
+   sudo mv /var/lib/postgresql/16/main /mnt/database/postgres/
+   ```
+
+4. Update cluster config:
+
+   ```bash
+   sudo pg_conftool 16 main set data_directory '/mnt/database/postgres/main'
+   ```
+
+   Or manually edit:
+
+   ```bash
+   sudo nano /etc/postgresql/16/main/postgresql.conf
+   ```
+
+   Set:
+
+   ```
+   data_directory = '/mnt/database/postgres/main'
+   ```
+
+5. Set ownership (critical):
+
+   ```bash
+   sudo chown -R postgres:postgres /mnt/database/postgres
+   sudo chmod 700 /mnt/database/postgres/main
+   ```
+
+6. Restart PostgreSQL:
+
+   ```bash
+   sudo systemctl start postgresql
+   ```
+
+7. Verify new data directory:
+
+   ```bash
+   sudo -u postgres psql -c "SHOW data_directory;"
+   ```
