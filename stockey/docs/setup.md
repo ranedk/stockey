@@ -93,7 +93,6 @@ In table `macro_usa_ism` - ISM Manufacturing data
 
 This is backed by redis to figure if downloads have been done or not.
 
-
 # Bhavcopy
 
 The daily bhavcopy has daily market data about price, volumes and trades.
@@ -148,6 +147,32 @@ Ubuntu: `/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=
 `python -m data.rbi.download_bank_rates`
 
 This is run daily, but updates rarely. There is no need to figure out last pulled dated since this returns entire data every time.
+
+To download G-Sec rates:
+
+`python -m data.rbi.download_fbil_gsec`
+
+To download 10Y bond rates:
+
+`python -m data.ininvesting.in10y`
+
+G-Sec get updated daily.
+
+# WPI data 
+
+`python -m data.eaindustry.wpi`
+
+# CPI data
+
+Download detailed CPI data
+
+`python -m data.mospi.cpi`
+
+# FPI data
+
+Download FPI data
+
+`python -m data.nseindia.fpi`
 
 # Schema and AI
 
