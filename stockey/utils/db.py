@@ -121,13 +121,6 @@ def upsert_to_db(
             try:
                 # 1. Ensure main & temp tables
                 cur.execute(create_main_sql)
-                # 1a. Promote to TimescaleDB hypertable (optional)
-                if timescaledb_column:
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
-                    cur.execute(
-                        "SELECT create_hypertable(%s, %s, if_not_exists => TRUE);",
-                        (table_name, timescaledb_column),
-                    )
                 cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
                 cur.execute(create_temp_sql)
 
@@ -142,7 +135,7 @@ def upsert_to_db(
                     copy_buf,
                 )
 
-                # 3. Ensure unique index (optional if you already have a PK/unique)
+                # 3.a. Ensure unique index (optional if you already have a PK/unique)
                 if unique_keys:
                     idx_name = f"idx_{table_name.replace('.', '_')}_{'_'.join(unique_keys)}"
                     cur.execute(
@@ -153,6 +146,14 @@ def upsert_to_db(
                             full_table,
                             sql.SQL(", ").join(conflict_identifiers),
                         )
+                    )
+
+                # 3.b. Promote to TimescaleDB hypertable (optional)
+                if timescaledb_column:
+                    cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+                    cur.execute(
+                        "SELECT create_hypertable(%s, %s, if_not_exists => TRUE);",
+                        (table_name, timescaledb_column),
                     )
 
                 # 4. UPSERT
