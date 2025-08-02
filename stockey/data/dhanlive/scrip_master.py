@@ -80,10 +80,10 @@ CREATE TABLE IF NOT EXISTS master_dhan_instruments (
     valid_to                TIMESTAMP,
     load_ts                 TIMESTAMP NOT NULL,
 
-    PRIMARY KEY (security_id, valid_from)
+    PRIMARY KEY (security_id, segment, valid_from)
 );
 CREATE INDEX IF NOT EXISTS idx_master_dhan_active
-    ON master_dhan_instruments (security_id, valid_to);
+    ON master_dhan_instruments (security_id, segment, valid_to);
 """
 
 
@@ -141,6 +141,7 @@ def make_update_sql(tracked_cols: list[str]) -> str:
     SET    valid_to = %(load_ts)s
     FROM   _stage st
     WHERE  dst.security_id = st.security_id
+      AND  dst.segment = st.segment
       AND  dst.valid_to IS NULL
       AND  ({diff_cond});
     """
@@ -172,6 +173,7 @@ SELECT st.*,
 FROM   _stage st
 LEFT   JOIN master_dhan_instruments m
        ON m.security_id = st.security_id
+       AND m.segment = st.segment
        AND m.valid_to IS NULL
 WHERE  m.security_id IS NULL;
 """
