@@ -98,13 +98,13 @@ def get_wpi_for_year(year):
         df = pd.DataFrame(records)
         df["cname"] = item[0]
         df["name"] = item[1]
-        upsert_to_db(df, "eaindustry_wpi", unique_keys=["date", "cname"])
+        upsert_to_db(df, "eaindustry_wpi", unique_keys=["date", "cname"], timescaledb_column="date")
         time.sleep(0.2)
 
 
 def sync_wpi():
     today = date.today()
-    for year in range(2015, today.year + 1):
+    for year in range(2014, today.year + 1):
         for month in range(1, 13):
             if year == today.year and month >= today.month:
                 continue
@@ -116,3 +116,6 @@ def sync_wpi():
 
 if __name__ == "__main__":
     sync_wpi()
+
+    # To setup the first set of tables
+    # get_wpi_for_year(2014)
