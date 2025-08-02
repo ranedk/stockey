@@ -22,7 +22,7 @@ def download_data(
     dtype: str,
     from_date: datetime,
     to_date: datetime,
-    r: redis.Redis,
+    rop: redis.Redis,
 ) -> bool:
     """
     Automate NSE Block Bulk data download
@@ -67,7 +67,7 @@ def download_data(
         store.save_file(file_path, prefix="nsedeals")
 
         print(f"✅ Success: {from_date_str} - {to_date_str}")
-        mark_dates_as_downloaded(r, dtype, from_date, to_date)
+        mark_dates_as_downloaded(rop, dtype, from_date, to_date)
         return True
 
     except Exception as err:
@@ -79,25 +79,25 @@ def download_data(
         browser.close()
 
 
-def mark_dates_as_downloaded(r, dtype, start_date, end_date):
-    r.sadd(
+def mark_dates_as_downloaded(rop, dtype, start_date, end_date):
+    rop.sadd(
         f"nse:{dtype}",
         *(dt.strftime("%Y-%m-%d") for dt in daterange(start_date, end_date)),
     )
 
 
 # Check missing dates
-def get_missing_dates(r, dtype, start_date, end_date):
-    pipe = r.pipeline(transaction=False)
+def get_missing_dates(rop, dtype, start_date, end_date):
+    pipe = rop.pipeline(transaction=False)
     for dt in daterange(start_date, end_date):
         pipe.sismember(f"nse:{dtype}", dt.strftime("%Y-%m-%d"))
     flags = pipe.execute()
     return [d for d, have in zip(daterange(start_date, end_date), flags) if not have]
 
 
-def get_next_download_block(r, dtype, g_start, g_end):
+def get_next_download_block(rop, dtype, g_start, g_end):
     # All missing calendar days for this dtype
-    missing = get_missing_dates(r, dtype, g_start, g_end)
+    missing = get_missing_dates(rop, dtype, g_start, g_end)
     if not missing:
         return None  # nothing left to fetch
 
@@ -122,7 +122,7 @@ def get_next_download_block(r, dtype, g_start, g_end):
 
 def main() -> None:
     try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         global_start = datetime.strptime("2014-01-01", "%Y-%m-%d")
         global_end = datetime.today()
 
@@ -130,7 +130,7 @@ def main() -> None:
             for dtype in ["block_deals", "bulk_deals", "short_selling"]:
                 while True:
                     block = get_next_download_block(
-                        r, dtype, global_start, global_end
+                        rop, dtype, global_start, global_end
                     )
                     if not block:
                         print(f"All data downloaded for {dtype} ✅")
@@ -138,9 +138,9 @@ def main() -> None:
                     print(
                         f"Download {dtype} {block[0].strftime('%d-%m-%Y')} and {block[1].strftime('%d-%m-%Y')}"
                     )
-                    download_data(p, dtype, block[0], block[1], r)
+                    download_data(p, dtype, block[0], block[1], rop)
     finally:
-        r.close()
+        rop.close()
 
 
 if __name__ == "__main__":

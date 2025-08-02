@@ -18,7 +18,7 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 DOWNLOADED = "fbilgec:downloaded"
 FAILED = "fbilgec:failed"
-rdb = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 
 HEADERS = get_dynamic_headers()
@@ -108,7 +108,7 @@ def download_gsec(fdate: date, cookies):
 
     formatted_date = fdate.strftime("%Y-%m-%d")
     print("GSec for ", formatted_date)
-    if rdb.sismember(DOWNLOADED, formatted_date) or rdb.sismember(
+    if rop.sismember(DOWNLOADED, formatted_date) or rop.sismember(
         FAILED, formatted_date
     ):
         print("Already downloaded or failed")
@@ -125,7 +125,7 @@ def download_gsec(fdate: date, cookies):
     )
     if response.status_code != 200:
         print("Skipping (with error) GSec for ", formatted_date, fdate.strftime("%a"))
-        rdb.sadd(FAILED, formatted_date)
+        rop.sadd(FAILED, formatted_date)
         return
 
     with tempfile.NamedTemporaryFile(suffix=".xls", delete=False) as tmp:
@@ -136,7 +136,7 @@ def download_gsec(fdate: date, cookies):
     upsert_to_db(df_quote, "fbil_gsec_quote", unique_keys=["trade_date", "isin"])
     upsert_to_db(df_par, "fbil_gsec_par", unique_keys=["trade_date", "tenor_years"])
 
-    rdb.sadd(DOWNLOADED, formatted_date)
+    rop.sadd(DOWNLOADED, formatted_date)
     time.sleep(0.5)
     print("Downloaded GSec for ", formatted_date)
 

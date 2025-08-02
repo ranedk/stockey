@@ -175,12 +175,13 @@ sudo mkdir -p /mnt/database/redis
 sudo mkdir -p /mnt/database/postgres
 
 # Set correct ownerships (redis:redis and postgres:postgres)
-sudo chown redis:redis /mnt/database/redis
-sudo chown postgres:postgres /mnt/database/postgres
+sudo chown redis:redis -R /mnt/database/redis
+sudo chown postgres:postgres -R /mnt/database/postgres
 
-# Optional: permissions
-sudo chmod 700 /mnt/database/postgres
-sudo chmod 770 /mnt/database/redis
+# Permissions
+sudo chmod 711 /mnt
+sudo chmod 751 /mnt/database
+sudo chmod 750 -R /mnt/database/redis /mnt/database/postgres
 ```
 
 ---

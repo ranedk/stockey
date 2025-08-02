@@ -19,7 +19,7 @@ env.read_env()
 REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 REDIS_SET = "cpi:downloaded"
-rdb = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 HEADERS = get_dynamic_headers()
 
@@ -150,7 +150,7 @@ def sync_cpi_data():
     # Build the complete month list and filter out those already present
     all_months = list(month_iter(start_month, last_month))
     month_keys = [m.isoformat() for m in all_months]
-    have = {k for k in month_keys if rdb.sismember(REDIS_SET, k)}
+    have = {k for k in month_keys if rop.sismember(REDIS_SET, k)}
     missing_months = [m for m in all_months if m.isoformat() not in have]
 
     if not missing_months:
@@ -165,7 +165,7 @@ def sync_cpi_data():
             new_members = [
                 m.isoformat() for m in month_iter(run_start, first_of_month(run_end))
             ]
-            rdb.sadd(REDIS_SET, *new_members)
+            rop.sadd(REDIS_SET, *new_members)
         except Exception:
             print("Failed to download CPI for %s → %s", run_start, run_end)
             break
