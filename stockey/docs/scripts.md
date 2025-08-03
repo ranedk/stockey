@@ -1,30 +1,35 @@
 ```
-script: data/nsdl/fpi.py
-db:fii_investments
+script: data/eaindustry/wpi.py
+db:eaindustry_wpi
+frequency: daily
+date: first_of_month
+redis_key: wpi:downloaded
+
 ```
 
 
 ```
-script: data/nsdl/fpi.py
-db:fii_derivatives
+script: data/rbi/download_fbil_gsec.py
+db:fbil_gsec_quote
+frequency: daily
+date: everyday
+redis_key: fbilgec:downloaded
 ```
 
 
 ```
-script: data/fred/us_macro.py
-db:DGS10": "ust10y_yield  # 10-year Treasury constant-maturity
-```
-
-
-```
-script: data/fred/us_macro.py
-db:EFFR": "fedfunds_eff  # Effective Fed-funds rate (daily)
+script: data/rbi/download_fbil_gsec.py
+db:fbil_gsec_par
+frequency: daily
+date: everyday
+redis_key: fbilgec:downloaded
 ```
 
 
 ```
 script: data/fred/us_macro.py
 db:macro_usa
+date: everyday
 ```
 
 
@@ -41,14 +46,14 @@ db:macro_usa_ism
 
 
 ```
-script: data/rbi/download_fbil_gsec.py
-db:fbil_gsec_quote
+script: data/nsdl/fpi.py
+db:fii_investments
 ```
 
 
 ```
-script: data/rbi/download_fbil_gsec.py
-db:fbil_gsec_par
+script: data/nsdl/fpi.py
+db:fii_derivatives
 ```
 
 

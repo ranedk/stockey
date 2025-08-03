@@ -81,12 +81,14 @@ def fetch_fred_series(
         df_usa,
         "macro_usa",
         unique_keys=["date"],
+        timescaledb_column="date",
     )
 
     upsert_to_db(
         df_india_gdp,
         "macro_india_gdp",
         unique_keys=["date"],
+        timescaledb_column="date",
     )
 
 
@@ -114,11 +116,13 @@ def fetch_ism_manufacturing():
     ism = response.json()
     df = pd.DataFrame.from_dict(ism)
     df = df.drop(columns=["id", "ratioDeviation"]).rename(columns={"dateUtc": "date"})
+    df['date'] = pd.to_datetime(df['date'])
 
     upsert_to_db(
         df,
         "macro_usa_ism",
         unique_keys=["date"],
+        timescaledb_column="date",
     )
     return df
 
