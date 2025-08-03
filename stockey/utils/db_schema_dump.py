@@ -94,6 +94,9 @@ def main():
 
     # print
     for schema, table in tables:
+        if schema.startswith("_"):
+            continue
+
         print(f"\n{schema}.{table}")
         for c in colmap[(schema, table)]:
             flags = []
