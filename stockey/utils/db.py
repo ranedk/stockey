@@ -4,6 +4,7 @@ from datetime import date, datetime
 from typing import List, Tuple, Union
 
 import pandas as pd
+import pandas.api.types as pdt
 import psycopg2
 from environs import Env
 from psycopg2 import sql
@@ -31,6 +32,142 @@ def get_connection():
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD
     )
 
+def pandas_to_postgres_type(dtype: str):
+    PANDAS_TO_POSTGRES = {
+        # ----- NumPy integers -----
+        "int8":  "SMALLINT",
+        "int16": "SMALLINT",
+        "int32": "INTEGER",
+        "int64": "BIGINT",
+
+        # Unsigned (pick safe wider PG types; uint64 can exceed BIGINT)
+        "uint8":  "SMALLINT",
+        "uint16": "INTEGER",
+        "uint32": "BIGINT",
+        "uint64": "NUMERIC(20)",  # use NUMERIC to avoid overflow
+
+        # ----- Nullable pandas integers -----
+        "Int8":  "SMALLINT",
+        "Int16": "SMALLINT",
+        "Int32": "INTEGER",
+        "Int64": "BIGINT",
+
+        # Unsigned nullable
+        "UInt8":  "SMALLINT",
+        "UInt16": "INTEGER",
+        "UInt32": "BIGINT",
+        "UInt64": "NUMERIC(20)",
+
+        # ----- Floats -----
+        "float16": "REAL",
+        "float32": "REAL",
+        "float64": "DOUBLE PRECISION",
+
+        # Nullable floats
+        "Float32": "REAL",
+        "Float64": "DOUBLE PRECISION",
+
+        # ----- Booleans -----
+        "bool":     "BOOLEAN",
+        "boolean":  "BOOLEAN",  # pandas nullable BooleanDtype
+
+        # ----- Strings / text -----
+        "string":          "TEXT",
+        "string[python]":  "TEXT",
+        "string[pyarrow]": "TEXT",
+        "object":          "TEXT",  # generic fallback for Python objects
+
+        # ----- Datetime-like -----
+        # Always map to TIMESTAMPTZ for TimescaleDB time columns
+        "datetime64[ns]":        "TIMESTAMPTZ",
+        "datetime64[ns, UTC]":   "TIMESTAMPTZ",
+        # (Other tz variants will be handled by a rule-based fallback; see helper below.)
+
+        # ----- Timedelta-like -----
+        "timedelta64[ns]": "INTERVAL",
+
+        # ----- Categorical -----
+        "category": "TEXT",  # store labels; if you store codes, use SMALLINT/INT
+
+        # ----- Complex (no native PG complex) -----
+        "complex64":  "TEXT",
+        "complex128": "TEXT",
+
+        # ----- Periods (choose representation; here we use DATE where sensible) -----
+        "period[D]":      "DATE",
+        "period[M]":      "DATE",
+        "period[Q-DEC]":  "DATE",
+        "period[A-DEC]":  "DATE",
+
+        # ----- Intervals (pandas Interval) -----
+        # Representation varies by subtype; simplest is TEXT
+        "interval[int64]":         "TEXT",
+        "interval[float64]":       "TEXT",
+        "interval[datetime64[ns]]":"TEXT",
+
+        # ----- Sparse (store dense values as their logical type or TEXT) -----
+        "Sparse[int64]":    "BIGINT",
+        "Sparse[float64]":  "DOUBLE PRECISION",
+        "Sparse[boolean]":  "BOOLEAN",
+        "Sparse[string]":   "TEXT",
+
+        # ===== PyArrow-backed (when using Arrow dtype backend) =====
+        # Numerics
+        "int8[pyarrow]":    "SMALLINT",
+        "int16[pyarrow]":   "SMALLINT",
+        "int32[pyarrow]":   "INTEGER",
+        "int64[pyarrow]":   "BIGINT",
+        "uint8[pyarrow]":   "SMALLINT",
+        "uint16[pyarrow]":  "INTEGER",
+        "uint32[pyarrow]":  "BIGINT",
+        "uint64[pyarrow]":  "NUMERIC(20)",
+        "float32[pyarrow]": "REAL",
+        "float64[pyarrow]": "DOUBLE PRECISION",
+        "boolean[pyarrow]": "BOOLEAN",
+        "decimal[pyarrow]": "NUMERIC",     # precision/scale not embedded in key
+
+        # Binary
+        "binary[pyarrow]":       "BYTEA",
+        "large_binary[pyarrow]": "BYTEA",
+
+        # Dates / times
+        "date32[pyarrow]":  "DATE",
+        "date64[pyarrow]":  "DATE",
+        "time32[pyarrow]":  "TIME",
+        "time64[pyarrow]":  "TIME",
+
+        # Timestamps / durations (units/tz may vary; see helper below)
+        "timestamp[pyarrow]": "TIMESTAMPTZ",
+        "duration[pyarrow]":  "INTERVAL",
+    }
+
+    key = str(dtype)
+    if key in PANDAS_TO_POSTGRES:
+        return PANDAS_TO_POSTGRES[key]
+
+    if pdt.is_datetime64_any_dtype(dtype):
+        return "TIMESTAMPTZ"        # good default for TimescaleDB
+    if pdt.is_timedelta64_dtype(dtype):
+        return "INTERVAL"
+    if pdt.is_integer_dtype(dtype):
+        # Best effort when width is unknown
+        return "BIGINT" if "64" in key or "Int64" in key else "INTEGER"
+    if pdt.is_float_dtype(dtype):
+        return "DOUBLE PRECISION"
+    if pdt.is_bool_dtype(dtype):
+        return "BOOLEAN"
+    if pdt.is_categorical_dtype(dtype):
+        return "TEXT"
+    if pdt.is_string_dtype(dtype):
+        return "TEXT"
+
+    # Arrow timestamp variants like 'timestamp[us, tz=UTC][pyarrow]' land here
+    if "timestamp" in key and "pyarrow" in key:
+        return "TIMESTAMPTZ"
+
+    # Last-resort default
+    return "TEXT"
+
 
 def generate_postgres_schema(
     df: pd.DataFrame,
@@ -41,26 +178,17 @@ def generate_postgres_schema(
     Return a `CREATE TABLE IF NOT EXISTS …` suited for PostgreSQL.
     Very simple dtype → SQL type mapping (expand as needed).
     """
-    pg_types = {
-        "int64": "BIGINT",
-        "int32": "INTEGER",
-        "float64": "DOUBLE PRECISION",
-        "float32": "REAL",
-        "bool": "BOOLEAN",
-        "datetime64[ns]": "TIMESTAMPTZ",
-        "object": "TEXT",
-        "string": "TEXT",
-    }
 
     col_defs = []
     for col, dtype in df.dtypes.items():
-        sql_type = pg_types.get(str(dtype), "TEXT")
+        sql_type = pandas_to_postgres_type(dtype)
         col_defs.append(f'"{col}" {sql_type}')
 
     unique_clause = ""
     if unique_keys and isinstance(unique_keys, (list, tuple)):
         keys = ", ".join(f'"{k}"' for k in unique_keys)
         unique_clause = f", UNIQUE ({keys})"
+
 
     return f'CREATE TABLE IF NOT EXISTS {table_name} ({", ".join(col_defs)}{unique_clause});'
 

@@ -1,6 +1,6 @@
 import tempfile
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 import numpy as np
 import pandas as pd
@@ -10,6 +10,7 @@ from environs import Env
 
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers
+from utils.date import reverse_daterange
 
 env = Env()
 env.read_env()
@@ -133,8 +134,24 @@ def download_gsec(fdate: date, cookies):
         print(tmp.name)
         df_quote, df_par = parse_xls(tmp.name, fdate)
 
-    upsert_to_db(df_quote, "fbil_gsec_quote", unique_keys=["trade_date", "isin"])
-    upsert_to_db(df_par, "fbil_gsec_par", unique_keys=["trade_date", "tenor_years"])
+    df_quote = df_quote.rename(columns={"trade_date": "date"})
+    df_par = df_par.rename(columns={"trade_date": "date"})
+
+    df_quote["date"] = pd.to_datetime(df_quote["date"], format="%Y-%m-%d")
+    df_par["date"] = pd.to_datetime(df_par["date"], format="%Y-%m-%d")
+
+    upsert_to_db(
+        df_quote,
+        "fbil_gsec_quote",
+        unique_keys=["date", "isin"],
+        timescaledb_column="date",
+    )
+    upsert_to_db(
+        df_par,
+        "fbil_gsec_par",
+        unique_keys=["date", "tenor_years"],
+        timescaledb_column="date",
+    )
 
     rop.sadd(DOWNLOADED, formatted_date)
     time.sleep(0.5)
@@ -143,12 +160,9 @@ def download_gsec(fdate: date, cookies):
 
 def download_all_gsec_data():
     cookies = get_cookies()
-    today = date.today()
-    n = 1
-    while n <= 365 * 12:
-        fdate = today - timedelta(days=n)
+    today = datetime.now()
+    for fdate in reverse_daterange(datetime(2014, 1, 1), today):
         download_gsec(fdate, cookies=cookies)
-        n += 1
 
 
 if __name__ == "__main__":
