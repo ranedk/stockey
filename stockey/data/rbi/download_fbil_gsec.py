@@ -161,7 +161,7 @@ def download_gsec(fdate: date, cookies):
 def download_all_gsec_data():
     cookies = get_cookies()
     today = datetime.now()
-    for fdate in reverse_daterange(datetime(2014, 1, 1), today):
+    for fdate in reverse_daterange(datetime(2014, 1, 1), today, last_of_month=True):
         download_gsec(fdate, cookies=cookies)
 
 
