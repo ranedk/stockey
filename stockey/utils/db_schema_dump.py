@@ -103,8 +103,8 @@ def main():
             if c["name"] in pkmap[(schema, table)]: flags.append("PK")
             if not c["nullable"]: flags.append("NOT NULL")
             if c["default"] is not None: flags.append(f"DEFAULT={c['default']}")
-            if col_to_idx[(schema, table)].get(c["name"]):
-                flags.append("IDX:" + ",".join(col_to_idx[(schema, table)][c["name"]]))
+            # if col_to_idx[(schema, table)].get(c["name"]):
+            #     flags.append("IDX:" + ",".join(col_to_idx[(schema, table)][c["name"]]))
             print(f"  - {c['name']}: {c['type']} {' '.join(flags)}")
 
         if idxmap[(schema, table)]:
