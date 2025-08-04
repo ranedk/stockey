@@ -22,8 +22,8 @@ REDIS_SET = "nsdl:fpi:downloaded"
 HEADERS = get_dynamic_headers()
 
 
-def get_fpi_data(date: date):
-    print(f"Fetching FPI data for date: {date}")
+def get_fpi_data(rdate: date):
+    print(f"Fetching FPI data for date: {rdate}")
     session = requests.Session()
     response = session.get(
         "https://www.fpi.nsdl.co.in/web/Reports/Archive.aspx", headers=HEADERS
@@ -32,7 +32,7 @@ def get_fpi_data(date: date):
     hidden = hidden_inputs_to_dict(response.content)
 
     data = {
-        "hdnDate": date.strftime("%d-%b-%Y"),
+        "hdnDate": rdate.strftime("%d-%b-%Y"),
         "HdnValexceldata": "",
         "hdnFlag": "",
         "__EVENTTARGET": "btnSubmit1",

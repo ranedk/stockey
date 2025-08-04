@@ -2,6 +2,11 @@ from datetime import datetime, timedelta
 import calendar
 
 
+def last_of_month(date: datetime) -> datetime:
+    """Return the last day of the month for the given date."""
+    return date.replace(day=calendar.monthrange(date.year, date.month)[1])
+
+
 def daterange(
     start_date: datetime,
     end_date: datetime,

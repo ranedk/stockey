@@ -10,6 +10,7 @@ from environs import Env
 
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers
+from utils.date import last_of_month
 
 env = Env()
 env.read_env()
@@ -39,6 +40,7 @@ def get_wpi_for_year(year):
         cookies=cookies,
         headers=HEADERS,
         data=data,
+        timeout=120
     )
 
     soup = BeautifulSoup(response.content, "html.parser")
@@ -69,6 +71,7 @@ def get_wpi_for_year(year):
             cookies=cookies,
             headers=HEADERS,
             data=data,
+            timeout=120
         )
 
         # Parse HTML
@@ -86,14 +89,14 @@ def get_wpi_for_year(year):
 
         # Create date and value pairs
         records = []
-        for i, month in enumerate(months):
+        for i, _ in enumerate(months):
             value = values[i]
             if value is not None:
                 # Use 1st of each month as the date
-                date_str = f"{year}-{i+1:02d}-01"
-                date = pd.to_datetime(date_str)
-                rop.sadd(REDIS_SET, date.strftime("%Y-%m-%d"))
-                records.append({"date": date, "value": float(value)})
+                rdate = last_of_month(date(int(year), i+1, 1))
+                rdate = pd.to_datetime(rdate)
+                rop.sadd(REDIS_SET, rdate.strftime("%Y-%m-%d"))
+                records.append({"date": rdate, "value": float(value)})
 
         df = pd.DataFrame(records)
         df["cname"] = item[0]

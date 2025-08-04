@@ -55,7 +55,7 @@ def fetch_fred_series(
         latest_date = date(2014, 1, 1)
 
     start = latest_date - timedelta(
-        days=10
+        days=15
     )  # Some values like inr_usd get updated later
     end = date.today()
 
@@ -66,6 +66,7 @@ def fetch_fred_series(
         # latest_date is today, no need to query further
         return
 
+    print("Pulling data %s to %s" % (start, end))
     df = pdr.DataReader(list(series.keys()), "fred", start, end)
     df = df.rename(columns=series)
 
