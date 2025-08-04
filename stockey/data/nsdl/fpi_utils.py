@@ -35,7 +35,7 @@ def _infer_year(df: pd.DataFrame, idx: int, month: int) -> int:
     # ← look backward
     for j in range(idx - 1, -1, -1):
         try:
-            d = pd.to_datetime(df.at[j, "reporting_date"], format="%d-%b-%Y")
+            d = pd.to_datetime(df.at[j, "date"], format="%d-%b-%Y")
             if d.month == month:
                 return d.year
         except ValueError:
@@ -44,7 +44,7 @@ def _infer_year(df: pd.DataFrame, idx: int, month: int) -> int:
     # → look forward (rarely needed)
     for j in range(idx + 1, len(df)):
         try:
-            d = pd.to_datetime(df.at[j, "reporting_date"], format="%d-%b-%Y")
+            d = pd.to_datetime(df.at[j, "date"], format="%d-%b-%Y")
             if d.month == month:
                 return d.year
         except ValueError:
@@ -53,24 +53,24 @@ def _infer_year(df: pd.DataFrame, idx: int, month: int) -> int:
     raise ValueError(f"Couldn’t infer year for monthly total at row {idx}")
 
 
-def fix_reporting_date(df: pd.DataFrame) -> pd.DataFrame:
+def fix_date(df: pd.DataFrame) -> pd.DataFrame:
     """
     • “Total for <Month>” → last day of that month (year inferred)
       and instrument → 'total_month_<instrument>'
     • “Total for <YYYY>”  → 31-Dec-YYYY
       and instrument → 'total_year_<instrument>'
-    Entire reporting_date column is returned as dtype datetime64[ns].
+    Entire date column is returned as dtype datetime64[ns].
     """
     out = df.copy()
 
-    for idx, val in out["reporting_date"].items():
+    for idx, val in out["date"].items():
         # ---- monthly totals -------------------------------------------------
         m = MONTH_PAT.match(val)
         if m:
             month_txt = m.group(1).lower()
             month_no = MONTH2NUM[month_txt]
             year_no = _infer_year(out, idx, month_no)
-            out.at[idx, "reporting_date"] = _last_day_of_month(year_no, month_no)
+            out.at[idx, "date"] = _last_day_of_month(year_no, month_no)
             out.at[idx, "instrument"] = "total_month_" + out.at[idx, "instrument"]
             continue
 
@@ -78,11 +78,11 @@ def fix_reporting_date(df: pd.DataFrame) -> pd.DataFrame:
         y = YEAR_PAT.match(val)
         if y:
             yr = int(y.group(1))
-            out.at[idx, "reporting_date"] = pd.Timestamp(yr, 12, 31)
+            out.at[idx, "date"] = pd.Timestamp(yr, 12, 31)
             out.at[idx, "instrument"] = "total_year_" + out.at[idx, "instrument"]
 
     # final dtype coercion (catches the ordinary day-level rows too)
-    out["reporting_date"] = pd.to_datetime(out["reporting_date"])
+    out["date"] = pd.to_datetime(out["date"])
     return out
 
 
@@ -95,10 +95,10 @@ def downloaded_for(
             SELECT
                 EXISTS(SELECT 1
                     FROM  "fii_investments"
-                    WHERE  "reporting_date" = %s
+                    WHERE  "date" = %s
                     AND "instrument" = 'equity_sub_total'
                     LIMIT  1)           AS has_target,
-                MAX("reporting_date")   AS latest_date
+                MAX("date")   AS latest_date
             FROM "fii_investments"
             WHERE "instrument" = 'equity_sub_total'
             """

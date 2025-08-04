@@ -12,8 +12,8 @@ def main():
 
     dump = f"export PGPASSWORD=stockey; pg_dump --host=localhost --port=5432 --username=stockey --table=public.{table_name} --data-only --column-inserts stockey > /tmp/{table_name}.sql"
     os.system(dump)
-    # restore = f"export PGPASSWORD=stockey; psql --host=172.26.39.7 --port=5432 --username=stockey --dbname=stockey --file=/tmp/{table_name}.sql"
-    # os.system(restore)
+    restore = f"export PGPASSWORD=stockey; psql --host=172.26.39.7 --port=5432 --username=stockey --dbname=stockey --file=/tmp/{table_name}.sql"
+    os.system(restore)
 
 
 

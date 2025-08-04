@@ -115,7 +115,7 @@ def fetch_ism_manufacturing():
     )
     ism = response.json()
     df = pd.DataFrame.from_dict(ism)
-    df = df.drop(columns=["id", "ratioDeviation"]).rename(columns={"dateUtc": "date"})
+    df = df.drop(columns=["id", "ratioDeviation"]).rename(columns={"dateUtc": "date", "periodDateUtc": "for_month"})
     df['date'] = pd.to_datetime(df['date'])
 
     upsert_to_db(

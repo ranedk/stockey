@@ -51,12 +51,14 @@ def get_fpi_data(date: date):
     upsert_to_db(
         fii_investments_df,
         "fii_investments",
-        unique_keys=["reporting_date", "instrument"],
+        unique_keys=["date", "instrument"],
+        timescaledb_column="date",
     )
     upsert_to_db(
         fii_derivatives_df,
         "fii_derivatives",
-        unique_keys=["reporting_date", "instrument"],
+        unique_keys=["date", "instrument"],
+        timescaledb_column="date",
     )
 
 
@@ -87,7 +89,7 @@ def parse_investments_table(table_html):
     df = df.iloc[:, :8]
 
     df.columns = [
-        "reporting_date",
+        "date",
         "itype",
         "iroute",
         "gross_purchases_inr_crore",
@@ -103,7 +105,7 @@ def parse_investments_table(table_html):
         lambda x: "total" if x == "debt_total" else x
     )
     df.drop(columns=["itype", "iroute", "usd_inr_rate"], inplace=True)
-    df = futils.fix_reporting_date(df)
+    df = futils.fix_date(df)
     return df
 
 
@@ -116,7 +118,7 @@ def parse_derivatives_table(table_html):
     df = df.iloc[:, :8]
 
     df.columns = [
-        "reporting_date",
+        "date",
         "instrument",
         "buy_number_of_contracts",
         "buy_amount",
@@ -126,7 +128,7 @@ def parse_derivatives_table(table_html):
         "open_interest_eod_amount",
     ]
     df["instrument"] = df["instrument"].apply(futils.to_snake)
-    df = futils.fix_reporting_date(df)
+    df = futils.fix_date(df)
     return df
 
 
