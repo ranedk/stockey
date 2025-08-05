@@ -307,7 +307,7 @@ def upsert_to_db(
             # commit on context exit
 
 
-def get_sql(sql: str, params: Tuple = ()) -> pd.Series:
+def get_sql(sql_query: str, params: Tuple = ()) -> pd.Series:
     """
     Run a parametrised SELECT and return exactly one row as a Series.
 
@@ -320,7 +320,7 @@ def get_sql(sql: str, params: Tuple = ()) -> pd.Series:
       Example:  "SELECT * FROM mytable WHERE id = %s"
     """
     with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, params)
+        cur.execute(sql_query, params)
         rows = cur.fetchall()  # list[dict]
 
     if not rows:
@@ -332,13 +332,13 @@ def get_sql(sql: str, params: Tuple = ()) -> pd.Series:
     return pd.Series(rows[0])
 
 
-def select_sql(sql: str, params: Tuple = ()) -> pd.DataFrame:
+def select_sql(sql_query: str, params: Tuple = ()) -> pd.DataFrame:
     """
     Run a parametrised SELECT and return every row as a DataFrame
     (empty DataFrame if no matches).
     """
     with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql, params)
+        cur.execute(sql_query, params)
         rows = cur.fetchall()
 
     return pd.DataFrame(rows)
