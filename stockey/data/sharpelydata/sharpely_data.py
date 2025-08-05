@@ -172,90 +172,6 @@ def parse_consolidated_statement(symbol, data, fccs):
     return df
 
 
-def get_corporate_actions(symbol):
-    try:
-        row = sdb.get_nse_equity(symbol)
-    except ValueError:
-        row = sdb.get_bse_equity(symbol)
-
-    resp = get_with_retries(
-        f"https://pyapiv2.mintbox.ai/api/core/getCorporateActionsV2/lseg_instrument_id={row.lseg_instrument_id}",
-        headers=HEADERS,
-    ).json()
-    sts = json.loads(resp["statements"])
-
-    # Save Capital Change Events
-    records = []
-    for row in sts["capital_change_events"]:
-        entry = row.copy()
-        entry["date"] = pd.to_datetime(row["announcement_date"])
-        entry["ex_date"] = pd.to_datetime(row["ex_date"])
-        entry["symbol"] = symbol
-        records.append(entry)
-
-    df = pd.DataFrame(records)
-    upsert_to_db(
-        df,
-        "events_capital_change",
-        unique_keys=["symbol", "event_type", "date"],
-        timescaledb_column="date",
-    )
-
-    # Save Dividend Events
-    records = []
-    for row in sts["dividend_events"]:
-        entry = row.copy()
-        entry["date"] = pd.to_datetime(row["announcement_date"])
-        entry["ex_date"] = pd.to_datetime(row["ex_date"])
-        entry["pay_date"] = pd.to_datetime(row["pay_date"])
-        entry["record_date"] = pd.to_datetime(row["record_date"])
-        entry["symbol"] = symbol
-        records.append(entry)
-
-    df = pd.DataFrame(records)
-    upsert_to_db(
-        df,
-        "events_dividend",
-        unique_keys=["symbol", "date", "pay_date"],
-        timescaledb_column="date",
-    )
-
-    # Save Earnings Events
-    records = []
-    for obj in sts["earning_events"]:
-        for report_date, rows in obj.items():
-            for row in rows:
-                entry = row.copy()
-                entry["date"] = pd.to_datetime(report_date)
-                entry["period_end_date"] = pd.to_datetime(row["period_end_date"])
-                entry["symbol"] = symbol
-                records.append(entry)
-
-    df = pd.DataFrame(records)
-    # For some reason this has duplicates
-    df = df.drop_duplicates(
-        subset=[
-            "symbol",
-            "date",
-            "period_end_date",
-            "period_length",
-            "eps_marker",
-        ]
-    )
-    upsert_to_db(
-        df,
-        "events_earnings",
-        unique_keys=[
-            "symbol",
-            "date",
-            "period_end_date",
-            "period_length",
-            "eps_marker",
-        ],
-        timescaledb_column="date",
-    )
-
-
 def get_shareholding(symbol):
     resp = get_with_retries(
         f"https://pyapiv2.mintbox.ai/api/core/getShareHoldingsDataAccord/symbol={symbol}",
@@ -305,65 +221,6 @@ def get_shareholding(symbol):
         timescaledb_column="date",
     )
 
-
-def get_bulk_insider_trades(symbol):
-    json_data = {"params": json.dumps({"symbol": symbol})}
-    resp = get_with_retries(
-        "https://pyapiv2.mintbox.ai/api/core/getBulkBlockInsiderTrades",
-        headers=HEADERS,
-        method="POST",
-        json_data=json_data,
-    ).json()
-    deals = json.loads(resp)
-
-    # Bulk deals
-    records = []
-    for report_date, data in deals["bulk_deals"].items():
-        for row in data:
-            entry = row.copy()
-            entry["date"] = pd.to_datetime(report_date)
-            entry["date"] = pd.to_datetime(entry["date"])
-            entry["symbol"] = symbol
-            records.append(entry)
-
-    df = pd.DataFrame(records)
-    df = df.drop("symbol", axis=1)
-    upsert_to_db(
-        df,
-        "trades_bulk",
-        unique_keys=["symbol", "date", "name", "transaction_type"],
-        timescaledb_column="date",
-    )
-
-    # Insider Traders
-    records = []
-    for report_date, data in deals["insider_trades"].items():
-        for row in data:
-            entry = row.copy()
-            entry["exchange_broadcast_date"] = pd.to_datetime(
-                entry["exchange_broadcast_date"]
-            )
-            entry["acquisition_date_from"] = pd.to_datetime(
-                entry["acquisition_date_from"]
-            )
-            entry["acquisition_date_to"] = pd.to_datetime(entry["acquisition_date_to"])
-            entry["symbol"] = symbol
-            records.append(entry)
-
-    df = pd.DataFrame(records)
-    df = df.drop("symbol", axis=1)
-    unique_cols = [
-        "symbol",
-        "acquisition_date_from",
-        "acquisition_date_to",
-        "exchange_broadcast_date",
-        "acquirer_name",
-        "security_held_pre_tx_per",
-    ]
-    df = df.drop_duplicates(subset=unique_cols)
-    upsert_to_db(df, "trades_insider", unique_keys=unique_cols)
-
-
 def get_historical_mcap(symbol):
     json_data = {
         "stock": symbol,
@@ -403,4 +260,3 @@ if __name__ == "__main__":
         get_historical_mcap(symbol)
         get_financial_statement(symbol)
         get_shareholding(symbol)
-        # get_corporate_actions(symbol)

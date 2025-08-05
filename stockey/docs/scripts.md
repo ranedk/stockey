@@ -109,58 +109,12 @@ handle_date: on_this_date | offset: { days: 1}
 redis_key: nsdl:fpi:downloaded          # any future date is summary for end of month and end of year, getting updated daily
 ```
 
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:events_capital_change
-frequency:
-handle_date:
-redis_key:
-```
-
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:events_dividend
-frequency:
-handle_date:
-redis_key:
-```
-
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:events_earnings
-frequency:
-handle_date:
-redis_key:
-```
-
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:ticker
-frequency:
-handle_date:
-redis_key:
-```
-
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:report_date
-frequency:
-handle_date:
-redis_key:
-```
-
-
 ```
 script: data/sharpelydata/sharpely_data.py
 db:shareholding_category
-frequency:
-handle_date:
-redis_key:
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
 ```
 
 
@@ -168,28 +122,9 @@ redis_key:
 script: data/sharpelydata/sharpely_data.py
 db:shareholding_top_holders
 frequency:
-handle_date:
-redis_key:
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
 ```
-
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:trades_bulk
-frequency:
-handle_date:
-redis_key:
-```
-
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:stock": ticker,
-frequency:
-handle_date:
-redis_key:
-```
-
 
 ```
 script: data/sharpelydata/sharpely_data.py
@@ -202,16 +137,23 @@ redis_key:
 ```
 script: data/sharpelydata/scrip_master.py
 db:master_sharpely_funds
-frequency:
-handle_date:
-redis_key:
+frequency: daily
+handle_date: null
+redis_key: null
 ```
-
 
 ```
 script: data/sharpelydata/scrip_master.py
 db:master_sharpely_equity
-frequency:
-handle_date:
-redis_key:
+frequency: daily
+handle_date: null
+redis_key: null
+```
+
+```
+script: data/dhanlive/scrip_master.py
+db: master_dhan_instruments
+frequency: daily
+handle_date: null
+redis_key: null
 ```
