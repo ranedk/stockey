@@ -39,7 +39,9 @@ def get_insider_deals(
     Automate NSE insider deals download from
     https://www.nseindia.com/companies-listing/corporate-filings-insider-trading
     """
-    page.goto("https://www.nseindia.com/companies-listing/corporate-filings-insider-trading")
+    page.goto(
+        "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading"
+    )
     page.wait_for_timeout(get_random(1000, 2000))
 
     params = {
@@ -88,25 +90,33 @@ def get_insider_deals(
     df = df.rename(columns=rename_map)
     df = df.reindex(columns=list(rename_map.values()))
 
-    for col in ["quantity","value_inr","holding_pct_before","holding_pct_after"]:
-        s = df[col].astype(str).str.replace(',', '')
-        s = s.mask(s.eq('-'))
+    for col in ["quantity", "value_inr", "holding_pct_before", "holding_pct_after"]:
+        s = df[col].astype(str).str.replace(",", "")
+        s = s.mask(s.eq("-"))
         df[col] = pd.to_numeric(s)
 
-    for col in ["trade_date_from","trade_date_to","date"]:
+    for col in ["trade_date_from", "trade_date_to", "date"]:
         df[col] = pd.to_datetime(df[col], format="%d-%b-%Y")
 
-    df['reporting_date'] = pd.to_datetime(df['reporting_date'], format="%d-%b-%Y %H:%M")
-    unique_keys = ["disclosure_id", "person_id", "date", "symbol", "insider_name", "transaction_type", "holding_shares_after", "holding_pct_before"]
+    df["reporting_date"] = pd.to_datetime(df["reporting_date"], format="%d-%b-%Y %H:%M")
+    unique_keys = [
+        "disclosure_id",
+        "person_id",
+        "date",
+        "symbol",
+        "insider_name",
+        "transaction_type",
+        "holding_shares_after",
+        "holding_pct_before",
+    ]
 
-    df = df.sort_values("reporting_date").drop_duplicates(subset=unique_keys, keep="last")
-    upsert_to_db(
-        df,
-        "nseindia_insider_deals",
-        unique_keys=unique_keys,
-        timescaledb_column="date"
+    df = df.sort_values("reporting_date").drop_duplicates(
+        subset=unique_keys, keep="last"
     )
-    rop.set(f"{REDIS_SET}:{symbol}", to_date.strftime('%Y-%m-%d'))
+    upsert_to_db(
+        df, "nseindia_insider_deals", unique_keys=unique_keys, timescaledb_column="date"
+    )
+    rop.set(f"{REDIS_SET}:{symbol}", to_date.strftime("%Y-%m-%d"))
     return df
 
 
@@ -116,9 +126,7 @@ def sync_insider_deals(symbols: List[str]) -> None:
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
 
-        page.goto("https://www.nseindia.com")
-        page.wait_for_timeout(get_random(1000, 3000))
-
+        counter = 0
         for symbol in symbols:
             eqt = get_nse_equity(symbol)
             issuer = eqt.display_name
@@ -129,13 +137,17 @@ def sync_insider_deals(symbols: List[str]) -> None:
             else:
                 from_date = datetime(2014, 1, 1)
 
+            if counter % 10 == 0:
+                page.goto("https://www.nseindia.com")
+                page.wait_for_timeout(get_random(1000, 3000))
+
             to_date = datetime.today()
-            get_insider_deals(
-                page, symbol, issuer, from_date, to_date
-            )
-        rop.close()
+            get_insider_deals(page, symbol, issuer, from_date, to_date)
+            counter += 1
+
         page.close()
-    browser.close()
+        browser.close()
+        rop.close()
 
 
 if __name__ == "__main__":
