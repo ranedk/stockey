@@ -64,6 +64,7 @@ def get_insider_deals(
     df = pd.DataFrame(data["data"])
     rename_map = {
         "did": "disclosure_id",
+        "pid": "person_id",
         "symbol": "symbol",
         "acqName": "insider_name",
         "personCategory": "person_category",
@@ -79,31 +80,33 @@ def get_insider_deals(
         "exchange": "exchange",
         "befAcqSharesPer": "holding_pct_before",
         "afterAcqSharesPer": "holding_pct_after",
+        "befAcqSharesNo": "holding_shares_before",
+        "afterAcqSharesNo": "holding_shares_after",
         "date": "reporting_date",
     }
 
-    df = df.rename(columns=rename_map, errors="ignore")
-    df = df[[
-        "disclosure_id","symbol","insider_name","person_category","transaction_type",
-        "quantity","value_inr","trade_date_from","trade_date_to","intimation_date",
-        "acq_mode","security_type","derivative_type",
-        "holding_pct_before","holding_pct_after"
-    ]]
+    df = df.rename(columns=rename_map)
+    df = df.reindex(columns=list(rename_map.values()))
 
     for col in ["quantity","value_inr","holding_pct_before","holding_pct_after"]:
-        df[col] = pd.to_numeric(df[col], errors="ignore")
+        s = df[col].astype(str).str.replace(',', '')
+        s = s.mask(s.eq('-'))
+        df[col] = pd.to_numeric(s)
 
-    for col in ["trade_date_from","trade_date_to","intimation_date","reporting_date", "date"]:
-        df[col] = pd.to_datetime(df[col])
+    for col in ["trade_date_from","trade_date_to","date"]:
+        df[col] = pd.to_datetime(df[col], format="%d-%b-%Y")
 
+    df['reporting_date'] = pd.to_datetime(df['reporting_date'], format="%d-%b-%Y %H:%M")
+    unique_keys = ["disclosure_id", "person_id", "date", "symbol", "insider_name", "transaction_type", "holding_shares_after", "holding_pct_before"]
+
+    df = df.sort_values("reporting_date").drop_duplicates(subset=unique_keys, keep="last")
     upsert_to_db(
         df,
         "nseindia_insider_deals",
-        unique_keys=["disclosure_id", "date", "symbol", "insider_name", "transaction_type"],
+        unique_keys=unique_keys,
         timescaledb_column="date"
     )
     rop.set(f"{REDIS_SET}:{symbol}", to_date.strftime('%Y-%m-%d'))
-
     return df
 
 
@@ -130,8 +133,8 @@ def sync_insider_deals(symbols: List[str]) -> None:
             get_insider_deals(
                 page, symbol, issuer, from_date, to_date
             )
-    rop.close()
-    page.close()
+        rop.close()
+        page.close()
     browser.close()
 
 
