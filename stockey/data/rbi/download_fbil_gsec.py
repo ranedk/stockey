@@ -10,7 +10,7 @@ from environs import Env
 
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers
-from utils.date import reverse_daterange
+from utils.date import daterange
 
 env = Env()
 env.read_env()
@@ -18,7 +18,6 @@ env.read_env()
 REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 DOWNLOADED = "fbilgec:downloaded"
-FAILED = "fbilgec:failed"
 rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 
@@ -109,11 +108,6 @@ def download_gsec(fdate: date, cookies):
 
     formatted_date = fdate.strftime("%Y-%m-%d")
     print("GSec for ", formatted_date)
-    if rop.sismember(DOWNLOADED, formatted_date) or rop.sismember(
-        FAILED, formatted_date
-    ):
-        print("Already downloaded or failed")
-        return
 
     params = {
         #'date': '2025-06-05', # format date
@@ -126,7 +120,6 @@ def download_gsec(fdate: date, cookies):
     )
     if response.status_code != 200:
         print("Skipping (with error) GSec for ", formatted_date, fdate.strftime("%a"))
-        rop.sadd(FAILED, formatted_date)
         return
 
     with tempfile.NamedTemporaryFile(suffix=".xls", delete=False) as tmp:
@@ -153,15 +146,21 @@ def download_gsec(fdate: date, cookies):
         timescaledb_column="date",
     )
 
-    rop.sadd(DOWNLOADED, formatted_date)
-    time.sleep(0.5)
+    rop.set(DOWNLOADED, formatted_date)
+    time.sleep(1)
     print("Downloaded GSec for ", formatted_date)
 
 
 def download_all_gsec_data():
     cookies = get_cookies()
     today = datetime.now()
-    for fdate in reverse_daterange(datetime(2014, 1, 1), today, last_of_month=True):
+    from_date = rop.get(DOWNLOADED)
+    if from_date:
+        from_date = datetime.strptime(from_date, "%Y-%m-%d")
+    else:
+        from_date = datetime(2014, 1, 1)
+
+    for fdate in daterange(from_date, today):
         download_gsec(fdate, cookies=cookies)
 
 

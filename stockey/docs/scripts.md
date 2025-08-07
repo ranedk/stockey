@@ -157,3 +157,139 @@ frequency: daily
 handle_date: null
 redis_key: null
 ```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_mcap
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_circuit_hit
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_sme_bhavdata
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_sec_bhavdata
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_reg
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_pe
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_mto
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_csqr
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_cmvolt
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_var1
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_cat_turnover
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/bhavcopy_parser.py
+db: nseindia_catg
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/corporate_actions.py
+db: nseindia_corporate_actions
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/earnings_events.py
+db: nseindia_earnings_events
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/insider_deals.py
+db: nseindia_insider_deals
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/offmarket_parser.py
+db: nseindia_block_deals, nseindia_bulk_deals, nseindia_shortselling
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/nseindia/recent_events.py
+db: nseindia_events
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```

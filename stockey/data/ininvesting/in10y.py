@@ -107,7 +107,12 @@ def download_gsec_data(page, from_date: date, to_date: date):
     for col in ["last_close", "last_open", "last_max", "last_min", "change_precent"]:
         df[col] = pd.to_numeric(df[col], errors="ignore")
 
-    upsert_to_db(df, "ininvesting_gsec", unique_keys=["date"])
+    upsert_to_db(
+            df,
+            "ininvesting_gsec",
+            unique_keys=["date"],
+            timescaledb_column=["date"]
+    )
     return df
 
 
@@ -118,7 +123,7 @@ def sync_gsec_prices(today: date | None = None):
     thats already been checked.
     """
     today = today or date.today()
-    lookback_start = today - relativedelta(years=10)
+    lookback_start = date(2014, 1, 1)
     first_missing = find_first_missing(lookback_start, today)
 
     if first_missing is None:

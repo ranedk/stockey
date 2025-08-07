@@ -38,7 +38,7 @@ def process_csv(file_name, csv_path):
     df['date'] = pd.to_datetime(df['date'])
     upsert_to_db(df, f"nseindia_{dtype}", unique_keys=unique_keys)
     rop.sadd(REDIS_SET, file_name)
-    
+
 
 if __name__ == "__main__":
     for f in store.list_files("nsedeals"):

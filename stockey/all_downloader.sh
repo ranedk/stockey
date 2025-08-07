@@ -11,7 +11,11 @@ python -m data.ininvesting.in10y
 python -m data.sharpelydata.sharpely_data
 python -m data.nseindia.offmarket
 python -m data.nseindia.bhavcopy_downloader
-python -m data.nseindia.events_downloader
 python -m data.nseindia.bhavcopy_parser
 python -m data.mospi.cpi
 python -m data.nsdl.fpi
+python -m data/nseindia/corporate_actions.py
+python -m data/nseindia/earnings_events.py
+python -m data/nseindia/insider_deals.py
+python -m data/nseindia/offmarket_parser.py
+python -m data/nseindia/recent_events.py
