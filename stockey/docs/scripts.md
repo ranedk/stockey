@@ -133,6 +133,13 @@ frequency:
 handle_date:
 redis_key:
 ```
+```
+script: data/nseindia/trading_days.py
+db: nseindia_trading_days
+frequency: yearly
+handle_date: null
+redis_key: null
+```
 
 ```
 script: data/sharpelydata/scrip_master.py

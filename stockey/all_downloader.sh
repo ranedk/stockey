@@ -1,5 +1,6 @@
 #!/bin/bash
 
+python -m data.nseindia.trading_days
 python -m data.dhanlive.scrip_master
 python -m data.sharpelydata.scrip_master
 
