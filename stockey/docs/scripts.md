@@ -277,6 +277,21 @@ frequency: daily
 handle_date: on_this_date | offset: { days: 1}
 redis_key: null
 ```
+```
+script: data/nseindia/indices_parser
+db: nseindia_indices
+frequency: daily
+handle_date: on_this_date | offset: { days: 1}
+redis_key: null
+```
+
+```
+script: data/rbi/download_bank_rates.py
+db: rbi_bank_rates
+frequency: daily
+handle_date: on_this_date
+redis_key: null
+```
 
 ```
 script: data/nseindia/offmarket_parser.py

@@ -56,6 +56,12 @@ GROUP BY 1,2,3,4
 ORDER BY 1,2,3;
 """
 
+SQL_TS_HYPERTABLES = """
+SELECT hypertable_schema, hypertable_name
+FROM   timescaledb_information.hypertables
+WHERE  hypertable_schema = ANY(%s);
+"""
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--schemas", default="", help="Comma-separated schema list (default: all except system)")
@@ -92,12 +98,17 @@ def main():
             for c in cols:
                 col_to_idx[(s, t)][c].append(idx)
 
+        cur.execute(SQL_TS_HYPERTABLES, (schemas,))
+        hypertables = {(s, t) for s, t in cur.fetchall()}
+
     # print
     for schema, table in tables:
         if schema.startswith("_"):
             continue
 
         print(f"\n{schema}.{table}")
+        if (schema, table) in hypertables and not idxmap[(schema, table)]:
+            raise ValueError("  !! NO TimescaleDB index found !!")
         for c in colmap[(schema, table)]:
             flags = []
             if c["name"] in pkmap[(schema, table)]: flags.append("PK")

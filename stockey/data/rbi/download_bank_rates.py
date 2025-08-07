@@ -76,8 +76,13 @@ def download_latest_rates(playwright) -> bool:
     download = dl_info.value
     file_path = download.path()  # sync call
     df = parse_excel_file(file_path)
-    upsert_to_db(df, "rbi_bank_rates", unique_keys=["effective_date"])
+    df["date"] = pd.to_datetime(df["effective_date"], format="%d-%m-%Y")
+    df = df.drop(columns=["effective_date"])
+    for col in ["bank_rate", "repo_rate", "reverse_repo_rate", "sdf_rate", "msf_rate", "crr", "slr"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    upsert_to_db(df, "rbi_bank_rates", unique_keys=["date"], timescaledb_column="date")
 
+    rates_page.close()
     page.close()
     browser.close()
 

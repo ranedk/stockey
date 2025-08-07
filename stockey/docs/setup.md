@@ -160,7 +160,7 @@ To download 10Y bond rates:
 
 G-Sec get updated daily.
 
-# WPI data 
+# WPI data
 
 `python -m data.eaindustry.wpi`
 
