@@ -312,11 +312,11 @@ def get_sql(sql_query: str, params: Tuple = ()) -> pd.Series:
     Run a parametrised SELECT and return exactly one row as a Series.
 
     Raises:
-        ValueError – if zero or >1 rows are returned.
+        ValueError - if zero or >1 rows are returned.
 
     Notes
     -----
-    • Use **%s** placeholders in *sql* – that’s what psycopg2 expects.
+    • Use **%s** placeholders in *sql* - that’s what psycopg2 expects.
       Example:  "SELECT * FROM mytable WHERE id = %s"
     """
     with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
