@@ -2,6 +2,7 @@ import uuid
 import io
 from datetime import date, datetime
 from typing import List, Tuple, Union
+from contextlib import contextmanager
 
 import pandas as pd
 import pandas.api.types as pdt
@@ -20,7 +21,7 @@ DB_NAME = env("POSTGRES_DB")
 DB_USER = env("POSTGRES_USER")
 DB_PASSWORD = env("POSTGRES_PASSWORD")
 
-
+@contextmanager
 def get_connection():
     """
     Returns a new connection to the configured PostgreSQL database.
@@ -28,9 +29,18 @@ def get_connection():
         from utils.db import get_connection
         conn = get_connection()
     """
-    return psycopg2.connect(
+    conn =  psycopg2.connect(
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD
     )
+    try:
+        yield conn
+        conn.commit()
+    except:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 
 def pandas_to_postgres_type(dtype: str):
     PANDAS_TO_POSTGRES = {

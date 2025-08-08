@@ -353,8 +353,6 @@ def parse_cat_turnover(path):
     except ValueError:
         df = pd.read_excel(path, skiprows=3, header=None)
 
-    print("Parsing cat turnover")
-    print(df)
     df.columns = ["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"]
     df.dropna(
         subset=["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"],
