@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 import calendar
+from typing import List
+import pandas as pd
 
 
 def last_of_month(date: datetime) -> datetime:
@@ -87,3 +89,16 @@ def reverse_daterange(
     total_days = (end_date - start_date).days
     for n in range(total_days + 1):
         yield end_date - timedelta(days=n)
+
+def pd_to_datetime(df: pd.DataFrame, col: str, formats: List[str]) -> pd.DataFrame:
+    fixed = False
+    for fmt in formats:
+        try:
+            df[col] = pd.to_datetime(df[col], format=fmt)
+            fixed = True
+            break
+        except ValueError:
+            pass
+    if not fixed:
+        raise ValueError("No valid date format found")
+    return df

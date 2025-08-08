@@ -12,6 +12,7 @@ import redis
 
 from utils.db import upsert_to_db
 from utils import store
+from utils.date import pd_to_datetime
 
 
 env = Env()
@@ -347,17 +348,21 @@ def parse_var1(path):
 
 
 def parse_cat_turnover(path):
-    df = pd.read_excel(path, sheet_name="Daily", skiprows=2, header=None)
+    try:
+        df = pd.read_excel(path, sheet_name="Daily", skiprows=2, header=None)
+    except ValueError:
+        df = pd.read_excel(path, skiprows=3, header=None)
+
+    print("Parsing cat turnover")
+    print(df)
     df.columns = ["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"]
-    df["trade_date"] = pd.to_datetime(
-        df["trade_date"], format="%d %b %y", errors="coerce"
-    )
-    df["buy_rs_cr"] = pd.to_numeric(df["buy_rs_cr"], errors="coerce")
-    df["sell_rs_cr"] = pd.to_numeric(df["sell_rs_cr"], errors="coerce")
     df.dropna(
         subset=["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"],
         inplace=True,
     )
+    df = pd_to_datetime(df, "trade_date", ["%d %b %y", "%d-%b-%y"])
+    df["buy_rs_cr"] = pd.to_numeric(df["buy_rs_cr"], errors="coerce")
+    df["sell_rs_cr"] = pd.to_numeric(df["sell_rs_cr"], errors="coerce")
     upsert_to_db(
         df, "nseindia_cat_turnover", unique_keys=["trade_date", "client_category"]
     )
