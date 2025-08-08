@@ -1,5 +1,6 @@
 # bhavcopy download from S3 and parse
 import io
+import shutil
 import tempfile
 import zipfile
 import glob
@@ -443,6 +444,9 @@ def unzip_and_process(zip_path):
                 mcap_files = glob.glob(os.path.join(nested_tmpdir, "MCAP*.csv"))
                 for file_path in mcap_files:
                     parse_mcap(file_path)
+
+    shutil.rmtree(zip_path)
+
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # bhavcopy download from S3 and parse
-import io
+import shutil
 import tempfile
 import zipfile
 import glob
@@ -39,16 +39,34 @@ def parse_indices_close(path):
         "turnover_cr",
         "pe",
         "pb",
-        "div_yield"
+        "div_yield",
     ]
 
     df = df.reset_index(drop=True)
     df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y")
-    for col in ["open", "high", "low", "close", "points_change", "percent_change", "volume", "turnover_cr", "pe", "pb", "div_yield"]:
+    for col in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "points_change",
+        "percent_change",
+        "volume",
+        "turnover_cr",
+        "pe",
+        "pb",
+        "div_yield",
+    ]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    
-    upsert_to_db(df, "nseindia_indices", unique_keys=["date", "index_name"], timescaledb_column="date")
+
+    upsert_to_db(
+        df,
+        "nseindia_indices",
+        unique_keys=["date", "index_name"],
+        timescaledb_column="date",
+    )
     return df
+
 
 def unzip_and_process(zip_path):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -58,6 +76,8 @@ def unzip_and_process(zip_path):
         indices_close_files = glob.glob(os.path.join(tmpdir, "ind_close_*.csv"))
         for file_path in indices_close_files:
             parse_indices_close(file_path)
+
+    shutil.rmtree(zip_path)
 
 
 if __name__ == "__main__":

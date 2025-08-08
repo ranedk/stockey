@@ -1,4 +1,5 @@
 # offmarket parser
+import shutil
 import pandas as pd
 from environs import Env
 import redis
@@ -38,6 +39,7 @@ def process_csv(file_name, csv_path):
     df['date'] = pd.to_datetime(df['date'])
     upsert_to_db(df, f"nseindia_{dtype}", unique_keys=unique_keys)
     rop.sadd(REDIS_SET, file_name)
+    shutil.rmtree(csv_path)
 
 
 if __name__ == "__main__":
