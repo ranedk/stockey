@@ -1,5 +1,5 @@
 # offmarket parser
-import shutil
+import os
 import pandas as pd
 from environs import Env
 import redis
@@ -20,6 +20,7 @@ rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 def process_csv(file_name, csv_path):
     """Process a block deals, bulk deals and short selling CSV file."""
+    print("Processing %s - %s" % (file_name, csv_path))
     df = pd.read_csv(csv_path)
     if "block_deals" in file_name:
         dtype = "block_deals"
@@ -39,7 +40,7 @@ def process_csv(file_name, csv_path):
     df['date'] = pd.to_datetime(df['date'])
     upsert_to_db(df, f"nseindia_{dtype}", unique_keys=unique_keys)
     rop.sadd(REDIS_SET, file_name)
-    shutil.rmtree(csv_path)
+    os.remove(csv_path)
 
 
 if __name__ == "__main__":

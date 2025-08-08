@@ -1,5 +1,4 @@
 # bhavcopy download from S3 and parse
-import shutil
 import tempfile
 import zipfile
 import glob
@@ -69,6 +68,7 @@ def parse_indices_close(path):
 
 
 def unzip_and_process(zip_path):
+    print("Processing %s" % zip_path)
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             zip_ref.extractall(tmpdir)
@@ -77,7 +77,7 @@ def unzip_and_process(zip_path):
         for file_path in indices_close_files:
             parse_indices_close(file_path)
 
-    shutil.rmtree(zip_path)
+    os.remove(zip_path)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 # bhavcopy_downloader.py
+import os
 import random
 from datetime import datetime, timedelta
 
@@ -63,6 +64,7 @@ def download_bhavcopy_for_date(
         download.save_as(file_path)
 
         store.save_file( file_path=file_path, prefix="bhavcopy")
+        os.remove(file_path)
 
         weekday = datetime.strptime(display_date, "%d-%b-%Y").strftime("%A")
         print(f"✅ Success: {formatted_date} ({weekday})")

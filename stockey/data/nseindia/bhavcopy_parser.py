@@ -1,17 +1,15 @@
 # bhavcopy download from S3 and parse
 import io
-import shutil
 import tempfile
 import zipfile
 import glob
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pandas as pd
 from environs import Env
 import redis
 
-from utils.date import reverse_daterange
 from utils.db import upsert_to_db
 from utils import store
 
@@ -387,6 +385,7 @@ def parse_catg(path):
     return df
 
 def unzip_and_process(zip_path):
+    print("Processing %s" % zip_path)
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             zip_ref.extractall(tmpdir)
@@ -445,7 +444,7 @@ def unzip_and_process(zip_path):
                 for file_path in mcap_files:
                     parse_mcap(file_path)
 
-    shutil.rmtree(zip_path)
+    os.remove(zip_path)
 
 
 
