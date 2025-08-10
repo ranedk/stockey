@@ -10,6 +10,8 @@ from environs import Env
 from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import reverse_daterange
+from utils.chrome import restart_chrome
+
 
 env = Env()
 env.read_env()
@@ -106,12 +108,7 @@ def main() -> None:
             failures = 0 if success else failures + 1
 
     if failures >= 7:
-        print("📉 Stopped after 7 consecutive failures.")
-        os.system("pkill chrome")
-        os.system("rm -rf /home/rane/Downloads/playwright_boilerplate/chromesetup")
-        os.system("cp -r /home/rane/Downloads/playwright_boilerplate/originalchromesetup /home/rane/Downloads/playwright_boilerplate/chromesetup")
-        time.sleep(10)
-        subprocess.Popen(["/opt/google/chrome/chrome", "--remote-debugging-port=9222", "--user-data-dir=/home/rane/Downloads/playwright_boilerplate/chromesetup"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        restart_chrome()
         time.sleep(20)
         main()
     else:
