@@ -1,5 +1,7 @@
 # indices_downloader.py
 import os
+import subprocess
+import time
 import random
 from datetime import datetime, timedelta
 
@@ -105,6 +107,13 @@ def main() -> None:
 
     if failures >= 7:
         print("📉 Stopped after 7 consecutive failures.")
+        os.system("pkill chrome")
+        os.system("rm -rf /home/rane/Downloads/playwright_boilerplate/chromesetup")
+        os.system("cp -r /home/rane/Downloads/playwright_boilerplate/originalchromesetup /home/rane/Downloads/playwright_boilerplate/chromesetup")
+        time.sleep(10)
+        subprocess.Popen(["/opt/google/chrome/chrome", "--remote-debugging-port=9222", "--user-data-dir=/home/rane/Downloads/playwright_boilerplate/chromesetup"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(20)
+        main()
     else:
         print("All caught up! Done")
     rop.close()
