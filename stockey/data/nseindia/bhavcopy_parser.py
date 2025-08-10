@@ -66,84 +66,41 @@ def parse_circuit_hit(path):
     upsert_to_db(df, "nseindia_circuit_hit", unique_keys=["date", "symbol", "series", "circuit_hit"])
     return df
 
-
-def parse_sme_bhavdata(path):
-    parts = os.path.basename(path)
-    for_date = pd.to_datetime(parts, format="sme%d%m%y.csv")
-    df = pd.read_csv(path, skiprows=1)
-    df = df.reset_index(drop=True)
-    df.columns = [
-        "market",
-        "series",
-        "symbol",
-        "security_name",
-        "previous_close",
-        "open",
-        "high",
-        "low",
-        "close",
-        "net_traded_value",
-        "net_traded_qty",
-        "corp_indicator",
-        "high_52_week",
-        "low_52_week",
-    ]
-    df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
-    for c in [
-        "previous_close",
-        "open",
-        "high",
-        "low",
-        "close",
-        "net_traded_value",
-        "net_traded_qty",
-        "high_52_week",
-        "low_52_week",
-    ]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["date"] = for_date
-    upsert_to_db(df, "nseindia_sme_bhavdata", unique_keys=["date", "symbol", "series"])
-    return df
-
-
-def parse_sec_bhavdata(path):
-    df = pd.read_csv(path, skiprows=1)
+def parse_ohlcv(csv_path):
+    df = pd.read_csv(csv_path, skiprows=1)
     df = df.reset_index(drop=True)
     df.columns = [
         "symbol",
         "series",
+        "open",
+        "high",
+        "low",
+        "close",
+        "last",
+        "previous_close",
+        "volume",
+        "total_value",
         "date",
-        "previous_close",
-        "open",
-        "high",
-        "low",
-        "last_traded_price",
-        "close",
-        "average",
-        "total_traded_quantity",
-        "turnover_lacs",
         "number_of_trades",
-        "delivery_quantity",
-        "deliverable_percent",
+        "isin",
+        "ignore"
     ]
+    df = df.drop(columns="ignore")
     df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
     for c in [
-        "previous_close",
         "open",
         "high",
         "low",
-        "last_traded_price",
         "close",
-        "average",
-        "total_traded_quantity",
-        "turnover_lacs",
+        "last",
+        "previous_close",
+        "volume",
+        "total_value",
         "number_of_trades",
-        "delivery_quantity",
-        "deliverable_percent",
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["date"] = pd.to_datetime(df["date"], format="%d-%b-%Y")
-    upsert_to_db(df, "nseindia_sec_bhavdata", unique_keys=["date", "symbol", "series"])
+    upsert_to_db(df, "nseindia_ohlcv", unique_keys=["date", "symbol", "series"])
     return df
 
 
@@ -283,6 +240,7 @@ def parse_csqr(path):
 
 def parse_cmvolt(path):
     df = pd.read_csv(path, skiprows=1)
+    df = df.iloc[:, :8]
     df = df.reset_index(drop=True)
     df.columns = [
         "date",
@@ -425,13 +383,15 @@ def unzip_and_process(zip_path):
         for file_path in reg_files:
             parse_reg(file_path)
 
-        sec_bhavdata_files = glob.glob(os.path.join(tmpdir, "sec_bhavdata_*.CSV"))
-        for file_path in sec_bhavdata_files:
-            parse_sec_bhavdata(file_path)
+        nested_zips = glob.glob(os.path.join(tmpdir, "cm*.zip"))
+        for nested_zip in nested_zips:
+            with tempfile.TemporaryDirectory() as nested_tmpdir:
+                with zipfile.ZipFile(nested_zip, "r") as nested_ref:
+                    nested_ref.extractall(nested_tmpdir)
 
-        sme_bhavdata_files = glob.glob(os.path.join(tmpdir, "sme*.CSV"))
-        for file_path in sme_bhavdata_files:
-            parse_sme_bhavdata(file_path)
+                cm_files = glob.glob(os.path.join(nested_tmpdir, "cm*.csv"))
+                for file_path in cm_files:
+                    parse_ohlcv(file_path)
 
         nested_zips = glob.glob(os.path.join(tmpdir, "PR*.zip"))
         for nested_zip in nested_zips:
@@ -457,6 +417,7 @@ if __name__ == "__main__":
             print(f"⏩ Already parsed: {f}")
             continue
         file_path = store.get_as_temp_file(f)
+        print(f"For: {f}")
         unzip_and_process(file_path)
         rop.sadd(REDIS_SET, f)
     rop.close()
