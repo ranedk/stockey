@@ -56,7 +56,7 @@ def parse_mcap(path):
 def parse_circuit_hit(path):
     parts = os.path.basename(path)
     for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
-    df = pd.read_csv(path, usecols=[0, 1, 3])
+    df = pd.read_csv(path, usecols=[0, 1, 3], encoding='utf-8', encoding_errors='ignore')
     df.columns = ["symbol", "series", "circuit_hit"]
     df["date"] = for_date
     upsert_to_db(
@@ -69,6 +69,7 @@ def parse_circuit_hit(path):
 
 def parse_ohlcv(csv_path):
     df = pd.read_csv(csv_path, skiprows=1)
+    df = df.iloc[:, :13]
     df = df.reset_index(drop=True)
     df.columns = [
         "symbol",
@@ -84,9 +85,7 @@ def parse_ohlcv(csv_path):
         "date",
         "number_of_trades",
         "isin",
-        "ignore",
     ]
-    df = df.drop(columns="ignore")
     df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
     for c in [
         "open",
