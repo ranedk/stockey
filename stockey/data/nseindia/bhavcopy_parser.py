@@ -99,7 +99,7 @@ def parse_ohlcv(csv_path):
         "number_of_trades",
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["date"] = pd.to_datetime(df["date"], format="%d-%b-%Y")
+    df = pd_to_datetime(df, "date", formats=["%d-%b-%Y", "%d-%b-%y"])
     upsert_to_db(df, "nseindia_ohlcv", unique_keys=["date", "symbol", "series"])
     return df
 
@@ -394,7 +394,7 @@ def unzip_and_process(zip_path):
                 with zipfile.ZipFile(nested_zip, "r") as nested_ref:
                     nested_ref.extractall(nested_tmpdir)
 
-                cm_files = glob.glob(os.path.join(nested_tmpdir, "cm*.csv"))
+                cm_files = glob.glob(os.path.join(nested_tmpdir, "**","cm*.csv"))
                 for file_path in cm_files:
                     parse_ohlcv(file_path)
 

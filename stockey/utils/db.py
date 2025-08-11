@@ -425,3 +425,17 @@ def table_has_date(
     if latest_date and isinstance(latest_date, datetime):
         latest_date = latest_date.date()
     return has_target, latest_date
+
+
+def get_max_date(feature_table):
+    """
+    Return the maximum date from the feature table.
+    """
+    try:
+        df = sql_to_df(f"SELECT max(date) AS max_date FROM {feature_table};")
+        if df["max_date"].notna().any():
+            dt = pd.to_datetime(df.loc[0, "max_date"])
+            return dt.normalize()
+    except Exception:
+        pass  # table may not exist on first run
+    return None

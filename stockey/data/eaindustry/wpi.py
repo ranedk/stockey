@@ -111,14 +111,25 @@ def sync_wpi():
         for month in range(1, 13):
             if year == today.year and month >= today.month:
                 continue
-            day = date(year, month, 1)
-            if not rop.sismember(REDIS_SET, day.strftime("%Y-%m-%d")):
-                print(f"Checking for {day}")
+            rdate = last_of_month(date(year, month, 1))
+            if not rop.sismember(REDIS_SET, rdate.strftime("%Y-%m-%d")):
+                print(f"Checking for {rdate}")
                 get_wpi_for_year(year)
+            else:
+                print(f"Done for {rdate}")
+
+
+def run():
+    # To setup the first set of tables
+    # get_wpi_for_year(2014)
+    try:
+        sync_wpi()
+    except requests.exceptions.ConnectionError as e:
+        time.sleep(20)
+        HEADERS = get_dynamic_headers()
+        print(f"Error: {e}")
+        run()
 
 
 if __name__ == "__main__":
-    sync_wpi()
-
-    # To setup the first set of tables
-    # get_wpi_for_year(2014)
+    run()

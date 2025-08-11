@@ -107,8 +107,6 @@ def main():
             continue
 
         print(f"\n{schema}.{table}")
-        if (schema, table) in hypertables and not idxmap[(schema, table)]:
-            raise ValueError("  !! NO TimescaleDB index found !!")
         for c in colmap[(schema, table)]:
             flags = []
             if c["name"] in pkmap[(schema, table)]: flags.append("PK")
@@ -123,6 +121,9 @@ def main():
             for idx in idxmap[(schema, table)]:
                 u = "UNIQUE " if idx["unique"] else ""
                 print(f"    {idx['name']}: {u}({', '.join(idx['cols'])})")
+
+        if (schema, table) in hypertables and not idxmap[(schema, table)]:
+            print("  !! NO TimescaleDB index found !!\n\n")
 
 if __name__ == "__main__":
     main()
