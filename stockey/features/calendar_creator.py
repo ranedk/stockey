@@ -2,7 +2,9 @@
 import pandas as pd, numpy as np
 from datetime import date
 from psycopg2.extras import execute_values
-from utils.db import get_connection  # your helper
+from utils.db import get_connection
+
+
 MIN_DATE = "2014-01-01"
 OHLCV_TABLE = "nse_ohlcv"  # <-- change
 OHLCV_DATE_COL = "trade_date"  # <-- change

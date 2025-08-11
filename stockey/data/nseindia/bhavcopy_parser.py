@@ -32,26 +32,22 @@ def parse_mcap(path):
     df = pd.read_csv(io.StringIO(cleaned_data), skiprows=1)
     df = df.reset_index(drop=True)
     df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
-    df.columns =[
-        'trade_date',
-        'symbol',
-        'series',
-        'security_name',
-        'category',
-        'last_trade_date',
-        'face_value_rs',
-        'issue_size',
-        'close_price_paid_up_value_rs',
-        'market_cap_rs'
+    df.columns = [
+        "trade_date",
+        "symbol",
+        "series",
+        "security_name",
+        "category",
+        "last_trade_date",
+        "face_value_rs",
+        "issue_size",
+        "close_price_paid_up_value_rs",
+        "market_cap_rs",
     ]
-    df['date'] = pd.to_datetime(df['trade_date'], format="%d %b %Y")
+    df["date"] = pd.to_datetime(df["trade_date"], format="%d %b %Y")
     df = df.drop(columns=["trade_date", "security_name"])
-    df['issue_size'] = pd.to_numeric(df['issue_size'], errors="coerce").astype("Int64")
-    for c in [
-        'face_value_rs',
-        'close_price_paid_up_value_rs',
-        'market_cap_rs'
-    ]:
+    df["issue_size"] = pd.to_numeric(df["issue_size"], errors="coerce").astype("Int64")
+    for c in ["face_value_rs", "close_price_paid_up_value_rs", "market_cap_rs"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     upsert_to_db(df, "nseindia_mcap", unique_keys=["date", "symbol", "series"])
     return df
@@ -63,8 +59,13 @@ def parse_circuit_hit(path):
     df = pd.read_csv(path, usecols=[0, 1, 3])
     df.columns = ["symbol", "series", "circuit_hit"]
     df["date"] = for_date
-    upsert_to_db(df, "nseindia_circuit_hit", unique_keys=["date", "symbol", "series", "circuit_hit"])
+    upsert_to_db(
+        df,
+        "nseindia_circuit_hit",
+        unique_keys=["date", "symbol", "series", "circuit_hit"],
+    )
     return df
+
 
 def parse_ohlcv(csv_path):
     df = pd.read_csv(csv_path, skiprows=1)
@@ -83,7 +84,7 @@ def parse_ohlcv(csv_path):
         "date",
         "number_of_trades",
         "isin",
-        "ignore"
+        "ignore",
     ]
     df = df.drop(columns="ignore")
     df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
@@ -301,7 +302,9 @@ def parse_var1(path):
 
     df["for_date"] = pd.to_datetime(for_date)
     df["entry_number"] = entry_number
-    upsert_to_db(df, "nseindia_var1", unique_keys=["for_date", "entry_number", "series", "symbol", "isin"])
+    unique_keys = ["for_date", "entry_number", "series", "symbol", "isin"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_var1", unique_keys=unique_keys)
     return df
 
 
@@ -336,14 +339,17 @@ def parse_catg(path):
     df["category"] = pd.to_numeric(df["category"], errors="coerce").astype("Int64")
     df["impact_cost"] = pd.to_numeric(df["impact_cost"], errors="coerce")
     df["for_month"] = pd.to_datetime(for_month)
-    
+
     # ISIN is not unique, there can be multiple Symbols with the same ISIN because the same underlying
     # can be traded in different series (e.g. Nifty 50 and Nifty 50 Future)
     # Also, the same symbol and isin can be a part of more than one series e.g. SHAKTIPUMP is traded in
     # series BE and EQ
     # When company changes its name, symbol also changes but ISIN remains the same
-    upsert_to_db(df, "nseindia_catg", unique_keys=["for_month", "series", "symbol", "isin"])
+    upsert_to_db(
+        df, "nseindia_catg", unique_keys=["for_month", "series", "symbol", "isin"]
+    )
     return df
+
 
 def unzip_and_process(zip_path):
     print("Processing %s" % zip_path)
@@ -408,7 +414,6 @@ def unzip_and_process(zip_path):
                     parse_mcap(file_path)
 
     os.remove(zip_path)
-
 
 
 if __name__ == "__main__":

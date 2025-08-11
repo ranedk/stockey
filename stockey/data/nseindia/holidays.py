@@ -86,7 +86,7 @@ def get_random(min_ms: int, max_ms: int) -> int:
     return int(random.uniform(min_ms, max_ms))
 
 
-def dowload_trading_days(
+def download_holidays(
     playwright,
 ) -> bool:
     """
@@ -122,7 +122,7 @@ def dowload_trading_days(
             'weekDay': 'weekday',
             'description': 'holiday',
             'morning_session': 'morning_session',
-            "evening_session": "evening_session", 
+            "evening_session": "evening_session",
             "Sr_no": "sr_no"
         })
         df = df.drop(columns=["sr_no", "weekday"])
@@ -132,7 +132,7 @@ def dowload_trading_days(
 
     full_df = full_df.reset_index(drop=True)
     full_df = full_df.drop_duplicates(subset=["date", "type"], keep='last')
-    upsert_to_db(full_df, "nseindia_trading_days", unique_keys=["date", "type"], timescaledb_column="date")
+    upsert_to_db(full_df, "nseindia_holidays", unique_keys=["date", "type"], timescaledb_column="date")
     rop.set(REDIS_SET, datetime.today().strftime("%Y-%m-%d"))
 
     page.close()
@@ -145,7 +145,7 @@ def main() -> None:
         if rop.get(REDIS_SET):
             print("Last crawl on ", rop.get(REDIS_SET))
 
-        dowload_trading_days(p)
+        download_holidays(p)
 
     rop.close()
 

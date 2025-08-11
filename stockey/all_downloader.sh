@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Masters
-python -m data.nseindia.trading_days
+python -m data.nseindia.holidays
 python -m data.dhanlive.scrip_master
 python -m data.sharpelydata.scrip_master
 

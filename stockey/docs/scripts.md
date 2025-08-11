@@ -134,8 +134,8 @@ handle_date:
 redis_key:
 ```
 ```
-script: data/nseindia/trading_days.py
-db: nseindia_trading_days
+script: data/nseindia/holidays.py
+db: nseindia_holidays
 frequency: yearly
 handle_date: null
 redis_key: null
