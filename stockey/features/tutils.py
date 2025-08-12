@@ -23,7 +23,7 @@ def read_crawled_table(table_name, date_column, start_period_dt):
     """
     Read table from database with date_column >= start_period_dt
     """
-    params = {"start": start_period_dt.tz_convert("UTC")}
+    params = {"start": start_period_dt.tz_localize("UTC")}
 
     sql = f"""
         SELECT *
@@ -94,9 +94,9 @@ def build_feature_from_monthly(
     Column in `source_table` representing the source row date. Defaults to "date".
     value_cols (str | Sequence[str] | Mapping[str, str], optional):
     Value columns to carry into the feature table.
-     - str: single column, kept as-is.
-     - Sequence[str]: multiple columns, kept as-is.
-     - Mapping[str, str]: source→destination rename map. Defaults to "value".
+        - str: single column, kept as-is.
+        - Sequence[str]: multiple columns, kept as-is.
+        - Mapping[str, str]: source→destination rename map. Defaults to "value".
     unique_keys (Sequence[str], optional):
     Composite key for the feature table. MUST include "date".
     Keys other than "date" are treated as dimension columns (dims). Defaults to ("date",).
@@ -130,23 +130,23 @@ def build_feature_from_monthly(
 
     Example:
     build_feature_from_monthly(
-    source_table="public.eaindustry_wpi",
-    feature_table="public.feature_wpi",
-    date_col="date",
-    value_cols={"value": "wpi_value"},
-    unique_keys=["date", "cname"],
-    release_strategy=lambda period: period + MonthBegin(1) + pd.offsets.Day(13),
-    snap_direction="forward",
-    start_period_dt=pd.Timestamp("2013-01-01"),
-    start_if_empty=pd.Timestamp("2014-01-01"),
+        source_table="public.eaindustry_wpi",
+        feature_table="public.feature_wpi",
+        date_col="date",
+        value_cols={"value": "wpi_value"},
+        unique_keys=["date", "cname"],
+        release_strategy=lambda period: period + MonthBegin(1) + pd.offsets.Day(13),
+        snap_direction="forward",
+        start_period_dt=pd.Timestamp("2013-01-01"),
+        start_if_empty=pd.Timestamp("2014-01-01"),
     )
     """
 
-    now = pd.Timestamp.now().normalize()
-    if "date" not in unique_keys:
-        raise ValueError("unique_keys must include 'date'.")
+    now = pd.Timestamp.now().tz_localize("UTC")
+    if date_col not in unique_keys:
+        raise ValueError(f"unique_keys must include '{date_col}'.")
 
-    dims = [k for k in unique_keys if k != "date"]
+    dims = [k for k in unique_keys if k != date_col]
     vmap = _value_map(value_cols)
 
     # incremental window
@@ -225,7 +225,7 @@ def build_feature_from_monthly(
     renamed_values = list(vmap.values())
 
     right_cols = ["release_date", "period"] + renamed_values + dims
-    right = df[right_cols].sort_values(dims + ["release_date"]).reset_index(drop=True)
+    right = df[right_cols].sort_values(["release_date"] + dims).reset_index(drop=True)
 
     # LEFT: trading days × dims (Cartesian if dims exist)
     if dims:
@@ -233,7 +233,7 @@ def build_feature_from_monthly(
         left = (
             tdays.assign(_k=1).merge(dims_df.assign(_k=1), on="_k").drop(columns="_k")
         )
-        left = left.sort_values(dims + ["date"]).reset_index(drop=True)
+        left = left.sort_values(["date"] + dims).reset_index(drop=True)
     else:
         left = tdays.sort_values("date").reset_index(drop=True)
 
@@ -252,7 +252,7 @@ def build_feature_from_monthly(
     out_cols = ["date"] + dims + renamed_values + ["period", "release_date"]
     out = (
         merged[out_cols]
-        .sort_values(dims + ["date"] if dims else ["date"])
+        .sort_values(["date"] + dims if dims else ["date"])
         .reset_index(drop=True)
     )
 

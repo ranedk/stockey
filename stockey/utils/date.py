@@ -90,15 +90,20 @@ def reverse_daterange(
     for n in range(total_days + 1):
         yield end_date - timedelta(days=n)
 
-def pd_to_datetime(df: pd.DataFrame, col: str, formats: List[str]) -> pd.DataFrame:
+def pd_to_datetime(df: pd.DataFrame, col: str, formats: List[str], errors: str="raise") -> pd.DataFrame:
     fixed = False
     for fmt in formats:
         try:
-            df[col] = pd.to_datetime(df[col], format=fmt)
+            df[col] = pd.to_datetime(df[col], format=fmt, errors=errors)
             fixed = True
             break
         except ValueError:
             pass
     if not fixed:
         raise ValueError("No valid date format found")
+    return df
+
+
+def remove_invalid_dates(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    df = df[df[col].astype(str).str.contains(r'\d{2}', na=False)]
     return df

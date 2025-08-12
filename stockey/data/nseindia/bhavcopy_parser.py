@@ -12,7 +12,7 @@ import redis
 
 from utils.db import upsert_to_db
 from utils import store
-from utils.date import pd_to_datetime
+from utils.date import pd_to_datetime, remove_invalid_dates
 
 
 env = Env()
@@ -49,7 +49,9 @@ def parse_mcap(path):
     df["issue_size"] = pd.to_numeric(df["issue_size"], errors="coerce").astype("Int64")
     for c in ["face_value_rs", "close_price_paid_up_value_rs", "market_cap_rs"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    upsert_to_db(df, "nseindia_mcap", unique_keys=["date", "symbol", "series"])
+    unique_keys = ["date", "symbol", "series"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_mcap", unique_keys=unique_keys)
     return df
 
 
@@ -59,10 +61,12 @@ def parse_circuit_hit(path):
     df = pd.read_csv(path, usecols=[0, 1, 3], encoding='utf-8', encoding_errors='ignore')
     df.columns = ["symbol", "series", "circuit_hit"]
     df["date"] = for_date
+    unique_keys = ["date", "symbol", "series", "circuit_hit"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
     upsert_to_db(
         df,
         "nseindia_circuit_hit",
-        unique_keys=["date", "symbol", "series", "circuit_hit"],
+        unique_keys=unique_keys,
     )
     return df
 
@@ -100,7 +104,9 @@ def parse_ohlcv(csv_path):
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = pd_to_datetime(df, "date", formats=["%d-%b-%Y", "%d-%b-%y"])
-    upsert_to_db(df, "nseindia_ohlcv", unique_keys=["date", "symbol", "series"])
+    unique_keys = ["date", "symbol", "series"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_ohlcv", unique_keys=unique_keys)
     return df
 
 
@@ -174,7 +180,9 @@ def parse_reg(path):
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["date"] = for_date
-    upsert_to_db(df, "nseindia_reg", unique_keys=["date", "symbol"])
+    unique_keys = ["date", "symbol"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_reg", unique_keys=unique_keys)
     return df
 
 
@@ -187,7 +195,9 @@ def parse_pe(path):
     for c in ["pe", "adjusted_pe"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["date"] = for_date
-    upsert_to_db(df, "nseindia_pe", unique_keys=["date", "symbol"])
+    unique_keys = ["date", "symbol"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_pe", unique_keys=unique_keys)
     return df
 
 
@@ -211,7 +221,9 @@ def parse_mto(path):
     df["deliverable_percent"] = pd.to_numeric(
         df["deliverable_percent"], errors="coerce"
     )
-    upsert_to_db(df, "nseindia_mto", unique_keys=["date", "symbol"])
+    unique_keys = ["date", "symbol"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_mto", unique_keys=unique_keys)
     return df
 
 
@@ -232,8 +244,10 @@ def parse_csqr(path):
         df["settlement_number"], errors="coerce"
     ).astype("Int64")
     df["official_close"] = pd.to_numeric(df["official_close"], errors="coerce")
+    unique_keys = ["date", "symbol", "settlement_number"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
     upsert_to_db(
-        df, "nseindia_csqr", unique_keys=["date", "symbol", "settlement_number"]
+        df, "nseindia_csqr", unique_keys=unique_keys
     )
     return df
 
@@ -262,7 +276,10 @@ def parse_cmvolt(path):
         "annualized_volatility",
     ]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    upsert_to_db(df, "nseindia_cmvolt", unique_keys=["date", "symbol"])
+
+    unique_keys = ["date", "symbol"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_cmvolt", unique_keys=unique_keys)
     return df
 
 
@@ -318,7 +335,8 @@ def parse_cat_turnover(path):
         subset=["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"],
         inplace=True,
     )
-    df = pd_to_datetime(df, "trade_date", ["%d %b %y", "%d-%b-%y"])
+    df = remove_invalid_dates(df, "trade_date")
+    df = pd_to_datetime(df, "trade_date", ["%d %b %y", "%d-%b-%y"], errors="coerce")
     df["buy_rs_cr"] = pd.to_numeric(df["buy_rs_cr"], errors="coerce")
     df["sell_rs_cr"] = pd.to_numeric(df["sell_rs_cr"], errors="coerce")
     upsert_to_db(
@@ -416,8 +434,9 @@ def unzip_and_process(zip_path):
 
 
 if __name__ == "__main__":
+    parsed_sites = rop.smembers(REDIS_SET)
     for f in store.list_files("bhavcopy"):
-        if rop.sismember(REDIS_SET, f):
+        if f in parsed_sites:
             print(f"⏩ Already parsed: {f}")
             continue
         file_path = store.get_as_temp_file(f)
