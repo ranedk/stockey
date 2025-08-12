@@ -43,6 +43,7 @@ def build_nearest_release_rows(
     release_mapper: Optional[Callable[[pd.Timestamp], pd.Timestamp]] = None,
     col_map: Optional[Mapping[str, str]] = None,
     today: Optional[pd.Timestamp] = None,
+    source_sql: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Build a DataFrame by, for each trading day since the target table's max date,
@@ -73,7 +74,7 @@ def build_nearest_release_rows(
         get_trading_days: Callable(start_dt: pd.Timestamp, end_dt: pd.Timestamp) -> list-like
             trading days (inclusive) used as as-of dates.
         today: Optional override for “now”; defaults to current date in UTC.
-
+        source_sql: Optional SQL query to read source table.
     Returns:
         pd.DataFrame: One row per matched trading day with columns from `source_table`
         plus:
@@ -118,7 +119,9 @@ def build_nearest_release_rows(
     trading_dates = pd.DataFrame({"asof_date": pd.to_datetime(process_dates).normalize()}).sort_values("asof_date")
 
     # 3) read source_table and derive release_date via release_mapper
-    df_source = sql_to_df(f"SELECT * FROM {source_table}")
+    if not source_sql:
+        source_sql = f"SELECT * FROM {source_table}"
+    df_source = sql_to_df(source_sql)
     if source_date_col not in df_source.columns:
         raise KeyError(f"{source_date_col} not in source table")
 
