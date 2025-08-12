@@ -26,6 +26,7 @@ rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 
 def parse_mcap(path):
+    print("Processing MCAP")
     data = open(path).read()
     lines = [line.strip().rstrip(".") for line in data.strip().split("\n")]
     cleaned_data = "\n".join(lines[:-3])
@@ -56,6 +57,7 @@ def parse_mcap(path):
 
 
 def parse_circuit_hit(path):
+    print("Processing Circuit Hit")
     parts = os.path.basename(path)
     for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
     df = pd.read_csv(path, usecols=[0, 1, 3], encoding='utf-8', encoding_errors='ignore')
@@ -70,8 +72,48 @@ def parse_circuit_hit(path):
     )
     return df
 
+def parse_bhavcopy(csv_path):
+    print("Processing BhavCopy")
+    df = pd.read_csv(csv_path)
+    cmap = {
+        'TradDt': 'date',
+        'ISIN': 'isin',
+        'TckrSymb': 'symbol',
+        'SctySrs': 'series',
+        'OpnPric': 'open',
+        'HghPric': 'high',
+        'LwPric': 'low',
+        'ClsPric': 'close',
+        'LastPric': 'last',
+        'PrvsClsgPric': 'previous_close',
+        'TtlTradgVol': 'volume',
+        'TtlTrfVal': 'total_value',
+        'TtlNbOfTxsExctd': 'number_of_trades',
+    }
+    df = df[list(cmap.keys())]
+    df.columns = list(cmap.values())
+    df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+    for c in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "last",
+        "previous_close",
+        "volume",
+        "total_value",
+        "number_of_trades",
+    ]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = pd_to_datetime(df, "date", formats=["%Y-%m-%d", "%d-%b-%Y", "%d-%b-%y"])
+    unique_keys = ["date", "symbol", "series"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_ohlcv", unique_keys=unique_keys)
+    return df
+
 
 def parse_ohlcv(csv_path):
+    print("Processing OHLCV")
     df = pd.read_csv(csv_path, skiprows=1)
     df = df.iloc[:, :13]
     df = df.reset_index(drop=True)
@@ -111,6 +153,7 @@ def parse_ohlcv(csv_path):
 
 
 def parse_reg(path):
+    print("Processing REG")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="IND%d%m%y")
     df = pd.read_csv(path, skiprows=1)
@@ -187,6 +230,7 @@ def parse_reg(path):
 
 
 def parse_pe(path):
+    print("Processing PE")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="%d%m%y")
     df = pd.read_csv(path, skiprows=1)
@@ -202,6 +246,7 @@ def parse_pe(path):
 
 
 def parse_mto(path):
+    print("Processing MTO")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="%d%m%Y")
     df = pd.read_csv(path, skiprows=4)
@@ -228,6 +273,7 @@ def parse_mto(path):
 
 
 def parse_csqr(path):
+    print("Processing CSQR")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="%d%m%Y")
     df = pd.read_csv(path)
@@ -253,6 +299,7 @@ def parse_csqr(path):
 
 
 def parse_cmvolt(path):
+    print("Processing CMVOL")
     df = pd.read_csv(path, skiprows=1)
     df = df.iloc[:, :8]
     df = df.reset_index(drop=True)
@@ -284,6 +331,7 @@ def parse_cmvolt(path):
 
 
 def parse_var1(path):
+    print("Processing VAR1")
     with open(path) as f:
         parts = f.readline().strip().split(",")
         for_date = datetime.strptime(parts[1], "%d%m%Y").date()
@@ -325,11 +373,15 @@ def parse_var1(path):
 
 
 def parse_cat_turnover(path):
+    print("Processing CAT Turnover")
     try:
         df = pd.read_excel(path, sheet_name="Daily", skiprows=2, header=None)
     except ValueError:
         df = pd.read_excel(path, skiprows=3, header=None)
+    except:
+        return
 
+    df = df.iloc[:, :4]
     df.columns = ["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"]
     df.dropna(
         subset=["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"],
@@ -346,6 +398,7 @@ def parse_cat_turnover(path):
 
 
 def parse_catg(path):
+    print("Processing CATG")
     with open(path) as f:
         header = f.readline().strip().split(",")
         for_month = datetime.strptime(f"01,{header[1]},{header[2]}", "%d,%b,%Y").date()
@@ -374,59 +427,69 @@ def unzip_and_process(zip_path):
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             zip_ref.extractall(tmpdir)
 
-        catg_files = glob.glob(os.path.join(tmpdir, "C_CATG_*.T*"))
+        catg_files = glob.glob(os.path.join(tmpdir, "**", "C_CATG_*.T*"), recursive=True)
         for file_path in catg_files:
             parse_catg(file_path)
 
-        var1_files = glob.glob(os.path.join(tmpdir, "C_VAR1_*_*.DAT"))
+        var1_files = glob.glob(os.path.join(tmpdir, "**", "C_VAR1_*_*.DAT"), recursive=True)
         for file_path in var1_files:
             parse_var1(file_path)
 
-        cat_turnover_files = glob.glob(os.path.join(tmpdir, "cat_turnover_*.xls"))
+        cat_turnover_files = glob.glob(os.path.join(tmpdir, "**", "cat_turnover_*.xls"), recursive=True)
         for file_path in cat_turnover_files:
             parse_cat_turnover(file_path)
 
-        cmvolt_files = glob.glob(os.path.join(tmpdir, "CMVOLT_*.CSV"))
+        cmvolt_files = glob.glob(os.path.join(tmpdir, "**", "CMVOLT_*.CSV"), recursive=True)
         for file_path in cmvolt_files:
             parse_cmvolt(file_path)
 
-        csqr_files = glob.glob(os.path.join(tmpdir, "CSQR_*.CSV"))
+        csqr_files = glob.glob(os.path.join(tmpdir, "**", "CSQR_*.CSV"), recursive=True)
         for file_path in csqr_files:
             parse_csqr(file_path)
 
-        mto_files = glob.glob(os.path.join(tmpdir, "MTO_*.CSV"))
+        mto_files = glob.glob(os.path.join(tmpdir, "**", "MTO_*.CSV"), recursive=True)
         for file_path in mto_files:
             parse_mto(file_path)
 
-        pe_files = glob.glob(os.path.join(tmpdir, "PE_*.CSV"))
+        pe_files = glob.glob(os.path.join(tmpdir, "**", "PE_*.CSV"), recursive=True)
         for file_path in pe_files:
             parse_pe(file_path)
 
-        reg_files = glob.glob(os.path.join(tmpdir, "REG_*.CSV"))
+        reg_files = glob.glob(os.path.join(tmpdir, "**", "REG_*.CSV"), recursive=True)
         for file_path in reg_files:
             parse_reg(file_path)
 
-        nested_zips = glob.glob(os.path.join(tmpdir, "cm*.zip"))
+        nested_zips = glob.glob(os.path.join(tmpdir, "**", "cm*.zip"), recursive=True)
         for nested_zip in nested_zips:
             with tempfile.TemporaryDirectory() as nested_tmpdir:
                 with zipfile.ZipFile(nested_zip, "r") as nested_ref:
                     nested_ref.extractall(nested_tmpdir)
 
-                cm_files = glob.glob(os.path.join(nested_tmpdir, "**","cm*.csv"))
+                cm_files = glob.glob(os.path.join(nested_tmpdir, "**", "cm*.csv"), recursive=True)
                 for file_path in cm_files:
                     parse_ohlcv(file_path)
 
-        nested_zips = glob.glob(os.path.join(tmpdir, "PR*.zip"))
+        nested_zips = glob.glob(os.path.join(tmpdir, "**", "BhavCopy*.zip"), recursive=True)
         for nested_zip in nested_zips:
             with tempfile.TemporaryDirectory() as nested_tmpdir:
                 with zipfile.ZipFile(nested_zip, "r") as nested_ref:
                     nested_ref.extractall(nested_tmpdir)
 
-                bh_files = glob.glob(os.path.join(nested_tmpdir, "bh*.csv"))
+                bhav_files = glob.glob(os.path.join(nested_tmpdir, "**", "BhavCopy*.csv"), recursive=True)
+                for file_path in bhav_files:
+                    parse_bhavcopy(file_path)
+
+        nested_zips = glob.glob(os.path.join(tmpdir, "**", "PR*.zip"), recursive=True)
+        for nested_zip in nested_zips:
+            with tempfile.TemporaryDirectory() as nested_tmpdir:
+                with zipfile.ZipFile(nested_zip, "r") as nested_ref:
+                    nested_ref.extractall(nested_tmpdir)
+
+                bh_files = glob.glob(os.path.join(nested_tmpdir, "**", "bh*.csv"), recursive=True)
                 for file_path in bh_files:
                     parse_circuit_hit(file_path)
 
-                mcap_files = glob.glob(os.path.join(nested_tmpdir, "MCAP*.csv"))
+                mcap_files = glob.glob(os.path.join(nested_tmpdir, "**", "MCAP*.csv"), recursive=True)
                 for file_path in mcap_files:
                     parse_mcap(file_path)
 

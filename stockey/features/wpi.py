@@ -1,17 +1,20 @@
 import pandas as pd
 from pandas.tseries.offsets import MonthBegin, MonthEnd
-from .tutils import build_feature_from_monthly
+
+from utils.db import upsert_to_db
+from .tutils import build_nearest_release_rows
+
 
 if __name__ == "__main__":
-    build_feature_from_monthly(
+    df = build_nearest_release_rows(
+        "feature_wpi",
+        target_date_col="date",
         source_table="public.eaindustry_wpi",
-        feature_table="public.feature_wpi",
-        date_col="date",
-        value_cols={"value": "wpi"},       # or ["value1","value2"] or "value"
-        unique_keys=["date", "cname"],           # dims inferred = ["cname"]
-        period_fn=lambda period: period + MonthEnd(0),
-        release_strategy=lambda period: period + MonthBegin(1) + pd.offsets.Day(13),  # 14th next month
-        snap_direction="forward",
-        start_period_dt=pd.Timestamp("2013-01-01"),
-        start_if_empty=pd.Timestamp("2014-01-01"),
+        source_date_col="date",
+        release_mapper=lambda period: period
+        + MonthEnd(0)
+        + MonthBegin(1)
+        + pd.offsets.Day(13),
+        col_map={"value": "wpi", "cname": "cname", "name": "name"},
     )
+    upsert_to_db(df, "feature_wpi", unique_keys=["date", "cname"], timescaledb_column="date")
