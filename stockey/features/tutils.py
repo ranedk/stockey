@@ -1,8 +1,9 @@
+# Feature creation utils
+from typing import Callable, Mapping, Optional
 import pandas as pd
 from pandas.io.sql import DatabaseError
+from sqlalchemy.exc import ProgrammingError 
 from utils.db import sql_to_df
-import pandas as pd
-from typing import Callable, Mapping, Optional
 
 
 def get_trading_days(start_dt: pd.Timestamp, end_dt: pd.Timestamp):
@@ -23,15 +24,16 @@ def get_max_date(table_name, date_column):
     """
     Get max date from table.
     """
+    today = pd.Timestamp(2014, 1, 1).tz_localize("UTC").normalize()
     q = f'SELECT MAX("{date_column}") AS max_date FROM {table_name}'
     try:
         max_date = sql_to_df(q)["max_date"].iloc[0]
-    except DatabaseError:
-        return pd.Timestamp(2014, 1, 1)
+    except (DatabaseError, ProgrammingError):
+        return today
     max_date = pd.to_datetime(max_date, errors="coerce")
     if pd.isna(max_date):
-        return pd.Timestamp(2014, 1, 1)
-    return max_date
+        return today
+    return max_date.tz_localize("UTC").normalize()
 
 
 def build_nearest_release_rows(
@@ -105,18 +107,24 @@ def build_nearest_release_rows(
 
     # 1) max_date from target_table
     max_date = get_max_date(target_table, target_date_col)
+    print(f"Date since {target_table} needs to be processed: {max_date}")
 
     # 2) process_dates via get_trading_days
     if today is None:
         today = pd.Timestamp.now(tz="UTC").normalize()
+
     start_dt = (max_date.normalize() + pd.Timedelta(days=1))
     if start_dt > today:
-        return pd.DataFrame()
-    process_dates = get_trading_days(start_dt=start_dt, end_dt=today)
-    if not process_dates:
+        print(f"No dates to process since {max_date}")
         return pd.DataFrame()
 
-    trading_dates = pd.DataFrame({"asof_date": pd.to_datetime(process_dates).normalize()}).sort_values("asof_date")
+    process_dates = get_trading_days(start_dt=start_dt, end_dt=today)
+    if process_dates.empty:
+        print(f"No trading days found between {start_dt} and {today}")
+        return pd.DataFrame()
+
+    trading_dates = process_dates.rename(columns={'date': 'asof_date'})
+    print(f"Found {len(trading_dates)} dates between {start_dt} and {today}")
 
     # 3) read source_table and derive release_date via release_mapper
     if not source_sql:
@@ -124,6 +132,7 @@ def build_nearest_release_rows(
     df_source = sql_to_df(source_sql)
     if source_date_col not in df_source.columns:
         raise KeyError(f"{source_date_col} not in source table")
+    print(f"Found {len(df_source)} rows in {source_table}")
 
     df_source["release_date"] = release_mapper(df_source[source_date_col])
     df_source = df_source.sort_values("release_date")
@@ -147,6 +156,10 @@ def build_nearest_release_rows(
     # 5) rename columns
     if col_map:
         matched = matched.rename(columns=col_map)
+
+    # Only 2 dates asof_date and release_date in the dataframe
+    matched = matched.drop(columns=[source_date_col])
+    print(f"Found {len(matched)} rows to update")
 
     # 6) return df (keep asof_date for traceability; drop if you don't want it)
     return matched.reset_index(drop=True)

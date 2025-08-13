@@ -467,7 +467,8 @@ def unzip_and_process(zip_path):
 
                 cm_files = glob.glob(os.path.join(nested_tmpdir, "**", "cm*.csv"), recursive=True)
                 for file_path in cm_files:
-                    parse_ohlcv(file_path)
+                    if not os.path.isdir(file_path):
+                        parse_ohlcv(file_path)
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "BhavCopy*.zip"), recursive=True)
         for nested_zip in nested_zips:
@@ -477,7 +478,8 @@ def unzip_and_process(zip_path):
 
                 bhav_files = glob.glob(os.path.join(nested_tmpdir, "**", "BhavCopy*.csv"), recursive=True)
                 for file_path in bhav_files:
-                    parse_bhavcopy(file_path)
+                    if not os.path.isdir(file_path):
+                        parse_bhavcopy(file_path)
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "PR*.zip"), recursive=True)
         for nested_zip in nested_zips:

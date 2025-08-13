@@ -62,7 +62,7 @@ def parse_indices_close(path):
         df,
         "nseindia_indices",
         unique_keys=["date", "index_name"],
-        timescaledb_column="date",
+        timescaledb_column="date"
     )
     return df
 

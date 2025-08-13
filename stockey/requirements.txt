@@ -11,6 +11,7 @@ ua_generator==2.0.8
 ipython==9.3.0
 openpyxl==3.1.5
 psycopg2==2.9.10
+sqlalchemy==2.0.43
 pytest>=7.4.0
 pytest-cov>=4.1.0
 pandas-datareader==0.10.0

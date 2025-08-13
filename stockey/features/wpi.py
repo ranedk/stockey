@@ -7,7 +7,7 @@ from .tutils import build_nearest_release_rows
 
 if __name__ == "__main__":
     df = build_nearest_release_rows(
-        "feature_wpi",
+        "features_wpi",
         target_date_col="date",
         source_table="public.eaindustry_wpi",
         source_date_col="date",
@@ -17,4 +17,4 @@ if __name__ == "__main__":
         + pd.offsets.Day(13),
         col_map={"value": "wpi", "cname": "cname", "name": "name"},
     )
-    upsert_to_db(df, "feature_wpi", unique_keys=["date", "cname"], timescaledb_column="date")
+    upsert_to_db(df, "features_wpi", unique_keys=["asof_date", "cname"], timescaledb_column="asof_date")

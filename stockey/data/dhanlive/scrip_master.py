@@ -18,7 +18,7 @@ import pandas as pd
 import requests
 from environs import Env
 
-from utils.db import get_connection
+from utils.db import db_session
 
 env = Env()
 env.read_env()
@@ -182,7 +182,7 @@ WHERE  m.security_id IS NULL;
 def update_database(df: pd.DataFrame) -> None:
     load_ts = datetime.now(timezone.utc)
 
-    with get_connection() as conn, conn.cursor() as cur:
+    with db_session() as (conn, cur):
         # schema
         cur.execute(DDL)
         conn.commit()

@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-import os, argparse
-import psycopg2
+import argparse
 from collections import defaultdict
-from utils.db import get_connection
+from utils.db import db_session
 
 EXCLUDE_SCHEMAS = {"pg_catalog", "information_schema"}
 
@@ -67,7 +66,7 @@ def main():
     ap.add_argument("--schemas", default="", help="Comma-separated schema list (default: all except system)")
     args = ap.parse_args()
 
-    with get_connection() as conn, conn.cursor() as cur:
+    with db_session() as (conn, cur):
         # figure schemas
         if args.schemas:
             schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]

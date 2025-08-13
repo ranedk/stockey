@@ -1,3 +1,4 @@
+""" Database utilities """
 import uuid
 import io
 from datetime import date, datetime
@@ -6,10 +7,10 @@ from contextlib import contextmanager
 
 import pandas as pd
 import pandas.api.types as pdt
-import psycopg2
 from environs import Env
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
+import sqlalchemy as sa
 
 env = Env()
 env.read_env()
@@ -21,26 +22,39 @@ DB_NAME = env("POSTGRES_DB")
 DB_USER = env("POSTGRES_USER")
 DB_PASSWORD = env("POSTGRES_PASSWORD")
 
-@contextmanager
-def get_connection():
-    """
-    Returns a new connection to the configured PostgreSQL database.
-    Usage:
-        from utils.db import get_connection
-        conn = get_connection()
-    """
-    conn =  psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD
-    )
-    try:
-        yield conn
-        conn.commit()
-    except:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+# Singleton connection engine for sqlalchemy
+_engine = sa.create_engine(
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
 
+@contextmanager
+def db_session(dict_factory: bool = False):
+    """
+    Provides a context-managed database session.
+
+    This handles opening a connection, getting a cursor, and managing
+    commits and rollbacks. The connection is automatically closed
+    upon exiting the `with` block.
+    """
+    conn = None
+    cur = None
+    try:
+        conn = _engine.raw_connection()
+        if dict_factory:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+        else:
+            cur = conn.cursor()
+        yield conn, cur
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 def pandas_to_postgres_type(dtype: str):
     PANDAS_TO_POSTGRES = {
@@ -254,67 +268,65 @@ def upsert_to_db(
     create_temp_sql = generate_postgres_schema(df, temp_table_name, False)
 
     # --- execute ------------------------------------------------------------
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            try:
-                # 1. Ensure main & temp tables
-                cur.execute(create_main_sql)
-                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
-                cur.execute(create_temp_sql)
+    with db_session() as (conn, cur):
+        try:
+            # 1. Ensure main & temp tables
+            cur.execute(create_main_sql)
+            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
+            cur.execute(create_temp_sql)
 
-                # 2. COPY data into temp
-                copy_buf = io.StringIO()
-                df.to_csv(copy_buf, header=False, index=False, sep="\t", na_rep="\\N")
-                copy_buf.seek(0)
-                cur.copy_expert(
+            # 2. COPY data into temp
+            copy_buf = io.StringIO()
+            df.to_csv(copy_buf, header=False, index=False, sep="\t", na_rep="\\N")
+            copy_buf.seek(0)
+            cur.copy_expert(
+                sql.SQL(
+                    "COPY {} ({}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')"
+                ).format(temp_table, sql.SQL(", ").join(col_identifiers)),
+                copy_buf,
+            )
+
+            # 3.a. Ensure unique index (optional if you already have a PK/unique)
+            if unique_keys:
+                idx_name = f"idx_{table_name.replace('.', '_')}_{'_'.join(unique_keys)}"
+                cur.execute(
                     sql.SQL(
-                        "COPY {} ({}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')"
-                    ).format(temp_table, sql.SQL(", ").join(col_identifiers)),
-                    copy_buf,
+                        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})"
+                    ).format(
+                        sql.Identifier(idx_name),
+                        full_table,
+                        sql.SQL(", ").join(conflict_identifiers),
+                    )
                 )
 
-                # 3.a. Ensure unique index (optional if you already have a PK/unique)
-                if unique_keys:
-                    idx_name = f"idx_{table_name.replace('.', '_')}_{'_'.join(unique_keys)}"
-                    cur.execute(
-                        sql.SQL(
-                            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})"
-                        ).format(
-                            sql.Identifier(idx_name),
-                            full_table,
-                            sql.SQL(", ").join(conflict_identifiers),
-                        )
-                    )
-
-                # 3.b. Promote to TimescaleDB hypertable (optional)
-                if timescaledb_column:
-                    cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
-                    cur.execute(
-                        "SELECT create_hypertable(%s, %s, if_not_exists => TRUE);",
-                        (table_name, timescaledb_column),
-                    )
-
-                # 4. UPSERT
-                insert_sql = sql.SQL(
-                    """
-                    INSERT INTO {dest} ({cols})
-                    SELECT {cols} FROM {src}
-                    ON CONFLICT ({conflict_cols}) {on_conflict}
-                    """
-                ).format(
-                    dest=full_table,
-                    src=temp_table,
-                    cols=sql.SQL(", ").join(col_identifiers),
-                    conflict_cols=sql.SQL(", ").join(conflict_identifiers),
-                    on_conflict=on_conflict,
+            # 3.b. Promote to TimescaleDB hypertable (optional)
+            if timescaledb_column:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS timescaledb;")
+                cur.execute(
+                    "SELECT create_hypertable(%s, %s, if_not_exists => TRUE);",
+                    (table_name, timescaledb_column),
                 )
 
-                cur.execute(insert_sql)
+            # 4. UPSERT
+            insert_sql = sql.SQL(
+                """
+                INSERT INTO {dest} ({cols})
+                SELECT {cols} FROM {src}
+                ON CONFLICT ({conflict_cols}) {on_conflict}
+                """
+            ).format(
+                dest=full_table,
+                src=temp_table,
+                cols=sql.SQL(", ").join(col_identifiers),
+                conflict_cols=sql.SQL(", ").join(conflict_identifiers),
+                on_conflict=on_conflict,
+            )
 
-            finally:
-                # 5. Drop temp regardless of success
-                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
-            # commit on context exit
+            cur.execute(insert_sql)
+
+        finally:
+            # 5. Drop temp regardless of success
+            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
 
 
 def sql_to_df(sql_query: str, params: Tuple = ()) -> pd.DataFrame:
@@ -322,10 +334,9 @@ def sql_to_df(sql_query: str, params: Tuple = ()) -> pd.DataFrame:
     Run a parametrised SELECT and return every row as a DataFrame
     (empty DataFrame if no matches).
     """
-    with get_connection() as conn:
-        return pd.read_sql(sql_query, conn, params=params)
+    return pd.read_sql(sql_query, con=_engine, params=params)
 
-def get_sql(sql_query: str, params: Tuple = ()) -> pd.Series:
+def get_sql( sql_query: str, params: Tuple = ()) -> pd.Series:
     """
     Run a parametrised SELECT and return exactly one row as a Series.
 
@@ -337,7 +348,7 @@ def get_sql(sql_query: str, params: Tuple = ()) -> pd.Series:
     • Use **%s** placeholders in *sql* - that’s what psycopg2 expects.
       Example:  "SELECT * FROM mytable WHERE id = %s"
     """
-    with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+    with db_session(dict_factory=True) as (conn, cur):
         cur.execute(sql_query, params)
         rows = cur.fetchall()  # list[dict]
 
@@ -348,18 +359,6 @@ def get_sql(sql_query: str, params: Tuple = ()) -> pd.Series:
 
     # RealDictCursor gives us a dict → easy DataFrame/Series conversion
     return pd.Series(rows[0])
-
-
-def select_sql(sql_query: str, params: Tuple = ()) -> pd.DataFrame:
-    """
-    Run a parametrised SELECT and return every row as a DataFrame
-    (empty DataFrame if no matches).
-    """
-    with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(sql_query, params)
-        rows = cur.fetchall()
-
-    return pd.DataFrame(rows)
 
 
 def table_has_date(
@@ -381,7 +380,7 @@ def table_has_date(
     ValueError if the column is not of type DATE.
     """
 
-    with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+    with db_session(dict_factory=True) as (conn, cur):
         cur.execute(
             """
             SELECT data_type
@@ -418,7 +417,7 @@ def table_has_date(
         column=sql.Identifier(column),
     )
 
-    with conn.cursor() as cur:
+    with db_session(dict_factory=True) as (_, cur): 
         cur.execute(query, (date_only,))
         has_target, latest_date = cur.fetchone()
 

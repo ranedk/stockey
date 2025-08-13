@@ -4,9 +4,8 @@ from datetime import date, datetime
 
 import pandas as pd
 from psycopg2 import sql
-from psycopg2.extras import RealDictCursor
 
-from utils.db import get_connection
+from utils.db import get_sql
 
 MONTH_PAT = re.compile(r"^Total for ([A-Za-z]+)$")
 YEAR_PAT = re.compile(r"^Total for (\d{4})$")
@@ -89,25 +88,24 @@ def fix_date(df: pd.DataFrame) -> pd.DataFrame:
 def downloaded_for(
     target: date,
 ) -> bool:
-    with get_connection() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        query = sql.SQL(
-            """
-            SELECT
-                EXISTS(SELECT 1
-                    FROM  "fii_investments"
-                    WHERE  "date" = %s
-                    AND "instrument" = 'equity_sub_total'
-                    LIMIT  1)           AS has_target,
-                MAX("date")   AS latest_date
-            FROM "fii_investments"
-            WHERE "instrument" = 'equity_sub_total'
-            """
-        )
+    query = sql.SQL(
+        """
+        SELECT
+            EXISTS(SELECT 1
+                FROM  "fii_investments"
+                WHERE  "date" = %s
+                AND "instrument" = 'equity_sub_total'
+                LIMIT  1)           AS has_target,
+            MAX("date")   AS latest_date
+        FROM "fii_investments"
+        WHERE "instrument" = 'equity_sub_total'
+        """
+    )
 
-        with conn.cursor() as cur:
-            cur.execute(query, (target,))
-            has_target, latest_date = cur.fetchone()
+    d = get_sql(query, (target,))
+    has_target = d["has_target"]
+    latest_date = d["latest_date"]
 
-        if latest_date and isinstance(latest_date, datetime):
-            latest_date = latest_date.date()
-        return has_target, latest_date
+    if latest_date and isinstance(latest_date, datetime):
+        latest_date = latest_date.date()
+    return has_target, latest_date
