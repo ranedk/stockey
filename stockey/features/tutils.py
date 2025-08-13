@@ -1,5 +1,5 @@
 # Feature creation utils
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, Optional, List
 import pandas as pd
 from pandas.io.sql import DatabaseError
 from sqlalchemy.exc import ProgrammingError 
@@ -46,6 +46,7 @@ def build_nearest_release_rows(
     col_map: Optional[Mapping[str, str]] = None,
     today: Optional[pd.Timestamp] = None,
     source_sql: Optional[str] = None,
+    source_unique_cols: List[str] = (),
 ) -> pd.DataFrame:
     """
     Build a DataFrame by, for each trading day since the target table's max date,
@@ -77,6 +78,7 @@ def build_nearest_release_rows(
             trading days (inclusive) used as as-of dates.
         today: Optional override for “now”; defaults to current date in UTC.
         source_sql: Optional SQL query to read source table.
+        source_unique_cols: Optional list of columns to use for unique key.
     Returns:
         pd.DataFrame: One row per matched trading day with columns from `source_table`
         plus:
@@ -134,18 +136,43 @@ def build_nearest_release_rows(
         raise KeyError(f"{source_date_col} not in source table")
     print(f"Found {len(df_source)} rows in {source_table}")
 
-    df_source["release_date"] = release_mapper(df_source[source_date_col])
+    # Ensure uniques exist
+    for c in source_unique_cols:
+        if c not in df_source.columns:
+            raise KeyError(f"{c} not in source table (required in source_unique_cols)")
+
+
+    src_dates = pd.to_datetime(df_source[source_date_col], utc=True).dt.normalize()
+    if release_mapper:
+        df_source["release_date"] = release_mapper(src_dates)
+    else:
+        df_source["release_date"] = src_dates
     df_source = df_source.sort_values("release_date")
+
+    df_source = df_source.sort_values(["release_date"] + (list(source_unique_cols) if source_unique_cols else []))
 
     if df_source.empty:
         return pd.DataFrame()
 
-    # 4) nearest prior row per process date (vectorized instead of manual loop)
+   # 3b) Build the trading-day × uniques frame so every group appears each day
+    source_unique_cols = [c for c in source_unique_cols if c != source_date_col]
+    if source_unique_cols:
+        uniques = df_source[source_unique_cols].drop_duplicates().reset_index(drop=True)
+        uniques["_k"] = 1
+        td = trading_dates.copy()
+        td["_k"] = 1
+        td_by = td.merge(uniques, on="_k", how="left").drop(columns="_k")
+    else:
+        td_by = trading_dates.copy()  # no partitioning requested 
+
+    # 4) BY-partitioned nearest prior row per process date
+    #    pandas.merge_asof supports `by=` to partition the as-of join.
     matched = pd.merge_asof(
-        trading_dates.sort_values("asof_date"),
-        df_source.sort_values("release_date"),
+        td_by.sort_values(["asof_date"] + list(source_unique_cols)),
+        df_source.sort_values(["release_date"] + list(source_unique_cols)),
         left_on="asof_date",
         right_on="release_date",
+        by=source_unique_cols if source_unique_cols else None,
         direction="backward",
         allow_exact_matches=True,
     )
@@ -158,7 +185,9 @@ def build_nearest_release_rows(
         matched = matched.rename(columns=col_map)
 
     # Only 2 dates asof_date and release_date in the dataframe
-    matched = matched.drop(columns=[source_date_col])
+    if source_date_col in matched.columns:
+        matched = matched.drop(columns=[source_date_col])
+
     print(f"Found {len(matched)} rows to update")
 
     # 6) return df (keep asof_date for traceability; drop if you don't want it)
