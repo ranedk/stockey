@@ -47,6 +47,8 @@ def build_nearest_release_rows(
     today: Optional[pd.Timestamp] = None,
     source_sql: Optional[str] = None,
     source_unique_cols: List[str] = (),
+    stack_value_cols: tuple[str, ...] = (), # these cols are sometimes like the rbi_bank_rates table 
+    pivot_wide: bool = True,                # return wide (one row per day) 
 ) -> pd.DataFrame:
     """
     Build a DataFrame by, for each trading day since the target table's max date,
@@ -79,6 +81,8 @@ def build_nearest_release_rows(
         today: Optional override for “now”; defaults to current date in UTC.
         source_sql: Optional SQL query to read source table.
         source_unique_cols: Optional list of columns to use for unique key.
+        stack_value_cols: Optional list of columns to stack as values.
+        pivot_wide: Optional bool to return wide (one row per day) table.
     Returns:
         pd.DataFrame: One row per matched trading day with columns from `source_table`
         plus:
@@ -141,6 +145,15 @@ def build_nearest_release_rows(
         if c not in df_source.columns:
             raise KeyError(f"{c} not in source table (required in source_unique_cols)")
 
+    # reshape wide->long so each metric is its own series
+    if stack_value_cols:
+        keep = [source_date_col] + list(stack_value_cols)
+        df_source = df_source[keep].melt(
+            id_vars=[source_date_col], var_name="_metric", value_name="_value"
+        ).dropna(subset=["_value"])
+        # ensure we partition the as-of join by the metric
+        if not source_unique_cols:
+            source_unique_cols = ("_metric",)
 
     src_dates = pd.to_datetime(df_source[source_date_col], utc=True).dt.normalize()
     if release_mapper:
@@ -177,8 +190,17 @@ def build_nearest_release_rows(
         allow_exact_matches=True,
     )
 
-    # Drop process dates with no prior release_date match
-    matched = matched.dropna(subset=["release_date"])
+    # (optional) pivot back to wide columns per metric
+    if stack_value_cols and pivot_wide:
+        values_wide = matched.pivot(index="asof_date", columns="_metric", values="_value").reset_index()
+        values_wide.columns.name = None
+        rd_wide = (
+            matched.assign(_rd=matched["release_date"])
+               .pivot(index="asof_date", columns="_metric", values="_rd")
+               .add_suffix("_release_date")
+               .reset_index()
+        )
+        matched = values_wide.merge(rd_wide, on="asof_date", how="left")
 
     # 5) rename columns
     if col_map:

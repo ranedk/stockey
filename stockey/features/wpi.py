@@ -18,5 +18,4 @@ if __name__ == "__main__":
         col_map={"value": "wpi", "cname": "cname", "name": "name"},
         source_unique_cols=["cname", "date"]
     )
-    from IPython import embed; embed()
     upsert_to_db(df, "features_wpi", unique_keys=["asof_date", "cname"], timescaledb_column="asof_date")
