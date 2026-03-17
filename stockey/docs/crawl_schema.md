@@ -172,7 +172,7 @@ public.master_sharpely_funds
   - isin_code: text
   - amfi_code: text
   - sharpely_id: text
-  - regular_plan_id: double precision
+  - regular_plan_id: text
   - nse_symbol: text
   - bse_symbol: text
   - bse_scheme_code: text

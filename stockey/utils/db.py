@@ -365,7 +365,7 @@ def table_has_date(
     table: str,
     column: str,
     target: Union[date, datetime],
-) -> bool:
+) -> tuple[bool, date | None]:
     """
     Return True if *table.column* contains *target* ignoring any time part.
 
@@ -417,9 +417,11 @@ def table_has_date(
         column=sql.Identifier(column),
     )
 
-    with db_session(dict_factory=True) as (_, cur): 
+    with db_session(dict_factory=True) as (_, cur):
         cur.execute(query, (date_only,))
-        has_target, latest_date = cur.fetchone()
+        row = cur.fetchone()
+        has_target = row["has_target"]
+        latest_date = row["latest_date"]
 
     if latest_date and isinstance(latest_date, datetime):
         latest_date = latest_date.date()
