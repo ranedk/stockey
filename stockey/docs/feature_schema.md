@@ -18,5 +18,3 @@ public.dim_trading_days
     dim_trading_days_date_key: UNIQUE (date)
     idx_dim_trading_days_date: UNIQUE (date)
 ```
-
-

@@ -199,7 +199,7 @@ def get_shareholding(symbol):
         "1": "indian",
         "2": "institutional",
         "6": "non-institutional",
-    } 
+    }
     records = []
     for report_date, holders in shs.items():
         for k, stype in type_map.items():

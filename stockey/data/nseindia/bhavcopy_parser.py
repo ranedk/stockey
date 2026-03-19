@@ -59,7 +59,11 @@ def parse_mcap(path):
 def parse_circuit_hit(path):
     print("Processing Circuit Hit")
     parts = os.path.basename(path)
-    for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
+    try:
+        for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
+    except ValueError: # Format issue
+        for_date = pd.to_datetime(parts, format="bh%d%m%Y.csv")
+
     df = pd.read_csv(path, usecols=[0, 1, 3], encoding='utf-8', encoding_errors='ignore')
     df.columns = ["symbol", "series", "circuit_hit"]
     df["date"] = for_date
