@@ -49,7 +49,34 @@ Expected prefixes:
 
 ## Data loaders
 
-Symbol-specific loaders default to [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt). You can override that per run with `--symbols` or the `STOCKEY_SYMBOLS` env var.
+Symbol-specific loaders default to [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt). Daily derivation jobs can instead use [`config/watchlist_symbols.txt`](/home/rane/code/stockey/config/watchlist_symbols.txt). You can override either flow per run with `--symbols` or the `STOCKEY_SYMBOLS` env var.
+
+## Orchestration scripts
+
+The repo now has three top-level orchestration layers:
+
+1. Raw daily downloads:
+
+```sh
+./all_downloads.sh
+```
+
+2. Daily incremental derivations for the watchlist:
+
+```sh
+./all_daily_derivations.sh
+```
+
+3. On-demand backfills:
+
+```sh
+./all_backfill.sh
+./all_backfill.sh watchlist 5
+./all_backfill.sh tracked 5
+./all_backfill.sh all 5
+```
+
+`all_downloader.sh` and `all_features.sh` are kept as compatibility wrappers for the first two flows.
 
 ### Dhan master
 
@@ -98,12 +125,25 @@ Parsers:
 
 ```sh
 python -m data.nseindia.bhavcopy_parser
+python -m data.nseindia.security_history
+python -m data.nseindia.security_dimension
+python -m data.nseindia.adjusted_prices --only all
+python -m features.price_daily
 python -m data.nseindia.indices_parser
 python -m data.nseindia.offmarket_parser
 python -m data.nseindia.corporate_actions --symbols RELIANCE TCS --from-date 2024-01-01 --to-date 2024-12-31
 python -m data.nseindia.earnings_events --symbols RELIANCE TCS
 python -m data.nseindia.insider_deals --symbols RELIANCE TCS
 ```
+
+Recommended cron shape:
+
+```sh
+./all_downloads.sh
+./all_daily_derivations.sh
+```
+
+Use `all_backfill.sh` manually or from a separate weekly/repair schedule.
 
 Chrome remote debugging is still required for the Playwright/browser-driven flows:
 
@@ -155,4 +195,8 @@ python scripts/agent_tool_runner.py list --category storage
 1. `ISIN` is not unique. A single underlying can trade in multiple series.
 2. `symbol + ISIN` is not unique across series.
 3. Company renames usually change symbol, but not `ISIN`.
-4. Large runtime artifacts such as `base_chromed_data/` and `http_cache/` should stay out of git.
+4. `dim_security_history` is the canonical source for rename continuity and review flags.
+5. `dim_security_overrides` is where manual merger / demerger / scheme mappings should be curated.
+6. Large runtime artifacts such as `base_chromed_data/` and `http_cache/` should stay out of git.
+7. Run `security_history`, `security_dimension`, `adjusted_prices`, and `features.price_daily` sequentially, not in parallel.
+8. `all_daily_derivations.sh` uses `config/watchlist_symbols.txt` and falls back to `config/tracked_symbols.txt` if the watchlist file is empty.

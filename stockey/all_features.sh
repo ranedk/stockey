@@ -2,4 +2,4 @@
 
 set -euo pipefail
 
-python -m features.calendar_creator
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/all_daily_derivations.sh"

@@ -21,7 +21,7 @@ def compute_trading_days() -> pd.DataFrame:
     # 1) Historical trading days from OHLCV
     hist = sql_to_df(
         "SELECT DISTINCT date FROM nseindia_ohlcv WHERE date::date >= %s",
-        params=[MIN_DATE],
+        params=(MIN_DATE,),
     )
 
     # 2) Current/future years from holidays (Mon–Fri minus holidays)

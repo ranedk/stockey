@@ -76,6 +76,39 @@ def parse_circuit_hit(path):
     )
     return df
 
+
+def parse_corporate_actions_bc(path):
+    print("Processing Corporate Actions BC")
+    df = pd.read_csv(path)
+    df.columns = [
+        "series",
+        "symbol",
+        "security_name",
+        "record_date",
+        "bc_start_date",
+        "bc_end_date",
+        "date",
+        "nd_start_date",
+        "nd_end_date",
+        "subject",
+    ]
+    df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+
+    for col in ["record_date", "bc_start_date", "bc_end_date", "date", "nd_start_date", "nd_end_date"]:
+        s = (
+            df[col]
+            .astype("string")
+            .str.strip()
+            .replace({"": pd.NA, "-": pd.NA, "None": pd.NA, "null": pd.NA})
+        )
+        df[col] = pd.to_datetime(s, format="%d/%m/%Y", errors="coerce")
+
+    df = df.dropna(subset=["date", "symbol", "series", "subject"])
+    unique_keys = ["date", "symbol", "series", "subject"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    upsert_to_db(df, "nseindia_corporate_actions_bc_raw", unique_keys=unique_keys, timescaledb_column="date")
+    return df
+
 def parse_bhavcopy(csv_path):
     print("Processing BhavCopy")
     df = pd.read_csv(csv_path)
@@ -490,6 +523,10 @@ def unzip_and_process(zip_path):
             with tempfile.TemporaryDirectory() as nested_tmpdir:
                 with zipfile.ZipFile(nested_zip, "r") as nested_ref:
                     nested_ref.extractall(nested_tmpdir)
+
+                bc_files = glob.glob(os.path.join(nested_tmpdir, "**", "Bc*.csv"), recursive=True)
+                for file_path in bc_files:
+                    parse_corporate_actions_bc(file_path)
 
                 bh_files = glob.glob(os.path.join(nested_tmpdir, "**", "bh*.csv"), recursive=True)
                 for file_path in bh_files:

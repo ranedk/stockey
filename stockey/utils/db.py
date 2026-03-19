@@ -220,21 +220,21 @@ def generate_postgres_schema(
             sql.SQL("{} {}").format(sql.Identifier(col), sql.SQL(sql_type))
         )
 
-    unique_clause = sql.SQL("")
-    if unique_keys and isinstance(unique_keys, (list, tuple)):
-        unique_clause = sql.SQL(", UNIQUE ({})").format(
-            sql.SQL(", ").join(sql.Identifier(k) for k in unique_keys)
-        )
-
     create_prefix = sql.SQL("CREATE TEMP TABLE IF NOT EXISTS {}").format(
         qualified_identifier(table_name)
     ) if temporary else sql.SQL("CREATE TABLE IF NOT EXISTS {}").format(
         qualified_identifier(table_name)
     )
-    return sql.SQL("{} ({}){};").format(
+    table_body = sql.SQL(", ").join(col_defs)
+    if unique_keys and isinstance(unique_keys, (list, tuple)):
+        table_body = sql.SQL("{}, UNIQUE ({})").format(
+            table_body,
+            sql.SQL(", ").join(sql.Identifier(k) for k in unique_keys),
+        )
+
+    return sql.SQL("{} ({});").format(
         create_prefix,
-        sql.SQL(", ").join(col_defs),
-        unique_clause,
+        table_body,
     )
 
 
@@ -291,6 +291,28 @@ def upsert_to_db(
         try:
             # 1. Ensure main & temp tables
             cur.execute(create_main_sql)
+            schema_name, base_table_name = (
+                table_name.split(".", 1) if "." in table_name else ("public", table_name)
+            )
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = %s AND table_name = %s
+                """,
+                (schema_name, base_table_name),
+            )
+            existing_columns = {row[0] for row in cur.fetchall()}
+            for col, dtype in df.dtypes.items():
+                if col in existing_columns:
+                    continue
+                cur.execute(
+                    sql.SQL("ALTER TABLE {} ADD COLUMN IF NOT EXISTS {} {}").format(
+                        full_table,
+                        sql.Identifier(col),
+                        sql.SQL(pandas_to_postgres_type(dtype)),
+                    )
+                )
             cur.execute(create_temp_sql)
 
             # 2. COPY data into temp

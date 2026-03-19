@@ -20,22 +20,11 @@ psql --host=<server_ip> --port=5432 --username=stockey --dbname=stockey --file=<
 python -m utils.db_schema_dump --schemas public
 ```
 
-## Safe SQL type migrations for legacy NSDL tables
+## Review security identity issues
 
-If `fii_investments` or `fii_derivatives` were created before numeric coercion was added in code, convert them once on the database:
-
-```sql
-ALTER TABLE public.fii_investments
-    ALTER COLUMN gross_purchases_inr_crore TYPE double precision USING NULLIF(REPLACE(gross_purchases_inr_crore, ',', ''), '')::double precision,
-    ALTER COLUMN gross_sales_inr_crore TYPE double precision USING NULLIF(REPLACE(gross_sales_inr_crore, ',', ''), '')::double precision,
-    ALTER COLUMN net_investment_inr_crore TYPE double precision USING NULLIF(REPLACE(net_investment_inr_crore, ',', ''), '')::double precision,
-    ALTER COLUMN net_investment_usd_million TYPE double precision USING NULLIF(REPLACE(net_investment_usd_million, ',', ''), '')::double precision;
-
-ALTER TABLE public.fii_derivatives
-    ALTER COLUMN buy_number_of_contracts TYPE double precision USING NULLIF(REPLACE(buy_number_of_contracts, ',', ''), '')::double precision,
-    ALTER COLUMN buy_amount TYPE double precision USING NULLIF(REPLACE(buy_amount, ',', ''), '')::double precision,
-    ALTER COLUMN sell_number_of_contracts TYPE double precision USING NULLIF(REPLACE(sell_number_of_contracts, ',', ''), '')::double precision,
-    ALTER COLUMN sell_amount TYPE double precision USING NULLIF(REPLACE(sell_amount, ',', ''), '')::double precision,
-    ALTER COLUMN open_interest_eod_number_of_contracts TYPE double precision USING NULLIF(REPLACE(open_interest_eod_number_of_contracts, ',', ''), '')::double precision,
-    ALTER COLUMN open_interest_eod_amount TYPE double precision USING NULLIF(REPLACE(open_interest_eod_amount, ',', ''), '')::double precision;
+```sh
+python -m data.nseindia.security_history
+/home/rane/code/stockey/.xstockey/bin/python scripts/sql_query_runner.py --read-only "select * from dim_security_review_events where needs_review = true order by confidence desc, last_seen desc limit 50"
 ```
+
+Manual overrides go into `dim_security_overrides`. Use them for mergers, demergers, scheme changes, and any rename the heuristics flag incorrectly.

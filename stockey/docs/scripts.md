@@ -26,6 +26,9 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap` | Fundamental data |
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
 | `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives |
+| `data/nseindia/adjusted_prices.py` | `nseindia_corporate_actions_normalized`, `nseindia_ohlcv_adjusted` | Normalizes action text and builds split/bonus-adjusted OHLCV |
+| `data/nseindia/security_history.py` | `dim_security_history`, `dim_security_review_events`, `dim_security_overrides` | Builds canonical security identity history and review queue for renames / identity breaks |
+| `data/nseindia/security_dimension.py` | `dim_security` | Current canonical security dimension keyed by `security_id` |
 | `data/nseindia/indices_parser.py` | `nseindia_indices` | Index history |
 | `data/nseindia/corporate_actions.py` | `nseindia_corporate_actions` | Corporate actions |
 | `data/nseindia/earnings_events.py` | `nseindia_earnings_events` | Earnings calendar |
@@ -37,6 +40,16 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 ## Management scripts
 
 These are the JSON-first scripts that are easiest to call from a human shell, an LLM tool wrapper, or an MCP server shim.
+
+## Orchestration scripts
+
+| Script | Purpose | Scope |
+| --- | --- | --- |
+| `all_downloads.sh` | Daily raw ingestion and parsing | Market-wide downloads plus tracked-symbol loaders |
+| `all_daily_derivations.sh` | Daily incremental derived data | Watchlist symbols from `config/watchlist_symbols.txt` |
+| `all_backfill.sh` | On-demand repair and historical rebuilds | `watchlist`, `tracked`, or `all` |
+| `all_downloader.sh` | Compatibility wrapper | Delegates to `all_downloads.sh` |
+| `all_features.sh` | Compatibility wrapper | Delegates to `all_daily_derivations.sh` |
 
 ## Symbol-specific module runs
 
@@ -58,7 +71,37 @@ python -m data.sharpelydata.sharpely_data --symbols RELIANCE TCS --from-date 202
 python -m data.nseindia.corporate_actions --symbols RELIANCE,TCS
 python -m data.nseindia.earnings_events
 python -m data.nseindia.insider_deals
+python -m data.nseindia.adjusted_prices --only all
+python -m data.nseindia.security_history
+python -m data.nseindia.security_dimension
+python -m features.price_daily
 ```
+
+Recommended order for the identity-aware NSE pipeline:
+
+```sh
+python -m data.nseindia.bhavcopy_parser
+python -m data.nseindia.security_history
+python -m data.nseindia.security_dimension
+python -m data.nseindia.adjusted_prices --only all
+python -m features.price_daily
+```
+
+Top-level orchestration examples:
+
+```sh
+./all_downloads.sh
+./all_daily_derivations.sh
+./all_backfill.sh watchlist 5
+./all_backfill.sh tracked 5
+TRUNCATE_DERIVED=1 ./all_backfill.sh all 5
+```
+
+Notes:
+
+- `all_daily_derivations.sh` loads symbols from [`config/watchlist_symbols.txt`](/home/rane/code/stockey/config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt)
+- `all_backfill.sh` defaults to `watchlist 5`
+- only use `TRUNCATE_DERIVED=1` when you intentionally want a full rebuild of derived price and feature tables
 
 ### SQL
 
@@ -105,3 +148,4 @@ If you expose these through tools or MCP:
 - Pass SQL through `--file` or stdin for multi-line queries.
 - Keep download/scrape agents separate from analysis agents.
 - Prefer the registry in [`docs/tool_registry.json`](/home/rane/code/stockey/docs/tool_registry.json) instead of hard-coding shell commands in prompts.
+- Prefer `security_id` over raw `symbol` when stitching history across renames.

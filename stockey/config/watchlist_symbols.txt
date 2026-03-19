@@ -1,0 +1,6 @@
+# Symbols used by `all_daily_derivations.sh`.
+# If this file is empty, the script falls back to `config/tracked_symbols.txt`.
+#
+# One symbol per line, for example:
+# HDFCBANK
+# RELIANCE
