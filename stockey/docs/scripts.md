@@ -315,3 +315,26 @@ frequency: daily
 handle_date: on_this_date | offset: { days: 1}
 redis_key: null
 ```
+
+# Management script
+
+You can also use the following script
+
+
+### Query Redis Server Data
+
+`python scripts/redis_query_runner.py`
+
+e.g. `python scripts/redis_query_runner.py raw SMEMBERS bhav:parsed`
+
+### Query S3 Data
+
+`python scripts/s3_query_runner.py`
+
+e.g. `python scripts/s3_query_runner.py list`
+
+### Query SQL Data
+
+`python scripts/sql_query_runner.py`
+
+e.g. `python scripts/sql_query_runner.py "select * from fii_investments limit 10"`

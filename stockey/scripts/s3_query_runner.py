@@ -8,7 +8,13 @@ from datetime import datetime
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
+from environs import Env
 from utils.store import _get_client
+
+env = Env()
+env.read_env()
+
+AWS_BUCKET_NAME: str = env.str("AWS_BUCKET_NAME", "stockeydata")
 
 
 def normalize_dt(value):
@@ -74,7 +80,7 @@ def main():
     sub = parser.add_subparsers(dest="action", required=True)
 
     list_p = sub.add_parser("list", help="List files in a bucket")
-    list_p.add_argument("--bucket", required=True)
+    list_p.add_argument("--bucket", default=AWS_BUCKET_NAME)
     list_p.add_argument("--prefix", default="")
     list_p.add_argument("--max-keys", type=int, default=100)
     list_p.add_argument("--continuation-token")
