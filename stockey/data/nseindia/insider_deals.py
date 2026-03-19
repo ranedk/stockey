@@ -1,47 +1,32 @@
-# bhavcopy_downloader.py
+import argparse
 import random
-from urllib.parse import urlencode
-from typing import List
 from datetime import datetime
-import pandas as pd
+from typing import List
+from urllib.parse import urlencode
 
-import redis
+import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
+
 from data.dhanlive.dhan_db import get_nse_equity
 from utils.db import upsert_to_db
+from utils.sync import choose_from_date, get_db_max_date, get_redis_client, get_redis_cursor, load_tracked_symbols, normalize_date_window, parse_datetime_arg, set_redis_cursor
 
 env = Env()
 env.read_env()
 
-
 REDIS_HOST = env("REDIS_HOST")
-REDIS_PORT = env("REDIS_PORT")
+REDIS_PORT = env.int("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:insider_deals"
 
-rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-
 
 def get_random(min_ms: int, max_ms: int) -> int:
-    """Return a random int in milliseconds between min_ms and max_ms."""
     return int(random.uniform(min_ms, max_ms))
 
 
-def get_insider_deals(
-    page,
-    symbol: str,
-    issuer: str,
-    from_date: datetime,
-    to_date: datetime,
-) -> bool:
-    """
-    Automate NSE insider deals download from
-    https://www.nseindia.com/companies-listing/corporate-filings-insider-trading
-    """
-    page.goto(
-        "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading"
-    )
+def fetch_insider_deals(page, symbol: str, issuer: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
+    page.goto("https://www.nseindia.com/companies-listing/corporate-filings-insider-trading")
     page.wait_for_timeout(get_random(1000, 2000))
 
     params = {
@@ -51,10 +36,8 @@ def get_insider_deals(
         "symbol": symbol,
         "issuer": issuer,
     }
-
     url = f"https://www.nseindia.com/api/corporates-pit?{urlencode(params)}"
-
-    data = page.evaluate(
+    payload = page.evaluate(
         """async (url) => {
             const res = await fetch(url, { credentials: 'same-origin' });
             if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -63,7 +46,10 @@ def get_insider_deals(
         url,
     )
 
-    df = pd.DataFrame(data["data"])
+    df = pd.DataFrame(payload.get("data", []))
+    if df.empty:
+        return df
+
     rename_map = {
         "did": "disclosure_id",
         "pid": "person_id",
@@ -86,14 +72,13 @@ def get_insider_deals(
         "afterAcqSharesNo": "holding_shares_after",
         "date": "reporting_date",
     }
-
     df = df.rename(columns=rename_map)
     df = df.reindex(columns=list(rename_map.values()))
 
-    for col in ["quantity", "value_inr", "holding_pct_before", "holding_pct_after"]:
-        s = df[col].astype(str).str.replace(",", "")
+    for col in ["quantity", "value_inr", "holding_pct_before", "holding_pct_after", "holding_shares_before", "holding_shares_after"]:
+        s = df[col].astype("string").str.replace(",", "", regex=False)
         s = s.mask(s.eq("-"))
-        df[col] = pd.to_numeric(s)
+        df[col] = pd.to_numeric(s, errors="coerce")
 
     for col in ["trade_date_from", "trade_date_to", "date"]:
         df[col] = pd.to_datetime(df[col], format="%d-%b-%Y")
@@ -109,47 +94,80 @@ def get_insider_deals(
         "holding_shares_after",
         "holding_pct_before",
     ]
-
-    df = df.sort_values("reporting_date").drop_duplicates(
-        subset=unique_keys, keep="last"
-    )
-    upsert_to_db(
-        df, "nseindia_insider_deals", unique_keys=unique_keys, timescaledb_column="date"
-    )
-    rop.set(f"{REDIS_SET}:{symbol}", to_date.strftime("%Y-%m-%d"))
-    return df
+    return df.sort_values("reporting_date").drop_duplicates(subset=unique_keys, keep="last")
 
 
-def sync_insider_deals(symbols: List[str]) -> None:
+def sync_insider_deals(symbols: List[str], from_date: datetime | None = None, to_date: datetime | None = None) -> None:
+    _, to_date = normalize_date_window(from_date, to_date)
+    redis_client = get_redis_client(REDIS_HOST, REDIS_PORT)
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
 
         counter = 0
-        for symbol in symbols:
-            eqt = get_nse_equity(symbol)
-            issuer = eqt.display_name
+        try:
+            for symbol in symbols:
+                eqt = get_nse_equity(symbol)
+                issuer = eqt.display_name
 
-            from_date = rop.get(f"{REDIS_SET}:{symbol}")
-            if from_date:
-                from_date = datetime.strptime(from_date, "%Y-%m-%d")
-            else:
-                from_date = datetime(2014, 1, 1)
+                effective_from_date = choose_from_date(
+                    from_date,
+                    [
+                        get_redis_cursor(redis_client, f"{REDIS_SET}:{symbol}"),
+                        get_db_max_date("nseindia_insider_deals", filters={"symbol": symbol}),
+                    ],
+                )
+                if effective_from_date > to_date:
+                    continue
 
-            if counter % 10 == 0:
-                page.goto("https://www.nseindia.com")
-                page.wait_for_timeout(get_random(1000, 3000))
+                if counter % 10 == 0:
+                    page.goto("https://www.nseindia.com")
+                    page.wait_for_timeout(get_random(1000, 3000))
 
-            to_date = datetime.today()
-            get_insider_deals(page, symbol, issuer, from_date, to_date)
-            counter += 1
+                df = fetch_insider_deals(page, symbol, issuer, effective_from_date, to_date)
+                if not df.empty:
+                    upsert_to_db(
+                        df,
+                        "nseindia_insider_deals",
+                        unique_keys=[
+                            "disclosure_id",
+                            "person_id",
+                            "date",
+                            "symbol",
+                            "insider_name",
+                            "transaction_type",
+                            "holding_shares_after",
+                            "holding_pct_before",
+                        ],
+                        timescaledb_column="date",
+                    )
+                set_redis_cursor(redis_client, f"{REDIS_SET}:{symbol}", to_date)
+                counter += 1
+        finally:
+            page.close()
+            browser.close()
+            redis_client.close()
 
-        page.close()
-        browser.close()
-        rop.close()
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync NSE insider deals for tracked symbols")
+    parser.add_argument("--symbols", nargs="*", help="Symbols, comma-separated or repeated")
+    parser.add_argument("--from-date", dest="from_date", help="Start date in YYYY-MM-DD")
+    parser.add_argument("--to-date", dest="to_date", help="End date in YYYY-MM-DD")
+    args = parser.parse_args()
+
+    symbols = load_tracked_symbols(args.symbols)
+    if not symbols:
+        raise SystemExit("No symbols provided. Use --symbols, STOCKEY_SYMBOLS, or config/tracked_symbols.txt")
+
+    sync_insider_deals(
+        symbols=symbols,
+        from_date=parse_datetime_arg(args.from_date),
+        to_date=parse_datetime_arg(args.to_date),
+    )
 
 
 if __name__ == "__main__":
-    symbols = ["SHAKTIPUMP", "HDFCBANK"]
-    sync_insider_deals(symbols)
+    main()

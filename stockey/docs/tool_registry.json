@@ -1,0 +1,158 @@
+{
+  "version": 1,
+  "tools": [
+    {
+      "name": "sql_query",
+      "category": "storage",
+      "description": "Run a SQL query and return JSON.",
+      "command": ["python", "scripts/sql_query_runner.py"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--read-only", "select * from macro_usa order by date desc limit 5"],
+          "description": "Read recent macro rows"
+        }
+      ]
+    },
+    {
+      "name": "redis_scan",
+      "category": "storage",
+      "description": "Scan Redis keys and return JSON.",
+      "command": ["python", "scripts/redis_query_runner.py", "scan"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["--pattern", "nse:*"],
+          "description": "Inspect NSE-related keys"
+        }
+      ]
+    },
+    {
+      "name": "redis_get",
+      "category": "storage",
+      "description": "Read one Redis key and return JSON.",
+      "command": ["python", "scripts/redis_query_runner.py", "get"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["bhav:parsed", "--max-items", "20"],
+          "description": "Inspect one parsed-set key"
+        }
+      ]
+    },
+    {
+      "name": "s3_list",
+      "category": "storage",
+      "description": "List S3 objects or prefixes as JSON.",
+      "command": ["python", "scripts/s3_query_runner.py", "list"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["--prefix", "bhavcopy/", "--delimiter", "/"],
+          "description": "List bhavcopy prefixes"
+        }
+      ]
+    },
+    {
+      "name": "s3_head",
+      "category": "storage",
+      "description": "Fetch S3 object metadata as JSON.",
+      "command": ["python", "scripts/s3_query_runner.py", "head"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["--key", "bhavcopy/example.zip"],
+          "description": "Read S3 object metadata"
+        }
+      ]
+    },
+    {
+      "name": "load_us_macro",
+      "category": "ingestion",
+      "description": "Run the FRED and ISM macro loaders.",
+      "command": ["python", "-m", "data.fred.us_macro"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_nsdl_fpi",
+      "category": "ingestion",
+      "description": "Run the NSDL FPI loader.",
+      "command": ["python", "-m", "data.nsdl.fpi"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_sharpely_master",
+      "category": "ingestion",
+      "description": "Refresh Sharpely security master tables.",
+      "command": ["python", "-m", "data.sharpelydata.scrip_master"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_sharpely_fundamentals",
+      "category": "ingestion",
+      "description": "Run the Sharpely fundamentals loader.",
+      "command": ["python", "-m", "data.sharpelydata.sharpely_data"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "load_dhan_master",
+      "category": "ingestion",
+      "description": "Refresh the Dhan master instrument table.",
+      "command": ["python", "-m", "data.dhanlive.scrip_master"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "download_nse_bhavcopy",
+      "category": "download",
+      "description": "Run the NSE bhavcopy downloader.",
+      "command": ["python", "-m", "data.nseindia.bhavcopy_downloader"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "parse_nse_bhavcopy",
+      "category": "ingestion",
+      "description": "Parse downloaded NSE bhavcopy archives.",
+      "command": ["python", "-m", "data.nseindia.bhavcopy_parser"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "download_nse_indices",
+      "category": "download",
+      "description": "Run the NSE indices downloader.",
+      "command": ["python", "-m", "data.nseindia.indices_downloader"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "parse_nse_indices",
+      "category": "ingestion",
+      "description": "Parse downloaded NSE index archives.",
+      "command": ["python", "-m", "data.nseindia.indices_parser"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "download_nse_offmarket",
+      "category": "download",
+      "description": "Run the NSE block, bulk, and short-selling downloader.",
+      "command": ["python", "-m", "data.nseindia.offmarket"],
+      "read_only": false,
+      "examples": []
+    },
+    {
+      "name": "parse_nse_offmarket",
+      "category": "ingestion",
+      "description": "Parse downloaded NSE off-market CSV files.",
+      "command": ["python", "-m", "data.nseindia.offmarket_parser"],
+      "read_only": false,
+      "examples": []
+    }
+  ]
+}

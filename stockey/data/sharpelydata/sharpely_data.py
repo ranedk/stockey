@@ -1,3 +1,4 @@
+import argparse
 import json
 from datetime import datetime
 
@@ -7,8 +8,8 @@ from environs import Env
 from utils.db import upsert_to_db
 from utils.http import get_with_retries
 from utils.date import last_of_month
+from utils.sync import choose_from_date, get_db_max_date, load_tracked_symbols, normalize_date_window, parse_datetime_arg
 
-from . import sharpely_db as sdb
 from . import sharpely_utils as su
 
 env = Env()
@@ -16,14 +17,26 @@ env.read_env()
 HEADERS = su.get_sharpely_headers()
 
 
-def get_financial_statement(symbol):
+def filter_by_date_range(df: pd.DataFrame, from_date: datetime | None, to_date: datetime | None) -> pd.DataFrame:
+    if df.empty or "date" not in df.columns:
+        return df
+
+    series = pd.to_datetime(df["date"], errors="coerce")
+    if from_date is not None:
+        df = df[series >= pd.Timestamp(from_date)]
+        series = pd.to_datetime(df["date"], errors="coerce")
+    if to_date is not None:
+        df = df[series <= pd.Timestamp(to_date)]
+    return df.reset_index(drop=True)
+
+
+def get_financial_statement(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None):
     resp = get_with_retries(
         f"https://pyapiv2.mintbox.ai/api/core/getFinancialStatementsV2/ticker={symbol}",
         headers=HEADERS,
     ).json()
     fin = json.loads(resp["statements"])
 
-    # Step 2: Filter FCC codes you care about (add/remove as needed)
     income_fccs = {
         "SREV": "gross_revenue",
         "STLR": "total_revenue",
@@ -47,16 +60,11 @@ def get_financial_statement(symbol):
         "SEBITDA": "ebitda",
         "SDEA": "depreciation_and_amortization",
         "SVLAR": "employee_and_related_expenses",
-        "SINTEX": "interest_expense",  # same meaning as SIEN
-        "SOPEX": "operating_expenses",  # generic form, same as SOET in some cases
+        "SINTEX": "interest_expense",
+        "SOPEX": "operating_expenses",
     }
 
-    income_df = parse_consolidated_statement(
-        symbol, fin["inc_consol_interim"], income_fccs
-    )
-
     balance_fccs = {
-        # --- Universal drivers (all sectors) ---
         "SCAE": "cash_and_cash_equivalents",
         "SCASH": "cash_and_cash_equivalents",
         "SSTI": "short_term_investments",
@@ -77,18 +85,15 @@ def get_financial_statement(symbol):
         "QTEP": "total_shareholders_equity",
         "SRED": "retained_earnings",
         "STBL": "total_liabilities_and_equity",
-        # --- Product / Manufacturing-heavy ---
         "SCLR": "short_term_loans_and_receivables",
         "SCLD": "capitalized_leases_current_portion",
         "SLCL": "capitalized_lease_obligations_long_term",
         "SDTA": "deferred_tax_asset_long_term",
         "STCAXIN": "total_current_assets_ex_inventories",
-        # --- Services / SaaS / IP-driven ---
         "STIN": "intangible_assets_ex_goodwill_net",
         "STFL": "finance_and_operating_lease_liabilities",
         "STDL": "lease_debt_including_liabilities",
         "SACRU": "accruals_short_term",
-        # --- Financial Services / FinTech / Banks ---
         "SLNS": "loans_short_term",
         "SLNG": "loans_long_term",
         "STIV": "total_investments",
@@ -97,49 +102,44 @@ def get_financial_statement(symbol):
         "SSND": "net_debt",
     }
 
-    balance_df = parse_consolidated_statement(
-        symbol, fin["bal_consol_interim"], balance_fccs
-    )
-
     cashflow_fccs = {
-        # ── Operating activities ─────────────────────────────────────────
-        "SPLS": "net_income_starting_line",  # Profit / (loss) starting point
-        "SNCR": "non_cash_adjustments",  # All non-cash add-backs excl. D&A
-        "SDAI": "depreciation_and_amortization",  # Depreciation, depletion & amort
-        "SCWC": "change_in_working_capital",  # ∆ working capital (±)
-        "STLO": "net_cash_from_operating_activities",  # Operating cash flow (OCF)
-        # ── Investing activities ────────────────────────────────────────
-        "SCAP": "capital_expenditures_net",  # Net CapEx (PPE & intangibles)
-        "SBAS": "acquisition_or_disposal_of_business",  # M&A cash flows
-        "STLI": "net_cash_from_investing_activities",  # Total investing CF
-        # ── Financing activities ────────────────────────────────────────
-        "SCDP": "dividends_paid_total",  # All cash dividends
-        "SCSBN": "common_stock_buyback_net",  # Share repurchase / issuance net
-        "SPSS": "stock_issuance_retirement_net",  # Stock issued / retired (all classes)
-        "SPRD": "debt_issuance_retirement_total",  # Net debt movement (LT + ST)
-        "STLF": "net_cash_from_financing_activities",  # Total financing CF
-        # ── Free-cash metrics (supplemental) ────────────────────────────
-        "SFCFO": "free_operating_cash_flow",  # FOCF after dividends
-        "SFCFE": "free_cash_flow_to_equity",  # FCFE (for DDM / levered DCF)
-        "SFCFL": "free_operating_cash_flow_gross",  # FOCF before dividends
-        # ── Cash reconciliation ─────────────────────────────────────────
-        "SNCC": "net_change_in_cash",  # Δ cash
+        "SPLS": "net_income_starting_line",
+        "SNCR": "non_cash_adjustments",
+        "SDAI": "depreciation_and_amortization",
+        "SCWC": "change_in_working_capital",
+        "STLO": "net_cash_from_operating_activities",
+        "SCAP": "capital_expenditures_net",
+        "SBAS": "acquisition_or_disposal_of_business",
+        "STLI": "net_cash_from_investing_activities",
+        "SCDP": "dividends_paid_total",
+        "SCSBN": "common_stock_buyback_net",
+        "SPSS": "stock_issuance_retirement_net",
+        "SPRD": "debt_issuance_retirement_total",
+        "STLF": "net_cash_from_financing_activities",
+        "SFCFO": "free_operating_cash_flow",
+        "SFCFE": "free_cash_flow_to_equity",
+        "SFCFL": "free_operating_cash_flow_gross",
+        "SNCC": "net_change_in_cash",
         "SNCB": "cash_beginning_balance",
         "SNCE": "cash_ending_balance",
     }
 
-    cashflow_df = parse_consolidated_statement(
-        symbol, fin["cas_consol_interim"], cashflow_fccs
-    )
+    table_map = {
+        "stmt_income": parse_consolidated_statement(symbol, fin["inc_consol_interim"], income_fccs),
+        "stmt_balancesheet": parse_consolidated_statement(symbol, fin["bal_consol_interim"], balance_fccs),
+        "stmt_cashflow": parse_consolidated_statement(symbol, fin["cas_consol_interim"], cashflow_fccs),
+    }
 
-    for dbname, df in zip(
-        ["stmt_income", "stmt_balancesheet", "stmt_cashflow"],
-        [income_df, balance_df, cashflow_df],
-    ):
+    for table_name, df in table_map.items():
+        if df.empty:
+            continue
         df["date"] = pd.to_datetime(df["date"])
+        df = filter_by_date_range(df, from_date, to_date)
+        if df.empty:
+            continue
         upsert_to_db(
             df,
-            dbname,
+            table_name,
             unique_keys=["symbol", "date", "period_length"],
             timescaledb_column="date",
         )
@@ -165,6 +165,10 @@ def parse_consolidated_statement(symbol, data, fccs):
                 )
 
     df_long = pd.DataFrame(rows)
+    if df_long.empty:
+        return pd.DataFrame(columns=["date", "period_length", "symbol"])
+
+    df_long["value"] = pd.to_numeric(df_long["value"], errors="coerce")
     df = df_long.pivot_table(
         index=["date", "period_length"], columns="metric", values="value"
     ).reset_index()
@@ -172,7 +176,7 @@ def parse_consolidated_statement(symbol, data, fccs):
     return df
 
 
-def get_shareholding(symbol):
+def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None):
     resp = get_with_retries(
         f"https://pyapiv2.mintbox.ai/api/core/getShareHoldingsDataAccord/symbol={symbol}",
         headers=HEADERS,
@@ -187,13 +191,16 @@ def get_shareholding(symbol):
             records.append(entry)
 
     df = pd.DataFrame(records)
-    df['symbol'] = symbol
-    upsert_to_db(
-        df,
-        "shareholding_category",
-        unique_keys=["symbol", "date", "sh_code"],
-        timescaledb_column="date",
-    )
+    if not df.empty:
+        df["symbol"] = symbol
+        df = filter_by_date_range(df, from_date, to_date)
+        if not df.empty:
+            upsert_to_db(
+                df,
+                "shareholding_category",
+                unique_keys=["symbol", "date", "sh_code"],
+                timescaledb_column="date",
+            )
 
     type_map = {
         "1": "indian",
@@ -205,15 +212,21 @@ def get_shareholding(symbol):
         for k, stype in type_map.items():
             if not holders.get(k):
                 continue
-            for row in holders[k]['top_holders']:
+            for row in holders[k]["top_holders"]:
                 entry = row.copy()
                 entry["date"] = pd.to_datetime(last_of_month(datetime.strptime(report_date, "%Y%m")))
-                entry['stype'] = stype
+                entry["stype"] = stype
                 records.append(entry)
 
     df = pd.DataFrame(records)
-    df['symbol'] = symbol
-    df = df[df.duplicated(subset=["symbol", "date", "name", "stype"], keep='first')]
+    if df.empty:
+        return
+
+    df["symbol"] = symbol
+    df = df.drop_duplicates(subset=["symbol", "date", "name", "stype"], keep="last")
+    df = filter_by_date_range(df, from_date, to_date)
+    if df.empty:
+        return
     upsert_to_db(
         df,
         "shareholding_top_holders",
@@ -221,13 +234,14 @@ def get_shareholding(symbol):
         timescaledb_column="date",
     )
 
-def get_historical_mcap(symbol):
+
+def get_historical_mcap(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None):
     json_data = {
         "stock": symbol,
         "metric_code": "mcap",
         "frequency": "D",
-        "start_date": None,
-        "end_date": None,
+        "start_date": from_date.strftime("%Y-%m-%d") if from_date else None,
+        "end_date": to_date.strftime("%Y-%m-%d") if to_date else None,
     }
     resp = get_with_retries(
         "https://pyapiv2.mintbox.ai/api/core/getHistoricalMetricData",
@@ -239,24 +253,75 @@ def get_historical_mcap(symbol):
 
     records = []
     for row in mcap_data:
-        entry = {}
-        entry["date"] = row["timestamp"]
-        entry["mcap"] = row["mcap"]
-        records.append(entry)
+        records.append({"date": row["timestamp"], "mcap": row["mcap"]})
 
     df = pd.DataFrame(records)
+    if df.empty:
+        return
     df["date"] = pd.to_datetime(df["date"])
+    df["mcap"] = pd.to_numeric(df["mcap"], errors="coerce")
     df["symbol"] = symbol
+    df = filter_by_date_range(df, from_date, to_date)
+    if df.empty:
+        return
     upsert_to_db(
         df,
         "historical_mcap",
         unique_keys=["symbol", "date"],
-        timescaledb_column="date"
+        timescaledb_column="date",
+    )
+
+
+def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to_date: datetime | None = None):
+    _, to_date = normalize_date_window(from_date, to_date)
+
+    for symbol in symbols:
+        stmt_from_date = choose_from_date(
+            from_date,
+            [
+                get_db_max_date("stmt_income", filters={"symbol": symbol}),
+                get_db_max_date("stmt_balancesheet", filters={"symbol": symbol}),
+                get_db_max_date("stmt_cashflow", filters={"symbol": symbol}),
+            ],
+        )
+        if stmt_from_date <= to_date:
+            get_financial_statement(symbol, stmt_from_date, to_date)
+
+        shareholding_from_date = choose_from_date(
+            from_date,
+            [
+                get_db_max_date("shareholding_category", filters={"symbol": symbol}),
+                get_db_max_date("shareholding_top_holders", filters={"symbol": symbol}),
+            ],
+        )
+        if shareholding_from_date <= to_date:
+            get_shareholding(symbol, shareholding_from_date, to_date)
+
+        mcap_from_date = choose_from_date(
+            from_date,
+            [get_db_max_date("historical_mcap", filters={"symbol": symbol})],
+        )
+        if mcap_from_date <= to_date:
+            get_historical_mcap(symbol, mcap_from_date, to_date)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync Sharpely fundamentals for tracked symbols")
+    parser.add_argument("--symbols", nargs="*", help="Symbols, comma-separated or repeated")
+    parser.add_argument("--from-date", dest="from_date", help="Start date in YYYY-MM-DD")
+    parser.add_argument("--to-date", dest="to_date", help="End date in YYYY-MM-DD")
+    args = parser.parse_args()
+
+    symbols = load_tracked_symbols(args.symbols)
+    if not symbols:
+        raise SystemExit("No symbols provided. Use --symbols, STOCKEY_SYMBOLS, or config/tracked_symbols.txt")
+
+    sync_sharpely_data(
+        symbols=symbols,
+        from_date=parse_datetime_arg(args.from_date),
+        to_date=parse_datetime_arg(args.to_date),
     )
 
 
 if __name__ == "__main__":
-    for symbol in ["SHAKTIPUMP", "HDFCBANK"]:
-        get_historical_mcap(symbol)
-        get_financial_statement(symbol)
-        get_shareholding(symbol)
+    main()

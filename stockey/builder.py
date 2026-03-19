@@ -1,13 +1,13 @@
 import json
 import os
-import platform
 import shutil
 import subprocess  # nosec B603, B404
 import sys
-from typing import Optional, Tuple
+from pathlib import Path
 
 
 def install_requirements(folder, project_name):
+    original_cwd = os.getcwd()
     os.chdir(folder)
     venv_path = f".x{project_name}"
     try:
@@ -33,7 +33,7 @@ def install_requirements(folder, project_name):
     except subprocess.CalledProcessError as e:
         print(f"Failed to install requirements for {project_name}: {e}")
     finally:
-        os.chdir(folder)
+        os.chdir(original_cwd)
 
 
 def vscode_config(folder, project_name):
@@ -60,7 +60,7 @@ def copy_environment(from_dir, to_dir):
     shutil.copy(f"{from_dir}/.env", f"{to_dir}/.env")
 
 
-original_dir = os.getcwd()
+original_dir = str(Path(__file__).resolve().parent)
 project_name = "stockey"
 SERVICES = ["notebooks", "live", "backtest", "data"]
 
@@ -77,4 +77,5 @@ def main():
     setup_env()
 
 
-main()
+if __name__ == "__main__":
+    main()

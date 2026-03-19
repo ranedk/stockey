@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 
-import os
-import json
 import argparse
+import json
 from typing import Any
 
 import redis
@@ -15,7 +14,7 @@ env.read_env()
 def get_redis_client() -> redis.Redis:
     return redis.Redis(
         host=env("REDIS_HOST"),
-        port=int(env("REDIS_PORT")),
+        port=env.int("REDIS_PORT"),
         db=env.int("REDIS_DB"),
         decode_responses=True,
     )
@@ -42,35 +41,29 @@ def read_key(r: redis.Redis, key: str, max_items: int = 100):
 
     if key_type == "string":
         result["value"] = r.get(key)
-
     elif key_type == "set":
-        members = list(r.smembers(key))
+        members = sorted(r.smembers(key))
         result["count"] = len(members)
         result["members"] = members[:max_items]
-
     elif key_type == "hash":
         data = r.hgetall(key)
         items = list(data.items())[:max_items]
         result["count"] = len(data)
         result["value"] = dict(items)
-
     elif key_type == "list":
         values = r.lrange(key, 0, max_items - 1)
         result["count"] = r.llen(key)
         result["value"] = values
-
     elif key_type == "zset":
         values = r.zrange(key, 0, max_items - 1, withscores=True)
         result["count"] = r.zcard(key)
         result["value"] = [{"member": m, "score": s} for m, s in values]
-
     elif key_type == "stream":
         values = r.xrange(key, count=max_items)
+        result["count"] = len(values)
         result["value"] = [{"id": msg_id, "fields": fields} for msg_id, fields in values]
-
     elif key_type == "none":
         result["value"] = None
-
     else:
         result["note"] = f"Unsupported or unknown Redis type: {key_type}"
 
@@ -81,7 +74,7 @@ def scan_keys(r: redis.Redis, pattern: str = "*", cursor: int = 0, count: int = 
     next_cursor, keys = r.scan(cursor=cursor, match=pattern, count=count)
     return {
         "cursor": next_cursor,
-        "keys": keys,
+        "keys": sorted(keys),
         "count": len(keys),
     }
 
@@ -107,6 +100,9 @@ def main():
     get_p.add_argument("key")
     get_p.add_argument("--max-items", type=int, default=100)
 
+    exists_p = sub.add_parser("exists", help="Check whether a key exists")
+    exists_p.add_argument("key")
+
     raw_p = sub.add_parser("raw", help="Run arbitrary Redis command")
     raw_p.add_argument("command", nargs=argparse.REMAINDER)
 
@@ -121,29 +117,33 @@ def main():
                 cursor=args.cursor,
                 count=args.count,
             )
-
         elif args.action == "get":
             result = read_key(
                 r,
                 key=args.key,
                 max_items=args.max_items,
             )
-
+        elif args.action == "exists":
+            result = {"key": args.key, "exists": bool(r.exists(args.key))}
         elif args.action == "raw":
             if not args.command:
                 raise ValueError("Provide a command after 'raw'")
-            result = run_raw_command(r, args.command)
-
+            result = {"command": args.command, "result": run_raw_command(r, args.command)}
         else:
             raise ValueError(f"Unsupported action: {args.action}")
 
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        print(json.dumps({"status": "ok", **result}, indent=2, ensure_ascii=False))
 
     except Exception as e:
-        print(json.dumps({
-            "status": "error",
-            "error": str(e),
-        }, indent=2))
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error": str(e),
+                },
+                indent=2,
+            )
+        )
         raise SystemExit(1)
 
 

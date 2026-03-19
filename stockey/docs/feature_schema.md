@@ -3,7 +3,7 @@
 `python -m features.calendar_creator`
 
 To get dates from OHCLV and NSE trading holidays to create base set of trading dates.
-> Note: Removal logic for dates in case of any arbitary NSE announcements is not implemented
+> Note: removal logic for dates affected by ad hoc NSE announcements is not implemented.
 
 ```
 public.dim_trading_days

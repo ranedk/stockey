@@ -1,340 +1,107 @@
-## 1. Purpose
+# Script Inventory
 
-* Describe how each crawler script ingests macro-economic data.
-* Define the metadata every script must expose so incremental loads can resume safely.
+## Ingestion rules
 
+Every ingestion script should declare or at least follow these operational fields:
 
-## 2. Common metadata fields
+- `script`: import path from repo root
+- `db`: destination table
+- `frequency`: source cadence, not cron cadence
+- `handle_date`: how source dates map into the stored time index
+- `redis_key`: optional cursor key for incremental loads
 
-* `script` - import path (relative to project root) of the crawler, e.g. `data/rbi/download_fbil_gsec.py`.
-* `db` - destination table / collection / topic name, e.g. `fbil_gsec_quote`.
-* `frequency` - expected arrival cadence at the **source**, not the cron interval.
+All crawlers are allowed to run daily. Non-daily sources should exit early when nothing new is available.
 
-  * Allowed values: `daily`, `weekly`, `monthly`, `quarterly`, `annual`, `unknown`.
-* `handle_date` - strategy for turning the source's date(s) into our time index.
-* `redis_key` - Redis key that stores the latest successfully ingested cursor so the next run can continue; use `null` if the script is idempotent or if the there is a database based cursor.
+## Current loaders
 
-> **Cron vs. source frequency:** All crawlers are triggered **daily**. If `frequency` isn't `daily`, the script must check whether new data exists and exit early if nothing changed.
+| Script | Tables | Notes |
+| --- | --- | --- |
+| `data/eaindustry/wpi.py` | `eaindustry_wpi` | Monthly WPI |
+| `data/fred/us_macro.py` | `macro_usa`, `macro_india_gdp`, `macro_usa_ism` | FRED + FXStreet ISM |
+| `data/mospi/cpi.py` | `mospi_cpi` | Detailed CPI |
+| `data/nsdl/fpi.py` | `fii_investments`, `fii_derivatives` | NSDL flows; now coerces numeric fields before DB load |
+| `data/rbi/download_bank_rates.py` | `rbi_bank_rates` | RBI key policy rates |
+| `data/rbi/download_fbil_gsec.py` | `fbil_gsec_quote`, `fbil_gsec_par` | G-sec quotes + par curve |
+| `data/sharpelydata/scrip_master.py` | `master_sharpely_funds`, `master_sharpely_equity` | Security masters |
+| `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap` | Fundamental data |
+| `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
+| `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives |
+| `data/nseindia/indices_parser.py` | `nseindia_indices` | Index history |
+| `data/nseindia/corporate_actions.py` | `nseindia_corporate_actions` | Corporate actions |
+| `data/nseindia/earnings_events.py` | `nseindia_earnings_events` | Earnings calendar |
+| `data/nseindia/insider_deals.py` | `nseindia_insider_deals` | Insider deals |
+| `data/nseindia/offmarket_parser.py` | `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_shortselling` | Off-market parsers |
+| `data/nseindia/recent_events.py` | `nseindia_events` | NSE event feed |
+| `data/nseindia/holidays.py` | `nseindia_holidays` | Trading holidays |
 
-## 3. `handle_date` strategies
+## Management scripts
 
-* `forward_fill` - use for "level" series where the value remains valid until a new one arrives (e.g. policy rate, index levels).
+These are the JSON-first scripts that are easiest to call from a human shell, an LLM tool wrapper, or an MCP server shim.
 
-  * Rule: store value on `as_on_date` and automatically extend it forward until a new record arrives.
+## Symbol-specific module runs
 
-* `on_this_date` - use for one-off events or daily flows (e.g. FPI net flow, dividend declaration date).
+These modules still work cleanly with `python -m ...`, which is a good fit for cron and shell orchestration. The entrypoints now support:
 
-  * Rule: insert exactly one row on `as_on_date`; custom logic to model
+- `--symbols`
+- `--from-date YYYY-MM-DD`
+- `--to-date YYYY-MM-DD`
 
-* `future_data` - use for schedules or targets published ahead of time (e.g. auction calendar).
+If `--symbols` is omitted, they fall back to:
 
-  * Rule: generate rows for future dates based on offsets such as `offset: {months: 1, day: 1}` or `offset: {months: 0, day: 'last'}`.
+1. `STOCKEY_SYMBOLS`
+2. [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt)
 
-* `revision_overwrite` - use for datasets that republish history (e.g. GDP revisions).
+Examples:
 
-  * Rule: upsert on `(date, version)` or delete the affected date range and re-insert latest values.
-
-* `cumulative_reset` - use for YTD metrics that reset at FY or quarter boundaries.
-
-  * Rule: detect boundary dates; reset running total; derive daily/period deltas if needed.
-
-* `snapshot_panel` - use for cross-section snapshots with extra dimensions (e.g. full yield curve).
-
-  * Rule: treat `as_on_date` as the index; keep other dimensions in columns or a separate child table.
-
-
-## 3. Script inventory
-
-```
-script: data/eaindustry/wpi.py
-db: eaindustry_wpi
-frequency: monthly
-handle_date: forward_fill | offset : {months: 1, days: 14}   # 14 of the next month
-redis_key: wpi:downloaded
-```
-
-```
-script: data/rbi/download_fbil_gsec.py
-db: fbil_gsec_quote
-frequency: daily
-handle_date: forward_fill | offset: { days: 7 }              # declared next week
-redis_key: fbilgec:downloaded
-```
-
-```
-script: data/rbi/download_fbil_gsec.py
-db: fbil_gsec_par
-frequency: daily
-handle_date: forward_fill | offset: { days: 7 }              # declared next week
-redis_key: fbilgec:downloaded
-```
-
-```
-script: data/fred/us_macro.py
-db: macro_usa
-frequency: unknown
-handle_date: forward_fill | offset: { days: 10}
-redis_key: null
-```
-
-```
-script: data/fred/us_macro.py
-db: macro_india_gdp
-frequency: unknown
-handle_date: forward_fill | offset: { days: 10}
-redis_key: null
-```
-
-```
-script: data/fred/us_macro.py
-db: macro_usa_ism
-frequency: daily
-handle_date: forward_fill | offset: { days: 2}
-redis_key: null
-```
-
-```
-script: data/nsdl/fpi.py
-db: fii_investments
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: nsdl:fpi:downloaded          # any future date is summary for end of month and end of year, getting updated daily
-```
-
-```
-script: data/nsdl/fpi.py
-db:fii_derivatives
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: nsdl:fpi:downloaded          # any future date is summary for end of month and end of year, getting updated daily
-```
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:shareholding_category
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:shareholding_top_holders
-frequency:
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/sharpelydata/sharpely_data.py
-db:historical_mcap
-frequency:
-handle_date:
-redis_key:
-```
-```
-script: data/nseindia/holidays.py
-db: nseindia_holidays
-frequency: yearly
-handle_date: null
-redis_key: null
-```
-
-```
-script: data/sharpelydata/scrip_master.py
-db:master_sharpely_funds
-frequency: daily
-handle_date: null
-redis_key: null
-```
-
-```
-script: data/sharpelydata/scrip_master.py
-db:master_sharpely_equity
-frequency: daily
-handle_date: null
-redis_key: null
-```
-
-```
-script: data/dhanlive/scrip_master.py
-db: master_dhan_instruments
-frequency: daily
-handle_date: null
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_mcap
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_circuit_hit
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_sme_bhavdata
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_sec_bhavdata
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_reg
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_pe
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_mto
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_csqr
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_cmvolt
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
+```sh
+python -m data.sharpelydata.sharpely_data --symbols RELIANCE TCS --from-date 2024-01-01 --to-date 2024-12-31
+python -m data.nseindia.corporate_actions --symbols RELIANCE,TCS
+python -m data.nseindia.earnings_events
+python -m data.nseindia.insider_deals
 ```
 
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_var1
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_cat_turnover
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
+### SQL
 
-```
-script: data/nseindia/bhavcopy_parser.py
-db: nseindia_catg
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
+```sh
+python scripts/sql_query_runner.py "select * from fii_investments limit 5"
+python scripts/sql_query_runner.py --read-only --params-json '{"symbol":"RELIANCE"}' "select * from historical_mcap where symbol = %(symbol)s order by date desc limit 3"
+python scripts/sql_query_runner.py --file query.sql
+cat query.sql | python scripts/sql_query_runner.py --read-only
 ```
 
-```
-script: data/nseindia/corporate_actions.py
-db: nseindia_corporate_actions
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
+### Redis
 
-```
-script: data/nseindia/earnings_events.py
-db: nseindia_earnings_events
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
+```sh
+python scripts/redis_query_runner.py scan --pattern 'bhav:*'
+python scripts/redis_query_runner.py get bhav:parsed --max-items 20
+python scripts/redis_query_runner.py exists nsdl:fpi:downloaded
+python scripts/redis_query_runner.py raw SMEMBERS bhav:parsed
 ```
 
-```
-script: data/nseindia/insider_deals.py
-db: nseindia_insider_deals
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-```
-script: data/nseindia/indices_parser
-db: nseindia_indices
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
+### S3
 
+```sh
+python scripts/s3_query_runner.py list --prefix bhavcopy/ --delimiter /
+python scripts/s3_query_runner.py head --key bhavcopy/example.zip
 ```
-script: data/rbi/download_bank_rates.py
-db: rbi_bank_rates
-frequency: daily
-handle_date: on_this_date
-redis_key: null
-```
 
-```
-script: data/nseindia/offmarket_parser.py
-db: nseindia_block_deals, nseindia_bulk_deals, nseindia_shortselling
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
+### Curated Agent Runner
 
+```sh
+python scripts/agent_tool_runner.py list
+python scripts/agent_tool_runner.py list --category storage
+python scripts/agent_tool_runner.py run sql_query -- --read-only "select * from macro_usa limit 5"
+python scripts/agent_tool_runner.py run redis_get -- bhav:parsed --max-items 20
+python scripts/agent_tool_runner.py run load_us_macro --allow-writes
 ```
-script: data/nseindia/recent_events.py
-db: nseindia_events
-frequency: daily
-handle_date: on_this_date | offset: { days: 1}
-redis_key: null
-```
-
-# Management script
-
-You can also use the following script
-
-
-### Query Redis Server Data
-
-`python scripts/redis_query_runner.py`
-
-e.g. `python scripts/redis_query_runner.py raw SMEMBERS bhav:parsed`
-
-### Query S3 Data
-
-`python scripts/s3_query_runner.py`
-
-e.g. `python scripts/s3_query_runner.py list`
 
-### Query SQL Data
+## LLM-facing conventions
 
-`python scripts/sql_query_runner.py`
+If you expose these through tools or MCP:
 
-e.g. `python scripts/sql_query_runner.py "select * from fii_investments limit 10"`
+- Keep stdout machine-readable JSON.
+- Treat non-zero exit code as failure.
+- Prefer `--read-only` on SQL agents that should not mutate state.
+- Pass SQL through `--file` or stdin for multi-line queries.
+- Keep download/scrape agents separate from analysis agents.
+- Prefer the registry in [`docs/tool_registry.json`](/home/rane/code/stockey/docs/tool_registry.json) instead of hard-coding shell commands in prompts.

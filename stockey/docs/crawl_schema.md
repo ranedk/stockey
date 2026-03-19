@@ -1,5 +1,7 @@
 # Schema of crawled data
 
+This file is a point-in-time dump from one database, not a canonical migration source. If live table types drift from code, regenerate it with `python -m utils.db_schema_dump --schemas public`.
+
 ```
 public.eaindustry_wpi
   - date: timestamp with time zone NOT NULL

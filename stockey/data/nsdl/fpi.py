@@ -80,6 +80,13 @@ def filter_bad_rows(df):
     return df[valid_mask].copy()
 
 
+def coerce_numeric_columns(df, columns):
+    for col in columns:
+        cleaned = df[col].astype("string").str.replace(",", "", regex=False)
+        df[col] = pd.to_numeric(cleaned, errors="coerce")
+    return df
+
+
 def parse_investments_table(table_html):
     grid = table_to_grid(table_html)
     grid_df = pd.DataFrame(grid)
@@ -103,6 +110,16 @@ def parse_investments_table(table_html):
     )
     df["instrument"] = df["instrument"].apply(
         lambda x: "total" if x == "debt_total" else x
+    )
+    df = coerce_numeric_columns(
+        df,
+        [
+            "gross_purchases_inr_crore",
+            "gross_sales_inr_crore",
+            "net_investment_inr_crore",
+            "net_investment_usd_million",
+            "usd_inr_rate",
+        ],
     )
     df.drop(columns=["itype", "iroute", "usd_inr_rate"], inplace=True)
     df = futils.fix_date(df)
@@ -128,6 +145,17 @@ def parse_derivatives_table(table_html):
         "open_interest_eod_amount",
     ]
     df["instrument"] = df["instrument"].apply(futils.to_snake)
+    df = coerce_numeric_columns(
+        df,
+        [
+            "buy_number_of_contracts",
+            "buy_amount",
+            "sell_number_of_contracts",
+            "sell_amount",
+            "open_interest_eod_number_of_contracts",
+            "open_interest_eod_amount",
+        ],
+    )
     df = futils.fix_date(df)
     return df
 

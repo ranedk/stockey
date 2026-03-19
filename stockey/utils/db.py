@@ -1,9 +1,9 @@
-""" Database utilities """
-import uuid
+"""Database utilities."""
 import io
-from datetime import date, datetime
-from typing import List, Tuple, Union
+import uuid
 from contextlib import contextmanager
+from datetime import date, datetime
+from typing import List, Sequence, Tuple, Union
 
 import pandas as pd
 import pandas.api.types as pdt
@@ -26,6 +26,14 @@ DB_PASSWORD = env("POSTGRES_PASSWORD")
 _engine = sa.create_engine(
     f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 )
+
+
+def qualified_identifier(name: str) -> sql.Identifier:
+    """Return a quoted identifier for `table` or `schema.table` names."""
+    parts = [part for part in name.split(".") if part]
+    if not parts:
+        raise ValueError("Identifier cannot be empty")
+    return sql.Identifier(*parts)
 
 @contextmanager
 def db_session(dict_factory: bool = False):
@@ -196,25 +204,38 @@ def pandas_to_postgres_type(dtype: str):
 def generate_postgres_schema(
     df: pd.DataFrame,
     table_name: str,
-    unique_keys: List[str] | bool,
-) -> str:
+    unique_keys: Sequence[str] | bool,
+    *,
+    temporary: bool = False,
+) -> sql.Composed:
     """
     Return a `CREATE TABLE IF NOT EXISTS …` suited for PostgreSQL.
     Very simple dtype → SQL type mapping (expand as needed).
     """
 
-    col_defs = []
+    col_defs: list[sql.Composed] = []
     for col, dtype in df.dtypes.items():
         sql_type = pandas_to_postgres_type(dtype)
-        col_defs.append(f'"{col}" {sql_type}')
+        col_defs.append(
+            sql.SQL("{} {}").format(sql.Identifier(col), sql.SQL(sql_type))
+        )
 
-    unique_clause = ""
+    unique_clause = sql.SQL("")
     if unique_keys and isinstance(unique_keys, (list, tuple)):
-        keys = ", ".join(f'"{k}"' for k in unique_keys)
-        unique_clause = f", UNIQUE ({keys})"
+        unique_clause = sql.SQL(", UNIQUE ({})").format(
+            sql.SQL(", ").join(sql.Identifier(k) for k in unique_keys)
+        )
 
-
-    return f'CREATE TABLE IF NOT EXISTS {table_name} ({", ".join(col_defs)}{unique_clause});'
+    create_prefix = sql.SQL("CREATE TEMP TABLE IF NOT EXISTS {}").format(
+        qualified_identifier(table_name)
+    ) if temporary else sql.SQL("CREATE TABLE IF NOT EXISTS {}").format(
+        qualified_identifier(table_name)
+    )
+    return sql.SQL("{} ({}){};").format(
+        create_prefix,
+        sql.SQL(", ").join(col_defs),
+        unique_clause,
+    )
 
 
 def upsert_to_db(
@@ -236,17 +257,10 @@ def upsert_to_db(
         raise ValueError(f"DataFrame missing unique keys: {missing}")
 
     # --- helpers ------------------------------------------------------------
-    def ident_from_table(tname: str) -> sql.Identifier:
-        """Return sql.Identifier, handling optional schema-qualified names."""
-        if "." in tname:
-            schema, name = tname.split(".", 1)
-            return sql.Identifier(schema, name)
-        return sql.Identifier(tname)
-
     # Columns & conflicts
-    full_table = ident_from_table(table_name)
-    temp_table_name = f"{table_name}_temp_{uuid.uuid4().hex[:8]}"
-    temp_table = ident_from_table(temp_table_name)
+    full_table = qualified_identifier(table_name)
+    temp_table_name = f"_tmp_{table_name.replace('.', '_')}_{uuid.uuid4().hex[:8]}"
+    temp_table = qualified_identifier(temp_table_name)
 
     col_identifiers = [sql.Identifier(c) for c in cols]
     conflict_identifiers = [sql.Identifier(c) for c in unique_keys]
@@ -265,14 +279,18 @@ def upsert_to_db(
 
     # --- create table DDLs (yours) -----------------------------------------
     create_main_sql = generate_postgres_schema(df, table_name, unique_keys)
-    create_temp_sql = generate_postgres_schema(df, temp_table_name, False)
+    create_temp_sql = generate_postgres_schema(
+        df,
+        temp_table_name,
+        False,
+        temporary=True,
+    )
 
     # --- execute ------------------------------------------------------------
     with db_session() as (conn, cur):
         try:
             # 1. Ensure main & temp tables
             cur.execute(create_main_sql)
-            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
             cur.execute(create_temp_sql)
 
             # 2. COPY data into temp
@@ -406,9 +424,9 @@ def table_has_date(
         SELECT
             EXISTS(SELECT 1
                    FROM   {schema}.{table}
-                   WHERE  {column} = %s
+                   WHERE  {column}::date = %s
                    LIMIT  1)                     AS has_target,
-            MAX({column})                       AS latest_date
+            MAX({column}::date)                 AS latest_date
         FROM {schema}.{table}
         """
     ).format(
@@ -436,6 +454,10 @@ def get_max_date(feature_table):
         df = sql_to_df(f"SELECT max(date) AS max_date FROM {feature_table};")
         if df["max_date"].notna().any():
             dt = pd.to_datetime(df.loc[0, "max_date"])
+            if getattr(dt, "tzinfo", None) is None:
+                dt = dt.tz_localize("UTC")
+            else:
+                dt = dt.tz_convert("UTC")
             return dt.normalize()
     except Exception:
         pass  # table may not exist on first run

@@ -1,49 +1,35 @@
-# bhavcopy_downloader.py
+import argparse
 import random
-from urllib.parse import urlencode
-from typing import List
 from datetime import datetime
-import pandas as pd
+from typing import List
+from urllib.parse import urlencode
 
-import redis
+import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
+
 from data.dhanlive.dhan_db import get_nse_equity
 from utils.db import upsert_to_db
+from utils.sync import choose_from_date, get_db_max_date, get_redis_client, get_redis_cursor, load_tracked_symbols, normalize_date_window, parse_datetime_arg, set_redis_cursor
 
 env = Env()
 env.read_env()
 
-
 REDIS_HOST = env("REDIS_HOST")
-REDIS_PORT = env("REDIS_PORT")
+REDIS_PORT = env.int("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:earnings_events"
 
-rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-
 
 def get_random(min_ms: int, max_ms: int) -> int:
-    """Return a random int in milliseconds between min_ms and max_ms."""
     return int(random.uniform(min_ms, max_ms))
 
 
-def get_earnings_events(
-    page,
-    symbol: str,
-    issuer: str,
-    from_date: datetime,
-    to_date: datetime,
-) -> bool:
-    """
-    Automate NSE earnings events download from
-    https://www.nseindia.com/companies-listing/corporate-filings-financial-results
-    """
-    page.goto(
-        "https://www.nseindia.com/companies-listing/corporate-filings-financial-results"
-    )
+def fetch_earnings_events(page, symbol: str, issuer: str, from_date: datetime, to_date: datetime) -> pd.DataFrame:
+    page.goto("https://www.nseindia.com/companies-listing/corporate-filings-financial-results")
     page.wait_for_timeout(get_random(1000, 2000))
 
+    frames = []
     for period in ["Quarterly", "Half-Yearly", "Annual"]:
         params = {
             "index": "equities",
@@ -53,9 +39,7 @@ def get_earnings_events(
             "issuer": issuer,
             "period": period,
         }
-
         url = f"https://www.nseindia.com/api/corporates-financial-results?{urlencode(params)}"
-
         data = page.evaluate(
             """async (url) => {
                 const res = await fetch(url, { credentials: 'same-origin' });
@@ -64,9 +48,7 @@ def get_earnings_events(
             }""",
             url,
         )
-
         if not data:
-            print("No data found for", symbol, period, from_date, to_date)
             continue
 
         df = pd.DataFrame(data)
@@ -86,63 +68,85 @@ def get_earnings_events(
             "consolidated": "consolidated",
             "isin": "isin",
         }
-
         df = df.rename(columns=rename_map)
         df = df.reindex(columns=list(rename_map.values()))
-
         for col in ["from_date", "to_date"]:
             df[col] = pd.to_datetime(df[col], format="%d-%b-%Y")
-
-        df["reporting_date"] = pd.to_datetime(
-            df["reporting_date"], format="%d-%b-%Y %H:%M:%S"
-        )
+        df["reporting_date"] = pd.to_datetime(df["reporting_date"], format="%d-%b-%Y %H:%M:%S")
         df["date"] = df["to_date"]
-        unique_keys = ["date", "symbol", "reporting_date", "period"]
-
-        df = df.sort_values("reporting_date").drop_duplicates(
-            subset=unique_keys, keep="last"
-        )
-        upsert_to_db(
-            df,
-            "nseindia_earnings_events",
-            unique_keys=unique_keys,
-            timescaledb_column="date",
-        )
+        frames.append(df)
         page.wait_for_timeout(get_random(1000, 2000))
 
-    rop.set(f"{REDIS_SET}:{symbol}", to_date.strftime("%Y-%m-%d"))
+    if not frames:
+        return pd.DataFrame()
+
+    full_df = pd.concat(frames, ignore_index=True)
+    unique_keys = ["date", "symbol", "reporting_date", "period"]
+    return full_df.sort_values("reporting_date").drop_duplicates(subset=unique_keys, keep="last")
 
 
-def sync_earnings_events(symbols: List[str]) -> None:
+def sync_earnings_events(symbols: List[str], from_date: datetime | None = None, to_date: datetime | None = None) -> None:
+    _, to_date = normalize_date_window(from_date, to_date)
+    redis_client = get_redis_client(REDIS_HOST, REDIS_PORT)
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
 
         counter = 0
-        for symbol in symbols:
-            eqt = get_nse_equity(symbol)
-            issuer = eqt.display_name
+        try:
+            for symbol in symbols:
+                eqt = get_nse_equity(symbol)
+                issuer = eqt.display_name
 
-            from_date = rop.get(f"{REDIS_SET}:{symbol}")
-            if from_date:
-                from_date = datetime.strptime(from_date, "%Y-%m-%d")
-            else:
-                from_date = datetime(2014, 1, 1)
+                effective_from_date = choose_from_date(
+                    from_date,
+                    [
+                        get_redis_cursor(redis_client, f"{REDIS_SET}:{symbol}"),
+                        get_db_max_date("nseindia_earnings_events", filters={"symbol": symbol}),
+                    ],
+                )
+                if effective_from_date > to_date:
+                    continue
 
-            if counter % 10 == 0:
-                page.goto("https://www.nseindia.com")
-                page.wait_for_timeout(get_random(1000, 3000))
+                if counter % 10 == 0:
+                    page.goto("https://www.nseindia.com")
+                    page.wait_for_timeout(get_random(1000, 3000))
 
-            to_date = datetime.today()
-            get_earnings_events(page, symbol, issuer, from_date, to_date)
-            counter += 1
+                df = fetch_earnings_events(page, symbol, issuer, effective_from_date, to_date)
+                if not df.empty:
+                    upsert_to_db(
+                        df,
+                        "nseindia_earnings_events",
+                        unique_keys=["date", "symbol", "reporting_date", "period"],
+                        timescaledb_column="date",
+                    )
+                set_redis_cursor(redis_client, f"{REDIS_SET}:{symbol}", to_date)
+                counter += 1
+        finally:
+            page.close()
+            browser.close()
+            redis_client.close()
 
-        page.close()
-        browser.close()
-        rop.close()
+
+def main():
+    parser = argparse.ArgumentParser(description="Sync NSE earnings events for tracked symbols")
+    parser.add_argument("--symbols", nargs="*", help="Symbols, comma-separated or repeated")
+    parser.add_argument("--from-date", dest="from_date", help="Start date in YYYY-MM-DD")
+    parser.add_argument("--to-date", dest="to_date", help="End date in YYYY-MM-DD")
+    args = parser.parse_args()
+
+    symbols = load_tracked_symbols(args.symbols)
+    if not symbols:
+        raise SystemExit("No symbols provided. Use --symbols, STOCKEY_SYMBOLS, or config/tracked_symbols.txt")
+
+    sync_earnings_events(
+        symbols=symbols,
+        from_date=parse_datetime_arg(args.from_date),
+        to_date=parse_datetime_arg(args.to_date),
+    )
 
 
 if __name__ == "__main__":
-    symbols = ["SHAKTIPUMP", "HDFCBANK"]
-    sync_earnings_events(symbols)
+    main()

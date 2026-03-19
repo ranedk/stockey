@@ -1,6 +1,5 @@
-import sys
 import os
-import subprocess
+import sys
 
 
 def main():
@@ -16,5 +15,5 @@ def main():
     os.system(restore)
 
 
-
-main()
+if __name__ == "__main__":
+    main()

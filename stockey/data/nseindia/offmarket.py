@@ -3,13 +3,17 @@ import random
 from datetime import datetime
 
 import redis
+from environs import Env
 from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import daterange
 
-REDIS_HOST = "localhost"
-REDIS_PORT = 6379
-CDP_ENDPOINT = "http://localhost:9222"  # Chrome started with --remote-debugging-port=9222  # Chromium or webkit won't work with NSE website
+env = Env()
+env.read_env()
+
+REDIS_HOST = env("REDIS_HOST")
+REDIS_PORT = env.int("REDIS_PORT")
+CDP_ENDPOINT = env("CDP_ENDPOINT")  # Chromium or webkit won't work with NSE website
 
 
 def get_random(min_ms: int, max_ms: int) -> int:

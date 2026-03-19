@@ -2,7 +2,7 @@
 from typing import Callable, Mapping, Optional, List
 import pandas as pd
 from pandas.io.sql import DatabaseError
-from sqlalchemy.exc import ProgrammingError 
+from sqlalchemy.exc import ProgrammingError
 from utils.db import sql_to_df
 
 
@@ -33,7 +33,9 @@ def get_max_date(table_name, date_column):
     max_date = pd.to_datetime(max_date, errors="coerce")
     if pd.isna(max_date):
         return today
-    return max_date.tz_localize("UTC").normalize()
+    if getattr(max_date, "tzinfo", None) is None:
+        return max_date.tz_localize("UTC").normalize()
+    return max_date.tz_convert("UTC").normalize()
 
 
 def build_nearest_release_rows(
@@ -214,4 +216,3 @@ def build_nearest_release_rows(
 
     # 6) return df (keep asof_date for traceability; drop if you don't want it)
     return matched.reset_index(drop=True)
-

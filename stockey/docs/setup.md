@@ -1,194 +1,158 @@
-# Dev postgres setup:
+# Setup
+
+## Python environment
+
+Create the project environment and VS Code settings:
 
 ```sh
-$ sudo -u postgres psql
+python builder.py
+source .xstockey/bin/activate
 ```
 
+`builder.py` is now safe to import and only runs when executed directly.
+
+## PostgreSQL
+
 ```sh
+sudo -u postgres psql
+```
+
+```sql
 CREATE DATABASE stockey;
 CREATE USER stockey WITH ENCRYPTED PASSWORD 'stockey';
 GRANT ALL PRIVILEGES ON DATABASE stockey TO stockey;
-GRANT ALL ON SCHEMA public TO stockey;
 ALTER DATABASE stockey OWNER TO stockey;
+\c stockey
+GRANT ALL ON SCHEMA public TO stockey;
 GRANT USAGE ON SCHEMA public TO stockey;
-
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 ```
 
-# `pg_dump` & `pg_restore`
+## Redis backup
 
 ```sh
-# PG DUMP with a format
-
-PGPASSWORD=stockey pg_dump -h localhost -p 5432 -U stockey --format=custom -f /tmp/full_db_dump.custom stockey
-
-
-# PG RESTORE from a format
-
-PGPASSWORD=stockey pg_restore --disable-triggers -h localhost -p 5432 -U stockey -d stockey /tmp/full_db_dump.custom
+python utils/redis_bkp_restore.py --host localhost --port 6379 --db 0 --file backups/redis_global_backup.json backup
 ```
 
-# Redis
+## S3 backup layout
 
-The state of downloads is stored in redis, which can be updated regularly:
-
-**Backup**
-
-`python utils/redis_bkp_restore.py --host localhost --port 6379 --db 0 --file backups/redis_global_backup.json backup`
-
-# S3 backups
-
-`aws s3 ls s3://stockeydata/`
-
-```
-    PRE bhavcopy/           # bhavcopy dump files
-    PRE nsedeals/           # nse deals dump files
-    PRE pgdump/             # postgres dumps with date marks
-    PRE rdbdump/            # redis dumps with date marks
+```sh
+aws s3 ls s3://stockeydata/
 ```
 
-# Dhan
+Expected prefixes:
 
-`python -m data.dhanlive.scrip_master`
+- `bhavcopy/`
+- `nsedeals/`
+- `pgdump/`
+- `rdbdump/`
 
-This is the main master which has a list of all assets that being traded. This is from Dhan which will be our primary trading account.
+## Data loaders
 
-# Sharpely master setup
+Symbol-specific loaders default to [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt). You can override that per run with `--symbols` or the `STOCKEY_SYMBOLS` env var.
 
-`python -m data.sharpelydata.scrip_master`
+### Dhan master
 
-This is the master from the Sharpely website, from where we will scrap fundamental data for all the scrips.
-The links between all scrips will be via their BSE Ticker or NSE Ticker.
-
-## Sharpely data
-
-- Financial statements: `get_financial_statement(ticker)`
-- Corporate Actions: `get_corporate_actions(ticker)`
-- Shareholding: `get_shareholding(ticker)`
-- Bulk Insider trades: `get_bulk_insider_trades(ticker)`
-- Historical MCap: `get_historical_mcap(ticker)`
-
-`python -m data.sharpelydata.sharpely_data`
-
-> TODO: Add loop to get all ticker data for other scrips
-
-## US Macro data, ISM Manufacturing and India GDP numbers
-
-In table `macro_usa`
-
-- 10-year Treasury constant-maturity
-- Effective Fed-funds rate (daily)
-- CBOE VIX close
-- Growth & inflation
-- NFP (level, ‘000)
-- CPI SA
-- CPI core SA
-- USD & commodities
-- Trade-weighted dollar (goods only)
-- WTI crude spot $/bbl
-- India GDP numbers
-- INR USD Spot price
-
-In table `macro_usa_ism` - ISM Manufacturing data
-
-`python -m data.fred.us_macro`
-
-This is backed by redis to figure if downloads have been done or not.
-
-# Bhavcopy
-
-The daily bhavcopy has daily market data about price, volumes and trades.
-The script downloads all bhavcopy zip from NSE.
-
-You will have to stop all running instances of chrome to be able to run the new instance in debugging mode. You can use `pkill chrome` to kill all instances.
-
-OSX: `/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
-
-OR
-
-Ubuntu: `/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
-
-## Run the bhavcopy downloader
-
-```shell
-python data/bhavcopy/downloader.py
+```sh
+python -m data.dhanlive.scrip_master
 ```
 
-This is backed by redis to figure if downloads have been done or not.
+### Sharpely masters
 
-# Bulk/Block/Short Deals downloader
-
-This has the bulk, block and short deals from the market
-
-You will have to stop all running instances of chrome to be able to run the new instance in debugging mode. You can use `pkill chrome` to kill all instances.
-OSX: `/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
-
-OR
-
-Ubuntu: `/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
-
-## Run the bhavcopy downloader
-
-```shell
-python data/bhavcopy/bulk_block_short_downloader.py
+```sh
+python -m data.sharpelydata.scrip_master
 ```
 
-This is backed by redis to figure if downloads have been done or not.
+### Sharpely fundamentals
 
-# RBI Bank rates
+```sh
+python -m data.sharpelydata.sharpely_data
+python -m data.sharpelydata.sharpely_data --symbols RELIANCE TCS --from-date 2024-01-01 --to-date 2024-12-31
+```
 
-For kinds of bank rates set by RBI monetary policy
+Key extractors:
 
-You will have to stop all running instances of chrome to be able to run the new instance in debugging mode. You can use `pkill chrome` to kill all instances.
-OSX: `/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
+- `get_financial_statement(symbol)`
+- `get_shareholding(symbol)`
+- `get_historical_mcap(symbol)`
 
-OR
+### US macro and ISM
 
-Ubuntu: `/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup`
+```sh
+python -m data.fred.us_macro
+```
 
-`python -m data.rbi.download_bank_rates`
+This writes to `macro_usa`, `macro_india_gdp`, and `macro_usa_ism`.
 
-This is run daily, but updates rarely. There is no need to figure out last pulled dated since this returns entire data every time.
+### NSE bhavcopy and related parsers
 
-To download G-Sec rates:
+Downloaders:
 
-`python -m data.rbi.download_fbil_gsec`
+```sh
+python -m data.nseindia.bhavcopy_downloader
+python -m data.nseindia.indices_downloader
+python -m data.nseindia.offmarket
+```
 
-To download 10Y bond rates:
+Parsers:
 
-`python -m data.ininvesting.in10y`
+```sh
+python -m data.nseindia.bhavcopy_parser
+python -m data.nseindia.indices_parser
+python -m data.nseindia.offmarket_parser
+python -m data.nseindia.corporate_actions --symbols RELIANCE TCS --from-date 2024-01-01 --to-date 2024-12-31
+python -m data.nseindia.earnings_events --symbols RELIANCE TCS
+python -m data.nseindia.insider_deals --symbols RELIANCE TCS
+```
 
-G-Sec get updated daily.
+Chrome remote debugging is still required for the Playwright/browser-driven flows:
 
-# WPI data
+```sh
+/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup
+```
 
-`python -m data.eaindustry.wpi`
+### RBI
 
-# CPI data
+```sh
+python -m data.rbi.download_bank_rates
+python -m data.rbi.download_fbil_gsec
+```
 
-Download detailed CPI data
+### CPI / WPI / FPI
 
-`python -m data.mospi.cpi`
+```sh
+python -m data.mospi.cpi
+python -m data.eaindustry.wpi
+python -m data.nsdl.fpi
+```
 
-# FPI data
+## Schema docs
 
-Download FPI data
+Human-readable table summaries:
 
-`python -m data.nseindia.fpi`
+```sh
+python -m utils.db_schema_dump --schemas public
+```
 
-# Schema and AI
+Use [`docs/crawl_schema.md`](/home/rane/code/stockey/docs/crawl_schema.md) and [`docs/feature_schema.md`](/home/rane/code/stockey/docs/feature_schema.md) as the maintained references. [`docs/schema.sql`](/home/rane/code/stockey/docs/schema.sql) now contains only targeted admin SQL instead of a full `pg_dump`.
 
-The schema is generated using `python -m utils.db_schema_dump`
-The definitions are added later using AI
+## Agent-facing tool surface
 
-# TODO
+The curated agent-safe commands live in:
 
-NSE Indices historical data by day
+- [`docs/tool_registry.json`](/home/rane/code/stockey/docs/tool_registry.json)
+- [`scripts/agent_tool_runner.py`](/home/rane/code/stockey/scripts/agent_tool_runner.py)
 
-https://www.niftyindices.com/reports/historical-data
+Quick checks:
 
-# NOTES
+```sh
+python scripts/agent_tool_runner.py list
+python scripts/agent_tool_runner.py list --category storage
+```
 
-1. ISIN is not unique, there can be multiple Symbols with the same ISIN because the same underlying can be traded in different series (e.g. Nifty 50 and Nifty 50 Future).
-2. The same SYMBOL and ISIN can be a part of more than one series e.g. SHAKTIPUMP is traded in series BE and EQ
-3. When company changes its name, symbol also changes but ISIN remains the same
+## Notes
+
+1. `ISIN` is not unique. A single underlying can trade in multiple series.
+2. `symbol + ISIN` is not unique across series.
+3. Company renames usually change symbol, but not `ISIN`.
+4. Large runtime artifacts such as `base_chromed_data/` and `http_cache/` should stay out of git.

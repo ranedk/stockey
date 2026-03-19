@@ -212,3 +212,5 @@ chromesetup
 .vscode
 .xstockey
 http_cache
+base_chromed_data/
+backups/
