@@ -179,17 +179,41 @@ def mark_till_date(rop, end_date):
         rop.sadd(REDIS_SET, (start + timedelta(days=i)).strftime("%Y-%m-%d"))
 
 
+def latest_downloaded_date(rop, today: date) -> date | None:
+    _, latest_db_date = futils.downloaded_for(today)
+    if latest_db_date is not None:
+        return latest_db_date
+
+    has_today = rop.sismember(REDIS_SET, today.strftime("%Y-%m-%d"))
+    if has_today:
+        return today
+
+    latest_redis_date = None
+    members = rop.smembers(REDIS_SET)
+    if members:
+        latest_redis_date = max(datetime.strptime(value, "%Y-%m-%d").date() for value in members)
+
+    candidates = [value for value in [latest_db_date, latest_redis_date] if value is not None]
+    return max(candidates) if candidates else None
+
+
 def update_fpi_data():
     rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
     today = date.today()
-    year, month = 2014, 1
+    latest_done = latest_downloaded_date(rop, today)
+    if latest_done is not None:
+        year, month = latest_done.year, latest_done.month
+    else:
+        year, month = 2014, 1
 
     while (year, month) <= (today.year, today.month):
         last_dom = futils.get_last_date(year, month).day
         target_date = date(year, month, last_dom)
         target_date = min(target_date, today)
 
-        found = False
+        found, _ = futils.downloaded_for(target_date)
+        if found:
+            mark_till_date(rop, target_date)
 
         if not found:
             get_fpi_data(target_date)

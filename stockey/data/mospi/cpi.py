@@ -12,6 +12,7 @@ from environs import Env
 
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers, hidden_inputs_to_dict
+from utils.sync import get_db_max_date
 
 env = Env()
 env.read_env()
@@ -151,6 +152,11 @@ def sync_cpi_data():
     all_months = list(month_iter(start_month, last_month))
     month_keys = [m.isoformat() for m in all_months]
     have = {k for k in month_keys if rop.sismember(REDIS_SET, k)}
+    latest_db_month = get_db_max_date("mospi_cpi", date_column="cpi_for_month")
+    if latest_db_month is not None:
+        for month_start in all_months:
+            if month_start <= latest_db_month.date():
+                have.add(month_start.isoformat())
     missing_months = [m for m in all_months if m.isoformat() not in have]
 
     if not missing_months:

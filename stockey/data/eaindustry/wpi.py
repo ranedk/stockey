@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 from environs import Env
 
 from utils.db import upsert_to_db
+from utils.sync import get_db_max_date
 from utils.http import get_dynamic_headers
 from utils.date import last_of_month
 
@@ -107,11 +108,16 @@ def get_wpi_for_year(year):
 
 def sync_wpi():
     today = date.today()
+    latest_db_date = get_db_max_date("eaindustry_wpi")
     for year in range(2014, today.year + 1):
         for month in range(1, 13):
             if year == today.year and month >= today.month:
                 continue
             rdate = last_of_month(date(year, month, 1))
+            if latest_db_date is not None and rdate <= latest_db_date.date():
+                rop.sadd(REDIS_SET, rdate.strftime("%Y-%m-%d"))
+                print(f"Done for {rdate} (db)")
+                continue
             if not rop.sismember(REDIS_SET, rdate.strftime("%Y-%m-%d")):
                 print(f"Checking for {rdate}")
                 get_wpi_for_year(year)
