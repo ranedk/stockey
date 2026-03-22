@@ -157,6 +157,7 @@ public.master_dhan_instruments
     master_dhan_instruments_pkey: UNIQUE (security_id, segment, valid_from)
 
 public.master_sharpely_equity
+  - sharpely_id: text
   - symbol: text
   - bse_ticker: text
   - proper_name: text
@@ -168,6 +169,17 @@ public.master_sharpely_equity
   # Indexes
     idx_master_sharpely_equity_symbol_bse_ticker: UNIQUE (symbol, bse_ticker)
     master_sharpely_equity_symbol_bse_ticker_key: UNIQUE (symbol, bse_ticker)
+
+public.company_master
+  - company_master_id: text
+  - company_name: text
+  - sharpely_id: text
+  - dhan_bse_id: bigint
+  - dhan_nse_id: bigint
+  - bse_ticker: text
+  - nse_ticker: text
+  # Indexes
+    idx_company_master_company_master_id: UNIQUE (company_master_id)
 
 public.master_sharpely_funds
   - plan_id: bigint
@@ -198,6 +210,7 @@ public.master_sharpely_funds
     master_sharpely_funds_amfi_code_key: UNIQUE (amfi_code)
 
 public.nseindia_corporate_actions
+  - company_master_id: text
   - symbol: text
   - series: text
   - face_value: text
@@ -217,6 +230,7 @@ public.nseindia_corporate_actions
     nseindia_corporate_actions_date_symbol_key: UNIQUE (date, symbol)
 
 public.nseindia_earnings_events
+  - company_master_id: text
   - symbol: text
   - company: text
   - industry: text

@@ -10,6 +10,7 @@ import pandas as pd
 from environs import Env
 import redis
 
+from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
 from utils import store
 from utils.date import pd_to_datetime, remove_invalid_dates
@@ -23,6 +24,10 @@ REDIS_PORT = env("REDIS_PORT")
 REDIS_SET = "bhav:parsed"
 
 rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+
+def with_company_master(df: pd.DataFrame) -> pd.DataFrame:
+    return attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
 
 
 def parse_mcap(path):
@@ -52,6 +57,7 @@ def parse_mcap(path):
         df[c] = pd.to_numeric(df[c], errors="coerce")
     unique_keys = ["date", "symbol", "series"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_mcap", unique_keys=unique_keys)
     return df
 
@@ -69,6 +75,7 @@ def parse_circuit_hit(path):
     df["date"] = for_date
     unique_keys = ["date", "symbol", "series", "circuit_hit"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(
         df,
         "nseindia_circuit_hit",
@@ -106,6 +113,7 @@ def parse_corporate_actions_bc(path):
     df = df.dropna(subset=["date", "symbol", "series", "subject"])
     unique_keys = ["date", "symbol", "series", "subject"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_corporate_actions_bc_raw", unique_keys=unique_keys, timescaledb_column="date")
     return df
 
@@ -145,6 +153,7 @@ def parse_bhavcopy(csv_path):
     df = pd_to_datetime(df, "date", formats=["%Y-%m-%d", "%d-%b-%Y", "%d-%b-%y"])
     unique_keys = ["date", "symbol", "series"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_ohlcv", unique_keys=unique_keys)
     return df
 
@@ -185,6 +194,7 @@ def parse_ohlcv(csv_path):
     df = pd_to_datetime(df, "date", formats=["%d-%b-%Y", "%d-%b-%y"])
     unique_keys = ["date", "symbol", "series"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_ohlcv", unique_keys=unique_keys)
     return df
 
@@ -262,6 +272,7 @@ def parse_reg(path):
     df["date"] = for_date
     unique_keys = ["date", "symbol"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_reg", unique_keys=unique_keys)
     return df
 
@@ -278,6 +289,7 @@ def parse_pe(path):
     df["date"] = for_date
     unique_keys = ["date", "symbol"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_pe", unique_keys=unique_keys)
     return df
 
@@ -305,6 +317,7 @@ def parse_mto(path):
     )
     unique_keys = ["date", "symbol"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_mto", unique_keys=unique_keys)
     return df
 
@@ -329,6 +342,7 @@ def parse_csqr(path):
     df["official_close"] = pd.to_numeric(df["official_close"], errors="coerce")
     unique_keys = ["date", "symbol", "settlement_number"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(
         df, "nseindia_csqr", unique_keys=unique_keys
     )
@@ -363,6 +377,7 @@ def parse_cmvolt(path):
 
     unique_keys = ["date", "symbol"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_cmvolt", unique_keys=unique_keys)
     return df
 
@@ -405,6 +420,7 @@ def parse_var1(path):
     df["entry_number"] = entry_number
     unique_keys = ["for_date", "entry_number", "series", "symbol", "isin"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
     upsert_to_db(df, "nseindia_var1", unique_keys=unique_keys)
     return df
 
@@ -452,6 +468,7 @@ def parse_catg(path):
     # Also, the same symbol and isin can be a part of more than one series e.g. SHAKTIPUMP is traded in
     # series BE and EQ
     # When company changes its name, symbol also changes but ISIN remains the same
+    df = with_company_master(df)
     upsert_to_db(
         df, "nseindia_catg", unique_keys=["for_month", "series", "symbol", "isin"]
     )

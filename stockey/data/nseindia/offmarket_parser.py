@@ -4,6 +4,7 @@ import pandas as pd
 from environs import Env
 import redis
 
+from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
 from utils import store
 
@@ -38,6 +39,7 @@ def process_csv(file_name, csv_path):
         raise ValueError("file %s type not supported" % file_name)
 
     df['date'] = pd.to_datetime(df['date'])
+    df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
     upsert_to_db(df, f"nseindia_{dtype}", unique_keys=unique_keys)
     rop.sadd(REDIS_SET, file_name)
     os.remove(csv_path)

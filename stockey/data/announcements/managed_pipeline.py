@@ -7,7 +7,7 @@ from typing import List, Optional, Sequence
 
 import pytz
 
-from .db import load_companies_by_ticker
+from .db import load_company_master_targets
 from .models import Announcement
 from .pipeline import AnnouncementPipeline
 from .state import (
@@ -51,10 +51,10 @@ class ManagedAnnouncementPipeline:
         exchanges: Optional[Sequence[str]] = None,
         parse_reports: Optional[Sequence[str]] = None,
     ) -> IngestSummary:
-        targets = list(load_companies_by_ticker(ticker=ticker, exchanges=exchanges))
+        targets = list(load_company_master_targets(ticker=ticker, exchanges=exchanges))
         summary = IngestSummary(requested=len(targets))
         if not targets:
-            raise ValueError(f"No tracked company found for ticker: {ticker}")
+            raise ValueError(f"No company master mapping found for ticker: {ticker}")
 
         start_dt = self._date_start(from_date)
         end_dt = self._date_end(to_date)
@@ -85,12 +85,13 @@ class ManagedAnnouncementPipeline:
 
                 if not announcement.three_page_ocr_text and announcement.pdf_bytes:
                     self.pipeline.ocr_first_pages([announcement])
-                    summary.ocred += 1
+                    if not announcement.ocr_error:
+                        summary.ocred += 1
                     self._persist_document(
                         announcement,
                         existing_document,
                         pdf_status="completed",
-                        ocr_status="completed",
+                        ocr_status="failed" if announcement.ocr_error else "completed",
                     )
 
                 if announcement.combined_text and not announcement.categories:
@@ -131,7 +132,7 @@ class ManagedAnnouncementPipeline:
                         existing_document,
                         pdf_status=self._document_status(existing_document, "pdf_status", announcement.pdf_bytes),
                         ocr_status=self._document_status(existing_document, "ocr_status", announcement.three_page_ocr_text),
-                        parse_status=existing_document.get("parse_status") or "completed",
+                        parse_status="completed",
                     )
                     summary.skipped += 1
                 else:

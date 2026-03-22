@@ -23,6 +23,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/rbi/download_bank_rates.py` | `rbi_bank_rates` | RBI key policy rates |
 | `data/rbi/download_fbil_gsec.py` | `fbil_gsec_quote`, `fbil_gsec_par` | G-sec quotes + par curve |
 | `data/sharpelydata/scrip_master.py` | `master_sharpely_funds`, `master_sharpely_equity` | Security masters |
+| `data/company_master.py` | `company_master` | Unified company identity built from Sharpely + Dhan masters |
 | `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap` | Fundamental data |
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
 | `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives |
@@ -33,9 +34,11 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/nseindia/corporate_actions.py` | `nseindia_corporate_actions` | Corporate actions |
 | `data/nseindia/earnings_events.py` | `nseindia_earnings_events` | Earnings calendar |
 | `data/nseindia/insider_deals.py` | `nseindia_insider_deals` | Insider deals |
-| `data/nseindia/offmarket_parser.py` | `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_shortselling` | Off-market parsers |
+| `data/nseindia/offmarket_parser.py` | `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_short_selling` | Off-market parsers |
 | `data/nseindia/recent_events.py` | `nseindia_events` | NSE event feed |
 | `data/nseindia/holidays.py` | `nseindia_holidays` | Trading holidays |
+| `data/announcements/cli.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Exchange announcement ingest keyed by `company_master_id` |
+| `data/backfill_company_master_ids.py` | many existing symbol-based tables | Adds and backfills `company_master_id` on historical rows |
 
 ## Management scripts
 
@@ -74,6 +77,7 @@ python -m data.nseindia.insider_deals
 python -m data.nseindia.adjusted_prices --only all
 python -m data.nseindia.security_history
 python -m data.nseindia.security_dimension
+python -m data.announcements.cli --ticker SHAKTIPUMP --exchange NSE --from-date 2026-03-01 --to-date 2026-03-22
 python -m features.price_daily
 ```
 
@@ -149,3 +153,4 @@ If you expose these through tools or MCP:
 - Keep download/scrape agents separate from analysis agents.
 - Prefer the registry in [`docs/tool_registry.json`](/home/rane/code/stockey/docs/tool_registry.json) instead of hard-coding shell commands in prompts.
 - Prefer `security_id` over raw `symbol` when stitching history across renames.
+- Prefer `company_master_id` over raw exchange tickers when joining company-level datasets across NSE and BSE.

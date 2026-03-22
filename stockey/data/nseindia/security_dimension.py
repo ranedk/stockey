@@ -42,15 +42,21 @@ def build_dim_security() -> pd.DataFrame:
           AND exch_id = 'NSE'
         """
     )
-
-    sharpely = sql_to_df(
+    company_master = sql_to_df(
         """
         SELECT
-            symbol,
+            company_master_id,
+            nse_ticker AS symbol,
             bse_ticker,
-            proper_name,
+            company_name,
             sector_code
-        FROM master_sharpely_equity
+        FROM company_master cm
+        LEFT JOIN master_sharpely_equity mse
+               ON mse.symbol = cm.nse_ticker
+              AND (
+                    (mse.bse_ticker = cm.bse_ticker)
+                    OR (mse.bse_ticker IS NULL AND cm.bse_ticker IS NULL)
+                  )
         """
     )
 
@@ -65,10 +71,10 @@ def build_dim_security() -> pd.DataFrame:
     ).reset_index()
 
     dhan = dhan.sort_values(["symbol", "series"]).drop_duplicates(subset=["symbol", "series"], keep="last")
-    sharpely = sharpely.sort_values(["symbol"]).drop_duplicates(subset=["symbol"], keep="last")
+    company_master = company_master.sort_values(["symbol"]).drop_duplicates(subset=["symbol"], keep="last")
     df = latest.merge(summary, on="security_id", how="left")
     df = df.merge(dhan, on=["symbol", "series"], how="left")
-    df = df.merge(sharpely, on="symbol", how="left")
+    df = df.merge(company_master, on="symbol", how="left")
     df["is_active_recent"] = df["last_trade_date"] >= (pd.Timestamp.utcnow() - pd.Timedelta(days=31))
     df = df.sort_values(["security_id", "last_trade_date"]).drop_duplicates(subset=["security_id"], keep="last")
     return df

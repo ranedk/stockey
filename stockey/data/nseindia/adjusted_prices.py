@@ -6,6 +6,7 @@ from typing import Iterable
 import pandas as pd
 
 from data.nseindia.security_history import attach_security_identity
+from utils.company_master import attach_company_master_id
 from utils.db import sql_to_df, upsert_to_db
 
 
@@ -287,6 +288,7 @@ def sync_normalized_actions(symbols: Iterable[str] | None = None) -> pd.DataFram
     if normalized.empty:
         return normalized
 
+    normalized = attach_company_master_id(normalized, ticker_column="symbol", exchange="NSE")
     upsert_to_db(
         normalized,
         "nseindia_corporate_actions_normalized",
@@ -301,6 +303,7 @@ def sync_adjusted_prices(symbols: Iterable[str] | None = None) -> pd.DataFrame:
     if adjusted.empty:
         return adjusted
 
+    adjusted = attach_company_master_id(adjusted, ticker_column="symbol", exchange="NSE")
     upsert_to_db(
         adjusted,
         "nseindia_ohlcv_adjusted",

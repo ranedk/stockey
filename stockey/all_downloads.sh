@@ -8,6 +8,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/rane/code/stockey/.xstockey/bin/python}"
 "${PYTHON_BIN}" -m data.nseindia.holidays
 "${PYTHON_BIN}" -m data.dhanlive.scrip_master
 "${PYTHON_BIN}" -m data.sharpelydata.scrip_master
+"${PYTHON_BIN}" -m data.company_master
 
 # Macro and policy data
 "${PYTHON_BIN}" -m data.fred.us_macro

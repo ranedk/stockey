@@ -11,7 +11,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ticker", required=True)
     parser.add_argument("--from-date", required=True, type=date.fromisoformat)
     parser.add_argument("--to-date", required=True, type=date.fromisoformat)
-    parser.add_argument("--exchange", action="append", dest="exchanges")
+    parser.add_argument("--exchange", action="append", dest="exchanges", required=True)
     parser.add_argument("--report", action="append", dest="reports")
     return parser.parse_args()
 

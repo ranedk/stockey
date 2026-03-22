@@ -2,6 +2,7 @@ import hashlib
 
 import pandas as pd
 
+from utils.company_master import map_company_master_ids
 from utils.db import db_session, sql_to_df, upsert_to_db
 
 
@@ -309,6 +310,7 @@ def build_security_history() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     overrides = load_security_overrides()
     history = assign_security_identity(observations, overrides)
+    history["company_master_id"] = map_company_master_ids(history["symbol"], exchange="NSE")
     history = history.sort_values(["security_id", "effective_from", "symbol", "series", "isin"])
     review = build_review_events(history)
     return history, review

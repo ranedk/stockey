@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
+from sqlalchemy.exc import ProgrammingError
 
 from .models import Announcement, ParsedReport
 from utils.db import sql_to_df, upsert_to_db
@@ -45,7 +46,12 @@ def get_existing_documents(unique_ids: Sequence[str]) -> Dict[str, Dict]:
         FROM {DOCUMENT_TABLE}
         WHERE unique_id = ANY(%s)
     """
-    df = sql_to_df(query, params=(list(unique_ids),))
+    try:
+        df = sql_to_df(query, params=(list(unique_ids),))
+    except ProgrammingError as exc:
+        if 'relation "announcement_pipeline_documents" does not exist' in str(exc):
+            return {}
+        raise
     if df.empty:
         return {}
     rows = df.to_dict(orient="records")
@@ -60,7 +66,12 @@ def get_existing_reports(unique_ids: Sequence[str]) -> Dict[tuple[str, str], Dic
         FROM {REPORT_TABLE}
         WHERE unique_id = ANY(%s)
     """
-    df = sql_to_df(query, params=(list(unique_ids),))
+    try:
+        df = sql_to_df(query, params=(list(unique_ids),))
+    except ProgrammingError as exc:
+        if 'relation "announcement_pipeline_reports" does not exist' in str(exc):
+            return {}
+        raise
     if df.empty:
         return {}
     rows = df.to_dict(orient="records")
@@ -90,6 +101,7 @@ def save_announcement_artifacts(announcement: Announcement) -> Dict[str, str]:
         json.dumps(
             {
                 "unique_id": announcement.unique_id,
+                "company_master_id": announcement.company_master_id,
                 "exchange": announcement.exchange,
                 "ticker": announcement.ticker,
                 "company_name": announcement.company_name,
@@ -150,6 +162,7 @@ def document_row_from_announcement(
     existing_row = existing_row or {}
     return {
         "unique_id": announcement.unique_id,
+        "company_master_id": announcement.company_master_id,
         "exchange": announcement.exchange,
         "ticker": announcement.ticker,
         "company_name": announcement.company_name,
@@ -185,6 +198,7 @@ def report_rows_from_announcement(announcement: Announcement) -> List[Dict]:
         rows.append(
             {
                 "unique_id": announcement.unique_id,
+                "company_master_id": announcement.company_master_id,
                 "exchange": announcement.exchange,
                 "ticker": announcement.ticker,
                 "company_name": announcement.company_name,

@@ -9,6 +9,7 @@ from environs import Env
 from playwright.sync_api import sync_playwright
 
 from data.dhanlive.dhan_db import get_nse_equity
+from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
 from utils.sync import choose_from_date, get_db_max_date, get_redis_client, get_redis_cursor, load_tracked_symbols, normalize_date_window, parse_datetime_arg, set_redis_cursor
 
@@ -128,6 +129,7 @@ def sync_insider_deals(symbols: List[str], from_date: datetime | None = None, to
 
                 df = fetch_insider_deals(page, symbol, issuer, effective_from_date, to_date)
                 if not df.empty:
+                    df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
                     upsert_to_db(
                         df,
                         "nseindia_insider_deals",

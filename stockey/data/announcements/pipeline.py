@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import textwrap
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Type
 
@@ -14,33 +15,39 @@ from pdf2image import convert_from_bytes, pdfinfo_from_bytes
 from pydantic import BaseModel, create_model
 
 from .categorize import report_category_map
-from .models import Announcement, CompanyTarget, ParsedReport
-from .ocr import POCR
+from .models import Announcement, CompanyMasterTarget, ParsedReport
 from .prompts import CATEGORY_PROMPTS, REPORT_PROMPTS
 from .schemas import DOCUMENT_PYDANTIC_MAP, MODEL_TYPE_MAP
 from utils.http import get_dynamic_headers
 from utils.log import setup_logger
 
-logger = setup_logger()
+from environs import Env
+
+env = Env()
+env.read_env()
+logger = setup_logger("announcement_pipeline")
+
+OPENAI_API_KEY = env("OPENAI_API_KEY")
 
 
 class AnnouncementPipeline:
     def __init__(
         self,
         openai_client: Optional[OpenAI] = None,
+        ocr_engine: Optional[object] = None,
         openai_model: str = "gpt-4o-2024-08-06",
         request_timeout: int = 60,
     ) -> None:
         self.openai_client = openai_client
+        self.ocr_engine = ocr_engine
         self.openai_model = openai_model
         self.request_timeout = request_timeout
-        self.ocr_engine = POCR()
         self._bse_headers = self._build_bse_headers()
         self._nse_headers, self._nse_cookies = self._build_nse_session()
 
     def fetch_announcements(
         self,
-        companies: Sequence[CompanyTarget],
+        companies: Sequence[CompanyMasterTarget],
         since: Optional[datetime] = None,
     ) -> List[Announcement]:
         since = since or (datetime.now(tz=pytz.UTC) - timedelta(days=30))
@@ -77,6 +84,7 @@ class AnnouncementPipeline:
                 )
             response.raise_for_status()
             announcement.pdf_bytes = response.content
+            announcement.ocr_error = None
         return list(announcements)
 
     def ocr_first_pages(self, announcements: Sequence[Announcement], max_pages: int = 3) -> List[Announcement]:
@@ -87,11 +95,19 @@ class AnnouncementPipeline:
             pdf_info = pdfinfo_from_bytes(announcement.pdf_bytes)
             announcement.number_of_pages = int(pdf_info.get("Pages", 0))
             page_texts: List[str] = []
+            ocr_engine = None
             for image in images:
-                with tempfile.NamedTemporaryFile(suffix=".ppm", delete=True) as handle:
-                    image.save(handle, format="PPM")
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as handle:
+                    image.save(handle, format="PNG")
                     handle.flush()
-                    text = self.ocr_engine.ocr_page(handle.name)
+                    try:
+                        if ocr_engine is None:
+                            ocr_engine = self._get_ocr_engine()
+                        text = ocr_engine.ocr_page(handle.name)
+                    except Exception as exc:
+                        announcement.ocr_error = str(exc)
+                        logger.warning("OCR failed for %s: %s", announcement.unique_id, exc)
+                        break
                     if text:
                         page_texts.append(text)
             announcement.three_page_ocr_text = "\n\n".join(page_texts)
@@ -163,7 +179,7 @@ class AnnouncementPipeline:
 
     def process(
         self,
-        companies: Sequence[CompanyTarget],
+        companies: Sequence[CompanyMasterTarget],
         since: Optional[datetime] = None,
         parse_reports: Optional[Sequence[str]] = None,
         download_files: bool = True,
@@ -182,7 +198,7 @@ class AnnouncementPipeline:
             self.parse_categories(announcements, report_names=parse_reports)
         return announcements
 
-    def _fetch_bse_announcements(self, company: CompanyTarget, since: datetime) -> List[Announcement]:
+    def _fetch_bse_announcements(self, company: CompanyMasterTarget, since: datetime) -> List[Announcement]:
         from_date = datetime.now().strftime("%Y%m%d")
         to_date = since.astimezone(pytz.UTC).strftime("%Y%m%d")
         page_num = 1
@@ -217,7 +233,7 @@ class AnnouncementPipeline:
             page_num += 1
         return [self._normalize_bse_announcement(company, row) for row in rows]
 
-    def _fetch_nse_announcements(self, company: CompanyTarget, since: datetime) -> List[Announcement]:
+    def _fetch_nse_announcements(self, company: CompanyMasterTarget, since: datetime) -> List[Announcement]:
         response = requests.get(
             "https://www.nseindia.com/api/corporate-disclosure-getquote",
             params={
@@ -234,7 +250,7 @@ class AnnouncementPipeline:
         response.raise_for_status()
         return [self._normalize_nse_announcement(company, row) for row in response.json()]
 
-    def _normalize_bse_announcement(self, company: CompanyTarget, row: Dict) -> Announcement:
+    def _normalize_bse_announcement(self, company: CompanyMasterTarget, row: Dict) -> Announcement:
         attachment_name = (row.get("ATTACHMENTNAME") or "").strip() or None
         attachment_url = None
         if attachment_name and attachment_name.lower().endswith(".pdf"):
@@ -242,6 +258,7 @@ class AnnouncementPipeline:
         published_on = self._parse_bse_datetime(row["DT_TM"])
         exchange_published_on = self._parse_bse_datetime(row["DissemDT"])
         return Announcement(
+            company_master_id=company.company_master_id,
             exchange="BSE",
             ticker=company.ticker,
             company_name=company.company_name,
@@ -257,7 +274,7 @@ class AnnouncementPipeline:
             attachment_name=attachment_name,
         )
 
-    def _normalize_nse_announcement(self, company: CompanyTarget, row: Dict) -> Announcement:
+    def _normalize_nse_announcement(self, company: CompanyMasterTarget, row: Dict) -> Announcement:
         attachment_url = (row.get("attchmntFile") or "").strip() or None
         attachment_name = attachment_url.rsplit("/", 1)[-1] if attachment_url else None
         if attachment_name and not attachment_name.lower().endswith(".pdf"):
@@ -265,6 +282,7 @@ class AnnouncementPipeline:
         published_on = self._parse_nse_datetime(row["exchdisstime"])
         exchange_published_on = self._parse_nse_datetime(row["sort_date"])
         return Announcement(
+            company_master_id=company.company_master_id,
             exchange="NSE",
             ticker=company.ticker,
             company_name=company.company_name,
@@ -304,6 +322,7 @@ class AnnouncementPipeline:
 
     def _build_document_context(self, announcement: Announcement) -> str:
         payload = {
+            "company_master_id": announcement.company_master_id,
             "exchange": announcement.exchange,
             "ticker": announcement.ticker,
             "company_name": announcement.company_name or "",
@@ -370,22 +389,50 @@ class AnnouncementPipeline:
         return headers
 
     def _build_nse_session(self):
-        headers = get_dynamic_headers()
-        headers.update(
-            {
-                "accept": "*/*",
-                "origin": "https://www.nseindia.com",
-                "referer": "https://www.nseindia.com",
-            }
-        )
-        response = requests.get("https://www.nseindia.com", headers=headers, timeout=self.request_timeout)
-        response.raise_for_status()
-        return headers, response.cookies.get_dict()
+        last_error: Exception | None = None
+        bootstrap_urls = [
+            "https://www.nseindia.com",
+            "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+        ]
+        for attempt in range(1, 6):
+            headers = get_dynamic_headers()
+            headers.update(
+                {
+                    "accept": "*/*",
+                    "origin": "https://www.nseindia.com",
+                    "referer": "https://www.nseindia.com",
+                }
+            )
+            for bootstrap_url in bootstrap_urls:
+                try:
+                    response = requests.get(bootstrap_url, headers=headers, timeout=self.request_timeout)
+                    response.raise_for_status()
+                    return headers, response.cookies.get_dict()
+                except requests.RequestException as exc:
+                    last_error = exc
+                    logger.warning(
+                        "NSE session bootstrap failed on attempt %s for %s: %s",
+                        attempt,
+                        bootstrap_url,
+                        exc,
+                    )
+            if attempt < 5:
+                sleep_for = min(2 ** (attempt - 1), 8)
+                time.sleep(sleep_for)
+        logger.warning("Proceeding without NSE bootstrap cookies after repeated failures")
+        return headers, {}
 
     def _get_openai_client(self) -> OpenAI:
         if self.openai_client is None:
-            self.openai_client = OpenAI()
+            self.openai_client = OpenAI(api_key=OPENAI_API_KEY)
         return self.openai_client
+
+    def _get_ocr_engine(self):
+        if self.ocr_engine is None:
+            from .ocr import POCR
+
+            self.ocr_engine = POCR()
+        return self.ocr_engine
 
     @staticmethod
     def _dedupe_announcements(items: Sequence[Announcement]) -> List[Announcement]:

@@ -38,6 +38,7 @@ def get_latest_from_sharpely(headers):
     ]
 
     stock_keys = [
+        "sharpely_id",
         "symbol",
         "bse_ticker",
         "proper_name",

@@ -5,6 +5,7 @@ from datetime import datetime
 import pandas as pd
 from environs import Env
 
+from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
 from utils.http import get_with_retries
 from utils.date import last_of_month
@@ -137,6 +138,7 @@ def get_financial_statement(symbol: str, from_date: datetime | None = None, to_d
         df = filter_by_date_range(df, from_date, to_date)
         if df.empty:
             continue
+        df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
         upsert_to_db(
             df,
             table_name,
@@ -195,6 +197,7 @@ def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: da
         df["symbol"] = symbol
         df = filter_by_date_range(df, from_date, to_date)
         if not df.empty:
+            df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
             upsert_to_db(
                 df,
                 "shareholding_category",
@@ -227,6 +230,7 @@ def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: da
     df = filter_by_date_range(df, from_date, to_date)
     if df.empty:
         return
+    df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
     upsert_to_db(
         df,
         "shareholding_top_holders",
@@ -264,6 +268,7 @@ def get_historical_mcap(symbol: str, from_date: datetime | None = None, to_date:
     df = filter_by_date_range(df, from_date, to_date)
     if df.empty:
         return
+    df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
     upsert_to_db(
         df,
         "historical_mcap",
