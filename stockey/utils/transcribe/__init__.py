@@ -1,6 +1,7 @@
 from .llm_transcribe import (
     DEFAULT_GEMINI_MODEL,
     DEFAULT_OPENAI_MODEL,
+    transcribe_audio_bytes,
     transcribe_audio_url,
     transcribe_with_gemini,
     transcribe_with_openai,
@@ -9,6 +10,7 @@ from .llm_transcribe import (
 __all__ = [
     "DEFAULT_GEMINI_MODEL",
     "DEFAULT_OPENAI_MODEL",
+    "transcribe_audio_bytes",
     "transcribe_audio_url",
     "transcribe_with_gemini",
     "transcribe_with_openai",

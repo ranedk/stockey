@@ -45,13 +45,53 @@ class Announcement:
     exchange_published_on: datetime
     attachment_url: Optional[str] = None
     attachment_name: Optional[str] = None
-    pdf_bytes: Optional[bytes] = field(default=None, repr=False)
+    attachment_content_type: Optional[str] = None
+    attachment_bytes: Optional[bytes] = field(default=None, repr=False)
     number_of_pages: Optional[int] = None
     three_page_ocr_text: str = ""
+    full_ocr_text: str = ""
+    audio_attachment_url: Optional[str] = None
+    audio_attachment_name: Optional[str] = None
+    audio_transcript_text: str = ""
+    concise_summary_text: str = ""
     ocr_error: Optional[str] = None
     categories: List[str] = field(default_factory=list)
     parsed_reports: List[ParsedReport] = field(default_factory=list)
 
     @property
     def combined_text(self) -> str:
-        return "\n".join(part for part in [self.text, self.three_page_ocr_text] if part)
+        return "\n".join(
+            part
+            for part in [
+                self.text,
+                self.three_page_ocr_text,
+                self.full_ocr_text,
+                self.audio_transcript_text,
+            ]
+            if part
+        )
+
+    def attachment_extension(self) -> str:
+        if self.attachment_name and "." in self.attachment_name:
+            return self.attachment_name.rsplit(".", 1)[-1].lower()
+        if not self.attachment_content_type:
+            return ""
+        if "pdf" in self.attachment_content_type:
+            return "pdf"
+        if "mpeg" in self.attachment_content_type or "mp3" in self.attachment_content_type:
+            return "mp3"
+        if "wav" in self.attachment_content_type:
+            return "wav"
+        if "mp4" in self.attachment_content_type:
+            return "mp4"
+        if "ogg" in self.attachment_content_type:
+            return "ogg"
+        if "webm" in self.attachment_content_type:
+            return "webm"
+        return ""
+
+    def is_pdf_attachment(self) -> bool:
+        return self.attachment_extension() == "pdf"
+
+    def is_audio_attachment(self) -> bool:
+        return self.attachment_extension() in {"mp3", "wav", "mp4", "m4a", "aac", "ogg", "webm"}

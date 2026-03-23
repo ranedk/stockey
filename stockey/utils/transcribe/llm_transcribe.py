@@ -50,6 +50,14 @@ def cleanup_temp_file(path: str) -> None:
         pass
 
 
+def persist_bytes_to_temp_file(data: bytes, suffix: str) -> str:
+    handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    handle.write(data)
+    handle.flush()
+    handle.close()
+    return handle.name
+
+
 def transcribe_with_openai(
     audio_path: str,
     *,
@@ -155,6 +163,27 @@ def transcribe_audio_url(
     gemini_model: str = DEFAULT_GEMINI_MODEL,
 ) -> dict[str, str]:
     temp_path, mime_type = download_audio_file(audio_url)
+    try:
+        results: dict[str, str] = {}
+        if provider in {"openai", "both"}:
+            results["openai"] = transcribe_with_openai(temp_path, model=openai_model)
+        if provider in {"gemini", "both"}:
+            results["gemini"] = transcribe_with_gemini(temp_path, mime_type=mime_type, model=gemini_model)
+        return results
+    finally:
+        cleanup_temp_file(temp_path)
+
+
+def transcribe_audio_bytes(
+    audio_bytes: bytes,
+    *,
+    suffix: str,
+    mime_type: str,
+    provider: Provider = "both",
+    openai_model: str = DEFAULT_OPENAI_MODEL,
+    gemini_model: str = DEFAULT_GEMINI_MODEL,
+) -> dict[str, str]:
+    temp_path = persist_bytes_to_temp_file(audio_bytes, suffix=suffix)
     try:
         results: dict[str, str] = {}
         if provider in {"openai", "both"}:

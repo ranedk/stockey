@@ -195,7 +195,9 @@ Extract structured **debt capital details** from the provided **conference call 
         is_table=False,
         query="",
     ),
-    "EmployeeCount": PromptDefinition(name="EmployeeCount", prompt="", is_table=False, query=""),
+    "EmployeeCount": PromptDefinition(
+        name="EmployeeCount", prompt="", is_table=False, query=""
+    ),
     "FundRaise": PromptDefinition(
         name="FundRaise",
         prompt="""### **Goal**:

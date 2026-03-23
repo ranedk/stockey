@@ -123,6 +123,15 @@ python -m data.announcements.cli --ticker SHAKTIPUMP --exchange NSE --from-date 
 python -m features.price_daily
 ```
 
+Announcement pipeline model controls:
+
+```sh
+OCR_USING=gemini-3-flash-preview \
+TRANSCRIBE_WITH=gemini-3-flash-preview \
+SUMMARIZE_WITH=gpt-5-mini-2025-08-07 \
+python -m data.announcements.cli --ticker SHAKTIPUMP --exchange NSE --from-date 2026-03-01 --to-date 2026-03-22
+```
+
 ## Dhan usage
 
 ### OHLCV

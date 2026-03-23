@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
@@ -34,6 +34,9 @@ def build_artifact_keys(announcement: Announcement) -> Dict[str, str]:
         "raw": f"{prefix}/raw_announcement.json",
         "pdf": f"{prefix}/source_document.{extension}",
         "ocr": f"{prefix}/ocr_first_3_pages.txt",
+        "full_ocr": f"{prefix}/ocr_full_document.txt",
+        "audio_transcript": f"{prefix}/audio_transcript.txt",
+        "concise_summary": f"{prefix}/concise_summary.txt",
         "reports_prefix": f"{prefix}/parsed_reports",
     }
 
@@ -78,7 +81,7 @@ def get_existing_reports(unique_ids: Sequence[str]) -> Dict[tuple[str, str], Dic
     return {(row["unique_id"], row["report_name"]): row for row in rows}
 
 
-def load_pdf_bytes(document_row: Dict) -> Optional[bytes]:
+def load_attachment_bytes(document_row: Dict) -> Optional[bytes]:
     key = document_row.get("pdf_s3_key")
     if not key:
         return None
@@ -89,6 +92,33 @@ def load_ocr_text(document_row: Dict) -> str:
     if document_row.get("three_page_ocr_text"):
         return document_row["three_page_ocr_text"]
     key = document_row.get("ocr_s3_key")
+    if not key:
+        return ""
+    return get_file_content(key).decode("utf-8")
+
+
+def load_full_ocr_text(document_row: Dict) -> str:
+    if document_row.get("full_ocr_text"):
+        return document_row["full_ocr_text"]
+    key = document_row.get("full_ocr_s3_key")
+    if not key:
+        return ""
+    return get_file_content(key).decode("utf-8")
+
+
+def load_audio_transcript_text(document_row: Dict) -> str:
+    if document_row.get("audio_transcript_text"):
+        return document_row["audio_transcript_text"]
+    key = document_row.get("audio_transcript_s3_key")
+    if not key:
+        return ""
+    return get_file_content(key).decode("utf-8")
+
+
+def load_concise_summary_text(document_row: Dict) -> str:
+    if document_row.get("concise_summary_text"):
+        return document_row["concise_summary_text"]
+    key = document_row.get("concise_summary_s3_key")
     if not key:
         return ""
     return get_file_content(key).decode("utf-8")
@@ -117,10 +147,16 @@ def save_announcement_artifacts(announcement: Announcement) -> Dict[str, str]:
             default=str,
         ),
     )
-    if announcement.pdf_bytes:
-        save_file_content(keys["pdf"], announcement.pdf_bytes)
+    if announcement.attachment_bytes:
+        save_file_content(keys["pdf"], announcement.attachment_bytes)
     if announcement.three_page_ocr_text:
         save_file_content(keys["ocr"], announcement.three_page_ocr_text)
+    if announcement.full_ocr_text:
+        save_file_content(keys["full_ocr"], announcement.full_ocr_text)
+    if announcement.audio_transcript_text:
+        save_file_content(keys["audio_transcript"], announcement.audio_transcript_text)
+    if announcement.concise_summary_text:
+        save_file_content(keys["concise_summary"], announcement.concise_summary_text)
     return keys
 
 
@@ -157,7 +193,7 @@ def document_row_from_announcement(
     parse_status: Optional[str] = None,
     error: Optional[str] = None,
 ) -> Dict:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     storage_keys = storage_keys or build_artifact_keys(announcement)
     existing_row = existing_row or {}
     return {
@@ -174,15 +210,51 @@ def document_row_from_announcement(
         "exchange_published_on": announcement.exchange_published_on,
         "attachment_url": announcement.attachment_url,
         "attachment_name": announcement.attachment_name,
+        "attachment_content_type": announcement.attachment_content_type,
+        "audio_attachment_url": announcement.audio_attachment_url,
+        "audio_attachment_name": announcement.audio_attachment_name,
         "storage_prefix": storage_keys["prefix"],
         "raw_s3_key": storage_keys["raw"],
-        "pdf_s3_key": existing_row.get("pdf_s3_key") or (storage_keys["pdf"] if announcement.pdf_bytes else None),
-        "ocr_s3_key": existing_row.get("ocr_s3_key") or (storage_keys["ocr"] if announcement.three_page_ocr_text else None),
+        "pdf_s3_key": existing_row.get("pdf_s3_key")
+        or (storage_keys["pdf"] if announcement.attachment_bytes else None),
+        "ocr_s3_key": existing_row.get("ocr_s3_key")
+        or (storage_keys["ocr"] if announcement.three_page_ocr_text else None),
+        "full_ocr_s3_key": existing_row.get("full_ocr_s3_key")
+        or (storage_keys["full_ocr"] if announcement.full_ocr_text else None),
+        "audio_transcript_s3_key": existing_row.get("audio_transcript_s3_key")
+        or (storage_keys["audio_transcript"] if announcement.audio_transcript_text else None),
+        "concise_summary_s3_key": existing_row.get("concise_summary_s3_key")
+        or (storage_keys["concise_summary"] if announcement.concise_summary_text else None),
         "number_of_pages": announcement.number_of_pages,
-        "three_page_ocr_text": announcement.three_page_ocr_text or existing_row.get("three_page_ocr_text"),
+        "three_page_ocr_text": announcement.three_page_ocr_text
+        or existing_row.get("three_page_ocr_text"),
+        "full_ocr_text": announcement.full_ocr_text or existing_row.get("full_ocr_text"),
+        "audio_transcript_text": announcement.audio_transcript_text
+        or existing_row.get("audio_transcript_text"),
+        "concise_summary_text": announcement.concise_summary_text
+        or existing_row.get("concise_summary_text"),
         "categories_json": json.dumps(announcement.categories),
-        "pdf_status": pdf_status or existing_row.get("pdf_status") or ("completed" if announcement.pdf_bytes else "pending"),
-        "ocr_status": ocr_status or existing_row.get("ocr_status") or ("completed" if announcement.three_page_ocr_text else "pending"),
+        "parsed_reports_json": json.dumps(
+            [
+                {
+                    "category": report.category,
+                    "report_name": report.report_name,
+                    "model_name": report.model_name,
+                    "data": report.data,
+                }
+                for report in announcement.parsed_reports
+            ],
+            ensure_ascii=True,
+            default=str,
+        )
+        if announcement.parsed_reports
+        else existing_row.get("parsed_reports_json"),
+        "pdf_status": pdf_status
+        or existing_row.get("pdf_status")
+        or ("completed" if announcement.attachment_bytes else "pending"),
+        "ocr_status": ocr_status
+        or existing_row.get("ocr_status")
+        or ("completed" if announcement.three_page_ocr_text else "pending"),
         "parse_status": parse_status or existing_row.get("parse_status") or "pending",
         "last_error": error,
         "created_at": existing_row.get("created_at") or now,
@@ -191,7 +263,7 @@ def document_row_from_announcement(
 
 
 def report_rows_from_announcement(announcement: Announcement) -> List[Dict]:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     rows: List[Dict] = []
     for report in announcement.parsed_reports:
         report_s3_key = save_report_artifact(announcement, report)

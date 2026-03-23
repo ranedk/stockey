@@ -12,10 +12,13 @@ from .models import Announcement
 from .pipeline import AnnouncementPipeline
 from .state import (
     document_row_from_announcement,
+    load_audio_transcript_text,
     get_existing_documents,
     get_existing_reports,
+    load_attachment_bytes,
+    load_concise_summary_text,
+    load_full_ocr_text,
     load_ocr_text,
-    load_pdf_bytes,
     report_rows_from_announcement,
     save_announcement_artifacts,
     upsert_documents,
@@ -83,7 +86,7 @@ class ManagedAnnouncementPipeline:
                         pdf_status="completed",
                     )
 
-                if not announcement.three_page_ocr_text and announcement.pdf_bytes:
+                if not announcement.three_page_ocr_text and announcement.attachment_bytes:
                     self.pipeline.ocr_first_pages([announcement])
                     if not announcement.ocr_error:
                         summary.ocred += 1
@@ -100,9 +103,31 @@ class ManagedAnnouncementPipeline:
                     self._persist_document(
                         announcement,
                         existing_document,
-                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.pdf_bytes),
-                        ocr_status=self._document_status(existing_document, "ocr_status", announcement.three_page_ocr_text),
+                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.attachment_bytes),
+                        ocr_status=self._document_status(
+                            existing_document,
+                            "ocr_status",
+                            announcement.three_page_ocr_text or announcement.full_ocr_text or announcement.audio_transcript_text,
+                        ),
                     )
+
+                if announcement.categories and self.pipeline.requires_full_ocr(announcement):
+                    if not announcement.full_ocr_text and announcement.attachment_bytes:
+                        self.pipeline.ocr_full_documents([announcement])
+                        self._persist_document(
+                            announcement,
+                            existing_document,
+                            pdf_status=self._document_status(existing_document, "pdf_status", announcement.attachment_bytes),
+                            ocr_status="failed" if announcement.ocr_error else "completed",
+                        )
+                    if self.pipeline.should_transcribe_earnings_audio(announcement) and not announcement.audio_transcript_text:
+                        self.pipeline.transcribe_earnings_call_audio([announcement])
+                        self._persist_document(
+                            announcement,
+                            existing_document,
+                            pdf_status=self._document_status(existing_document, "pdf_status", announcement.attachment_bytes),
+                            ocr_status="failed" if announcement.ocr_error else "completed",
+                        )
 
                 missing_reports = self._missing_reports(
                     announcement,
@@ -122,16 +147,24 @@ class ManagedAnnouncementPipeline:
                     self._persist_document(
                         announcement,
                         existing_document,
-                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.pdf_bytes),
-                        ocr_status=self._document_status(existing_document, "ocr_status", announcement.three_page_ocr_text),
+                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.attachment_bytes),
+                        ocr_status=self._document_status(
+                            existing_document,
+                            "ocr_status",
+                            announcement.three_page_ocr_text or announcement.full_ocr_text or announcement.audio_transcript_text,
+                        ),
                         parse_status="completed",
                     )
                 elif announcement.categories:
                     self._persist_document(
                         announcement,
                         existing_document,
-                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.pdf_bytes),
-                        ocr_status=self._document_status(existing_document, "ocr_status", announcement.three_page_ocr_text),
+                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.attachment_bytes),
+                        ocr_status=self._document_status(
+                            existing_document,
+                            "ocr_status",
+                            announcement.three_page_ocr_text or announcement.full_ocr_text or announcement.audio_transcript_text,
+                        ),
                         parse_status="completed",
                     )
                     summary.skipped += 1
@@ -139,13 +172,27 @@ class ManagedAnnouncementPipeline:
                     self._persist_document(
                         announcement,
                         existing_document,
-                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.pdf_bytes),
-                        ocr_status=self._document_status(existing_document, "ocr_status", announcement.three_page_ocr_text),
+                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.attachment_bytes),
+                        ocr_status=self._document_status(
+                            existing_document,
+                            "ocr_status",
+                            announcement.three_page_ocr_text or announcement.full_ocr_text or announcement.audio_transcript_text,
+                        ),
                         parse_status="skipped",
                     )
                     summary.skipped += 1
 
-                announcement.pdf_bytes = None
+                if announcement.combined_text and not announcement.concise_summary_text:
+                    self.pipeline.summarize_concisely([announcement])
+                    self._persist_document(
+                        announcement,
+                        existing_document,
+                        pdf_status=self._document_status(existing_document, "pdf_status", announcement.attachment_bytes),
+                        ocr_status=self._document_status(existing_document, "ocr_status", announcement.three_page_ocr_text or announcement.full_ocr_text or announcement.audio_transcript_text),
+                        parse_status=self._document_status(existing_document, "parse_status", announcement.concise_summary_text or announcement.parsed_reports),
+                    )
+
+                announcement.attachment_bytes = None
             except Exception as exc:
                 logger.exception("Failed announcement %s", announcement.unique_id)
                 summary.failed += 1
@@ -182,13 +229,19 @@ class ManagedAnnouncementPipeline:
         categories_json = existing_document.get("categories_json")
         if categories_json:
             announcement.categories = json.loads(categories_json)
+        announcement.three_page_ocr_text = load_ocr_text(existing_document)
+        announcement.full_ocr_text = load_full_ocr_text(existing_document)
+        announcement.audio_transcript_text = load_audio_transcript_text(existing_document)
+        announcement.concise_summary_text = load_concise_summary_text(existing_document)
         if existing_document.get("ocr_status") == "completed":
-            announcement.three_page_ocr_text = load_ocr_text(existing_document)
             announcement.number_of_pages = existing_document.get("number_of_pages")
+        announcement.audio_attachment_url = existing_document.get("audio_attachment_url")
+        announcement.audio_attachment_name = existing_document.get("audio_attachment_name")
 
     def _ensure_downloaded(self, announcement: Announcement, existing_document: dict) -> None:
         if existing_document.get("pdf_status") == "completed" and existing_document.get("pdf_s3_key"):
-            announcement.pdf_bytes = load_pdf_bytes(existing_document)
+            announcement.attachment_bytes = load_attachment_bytes(existing_document)
+            announcement.attachment_content_type = existing_document.get("attachment_content_type")
             return
         self.pipeline.download_announcements([announcement])
         save_announcement_artifacts(announcement)
