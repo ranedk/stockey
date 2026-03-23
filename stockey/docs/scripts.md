@@ -30,6 +30,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/dhanlive/screener.py` | `dhan_screener_snapshots` | Stores rendered ScanX screener `ng-state` JSON by screener slug and date |
 | `data/dhanlive/screener_registry.py` | `dhan_screeners` | Registry utility to add/list/remove screeners and inspect latest stored snapshots |
 | `utils/ocr` | none | Provider-agnostic PDF OCR utility using Gemini 3 Flash preview and OpenAI GPT-5 nano |
+| `utils/transcribe` | none | Audio transcription utility for remote mp3/wav/mp4 links using Gemini 3 Flash preview and OpenAI transcription APIs |
 | `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives |
 | `data/nseindia/adjusted_prices.py` | `nseindia_corporate_actions_normalized`, `nseindia_ohlcv_adjusted` | Normalizes action text and builds split/bonus-adjusted OHLCV |
 | `data/nseindia/security_history.py` | `dim_security_history`, `dim_security_review_events`, `dim_security_overrides` | Builds canonical security identity history and review queue for renames / identity breaks |
@@ -110,6 +111,8 @@ python -m data.dhanlive.screener_registry latest --screener momentum-stocks-2902
 python -m data.dhanlive.screener https://scanx.trade/stock-screener/momentum-stocks-290258
 python -m utils.ocr /tmp/sample.pdf --provider gemini --pages 1
 python -m utils.ocr /tmp/sample.pdf --provider openai --pages 1,3-5
+python -m utils.transcribe https://example.com/audio.mp3 --provider gemini
+python -m utils.transcribe https://example.com/audio.mp4 --provider openai
 python -m data.nseindia.corporate_actions --symbols RELIANCE,TCS
 python -m data.nseindia.earnings_events
 python -m data.nseindia.insider_deals
@@ -230,6 +233,51 @@ Output shape:
 
 - JSON object keyed by provider
 - each provider contains page-number-to-text mappings
+
+## Audio transcription usage
+
+Module: `utils.transcribe`
+
+Purpose:
+
+- download an audio URL
+- transcribe the spoken content
+- support OpenAI, Gemini, or both
+
+Accepted inputs:
+
+- `mp3`
+- `wav`
+- `mp4`
+- other formats supported by the provider APIs, as long as the URL is downloadable
+
+Providers:
+
+- OpenAI transcription model: `gpt-4o-mini-transcribe`
+- Gemini audio understanding model: `gemini-3-flash-preview`
+
+Note:
+
+- OpenAI GPT-5 nano does not currently support audio input, so the OpenAI side uses the official transcription model instead.
+
+Auth:
+
+- reads `OPENAI_API_KEY` from `.env`
+- reads `GEMINI_KEY` from `.env`
+
+Commands:
+
+```sh
+python -m utils.transcribe https://example.com/audio.mp3
+python -m utils.transcribe https://example.com/audio.wav --provider gemini
+python -m utils.transcribe https://example.com/audio.mp4 --provider openai
+python -m utils.transcribe https://example.com/audio.mp3 --provider both
+```
+
+Output shape:
+
+- JSON object keyed by provider
+- each provider contains the transcribed text string
 
 Recommended order for the identity-aware NSE pipeline:
 

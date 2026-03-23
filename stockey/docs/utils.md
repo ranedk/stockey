@@ -46,6 +46,38 @@ Tested locally with:
 /home/rane/code/stockey/.xstockey/bin/python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider openai --pages 1
 ```
 
+## Transcribe audio from URLs
+
+The transcription utility lives under [`utils/transcribe`](/home/rane/code/stockey/utils/transcribe).
+
+It:
+
+- downloads an audio file from a URL
+- sends it to OpenAI or Gemini
+- returns plain transcript text in JSON
+
+Examples:
+
+```sh
+python -m utils.transcribe https://example.com/audio.mp3
+python -m utils.transcribe https://example.com/audio.wav --provider gemini
+python -m utils.transcribe https://example.com/audio.mp4 --provider openai
+python -m utils.transcribe https://example.com/audio.mp3 --provider both
+```
+
+Model notes:
+
+- Gemini uses `gemini-3-flash-preview`
+- OpenAI uses `gpt-4o-mini-transcribe`
+- GPT-5 nano is not used for audio because OpenAI does not currently support audio input on that model
+
+Tested locally with a generated mp3 served over localhost:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python -m utils.transcribe http://127.0.0.1:8765/sample.mp3 --provider openai
+/home/rane/code/stockey/.xstockey/bin/python -m utils.transcribe http://127.0.0.1:8765/sample.mp3 --provider gemini
+```
+
 ## Review security identity issues
 
 ```sh
