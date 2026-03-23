@@ -26,6 +26,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/company_master.py` | `company_master` | Unified company identity built from Sharpely + Dhan masters |
 | `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap` | Fundamental data |
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
+| `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan historical OHLCV keyed by `company_master_id`; daily sync overlaps recent history and refreshes full history after split/bonus actions |
 | `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives |
 | `data/nseindia/adjusted_prices.py` | `nseindia_corporate_actions_normalized`, `nseindia_ohlcv_adjusted` | Normalizes action text and builds split/bonus-adjusted OHLCV |
 | `data/nseindia/security_history.py` | `dim_security_history`, `dim_security_review_events`, `dim_security_overrides` | Builds canonical security identity history and review queue for renames / identity breaks |
@@ -71,6 +72,8 @@ Examples:
 
 ```sh
 python -m data.sharpelydata.sharpely_data --symbols RELIANCE TCS --from-date 2024-01-01 --to-date 2024-12-31
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --from-date 2024-01-01 --to-date 2026-03-22
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --intraday-interval 5 --from-date 2026-03-01 --to-date 2026-03-22
 python -m data.nseindia.corporate_actions --symbols RELIANCE,TCS
 python -m data.nseindia.earnings_events
 python -m data.nseindia.insider_deals

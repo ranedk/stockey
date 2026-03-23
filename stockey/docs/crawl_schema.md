@@ -181,6 +181,44 @@ public.company_master
   # Indexes
     idx_company_master_company_master_id: UNIQUE (company_master_id)
 
+public.dhan_ohlcv_daily
+  - company_master_id: text NOT NULL
+  - exchange: text NOT NULL
+  - ticker: text NOT NULL
+  - security_id: bigint NOT NULL
+  - exchange_segment: text NOT NULL
+  - instrument: text NOT NULL
+  - date: timestamp with time zone NOT NULL
+  - open: double precision
+  - high: double precision
+  - low: double precision
+  - close: double precision
+  - volume: double precision
+  - open_interest: double precision
+  - source_timestamp: timestamp with time zone
+  - load_ts: timestamp with time zone NOT NULL
+  # Indexes
+    dhan_ohlcv_daily_exchange_security_id_date_key: UNIQUE (exchange, security_id, date)
+
+public.dhan_ohlcv_intraday
+  - company_master_id: text NOT NULL
+  - exchange: text NOT NULL
+  - ticker: text NOT NULL
+  - security_id: bigint NOT NULL
+  - exchange_segment: text NOT NULL
+  - instrument: text NOT NULL
+  - interval_minutes: integer NOT NULL
+  - timestamp: timestamp with time zone NOT NULL
+  - open: double precision
+  - high: double precision
+  - low: double precision
+  - close: double precision
+  - volume: double precision
+  - open_interest: double precision
+  - load_ts: timestamp with time zone NOT NULL
+  # Indexes
+    dhan_ohlcv_intraday_exchange_security_id_interval_minutes_t_key: UNIQUE (exchange, security_id, interval_minutes, timestamp)
+
 public.master_sharpely_funds
   - plan_id: bigint
   - isin_code: text

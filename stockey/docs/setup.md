@@ -84,6 +84,19 @@ The repo now has three top-level orchestration layers:
 python -m data.dhanlive.scrip_master
 ```
 
+### Dhan OHLCV
+
+The Dhan historical loader supports two auth modes:
+
+- `DHAN_ACCESS_TOKEN` directly, if you already have a valid user token
+- API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, and `DHAN_API_SECRET`
+
+With the API key flow, the loader opens the Dhan consent URL in a normal browser. After login, paste the full redirected URL back into the same terminal; the loader extracts `tokenId`, exchanges it for an access token, and caches that token under `.cache/dhan_access_token.json` for later runs until expiry.
+
+```sh
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --from-date 2024-01-01 --to-date 2026-03-22
+```
+
 ### Sharpely masters
 
 ```sh
