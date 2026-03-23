@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import pandas as pd
 
 from data.dhanlive.auth import DhanAuthError
 from data.dhanlive.client import DhanAPIError, DhanHistoricalClient, candles_to_df
-from data.dhanlive.dhan_db import get_company_master_equity
+from data.dhanlive.dhan_db import resolve_dhan_identity
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import load_tracked_symbols, normalize_date_window, parse_datetime_arg
 
 
-DEFAULT_HISTORY_START = datetime(2000, 1, 1)
-DEFAULT_DAILY_OVERLAP_DAYS = 30
+DEFAULT_DAILY_YEARS = 5
+DEFAULT_INTRADAY_DAYS = 1
 INTRADAY_MAX_WINDOW_DAYS = 90
 SUPPORTED_INTRADAY_INTERVALS = (1, 5, 15, 25, 60)
 
@@ -28,7 +28,8 @@ def ensure_ohlcv_tables() -> None:
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {DAILY_TABLE} (
-                company_master_id TEXT NOT NULL,
+                company_master_id TEXT,
+                asset_type TEXT NOT NULL,
                 exchange TEXT NOT NULL,
                 ticker TEXT NOT NULL,
                 security_id BIGINT NOT NULL,
@@ -50,7 +51,8 @@ def ensure_ohlcv_tables() -> None:
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {INTRADAY_TABLE} (
-                company_master_id TEXT NOT NULL,
+                company_master_id TEXT,
+                asset_type TEXT NOT NULL,
                 exchange TEXT NOT NULL,
                 ticker TEXT NOT NULL,
                 security_id BIGINT NOT NULL,
@@ -69,37 +71,18 @@ def ensure_ohlcv_tables() -> None:
             )
             """
         )
+        cur.execute(f"ALTER TABLE {DAILY_TABLE} ALTER COLUMN company_master_id DROP NOT NULL")
+        cur.execute(f"ALTER TABLE {INTRADAY_TABLE} ALTER COLUMN company_master_id DROP NOT NULL")
+        cur.execute(f"ALTER TABLE {DAILY_TABLE} ADD COLUMN IF NOT EXISTS asset_type TEXT")
+        cur.execute(f"ALTER TABLE {INTRADAY_TABLE} ADD COLUMN IF NOT EXISTS asset_type TEXT")
+        cur.execute(f"UPDATE {DAILY_TABLE} SET asset_type = 'stock' WHERE asset_type IS NULL")
+        cur.execute(f"UPDATE {INTRADAY_TABLE} SET asset_type = 'stock' WHERE asset_type IS NULL")
+        cur.execute(f"ALTER TABLE {DAILY_TABLE} ALTER COLUMN asset_type SET NOT NULL")
+        cur.execute(f"ALTER TABLE {INTRADAY_TABLE} ALTER COLUMN asset_type SET NOT NULL")
 
 
-def resolve_equity_identity(ticker: str, exchange: str) -> dict[str, object]:
-    company = get_company_master_equity(ticker, exchange)
-    exchange_upper = exchange.upper()
-    if exchange_upper == "NSE":
-        security_id = company.get("dhan_nse_id")
-        resolved_ticker = company.get("nse_ticker")
-        exchange_segment = "NSE_EQ"
-    elif exchange_upper == "BSE":
-        security_id = company.get("dhan_bse_id")
-        resolved_ticker = company.get("bse_ticker")
-        exchange_segment = "BSE_EQ"
-    else:
-        raise ValueError(f"Unsupported exchange: {exchange}")
-
-    if pd.isna(security_id):
-        raise ValueError(f"No Dhan security id mapped for {exchange_upper}:{ticker}")
-
-    return {
-        "company_master_id": company["company_master_id"],
-        "exchange": exchange_upper,
-        "ticker": str(resolved_ticker).strip(),
-        "security_id": int(security_id),
-        "exchange_segment": exchange_segment,
-        "instrument": "EQUITY",
-    }
-
-
-def latest_daily_snapshot(ticker: str, exchange: str) -> dict[str, datetime | None]:
-    company = get_company_master_equity(ticker, exchange)
+def latest_daily_snapshot(identifier: str, exchange: str, asset_type: str) -> dict[str, datetime | None]:
+    identity = resolve_dhan_identity(identifier, exchange, asset_type=asset_type)
     df = sql_to_df(
         f"""
         SELECT
@@ -107,10 +90,11 @@ def latest_daily_snapshot(ticker: str, exchange: str) -> dict[str, datetime | No
             MAX(date) AS max_date,
             MAX(load_ts) AS max_load_ts
         FROM {DAILY_TABLE}
-        WHERE company_master_id = %s
+        WHERE security_id = %s
           AND exchange = %s
+          AND asset_type = %s
         """,
-        params=(company["company_master_id"], exchange.upper()),
+        params=(identity["security_id"], exchange.upper(), asset_type.lower()),
     )
     if df.empty:
         return {"min_date": None, "max_date": None, "max_load_ts": None}
@@ -146,23 +130,13 @@ def has_recent_adjustment(symbol: str, latest_stored_date: datetime | None) -> b
 def choose_daily_refresh_start(
     ticker: str,
     exchange: str,
+    asset_type: str,
     explicit_from_date: datetime | None,
-    overlap_days: int = DEFAULT_DAILY_OVERLAP_DAYS,
+    years: int = DEFAULT_DAILY_YEARS,
 ) -> datetime:
     if explicit_from_date is not None:
         return explicit_from_date
-
-    snapshot = latest_daily_snapshot(ticker, exchange)
-    min_date = snapshot["min_date"]
-    max_date = snapshot["max_date"]
-    if max_date is None:
-        return DEFAULT_HISTORY_START
-
-    if exchange.upper() == "NSE" and has_recent_adjustment(ticker, max_date):
-        return min_date or DEFAULT_HISTORY_START
-
-    overlap_start = max_date - timedelta(days=overlap_days)
-    return max(overlap_start, min_date or DEFAULT_HISTORY_START)
+    return datetime.now() - timedelta(days=365 * years)
 
 
 def normalize_daily_frame(df: pd.DataFrame, identity: dict[str, object]) -> pd.DataFrame:
@@ -177,6 +151,7 @@ def normalize_daily_frame(df: pd.DataFrame, identity: dict[str, object]) -> pd.D
     )
     normalized["date"] = pd.to_datetime(trade_dates, utc=True)
     normalized["company_master_id"] = identity["company_master_id"]
+    normalized["asset_type"] = identity["asset_type"]
     normalized["exchange"] = identity["exchange"]
     normalized["ticker"] = identity["ticker"]
     normalized["security_id"] = identity["security_id"]
@@ -185,6 +160,7 @@ def normalize_daily_frame(df: pd.DataFrame, identity: dict[str, object]) -> pd.D
     normalized["load_ts"] = pd.Timestamp.utcnow()
     ordered_columns = [
         "company_master_id",
+        "asset_type",
         "exchange",
         "ticker",
         "security_id",
@@ -220,6 +196,7 @@ def normalize_intraday_frame(
     normalized = df.copy()
     normalized['timestamp'] = normalized["source_timestamp"]
     normalized["company_master_id"] = identity["company_master_id"]
+    normalized["asset_type"] = identity["asset_type"]
     normalized["exchange"] = identity["exchange"]
     normalized["ticker"] = identity["ticker"]
     normalized["security_id"] = identity["security_id"]
@@ -229,6 +206,7 @@ def normalize_intraday_frame(
     normalized["load_ts"] = pd.Timestamp.utcnow()
     ordered_columns = [
         "company_master_id",
+        "asset_type",
         "exchange",
         "ticker",
         "security_id",
@@ -260,14 +238,15 @@ def sync_daily_ohlcv(
     ticker: str,
     *,
     exchange: str = "NSE",
+    asset_type: str = "stock",
     from_date: datetime | None = None,
     to_date: datetime | None = None,
     client: DhanHistoricalClient | None = None,
 ) -> pd.DataFrame:
     ensure_ohlcv_tables()
-    identity = resolve_equity_identity(ticker, exchange)
+    identity = resolve_dhan_identity(ticker, exchange, asset_type=asset_type)
     effective_from_date, effective_to_date = normalize_date_window(
-        choose_daily_refresh_start(ticker, exchange, from_date),
+        choose_daily_refresh_start(ticker, exchange, asset_type, from_date),
         to_date,
     )
     payload = (client or DhanHistoricalClient()).fetch_daily(
@@ -302,6 +281,7 @@ def sync_intraday_ohlcv(
     ticker: str,
     *,
     exchange: str = "NSE",
+    asset_type: str = "stock",
     interval_minutes: int = 1,
     from_date: datetime | None = None,
     to_date: datetime | None = None,
@@ -311,8 +291,10 @@ def sync_intraday_ohlcv(
         raise ValueError(f"Unsupported interval: {interval_minutes}")
 
     ensure_ohlcv_tables()
-    identity = resolve_equity_identity(ticker, exchange)
+    identity = resolve_dhan_identity(ticker, exchange, asset_type=asset_type)
     effective_from_date, effective_to_date = normalize_date_window(from_date, to_date)
+    if from_date is None:
+        effective_from_date = datetime.now() - timedelta(days=DEFAULT_INTRADAY_DAYS)
     if to_date is not None and effective_to_date.time() == datetime.min.time():
         effective_to_date = effective_to_date + timedelta(days=1)
     api_client = client or DhanHistoricalClient()
@@ -351,6 +333,7 @@ def sync_many_daily(
     tickers: Iterable[str],
     *,
     exchange: str = "NSE",
+    asset_type: str = "stock",
     from_date: datetime | None = None,
     to_date: datetime | None = None,
 ) -> list[dict[str, object]]:
@@ -360,6 +343,7 @@ def sync_many_daily(
         df = sync_daily_ohlcv(
             ticker,
             exchange=exchange,
+            asset_type=asset_type,
             from_date=from_date,
             to_date=to_date,
             client=client,
@@ -367,6 +351,7 @@ def sync_many_daily(
         results.append(
             {
                 "ticker": ticker,
+                "asset_type": asset_type,
                 "exchange": exchange.upper(),
                 "rows": len(df),
                 "from_date": None if df.empty else str(df["date"].min()),
@@ -376,10 +361,51 @@ def sync_many_daily(
     return results
 
 
+def sync_many_intraday(
+    tickers: Iterable[str],
+    *,
+    exchange: str = "NSE",
+    asset_type: str = "stock",
+    interval_minutes: int = 1,
+    from_date: datetime | None = None,
+    to_date: datetime | None = None,
+) -> list[dict[str, object]]:
+    client = DhanHistoricalClient()
+    results: list[dict[str, object]] = []
+    for ticker in tickers:
+        df = sync_intraday_ohlcv(
+            ticker,
+            exchange=exchange,
+            asset_type=asset_type,
+            interval_minutes=interval_minutes,
+            from_date=from_date,
+            to_date=to_date,
+            client=client,
+        )
+        results.append(
+            {
+                "ticker": ticker,
+                "asset_type": asset_type,
+                "exchange": exchange.upper(),
+                "interval_minutes": interval_minutes,
+                "rows": len(df),
+                "from_timestamp": None if df.empty else str(df["timestamp"].min()),
+                "to_timestamp": None if df.empty else str(df["timestamp"].max()),
+            }
+        )
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Sync Dhan OHLCV history for tracked symbols")
     parser.add_argument("--symbols", nargs="*", help="Symbols, comma-separated or repeated")
     parser.add_argument("--exchange", default="NSE", choices=["NSE", "BSE"], help="Cash equity exchange")
+    parser.add_argument(
+        "--asset-type",
+        default="stock",
+        choices=["stock", "index", "benchmark"],
+        help="What the provided symbol(s) represent",
+    )
     parser.add_argument("--from-date", dest="from_date", help="Start date in YYYY-MM-DD")
     parser.add_argument("--to-date", dest="to_date", help="End date in YYYY-MM-DD")
     parser.add_argument(
@@ -387,7 +413,14 @@ def main() -> None:
         dest="intraday_interval",
         type=int,
         choices=SUPPORTED_INTRADAY_INTERVALS,
-        help="Optional intraday interval to sync instead of daily",
+        default=1,
+        help="Intraday interval to sync when intraday is enabled",
+    )
+    parser.add_argument(
+        "--only",
+        choices=["daily", "intraday", "both"],
+        default="both",
+        help="Whether to sync only daily candles, only intraday candles, or both",
     )
     args = parser.parse_args()
 
@@ -400,33 +433,26 @@ def main() -> None:
     to_date = parse_datetime_arg(args.to_date)
 
     try:
-        if args.intraday_interval:
-            for symbol in symbols:
-                df = sync_intraday_ohlcv(
-                    symbol,
-                    exchange=args.exchange,
-                    interval_minutes=args.intraday_interval,
-                    from_date=from_date,
-                    to_date=to_date,
-                )
-                print(
-                    {
-                        "ticker": symbol,
-                        "exchange": args.exchange,
-                        "interval_minutes": args.intraday_interval,
-                        "rows": len(df),
-                    },
-                    flush=True,
-                )
-            return
+        if args.only in {"daily", "both"}:
+            for row in sync_many_daily(
+                symbols,
+                exchange=args.exchange,
+                asset_type=args.asset_type,
+                from_date=from_date,
+                to_date=to_date,
+            ):
+                print({"mode": "daily", **row}, flush=True)
 
-        for row in sync_many_daily(
-            symbols,
-            exchange=args.exchange,
-            from_date=from_date,
-            to_date=to_date,
-        ):
-            print(row, flush=True)
+        if args.only in {"intraday", "both"}:
+            for row in sync_many_intraday(
+                symbols,
+                exchange=args.exchange,
+                asset_type=args.asset_type,
+                interval_minutes=args.intraday_interval,
+                from_date=from_date,
+                to_date=to_date,
+            ):
+                print({"mode": "intraday", **row}, flush=True)
     except (DhanAPIError, DhanAuthError) as exc:
         raise SystemExit(str(exc))
 

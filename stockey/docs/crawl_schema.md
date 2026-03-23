@@ -182,7 +182,8 @@ public.company_master
     idx_company_master_company_master_id: UNIQUE (company_master_id)
 
 public.dhan_ohlcv_daily
-  - company_master_id: text NOT NULL
+  - company_master_id: text
+  - asset_type: text NOT NULL
   - exchange: text NOT NULL
   - ticker: text NOT NULL
   - security_id: bigint NOT NULL
@@ -201,7 +202,8 @@ public.dhan_ohlcv_daily
     dhan_ohlcv_daily_exchange_security_id_date_key: UNIQUE (exchange, security_id, date)
 
 public.dhan_ohlcv_intraday
-  - company_master_id: text NOT NULL
+  - company_master_id: text
+  - asset_type: text NOT NULL
   - exchange: text NOT NULL
   - ticker: text NOT NULL
   - security_id: bigint NOT NULL
@@ -218,6 +220,26 @@ public.dhan_ohlcv_intraday
   - load_ts: timestamp with time zone NOT NULL
   # Indexes
     dhan_ohlcv_intraday_exchange_security_id_interval_minutes_t_key: UNIQUE (exchange, security_id, interval_minutes, timestamp)
+
+public.dhan_screener_snapshots
+  - screener_slug: text NOT NULL
+  - screener_name: text NOT NULL
+  - screener_url: text NOT NULL
+  - date: date NOT NULL
+  - raw_json: jsonb NOT NULL
+  - load_ts: timestamp with time zone NOT NULL
+  # Indexes
+    dhan_screener_snapshots_date_screener_slug_key: UNIQUE (date, screener_slug)
+
+public.dhan_screeners
+  - screener_slug: text NOT NULL
+  - screener_name: text NOT NULL
+  - screener_url: text NOT NULL
+  - is_active: boolean NOT NULL
+  - created_ts: timestamp with time zone NOT NULL
+  - updated_ts: timestamp with time zone NOT NULL
+  # Indexes
+    dhan_screeners_pkey: UNIQUE (screener_slug)
 
 public.master_sharpely_funds
   - plan_id: bigint

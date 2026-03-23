@@ -94,8 +94,31 @@ The Dhan historical loader supports two auth modes:
 With the API key flow, the loader opens the Dhan consent URL in a normal browser. After login, paste the full redirected URL back into the same terminal; the loader extracts `tokenId`, exchanges it for an access token, and caches that token under `.cache/dhan_access_token.json` for later runs until expiry.
 
 ```sh
-python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --from-date 2024-01-01 --to-date 2026-03-22
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
+python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
 ```
+
+By default the loader syncs:
+
+- 5 years of daily candles
+- the last 1 day of 1-minute intraday candles
+
+Supported asset types are `stock`, `index`, and `benchmark`.
+
+### Dhan screeners
+
+The ScanX screener downloader uses Chrome remote debugging and reads active screener URLs from `dhan_screeners`.
+
+Typical flow:
+
+```sh
+python -m data.dhanlive.screener_registry add https://scanx.trade/stock-screener/momentum-stocks-290258
+python -m data.dhanlive.screener_registry list
+python -m data.dhanlive.screener
+python -m data.dhanlive.screener_registry latest --screener momentum-stocks-290258
+```
+
+Use `--raw` with `latest` if you want the full stored JSON payload instead of the summary view.
 
 ### Sharpely masters
 

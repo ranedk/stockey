@@ -26,7 +26,9 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/company_master.py` | `company_master` | Unified company identity built from Sharpely + Dhan masters |
 | `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap` | Fundamental data |
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
-| `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan historical OHLCV keyed by `company_master_id`; daily sync overlaps recent history and refreshes full history after split/bonus actions |
+| `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync is 5 years daily plus last 1 day of 1-minute bars |
+| `data/dhanlive/screener.py` | `dhan_screener_snapshots` | Stores rendered ScanX screener `ng-state` JSON by screener slug and date |
+| `data/dhanlive/screener_registry.py` | `dhan_screeners` | Registry utility to add/list/remove screeners and inspect latest stored snapshots |
 | `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives |
 | `data/nseindia/adjusted_prices.py` | `nseindia_corporate_actions_normalized`, `nseindia_ohlcv_adjusted` | Normalizes action text and builds split/bonus-adjusted OHLCV |
 | `data/nseindia/security_history.py` | `dim_security_history`, `dim_security_review_events`, `dim_security_overrides` | Builds canonical security identity history and review queue for renames / identity breaks |
@@ -44,6 +46,31 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 ## Management scripts
 
 These are the JSON-first scripts that are easiest to call from a human shell, an LLM tool wrapper, or an MCP server shim.
+
+## General usage guidelines
+
+- Prefer `python -m ...` from the repo root so relative config and `.env` loading behave consistently.
+- Use the project venv when running ingestion jobs manually:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python -m ...
+```
+
+- Symbol-scoped loaders fall back in this order:
+  1. `--symbols`
+  2. `STOCKEY_SYMBOLS`
+  3. [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt)
+- Browser-driven loaders require Chrome remote debugging when they connect over CDP:
+
+```sh
+/opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup
+```
+
+- Dhan OHLCV auth falls back in this order:
+  1. `DHAN_ACCESS_TOKEN`
+  2. cached token at `.cache/dhan_access_token.json`
+  3. API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET`
+- In the API key flow, the script opens the Dhan consent page in the browser and waits for you to paste the redirected URL back into the terminal. The access token is then cached until expiry.
 
 ## Orchestration scripts
 
@@ -72,8 +99,14 @@ Examples:
 
 ```sh
 python -m data.sharpelydata.sharpely_data --symbols RELIANCE TCS --from-date 2024-01-01 --to-date 2024-12-31
-python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --from-date 2024-01-01 --to-date 2026-03-22
-python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --intraday-interval 5 --from-date 2026-03-01 --to-date 2026-03-22
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --only daily
+python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
+python -m data.dhanlive.ohlcv --symbols BANKNIFTY --asset-type index --exchange NSE --only intraday
+python -m data.dhanlive.screener_registry add https://scanx.trade/stock-screener/momentum-stocks-290258
+python -m data.dhanlive.screener_registry list
+python -m data.dhanlive.screener_registry latest --screener momentum-stocks-290258
+python -m data.dhanlive.screener https://scanx.trade/stock-screener/momentum-stocks-290258
 python -m data.nseindia.corporate_actions --symbols RELIANCE,TCS
 python -m data.nseindia.earnings_events
 python -m data.nseindia.insider_deals
@@ -83,6 +116,76 @@ python -m data.nseindia.security_dimension
 python -m data.announcements.cli --ticker SHAKTIPUMP --exchange NSE --from-date 2026-03-01 --to-date 2026-03-22
 python -m features.price_daily
 ```
+
+## Dhan usage
+
+### OHLCV
+
+Module: `data.dhanlive.ohlcv`
+
+Default behavior:
+
+- syncs 5 years of daily candles
+- syncs the last 1 day of 1-minute intraday candles
+- defaults to `asset_type=stock`
+- supports `asset_type=stock|index|benchmark`
+
+Common usage:
+
+```sh
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --only daily
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --only intraday
+python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
+python -m data.dhanlive.ohlcv --symbols BANKNIFTY --asset-type index --exchange NSE --only intraday
+python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --from-date 2025-01-01 --to-date 2025-12-31 --only daily
+```
+
+Operational notes:
+
+- Stocks resolve through `company_master`.
+- Indices and benchmarks resolve directly from `master_dhan_instruments`.
+- Stored tables:
+  - `dhan_ohlcv_daily`
+  - `dhan_ohlcv_intraday`
+- Key columns:
+  - `asset_type`
+  - `exchange`
+  - `ticker`
+  - `security_id`
+  - `company_master_id` for stocks, nullable for indices/benchmarks
+
+### ScanX screeners
+
+Registry utility: `data.dhanlive.screener_registry`
+
+Downloader: `data.dhanlive.screener`
+
+Recommended workflow:
+
+1. Register one or more screeners.
+2. Verify the registry contents.
+3. Let `all_downloads.sh` or `python -m data.dhanlive.screener` sync the active registry daily.
+4. Inspect latest snapshots with the registry utility.
+
+Commands:
+
+```sh
+python -m data.dhanlive.screener_registry add https://scanx.trade/stock-screener/momentum-stocks-290258
+python -m data.dhanlive.screener_registry list
+python -m data.dhanlive.screener
+python -m data.dhanlive.screener_registry latest
+python -m data.dhanlive.screener_registry latest --screener momentum-stocks-290258
+python -m data.dhanlive.screener_registry latest --screener momentum-stocks-290258 --raw
+python -m data.dhanlive.screener_registry remove momentum-stocks-290258
+```
+
+Operational notes:
+
+- `data.dhanlive.screener` uses the active rows in `dhan_screeners` when run without URL arguments.
+- `data.dhanlive.screener` can still be pointed at explicit URLs directly.
+- Snapshots are stored in `dhan_screener_snapshots` by `date + screener_slug`.
+- `latest` is compact by default; use `--raw` to print the full stored JSON payload.
 
 Recommended order for the identity-aware NSE pipeline:
 
@@ -109,6 +212,9 @@ Notes:
 - `all_daily_derivations.sh` loads symbols from [`config/watchlist_symbols.txt`](/home/rane/code/stockey/config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt)
 - `all_backfill.sh` defaults to `watchlist 5`
 - only use `TRUNCATE_DERIVED=1` when you intentionally want a full rebuild of derived price and feature tables
+- `all_downloads.sh` now includes:
+  - Dhan OHLCV sync
+  - Dhan screener sync from the active screener registry
 
 ### SQL
 

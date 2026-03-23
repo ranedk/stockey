@@ -1,3 +1,4 @@
+import pandas as pd
 from environs import Env
 
 from utils.db import get_sql, sql_to_df
@@ -37,18 +38,89 @@ def get_company_master_equity(ticker: str, exchange: str):
     return company.iloc[0]
 
 
+def get_index_instrument(symbol: str, exchange: str):
+    exchange_upper = exchange.upper()
+    symbol_upper = symbol.strip().upper()
+    query = """
+        SELECT *
+        FROM master_dhan_instruments
+        WHERE valid_to IS NULL
+          AND exch_id = %s
+          AND segment = 'I'
+          AND instrument = 'INDEX'
+          AND instrument_type = 'INDEX'
+          AND (
+                UPPER(COALESCE(underlying_symbol, '')) = %s
+             OR UPPER(COALESCE(symbol_name, '')) = %s
+             OR UPPER(COALESCE(display_name, '')) = %s
+          )
+        ORDER BY load_ts DESC, valid_from DESC
+        LIMIT 1
+    """
+    return get_sql(query, (exchange_upper, symbol_upper, symbol_upper, symbol_upper))
+
+
+def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "stock") -> dict[str, object]:
+    asset_type_lower = asset_type.lower()
+    exchange_upper = exchange.upper()
+
+    if asset_type_lower == "stock":
+        company = get_company_master_equity(identifier, exchange_upper)
+        if exchange_upper == "NSE":
+            security_id = company.get("dhan_nse_id")
+            resolved_ticker = company.get("nse_ticker")
+            exchange_segment = "NSE_EQ"
+        elif exchange_upper == "BSE":
+            security_id = company.get("dhan_bse_id")
+            resolved_ticker = company.get("bse_ticker")
+            exchange_segment = "BSE_EQ"
+        else:
+            raise ValueError(f"Unsupported exchange for stock: {exchange}")
+        if pd.isna(security_id):
+            raise ValueError(f"No Dhan security id mapped for {exchange_upper}:{identifier}")
+        return {
+            "company_master_id": company["company_master_id"],
+            "asset_type": "stock",
+            "exchange": exchange_upper,
+            "ticker": str(resolved_ticker).strip(),
+            "security_id": int(security_id),
+            "exchange_segment": exchange_segment,
+            "instrument": "EQUITY",
+        }
+
+    if asset_type_lower in {"index", "benchmark"}:
+        instrument = get_index_instrument(identifier, exchange_upper)
+        return {
+            "company_master_id": None,
+            "asset_type": asset_type_lower,
+            "exchange": exchange_upper,
+            "ticker": str(instrument.underlying_symbol).strip(),
+            "security_id": int(instrument.security_id),
+            "exchange_segment": "IDX_I",
+            "instrument": "INDEX",
+        }
+
+    raise ValueError(f"Unsupported asset_type: {asset_type}")
+
+
 def get_dhan_ohlcv_daily(
     ticker: str,
     *,
     exchange: str = "NSE",
+    asset_type: str = "stock",
     from_date: str | None = None,
     to_date: str | None = None,
 ):
-    company = get_company_master_equity(ticker, exchange)
-    conditions = ["company_master_id = %(company_master_id)s", "exchange = %(exchange)s"]
+    identity = resolve_dhan_identity(ticker, exchange, asset_type=asset_type)
+    conditions = [
+        "exchange = %(exchange)s",
+        "security_id = %(security_id)s",
+        "asset_type = %(asset_type)s",
+    ]
     params: dict[str, object] = {
-        "company_master_id": company["company_master_id"],
+        "security_id": identity["security_id"],
         "exchange": exchange.upper(),
+        "asset_type": asset_type.lower(),
     }
     if from_date:
         conditions.append("date >= %(from_date)s")
@@ -72,19 +144,22 @@ def get_dhan_ohlcv_intraday(
     ticker: str,
     *,
     exchange: str = "NSE",
+    asset_type: str = "stock",
     interval_minutes: int = 1,
     from_timestamp: str | None = None,
     to_timestamp: str | None = None,
 ):
-    company = get_company_master_equity(ticker, exchange)
+    identity = resolve_dhan_identity(ticker, exchange, asset_type=asset_type)
     conditions = [
-        "company_master_id = %(company_master_id)s",
         "exchange = %(exchange)s",
+        "security_id = %(security_id)s",
+        "asset_type = %(asset_type)s",
         "interval_minutes = %(interval_minutes)s",
     ]
     params: dict[str, object] = {
-        "company_master_id": company["company_master_id"],
+        "security_id": identity["security_id"],
         "exchange": exchange.upper(),
+        "asset_type": asset_type.lower(),
         "interval_minutes": interval_minutes,
     }
     if from_timestamp:
