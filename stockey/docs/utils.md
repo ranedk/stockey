@@ -20,6 +20,32 @@ psql --host=<server_ip> --port=5432 --username=stockey --dbname=stockey --file=<
 python -m utils.db_schema_dump --schemas public
 ```
 
+## OCR PDFs with LLMs
+
+The OCR utility lives under [`utils/ocr`](/home/rane/code/stockey/utils/ocr).
+
+It supports:
+
+- OpenAI via `OPENAI_API_KEY`
+- Gemini via `GEMINI_KEY`
+- page selection using `all`, single pages, comma lists, or ranges
+
+Examples:
+
+```sh
+python -m utils.ocr /path/to/file.pdf
+python -m utils.ocr /path/to/file.pdf --provider gemini --pages 1
+python -m utils.ocr /path/to/file.pdf --provider openai --pages 1,3-5
+python -m utils.ocr /path/to/file.pdf --provider both --pages all
+```
+
+Tested locally with:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider gemini --pages 1
+/home/rane/code/stockey/.xstockey/bin/python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider openai --pages 1
+```
+
 ## Review security identity issues
 
 ```sh
