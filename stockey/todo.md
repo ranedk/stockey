@@ -1,13 +1,15 @@
 # Investment Advisory TODO
 
-This file maps the target workflow in [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) to the current codebase state as of 2026-03-23.
+This file maps the target workflow in [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) to the current codebase state as of 2026-03-24.
 
 ## Implemented
 
 - Task 1 screener normalization:
-  - [`advisory/screener_parser.py`](/home/rane/code/stockey/advisory/screener_parser.py) materializes `advisory_screener_constituents` from `dhan_screener_snapshots`.
+  - [`data/screenerin/screener_parser.py`](/home/rane/code/stockey/data/screenerin/screener_parser.py) stores parsed Screener.in snapshots in `screenerin_screener_snapshots`.
+  - [`advisory/screener_parser.py`](/home/rane/code/stockey/advisory/screener_parser.py) materializes `advisory_screener_constituents` from `screenerin_screener_snapshots`.
 - Task 2 OHLCV ingestion foundation:
   - [`data/dhanlive/ohlcv.py`](/home/rane/code/stockey/data/dhanlive/ohlcv.py) ingests `dhan_ohlcv_daily` and `dhan_ohlcv_intraday`.
+  - Advisory technicals and rule evaluation now use Dhan as the canonical OHLCV source.
 - Task 3 macro snapshot:
   - [`advisory/macro_snapshot.py`](/home/rane/code/stockey/advisory/macro_snapshot.py) materializes `advisory_macro_daily`.
   - Existing macro tables are being reused: `rbi_bank_rates`, `fbil_gsec_par`, `mospi_cpi`, `eaindustry_wpi`, `macro_usa`.
@@ -29,6 +31,19 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
 - Task 7 watchlist layer:
   - [`advisory/watchlist_builder.py`](/home/rane/code/stockey/advisory/watchlist_builder.py) materializes `advisory_watchlist` from passed candidates.
   - [`advisory/announcement_watch.py`](/home/rane/code/stockey/advisory/announcement_watch.py) drives the managed announcement pipeline for active watchlist rows and materializes `advisory_watch_events`.
+  - [`data/economictimes/rss.py`](/home/rane/code/stockey/data/economictimes/rss.py) stores raw ET RSS items in `economictimes_rss_items`.
+  - [`advisory/news_watch.py`](/home/rane/code/stockey/advisory/news_watch.py) matches ET RSS items onto active watchlist rows and materializes `advisory_news_events`.
+- Task 8 announcement parser + LLM evaluator:
+  - [`advisory/prompts.py`](/home/rane/code/stockey/advisory/prompts.py) defines the structured event-evaluation prompt contract.
+  - [`advisory/llm_event_evaluator.py`](/home/rane/code/stockey/advisory/llm_event_evaluator.py) evaluates triggered official-announcement and ET RSS watch events with point-in-time advisory context.
+  - LLM outputs are persisted into `advisory_event_evaluations` and `advisory_event_risks`.
+- Task 9 risk profiling and allocation:
+  - [`advisory/risk_engine.py`](/home/rane/code/stockey/advisory/risk_engine.py) materializes `advisory_allocations` with risk bucket, conviction bucket, suggested allocation, and invalidation guidance.
+  - [`advisory/portfolio_engine.py`](/home/rane/code/stockey/advisory/portfolio_engine.py) materializes `advisory_portfolio_orders` with capital-aware order planning on top of `advisory_allocations`.
+  - Portfolio overlap controls are now in place using Sharpely peer clusters first and sector-code fallback groups to avoid stacking correlated names.
+  - [`advisory/position_lifecycle.py`](/home/rane/code/stockey/advisory/position_lifecycle.py) materializes `advisory_position_lifecycle` and `advisory_rebalance_actions` for paper-position monitoring and rebalance/exit suggestions.
+  - [`advisory/execution_engine.py`](/home/rane/code/stockey/advisory/execution_engine.py) materializes `advisory_execution_orders` and `advisory_execution_fills` for broker handoff and Dhan order/trade reconciliation.
+  - [`advisory/pipeline.py`](/home/rane/code/stockey/advisory/pipeline.py) orchestrates the advisory stack end to end with stage controls.
 - Agent-safe execution surface:
   - JSON runners exist in [`scripts/sql_query_runner.py`](/home/rane/code/stockey/scripts/sql_query_runner.py), [`scripts/redis_query_runner.py`](/home/rane/code/stockey/scripts/redis_query_runner.py), and [`scripts/s3_query_runner.py`](/home/rane/code/stockey/scripts/s3_query_runner.py).
   - Curated registry execution exists in [`scripts/agent_tool_runner.py`](/home/rane/code/stockey/scripts/agent_tool_runner.py).
@@ -38,8 +53,7 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
 ### Task 1. Screener crawler
 
 - Current normalized screener coverage is still shallow.
-  - `advisory_screener_constituents` currently reflects one live ScanX screener slug.
-  - All four setups are temporarily mapped onto the same screener universe in [`config/advisory_setups.yaml`](/home/rane/code/stockey/config/advisory_setups.yaml).
+  - `advisory_screener_constituents` now reads Screener.in snapshots, but the upstream source is still only the four current advisory screeners.
 - Still needed:
   - more setup-specific screeners
   - support for multiple upstream screener sources
@@ -51,9 +65,9 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
   - a unified price inventory table such as `advisory_price_inventory`
   - missing-bar detection and freshness QA
   - sector/index price coverage beyond the current peer-basket approximation
-  - a Dhan-adjusted price view if execution should depend on Dhan bars directly
-- Current blocker surfaced by the rule engine:
-  - some live screener symbols, for example `GUJALKALI`, do not yet exist in `nseindia_ohlcv_adjusted`, so they fail technical evaluation even though screener parsing works
+- Advisory design decision:
+  - `dhan_ohlcv_daily` is now the canonical OHLCV source for the advisory stack
+  - NSE bhavcopy and local adjusted-price derivations remain optional reference and reconciliation pipelines, not advisory dependencies
 
 ### Task 3. Macro crawler
 
@@ -75,7 +89,6 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
 
 - `advisory_technical_daily` exists and includes the required TA-Lib feature set.
 - Still needed:
-  - broader stock coverage in `nseindia_ohlcv_adjusted`
   - intraday feature layer for timing
   - sector/index benchmark mapping where a peer basket is not sufficient
 
@@ -94,24 +107,25 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
 - Still needed:
   - trigger taxonomy refinement by setup
   - better watch lifecycle states beyond `active`
-  - tighter filtering of which announcement categories should become material watch events
+  - tighter filtering of which announcement and ET RSS categories should become material watch events
 
 ### Task 8. Announcement parser + LLM evaluator
 
-- OCR and storage exist, but investment evaluation does not.
+- OCR, storage, and the first LLM investment-evaluation layer now exist.
 - Still needed:
-  - [`advisory/llm_event_evaluator.py`](/home/rane/code/stockey/advisory/llm_event_evaluator.py)
-  - [`advisory/prompts.py`](/home/rane/code/stockey/advisory/prompts.py)
-  - tables:
-    - `advisory_event_evaluations`
-    - `advisory_event_risks`
+  - materiality gating so only high-signal announcement and ET RSS watch events go to the evaluator by default
+  - review queue tooling for `review_manual` verdicts
+  - batch/backpressure policy for heavy announcement days
 
 ### Task 9. Risk profiling and allocation
 
-- Not implemented.
+- `advisory_allocations` now exists and is produced by [`advisory/risk_engine.py`](/home/rane/code/stockey/advisory/risk_engine.py).
+- `advisory_portfolio_orders` now exists and is produced by [`advisory/portfolio_engine.py`](/home/rane/code/stockey/advisory/portfolio_engine.py).
+- `advisory_position_lifecycle` and `advisory_rebalance_actions` now exist and are produced by [`advisory/position_lifecycle.py`](/home/rane/code/stockey/advisory/position_lifecycle.py).
+- `advisory_execution_orders` and `advisory_execution_fills` now exist and are produced by [`advisory/execution_engine.py`](/home/rane/code/stockey/advisory/execution_engine.py).
 - Still needed:
-  - [`advisory/risk_engine.py`](/home/rane/code/stockey/advisory/risk_engine.py)
-  - table `advisory_allocations`
+  - richer execution-state transitions once real fills, modifications, and partial exits exist
+  - postback/webhook ingestion so order-state updates do not depend only on polling
 
 ## Cross-cutting work still needed
 
@@ -129,11 +143,13 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
   - `advisory/rule_engine.py`
   - `advisory/watchlist_builder.py`
   - `advisory/announcement_watch.py`
-- Still needed:
+  - `advisory/news_watch.py`
   - `advisory/llm_event_evaluator.py`
   - `advisory/prompts.py`
   - `advisory/risk_engine.py`
-  - `advisory/pipeline.py`
+  - `advisory/portfolio_engine.py`
+  - `advisory/position_lifecycle.py`
+  - `advisory/execution_engine.py`
 
 ### 2. Point-in-time advisory tables
 
@@ -146,10 +162,16 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
   - `advisory_candidate_rejections`
   - `advisory_watchlist`
   - `advisory_watch_events`
-- Still needed:
+  - `economictimes_rss_items`
+  - `advisory_news_events`
   - `advisory_event_evaluations`
   - `advisory_event_risks`
   - `advisory_allocations`
+  - `advisory_portfolio_orders`
+  - `advisory_position_lifecycle`
+  - `advisory_rebalance_actions`
+  - `advisory_execution_orders`
+  - `advisory_execution_fills`
 
 ### 3. Market-cap and segment tagging
 
@@ -166,7 +188,7 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
   - macro staleness alerts
   - OHLCV gap detection
   - intraday availability checks
-  - missing-coverage reports for live screener names
+  - missing-coverage reports for live screener names in `dhan_ohlcv_daily`
   - LLM evaluation source-trace validation
 
 ### 5. JSON-first CLIs and agent tools
@@ -181,9 +203,11 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
   - `python -m advisory.rule_engine`
   - `python -m advisory.watchlist_builder`
   - `python -m advisory.announcement_watch`
-- Still needed:
   - `python -m advisory.llm_event_evaluator`
   - `python -m advisory.risk_engine`
+  - `python -m advisory.portfolio_engine`
+  - `python -m advisory.position_lifecycle`
+  - `python -m advisory.execution_engine`
   - `python -m advisory.pipeline`
 
 ### 6. Research and backtest layer
@@ -200,18 +224,19 @@ This file maps the target workflow in [`docs/implementation.md`](/home/rane/code
 
 ## Recommended next implementation order
 
-1. Expand OHLCV and adjusted-price coverage for live screener symbols so the rule engine is not blocked by missing technical snapshots.
+1. Expand Dhan OHLCV coverage for live screener symbols and add explicit OHLCV inventory/QA checks.
 2. Add a maintained market-cap / segment mapping dimension instead of setup-local heuristics.
-3. Build the LLM event evaluator and prompt contract.
-4. Build risk sizing and allocation.
-5. Add breadth, policy-window, and manual shock override inputs to `advisory_market_regime`.
-6. Refine watch-event filtering so the watch layer prioritizes only material announcement categories.
+3. Add breadth, policy-window, and manual shock override inputs to `advisory_market_regime`.
+4. Refine watch-event filtering so the watch layer prioritizes only material announcement categories before LLM evaluation.
+5. Add review-queue tooling for `review_manual` event verdicts.
+6. Add postback-driven execution updates and real partial-exit/modify/cancel flows on top of the current execution engine.
 
 ## Notes for the implementing agent
 
 - Prefer existing JSON runners in `scripts/` for inspection and verification.
 - Prefer `company_master_id` as the join key wherever possible.
 - Use point-in-time joins only. Do not use future fundamentals or macro values.
+- For advisory technicals and rule evaluation, treat `dhan_ohlcv_daily` as the canonical OHLCV source.
 - Reuse `features/tutils.py` patterns for release-aware daily snapshots.
 - Use TA-Lib for technicals, `pandas` for feature assembly, `scikit-learn` and `xgboost` only where a model is explicitly introduced.
 - Keep raw ingestion, daily snapshots, rule outputs, and LLM outputs in separate tables.

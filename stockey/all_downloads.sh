@@ -20,7 +20,7 @@ PYTHON_BIN="${PYTHON_BIN:-/home/rane/code/stockey/.xstockey/bin/python}"
 
 # Symbol-scoped fundamentals and event feeds use tracked symbols by default.
 "${PYTHON_BIN}" -m data.dhanlive.ohlcv
-"${PYTHON_BIN}" -m data.dhanlive.screener
+"${PYTHON_BIN}" -m data.screenerin.screener_parser --seed-defaults
 "${PYTHON_BIN}" -m data.sharpelydata.sharpely_data
 "${PYTHON_BIN}" -m data.nseindia.corporate_actions
 "${PYTHON_BIN}" -m data.nseindia.earnings_events

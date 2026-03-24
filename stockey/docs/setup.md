@@ -93,6 +93,14 @@ The Dhan historical loader supports two auth modes:
 
 With the API key flow, the loader opens the Dhan consent URL in a normal browser. After login, paste the full redirected URL back into the same terminal; the loader extracts `tokenId`, exchanges it for an access token, and caches that token under `.cache/dhan_access_token.json` for later runs until expiry.
 
+If the cached token becomes invalid before its stored expiry, refresh it directly with:
+
+```sh
+python -m data.dhanlive.auth_cli status
+python -m data.dhanlive.auth_cli refresh --clear-cache-first
+python -m data.dhanlive.auth_cli validate
+```
+
 ```sh
 python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
 python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
@@ -105,17 +113,17 @@ By default the loader syncs:
 
 Supported asset types are `stock`, `index`, and `benchmark`.
 
-### Dhan screeners
+### Screener.in screeners
 
-The ScanX screener downloader uses Chrome remote debugging and reads active screener URLs from `dhan_screeners`.
+The Screener.in downloader reads active screener URLs from `screenerin_screeners`.
 
 Typical flow:
 
 ```sh
-python -m data.dhanlive.screener_registry add https://scanx.trade/stock-screener/momentum-stocks-290258
-python -m data.dhanlive.screener_registry list
-python -m data.dhanlive.screener
-python -m data.dhanlive.screener_registry latest --screener momentum-stocks-290258
+python -m data.screenerin.screener_registry seed-defaults
+python -m data.screenerin.screener_registry list
+python -m data.screenerin.screener_parser --seed-defaults
+python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1
 ```
 
 Use `--raw` with `latest` if you want the full stored JSON payload instead of the summary view.
@@ -148,6 +156,8 @@ python -m data.fred.us_macro
 This writes to `macro_usa`, `macro_india_gdp`, and `macro_usa_ism`.
 
 ### NSE bhavcopy and related parsers
+
+This is the legacy/reference NSE pipeline. It is still useful for identity maintenance, reconciliation, and historical audit work, but it is no longer required for the advisory runtime path.
 
 Downloaders:
 
@@ -232,6 +242,16 @@ The runner uses the invoking interpreter for downstream Python commands, so star
 
 Use [`todo.md`](/home/rane/code/stockey/todo.md) as the maintained gap list for the investment advisory system described in [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md). That file is the source of truth for what is already present and what still needs to be built.
 
+For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](/home/rane/code/stockey/docs/advisory_manual.md). That is the practical runbook for:
+
+- running the advisory stack
+- adding or removing screeners
+- changing setup rules
+- understanding stage ownership
+- debugging outputs and failures
+
+For copy-paste change recipes, use [`docs/advisory_change_cookbook.md`](/home/rane/code/stockey/docs/advisory_change_cookbook.md).
+
 Current advisory bootstrap commands:
 
 ```sh
@@ -243,10 +263,28 @@ Current advisory bootstrap commands:
 /home/rane/code/stockey/.xstockey/bin/python -m advisory.technical_features
 /home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
 /home/rane/code/stockey/.xstockey/bin/python -m advisory.watchlist_builder
+/home/rane/code/stockey/.xstockey/bin/python -m data.economictimes.rss
 /home/rane/code/stockey/.xstockey/bin/python -m advisory.announcement_watch
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_watch --refresh-feeds
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace HDFCBANK --format text
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.dashboard --format text
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.llm_event_evaluator
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.risk_engine
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.portfolio_engine
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.position_lifecycle
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.execution_engine
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --dry-run --stop-at portfolio
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --include-watch --include-news --dry-run
+/home/rane/code/stockey/.xstockey/bin/python -m pytest tests/test_advisory_regression.py
+/home/rane/code/stockey/.xstockey/bin/python scripts/cleanup_deprecated_tables.py --dry-run
 ```
 
+For advisory execution, use Dhan daily OHLCV as the canonical price source. The NSE bhavcopy and adjusted-price jobs remain optional reference pipelines and are no longer required by the advisory technical/rule stack.
+
 The fundamentals and technical builders refresh peer membership on normal runs before computing peer-relative features. The technical builder also fills missing peer OHLCV before computing `rs_vs_sector`. Use `--skip-peer-sync` to disable that preflight.
+
+For live order placement through Dhan, the API static IP must be whitelisted on the Dhan side. Use `advisory.execution_engine` without `--live` to stage and inspect broker handoff rows safely before any live submission.
 
 ## Notes
 
@@ -256,5 +294,5 @@ The fundamentals and technical builders refresh peer membership on normal runs b
 4. `dim_security_history` is the canonical source for rename continuity and review flags.
 5. `dim_security_overrides` is where manual merger / demerger / scheme mappings should be curated.
 6. Large runtime artifacts such as `base_chromed_data/` and `http_cache/` should stay out of git.
-7. Run `security_history`, `security_dimension`, `adjusted_prices`, and `features.price_daily` sequentially, not in parallel.
+7. Run `security_history`, `security_dimension`, `adjusted_prices`, and `features.price_daily` sequentially, not in parallel when you need the legacy NSE identity/adjusted-price reference pipeline.
 8. `all_daily_derivations.sh` uses `config/watchlist_symbols.txt` and falls back to `config/tracked_symbols.txt` if the watchlist file is empty.

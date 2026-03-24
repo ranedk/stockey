@@ -33,8 +33,10 @@ def resolve_symbol_universe(symbols: list[str] | None) -> list[str]:
         return values
     df = sql_to_df(
         """
-        SELECT DISTINCT symbol
-        FROM nseindia_ohlcv_adjusted
+        SELECT DISTINCT ticker AS symbol
+        FROM dhan_ohlcv_daily
+        WHERE asset_type = 'stock'
+          AND exchange = 'NSE'
         ORDER BY symbol
         """
     )
@@ -109,7 +111,7 @@ def load_price_history(
     if not symbols:
         return pd.DataFrame()
 
-    clauses = ["symbol = ANY(%s)"]
+    clauses = ["ticker = ANY(%s)", "asset_type = 'stock'", "exchange = 'NSE'"]
     params: list[object] = [symbols]
     if start_date is not None:
         clauses.append("date >= %s")
@@ -118,79 +120,29 @@ def load_price_history(
         clauses.append("date <= %s")
         params.append(to_date)
 
-    adjusted = sql_to_df(
+    df = sql_to_df(
         f"""
         SELECT
-            symbol,
-            series,
+            ticker AS symbol,
+            'EQ' AS series,
             security_id,
-            isin,
+            NULL::text AS isin,
             date,
-            adj_open,
-            adj_high,
-            adj_low,
-            adj_close,
+            open AS adj_open,
+            high AS adj_high,
+            low AS adj_low,
+            close AS adj_close,
             volume,
-            total_value
-        FROM nseindia_ohlcv_adjusted
+            close * volume AS total_value
+        FROM dhan_ohlcv_daily
         WHERE {' AND '.join(clauses)}
-          AND series = 'EQ'
-        ORDER BY symbol, series, date
+        ORDER BY ticker, date
         """,
         params=tuple(params),
     )
-    if not adjusted.empty:
-        adjusted["date"] = normalize_timestamp(adjusted["date"])
-    adjusted_symbols = (
-        adjusted["symbol"].astype("string").str.strip().str.upper().dropna().unique().tolist()
-        if not adjusted.empty
-        else []
-    )
-    missing_symbols = [symbol for symbol in symbols if symbol not in set(adjusted_symbols)]
-
-    dhan = pd.DataFrame()
-    if missing_symbols:
-        dhan_clauses = ["ticker = ANY(%s)", "asset_type = 'stock'", "exchange = 'NSE'"]
-        dhan_params: list[object] = [missing_symbols]
-        if start_date is not None:
-            dhan_clauses.append("date >= %s")
-            dhan_params.append(start_date)
-        if to_date is not None:
-            dhan_clauses.append("date <= %s")
-            dhan_params.append(to_date)
-        dhan = sql_to_df(
-            f"""
-            SELECT
-                ticker AS symbol,
-                'EQ' AS series,
-                security_id,
-                NULL::text AS isin,
-                date,
-                open AS adj_open,
-                high AS adj_high,
-                low AS adj_low,
-                close AS adj_close,
-                volume,
-                close * volume AS total_value
-            FROM dhan_ohlcv_daily
-            WHERE {' AND '.join(dhan_clauses)}
-            ORDER BY ticker, date
-            """,
-            params=tuple(dhan_params),
-        )
-        if not dhan.empty:
-            dhan["date"] = normalize_timestamp(dhan["date"])
-
-    if adjusted.empty and dhan.empty:
-        return pd.DataFrame()
-    if adjusted.empty:
-        df = dhan.copy()
-    elif dhan.empty:
-        df = adjusted.copy()
-    else:
-        df = pd.concat([adjusted, dhan], ignore_index=True)
     if df.empty:
         return df
+    df["date"] = normalize_timestamp(df["date"])
     numeric_cols = [
         "adj_open",
         "adj_high",

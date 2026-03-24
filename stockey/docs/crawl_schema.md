@@ -221,25 +221,30 @@ public.dhan_ohlcv_intraday
   # Indexes
     dhan_ohlcv_intraday_exchange_security_id_interval_minutes_t_key: UNIQUE (exchange, security_id, interval_minutes, timestamp)
 
-public.dhan_screener_snapshots
+public.screenerin_screener_snapshots
   - screener_slug: text NOT NULL
   - screener_name: text NOT NULL
   - screener_url: text NOT NULL
+  - screen_id: bigint
+  - source_name: text NOT NULL
+  - row_count: bigint NOT NULL
   - date: date NOT NULL
   - raw_json: jsonb NOT NULL
   - load_ts: timestamp with time zone NOT NULL
   # Indexes
-    dhan_screener_snapshots_date_screener_slug_key: UNIQUE (date, screener_slug)
+    screenerin_screener_snapshots_date_screener_slug_key: UNIQUE (date, screener_slug)
 
-public.dhan_screeners
+public.screenerin_screeners
   - screener_slug: text NOT NULL
   - screener_name: text NOT NULL
   - screener_url: text NOT NULL
+  - screen_id: bigint
+  - source_name: text NOT NULL
   - is_active: boolean NOT NULL
   - created_ts: timestamp with time zone NOT NULL
   - updated_ts: timestamp with time zone NOT NULL
   # Indexes
-    dhan_screeners_pkey: UNIQUE (screener_slug)
+    screenerin_screeners_pkey: UNIQUE (screener_slug)
 
 public.master_sharpely_funds
   - plan_id: bigint

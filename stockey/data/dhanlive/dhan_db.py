@@ -70,6 +70,8 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
             security_id = company.get("dhan_nse_id")
             resolved_ticker = company.get("nse_ticker")
             exchange_segment = "NSE_EQ"
+            if pd.isna(security_id):
+                security_id = _resolve_nse_fallback_security_id(company)
         elif exchange_upper == "BSE":
             security_id = company.get("dhan_bse_id")
             resolved_ticker = company.get("bse_ticker")
@@ -101,6 +103,34 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
         }
 
     raise ValueError(f"Unsupported asset_type: {asset_type}")
+
+
+def _resolve_nse_fallback_security_id(company: pd.Series) -> int | None:
+    dhan_bse_id = company.get("dhan_bse_id")
+    if pd.isna(dhan_bse_id):
+        return None
+    fallback = sql_to_df(
+        """
+        SELECT n.security_id
+        FROM master_dhan_instruments b
+        JOIN master_dhan_instruments n
+          ON n.isin = b.isin
+        WHERE b.security_id = %s
+          AND b.exch_id = 'BSE'
+          AND b.valid_to IS NULL
+          AND n.exch_id = 'NSE'
+          AND n.instrument = 'EQUITY'
+          AND n.instrument_type = 'ES'
+          AND n.valid_to IS NULL
+        ORDER BY n.load_ts DESC, n.valid_from DESC
+        LIMIT 1
+        """,
+        params=(int(dhan_bse_id),),
+    )
+    if fallback.empty:
+        return None
+    value = fallback.iloc[0]["security_id"]
+    return None if pd.isna(value) else int(value)
 
 
 def get_dhan_ohlcv_daily(

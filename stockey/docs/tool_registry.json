@@ -107,9 +107,22 @@
       "examples": []
     },
     {
+      "name": "load_economic_times_rss",
+      "category": "ingestion",
+      "description": "Fetch and store Economic Times RSS items.",
+      "command": ["python", "-m", "data.economictimes.rss"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview fetched ET RSS items without writing."
+        }
+      ]
+    },
+    {
       "name": "download_nse_bhavcopy",
       "category": "download",
-      "description": "Run the NSE bhavcopy downloader.",
+      "description": "Run the legacy/reference NSE bhavcopy downloader.",
       "command": ["python", "-m", "data.nseindia.bhavcopy_downloader"],
       "read_only": false,
       "examples": []
@@ -117,7 +130,7 @@
     {
       "name": "parse_nse_bhavcopy",
       "category": "ingestion",
-      "description": "Parse downloaded NSE bhavcopy archives.",
+      "description": "Parse downloaded NSE bhavcopy archives for the legacy/reference NSE pipeline.",
       "command": ["python", "-m", "data.nseindia.bhavcopy_parser"],
       "read_only": false,
       "examples": []
@@ -157,7 +170,7 @@
     {
       "name": "build_advisory_screener_constituents",
       "category": "ingestion",
-      "description": "Normalize stored Dhan ScanX screener snapshots into advisory_screener_constituents.",
+      "description": "Normalize stored Screener.in snapshots into advisory_screener_constituents.",
       "command": ["python", "-m", "advisory.screener_parser"],
       "read_only": false,
       "examples": [
@@ -268,6 +281,160 @@
         {
           "args": ["--dry-run"],
           "description": "Preview advisory announcement watch execution without writing."
+        }
+      ]
+    },
+    {
+      "name": "run_advisory_news_watch",
+      "category": "analysis",
+      "description": "Match Economic Times RSS items onto active advisory watchlist rows and persist advisory news events.",
+      "command": ["python", "-m", "advisory.news_watch"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview matched ET RSS watch events without writing."
+        },
+        {
+          "args": ["--refresh-feeds", "--dry-run"],
+          "description": "Refresh ET RSS feeds first, then preview matched advisory news events."
+        }
+      ]
+    },
+    {
+      "name": "trace_advisory_symbol",
+      "category": "analysis",
+      "description": "Trace one symbol through screener, rule, watch, event, allocation, portfolio, lifecycle, and execution stages.",
+      "command": ["python", "-m", "advisory.symbol_trace"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["HDFCBANK"],
+          "description": "Show the latest JSON trace for one symbol."
+        },
+        {
+          "args": ["HDFCBANK", "--setup", "LARGECAP_BREAKOUT_V1", "--format", "text"],
+          "description": "Show a setup-specific text trace for one symbol."
+        }
+      ]
+    },
+    {
+      "name": "trace_advisory_setup",
+      "category": "analysis",
+      "description": "Trace one setup through screener universe, candidates, rejections, watch, event, allocation, portfolio, lifecycle, and execution stages.",
+      "command": ["python", "-m", "advisory.setup_trace"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["LARGECAP_BREAKOUT_V1"],
+          "description": "Show the latest JSON trace for one setup."
+        },
+        {
+          "args": ["LARGECAP_BREAKOUT_V1", "--format", "text"],
+          "description": "Show a text summary for one setup."
+        }
+      ]
+    },
+    {
+      "name": "show_advisory_dashboard",
+      "category": "analysis",
+      "description": "Show a compact all-setups dashboard with funnel counts, regime, and top rejection reason.",
+      "command": ["python", "-m", "advisory.dashboard"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["--format", "text"],
+          "description": "Show the setup dashboard as a compact text table."
+        },
+        {
+          "args": ["--format", "json"],
+          "description": "Show the setup dashboard as JSON."
+        }
+      ]
+    },
+    {
+      "name": "run_advisory_llm_event_evaluator",
+      "category": "analysis",
+      "description": "Evaluate triggered announcement and ET RSS watch events with point-in-time advisory context and persist verdicts plus risks.",
+      "command": ["python", "-m", "advisory.llm_event_evaluator"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview advisory LLM event evaluations without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_allocations",
+      "category": "analysis",
+      "description": "Build advisory risk buckets, position sizing, and invalidation guidance from evaluated watch events.",
+      "command": ["python", "-m", "advisory.risk_engine"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview advisory allocations without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_portfolio_orders",
+      "category": "analysis",
+      "description": "Build capital-aware portfolio order plans from advisory allocations.",
+      "command": ["python", "-m", "advisory.portfolio_engine"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview advisory portfolio orders without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_position_lifecycle",
+      "category": "analysis",
+      "description": "Build paper-position lifecycle states and rebalance suggestions from approved advisory portfolio orders.",
+      "command": ["python", "-m", "advisory.position_lifecycle"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview advisory lifecycle and rebalance outputs without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_execution_orders",
+      "category": "analysis",
+      "description": "Build broker handoff orders from approved advisory portfolio orders and optionally reconcile live Dhan execution state.",
+      "command": ["python", "-m", "advisory.execution_engine"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview advisory execution orders without writing."
+        },
+        {
+          "args": ["--reconcile-only", "--dry-run"],
+          "description": "Preview live execution reconciliation without writing."
+        }
+      ]
+    },
+    {
+      "name": "run_advisory_pipeline",
+      "category": "analysis",
+      "description": "Run the advisory stack end to end with stage controls from screener normalization through portfolio/execution planning.",
+      "command": ["python", "-m", "advisory.pipeline"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run", "--stop-at", "portfolio"],
+          "description": "Preview the pipeline through portfolio planning without writing."
+        },
+        {
+          "args": ["--include-watch", "--include-news", "--include-lifecycle", "--dry-run"],
+          "description": "Preview the full advisory pipeline including announcement watch, ET RSS news watch, and lifecycle stages."
         }
       ]
     }

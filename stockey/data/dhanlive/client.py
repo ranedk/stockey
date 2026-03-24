@@ -7,6 +7,11 @@ import pandas as pd
 import requests
 
 from data.dhanlive.auth import get_access_token
+from environs import Env
+
+
+env = Env()
+env.read_env()
 
 
 class DhanAPIError(RuntimeError):
@@ -102,6 +107,127 @@ class DhanHistoricalClient:
             f"Dhan API request failed with status {response.status_code}: "
             f"{error_message or response.text.strip()}"
         )
+
+
+class DhanTradingClient(DhanHistoricalClient):
+    def __init__(
+        self,
+        access_token: str | None = None,
+        client_id: str | None = None,
+        timeout: int = 60,
+    ):
+        super().__init__(access_token=access_token, timeout=timeout)
+        self.client_id = client_id or env("DHAN_CLIENT_ID")
+
+    def place_order(
+        self,
+        *,
+        correlation_id: str,
+        transaction_type: str,
+        exchange_segment: str,
+        product_type: str,
+        order_type: str,
+        validity: str,
+        security_id: int | str,
+        quantity: int,
+        price: float | None = None,
+        trigger_price: float | None = None,
+        disclosed_quantity: int | None = None,
+        after_market_order: bool = False,
+        amo_time: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "dhanClientId": self.client_id,
+            "correlationId": correlation_id,
+            "transactionType": transaction_type,
+            "exchangeSegment": exchange_segment,
+            "productType": product_type,
+            "orderType": order_type,
+            "validity": validity,
+            "securityId": str(security_id),
+            "quantity": int(quantity),
+            "disclosedQuantity": int(disclosed_quantity or 0),
+            "price": float(price or 0),
+            "triggerPrice": float(trigger_price or 0),
+            "afterMarketOrder": bool(after_market_order),
+            "amoTime": amo_time or "",
+        }
+        response = self.session.post(
+            f"{self.BASE_URL}/orders",
+            json=payload,
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def modify_order(
+        self,
+        *,
+        order_id: str,
+        quantity: int | None = None,
+        price: float | None = None,
+        trigger_price: float | None = None,
+        disclosed_quantity: int | None = None,
+        validity: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"dhanClientId": self.client_id}
+        if quantity is not None:
+            payload["quantity"] = int(quantity)
+        if price is not None:
+            payload["price"] = float(price)
+        if trigger_price is not None:
+            payload["triggerPrice"] = float(trigger_price)
+        if disclosed_quantity is not None:
+            payload["disclosedQuantity"] = int(disclosed_quantity)
+        if validity is not None:
+            payload["validity"] = validity
+        response = self.session.put(
+            f"{self.BASE_URL}/orders/{order_id}",
+            json=payload,
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def cancel_order(self, order_id: str) -> dict[str, Any]:
+        response = self.session.delete(
+            f"{self.BASE_URL}/orders/{order_id}",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def get_orders(self) -> list[dict[str, Any]] | dict[str, Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/orders",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def get_order_by_id(self, order_id: str) -> dict[str, Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/orders/{order_id}",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def get_order_by_correlation_id(self, correlation_id: str) -> dict[str, Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/orders/external/{correlation_id}",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def get_trades(self) -> list[dict[str, Any]] | dict[str, Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/trades",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def get_trades_by_order_id(self, order_id: str) -> list[dict[str, Any]] | dict[str, Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/trades/{order_id}",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
 
 
 def candles_to_df(payload: dict[str, Any]) -> pd.DataFrame:

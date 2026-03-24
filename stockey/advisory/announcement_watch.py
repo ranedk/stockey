@@ -19,6 +19,55 @@ def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
 
 
+def ensure_watch_outputs_tables() -> None:
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE} (
+                asof_date TIMESTAMPTZ NOT NULL,
+                setup_id TEXT NOT NULL,
+                setup_name TEXT,
+                regime_name TEXT,
+                symbol TEXT NOT NULL,
+                company_master_id TEXT,
+                screener_slug TEXT,
+                rank BIGINT,
+                watch_enabled BOOLEAN,
+                watch_reasons_json TEXT,
+                watch_status TEXT,
+                watch_started_at TIMESTAMPTZ,
+                last_checked_at TIMESTAMPTZ,
+                last_document_published_on TIMESTAMPTZ,
+                load_ts TIMESTAMPTZ,
+                UNIQUE (asof_date, setup_id, symbol)
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
+                published_on TIMESTAMPTZ NOT NULL,
+                asof_date TIMESTAMPTZ,
+                setup_id TEXT NOT NULL,
+                setup_name TEXT,
+                symbol TEXT NOT NULL,
+                company_master_id TEXT,
+                unique_id TEXT NOT NULL,
+                exchange TEXT,
+                subject TEXT,
+                filed_under_category TEXT,
+                parse_status TEXT,
+                concise_summary_text TEXT,
+                categories_json TEXT,
+                watch_reasons_json TEXT,
+                event_status TEXT,
+                load_ts TIMESTAMPTZ,
+                UNIQUE (published_on, setup_id, symbol, unique_id)
+            )
+            """
+        )
+
+
 def load_watchlist(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -120,6 +169,7 @@ def build_event_rows(watch_row: pd.Series, docs: pd.DataFrame) -> pd.DataFrame:
 
 
 def persist_watch_outputs(watchlist_updates: pd.DataFrame, events: pd.DataFrame) -> None:
+    ensure_watch_outputs_tables()
     if not watchlist_updates.empty:
         upsert_to_db(
             watchlist_updates,
@@ -131,7 +181,7 @@ def persist_watch_outputs(watchlist_updates: pd.DataFrame, events: pd.DataFrame)
         upsert_to_db(
             events,
             EVENTS_TABLE,
-            unique_keys=["setup_id", "symbol", "unique_id"],
+            unique_keys=["published_on", "setup_id", "symbol", "unique_id"],
             timescaledb_column="published_on",
         )
 
@@ -148,7 +198,7 @@ def run_announcement_watch(
         return pd.DataFrame(), pd.DataFrame(), {"watch_count": 0, "ingest_runs": []}
 
     pipeline = ManagedAnnouncementPipeline()
-    effective_to = pd.Timestamp(to_date or pd.Timestamp.utcnow(), tz="UTC")
+    effective_to = pd.to_datetime(to_date or pd.Timestamp.utcnow(), utc=True, errors="coerce")
     watch_updates: list[dict[str, object]] = []
     event_frames: list[pd.DataFrame] = []
     ingest_runs: list[dict[str, object]] = []

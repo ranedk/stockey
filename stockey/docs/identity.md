@@ -42,7 +42,9 @@ Recommended usage:
 - `nseindia_ohlcv_adjusted` now carries `security_id`
 - `features_price_daily` groups on `security_id`
 
-This keeps adjusted prices and features stable when the market identifier changes.
+This keeps the legacy/reference NSE adjusted-price pipeline stable when the market identifier changes.
+
+For the advisory runtime path, OHLCV now comes from `dhan_ohlcv_daily`; the identity-aware NSE pipeline remains useful for reconciliation, audit, and other non-advisory derived features.
 
 ## Run order
 
@@ -57,7 +59,7 @@ python -m features.price_daily
 
 Do not run the first three in parallel. They touch the same derived identity tables.
 
-For daily watchlist processing, the same sequence is wrapped by:
+For the legacy NSE-derived daily watchlist/reference processing, the same sequence is wrapped by:
 
 ```sh
 ./all_daily_derivations.sh

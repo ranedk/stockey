@@ -26,13 +26,14 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/company_master.py` | `company_master` | Unified company identity built from Sharpely + Dhan masters |
 | `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap`, `sharpely_stock_meta`, `sharpely_stock_peers` | Fundamental data plus current stock metadata and peer snapshots |
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
+| `data/dhanlive/auth_cli.py` | none | Dhan token status, refresh, validate, and cache-clear helper |
 | `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync is 5 years daily plus last 1 day of 1-minute bars |
-| `data/dhanlive/screener.py` | `dhan_screener_snapshots` | Stores rendered ScanX screener `ng-state` JSON by screener slug and date |
-| `data/dhanlive/screener_registry.py` | `dhan_screeners` | Registry utility to add/list/remove screeners and inspect latest stored snapshots |
+| `data/screenerin/screener_parser.py` | `screenerin_screener_snapshots` | Stores parsed Screener.in screener snapshots by screener slug and date |
+| `data/screenerin/screener_registry.py` | `screenerin_screeners` | Registry utility to add/list/remove Screener.in screeners and inspect latest stored snapshots |
 | `utils/ocr` | none | Provider-agnostic PDF OCR utility using Gemini 3 Flash preview and OpenAI GPT-5 nano |
 | `utils/transcribe` | none | Audio transcription utility for remote mp3/wav/mp4 links using Gemini 3 Flash preview and OpenAI transcription APIs |
-| `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives |
-| `data/nseindia/adjusted_prices.py` | `nseindia_corporate_actions_normalized`, `nseindia_ohlcv_adjusted` | Normalizes action text and builds split/bonus-adjusted OHLCV |
+| `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives for the legacy/reference NSE pipeline |
+| `data/nseindia/adjusted_prices.py` | `nseindia_corporate_actions_normalized`, `nseindia_ohlcv_adjusted` | Builds split/bonus-adjusted OHLCV for the legacy/reference NSE pipeline |
 | `data/nseindia/security_history.py` | `dim_security_history`, `dim_security_review_events`, `dim_security_overrides` | Builds canonical security identity history and review queue for renames / identity breaks |
 | `data/nseindia/security_dimension.py` | `dim_security` | Current canonical security dimension keyed by `security_id` |
 | `data/nseindia/indices_parser.py` | `nseindia_indices` | Index history |
@@ -44,10 +45,18 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/nseindia/holidays.py` | `nseindia_holidays` | Trading holidays |
 | `data/announcements/cli.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Exchange announcement ingest keyed by `company_master_id` |
 | `data/backfill_company_master_ids.py` | many existing symbol-based tables | Adds and backfills `company_master_id` on historical rows |
+| `scripts/cleanup_deprecated_tables.py` | none | Drops deprecated tables that are no longer used by the active advisory stack |
 
 ## Management scripts
 
 These are the JSON-first scripts that are easiest to call from a human shell, an LLM tool wrapper, or an MCP server shim.
+
+Regression checks:
+
+```sh
+python -m pytest tests/test_advisory_regression.py
+python scripts/cleanup_deprecated_tables.py --dry-run
+```
 
 ## General usage guidelines
 
@@ -80,6 +89,15 @@ These are the JSON-first scripts that are easiest to call from a human shell, an
   3. API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET`
 - In the API key flow, the script opens the Dhan consent page in the browser and waits for you to paste the redirected URL back into the terminal. The access token is then cached until expiry.
 
+Quick Dhan token maintenance:
+
+```sh
+python -m data.dhanlive.auth_cli status
+python -m data.dhanlive.auth_cli validate
+python -m data.dhanlive.auth_cli refresh --clear-cache-first
+python -m data.dhanlive.auth_cli clear-cache
+```
+
 ## Orchestration scripts
 
 | Script | Purpose | Scope |
@@ -111,10 +129,10 @@ python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
 python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --only daily
 python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
 python -m data.dhanlive.ohlcv --symbols BANKNIFTY --asset-type index --exchange NSE --only intraday
-python -m data.dhanlive.screener_registry add https://scanx.trade/stock-screener/momentum-stocks-290258
-python -m data.dhanlive.screener_registry list
-python -m data.dhanlive.screener_registry latest --screener momentum-stocks-290258
-python -m data.dhanlive.screener https://scanx.trade/stock-screener/momentum-stocks-290258
+python -m data.screenerin.screener_registry seed-defaults
+python -m data.screenerin.screener_registry list
+python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1
+python -m data.screenerin.screener_parser --seed-defaults
 python -m utils.ocr /tmp/sample.pdf --provider gemini --pages 1
 python -m utils.ocr /tmp/sample.pdf --provider openai --pages 1,3-5
 python -m utils.transcribe https://example.com/audio.mp3 --provider gemini
@@ -176,41 +194,51 @@ Operational notes:
   - `security_id`
   - `company_master_id` for stocks, nullable for indices/benchmarks
 
-### ScanX screeners
+### Screener.in screeners
 
-Registry utility: `data.dhanlive.screener_registry`
+Registry utility: `data.screenerin.screener_registry`
 
-Downloader: `data.dhanlive.screener`
+Downloader: `data.screenerin.screener_parser`
 
 Recommended workflow:
 
-1. Register one or more screeners.
+1. Register the advisory screeners or seed the defaults.
 2. Verify the registry contents.
-3. Let `all_downloads.sh` or `python -m data.dhanlive.screener` sync the active registry daily.
+3. Let `all_downloads.sh` or `python -m data.screenerin.screener_parser --seed-defaults` sync the active registry daily.
 4. Inspect latest snapshots with the registry utility.
 
 Commands:
 
 ```sh
-python -m data.dhanlive.screener_registry add https://scanx.trade/stock-screener/momentum-stocks-290258
-python -m data.dhanlive.screener_registry list
-python -m data.dhanlive.screener
-python -m data.dhanlive.screener_registry latest
-python -m data.dhanlive.screener_registry latest --screener momentum-stocks-290258
-python -m data.dhanlive.screener_registry latest --screener momentum-stocks-290258 --raw
-python -m data.dhanlive.screener_registry remove momentum-stocks-290258
+python -m data.screenerin.screener_registry seed-defaults
+python -m data.screenerin.screener_registry list
+python -m data.screenerin.screener_parser --seed-defaults
+python -m data.screenerin.screener_registry latest
+python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1
+python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1 --raw
+python -m data.screenerin.screener_registry remove sme-momentum-screen-v1
 ```
 
 Operational notes:
 
-- `data.dhanlive.screener` uses the active rows in `dhan_screeners` when run without URL arguments.
-- `data.dhanlive.screener` can still be pointed at explicit URLs directly.
-- Snapshots are stored in `dhan_screener_snapshots` by `date + screener_slug`.
+- `data.screenerin.screener_parser` uses the active rows in `screenerin_screeners` when run without URL arguments.
+- `data.screenerin.screener_parser` can still be pointed at explicit Screener.in URLs directly.
+- Snapshots are stored in `screenerin_screener_snapshots` by `date + screener_slug`.
 - `latest` is compact by default; use `--raw` to print the full stored JSON payload.
 
 ## Advisory implementation
 
 The programming checklist for the investment advisory system lives in [`todo.md`](/home/rane/code/stockey/todo.md). It separates what already exists from the missing modules, tables, and agent-safe commands still required to make [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) executable end to end.
+
+The practical operator guide lives in [`docs/advisory_manual.md`](/home/rane/code/stockey/docs/advisory_manual.md). Use it for:
+
+- daily runs
+- adding screeners
+- changing setup rules
+- understanding which modules and tables to inspect
+- debugging rule, watch, event, and execution outputs
+
+For shorter example-driven edits, use [`docs/advisory_change_cookbook.md`](/home/rane/code/stockey/docs/advisory_change_cookbook.md).
 
 ## OCR usage
 
@@ -298,7 +326,7 @@ Output shape:
 - JSON object keyed by provider
 - each provider contains the transcribed text string
 
-Recommended order for the identity-aware NSE pipeline:
+Recommended order for the legacy/reference identity-aware NSE pipeline:
 
 ```sh
 python -m data.nseindia.bhavcopy_parser
@@ -307,6 +335,8 @@ python -m data.nseindia.security_dimension
 python -m data.nseindia.adjusted_prices --only all
 python -m features.price_daily
 ```
+
+This NSE bhavcopy plus adjusted-price path is now a reference and reconciliation pipeline. The advisory runtime path uses Dhan OHLCV directly and does not depend on `nseindia_ohlcv_adjusted`.
 
 Top-level orchestration examples:
 
@@ -360,6 +390,7 @@ python scripts/agent_tool_runner.py list --category storage
 python scripts/agent_tool_runner.py run sql_query -- --read-only "select * from macro_usa limit 5"
 python scripts/agent_tool_runner.py run redis_get -- bhav:parsed --max-items 20
 python scripts/agent_tool_runner.py run load_us_macro --allow-writes
+python scripts/agent_tool_runner.py run load_economic_times_rss --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_screener_constituents --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_macro_daily --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_fundamentals_daily --allow-writes -- --dry-run
@@ -369,6 +400,16 @@ python scripts/agent_tool_runner.py run build_advisory_technical_daily --allow-w
 python scripts/agent_tool_runner.py run run_advisory_rule_engine --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_watchlist --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run run_advisory_announcement_watch --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run run_advisory_news_watch --allow-writes -- --refresh-feeds --dry-run
+python scripts/agent_tool_runner.py run trace_advisory_symbol -- HDFCBANK --format text
+python scripts/agent_tool_runner.py run trace_advisory_setup -- LARGECAP_BREAKOUT_V1 --format text
+python scripts/agent_tool_runner.py run show_advisory_dashboard -- --format text
+python scripts/agent_tool_runner.py run run_advisory_llm_event_evaluator --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_allocations --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_portfolio_orders --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_position_lifecycle --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_execution_orders --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run run_advisory_pipeline --allow-writes -- --dry-run --stop-at portfolio
 ```
 
 ### Advisory modules
@@ -389,11 +430,54 @@ python -m advisory.rule_engine --dry-run
 python -m advisory.rule_engine
 python -m advisory.watchlist_builder --dry-run
 python -m advisory.watchlist_builder
+python -m data.economictimes.rss --dry-run
+python -m data.economictimes.rss
 python -m advisory.announcement_watch --dry-run
 python -m advisory.announcement_watch
+python -m advisory.news_watch --dry-run
+python -m advisory.news_watch --refresh-feeds
+python -m advisory.symbol_trace HDFCBANK --format text
+python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
+python -m advisory.dashboard --format text
+python -m advisory.llm_event_evaluator --dry-run
+python -m advisory.llm_event_evaluator
+python -m advisory.risk_engine --dry-run
+python -m advisory.risk_engine
+python -m advisory.portfolio_engine --dry-run
+python -m advisory.portfolio_engine
+python -m advisory.position_lifecycle --dry-run
+python -m advisory.position_lifecycle
+python -m advisory.execution_engine --dry-run
+python -m advisory.execution_engine --reconcile-only --dry-run
+python -m advisory.pipeline --dry-run --stop-at portfolio
+python -m advisory.pipeline --include-watch --include-lifecycle --dry-run
 ```
 
 `advisory.fundamental_snapshot` and `advisory.technical_features` refresh peer snapshots automatically on normal write runs. Use `--skip-peer-sync` if you want a pure build against already-synced data.
+
+For the advisory stack, `dhan_ohlcv_daily` is the canonical OHLCV source. The NSE bhavcopy plus adjusted-price pipeline remains available for reference and reconciliation, but advisory technicals and rule evaluation no longer depend on `nseindia_ohlcv_adjusted`.
+
+`data.economictimes.rss` stores raw ET RSS items in `economictimes_rss_items`.
+
+`advisory.news_watch` matches ET RSS items onto the active watchlist and writes `advisory_news_events`.
+
+`advisory.symbol_trace` reads the advisory state tables and produces a single-symbol trace across screener, rule, watch, event, allocation, portfolio, lifecycle, and execution stages.
+
+`advisory.setup_trace` reads the advisory state tables and produces a setup-level trace across screener universe, candidates, rejections, watch, event, allocation, portfolio, lifecycle, and execution stages.
+
+`advisory.dashboard` shows all configured setups in one compact table or JSON payload using the same setup-trace logic underneath.
+
+`advisory.llm_event_evaluator` reads both `advisory_watch_events` and `advisory_news_events`, joins `announcement_pipeline_documents` when official filings exist, and adds point-in-time regime, technical, and fundamentals context before writing `advisory_event_evaluations` and `advisory_event_risks`.
+
+`advisory.risk_engine` reads `advisory_event_evaluations`, joins the latest point-in-time technical and fundamental context, and writes `advisory_allocations` with risk bucket, conviction bucket, suggested INR allocation, and invalidation guidance.
+
+`advisory.portfolio_engine` reads `advisory_allocations`, ranks approved allocations by conviction/risk/liquidity-aware priority, applies portfolio-level capital and setup caps, and writes `advisory_portfolio_orders`.
+
+`advisory.position_lifecycle` reads approved `advisory_portfolio_orders`, marks paper entry/current prices from `dhan_ohlcv_daily`, and writes `advisory_position_lifecycle` plus `advisory_rebalance_actions` with hold/trim/exit/review suggestions.
+
+`advisory.execution_engine` reads approved `advisory_portfolio_orders`, builds broker handoff orders in `advisory_execution_orders`, and can reconcile order/trade state from Dhan into `advisory_execution_orders` plus `advisory_execution_fills`. Use `--live` only when you explicitly want to place live orders through Dhan. Live Dhan order placement requires the API static IP to be whitelisted.
+
+`advisory.pipeline` is the thin end-to-end orchestrator over the existing advisory modules. Use `--start-at` / `--stop-at` to run a subset of stages, `--include-watch` to include announcement stages, `--include-news` for ET RSS matching, `--include-lifecycle` for paper-position monitoring, and `--include-execution` for broker handoff planning.
 
 ## LLM-facing conventions
 

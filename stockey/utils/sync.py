@@ -123,6 +123,6 @@ def normalize_date_window(
     from_date: datetime | None,
     to_date: datetime | None,
 ) -> tuple[datetime, datetime]:
-    start = from_date or DEFAULT_START_DATE
-    end = to_date or datetime.today()
+    start = pd.Timestamp(from_date or DEFAULT_START_DATE).to_pydatetime()
+    end = pd.Timestamp(to_date or datetime.today()).to_pydatetime()
     return start, end

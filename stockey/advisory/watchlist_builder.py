@@ -16,6 +16,32 @@ def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
 
 
+def ensure_watchlist_table() -> None:
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                asof_date TIMESTAMPTZ NOT NULL,
+                setup_id TEXT NOT NULL,
+                setup_name TEXT,
+                regime_name TEXT,
+                symbol TEXT NOT NULL,
+                company_master_id TEXT,
+                screener_slug TEXT,
+                rank BIGINT,
+                watch_enabled BOOLEAN,
+                watch_reasons_json TEXT,
+                watch_status TEXT,
+                watch_started_at TIMESTAMPTZ,
+                last_checked_at TIMESTAMPTZ,
+                last_document_published_on TIMESTAMPTZ,
+                load_ts TIMESTAMPTZ,
+                UNIQUE (asof_date, setup_id, symbol)
+            )
+            """
+        )
+
+
 def load_candidate_rows(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -136,13 +162,11 @@ def build_watchlist(
 
 
 def persist_watchlist(df: pd.DataFrame, *, rebuild: bool = False, asof_date: pd.Timestamp | None = None) -> None:
+    ensure_watchlist_table()
     if df.empty:
         return
     if rebuild and asof_date is not None:
         with db_session() as (_, cur):
-            cur.execute(
-                f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} (asof_date TIMESTAMPTZ, setup_id TEXT, symbol TEXT)"
-            )
             cur.execute(f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s", (asof_date,))
     upsert_to_db(
         df,

@@ -23,14 +23,20 @@ class DhanAuthError(RuntimeError):
     pass
 
 
-def load_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> str | None:
+def load_cached_access_token_payload(cache_path: Path = DEFAULT_TOKEN_CACHE) -> dict | None:
     if not cache_path.exists():
         return None
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+    return payload if isinstance(payload, dict) else None
 
+
+def load_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> str | None:
+    payload = load_cached_access_token_payload(cache_path)
+    if payload is None:
+        return None
     token = payload.get("accessToken")
     expiry_time = payload.get("expiryTime")
     if not token or not expiry_time:
@@ -47,6 +53,14 @@ def load_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> str | No
 def cache_access_token(payload: dict, cache_path: Path = DEFAULT_TOKEN_CACHE) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def clear_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> bool:
+    try:
+        cache_path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def generate_consent_app_id(

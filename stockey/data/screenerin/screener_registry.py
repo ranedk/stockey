@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 
-from data.dhanlive.screener import (
+from data.screenerin.screener_parser import (
     list_registered_screeners,
     load_latest_snapshots,
     remove_registered_screener,
+    seed_default_screeners,
     summarize_latest_snapshots,
     upsert_registered_screener,
 )
@@ -16,12 +17,11 @@ def print_records(df) -> None:
     if df.empty:
         print("[]", flush=True)
         return
-    records = df.to_dict(orient="records")
-    print(json.dumps(records, indent=2, default=str), flush=True)
+    print(json.dumps(df.to_dict(orient="records"), indent=2, default=str), flush=True)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Manage the registered Dhan ScanX screeners")
+    parser = argparse.ArgumentParser(description="Manage registered Screener.in screeners")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     add_parser = subparsers.add_parser("add", help="Add or update one or more screeners")
@@ -37,6 +37,8 @@ def main() -> None:
     latest_parser = subparsers.add_parser("latest", help="Show the latest stored snapshot(s)")
     latest_parser.add_argument("--screener", help="Specific screener slug")
     latest_parser.add_argument("--raw", action="store_true", help="Include the full raw_json payload")
+
+    subparsers.add_parser("seed-defaults", help="Register the four advisory Screener.in screeners")
 
     args = parser.parse_args()
 
@@ -55,8 +57,7 @@ def main() -> None:
         return
 
     if args.command == "remove":
-        results = [remove_registered_screener(identifier) for identifier in args.identifiers]
-        print(json.dumps(results, indent=2, default=str), flush=True)
+        print(json.dumps([remove_registered_screener(identifier) for identifier in args.identifiers], indent=2, default=str), flush=True)
         return
 
     if args.command == "latest":
@@ -65,6 +66,9 @@ def main() -> None:
         else:
             print_records(summarize_latest_snapshots(args.screener))
         return
+
+    if args.command == "seed-defaults":
+        print(json.dumps(seed_default_screeners(), indent=2, default=str), flush=True)
 
 
 if __name__ == "__main__":

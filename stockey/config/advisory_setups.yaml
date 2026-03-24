@@ -1,7 +1,7 @@
 setups:
   - setup_id: SME_MOMENTUM_V1
     setup_name: SME momentum in supportive regime
-    screener_slug: momentum-stocks-290258
+    screener_slug: sme-momentum-screen-v1
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -33,7 +33,7 @@ setups:
 
   - setup_id: LARGECAP_BREAKOUT_V1
     setup_name: Large-cap breakout / continuation
-    screener_slug: momentum-stocks-290258
+    screener_slug: largecap-breakout-screen-v1
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -65,7 +65,7 @@ setups:
 
   - setup_id: DEFENSIVE_TARIFF_V1
     setup_name: Large-cap defensive / tariff-rising regime
-    screener_slug: momentum-stocks-290258
+    screener_slug: defensive-tariff-screen-v1
     allowed_regimes:
       - STABLE_BUT_TARIFF_RISING
       - RISK_OFF
@@ -93,7 +93,7 @@ setups:
 
   - setup_id: MIDCAP_IMPROVER_V1
     setup_name: Mid-cap improving fundamentals + near breakout
-    screener_slug: momentum-stocks-290258
+    screener_slug: midcap-improver-screen-v1
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW

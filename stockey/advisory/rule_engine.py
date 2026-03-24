@@ -24,6 +24,82 @@ def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
 
 
+def ensure_rule_output_tables() -> None:
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {CANDIDATES_TABLE} (
+                asof_date TIMESTAMPTZ NOT NULL,
+                screener_date TIMESTAMPTZ,
+                setup_id TEXT NOT NULL,
+                setup_name TEXT,
+                regime_name TEXT,
+                symbol TEXT NOT NULL,
+                company_master_id TEXT,
+                screener_slug TEXT,
+                rank BIGINT,
+                avg_traded_value_20d DOUBLE PRECISION,
+                rs_vs_benchmark DOUBLE PRECISION,
+                rs_vs_sector DOUBLE PRECISION,
+                total_revenue_qoq_growth_vs_sector DOUBLE PRECISION,
+                profit_after_tax_qoq_growth_vs_sector DOUBLE PRECISION,
+                debt_to_equity_vs_sector DOUBLE PRECISION,
+                watch_enabled BOOLEAN,
+                watch_reasons TEXT,
+                rule_pass BOOLEAN,
+                load_ts TIMESTAMPTZ,
+                UNIQUE (asof_date, setup_id, symbol)
+            )
+            """
+        )
+        candidate_columns = {
+            "screener_date": "TIMESTAMPTZ",
+            "setup_name": "TEXT",
+            "regime_name": "TEXT",
+            "company_master_id": "TEXT",
+            "screener_slug": "TEXT",
+            "rank": "BIGINT",
+            "avg_traded_value_20d": "DOUBLE PRECISION",
+            "rs_vs_benchmark": "DOUBLE PRECISION",
+            "rs_vs_sector": "DOUBLE PRECISION",
+            "total_revenue_qoq_growth_vs_sector": "DOUBLE PRECISION",
+            "profit_after_tax_qoq_growth_vs_sector": "DOUBLE PRECISION",
+            "debt_to_equity_vs_sector": "DOUBLE PRECISION",
+            "watch_enabled": "BOOLEAN",
+            "watch_reasons": "TEXT",
+            "rule_pass": "BOOLEAN",
+            "load_ts": "TIMESTAMPTZ",
+        }
+        for column, sql_type in candidate_columns.items():
+            cur.execute(f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {REJECTIONS_TABLE} (
+                asof_date TIMESTAMPTZ NOT NULL,
+                setup_id TEXT NOT NULL,
+                symbol TEXT,
+                reason_code TEXT NOT NULL,
+                screener_date TIMESTAMPTZ,
+                setup_name TEXT,
+                company_master_id TEXT,
+                reason_detail TEXT,
+                load_ts TIMESTAMPTZ,
+                UNIQUE (asof_date, setup_id, symbol, reason_code)
+            )
+            """
+        )
+        rejection_columns = {
+            "screener_date": "TIMESTAMPTZ",
+            "setup_name": "TEXT",
+            "company_master_id": "TEXT",
+            "reason_detail": "TEXT",
+            "load_ts": "TIMESTAMPTZ",
+        }
+        for column, sql_type in rejection_columns.items():
+            cur.execute(f"ALTER TABLE {REJECTIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+
+
 def get_effective_dates(asof_date: pd.Timestamp | None = None) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     screener_cutoff = asof_date
     if screener_cutoff is None:
@@ -83,7 +159,7 @@ def load_screener_universe(asof_date: pd.Timestamp, screener_slug: str | None) -
     df = sql_to_df(
         f"""
         SELECT
-            date AS asof_date,
+            date AS screener_date,
             screener_slug,
             screener_name,
             ticker AS symbol,
@@ -102,7 +178,7 @@ def load_screener_universe(asof_date: pd.Timestamp, screener_slug: str | None) -
     )
     if df.empty:
         return df
-    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["screener_date"] = normalize_timestamp(df["screener_date"])
     df["symbol"] = df["symbol"].astype("string").str.upper()
     return df
 
@@ -331,6 +407,8 @@ def run_rule_engine(
     ]
     screener_frames = [frame for frame in screener_frames if not frame.empty]
     if screener_frames:
+        for frame in screener_frames:
+            frame["asof_date"] = effective_date
         symbols_to_refresh = sorted(
             pd.concat(screener_frames, ignore_index=True)["symbol"]
             .dropna()
@@ -339,9 +417,23 @@ def run_rule_engine(
             .drop_duplicates()
             .tolist()
         )
-        meta["preflight"] = refresh_missing_snapshots(symbols_to_refresh, effective_date)
-        technical = load_technical(effective_date)
-        fundamentals = load_fundamentals(effective_date)
+        technical_symbols = (
+            technical["symbol"].dropna().astype("string").str.upper().drop_duplicates().tolist()
+            if not technical.empty
+            else []
+        )
+        fundamental_symbols = (
+            fundamentals["symbol"].dropna().astype("string").str.upper().drop_duplicates().tolist()
+            if not fundamentals.empty
+            else []
+        )
+        available_symbols = set(technical_symbols).intersection(fundamental_symbols)
+        missing_symbols = [symbol for symbol in symbols_to_refresh if symbol not in available_symbols]
+        meta["missing_snapshot_symbols"] = missing_symbols
+        if missing_symbols:
+            meta["preflight"] = refresh_missing_snapshots(missing_symbols, effective_date)
+            technical = load_technical(effective_date)
+            fundamentals = load_fundamentals(effective_date)
 
     for setup in setups:
         universe = load_screener_universe(screener_date, setup.get("screener_slug"))
@@ -360,6 +452,8 @@ def run_rule_engine(
                 }
             )
             continue
+        universe = universe.copy()
+        universe["asof_date"] = effective_date
 
         merged = universe.merge(
             technical.drop_duplicates(subset=["asof_date", "symbol"], keep="last"),
@@ -429,10 +523,9 @@ def persist_rule_outputs(
     asof_date: pd.Timestamp | None,
     rebuild: bool = False,
 ) -> None:
+    ensure_rule_output_tables()
     if rebuild and asof_date is not None:
         with db_session() as (_, cur):
-            cur.execute(f"CREATE TABLE IF NOT EXISTS {CANDIDATES_TABLE} (asof_date TIMESTAMPTZ, setup_id TEXT, symbol TEXT)")
-            cur.execute(f"CREATE TABLE IF NOT EXISTS {REJECTIONS_TABLE} (asof_date TIMESTAMPTZ, setup_id TEXT, symbol TEXT, reason_code TEXT)")
             cur.execute(f"DELETE FROM {CANDIDATES_TABLE} WHERE asof_date = %s", (asof_date,))
             cur.execute(f"DELETE FROM {REJECTIONS_TABLE} WHERE asof_date = %s", (asof_date,))
     if not candidates.empty:

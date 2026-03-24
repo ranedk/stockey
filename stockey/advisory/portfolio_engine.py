@@ -1,0 +1,519 @@
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from typing import Any
+
+import pandas as pd
+
+from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.sync import parse_datetime_arg
+
+
+ALLOCATIONS_TABLE = "advisory_allocations"
+PORTFOLIO_TABLE = "advisory_portfolio_orders"
+
+DEFAULT_PORTFOLIO_CAPITAL_INR = 300_000.0
+DEFAULT_MAX_POSITIONS = 5
+DEFAULT_SINGLE_POSITION_CAP_PCT = 0.35
+DEFAULT_SETUP_CAP_PCT = 0.50
+DEFAULT_MAX_POSITIONS_PER_OVERLAP_GROUP = 1
+
+CONVICTION_SCORE = {
+    "low": 1.0,
+    "medium": 2.0,
+    "high": 3.0,
+}
+RISK_PENALTY = {
+    "low": 0.0,
+    "medium": 0.2,
+    "medium_high": 0.5,
+    "high": 1.0,
+}
+
+
+@dataclass(frozen=True)
+class PortfolioConfig:
+    capital_inr: float
+    max_positions: int
+    single_position_cap_pct: float
+    per_setup_cap_pct: float
+    max_positions_per_overlap_group: int
+
+
+def normalize_timestamp(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
+
+
+def table_exists(table_name: str) -> bool:
+    df = sql_to_df(
+        """
+        SELECT 1 AS exists_flag
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        LIMIT 1
+        """,
+        params=(table_name,),
+    )
+    return not df.empty
+
+
+def ensure_portfolio_table() -> None:
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {PORTFOLIO_TABLE} (
+                published_on TIMESTAMPTZ NOT NULL,
+                asof_date TIMESTAMPTZ,
+                planned_at TIMESTAMPTZ,
+                setup_id TEXT NOT NULL,
+                setup_name TEXT,
+                symbol TEXT NOT NULL,
+                company_master_id TEXT,
+                unique_id TEXT NOT NULL,
+                portfolio_capital_inr DOUBLE PRECISION,
+                max_positions BIGINT,
+                plan_rank BIGINT,
+                portfolio_status TEXT,
+                portfolio_reason TEXT,
+                priority_score DOUBLE PRECISION,
+                overlap_group TEXT,
+                overlap_reason TEXT,
+                requested_allocation_inr DOUBLE PRECISION,
+                approved_allocation_inr DOUBLE PRECISION,
+                remaining_capital_after_inr DOUBLE PRECISION,
+                stop_price DOUBLE PRECISION,
+                invalidation_price DOUBLE PRECISION,
+                invalidation_rule TEXT,
+                execution_notes TEXT,
+                context_snapshot_json TEXT,
+                load_ts TIMESTAMPTZ,
+                UNIQUE (published_on, setup_id, symbol, unique_id)
+            )
+            """
+        )
+        column_defs = {
+            "setup_name": "TEXT",
+            "company_master_id": "TEXT",
+            "portfolio_capital_inr": "DOUBLE PRECISION",
+            "max_positions": "BIGINT",
+            "plan_rank": "BIGINT",
+            "portfolio_status": "TEXT",
+            "portfolio_reason": "TEXT",
+            "priority_score": "DOUBLE PRECISION",
+            "overlap_group": "TEXT",
+            "overlap_reason": "TEXT",
+            "requested_allocation_inr": "DOUBLE PRECISION",
+            "approved_allocation_inr": "DOUBLE PRECISION",
+            "remaining_capital_after_inr": "DOUBLE PRECISION",
+            "stop_price": "DOUBLE PRECISION",
+            "invalidation_price": "DOUBLE PRECISION",
+            "invalidation_rule": "TEXT",
+            "execution_notes": "TEXT",
+            "context_snapshot_json": "TEXT",
+            "load_ts": "TIMESTAMPTZ",
+        }
+        for column, sql_type in column_defs.items():
+            cur.execute(f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+
+
+def load_allocations(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+    include_planned: bool = False,
+) -> pd.DataFrame:
+    if not table_exists(ALLOCATIONS_TABLE):
+        return pd.DataFrame()
+
+    clauses = ["a.allocation_status = 'allocated'"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("a.asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append("a.asof_date = (SELECT MAX(asof_date) FROM advisory_allocations)")
+    if symbols:
+        clauses.append("a.symbol = ANY(%s)")
+        params.append([value.upper() for value in symbols])
+    if setup_ids:
+        clauses.append("a.setup_id = ANY(%s)")
+        params.append([value.upper() for value in setup_ids])
+
+    join_sql = ""
+    select_sql = ""
+    if table_exists(PORTFOLIO_TABLE):
+        join_sql = f"""
+        LEFT JOIN {PORTFOLIO_TABLE} p
+          ON p.published_on = a.published_on
+         AND p.setup_id = a.setup_id
+         AND p.symbol = a.symbol
+         AND p.unique_id = a.unique_id
+        """
+        select_sql = ", p.unique_id AS planned_unique_id"
+        if not include_planned:
+            clauses.append("p.unique_id IS NULL")
+
+    df = sql_to_df(
+        f"""
+        SELECT
+            a.*
+            {select_sql}
+        FROM {ALLOCATIONS_TABLE} a
+        {join_sql}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY a.published_on, a.setup_id, a.symbol
+        """,
+        params=tuple(params) if params else None,
+    )
+    if df.empty:
+        return df
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    return df
+
+
+def load_symbol_metadata(symbols: list[str]) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "sector_code"])
+    meta = sql_to_df(
+        """
+        SELECT m.symbol, m.sector_code
+        FROM sharpely_stock_meta m
+        JOIN (
+            SELECT symbol, MAX(as_on_date) AS max_as_on_date
+            FROM sharpely_stock_meta
+            WHERE symbol = ANY(%s)
+            GROUP BY symbol
+        ) latest
+          ON latest.symbol = m.symbol
+         AND latest.max_as_on_date = m.as_on_date
+        WHERE m.symbol = ANY(%s)
+        """,
+        params=(symbols, symbols),
+    )
+    if meta.empty:
+        return pd.DataFrame(columns=["symbol", "sector_code"])
+    meta["symbol"] = meta["symbol"].astype("string").str.upper()
+    meta["sector_code"] = meta["sector_code"].astype("string")
+    return meta.drop_duplicates(subset=["symbol"], keep="last")
+
+
+def load_peer_edges(symbols: list[str]) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame(columns=["anchor_symbol", "peer_symbol"])
+    df = sql_to_df(
+        """
+        SELECT p.anchor_symbol, p.peer_symbol
+        FROM sharpely_stock_peers p
+        JOIN (
+            SELECT anchor_symbol, MAX(as_on_date) AS max_as_on_date
+            FROM sharpely_stock_peers
+            WHERE anchor_symbol = ANY(%s)
+            GROUP BY anchor_symbol
+        ) latest
+          ON latest.anchor_symbol = p.anchor_symbol
+         AND latest.max_as_on_date = p.as_on_date
+        WHERE p.anchor_symbol = ANY(%s)
+          AND p.peer_symbol = ANY(%s)
+          AND COALESCE(p.is_self_peer, FALSE) = FALSE
+          AND COALESCE(p.nse_active, 1) = 1
+          AND COALESCE(p.is_exclusion_list, 0) = 0
+        """,
+        params=(symbols, symbols, symbols),
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["anchor_symbol", "peer_symbol"])
+    for col in ["anchor_symbol", "peer_symbol"]:
+        df[col] = df[col].astype("string").str.upper()
+    return df.drop_duplicates(subset=["anchor_symbol", "peer_symbol"], keep="last")
+
+
+def build_overlap_map(symbols: list[str]) -> dict[str, tuple[str, str]]:
+    unique_symbols = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
+    if not unique_symbols:
+        return {}
+
+    adjacency: dict[str, set[str]] = {symbol: set() for symbol in unique_symbols}
+    peer_edges = load_peer_edges(unique_symbols)
+    for _, edge in peer_edges.iterrows():
+        left = str(edge["anchor_symbol"]).upper()
+        right = str(edge["peer_symbol"]).upper()
+        if left in adjacency and right in adjacency:
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+
+    overlap_map: dict[str, tuple[str, str]] = {}
+    seen: set[str] = set()
+    cluster_idx = 0
+    for symbol in unique_symbols:
+        if symbol in seen or not adjacency[symbol]:
+            continue
+        cluster_idx += 1
+        stack = [symbol]
+        component: list[str] = []
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            component.append(node)
+            stack.extend(adjacency[node] - seen)
+        group_name = f"peer_cluster:{cluster_idx}"
+        for node in component:
+            overlap_map[node] = (group_name, "peer_cluster")
+
+    meta = load_symbol_metadata(unique_symbols)
+    sector_map = {}
+    if not meta.empty:
+        sector_map = (
+            meta.dropna(subset=["sector_code"])
+            .set_index("symbol")["sector_code"]
+            .astype(str)
+            .to_dict()
+        )
+    for symbol in unique_symbols:
+        if symbol in overlap_map:
+            continue
+        sector_code = sector_map.get(symbol)
+        if sector_code:
+            overlap_map[symbol] = (f"sector:{sector_code}", "sector_code")
+        else:
+            overlap_map[symbol] = (f"symbol:{symbol}", "symbol_only")
+    return overlap_map
+
+
+def compute_priority_score(row: pd.Series) -> float:
+    confidence = float(pd.to_numeric(row.get("confidence"), errors="coerce") or 0.0)
+    conviction_score = CONVICTION_SCORE.get(str(row.get("conviction_bucket", "")).lower(), 1.0)
+    risk_penalty = RISK_PENALTY.get(str(row.get("risk_bucket", "")).lower(), 0.5)
+    allocation_size = float(pd.to_numeric(row.get("suggested_allocation_inr"), errors="coerce") or 0.0)
+    liquidity_penalty = 0.0
+    adv_pct = pd.to_numeric(row.get("allocation_pct_of_adv20d"), errors="coerce")
+    if pd.notna(adv_pct) and adv_pct > 0.0025:
+        liquidity_penalty = min(float(adv_pct) * 100.0, 1.5)
+    return round((confidence * 3.0) + conviction_score - risk_penalty - liquidity_penalty + (allocation_size / 100_000.0), 6)
+
+
+def build_execution_notes(row: pd.Series, approved_allocation: float, portfolio_status: str, portfolio_reason: str | None = None) -> str | None:
+    notes: list[str] = []
+    if portfolio_status == "approved":
+        notes.append(f"Approve up to INR {approved_allocation:,.0f} subject to liquidity and execution review.")
+    elif portfolio_status == "trimmed":
+        notes.append(f"Trimmed from requested INR {float(row.get('suggested_allocation_inr') or 0.0):,.0f} due to portfolio caps.")
+    elif portfolio_status == "deferred":
+        if portfolio_reason == "overlap_cap":
+            notes.append(f"Deferred because overlap group {row.get('overlap_group')} already reached its limit.")
+        elif portfolio_reason == "max_positions":
+            notes.append("Deferred because the portfolio already reached its max position count.")
+        else:
+            notes.append("Deferred because portfolio capital or setup cap was exhausted.")
+    if pd.notna(row.get("stop_price")):
+        notes.append(f"Stop reference {float(row['stop_price']):.2f}.")
+    if pd.notna(row.get("invalidation_price")):
+        notes.append(f"Invalidation reference {float(row['invalidation_price']):.2f}.")
+    base_notes = str(row.get("notes") or "").strip()
+    if base_notes:
+        notes.append(base_notes)
+    return " ".join(notes) if notes else None
+
+
+def build_portfolio_orders(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+    include_planned: bool = False,
+    config: PortfolioConfig | None = None,
+) -> pd.DataFrame:
+    config = config or PortfolioConfig(
+        capital_inr=DEFAULT_PORTFOLIO_CAPITAL_INR,
+        max_positions=DEFAULT_MAX_POSITIONS,
+        single_position_cap_pct=DEFAULT_SINGLE_POSITION_CAP_PCT,
+        per_setup_cap_pct=DEFAULT_SETUP_CAP_PCT,
+        max_positions_per_overlap_group=DEFAULT_MAX_POSITIONS_PER_OVERLAP_GROUP,
+    )
+    allocations = load_allocations(
+        asof_date=asof_date,
+        symbols=symbols,
+        setup_ids=setup_ids,
+        include_planned=include_planned,
+    )
+    if allocations.empty:
+        return pd.DataFrame()
+
+    working = allocations.copy()
+    overlap_map = build_overlap_map(working["symbol"].astype(str).tolist())
+    working["overlap_group"] = working["symbol"].map(lambda s: overlap_map.get(str(s).upper(), (f"symbol:{s}", "symbol_only"))[0])
+    working["overlap_reason"] = working["symbol"].map(lambda s: overlap_map.get(str(s).upper(), (f"symbol:{s}", "symbol_only"))[1])
+    working["priority_score"] = working.apply(compute_priority_score, axis=1)
+    working["requested_allocation_inr"] = pd.to_numeric(working["suggested_allocation_inr"], errors="coerce").fillna(0.0)
+    working = working.sort_values(
+        by=["priority_score", "confidence", "requested_allocation_inr", "published_on"],
+        ascending=[False, False, False, True],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    remaining_capital = float(config.capital_inr)
+    setup_caps_used: dict[str, float] = {}
+    overlap_group_counts: dict[str, int] = {}
+    approved_positions = 0
+    rows: list[dict[str, Any]] = []
+
+    single_position_cap = float(config.capital_inr) * float(config.single_position_cap_pct)
+    setup_cap_value = float(config.capital_inr) * float(config.per_setup_cap_pct)
+
+    for idx, (_, row) in enumerate(working.iterrows(), start=1):
+        setup_id = str(row["setup_id"]).upper()
+        requested = min(float(row["requested_allocation_inr"]), single_position_cap)
+        setup_used = setup_caps_used.get(setup_id, 0.0)
+        setup_remaining = max(setup_cap_value - setup_used, 0.0)
+        overlap_group = str(row.get("overlap_group"))
+        overlap_count = overlap_group_counts.get(overlap_group, 0)
+        portfolio_reason: str | None = None
+
+        if overlap_count >= int(config.max_positions_per_overlap_group):
+            approved = 0.0
+            status = "deferred"
+            portfolio_reason = "overlap_cap"
+        elif approved_positions >= int(config.max_positions):
+            approved = 0.0
+            status = "deferred"
+            portfolio_reason = "max_positions"
+        else:
+            approved = min(requested, remaining_capital, setup_remaining)
+            if approved <= 0:
+                status = "deferred"
+                portfolio_reason = "capital_or_setup_cap"
+            elif approved + 1e-9 < float(row["requested_allocation_inr"]):
+                status = "trimmed"
+                portfolio_reason = "capital_or_setup_cap"
+            else:
+                status = "approved"
+                portfolio_reason = "within_limits"
+
+        approved = float(int(approved // 1000) * 1000) if approved > 0 else 0.0
+        if approved <= 0:
+            status = "deferred"
+            portfolio_reason = portfolio_reason or "capital_or_setup_cap"
+        else:
+            remaining_capital = max(remaining_capital - approved, 0.0)
+            setup_caps_used[setup_id] = setup_used + approved
+            overlap_group_counts[overlap_group] = overlap_count + 1
+            approved_positions += 1
+
+        rows.append(
+            {
+                "published_on": row["published_on"],
+                "asof_date": row["asof_date"],
+                "planned_at": pd.Timestamp.utcnow(),
+                "setup_id": row["setup_id"],
+                "setup_name": row.get("setup_name"),
+                "symbol": row["symbol"],
+                "company_master_id": row.get("company_master_id"),
+                "unique_id": row["unique_id"],
+                "portfolio_capital_inr": config.capital_inr,
+                "max_positions": config.max_positions,
+                "plan_rank": idx,
+                "portfolio_status": status,
+                "portfolio_reason": portfolio_reason,
+                "priority_score": row["priority_score"],
+                "overlap_group": overlap_group,
+                "overlap_reason": row.get("overlap_reason"),
+                "requested_allocation_inr": float(row["requested_allocation_inr"]),
+                "approved_allocation_inr": approved,
+                "remaining_capital_after_inr": remaining_capital,
+                "stop_price": row.get("stop_price"),
+                "invalidation_price": row.get("invalidation_price"),
+                "invalidation_rule": row.get("invalidation_rule"),
+                "execution_notes": build_execution_notes(row, approved, status, portfolio_reason),
+                "context_snapshot_json": row.get("context_snapshot_json"),
+                "load_ts": pd.Timestamp.utcnow(),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def persist_portfolio_orders(df: pd.DataFrame) -> None:
+    ensure_portfolio_table()
+    if df.empty:
+        return
+    upsert_to_db(
+        df,
+        PORTFOLIO_TABLE,
+        unique_keys=["published_on", "setup_id", "symbol", "unique_id"],
+        timescaledb_column="published_on",
+    )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build capital-aware portfolio order plans from advisory allocations.")
+    parser.add_argument("--date", type=parse_datetime_arg, help="Allocation asof date in YYYY-MM-DD")
+    parser.add_argument("--symbols", nargs="*", help="Optional symbols")
+    parser.add_argument("--setup", dest="setup_ids", nargs="*", help="Optional setup ids")
+    parser.add_argument("--capital-inr", type=float, default=DEFAULT_PORTFOLIO_CAPITAL_INR, help="Portfolio capital budget in INR")
+    parser.add_argument("--max-positions", type=int, default=DEFAULT_MAX_POSITIONS, help="Maximum simultaneous approved positions")
+    parser.add_argument("--single-position-cap-pct", type=float, default=DEFAULT_SINGLE_POSITION_CAP_PCT, help="Per-position cap as a fraction of total capital")
+    parser.add_argument("--per-setup-cap-pct", type=float, default=DEFAULT_SETUP_CAP_PCT, help="Per-setup cap as a fraction of total capital")
+    parser.add_argument("--max-positions-per-overlap-group", type=int, default=DEFAULT_MAX_POSITIONS_PER_OVERLAP_GROUP, help="Maximum simultaneous approved positions within the same overlap group")
+    parser.add_argument("--include-planned", action="store_true", help="Rebuild rows that already exist in advisory_portfolio_orders")
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+
+def summarize(df: pd.DataFrame) -> dict[str, Any]:
+    if df.empty:
+        return {
+            "status": "ok",
+            "table": PORTFOLIO_TABLE,
+            "row_count": 0,
+            "approved_count": 0,
+            "trimmed_count": 0,
+            "deferred_count": 0,
+            "approved_capital_inr": 0.0,
+            "sample": [],
+        }
+    return {
+        "status": "ok",
+        "table": PORTFOLIO_TABLE,
+        "row_count": int(len(df)),
+        "approved_count": int((df["portfolio_status"] == "approved").sum()),
+        "trimmed_count": int((df["portfolio_status"] == "trimmed").sum()),
+        "deferred_count": int((df["portfolio_status"] == "deferred").sum()),
+        "approved_capital_inr": float(pd.to_numeric(df["approved_allocation_inr"], errors="coerce").fillna(0.0).sum()),
+        "sample": df.head(10).to_dict(orient="records"),
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
+    config = PortfolioConfig(
+        capital_inr=float(args.capital_inr),
+        max_positions=int(args.max_positions),
+        single_position_cap_pct=float(args.single_position_cap_pct),
+        per_setup_cap_pct=float(args.per_setup_cap_pct),
+        max_positions_per_overlap_group=int(args.max_positions_per_overlap_group),
+    )
+    df = build_portfolio_orders(
+        asof_date=asof_date,
+        symbols=args.symbols,
+        setup_ids=args.setup_ids,
+        include_planned=bool(args.include_planned),
+        config=config,
+    )
+    if not args.dry_run:
+        persist_portfolio_orders(df)
+    result = summarize(df)
+    result["dry_run"] = bool(args.dry_run)
+    print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
