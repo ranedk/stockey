@@ -153,6 +153,123 @@
       "command": ["python", "-m", "data.nseindia.offmarket_parser"],
       "read_only": false,
       "examples": []
+    },
+    {
+      "name": "build_advisory_screener_constituents",
+      "category": "ingestion",
+      "description": "Normalize stored Dhan ScanX screener snapshots into advisory_screener_constituents.",
+      "command": ["python", "-m", "advisory.screener_parser"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview normalized screener rows without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_macro_daily",
+      "category": "ingestion",
+      "description": "Build the advisory point-in-time macro snapshot table.",
+      "command": ["python", "-m", "advisory.macro_snapshot"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview the advisory macro snapshot without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_fundamentals_daily",
+      "category": "ingestion",
+      "description": "Build the advisory point-in-time fundamentals snapshot table.",
+      "command": ["python", "-m", "advisory.fundamental_snapshot"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview the advisory fundamentals snapshot without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_market_regime",
+      "category": "ingestion",
+      "description": "Build REGIME_ALGO_V1 market regime classifications.",
+      "command": ["python", "-m", "advisory.regime_engine"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview the advisory market regime output without writing."
+        }
+      ]
+    },
+    {
+      "name": "sync_advisory_peers",
+      "category": "ingestion",
+      "description": "Incrementally refresh Sharpely peer snapshots, peer fundamentals, and Dhan peer OHLCV.",
+      "command": ["python", "-m", "advisory.peer_sync"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--symbols", "HDFCBANK"],
+          "description": "Refresh the latest peer universe and peer market data for HDFCBANK."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_technical_daily",
+      "category": "ingestion",
+      "description": "Build the TA-Lib based advisory technical feature table.",
+      "command": ["python", "-m", "advisory.technical_features"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview the advisory technical features without writing."
+        }
+      ]
+    },
+    {
+      "name": "run_advisory_rule_engine",
+      "category": "analysis",
+      "description": "Apply setup rules on advisory snapshots and persist candidates plus reject reasons.",
+      "command": ["python", "-m", "advisory.rule_engine"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview advisory setup candidates and rejections without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_watchlist",
+      "category": "analysis",
+      "description": "Build announcement watchlist rows from advisory candidates.",
+      "command": ["python", "-m", "advisory.watchlist_builder"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview advisory watchlist rows without writing."
+        }
+      ]
+    },
+    {
+      "name": "run_advisory_announcement_watch",
+      "category": "analysis",
+      "description": "Run managed announcement ingest for active watchlist rows and persist watch events.",
+      "command": ["python", "-m", "advisory.announcement_watch"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview advisory announcement watch execution without writing."
+        }
+      ]
     }
   ]
 }

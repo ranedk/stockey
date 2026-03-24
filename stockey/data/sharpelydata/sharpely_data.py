@@ -6,7 +6,7 @@ import pandas as pd
 from environs import Env
 
 from utils.company_master import attach_company_master_id
-from utils.db import upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_with_retries
 from utils.date import last_of_month
 from utils.sync import choose_from_date, get_db_max_date, load_tracked_symbols, normalize_date_window, parse_datetime_arg
@@ -16,6 +16,8 @@ from . import sharpely_utils as su
 env = Env()
 env.read_env()
 HEADERS = su.get_sharpely_headers()
+SHARPELY_STOCK_META_TABLE = "sharpely_stock_meta"
+SHARPELY_STOCK_PEERS_TABLE = "sharpely_stock_peers"
 
 
 def filter_by_date_range(df: pd.DataFrame, from_date: datetime | None, to_date: datetime | None) -> pd.DataFrame:
@@ -178,6 +180,199 @@ def parse_consolidated_statement(symbol, data, fccs):
     return df
 
 
+def normalize_meta_rows(symbol: str, meta_data: list[dict]) -> pd.DataFrame:
+    rows = []
+    for item in meta_data:
+        if not isinstance(item, dict):
+            continue
+        row = {
+            "symbol": symbol,
+            "proper_name": item.get("proper_name"),
+            "isin": item.get("isin"),
+            "nse_ticker": item.get("nse_ticker"),
+            "bse_ticker": item.get("bse_ticker"),
+            "sector_code": item.get("sector_code"),
+            "industry_code": item.get("industry_code"),
+            "nse_basic_ind_code": item.get("nse_basic_ind_code"),
+            "macro_sec_code": item.get("macro_sec_code"),
+            "style_box_code": item.get("style_box_code"),
+            "risk_box_code": item.get("risk_box_code"),
+            "mcap": item.get("mcap"),
+            "enterprise_val": item.get("enterprise_val"),
+            "price": item.get("price"),
+            "price_date": item.get("price_date"),
+            "as_on_date": item.get("as_on_date"),
+            "raw_json": json.dumps(item, ensure_ascii=False, sort_keys=True),
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
+    for col in [
+        "style_box_code",
+        "risk_box_code",
+        "mcap",
+        "enterprise_val",
+        "price",
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["price_date", "as_on_date"]:
+        df[col] = pd.to_datetime(df[col], utc=True, errors="coerce")
+    df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
+    return df.drop_duplicates(subset=["symbol", "as_on_date"], keep="last")
+
+
+def save_stock_meta(symbol: str, meta_data: list[dict]) -> pd.DataFrame:
+    df = normalize_meta_rows(symbol, meta_data)
+    if df.empty:
+        return df
+    upsert_to_db(
+        df,
+        SHARPELY_STOCK_META_TABLE,
+        unique_keys=["symbol", "as_on_date"],
+        timescaledb_column="as_on_date",
+    )
+    return df
+
+
+def get_stock_meta(symbol: str):
+    json_data = {
+        'stocks': [
+            symbol,
+        ],
+        'cols': [],
+        'all_cols': True,
+    }
+
+    response = get_with_retries('https://pyapiv2.mintbox.ai/api/core/getStocksColData', headers=HEADERS, method='POST', json_data=json_data)
+    meta_data = json.loads(json.loads(response.content))
+    return meta_data
+
+
+def load_latest_stock_meta(symbol: str) -> dict | None:
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM {SHARPELY_STOCK_META_TABLE}
+        WHERE symbol = %s
+        ORDER BY as_on_date DESC
+        LIMIT 1
+        """,
+        params=(symbol.upper(),),
+    )
+    if df.empty:
+        return None
+    row = df.iloc[0].to_dict()
+    raw_json = row.get("raw_json")
+    if isinstance(raw_json, str):
+        try:
+            return json.loads(raw_json)
+        except json.JSONDecodeError:
+            return row
+    return row
+
+
+def normalize_peer_rows(symbol: str, meta: dict, peers: list[dict]) -> pd.DataFrame:
+    rows = []
+    anchor_as_on = meta.get("as_on_date")
+    anchor_ts = pd.to_datetime(anchor_as_on, utc=True, errors="coerce")
+    for rank, item in enumerate(peers, start=1):
+        if not isinstance(item, dict) or not item.get("symbol"):
+            continue
+        peer_as_on = item.get("as_on_date")
+        peer_ts = pd.to_datetime(peer_as_on, unit="ms", utc=True, errors="coerce")
+        effective_as_on = anchor_ts
+        if pd.isna(effective_as_on):
+            effective_as_on = peer_ts
+        rows.append(
+            {
+                "anchor_symbol": symbol,
+                "peer_symbol": str(item.get("symbol")).strip().upper(),
+                "sector_code": item.get("sector_code") or meta.get("sector_code"),
+                "industry_code": item.get("industry_code") or meta.get("industry_code"),
+                "nse_basic_ind_code": item.get("nse_basic_ind_code") or meta.get("nse_basic_ind_code"),
+                "peer_rank": rank,
+                "is_self_peer": str(item.get("symbol")).strip().upper() == symbol,
+                "nse_segment": item.get("nse_segment"),
+                "bse_segment": item.get("bse_segment"),
+                "nse_active": item.get("nse_active"),
+                "is_exclusion_list": item.get("is_exclusion_list"),
+                "peer_mcap": item.get("mcap"),
+                "peer_as_on_date": peer_ts,
+                "as_on_date": effective_as_on,
+                "raw_json": json.dumps(item, ensure_ascii=False, sort_keys=True),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df["anchor_symbol"] = df["anchor_symbol"].astype("string").str.strip().str.upper()
+    df["peer_symbol"] = df["peer_symbol"].astype("string").str.strip().str.upper()
+    for col in ["peer_rank", "nse_active", "is_exclusion_list", "peer_mcap"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["is_self_peer"] = df["is_self_peer"].astype("boolean")
+    df = attach_company_master_id(df, ticker_column="anchor_symbol", exchange="NSE", target_column="anchor_company_master_id")
+    df = attach_company_master_id(df, ticker_column="peer_symbol", exchange="NSE", target_column="peer_company_master_id")
+    return df.drop_duplicates(subset=["anchor_symbol", "peer_symbol", "as_on_date"], keep="last")
+
+
+def save_stock_peers(symbol: str, meta: dict, peers: list[dict]) -> pd.DataFrame:
+    df = normalize_peer_rows(symbol, meta, peers)
+    if df.empty:
+        return df
+    upsert_to_db(
+        df,
+        SHARPELY_STOCK_PEERS_TABLE,
+        unique_keys=["anchor_symbol", "peer_symbol", "as_on_date"],
+        timescaledb_column="as_on_date",
+    )
+    return df
+
+
+def get_stock_peers(symbol: str, meta: dict | None = None):
+    meta = meta or load_latest_stock_meta(symbol) or {}
+    industry_code = meta.get("nse_basic_ind_code")
+    if not industry_code:
+        raise ValueError(f"Missing nse_basic_ind_code for {symbol}. Run get_stock_meta first.")
+
+    json_data = {
+        'rules': [
+            {
+                'abs_val_1': industry_code,
+                'abs_val_2': None,
+                'adj_operator': None,
+                'checklist_id': 0,
+                'client_id': 0,
+                'comp_operator': 'eq',
+                'is_active': 1,
+                'is_advanced': 0,
+                'oper': 'isin_comp',
+                'pos': 2,
+                'primary_col': 'nse_basic_ind_code',
+                'primary_col_table': 'S',
+                'rel_comp_name': None,
+                'rel_comp_stat': None,
+                'rule_id': 2,
+                'rule_name': 'nse_basic_ind_code',
+                'sec_col': None,
+                'sec_col_table': None,
+            },
+        ],
+        'cols': [],
+    }
+    response = get_with_retries(
+        'https://pyapiv2.mintbox.ai/api/core/getAllScreenedStocksNew',
+        headers=HEADERS,
+        method='POST',
+        json_data=json_data,
+    )
+    peers = json.loads(json.loads(response.content))
+    return peers
+
+
 def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None):
     resp = get_with_retries(
         f"https://pyapiv2.mintbox.ai/api/core/getShareHoldingsDataAccord/symbol={symbol}",
@@ -279,8 +474,38 @@ def get_historical_mcap(symbol: str, from_date: datetime | None = None, to_date:
 
 def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to_date: datetime | None = None):
     _, to_date = normalize_date_window(from_date, to_date)
+    snapshot_target = pd.Timestamp(to_date)
+    if snapshot_target.tzinfo is not None:
+        snapshot_target = snapshot_target.tz_convert("UTC").tz_localize(None)
+    snapshot_target = snapshot_target.normalize()
+    to_date = snapshot_target.to_pydatetime()
 
     for symbol in symbols:
+        meta_max_date = get_db_max_date(
+            SHARPELY_STOCK_META_TABLE,
+            date_column="as_on_date",
+            filters={"symbol": symbol},
+        )
+        peers_max_date = get_db_max_date(
+            SHARPELY_STOCK_PEERS_TABLE,
+            date_column="as_on_date",
+            filters={"anchor_symbol": symbol},
+        )
+        meta_max_ts = pd.Timestamp(meta_max_date).normalize() if meta_max_date is not None else None
+        peers_max_ts = pd.Timestamp(peers_max_date).normalize() if peers_max_date is not None else None
+        need_meta_snapshot = meta_max_ts is None or meta_max_ts < snapshot_target
+        need_peers_snapshot = peers_max_ts is None or peers_max_ts < snapshot_target
+        cached_meta: dict | None = None
+        if need_meta_snapshot or need_peers_snapshot:
+            meta_payload = get_stock_meta(symbol)
+            meta_df = save_stock_meta(symbol, meta_payload)
+            if not meta_df.empty:
+                raw = meta_df.iloc[-1].get("raw_json")
+                cached_meta = json.loads(raw) if isinstance(raw, str) else None
+        if need_peers_snapshot:
+            peer_payload = get_stock_peers(symbol, meta=cached_meta)
+            save_stock_peers(symbol, cached_meta or {}, peer_payload)
+
         stmt_from_date = choose_from_date(
             from_date,
             [

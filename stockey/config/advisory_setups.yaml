@@ -1,0 +1,132 @@
+setups:
+  - setup_id: SME_MOMENTUM_V1
+    setup_name: SME momentum in supportive regime
+    screener_slug: momentum-stocks-290258
+    allowed_regimes:
+      - BULL_RISK_ON
+      - BULL_NARROW
+      - STABLE
+    market_cap_max: 10000
+    min_avg_traded_value_20d: 20000000
+    max_breakout_extension_pct: 8
+    min_dist_52w_high: -15
+    technical_rules:
+      - column: pass_above_dma_20
+        operator: eq
+        value: true
+      - column: pass_above_dma_50
+        operator: eq
+        value: true
+      - column: atr_compression_pct
+        operator: lte
+        value: 0.7
+      - column: rs_vs_benchmark
+        operator: gte
+        value: 0.0
+    watch_reasons:
+      - order wins
+      - capacity expansion
+      - results
+      - pledge changes
+      - governance issues
+      - dilution
+
+  - setup_id: LARGECAP_BREAKOUT_V1
+    setup_name: Large-cap breakout / continuation
+    screener_slug: momentum-stocks-290258
+    allowed_regimes:
+      - BULL_RISK_ON
+      - BULL_NARROW
+      - STABLE
+      - STABLE_BUT_TARIFF_RISING
+    market_cap_min: 20000
+    min_avg_traded_value_20d: 500000000
+    max_breakout_extension_pct: 10
+    min_dist_52w_high: -12
+    technical_rules:
+      - column: pass_above_dma_50
+        operator: eq
+        value: true
+      - column: pass_above_dma_200
+        operator: eq
+        value: true
+      - column: rs_vs_benchmark
+        operator: gte
+        value: 0.0
+      - column: rs_vs_sector
+        operator: gte
+        value: 0.0
+    watch_reasons:
+      - earnings
+      - guidance changes
+      - major orders
+      - policy or tariff events
+      - management commentary
+
+  - setup_id: DEFENSIVE_TARIFF_V1
+    setup_name: Large-cap defensive / tariff-rising regime
+    screener_slug: momentum-stocks-290258
+    allowed_regimes:
+      - STABLE_BUT_TARIFF_RISING
+      - RISK_OFF
+    market_cap_min: 20000
+    min_avg_traded_value_20d: 500000000
+    max_breakout_extension_pct: 8
+    min_dist_52w_high: -20
+    technical_rules:
+      - column: pass_above_dma_200
+        operator: eq
+        value: true
+      - column: rs_vs_benchmark
+        operator: gte
+        value: -0.02
+    fundamental_rules:
+      - column: debt_to_equity_vs_sector
+        operator: lte
+        value: 0.25
+    watch_reasons:
+      - margin commentary
+      - raw material impact
+      - tariff commentary
+      - forex impact
+      - management guidance
+
+  - setup_id: MIDCAP_IMPROVER_V1
+    setup_name: Mid-cap improving fundamentals + near breakout
+    screener_slug: momentum-stocks-290258
+    allowed_regimes:
+      - BULL_RISK_ON
+      - BULL_NARROW
+      - STABLE
+    market_cap_min: 5000
+    market_cap_max: 20000
+    min_avg_traded_value_20d: 100000000
+    max_breakout_extension_pct: 10
+    min_dist_52w_high: -20
+    technical_rules:
+      - column: pass_above_dma_50
+        operator: eq
+        value: true
+      - column: pass_above_dma_200
+        operator: eq
+        value: true
+      - column: rs_vs_benchmark
+        operator: gte
+        value: 0.0
+    fundamental_rules:
+      - column: total_revenue_qoq_growth_vs_sector
+        operator: gte
+        value: 0.0
+      - column: profit_after_tax_qoq_growth_vs_sector
+        operator: gte
+        value: 0.0
+      - column: debt_to_equity_vs_sector
+        operator: lte
+        value: 0.15
+    watch_reasons:
+      - results
+      - order wins
+      - capex
+      - debt reduction
+      - promoter actions
+      - dilution risk

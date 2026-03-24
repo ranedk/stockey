@@ -222,9 +222,31 @@ The curated agent-safe commands live in:
 Quick checks:
 
 ```sh
-python scripts/agent_tool_runner.py list
-python scripts/agent_tool_runner.py list --category storage
+/home/rane/code/stockey/.xstockey/bin/python scripts/agent_tool_runner.py list
+/home/rane/code/stockey/.xstockey/bin/python scripts/agent_tool_runner.py list --category storage
 ```
+
+The runner uses the invoking interpreter for downstream Python commands, so starting it from the project venv keeps the entire agent tool chain in the same environment.
+
+## Advisory implementation checklist
+
+Use [`todo.md`](/home/rane/code/stockey/todo.md) as the maintained gap list for the investment advisory system described in [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md). That file is the source of truth for what is already present and what still needs to be built.
+
+Current advisory bootstrap commands:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.screener_parser
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.macro_snapshot
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.fundamental_snapshot
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.regime_engine
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.peer_sync --symbols HDFCBANK
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.technical_features
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.watchlist_builder
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.announcement_watch
+```
+
+The fundamentals and technical builders refresh peer membership on normal runs before computing peer-relative features. The technical builder also fills missing peer OHLCV before computing `rs_vs_sector`. Use `--skip-peer-sync` to disable that preflight.
 
 ## Notes
 

@@ -1,282 +1,623 @@
-# What to borrow
+# Investment Pipeline — Task and Setup Based Spec
 
-* **Borrow** broad fundamental screening from **Screener**. It supports custom screens, alerts, CSV export, company announcements, Excel export workflows, and now has AI over official company documents. ([Screener.][1])
-* **Borrow** technical shortlist generation from **ScanX**. It offers 50+ readymade screeners, 200+ custom filters, sectoral research, and technical screens for breakouts, RSI, support/resistance, crossovers, momentum and squeeze/range setups; its live scanner is tied to Dhan login for real-time access. ([Dhan][2])
-* Use **one broker API** as your price source of truth. **Dhan** says its daily historical data starts from a stock’s inception, intraday goes back 5 years, and daily historical data is adjusted for bonuses and splits. **Zerodha**’s paid Kite Connect includes historical and live market data for ₹500/month, while the free personal tier does not include market data; Zerodha also adjusts historical OHLC for corporate actions. ([Dhan][3])
-* Use **official** sources for disclosures and hard-risk flags: **NSE corporate filings/announcements**, **NSE pledged-data pages**, and **SEBI ASM/GSM surveillance** lists. ([NSE India][4])
+## Goal
 
-So the stack should become:
+Build a practical stock decision pipeline with a small number of reusable tasks and a few concrete setup playbooks.
 
-1. **External shortlist layer**: Screener + ScanX
-2. **Your validation layer**: Dhan/Zerodha OHLC + a few local indicators
-3. **Your edge layer**: NSE/BSE filing fetch, dedup, OCR only if needed, LLM event parser, regime overrides, final ranking
+The pipeline should:
 
-## 1) Horizon-specific rulesets
-
-First, don’t treat short, mid and long term as one pipeline with different weights. They need different vetoes.
-
-### A. Long term: 6 to 24 months
-
-This is **business quality first, entry quality second**.
-
-**Universe**
-
-* Large cap + mid cap as default
-* Small cap only if balance sheet and cash conversion are clean
-* SME usually **off by default**
-* SME gets enabled only in **clear bull / risk-on** regime and only as a small satellite book
-
-**Step-by-step**
-
-1. Start with Screener-style fundamental screens: sales growth, PAT growth, ROCE/ROE, debt, cash flow quality, dilution, pledge, auditor/governance clues.
-2. Remove all governance poison immediately: rising pledge, auditor resignation/qualification, serial dilution, receivables blowing up vs sales, cash flow mismatch.
-3. Prefer businesses where the next 2–8 quarters are understandable: capacity addition, order book conversion, deleveraging, margin improvement, market-share gain.
-4. Use technicals only for **entry timing**: base, retest, not wildly extended.
-5. Use event layer to answer: “Is the thesis strengthening or breaking?”
-6. Size larger only in liquid names with clean governance.
-
-**Long-term regime rules**
-
-* In **bull** regime: allow select small caps; still keep SME small.
-* In **neutral** regime: large/mid dominate.
-* In **bear / shock** regime: no fresh SME buys; deep cyclicals need stronger balance sheets; cash-generators and leaders get preference.
-
-**What matters most**
-
-* Earnings quality
-* Balance sheet
-* Promoter behaviour
-* Industry tailwind
-* Execution visibility
-
-**What matters less**
-
-* One-day breakout
-* Short-term RSI
-* Social-media/news excitement
-
-### B. Mid term: 1 to 6 months
-
-This is where your original pipeline fits best.
-
-**Universe**
-
-* Large, mid, small
-* SME only if: strong regime + real liquidity + real event catalyst + actual setup
-
-**Step-by-step**
-
-1. Use Screener for broad structural quality.
-2. Use ScanX for technical state: compression, near breakout, RS, momentum, volume pattern.
-3. Pull your own OHLC only for survivors and recompute a few local checks: ATR compression, 20/50/200DMA structure, distance from highs, volume expansion.
-4. Fetch latest 30–90 day announcements/news for top 50–150 names.
-5. Let LLM produce structured event facts only.
-6. Apply hard overrides:
-
-   * ASM/GSM or surveillance = usually reject
-   * severe governance flag = reject
-   * too extended = demote
-7. Rank by **fundamental + technical + event + tradeability**
-
-**Mid-term regime rules**
-
-* **Bull**: breakout/continuation setups work; allow select small caps and exceptional SMEs.
-* **Neutral**: prefer leaders near highs, not laggards.
-* **Bear**: focus on relative-strength names only; avoid low-float breakouts; mostly large/mid.
-* **Shock**: cut SME entirely; reduce cyclical exposure unless the stock is a direct beneficiary.
-
-### C. Short term: 2 days to 6 weeks
-
-This is **market regime first, stock second**.
-
-**Universe**
-
-* Highly liquid large caps and liquid mid caps
-* SME should be a **separate speculative book**, not mixed into the main pipeline
-
-**Step-by-step**
-
-1. Check market state first: index trend, breadth, volatility, sector leadership.
-2. Run ScanX/live scanners for liquid technical setups only.
-3. Confirm with your own OHLC and volume.
-4. Avoid holding through binary events unless that event itself is the trade thesis.
-5. Use very strict invalidation.
-6. If regime is messy, trade less. Cash is a valid position.
-
-**Short-term regime rules**
-
-* In **risk-off**, most breakout systems degrade.
-* In **shock**, either don’t trade or only trade very liquid direct beneficiaries.
-* Never let SME names masquerade as “short-term investments.” They are often liquidity traps.
+* use external screeners and broker/platform data as much as possible,
+* minimize local calculations,
+* watch announcements only for shortlisted stocks,
+* use LLM only after a stock has already passed screener + regime + technical checks.
 
 ---
 
-## 2) Regime engine you should hard-code
+# Tasks
 
-This part should be simple and cheap.
+## Task 1 — Screener crawler
 
-Use 5 regime flags:
+### Objective
 
-1. **Index trend**: Nifty / Nifty 500 above or below medium and long trend
-2. **Breadth**: participation, not just index level
-3. **Volatility**: India VIX or realized vol
-4. **Macro shock**: oil, INR, yields
-5. **Policy/geopolitical shock flag**: tariff escalation, war/conflict, sanctions, severe regulation
+Crawler for screener is ready and returns stocks for a given screener.
 
-You do not need a PhD model for this. A coarse regime engine is enough.
+### Input
 
-Why this matters: WTO’s March 2026 outlook says tariffs and uncertainty shaped trade patterns, and prolonged conflict can keep transport and fuel costs elevated while hurting net energy-importing regions more. IMF said its World Uncertainty Index had doubled since January 2025, and BIS notes uncertainty weakens business investment. That is enough justification to raise the hurdle rate and shrink your universe during shock periods. ([World Trade Organization][5])
+* screener name or screener URL
+* optional date
 
----
+### Output
 
-## 3) How to handle war/conflict and tariff news
+* list of stocks
+* screener snapshot metadata
 
-Do **not** convert headline news directly into buy signals.
+### Notes
 
-Use this 6-question filter for each affected stock:
-
-1. Is the company a **direct** beneficiary/victim, or is this just a story?
-2. Does it have **pricing power**?
-3. Is it **import-dependent** for key raw materials/components?
-4. Is it **export-dependent** into the affected geography?
-5. Can it actually **execute** if demand shifts to it?
-6. Is the chart confirming the thesis, or are you forcing a macro narrative onto a bad stock?
-
-### Tariff priors
-
-* Tariff headlines help only if the company has **domestic capacity**, acceptable margins, and low dependence on imported inputs.
-* “China+1” style stories are useless without customer approvals, capacity, working capital and execution proof.
-* Tariff beneficiaries without balance-sheet strength are usually traps.
-
-### War/conflict priors
-
-* First-order transmission is usually through **oil, gas, shipping, fertilizer, FX, rates**.
-* Energy/import-sensitive sectors get penalized first.
-* Domestic-defense, energy, logistics or substitute-manufacturing stories should only be trusted if earnings/order flow supports them.
-* In shock periods, lower-cap names deserve an automatic penalty even if the story sounds right.
+This task should support multiple upstream screeners later, but v1 can start with one reliable source.
 
 ---
 
-## 4) Operational priors to hard-code
+## Task 2 — OHLCV crawler
 
-These are not “truth.” They are **default priors** until your own data disproves them.
+### Objective
 
-### Market-structure priors
+Crawler for OHLCV for shortlisted stocks.
 
-* SME and microcaps are the **first bucket to disable** in risk-off.
-* Breakouts work better with broad participation; lone-stock breakouts in weak breadth fail more.
-* Governance red flags override cheap valuation.
-* Price action without liquidity is noise.
-* Event positives do not override ASM/GSM/surveillance. ([Securities and Exchange Board of India][6])
+### Input
 
-### Business-quality priors
+* stock list from Task 1
+* benchmark/index symbols
+* date range
 
-* **New order win** matters only if it is material relative to revenue/order book and the company can fund execution.
-* **Capex announcement** is positive only if utilization, balance sheet and demand visibility exist.
-* **Deleveraging + margin improvement** is a stronger signal than revenue growth alone in many cyclicals.
-* **Receivables up sharply after “growth”** is suspicious.
-* **Promoter pledge rising** is a major negative unless clearly explained and temporary. NSE explicitly provides pledged-data disclosures, so this should be machine-checked. ([NSE India][7])
+### Required data
 
-### Macro/sector priors
+* last 5 years of daily OHLCV
+* latest 1 day of 1-minute data if available
 
-* Oil up: good for upstream/energy-linked beneficiaries, bad for many importers and energy users.
-* INR weakness: usually helps exporters with domestic costs, hurts import-heavy sectors unless they can pass cost through.
-* Falling rates or easing liquidity: better for financials, housing-linked names, discretionary cyclicals.
-* Tariff protection helps only if local substitutes actually exist.
-* Commodity consumers need pricing power; commodity producers need cycle discipline.
+### Output
 
-### Geography/location priors
+* OHLCV stored for each stock
+* daily benchmark OHLCV
+* sector/index OHLCV where needed
 
-* Single-plant or single-port dependence raises operational risk.
-* State-policy dependence matters for EPC, infra, tourism, hospitals, liquor, mining, building materials.
-* Monsoon/rural-income dependence matters for tractors, agrochem, rural financiers, some FMCG and two-wheelers.
-* Export geography concentration matters more than people admit.
+### Notes
+
+Use external broker/platform data as the primary source. Do not build price adjustment logic first unless forced.
 
 ---
 
-## 5) What to backtest and what not to waste time on
+## Task 3 — Macro crawler
 
-**Backtest**
+### Objective
 
-* Your own OHLC-based rules
-* Your own regime filters
-* Event reaction templates after structured parsing
-* Final score weights
-* Entry/invalidation logic
+Crawler for macro parameters.
 
-**Do not waste time trying to backtest**
+### Input
 
-* Third-party screener logic you don’t own
-* Uncaptured historical outputs from Screener/ScanX
-* “Narrative priors” as if they were clean labels
+* configured macro series list
 
-But do this from day 1:
+### Existing data
 
-* save **daily CSV snapshots** of every Screener/ScanX shortlist
-* save broker OHLC snapshot
-* save regime flags
-* save event parser outputs
+Use what is already available from earlier work where usable without major new engineering.
 
-That gives you a forward test archive even if you cannot reconstruct the past.
+### Minimum macro list
+
+* G-Sec yields
+* RBI policy rate / repo-related data
+* CPI
+* WPI
+* USDINR or relevant FX proxies
+* sector-linked commodity prices where relevant
+
+### Mark as new if added
+
+If a macro variable is not already available in the current local system, mark it as `NEW_MACRO_SOURCE_REQUIRED`.
+
+### Output
+
+* macro snapshot table by date
+* freshness status
 
 ---
 
-## 6) Minimal-code version I would actually build
+## Task 4 — Regime engine
 
-1. **Screener**
+### Objective
 
-   * 3–5 saved screens for long-term quality, mid-term improvers, balance-sheet clean small caps
-   * export CSV daily
-2. **ScanX**
+Classify market regime using benchmark, macro, volatility, and policy/shock context.
 
-   * 3–5 saved technical screens: squeeze, near-high, breakout, RS, volume
-   * export/capture symbols daily
-3. **Broker API**
+### Output
 
-   * choose **one**: Dhan or Zerodha
-   * pull OHLC only for shortlisted symbols
-   * compute just 8–12 local indicators
-4. **Official feeds**
+One of:
 
-   * NSE announcements
-   * NSE pledged data
-   * SEBI ASM/GSM
-5. **Your event layer**
+* `BULL_RISK_ON`
+* `BULL_NARROW`
+* `STABLE`
+* `STABLE_BUT_TARIFF_RISING`
+* `RISK_OFF`
+* `SHOCK`
 
-   * fetch top docs for top 50–100 names
-   * structured extraction only
-6. **Rule engine**
+### Notes
 
-   * horizon-specific weights
-   * regime penalties
-   * SME enable/disable switch
-7. **Final output**
+The exact algo can be implemented later. For now, refer to this as:
 
-   * ranked list + state + thesis + top risks + veto flags
+* `REGIME_ALGO_V1`
 
-That is small enough to ship.
+---
 
-## 7) Final recommendation
+## Task 5 — Technical parameter calculator
 
-The correct redesign is:
+### Objective
 
-* **Do not** build full fundamentals + full technical indicator infra + full historical document warehouse first.
-* **Do** use Screener/ScanX for upstream filtering, a broker API for clean adjusted OHLC, and official exchange/regulator pages for disclosures and risk flags.
-* Keep your proprietary work focused on:
+Given stocks from Task 2, compute the small set of technical parameters required by setups.
 
-  * regime logic
-  * structured announcement/news parsing
-  * hard overrides
-  * final decision memo
+### Minimum technical parameters
 
-And one correction: don’t call your priors “ground truth.” They’re **priors**. Ground truth is what survives logging and future validation.
+* 20 DMA
+* 50 DMA
+* 200 DMA
+* ATR 20
+* ATR compression percentile
+* Bollinger Band width
+* distance to 20D high
+* distance to 50D high
+* distance to 52W high
+* average traded value 20D
+* average traded value 60D
+* relative strength vs benchmark
+* relative strength vs sector
+* breakout extension %
 
-If you want, next I’ll turn this into a concrete **v2 implementation spec** with exact modules, tables, daily jobs, and horizon-specific rule configs.
+### Output
 
-[1]: https://www.screener.in/features/ "Features - Screener"
-[2]: https://dhan.co/scanx-stock-screener/ "ScanX Stock Screener: 50+ Screeners for Stock & Live Market Insights"
-[3]: https://dhan.co/support/platforms/dhanhq-api/what-timeframe-data-is-available-through-dhan-s-historical-data-apis/ "What timeframe data is available through Dhan’s Historical Data APIs? | Dhan Support"
-[4]: https://www.nseindia.com/companies-listing/corporate-filings-application?utm_source=chatgpt.com "Corporate Filings- Equity, Debt, MF, SME"
-[5]: https://www.wto.org/english/res_e/booksp_e/gtos0326_e.pdf "Global Trade Outlook and Statistics - March 2026"
-[6]: https://www.sebi.gov.in/curation/surviellance.html "Securities and Exchange Board of India"
-[7]: https://www.nseindia.com/companies-listing/corporate-filings-pledged-data?utm_source=chatgpt.com "Corporate Filings Pledged Data - Equity, SME"
+* stock technical profile
+* pass/fail flags used by setups
+
+---
+
+## Task 6 — Rule engine
+
+### Objective
+
+Apply setup-specific rules on top of screener + OHLCV + technicals + regime.
+
+### Output
+
+* shortlisted stocks by setup
+* reject reasons
+* watchlist reasons
+
+---
+
+## Task 7 — Announcement watcher
+
+### Objective
+
+Mark shortlisted stocks for announcement watching.
+
+### Output
+
+* watchlist of stocks
+* watch status
+* last checked time
+
+### Trigger sources
+
+* exchange announcements
+* results
+* pledges / governance related updates
+* major company filings
+* major company-specific news if added later
+
+---
+
+## Task 8 — Announcement parser + LLM evaluator
+
+### Objective
+
+When announcement is triggered, fetch it, parse it, and send it to LLM for structured evaluation.
+
+### LLM role
+
+LLM should not directly say buy/sell blindly.
+
+LLM should answer:
+
+* what happened,
+* whether it is positive / negative / mixed,
+* whether it is material,
+* whether it strengthens the current setup,
+* whether it introduces governance / balance-sheet / execution risk,
+* whether the stock is worth investing now given all current data.
+
+### Output
+
+* structured event summary
+* event verdict
+* key risks
+* recommendation to continue / reject / review manually
+
+---
+
+## Task 9 — Risk profiling and allocation
+
+### Objective
+
+If stock qualifies after announcement and rule checks, assign risk profile and investment amount.
+
+### Output
+
+* risk bucket
+* conviction bucket
+* suggested allocation amount X
+* stop / invalidation guidance if applicable
+
+---
+
+# Setup Template
+
+Each setup should follow this format.
+
+## Generic Setup Flow
+
+1. Check regime based on `REGIME_ALGO_V1`
+2. If regime matches setup, get stocks from screener with setup-specific screener rules
+3. Get OHLCV for these stocks — last 5 years daily, latest 1 day 1-minute if available
+4. Find required technical parameters
+5. Apply setup rule
+6. Mark qualified stocks for announcement watch
+7. If announcement is triggered, fetch, parse, and let LLM evaluate with access to all current stock data
+8. If stock still qualifies, profile risk and invest X amount
+
+---
+
+# Setups
+
+## Setup 1 — Strategy 1 — SME momentum in supportive regime
+
+### Regime requirement
+
+Allowed only if regime is one of:
+
+* `BULL_RISK_ON`
+* `BULL_NARROW`
+* `STABLE`
+
+Not allowed if regime is:
+
+* `STABLE_BUT_TARIFF_RISING`
+* `RISK_OFF`
+* `SHOCK`
+
+### Screener rules
+
+Placeholder:
+
+* `SME_MOMENTUM_SCREEN_V1`
+
+Typical intent:
+
+* acceptable liquidity for SME
+* no obvious governance poison
+* recent earnings or business momentum
+* price not too far from highs
+* avoid obvious junk / freeze names
+
+### Technical parameters to use
+
+* 20 DMA, 50 DMA
+* ATR compression
+* Bollinger width
+* distance to 52W high
+* average traded value 20D/60D
+* relative strength vs SME/smallcap benchmark
+* breakout extension %
+
+### Apply rule
+
+Placeholder:
+
+* `SME_SETUP_RULE_V1`
+
+Typical intent:
+
+* stock is in compression or early breakout
+* not overextended
+* liquidity acceptable
+* relative strength supportive
+
+### Announcement watch
+
+Watch for:
+
+* order wins
+* capacity expansion
+* results
+* pledge changes
+* auditor/governance issues
+* dilution / fund raise
+
+### Post-announcement LLM question
+
+* is this event a real business catalyst or just noise?
+* does it improve confidence or introduce hidden risk?
+
+### Risk profiling
+
+* high risk bucket by default
+* smaller allocation cap than large/mid caps
+
+---
+
+## Setup 2 — Strategy 1 — Large-cap breakout / continuation
+
+### Regime requirement
+
+Allowed in:
+
+* `BULL_RISK_ON`
+* `BULL_NARROW`
+* `STABLE`
+* selectively `STABLE_BUT_TARIFF_RISING`
+
+Avoid fresh entries in:
+
+* `RISK_OFF`
+* `SHOCK`
+  unless direct beneficiary and very liquid
+
+### Screener rules
+
+Placeholder:
+
+* `LARGECAP_BREAKOUT_SCREEN_V1`
+
+Typical intent:
+
+* liquid large caps
+* price near highs
+* strong relative strength
+* acceptable recent earnings profile
+
+### Technical parameters to use
+
+* 20/50/200 DMA
+* ATR compression
+* Bollinger width
+* distance to 20D/50D/52W high
+* RS vs Nifty / sector
+* breakout extension %
+* traded value
+
+### Apply rule
+
+Placeholder:
+
+* `LARGECAP_BREAKOUT_RULE_V1`
+
+Typical intent:
+
+* clean base or continuation
+* leadership within sector
+* not too extended
+* broad market not breaking down
+
+### Announcement watch
+
+Watch for:
+
+* earnings
+* guidance changes
+* major orders or client wins
+* sector-sensitive policy or tariff events
+* management commentary changes
+
+### Post-announcement LLM question
+
+* does this strengthen the continuation thesis or invalidate it?
+
+### Risk profiling
+
+* lower risk bucket than SME
+* larger max allocation than SME
+
+---
+
+## Setup 3 — Strategy 1 — Large-cap defensive / tariff-rising regime
+
+### Regime requirement
+
+Only when regime is:
+
+* `STABLE_BUT_TARIFF_RISING`
+* or `RISK_OFF` with selective defensive leadership
+
+### Screener rules
+
+Placeholder:
+
+* `DEFENSIVE_TARIFF_SCREEN_V1`
+
+Typical intent:
+
+* liquid large caps
+* pricing power
+* lower external shock sensitivity
+* better balance sheet
+* stable earnings profile
+
+### Technical parameters to use
+
+* 50 DMA, 200 DMA
+* RS vs benchmark
+* drawdown control
+* volatility state
+* extension %
+
+### Apply rule
+
+Placeholder:
+
+* `DEFENSIVE_TARIFF_RULE_V1`
+
+Typical intent:
+
+* stock is holding trend while market weakens
+* not deeply broken technically
+* shock narrative is not hurting business directly
+
+### Announcement watch
+
+Watch for:
+
+* margin commentary
+* raw material impact
+* tariff commentary
+* forex impact
+* management guidance
+
+### Post-announcement LLM question
+
+* is this company exposed to tariff shock or a relative beneficiary?
+
+### Risk profiling
+
+* medium risk bucket
+* moderate allocation
+
+---
+
+## Setup 4 — Strategy 1 — Mid-cap improving fundamentals + near breakout
+
+### Regime requirement
+
+Allowed in:
+
+* `BULL_RISK_ON`
+* `BULL_NARROW`
+* `STABLE`
+
+Restrict in:
+
+* `STABLE_BUT_TARIFF_RISING`
+* `RISK_OFF`
+* `SHOCK`
+
+### Screener rules
+
+Placeholder:
+
+* `MIDCAP_IMPROVER_SCREEN_V1`
+
+Typical intent:
+
+* improving quarterly numbers
+* manageable debt
+* no recent severe governance red flags
+* technical setup not too late
+
+### Technical parameters to use
+
+* 20/50/200 DMA
+* ATR compression
+* Bollinger width
+* distance to highs
+* RS vs benchmark and sector
+* breakout extension %
+
+### Apply rule
+
+Placeholder:
+
+* `MIDCAP_IMPROVER_RULE_V1`
+
+Typical intent:
+
+* business improvement plus technical readiness
+* avoid late-stage euphoric moves
+
+### Announcement watch
+
+Watch for:
+
+* results
+* order wins
+* capex
+* debt reduction
+* promoter actions
+* dilution risk
+
+### Risk profiling
+
+* medium-high risk bucket
+* smaller than large cap, larger than SME only if liquidity is strong
+
+---
+
+# Output Contract
+
+## Output per task
+
+### Task 1 output
+
+* screener name
+* date
+* stock list
+
+### Task 2 output
+
+* stock
+* OHLCV availability status
+* time ranges fetched
+
+### Task 3 output
+
+* macro parameter
+* latest value
+* freshness status
+* `NEW_MACRO_SOURCE_REQUIRED` if unavailable
+
+### Task 4 output
+
+* date
+* regime name
+* regime notes
+
+### Task 5 output
+
+* stock
+* technical parameter values
+* technical pass/fail flags
+
+### Task 6 output
+
+* stock
+* setup name
+* rule pass/fail
+* reject reasons
+
+### Task 7 output
+
+* stock
+* watch enabled
+* watch reason
+
+### Task 8 output
+
+* stock
+* announcement summary
+* event verdict
+* continue/reject/manual-review
+
+### Task 9 output
+
+* stock
+* risk bucket
+* allocation X
+* notes
+
+---
+
+# Immediate Build Order
+
+## Phase 1
+
+Build these first:
+
+1. Task 1 — Screener crawler
+2. Task 2 — OHLCV crawler
+3. Task 3 — Macro crawler
+4. Task 4 — Regime engine
+5. Task 5 — Technical parameter calculator
+6. Task 6 — Rule engine
+
+## Phase 2
+
+Then add:
+7. Task 7 — Announcement watcher
+8. Task 8 — Announcement parser + LLM evaluator
+
+## Phase 3
+
+Then add:
+9. Task 9 — Risk profiling and allocation

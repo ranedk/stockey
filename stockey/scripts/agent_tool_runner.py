@@ -48,6 +48,8 @@ def run_tool(tool_name: str, tool_args: list[str], allow_writes: bool) -> dict:
         )
 
     command = [*tool["command"], *tool_args]
+    if command and command[0] in {"python", "python3"}:
+        command[0] = sys.executable
     proc = subprocess.run(
         command,
         cwd=REPO_ROOT,
@@ -106,12 +108,16 @@ def main():
             result = list_tools(category=args.category)
         elif args.action == "run":
             forwarded = args.tool_args
+            allow_writes = args.allow_writes
+            if "--allow-writes" in forwarded:
+                allow_writes = True
+                forwarded = [value for value in forwarded if value != "--allow-writes"]
             if forwarded and forwarded[0] == "--":
                 forwarded = forwarded[1:]
             result = run_tool(
                 tool_name=args.tool,
                 tool_args=forwarded,
-                allow_writes=args.allow_writes,
+                allow_writes=allow_writes,
             )
         else:
             raise ValueError(f"Unsupported action: {args.action}")

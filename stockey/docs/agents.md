@@ -61,6 +61,8 @@ python scripts/agent_tool_runner.py run load_us_macro --allow-writes
 
 The runner blocks non-read-only tools unless `--allow-writes` is passed. That is the right default for analyst-style agents.
 
+The runner resolves `python` and `python3` commands to the invoking interpreter, so launching it with `/home/rane/code/stockey/.xstockey/bin/python` keeps downstream tools inside the project virtualenv.
+
 ## Data modeling advice
 
 Before adding more agents, finish these pieces:
@@ -70,3 +72,7 @@ Before adding more agents, finish these pieces:
 - standardize table names and unique keys
 - document per-table date semantics
 - prefer numeric SQL types at ingest time instead of repairing them later
+
+## Advisory system next step
+
+The implementation gap for the investment advisory workflow is tracked in [`todo.md`](/home/rane/code/stockey/todo.md). Use that file as the execution checklist before exposing new advisory tools to agents.

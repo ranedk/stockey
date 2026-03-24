@@ -24,7 +24,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/rbi/download_fbil_gsec.py` | `fbil_gsec_quote`, `fbil_gsec_par` | G-sec quotes + par curve |
 | `data/sharpelydata/scrip_master.py` | `master_sharpely_funds`, `master_sharpely_equity` | Security masters |
 | `data/company_master.py` | `company_master` | Unified company identity built from Sharpely + Dhan masters |
-| `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap` | Fundamental data |
+| `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap`, `sharpely_stock_meta`, `sharpely_stock_peers` | Fundamental data plus current stock metadata and peer snapshots |
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
 | `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync is 5 years daily plus last 1 day of 1-minute bars |
 | `data/dhanlive/screener.py` | `dhan_screener_snapshots` | Stores rendered ScanX screener `ng-state` JSON by screener slug and date |
@@ -56,6 +56,12 @@ These are the JSON-first scripts that are easiest to call from a human shell, an
 
 ```sh
 /home/rane/code/stockey/.xstockey/bin/python -m ...
+```
+
+- Use the same interpreter for the curated runner:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python scripts/agent_tool_runner.py list
 ```
 
 - Symbol-scoped loaders fall back in this order:
@@ -201,6 +207,10 @@ Operational notes:
 - `data.dhanlive.screener` can still be pointed at explicit URLs directly.
 - Snapshots are stored in `dhan_screener_snapshots` by `date + screener_slug`.
 - `latest` is compact by default; use `--raw` to print the full stored JSON payload.
+
+## Advisory implementation
+
+The programming checklist for the investment advisory system lives in [`todo.md`](/home/rane/code/stockey/todo.md). It separates what already exists from the missing modules, tables, and agent-safe commands still required to make [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) executable end to end.
 
 ## OCR usage
 
@@ -350,7 +360,40 @@ python scripts/agent_tool_runner.py list --category storage
 python scripts/agent_tool_runner.py run sql_query -- --read-only "select * from macro_usa limit 5"
 python scripts/agent_tool_runner.py run redis_get -- bhav:parsed --max-items 20
 python scripts/agent_tool_runner.py run load_us_macro --allow-writes
+python scripts/agent_tool_runner.py run build_advisory_screener_constituents --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_macro_daily --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_fundamentals_daily --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_market_regime --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run sync_advisory_peers --allow-writes -- --symbols HDFCBANK
+python scripts/agent_tool_runner.py run build_advisory_technical_daily --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run run_advisory_rule_engine --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_watchlist --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run run_advisory_announcement_watch --allow-writes -- --dry-run
 ```
+
+### Advisory modules
+
+```sh
+python -m advisory.screener_parser --dry-run
+python -m advisory.screener_parser
+python -m advisory.macro_snapshot --dry-run
+python -m advisory.macro_snapshot
+python -m advisory.fundamental_snapshot --dry-run
+python -m advisory.fundamental_snapshot
+python -m advisory.regime_engine --dry-run
+python -m advisory.regime_engine
+python -m advisory.peer_sync --symbols HDFCBANK
+python -m advisory.technical_features --dry-run
+python -m advisory.technical_features
+python -m advisory.rule_engine --dry-run
+python -m advisory.rule_engine
+python -m advisory.watchlist_builder --dry-run
+python -m advisory.watchlist_builder
+python -m advisory.announcement_watch --dry-run
+python -m advisory.announcement_watch
+```
+
+`advisory.fundamental_snapshot` and `advisory.technical_features` refresh peer snapshots automatically on normal write runs. Use `--skip-peer-sync` if you want a pure build against already-synced data.
 
 ## LLM-facing conventions
 
