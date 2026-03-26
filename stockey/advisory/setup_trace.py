@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.setup_registry import load_setup_registry
 from utils.db import sql_to_df
 from utils.sync import parse_datetime_arg
 
@@ -100,39 +101,64 @@ def load_setup_regime(asof_date: pd.Timestamp | None) -> dict[str, Any] | None:
     return df.iloc[0].to_dict()
 
 
-def load_latest_setup_screener(setup_id: str) -> pd.DataFrame:
-    if not table_exists("advisory_candidates") or not table_exists("advisory_screener_constituents"):
+def load_market_overlay(asof_date: pd.Timestamp | None) -> dict[str, Any] | None:
+    if asof_date is None or not table_exists("advisory_market_overlay_daily"):
+        return None
+    df = sql_to_df(
+        """
+        SELECT *
+        FROM advisory_market_overlay_daily
+        WHERE asof_date = %s
+        LIMIT 1
+        """,
+        params=(asof_date,),
+    )
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def resolve_setup_screeners(setup_id: str, overlay_name: str | None = None) -> list[str]:
+    screener_slugs: list[str] = []
+    for setup in load_setup_registry():
+        if str(setup.get("setup_id", "")).upper() != setup_id.upper():
+            continue
+        screener_slugs = [str(value) for value in (setup.get("screeners") or setup.get("screener_slugs") or []) if value]
+        if not screener_slugs and setup.get("screener_slug"):
+            screener_slugs = [str(setup["screener_slug"])]
+        overlay_cfg = (setup.get("overlay_screeners") or {}).get(str(overlay_name or "NONE").upper(), {})
+        remove = {str(value) for value in (overlay_cfg.get("remove") or []) if value}
+        add = [str(value) for value in (overlay_cfg.get("add") or []) if value]
+        screener_slugs = [value for value in screener_slugs if value not in remove]
+        for value in add:
+            if value not in screener_slugs:
+                screener_slugs.append(value)
+        break
+    return screener_slugs
+
+
+def load_latest_setup_screener(setup_id: str, overlay_name: str | None = None) -> pd.DataFrame:
+    if not table_exists("advisory_screener_constituents"):
+        return pd.DataFrame()
+    screener_slugs = resolve_setup_screeners(setup_id, overlay_name=overlay_name)
+    if not screener_slugs:
         return pd.DataFrame()
     return sql_to_df(
         """
-        WITH cfg AS (
-            SELECT DISTINCT screener_slug
-            FROM advisory_candidates
-            WHERE setup_id = %s
-            UNION
-            SELECT DISTINCT screener_slug
-            FROM advisory_screener_constituents
-            WHERE screener_slug = (
-                SELECT screener_slug
-                FROM advisory_candidates
-                WHERE setup_id = %s
-                ORDER BY asof_date DESC
-                LIMIT 1
-            )
-        ),
+        WITH
         latest AS (
             SELECT MAX(date) AS screener_date
             FROM advisory_screener_constituents
-            WHERE screener_slug IN (SELECT screener_slug FROM cfg)
+            WHERE screener_slug = ANY(%s)
         )
         SELECT s.*
         FROM advisory_screener_constituents s
         JOIN latest l
           ON l.screener_date = s.date
-        WHERE s.screener_slug IN (SELECT screener_slug FROM cfg)
+        WHERE s.screener_slug = ANY(%s)
         ORDER BY s.rank, s.ticker
         """,
-        params=(setup_id.upper(), setup_id.upper()),
+        params=(screener_slugs, screener_slugs),
     )
 
 
@@ -184,7 +210,8 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
     setup_id_upper = setup_id.upper()
     resolved_asof_date = resolve_asof_date(setup_id_upper, requested_date=asof_date)
 
-    screener_rows = load_latest_setup_screener(setup_id_upper)
+    overlay_row = load_market_overlay(resolved_asof_date)
+    screener_rows = load_latest_setup_screener(setup_id_upper, overlay_name=(overlay_row or {}).get("overlay_name"))
     candidate_rows = load_setup_rows("advisory_candidates", setup_id_upper, resolved_asof_date)
     rejection_rows = load_setup_rows("advisory_candidate_rejections", setup_id_upper, resolved_asof_date, limit=5000)
     watchlist_rows = load_setup_rows("advisory_watchlist", setup_id_upper, resolved_asof_date)
@@ -203,11 +230,51 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
     evaluated_symbols = set(evaluation_rows.get("symbol", pd.Series(dtype="string")).dropna().astype(str).str.upper().tolist())
     allocated_symbols = set(allocation_rows.get("symbol", pd.Series(dtype="string")).dropna().astype(str).str.upper().tolist())
     portfolio_symbols = set(portfolio_rows.get("symbol", pd.Series(dtype="string")).dropna().astype(str).str.upper().tolist())
+    active_screeners = resolve_setup_screeners(setup_id_upper, overlay_name=(overlay_row or {}).get("overlay_name"))
+    candidate_count_by_screener = (
+        screener_rows.get("screener_slug", pd.Series(dtype="string")).dropna().astype("string").value_counts().to_dict()
+        if not screener_rows.empty and "screener_slug" in screener_rows.columns
+        else {}
+    )
+    candidate_state_counts = (
+        candidate_rows.get("candidate_state", pd.Series(dtype="string")).dropna().astype("string").value_counts().to_dict()
+        if not candidate_rows.empty
+        else {}
+    )
+    current_watch_state_counts = (
+        watchlist_rows.get("current_state", pd.Series(dtype="string")).dropna().astype("string").value_counts().to_dict()
+        if not watchlist_rows.empty
+        else {}
+    )
+    latest_transition_counts = (
+        evaluation_rows.get("state_transition_hint", pd.Series(dtype="string")).dropna().astype("string").value_counts().to_dict()
+        if not evaluation_rows.empty
+        else {}
+    )
+    avg_setup_score = None
+    avg_technical_score = None
+    avg_fundamental_score = None
+    if not candidate_rows.empty:
+        if "setup_score" in candidate_rows.columns:
+            avg_setup_score = round(float(pd.to_numeric(candidate_rows["setup_score"], errors="coerce").dropna().mean()), 6) if not pd.to_numeric(candidate_rows["setup_score"], errors="coerce").dropna().empty else None
+        if "technical_score" in candidate_rows.columns:
+            avg_technical_score = round(float(pd.to_numeric(candidate_rows["technical_score"], errors="coerce").dropna().mean()), 6) if not pd.to_numeric(candidate_rows["technical_score"], errors="coerce").dropna().empty else None
+        if "fundamental_score" in candidate_rows.columns:
+            avg_fundamental_score = round(float(pd.to_numeric(candidate_rows["fundamental_score"], errors="coerce").dropna().mean()), 6) if not pd.to_numeric(candidate_rows["fundamental_score"], errors="coerce").dropna().empty else None
+    near_miss_count = 0
+    if not candidate_rows.empty and "near_miss_flag" in candidate_rows.columns:
+        near_miss_count += int(candidate_rows["near_miss_flag"].fillna(False).astype(bool).sum())
+    if not rejection_rows.empty and "is_near_miss" in rejection_rows.columns:
+        near_miss_count += int(rejection_rows["is_near_miss"].fillna(False).astype(bool).sum())
 
     stage_summary = {
         "asof_date": None if resolved_asof_date is None else resolved_asof_date.isoformat(),
         "regime_name": (regime_row or {}).get("regime_name"),
+        "overlay_name": (overlay_row or {}).get("overlay_name"),
+        "overlay_reason": (overlay_row or {}).get("overlay_reason"),
+        "active_screeners": active_screeners,
         "screener_universe_count": int(len(screener_symbols)),
+        "candidate_count_by_screener": candidate_count_by_screener,
         "candidate_count": int(len(candidate_symbols)),
         "rejection_count": int(len(rejection_rows)),
         "watchlist_count": int(len(watch_symbols)),
@@ -218,6 +285,13 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
         "portfolio_count": int(len(portfolio_symbols)),
         "lifecycle_count": int(len(lifecycle_rows)),
         "execution_count": int(len(execution_rows)),
+        "watch_state_counts": candidate_state_counts,
+        "current_watch_state_counts": current_watch_state_counts,
+        "latest_transition_counts": latest_transition_counts,
+        "avg_setup_score": avg_setup_score,
+        "avg_technical_score": avg_technical_score,
+        "avg_fundamental_score": avg_fundamental_score,
+        "near_miss_count": near_miss_count,
     }
 
     funnel_summary = {
@@ -235,6 +309,10 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
 
     decision_summary = {
         "top_rejection_reasons": load_top_rejection_reasons(setup_id_upper, resolved_asof_date),
+        "overlay_name": (overlay_row or {}).get("overlay_name"),
+        "overlay_reason": (overlay_row or {}).get("overlay_reason"),
+        "active_screeners": active_screeners,
+        "candidate_count_by_screener": candidate_count_by_screener,
         "latest_event_verdict": (latest_eval_row or {}).get("verdict"),
         "latest_event_source": (latest_eval_row or {}).get("event_source"),
         "latest_portfolio_status": (latest_portfolio_row or {}).get("portfolio_status"),
@@ -248,6 +326,7 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
         "decision_summary": decision_summary,
         "stages": {
             "regime": row_to_json_ready(regime_row),
+            "overlay": row_to_json_ready(overlay_row),
             "screeners": df_to_records(screener_rows, limit=15),
             "candidates": df_to_records(candidate_rows, limit=15),
             "rejections": df_to_records(rejection_rows, limit=15),
@@ -282,6 +361,15 @@ def format_text(trace: dict[str, Any]) -> str:
             "",
             "Decision summary:",
             f"- top_rejection_reasons: {trace['decision_summary'].get('top_rejection_reasons')}",
+            f"- overlay_name: {trace['decision_summary'].get('overlay_name')}",
+            f"- overlay_reason: {trace['decision_summary'].get('overlay_reason')}",
+            f"- active_screeners: {trace['decision_summary'].get('active_screeners')}",
+            f"- candidate_count_by_screener: {trace['decision_summary'].get('candidate_count_by_screener')}",
+            f"- watch_state_counts: {trace['stage_summary'].get('watch_state_counts')}",
+            f"- current_watch_state_counts: {trace['stage_summary'].get('current_watch_state_counts')}",
+            f"- latest_transition_counts: {trace['stage_summary'].get('latest_transition_counts')}",
+            f"- avg_setup_score: {trace['stage_summary'].get('avg_setup_score')}",
+            f"- near_miss_count: {trace['stage_summary'].get('near_miss_count')}",
             f"- latest_event_verdict: {trace['decision_summary'].get('latest_event_verdict')}",
             f"- latest_event_source: {trace['decision_summary'].get('latest_event_source')}",
             f"- latest_portfolio_status: {trace['decision_summary'].get('latest_portfolio_status')}",

@@ -216,7 +216,6 @@ class AnnouncementPipeline:
                 )
                 completion = self._get_openai_client().beta.chat.completions.parse(
                     model=self.summarize_model,
-                    temperature=0,
                     messages=[
                         {
                             "role": "system",

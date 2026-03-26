@@ -179,6 +179,89 @@ def df_to_records(df: pd.DataFrame, date_cols: list[str] | None = None, limit: i
     return records
 
 
+def load_aggregated_event_decision(symbol: str, setup_id: str | None = None) -> dict[str, Any] | None:
+    if not table_exists("advisory_event_evaluations"):
+        return None
+
+    clauses = ["symbol = %s"]
+    params: list[object] = [symbol.upper()]
+    if setup_id:
+        clauses.append("setup_id = %s")
+        params.append(setup_id.upper())
+    clauses.append(
+        """
+        asof_date = (
+            SELECT MAX(asof_date)
+            FROM advisory_event_evaluations
+            WHERE symbol = %s
+        )
+        """
+    )
+    params.append(symbol.upper())
+
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM advisory_event_evaluations
+        WHERE {' AND '.join(clauses)}
+        ORDER BY published_on, load_ts NULLS LAST
+        """,
+        params=tuple(params),
+    )
+    if df.empty:
+        return None
+
+    df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
+    df["score_impact"] = pd.to_numeric(df["score_impact"], errors="coerce").fillna(0.0)
+    latest = df.sort_values(["published_on"], ascending=[True], kind="stable").iloc[-1].to_dict()
+    hints = {str(value).upper() for value in df.get("state_transition_hint", pd.Series(dtype="string")).dropna().astype(str)}
+    verdicts = {str(value).lower() for value in df.get("verdict", pd.Series(dtype="string")).dropna().astype(str)}
+    total_score_impact = round(max(-0.35, min(0.35, float(df["score_impact"].sum()))), 4)
+    any_investable = bool(pd.Series(df.get("investable_now")).fillna(False).astype(bool).any())
+
+    if "DOWNGRADE_TO_REJECT" in hints or "reject" in verdicts:
+        transition_hint = "DOWNGRADE_TO_REJECT"
+    elif "UPGRADE_TO_PASS_NOW" in hints:
+        transition_hint = "UPGRADE_TO_PASS_NOW"
+    elif total_score_impact >= 0.12:
+        transition_hint = "RAISE_SCORE_ONLY"
+    elif total_score_impact <= -0.12:
+        transition_hint = "CUT_SCORE_ONLY"
+    elif "REVIEW_MANUAL" in hints:
+        transition_hint = "REVIEW_MANUAL"
+    else:
+        transition_hint = "NO_CHANGE"
+
+    if "reject" in verdicts:
+        verdict = "reject"
+    elif "continue" in verdicts:
+        verdict = "continue"
+    elif "review_manual" in verdicts:
+        verdict = "review_manual"
+    else:
+        verdict = str(latest.get("verdict") or "review_manual")
+
+    if verdict == "reject" or transition_hint == "DOWNGRADE_TO_REJECT":
+        investable_now = False
+    else:
+        investable_now = any_investable
+
+    return {
+        "asof_date": latest.get("asof_date"),
+        "published_on": latest.get("published_on"),
+        "setup_id": latest.get("setup_id"),
+        "symbol": latest.get("symbol"),
+        "effective_event_class": latest.get("event_class"),
+        "effective_event_verdict": verdict,
+        "effective_state_transition_hint": transition_hint,
+        "effective_event_score_impact": total_score_impact,
+        "effective_investable_now": investable_now,
+        "effective_event_source": latest.get("event_source"),
+        "raw_event_count": int(len(df)),
+        "has_review_manual": "REVIEW_MANUAL" in hints or "review_manual" in verdicts,
+    }
+
+
 def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
     symbol_upper = symbol.upper()
     screener_rows = load_latest_screener_rows(symbol_upper, setup_id=setup_id)
@@ -190,6 +273,7 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
     announcement_events = latest_rows("advisory_watch_events", symbol=symbol_upper, setup_id=setup_id, date_column="published_on", limit=10)
     news_events = latest_rows("advisory_news_events", symbol=symbol_upper, setup_id=setup_id, date_column="published_on", limit=10)
     event_eval = latest_single_row("advisory_event_evaluations", symbol=symbol_upper, setup_id=setup_id, date_column="published_on")
+    aggregated_event = load_aggregated_event_decision(symbol_upper, setup_id=setup_id)
     allocation_row = latest_single_row("advisory_allocations", symbol=symbol_upper, setup_id=setup_id, date_column="published_on")
     portfolio_row = latest_single_row("advisory_portfolio_orders", symbol=symbol_upper, setup_id=setup_id, date_column="published_on")
     lifecycle_row = latest_single_row("advisory_position_lifecycle", symbol=symbol_upper, setup_id=setup_id, date_column="published_on")
@@ -200,11 +284,16 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
         "has_technical_snapshot": technical_row is not None,
         "has_fundamental_snapshot": fundamental_row is not None,
         "passed_rule_engine": candidate_row is not None,
+        "base_regime": (candidate_row or {}).get("base_regime") or (watchlist_row or {}).get("base_regime"),
+        "news_overlay": (candidate_row or {}).get("news_overlay") or (watchlist_row or {}).get("news_overlay"),
+        "candidate_state": (candidate_row or {}).get("candidate_state"),
+        "current_watch_state": (watchlist_row or {}).get("current_state") or (watchlist_row or {}).get("candidate_state"),
         "latest_rejection_count": int(len(rejection_rows)),
         "on_watchlist": watchlist_row is not None,
         "announcement_event_count": int(len(announcement_events)),
         "news_event_count": int(len(news_events)),
         "has_event_evaluation": event_eval is not None,
+        "has_aggregated_event_decision": aggregated_event is not None,
         "has_allocation": allocation_row is not None,
         "has_portfolio_order": portfolio_row is not None,
         "has_lifecycle_row": lifecycle_row is not None,
@@ -226,7 +315,18 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
             }
         ),
         "latest_event_verdict": (event_eval or {}).get("verdict"),
+        "latest_event_class": (event_eval or {}).get("event_class"),
+        "latest_state_transition_hint": (event_eval or {}).get("state_transition_hint"),
         "latest_event_source": (event_eval or {}).get("event_source"),
+        "source_screener_slug": (watchlist_row or {}).get("source_screener_slug") or (candidate_row or {}).get("source_screener_slug"),
+        "source_screener_list": (watchlist_row or {}).get("source_screener_list") or (candidate_row or {}).get("source_screener_list"),
+        "effective_event_verdict": (aggregated_event or {}).get("effective_event_verdict"),
+        "effective_event_class": (aggregated_event or {}).get("effective_event_class"),
+        "effective_state_transition_hint": (aggregated_event or {}).get("effective_state_transition_hint"),
+        "effective_event_score_impact": (aggregated_event or {}).get("effective_event_score_impact"),
+        "effective_investable_now": (aggregated_event or {}).get("effective_investable_now"),
+        "effective_event_source": (aggregated_event or {}).get("effective_event_source"),
+        "effective_raw_event_count": (aggregated_event or {}).get("raw_event_count"),
         "latest_allocation_status": (allocation_row or {}).get("allocation_status"),
         "latest_portfolio_status": (portfolio_row or {}).get("portfolio_status"),
         "latest_execution_status": (execution_row or {}).get("execution_status"),
@@ -249,6 +349,7 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
             "announcement_events": df_to_records(announcement_events, date_cols=["published_on", "asof_date"]),
             "news_events": df_to_records(news_events, date_cols=["published_on", "asof_date"]),
             "event_evaluation": row_to_json_ready(event_eval),
+            "aggregated_event_decision": row_to_json_ready(aggregated_event),
             "allocation": row_to_json_ready(allocation_row),
             "portfolio": row_to_json_ready(portfolio_row),
             "lifecycle": row_to_json_ready(lifecycle_row),
@@ -273,7 +374,18 @@ def format_text(trace: dict[str, Any]) -> str:
             f"- latest_setup_id: {trace['decision_summary'].get('latest_setup_id')}",
             f"- latest_rejection_reasons: {trace['decision_summary'].get('latest_rejection_reasons')}",
             f"- latest_event_verdict: {trace['decision_summary'].get('latest_event_verdict')}",
+            f"- latest_event_class: {trace['decision_summary'].get('latest_event_class')}",
+            f"- latest_state_transition_hint: {trace['decision_summary'].get('latest_state_transition_hint')}",
             f"- latest_event_source: {trace['decision_summary'].get('latest_event_source')}",
+            f"- source_screener_slug: {trace['decision_summary'].get('source_screener_slug')}",
+            f"- source_screener_list: {trace['decision_summary'].get('source_screener_list')}",
+            f"- effective_event_verdict: {trace['decision_summary'].get('effective_event_verdict')}",
+            f"- effective_event_class: {trace['decision_summary'].get('effective_event_class')}",
+            f"- effective_state_transition_hint: {trace['decision_summary'].get('effective_state_transition_hint')}",
+            f"- effective_event_score_impact: {trace['decision_summary'].get('effective_event_score_impact')}",
+            f"- effective_investable_now: {trace['decision_summary'].get('effective_investable_now')}",
+            f"- effective_event_source: {trace['decision_summary'].get('effective_event_source')}",
+            f"- effective_raw_event_count: {trace['decision_summary'].get('effective_raw_event_count')}",
             f"- latest_allocation_status: {trace['decision_summary'].get('latest_allocation_status')}",
             f"- latest_portfolio_status: {trace['decision_summary'].get('latest_portfolio_status')}",
             f"- latest_execution_status: {trace['decision_summary'].get('latest_execution_status')}",

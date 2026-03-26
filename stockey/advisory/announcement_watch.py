@@ -32,9 +32,22 @@ def ensure_watch_outputs_tables() -> None:
                 company_master_id TEXT,
                 screener_slug TEXT,
                 rank BIGINT,
+                candidate_state TEXT,
+                current_state TEXT,
+                watch_reason_detail TEXT,
+                entry_style TEXT,
+                attractive_price_low DOUBLE PRECISION,
+                attractive_price_high DOUBLE PRECISION,
+                invalidation_price DOUBLE PRECISION,
+                entry_note TEXT,
+                near_miss_flag BOOLEAN,
+                last_event_class TEXT,
+                last_state_transition_hint TEXT,
+                last_event_score_impact DOUBLE PRECISION,
                 watch_enabled BOOLEAN,
                 watch_reasons_json TEXT,
                 watch_status TEXT,
+                state_updated_at TIMESTAMPTZ,
                 watch_started_at TIMESTAMPTZ,
                 last_checked_at TIMESTAMPTZ,
                 last_document_published_on TIMESTAMPTZ,
@@ -43,6 +56,35 @@ def ensure_watch_outputs_tables() -> None:
             )
             """
         )
+        watchlist_columns = {
+            "setup_name": "TEXT",
+            "regime_name": "TEXT",
+            "company_master_id": "TEXT",
+            "screener_slug": "TEXT",
+            "rank": "BIGINT",
+            "candidate_state": "TEXT",
+            "current_state": "TEXT",
+            "watch_reason_detail": "TEXT",
+            "entry_style": "TEXT",
+            "attractive_price_low": "DOUBLE PRECISION",
+            "attractive_price_high": "DOUBLE PRECISION",
+            "invalidation_price": "DOUBLE PRECISION",
+            "entry_note": "TEXT",
+            "near_miss_flag": "BOOLEAN",
+            "last_event_class": "TEXT",
+            "last_state_transition_hint": "TEXT",
+            "last_event_score_impact": "DOUBLE PRECISION",
+            "watch_enabled": "BOOLEAN",
+            "watch_reasons_json": "TEXT",
+            "watch_status": "TEXT",
+            "state_updated_at": "TIMESTAMPTZ",
+            "watch_started_at": "TIMESTAMPTZ",
+            "last_checked_at": "TIMESTAMPTZ",
+            "last_document_published_on": "TIMESTAMPTZ",
+            "load_ts": "TIMESTAMPTZ",
+        }
+        for column, sql_type in watchlist_columns.items():
+            cur.execute(f"ALTER TABLE {WATCHLIST_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
@@ -74,7 +116,7 @@ def load_watchlist(
     symbols: list[str] | None = None,
     setup_ids: list[str] | None = None,
 ) -> pd.DataFrame:
-    clauses = ["watch_status = 'active'"]
+    clauses = ["COALESCE(watch_enabled, TRUE) = TRUE", "COALESCE(watch_status, 'active') IN ('active', 'review_manual')"]
     params: list[object] = []
     if asof_date is not None:
         clauses.append("asof_date = %s")
@@ -251,9 +293,22 @@ def run_announcement_watch(
                 "company_master_id": row["company_master_id"],
                 "screener_slug": row.get("screener_slug"),
                 "rank": row.get("rank"),
+                "candidate_state": row.get("candidate_state"),
+                "current_state": row.get("current_state"),
+                "watch_reason_detail": row.get("watch_reason_detail"),
+                "entry_style": row.get("entry_style"),
+                "attractive_price_low": row.get("attractive_price_low"),
+                "attractive_price_high": row.get("attractive_price_high"),
+                "invalidation_price": row.get("invalidation_price"),
+                "entry_note": row.get("entry_note"),
+                "near_miss_flag": row.get("near_miss_flag"),
+                "last_event_class": row.get("last_event_class"),
+                "last_state_transition_hint": row.get("last_state_transition_hint"),
+                "last_event_score_impact": row.get("last_event_score_impact"),
                 "watch_enabled": row.get("watch_enabled", True),
                 "watch_reasons_json": row["watch_reasons_json"],
                 "watch_status": row.get("watch_status", "active"),
+                "state_updated_at": pd.to_datetime(row.get("state_updated_at"), utc=True, errors="coerce"),
                 "watch_started_at": pd.to_datetime(row.get("watch_started_at"), utc=True, errors="coerce"),
                 "last_checked_at": effective_to,
                 "last_document_published_on": last_published,

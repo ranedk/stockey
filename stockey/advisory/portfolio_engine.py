@@ -81,6 +81,9 @@ def ensure_portfolio_table() -> None:
                 priority_score DOUBLE PRECISION,
                 overlap_group TEXT,
                 overlap_reason TEXT,
+                event_class TEXT,
+                state_transition_hint TEXT,
+                score_impact DOUBLE PRECISION,
                 requested_allocation_inr DOUBLE PRECISION,
                 approved_allocation_inr DOUBLE PRECISION,
                 remaining_capital_after_inr DOUBLE PRECISION,
@@ -105,6 +108,9 @@ def ensure_portfolio_table() -> None:
             "priority_score": "DOUBLE PRECISION",
             "overlap_group": "TEXT",
             "overlap_reason": "TEXT",
+            "event_class": "TEXT",
+            "state_transition_hint": "TEXT",
+            "score_impact": "DOUBLE PRECISION",
             "requested_allocation_inr": "DOUBLE PRECISION",
             "approved_allocation_inr": "DOUBLE PRECISION",
             "remaining_capital_after_inr": "DOUBLE PRECISION",
@@ -288,15 +294,27 @@ def build_overlap_map(symbols: list[str]) -> dict[str, tuple[str, str]]:
 
 
 def compute_priority_score(row: pd.Series) -> float:
-    confidence = float(pd.to_numeric(row.get("confidence"), errors="coerce") or 0.0)
+    confidence_raw = pd.to_numeric(row.get("confidence"), errors="coerce")
+    confidence = 0.0 if pd.isna(confidence_raw) else float(confidence_raw)
     conviction_score = CONVICTION_SCORE.get(str(row.get("conviction_bucket", "")).lower(), 1.0)
     risk_penalty = RISK_PENALTY.get(str(row.get("risk_bucket", "")).lower(), 0.5)
-    allocation_size = float(pd.to_numeric(row.get("suggested_allocation_inr"), errors="coerce") or 0.0)
+    allocation_size_raw = pd.to_numeric(row.get("suggested_allocation_inr"), errors="coerce")
+    allocation_size = 0.0 if pd.isna(allocation_size_raw) else float(allocation_size_raw)
+    score_impact_raw = pd.to_numeric(row.get("score_impact"), errors="coerce")
+    score_impact = 0.0 if pd.isna(score_impact_raw) else float(score_impact_raw)
+    transition_hint = str(row.get("state_transition_hint", "")).upper()
     liquidity_penalty = 0.0
     adv_pct = pd.to_numeric(row.get("allocation_pct_of_adv20d"), errors="coerce")
     if pd.notna(adv_pct) and adv_pct > 0.0025:
         liquidity_penalty = min(float(adv_pct) * 100.0, 1.5)
-    return round((confidence * 3.0) + conviction_score - risk_penalty - liquidity_penalty + (allocation_size / 100_000.0), 6)
+    transition_bonus = 0.0
+    if transition_hint == "UPGRADE_TO_PASS_NOW":
+        transition_bonus = 1.0
+    elif transition_hint == "RAISE_SCORE_ONLY":
+        transition_bonus = 0.35
+    elif transition_hint == "CUT_SCORE_ONLY":
+        transition_bonus = -0.35
+    return round((confidence * 3.0) + conviction_score - risk_penalty - liquidity_penalty + (allocation_size / 100_000.0) + (score_impact * 2.0) + transition_bonus, 6)
 
 
 def build_execution_notes(row: pd.Series, approved_allocation: float, portfolio_status: str, portfolio_reason: str | None = None) -> str | None:
@@ -316,6 +334,8 @@ def build_execution_notes(row: pd.Series, approved_allocation: float, portfolio_
         notes.append(f"Stop reference {float(row['stop_price']):.2f}.")
     if pd.notna(row.get("invalidation_price")):
         notes.append(f"Invalidation reference {float(row['invalidation_price']):.2f}.")
+    if str(row.get("state_transition_hint") or "").strip():
+        notes.append(f"Event transition {row.get('state_transition_hint')}.")
     base_notes = str(row.get("notes") or "").strip()
     if base_notes:
         notes.append(base_notes)
@@ -424,6 +444,9 @@ def build_portfolio_orders(
                 "priority_score": row["priority_score"],
                 "overlap_group": overlap_group,
                 "overlap_reason": row.get("overlap_reason"),
+                "event_class": row.get("event_class"),
+                "state_transition_hint": row.get("state_transition_hint"),
+                "score_impact": row.get("score_impact"),
                 "requested_allocation_inr": float(row["requested_allocation_inr"]),
                 "approved_allocation_inr": approved,
                 "remaining_capital_after_inr": remaining_capital,
@@ -443,6 +466,10 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
     ensure_portfolio_table()
     if df.empty:
         return
+    with db_session() as (_, cur):
+        asof_dates = [value.to_pydatetime() if hasattr(value, "to_pydatetime") else value for value in pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dropna().unique().tolist()]
+        if asof_dates:
+            cur.execute(f"DELETE FROM {PORTFOLIO_TABLE} WHERE asof_date = ANY(%s)", (asof_dates,))
     upsert_to_db(
         df,
         PORTFOLIO_TABLE,

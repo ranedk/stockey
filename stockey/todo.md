@@ -1,242 +1,280 @@
 # Investment Advisory TODO
 
-This file maps the target workflow in [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) to the current codebase state as of 2026-03-24.
+This file tracks the next advisory redesign as of 2026-03-26.
 
-## Implemented
+The current system already has:
 
-- Task 1 screener normalization:
-  - [`data/screenerin/screener_parser.py`](/home/rane/code/stockey/data/screenerin/screener_parser.py) stores parsed Screener.in snapshots in `screenerin_screener_snapshots`.
-  - [`advisory/screener_parser.py`](/home/rane/code/stockey/advisory/screener_parser.py) materializes `advisory_screener_constituents` from `screenerin_screener_snapshots`.
-- Task 2 OHLCV ingestion foundation:
-  - [`data/dhanlive/ohlcv.py`](/home/rane/code/stockey/data/dhanlive/ohlcv.py) ingests `dhan_ohlcv_daily` and `dhan_ohlcv_intraday`.
-  - Advisory technicals and rule evaluation now use Dhan as the canonical OHLCV source.
-- Task 3 macro snapshot:
-  - [`advisory/macro_snapshot.py`](/home/rane/code/stockey/advisory/macro_snapshot.py) materializes `advisory_macro_daily`.
-  - Existing macro tables are being reused: `rbi_bank_rates`, `fbil_gsec_par`, `mospi_cpi`, `eaindustry_wpi`, `macro_usa`.
-- Peer and Sharpely sync:
-  - [`data/sharpelydata/sharpely_data.py`](/home/rane/code/stockey/data/sharpelydata/sharpely_data.py) persists `sharpely_stock_meta` and `sharpely_stock_peers`.
-  - [`advisory/peer_sync.py`](/home/rane/code/stockey/advisory/peer_sync.py) incrementally refreshes peer metadata, fundamentals, and missing peer OHLCV.
-- Task 4 regime engine:
-  - [`advisory/regime_engine.py`](/home/rane/code/stockey/advisory/regime_engine.py) materializes `advisory_market_regime` using `REGIME_ALGO_V1`.
-- Task 5 technical parameter calculator:
-  - [`advisory/technical_features.py`](/home/rane/code/stockey/advisory/technical_features.py) materializes `advisory_technical_daily`.
-  - TA-Lib features are in place, including peer-based `rs_vs_sector`.
-- Point-in-time fundamentals:
-  - [`advisory/fundamental_snapshot.py`](/home/rane/code/stockey/advisory/fundamental_snapshot.py) materializes `advisory_fundamentals_daily`.
-  - Peer-relative fundamental deltas vs sector peers are in place.
-- Task 6 setup registry and rule engine:
-  - [`config/advisory_setups.yaml`](/home/rane/code/stockey/config/advisory_setups.yaml) defines setup rules.
-  - [`advisory/setup_registry.py`](/home/rane/code/stockey/advisory/setup_registry.py) loads the setup registry.
-  - [`advisory/rule_engine.py`](/home/rane/code/stockey/advisory/rule_engine.py) materializes `advisory_candidates` and `advisory_candidate_rejections`.
-- Task 7 watchlist layer:
-  - [`advisory/watchlist_builder.py`](/home/rane/code/stockey/advisory/watchlist_builder.py) materializes `advisory_watchlist` from passed candidates.
-  - [`advisory/announcement_watch.py`](/home/rane/code/stockey/advisory/announcement_watch.py) drives the managed announcement pipeline for active watchlist rows and materializes `advisory_watch_events`.
-  - [`data/economictimes/rss.py`](/home/rane/code/stockey/data/economictimes/rss.py) stores raw ET RSS items in `economictimes_rss_items`.
-  - [`advisory/news_watch.py`](/home/rane/code/stockey/advisory/news_watch.py) matches ET RSS items onto active watchlist rows and materializes `advisory_news_events`.
-- Task 8 announcement parser + LLM evaluator:
-  - [`advisory/prompts.py`](/home/rane/code/stockey/advisory/prompts.py) defines the structured event-evaluation prompt contract.
-  - [`advisory/llm_event_evaluator.py`](/home/rane/code/stockey/advisory/llm_event_evaluator.py) evaluates triggered official-announcement and ET RSS watch events with point-in-time advisory context.
-  - LLM outputs are persisted into `advisory_event_evaluations` and `advisory_event_risks`.
-- Task 9 risk profiling and allocation:
-  - [`advisory/risk_engine.py`](/home/rane/code/stockey/advisory/risk_engine.py) materializes `advisory_allocations` with risk bucket, conviction bucket, suggested allocation, and invalidation guidance.
-  - [`advisory/portfolio_engine.py`](/home/rane/code/stockey/advisory/portfolio_engine.py) materializes `advisory_portfolio_orders` with capital-aware order planning on top of `advisory_allocations`.
-  - Portfolio overlap controls are now in place using Sharpely peer clusters first and sector-code fallback groups to avoid stacking correlated names.
-  - [`advisory/position_lifecycle.py`](/home/rane/code/stockey/advisory/position_lifecycle.py) materializes `advisory_position_lifecycle` and `advisory_rebalance_actions` for paper-position monitoring and rebalance/exit suggestions.
-  - [`advisory/execution_engine.py`](/home/rane/code/stockey/advisory/execution_engine.py) materializes `advisory_execution_orders` and `advisory_execution_fills` for broker handoff and Dhan order/trade reconciliation.
-  - [`advisory/pipeline.py`](/home/rane/code/stockey/advisory/pipeline.py) orchestrates the advisory stack end to end with stage controls.
-- Agent-safe execution surface:
-  - JSON runners exist in [`scripts/sql_query_runner.py`](/home/rane/code/stockey/scripts/sql_query_runner.py), [`scripts/redis_query_runner.py`](/home/rane/code/stockey/scripts/redis_query_runner.py), and [`scripts/s3_query_runner.py`](/home/rane/code/stockey/scripts/s3_query_runner.py).
-  - Curated registry execution exists in [`scripts/agent_tool_runner.py`](/home/rane/code/stockey/scripts/agent_tool_runner.py).
+- screener normalization into `advisory_screener_constituents`
+- macro snapshot and base regime classification
+- technical and fundamental snapshots
+- rule engine, watchlist, announcement watch, and ET RSS watch
+- LLM event evaluation
+- risk, portfolio, lifecycle, and trace/dashboard tools
 
-## Partially implemented or still missing
+The next weakness is not missing infrastructure. It is setup activation logic:
 
-### Task 1. Screener crawler
+- setups are still too tightly tied to single screeners
+- regime handling is still too flat for temporary shock contexts
+- news context is not first-class in setup activation
+- traces do not clearly show which screener pool and overlay drove candidate generation
 
-- Current normalized screener coverage is still shallow.
-  - `advisory_screener_constituents` now reads Screener.in snapshots, but the upstream source is still only the four current advisory screeners.
-- Still needed:
-  - more setup-specific screeners
-  - support for multiple upstream screener sources
-  - stronger setup-to-screener curation
+## Objective
 
-### Task 2. OHLCV crawler
+Add a stable two-layer activation model:
 
-- Dhan OHLCV ingestion works, but the advisory stack still lacks:
-  - a unified price inventory table such as `advisory_price_inventory`
-  - missing-bar detection and freshness QA
-  - sector/index price coverage beyond the current peer-basket approximation
-- Advisory design decision:
-  - `dhan_ohlcv_daily` is now the canonical OHLCV source for the advisory stack
-  - NSE bhavcopy and local adjusted-price derivations remain optional reference and reconciliation pipelines, not advisory dependencies
+- one base regime from the existing `advisory_market_regime`
+- one lightweight daily news overlay
 
-### Task 3. Macro crawler
+Then use that pair to:
 
-- Current gap remains:
-  - `NEW_MACRO_SOURCE_REQUIRED`: sector-linked commodity prices
-- Still needed:
-  - explicit policy-window flags
-  - explicit shock-window flags
+- activate or suppress setups
+- choose multiple screeners per setup
+- add or remove screeners under overlays
+- improve candidate generation without changing data sources
 
-### Task 4. Regime engine
+## Product Model
 
-- `advisory_market_regime` exists and emits only the documented labels.
-- Still needed:
-  - breadth proxies
-  - manual shock override table
-  - richer policy-event features instead of only threshold-based macro pressure flags
+### Base regime
 
-### Task 5. Technical parameter calculator
+Keep the existing regime model:
 
-- `advisory_technical_daily` exists and includes the required TA-Lib feature set.
-- Still needed:
-  - intraday feature layer for timing
-  - sector/index benchmark mapping where a peer basket is not sufficient
+- `BULL_RISK_ON`
+- `BULL_NARROW`
+- `STABLE`
+- `STABLE_BUT_TARIFF_RISING`
+- `RISK_OFF`
+- `SHOCK`
 
-### Task 6. Rule engine
+### News overlay
 
-- The first-pass rule engine is live and persists explicit reject reasons.
-- Still needed:
-  - better market-cap bucket and SME/mid/large tagging
-  - setup-specific screener diversity
-  - better handling for names missing technical or fundamental coverage
-  - automatic watchlist materialization from passed candidates
+Add a second daily layer:
 
-### Task 7. Announcement watcher
+- `NONE`
+- `GEOPOLITICAL_RISK`
+- `OIL_SHOCK`
+- `TARIFF_PRESSURE`
+- `SECTOR_POLICY_SHOCK`
+- `EVENT_CLUSTER`
 
-- Setup-aware watchlist orchestration now exists.
-- Still needed:
-  - trigger taxonomy refinement by setup
-  - better watch lifecycle states beyond `active`
-  - tighter filtering of which announcement and ET RSS categories should become material watch events
+This is not a replacement for base regime. It is a context overlay.
 
-### Task 8. Announcement parser + LLM evaluator
+## Scope
 
-- OCR, storage, and the first LLM investment-evaluation layer now exist.
-- Still needed:
-  - materiality gating so only high-signal announcement and ET RSS watch events go to the evaluator by default
-  - review queue tooling for `review_manual` verdicts
-  - batch/backpressure policy for heavy announcement days
+In scope:
 
-### Task 9. Risk profiling and allocation
+- multiple screeners per setup
+- overlay-aware setup activation
+- overlay-aware screener expansion or suppression
+- diagnostics for active screeners and overlays
+- provenance fields on candidates and watchlists
 
-- `advisory_allocations` now exists and is produced by [`advisory/risk_engine.py`](/home/rane/code/stockey/advisory/risk_engine.py).
-- `advisory_portfolio_orders` now exists and is produced by [`advisory/portfolio_engine.py`](/home/rane/code/stockey/advisory/portfolio_engine.py).
-- `advisory_position_lifecycle` and `advisory_rebalance_actions` now exist and are produced by [`advisory/position_lifecycle.py`](/home/rane/code/stockey/advisory/position_lifecycle.py).
-- `advisory_execution_orders` and `advisory_execution_fills` now exist and are produced by [`advisory/execution_engine.py`](/home/rane/code/stockey/advisory/execution_engine.py).
-- Still needed:
-  - richer execution-state transitions once real fills, modifications, and partial exits exist
-  - postback/webhook ingestion so order-state updates do not depend only on polling
+Out of scope:
 
-## Cross-cutting work still needed
+- new vendors
+- broker/feed expansion
+- macro engine rewrite
+- full market-wide news-first discovery
+- turning every headline into a new regime
 
-### 1. Advisory package expansion
+## Current Reality
 
-- Existing advisory modules:
-  - `advisory/__init__.py`
-  - `advisory/screener_parser.py`
-  - `advisory/macro_snapshot.py`
-  - `advisory/peer_sync.py`
-  - `advisory/regime_engine.py`
-  - `advisory/setup_registry.py`
-  - `advisory/technical_features.py`
-  - `advisory/fundamental_snapshot.py`
-  - `advisory/rule_engine.py`
-  - `advisory/watchlist_builder.py`
-  - `advisory/announcement_watch.py`
-  - `advisory/news_watch.py`
-  - `advisory/llm_event_evaluator.py`
-  - `advisory/prompts.py`
-  - `advisory/risk_engine.py`
-  - `advisory/portfolio_engine.py`
-  - `advisory/position_lifecycle.py`
-  - `advisory/execution_engine.py`
+Already implemented from the previous redesign:
 
-### 2. Point-in-time advisory tables
+- ranked setup scoring
+- reduced hard rejects
+- watch states and entry-zone metadata
+- event taxonomy and state-transition hints
+- aggregated event effect handling in watch, risk, and portfolio
+- improved symbol/setup trace visibility
 
-- Implemented:
-  - `advisory_macro_daily`
-  - `advisory_fundamentals_daily`
-  - `advisory_technical_daily`
-  - `advisory_market_regime`
-  - `advisory_candidates`
-  - `advisory_candidate_rejections`
-  - `advisory_watchlist`
-  - `advisory_watch_events`
-  - `economictimes_rss_items`
-  - `advisory_news_events`
-  - `advisory_event_evaluations`
-  - `advisory_event_risks`
-  - `advisory_allocations`
-  - `advisory_portfolio_orders`
-  - `advisory_position_lifecycle`
-  - `advisory_rebalance_actions`
-  - `advisory_execution_orders`
-  - `advisory_execution_fills`
+Main gaps now:
 
-### 3. Market-cap and segment tagging
+- config still defaults to a single screener mental model
+- setups do not read a market overlay
+- rule engine does not expose active screener provenance cleanly
+- dashboard and setup trace do not show overlay-driven activation
 
-- Current setup rules use heuristic market-cap thresholds from screener data.
-- Still needed:
-  - maintained market-cap bucket dimension
-  - SME / large-cap / mid-cap / defensive tags
-  - canonical benchmark and sector-index mapping
+## Delivery Plan
 
-### 4. Validation and data quality checks
+### Phase 1: Multi-Screener Setup Mapping
 
-- Still needed:
-  - stale screener snapshot checks
-  - macro staleness alerts
-  - OHLCV gap detection
-  - intraday availability checks
-  - missing-coverage reports for live screener names in `dhan_ohlcv_daily`
-  - LLM evaluation source-trace validation
+Goal:
 
-### 5. JSON-first CLIs and agent tools
+- let setups consume multiple screeners deterministically
 
-- Implemented CLIs:
-  - `python -m advisory.screener_parser`
-  - `python -m advisory.macro_snapshot`
-  - `python -m advisory.peer_sync`
-  - `python -m advisory.regime_engine`
-  - `python -m advisory.technical_features`
-  - `python -m advisory.fundamental_snapshot`
-  - `python -m advisory.rule_engine`
-  - `python -m advisory.watchlist_builder`
-  - `python -m advisory.announcement_watch`
-  - `python -m advisory.llm_event_evaluator`
-  - `python -m advisory.risk_engine`
-  - `python -m advisory.portfolio_engine`
-  - `python -m advisory.position_lifecycle`
-  - `python -m advisory.execution_engine`
-  - `python -m advisory.pipeline`
+Tasks:
 
-### 6. Research and backtest layer
+1. Update [`config/advisory_setups.yaml`](/home/rane/code/stockey/config/advisory_setups.yaml)
+   - replace single-screener assumptions with:
+     - `screeners`
+     - `screener_mode`
+     - `overlay_screeners`
+     - `allowed_overlays`
+     - `blocked_overlays`
+2. Update [`advisory/setup_registry.py`](/home/rane/code/stockey/advisory/setup_registry.py)
+   - normalize old and new setup config shapes
+   - keep backward compatibility where practical
+3. Update [`advisory/rule_engine.py`](/home/rane/code/stockey/advisory/rule_engine.py)
+   - resolve active screeners per setup
+   - support `union` and `intersection`
+   - preserve source screener provenance
 
-- Still needed:
-  - `advisory/models/dataset_builder.py`
-  - `advisory/models/train_ranker.py`
-  - `advisory/models/train_event_model.py`
-  - `advisory/backtest.py`
-- Use:
-  - `pandas`
-  - `scikit-learn`
-  - `xgboost`
+Done when:
 
-## Recommended next implementation order
+- at least one setup runs against more than one screener
+- trace output shows which screener pool was active
+- existing setups do not break
 
-1. Expand Dhan OHLCV coverage for live screener symbols and add explicit OHLCV inventory/QA checks.
-2. Add a maintained market-cap / segment mapping dimension instead of setup-local heuristics.
-3. Add breadth, policy-window, and manual shock override inputs to `advisory_market_regime`.
-4. Refine watch-event filtering so the watch layer prioritizes only material announcement categories before LLM evaluation.
-5. Add review-queue tooling for `review_manual` event verdicts.
-6. Add postback-driven execution updates and real partial-exit/modify/cancel flows on top of the current execution engine.
+### Phase 2: Add Market News Overlay
 
-## Notes for the implementing agent
+Goal:
 
-- Prefer existing JSON runners in `scripts/` for inspection and verification.
-- Prefer `company_master_id` as the join key wherever possible.
-- Use point-in-time joins only. Do not use future fundamentals or macro values.
-- For advisory technicals and rule evaluation, treat `dhan_ohlcv_daily` as the canonical OHLCV source.
-- Reuse `features/tutils.py` patterns for release-aware daily snapshots.
-- Use TA-Lib for technicals, `pandas` for feature assembly, `scikit-learn` and `xgboost` only where a model is explicitly introduced.
-- Keep raw ingestion, daily snapshots, rule outputs, and LLM outputs in separate tables.
+- classify one daily overlay from ET RSS and existing regime context
+
+Tasks:
+
+1. Add [`advisory/news_overlay_engine.py`](/home/rane/code/stockey/advisory/news_overlay_engine.py)
+   - read recent ET RSS / matched news context
+   - combine with existing regime flags
+   - write:
+     - `asof_date`
+     - `base_regime`
+     - `overlay_name`
+     - `overlay_intensity`
+     - `overlay_reason`
+     - `source_count`
+2. Keep [`advisory/regime_engine.py`](/home/rane/code/stockey/advisory/regime_engine.py) unchanged in principle
+   - it remains the stable base layer
+
+Done when:
+
+- one overlay row is available per date
+- `NONE` is valid
+- dashboard and traces can display the overlay
+
+### Phase 3: Overlay-Aware Setup Activation
+
+Goal:
+
+- use base regime plus overlay to decide whether setups run and which screeners they use
+
+Tasks:
+
+1. Extend [`advisory/rule_engine.py`](/home/rane/code/stockey/advisory/rule_engine.py)
+   - apply:
+     - `allowed_regimes`
+     - `blocked_regimes`
+     - `allowed_overlays`
+     - `blocked_overlays`
+   - reject with:
+     - `regime_not_allowed`
+     - `overlay_not_allowed`
+   - add overlay-driven screener expansion/removal
+2. Preserve candidate metadata:
+   - `source_screener_slug`
+   - `source_screener_list`
+   - `base_regime`
+   - `news_overlay`
+
+Done when:
+
+- setup activation clearly depends on both layers
+- overlay can add screeners without code changes
+- inclusion and rejection reasons are traceable
+
+### Phase 4: Diagnostics and Downstream Provenance
+
+Goal:
+
+- show setup activation path clearly
+
+Tasks:
+
+1. Update [`advisory/watchlist_builder.py`](/home/rane/code/stockey/advisory/watchlist_builder.py)
+   - preserve screener and overlay provenance
+2. Update [`advisory/setup_trace.py`](/home/rane/code/stockey/advisory/setup_trace.py)
+   - show:
+     - base regime
+     - active overlay
+     - overlay reason
+     - active screeners
+     - candidate counts by screener
+3. Update [`advisory/dashboard.py`](/home/rane/code/stockey/advisory/dashboard.py)
+   - expose:
+     - regime
+     - overlay
+     - active screeners
+     - top rejection reason
+
+Done when:
+
+- one command can explain why a setup ran
+- one command can explain which screener pool drove candidate generation
+
+## Minimum Schema Changes
+
+### New table
+
+`advisory_market_overlay_daily`
+
+- `asof_date`
+- `base_regime`
+- `overlay_name`
+- `overlay_intensity`
+- `overlay_reason`
+- `source_count`
+- `load_ts`
+
+### `advisory_candidates`
+
+- `source_screener_slug`
+- `source_screener_list`
+- `base_regime`
+- `news_overlay`
+
+### `advisory_watchlist`
+
+- `source_screener_slug`
+- `source_screener_list`
+- `base_regime`
+- `news_overlay`
+
+## Operating Workflow
+
+1. Run:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_overlay_engine --dry-run
+```
+
+2. Run:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine --dry-run
+```
+
+3. Inspect:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.setup_trace <SETUP_ID> --format text
+```
+
+4. Check:
+
+- active regime
+- active overlay
+- active screeners
+- candidate counts by screener
+- top rejection reasons
+
+## Blunt Rule
+
+Do not build a new “regime” every time the market narrative changes.
+
+Build:
+
+- one stable base regime
+- one lightweight market/news overlay
+- one flexible multi-screener setup mapping layer
+
+That is the right level of reactivity for this stack.

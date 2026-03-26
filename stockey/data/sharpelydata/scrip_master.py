@@ -59,10 +59,11 @@ def get_latest_from_sharpely(headers):
             headers=headers,
         ).json()
         data = json.loads(resp)
+        response_keys = list(data["keys"])
 
         for val in json.loads(data["values"]):
-            row = [v for k, v in zip(data["keys"], val) if k in keys_of_interest[i]]
-            _data.append(row)
+            row_map = dict(zip(response_keys, val))
+            _data.append({key: row_map.get(key) for key in keys_of_interest[i]})
 
         df = pd.DataFrame(_data, columns=keys_of_interest[i])
         dfs.append(df)

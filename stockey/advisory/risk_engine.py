@@ -12,6 +12,9 @@ from utils.sync import parse_datetime_arg
 
 
 ALLOCATIONS_TABLE = "advisory_allocations"
+_TRANSITION_CUTOFF = 0.12
+_MATERIALITY_ORDER = {"low": 1, "medium": 2, "high": 3}
+_RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,26 @@ SETUP_RISK_PROFILES: dict[str, SetupRiskProfile] = {
         base_risk_bucket="medium_high",
         max_allocation_inr=50_000,
         invalidation_anchor="dma_20",
+    ),
+    "SME_TACTICAL_SWING_V1": SetupRiskProfile(
+        base_risk_bucket="high",
+        max_allocation_inr=25_000,
+        invalidation_anchor="dma_20",
+    ),
+    "MIDCAP_IMPROVER_SWING_V1": SetupRiskProfile(
+        base_risk_bucket="medium_high",
+        max_allocation_inr=50_000,
+        invalidation_anchor="dma_20",
+    ),
+    "LARGECAP_BREAKOUT_POSITION_V1": SetupRiskProfile(
+        base_risk_bucket="medium",
+        max_allocation_inr=100_000,
+        invalidation_anchor="dma_50",
+    ),
+    "DEFENSIVE_REGIME_POSITION_V1": SetupRiskProfile(
+        base_risk_bucket="medium",
+        max_allocation_inr=75_000,
+        invalidation_anchor="dma_50",
     ),
 }
 
@@ -94,6 +117,9 @@ def ensure_allocations_table() -> None:
                 investable_now BOOLEAN,
                 materiality TEXT,
                 setup_effect TEXT,
+                event_class TEXT,
+                state_transition_hint TEXT,
+                score_impact DOUBLE PRECISION,
                 confidence DOUBLE PRECISION,
                 risk_bucket TEXT,
                 conviction_bucket TEXT,
@@ -110,6 +136,34 @@ def ensure_allocations_table() -> None:
             )
             """
         )
+        column_defs = {
+            "asof_date": "TIMESTAMPTZ",
+            "allocated_at": "TIMESTAMPTZ",
+            "setup_name": "TEXT",
+            "company_master_id": "TEXT",
+            "evaluation_status": "TEXT",
+            "evaluation_verdict": "TEXT",
+            "investable_now": "BOOLEAN",
+            "materiality": "TEXT",
+            "setup_effect": "TEXT",
+            "event_class": "TEXT",
+            "state_transition_hint": "TEXT",
+            "score_impact": "DOUBLE PRECISION",
+            "confidence": "DOUBLE PRECISION",
+            "risk_bucket": "TEXT",
+            "conviction_bucket": "TEXT",
+            "allocation_status": "TEXT",
+            "suggested_allocation_inr": "DOUBLE PRECISION",
+            "allocation_pct_of_adv20d": "DOUBLE PRECISION",
+            "stop_price": "DOUBLE PRECISION",
+            "invalidation_price": "DOUBLE PRECISION",
+            "invalidation_rule": "TEXT",
+            "notes": "TEXT",
+            "context_snapshot_json": "TEXT",
+            "load_ts": "TIMESTAMPTZ",
+        }
+        for column, sql_type in column_defs.items():
+            cur.execute(f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
 
 
 def load_event_evaluations(
@@ -166,6 +220,127 @@ def load_event_evaluations(
         return df
     df["asof_date"] = normalize_timestamp(df["asof_date"])
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["score_impact"] = pd.to_numeric(df["score_impact"], errors="coerce").fillna(0.0)
+
+    def _pick_level(values: pd.Series, order: dict[str, int], default: str) -> str:
+        cleaned = [str(value).lower() for value in values if str(value).strip()]
+        if not cleaned:
+            return default
+        return max(cleaned, key=lambda item: order.get(item, -1))
+
+    rows: list[dict[str, Any]] = []
+    for (asof_key, setup_id, symbol), group in df.groupby(["asof_date", "setup_id", "symbol"], dropna=False, sort=False):
+        group = group.sort_values(["published_on"], ascending=[True], kind="stable")
+        latest = group.iloc[-1].to_dict()
+        hints = {str(value).upper() for value in group["state_transition_hint"].dropna().astype(str)}
+        verdicts = {str(value).lower() for value in group["verdict"].dropna().astype(str)}
+        total_score_impact = round(max(-0.35, min(0.35, float(group["score_impact"].sum()))), 4)
+
+        if "DOWNGRADE_TO_REJECT" in hints or "reject" in verdicts:
+            transition_hint = "DOWNGRADE_TO_REJECT"
+        elif "UPGRADE_TO_PASS_NOW" in hints:
+            transition_hint = "UPGRADE_TO_PASS_NOW"
+        elif total_score_impact >= _TRANSITION_CUTOFF:
+            transition_hint = "RAISE_SCORE_ONLY"
+        elif total_score_impact <= -_TRANSITION_CUTOFF:
+            transition_hint = "CUT_SCORE_ONLY"
+        elif "REVIEW_MANUAL" in hints:
+            transition_hint = "REVIEW_MANUAL"
+        else:
+            transition_hint = "NO_CHANGE"
+
+        if "reject" in verdicts:
+            verdict = "reject"
+        elif "continue" in verdicts:
+            verdict = "continue"
+        elif "review_manual" in verdicts:
+            verdict = "review_manual"
+        else:
+            verdict = str(latest.get("verdict") or "review_manual")
+
+        any_investable = bool(pd.Series(group.get("investable_now")).fillna(False).astype(bool).any())
+        if verdict == "reject":
+            investable_now = False
+        elif transition_hint == "DOWNGRADE_TO_REJECT":
+            investable_now = False
+        else:
+            investable_now = any_investable
+
+        if total_score_impact >= _TRANSITION_CUTOFF:
+            setup_effect = "strengthens"
+            sentiment = "positive"
+        elif total_score_impact <= -_TRANSITION_CUTOFF:
+            setup_effect = "weakens"
+            sentiment = "negative"
+        else:
+            setup_effect = str(latest.get("setup_effect") or "neutral")
+            sentiment = str(latest.get("sentiment") or "neutral")
+
+        merged = dict(latest)
+        merged["asof_date"] = asof_key
+        merged["setup_id"] = setup_id
+        merged["symbol"] = symbol
+        merged["published_on"] = latest.get("published_on")
+        merged["event_class"] = latest.get("event_class")
+        merged["state_transition_hint"] = transition_hint
+        merged["score_impact"] = total_score_impact
+        merged["verdict"] = verdict
+        merged["investable_now"] = investable_now
+        merged["setup_effect"] = setup_effect
+        merged["sentiment"] = sentiment
+        merged["materiality"] = _pick_level(group["materiality"], _MATERIALITY_ORDER, str(latest.get("materiality") or "low"))
+        merged["governance_risk"] = _pick_level(group["governance_risk"], _RISK_ORDER, str(latest.get("governance_risk") or "none"))
+        merged["balance_sheet_risk"] = _pick_level(group["balance_sheet_risk"], _RISK_ORDER, str(latest.get("balance_sheet_risk") or "none"))
+        merged["execution_risk"] = _pick_level(group["execution_risk"], _RISK_ORDER, str(latest.get("execution_risk") or "none"))
+        merged["confidence"] = float(pd.to_numeric(group["confidence"], errors="coerce").dropna().max()) if not pd.to_numeric(group["confidence"], errors="coerce").dropna().empty else latest.get("confidence")
+        merged["has_review_manual"] = "REVIEW_MANUAL" in hints or "review_manual" in verdicts
+        rows.append(merged)
+
+    return pd.DataFrame(rows)
+
+
+def load_watch_states(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+) -> pd.DataFrame:
+    if not table_exists("advisory_watchlist"):
+        return pd.DataFrame()
+
+    clauses = ["1 = 1"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append("asof_date = (SELECT MAX(asof_date) FROM advisory_watchlist)")
+    if symbols:
+        clauses.append("symbol = ANY(%s)")
+        params.append([value.upper() for value in symbols])
+    if setup_ids:
+        clauses.append("setup_id = ANY(%s)")
+        params.append([value.upper() for value in setup_ids])
+
+    df = sql_to_df(
+        f"""
+        SELECT
+            asof_date,
+            setup_id,
+            symbol,
+            candidate_state,
+            current_state,
+            watch_status
+        FROM advisory_watchlist
+        WHERE {' AND '.join(clauses)}
+        ORDER BY asof_date, setup_id, symbol
+        """,
+        params=tuple(params) if params else None,
+    )
+    if df.empty:
+        return df
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
     df["symbol"] = df["symbol"].astype("string").str.upper()
     return df
 
@@ -251,12 +426,20 @@ def compute_risk_bucket(row: pd.Series, context: dict[str, Any]) -> str:
     if pd.notna(debt_to_equity_vs_sector) and debt_to_equity_vs_sector > 0.5:
         bucket = bump_risk_bucket(bucket, 1)
 
+    event_class = str(row.get("event_class", "")).upper()
+    score_impact = pd.to_numeric(row.get("score_impact"), errors="coerce")
+    if event_class in {"AUDITOR_GOVERNANCE", "DILUTION", "PLEDGE_UP", "GUIDANCE_DOWNGRADE", "RESULTS_NEGATIVE", "POLICY_SECTOR_NEGATIVE"}:
+        bucket = bump_risk_bucket(bucket, 1)
+    if pd.notna(score_impact) and score_impact <= -0.20:
+        bucket = bump_risk_bucket(bucket, 1)
+
     return clamp_risk_bucket(bucket)
 
 
 def compute_conviction_bucket(row: pd.Series, context: dict[str, Any]) -> str:
     score = 0.0
-    score += float(pd.to_numeric(row.get("confidence"), errors="coerce") or 0.0) * 2.0
+    confidence = pd.to_numeric(row.get("confidence"), errors="coerce")
+    score += (0.0 if pd.isna(confidence) else float(confidence)) * 2.0
 
     materiality = str(row.get("materiality", "")).lower()
     setup_effect = str(row.get("setup_effect", "")).lower()
@@ -280,6 +463,20 @@ def compute_conviction_bucket(row: pd.Series, context: dict[str, Any]) -> str:
         score -= 0.25
     elif sentiment == "negative":
         score -= 1.0
+
+    score_impact = pd.to_numeric(row.get("score_impact"), errors="coerce")
+    if pd.notna(score_impact):
+        score += float(score_impact) * 2.0
+
+    state_transition_hint = str(row.get("state_transition_hint", "")).upper()
+    if state_transition_hint == "UPGRADE_TO_PASS_NOW":
+        score += 0.75
+    elif state_transition_hint == "DOWNGRADE_TO_REJECT":
+        score -= 1.25
+    elif state_transition_hint == "RAISE_SCORE_ONLY":
+        score += 0.30
+    elif state_transition_hint == "CUT_SCORE_ONLY":
+        score -= 0.50
 
     rs_vs_benchmark = pd.to_numeric(context.get("rs_vs_benchmark"), errors="coerce")
     rs_vs_sector = pd.to_numeric(context.get("rs_vs_sector"), errors="coerce")
@@ -348,6 +545,13 @@ def build_allocations(
     )
     if evaluations.empty:
         return pd.DataFrame()
+    watch_states = load_watch_states(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+    if not watch_states.empty:
+        evaluations = evaluations.merge(
+            watch_states[["asof_date", "setup_id", "symbol", "candidate_state", "current_state", "watch_status"]],
+            on=["asof_date", "setup_id", "symbol"],
+            how="left",
+        )
 
     rows: list[dict[str, Any]] = []
     for _, row in evaluations.iterrows():
@@ -361,20 +565,52 @@ def build_allocations(
         verdict = str(row.get("verdict", "")).lower()
         evaluation_status = str(row.get("evaluation_status", "")).lower()
         investable_now = bool(row.get("investable_now", False))
+        current_state = str(row.get("current_state", "")).upper()
+        event_class = str(row.get("event_class", "")).upper()
+        state_transition_hint = str(row.get("state_transition_hint", "")).upper()
+        score_impact_raw = pd.to_numeric(row.get("score_impact"), errors="coerce")
+        score_impact = 0.0 if pd.isna(score_impact_raw) else float(score_impact_raw)
+        promoted_to_pass_now = current_state == "PASS_NOW" and state_transition_hint != "DOWNGRADE_TO_REJECT" and verdict != "reject"
+        actionable_now = investable_now or promoted_to_pass_now
 
         notes: list[str] = []
         if evaluation_status != "completed":
             allocation_status = "review_manual"
             suggested_allocation_inr = 0.0
             notes.append(f"LLM evaluation status is {evaluation_status}.")
-        elif verdict == "reject" or not investable_now:
+        elif state_transition_hint == "DOWNGRADE_TO_REJECT":
+            allocation_status = "rejected"
+            suggested_allocation_inr = 0.0
+            notes.append(f"Event transition {state_transition_hint} blocked automatic allocation.")
+        elif verdict == "review_manual":
+            if not actionable_now:
+                allocation_status = "rejected"
+                suggested_allocation_inr = 0.0
+                notes.append("Event evaluation does not support a fresh allocation.")
+            else:
+                raw_cap = float(profile.max_allocation_inr)
+                liquidity_cap = pd.to_numeric(context.get("avg_traded_value_20d"), errors="coerce")
+                if pd.notna(liquidity_cap):
+                    liquidity_cap = float(liquidity_cap) * 0.005
+                else:
+                    liquidity_cap = raw_cap
+                    notes.append("Liquidity cap fallback used because ADV20 was missing.")
+
+                suggested_allocation_inr = min(
+                    raw_cap * CONVICTION_MULTIPLIER[conviction_bucket] * RISK_BUCKET_MULTIPLIER[risk_bucket],
+                    liquidity_cap,
+                )
+                event_multiplier = max(0.50, min(1.25, 1.0 + score_impact))
+                suggested_allocation_inr = suggested_allocation_inr * event_multiplier
+                suggested_allocation_inr = round_allocation(suggested_allocation_inr)
+                allocation_status = "allocated" if suggested_allocation_inr > 0 else "review_manual"
+                notes.append("LLM requested manual review; keep this flagged for operator review.")
+                if promoted_to_pass_now and not investable_now:
+                    notes.append("Watchlist promotion to PASS_NOW overrode a conservative event investable flag.")
+        elif verdict == "reject" or not actionable_now:
             allocation_status = "rejected"
             suggested_allocation_inr = 0.0
             notes.append("Event evaluation does not support a fresh allocation.")
-        elif verdict == "review_manual":
-            allocation_status = "review_manual"
-            suggested_allocation_inr = 0.0
-            notes.append("LLM explicitly requested manual review.")
         elif str(row.get("governance_risk", "none")) == "high":
             allocation_status = "review_manual"
             suggested_allocation_inr = 0.0
@@ -392,6 +628,8 @@ def build_allocations(
                 raw_cap * CONVICTION_MULTIPLIER[conviction_bucket] * RISK_BUCKET_MULTIPLIER[risk_bucket],
                 liquidity_cap,
             )
+            event_multiplier = max(0.50, min(1.25, 1.0 + score_impact))
+            suggested_allocation_inr = suggested_allocation_inr * event_multiplier
             suggested_allocation_inr = round_allocation(suggested_allocation_inr)
 
             if suggested_allocation_inr <= 0:
@@ -399,6 +637,14 @@ def build_allocations(
                 notes.append("Computed allocation rounded down to zero.")
             else:
                 allocation_status = "allocated"
+                if state_transition_hint:
+                    notes.append(f"Event transition: {state_transition_hint}.")
+                if event_class:
+                    notes.append(f"Event class: {event_class}.")
+                if promoted_to_pass_now and not investable_now:
+                    notes.append("Watchlist promotion to PASS_NOW overrode a conservative event investable flag.")
+                if bool(row.get("has_review_manual", False)):
+                    notes.append("Another recent event still requires manual review.")
 
         adv20 = pd.to_numeric(context.get("avg_traded_value_20d"), errors="coerce")
         allocation_pct_of_adv20d = None
@@ -420,6 +666,9 @@ def build_allocations(
                 "investable_now": row.get("investable_now"),
                 "materiality": row.get("materiality"),
                 "setup_effect": row.get("setup_effect"),
+                "event_class": row.get("event_class"),
+                "state_transition_hint": row.get("state_transition_hint"),
+                "score_impact": row.get("score_impact"),
                 "confidence": row.get("confidence"),
                 "risk_bucket": risk_bucket,
                 "conviction_bucket": conviction_bucket,
@@ -442,6 +691,10 @@ def persist_allocations(df: pd.DataFrame) -> None:
     ensure_allocations_table()
     if df.empty:
         return
+    with db_session() as (_, cur):
+        asof_dates = [value.to_pydatetime() if hasattr(value, "to_pydatetime") else value for value in pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dropna().unique().tolist()]
+        if asof_dates:
+            cur.execute(f"DELETE FROM {ALLOCATIONS_TABLE} WHERE asof_date = ANY(%s)", (asof_dates,))
     upsert_to_db(
         df,
         ALLOCATIONS_TABLE,

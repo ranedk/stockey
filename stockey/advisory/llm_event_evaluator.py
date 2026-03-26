@@ -43,6 +43,30 @@ class EventEvaluation(BaseModel):
     execution_risk: Literal["none", "low", "medium", "high"]
     investable_now: bool
     verdict: Literal["continue", "reject", "review_manual"]
+    event_class: Literal[
+        "RESULTS_POSITIVE",
+        "RESULTS_NEGATIVE",
+        "ORDER_WIN",
+        "CAPEX_EXPANSION",
+        "GUIDANCE_UPGRADE",
+        "GUIDANCE_DOWNGRADE",
+        "PLEDGE_UP",
+        "PLEDGE_DOWN",
+        "DILUTION",
+        "AUDITOR_GOVERNANCE",
+        "POLICY_SECTOR_POSITIVE",
+        "POLICY_SECTOR_NEGATIVE",
+        "OTHER",
+    ]
+    state_transition_hint: Literal[
+        "UPGRADE_TO_PASS_NOW",
+        "DOWNGRADE_TO_REJECT",
+        "RAISE_SCORE_ONLY",
+        "CUT_SCORE_ONLY",
+        "NO_CHANGE",
+        "REVIEW_MANUAL",
+    ]
+    score_impact: float = Field(ge=-1.0, le=1.0)
     confidence: float = Field(ge=0.0, le=1.0)
     rationale: str = Field(min_length=10, max_length=1600)
     source_trace: list[str] = Field(default_factory=list, max_length=8)
@@ -78,6 +102,243 @@ def normalize_jsonish(value: Any) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return text
+
+
+def _flatten_jsonish_text(value: Any) -> str:
+    normalized = normalize_jsonish(value)
+    if normalized is None:
+        return ""
+    if isinstance(normalized, list):
+        return " ".join(str(item) for item in normalized if item is not None)
+    if isinstance(normalized, dict):
+        parts: list[str] = []
+        for key, item in normalized.items():
+            parts.append(str(key))
+            if item is not None:
+                parts.append(str(item))
+        return " ".join(parts)
+    return str(normalized)
+
+
+def _contains_any(text: str, tokens: list[str]) -> bool:
+    return any(token in text for token in tokens)
+
+
+VALID_EVENT_CLASSES = {
+    "RESULTS_POSITIVE",
+    "RESULTS_NEGATIVE",
+    "ORDER_WIN",
+    "CAPEX_EXPANSION",
+    "GUIDANCE_UPGRADE",
+    "GUIDANCE_DOWNGRADE",
+    "PLEDGE_UP",
+    "PLEDGE_DOWN",
+    "DILUTION",
+    "AUDITOR_GOVERNANCE",
+    "POLICY_SECTOR_POSITIVE",
+    "POLICY_SECTOR_NEGATIVE",
+    "OTHER",
+}
+
+
+def canonicalize_event_class(value: Any) -> str | None:
+    text = trim_text(value, 100)
+    if not text:
+        return None
+    normalized = text.strip().upper().replace("-", "_").replace(" ", "_")
+    alias_map = {
+        "RESULT_POSITIVE": "RESULTS_POSITIVE",
+        "RESULT_POSITIVE_S": "RESULTS_POSITIVE",
+        "POSITIVE_RESULTS": "RESULTS_POSITIVE",
+        "RESULTS_UPGRADE": "RESULTS_POSITIVE",
+        "RESULT_NEGATIVE": "RESULTS_NEGATIVE",
+        "NEGATIVE_RESULTS": "RESULTS_NEGATIVE",
+        "ORDER": "ORDER_WIN",
+        "CONTRACT_WIN": "ORDER_WIN",
+        "WORK_ORDER": "ORDER_WIN",
+        "CAPEX": "CAPEX_EXPANSION",
+        "GUIDANCE_POSITIVE": "GUIDANCE_UPGRADE",
+        "GUIDANCE_NEGATIVE": "GUIDANCE_DOWNGRADE",
+        "PROMOTER_PLEDGE_UP": "PLEDGE_UP",
+        "PROMOTER_PLEDGE_DOWN": "PLEDGE_DOWN",
+        "FUND_RAISE": "DILUTION",
+        "ESOP_DILUTION": "DILUTION",
+        "AUDITOR": "AUDITOR_GOVERNANCE",
+        "GOVERNANCE": "AUDITOR_GOVERNANCE",
+        "POLICY_POSITIVE": "POLICY_SECTOR_POSITIVE",
+        "POLICY_NEGATIVE": "POLICY_SECTOR_NEGATIVE",
+    }
+    normalized = alias_map.get(normalized, normalized)
+    return normalized if normalized in VALID_EVENT_CLASSES else None
+
+
+def classify_event_type(event_row: pd.Series, parsed: EventEvaluation) -> str:
+    subject_text = trim_text(event_row.get("subject"), 500) or ""
+    category_text = trim_text(event_row.get("filed_under_category"), 500) or ""
+    summary_text = trim_text(event_row.get("concise_summary_text"), 3000) or ""
+    categories_text = _flatten_jsonish_text(event_row.get("categories_json"))
+    strong_haystack = " ".join([subject_text, category_text, categories_text]).lower()
+    full_haystack = " ".join([subject_text, category_text, summary_text, categories_text]).lower()
+
+    if _contains_any(full_haystack, ["auditor", "forensic", "governance", "fraud", "whistleblower"]):
+        return "AUDITOR_GOVERNANCE"
+    if "pledge" in full_haystack:
+        return "PLEDGE_UP" if parsed.sentiment == "negative" else "PLEDGE_DOWN"
+    if _contains_any(full_haystack, ["guidance", "outlook", "revised estimate", "margin guidance"]):
+        return "GUIDANCE_UPGRADE" if parsed.sentiment == "positive" else "GUIDANCE_DOWNGRADE"
+    if _contains_any(
+        full_haystack,
+        [
+            "preferential",
+            "qip",
+            "warrant",
+            "warrants",
+            "dilution",
+            "rights issue",
+            "allotment of shares",
+            "esop",
+            "esos",
+            "esps",
+            "stock option",
+            "employee stock option",
+            "fund raise",
+            "fundraise",
+            "issue of equity",
+        ],
+    ):
+        return "DILUTION"
+    if _contains_any(
+        full_haystack,
+        [
+            "financial results",
+            "quarterly results",
+            "annual results",
+            "earnings",
+            "results",
+            "q1",
+            "q2",
+            "q3",
+            "q4",
+        ],
+    ):
+        return "RESULTS_POSITIVE" if parsed.sentiment == "positive" else "RESULTS_NEGATIVE"
+    if _contains_any(
+        full_haystack,
+        [
+            "capex",
+            "capacity expansion",
+            "capacity increase",
+            "new plant",
+            "brownfield",
+            "greenfield",
+            "commissioning",
+            "commercial production",
+        ],
+    ):
+        return "CAPEX_EXPANSION"
+
+    policy_tokens = ["policy", "tariff", "duty", "regulation", "regulatory", "gst", "export duty", "import duty"]
+    policy_exclusions = ["nclt order", "court order", "order no.", "change in director", "board meeting"]
+    if _contains_any(full_haystack, policy_tokens) and not _contains_any(full_haystack, policy_exclusions):
+        return "POLICY_SECTOR_POSITIVE" if parsed.sentiment == "positive" else "POLICY_SECTOR_NEGATIVE"
+
+    order_tokens = ["order win", "order award", "work order", "purchase order", "contract award", "letter of award", "loa", "contract win"]
+    order_exclusions = [
+        "change in director",
+        "director",
+        "board meeting",
+        "amalgamation",
+        "scheme of amalgamation",
+        "nclt",
+        "court order",
+        "first motion",
+        "order no.",
+        "general updates",
+        "disclosure of material issue",
+    ]
+    if (
+        _contains_any(full_haystack, order_tokens)
+        or (
+            _contains_any(full_haystack, ["order", "contract", "award"])
+            and not _contains_any(full_haystack, order_exclusions)
+            and _contains_any(strong_haystack, ["contract", "order", "award", "work order", "letter of award"])
+        )
+    ):
+        return "ORDER_WIN"
+    return "OTHER"
+
+
+def normalize_score_impact(parsed: EventEvaluation) -> float:
+    base = 0.0
+    materiality = {"low": 0.10, "medium": 0.20, "high": 0.35}.get(parsed.materiality, 0.0)
+    if parsed.setup_effect == "strengthens":
+        base += materiality
+    elif parsed.setup_effect == "neutral":
+        base += 0.0
+    elif parsed.setup_effect == "weakens":
+        base -= materiality
+    elif parsed.setup_effect == "contradicts":
+        base -= max(materiality, 0.35)
+
+    if parsed.sentiment == "positive":
+        base += 0.05
+    elif parsed.sentiment == "negative":
+        base -= 0.05
+    elif parsed.sentiment == "mixed":
+        base -= 0.02
+
+    if parsed.governance_risk == "high":
+        base = min(base, -0.60)
+    elif parsed.governance_risk == "medium":
+        base -= 0.15
+
+    if parsed.balance_sheet_risk == "high":
+        base -= 0.20
+    elif parsed.balance_sheet_risk == "medium":
+        base -= 0.10
+
+    if parsed.execution_risk == "high":
+        base -= 0.15
+    elif parsed.execution_risk == "medium":
+        base -= 0.05
+
+    return round(max(-1.0, min(1.0, base)), 4)
+
+
+def derive_state_transition_hint(parsed: EventEvaluation, event_class: str, score_impact: float) -> str:
+    if parsed.verdict == "review_manual":
+        return "REVIEW_MANUAL"
+
+    severe_negative_event = event_class in {
+        "AUDITOR_GOVERNANCE",
+        "PLEDGE_UP",
+        "GUIDANCE_DOWNGRADE",
+        "RESULTS_NEGATIVE",
+        "POLICY_SECTOR_NEGATIVE",
+    }
+    if parsed.verdict == "reject":
+        return "DOWNGRADE_TO_REJECT"
+    if severe_negative_event and (
+        parsed.setup_effect in {"weakens", "contradicts"}
+        or score_impact <= -0.15
+        or parsed.governance_risk in {"medium", "high"}
+        or parsed.balance_sheet_risk == "high"
+    ):
+        return "DOWNGRADE_TO_REJECT"
+    if parsed.investable_now and parsed.setup_effect == "strengthens" and parsed.materiality in {"medium", "high"} and score_impact >= 0.15:
+        return "UPGRADE_TO_PASS_NOW"
+    if score_impact >= 0.12:
+        return "RAISE_SCORE_ONLY"
+    if parsed.setup_effect in {"weakens", "contradicts"} or score_impact <= -0.12:
+        return "CUT_SCORE_ONLY"
+    return "NO_CHANGE"
+
+
+def normalize_event_evaluation(event_row: pd.Series, parsed: EventEvaluation) -> tuple[str, str, float]:
+    event_class = canonicalize_event_class(parsed.event_class) or classify_event_type(event_row, parsed)
+    score_impact = normalize_score_impact(parsed)
+    transition_hint = derive_state_transition_hint(parsed, event_class, score_impact)
+    return event_class, transition_hint, score_impact
 
 
 def load_watch_events(
@@ -438,12 +699,17 @@ def build_outputs(
                 execution_risk="none",
                 investable_now=False,
                 verdict="review_manual",
+                event_class="OTHER",
+                state_transition_hint="REVIEW_MANUAL",
+                score_impact=0.0,
                 confidence=0.0,
                 rationale=f"Automatic LLM evaluation failed: {exc}",
                 source_trace=["llm_error"],
                 key_risks=[],
             )
             evaluation_status = "error"
+
+        event_class, state_transition_hint, score_impact = normalize_event_evaluation(event_row, parsed)
 
         evaluation_rows.append(
             {
@@ -468,6 +734,9 @@ def build_outputs(
                 "execution_risk": parsed.execution_risk,
                 "investable_now": parsed.investable_now,
                 "verdict": parsed.verdict,
+                "event_class": event_class,
+                "state_transition_hint": state_transition_hint,
+                "score_impact": score_impact,
                 "confidence": parsed.confidence,
                 "what_happened": parsed.what_happened,
                 "rationale": parsed.rationale,
@@ -559,6 +828,9 @@ def ensure_output_tables() -> None:
                 execution_risk TEXT,
                 investable_now BOOLEAN,
                 verdict TEXT,
+                event_class TEXT,
+                state_transition_hint TEXT,
+                score_impact DOUBLE PRECISION,
                 confidence DOUBLE PRECISION,
                 what_happened TEXT,
                 rationale TEXT,
@@ -592,6 +864,9 @@ def ensure_output_tables() -> None:
             """
         )
         cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_class TEXT")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS state_transition_hint TEXT")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS score_impact DOUBLE PRECISION")
         cur.execute(f"ALTER TABLE {RISKS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT")
 
 

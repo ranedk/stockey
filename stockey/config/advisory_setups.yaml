@@ -1,15 +1,54 @@
 setups:
-  - setup_id: SME_MOMENTUM_V1
-    setup_name: SME momentum in supportive regime
-    screener_slug: sme-momentum-screen-v1
+  - setup_id: SME_TACTICAL_SWING_V1
+    setup_name: SME tactical swing
+    setup_family: SME_TACTICAL
+    holding_horizon_note: 3 days to 6 weeks
+    screeners:
+      - sme-momentum-screen-v1
+    screener_mode: union
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
       - STABLE
+    blocked_regimes:
+      - SHOCK
+    allowed_overlays:
+      - NONE
+      - EVENT_CLUSTER
+      - SECTOR_POLICY_SHOCK
+    blocked_overlays:
+      - GEOPOLITICAL_RISK
+      - OIL_SHOCK
+      - TARIFF_PRESSURE
+    overlay_screeners:
+      EVENT_CLUSTER:
+        add:
+          - midcap-improver-screen-v1
     market_cap_max: 10000
     min_avg_traded_value_20d: 20000000
     max_breakout_extension_pct: 8
-    min_dist_52w_high: -15
+    watch_pullback_extension_pct: 5
+    min_dist_52w_high: -18
+    scoring_weights:
+      technical: 0.45
+      fundamental: 0.20
+      regime_fit: 0.20
+      event: 0.15
+    score_thresholds:
+      pass_now: 0.70
+      watch_breakout: 0.58
+      watch_pullback: 0.52
+      watch_event: 0.48
+      near_miss_gap: 0.06
+    regime_policy:
+      preferred:
+        - BULL_RISK_ON
+        - BULL_NARROW
+      acceptable:
+        - STABLE
+      avoid:
+        - STABLE_BUT_TARIFF_RISING
+        - RISK_OFF
     technical_rules:
       - column: pass_above_dma_20
         operator: eq
@@ -19,90 +58,73 @@ setups:
         value: true
       - column: atr_compression_pct
         operator: lte
-        value: 0.7
+        value: 0.75
       - column: rs_vs_benchmark
         operator: gte
         value: 0.0
     watch_reasons:
+      - results
       - order wins
       - capacity expansion
-      - results
-      - pledge changes
+      - promoter or pledge changes
       - governance issues
       - dilution
+    entry_styles:
+      - BREAKOUT_PIVOT
+      - BREAKOUT_PLUS_EXTENSION_BAND
+      - RETEST_OF_PRIOR_BREAKOUT
 
-  - setup_id: LARGECAP_BREAKOUT_V1
-    setup_name: Large-cap breakout / continuation
-    screener_slug: largecap-breakout-screen-v1
+  - setup_id: MIDCAP_IMPROVER_SWING_V1
+    setup_name: Mid-cap improver swing
+    setup_family: MIDCAP_SWING
+    holding_horizon_note: 1 week to 10 weeks
+    screeners:
+      - midcap-improver-screen-v1
+      - largecap-breakout-screen-v1
+    screener_mode: union
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
       - STABLE
-      - STABLE_BUT_TARIFF_RISING
-    market_cap_min: 20000
-    min_avg_traded_value_20d: 500000000
-    max_breakout_extension_pct: 10
-    min_dist_52w_high: -12
-    technical_rules:
-      - column: pass_above_dma_50
-        operator: eq
-        value: true
-      - column: pass_above_dma_200
-        operator: eq
-        value: true
-      - column: rs_vs_benchmark
-        operator: gte
-        value: 0.0
-      - column: rs_vs_sector
-        operator: gte
-        value: 0.0
-    watch_reasons:
-      - earnings
-      - guidance changes
-      - major orders
-      - policy or tariff events
-      - management commentary
-
-  - setup_id: DEFENSIVE_TARIFF_V1
-    setup_name: Large-cap defensive / tariff-rising regime
-    screener_slug: defensive-tariff-screen-v1
-    allowed_regimes:
-      - STABLE_BUT_TARIFF_RISING
-      - RISK_OFF
-    market_cap_min: 20000
-    min_avg_traded_value_20d: 500000000
-    max_breakout_extension_pct: 8
-    min_dist_52w_high: -20
-    technical_rules:
-      - column: pass_above_dma_200
-        operator: eq
-        value: true
-      - column: rs_vs_benchmark
-        operator: gte
-        value: -0.02
-    fundamental_rules:
-      - column: debt_to_equity_vs_sector
-        operator: lte
-        value: 0.25
-    watch_reasons:
-      - margin commentary
-      - raw material impact
-      - tariff commentary
-      - forex impact
-      - management guidance
-
-  - setup_id: MIDCAP_IMPROVER_V1
-    setup_name: Mid-cap improving fundamentals + near breakout
-    screener_slug: midcap-improver-screen-v1
-    allowed_regimes:
-      - BULL_RISK_ON
-      - BULL_NARROW
-      - STABLE
+    blocked_regimes:
+      - SHOCK
+    allowed_overlays:
+      - NONE
+      - EVENT_CLUSTER
+      - SECTOR_POLICY_SHOCK
+    blocked_overlays:
+      - GEOPOLITICAL_RISK
+      - OIL_SHOCK
+    overlay_screeners:
+      TARIFF_PRESSURE:
+        remove:
+          - largecap-breakout-screen-v1
     market_cap_min: 5000
     market_cap_max: 20000
     min_avg_traded_value_20d: 100000000
     max_breakout_extension_pct: 10
-    min_dist_52w_high: -20
+    watch_pullback_extension_pct: 6
+    min_dist_52w_high: -22
+    scoring_weights:
+      technical: 0.35
+      fundamental: 0.35
+      regime_fit: 0.20
+      event: 0.10
+    score_thresholds:
+      pass_now: 0.68
+      watch_breakout: 0.57
+      watch_pullback: 0.52
+      watch_event: 0.48
+      near_miss_gap: 0.06
+    regime_policy:
+      preferred:
+        - BULL_RISK_ON
+        - BULL_NARROW
+      acceptable:
+        - STABLE
+      avoid:
+        - STABLE_BUT_TARIFF_RISING
+        - RISK_OFF
     technical_rules:
       - column: pass_above_dma_50
         operator: eq
@@ -130,3 +152,164 @@ setups:
       - debt reduction
       - promoter actions
       - dilution risk
+    entry_styles:
+      - BREAKOUT_PIVOT
+      - PULLBACK_TO_20DMA
+      - PULLBACK_TO_50DMA
+      - RETEST_OF_PRIOR_BREAKOUT
+
+  - setup_id: LARGECAP_BREAKOUT_POSITION_V1
+    setup_name: Large-cap breakout position
+    setup_family: LARGECAP_POSITION
+    holding_horizon_note: 2 weeks to 3 months
+    screeners:
+      - largecap-breakout-screen-v1
+      - midcap-improver-screen-v1
+    screener_mode: union
+    allowed_regimes:
+      - BULL_RISK_ON
+      - BULL_NARROW
+      - STABLE
+      - STABLE_BUT_TARIFF_RISING
+    blocked_regimes:
+      - SHOCK
+    allowed_overlays:
+      - NONE
+      - EVENT_CLUSTER
+      - TARIFF_PRESSURE
+      - SECTOR_POLICY_SHOCK
+    blocked_overlays:
+      - GEOPOLITICAL_RISK
+    overlay_screeners:
+      TARIFF_PRESSURE:
+        add:
+          - defensive-tariff-screen-v1
+      GEOPOLITICAL_RISK:
+        remove:
+          - largecap-breakout-screen-v1
+    market_cap_min: 20000
+    min_avg_traded_value_20d: 500000000
+    max_breakout_extension_pct: 10
+    watch_pullback_extension_pct: 6
+    min_dist_52w_high: -15
+    scoring_weights:
+      technical: 0.35
+      fundamental: 0.30
+      regime_fit: 0.20
+      event: 0.15
+    score_thresholds:
+      pass_now: 0.68
+      watch_breakout: 0.58
+      watch_pullback: 0.52
+      watch_event: 0.48
+      near_miss_gap: 0.05
+    regime_policy:
+      preferred:
+        - BULL_RISK_ON
+        - BULL_NARROW
+      acceptable:
+        - STABLE
+        - STABLE_BUT_TARIFF_RISING
+      avoid:
+        - RISK_OFF
+    technical_rules:
+      - column: pass_above_dma_50
+        operator: eq
+        value: true
+      - column: pass_above_dma_200
+        operator: eq
+        value: true
+      - column: rs_vs_benchmark
+        operator: gte
+        value: 0.0
+      - column: rs_vs_sector
+        operator: gte
+        value: 0.0
+    watch_reasons:
+      - earnings
+      - guidance changes
+      - major orders
+      - policy or tariff events
+      - management commentary
+    entry_styles:
+      - BREAKOUT_PIVOT
+      - BREAKOUT_PLUS_EXTENSION_BAND
+      - PULLBACK_TO_20DMA
+      - RETEST_OF_PRIOR_BREAKOUT
+
+  - setup_id: DEFENSIVE_REGIME_POSITION_V1
+    setup_name: Defensive regime position
+    setup_family: DEFENSIVE_POSITION
+    holding_horizon_note: 2 weeks to 3 months
+    screeners:
+      - defensive-tariff-screen-v1
+      - largecap-breakout-screen-v1
+    screener_mode: union
+    allowed_regimes:
+      - STABLE_BUT_TARIFF_RISING
+      - RISK_OFF
+      - STABLE
+    blocked_regimes:
+      - BULL_RISK_ON
+      - SHOCK
+    allowed_overlays:
+      - NONE
+      - TARIFF_PRESSURE
+      - OIL_SHOCK
+      - GEOPOLITICAL_RISK
+      - SECTOR_POLICY_SHOCK
+      - EVENT_CLUSTER
+    overlay_screeners:
+      TARIFF_PRESSURE:
+        add:
+          - midcap-improver-screen-v1
+      OIL_SHOCK:
+        add:
+          - defensive-tariff-screen-v1
+    market_cap_min: 20000
+    min_avg_traded_value_20d: 500000000
+    max_breakout_extension_pct: 8
+    watch_pullback_extension_pct: 5
+    min_dist_52w_high: -22
+    scoring_weights:
+      technical: 0.25
+      fundamental: 0.40
+      regime_fit: 0.25
+      event: 0.10
+    score_thresholds:
+      pass_now: 0.68
+      watch_breakout: 0.58
+      watch_pullback: 0.52
+      watch_event: 0.48
+      near_miss_gap: 0.05
+    regime_policy:
+      preferred:
+        - STABLE_BUT_TARIFF_RISING
+        - RISK_OFF
+      acceptable:
+        - STABLE
+      avoid:
+        - BULL_RISK_ON
+        - BULL_NARROW
+    technical_rules:
+      - column: pass_above_dma_200
+        operator: eq
+        value: true
+      - column: rs_vs_benchmark
+        operator: gte
+        value: -0.02
+    fundamental_rules:
+      - column: debt_to_equity_vs_sector
+        operator: lte
+        value: 0.25
+    watch_reasons:
+      - results
+      - margin commentary
+      - raw material impact
+      - tariff commentary
+      - forex impact
+      - management guidance
+    entry_styles:
+      - BREAKOUT_PIVOT
+      - PULLBACK_TO_20DMA
+      - PULLBACK_TO_50DMA

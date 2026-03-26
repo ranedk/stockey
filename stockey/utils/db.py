@@ -366,15 +366,22 @@ def upsert_to_db(
 
         finally:
             # 5. Drop temp regardless of success
-            cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
+            try:
+                cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
+            except Exception:
+                pass
 
 
-def sql_to_df(sql_query: str, params: Tuple = ()) -> pd.DataFrame:
+def sql_to_df(sql_query: str, params: Tuple | None = None) -> pd.DataFrame:
     """
     Run a parametrised SELECT and return every row as a DataFrame
     (empty DataFrame if no matches).
     """
-    return pd.read_sql(sql_query, con=_engine, params=params)
+    with db_session() as (_, cur):
+        cur.execute(sql_query, params or ())
+        rows = cur.fetchall()
+        columns = [desc[0] for desc in cur.description] if cur.description else []
+    return pd.DataFrame(rows, columns=columns)
 
 def get_sql( sql_query: str, params: Tuple = ()) -> pd.Series:
     """
