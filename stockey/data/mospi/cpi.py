@@ -1,5 +1,6 @@
 import calendar
 import json
+import time
 from argparse import ArgumentParser
 from datetime import date
 from io import StringIO
@@ -27,6 +28,8 @@ rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 HEADERS = get_dynamic_headers()
 NEW_CPI_START = date(2025, 1, 1)
 PAGE_LOG_INTERVAL = 10
+MONTH_RETRY_ATTEMPTS = 3
+MONTH_RETRY_SLEEP_SECONDS = 2
 
 
 def first_of_month(d: date) -> date:
@@ -364,19 +367,33 @@ def sync_cpi_data(
     )
 
     for index, month_start in enumerate(missing_months, start=1):
-        try:
-            print(f"[{index}/{len(missing_months)}] Downloading CPI for {month_label(month_start)}")
-            download_cpi_month(month_start)
-            mark_month_downloaded(month_start)
-            print(f"[{index}/{len(missing_months)}] Completed CPI for {month_label(month_start)}")
-        except KeyboardInterrupt:
-            print(
-                f"Interrupted while downloading CPI for {month_label(month_start)}. "
-                "Completed months are already persisted; rerun to resume."
-            )
-            raise
-        except Exception as exc:
-            print(f"[{index}/{len(missing_months)}] Failed CPI for {month_label(month_start)}: {exc}")
+        completed = False
+        for attempt in range(1, MONTH_RETRY_ATTEMPTS + 1):
+            try:
+                print(
+                    f"[{index}/{len(missing_months)}] Downloading CPI for {month_label(month_start)} "
+                    f"(attempt {attempt}/{MONTH_RETRY_ATTEMPTS})"
+                )
+                download_cpi_month(month_start)
+                mark_month_downloaded(month_start)
+                print(f"[{index}/{len(missing_months)}] Completed CPI for {month_label(month_start)}")
+                completed = True
+                break
+            except KeyboardInterrupt:
+                print(
+                    f"Interrupted while downloading CPI for {month_label(month_start)}. "
+                    "Completed months are already persisted; rerun to resume."
+                )
+                raise
+            except Exception as exc:
+                print(
+                    f"[{index}/{len(missing_months)}] Failed CPI for {month_label(month_start)} "
+                    f"on attempt {attempt}/{MONTH_RETRY_ATTEMPTS}: {exc}"
+                )
+                if attempt == MONTH_RETRY_ATTEMPTS:
+                    break
+                time.sleep(MONTH_RETRY_SLEEP_SECONDS)
+        if not completed:
             break
 
 

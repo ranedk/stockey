@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable
 
 import pandas as pd
@@ -17,6 +17,8 @@ DEFAULT_DAILY_YEARS = 5
 DEFAULT_INTRADAY_DAYS = 1
 INTRADAY_MAX_WINDOW_DAYS = 90
 SUPPORTED_INTRADAY_INTERVALS = (1, 5, 15, 25, 60)
+MARKET_CLOSE_HOUR = 15
+MARKET_CLOSE_MINUTE = 30
 
 
 DAILY_TABLE = "dhan_ohlcv_daily"
@@ -139,6 +141,70 @@ def choose_daily_refresh_start(
     return datetime.now() - timedelta(days=365 * years)
 
 
+def load_nse_holidays() -> set[date]:
+    try:
+        df = sql_to_df(
+            """
+            SELECT DISTINCT date::date AS holiday_date
+            FROM nseindia_holidays
+            WHERE type = 'CM'
+            """
+        )
+    except Exception:
+        return set()
+
+    if df.empty or "holiday_date" not in df.columns:
+        return set()
+
+    values = pd.to_datetime(df["holiday_date"], errors="coerce").dropna()
+    return {value.date() for value in values}
+
+
+def clamp_to_last_trading_day(target: datetime, *, exchange: str = "NSE") -> datetime:
+    current = target
+    holidays = load_nse_holidays() if exchange.upper() == "NSE" else set()
+    while current.weekday() >= 5 or current.date() in holidays:
+        current = current - timedelta(days=1)
+    return current
+
+
+def choose_daily_refresh_end(
+    to_date: datetime | None,
+    *,
+    exchange: str,
+) -> datetime:
+    requested = to_date or datetime.now()
+    return clamp_to_last_trading_day(requested, exchange=exchange)
+
+
+def is_no_data_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "no data present" in message or "incorrect parameters" in message
+
+
+def with_market_close(target: datetime) -> datetime:
+    return target.replace(
+        hour=MARKET_CLOSE_HOUR,
+        minute=MARKET_CLOSE_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+
+
+def choose_intraday_refresh_end(
+    to_date: datetime | None,
+    *,
+    exchange: str,
+) -> datetime:
+    requested = to_date or datetime.now()
+    clamped = clamp_to_last_trading_day(requested, exchange=exchange)
+    if clamped.date() != requested.date():
+        return with_market_close(clamped)
+    if to_date is not None and requested.time() == datetime.min.time():
+        return with_market_close(clamped)
+    return requested
+
+
 def normalize_daily_frame(df: pd.DataFrame, identity: dict[str, object]) -> pd.DataFrame:
     if df.empty:
         return df
@@ -245,17 +311,52 @@ def sync_daily_ohlcv(
 ) -> pd.DataFrame:
     ensure_ohlcv_tables()
     identity = resolve_dhan_identity(ticker, exchange, asset_type=asset_type)
-    effective_from_date, effective_to_date = normalize_date_window(
+    effective_from_date, requested_to_date = normalize_date_window(
         choose_daily_refresh_start(ticker, exchange, asset_type, from_date),
         to_date,
     )
-    payload = (client or DhanHistoricalClient()).fetch_daily(
-        security_id=identity["security_id"],
-        exchange_segment=str(identity["exchange_segment"]),
-        instrument=str(identity["instrument"]),
-        from_date=effective_from_date,
-        to_date=effective_to_date + timedelta(days=1),
-    )
+    effective_to_date = choose_daily_refresh_end(requested_to_date, exchange=exchange)
+    if effective_from_date > effective_to_date:
+        return pd.DataFrame()
+
+    api_client = client or DhanHistoricalClient()
+    try:
+        payload = api_client.fetch_daily(
+            security_id=identity["security_id"],
+            exchange_segment=str(identity["exchange_segment"]),
+            instrument=str(identity["instrument"]),
+            from_date=effective_from_date,
+            to_date=effective_to_date,
+        )
+    except DhanAPIError as exc:
+        if not is_no_data_error(exc):
+            raise
+        fallback_to_date = clamp_to_last_trading_day(
+            effective_to_date - timedelta(days=1),
+            exchange=exchange,
+        )
+        if fallback_to_date >= effective_to_date or effective_from_date > fallback_to_date:
+            return pd.DataFrame()
+        print(
+            {
+                "mode": "daily",
+                "ticker": ticker,
+                "asset_type": asset_type,
+                "exchange": exchange.upper(),
+                "warning": "dhan_no_data_retry",
+                "from_date": effective_from_date.strftime("%Y-%m-%d"),
+                "requested_to_date": requested_to_date.strftime("%Y-%m-%d"),
+                "retry_to_date": fallback_to_date.strftime("%Y-%m-%d"),
+            },
+            flush=True,
+        )
+        payload = api_client.fetch_daily(
+            security_id=identity["security_id"],
+            exchange_segment=str(identity["exchange_segment"]),
+            instrument=str(identity["instrument"]),
+            from_date=effective_from_date,
+            to_date=fallback_to_date,
+        )
     df = normalize_daily_frame(candles_to_df(payload), identity)
     if df.empty:
         return df
@@ -295,19 +396,38 @@ def sync_intraday_ohlcv(
     effective_from_date, effective_to_date = normalize_date_window(from_date, to_date)
     if from_date is None:
         effective_from_date = datetime.now() - timedelta(days=DEFAULT_INTRADAY_DAYS)
-    if to_date is not None and effective_to_date.time() == datetime.min.time():
-        effective_to_date = effective_to_date + timedelta(days=1)
+    effective_to_date = choose_intraday_refresh_end(effective_to_date if to_date is not None else None, exchange=exchange)
+    if effective_from_date > effective_to_date:
+        return pd.DataFrame()
     api_client = client or DhanHistoricalClient()
     frames: list[pd.DataFrame] = []
     for window_start, window_end in _intraday_windows(effective_from_date, effective_to_date):
-        payload = api_client.fetch_intraday(
-            security_id=identity["security_id"],
-            exchange_segment=str(identity["exchange_segment"]),
-            instrument=str(identity["instrument"]),
-            interval_minutes=interval_minutes,
-            from_datetime=window_start,
-            to_datetime=window_end,
-        )
+        try:
+            payload = api_client.fetch_intraday(
+                security_id=identity["security_id"],
+                exchange_segment=str(identity["exchange_segment"]),
+                instrument=str(identity["instrument"]),
+                interval_minutes=interval_minutes,
+                from_datetime=window_start,
+                to_datetime=window_end,
+            )
+        except DhanAPIError as exc:
+            if not is_no_data_error(exc):
+                raise
+            print(
+                {
+                    "mode": "intraday",
+                    "ticker": ticker,
+                    "asset_type": asset_type,
+                    "exchange": exchange.upper(),
+                    "interval_minutes": interval_minutes,
+                    "warning": "dhan_no_data_skip",
+                    "from_datetime": window_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    "to_datetime": window_end.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+                flush=True,
+            )
+            continue
         frame = normalize_intraday_frame(candles_to_df(payload), identity, interval_minutes)
         if not frame.empty:
             frames.append(frame)

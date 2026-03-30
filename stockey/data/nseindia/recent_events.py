@@ -8,6 +8,7 @@ from environs import Env
 from playwright.sync_api import sync_playwright
 from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
+from utils.sync import get_redis_set_members
 
 
 env = Env()
@@ -72,12 +73,13 @@ def parse_csv(csv_file):
 
 def main() -> None:
     rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    existing_members = get_redis_set_members(rop, REDIS_SET)
 
     with sync_playwright() as p:
         date_obj = datetime.today()
         formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
 
-        if rop.sismember(REDIS_SET, formatted_date):
+        if formatted_date in existing_members:
             return
 
         dowload_events(

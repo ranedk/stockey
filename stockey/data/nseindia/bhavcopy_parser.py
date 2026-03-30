@@ -475,8 +475,20 @@ def parse_catg(path):
     return df
 
 
+def is_empty_zip(path: str) -> bool:
+    try:
+        return os.path.getsize(path) == 0
+    except OSError:
+        return False
+
+
 def unzip_and_process(zip_path):
     print("Processing %s" % zip_path)
+    if is_empty_zip(zip_path):
+        print(f"⏭️ Skipping empty zip: {zip_path}")
+        os.remove(zip_path)
+        return
+
     with tempfile.TemporaryDirectory() as tmpdir:
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             zip_ref.extractall(tmpdir)
@@ -515,6 +527,9 @@ def unzip_and_process(zip_path):
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "cm*.zip"), recursive=True)
         for nested_zip in nested_zips:
+            if is_empty_zip(nested_zip):
+                print(f"⏭️ Skipping empty nested zip: {nested_zip}")
+                continue
             with tempfile.TemporaryDirectory() as nested_tmpdir:
                 with zipfile.ZipFile(nested_zip, "r") as nested_ref:
                     nested_ref.extractall(nested_tmpdir)
@@ -526,6 +541,9 @@ def unzip_and_process(zip_path):
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "BhavCopy*.zip"), recursive=True)
         for nested_zip in nested_zips:
+            if is_empty_zip(nested_zip):
+                print(f"⏭️ Skipping empty nested zip: {nested_zip}")
+                continue
             with tempfile.TemporaryDirectory() as nested_tmpdir:
                 with zipfile.ZipFile(nested_zip, "r") as nested_ref:
                     nested_ref.extractall(nested_tmpdir)
@@ -537,6 +555,9 @@ def unzip_and_process(zip_path):
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "PR*.zip"), recursive=True)
         for nested_zip in nested_zips:
+            if is_empty_zip(nested_zip):
+                print(f"⏭️ Skipping empty nested zip: {nested_zip}")
+                continue
             with tempfile.TemporaryDirectory() as nested_tmpdir:
                 with zipfile.ZipFile(nested_zip, "r") as nested_ref:
                     nested_ref.extractall(nested_tmpdir)

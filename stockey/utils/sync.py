@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
@@ -62,6 +62,22 @@ def get_redis_cursor(redis_client: redis.Redis, key: str) -> datetime | None:
 
 def set_redis_cursor(redis_client: redis.Redis, key: str, value: datetime) -> None:
     redis_client.set(key, value.strftime("%Y-%m-%d"))
+
+
+def get_redis_set_members(redis_client: redis.Redis, key: str) -> set[str]:
+    try:
+        return set(redis_client.smembers(key))
+    except Exception:
+        return set()
+
+
+def filter_missing_date_members(
+    values: Iterable[date | datetime],
+    existing_members: set[str],
+    *,
+    fmt: str = "%Y-%m-%d",
+) -> list[date | datetime]:
+    return [value for value in values if value.strftime(fmt) not in existing_members]
 
 
 def get_db_max_date(

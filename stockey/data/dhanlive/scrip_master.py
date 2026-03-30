@@ -75,6 +75,8 @@ CREATE TABLE IF NOT EXISTS master_dhan_instruments (
     buy_bo_profit_range_min_perc DOUBLE PRECISION,
     sell_bo_profit_range_min_perc DOUBLE PRECISION,
     mtf_leverage            DOUBLE PRECISION,
+    sm_upper_limit          DOUBLE PRECISION,
+    sm_lower_limit          DOUBLE PRECISION,
 
     valid_from              TIMESTAMP NOT NULL,
     valid_to                TIMESTAMP,
@@ -84,6 +86,10 @@ CREATE TABLE IF NOT EXISTS master_dhan_instruments (
 );
 CREATE INDEX IF NOT EXISTS idx_master_dhan_active
     ON master_dhan_instruments (security_id, segment, valid_to);
+ALTER TABLE master_dhan_instruments
+    ADD COLUMN IF NOT EXISTS sm_upper_limit DOUBLE PRECISION;
+ALTER TABLE master_dhan_instruments
+    ADD COLUMN IF NOT EXISTS sm_lower_limit DOUBLE PRECISION;
 """
 
 
@@ -107,6 +113,7 @@ def download_master_csv(timeout: int = 30) -> Path:
 def load_csv(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(
         csv_path,
+        low_memory=False,
         dtype={
             "EXCH_ID": "string",
             "SEGMENT": "string",
@@ -124,6 +131,21 @@ def load_csv(csv_path: Path) -> pd.DataFrame:
             "STRIKE_PRICE": "float64",
             "OPTION_TYPE": "string",
             "TICK_SIZE": "float64",
+            "EXPIRY_FLAG": "string",
+            "BRACKET_FLAG": "string",
+            "COVER_FLAG": "string",
+            "ASM_GSM_FLAG": "string",
+            "ASM_GSM_CATEGORY": "string",
+            "BUY_SELL_INDICATOR": "string",
+            "BUY_CO_MIN_MARGIN_PER": "float64",
+            "BUY_CO_SL_RANGE_MAX_PERC": "float64",
+            "BUY_CO_SL_RANGE_MIN_PERC": "float64",
+            "BUY_BO_MIN_MARGIN_PER": "float64",
+            "BUY_BO_PROFIT_RANGE_MAX_PERC": "float64",
+            "BUY_BO_PROFIT_RANGE_MIN_PERC": "float64",
+            "MTF_LEVERAGE": "float64",
+            "SM_UPPER_LIMIT": "float64",
+            "SM_LOWER_LIMIT": "float64",
         },
     )
     df["SM_EXPIRY_DATE"] = pd.to_datetime(df["SM_EXPIRY_DATE"], errors="coerce")
@@ -164,6 +186,7 @@ INSERT INTO master_dhan_instruments (
     buy_bo_profit_range_max_perc, sell_bo_profit_range_max_perc,
     buy_bo_profit_range_min_perc, sell_bo_profit_range_min_perc,
     mtf_leverage,
+    sm_upper_limit, sm_lower_limit,
     valid_from, valid_to, load_ts
 )
 SELECT st.*,

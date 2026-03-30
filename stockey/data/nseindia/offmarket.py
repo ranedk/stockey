@@ -1,12 +1,12 @@
-# bulk_block_short_downloader.py
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import redis
 from environs import Env
 from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import daterange
+from utils.sync import get_redis_set_members
 
 env = Env()
 env.read_env()
@@ -14,11 +14,16 @@ env.read_env()
 REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env.int("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")  # Chromium or webkit won't work with NSE website
+MAX_DOWNLOAD_ATTEMPTS = 5
 
 
 def get_random(min_ms: int, max_ms: int) -> int:
     """Return a random int in milliseconds between min_ms and max_ms."""
     return int(random.uniform(min_ms, max_ms))
+
+
+def latest_completed_day() -> datetime:
+    return datetime.today() - timedelta(days=1)
 
 
 def download_data(
@@ -91,17 +96,20 @@ def mark_dates_as_downloaded(rop, dtype, start_date, end_date):
 
 
 # Check missing dates
-def get_missing_dates(rop, dtype, start_date, end_date):
-    pipe = rop.pipeline(transaction=False)
-    for dt in daterange(start_date, end_date):
-        pipe.sismember(f"nse:{dtype}", dt.strftime("%Y-%m-%d"))
-    flags = pipe.execute()
-    return [d for d, have in zip(daterange(start_date, end_date), flags) if not have]
+def get_missing_dates(rop, dtype, start_date, end_date, skipped_dates=None):
+    skipped_dates = skipped_dates or set()
+    existing_members = get_redis_set_members(rop, f"nse:{dtype}")
+    return [
+        d
+        for d in daterange(start_date, end_date)
+        if d.strftime("%Y-%m-%d") not in existing_members
+        and d.strftime("%Y-%m-%d") not in skipped_dates
+    ]
 
 
-def get_next_download_block(rop, dtype, g_start, g_end):
+def get_next_download_block(rop, dtype, g_start, g_end, skipped_dates=None):
     # All missing calendar days for this dtype
-    missing = get_missing_dates(rop, dtype, g_start, g_end)
+    missing = get_missing_dates(rop, dtype, g_start, g_end, skipped_dates=skipped_dates)
     if not missing:
         return None  # nothing left to fetch
 
@@ -128,21 +136,37 @@ def main() -> None:
     try:
         rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         global_start = datetime.strptime("2014-01-01", "%Y-%m-%d")
-        global_end = datetime.today()
+        global_end = latest_completed_day()
+
+        print(f"Downloading NSE offmarket data through {global_end.strftime('%d-%m-%Y')}")
 
         with sync_playwright() as p:
             for dtype in ["block_deals", "bulk_deals", "short_selling"]:
+                skipped_dates: set[str] = set()
                 while True:
                     block = get_next_download_block(
-                        rop, dtype, global_start, global_end
+                        rop, dtype, global_start, global_end, skipped_dates=skipped_dates
                     )
                     if not block:
                         print(f"All data downloaded for {dtype} ✅")
                         break
-                    print(
-                        f"Download {dtype} {block[0].strftime('%d-%m-%Y')} and {block[1].strftime('%d-%m-%Y')}"
-                    )
-                    download_data(p, dtype, block[0], block[1], rop)
+                    print(f"Download {dtype} {block[0].strftime('%d-%m-%Y')} and {block[1].strftime('%d-%m-%Y')}")
+                    success = False
+                    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+                        print(
+                            f"Attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} for {dtype} "
+                            f"{block[0].strftime('%d-%m-%Y')} -> {block[1].strftime('%d-%m-%Y')}"
+                        )
+                        success = download_data(p, dtype, block[0], block[1], rop)
+                        if success:
+                            break
+                    if not success:
+                        skipped = [dt.strftime("%Y-%m-%d") for dt in daterange(block[0], block[1])]
+                        skipped_dates.update(skipped)
+                        print(
+                            f"⏭️ Skipping {dtype} {block[0].strftime('%d-%m-%Y')} -> "
+                            f"{block[1].strftime('%d-%m-%Y')} after {MAX_DOWNLOAD_ATTEMPTS} failed attempts"
+                        )
     finally:
         rop.close()
 
