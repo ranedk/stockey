@@ -153,10 +153,12 @@ def parse_screener_html(html: str, *, url: str | None = None) -> dict[str, objec
         name_link = tds[1].find("a")
         company_url = name_link.get("href") if name_link else None
         page_slug = None
+        ticker = None
         if company_url:
             company_parts = [part for part in company_url.split("/") if part]
             if len(company_parts) >= 2 and company_parts[0] == "company":
                 page_slug = company_parts[1]
+                ticker = company_parts[1]
 
         metrics: dict[str, object] = {}
         for header, td in zip(headers[2:], tds[2:]):
@@ -168,6 +170,7 @@ def parse_screener_html(html: str, *, url: str | None = None) -> dict[str, objec
                 "company_id": to_number(company_id),
                 "name": clean_text(name_link.get_text(" ", strip=True)) if name_link else clean_text(tds[1].get_text(" ", strip=True)),
                 "url": company_url,
+                "ticker": ticker,
                 "page_slug": page_slug,
                 "metrics": metrics,
             }

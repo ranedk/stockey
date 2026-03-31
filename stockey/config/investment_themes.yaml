@@ -1,0 +1,729 @@
+catalog_version: 1
+default_asof_timezone: UTC
+
+themes:
+  - theme_id: DOMESTIC_CAPEX_INDUSTRIALS
+    name: Domestic Capex Industrials
+    status: active
+    description: Multi-year domestic capex, manufacturing, and infra buildout theme.
+    classification:
+      family: domestic_capex
+      sector_bias: [industrials, capital_goods, engineering, infrastructure]
+      market_cap_fit: [large_cap, mid_cap, strong_small_cap]
+      holding_profile: structural
+      holding_period_days: {min: 180, max: 1825}
+      risk_level: medium
+      exit_trigger_types: [thesis, fundamental, technical]
+    detection:
+      keywords:
+        include: [capex, industrial, manufacturing, order book, infra spend, domestic demand, project award]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, advisory_logic_expert]
+      output_mode: idea_candidates
+      priority: 70
+    screener_templates:
+      - template_id: domestic-capex-industrials-v1
+        provider: screenerin
+        slug: domestic-capex-industrials-v1
+        label: DOMESTIC CAPEX INDUSTRIALS V1
+        horizon: structural
+        holding_horizon_note: 2 to 5 years
+        entry_style: breakout_or_quality_pullback
+        query: |
+          Market Capitalization > 1500 AND
+          Sales growth 3Years > 10 AND
+          Profit growth 3Years > 10 AND
+          Return on capital employed > 14 AND
+          Debt to equity < 1.2 AND
+          Current price > 200 Day Moving Average
+    decay:
+      model: slow
+      half_life_days: 60
+      max_active_days: 365
+      refresh_on_new_match: true
+      cooldown_days: 14
+    portfolio_guidance:
+      positive_sectors: [industrials, capital_goods, engineering, infrastructure]
+      ideal_screener_logic: order-book growth, earnings growth, debt discipline, RS leadership, base breakout
+      invalidation_signals:
+        - capex cycle weakens
+        - execution slips for multiple quarters
+        - order inflow slows materially
+        - weekly structure breaks
+
+  - theme_id: DEFENSE_INDIGENISATION
+    name: Defense Indigenisation
+    status: active
+    description: Defense order flow, indigenisation, and local manufacturing tailwind.
+    classification:
+      family: defense
+      sector_bias: [defense, aerospace, electronics]
+      market_cap_fit: [large_cap, mid_cap, selective_small_cap]
+      holding_profile: structural
+      holding_period_days: {min: 90, max: 1825}
+      risk_level: medium
+      exit_trigger_types: [thesis, technical]
+    detection:
+      keywords:
+        include: [defense, indigenisation, military, aerospace, missile, radar, defense order, procurement]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, advisory_logic_expert, risk_portfolio_expert]
+      output_mode: idea_candidates
+      priority: 82
+    screener_templates:
+      - template_id: defense-indigenisation-v1
+        provider: screenerin
+        slug: defense-indigenisation-v1
+        label: DEFENSE INDIGENISATION V1
+        horizon: structural
+        holding_horizon_note: 1 to 5 years
+        entry_style: breakout_or_trend_continuation
+        query: |
+          Market Capitalization > 1000 AND
+          Sales growth 3Years > 10 AND
+          Return on capital employed > 14 AND
+          Debt to equity < 1 AND
+          Promoter holding > 45 AND
+          Current price > 200 Day Moving Average
+    decay:
+      model: medium
+      half_life_days: 45
+      max_active_days: 240
+      refresh_on_new_match: true
+      cooldown_days: 10
+    portfolio_guidance:
+      positive_sectors: [defense, aerospace, electronics]
+      ideal_screener_logic: order wins, balance-sheet quality, operating leverage, local manufacturing tailwind
+      invalidation_signals:
+        - delayed orders
+        - policy slowdown
+        - failed long-term trend
+
+  - theme_id: ELECTRONICS_EMS_COMPONENTS
+    name: Electronics EMS Components
+    status: active
+    description: Electronics manufacturing, EMS, and component makers with capacity and export tailwinds.
+    classification:
+      family: manufacturing_exports
+      sector_bias: [electronics, ems, components]
+      market_cap_fit: [mid_cap, small_cap, selective_sme]
+      holding_profile: structural
+      holding_period_days: {min: 180, max: 1825}
+      risk_level: medium_high
+      exit_trigger_types: [fundamental, technical]
+    detection:
+      keywords:
+        include: [ems, electronics, component, capacity expansion, export growth, import substitution, pli]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, advisory_logic_expert]
+      output_mode: idea_candidates
+      priority: 76
+    screener_templates:
+      - template_id: electronics-ems-components-v1
+        provider: screenerin
+        slug: electronics-ems-components-v1
+        label: ELECTRONICS EMS COMPONENTS V1
+        horizon: structural
+        holding_horizon_note: 2 to 5 years
+        entry_style: near_52w_high_breakout
+        query: |
+          Market Capitalization > 500 AND
+          Sales growth 3Years > 12 AND
+          Profit growth 3Years > 12 AND
+          Return on capital employed > 12 AND
+          Debt to equity < 1.2 AND
+          Current price > 50 Day Moving Average
+    decay:
+      model: medium
+      half_life_days: 45
+      max_active_days: 240
+      refresh_on_new_match: true
+      cooldown_days: 10
+    portfolio_guidance:
+      positive_sectors: [electronics, ems, components]
+      ideal_screener_logic: capacity expansion, customer additions, export growth, margin expansion, breakout strength
+      invalidation_signals:
+        - customer concentration damage
+        - margin compression
+        - capex disappointment
+        - failed execution
+
+  - theme_id: POWER_GRID_STORAGE
+    name: Power Grid Storage
+    status: active
+    description: Power equipment, transmission, storage, cables, and grid buildout theme.
+    classification:
+      family: power_infrastructure
+      sector_bias: [power, grid, transmission, cables, storage]
+      market_cap_fit: [large_cap, mid_cap, small_cap]
+      holding_profile: medium_term
+      holding_period_days: {min: 90, max: 1460}
+      risk_level: medium
+      exit_trigger_types: [thesis, fundamental, technical]
+    detection:
+      keywords:
+        include: [transmission, transformer, grid capex, storage, power equipment, t&d, substation]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, advisory_logic_expert]
+      output_mode: idea_candidates
+      priority: 74
+    screener_templates:
+      - template_id: power-grid-storage-v1
+        provider: screenerin
+        slug: power-grid-storage-v1
+        label: POWER GRID STORAGE V1
+        horizon: medium_term
+        holding_horizon_note: 1 to 4 years
+        entry_style: trend_continuation
+        query: |
+          Market Capitalization > 1000 AND
+          Sales growth 3Years > 10 AND
+          Return on capital employed > 12 AND
+          Debt to equity < 1.5 AND
+          Current price > 200 Day Moving Average
+    decay:
+      model: medium
+      half_life_days: 45
+      max_active_days: 240
+      refresh_on_new_match: true
+      cooldown_days: 10
+    portfolio_guidance:
+      positive_sectors: [power, transmission, cables, storage]
+      ideal_screener_logic: order-book growth, policy tailwind, earnings upgrades, strong price-volume action
+      invalidation_signals:
+        - order cycle cools
+        - project delays
+        - margin squeeze
+        - price loses leadership
+
+  - theme_id: HEALTHCARE_SERVICES
+    name: Healthcare Services
+    status: active
+    description: Hospitals and diagnostics compounding theme driven by occupancy, pricing, and expansion.
+    classification:
+      family: healthcare_services
+      sector_bias: [hospitals, diagnostics, healthcare]
+      market_cap_fit: [large_cap, mid_cap]
+      holding_profile: structural
+      holding_period_days: {min: 365, max: 1825}
+      risk_level: low_medium
+      exit_trigger_types: [fundamental, technical]
+    detection:
+      keywords:
+        include: [hospital, diagnostics, occupancy, bed expansion, healthcare demand]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: theme_watch_pipeline
+      downstream_agents: [news_theme_expert, screener_designer]
+      output_mode: watch_candidates
+      priority: 58
+    screener_templates:
+      - template_id: healthcare-services-v1
+        provider: screenerin
+        slug: healthcare-services-v1
+        label: HEALTHCARE SERVICES V1
+        horizon: structural
+        holding_horizon_note: 3 to 5 years
+        entry_style: quality_pullback_or_stable_trend
+        query: |
+          Market Capitalization > 3000 AND
+          Sales growth 3Years > 10 AND
+          Return on capital employed > 12 AND
+          Debt to equity < 1 AND
+          Return on equity > 12
+    decay:
+      model: slow
+      half_life_days: 90
+      max_active_days: 365
+      refresh_on_new_match: true
+      cooldown_days: 14
+    portfolio_guidance:
+      positive_sectors: [hospitals, diagnostics]
+      ideal_screener_logic: occupancy growth, steady margins, low leverage, stable trend
+      invalidation_signals:
+        - growth slows materially
+        - expansion misfires
+        - valuation becomes extreme
+        - long-term trend deteriorates
+
+  - theme_id: DATA_CENTER_INFRA
+    name: Data Center Infra
+    status: active
+    description: Data center buildout beneficiaries in power, cooling, cables, EPC, and industrial infra.
+    classification:
+      family: digital_infrastructure
+      sector_bias: [power_equipment, cooling, cables, epc, industrial_infra]
+      market_cap_fit: [mid_cap, small_cap, selective_large_cap]
+      holding_profile: medium_term
+      holding_period_days: {min: 180, max: 730}
+      risk_level: medium_high
+      exit_trigger_types: [thesis, technical]
+    detection:
+      keywords:
+        include: [data center, hyperscaler, cooling, server park, digital infra, colocation]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, advisory_logic_expert]
+      output_mode: idea_candidates
+      priority: 68
+    screener_templates:
+      - template_id: data-center-infra-v1
+        provider: screenerin
+        slug: data-center-infra-v1
+        label: DATA CENTER INFRA V1
+        horizon: medium_term
+        holding_horizon_note: 6 to 24 months
+        entry_style: improving_technical_structure
+        query: |
+          Market Capitalization > 750 AND
+          Sales growth 3Years > 8 AND
+          Return on capital employed > 12 AND
+          Debt to equity < 1.5 AND
+          Current price > 50 Day Moving Average
+    decay:
+      model: medium
+      half_life_days: 35
+      max_active_days: 180
+      refresh_on_new_match: true
+      cooldown_days: 10
+    portfolio_guidance:
+      positive_sectors: [power_equipment, cooling, cables, epc]
+      ideal_screener_logic: order wins tied to digital infra, improving structure, actual earnings conversion
+      invalidation_signals:
+        - hype without order flow
+        - no earnings conversion
+        - failed breakout
+
+  - theme_id: CLEAN_BANKS_NBFCS
+    name: Clean Banks NBFCS
+    status: active
+    description: Clean lenders with credit growth, stable asset quality, and improving profitability.
+    classification:
+      family: financials
+      sector_bias: [banks, nbfc]
+      market_cap_fit: [large_cap, mid_cap]
+      holding_profile: medium_term
+      holding_period_days: {min: 180, max: 540}
+      risk_level: medium
+      exit_trigger_types: [fundamental, technical]
+    detection:
+      keywords:
+        include: [credit growth, asset quality, nim, retail lending, loan growth, slippage]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: theme_watch_pipeline
+      downstream_agents: [news_theme_expert, screener_designer]
+      output_mode: watch_candidates
+      priority: 60
+    screener_templates:
+      - template_id: clean-banks-nbfcs-v1
+        provider: screenerin
+        slug: clean-banks-nbfcs-v1
+        label: CLEAN BANKS NBFCS V1
+        horizon: medium_term
+        holding_horizon_note: 6 to 18 months
+        entry_style: breakout_from_long_consolidation
+        query: |
+          Market Capitalization > 5000 AND
+          Return on equity > 12 AND
+          Profit growth 3Years > 10 AND
+          Sales growth 3Years > 8 AND
+          Current price > 200 Day Moving Average
+    decay:
+      model: medium
+      half_life_days: 45
+      max_active_days: 180
+      refresh_on_new_match: true
+      cooldown_days: 10
+    portfolio_guidance:
+      positive_sectors: [banks, nbfc]
+      ideal_screener_logic: credit growth, stable asset quality, improving ROA/ROE, relative strength
+      invalidation_signals:
+        - asset-quality deterioration
+        - credit-cost surprise
+        - rate cycle turns adverse
+        - support breaks
+
+  - theme_id: GOLD_CRISIS_HEDGE
+    name: Gold Crisis Hedge
+    status: active
+    description: Gold and gold finance tactical hedge under stress, rupee weakness, and inflation/oil pressure.
+    classification:
+      family: crisis_hedge
+      sector_bias: [gold, gold_finance]
+      market_cap_fit: [large_cap, mid_cap]
+      holding_profile: tactical
+      holding_period_days: {min: 90, max: 270}
+      risk_level: medium
+      exit_trigger_types: [thesis, technical]
+    detection:
+      keywords:
+        include: [gold rally, geopolitical stress, rupee weakness, inflation spike, oil spike, safe haven]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: defensive_riskoff_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, risk_portfolio_expert]
+      output_mode: tactical_candidates
+      priority: 64
+    screener_templates:
+      - template_id: gold-crisis-hedge-v1
+        provider: screenerin
+        slug: gold-crisis-hedge-v1
+        label: GOLD CRISIS HEDGE V1
+        horizon: tactical
+        holding_horizon_note: 3 to 9 months
+        entry_style: tactical_momentum_confirmation
+        query: |
+          Market Capitalization > 1000 AND
+          Return on capital employed > 10 AND
+          Debt to equity < 2 AND
+          Current price > 50 Day Moving Average AND
+          Current price > 200 Day Moving Average
+    decay:
+      model: fast
+      half_life_days: 20
+      max_active_days: 120
+      refresh_on_new_match: true
+      cooldown_days: 7
+    portfolio_guidance:
+      positive_sectors: [gold, gold_finance]
+      ideal_screener_logic: gold uptrend, geopolitical stress, inflation/oil pressure, tactical confirmation
+      invalidation_signals:
+        - crisis premium fades
+        - gold trend weakens
+        - rupee and oil stress ease
+        - momentum reverses
+
+  - theme_id: PREMIUM_REAL_ESTATE
+    name: Premium Real Estate
+    status: active
+    description: Urban premium residential demand and real estate rerating theme.
+    classification:
+      family: consumption_real_assets
+      sector_bias: [real_estate, urban_consumption]
+      market_cap_fit: [large_cap, mid_cap, selective_small_cap]
+      holding_profile: medium_term
+      holding_period_days: {min: 180, max: 540}
+      risk_level: medium
+      exit_trigger_types: [fundamental, technical]
+    detection:
+      keywords:
+        include: [pre-sales, launch pipeline, premium housing, urban demand, real estate demand]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: theme_watch_pipeline
+      downstream_agents: [news_theme_expert, screener_designer]
+      output_mode: watch_candidates
+      priority: 56
+    screener_templates:
+      - template_id: premium-real-estate-v1
+        provider: screenerin
+        slug: premium-real-estate-v1
+        label: PREMIUM REAL ESTATE V1
+        horizon: medium_term
+        holding_horizon_note: 6 to 18 months
+        entry_style: consolidation_breakout
+        query: |
+          Market Capitalization > 2000 AND
+          Sales growth 3Years > 10 AND
+          Debt to equity < 1.5 AND
+          Profit growth 3Years > 8 AND
+          Current price > 200 Day Moving Average
+    decay:
+      model: medium
+      half_life_days: 45
+      max_active_days: 180
+      refresh_on_new_match: true
+      cooldown_days: 10
+    portfolio_guidance:
+      positive_sectors: [real_estate]
+      ideal_screener_logic: pre-sales growth, launch pipeline, balance-sheet improvement, strong consolidation breakout
+      invalidation_signals:
+        - demand slows
+        - rates hurt affordability
+        - execution delays
+        - failed trend continuation
+
+  - theme_id: SME_DEFENSE_SUPPLIERS
+    name: SME Defense Suppliers
+    status: active
+    description: SME/small-cap tactical defense suppliers with fresh orders and tight bases.
+    classification:
+      family: defense_tactical
+      sector_bias: [defense, aerospace]
+      market_cap_fit: [small_cap, sme]
+      holding_profile: swing
+      holding_period_days: {min: 14, max: 180}
+      risk_level: high
+      exit_trigger_types: [technical, thesis, time]
+    detection:
+      keywords:
+        include: [defense order, supplier, military tender, aerospace component, missile order]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, risk_portfolio_expert]
+      output_mode: tactical_candidates
+      priority: 78
+    screener_templates:
+      - template_id: sme-defense-suppliers-v1
+        provider: screenerin
+        slug: sme-defense-suppliers-v1
+        label: SME DEFENSE SUPPLIERS V1
+        horizon: swing
+        holding_horizon_note: 2 to 8 weeks or up to 6 months
+        entry_style: tight_base_breakout
+        query: |
+          Market Capitalization > 300 AND
+          Sales growth 3Years > 12 AND
+          Debt to equity < 1.2 AND
+          Current price > 50 Day Moving Average AND
+          Current price > 200 Day Moving Average
+    decay:
+      model: fast
+      half_life_days: 15
+      max_active_days: 90
+      refresh_on_new_match: true
+      cooldown_days: 5
+    portfolio_guidance:
+      positive_sectors: [defense]
+      ideal_screener_logic: order wins, tight base, liquidity filter, avoid erratic operator charts
+      invalidation_signals:
+        - breakout failure
+        - volume dries up
+        - sharp reversal below pivot
+        - liquidity trap signs
+
+  - theme_id: SME_POWER_EQUIPMENT
+    name: SME Power Equipment
+    status: active
+    description: SME power equipment, cables, and transformer tactical momentum theme.
+    classification:
+      family: power_tactical
+      sector_bias: [power, cables, transformers]
+      market_cap_fit: [small_cap, sme]
+      holding_profile: swing
+      holding_period_days: {min: 14, max: 180}
+      risk_level: high
+      exit_trigger_types: [technical, time]
+    detection:
+      keywords:
+        include: [transformer order, cable demand, power equipment, substation order, t&d order]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, risk_portfolio_expert]
+      output_mode: tactical_candidates
+      priority: 72
+    screener_templates:
+      - template_id: sme-power-equipment-v1
+        provider: screenerin
+        slug: sme-power-equipment-v1
+        label: SME POWER EQUIPMENT V1
+        horizon: swing
+        holding_horizon_note: 2 to 8 weeks or up to 6 months
+        entry_style: clean_breakout_with_participation
+        query: |
+          Market Capitalization > 250 AND
+          Sales growth 3Years > 10 AND
+          Profit growth 3Years > 10 AND
+          Debt to equity < 1.5 AND
+          Current price > 50 Day Moving Average
+    decay:
+      model: fast
+      half_life_days: 15
+      max_active_days: 90
+      refresh_on_new_match: true
+      cooldown_days: 5
+    portfolio_guidance:
+      positive_sectors: [power, cables, transformers]
+      ideal_screener_logic: sector strength, order flow, earnings acceleration, breakout with participation
+      invalidation_signals:
+        - breakout failure
+        - sector rotation out
+        - reversal on heavy volume
+
+  - theme_id: SME_ELECTRONICS_COMPONENTS
+    name: SME Electronics Components
+    status: active
+    description: SME electronics, EMS, and component tactical names backed by customer or order catalysts.
+    classification:
+      family: manufacturing_tactical
+      sector_bias: [electronics, ems, components]
+      market_cap_fit: [small_cap, sme]
+      holding_profile: swing
+      holding_period_days: {min: 14, max: 180}
+      risk_level: high
+      exit_trigger_types: [technical, thesis, time]
+    detection:
+      keywords:
+        include: [component order, ems, customer win, capacity expansion, electronics export]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, risk_portfolio_expert]
+      output_mode: tactical_candidates
+      priority: 70
+    screener_templates:
+      - template_id: sme-electronics-components-v1
+        provider: screenerin
+        slug: sme-electronics-components-v1
+        label: SME ELECTRONICS COMPONENTS V1
+        horizon: swing
+        holding_horizon_note: 2 to 8 weeks or up to 6 months
+        entry_style: near_high_breakout
+        query: |
+          Market Capitalization > 250 AND
+          Sales growth 3Years > 12 AND
+          Debt to equity < 1.5 AND
+          Profit growth 3Years > 10 AND
+          Current price > 50 Day Moving Average
+    decay:
+      model: fast
+      half_life_days: 15
+      max_active_days: 90
+      refresh_on_new_match: true
+      cooldown_days: 5
+    portfolio_guidance:
+      positive_sectors: [electronics, ems, components]
+      ideal_screener_logic: customer/order trigger, capacity narrative turning into numbers, strong momentum
+      invalidation_signals:
+        - momentum failure
+        - poor liquidity
+        - dilution
+        - customer disappointment
+
+  - theme_id: SMALLCAP_INDUSTRIAL_BREAKOUTS
+    name: Smallcap Industrial Breakouts
+    status: active
+    description: Small-cap industrials with improving fundamentals and clean breakout structures.
+    classification:
+      family: industrial_breakout
+      sector_bias: [industrials, capital_goods]
+      market_cap_fit: [small_cap]
+      holding_profile: swing
+      holding_period_days: {min: 14, max: 180}
+      risk_level: high
+      exit_trigger_types: [technical, fundamental, time]
+    detection:
+      keywords:
+        include: [industrial breakout, margin expansion, smallcap industrial, order momentum, capacity utilization]
+        exclude: []
+      match:
+        title_weight: 2.0
+        description_weight: 1.0
+        min_hit_score: 2
+        max_titles_for_reason: 3
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer, advisory_logic_expert, risk_portfolio_expert]
+      output_mode: tactical_candidates
+      priority: 66
+    screener_templates:
+      - template_id: smallcap-industrial-breakouts-v1
+        provider: screenerin
+        slug: smallcap-industrial-breakouts-v1
+        label: SMALLCAP INDUSTRIAL BREAKOUTS V1
+        horizon: swing
+        holding_horizon_note: 2 to 8 weeks or up to 6 months
+        entry_style: compression_breakout
+        query: |
+          Market Capitalization > 300 AND
+          Sales growth 3Years > 10 AND
+          Profit growth 3Years > 10 AND
+          Return on capital employed > 12 AND
+          Debt to equity < 1.5 AND
+          Current price > 50 Day Moving Average
+    decay:
+      model: fast
+      half_life_days: 15
+      max_active_days: 90
+      refresh_on_new_match: true
+      cooldown_days: 5
+    portfolio_guidance:
+      positive_sectors: [industrials]
+      ideal_screener_logic: sales/profit acceleration, improving margins, price compression, breakout near highs
+      invalidation_signals:
+        - failed breakout
+        - earnings miss
+        - repeated circuits
+        - breakdown below invalidation
+
+metadata:
+  required_fields:
+    - theme_id
+    - name
+    - classification
+    - detection
+    - routing
+    - screener_templates
+    - decay

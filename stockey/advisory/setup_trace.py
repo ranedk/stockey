@@ -223,6 +223,7 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
     setup_id_upper = setup_id.upper()
     resolved_asof_date = resolve_asof_date(setup_id_upper, requested_date=asof_date)
 
+    theme_mapping = load_active_theme_screener_mapping(asof_date=resolved_asof_date)
     overlay_row = load_market_overlay(resolved_asof_date)
     screener_rows = load_latest_setup_screener(setup_id_upper, overlay_name=(overlay_row or {}).get("overlay_name"))
     candidate_rows = load_setup_rows("advisory_candidates", setup_id_upper, resolved_asof_date)
@@ -248,6 +249,8 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
         overlay_name=(overlay_row or {}).get("overlay_name"),
         asof_date=resolved_asof_date,
     )
+    active_theme_agent_roles = theme_mapping.get("recommended_agent_roles") or []
+    active_theme_pipeline_branches = theme_mapping.get("recommended_pipeline_branches") or []
     candidate_count_by_screener = (
         screener_rows.get("screener_slug", pd.Series(dtype="string")).dropna().astype("string").value_counts().to_dict()
         if not screener_rows.empty and "screener_slug" in screener_rows.columns
@@ -290,6 +293,8 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
         "overlay_name": (overlay_row or {}).get("overlay_name"),
         "overlay_reason": (overlay_row or {}).get("overlay_reason"),
         "active_theme_ids": active_theme_ids,
+        "active_theme_agent_roles": active_theme_agent_roles,
+        "active_theme_pipeline_branches": active_theme_pipeline_branches,
         "active_screeners": active_screeners,
         "screener_universe_count": int(len(screener_symbols)),
         "candidate_count_by_screener": candidate_count_by_screener,
@@ -330,6 +335,8 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
         "overlay_name": (overlay_row or {}).get("overlay_name"),
         "overlay_reason": (overlay_row or {}).get("overlay_reason"),
         "active_theme_ids": active_theme_ids,
+        "active_theme_agent_roles": active_theme_agent_roles,
+        "active_theme_pipeline_branches": active_theme_pipeline_branches,
         "active_screeners": active_screeners,
         "candidate_count_by_screener": candidate_count_by_screener,
         "latest_event_verdict": (latest_eval_row or {}).get("verdict"),
@@ -383,6 +390,8 @@ def format_text(trace: dict[str, Any]) -> str:
             f"- overlay_name: {trace['decision_summary'].get('overlay_name')}",
             f"- overlay_reason: {trace['decision_summary'].get('overlay_reason')}",
             f"- active_theme_ids: {trace['decision_summary'].get('active_theme_ids')}",
+            f"- active_theme_agent_roles: {trace['decision_summary'].get('active_theme_agent_roles')}",
+            f"- active_theme_pipeline_branches: {trace['decision_summary'].get('active_theme_pipeline_branches')}",
             f"- active_screeners: {trace['decision_summary'].get('active_screeners')}",
             f"- candidate_count_by_screener: {trace['decision_summary'].get('candidate_count_by_screener')}",
             f"- watch_state_counts: {trace['stage_summary'].get('watch_state_counts')}",

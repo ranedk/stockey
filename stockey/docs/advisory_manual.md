@@ -62,7 +62,8 @@ These are the main files you will edit when maintaining the advisory system:
 - portfolio planning: [`advisory/portfolio_engine.py`](/home/rane/code/stockey/advisory/portfolio_engine.py)
 - lifecycle: [`advisory/position_lifecycle.py`](/home/rane/code/stockey/advisory/position_lifecycle.py)
 - execution planning: [`advisory/execution_engine.py`](/home/rane/code/stockey/advisory/execution_engine.py)
-- full orchestrator: [`advisory/pipeline.py`](/home/rane/code/stockey/advisory/pipeline.py)
+- master orchestrator: [`advisory/master_pipeline.py`](/home/rane/code/stockey/advisory/master_pipeline.py)
+- component orchestrator: [`advisory/pipeline.py`](/home/rane/code/stockey/advisory/pipeline.py)
 - symbol trace utility: [`advisory/symbol_trace.py`](/home/rane/code/stockey/advisory/symbol_trace.py)
 - setup trace utility: [`advisory/setup_trace.py`](/home/rane/code/stockey/advisory/setup_trace.py)
 - all-setups dashboard: [`advisory/dashboard.py`](/home/rane/code/stockey/advisory/dashboard.py)
@@ -92,13 +93,14 @@ python -m ...
 ### Full advisory dry-run
 
 ```sh
-python -m advisory.pipeline --include-watch --include-news --dry-run
+python -m advisory.master_pipeline --dry-run
 ```
 
 ### Full advisory write run
 
 ```sh
-python -m advisory.pipeline --include-watch --include-news
+./all_advisory.sh
+python -m advisory.master_pipeline
 ```
 
 ### Through portfolio only
@@ -364,8 +366,8 @@ There are now two event paths.
 ### Daily market run
 
 ```sh
-./all_downloads.sh
-python -m advisory.pipeline --include-watch --include-news
+./all_advisory.sh
+python -m advisory.master_pipeline
 ```
 
 ### If you only changed rules

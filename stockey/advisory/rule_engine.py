@@ -734,6 +734,8 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
     meta["overlay_intensity"] = overlay.get("overlay_intensity")
     meta["active_theme_ids"] = theme_screener_mapping.get("theme_ids") or []
     meta["theme_screeners"] = theme_screener_mapping.get("screener_slugs") or []
+    meta["theme_recommended_agent_roles"] = theme_screener_mapping.get("recommended_agent_roles") or []
+    meta["theme_recommended_pipeline_branches"] = theme_screener_mapping.get("recommended_pipeline_branches") or []
     meta["theme_error"] = theme_screener_mapping.get("error")
 
     setup_screeners: dict[str, list[str]] = {}

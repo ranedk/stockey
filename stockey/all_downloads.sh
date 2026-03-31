@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-./.xstockey/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-/home/rane/code/stockey/.xstockey/bin/python}"
 
 # Masters
 "${PYTHON_BIN}" -m data.nseindia.holidays
@@ -34,3 +34,4 @@ PYTHON_BIN="${PYTHON_BIN:-./.xstockey/bin/python}"
 "${PYTHON_BIN}" -m data.nseindia.indices_downloader
 "${PYTHON_BIN}" -m data.nseindia.indices_parser
 "${PYTHON_BIN}" -m data.nseindia.recent_events
+"${PYTHON_BIN}" -m data.economictimes.rss

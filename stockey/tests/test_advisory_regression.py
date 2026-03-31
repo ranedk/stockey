@@ -5,7 +5,7 @@ import json
 
 import pandas as pd
 
-from advisory import dashboard, execution_engine, llm_event_evaluator, news_overlay_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, watchlist_builder
+from advisory import dashboard, execution_engine, llm_event_evaluator, master_pipeline, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, watchlist_builder
 
 
 def test_portfolio_engine_overlap_cap(monkeypatch):
@@ -415,6 +415,167 @@ def test_event_normalization_keeps_positive_non_investable_event_out_of_reject_s
     assert score_impact > 0
 
 
+def test_news_theme_engine_normalizes_richer_investment_theme_schema(tmp_path):
+    config_path = tmp_path / "investment_themes.yaml"
+    config_path.write_text(
+        """
+themes:
+  - theme_id: DEFENSE_INDIGENISATION
+    name: Defense Indigenisation
+    status: active
+    description: Defense manufacturing theme.
+    classification:
+      market_cap_fit: [large_cap, mid_cap]
+      holding_profile: structural
+      holding_period_days: {min: 90, max: 365}
+      risk_level: medium
+      exit_trigger_types: [thesis, technical]
+    detection:
+      keywords:
+        include: [defense, order, procurement]
+        exclude: [rumor]
+      match:
+        title_weight: 3
+        description_weight: 1
+        min_hit_score: 2
+        max_titles_for_reason: 2
+    routing:
+      primary_pipeline: event_opportunity_pipeline
+      downstream_agents: [news_theme_expert, screener_designer]
+      output_mode: idea_candidates
+      priority: 80
+    screener_templates:
+      - template_id: defense-indigenisation-v1
+        provider: screenerin
+        slug: defense-indigenisation-v1
+        label: DEFENSE INDIGENISATION V1
+        holding_horizon_note: 1 to 5 years
+        entry_style: breakout_or_trend_continuation
+        query: |
+          Market Capitalization > 1000
+    decay:
+      model: medium
+      half_life_days: 45
+    portfolio_guidance:
+      positive_sectors: [defense, aerospace]
+      ideal_screener_logic: order wins and quality balance sheet
+      invalidation_signals: [delayed orders]
+""",
+        encoding="utf-8",
+    )
+
+    themes = news_theme_engine.load_theme_config(config_path=str(config_path))
+    assert len(themes) == 1
+    theme = themes[0]
+    assert theme["theme_id"] == "DEFENSE_INDIGENISATION"
+    assert theme["recommended_agent_roles"] == ["news_theme_expert", "screener_designer"]
+    assert theme["recommended_pipeline_branches"] == ["event_opportunity_pipeline"]
+    assert theme["market_cap_fit"] == ["large_cap", "mid_cap"]
+    assert theme["ideal_screener_logic"] == "order wins and quality balance sheet"
+    assert theme["negative_keywords"] == ["rumor"]
+    assert theme["suggested_screeners"][0]["screener_query"] == "Market Capitalization > 1000"
+
+
+def test_news_theme_engine_active_mapping_carries_roles_and_pipeline(monkeypatch):
+    monkeypatch.setattr(
+        news_theme_engine,
+        "build_theme_recommendations",
+        lambda **kwargs: {
+            "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+            "recommendations": [
+                {
+                    "theme_id": "DEFENSE_INDIGENISATION",
+                    "recommended_agent_roles": ["news_theme_expert", "risk_portfolio_expert"],
+                    "recommended_pipeline_branches": ["event_opportunity_pipeline"],
+                },
+                {
+                    "theme_id": "POWER_GRID_STORAGE",
+                    "recommended_agent_roles": ["screener_designer"],
+                    "recommended_pipeline_branches": ["theme_watch_pipeline"],
+                },
+            ],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        news_theme_engine,
+        "list_theme_screeners",
+        lambda theme_id=None: pd.DataFrame(
+            [
+                {"theme_id": "DEFENSE_INDIGENISATION", "screener_slug": "defense-indigenisation-v1", "is_active": True},
+                {"theme_id": "POWER_GRID_STORAGE", "screener_slug": "power-grid-storage-v1", "is_active": True},
+            ]
+        ),
+    )
+
+    mapping = news_theme_engine.load_active_theme_screener_mapping(asof_date=pd.Timestamp("2026-03-31T00:00:00Z"))
+    assert mapping["theme_ids"] == ["DEFENSE_INDIGENISATION", "POWER_GRID_STORAGE"]
+    assert mapping["screener_slugs"] == ["defense-indigenisation-v1", "power-grid-storage-v1"]
+    assert mapping["recommended_agent_roles"] == ["news_theme_expert", "risk_portfolio_expert", "screener_designer"]
+    assert mapping["recommended_pipeline_branches"] == ["event_opportunity_pipeline", "theme_watch_pipeline"]
+
+
+def test_master_pipeline_builds_sub_agent_workflow_with_pending_screeners(monkeypatch):
+    monkeypatch.setattr(
+        master_pipeline,
+        "build_overlay_state",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+                    "base_regime": "RISK_OFF",
+                    "overlay_name": "OIL_SHOCK",
+                    "overlay_intensity": 1.0,
+                    "overlay_reason": "oil news cluster",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        master_pipeline,
+        "build_theme_recommendations",
+        lambda **kwargs: {
+            "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+            "recommendations": [
+                {
+                    "theme_id": "ENERGY_SUPPLY_SHOCK",
+                    "theme_name": "Energy Supply Shock",
+                    "theme_intensity": 0.9,
+                    "theme_reason": "crude spike",
+                    "recommended_agent_roles": ["news_theme_expert", "screener_designer"],
+                    "recommended_pipeline_branches": ["event_opportunity_pipeline"],
+                    "suggested_screeners": [
+                        {
+                            "slug": "news-energy-supply-shock-beneficiaries-v1",
+                            "screener_name": "NEWS ENERGY SUPPLY SHOCK BENEFICIARIES V1",
+                            "screener_query": "Market Capitalization > 2000",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        master_pipeline,
+        "load_active_theme_screener_mapping",
+        lambda **kwargs: {
+            "theme_ids": ["ENERGY_SUPPLY_SHOCK"],
+            "screener_slugs": [],
+            "recommended_agent_roles": ["news_theme_expert", "screener_designer"],
+            "recommended_pipeline_branches": ["event_opportunity_pipeline"],
+        },
+    )
+    monkeypatch.setattr(master_pipeline, "list_theme_screeners", lambda *args, **kwargs: pd.DataFrame())
+
+    workflow = master_pipeline.build_sub_agent_workflow(asof_date=pd.Timestamp("2026-03-31T00:00:00Z"))
+    assert workflow["base_regime"] == "RISK_OFF"
+    assert workflow["news_overlay"] == "OIL_SHOCK"
+    assert "data_pipeline_expert" in workflow["recommended_agent_roles"]
+    assert "event_opportunity_pipeline" in workflow["pipeline_branches"]
+    assert workflow["themes"][0]["pending_screeners"][0]["slug"] == "news-energy-supply-shock-beneficiaries-v1"
+    assert any(task["agent_role"] == "screener_designer" for task in workflow["tasks"])
+
+
 def test_portfolio_priority_rewards_positive_event_transition():
     base = pd.Series(
         {
@@ -606,9 +767,10 @@ def test_rule_engine_resolves_overlay_screeners_and_blocks_disallowed_overlay():
         },
         "score_thresholds": {"pass_now": 0.68, "watch_breakout": 0.58, "watch_event": 0.48, "near_miss_gap": 0.05},
     }
-    active_screeners, mode = rule_engine.resolve_setup_screeners(setup, "TARIFF_PRESSURE")
+    active_screeners, mode, theme_ids = rule_engine.resolve_setup_screeners(setup, "TARIFF_PRESSURE")
     assert active_screeners == ["screen-b", "screen-c"]
     assert mode == "union"
+    assert theme_ids == []
 
     row = pd.Series(
         {

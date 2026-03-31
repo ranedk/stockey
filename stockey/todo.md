@@ -2,6 +2,13 @@
 
 This file tracks the next advisory redesign as of 2026-03-26.
 
+Primary operator path:
+
+- `./all_advisory.sh`
+- `python -m advisory.master_pipeline`
+
+Use `advisory.pipeline` only for component-level advisory runs and debugging.
+
 The current system already has:
 
 - screener normalization into `advisory_screener_constituents`
@@ -10,6 +17,7 @@ The current system already has:
 - rule engine, watchlist, announcement watch, and ET RSS watch
 - LLM event evaluation
 - risk, portfolio, lifecycle, and trace/dashboard tools
+- authenticated ad hoc Screener.in raw query support with persisted company-level results
 
 The next weakness is not missing infrastructure. It is setup activation logic:
 
@@ -103,6 +111,13 @@ Main gaps now:
 - rule engine does not expose active screener provenance cleanly
 - dashboard and setup trace do not show overlay-driven activation
 - there is no workflow that turns a major news theme into a concrete Screener.in screener draft for operator review
+
+Recently implemented:
+
+- `advisory.news_theme_engine` recommends Screener.in query text from active news themes
+- theme-linked Screener.in URLs can be registered back into the project
+- `EVENT_OPPORTUNITY_V1` can consume registered theme screeners
+- `data.screenerin.ad_hoc_query` can run authenticated one-off Screener.in raw queries and persist company-level rows
 
 ## Additional Objective: News-Led Opportunity Discovery
 
@@ -351,32 +366,43 @@ Done when:
 1. Run:
 
 ```sh
-./.xstockey/bin/python -m advisory.news_overlay_engine --dry-run
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_overlay_engine --dry-run
 ```
 
 2. Run:
 
 ```sh
-./.xstockey/bin/python -m advisory.rule_engine --dry-run
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine --dry-run
 ```
 
 3. Inspect:
 
 ```sh
-./.xstockey/bin/python -m advisory.setup_trace <SETUP_ID> --format text
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.setup_trace <SETUP_ID> --format text
 ```
 
 4. For major event/news themes, run:
 
 ```sh
-./.xstockey/bin/python -m advisory.news_theme_engine --dry-run
+/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_theme_engine --dry-run
 ```
 
 5. Copy the suggested Screener.in query, create the screener manually, then continue by registering the URL:
 
 ```sh
-./.xstockey/bin/python -m data.screenerin.screener_registry add <SCREENER_URL>
+/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_registry add <SCREENER_URL>
 ```
+
+6. For an authenticated ad hoc fundamental query outside the registered setup flow, run:
+
+```sh
+/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.ad_hoc_query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
+```
+
+This assumes Chrome remote debugging is already running. If Screener.in redirects to login, the command blocks in the terminal until login is completed. Results are stored in:
+
+- `screenerin_ad_hoc_query_runs`
+- `screenerin_ad_hoc_query_results`
 
 4. Check:
 

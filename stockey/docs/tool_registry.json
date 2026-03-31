@@ -181,6 +181,19 @@
       ]
     },
     {
+      "name": "run_screener_ad_hoc_query",
+      "category": "ingestion",
+      "description": "Run an authenticated ad hoc Screener.in raw query, parse the HTML table, and store the result rows.",
+      "command": ["python", "-m", "data.screenerin.ad_hoc_query"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--name", "Deep Value ROCE", "--query", "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"],
+          "description": "Run and store one ad hoc fundamental screener query."
+        }
+      ]
+    },
+    {
       "name": "build_advisory_macro_daily",
       "category": "ingestion",
       "description": "Build the advisory point-in-time macro snapshot table.",
@@ -422,19 +435,36 @@
       ]
     },
     {
+      "name": "run_master_advisory_pipeline",
+      "category": "analysis",
+      "description": "Run the single top-level advisory workflow that chains data download, news/theme routing, advisory, risk, portfolio, lifecycle, and execution planning.",
+      "command": ["python", "-m", "advisory.master_pipeline"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview the full repo-level advisory workflow without writing."
+        },
+        {
+          "args": ["--dry-run", "--stop-at", "portfolio"],
+          "description": "Preview the master workflow through portfolio planning without writing."
+        }
+      ]
+    },
+    {
       "name": "run_advisory_pipeline",
       "category": "analysis",
-      "description": "Run the advisory stack end to end with stage controls from screener normalization through portfolio/execution planning.",
+      "description": "Run the component-level advisory orchestrator with stage controls from screener normalization through portfolio/execution planning.",
       "command": ["python", "-m", "advisory.pipeline"],
       "read_only": false,
       "examples": [
         {
           "args": ["--dry-run", "--stop-at", "portfolio"],
-          "description": "Preview the pipeline through portfolio planning without writing."
+          "description": "Preview the component advisory pipeline through portfolio planning without writing."
         },
         {
           "args": ["--include-watch", "--include-news", "--include-lifecycle", "--dry-run"],
-          "description": "Preview the full advisory pipeline including announcement watch, ET RSS news watch, and lifecycle stages."
+          "description": "Preview the component advisory pipeline including announcement watch, ET RSS news watch, and lifecycle stages."
         }
       ]
     }

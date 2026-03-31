@@ -30,6 +30,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync is 5 years daily plus last 1 day of 1-minute bars |
 | `data/screenerin/screener_parser.py` | `screenerin_screener_snapshots` | Stores parsed Screener.in screener snapshots by screener slug and date |
 | `data/screenerin/screener_registry.py` | `screenerin_screeners` | Registry utility to add/list/remove Screener.in screeners and inspect latest stored snapshots |
+| `data/screenerin/ad_hoc_query.py` | `screenerin_ad_hoc_query_runs`, `screenerin_ad_hoc_query_results` | Authenticated ad hoc Screener.in raw query runner; blocks for manual login if needed and stores parsed company rows plus queried metrics |
 | `utils/ocr` | none | Provider-agnostic PDF OCR utility using Gemini 3 Flash preview and OpenAI GPT-5 nano |
 | `utils/transcribe` | none | Audio transcription utility for remote mp3/wav/mp4 links using Gemini 3 Flash preview and OpenAI transcription APIs |
 | `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives for the legacy/reference NSE pipeline |
@@ -102,6 +103,7 @@ python -m data.dhanlive.auth_cli clear-cache
 
 | Script | Purpose | Scope |
 | --- | --- | --- |
+| `all_advisory.sh` | Primary advisory orchestrator | Runs raw ingestion, news/theme routing, advisory, risk, portfolio, lifecycle, and execution in one flow |
 | `all_downloads.sh` | Daily raw ingestion and parsing | Market-wide downloads plus tracked-symbol loaders |
 | `all_daily_derivations.sh` | Daily incremental derived data | Watchlist symbols from `config/watchlist_symbols.txt` |
 | `all_backfill.sh` | On-demand repair and historical rebuilds | `watchlist`, `tracked`, or `all` |
@@ -131,8 +133,10 @@ python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange 
 python -m data.dhanlive.ohlcv --symbols BANKNIFTY --asset-type index --exchange NSE --only intraday
 python -m data.screenerin.screener_registry seed-defaults
 python -m data.screenerin.screener_registry list
+python -m data.screenerin.screener_registry query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
 python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1
 python -m data.screenerin.screener_parser --seed-defaults
+python -m advisory.master_pipeline --dry-run
 python -m utils.ocr /tmp/sample.pdf --provider gemini --pages 1
 python -m utils.ocr /tmp/sample.pdf --provider openai --pages 1,3-5
 python -m utils.transcribe https://example.com/audio.mp3 --provider gemini
@@ -200,11 +204,13 @@ Registry utility: `data.screenerin.screener_registry`
 
 Downloader: `data.screenerin.screener_parser`
 
+Ad hoc query runner: `data.screenerin.ad_hoc_query`
+
 Recommended workflow:
 
 1. Register the advisory screeners or seed the defaults.
 2. Verify the registry contents.
-3. Let `all_downloads.sh` or `python -m data.screenerin.screener_parser --seed-defaults` sync the active registry daily.
+3. Let `./all_advisory.sh` or `python -m advisory.master_pipeline` sync the active registry and run the downstream advisory flow daily.
 4. Inspect latest snapshots with the registry utility.
 
 Commands:
@@ -212,6 +218,8 @@ Commands:
 ```sh
 python -m data.screenerin.screener_registry seed-defaults
 python -m data.screenerin.screener_registry list
+python -m data.screenerin.screener_registry query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
+python -m data.screenerin.ad_hoc_query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
 python -m data.screenerin.screener_parser --seed-defaults
 python -m data.screenerin.screener_registry latest
 python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1
@@ -225,6 +233,11 @@ Operational notes:
 - `data.screenerin.screener_parser` can still be pointed at explicit Screener.in URLs directly.
 - Snapshots are stored in `screenerin_screener_snapshots` by `date + screener_slug`.
 - `latest` is compact by default; use `--raw` to print the full stored JSON payload.
+- `data.screenerin.ad_hoc_query` assumes Chrome is already running with remote debugging enabled.
+- `data.screenerin.ad_hoc_query` checks `https://www.screener.in/dash/` first and blocks in the terminal if manual login is required.
+- ad hoc runs are stored in `screenerin_ad_hoc_query_runs`.
+- normalized company rows for ad hoc runs are stored in `screenerin_ad_hoc_query_results`.
+- parsed ad hoc output includes `company_name`, `ticker`, `company_url`, `rank`, and `metrics`.
 
 ## Advisory implementation
 
@@ -341,7 +354,8 @@ This NSE bhavcopy plus adjusted-price path is now a reference and reconciliation
 Top-level orchestration examples:
 
 ```sh
-./all_downloads.sh
+./all_advisory.sh
+python -m advisory.master_pipeline --dry-run
 ./all_daily_derivations.sh
 ./all_backfill.sh watchlist 5
 ./all_backfill.sh tracked 5
@@ -353,9 +367,14 @@ Notes:
 - `all_daily_derivations.sh` loads symbols from [`config/watchlist_symbols.txt`](/home/rane/code/stockey/config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt)
 - `all_backfill.sh` defaults to `watchlist 5`
 - only use `TRUNCATE_DERIVED=1` when you intentionally want a full rebuild of derived price and feature tables
-- `all_downloads.sh` now includes:
+- `all_advisory.sh` now includes the full raw ingestion flow plus the advisory master pipeline:
+  - market data downloads and parsers
   - Dhan OHLCV sync
-  - Dhan screener sync from the active screener registry
+  - Screener.in registry sync and advisory screener normalization
+  - advisory theme routing
+  - advisory rule, watch, news, event, risk, portfolio, lifecycle, and execution stages
+
+- `all_downloads.sh` remains the lower-level raw ingestion component used by the master pipeline.
 
 ### SQL
 
@@ -409,6 +428,7 @@ python scripts/agent_tool_runner.py run build_advisory_allocations --allow-write
 python scripts/agent_tool_runner.py run build_advisory_portfolio_orders --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_position_lifecycle --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_execution_orders --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run run_master_advisory_pipeline --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run run_advisory_pipeline --allow-writes -- --dry-run --stop-at portfolio
 ```
 
@@ -477,7 +497,7 @@ For the advisory stack, `dhan_ohlcv_daily` is the canonical OHLCV source. The NS
 
 `advisory.execution_engine` reads approved `advisory_portfolio_orders`, builds broker handoff orders in `advisory_execution_orders`, and can reconcile order/trade state from Dhan into `advisory_execution_orders` plus `advisory_execution_fills`. Use `--live` only when you explicitly want to place live orders through Dhan. Live Dhan order placement requires the API static IP to be whitelisted.
 
-`advisory.pipeline` is the thin end-to-end orchestrator over the existing advisory modules. Use `--start-at` / `--stop-at` to run a subset of stages, `--include-watch` to include announcement stages, `--include-news` for ET RSS matching, `--include-lifecycle` for paper-position monitoring, and `--include-execution` for broker handoff planning.
+`advisory.master_pipeline` is the single top-level orchestrator over the full repo flow. Use `./all_advisory.sh` for the shell entry point, or run `python -m advisory.master_pipeline` directly. Lower-level modules such as `all_downloads.sh` and `advisory.pipeline` remain available for component runs and targeted debugging.
 
 ## LLM-facing conventions
 

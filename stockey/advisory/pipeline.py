@@ -19,6 +19,8 @@ from advisory.llm_event_evaluator import DEFAULT_MODEL as DEFAULT_EVENT_MODEL
 from advisory.llm_event_evaluator import build_outputs as build_event_evaluations
 from advisory.llm_event_evaluator import persist_outputs as persist_event_evaluations
 from advisory.macro_snapshot import build_macro_snapshot, persist_macro_snapshot
+from advisory.news_overlay_engine import build_overlay_state, persist_overlay_state
+from advisory.news_theme_engine import build_theme_recommendations, load_active_theme_screener_mapping
 from advisory.news_watch import persist_news_events, run_news_watch
 from advisory.peer_sync import sync_peer_data
 from advisory.portfolio_engine import build_portfolio_orders, persist_portfolio_orders, PortfolioConfig
@@ -39,6 +41,8 @@ PIPELINE_STAGES = [
     "technicals",
     "fundamentals",
     "regime",
+    "overlay",
+    "themes",
     "rules",
     "watchlist",
     "watch",
@@ -110,8 +114,7 @@ def stage_enabled(stage: str, start_at: str | None, stop_at: str | None) -> bool
     return True
 
 
-def main() -> int:
-    args = parse_args()
+def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
     summary: dict[str, Any] = {
         "status": "ok",
@@ -167,6 +170,31 @@ def main() -> int:
         if not args.dry_run:
             persist_regime_snapshot(regime_df, rebuild=bool(args.rebuild))
         summary["stages"]["regime"] = _json_ready(regime_df)
+
+    if stage_enabled("overlay", args.start_at, args.stop_at):
+        overlay_df = build_overlay_state(asof_date=asof_date)
+        if not args.dry_run:
+            persist_overlay_state(
+                overlay_df,
+                rebuild=bool(args.rebuild),
+                asof_date=asof_date or (overlay_df["asof_date"].max() if not overlay_df.empty else None),
+            )
+        summary["stages"]["overlay"] = _json_ready(overlay_df)
+
+    if stage_enabled("themes", args.start_at, args.stop_at):
+        theme_payload = build_theme_recommendations(asof_date=asof_date)
+        theme_mapping = load_active_theme_screener_mapping(asof_date=asof_date)
+        summary["stages"]["themes"] = {
+            "meta": _json_ready(
+                {
+                    "asof_date": theme_payload.get("asof_date"),
+                    "news_count": theme_payload.get("news_count"),
+                    "error": theme_payload.get("error"),
+                }
+            ),
+            "recommendations": _json_ready(theme_payload.get("recommendations") or []),
+            "active_mapping": _json_ready(theme_mapping),
+        }
 
     candidates = pd.DataFrame()
     rejections = pd.DataFrame()
@@ -307,6 +335,12 @@ def main() -> int:
             "fills": _json_ready(fills_df),
         }
 
+    return summary
+
+
+def main() -> int:
+    args = parse_args()
+    summary = run_pipeline(args)
     print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
     return 0
 

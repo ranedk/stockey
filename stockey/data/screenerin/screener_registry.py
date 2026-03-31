@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from data.screenerin.ad_hoc_query import run_ad_hoc_query
 from data.screenerin.screener_parser import (
     list_registered_screeners,
     load_latest_snapshots,
@@ -38,6 +39,10 @@ def main() -> None:
     latest_parser.add_argument("--screener", help="Specific screener slug")
     latest_parser.add_argument("--raw", action="store_true", help="Include the full raw_json payload")
 
+    query_parser = subparsers.add_parser("query", help="Run an ad hoc authenticated Screener.in raw query and store the results")
+    query_parser.add_argument("--query", required=True, help="Screener.in query text")
+    query_parser.add_argument("--name", help="Friendly name for the ad hoc query")
+
     subparsers.add_parser("seed-defaults", help="Register the four advisory Screener.in screeners")
 
     args = parser.parse_args()
@@ -65,6 +70,18 @@ def main() -> None:
             print_records(load_latest_snapshots(args.screener))
         else:
             print_records(summarize_latest_snapshots(args.screener))
+        return
+
+    if args.command == "query":
+        print(
+            json.dumps(
+                run_ad_hoc_query(query_text=args.query, query_name=args.name),
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            ),
+            flush=True,
+        )
         return
 
     if args.command == "seed-defaults":
