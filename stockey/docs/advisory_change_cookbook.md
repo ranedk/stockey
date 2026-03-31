@@ -9,19 +9,19 @@ Use [`docs/advisory_manual.md`](/home/rane/code/stockey/docs/advisory_manual.md)
 ### Register the Screener.in URL
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-new-screen/"
+python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-new-screen/"
 ```
 
 ### Sync the raw screener snapshot
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_parser
+python -m data.screenerin.screener_parser
 ```
 
 ### Normalize to the advisory universe
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.screener_parser
+python -m advisory.screener_parser
 ```
 
 ### Add a setup in [config/advisory_setups.yaml](/home/rane/code/stockey/config/advisory_setups.yaml)
@@ -54,14 +54,14 @@ Example:
 ### Test the setup
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine --dry-run
+python -m advisory.rule_engine --dry-run
 ```
 
 ### If it looks right, persist it
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.watchlist_builder
+python -m advisory.rule_engine
+python -m advisory.watchlist_builder
 ```
 
 ## 2. Loosen or tighten one setup’s thresholds
@@ -78,14 +78,14 @@ Common changes:
 After changing the file:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine --dry-run
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace HDFCBANK --format text
+python -m advisory.rule_engine --dry-run
+python -m advisory.symbol_trace HDFCBANK --format text
 ```
 
 If correct:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
+python -m advisory.rule_engine
 ```
 
 ## 3. Trace one symbol through the pipeline
@@ -93,19 +93,19 @@ If correct:
 Use the symbol trace CLI:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace HDFCBANK --format text
+python -m advisory.symbol_trace HDFCBANK --format text
 ```
 
 JSON form:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace HDFCBANK
+python -m advisory.symbol_trace HDFCBANK
 ```
 
 Setup-specific trace:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace HDFCBANK --setup LARGECAP_BREAKOUT_V1 --format text
+python -m advisory.symbol_trace HDFCBANK --setup LARGECAP_BREAKOUT_V1 --format text
 ```
 
 What it shows:
@@ -124,13 +124,13 @@ What it shows:
 Use the setup trace CLI:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
+python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
 ```
 
 JSON form:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.setup_trace LARGECAP_BREAKOUT_V1
+python -m advisory.setup_trace LARGECAP_BREAKOUT_V1
 ```
 
 What it shows:
@@ -146,13 +146,13 @@ What it shows:
 Use the dashboard CLI:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.dashboard --format text
+python -m advisory.dashboard --format text
 ```
 
 JSON form:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.dashboard --format json
+python -m advisory.dashboard --format json
 ```
 
 This is the fastest way to see:
@@ -169,17 +169,17 @@ This is the fastest way to see:
 For official announcements plus ET RSS:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.announcement_watch
-/home/rane/code/stockey/.xstockey/bin/python -m data.economictimes.rss
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_watch
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.llm_event_evaluator
+python -m advisory.announcement_watch
+python -m data.economictimes.rss
+python -m advisory.news_watch
+python -m advisory.llm_event_evaluator
 ```
 
 ## 5. Rebuild the full advisory flow after a strategy change
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --include-watch --include-news --dry-run
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --include-watch --include-news
+python -m advisory.pipeline --include-watch --include-news --dry-run
+python -m advisory.pipeline --include-watch --include-news
 ```
 
 ## 6. Check why the rule engine produced zero candidates
@@ -187,17 +187,17 @@ For official announcements plus ET RSS:
 Run:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python scripts/sql_query_runner.py --read-only "select * from advisory_candidate_rejections order by asof_date desc, setup_id, symbol limit 100"
+python scripts/sql_query_runner.py --read-only "select * from advisory_candidate_rejections order by asof_date desc, setup_id, symbol limit 100"
 ```
 
 Then trace one rejected symbol:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace IGL --format text
+python -m advisory.symbol_trace IGL --format text
 ```
 
 ## 7. Validate after any change
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m pytest tests/test_advisory_regression.py
+python -m pytest tests/test_advisory_regression.py
 ```

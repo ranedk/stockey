@@ -34,6 +34,7 @@ def ensure_watchlist_table() -> None:
                 regime_name TEXT,
                 base_regime TEXT,
                 news_overlay TEXT,
+                theme_ids TEXT,
                 symbol TEXT NOT NULL,
                 company_master_id TEXT,
                 screener_slug TEXT,
@@ -69,6 +70,7 @@ def ensure_watchlist_table() -> None:
             "regime_name": "TEXT",
             "base_regime": "TEXT",
             "news_overlay": "TEXT",
+            "theme_ids": "TEXT",
             "company_master_id": "TEXT",
             "screener_slug": "TEXT",
             "source_screener_slug": "TEXT",
@@ -341,7 +343,7 @@ def build_watchlist(
     out["last_checked_at"] = pd.NaT
     out["last_document_published_on"] = pd.NaT
     out["load_ts"] = pd.Timestamp.utcnow()
-    for column in ["base_regime", "news_overlay", "source_screener_slug", "source_screener_list"]:
+    for column in ["base_regime", "news_overlay", "theme_ids", "source_screener_slug", "source_screener_list"]:
         if column not in out.columns:
             out[column] = pd.NA
 
@@ -375,6 +377,7 @@ def build_watchlist(
         "regime_name",
         "base_regime",
         "news_overlay",
+        "theme_ids",
         "symbol",
         "company_master_id",
         "screener_slug",

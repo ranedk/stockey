@@ -8,6 +8,7 @@ import pandas as pd
 
 from advisory.data_sync import ensure_advisory_symbol_inputs
 from advisory.fundamental_snapshot import build_fundamental_snapshot, persist_fundamental_snapshot
+from advisory.news_theme_engine import load_active_theme_screener_mapping
 from advisory.peer_sync import sync_peer_data
 from advisory.setup_registry import load_setup_registry
 from advisory.technical_features import build_technical_features, persist_technical_features
@@ -59,6 +60,7 @@ def ensure_rule_output_tables() -> None:
                 regime_name TEXT,
                 base_regime TEXT,
                 news_overlay TEXT,
+                theme_ids TEXT,
                 symbol TEXT NOT NULL,
                 company_master_id TEXT,
                 screener_slug TEXT,
@@ -100,6 +102,7 @@ def ensure_rule_output_tables() -> None:
             "regime_name": "TEXT",
             "base_regime": "TEXT",
             "news_overlay": "TEXT",
+            "theme_ids": "TEXT",
             "company_master_id": "TEXT",
             "screener_slug": "TEXT",
             "source_screener_slug": "TEXT",
@@ -254,10 +257,21 @@ def load_overlay(asof_date: pd.Timestamp, regime_name: str | None = None) -> dic
     }
 
 
-def resolve_setup_screeners(setup: dict[str, Any], overlay_name: str | None) -> tuple[list[str], str]:
+def resolve_setup_screeners(
+    setup: dict[str, Any],
+    overlay_name: str | None,
+    *,
+    theme_screener_mapping: dict[str, Any] | None = None,
+) -> tuple[list[str], str, list[str]]:
     base_screeners = [str(value) for value in (setup.get("screeners") or setup.get("screener_slugs") or []) if value]
     if not base_screeners and setup.get("screener_slug"):
         base_screeners = [str(setup["screener_slug"])]
+    theme_ids: list[str] = []
+    if str(setup.get("setup_id") or "").upper() == "EVENT_OPPORTUNITY_V1":
+        theme_ids = [str(value) for value in ((theme_screener_mapping or {}).get("theme_ids") or []) if value]
+        for value in ((theme_screener_mapping or {}).get("screener_slugs") or []):
+            if value and str(value) not in base_screeners:
+                base_screeners.append(str(value))
     overlay_cfg = (setup.get("overlay_screeners") or {}).get(str(overlay_name or "NONE").upper(), {})
     add = [str(value) for value in (overlay_cfg.get("add") or []) if value]
     remove = {str(value) for value in (overlay_cfg.get("remove") or []) if value}
@@ -265,7 +279,7 @@ def resolve_setup_screeners(setup: dict[str, Any], overlay_name: str | None) -> 
     for value in add:
         if value not in active:
             active.append(value)
-    return active, str(setup.get("screener_mode") or "union").lower()
+    return active, str(setup.get("screener_mode") or "union").lower(), theme_ids
 
 
 def load_screener_universe(asof_date: pd.Timestamp, screener_slugs: list[str] | None, *, screener_mode: str = "union") -> pd.DataFrame:
@@ -714,18 +728,27 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
     }
     overlay = load_overlay(effective_date, regime_name=str(regime.get("regime_name") or ""))
     overlay_name = str(overlay.get("overlay_name") or "NONE").upper()
+    theme_screener_mapping = load_active_theme_screener_mapping(asof_date=effective_date)
     meta["overlay_name"] = overlay_name
     meta["overlay_reason"] = overlay.get("overlay_reason")
     meta["overlay_intensity"] = overlay.get("overlay_intensity")
+    meta["active_theme_ids"] = theme_screener_mapping.get("theme_ids") or []
+    meta["theme_screeners"] = theme_screener_mapping.get("screener_slugs") or []
+    meta["theme_error"] = theme_screener_mapping.get("error")
 
     setup_screeners: dict[str, list[str]] = {}
     setup_screener_modes: dict[str, str] = {}
     screener_frames = []
     for setup in setups:
-        active_screeners, screener_mode = resolve_setup_screeners(setup, overlay_name)
+        active_screeners, screener_mode, active_theme_ids = resolve_setup_screeners(
+            setup,
+            overlay_name,
+            theme_screener_mapping=theme_screener_mapping,
+        )
         setup_screeners[setup["setup_id"].upper()] = active_screeners
         setup_screener_modes[setup["setup_id"].upper()] = screener_mode
         meta.setdefault("active_screeners_by_setup", {})[setup["setup_id"]] = active_screeners
+        meta.setdefault("active_theme_ids_by_setup", {})[setup["setup_id"]] = active_theme_ids
         frame = load_screener_universe(screener_date, active_screeners, screener_mode=screener_mode)
         if not frame.empty:
             screener_frames.append(frame)
@@ -763,6 +786,7 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
                     "company_master_id": None,
                     "base_regime": regime_name,
                     "news_overlay": overlay_name,
+                    "theme_ids": json.dumps(meta.get("active_theme_ids_by_setup", {}).get(setup["setup_id"], [])),
                     "reason_code": "missing_screener_universe",
                     "severity": "hard",
                     "is_near_miss": False,
@@ -803,6 +827,7 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
                         "regime_name": regime_name,
                         "base_regime": regime_name,
                         "news_overlay": overlay_name,
+                        "theme_ids": json.dumps(meta.get("active_theme_ids_by_setup", {}).get(setup["setup_id"], [])),
                         "symbol": row["symbol"],
                         "company_master_id": row["company_master_id"],
                         "screener_slug": row.get("screener_slug"),

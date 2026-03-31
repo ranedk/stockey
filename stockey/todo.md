@@ -17,6 +17,7 @@ The next weakness is not missing infrastructure. It is setup activation logic:
 - regime handling is still too flat for temporary shock contexts
 - news context is not first-class in setup activation
 - traces do not clearly show which screener pool and overlay drove candidate generation
+- news is still mostly used as an overlay or event adjustment, not as a discovery engine for new opportunity-specific screeners
 
 ## Objective
 
@@ -31,6 +32,13 @@ Then use that pair to:
 - choose multiple screeners per setup
 - add or remove screeners under overlays
 - improve candidate generation without changing data sources
+
+Also add a separate event-theme discovery path that can:
+
+- detect opportunity themes from major market news
+- suggest Screener.in-compatible screener definitions for those themes
+- pause for operator-created Screener.in links
+- continue the advisory flow once those links are registered
 
 ## Product Model
 
@@ -75,6 +83,7 @@ Out of scope:
 - macro engine rewrite
 - full market-wide news-first discovery
 - turning every headline into a new regime
+- letting the LLM invent unlimited one-off screeners with no taxonomy
 
 ## Current Reality
 
@@ -93,6 +102,68 @@ Main gaps now:
 - setups do not read a market overlay
 - rule engine does not expose active screener provenance cleanly
 - dashboard and setup trace do not show overlay-driven activation
+- there is no workflow that turns a major news theme into a concrete Screener.in screener draft for operator review
+
+## Additional Objective: News-Led Opportunity Discovery
+
+Build a controlled theme-discovery layer where:
+
+- base regime + regular screeners still run daily
+- major news themes can create additional discovery paths
+- those paths emit candidate Screener.in queries in operator-friendly format
+- the operator can create the screener on Screener.in, paste the link back, and resume ingestion
+
+This should be:
+
+- taxonomy-based
+- explainable
+- human-in-the-loop
+
+It should not be:
+
+- fully automatic headline trading
+- unconstrained LLM-generated screener sprawl
+
+## Product Model: News Theme Engine
+
+### Theme taxonomy
+
+Introduce a stable theme layer such as:
+
+- `PHARMA_EXPORT_SHIFT`
+- `ENERGY_SUPPLY_SHOCK`
+- `AGRI_SUPPLY_SHOCK_COTTON`
+- `DEFENSE_TENSION`
+- `POWER_POLICY_SHIFT`
+- `METAL_SUPPLY_SHOCK`
+- `TEXTILE_EXPORT_SHIFT`
+- `CHEMICAL_INPUT_SHOCK`
+
+Each theme should have:
+
+- trigger keywords / classification hints
+- positive sectors
+- negative sectors or cost-burdened sectors where relevant
+- one or more suggested Screener.in query templates
+- expected holding horizon
+- expiry/decay note
+
+### Operator workflow
+
+1. Run a news theme command
+2. See active theme recommendations
+3. Copy the generated Screener.in query text
+4. Create the screener manually in Screener.in
+5. Paste the Screener.in URL back into the project
+6. Register and ingest it
+7. Use it in the event-opportunity setup flow
+
+### Acceptance
+
+- one command can tell the operator which screener to create
+- output is in Screener.in query text form, not only a theme label
+- the generated screener recommendation includes a suggested slug/name
+- the project can resume once the operator provides the Screener.in URL
 
 ## Delivery Plan
 
@@ -211,6 +282,42 @@ Done when:
 - one command can explain why a setup ran
 - one command can explain which screener pool drove candidate generation
 
+### Phase 5: News Theme to Screener Workflow
+
+Goal:
+
+- turn major news themes into operator-created Screener.in screeners
+
+Tasks:
+
+1. Add [`advisory/news_theme_engine.py`](/home/rane/code/stockey/advisory/news_theme_engine.py)
+   - read recent market news
+   - classify one or more stable opportunity themes
+   - generate:
+     - `theme_id`
+     - `theme_reason`
+     - `theme_intensity`
+     - suggested Screener.in query text
+     - suggested screener slug/name
+2. Add a config file for theme mappings and screener query templates
+   - keep templates deterministic and editable
+3. Add a small operator workflow command
+   - print:
+     - active theme
+     - rationale
+     - Screener.in query text to paste
+     - next step instructions asking for the Screener.in URL
+4. Extend screener registry usage
+   - once the operator provides the URL, register it using the existing Screener.in registry flow
+5. Add an event-opportunity setup family later
+   - optional next step after manual screener creation is working
+
+Done when:
+
+- the system can recommend a concrete Screener.in screener definition from news
+- the operator can create it manually and feed the URL back into the system
+- the recommendation path is separate from the normal daily regime/setup path
+
 ## Minimum Schema Changes
 
 ### New table
@@ -244,19 +351,31 @@ Done when:
 1. Run:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_overlay_engine --dry-run
+./.xstockey/bin/python -m advisory.news_overlay_engine --dry-run
 ```
 
 2. Run:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine --dry-run
+./.xstockey/bin/python -m advisory.rule_engine --dry-run
 ```
 
 3. Inspect:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.setup_trace <SETUP_ID> --format text
+./.xstockey/bin/python -m advisory.setup_trace <SETUP_ID> --format text
+```
+
+4. For major event/news themes, run:
+
+```sh
+./.xstockey/bin/python -m advisory.news_theme_engine --dry-run
+```
+
+5. Copy the suggested Screener.in query, create the screener manually, then continue by registering the URL:
+
+```sh
+./.xstockey/bin/python -m data.screenerin.screener_registry add <SCREENER_URL>
 ```
 
 4. Check:

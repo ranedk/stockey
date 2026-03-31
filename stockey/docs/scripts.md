@@ -64,13 +64,13 @@ python scripts/cleanup_deprecated_tables.py --dry-run
 - Use the project venv when running ingestion jobs manually:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m ...
+python -m ...
 ```
 
 - Use the same interpreter for the curated runner:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python scripts/agent_tool_runner.py list
+python scripts/agent_tool_runner.py list
 ```
 
 - Symbol-scoped loaders fall back in this order:

@@ -313,3 +313,65 @@ setups:
       - BREAKOUT_PIVOT
       - PULLBACK_TO_20DMA
       - PULLBACK_TO_50DMA
+
+  - setup_id: EVENT_OPPORTUNITY_V1
+    setup_name: Event opportunity
+    setup_family: EVENT_OPPORTUNITY
+    holding_horizon_note: 3 days to 8 weeks
+    screeners: []
+    screener_mode: union
+    allowed_regimes:
+      - BULL_RISK_ON
+      - BULL_NARROW
+      - STABLE
+      - STABLE_BUT_TARIFF_RISING
+      - RISK_OFF
+    blocked_regimes:
+      - SHOCK
+    allowed_overlays:
+      - NONE
+      - EVENT_CLUSTER
+      - SECTOR_POLICY_SHOCK
+      - TARIFF_PRESSURE
+      - OIL_SHOCK
+      - GEOPOLITICAL_RISK
+    market_cap_min: 500
+    min_avg_traded_value_20d: 50000000
+    max_breakout_extension_pct: 12
+    watch_pullback_extension_pct: 7
+    min_dist_52w_high: -25
+    scoring_weights:
+      technical: 0.30
+      fundamental: 0.25
+      regime_fit: 0.15
+      event: 0.30
+    score_thresholds:
+      pass_now: 0.66
+      watch_breakout: 0.56
+      watch_pullback: 0.50
+      watch_event: 0.46
+      near_miss_gap: 0.06
+    regime_policy:
+      preferred:
+        - STABLE
+        - STABLE_BUT_TARIFF_RISING
+        - BULL_NARROW
+      acceptable:
+        - BULL_RISK_ON
+        - RISK_OFF
+      avoid:
+        - SHOCK
+    technical_rules:
+      - column: rs_vs_benchmark
+        operator: gte
+        value: -0.05
+    watch_reasons:
+      - theme confirmation
+      - policy follow-through
+      - order flow
+      - commodity shock persistence
+      - management commentary
+    entry_styles:
+      - BREAKOUT_PIVOT
+      - PULLBACK_TO_20DMA
+      - RETEST_OF_PRIOR_BREAKOUT

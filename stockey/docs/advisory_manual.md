@@ -86,53 +86,53 @@ These are the core advisory tables to know:
 Use the project venv:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m ...
+python -m ...
 ```
 
 ### Full advisory dry-run
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --include-watch --include-news --dry-run
+python -m advisory.pipeline --include-watch --include-news --dry-run
 ```
 
 ### Full advisory write run
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --include-watch --include-news
+python -m advisory.pipeline --include-watch --include-news
 ```
 
 ### Through portfolio only
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --dry-run --stop-at portfolio
+python -m advisory.pipeline --dry-run --stop-at portfolio
 ```
 
 ### Specific stages
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.screener_parser
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.technical_features
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.fundamental_snapshot
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.watchlist_builder
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.announcement_watch
-/home/rane/code/stockey/.xstockey/bin/python -m data.economictimes.rss
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_watch --refresh-feeds
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.llm_event_evaluator
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.risk_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.portfolio_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.position_lifecycle
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.execution_engine --dry-run
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace HDFCBANK --format text
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.dashboard --format text
+python -m advisory.screener_parser
+python -m advisory.technical_features
+python -m advisory.fundamental_snapshot
+python -m advisory.rule_engine
+python -m advisory.watchlist_builder
+python -m advisory.announcement_watch
+python -m data.economictimes.rss
+python -m advisory.news_watch --refresh-feeds
+python -m advisory.llm_event_evaluator
+python -m advisory.risk_engine
+python -m advisory.portfolio_engine
+python -m advisory.position_lifecycle
+python -m advisory.execution_engine --dry-run
+python -m advisory.symbol_trace HDFCBANK --format text
+python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
+python -m advisory.dashboard --format text
 ```
 
 ### Regression and cleanup
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m pytest tests/test_advisory_regression.py
-/home/rane/code/stockey/.xstockey/bin/python scripts/cleanup_deprecated_tables.py --dry-run
+python -m pytest tests/test_advisory_regression.py
+python scripts/cleanup_deprecated_tables.py --dry-run
 ```
 
 ## How to add a new screener
@@ -144,49 +144,49 @@ The system currently uses Screener.in as the active advisory screener source.
 Example:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-new-screen/"
+python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-new-screen/"
 ```
 
 Optional display name:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-new-screen/" --name "My New Screen"
+python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-new-screen/" --name "My New Screen"
 ```
 
 List registered screeners:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_registry list
+python -m data.screenerin.screener_registry list
 ```
 
 Inspect latest rows:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_registry latest --screener my-new-screen
+python -m data.screenerin.screener_registry latest --screener my-new-screen
 ```
 
 Remove a screener:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_registry remove my-new-screen
+python -m data.screenerin.screener_registry remove my-new-screen
 ```
 
 ### Step 2: sync the raw screener snapshot
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_parser
+python -m data.screenerin.screener_parser
 ```
 
 ### Step 3: normalize into the advisory universe
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.screener_parser
+python -m advisory.screener_parser
 ```
 
 ### Step 4: verify the results
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python scripts/sql_query_runner.py --read-only "select date, screener_slug, count(*) as row_count from advisory_screener_constituents group by 1,2 order by 1 desc,2"
+python scripts/sql_query_runner.py --read-only "select date, screener_slug, count(*) as row_count from advisory_screener_constituents group by 1,2 order by 1 desc,2"
 ```
 
 ## How to add or change a setup
@@ -282,14 +282,14 @@ Typical fundamental columns:
 Run:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine --dry-run
+python -m advisory.rule_engine --dry-run
 ```
 
 If the output looks correct:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.watchlist_builder
+python -m advisory.rule_engine
+python -m advisory.watchlist_builder
 ```
 
 ## How to inspect why a stock passed or failed
@@ -297,19 +297,19 @@ If the output looks correct:
 The fastest way is:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace HDFCBANK --format text
+python -m advisory.symbol_trace HDFCBANK --format text
 ```
 
 ### Passed candidates
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python scripts/sql_query_runner.py --read-only "select * from advisory_candidates order by asof_date desc, setup_id, symbol limit 50"
+python scripts/sql_query_runner.py --read-only "select * from advisory_candidates order by asof_date desc, setup_id, symbol limit 50"
 ```
 
 ### Rejections
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python scripts/sql_query_runner.py --read-only "select * from advisory_candidate_rejections order by asof_date desc, setup_id, symbol limit 100"
+python scripts/sql_query_runner.py --read-only "select * from advisory_candidate_rejections order by asof_date desc, setup_id, symbol limit 100"
 ```
 
 ### Common rejection reasons
@@ -365,31 +365,31 @@ There are now two event paths.
 
 ```sh
 ./all_downloads.sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --include-watch --include-news
+python -m advisory.pipeline --include-watch --include-news
 ```
 
 ### If you only changed rules
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.watchlist_builder
+python -m advisory.rule_engine
+python -m advisory.watchlist_builder
 ```
 
 ### If you only changed screeners
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.screenerin.screener_parser
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.screener_parser
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
+python -m data.screenerin.screener_parser
+python -m advisory.screener_parser
+python -m advisory.rule_engine
 ```
 
 ### If you want event processing only
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.announcement_watch
-/home/rane/code/stockey/.xstockey/bin/python -m data.economictimes.rss
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_watch
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.llm_event_evaluator
+python -m advisory.announcement_watch
+python -m data.economictimes.rss
+python -m advisory.news_watch
+python -m advisory.llm_event_evaluator
 ```
 
 ## Troubleshooting
@@ -399,9 +399,9 @@ There are now two event paths.
 Use:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m data.dhanlive.auth_cli status
-/home/rane/code/stockey/.xstockey/bin/python -m data.dhanlive.auth_cli refresh --clear-cache-first
-/home/rane/code/stockey/.xstockey/bin/python -m data.dhanlive.auth_cli validate
+python -m data.dhanlive.auth_cli status
+python -m data.dhanlive.auth_cli refresh --clear-cache-first
+python -m data.dhanlive.auth_cli validate
 ```
 
 ### Screener looks empty
@@ -448,7 +448,7 @@ When you change the advisory system:
 4. run:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m pytest tests/test_advisory_regression.py
+python -m pytest tests/test_advisory_regression.py
 ```
 
 5. run at least one relevant dry-run command for the changed stage

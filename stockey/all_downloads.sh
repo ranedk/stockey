@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-/home/rane/code/stockey/.xstockey/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-./.xstockey/bin/python}"
 
 # Masters
 "${PYTHON_BIN}" -m data.nseindia.holidays

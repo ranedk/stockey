@@ -42,8 +42,8 @@ python -m utils.ocr /path/to/file.pdf --provider both --pages all
 Tested locally with:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider gemini --pages 1
-/home/rane/code/stockey/.xstockey/bin/python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider openai --pages 1
+python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider gemini --pages 1
+python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider openai --pages 1
 ```
 
 ## Transcribe audio from URLs
@@ -74,15 +74,15 @@ Model notes:
 Tested locally with a generated mp3 served over localhost:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m utils.transcribe http://127.0.0.1:8765/sample.mp3 --provider openai
-/home/rane/code/stockey/.xstockey/bin/python -m utils.transcribe http://127.0.0.1:8765/sample.mp3 --provider gemini
+python -m utils.transcribe http://127.0.0.1:8765/sample.mp3 --provider openai
+python -m utils.transcribe http://127.0.0.1:8765/sample.mp3 --provider gemini
 ```
 
 ## Review security identity issues
 
 ```sh
 python -m data.nseindia.security_history
-/home/rane/code/stockey/.xstockey/bin/python scripts/sql_query_runner.py --read-only "select * from dim_security_review_events where needs_review = true order by confidence desc, last_seen desc limit 50"
+python scripts/sql_query_runner.py --read-only "select * from dim_security_review_events where needs_review = true order by confidence desc, last_seen desc limit 50"
 ```
 
 Manual overrides go into `dim_security_overrides`. Use them for mergers, demergers, scheme changes, and any rename the heuristics flag incorrectly.

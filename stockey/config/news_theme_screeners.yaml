@@ -1,0 +1,134 @@
+themes:
+  - theme_id: PHARMA_EXPORT_SHIFT
+    theme_name: Pharma Export Shift
+    keywords:
+      - pharma
+      - drug
+      - usfda
+      - us law
+      - import restriction
+      - china plus one
+      - api
+      - formulation
+    positive_sectors:
+      - pharma
+      - healthcare
+      - api
+    suggested_screeners:
+      - slug: news-pharma-export-shift-v1
+        screener_name: NEWS PHARMA EXPORT SHIFT V1
+        holding_horizon_note: 2 weeks to 3 months
+        screener_query: |
+          Market Capitalization > 1000 AND
+          Sales growth 3Years > 8 AND
+          Return on capital employed > 12 AND
+          Debt to equity < 1 AND
+          Promoter holding > 35 AND
+          Price to earning < 60
+      - slug: news-pharma-quality-us-opportunity-v1
+        screener_name: NEWS PHARMA QUALITY US OPPORTUNITY V1
+        holding_horizon_note: 1 month to 3 months
+        screener_query: |
+          Market Capitalization > 3000 AND
+          Return on equity > 12 AND
+          Profit growth 3Years > 8 AND
+          Debt to equity < 0.8 AND
+          Current price > 200 Day Moving Average
+
+  - theme_id: ENERGY_SUPPLY_SHOCK
+    theme_name: Energy Supply Shock
+    keywords:
+      - iran
+      - strait of hormuz
+      - oil shock
+      - crude spike
+      - middle east
+      - opec
+      - gas spike
+    positive_sectors:
+      - oil
+      - gas
+      - upstream
+      - defense
+    suggested_screeners:
+      - slug: news-energy-supply-shock-beneficiaries-v1
+        screener_name: NEWS ENERGY SUPPLY SHOCK BENEFICIARIES V1
+        holding_horizon_note: 1 week to 8 weeks
+        screener_query: |
+          Market Capitalization > 2000 AND
+          Operating profit margin > 10 AND
+          Debt to equity < 1.5 AND
+          Current price > 50 Day Moving Average AND
+          Current price > 200 Day Moving Average
+
+  - theme_id: AGRI_SUPPLY_SHOCK_COTTON
+    theme_name: Agri Supply Shock Cotton
+    keywords:
+      - cotton
+      - crop damage
+      - pest
+      - monsoon deficit
+      - farm output
+      - acreage
+      - yield damage
+    positive_sectors:
+      - textile
+      - agri
+    suggested_screeners:
+      - slug: news-cotton-supply-shock-v1
+        screener_name: NEWS COTTON SUPPLY SHOCK V1
+        holding_horizon_note: 1 week to 6 weeks
+        screener_query: |
+          Market Capitalization > 500 AND
+          Sales growth 3Years > 5 AND
+          Debt to equity < 1.5 AND
+          Current price > 50 Day Moving Average AND
+          Price to earning < 40
+
+  - theme_id: DEFENSE_TENSION
+    theme_name: Defense Tension
+    keywords:
+      - war
+      - missile
+      - border tension
+      - military
+      - defense order
+      - conflict
+    positive_sectors:
+      - defense
+      - aerospace
+      - radar
+    suggested_screeners:
+      - slug: news-defense-tension-v1
+        screener_name: NEWS DEFENSE TENSION V1
+        holding_horizon_note: 1 week to 2 months
+        screener_query: |
+          Market Capitalization > 1000 AND
+          Sales growth 3Years > 8 AND
+          Return on capital employed > 12 AND
+          Debt to equity < 1 AND
+          Current price > 50 Day Moving Average
+
+  - theme_id: POWER_POLICY_SHIFT
+    theme_name: Power Policy Shift
+    keywords:
+      - power policy
+      - transmission
+      - renewable bid
+      - grid capex
+      - electricity reform
+      - storage policy
+    positive_sectors:
+      - power
+      - utilities
+      - transmission
+    suggested_screeners:
+      - slug: news-power-policy-shift-v1
+        screener_name: NEWS POWER POLICY SHIFT V1
+        holding_horizon_note: 2 weeks to 3 months
+        screener_query: |
+          Market Capitalization > 1500 AND
+          Sales growth 3Years > 8 AND
+          Debt to equity < 2 AND
+          Return on equity > 10 AND
+          Current price > 200 Day Moving Average

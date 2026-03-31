@@ -232,8 +232,8 @@ The curated agent-safe commands live in:
 Quick checks:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python scripts/agent_tool_runner.py list
-/home/rane/code/stockey/.xstockey/bin/python scripts/agent_tool_runner.py list --category storage
+python scripts/agent_tool_runner.py list
+python scripts/agent_tool_runner.py list --category storage
 ```
 
 The runner uses the invoking interpreter for downstream Python commands, so starting it from the project venv keeps the entire agent tool chain in the same environment.
@@ -255,29 +255,29 @@ For copy-paste change recipes, use [`docs/advisory_change_cookbook.md`](/home/ra
 Current advisory bootstrap commands:
 
 ```sh
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.screener_parser
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.macro_snapshot
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.fundamental_snapshot
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.regime_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.peer_sync --symbols HDFCBANK
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.technical_features
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.rule_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.watchlist_builder
-/home/rane/code/stockey/.xstockey/bin/python -m data.economictimes.rss
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.announcement_watch
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.news_watch --refresh-feeds
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.symbol_trace HDFCBANK --format text
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.dashboard --format text
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.llm_event_evaluator
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.risk_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.portfolio_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.position_lifecycle
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.execution_engine
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --dry-run --stop-at portfolio
-/home/rane/code/stockey/.xstockey/bin/python -m advisory.pipeline --include-watch --include-news --dry-run
-/home/rane/code/stockey/.xstockey/bin/python -m pytest tests/test_advisory_regression.py
-/home/rane/code/stockey/.xstockey/bin/python scripts/cleanup_deprecated_tables.py --dry-run
+python -m advisory.screener_parser
+python -m advisory.macro_snapshot
+python -m advisory.fundamental_snapshot
+python -m advisory.regime_engine
+python -m advisory.peer_sync --symbols HDFCBANK
+python -m advisory.technical_features
+python -m advisory.rule_engine
+python -m advisory.watchlist_builder
+python -m data.economictimes.rss
+python -m advisory.announcement_watch
+python -m advisory.news_watch --refresh-feeds
+python -m advisory.symbol_trace HDFCBANK --format text
+python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
+python -m advisory.dashboard --format text
+python -m advisory.llm_event_evaluator
+python -m advisory.risk_engine
+python -m advisory.portfolio_engine
+python -m advisory.position_lifecycle
+python -m advisory.execution_engine
+python -m advisory.pipeline --dry-run --stop-at portfolio
+python -m advisory.pipeline --include-watch --include-news --dry-run
+python -m pytest tests/test_advisory_regression.py
+python scripts/cleanup_deprecated_tables.py --dry-run
 ```
 
 For advisory execution, use Dhan daily OHLCV as the canonical price source. The NSE bhavcopy and adjusted-price jobs remain optional reference pipelines and are no longer required by the advisory technical/rule stack.

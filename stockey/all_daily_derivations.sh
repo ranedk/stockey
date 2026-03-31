@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-PYTHON_BIN="${PYTHON_BIN:-/home/rane/code/stockey/.xstockey/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-./.xstockey/bin/python}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WATCHLIST_FILE="${WATCHLIST_FILE:-${REPO_ROOT}/config/watchlist_symbols.txt}"
 TRACKED_FILE="${TRACKED_FILE:-${REPO_ROOT}/config/tracked_symbols.txt}"

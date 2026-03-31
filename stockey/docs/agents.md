@@ -61,7 +61,7 @@ python scripts/agent_tool_runner.py run load_us_macro --allow-writes
 
 The runner blocks non-read-only tools unless `--allow-writes` is passed. That is the right default for analyst-style agents.
 
-The runner resolves `python` and `python3` commands to the invoking interpreter, so launching it with `/home/rane/code/stockey/.xstockey/bin/python` keeps downstream tools inside the project virtualenv.
+The runner resolves `python` and `python3` commands to the invoking interpreter, so launching it with `python` keeps downstream tools inside the project virtualenv.
 
 ## Data modeling advice
 

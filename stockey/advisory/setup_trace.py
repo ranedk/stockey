@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.news_theme_engine import load_active_theme_screener_mapping
 from advisory.setup_registry import load_setup_registry
 from utils.db import sql_to_df
 from utils.sync import parse_datetime_arg
@@ -118,14 +119,26 @@ def load_market_overlay(asof_date: pd.Timestamp | None) -> dict[str, Any] | None
     return df.iloc[0].to_dict()
 
 
-def resolve_setup_screeners(setup_id: str, overlay_name: str | None = None) -> list[str]:
+def resolve_setup_screeners(
+    setup_id: str,
+    overlay_name: str | None = None,
+    *,
+    asof_date: pd.Timestamp | None = None,
+) -> tuple[list[str], list[str]]:
     screener_slugs: list[str] = []
+    active_theme_ids: list[str] = []
+    theme_mapping = load_active_theme_screener_mapping(asof_date=asof_date)
     for setup in load_setup_registry():
         if str(setup.get("setup_id", "")).upper() != setup_id.upper():
             continue
         screener_slugs = [str(value) for value in (setup.get("screeners") or setup.get("screener_slugs") or []) if value]
         if not screener_slugs and setup.get("screener_slug"):
             screener_slugs = [str(setup["screener_slug"])]
+        if str(setup.get("setup_id", "")).upper() == "EVENT_OPPORTUNITY_V1":
+            active_theme_ids = [str(value) for value in (theme_mapping.get("theme_ids") or []) if value]
+            for value in (theme_mapping.get("screener_slugs") or []):
+                if value and str(value) not in screener_slugs:
+                    screener_slugs.append(str(value))
         overlay_cfg = (setup.get("overlay_screeners") or {}).get(str(overlay_name or "NONE").upper(), {})
         remove = {str(value) for value in (overlay_cfg.get("remove") or []) if value}
         add = [str(value) for value in (overlay_cfg.get("add") or []) if value]
@@ -134,13 +147,13 @@ def resolve_setup_screeners(setup_id: str, overlay_name: str | None = None) -> l
             if value not in screener_slugs:
                 screener_slugs.append(value)
         break
-    return screener_slugs
+    return screener_slugs, active_theme_ids
 
 
 def load_latest_setup_screener(setup_id: str, overlay_name: str | None = None) -> pd.DataFrame:
     if not table_exists("advisory_screener_constituents"):
         return pd.DataFrame()
-    screener_slugs = resolve_setup_screeners(setup_id, overlay_name=overlay_name)
+    screener_slugs, _ = resolve_setup_screeners(setup_id, overlay_name=overlay_name)
     if not screener_slugs:
         return pd.DataFrame()
     return sql_to_df(
@@ -230,7 +243,11 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
     evaluated_symbols = set(evaluation_rows.get("symbol", pd.Series(dtype="string")).dropna().astype(str).str.upper().tolist())
     allocated_symbols = set(allocation_rows.get("symbol", pd.Series(dtype="string")).dropna().astype(str).str.upper().tolist())
     portfolio_symbols = set(portfolio_rows.get("symbol", pd.Series(dtype="string")).dropna().astype(str).str.upper().tolist())
-    active_screeners = resolve_setup_screeners(setup_id_upper, overlay_name=(overlay_row or {}).get("overlay_name"))
+    active_screeners, active_theme_ids = resolve_setup_screeners(
+        setup_id_upper,
+        overlay_name=(overlay_row or {}).get("overlay_name"),
+        asof_date=resolved_asof_date,
+    )
     candidate_count_by_screener = (
         screener_rows.get("screener_slug", pd.Series(dtype="string")).dropna().astype("string").value_counts().to_dict()
         if not screener_rows.empty and "screener_slug" in screener_rows.columns
@@ -272,6 +289,7 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
         "regime_name": (regime_row or {}).get("regime_name"),
         "overlay_name": (overlay_row or {}).get("overlay_name"),
         "overlay_reason": (overlay_row or {}).get("overlay_reason"),
+        "active_theme_ids": active_theme_ids,
         "active_screeners": active_screeners,
         "screener_universe_count": int(len(screener_symbols)),
         "candidate_count_by_screener": candidate_count_by_screener,
@@ -311,6 +329,7 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
         "top_rejection_reasons": load_top_rejection_reasons(setup_id_upper, resolved_asof_date),
         "overlay_name": (overlay_row or {}).get("overlay_name"),
         "overlay_reason": (overlay_row or {}).get("overlay_reason"),
+        "active_theme_ids": active_theme_ids,
         "active_screeners": active_screeners,
         "candidate_count_by_screener": candidate_count_by_screener,
         "latest_event_verdict": (latest_eval_row or {}).get("verdict"),
@@ -363,6 +382,7 @@ def format_text(trace: dict[str, Any]) -> str:
             f"- top_rejection_reasons: {trace['decision_summary'].get('top_rejection_reasons')}",
             f"- overlay_name: {trace['decision_summary'].get('overlay_name')}",
             f"- overlay_reason: {trace['decision_summary'].get('overlay_reason')}",
+            f"- active_theme_ids: {trace['decision_summary'].get('active_theme_ids')}",
             f"- active_screeners: {trace['decision_summary'].get('active_screeners')}",
             f"- candidate_count_by_screener: {trace['decision_summary'].get('candidate_count_by_screener')}",
             f"- watch_state_counts: {trace['stage_summary'].get('watch_state_counts')}",
