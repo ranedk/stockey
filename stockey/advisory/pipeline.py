@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import threading
+import time
 from typing import Any
 
 import pandas as pd
@@ -53,6 +56,7 @@ PIPELINE_STAGES = [
     "lifecycle",
     "execution",
 ]
+HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 def _json_ready(value: Any) -> Any:
@@ -68,6 +72,32 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, list):
         return [_json_ready(v) for v in value]
     return value
+
+
+def _emit_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def _start_stage(stage: str) -> tuple[float, threading.Event, threading.Thread]:
+    _emit_progress(f"[advisory.pipeline] stage={stage} start")
+    started_at = time.monotonic()
+    stop_event = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+            _emit_progress(f"[advisory.pipeline] stage={stage} running elapsed={time.monotonic() - started_at:.2f}s")
+
+    thread = threading.Thread(target=_heartbeat, name=f"advisory-pipeline-{stage}-heartbeat", daemon=True)
+    thread.start()
+    return started_at, stop_event, thread
+
+
+def _finish_stage(stage: str, stage_state: tuple[float, threading.Event, threading.Thread], detail: str | None = None) -> None:
+    started_at, stop_event, thread = stage_state
+    stop_event.set()
+    thread.join(timeout=0.1)
+    suffix = f" {detail}" if detail else ""
+    _emit_progress(f"[advisory.pipeline] stage={stage} done elapsed={time.monotonic() - started_at:.2f}s{suffix}")
 
 
 def parse_stage(value: str | None) -> str | None:
@@ -128,22 +158,29 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     setup_ids = args.setup_ids
 
     if stage_enabled("screeners", args.start_at, args.stop_at):
+        stage_started = _start_stage("screeners")
         screener_df = build_constituents(snapshot_date=None if asof_date is None else asof_date.date(), latest_only=asof_date is None)
         if not args.dry_run:
             persist_constituents(screener_df)
         summary["stages"]["screeners"] = _json_ready(screener_df)
+        _finish_stage("screeners", stage_started, f"rows={len(screener_df)}")
 
     if stage_enabled("macro", args.start_at, args.stop_at):
+        stage_started = _start_stage("macro")
         macro_df = build_macro_snapshot(from_date=asof_date, to_date=asof_date, rebuild=bool(args.rebuild))
         if not args.dry_run:
             persist_macro_snapshot(macro_df, rebuild=bool(args.rebuild))
         summary["stages"]["macro"] = _json_ready(macro_df)
+        _finish_stage("macro", stage_started, f"rows={len(macro_df)}")
 
     if stage_enabled("peer_sync", args.start_at, args.stop_at) and not args.skip_peer_sync:
+        stage_started = _start_stage("peer_sync")
         peer_result = sync_peer_data(symbols=symbols, to_date=asof_date)
         summary["stages"]["peer_sync"] = _json_ready(peer_result)
+        _finish_stage("peer_sync", stage_started)
 
     if stage_enabled("technicals", args.start_at, args.stop_at):
+        stage_started = _start_stage("technicals")
         technical_df = build_technical_features(
             symbols=symbols,
             from_date=asof_date,
@@ -153,8 +190,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         if not args.dry_run:
             persist_technical_features(technical_df, rebuild=bool(args.rebuild), symbols=symbols)
         summary["stages"]["technicals"] = _json_ready(technical_df)
+        _finish_stage("technicals", stage_started, f"rows={len(technical_df)}")
 
     if stage_enabled("fundamentals", args.start_at, args.stop_at):
+        stage_started = _start_stage("fundamentals")
         fundamental_df = build_fundamental_snapshot(
             symbols=symbols,
             from_date=asof_date,
@@ -164,14 +203,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         if not args.dry_run:
             persist_fundamental_snapshot(fundamental_df)
         summary["stages"]["fundamentals"] = _json_ready(fundamental_df)
+        _finish_stage("fundamentals", stage_started, f"rows={len(fundamental_df)}")
 
     if stage_enabled("regime", args.start_at, args.stop_at):
+        stage_started = _start_stage("regime")
         regime_df = build_regime_snapshot(from_date=asof_date, to_date=asof_date)
         if not args.dry_run:
             persist_regime_snapshot(regime_df, rebuild=bool(args.rebuild))
         summary["stages"]["regime"] = _json_ready(regime_df)
+        _finish_stage("regime", stage_started, f"rows={len(regime_df)}")
 
     if stage_enabled("overlay", args.start_at, args.stop_at):
+        stage_started = _start_stage("overlay")
         overlay_df = build_overlay_state(asof_date=asof_date)
         if not args.dry_run:
             persist_overlay_state(
@@ -180,8 +223,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 asof_date=asof_date or (overlay_df["asof_date"].max() if not overlay_df.empty else None),
             )
         summary["stages"]["overlay"] = _json_ready(overlay_df)
+        _finish_stage("overlay", stage_started, f"rows={len(overlay_df)}")
 
     if stage_enabled("themes", args.start_at, args.stop_at):
+        stage_started = _start_stage("themes")
         theme_payload = build_theme_recommendations(asof_date=asof_date)
         theme_mapping = load_active_theme_screener_mapping(asof_date=asof_date)
         summary["stages"]["themes"] = {
@@ -195,11 +240,13 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "recommendations": _json_ready(theme_payload.get("recommendations") or []),
             "active_mapping": _json_ready(theme_mapping),
         }
+        _finish_stage("themes", stage_started, f"active_themes={len(theme_payload.get('recommendations') or [])}")
 
     candidates = pd.DataFrame()
     rejections = pd.DataFrame()
     meta: dict[str, Any] = {}
     if stage_enabled("rules", args.start_at, args.stop_at):
+        stage_started = _start_stage("rules")
         candidates, rejections, meta = run_rule_engine(
             asof_date=asof_date,
             setup_ids=setup_ids,
@@ -218,15 +265,19 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "candidates": _json_ready(candidates),
             "rejections": _json_ready(rejections),
         }
+        _finish_stage("rules", stage_started, f"candidates={len(candidates)} rejections={len(rejections)}")
 
     if args.include_watch:
         if stage_enabled("watchlist", args.start_at, args.stop_at):
+            stage_started = _start_stage("watchlist")
             watchlist_df = build_watchlist(asof_date=asof_date, setup_ids=setup_ids, symbols=symbols)
             if not args.dry_run:
                 persist_watchlist(watchlist_df, rebuild=bool(args.rebuild), asof_date=asof_date or (watchlist_df["asof_date"].max() if not watchlist_df.empty else None))
             summary["stages"]["watchlist"] = _json_ready(watchlist_df)
+            _finish_stage("watchlist", stage_started, f"rows={len(watchlist_df)}")
 
         if stage_enabled("watch", args.start_at, args.stop_at):
+            stage_started = _start_stage("watch")
             watch_updates, watch_events, watch_meta = run_announcement_watch(
                 asof_date=asof_date,
                 symbols=symbols,
@@ -240,8 +291,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 "watch_updates": _json_ready(watch_updates),
                 "watch_events": _json_ready(watch_events),
             }
+            _finish_stage("watch", stage_started, f"updates={len(watch_updates)} events={len(watch_events)}")
 
         if args.include_news and stage_enabled("news", args.start_at, args.stop_at):
+            stage_started = _start_stage("news")
             news_events, news_meta = run_news_watch(
                 asof_date=asof_date,
                 symbols=symbols,
@@ -255,8 +308,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 "meta": _json_ready(news_meta),
                 "news_events": _json_ready(news_events),
             }
+            _finish_stage("news", stage_started, f"events={len(news_events)}")
 
         if stage_enabled("evaluate", args.start_at, args.stop_at):
+            stage_started = _start_stage("evaluate")
             from advisory.llm_event_evaluator import load_watch_events
 
             events = load_watch_events(
@@ -277,14 +332,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 "evaluations": _json_ready(eval_df),
                 "risks": _json_ready(risks_df),
             }
+            _finish_stage("evaluate", stage_started, f"evaluations={len(eval_df)} risks={len(risks_df)}")
 
     if stage_enabled("risk", args.start_at, args.stop_at):
+        stage_started = _start_stage("risk")
         allocations_df = build_allocations(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids, include_allocated=bool(args.rebuild))
         if not args.dry_run:
             persist_allocations(allocations_df)
         summary["stages"]["risk"] = _json_ready(allocations_df)
+        _finish_stage("risk", stage_started, f"rows={len(allocations_df)}")
 
     if stage_enabled("portfolio", args.start_at, args.stop_at):
+        stage_started = _start_stage("portfolio")
         portfolio_df = build_portfolio_orders(
             asof_date=asof_date,
             symbols=symbols,
@@ -301,8 +360,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         if not args.dry_run:
             persist_portfolio_orders(portfolio_df)
         summary["stages"]["portfolio"] = _json_ready(portfolio_df)
+        _finish_stage("portfolio", stage_started, f"rows={len(portfolio_df)}")
 
     if args.include_lifecycle and stage_enabled("lifecycle", args.start_at, args.stop_at):
+        stage_started = _start_stage("lifecycle")
         lifecycle_df, rebalance_df = build_lifecycle_outputs(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
         if not args.dry_run:
             persist_lifecycle_outputs(lifecycle_df, rebalance_df)
@@ -310,8 +371,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "lifecycle": _json_ready(lifecycle_df),
             "rebalance": _json_ready(rebalance_df),
         }
+        _finish_stage("lifecycle", stage_started, f"lifecycle_rows={len(lifecycle_df)} rebalance_rows={len(rebalance_df)}")
 
     if args.include_execution and stage_enabled("execution", args.start_at, args.stop_at):
+        stage_started = _start_stage("execution")
         execution_df = build_execution_orders(
             asof_date=asof_date,
             symbols=symbols,
@@ -334,6 +397,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "reconciled": _json_ready(reconcile_df),
             "fills": _json_ready(fills_df),
         }
+        _finish_stage("execution", stage_started, f"planned={len(execution_df)} reconciled={len(reconcile_df)} fills={len(fills_df)}")
 
     return summary
 

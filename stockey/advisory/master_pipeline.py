@@ -4,6 +4,8 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,7 @@ from utils.sync import parse_datetime_arg
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DOWNLOAD_SCRIPT = REPO_ROOT / "all_downloads.sh"
+HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
 def _json_ready(value: Any) -> Any:
@@ -31,12 +34,32 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
-def _tail_lines(value: str | None, limit: int = 20) -> list[str]:
-    text = str(value or "").strip()
-    if not text:
-        return []
-    lines = [line for line in text.splitlines() if line.strip()]
-    return lines[-limit:]
+def _emit_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def _format_elapsed(started_at: float) -> str:
+    return f"{time.monotonic() - started_at:.2f}s"
+
+
+def _start_heartbeat(label: str) -> tuple[float, threading.Event, threading.Thread]:
+    started_at = time.monotonic()
+    stop_event = threading.Event()
+
+    def _heartbeat() -> None:
+        while not stop_event.wait(HEARTBEAT_INTERVAL_SECONDS):
+            _emit_progress(f"[advisory.master_pipeline] {label} running elapsed={_format_elapsed(started_at)}")
+
+    thread = threading.Thread(target=_heartbeat, name=f"master-pipeline-{label}-heartbeat", daemon=True)
+    thread.start()
+    return started_at, stop_event, thread
+
+
+def _stop_heartbeat(stage_state: tuple[float, threading.Event, threading.Thread]) -> float:
+    started_at, stop_event, thread = stage_state
+    stop_event.set()
+    thread.join(timeout=0.1)
+    return started_at
 
 
 def build_sub_agent_workflow(*, asof_date: pd.Timestamp | None = None) -> dict[str, Any]:
@@ -144,28 +167,29 @@ def run_downloads(*, dry_run: bool, download_script: Path, continue_on_error: bo
     command = [str(download_script)]
     if dry_run:
         return {"status": "skipped_dry_run", "command": command}
+    heartbeat = _start_heartbeat("downloads")
     try:
+        _emit_progress(f"[advisory.master_pipeline] downloads start command={' '.join(command)}")
         completed = subprocess.run(
             command,
             cwd=REPO_ROOT,
             check=True,
-            capture_output=True,
-            text=True,
         )
+        started_at = _stop_heartbeat(heartbeat)
+        _emit_progress(f"[advisory.master_pipeline] downloads done elapsed={_format_elapsed(started_at)}")
         return {
             "status": "ok",
             "command": command,
-            "stdout_tail": _tail_lines(completed.stdout),
-            "stderr_tail": _tail_lines(completed.stderr),
             "returncode": completed.returncode,
         }
     except subprocess.CalledProcessError as exc:
+        started_at = _stop_heartbeat(heartbeat)
+        _emit_progress(f"[advisory.master_pipeline] downloads failed returncode={exc.returncode}")
         result = {
             "status": "failed",
             "command": command,
-            "stdout_tail": _tail_lines(exc.stdout),
-            "stderr_tail": _tail_lines(exc.stderr),
             "returncode": exc.returncode,
+            "elapsed_seconds": round(time.monotonic() - started_at, 4),
         }
         if not continue_on_error:
             raise
@@ -238,6 +262,7 @@ def main() -> int:
     args = parse_args()
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
 
+    pipeline_started = time.monotonic()
     download_summary = {"status": "skipped"}
     if not args.skip_downloads:
         download_summary = run_downloads(
@@ -246,7 +271,13 @@ def main() -> int:
             continue_on_error=bool(args.continue_on_download_error),
         )
 
+    workflow_heartbeat = _start_heartbeat("workflow planning")
+    _emit_progress("[advisory.master_pipeline] workflow planning start")
     workflow = build_sub_agent_workflow(asof_date=asof_date)
+    workflow_started = _stop_heartbeat(workflow_heartbeat)
+    _emit_progress(
+        f"[advisory.master_pipeline] workflow planning done elapsed={_format_elapsed(workflow_started)} themes={len(workflow.get('themes') or [])} roles={len(workflow.get('recommended_agent_roles') or [])}"
+    )
     advisory_args = argparse.Namespace(
         date=args.date,
         symbols=args.symbols,
@@ -270,7 +301,14 @@ def main() -> int:
         event_model=args.event_model,
         dry_run=bool(args.dry_run),
     )
+    advisory_heartbeat = _start_heartbeat("advisory run")
+    _emit_progress("[advisory.master_pipeline] advisory run start")
     advisory_summary = run_pipeline(advisory_args)
+    advisory_started = _stop_heartbeat(advisory_heartbeat)
+    _emit_progress(
+        f"[advisory.master_pipeline] advisory run done elapsed={_format_elapsed(advisory_started)} stages={len((advisory_summary.get('stages') or {}))}"
+    )
+    _emit_progress(f"[advisory.master_pipeline] pipeline done elapsed={_format_elapsed(pipeline_started)}")
 
     summary = {
         "status": "ok" if download_summary.get("status") != "failed" else "warning",
