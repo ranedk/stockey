@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.setup_registry import load_setup_registry
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
@@ -40,6 +41,26 @@ class PortfolioConfig:
     single_position_cap_pct: float
     per_setup_cap_pct: float
     max_positions_per_overlap_group: int
+
+
+def get_setup_cap_overrides() -> dict[str, float]:
+    overrides: dict[str, float] = {}
+    for setup in load_setup_registry():
+        setup_id = str(setup.get("setup_id") or "").upper()
+        cap_pct = pd.to_numeric(setup.get("portfolio_cap_pct"), errors="coerce")
+        if setup_id and pd.notna(cap_pct):
+            overrides[setup_id] = float(cap_pct)
+    return overrides
+
+
+def get_single_position_cap_overrides() -> dict[str, float]:
+    overrides: dict[str, float] = {}
+    for setup in load_setup_registry():
+        setup_id = str(setup.get("setup_id") or "").upper()
+        cap_pct = pd.to_numeric(setup.get("single_position_cap_pct"), errors="coerce")
+        if setup_id and pd.notna(cap_pct):
+            overrides[setup_id] = float(cap_pct)
+    return overrides
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -293,6 +314,23 @@ def build_overlap_map(symbols: list[str]) -> dict[str, tuple[str, str]]:
     return overlap_map
 
 
+def effective_overlap_group(row: pd.Series, duplicate_symbols: set[str]) -> tuple[str, str]:
+    symbol = str(row.get("symbol") or "").upper()
+    if symbol in duplicate_symbols:
+        return (f"symbol:{symbol}", "same_symbol")
+    return (str(row.get("overlap_group") or f"symbol:{symbol}"), str(row.get("overlap_reason") or "symbol_only"))
+
+
+def overlap_limit_for_reason(reason: str, config: PortfolioConfig) -> int:
+    reason_normalized = str(reason or "").lower()
+    base_limit = int(config.max_positions_per_overlap_group)
+    if reason_normalized in {"same_symbol", "peer_cluster"}:
+        return 1
+    if reason_normalized == "sector_code":
+        return max(base_limit + 1, 2)
+    return max(base_limit, 1)
+
+
 def compute_priority_score(row: pd.Series) -> float:
     confidence_raw = pd.to_numeric(row.get("confidence"), errors="coerce")
     confidence = 0.0 if pd.isna(confidence_raw) else float(confidence_raw)
@@ -372,6 +410,14 @@ def build_portfolio_orders(
     working["overlap_reason"] = working["symbol"].map(lambda s: overlap_map.get(str(s).upper(), (f"symbol:{s}", "symbol_only"))[1])
     working["priority_score"] = working.apply(compute_priority_score, axis=1)
     working["requested_allocation_inr"] = pd.to_numeric(working["suggested_allocation_inr"], errors="coerce").fillna(0.0)
+    duplicate_symbols = {
+        str(symbol).upper()
+        for symbol, count in working["symbol"].astype("string").str.upper().value_counts().items()
+        if int(count) > 1
+    }
+    effective_overlap = working.apply(lambda row: effective_overlap_group(row, duplicate_symbols), axis=1)
+    working["effective_overlap_group"] = effective_overlap.map(lambda item: item[0])
+    working["effective_overlap_reason"] = effective_overlap.map(lambda item: item[1])
     working = working.sort_values(
         by=["priority_score", "confidence", "requested_allocation_inr", "published_on"],
         ascending=[False, False, False, True],
@@ -384,19 +430,24 @@ def build_portfolio_orders(
     approved_positions = 0
     rows: list[dict[str, Any]] = []
 
-    single_position_cap = float(config.capital_inr) * float(config.single_position_cap_pct)
-    setup_cap_value = float(config.capital_inr) * float(config.per_setup_cap_pct)
+    default_single_position_cap = float(config.capital_inr) * float(config.single_position_cap_pct)
+    setup_cap_overrides = get_setup_cap_overrides()
+    single_position_cap_overrides = get_single_position_cap_overrides()
 
     for idx, (_, row) in enumerate(working.iterrows(), start=1):
         setup_id = str(row["setup_id"]).upper()
+        single_position_cap = float(config.capital_inr) * float(single_position_cap_overrides.get(setup_id, config.single_position_cap_pct))
         requested = min(float(row["requested_allocation_inr"]), single_position_cap)
         setup_used = setup_caps_used.get(setup_id, 0.0)
+        setup_cap_value = float(config.capital_inr) * float(setup_cap_overrides.get(setup_id, config.per_setup_cap_pct))
         setup_remaining = max(setup_cap_value - setup_used, 0.0)
-        overlap_group = str(row.get("overlap_group"))
+        overlap_group = str(row.get("effective_overlap_group") or row.get("overlap_group"))
+        overlap_reason = str(row.get("effective_overlap_reason") or row.get("overlap_reason"))
+        overlap_limit = overlap_limit_for_reason(overlap_reason, config)
         overlap_count = overlap_group_counts.get(overlap_group, 0)
         portfolio_reason: str | None = None
 
-        if overlap_count >= int(config.max_positions_per_overlap_group):
+        if overlap_count >= overlap_limit:
             approved = 0.0
             status = "deferred"
             portfolio_reason = "overlap_cap"
@@ -443,7 +494,7 @@ def build_portfolio_orders(
                 "portfolio_reason": portfolio_reason,
                 "priority_score": row["priority_score"],
                 "overlap_group": overlap_group,
-                "overlap_reason": row.get("overlap_reason"),
+                "overlap_reason": overlap_reason,
                 "event_class": row.get("event_class"),
                 "state_transition_hint": row.get("state_transition_hint"),
                 "score_impact": row.get("score_impact"),
@@ -467,9 +518,20 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
     if df.empty:
         return
     with db_session() as (_, cur):
-        asof_dates = [value.to_pydatetime() if hasattr(value, "to_pydatetime") else value for value in pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dropna().unique().tolist()]
-        if asof_dates:
-            cur.execute(f"DELETE FROM {PORTFOLIO_TABLE} WHERE asof_date = ANY(%s)", (asof_dates,))
+        pairs = (
+            df[["asof_date", "setup_id"]]
+            .dropna()
+            .drop_duplicates()
+            .to_dict(orient="records")
+        )
+        for item in pairs:
+            cur.execute(
+                f"DELETE FROM {PORTFOLIO_TABLE} WHERE asof_date = %s AND setup_id = %s",
+                (
+                    pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                    str(item["setup_id"]),
+                ),
+            )
     upsert_to_db(
         df,
         PORTFOLIO_TABLE,
@@ -489,8 +551,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--per-setup-cap-pct", type=float, default=DEFAULT_SETUP_CAP_PCT, help="Per-setup cap as a fraction of total capital")
     parser.add_argument("--max-positions-per-overlap-group", type=int, default=DEFAULT_MAX_POSITIONS_PER_OVERLAP_GROUP, help="Maximum simultaneous approved positions within the same overlap group")
     parser.add_argument("--include-planned", action="store_true", help="Rebuild rows that already exist in advisory_portfolio_orders")
+    parser.add_argument("--format", choices=["json", "text"], default="json")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
+
+
+def _text_cell(value: object) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+    text = str(value)
+    return text if text else "-"
+
+
+def render_text_table(df: pd.DataFrame) -> str:
+    if df.empty:
+        return "No portfolio rows found."
+    columns = [
+        ("rank", 4),
+        ("symbol", 14),
+        ("setup_id", 22),
+        ("status", 10),
+        ("reason", 18),
+        ("approved_inr", 12),
+        ("requested_inr", 13),
+        ("priority", 8),
+        ("event", 16),
+        ("transition", 18),
+    ]
+    header = " ".join(label.ljust(width) for label, width in columns)
+    separator = " ".join("-" * width for _, width in columns)
+    lines = [header, separator]
+    working = df.sort_values(["plan_rank", "priority_score"], ascending=[True, False], kind="stable")
+    for _, row in working.iterrows():
+        values = [
+            _text_cell(row.get("plan_rank"))[:4],
+            _text_cell(row.get("symbol"))[:14],
+            _text_cell(row.get("setup_id"))[:22],
+            _text_cell(row.get("portfolio_status"))[:10],
+            _text_cell(row.get("portfolio_reason"))[:18],
+            _text_cell(row.get("approved_allocation_inr"))[:12],
+            _text_cell(row.get("requested_allocation_inr"))[:13],
+            _text_cell(row.get("priority_score"))[:8],
+            _text_cell(row.get("event_class"))[:16],
+            _text_cell(row.get("state_transition_hint"))[:18],
+        ]
+        lines.append(" ".join(value.ljust(width) for value, (_, width) in zip(values, columns)))
+    return "\n".join(lines)
 
 
 def summarize(df: pd.DataFrame) -> dict[str, Any]:
@@ -527,18 +635,22 @@ def main() -> int:
         per_setup_cap_pct=float(args.per_setup_cap_pct),
         max_positions_per_overlap_group=int(args.max_positions_per_overlap_group),
     )
+    include_planned = bool(args.include_planned or not args.dry_run)
     df = build_portfolio_orders(
         asof_date=asof_date,
         symbols=args.symbols,
         setup_ids=args.setup_ids,
-        include_planned=bool(args.include_planned),
+        include_planned=include_planned,
         config=config,
     )
     if not args.dry_run:
         persist_portfolio_orders(df)
     result = summarize(df)
     result["dry_run"] = bool(args.dry_run)
-    print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    if args.format == "text":
+        print(render_text_table(df))
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     return 0
 
 

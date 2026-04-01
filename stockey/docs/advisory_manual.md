@@ -41,6 +41,38 @@ Important runtime decisions:
 - non-official news source: Economic Times RSS
 - legacy/reference only: NSE bhavcopy plus local adjusted-price pipeline
 
+## Snapshot policy
+
+The advisory system now uses a simple snapshot policy:
+
+- `advisory_screener_constituents.date` is the anchor date for a run
+- regime and overlay use the latest available row on or before that date
+- technicals, fundamentals, and intraday features use the latest available per-symbol row on or before that date
+- setup-level `freshness_policy` decides how stale each input is allowed to be
+
+This is intentional. The system no longer rolls the entire advisory run back to the oldest common snapshot date across all datasets.
+
+## Latest update
+
+The latest advisory change added an intraday confirmation layer on top of the daily setup engine.
+
+- the base advisory logic is still daily-first
+- intraday candles are now pulled on demand from Dhan for the active screener universe
+- derived daily intraday features are persisted in `advisory_intraday_features_daily`
+- setups can reference those fields with `intraday_rules`
+- this is intended as a confirmation layer for breakouts and event setups, not as a full intraday trading engine
+
+## Snapshot policy
+
+The advisory snapshot policy is intentionally simple:
+
+- the screener date is the anchor date
+- regime, overlay, technicals, fundamentals, and intraday use the latest available snapshot on or before that anchor date
+- each setup decides how stale those inputs are allowed to be through `freshness_policy`
+- stale inputs should usually reduce confidence or move a name to `WATCH_*`, not silently drag the whole run back to an older market date
+
+This avoids the old behavior where the whole advisory run could fall back to one old common date just because one snapshot family was lagging.
+
 ## Main files
 
 These are the main files you will edit when maintaining the advisory system:
@@ -199,14 +231,18 @@ Each setup supports:
 
 - `setup_id`
 - `setup_name`
-- `screener_slug`
+- `screeners`
+- `screener_mode`
 - `allowed_regimes`
+- `allowed_overlays`
+- `blocked_overlays`
 - `market_cap_min`
 - `market_cap_max`
 - `min_avg_traded_value_20d`
 - `max_breakout_extension_pct`
 - `min_dist_52w_high`
 - `technical_rules`
+- `intraday_rules`
 - `fundamental_rules`
 - `watch_reasons`
 
@@ -215,10 +251,14 @@ Each setup supports:
 ```yaml
 - setup_id: MY_SETUP_V1
   setup_name: My setup
-  screener_slug: my-new-screen
+  screeners:
+    - my-new-screen
+  screener_mode: union
   allowed_regimes:
     - STABLE
     - BULL_NARROW
+  allowed_overlays:
+    - NONE
   market_cap_min: 5000
   min_avg_traded_value_20d: 100000000
   max_breakout_extension_pct: 8
@@ -230,6 +270,10 @@ Each setup supports:
     - column: rs_vs_benchmark
       operator: gte
       value: 0.0
+  intraday_rules:
+    - column: intraday_close_vs_vwap_pct
+      operator: gte
+      value: 0.0
   fundamental_rules:
     - column: debt_to_equity_vs_sector
       operator: lte
@@ -238,6 +282,48 @@ Each setup supports:
     - earnings
     - order wins
 ```
+
+## Intraday feature layer
+
+The advisory pipeline now has a separate intraday feature stage:
+
+```sh
+python -m advisory.intraday_features --date 2026-04-01
+python -m advisory.intraday_features --date 2026-04-01 --intervals 1 5 15
+```
+
+What it does:
+
+- syncs missing Dhan intraday history on demand for the active screener universe
+- supports Dhan candle intervals `1`, `5`, `15`, `25`, and `60` minutes
+- stores raw bars in `dhan_ohlcv_intraday`
+- stores derived daily intraday pattern features in `advisory_intraday_features_daily`
+- exposes columns such as:
+  - `intraday_close_vs_vwap_pct`
+  - `intraday_pct_bars_above_vwap`
+  - `intraday_close_location_pct`
+  - `intraday_opening_range_breakout_up`
+  - `intraday_prev_day_breakout_up`
+  - `intraday_failed_prev_day_breakout`
+  - `intraday_volume_vs_20d`
+  - `intraday_breakout_score`
+  - `intraday_pattern_label`
+
+These fields are optional setup inputs through `intraday_rules`. They are designed to support later pattern-model work such as XGBoost-based breakout confirmation without forcing that model path into the first rollout.
+
+## ML roadmap
+
+The ML path for advisory intraday confirmation should be feature-first, not raw-bar-first.
+
+Recommended sequence:
+
+1. persist and validate deterministic intraday features
+2. build labeled outcomes from later daily follow-through or failure
+3. train a separate breakout-confirmation model, likely XGBoost, on those persisted features
+4. write `model_name` and `model_score` back into `advisory_intraday_features_daily`
+5. use the model score as a soft scoring input inside the rule engine
+
+Do not wire an uncalibrated model directly into pass/reject logic. The deterministic intraday features should remain readable and usable even if the ML layer is disabled.
 
 ### Supported operators
 

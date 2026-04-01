@@ -5,7 +5,8 @@ import json
 
 import pandas as pd
 
-from advisory import dashboard, execution_engine, llm_event_evaluator, master_pipeline, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, watchlist_builder
+from advisory import announcement_watch, dashboard, execution_engine, intraday_features, llm_event_evaluator, master_pipeline, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, watchlist_builder
+from data import download_runner
 
 
 def test_portfolio_engine_overlap_cap(monkeypatch):
@@ -98,6 +99,111 @@ def test_portfolio_engine_overlap_cap(monkeypatch):
     assert status_map["ICICIBANK"] == "deferred"
     assert reason_map["ICICIBANK"] == "overlap_cap"
     assert status_map["RELIANCE"] == "approved"
+
+
+def test_portfolio_engine_allows_two_sector_names_but_blocks_same_symbol_duplicates(monkeypatch):
+    allocations = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-03-22T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-03-22T00:00:00Z"),
+                "setup_id": "LARGECAP_BREAKOUT_POSITION_V1",
+                "setup_name": "Largecap",
+                "symbol": "ABC",
+                "company_master_id": "nse:ABC",
+                "unique_id": "u1",
+                "confidence": 0.90,
+                "conviction_bucket": "high",
+                "risk_bucket": "medium",
+                "suggested_allocation_inr": 40000.0,
+                "allocation_pct_of_adv20d": 0.0001,
+                "stop_price": 100.0,
+                "invalidation_price": 95.0,
+                "invalidation_rule": "rule",
+                "notes": None,
+                "context_snapshot_json": "{}",
+            },
+            {
+                "published_on": pd.Timestamp("2026-03-22T10:00:00Z"),
+                "asof_date": pd.Timestamp("2026-03-22T00:00:00Z"),
+                "setup_id": "MIDCAP_IMPROVER_SWING_V1",
+                "setup_name": "Midcap",
+                "symbol": "XYZ",
+                "company_master_id": "nse:XYZ",
+                "unique_id": "u2",
+                "confidence": 0.88,
+                "conviction_bucket": "high",
+                "risk_bucket": "medium",
+                "suggested_allocation_inr": 35000.0,
+                "allocation_pct_of_adv20d": 0.0001,
+                "stop_price": 100.0,
+                "invalidation_price": 95.0,
+                "invalidation_rule": "rule",
+                "notes": None,
+                "context_snapshot_json": "{}",
+            },
+            {
+                "published_on": pd.Timestamp("2026-03-22T11:00:00Z"),
+                "asof_date": pd.Timestamp("2026-03-22T00:00:00Z"),
+                "setup_id": "INTRADAY_BREAKOUT_TACTICAL_V1",
+                "setup_name": "Intraday",
+                "symbol": "ABC",
+                "company_master_id": "nse:ABC",
+                "unique_id": "u3",
+                "confidence": 0.80,
+                "conviction_bucket": "medium",
+                "risk_bucket": "medium_high",
+                "suggested_allocation_inr": 10000.0,
+                "allocation_pct_of_adv20d": 0.0001,
+                "stop_price": 100.0,
+                "invalidation_price": 95.0,
+                "invalidation_rule": "rule",
+                "notes": None,
+                "context_snapshot_json": "{}",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(portfolio_engine, "load_allocations", lambda **kwargs: allocations.copy())
+    monkeypatch.setattr(
+        portfolio_engine,
+        "build_overlap_map",
+        lambda symbols: {
+            "ABC": ("sector:IN0501", "sector_code"),
+            "XYZ": ("sector:IN0501", "sector_code"),
+        },
+    )
+
+    df = portfolio_engine.build_portfolio_orders(
+        config=portfolio_engine.PortfolioConfig(
+            capital_inr=120000.0,
+            max_positions=5,
+            single_position_cap_pct=1.0,
+            per_setup_cap_pct=1.0,
+            max_positions_per_overlap_group=1,
+        )
+    )
+
+    status_map = df.set_index(["setup_id", "symbol"])["portfolio_status"].to_dict()
+    assert status_map[("LARGECAP_BREAKOUT_POSITION_V1", "ABC")] == "approved"
+    assert status_map[("MIDCAP_IMPROVER_SWING_V1", "XYZ")] == "approved"
+    assert status_map[("INTRADAY_BREAKOUT_TACTICAL_V1", "ABC")] == "deferred"
+    intraday_row = df[(df["setup_id"] == "INTRADAY_BREAKOUT_TACTICAL_V1") & (df["symbol"] == "ABC")].iloc[0]
+    assert intraday_row["overlap_reason"] == "same_symbol"
+
+
+def test_portfolio_engine_overlap_limit_for_reason():
+    config = portfolio_engine.PortfolioConfig(
+        capital_inr=100000.0,
+        max_positions=5,
+        single_position_cap_pct=1.0,
+        per_setup_cap_pct=1.0,
+        max_positions_per_overlap_group=1,
+    )
+    assert portfolio_engine.overlap_limit_for_reason("same_symbol", config) == 1
+    assert portfolio_engine.overlap_limit_for_reason("peer_cluster", config) == 1
+    assert portfolio_engine.overlap_limit_for_reason("sector_code", config) == 2
+    assert portfolio_engine.overlap_limit_for_reason("symbol_only", config) == 1
 
 
 def test_position_lifecycle_classification_paths():
@@ -276,6 +382,146 @@ def test_news_watch_matches_symbol_in_title(monkeypatch):
     assert row["symbol"] == "IGL"
     assert row["event_source"] == "economic_times_rss"
     assert row["match_score"] >= 4.0
+
+
+def test_announcement_watch_deduplicates_ingest_by_symbol(monkeypatch):
+    watchlist = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-03-24T00:00:00Z"),
+                "setup_id": "SETUP_A",
+                "setup_name": "A",
+                "regime_name": "STABLE",
+                "symbol": "ABC",
+                "company_master_id": "nse:ABC",
+                "watch_reasons_json": '["test"]',
+                "watch_status": "active",
+                "watch_enabled": True,
+                "last_checked_at": pd.NaT,
+                "last_document_published_on": pd.NaT,
+            },
+            {
+                "asof_date": pd.Timestamp("2026-03-24T00:00:00Z"),
+                "setup_id": "SETUP_B",
+                "setup_name": "B",
+                "regime_name": "STABLE",
+                "symbol": "ABC",
+                "company_master_id": "nse:ABC",
+                "watch_reasons_json": '["test"]',
+                "watch_status": "active",
+                "watch_enabled": True,
+                "last_checked_at": pd.NaT,
+                "last_document_published_on": pd.NaT,
+            },
+        ]
+    )
+    calls: list[tuple[str, object, object]] = []
+
+    class FakePipeline:
+        def ingest_date_range(self, ticker, from_date, to_date, exchanges=None, parse_reports=None):
+            calls.append((ticker, from_date, to_date))
+            return type(
+                "Summary",
+                (),
+                {
+                    "requested": 1,
+                    "discovered": 1,
+                    "downloaded": 0,
+                    "ocred": 0,
+                    "categorized": 0,
+                    "parsed": 0,
+                    "skipped": 1,
+                    "failed": 0,
+                },
+            )()
+
+    monkeypatch.setattr(announcement_watch, "load_watchlist", lambda **kwargs: watchlist.copy())
+    monkeypatch.setattr(announcement_watch, "ManagedAnnouncementPipeline", lambda: FakePipeline())
+    monkeypatch.setattr(
+        announcement_watch,
+        "load_documents_for_company",
+        lambda company_master_id, published_from, published_to: pd.DataFrame(
+            [
+                {
+                    "unique_id": "doc-1",
+                    "company_master_id": company_master_id,
+                    "exchange": "NSE",
+                    "subject": "Update",
+                    "filed_under_category": "Announcements",
+                    "published_on": pd.Timestamp("2026-03-24T10:00:00Z"),
+                    "parse_status": "completed",
+                    "concise_summary_text": "Done",
+                    "categories_json": "[]",
+                }
+            ]
+        ),
+    )
+
+    updates, events, meta = announcement_watch.run_announcement_watch(
+        asof_date=pd.Timestamp("2026-03-24T00:00:00Z"),
+        to_date=pd.Timestamp("2026-03-24T23:59:59Z"),
+    )
+    assert len(calls) == 1
+    assert calls[0][0] == "ABC"
+    assert len(updates) == 2
+    assert len(events) == 2
+    assert meta["watch_count"] == 2
+    assert meta["unique_ingest_targets"] == 1
+
+
+def test_announcement_watch_caps_initial_ingest_lookback(monkeypatch):
+    watchlist = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                "setup_id": "SETUP_A",
+                "setup_name": "A",
+                "regime_name": "STABLE",
+                "symbol": "ABC",
+                "company_master_id": "nse:ABC",
+                "watch_reasons_json": '["test"]',
+                "watch_status": "active",
+                "watch_enabled": True,
+                "last_checked_at": pd.NaT,
+                "last_document_published_on": pd.NaT,
+            }
+        ]
+    )
+    calls: list[tuple[object, object]] = []
+
+    class FakePipeline:
+        def ingest_date_range(self, ticker, from_date, to_date, exchanges=None, parse_reports=None):
+            calls.append((from_date, to_date))
+            return type(
+                "Summary",
+                (),
+                {
+                    "requested": 1,
+                    "discovered": 0,
+                    "downloaded": 0,
+                    "ocred": 0,
+                    "categorized": 0,
+                    "parsed": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                },
+            )()
+
+    monkeypatch.setattr(announcement_watch, "load_watchlist", lambda **kwargs: watchlist.copy())
+    monkeypatch.setattr(announcement_watch, "ManagedAnnouncementPipeline", lambda: FakePipeline())
+    monkeypatch.setattr(
+        announcement_watch,
+        "load_documents_for_company",
+        lambda company_master_id, published_from, published_to: pd.DataFrame(),
+    )
+
+    _, _, meta = announcement_watch.run_announcement_watch(
+        asof_date=pd.Timestamp("2026-03-20T00:00:00Z"),
+        to_date=pd.Timestamp("2026-04-01T00:00:00Z"),
+    )
+    assert calls[0][0] == pd.Timestamp("2026-03-29T00:00:00Z").date()
+    assert meta["capped_watch_rows"] == 1
+    assert meta["initial_lookback_days"] == 3
 
 
 def test_event_normalization_produces_taxonomy_and_transition():
@@ -576,6 +822,64 @@ def test_master_pipeline_builds_sub_agent_workflow_with_pending_screeners(monkey
     assert any(task["agent_role"] == "screener_designer" for task in workflow["tasks"])
 
 
+def test_download_runner_stops_on_failure_when_continue_disabled(monkeypatch):
+    monkeypatch.setattr(
+        download_runner,
+        "DOWNLOAD_STEPS",
+        [
+            {"module": "mod.ok", "args": [], "purpose": "test"},
+            {"module": "mod.fail", "args": [], "purpose": "test"},
+            {"module": "mod.skip", "args": [], "purpose": "test"},
+        ],
+    )
+
+    def fake_run(step: dict[str, object]) -> dict[str, object]:
+        if step["module"] == "mod.fail":
+            return {"module": step["module"], "status": "failed", "returncode": 1}
+        return {"module": step["module"], "status": "ok", "returncode": 0}
+
+    monkeypatch.setattr(download_runner, "run_download_module", fake_run)
+
+    payload = download_runner.run_all_downloads(continue_on_error=False, dry_run=False)
+    assert payload["status"] == "failed"
+    assert [row["module"] for row in payload["results"]] == ["mod.ok", "mod.fail"]
+
+
+def test_download_runner_prioritizes_dhan_and_screener_prechecks():
+    steps = download_runner.DOWNLOAD_STEPS
+    modules = [step["module"] for step in steps[:6]]
+    assert modules == [
+        "data.nseindia.holidays",
+        "data.dhanlive.scrip_master",
+        "data.sharpelydata.scrip_master",
+        "data.company_master",
+        "data.dhanlive.ohlcv",
+        "data.screenerin.screener_parser",
+    ]
+    assert steps[5]["args"] == ["--seed-defaults"]
+
+
+def test_master_pipeline_run_downloads_uses_python_runner(monkeypatch):
+    monkeypatch.setattr(
+        master_pipeline,
+        "run_all_downloads",
+        lambda **kwargs: {
+            "status": "ok",
+            "modules": ["data.nseindia.holidays"],
+            "results": [{"module": "data.nseindia.holidays", "status": "ok", "returncode": 0}],
+        },
+    )
+
+    payload = master_pipeline.run_downloads(
+        dry_run=False,
+        download_script=master_pipeline.DEFAULT_DOWNLOAD_SCRIPT,
+        continue_on_error=False,
+    )
+    assert payload["status"] == "ok"
+    assert payload["results"][0]["module"] == "data.nseindia.holidays"
+    assert payload["download_script"].endswith("all_downloads.sh")
+
+
 def test_portfolio_priority_rewards_positive_event_transition():
     base = pd.Series(
         {
@@ -797,7 +1101,56 @@ def test_rule_engine_resolves_overlay_screeners_and_blocks_disallowed_overlay():
     assert any(item["reason_code"] == "overlay_not_allowed" for item in rejections)
 
 
+def test_rule_engine_softens_non_preferred_overlay_into_score_penalty():
+    setup = {
+        "setup_id": "TEST",
+        "screeners": ["screen-a"],
+        "allowed_regimes": ["STABLE"],
+        "allowed_overlays": ["NONE"],
+        "blocked_overlays": [],
+        "technical_rules": [],
+        "fundamental_rules": [],
+        "intraday_rules": [],
+        "score_thresholds": {"pass_now": 0.68, "watch_breakout": 0.58, "watch_event": 0.48, "near_miss_gap": 0.05},
+    }
+    row = pd.Series(
+        {
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "company_master_id": "nse:ABC",
+            "adj_close": 100.0,
+            "technical_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "fundamentals_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "regime_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "fundamentals_freshness_status": "fresh",
+            "market_cap": 100000.0,
+            "avg_traded_value_20d": 1000000000.0,
+            "breakout_extension_pct": 1.0,
+            "pass_above_dma_20": True,
+            "pass_above_dma_50": True,
+            "pass_above_dma_200": True,
+            "rs_vs_benchmark": 0.1,
+            "rs_vs_sector": 0.1,
+        }
+    )
+    candidate_state, details, rejections = rule_engine.evaluate_setup_row(
+        row,
+        regime_name="STABLE",
+        overlay_name="TARIFF_PRESSURE",
+        setup=setup,
+    )
+    assert candidate_state != "REJECT"
+    assert details["setup_score"] < 0.68
+    assert not any(item["reason_code"] == "overlay_not_allowed" and item["severity"] == "hard" for item in rejections)
+
+
+def test_pipeline_stage_alias_watch_spans_ingest_and_match():
+    assert pipeline.stage_enabled("watch_ingest", start_at="watch", stop_at="watch")
+    assert pipeline.stage_enabled("watch_match", start_at="watch", stop_at="watch")
+    assert not pipeline.stage_enabled("news", start_at="watch", stop_at="watch")
+
+
 def test_risk_engine_keeps_investable_review_manual_as_allocated(monkeypatch):
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr(
         risk_engine,
         "load_event_evaluations",
@@ -840,6 +1193,22 @@ def test_risk_engine_keeps_investable_review_manual_as_allocated(monkeypatch):
             "rs_vs_sector": 0.1,
         },
     )
+    monkeypatch.setattr(
+        risk_engine,
+        "load_watch_states",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "setup_id": "DEFENSIVE_REGIME_POSITION_V1",
+                    "symbol": "ABC",
+                    "candidate_state": "WATCH_EVENT",
+                    "current_state": "WATCH_EVENT",
+                    "watch_status": "active",
+                }
+            ]
+        ),
+    )
 
     df = risk_engine.build_allocations(asof_date=pd.Timestamp("2026-03-20T00:00:00Z"))
     row = df.iloc[0]
@@ -849,6 +1218,7 @@ def test_risk_engine_keeps_investable_review_manual_as_allocated(monkeypatch):
 
 
 def test_risk_engine_promoted_pass_now_overrides_conservative_event_investable_flag(monkeypatch):
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr(
         risk_engine,
         "load_event_evaluations",
@@ -914,6 +1284,65 @@ def test_risk_engine_promoted_pass_now_overrides_conservative_event_investable_f
     assert row["allocation_status"] == "allocated"
     assert row["suggested_allocation_inr"] > 0
     assert "pass_now overrode" in str(row["notes"]).lower()
+
+
+def test_risk_engine_falls_back_to_base_candidates_without_event_rows(monkeypatch):
+    monkeypatch.setattr(risk_engine, "load_event_evaluations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        risk_engine,
+        "load_base_candidate_fallbacks",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-04-01T00:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                    "setup_id": "LARGECAP_BREAKOUT_POSITION_V1",
+                    "setup_name": "Large cap breakout",
+                    "symbol": "ABC",
+                    "company_master_id": "nse:ABC",
+                    "unique_id": "candidate:2026-04-01:LARGECAP_BREAKOUT_POSITION_V1:ABC",
+                    "evaluation_status": "completed",
+                    "verdict": "continue",
+                    "investable_now": True,
+                    "materiality": "low",
+                    "setup_effect": "neutral",
+                    "event_class": "BASE_CANDIDATE",
+                    "state_transition_hint": "NO_CHANGE",
+                    "score_impact": 0.0,
+                    "confidence": 0.6,
+                    "sentiment": "neutral",
+                    "governance_risk": "none",
+                    "balance_sheet_risk": "none",
+                    "execution_risk": "none",
+                    "candidate_state": "PASS_NOW",
+                    "current_state": "PASS_NOW",
+                    "watch_status": "active",
+                    "is_base_candidate_fallback": True,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(risk_engine, "load_watch_states", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        risk_engine,
+        "load_point_in_time_context",
+        lambda symbol, published_on: {
+            "avg_traded_value_20d": 1_000_000_000.0,
+            "adj_close": 100.0,
+            "atr_20": 5.0,
+            "dma_20": 98.0,
+            "dma_50": 95.0,
+            "dma_200": 90.0,
+            "rs_vs_benchmark": 0.1,
+            "rs_vs_sector": 0.1,
+        },
+    )
+
+    df = risk_engine.build_allocations(asof_date=pd.Timestamp("2026-04-01T00:00:00Z"))
+    row = df.iloc[0]
+    assert row["allocation_status"] == "allocated"
+    assert row["event_class"] == "BASE_CANDIDATE"
+    assert "base rule-engine state" in str(row["notes"]).lower()
 
 
 def test_symbol_trace_builds_stage_summary(monkeypatch):
@@ -1104,3 +1533,371 @@ def test_dashboard_aggregates_setup_traces(monkeypatch):
     assert len(df) == 2
     assert set(df["setup_id"]) == {"A", "B"}
     assert df.loc[df["setup_id"] == "A", "screener_universe_count"].iloc[0] == 10
+
+
+def test_setup_registry_loads_intraday_rules():
+    setup = next(item for item in setup_registry.load_setup_registry() if item["setup_id"] == "EVENT_OPPORTUNITY_V1")
+    assert setup["intraday_rules"]
+    assert setup["intraday_rules"][0]["column"] == "intraday_close_vs_vwap_pct"
+
+
+def test_intraday_feature_builder_detects_breakout_context():
+    intraday = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:ABC",
+                "symbol": "ABC",
+                "interval_minutes": 1,
+                "timestamp": pd.Timestamp("2026-03-31T03:45:00Z"),
+                "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.8,
+                "close": 100.5,
+                "volume": 1000.0,
+            },
+            {
+                "company_master_id": "nse:ABC",
+                "symbol": "ABC",
+                "interval_minutes": 1,
+                "timestamp": pd.Timestamp("2026-03-31T03:46:00Z"),
+                "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+                "open": 100.5,
+                "high": 102.2,
+                "low": 100.4,
+                "close": 101.8,
+                "volume": 1200.0,
+            },
+            {
+                "company_master_id": "nse:ABC",
+                "symbol": "ABC",
+                "interval_minutes": 1,
+                "timestamp": pd.Timestamp("2026-03-31T09:25:00Z"),
+                "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+                "open": 101.8,
+                "high": 103.0,
+                "low": 101.6,
+                "close": 102.7,
+                "volume": 1500.0,
+            },
+        ]
+    )
+    daily_reference = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "date": pd.Timestamp("2026-03-31T00:00:00Z"),
+                "prev_day_high": 101.5,
+                "prev_day_low": 98.0,
+                "avg_daily_volume_20d": 2500.0,
+            }
+        ]
+    )
+
+    out = intraday_features.compute_intraday_session_features(intraday, daily_reference=daily_reference)
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert bool(row["intraday_prev_day_breakout_up"]) is True
+    assert bool(row["intraday_failed_prev_day_breakout"]) is False
+    assert float(row["intraday_close_vs_vwap_pct"]) > 0
+    assert float(row["intraday_volume_vs_20d"]) > 1
+
+
+def test_intraday_features_builds_multiple_intervals(monkeypatch):
+    asof_date = pd.Timestamp("2026-04-01T00:00:00Z")
+    intraday_base = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:ABC",
+                "symbol": "ABC",
+                "interval_minutes": 1,
+                "timestamp": pd.Timestamp("2026-04-01T03:45:00Z"),
+                "asof_date": asof_date,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.8,
+                "close": 100.8,
+                "volume": 1000.0,
+            },
+            {
+                "company_master_id": "nse:ABC",
+                "symbol": "ABC",
+                "interval_minutes": 1,
+                "timestamp": pd.Timestamp("2026-04-01T04:15:00Z"),
+                "asof_date": asof_date,
+                "open": 100.8,
+                "high": 102.0,
+                "low": 100.7,
+                "close": 101.9,
+                "volume": 1500.0,
+            },
+            {
+                "company_master_id": "nse:ABC",
+                "symbol": "ABC",
+                "interval_minutes": 5,
+                "timestamp": pd.Timestamp("2026-04-01T03:45:00Z"),
+                "asof_date": asof_date,
+                "open": 100.0,
+                "high": 101.2,
+                "low": 99.9,
+                "close": 101.0,
+                "volume": 2000.0,
+            },
+            {
+                "company_master_id": "nse:ABC",
+                "symbol": "ABC",
+                "interval_minutes": 5,
+                "timestamp": pd.Timestamp("2026-04-01T04:15:00Z"),
+                "asof_date": asof_date,
+                "open": 101.0,
+                "high": 102.1,
+                "low": 100.9,
+                "close": 101.8,
+                "volume": 2500.0,
+            },
+        ]
+    )
+    daily_reference = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "date": asof_date,
+                "high": 100.5,
+                "low": 98.0,
+                "close": 99.5,
+                "volume": 1000.0,
+                "prev_day_high": 99.0,
+                "prev_day_low": 97.5,
+                "avg_daily_volume_20d": 1200.0,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(intraday_features, "ensure_intraday_features_table", lambda: None)
+    monkeypatch.setattr(intraday_features, "resolve_symbol_universe", lambda symbols, asof_date=None: ["ABC"])
+    monkeypatch.setattr(
+        intraday_features,
+        "load_intraday_history",
+        lambda symbols, start_timestamp, end_timestamp, interval_minutes: intraday_base[intraday_base["interval_minutes"] == interval_minutes].copy(),
+    )
+    monkeypatch.setattr(intraday_features, "load_daily_reference", lambda symbols, start_date, end_date: daily_reference.copy())
+
+    df, meta = intraday_features.build_intraday_features(
+        symbols=["ABC"],
+        asof_date=asof_date,
+        intervals=(1, 5),
+        ensure_history=False,
+    )
+
+    assert len(df) == 2
+    assert sorted(df["interval_minutes"].tolist()) == [1, 5]
+    assert meta["intervals"] == [1, 5]
+
+
+def test_rule_engine_intraday_confirmation_lifts_default_technical_score():
+    strong_row = pd.Series(
+        {
+            "pass_above_dma_20": True,
+            "pass_above_dma_50": True,
+            "pass_above_dma_200": True,
+            "rs_vs_benchmark": 0.15,
+            "rs_vs_sector": 0.10,
+            "intraday_close_vs_vwap_pct": 0.8,
+            "intraday_pct_bars_above_vwap": 0.9,
+            "intraday_close_location_pct": 0.85,
+            "intraday_opening_range_breakout_up": True,
+            "intraday_prev_day_breakout_up": True,
+            "intraday_failed_prev_day_breakout": False,
+            "intraday_volume_vs_20d": 1.6,
+            "intraday_breakout_score": 0.9,
+            "total_revenue_qoq_growth_vs_sector": 0.0,
+            "profit_after_tax_qoq_growth_vs_sector": 0.0,
+            "debt_to_equity_vs_sector": 0.1,
+            "promoter_total_vs_sector": 0.0,
+            "fii_vs_sector": 0.0,
+        }
+    )
+    weak_row = strong_row.copy()
+    weak_row["intraday_close_vs_vwap_pct"] = -0.4
+    weak_row["intraday_pct_bars_above_vwap"] = 0.2
+    weak_row["intraday_close_location_pct"] = 0.3
+    weak_row["intraday_opening_range_breakout_up"] = False
+    weak_row["intraday_prev_day_breakout_up"] = False
+    weak_row["intraday_failed_prev_day_breakout"] = True
+    weak_row["intraday_volume_vs_20d"] = 0.3
+    weak_row["intraday_breakout_score"] = 0.1
+
+    setup = {"technical_rules": [], "intraday_rules": [], "fundamental_rules": []}
+    strong_scores = rule_engine.compute_component_scores(strong_row, regime_name="STABLE", setup=setup)
+    weak_scores = rule_engine.compute_component_scores(weak_row, regime_name="STABLE", setup=setup)
+
+    assert strong_scores["technical_score"] > weak_scores["technical_score"]
+
+
+def test_setup_registry_loads_freshness_and_intraday_usage():
+    setup = next(item for item in setup_registry.load_setup_registry() if item["setup_id"] == "INTRADAY_BREAKOUT_TACTICAL_V1")
+    assert setup["intraday_usage_mode"] == "tactical_primary"
+    assert setup["freshness_policy"]["intraday_max_age_days"] == 1
+    assert setup["risk_profile"]["max_allocation_inr"] == 20000
+    assert setup["portfolio_cap_pct"] == 0.15
+
+
+def test_rule_engine_timing_only_demotes_pass_now_to_watch_breakout():
+    row = pd.Series(
+        {
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "company_master_id": "nse:ABC",
+            "adj_close": 100.0,
+            "technical_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "fundamentals_snapshot_date": pd.Timestamp("2026-03-15T00:00:00Z"),
+            "regime_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "intraday_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "fundamentals_freshness_status": "FRESH",
+            "market_cap": 100000.0,
+            "avg_traded_value_20d": 500000000.0,
+            "breakout_extension_pct": 2.0,
+            "dist_52w_high": -5.0,
+            "pass_above_dma_20": True,
+            "pass_above_dma_50": True,
+            "pass_above_dma_200": True,
+            "rs_vs_benchmark": 0.15,
+            "rs_vs_sector": 0.10,
+            "intraday_close_vs_vwap_pct": -0.2,
+            "intraday_pct_bars_above_vwap": 0.3,
+            "intraday_close_location_pct": 0.4,
+            "intraday_opening_range_breakout_up": False,
+            "intraday_prev_day_breakout_up": False,
+            "intraday_failed_prev_day_breakout": False,
+            "intraday_volume_vs_20d": 0.5,
+            "intraday_breakout_score": 0.2,
+            "total_revenue_qoq_growth_vs_sector": 0.1,
+            "profit_after_tax_qoq_growth_vs_sector": 0.1,
+            "debt_to_equity_vs_sector": 0.1,
+            "promoter_total_vs_sector": 0.0,
+            "fii_vs_sector": 0.0,
+        }
+    )
+    setup = {
+        "allowed_regimes": ["STABLE"],
+        "blocked_regimes": [],
+        "allowed_overlays": ["NONE"],
+        "blocked_overlays": [],
+        "technical_rules": [],
+        "intraday_rules": [{"column": "intraday_close_vs_vwap_pct", "operator": "gte", "value": 0.0}],
+        "fundamental_rules": [],
+        "score_thresholds": {"pass_now": 0.60, "watch_breakout": 0.50, "watch_event": 0.40, "near_miss_gap": 0.05},
+        "freshness_policy": {"technical_max_age_days": 10, "fundamentals_max_age_days": 180, "regime_max_age_days": 7, "intraday_max_age_days": 2, "fundamentals_required": True},
+        "intraday_usage_mode": "timing_only",
+        "min_avg_traded_value_20d": 100000000,
+        "max_breakout_extension_pct": 10,
+        "watch_pullback_extension_pct": 6,
+        "min_dist_52w_high": -20,
+    }
+    state, evaluation, _ = rule_engine.evaluate_setup_row(row, regime_name="STABLE", overlay_name="NONE", setup=setup)
+    assert state == "WATCH_BREAKOUT"
+    assert "intraday timing" in str(evaluation.get("watch_reason_detail"))
+
+
+def test_rule_engine_tactical_primary_can_run_without_fundamentals():
+    row = pd.Series(
+        {
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "company_master_id": "nse:ABC",
+            "adj_close": 100.0,
+            "technical_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "fundamentals_snapshot_date": pd.NaT,
+            "regime_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "intraday_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "fundamentals_freshness_status": pd.NA,
+            "market_cap": 10000.0,
+            "avg_traded_value_20d": 300000000.0,
+            "breakout_extension_pct": 2.0,
+            "dist_52w_high": -4.0,
+            "pass_above_dma_20": True,
+            "pass_above_dma_50": True,
+            "pass_above_dma_200": True,
+            "rs_vs_benchmark": 0.12,
+            "rs_vs_sector": 0.08,
+            "intraday_close_vs_vwap_pct": 0.4,
+            "intraday_pct_bars_above_vwap": 0.7,
+            "intraday_close_location_pct": 0.8,
+            "intraday_opening_range_breakout_up": True,
+            "intraday_prev_day_breakout_up": True,
+            "intraday_failed_prev_day_breakout": False,
+            "intraday_volume_vs_20d": 1.2,
+            "intraday_breakout_score": 0.8,
+            "total_revenue_qoq_growth_vs_sector": pd.NA,
+            "profit_after_tax_qoq_growth_vs_sector": pd.NA,
+            "debt_to_equity_vs_sector": pd.NA,
+            "promoter_total_vs_sector": pd.NA,
+            "fii_vs_sector": pd.NA,
+        }
+    )
+    setup = {
+        "allowed_regimes": ["STABLE"],
+        "blocked_regimes": [],
+        "allowed_overlays": ["NONE"],
+        "blocked_overlays": [],
+        "technical_rules": [],
+        "intraday_rules": [{"column": "intraday_breakout_score", "operator": "gte", "value": 0.55}],
+        "fundamental_rules": [],
+        "score_thresholds": {"pass_now": 0.55, "watch_breakout": 0.45, "watch_event": 0.35, "near_miss_gap": 0.05},
+        "freshness_policy": {"technical_max_age_days": 10, "fundamentals_max_age_days": 180, "regime_max_age_days": 7, "intraday_max_age_days": 1, "fundamentals_required": False},
+        "intraday_usage_mode": "tactical_primary",
+        "min_avg_traded_value_20d": 100000000,
+        "max_breakout_extension_pct": 8,
+        "watch_pullback_extension_pct": 5,
+        "min_dist_52w_high": -20,
+    }
+    state, _, rejections = rule_engine.evaluate_setup_row(row, regime_name="STABLE", overlay_name="NONE", setup=setup)
+    assert state in {"PASS_NOW", "WATCH_BREAKOUT"}
+    assert all(item["reason_code"] != "missing_fundamental_snapshot" for item in rejections)
+
+
+def test_portfolio_engine_uses_setup_cap_override(monkeypatch):
+    allocations = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-04-01T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "setup_id": "INTRADAY_BREAKOUT_TACTICAL_V1",
+                "setup_name": "Intraday breakout tactical",
+                "symbol": "ABC",
+                "company_master_id": "nse:ABC",
+                "unique_id": "a1",
+                "confidence": 0.90,
+                "conviction_bucket": "high",
+                "risk_bucket": "high",
+                "suggested_allocation_inr": 50000.0,
+                "allocation_pct_of_adv20d": 0.0001,
+                "stop_price": 100.0,
+                "invalidation_price": 95.0,
+                "invalidation_rule": "rule",
+                "notes": None,
+                "context_snapshot_json": "{}",
+            }
+        ]
+    )
+    monkeypatch.setattr(portfolio_engine, "load_allocations", lambda **kwargs: allocations.copy())
+    monkeypatch.setattr(portfolio_engine, "build_overlap_map", lambda symbols: {"ABC": ("symbol:ABC", "symbol_only")})
+    monkeypatch.setattr(
+        portfolio_engine,
+        "get_setup_cap_overrides",
+        lambda: {"INTRADAY_BREAKOUT_TACTICAL_V1": 0.15},
+    )
+    monkeypatch.setattr(
+        portfolio_engine,
+        "get_single_position_cap_overrides",
+        lambda: {},
+    )
+    df = portfolio_engine.build_portfolio_orders(
+        config=portfolio_engine.PortfolioConfig(
+            capital_inr=100000.0,
+            max_positions=5,
+            single_position_cap_pct=1.0,
+            per_setup_cap_pct=0.50,
+            max_positions_per_overlap_group=1,
+        )
+    )
+    row = df.iloc[0]
+    assert row["approved_allocation_inr"] == 15000.0

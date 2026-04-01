@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.announcement_watch import persist_watch_outputs, run_announcement_watch
+from advisory.announcement_watch import build_watch_updates_from_ingest, persist_watch_outputs, run_announcement_ingest
 from advisory.execution_engine import (
     build_execution_orders,
     persist_execution_orders,
@@ -18,6 +18,10 @@ from advisory.execution_engine import (
     submit_live_orders,
 )
 from advisory.fundamental_snapshot import build_fundamental_snapshot, persist_fundamental_snapshot
+from advisory.intraday_features import (
+    build_intraday_features,
+    persist_intraday_features,
+)
 from advisory.llm_event_evaluator import DEFAULT_MODEL as DEFAULT_EVENT_MODEL
 from advisory.llm_event_evaluator import build_outputs as build_event_evaluations
 from advisory.llm_event_evaluator import persist_outputs as persist_event_evaluations
@@ -42,13 +46,15 @@ PIPELINE_STAGES = [
     "macro",
     "peer_sync",
     "technicals",
+    "intraday",
     "fundamentals",
     "regime",
     "overlay",
     "themes",
     "rules",
     "watchlist",
-    "watch",
+    "watch_ingest",
+    "watch_match",
     "news",
     "evaluate",
     "risk",
@@ -56,6 +62,9 @@ PIPELINE_STAGES = [
     "lifecycle",
     "execution",
 ]
+LEGACY_STAGE_ALIASES = {
+    "watch": ("watch_ingest", "watch_match"),
+}
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
@@ -104,8 +113,9 @@ def parse_stage(value: str | None) -> str | None:
     if value is None:
         return None
     normalized = value.strip().lower()
-    if normalized not in PIPELINE_STAGES:
-        raise argparse.ArgumentTypeError(f"Unsupported stage: {value}. Choose from {', '.join(PIPELINE_STAGES)}")
+    if normalized not in PIPELINE_STAGES and normalized not in LEGACY_STAGE_ALIASES:
+        supported = PIPELINE_STAGES + list(LEGACY_STAGE_ALIASES)
+        raise argparse.ArgumentTypeError(f"Unsupported stage: {value}. Choose from {', '.join(supported)}")
     return normalized
 
 
@@ -114,10 +124,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date", type=parse_datetime_arg, help="Pipeline asof date in YYYY-MM-DD")
     parser.add_argument("--symbols", nargs="*", help="Optional symbols")
     parser.add_argument("--setup", dest="setup_ids", nargs="*", help="Optional setup ids")
-    parser.add_argument("--start-at", type=parse_stage, choices=PIPELINE_STAGES, help="Optional stage to start from")
-    parser.add_argument("--stop-at", type=parse_stage, choices=PIPELINE_STAGES, help="Optional stage to stop after")
+    parser.add_argument("--start-at", type=parse_stage, help="Optional stage to start from")
+    parser.add_argument("--stop-at", type=parse_stage, help="Optional stage to stop after")
     parser.add_argument("--rebuild", action="store_true", help="Use rebuild semantics where supported")
     parser.add_argument("--skip-peer-sync", action="store_true", help="Skip peer preflight before technicals/fundamentals")
+    parser.add_argument("--skip-intraday", action="store_true", help="Skip intraday feature sync/build")
+    parser.add_argument("--intraday-lookback-days", type=int, default=180, help="How much recent intraday history to maintain for advisory pattern features")
+    parser.add_argument(
+        "--intraday-intervals",
+        nargs="*",
+        type=int,
+        default=[1],
+        help="Intraday candle intervals to fetch/build for advisory intraday features",
+    )
     parser.add_argument("--include-watch", action="store_true", help="Run watch/event stages after rules")
     parser.add_argument("--include-news", action="store_true", help="Run ET RSS ingest and watch matching after watchlist")
     parser.add_argument("--include-lifecycle", action="store_true", help="Run paper-position lifecycle after portfolio planning")
@@ -137,9 +156,11 @@ def parse_args() -> argparse.Namespace:
 
 def stage_enabled(stage: str, start_at: str | None, stop_at: str | None) -> bool:
     idx = PIPELINE_STAGES.index(stage)
-    if start_at is not None and idx < PIPELINE_STAGES.index(start_at):
+    normalized_start = LEGACY_STAGE_ALIASES.get(start_at, (start_at, start_at))[0] if start_at is not None else None
+    normalized_stop = LEGACY_STAGE_ALIASES.get(stop_at, (stop_at, stop_at))[1] if stop_at is not None else None
+    if normalized_start is not None and idx < PIPELINE_STAGES.index(normalized_start):
         return False
-    if stop_at is not None and idx > PIPELINE_STAGES.index(stop_at):
+    if normalized_stop is not None and idx > PIPELINE_STAGES.index(normalized_stop):
         return False
     return True
 
@@ -156,12 +177,23 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
     symbols = args.symbols
     setup_ids = args.setup_ids
+    screener_symbols: list[str] | None = None
 
     if stage_enabled("screeners", args.start_at, args.stop_at):
         stage_started = _start_stage("screeners")
         screener_df = build_constituents(snapshot_date=None if asof_date is None else asof_date.date(), latest_only=asof_date is None)
         if not args.dry_run:
             persist_constituents(screener_df)
+        if not screener_df.empty and "symbol" in screener_df.columns:
+            screener_symbols = (
+                screener_df["symbol"]
+                .astype("string")
+                .dropna()
+                .str.strip()
+                .str.upper()
+                .drop_duplicates()
+                .tolist()
+            )
         summary["stages"]["screeners"] = _json_ready(screener_df)
         _finish_stage("screeners", stage_started, f"rows={len(screener_df)}")
 
@@ -169,7 +201,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         stage_started = _start_stage("macro")
         macro_df = build_macro_snapshot(from_date=asof_date, to_date=asof_date, rebuild=bool(args.rebuild))
         if not args.dry_run:
-            persist_macro_snapshot(macro_df, rebuild=bool(args.rebuild))
+            persist_macro_snapshot(macro_df)
         summary["stages"]["macro"] = _json_ready(macro_df)
         _finish_stage("macro", stage_started, f"rows={len(macro_df)}")
 
@@ -191,6 +223,38 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             persist_technical_features(technical_df, rebuild=bool(args.rebuild), symbols=symbols)
         summary["stages"]["technicals"] = _json_ready(technical_df)
         _finish_stage("technicals", stage_started, f"rows={len(technical_df)}")
+
+    if stage_enabled("intraday", args.start_at, args.stop_at) and not args.skip_intraday:
+        stage_started = _start_stage("intraday")
+        intraday_symbols = symbols or screener_symbols or []
+        intervals = tuple(sorted({int(value) for value in (args.intraday_intervals or [1]) if int(value) > 0}))
+        intraday_frames: list[pd.DataFrame] = []
+        intraday_meta: list[dict[str, Any]] = []
+        if intraday_symbols:
+            for interval_minutes in intervals:
+                interval_df, interval_meta = build_intraday_features(
+                    symbols=intraday_symbols,
+                    asof_date=asof_date,
+                    lookback_days=int(args.intraday_lookback_days),
+                    interval_minutes=interval_minutes,
+                    ensure_history=not bool(args.dry_run),
+                )
+                intraday_frames.append(interval_df)
+                intraday_meta.append(interval_meta)
+            intraday_df = pd.concat([frame for frame in intraday_frames if not frame.empty], ignore_index=True) if any(not frame.empty for frame in intraday_frames) else pd.DataFrame()
+            if not args.dry_run and not intraday_df.empty:
+                persist_intraday_features(
+                    intraday_df,
+                    rebuild=bool(args.rebuild),
+                    asof_date=asof_date,
+                )
+        else:
+            intraday_df = pd.DataFrame()
+        summary["stages"]["intraday"] = {
+            "features": _json_ready(intraday_df),
+            "meta": _json_ready(intraday_meta),
+        }
+        _finish_stage("intraday", stage_started, f"rows={len(intraday_df)} symbols={len(intraday_symbols)}")
 
     if stage_enabled("fundamentals", args.start_at, args.stop_at):
         stage_started = _start_stage("fundamentals")
@@ -268,6 +332,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         _finish_stage("rules", stage_started, f"candidates={len(candidates)} rejections={len(rejections)}")
 
     if args.include_watch:
+        watch_ingest_state: dict[str, object] | None = None
         if stage_enabled("watchlist", args.start_at, args.stop_at):
             stage_started = _start_stage("watchlist")
             watchlist_df = build_watchlist(asof_date=asof_date, setup_ids=setup_ids, symbols=symbols)
@@ -276,22 +341,42 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             summary["stages"]["watchlist"] = _json_ready(watchlist_df)
             _finish_stage("watchlist", stage_started, f"rows={len(watchlist_df)}")
 
-        if stage_enabled("watch", args.start_at, args.stop_at):
-            stage_started = _start_stage("watch")
-            watch_updates, watch_events, watch_meta = run_announcement_watch(
+        if stage_enabled("watch_ingest", args.start_at, args.stop_at):
+            stage_started = _start_stage("watch_ingest")
+            watch_ingest_state = run_announcement_ingest(
                 asof_date=asof_date,
                 symbols=symbols,
                 setup_ids=setup_ids,
                 to_date=asof_date,
             )
+            watch_meta = dict(watch_ingest_state.get("meta") or {})
+            summary["stages"]["watch_ingest"] = _json_ready(watch_meta)
+            _finish_stage(
+                "watch_ingest",
+                stage_started,
+                f"watch_count={watch_meta.get('watch_count', 0)} unique_targets={watch_meta.get('unique_ingest_targets', 0)}",
+            )
+
+        if stage_enabled("watch_match", args.start_at, args.stop_at):
+            stage_started = _start_stage("watch_match")
+            if watch_ingest_state is None:
+                watch_ingest_state = run_announcement_ingest(
+                    asof_date=asof_date,
+                    symbols=symbols,
+                    setup_ids=setup_ids,
+                    to_date=asof_date,
+                )
+            watch_updates, watch_events, watch_match_meta = build_watch_updates_from_ingest(watch_ingest_state)
             if not args.dry_run:
                 persist_watch_outputs(watch_updates, watch_events)
-            summary["stages"]["watch"] = {
+            watch_meta = dict(watch_ingest_state.get("meta") or {})
+            watch_meta.update(watch_match_meta)
+            summary["stages"]["watch_match"] = {
                 "meta": _json_ready(watch_meta),
                 "watch_updates": _json_ready(watch_updates),
                 "watch_events": _json_ready(watch_events),
             }
-            _finish_stage("watch", stage_started, f"updates={len(watch_updates)} events={len(watch_events)}")
+            _finish_stage("watch_match", stage_started, f"updates={len(watch_updates)} events={len(watch_events)}")
 
         if args.include_news and stage_enabled("news", args.start_at, args.stop_at):
             stage_started = _start_stage("news")

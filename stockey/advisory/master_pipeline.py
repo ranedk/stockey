@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 import threading
 import time
@@ -14,6 +13,7 @@ import pandas as pd
 from advisory.news_overlay_engine import build_overlay_state
 from advisory.news_theme_engine import build_theme_recommendations, list_theme_screeners, load_active_theme_screener_mapping
 from advisory.pipeline import PIPELINE_STAGES, parse_stage, run_pipeline
+from data.download_runner import run_all_downloads
 from utils.sync import parse_datetime_arg
 
 
@@ -164,36 +164,18 @@ def build_sub_agent_workflow(*, asof_date: pd.Timestamp | None = None) -> dict[s
 
 
 def run_downloads(*, dry_run: bool, download_script: Path, continue_on_error: bool) -> dict[str, Any]:
-    command = [str(download_script)]
-    if dry_run:
-        return {"status": "skipped_dry_run", "command": command}
-    heartbeat = _start_heartbeat("downloads")
-    try:
-        _emit_progress(f"[advisory.master_pipeline] downloads start command={' '.join(command)}")
-        completed = subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            check=True,
-        )
-        started_at = _stop_heartbeat(heartbeat)
-        _emit_progress(f"[advisory.master_pipeline] downloads done elapsed={_format_elapsed(started_at)}")
-        return {
-            "status": "ok",
-            "command": command,
-            "returncode": completed.returncode,
-        }
-    except subprocess.CalledProcessError as exc:
-        started_at = _stop_heartbeat(heartbeat)
-        _emit_progress(f"[advisory.master_pipeline] downloads failed returncode={exc.returncode}")
-        result = {
-            "status": "failed",
-            "command": command,
-            "returncode": exc.returncode,
-            "elapsed_seconds": round(time.monotonic() - started_at, 4),
-        }
-        if not continue_on_error:
-            raise
-        return result
+    started_at = time.monotonic()
+    _emit_progress("[advisory.master_pipeline] downloads start mode=in_process_python_runner")
+    result = run_all_downloads(
+        continue_on_error=continue_on_error,
+        dry_run=dry_run,
+    )
+    _emit_progress(
+        f"[advisory.master_pipeline] downloads done elapsed={_format_elapsed(started_at)} status={result.get('status')}"
+    )
+    result["download_script"] = str(download_script)
+    result["elapsed_seconds"] = round(time.monotonic() - started_at, 4)
+    return result
 
 
 def parse_args() -> argparse.Namespace:

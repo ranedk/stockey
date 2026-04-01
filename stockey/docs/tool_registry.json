@@ -435,6 +435,23 @@
       ]
     },
     {
+      "name": "build_advisory_intraday_features",
+      "category": "analysis",
+      "description": "Build and persist on-demand advisory intraday pattern features from stored Dhan candles for the active screener universe.",
+      "command": ["python", "-m", "advisory.intraday_features"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--date", "2026-04-01", "--dry-run"],
+          "description": "Preview the intraday feature slice for one advisory date."
+        },
+        {
+          "args": ["--date", "2026-04-01", "--intervals", "1", "5", "15"],
+          "description": "Build the intraday feature slice across multiple candle intervals."
+        }
+      ]
+    },
+    {
       "name": "run_master_advisory_pipeline",
       "category": "analysis",
       "description": "Run the single top-level advisory workflow that chains data download, news/theme routing, advisory, risk, portfolio, lifecycle, and execution planning.",

@@ -28,6 +28,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
 | `data/dhanlive/auth_cli.py` | none | Dhan token status, refresh, validate, and cache-clear helper |
 | `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync is 5 years daily plus last 1 day of 1-minute bars |
+| `advisory/intraday_features.py` | `advisory_intraday_features_daily` | On-demand advisory intraday feature builder; pulls missing intraday candles for the active screener universe and persists daily intraday pattern features |
 | `data/screenerin/screener_parser.py` | `screenerin_screener_snapshots` | Stores parsed Screener.in screener snapshots by screener slug and date |
 | `data/screenerin/screener_registry.py` | `screenerin_screeners` | Registry utility to add/list/remove Screener.in screeners and inspect latest stored snapshots |
 | `data/screenerin/ad_hoc_query.py` | `screenerin_ad_hoc_query_runs`, `screenerin_ad_hoc_query_results` | Authenticated ad hoc Screener.in raw query runner; blocks for manual login if needed and stores parsed company rows plus queried metrics |
@@ -498,6 +499,19 @@ For the advisory stack, `dhan_ohlcv_daily` is the canonical OHLCV source. The NS
 `advisory.execution_engine` reads approved `advisory_portfolio_orders`, builds broker handoff orders in `advisory_execution_orders`, and can reconcile order/trade state from Dhan into `advisory_execution_orders` plus `advisory_execution_fills`. Use `--live` only when you explicitly want to place live orders through Dhan. Live Dhan order placement requires the API static IP to be whitelisted.
 
 `advisory.master_pipeline` is the single top-level orchestrator over the full repo flow. Use `./all_advisory.sh` for the shell entry point, or run `python -m advisory.master_pipeline` directly. Lower-level modules such as `all_downloads.sh` and `advisory.pipeline` remain available for component runs and targeted debugging.
+
+The advisory flow now includes an `intraday` stage between daily technicals and rule evaluation. That stage:
+
+- resolves the current symbol universe from the active screener snapshot
+- backfills missing Dhan intraday bars on demand
+- can build from Dhan intervals `1`, `5`, `15`, `25`, and `60`
+- persists derived daily intraday pattern features into `advisory_intraday_features_daily`
+- makes those fields available to the rule engine for optional setup scoring
+
+Example:
+```sh
+python -m advisory.intraday_features --date 2026-04-01 --intervals 1 5 15
+```
 
 ## LLM-facing conventions
 

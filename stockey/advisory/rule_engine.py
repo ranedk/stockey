@@ -8,6 +8,8 @@ import pandas as pd
 
 from advisory.data_sync import ensure_advisory_symbol_inputs
 from advisory.fundamental_snapshot import build_fundamental_snapshot, persist_fundamental_snapshot
+from advisory.intraday_features import TABLE_NAME as INTRADAY_FEATURES_TABLE
+from advisory.intraday_features import build_intraday_features, persist_intraday_features
 from advisory.news_theme_engine import load_active_theme_screener_mapping
 from advisory.peer_sync import sync_peer_data
 from advisory.setup_registry import load_setup_registry
@@ -37,6 +39,20 @@ DEFAULT_SCORE_THRESHOLDS = {
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
+
+
+def table_exists(table_name: str) -> bool:
+    df = sql_to_df(
+        """
+        SELECT 1 AS exists_flag
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        LIMIT 1
+        """,
+        params=(table_name,),
+    )
+    return not df.empty
 
 
 def safe_float(value: Any) -> float | None:
@@ -77,6 +93,16 @@ def ensure_rule_output_tables() -> None:
                 avg_traded_value_20d DOUBLE PRECISION,
                 rs_vs_benchmark DOUBLE PRECISION,
                 rs_vs_sector DOUBLE PRECISION,
+                intraday_close_vs_vwap_pct DOUBLE PRECISION,
+                intraday_pct_bars_above_vwap DOUBLE PRECISION,
+                intraday_close_location_pct DOUBLE PRECISION,
+                intraday_opening_range_breakout_up BOOLEAN,
+                intraday_prev_day_breakout_up BOOLEAN,
+                intraday_failed_prev_day_breakout BOOLEAN,
+                intraday_volume_vs_20d DOUBLE PRECISION,
+                intraday_breakout_score DOUBLE PRECISION,
+                intraday_pattern_label TEXT,
+                intraday_interval_minutes INTEGER,
                 total_revenue_qoq_growth_vs_sector DOUBLE PRECISION,
                 profit_after_tax_qoq_growth_vs_sector DOUBLE PRECISION,
                 debt_to_equity_vs_sector DOUBLE PRECISION,
@@ -118,6 +144,16 @@ def ensure_rule_output_tables() -> None:
             "avg_traded_value_20d": "DOUBLE PRECISION",
             "rs_vs_benchmark": "DOUBLE PRECISION",
             "rs_vs_sector": "DOUBLE PRECISION",
+            "intraday_close_vs_vwap_pct": "DOUBLE PRECISION",
+            "intraday_pct_bars_above_vwap": "DOUBLE PRECISION",
+            "intraday_close_location_pct": "DOUBLE PRECISION",
+            "intraday_opening_range_breakout_up": "BOOLEAN",
+            "intraday_prev_day_breakout_up": "BOOLEAN",
+            "intraday_failed_prev_day_breakout": "BOOLEAN",
+            "intraday_volume_vs_20d": "DOUBLE PRECISION",
+            "intraday_breakout_score": "DOUBLE PRECISION",
+            "intraday_pattern_label": "TEXT",
+            "intraday_interval_minutes": "INTEGER",
             "total_revenue_qoq_growth_vs_sector": "DOUBLE PRECISION",
             "profit_after_tax_qoq_growth_vs_sector": "DOUBLE PRECISION",
             "debt_to_equity_vs_sector": "DOUBLE PRECISION",
@@ -172,35 +208,70 @@ def ensure_rule_output_tables() -> None:
             cur.execute(f"ALTER TABLE {REJECTIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
 
 
-def get_effective_dates(asof_date: pd.Timestamp | None = None) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
+DEFAULT_FRESHNESS_POLICY = {
+    "technical_max_age_days": 15,
+    "fundamentals_max_age_days": 150,
+    "regime_max_age_days": 15,
+    "intraday_max_age_days": 2,
+    "fundamentals_required": True,
+}
+
+
+def get_effective_dates(asof_date: pd.Timestamp | None = None) -> dict[str, pd.Timestamp | None]:
     screener_cutoff = asof_date
     if screener_cutoff is None:
         screener_df = sql_to_df("SELECT MAX(date) AS screener_date FROM advisory_screener_constituents")
         if screener_df.empty or pd.isna(pd.to_datetime(screener_df.iloc[0]["screener_date"], utc=True, errors="coerce")):
-            return None, None
+            return {
+                "requested_asof_date": None,
+                "screener_date": None,
+                "regime_date": None,
+                "technical_date": None,
+                "fundamentals_date": None,
+                "intraday_date": None,
+            }
         screener_cutoff = pd.to_datetime(screener_df.iloc[0]["screener_date"], utc=True, errors="coerce").normalize()
 
     df = sql_to_df(
         """
         SELECT
+            (SELECT MAX(date) FROM advisory_screener_constituents WHERE date <= %(asof_date)s) AS screener_date,
             (SELECT MAX(asof_date) FROM advisory_market_regime WHERE asof_date <= %(asof_date)s) AS regime_date,
             (SELECT MAX(asof_date) FROM advisory_technical_daily WHERE asof_date <= %(asof_date)s) AS technical_date,
-            (SELECT MAX(asof_date) FROM advisory_fundamentals_daily WHERE asof_date <= %(asof_date)s) AS fundamentals_date,
-            (SELECT MAX(date) FROM advisory_screener_constituents WHERE date <= %(asof_date)s) AS screener_date
+            (SELECT MAX(asof_date) FROM advisory_fundamentals_daily WHERE asof_date <= %(asof_date)s) AS fundamentals_date
         """,
         params={"asof_date": screener_cutoff},
     )
     if df.empty:
-        return None, None
+        return {
+            "requested_asof_date": screener_cutoff.normalize(),
+            "screener_date": None,
+            "regime_date": None,
+            "technical_date": None,
+            "fundamentals_date": None,
+            "intraday_date": None,
+        }
     row = df.iloc[0]
     screener_date = pd.to_datetime(row.get("screener_date"), utc=True, errors="coerce")
     regime_date = pd.to_datetime(row.get("regime_date"), utc=True, errors="coerce")
     technical_date = pd.to_datetime(row.get("technical_date"), utc=True, errors="coerce")
     fundamentals_date = pd.to_datetime(row.get("fundamentals_date"), utc=True, errors="coerce")
-    if any(pd.isna(value) for value in [screener_date, regime_date, technical_date, fundamentals_date]):
-        return None, None
-    evaluation_date = min(regime_date.normalize(), technical_date.normalize(), fundamentals_date.normalize())
-    return screener_date.normalize(), evaluation_date
+    intraday_date = None
+    if table_exists(INTRADAY_FEATURES_TABLE):
+        intraday_df = sql_to_df(
+            f"SELECT MAX(asof_date) AS intraday_date FROM {INTRADAY_FEATURES_TABLE} WHERE asof_date <= %s",
+            params=(screener_cutoff,),
+        )
+        if not intraday_df.empty:
+            intraday_date = pd.to_datetime(intraday_df.iloc[0].get("intraday_date"), utc=True, errors="coerce")
+    return {
+        "requested_asof_date": screener_cutoff.normalize(),
+        "screener_date": None if pd.isna(screener_date) else screener_date.normalize(),
+        "regime_date": None if pd.isna(regime_date) else regime_date.normalize(),
+        "technical_date": None if pd.isna(technical_date) else technical_date.normalize(),
+        "fundamentals_date": None if pd.isna(fundamentals_date) else fundamentals_date.normalize(),
+        "intraday_date": None if intraday_date is None or pd.isna(intraday_date) else intraday_date.normalize(),
+    }
 
 
 def load_regime(asof_date: pd.Timestamp) -> dict[str, Any] | None:
@@ -208,7 +279,8 @@ def load_regime(asof_date: pd.Timestamp) -> dict[str, Any] | None:
         """
         SELECT *
         FROM advisory_market_regime
-        WHERE asof_date = %s
+        WHERE asof_date <= %s
+        ORDER BY asof_date DESC
         LIMIT 1
         """,
         params=(asof_date,),
@@ -238,7 +310,8 @@ def load_overlay(asof_date: pd.Timestamp, regime_name: str | None = None) -> dic
             f"""
             SELECT *
             FROM {OVERLAY_TABLE}
-            WHERE asof_date = %s
+            WHERE asof_date <= %s
+            ORDER BY asof_date DESC
             LIMIT 1
             """,
             params=(asof_date,),
@@ -335,15 +408,105 @@ def load_screener_universe(asof_date: pd.Timestamp, screener_slugs: list[str] | 
 def load_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
     df = sql_to_df(
         """
-        SELECT *
+        SELECT DISTINCT ON (symbol)
+            asof_date AS technical_snapshot_date,
+            company_master_id,
+            symbol,
+            series,
+            security_id,
+            isin,
+            benchmark_name,
+            sector_code,
+            sector_name,
+            adj_close,
+            adj_high,
+            adj_low,
+            volume,
+            total_value,
+            dma_20,
+            dma_50,
+            dma_200,
+            atr_20,
+            atr_compression_pct,
+            bb_width,
+            dist_20d_high,
+            dist_50d_high,
+            dist_52w_high,
+            avg_traded_value_20d,
+            avg_traded_value_60d,
+            rs_vs_benchmark,
+            sector_peer_ret_20d,
+            sector_peer_count,
+            rs_vs_sector,
+            breakout_extension_pct,
+            pass_above_dma_20,
+            pass_above_dma_50,
+            pass_above_dma_200,
+            pass_liquidity_20d,
+            pass_near_52w_high,
+            pass_breakout_extension,
+            load_ts
         FROM advisory_technical_daily
-        WHERE asof_date = %s
+        WHERE asof_date <= %s
+        ORDER BY symbol, asof_date DESC
         """,
         params=(asof_date,),
     )
     if df.empty:
         return df
-    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["technical_snapshot_date"] = normalize_timestamp(df["technical_snapshot_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    return df
+
+
+def load_intraday(asof_date: pd.Timestamp) -> pd.DataFrame:
+    if not table_exists(INTRADAY_FEATURES_TABLE):
+        return pd.DataFrame()
+    df = sql_to_df(
+        f"""
+        SELECT DISTINCT ON (symbol)
+            asof_date AS intraday_snapshot_date,
+            symbol,
+            company_master_id,
+            interval_minutes,
+            bar_count,
+            session_open,
+            session_high,
+            session_low,
+            session_close,
+            session_volume,
+            intraday_vwap,
+            intraday_range_pct,
+            intraday_open_to_close_pct,
+            intraday_close_vs_vwap_pct,
+            intraday_pct_bars_above_vwap,
+            intraday_close_location_pct,
+            intraday_opening_range_high,
+            intraday_opening_range_low,
+            intraday_opening_range_breakout_up,
+            intraday_opening_range_breakout_down,
+            intraday_prev_day_high,
+            intraday_prev_day_low,
+            intraday_prev_day_breakout_up,
+            intraday_failed_prev_day_breakout,
+            intraday_first_30m_return_pct,
+            intraday_last_60m_return_pct,
+            intraday_volume_vs_20d,
+            intraday_breakout_score,
+            intraday_pattern_label,
+            model_name,
+            model_score,
+            load_ts
+        FROM {INTRADAY_FEATURES_TABLE}
+        WHERE asof_date <= %s
+          AND interval_minutes = 1
+        ORDER BY symbol, asof_date DESC
+        """,
+        params=(asof_date,),
+    )
+    if df.empty:
+        return df
+    df["intraday_snapshot_date"] = normalize_timestamp(df["intraday_snapshot_date"])
     df["symbol"] = df["symbol"].astype("string").str.upper()
     return df
 
@@ -351,15 +514,18 @@ def load_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
 def load_fundamentals(asof_date: pd.Timestamp) -> pd.DataFrame:
     df = sql_to_df(
         """
-        SELECT *
+        SELECT DISTINCT ON (symbol)
+            asof_date AS fundamentals_snapshot_date,
+            *
         FROM advisory_fundamentals_daily
-        WHERE asof_date = %s
+        WHERE asof_date <= %s
+        ORDER BY symbol, asof_date DESC
         """,
         params=(asof_date,),
     )
     if df.empty:
         return df
-    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["fundamentals_snapshot_date"] = normalize_timestamp(df["fundamentals_snapshot_date"])
     df["symbol"] = df["symbol"].astype("string").str.upper()
     return df
 
@@ -371,6 +537,9 @@ def refresh_missing_snapshots(symbols: list[str], effective_date: pd.Timestamp) 
     technical_df = build_technical_features(symbols=symbols, from_date=effective_date, to_date=effective_date, rebuild=False)
     persist_technical_features(technical_df, rebuild=False, symbols=symbols)
 
+    intraday_df, intraday_meta = build_intraday_features(symbols=symbols, asof_date=effective_date)
+    persist_intraday_features(intraday_df, rebuild=False, asof_date=effective_date)
+
     fundamentals_df = build_fundamental_snapshot(symbols=symbols, from_date=effective_date, to_date=effective_date, rebuild=False)
     persist_fundamental_snapshot(fundamentals_df)
 
@@ -378,6 +547,8 @@ def refresh_missing_snapshots(symbols: list[str], effective_date: pd.Timestamp) 
         "data_sync": sync_result,
         "peer_sync": peer_sync_result,
         "technical_rows": int(len(technical_df)),
+        "intraday_rows": int(len(intraday_df)),
+        "intraday_meta": intraday_meta,
         "fundamental_rows": int(len(fundamentals_df)),
     }
 
@@ -463,20 +634,159 @@ def overlay_is_allowed(overlay_name: str, setup: dict[str, Any]) -> bool:
     return True
 
 
+def overlay_is_explicitly_blocked(overlay_name: str, setup: dict[str, Any]) -> bool:
+    blocked = {str(value).upper() for value in (setup.get("blocked_overlays") or []) if value}
+    return str(overlay_name or "NONE").upper() in blocked
+
+
+def regime_is_explicitly_blocked(regime_name: str, setup: dict[str, Any]) -> bool:
+    blocked = {str(value).upper() for value in (setup.get("blocked_regimes") or []) if value}
+    return str(regime_name or "").upper() in blocked
+
+
+def component_age_days(candidate_asof_date: pd.Timestamp | None, source_asof_date: Any) -> int | None:
+    if candidate_asof_date is None:
+        return None
+    source_ts = pd.to_datetime(source_asof_date, utc=True, errors="coerce")
+    if pd.isna(source_ts):
+        return None
+    return int((candidate_asof_date.normalize() - source_ts.normalize()).days)
+
+
+def evaluate_freshness(
+    row: pd.Series,
+    *,
+    candidate_asof_date: pd.Timestamp,
+    setup: dict[str, Any],
+) -> list[dict[str, Any]]:
+    policy = {**DEFAULT_FRESHNESS_POLICY, **(setup.get("freshness_policy") or {})}
+    rejections: list[dict[str, Any]] = []
+
+    technical_age = component_age_days(candidate_asof_date, row.get("technical_asof_date"))
+    if technical_age is None:
+        rejections.append(build_rejection("missing_technical_snapshot", "technical snapshot missing", severity="hard"))
+    elif technical_age > int(policy.get("technical_max_age_days", DEFAULT_FRESHNESS_POLICY["technical_max_age_days"])):
+        rejections.append(build_rejection("technical_snapshot_stale", f"technical_age_days={technical_age}", severity="hard"))
+
+    fundamentals_age = component_age_days(candidate_asof_date, row.get("fundamentals_asof_date"))
+    fundamentals_required = bool(policy.get("fundamentals_required", DEFAULT_FRESHNESS_POLICY["fundamentals_required"]))
+    if fundamentals_age is None:
+        if fundamentals_required:
+            rejections.append(build_rejection("missing_fundamental_snapshot", "fundamental snapshot missing", severity="hard"))
+    elif fundamentals_age > int(policy.get("fundamentals_max_age_days", DEFAULT_FRESHNESS_POLICY["fundamentals_max_age_days"])):
+        severity = "hard" if fundamentals_required else "soft"
+        rejections.append(build_rejection("fundamental_snapshot_stale", f"fundamentals_age_days={fundamentals_age}", severity=severity))
+
+    regime_age = component_age_days(candidate_asof_date, row.get("regime_asof_date"))
+    if regime_age is None:
+        rejections.append(build_rejection("missing_regime_snapshot", "regime snapshot missing", severity="hard"))
+    elif regime_age > int(policy.get("regime_max_age_days", DEFAULT_FRESHNESS_POLICY["regime_max_age_days"])):
+        rejections.append(build_rejection("regime_snapshot_stale", f"regime_age_days={regime_age}", severity="hard"))
+
+    intraday_mode = str(setup.get("intraday_usage_mode") or "confirm_only").lower()
+    intraday_age = component_age_days(candidate_asof_date, row.get("intraday_asof_date"))
+    intraday_limit = int(policy.get("intraday_max_age_days", DEFAULT_FRESHNESS_POLICY["intraday_max_age_days"]))
+    if intraday_mode == "tactical_primary":
+        if intraday_age is None:
+            rejections.append(build_rejection("missing_intraday_snapshot", "intraday confirmation snapshot missing", severity="hard"))
+        elif intraday_age > intraday_limit:
+            rejections.append(build_rejection("intraday_snapshot_stale", f"intraday_age_days={intraday_age}", severity="hard"))
+    elif intraday_age is not None and intraday_age > intraday_limit:
+        rejections.append(build_rejection("intraday_snapshot_stale", f"intraday_age_days={intraday_age}", severity="soft"))
+
+    return rejections
+
+
+def intraday_positive_signal(row: pd.Series) -> bool:
+    breakout_score = safe_float(row.get("intraday_breakout_score"))
+    close_vs_vwap_pct = safe_float(row.get("intraday_close_vs_vwap_pct"))
+    close_location_pct = safe_float(row.get("intraday_close_location_pct"))
+    failed_breakout = bool(row.get("intraday_failed_prev_day_breakout"))
+    return bool(
+        not failed_breakout
+        and breakout_score is not None
+        and breakout_score >= 0.55
+        and close_vs_vwap_pct is not None
+        and close_vs_vwap_pct >= 0.0
+        and close_location_pct is not None
+        and close_location_pct >= 0.55
+    )
+
+
+def intraday_negative_signal(row: pd.Series) -> bool:
+    breakout_score = safe_float(row.get("intraday_breakout_score"))
+    close_vs_vwap_pct = safe_float(row.get("intraday_close_vs_vwap_pct"))
+    failed_breakout = bool(row.get("intraday_failed_prev_day_breakout"))
+    return bool(failed_breakout or (breakout_score is not None and breakout_score < 0.30) or (close_vs_vwap_pct is not None and close_vs_vwap_pct < -0.25))
+
+
+def get_freshness_policy(setup: dict[str, Any]) -> dict[str, Any]:
+    policy = dict(DEFAULT_FRESHNESS_POLICY)
+    policy.update(dict(setup.get("freshness_policy") or {}))
+    return policy
+
+
+def get_intraday_usage_mode(setup: dict[str, Any]) -> str:
+    return str(setup.get("intraday_usage_mode") or "confirm_only").lower()
+
+
+def snapshot_age_days(snapshot_date: Any, asof_date: Any) -> int | None:
+    snapshot_ts = pd.to_datetime(snapshot_date, utc=True, errors="coerce")
+    asof_ts = pd.to_datetime(asof_date, utc=True, errors="coerce")
+    if pd.isna(snapshot_ts) or pd.isna(asof_ts):
+        return None
+    return int((asof_ts.normalize() - snapshot_ts.normalize()).days)
+
+
 def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[str, Any]) -> dict[str, float]:
-    technical_scores = [score_rule(row.get(rule["column"]), rule["operator"], rule["value"]) for rule in setup.get("technical_rules", [])]
+    intraday_usage_mode = get_intraday_usage_mode(setup)
+    technical_rule_defs = list(setup.get("technical_rules", []))
+    if intraday_usage_mode != "none":
+        technical_rule_defs += list(setup.get("intraday_rules", []))
+    technical_scores = [score_rule(row.get(rule["column"]), rule["operator"], rule["value"]) for rule in technical_rule_defs]
     if technical_scores:
         technical_score = average_score(technical_scores, default=0.0)
     else:
-        technical_score = average_score(
-            [
-                1.0 if bool(row.get("pass_above_dma_20")) else 0.0,
-                1.0 if bool(row.get("pass_above_dma_50")) else 0.0,
-                1.0 if bool(row.get("pass_above_dma_200")) else 0.0,
-                score_rule(row.get("rs_vs_benchmark"), "gte", 0.0),
-                score_rule(row.get("rs_vs_sector"), "gte", 0.0),
+        technical_parts = [
+            1.0 if bool(row.get("pass_above_dma_20")) else 0.0,
+            1.0 if bool(row.get("pass_above_dma_50")) else 0.0,
+            1.0 if bool(row.get("pass_above_dma_200")) else 0.0,
+            score_rule(row.get("rs_vs_benchmark"), "gte", 0.0),
+            score_rule(row.get("rs_vs_sector"), "gte", 0.0),
+        ]
+        intraday_available = any(
+            not pd.isna(row.get(column))
+            for column in [
+                "intraday_close_vs_vwap_pct",
+                "intraday_pct_bars_above_vwap",
+                "intraday_close_location_pct",
+                "intraday_volume_vs_20d",
+                "intraday_breakout_score",
             ]
         )
+        if intraday_available or any(
+            bool(row.get(column))
+            for column in [
+                "intraday_opening_range_breakout_up",
+                "intraday_prev_day_breakout_up",
+                "intraday_failed_prev_day_breakout",
+            ]
+        ):
+            technical_parts.append(
+                average_score(
+                    [
+                        score_rule(row.get("intraday_close_vs_vwap_pct"), "gt", 0.0),
+                        score_rule(row.get("intraday_pct_bars_above_vwap"), "gte", 0.55),
+                        score_rule(row.get("intraday_close_location_pct"), "gte", 0.65),
+                        1.0 if bool(row.get("intraday_opening_range_breakout_up")) else 0.25,
+                        1.0 if bool(row.get("intraday_prev_day_breakout_up")) else 0.25,
+                        0.0 if bool(row.get("intraday_failed_prev_day_breakout")) else 1.0,
+                        score_rule(row.get("intraday_volume_vs_20d"), "gte", 0.8),
+                        score_rule(row.get("intraday_breakout_score"), "gte", 0.55),
+                    ]
+                )
+            )
+        technical_score = average_score(technical_parts)
 
     fundamental_rules = setup.get("fundamental_rules", [])
     if fundamental_rules:
@@ -604,14 +914,19 @@ def build_entry_plan(row: pd.Series, candidate_state: str) -> dict[str, Any]:
 
 def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, setup: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     thresholds = {**DEFAULT_SCORE_THRESHOLDS, **(setup.get("score_thresholds") or {})}
+    freshness_policy = get_freshness_policy(setup)
+    intraday_usage_mode = get_intraday_usage_mode(setup)
     rejections: list[dict[str, Any]] = []
+    soft_failures: list[str] = []
 
-    if regime_name not in set(setup.get("allowed_regimes") or []):
-        rejections.append(build_rejection("regime_not_allowed", f"regime={regime_name}", severity="hard"))
-    if regime_name in {str(value) for value in (setup.get("blocked_regimes") or []) if value}:
+    if regime_is_explicitly_blocked(regime_name, setup):
         rejections.append(build_rejection("regime_blocked", f"regime={regime_name}", severity="hard"))
-    if not overlay_is_allowed(overlay_name, setup):
+    elif regime_name not in set(setup.get("allowed_regimes") or []):
+        soft_failures.append(f"regime:{regime_name.lower()}_not_preferred")
+    if overlay_is_explicitly_blocked(overlay_name, setup):
         rejections.append(build_rejection("overlay_not_allowed", f"overlay={overlay_name}", severity="hard"))
+    elif not overlay_is_allowed(overlay_name, setup):
+        soft_failures.append(f"overlay:{str(overlay_name or 'NONE').lower()}_not_preferred")
 
     if pd.isna(row.get("company_master_id")):
         rejections.append(build_rejection("missing_company_master_id", "company_master_id is null", severity="hard"))
@@ -619,14 +934,33 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     if pd.isna(row.get("adj_close")):
         rejections.append(build_rejection("missing_technical_snapshot", "technical snapshot missing for date", severity="hard"))
 
-    if pd.isna(row.get("fundamentals_freshness_status")):
+    technical_age_days = snapshot_age_days(row.get("technical_snapshot_date"), row.get("asof_date"))
+    fundamentals_age_days = snapshot_age_days(row.get("fundamentals_snapshot_date"), row.get("asof_date"))
+    intraday_age_days = snapshot_age_days(row.get("intraday_snapshot_date"), row.get("asof_date"))
+    regime_age_days = snapshot_age_days(row.get("regime_snapshot_date"), row.get("asof_date"))
+
+    if technical_age_days is not None and technical_age_days > int(freshness_policy["technical_max_age_days"]):
+        soft_failures.append(f"technical:stale_{technical_age_days}d")
+    if regime_age_days is not None and regime_age_days > int(freshness_policy["regime_max_age_days"]):
+        soft_failures.append(f"regime:stale_{regime_age_days}d")
+
+    fundamentals_required = bool(freshness_policy.get("fundamentals_required", True))
+    if pd.isna(row.get("fundamentals_freshness_status")) and fundamentals_required:
         rejections.append(build_rejection("missing_fundamental_snapshot", "fundamental snapshot missing for date", severity="hard"))
 
     market_cap = safe_float(row.get("market_cap"))
-    if setup.get("market_cap_min") is not None and (market_cap is None or market_cap < float(setup["market_cap_min"])):
-        rejections.append(build_rejection("market_cap_below_min", f"market_cap={market_cap}", severity="hard"))
-    if setup.get("market_cap_max") is not None and (market_cap is None or market_cap > float(setup["market_cap_max"])):
-        rejections.append(build_rejection("market_cap_above_max", f"market_cap={market_cap}", severity="hard"))
+    market_cap_min = safe_float(setup.get("market_cap_min"))
+    market_cap_max = safe_float(setup.get("market_cap_max"))
+    if market_cap_min is not None:
+        if market_cap is None or market_cap < (market_cap_min * 0.70):
+            rejections.append(build_rejection("market_cap_below_min", f"market_cap={market_cap}", severity="hard"))
+        elif market_cap < market_cap_min:
+            soft_failures.append("market_cap:below_target")
+    if market_cap_max is not None:
+        if market_cap is None or market_cap > (market_cap_max * 1.30):
+            rejections.append(build_rejection("market_cap_above_max", f"market_cap={market_cap}", severity="hard"))
+        elif market_cap > market_cap_max:
+            soft_failures.append("market_cap:above_target")
 
     traded_value = safe_float(row.get("avg_traded_value_20d"))
     min_liquidity = safe_float(setup.get("min_avg_traded_value_20d"))
@@ -644,11 +978,23 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
 
     dist_52w_high = safe_float(row.get("dist_52w_high"))
     watch_pullback_extension_pct = safe_float(setup.get("watch_pullback_extension_pct"))
-
-    soft_failures: list[str] = []
+    if fundamentals_age_days is not None and fundamentals_age_days > int(freshness_policy["fundamentals_max_age_days"]):
+        soft_failures.append(f"fundamental:stale_{fundamentals_age_days}d")
+    intraday_missing = pd.isna(row.get("intraday_snapshot_date"))
+    intraday_stale = intraday_age_days is not None and intraday_age_days > int(freshness_policy["intraday_max_age_days"])
     for rule in setup.get("technical_rules", []):
         if not compare(row.get(rule["column"]), rule["operator"], rule["value"]):
             soft_failures.append(f"technical:{rule['column']}")
+    if intraday_usage_mode != "none":
+        if intraday_missing:
+            if intraday_usage_mode == "tactical_primary":
+                soft_failures.append("intraday:missing")
+        elif intraday_stale:
+            if intraday_usage_mode == "tactical_primary":
+                soft_failures.append(f"intraday:stale_{intraday_age_days}d")
+        for rule in setup.get("intraday_rules", []):
+            if not compare(row.get(rule["column"]), rule["operator"], rule["value"]):
+                soft_failures.append(f"intraday:{rule['column']}")
     for rule in setup.get("fundamental_rules", []):
         if not compare(row.get(rule["column"]), rule["operator"], rule["value"]):
             soft_failures.append(f"fundamental:{rule['column']}")
@@ -661,6 +1007,8 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     if hard_rejections:
         return "REJECT", {**scores, "near_miss_flag": near_miss_flag}, hard_rejections
 
+    intraday_rule_failures = [value for value in soft_failures if value.startswith("intraday:")]
+    non_intraday_soft_failures = [value for value in soft_failures if not value.startswith("intraday:")]
     candidate_state = "REJECT"
     watch_reason_detail = None
     if max_extension is not None and extension is not None and extension > max_extension:
@@ -669,7 +1017,7 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     elif watch_pullback_extension_pct is not None and extension is not None and extension > watch_pullback_extension_pct:
         candidate_state = "WATCH_PULLBACK"
         watch_reason_detail = f"extended enough to wait for pullback at {extension:.2f}%"
-    elif float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(soft_failures) <= 1:
+    elif float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(non_intraday_soft_failures) <= 2:
         candidate_state = "PASS_NOW"
         watch_reason_detail = "qualifies now with acceptable score and entry condition"
     elif float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
@@ -681,6 +1029,27 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     elif near_miss_flag:
         candidate_state = "WATCH_EVENT"
         watch_reason_detail = "near miss on score; keep on watch for improvement"
+
+    severe_intraday_miss = len(intraday_rule_failures) >= 2 or intraday_negative_signal(row)
+    if intraday_usage_mode == "timing_only" and candidate_state == "PASS_NOW" and intraday_rule_failures:
+        if severe_intraday_miss:
+            candidate_state = "WATCH_BREAKOUT"
+            watch_reason_detail = "daily setup qualifies but intraday timing confirmation is not ready"
+        else:
+            watch_reason_detail = "qualifies now; intraday timing is mixed but still acceptable"
+    elif intraday_usage_mode == "confirm_only" and candidate_state == "PASS_NOW" and intraday_rule_failures:
+        if severe_intraday_miss:
+            candidate_state = "WATCH_BREAKOUT"
+            watch_reason_detail = "daily setup is valid but intraday confirmation is still weak"
+        else:
+            watch_reason_detail = "qualifies now; intraday confirmation is mixed but not broken"
+    elif intraday_usage_mode == "tactical_primary":
+        if intraday_rule_failures:
+            if float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
+                candidate_state = "WATCH_BREAKOUT"
+                watch_reason_detail = "intraday tactical trigger not fully confirmed yet"
+            else:
+                candidate_state = "REJECT"
 
     if candidate_state == "REJECT":
         rejections.append(
@@ -703,35 +1072,42 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
 
 
 def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[str] | None = None, config_path: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    screener_date, effective_date = get_effective_dates(asof_date)
-    if effective_date is None or screener_date is None:
+    effective_dates = get_effective_dates(asof_date)
+    screener_date = effective_dates.get("screener_date")
+    if screener_date is None:
         return pd.DataFrame(), pd.DataFrame(), {"effective_date": None, "screener_date": None, "regime_name": None}
 
-    regime = load_regime(effective_date)
+    regime = load_regime(screener_date)
     if regime is None:
-        return pd.DataFrame(), pd.DataFrame(), {"effective_date": str(effective_date), "screener_date": str(screener_date), "regime_name": None}
+        return pd.DataFrame(), pd.DataFrame(), {"effective_date": str(screener_date), "screener_date": str(screener_date), "regime_name": None}
 
     setups = load_setup_registry(config_path)
     if setup_ids:
         selected = {value.upper() for value in setup_ids}
         setups = [setup for setup in setups if setup["setup_id"].upper() in selected]
 
-    technical = load_technical(effective_date)
-    fundamentals = load_fundamentals(effective_date)
+    technical = load_technical(screener_date)
+    intraday = load_intraday(screener_date)
+    fundamentals = load_fundamentals(screener_date)
 
     candidate_rows: list[dict[str, Any]] = []
     rejection_rows: list[dict[str, Any]] = []
     meta = {
-        "effective_date": str(effective_date),
+        "effective_date": str(screener_date),
         "screener_date": str(screener_date),
         "regime_name": regime.get("regime_name"),
+        "regime_snapshot_date": str(regime.get("asof_date")) if regime.get("asof_date") is not None else None,
+        "technical_snapshot_date": str(technical["technical_snapshot_date"].max()) if not technical.empty and "technical_snapshot_date" in technical.columns else None,
+        "intraday_snapshot_date": str(intraday["intraday_snapshot_date"].max()) if not intraday.empty and "intraday_snapshot_date" in intraday.columns else None,
+        "fundamentals_snapshot_date": str(fundamentals["fundamentals_snapshot_date"].max()) if not fundamentals.empty and "fundamentals_snapshot_date" in fundamentals.columns else None,
     }
-    overlay = load_overlay(effective_date, regime_name=str(regime.get("regime_name") or ""))
+    overlay = load_overlay(pd.to_datetime(regime.get("asof_date"), utc=True, errors="coerce") if regime.get("asof_date") is not None else screener_date, regime_name=str(regime.get("regime_name") or ""))
     overlay_name = str(overlay.get("overlay_name") or "NONE").upper()
-    theme_screener_mapping = load_active_theme_screener_mapping(asof_date=effective_date)
+    theme_screener_mapping = load_active_theme_screener_mapping(asof_date=screener_date)
     meta["overlay_name"] = overlay_name
     meta["overlay_reason"] = overlay.get("overlay_reason")
     meta["overlay_intensity"] = overlay.get("overlay_intensity")
+    meta["overlay_snapshot_date"] = str(overlay.get("asof_date")) if overlay.get("asof_date") is not None else None
     meta["active_theme_ids"] = theme_screener_mapping.get("theme_ids") or []
     meta["theme_screeners"] = theme_screener_mapping.get("screener_slugs") or []
     meta["theme_recommended_agent_roles"] = theme_screener_mapping.get("recommended_agent_roles") or []
@@ -757,17 +1133,26 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
     screener_frames = [frame for frame in screener_frames if not frame.empty]
     if screener_frames:
         for frame in screener_frames:
-            frame["asof_date"] = effective_date
+            frame["asof_date"] = screener_date
         symbols_to_refresh = sorted(pd.concat(screener_frames, ignore_index=True)["symbol"].dropna().astype("string").str.upper().drop_duplicates().tolist())
         technical_symbols = technical["symbol"].dropna().astype("string").str.upper().drop_duplicates().tolist() if not technical.empty else []
+        intraday_symbols = intraday["symbol"].dropna().astype("string").str.upper().drop_duplicates().tolist() if not intraday.empty else []
         fundamental_symbols = fundamentals["symbol"].dropna().astype("string").str.upper().drop_duplicates().tolist() if not fundamentals.empty else []
         available_symbols = set(technical_symbols).intersection(fundamental_symbols)
         missing_symbols = [symbol for symbol in symbols_to_refresh if symbol not in available_symbols]
+        missing_intraday_symbols = [symbol for symbol in symbols_to_refresh if symbol not in set(intraday_symbols)]
         meta["missing_snapshot_symbols"] = missing_symbols
+        meta["missing_intraday_symbols"] = missing_intraday_symbols
         if missing_symbols:
-            meta["preflight"] = refresh_missing_snapshots(missing_symbols, effective_date)
-            technical = load_technical(effective_date)
-            fundamentals = load_fundamentals(effective_date)
+            meta["preflight"] = refresh_missing_snapshots(missing_symbols, screener_date)
+            technical = load_technical(screener_date)
+            fundamentals = load_fundamentals(screener_date)
+            intraday = load_intraday(screener_date)
+        elif missing_intraday_symbols:
+            intraday_df, intraday_meta = build_intraday_features(symbols=missing_intraday_symbols, asof_date=screener_date)
+            persist_intraday_features(intraday_df, rebuild=False, asof_date=screener_date)
+            intraday = load_intraday(screener_date)
+            meta["intraday_preflight"] = intraday_meta
 
     regime_name = str(regime["regime_name"])
     for setup in setups:
@@ -780,7 +1165,7 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
         if universe.empty:
             rejection_rows.append(
                 {
-                    "asof_date": effective_date,
+                    "asof_date": screener_date,
                     "screener_date": screener_date,
                     "setup_id": setup["setup_id"],
                     "setup_name": setup["setup_name"],
@@ -799,20 +1184,28 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
             )
             continue
         universe = universe.copy()
-        universe["asof_date"] = effective_date
+        universe["asof_date"] = screener_date
 
         merged = universe.merge(
-            technical.drop_duplicates(subset=["asof_date", "symbol"], keep="last"),
-            on=["asof_date", "symbol", "company_master_id"],
+            technical.drop_duplicates(subset=["symbol"], keep="last"),
+            on=["symbol", "company_master_id"],
             how="left",
             suffixes=("", "_tech"),
         )
         merged = merged.merge(
-            fundamentals.drop_duplicates(subset=["asof_date", "symbol", "company_master_id"], keep="last"),
-            on=["asof_date", "symbol", "company_master_id"],
+            fundamentals.drop_duplicates(subset=["symbol"], keep="last"),
+            on=["symbol", "company_master_id"],
             how="left",
             suffixes=("", "_fund"),
         )
+        if not intraday.empty:
+            merged = merged.merge(
+                intraday.drop_duplicates(subset=["symbol"], keep="last"),
+                on=["symbol", "company_master_id"],
+                how="left",
+                suffixes=("", "_intraday"),
+            )
+        merged["regime_snapshot_date"] = pd.to_datetime(regime.get("asof_date"), utc=True, errors="coerce")
 
         for _, row in merged.iterrows():
             candidate_state, evaluation, rejections = evaluate_setup_row(row, regime_name=regime_name, overlay_name=overlay_name, setup=setup)
@@ -820,7 +1213,7 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
                 entry_plan = build_entry_plan(row, candidate_state)
                 candidate_rows.append(
                     {
-                        "asof_date": effective_date,
+                        "asof_date": screener_date,
                         "screener_date": screener_date,
                         "setup_id": setup["setup_id"],
                         "setup_name": setup["setup_name"],
@@ -846,6 +1239,16 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
                         "avg_traded_value_20d": row.get("avg_traded_value_20d"),
                         "rs_vs_benchmark": row.get("rs_vs_benchmark"),
                         "rs_vs_sector": row.get("rs_vs_sector"),
+                        "intraday_close_vs_vwap_pct": row.get("intraday_close_vs_vwap_pct"),
+                        "intraday_pct_bars_above_vwap": row.get("intraday_pct_bars_above_vwap"),
+                        "intraday_close_location_pct": row.get("intraday_close_location_pct"),
+                        "intraday_opening_range_breakout_up": row.get("intraday_opening_range_breakout_up"),
+                        "intraday_prev_day_breakout_up": row.get("intraday_prev_day_breakout_up"),
+                        "intraday_failed_prev_day_breakout": row.get("intraday_failed_prev_day_breakout"),
+                        "intraday_volume_vs_20d": row.get("intraday_volume_vs_20d"),
+                        "intraday_breakout_score": row.get("intraday_breakout_score"),
+                        "intraday_pattern_label": row.get("intraday_pattern_label"),
+                        "intraday_interval_minutes": row.get("interval_minutes"),
                         "total_revenue_qoq_growth_vs_sector": row.get("total_revenue_qoq_growth_vs_sector"),
                         "profit_after_tax_qoq_growth_vs_sector": row.get("profit_after_tax_qoq_growth_vs_sector"),
                         "debt_to_equity_vs_sector": row.get("debt_to_equity_vs_sector"),
@@ -864,7 +1267,7 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
             for rejection in rejections:
                 rejection_rows.append(
                     {
-                        "asof_date": effective_date,
+                        "asof_date": screener_date,
                         "screener_date": screener_date,
                         "setup_id": setup["setup_id"],
                         "setup_name": setup["setup_name"],
@@ -918,6 +1321,13 @@ def summarize(candidates: pd.DataFrame, rejections: pd.DataFrame, meta: dict[str
         "rejections_table": REJECTIONS_TABLE,
         "effective_date": meta.get("effective_date"),
         "screener_date": meta.get("screener_date"),
+        "snapshot_dates": {
+            "regime": meta.get("regime_snapshot_date"),
+            "overlay": meta.get("overlay_snapshot_date"),
+            "technicals": meta.get("technical_snapshot_date"),
+            "intraday": meta.get("intraday_snapshot_date"),
+            "fundamentals": meta.get("fundamentals_snapshot_date"),
+        },
         "regime_name": meta.get("regime_name"),
         "overlay_name": meta.get("overlay_name"),
         "overlay_reason": meta.get("overlay_reason"),

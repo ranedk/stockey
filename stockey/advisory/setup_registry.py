@@ -63,9 +63,15 @@ def load_setup_registry(config_path: str | None = None) -> list[dict[str, Any]]:
                 "score_thresholds": dict(setup.get("score_thresholds") or {}),
                 "regime_policy": dict(setup.get("regime_policy") or {}),
                 "technical_rules": list(setup.get("technical_rules", [])),
+                "intraday_rules": list(setup.get("intraday_rules", [])),
                 "fundamental_rules": list(setup.get("fundamental_rules", [])),
                 "watch_reasons": list(setup.get("watch_reasons", [])),
                 "entry_styles": list(setup.get("entry_styles", [])),
+                "freshness_policy": dict(setup.get("freshness_policy") or {}),
+                "intraday_usage_mode": str(setup.get("intraday_usage_mode") or "confirm_only").lower(),
+                "risk_profile": dict(setup.get("risk_profile") or {}),
+                "portfolio_cap_pct": setup.get("portfolio_cap_pct"),
+                "single_position_cap_pct": setup.get("single_position_cap_pct"),
             }
         )
     return normalized

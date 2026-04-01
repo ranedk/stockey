@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.setup_registry import load_setup_registry
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
@@ -79,6 +80,23 @@ CONVICTION_MULTIPLIER = {
     "medium": 0.70,
     "high": 1.00,
 }
+
+
+def get_setup_risk_profiles() -> dict[str, SetupRiskProfile]:
+    profiles = dict(SETUP_RISK_PROFILES)
+    for setup in load_setup_registry():
+        risk_profile = dict(setup.get("risk_profile") or {})
+        if not risk_profile:
+            continue
+        setup_id = str(setup.get("setup_id") or "").upper()
+        if not setup_id:
+            continue
+        profiles[setup_id] = SetupRiskProfile(
+            base_risk_bucket=str(risk_profile.get("base_risk_bucket") or "medium_high"),
+            max_allocation_inr=int(risk_profile.get("max_allocation_inr") or 40_000),
+            invalidation_anchor=str(risk_profile.get("invalidation_anchor") or "dma_20"),
+        )
+    return profiles
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -345,6 +363,143 @@ def load_watch_states(
     return df
 
 
+def load_base_candidate_fallbacks(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+    include_allocated: bool = False,
+) -> pd.DataFrame:
+    if not table_exists("advisory_watchlist"):
+        return pd.DataFrame()
+
+    clauses = ["w.current_state IN ('PASS_NOW', 'WATCH_BREAKOUT')"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("w.asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append("w.asof_date = (SELECT MAX(asof_date) FROM advisory_watchlist)")
+    if symbols:
+        clauses.append("w.symbol = ANY(%s)")
+        params.append([value.upper() for value in symbols])
+    if setup_ids:
+        clauses.append("w.setup_id = ANY(%s)")
+        params.append([value.upper() for value in setup_ids])
+
+    df = sql_to_df(
+        f"""
+        SELECT
+            w.asof_date,
+            w.setup_id,
+            c.setup_name,
+            w.symbol,
+            c.company_master_id,
+            w.candidate_state,
+            w.current_state
+        FROM advisory_watchlist w
+        LEFT JOIN advisory_candidates c
+          ON c.asof_date = w.asof_date
+         AND c.setup_id = w.setup_id
+         AND c.symbol = w.symbol
+        WHERE {' AND '.join(clauses)}
+        ORDER BY w.asof_date, w.setup_id, w.symbol
+        """,
+        params=tuple(params) if params else None,
+    )
+    if df.empty:
+        return df
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["published_on"] = pd.to_datetime(df["asof_date"], utc=True, errors="coerce")
+    df["unique_id"] = df.apply(
+        lambda row: f"candidate:{pd.to_datetime(row['asof_date'], utc=True, errors='coerce').date()}:{str(row['setup_id']).upper()}:{str(row['symbol']).upper()}",
+        axis=1,
+    )
+    if table_exists(ALLOCATIONS_TABLE) and not include_allocated:
+        existing_clauses = ["1 = 1"]
+        existing_params: list[object] = []
+        if asof_date is not None:
+            existing_clauses.append("asof_date = %s")
+            existing_params.append(asof_date)
+        existing = sql_to_df(
+            f"""
+            SELECT asof_date, setup_id, symbol, unique_id
+            FROM {ALLOCATIONS_TABLE}
+            WHERE {' AND '.join(existing_clauses)}
+            """,
+            params=tuple(existing_params) if existing_params else None,
+        )
+        if not existing.empty:
+            existing["asof_date"] = normalize_timestamp(existing["asof_date"])
+            existing["symbol"] = existing["symbol"].astype("string").str.upper()
+            existing_keys = {
+                (
+                    pd.to_datetime(item["asof_date"], utc=True, errors="coerce"),
+                    str(item["setup_id"]).upper(),
+                    str(item["symbol"]).upper(),
+                    str(item["unique_id"]),
+                )
+                for item in existing.to_dict(orient="records")
+            }
+            df = df[
+                ~df.apply(
+                    lambda row: (
+                        pd.to_datetime(row["asof_date"], utc=True, errors="coerce"),
+                        str(row["setup_id"]).upper(),
+                        str(row["symbol"]).upper(),
+                        str(row["unique_id"]),
+                    )
+                    in existing_keys,
+                    axis=1,
+                )
+            ]
+    if df.empty:
+        return df
+
+    def _fallback_confidence(current_state: Any) -> float:
+        state = str(current_state or "").upper()
+        if state == "PASS_NOW":
+            return 0.60
+        if state == "WATCH_BREAKOUT":
+            return 0.45
+        return 0.30
+
+    rows: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        current_state = str(row.get("current_state") or "").upper()
+        rows.append(
+            {
+                "published_on": row["published_on"],
+                "asof_date": row["asof_date"],
+                "setup_id": row["setup_id"],
+                "setup_name": row.get("setup_name"),
+                "symbol": row["symbol"],
+                "company_master_id": row.get("company_master_id"),
+                "unique_id": row["unique_id"],
+                "evaluation_status": "completed",
+                "verdict": "continue",
+                "investable_now": current_state in {"PASS_NOW", "WATCH_BREAKOUT"},
+                "materiality": "low",
+                "setup_effect": "neutral",
+                "event_class": "BASE_CANDIDATE",
+                "state_transition_hint": "NO_CHANGE",
+                "score_impact": 0.0,
+                "confidence": _fallback_confidence(current_state),
+                "sentiment": "neutral",
+                "governance_risk": "none",
+                "balance_sheet_risk": "none",
+                "execution_risk": "none",
+                "has_review_manual": False,
+                "candidate_state": row.get("candidate_state"),
+                "current_state": current_state,
+                "watch_status": "active",
+                "is_base_candidate_fallback": True,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[str, Any]:
     df = sql_to_df(
         """
@@ -403,7 +558,7 @@ def bump_risk_bucket(bucket: str, steps: int = 1) -> str:
 
 
 def compute_risk_bucket(row: pd.Series, context: dict[str, Any]) -> str:
-    profile = SETUP_RISK_PROFILES.get(str(row["setup_id"]).upper(), SetupRiskProfile("medium_high", 40_000, "dma_20"))
+    profile = get_setup_risk_profiles().get(str(row["setup_id"]).upper(), SetupRiskProfile("medium_high", 40_000, "dma_20"))
     bucket = profile.base_risk_bucket
 
     if str(row.get("governance_risk", "none")) in {"high"}:
@@ -543,6 +698,33 @@ def build_allocations(
         setup_ids=setup_ids,
         include_allocated=include_allocated,
     )
+    base_candidates = load_base_candidate_fallbacks(
+        asof_date=asof_date,
+        symbols=symbols,
+        setup_ids=setup_ids,
+        include_allocated=include_allocated,
+    )
+    if not base_candidates.empty:
+        if evaluations.empty:
+            evaluations = base_candidates
+        else:
+            existing_keys = {
+                (pd.to_datetime(row["asof_date"], utc=True, errors="coerce"), str(row["setup_id"]).upper(), str(row["symbol"]).upper())
+                for row in evaluations[["asof_date", "setup_id", "symbol"]].to_dict(orient="records")
+            }
+            base_candidates = base_candidates[
+                ~base_candidates.apply(
+                    lambda row: (
+                        pd.to_datetime(row["asof_date"], utc=True, errors="coerce"),
+                        str(row["setup_id"]).upper(),
+                        str(row["symbol"]).upper(),
+                    )
+                    in existing_keys,
+                    axis=1,
+                )
+            ]
+            if not base_candidates.empty:
+                evaluations = pd.concat([evaluations, base_candidates], ignore_index=True, sort=False)
     if evaluations.empty:
         return pd.DataFrame()
     watch_states = load_watch_states(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
@@ -553,10 +735,11 @@ def build_allocations(
             how="left",
         )
 
+    setup_profiles = get_setup_risk_profiles()
     rows: list[dict[str, Any]] = []
     for _, row in evaluations.iterrows():
         setup_id = str(row["setup_id"]).upper()
-        profile = SETUP_RISK_PROFILES.get(setup_id, SetupRiskProfile("medium_high", 40_000, "dma_20"))
+        profile = setup_profiles.get(setup_id, SetupRiskProfile("medium_high", 40_000, "dma_20"))
         context = load_point_in_time_context(str(row["symbol"]), pd.to_datetime(row["published_on"], utc=True, errors="coerce"))
         risk_bucket = compute_risk_bucket(row, context)
         conviction_bucket = compute_conviction_bucket(row, context)
@@ -570,10 +753,15 @@ def build_allocations(
         state_transition_hint = str(row.get("state_transition_hint", "")).upper()
         score_impact_raw = pd.to_numeric(row.get("score_impact"), errors="coerce")
         score_impact = 0.0 if pd.isna(score_impact_raw) else float(score_impact_raw)
+        is_base_candidate_fallback = bool(row.get("is_base_candidate_fallback", False))
         promoted_to_pass_now = current_state == "PASS_NOW" and state_transition_hint != "DOWNGRADE_TO_REJECT" and verdict != "reject"
         actionable_now = investable_now or promoted_to_pass_now
 
         notes: list[str] = []
+        if is_base_candidate_fallback:
+            notes.append("Allocation is based on base rule-engine state because no event evaluation was available.")
+            if current_state == "WATCH_BREAKOUT":
+                notes.append("Entry timing is still early; size remains conservative until confirmation improves.")
         if evaluation_status != "completed":
             allocation_status = "review_manual"
             suggested_allocation_inr = 0.0
@@ -628,6 +816,8 @@ def build_allocations(
                 raw_cap * CONVICTION_MULTIPLIER[conviction_bucket] * RISK_BUCKET_MULTIPLIER[risk_bucket],
                 liquidity_cap,
             )
+            if is_base_candidate_fallback and current_state == "WATCH_BREAKOUT":
+                suggested_allocation_inr = suggested_allocation_inr * 0.60
             event_multiplier = max(0.50, min(1.25, 1.0 + score_impact))
             suggested_allocation_inr = suggested_allocation_inr * event_multiplier
             suggested_allocation_inr = round_allocation(suggested_allocation_inr)
@@ -692,9 +882,20 @@ def persist_allocations(df: pd.DataFrame) -> None:
     if df.empty:
         return
     with db_session() as (_, cur):
-        asof_dates = [value.to_pydatetime() if hasattr(value, "to_pydatetime") else value for value in pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dropna().unique().tolist()]
-        if asof_dates:
-            cur.execute(f"DELETE FROM {ALLOCATIONS_TABLE} WHERE asof_date = ANY(%s)", (asof_dates,))
+        pairs = (
+            df[["asof_date", "setup_id"]]
+            .dropna()
+            .drop_duplicates()
+            .to_dict(orient="records")
+        )
+        for item in pairs:
+            cur.execute(
+                f"DELETE FROM {ALLOCATIONS_TABLE} WHERE asof_date = %s AND setup_id = %s",
+                (
+                    pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                    str(item["setup_id"]),
+                ),
+            )
     upsert_to_db(
         df,
         ALLOCATIONS_TABLE,

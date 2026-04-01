@@ -370,6 +370,12 @@ def build_watchlist(
             errors="ignore",
         )
 
+    out["last_event_score_impact"] = pd.to_numeric(out["last_event_score_impact"], errors="coerce")
+    for column in ["attractive_price_low", "attractive_price_high", "invalidation_price"]:
+        out[column] = pd.to_numeric(out[column], errors="coerce")
+    for column in ["state_updated_at", "watch_started_at", "last_checked_at", "last_document_published_on", "load_ts"]:
+        out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
+
     ordered_cols = [
         "asof_date",
         "setup_id",
@@ -414,7 +420,20 @@ def persist_watchlist(df: pd.DataFrame, *, rebuild: bool = False, asof_date: pd.
         return
     if rebuild and asof_date is not None:
         with db_session() as (_, cur):
-            cur.execute(f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s", (asof_date,))
+            pairs = (
+                df[["asof_date", "setup_id"]]
+                .dropna()
+                .drop_duplicates()
+                .to_dict(orient="records")
+            )
+            for item in pairs:
+                cur.execute(
+                    f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s AND setup_id = %s",
+                    (
+                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                        str(item["setup_id"]),
+                    ),
+                )
     upsert_to_db(
         df,
         TABLE_NAME,

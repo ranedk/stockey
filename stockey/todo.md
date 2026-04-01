@@ -26,6 +26,7 @@ The next weakness is not missing infrastructure. It is setup activation logic:
 - news context is not first-class in setup activation
 - traces do not clearly show which screener pool and overlay drove candidate generation
 - news is still mostly used as an overlay or event adjustment, not as a discovery engine for new opportunity-specific screeners
+- intraday price action is ingested but still underused relative to the daily-only feature stack
 
 ## Objective
 
@@ -118,6 +119,31 @@ Recently implemented:
 - theme-linked Screener.in URLs can be registered back into the project
 - `EVENT_OPPORTUNITY_V1` can consume registered theme screeners
 - `data.screenerin.ad_hoc_query` can run authenticated one-off Screener.in raw queries and persist company-level rows
+- `advisory.intraday_features` can now pull missing Dhan intraday bars on demand and persist daily intraday pattern features for advisory use
+- the intraday layer now supports multi-interval storage/builds (`1`, `5`, `15`, `25`, `60` minutes); model scoring is still a follow-on phase
+
+## Additional Objective: Intraday Pattern Layer
+
+Build a controlled intraday confirmation layer where:
+
+- daily regime/setup logic remains the base
+- intraday history is pulled only when the current screener universe needs it
+- the project stores that history and derived daily pattern features
+- setups can optionally use those intraday features through `intraday_rules`
+- later model work such as XGBoost uses the persisted feature history instead of raw bars directly
+
+This should be:
+
+- on-demand
+- persistent
+- feature-first
+- compatible with the existing rule engine
+
+It should not be:
+
+- a full intraday trading engine
+- an always-sync-5-years-for-all-symbols job
+- a model-first path without durable feature history
 
 ## Additional Objective: News-Led Opportunity Discovery
 
@@ -210,6 +236,38 @@ Done when:
 - at least one setup runs against more than one screener
 - trace output shows which screener pool was active
 - existing setups do not break
+
+### Phase 1B: Intraday Feature Foundation
+
+Goal:
+
+- use Dhan intraday data as an advisory confirmation layer without turning the stack into an intraday system
+
+Tasks:
+
+1. Add [`advisory/intraday_features.py`](/home/rane/code/stockey/advisory/intraday_features.py)
+   - sync missing intraday history on demand for the current screener universe
+   - persist derived daily intraday pattern features
+2. Update [`advisory/pipeline.py`](/home/rane/code/stockey/advisory/pipeline.py)
+   - add a dedicated `intraday` stage before `rules`
+3. Update [`advisory/rule_engine.py`](/home/rane/code/stockey/advisory/rule_engine.py)
+   - merge the latest intraday feature snapshot into candidate evaluation
+   - support `intraday_rules` in setup config
+4. Update [`config/advisory_setups.yaml`](/home/rane/code/stockey/config/advisory_setups.yaml)
+   - add light intraday confirmation rules for event and breakout-style setups
+
+Done when:
+
+- the advisory run can build `advisory_intraday_features_daily`
+- setup scoring can reference intraday fields without breaking existing runs
+- intraday sync is on-demand instead of a blanket full-history job
+
+Next phase:
+
+1. Create a labeled intraday breakout dataset from `advisory_intraday_features_daily`
+2. Train an `xgboost` breakout-confirmation model on persisted features rather than raw bars
+3. Persist `model_name` and `model_score` back into the intraday feature table
+4. Feed the calibrated model score into setup scoring as a soft input, not a hard gate
 
 ### Phase 2: Add Market News Overlay
 

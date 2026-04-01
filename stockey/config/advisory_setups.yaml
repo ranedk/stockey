@@ -5,27 +5,33 @@ setups:
     holding_horizon_note: 3 days to 6 weeks
     screeners:
       - sme-momentum-screen-v1
+      - midcap-improver-screen-v1
     screener_mode: union
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
       - STABLE
+      - STABLE_BUT_TARIFF_RISING
+      - RISK_OFF
     blocked_regimes:
       - SHOCK
     allowed_overlays:
       - NONE
       - EVENT_CLUSTER
       - SECTOR_POLICY_SHOCK
+      - TARIFF_PRESSURE
     blocked_overlays:
       - GEOPOLITICAL_RISK
       - OIL_SHOCK
-      - TARIFF_PRESSURE
     overlay_screeners:
       EVENT_CLUSTER:
         add:
           - midcap-improver-screen-v1
+      TARIFF_PRESSURE:
+        add:
+          - midcap-improver-screen-v1
     market_cap_max: 10000
-    min_avg_traded_value_20d: 20000000
+    min_avg_traded_value_20d: 15000000
     max_breakout_extension_pct: 8
     watch_pullback_extension_pct: 5
     min_dist_52w_high: -18
@@ -34,9 +40,21 @@ setups:
       fundamental: 0.20
       regime_fit: 0.20
       event: 0.15
+    freshness_policy:
+      technical_max_age_days: 15
+      fundamentals_max_age_days: 150
+      regime_max_age_days: 15
+      intraday_max_age_days: 2
+      fundamentals_required: true
+    intraday_usage_mode: timing_only
+    risk_profile:
+      base_risk_bucket: high
+      max_allocation_inr: 25000
+      invalidation_anchor: dma_20
+    portfolio_cap_pct: 0.20
     score_thresholds:
-      pass_now: 0.70
-      watch_breakout: 0.58
+      pass_now: 0.66
+      watch_breakout: 0.56
       watch_pullback: 0.52
       watch_event: 0.48
       near_miss_gap: 0.06
@@ -62,6 +80,13 @@ setups:
       - column: rs_vs_benchmark
         operator: gte
         value: 0.0
+    intraday_rules:
+      - column: intraday_close_vs_vwap_pct
+        operator: gte
+        value: 0.0
+      - column: intraday_pct_bars_above_vwap
+        operator: gte
+        value: 0.48
     watch_reasons:
       - results
       - order wins
@@ -86,33 +111,48 @@ setups:
       - BULL_RISK_ON
       - BULL_NARROW
       - STABLE
+      - STABLE_BUT_TARIFF_RISING
+      - RISK_OFF
     blocked_regimes:
       - SHOCK
     allowed_overlays:
       - NONE
       - EVENT_CLUSTER
       - SECTOR_POLICY_SHOCK
+      - TARIFF_PRESSURE
+      - OIL_SHOCK
     blocked_overlays:
       - GEOPOLITICAL_RISK
-      - OIL_SHOCK
     overlay_screeners:
       TARIFF_PRESSURE:
         remove:
           - largecap-breakout-screen-v1
     market_cap_min: 5000
     market_cap_max: 20000
-    min_avg_traded_value_20d: 100000000
+    min_avg_traded_value_20d: 75000000
     max_breakout_extension_pct: 10
     watch_pullback_extension_pct: 6
     min_dist_52w_high: -22
     scoring_weights:
-      technical: 0.35
-      fundamental: 0.35
-      regime_fit: 0.20
-      event: 0.10
+      technical: 0.40
+      fundamental: 0.40
+      regime_fit: 0.15
+      event: 0.05
+    freshness_policy:
+      technical_max_age_days: 15
+      fundamentals_max_age_days: 150
+      regime_max_age_days: 15
+      intraday_max_age_days: 2
+      fundamentals_required: true
+    intraday_usage_mode: confirm_only
+    risk_profile:
+      base_risk_bucket: medium_high
+      max_allocation_inr: 50000
+      invalidation_anchor: dma_20
+    portfolio_cap_pct: 0.30
     score_thresholds:
-      pass_now: 0.68
-      watch_breakout: 0.57
+      pass_now: 0.64
+      watch_breakout: 0.56
       watch_pullback: 0.52
       watch_event: 0.48
       near_miss_gap: 0.06
@@ -144,7 +184,7 @@ setups:
         value: 0.0
       - column: debt_to_equity_vs_sector
         operator: lte
-        value: 0.15
+        value: 0.30
     watch_reasons:
       - results
       - order wins
@@ -171,6 +211,7 @@ setups:
       - BULL_NARROW
       - STABLE
       - STABLE_BUT_TARIFF_RISING
+      - RISK_OFF
     blocked_regimes:
       - SHOCK
     allowed_overlays:
@@ -178,6 +219,7 @@ setups:
       - EVENT_CLUSTER
       - TARIFF_PRESSURE
       - SECTOR_POLICY_SHOCK
+      - OIL_SHOCK
     blocked_overlays:
       - GEOPOLITICAL_RISK
     overlay_screeners:
@@ -188,18 +230,30 @@ setups:
         remove:
           - largecap-breakout-screen-v1
     market_cap_min: 20000
-    min_avg_traded_value_20d: 500000000
+    min_avg_traded_value_20d: 350000000
     max_breakout_extension_pct: 10
     watch_pullback_extension_pct: 6
-    min_dist_52w_high: -15
+    min_dist_52w_high: -18
     scoring_weights:
       technical: 0.35
       fundamental: 0.30
       regime_fit: 0.20
       event: 0.15
+    freshness_policy:
+      technical_max_age_days: 15
+      fundamentals_max_age_days: 150
+      regime_max_age_days: 15
+      intraday_max_age_days: 2
+      fundamentals_required: true
+    intraday_usage_mode: confirm_only
+    risk_profile:
+      base_risk_bucket: medium
+      max_allocation_inr: 100000
+      invalidation_anchor: dma_50
+    portfolio_cap_pct: 0.45
     score_thresholds:
-      pass_now: 0.68
-      watch_breakout: 0.58
+      pass_now: 0.65
+      watch_breakout: 0.56
       watch_pullback: 0.52
       watch_event: 0.48
       near_miss_gap: 0.05
@@ -225,6 +279,13 @@ setups:
       - column: rs_vs_sector
         operator: gte
         value: 0.0
+    intraday_rules:
+      - column: intraday_close_vs_vwap_pct
+        operator: gte
+        value: 0.0
+      - column: intraday_close_location_pct
+        operator: gte
+        value: 0.50
     watch_reasons:
       - earnings
       - guidance changes
@@ -276,6 +337,18 @@ setups:
       fundamental: 0.40
       regime_fit: 0.25
       event: 0.10
+    freshness_policy:
+      technical_max_age_days: 15
+      fundamentals_max_age_days: 150
+      regime_max_age_days: 15
+      intraday_max_age_days: 2
+      fundamentals_required: true
+    intraday_usage_mode: confirm_only
+    risk_profile:
+      base_risk_bucket: medium
+      max_allocation_inr: 75000
+      invalidation_anchor: dma_50
+    portfolio_cap_pct: 0.35
     score_thresholds:
       pass_now: 0.68
       watch_breakout: 0.58
@@ -298,6 +371,13 @@ setups:
       - column: rs_vs_benchmark
         operator: gte
         value: -0.02
+    intraday_rules:
+      - column: intraday_close_vs_vwap_pct
+        operator: gte
+        value: -0.15
+      - column: intraday_pct_bars_above_vwap
+        operator: gte
+        value: 0.48
     fundamental_rules:
       - column: debt_to_equity_vs_sector
         operator: lte
@@ -334,6 +414,7 @@ setups:
       - SECTOR_POLICY_SHOCK
       - TARIFF_PRESSURE
       - OIL_SHOCK
+      - OIL_SHOCK
       - GEOPOLITICAL_RISK
     market_cap_min: 500
     min_avg_traded_value_20d: 50000000
@@ -345,6 +426,18 @@ setups:
       fundamental: 0.25
       regime_fit: 0.15
       event: 0.30
+    freshness_policy:
+      technical_max_age_days: 15
+      fundamentals_max_age_days: 180
+      regime_max_age_days: 15
+      intraday_max_age_days: 2
+      fundamentals_required: false
+    intraday_usage_mode: timing_only
+    risk_profile:
+      base_risk_bucket: medium_high
+      max_allocation_inr: 40000
+      invalidation_anchor: dma_20
+    portfolio_cap_pct: 0.25
     score_thresholds:
       pass_now: 0.66
       watch_breakout: 0.56
@@ -365,6 +458,16 @@ setups:
       - column: rs_vs_benchmark
         operator: gte
         value: -0.05
+    intraday_rules:
+      - column: intraday_close_vs_vwap_pct
+        operator: gte
+        value: 0.0
+      - column: intraday_pct_bars_above_vwap
+        operator: gte
+        value: 0.50
+      - column: intraday_close_location_pct
+        operator: gte
+        value: 0.55
     watch_reasons:
       - theme confirmation
       - policy follow-through
@@ -374,4 +477,95 @@ setups:
     entry_styles:
       - BREAKOUT_PIVOT
       - PULLBACK_TO_20DMA
+      - RETEST_OF_PRIOR_BREAKOUT
+
+  - setup_id: INTRADAY_BREAKOUT_TACTICAL_V1
+    setup_name: Intraday breakout tactical
+    setup_family: INTRADAY_TACTICAL
+    holding_horizon_note: same day to 5 trading days
+    screeners:
+      - largecap-breakout-screen-v1
+      - midcap-improver-screen-v1
+    screener_mode: union
+    allowed_regimes:
+      - BULL_RISK_ON
+      - BULL_NARROW
+      - STABLE
+      - STABLE_BUT_TARIFF_RISING
+      - RISK_OFF
+    blocked_regimes:
+      - SHOCK
+    allowed_overlays:
+      - NONE
+      - EVENT_CLUSTER
+      - SECTOR_POLICY_SHOCK
+      - TARIFF_PRESSURE
+      - OIL_SHOCK
+    blocked_overlays:
+      - GEOPOLITICAL_RISK
+    market_cap_min: 5000
+    min_avg_traded_value_20d: 150000000
+    max_breakout_extension_pct: 6
+    watch_pullback_extension_pct: 4
+    min_dist_52w_high: -18
+    scoring_weights:
+      technical: 0.55
+      fundamental: 0.10
+      regime_fit: 0.15
+      event: 0.20
+    freshness_policy:
+      technical_max_age_days: 15
+      fundamentals_max_age_days: 180
+      regime_max_age_days: 15
+      intraday_max_age_days: 1
+      fundamentals_required: false
+    intraday_usage_mode: tactical_primary
+    risk_profile:
+      base_risk_bucket: high
+      max_allocation_inr: 20000
+      invalidation_anchor: dma_20
+    portfolio_cap_pct: 0.15
+    single_position_cap_pct: 0.08
+    score_thresholds:
+      pass_now: 0.62
+      watch_breakout: 0.54
+      watch_pullback: 0.50
+      watch_event: 0.46
+      near_miss_gap: 0.06
+    regime_policy:
+      preferred:
+        - BULL_RISK_ON
+        - BULL_NARROW
+      acceptable:
+        - STABLE
+      avoid:
+        - RISK_OFF
+        - STABLE_BUT_TARIFF_RISING
+    technical_rules:
+      - column: pass_above_dma_20
+        operator: eq
+        value: true
+      - column: rs_vs_benchmark
+        operator: gte
+        value: -0.02
+    intraday_rules:
+      - column: intraday_close_vs_vwap_pct
+        operator: gte
+        value: 0.0
+      - column: intraday_pct_bars_above_vwap
+        operator: gte
+        value: 0.55
+      - column: intraday_close_location_pct
+        operator: gte
+        value: 0.60
+      - column: intraday_breakout_score
+        operator: gte
+        value: 0.55
+    watch_reasons:
+      - intraday breakout trigger
+      - opening range confirmation
+      - event follow-through
+      - volume expansion
+    entry_styles:
+      - BREAKOUT_PIVOT
       - RETEST_OF_PRIOR_BREAKOUT

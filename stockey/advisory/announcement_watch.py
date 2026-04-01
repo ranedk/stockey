@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import time
 from datetime import timedelta
 
 import pandas as pd
@@ -13,10 +15,15 @@ from utils.sync import parse_datetime_arg
 
 WATCHLIST_TABLE = "advisory_watchlist"
 EVENTS_TABLE = "advisory_watch_events"
+INITIAL_INGEST_LOOKBACK_DAYS = 3
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
+
+
+def _emit_progress(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 def ensure_watch_outputs_tables() -> None:
@@ -228,60 +235,151 @@ def persist_watch_outputs(watchlist_updates: pd.DataFrame, events: pd.DataFrame)
         )
 
 
-def run_announcement_watch(
+def _prepare_watchlist_for_ingest(
+    watchlist: pd.DataFrame,
+    *,
+    effective_to: pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    working = watchlist.copy()
+    working["company_master_id"] = working["company_master_id"].astype("string")
+    working["symbol"] = working["symbol"].astype("string").str.upper()
+    working["published_from"] = pd.Series(pd.NaT, index=working.index, dtype="datetime64[ns, UTC]")
+    working["published_from_capped"] = False
+    default_floor = (effective_to - pd.Timedelta(days=INITIAL_INGEST_LOOKBACK_DAYS)).normalize()
+
+    for index, row in working.iterrows():
+        last_checked = pd.to_datetime(row.get("last_checked_at"), utc=True, errors="coerce")
+        if pd.isna(last_checked):
+            published_from = max(pd.to_datetime(row["asof_date"], utc=True, errors="coerce"), default_floor)
+            if published_from > pd.to_datetime(row["asof_date"], utc=True, errors="coerce"):
+                working.at[index, "published_from_capped"] = True
+        else:
+            published_from = last_checked - pd.Timedelta(days=1)
+        working.at[index, "published_from"] = published_from
+
+    unique_ingest_targets = (
+        working.groupby(["company_master_id", "symbol"], dropna=False, sort=True)
+        .agg(
+            published_from=("published_from", "min"),
+            watch_rows=("setup_id", "count"),
+        )
+        .reset_index()
+    )
+    return working, unique_ingest_targets
+
+
+def run_announcement_ingest(
     *,
     asof_date: pd.Timestamp | None = None,
     symbols: list[str] | None = None,
     setup_ids: list[str] | None = None,
     to_date: pd.Timestamp | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+) -> dict[str, object]:
     watchlist = load_watchlist(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
     if watchlist.empty:
-        return pd.DataFrame(), pd.DataFrame(), {"watch_count": 0, "ingest_runs": []}
+        return {
+            "watchlist": pd.DataFrame(),
+            "effective_to": pd.to_datetime(to_date or pd.Timestamp.utcnow(), utc=True, errors="coerce"),
+            "docs_by_company": {},
+            "last_published_by_company": {},
+            "meta": {"watch_count": 0, "unique_ingest_targets": 0, "ingest_runs": []},
+        }
 
     pipeline = ManagedAnnouncementPipeline()
     effective_to = pd.to_datetime(to_date or pd.Timestamp.utcnow(), utc=True, errors="coerce")
-    watch_updates: list[dict[str, object]] = []
-    event_frames: list[pd.DataFrame] = []
     ingest_runs: list[dict[str, object]] = []
+    watchlist, unique_ingest_targets = _prepare_watchlist_for_ingest(watchlist, effective_to=effective_to)
+    total_targets = int(len(unique_ingest_targets))
+    docs_by_company: dict[str, pd.DataFrame] = {}
+    last_published_by_company: dict[str, pd.Timestamp | None] = {}
 
-    for _, row in watchlist.iterrows():
-        last_checked = pd.to_datetime(row.get("last_checked_at"), utc=True, errors="coerce")
-        if pd.isna(last_checked):
-            published_from = row["asof_date"]
-        else:
-            published_from = last_checked - pd.Timedelta(days=1)
+    for position, target in enumerate(unique_ingest_targets.itertuples(index=False), start=1):
+        company_master_id = str(target.company_master_id or "")
+        symbol = str(target.symbol or "").upper()
+        published_from = pd.to_datetime(target.published_from, utc=True, errors="coerce")
         published_to = effective_to
-
+        target_started = time.monotonic()
+        _emit_progress(
+            f"[advisory.announcement_watch] ingest {position}/{total_targets} symbol={symbol} from={published_from.date()} to={published_to.date()} watch_rows={int(target.watch_rows)}"
+        )
         summary = pipeline.ingest_date_range(
-            ticker=str(row["symbol"]),
+            ticker=symbol,
             from_date=published_from.date(),
             to_date=published_to.date(),
             exchanges=["NSE"],
         )
         ingest_runs.append(
             {
-                "symbol": row["symbol"],
-                "setup_id": row["setup_id"],
+                "symbol": symbol,
+                "company_master_id": company_master_id,
                 "requested": summary.requested,
                 "discovered": summary.discovered,
                 "downloaded": summary.downloaded,
+                "ocred": summary.ocred,
+                "categorized": summary.categorized,
                 "parsed": summary.parsed,
+                "skipped": summary.skipped,
                 "failed": summary.failed,
+                "elapsed_seconds": round(time.monotonic() - target_started, 4),
             }
+        )
+        _emit_progress(
+            f"[advisory.announcement_watch] ingest done symbol={symbol} elapsed={time.monotonic() - target_started:.2f}s discovered={summary.discovered} parsed={summary.parsed} failed={summary.failed}"
         )
 
         docs = load_documents_for_company(
-            str(row["company_master_id"]),
+            company_master_id,
             published_from=published_from,
             published_to=published_to,
         )
+        docs_by_company[company_master_id] = docs
+        last_published_by_company[company_master_id] = (
+            docs["published_on"].max() if not docs.empty else None
+        )
+
+    return {
+        "watchlist": watchlist,
+        "effective_to": effective_to,
+        "docs_by_company": docs_by_company,
+        "last_published_by_company": last_published_by_company,
+        "meta": {
+            "watch_count": int(len(watchlist)),
+            "unique_ingest_targets": total_targets,
+            "initial_lookback_days": INITIAL_INGEST_LOOKBACK_DAYS,
+            "capped_watch_rows": int(pd.Series(watchlist["published_from_capped"]).fillna(False).astype(bool).sum()),
+            "ingest_runs": ingest_runs,
+        },
+    }
+
+
+def build_watch_updates_from_ingest(ingest_state: dict[str, object]) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    watchlist = ingest_state.get("watchlist")
+    if not isinstance(watchlist, pd.DataFrame) or watchlist.empty:
+        return pd.DataFrame(), pd.DataFrame(), {"watch_count": 0, "match_count": 0}
+
+    effective_to = pd.to_datetime(ingest_state.get("effective_to"), utc=True, errors="coerce")
+    docs_by_company = ingest_state.get("docs_by_company") if isinstance(ingest_state.get("docs_by_company"), dict) else {}
+    last_published_by_company = ingest_state.get("last_published_by_company") if isinstance(ingest_state.get("last_published_by_company"), dict) else {}
+    watch_updates: list[dict[str, object]] = []
+    event_frames: list[pd.DataFrame] = []
+
+    for _, row in watchlist.iterrows():
+        company_master_id = str(row["company_master_id"] or "")
+        published_from = pd.to_datetime(row.get("published_from"), utc=True, errors="coerce")
+        all_docs = docs_by_company.get(company_master_id, pd.DataFrame())
+        if not all_docs.empty:
+            docs = all_docs[all_docs["published_on"] >= published_from].copy()
+        else:
+            docs = pd.DataFrame()
         event_df = build_event_rows(row, docs)
         if not event_df.empty:
             event_frames.append(event_df)
             last_published = event_df["published_on"].max()
         else:
             last_published = pd.to_datetime(row.get("last_document_published_on"), utc=True, errors="coerce")
+            cached_last_published = last_published_by_company.get(company_master_id)
+            if pd.isna(last_published) and cached_last_published is not None:
+                last_published = pd.to_datetime(cached_last_published, utc=True, errors="coerce")
 
         watch_updates.append(
             {
@@ -320,8 +418,27 @@ def run_announcement_watch(
     events_df = pd.concat(event_frames, ignore_index=True) if event_frames else pd.DataFrame()
     meta = {
         "watch_count": int(len(watchlist)),
-        "ingest_runs": ingest_runs,
+        "match_count": int(len(events_df)),
     }
+    return watch_update_df, events_df, meta
+
+
+def run_announcement_watch(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+    to_date: pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    ingest_state = run_announcement_ingest(
+        asof_date=asof_date,
+        symbols=symbols,
+        setup_ids=setup_ids,
+        to_date=to_date,
+    )
+    watch_update_df, events_df, match_meta = build_watch_updates_from_ingest(ingest_state)
+    meta = dict(ingest_state.get("meta") or {})
+    meta.update(match_meta)
     return watch_update_df, events_df, meta
 
 
