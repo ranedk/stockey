@@ -16,12 +16,6 @@ from utils.http import get_dynamic_headers, get_with_retries
 SNAPSHOT_TABLE = "public.screenerin_screener_snapshots"
 REGISTRY_TABLE = "public.screenerin_screeners"
 SOURCE_NAME = "screener.in"
-DEFAULT_SCREENERS: dict[str, str] = {
-    "sme-momentum-screen-v1": "https://www.screener.in/screens/3565181/sme-momentum-screen-v1/",
-    "largecap-breakout-screen-v1": "https://www.screener.in/screens/3565184/largecap-breakout-screen-v1/",
-    "defensive-tariff-screen-v1": "https://www.screener.in/screens/3565185/defensive-tariff-screen-v1/",
-    "midcap-improver-screen-v1": "https://www.screener.in/screens/3565186/midcap-improver-screen-v1/",
-}
 
 
 def ensure_tables() -> None:
@@ -245,14 +239,6 @@ def upsert_registered_screener(
         "is_active": is_active,
     }
 
-
-def seed_default_screeners() -> list[dict[str, object]]:
-    return [
-        upsert_registered_screener(screener_url=url, screener_name=slug.replace("-", " ").upper())
-        for slug, url in DEFAULT_SCREENERS.items()
-    ]
-
-
 def list_registered_screeners(*, active_only: bool = False):
     ensure_tables()
     where_clause = "WHERE is_active = TRUE" if active_only else ""
@@ -416,18 +402,12 @@ def summarize_latest_snapshots(screener_slug: str | None = None):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch registered Screener.in screeners and store parsed snapshots.")
     parser.add_argument("urls", nargs="*", help="Optional Screener.in URLs to fetch. Defaults to active registry rows.")
-    parser.add_argument("--seed-defaults", action="store_true", help="Ensure the four advisory screeners exist in the registry before syncing.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.seed_defaults:
-        seed_default_screeners()
     urls = args.urls or load_registered_urls()
-    if not urls:
-        seed_default_screeners()
-        urls = load_registered_urls()
     for url in urls:
         print(json.dumps(sync_screener(url), ensure_ascii=False), flush=True)
 

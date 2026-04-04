@@ -14,7 +14,7 @@ DOWNLOAD_STEPS = [
     {"module": "data.sharpelydata.scrip_master", "args": [], "purpose": "sharpely_master_precheck"},
     {"module": "data.company_master", "args": [], "purpose": "identity_build"},
     {"module": "data.dhanlive.ohlcv", "args": [], "purpose": "dhan_ohlcv_precheck"},
-    {"module": "data.screenerin.screener_parser", "args": ["--seed-defaults"], "purpose": "screener_sync_precheck"},
+    {"module": "data.screenerin.screener_parser", "args": [], "purpose": "screener_sync_registered"},
     {"module": "data.fred.us_macro", "args": [], "purpose": "macro"},
     {"module": "data.eaindustry.wpi", "args": [], "purpose": "macro"},
     {"module": "data.rbi.download_fbil_gsec", "args": [], "purpose": "macro"},

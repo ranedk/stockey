@@ -115,18 +115,24 @@ Supported asset types are `stock`, `index`, and `benchmark`.
 
 ### Screener.in screeners
 
-The Screener.in downloader reads active screener URLs from `screenerin_screeners`.
+The recurring Screener.in downloader reads active production screener URLs from `screenerin_screeners`.
 
 Typical flow:
 
 ```sh
-python -m data.screenerin.screener_registry seed-defaults
+python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-production-screen/"
 python -m data.screenerin.screener_registry list
-python -m data.screenerin.screener_parser --seed-defaults
-python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1
+python -m data.screenerin.screener_parser
+python -m data.screenerin.screener_registry latest --screener my-production-screen
 ```
 
 Use `--raw` with `latest` if you want the full stored JSON payload instead of the summary view.
+
+For one-off research, use ad hoc queries instead of registering everything:
+
+```sh
+python -m data.screenerin.ad_hoc_query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
+```
 
 ### Sharpely masters
 

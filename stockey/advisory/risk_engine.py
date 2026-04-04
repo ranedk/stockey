@@ -13,6 +13,7 @@ from utils.sync import parse_datetime_arg
 
 
 ALLOCATIONS_TABLE = "advisory_allocations"
+REVIEWS_TABLE = "advisory_event_reviews"
 _TRANSITION_CUTOFF = 0.12
 _MATERIALITY_ORDER = {"low": 1, "medium": 2, "high": 3}
 _RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
@@ -139,6 +140,10 @@ def ensure_allocations_table() -> None:
                 state_transition_hint TEXT,
                 score_impact DOUBLE PRECISION,
                 confidence DOUBLE PRECISION,
+                review_action TEXT,
+                review_score DOUBLE PRECISION,
+                review_veto BOOLEAN,
+                review_reason TEXT,
                 risk_bucket TEXT,
                 conviction_bucket TEXT,
                 allocation_status TEXT,
@@ -168,6 +173,10 @@ def ensure_allocations_table() -> None:
             "state_transition_hint": "TEXT",
             "score_impact": "DOUBLE PRECISION",
             "confidence": "DOUBLE PRECISION",
+            "review_action": "TEXT",
+            "review_score": "DOUBLE PRECISION",
+            "review_veto": "BOOLEAN",
+            "review_reason": "TEXT",
             "risk_bucket": "TEXT",
             "conviction_bucket": "TEXT",
             "allocation_status": "TEXT",
@@ -222,13 +231,32 @@ def load_event_evaluations(
         if not include_allocated:
             clauses.append("a.unique_id IS NULL")
 
+    review_join = ""
+    review_select = ""
+    if table_exists(REVIEWS_TABLE):
+        review_join = f"""
+        LEFT JOIN {REVIEWS_TABLE} r
+          ON r.published_on = e.published_on
+         AND r.setup_id = e.setup_id
+         AND r.symbol = e.symbol
+         AND r.unique_id = e.unique_id
+        """
+        review_select = """
+            , r.review_action
+            , r.review_score
+            , r.veto AS review_veto
+            , r.review_reason
+        """
+
     df = sql_to_df(
         f"""
         SELECT
             e.*
             {alloc_select}
+            {review_select}
         FROM advisory_event_evaluations e
         {alloc_join}
+        {review_join}
         WHERE {' AND '.join(clauses)}
         ORDER BY e.published_on, e.setup_id, e.symbol, e.unique_id
         """,
@@ -240,6 +268,18 @@ def load_event_evaluations(
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
     df["symbol"] = df["symbol"].astype("string").str.upper()
     df["score_impact"] = pd.to_numeric(df["score_impact"], errors="coerce").fillna(0.0)
+    if "review_score" in df.columns:
+        df["review_score"] = pd.to_numeric(df["review_score"], errors="coerce").fillna(0.0)
+    else:
+        df["review_score"] = 0.0
+    if "review_veto" in df.columns:
+        df["review_veto"] = df["review_veto"].fillna(False).astype(bool)
+    else:
+        df["review_veto"] = False
+    if "review_action" not in df.columns:
+        df["review_action"] = pd.NA
+    if "review_reason" not in df.columns:
+        df["review_reason"] = pd.NA
 
     def _pick_level(values: pd.Series, order: dict[str, int], default: str) -> str:
         cleaned = [str(value).lower() for value in values if str(value).strip()]
@@ -254,6 +294,9 @@ def load_event_evaluations(
         hints = {str(value).upper() for value in group["state_transition_hint"].dropna().astype(str)}
         verdicts = {str(value).lower() for value in group["verdict"].dropna().astype(str)}
         total_score_impact = round(max(-0.35, min(0.35, float(group["score_impact"].sum()))), 4)
+        review_actions = {str(value).lower() for value in group["review_action"].dropna().astype(str)}
+        total_review_score = round(max(-1.0, min(0.0, float(group["review_score"].sum()))), 4)
+        has_review_veto = bool(pd.Series(group["review_veto"]).fillna(False).astype(bool).any())
 
         if "DOWNGRADE_TO_REJECT" in hints or "reject" in verdicts:
             transition_hint = "DOWNGRADE_TO_REJECT"
@@ -313,6 +356,18 @@ def load_event_evaluations(
         merged["execution_risk"] = _pick_level(group["execution_risk"], _RISK_ORDER, str(latest.get("execution_risk") or "none"))
         merged["confidence"] = float(pd.to_numeric(group["confidence"], errors="coerce").dropna().max()) if not pd.to_numeric(group["confidence"], errors="coerce").dropna().empty else latest.get("confidence")
         merged["has_review_manual"] = "REVIEW_MANUAL" in hints or "review_manual" in verdicts
+        if has_review_veto:
+            merged["review_action"] = "veto"
+        elif "review_manual" in review_actions:
+            merged["review_action"] = "review_manual"
+        elif "penalize" in review_actions or total_review_score <= -0.12:
+            merged["review_action"] = "penalize"
+        else:
+            merged["review_action"] = "clear"
+        merged["review_score"] = total_review_score
+        merged["review_veto"] = has_review_veto
+        review_reasons = [str(value).strip() for value in group["review_reason"].dropna().astype(str) if str(value).strip()]
+        merged["review_reason"] = "; ".join(dict.fromkeys(review_reasons))[:800] if review_reasons else None
         rows.append(merged)
 
     return pd.DataFrame(rows)
@@ -463,6 +518,8 @@ def load_base_candidate_fallbacks(
             return 0.60
         if state == "WATCH_BREAKOUT":
             return 0.45
+        if state == "ABSTAIN":
+            return 0.20
         return 0.30
 
     rows: list[dict[str, Any]] = []
@@ -753,6 +810,11 @@ def build_allocations(
         state_transition_hint = str(row.get("state_transition_hint", "")).upper()
         score_impact_raw = pd.to_numeric(row.get("score_impact"), errors="coerce")
         score_impact = 0.0 if pd.isna(score_impact_raw) else float(score_impact_raw)
+        review_score_raw = pd.to_numeric(row.get("review_score"), errors="coerce")
+        review_score = 0.0 if pd.isna(review_score_raw) else float(review_score_raw)
+        review_action = str(row.get("review_action") or "").lower()
+        review_veto = bool(row.get("review_veto", False))
+        review_reason = str(row.get("review_reason") or "").strip()
         is_base_candidate_fallback = bool(row.get("is_base_candidate_fallback", False))
         promoted_to_pass_now = current_state == "PASS_NOW" and state_transition_hint != "DOWNGRADE_TO_REJECT" and verdict != "reject"
         actionable_now = investable_now or promoted_to_pass_now
@@ -762,7 +824,19 @@ def build_allocations(
             notes.append("Allocation is based on base rule-engine state because no event evaluation was available.")
             if current_state == "WATCH_BREAKOUT":
                 notes.append("Entry timing is still early; size remains conservative until confirmation improves.")
-        if evaluation_status != "completed":
+        if current_state == "ABSTAIN":
+            allocation_status = "abstained"
+            suggested_allocation_inr = 0.0
+            notes.append("Explicit abstain: edge is too weak or too mixed to allocate capital.")
+        elif review_veto or review_action == "veto":
+            allocation_status = "rejected"
+            suggested_allocation_inr = 0.0
+            notes.append(f"Adversarial review vetoed this allocation: {review_reason or 'material contradiction or stale evidence'}.")
+        elif review_action == "review_manual":
+            allocation_status = "review_manual"
+            suggested_allocation_inr = 0.0
+            notes.append(f"Adversarial review requires manual review: {review_reason or 'review flags present'}.")
+        elif evaluation_status != "completed":
             allocation_status = "review_manual"
             suggested_allocation_inr = 0.0
             notes.append(f"LLM evaluation status is {evaluation_status}.")
@@ -789,6 +863,9 @@ def build_allocations(
                     liquidity_cap,
                 )
                 event_multiplier = max(0.50, min(1.25, 1.0 + score_impact))
+                if review_action == "penalize":
+                    event_multiplier = event_multiplier * max(0.60, 1.0 + review_score)
+                    notes.append(f"Adversarial review penalty applied: {review_reason or 'review flags present'}.")
                 suggested_allocation_inr = suggested_allocation_inr * event_multiplier
                 suggested_allocation_inr = round_allocation(suggested_allocation_inr)
                 allocation_status = "allocated" if suggested_allocation_inr > 0 else "review_manual"
@@ -819,6 +896,9 @@ def build_allocations(
             if is_base_candidate_fallback and current_state == "WATCH_BREAKOUT":
                 suggested_allocation_inr = suggested_allocation_inr * 0.60
             event_multiplier = max(0.50, min(1.25, 1.0 + score_impact))
+            if review_action == "penalize":
+                event_multiplier = event_multiplier * max(0.60, 1.0 + review_score)
+                notes.append(f"Adversarial review penalty applied: {review_reason or 'review flags present'}.")
             suggested_allocation_inr = suggested_allocation_inr * event_multiplier
             suggested_allocation_inr = round_allocation(suggested_allocation_inr)
 
@@ -860,6 +940,10 @@ def build_allocations(
                 "state_transition_hint": row.get("state_transition_hint"),
                 "score_impact": row.get("score_impact"),
                 "confidence": row.get("confidence"),
+                "review_action": row.get("review_action"),
+                "review_score": row.get("review_score"),
+                "review_veto": row.get("review_veto"),
+                "review_reason": row.get("review_reason"),
                 "risk_bucket": risk_bucket,
                 "conviction_bucket": conviction_bucket,
                 "allocation_status": allocation_status,
@@ -921,8 +1005,9 @@ def summarize(df: pd.DataFrame) -> dict[str, Any]:
             "table": ALLOCATIONS_TABLE,
             "row_count": 0,
             "allocated_count": 0,
-            "review_count": 0,
-            "rejected_count": 0,
+        "review_count": 0,
+        "rejected_count": 0,
+        "abstained_count": 0,
             "sample": [],
         }
     return {
@@ -932,6 +1017,7 @@ def summarize(df: pd.DataFrame) -> dict[str, Any]:
         "allocated_count": int((df["allocation_status"] == "allocated").sum()),
         "review_count": int((df["allocation_status"] == "review_manual").sum()),
         "rejected_count": int((df["allocation_status"] == "rejected").sum()),
+        "abstained_count": int((df["allocation_status"] == "abstained").sum()),
         "sample": df.head(10).to_dict(orient="records"),
     }
 

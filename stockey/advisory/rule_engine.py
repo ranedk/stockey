@@ -33,6 +33,7 @@ DEFAULT_SCORE_THRESHOLDS = {
     "watch_breakout": 0.58,
     "watch_pullback": 0.52,
     "watch_event": 0.48,
+    "abstain": 0.40,
     "near_miss_gap": 0.05,
 }
 
@@ -903,6 +904,15 @@ def build_entry_plan(row: pd.Series, candidate_state: str) -> dict[str, Any]:
             "entry_note": "Entry acceptable now within the current breakout band.",
         }
 
+    if candidate_state == "ABSTAIN":
+        return {
+            "entry_style": None,
+            "attractive_price_low": None,
+            "attractive_price_high": None,
+            "invalidation_price": invalidation_price,
+            "entry_note": "Do nothing for now; edge is too weak or mixed to justify monitoring or allocation.",
+        }
+
     return {
         "entry_style": None,
         "attractive_price_low": None,
@@ -1023,12 +1033,15 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     elif float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
         candidate_state = "WATCH_BREAKOUT"
         watch_reason_detail = "quality setup forming but not fully triggered"
-    elif float(scores["setup_score"]) >= float(thresholds["watch_event"]):
+    elif float(scores["setup_score"]) >= float(thresholds["watch_event"]) and len(non_intraday_soft_failures) <= 2:
         candidate_state = "WATCH_EVENT"
         watch_reason_detail = "candidate needs event confirmation before entry"
     elif near_miss_flag:
         candidate_state = "WATCH_EVENT"
         watch_reason_detail = "near miss on score; keep on watch for improvement"
+    elif float(scores["setup_score"]) >= float(thresholds.get("abstain", DEFAULT_SCORE_THRESHOLDS["abstain"])):
+        candidate_state = "ABSTAIN"
+        watch_reason_detail = "explicit abstain: setup is not broken, but edge is too weak or mixed to monitor actively"
 
     severe_intraday_miss = len(intraday_rule_failures) >= 2 or intraday_negative_signal(row)
     if intraday_usage_mode == "timing_only" and candidate_state == "PASS_NOW" and intraday_rule_failures:
@@ -1048,8 +1061,23 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
             if float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
                 candidate_state = "WATCH_BREAKOUT"
                 watch_reason_detail = "intraday tactical trigger not fully confirmed yet"
+            elif float(scores["setup_score"]) >= float(thresholds.get("abstain", DEFAULT_SCORE_THRESHOLDS["abstain"])):
+                candidate_state = "ABSTAIN"
+                watch_reason_detail = "explicit abstain: tactical trigger quality is too weak to monitor actively"
             else:
                 candidate_state = "REJECT"
+
+    if candidate_state == "ABSTAIN":
+        rejections.append(
+            build_rejection(
+                "abstain_low_edge",
+                f"setup_score={scores['setup_score']:.4f} watch_event={float(thresholds['watch_event']):.4f} soft_failures={len(soft_failures)}",
+                severity="soft",
+                is_near_miss=False,
+                delta_to_pass=score_gap,
+            )
+        )
+        return "ABSTAIN", {**scores, "near_miss_flag": near_miss_flag, "watch_reason_detail": watch_reason_detail}, rejections
 
     if candidate_state == "REJECT":
         rejections.append(
@@ -1071,7 +1099,13 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     return candidate_state, {**scores, "near_miss_flag": near_miss_flag, "watch_reason_detail": watch_reason_detail}, rejections
 
 
-def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[str] | None = None, config_path: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+def run_rule_engine(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    setup_ids: list[str] | None = None,
+    config_path: str | None = None,
+    skip_intraday_prefetch: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     effective_dates = get_effective_dates(asof_date)
     screener_date = effective_dates.get("screener_date")
     if screener_date is None:
@@ -1110,8 +1144,6 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
     meta["overlay_snapshot_date"] = str(overlay.get("asof_date")) if overlay.get("asof_date") is not None else None
     meta["active_theme_ids"] = theme_screener_mapping.get("theme_ids") or []
     meta["theme_screeners"] = theme_screener_mapping.get("screener_slugs") or []
-    meta["theme_recommended_agent_roles"] = theme_screener_mapping.get("recommended_agent_roles") or []
-    meta["theme_recommended_pipeline_branches"] = theme_screener_mapping.get("recommended_pipeline_branches") or []
     meta["theme_error"] = theme_screener_mapping.get("error")
 
     setup_screeners: dict[str, list[str]] = {}
@@ -1148,11 +1180,17 @@ def run_rule_engine(*, asof_date: pd.Timestamp | None = None, setup_ids: list[st
             technical = load_technical(screener_date)
             fundamentals = load_fundamentals(screener_date)
             intraday = load_intraday(screener_date)
-        elif missing_intraday_symbols:
+        elif missing_intraday_symbols and not skip_intraday_prefetch:
             intraday_df, intraday_meta = build_intraday_features(symbols=missing_intraday_symbols, asof_date=screener_date)
             persist_intraday_features(intraday_df, rebuild=False, asof_date=screener_date)
             intraday = load_intraday(screener_date)
             meta["intraday_preflight"] = intraday_meta
+        elif missing_intraday_symbols and skip_intraday_prefetch:
+            meta["intraday_preflight"] = {
+                "status": "skipped",
+                "reason": "skip_intraday_prefetch",
+                "missing_intraday_symbols": missing_intraday_symbols,
+            }
 
     regime_name = str(regime["regime_name"])
     for setup in setups:
@@ -1299,6 +1337,19 @@ def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, 
             cur.execute(f"DELETE FROM {CANDIDATES_TABLE} WHERE asof_date = %s", (asof_date,))
             cur.execute(f"DELETE FROM {REJECTIONS_TABLE} WHERE asof_date = %s", (asof_date,))
     if not candidates.empty:
+        candidates = candidates.copy()
+        for column in [
+            "intraday_opening_range_breakout_up",
+            "intraday_prev_day_breakout_up",
+            "intraday_failed_prev_day_breakout",
+            "near_miss_flag",
+            "watch_enabled",
+            "rule_pass",
+        ]:
+            if column in candidates.columns:
+                candidates[column] = candidates[column].map(
+                    lambda value: None if pd.isna(value) else bool(value)
+                ).astype("boolean")
         upsert_to_db(candidates, CANDIDATES_TABLE, unique_keys=["asof_date", "setup_id", "symbol"], timescaledb_column="asof_date")
     if not rejections.empty:
         upsert_to_db(rejections, REJECTIONS_TABLE, unique_keys=["asof_date", "setup_id", "symbol", "reason_code"], timescaledb_column="asof_date")
@@ -1309,6 +1360,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date", type=parse_datetime_arg, help="Asof date in YYYY-MM-DD")
     parser.add_argument("--setup", dest="setup_ids", nargs="*", help="Setup ids to evaluate")
     parser.add_argument("--config", help="Override setup registry YAML path")
+    parser.add_argument("--skip-intraday-prefetch", action="store_true", help="Skip on-demand intraday feature backfill inside the rule engine")
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -1343,7 +1395,12 @@ def summarize(candidates: pd.DataFrame, rejections: pd.DataFrame, meta: dict[str
 def main() -> int:
     args = parse_args()
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
-    candidates, rejections, meta = run_rule_engine(asof_date=asof_date, setup_ids=args.setup_ids, config_path=args.config)
+    candidates, rejections, meta = run_rule_engine(
+        asof_date=asof_date,
+        setup_ids=args.setup_ids,
+        config_path=args.config,
+        skip_intraday_prefetch=bool(args.skip_intraday_prefetch),
+    )
     effective_date = pd.to_datetime(meta.get("effective_date"), utc=True, errors="coerce")
     if not args.dry_run:
         persist_rule_outputs(candidates, rejections, asof_date=None if pd.isna(effective_date) else effective_date, rebuild=args.rebuild)

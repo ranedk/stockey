@@ -10,9 +10,14 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.news_overlay_engine import build_overlay_state
-from advisory.news_theme_engine import build_theme_recommendations, list_theme_screeners, load_active_theme_screener_mapping
 from advisory.pipeline import PIPELINE_STAGES, parse_stage, run_pipeline
+from advisory.research_ledger import (
+    build_data_snapshot as build_research_data_snapshot,
+    build_result_metrics as build_research_result_metrics,
+    finish_research_run,
+    parse_validation_protocol,
+    start_research_run,
+)
 from data.download_runner import run_all_downloads
 from utils.sync import parse_datetime_arg
 
@@ -62,107 +67,6 @@ def _stop_heartbeat(stage_state: tuple[float, threading.Event, threading.Thread]
     return started_at
 
 
-def build_sub_agent_workflow(*, asof_date: pd.Timestamp | None = None) -> dict[str, Any]:
-    overlay_df = build_overlay_state(asof_date=asof_date)
-    overlay_row = overlay_df.iloc[0].to_dict() if not overlay_df.empty else {}
-    theme_payload = build_theme_recommendations(asof_date=asof_date)
-    theme_mapping = load_active_theme_screener_mapping(asof_date=asof_date)
-    registered = list_theme_screeners()
-    if not registered.empty:
-        registered["theme_id"] = registered["theme_id"].astype("string").str.upper()
-        if "is_active" in registered.columns:
-            registered = registered[registered["is_active"].fillna(False)]
-
-    theme_items: list[dict[str, Any]] = []
-    required_roles = {"advisory_logic_expert", "risk_portfolio_expert"}
-    pipeline_branches = {"core_advisory_pipeline"}
-
-    for item in theme_payload.get("recommendations") or []:
-        theme_id = str(item.get("theme_id") or "").upper()
-        registered_rows = registered[registered["theme_id"] == theme_id] if not registered.empty else pd.DataFrame()
-        registered_slugs = sorted(registered_rows.get("screener_slug", pd.Series(dtype="string")).dropna().astype(str).unique().tolist())
-        pending_screeners = []
-        for screener in item.get("suggested_screeners") or []:
-            if str(screener.get("slug") or "") not in registered_slugs:
-                pending_screeners.append(
-                    {
-                        "slug": screener.get("slug"),
-                        "screener_name": screener.get("screener_name"),
-                        "screener_query": screener.get("screener_query"),
-                        "register_command": f"python -m advisory.news_theme_engine register-url --theme-id {theme_id} --url <SCREENER_URL> --name \"{screener.get('screener_name')}\"",
-                    }
-                )
-        roles = [str(value) for value in (item.get("recommended_agent_roles") or []) if value]
-        branches = [str(value) for value in (item.get("recommended_pipeline_branches") or []) if value]
-        required_roles.update(roles)
-        pipeline_branches.update(branches)
-        theme_items.append(
-            {
-                "theme_id": theme_id,
-                "theme_name": item.get("theme_name"),
-                "intensity": item.get("theme_intensity"),
-                "reason": item.get("theme_reason"),
-                "pipeline_branches": branches,
-                "recommended_agent_roles": roles,
-                "registered_screener_slugs": registered_slugs,
-                "pending_screeners": pending_screeners,
-            }
-        )
-
-    tasks: list[dict[str, Any]] = [
-        {
-            "agent_role": "data_pipeline_expert",
-            "responsibility": "Refresh raw ingestion sources and derived registries before advisory stages.",
-            "pipeline_branch": "core_advisory_pipeline",
-        },
-        {
-            "agent_role": "advisory_logic_expert",
-            "responsibility": "Run the ranked advisory stack from screeners through watchlist, event evaluation, risk, and portfolio.",
-            "pipeline_branch": "core_advisory_pipeline",
-        },
-    ]
-    if theme_items:
-        tasks.append(
-            {
-                "agent_role": "news_theme_expert",
-                "responsibility": "Validate active market themes against recent news and matched sources.",
-                "pipeline_branch": "theme_detection_pipeline",
-                "theme_ids": [item["theme_id"] for item in theme_items],
-            }
-        )
-    if any(item["pending_screeners"] for item in theme_items):
-        tasks.append(
-            {
-                "agent_role": "screener_designer",
-                "responsibility": "Create or update Screener.in screens for active themes that do not yet have registered URLs.",
-                "pipeline_branch": "event_opportunity_pipeline",
-                "theme_ids": [item["theme_id"] for item in theme_items if item["pending_screeners"]],
-            }
-        )
-    if "risk_portfolio_expert" in required_roles:
-        tasks.append(
-            {
-                "agent_role": "risk_portfolio_expert",
-                "responsibility": "Review event-driven sizing, overlap caps, and portfolio priority after candidate selection.",
-                "pipeline_branch": "core_advisory_pipeline",
-            }
-        )
-
-    return {
-        "asof_date": theme_payload.get("asof_date") or (overlay_row or {}).get("asof_date") or asof_date,
-        "base_regime": overlay_row.get("base_regime"),
-        "news_overlay": overlay_row.get("overlay_name"),
-        "overlay_intensity": overlay_row.get("overlay_intensity"),
-        "overlay_reason": overlay_row.get("overlay_reason"),
-        "pipeline_branches": sorted(pipeline_branches),
-        "recommended_agent_roles": sorted(required_roles | {"data_pipeline_expert"} | ({task["agent_role"] for task in tasks})),
-        "active_theme_ids": theme_mapping.get("theme_ids") or [],
-        "registered_theme_screeners": theme_mapping.get("screener_slugs") or [],
-        "themes": theme_items,
-        "tasks": tasks,
-    }
-
-
 def run_downloads(*, dry_run: bool, download_script: Path, continue_on_error: bool) -> dict[str, Any]:
     started_at = time.monotonic()
     _emit_progress("[advisory.master_pipeline] downloads start mode=in_process_python_runner")
@@ -187,6 +91,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stop-at", type=parse_stage, choices=PIPELINE_STAGES, help="Optional advisory stage to stop after")
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument("--skip-peer-sync", action="store_true")
+    parser.add_argument("--skip-intraday", action="store_true", help="Skip intraday feature sync/build")
+    parser.add_argument("--skip-intraday-prefetch", action="store_true", help="Skip on-demand intraday feature backfill inside the rule engine")
+    parser.add_argument("--intraday-lookback-days", type=int, default=180, help="How much recent intraday history to maintain for advisory pattern features")
+    parser.add_argument(
+        "--intraday-intervals",
+        nargs="*",
+        type=int,
+        default=[1],
+        help="Intraday candle intervals to fetch/build for advisory intraday features",
+    )
     parser.add_argument("--skip-downloads", action="store_true", help="Skip the raw download shell script")
     parser.add_argument("--skip-watch", action="store_true", help="Skip announcement watchlist stages")
     parser.add_argument("--skip-news", action="store_true", help="Skip ET RSS watch matching stages")
@@ -201,6 +115,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--portfolio-per-setup-cap-pct", type=float, default=0.50)
     parser.add_argument("--portfolio-max-positions-per-overlap-group", type=int, default=1)
     parser.add_argument("--event-model")
+    parser.add_argument("--event-model-artifact-dir", default=".cache/advisory_event_meta_model")
+    parser.add_argument("--log-research-ledger", action="store_true", help="Record this run in the advisory research ledger")
+    parser.add_argument("--ledger-label", help="Optional research-ledger label")
+    parser.add_argument("--ledger-objective", help="Optional research-ledger objective")
+    parser.add_argument("--ledger-validation-protocol", help="Optional JSON string describing validation protocol")
     parser.add_argument("--download-script", default=str(DEFAULT_DOWNLOAD_SCRIPT))
     parser.add_argument("--continue-on-download-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -209,104 +128,120 @@ def parse_args() -> argparse.Namespace:
 
 
 def format_text(summary: dict[str, Any]) -> str:
-    workflow = summary.get("sub_agent_workflow") or {}
     lines = [
         f"Pipeline: {summary.get('pipeline')}",
         f"Asof date: {summary.get('asof_date')}",
         f"Downloads: {(summary.get('downloads') or {}).get('status')}",
-        f"Base regime: {workflow.get('base_regime') or '-'}",
-        f"Overlay: {workflow.get('news_overlay') or '-'} | intensity={workflow.get('overlay_intensity')}",
-        f"Pipeline branches: {', '.join(workflow.get('pipeline_branches') or []) or '-'}",
-        f"Recommended agent roles: {', '.join(workflow.get('recommended_agent_roles') or []) or '-'}",
         "",
-        "Active themes:",
+        "Advisory stages:",
+        f"- stages_run={sorted((summary.get('advisory') or {}).get('stages', {}).keys())}",
     ]
-    for item in workflow.get("themes") or []:
-        lines.append(
-            f"- {item.get('theme_id')} | intensity={item.get('intensity')} | screeners={item.get('registered_screener_slugs') or []}"
-        )
-        if item.get("pending_screeners"):
-            lines.append(f"  pending_screeners={len(item.get('pending_screeners') or [])}")
-    lines.extend(["", "Tasks:"])
-    for task in workflow.get("tasks") or []:
-        lines.append(f"- {task.get('agent_role')}: {task.get('responsibility')}")
-    lines.extend(
-        [
-            "",
-            "Advisory stages:",
-            f"- stages_run={sorted((summary.get('advisory') or {}).get('stages', {}).keys())}",
-        ]
-    )
     return "\n".join(lines)
 
 
 def main() -> int:
     args = parse_args()
+    if not hasattr(args, "log_research_ledger"):
+        args.log_research_ledger = False
+    if not hasattr(args, "ledger_label"):
+        args.ledger_label = None
+    if not hasattr(args, "ledger_objective"):
+        args.ledger_objective = None
+    if not hasattr(args, "ledger_validation_protocol"):
+        args.ledger_validation_protocol = None
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
-
-    pipeline_started = time.monotonic()
-    download_summary = {"status": "skipped"}
-    if not args.skip_downloads:
-        download_summary = run_downloads(
-            dry_run=bool(args.dry_run),
-            download_script=Path(args.download_script),
-            continue_on_error=bool(args.continue_on_download_error),
+    research_run_id: str | None = None
+    if bool(args.log_research_ledger):
+        research_run_id = start_research_run(
+            run_type="master_advisory_pipeline",
+            entrypoint="advisory.master_pipeline",
+            config=vars(args),
+            asof_date=asof_date,
+            label=args.ledger_label,
+            objective=args.ledger_objective,
+            validation_protocol=parse_validation_protocol(args.ledger_validation_protocol),
         )
 
-    workflow_heartbeat = _start_heartbeat("workflow planning")
-    _emit_progress("[advisory.master_pipeline] workflow planning start")
-    workflow = build_sub_agent_workflow(asof_date=asof_date)
-    workflow_started = _stop_heartbeat(workflow_heartbeat)
-    _emit_progress(
-        f"[advisory.master_pipeline] workflow planning done elapsed={_format_elapsed(workflow_started)} themes={len(workflow.get('themes') or [])} roles={len(workflow.get('recommended_agent_roles') or [])}"
-    )
-    advisory_args = argparse.Namespace(
-        date=args.date,
-        symbols=args.symbols,
-        setup_ids=args.setup_ids,
-        start_at=args.start_at,
-        stop_at=args.stop_at,
-        rebuild=bool(args.rebuild),
-        skip_peer_sync=bool(args.skip_peer_sync),
-        include_watch=not bool(args.skip_watch),
-        include_news=not bool(args.skip_news),
-        include_lifecycle=not bool(args.skip_lifecycle),
-        include_execution=bool(args.include_execution),
-        live_execution=bool(args.live_execution),
-        execution_reconcile=bool(args.execution_reconcile),
-        eval_include_evaluated=bool(args.eval_include_evaluated),
-        portfolio_capital_inr=float(args.portfolio_capital_inr),
-        portfolio_max_positions=int(args.portfolio_max_positions),
-        portfolio_single_position_cap_pct=float(args.portfolio_single_position_cap_pct),
-        portfolio_per_setup_cap_pct=float(args.portfolio_per_setup_cap_pct),
-        portfolio_max_positions_per_overlap_group=int(args.portfolio_max_positions_per_overlap_group),
-        event_model=args.event_model,
-        dry_run=bool(args.dry_run),
-    )
-    advisory_heartbeat = _start_heartbeat("advisory run")
-    _emit_progress("[advisory.master_pipeline] advisory run start")
-    advisory_summary = run_pipeline(advisory_args)
-    advisory_started = _stop_heartbeat(advisory_heartbeat)
-    _emit_progress(
-        f"[advisory.master_pipeline] advisory run done elapsed={_format_elapsed(advisory_started)} stages={len((advisory_summary.get('stages') or {}))}"
-    )
-    _emit_progress(f"[advisory.master_pipeline] pipeline done elapsed={_format_elapsed(pipeline_started)}")
+    try:
+        pipeline_started = time.monotonic()
+        download_summary = {"status": "skipped"}
+        if not args.skip_downloads:
+            download_summary = run_downloads(
+                dry_run=bool(args.dry_run),
+                download_script=Path(args.download_script),
+                continue_on_error=bool(args.continue_on_download_error),
+            )
 
-    summary = {
-        "status": "ok" if download_summary.get("status") != "failed" else "warning",
-        "pipeline": "advisory.master_pipeline",
-        "asof_date": None if asof_date is None else asof_date.isoformat(),
-        "dry_run": bool(args.dry_run),
-        "downloads": download_summary,
-        "sub_agent_workflow": _json_ready(workflow),
-        "advisory": _json_ready(advisory_summary),
-    }
+        advisory_args = argparse.Namespace(
+            date=args.date,
+            symbols=args.symbols,
+            setup_ids=args.setup_ids,
+            start_at=args.start_at,
+            stop_at=args.stop_at,
+            rebuild=bool(args.rebuild),
+            skip_peer_sync=bool(args.skip_peer_sync),
+            skip_intraday=bool(args.skip_intraday),
+            skip_intraday_prefetch=bool(args.skip_intraday_prefetch),
+            intraday_lookback_days=int(args.intraday_lookback_days),
+            intraday_intervals=list(args.intraday_intervals or [1]),
+            include_watch=not bool(args.skip_watch),
+            include_news=not bool(args.skip_news),
+            include_lifecycle=not bool(args.skip_lifecycle),
+            include_execution=bool(args.include_execution),
+            live_execution=bool(args.live_execution),
+            execution_reconcile=bool(args.execution_reconcile),
+            eval_include_evaluated=bool(args.eval_include_evaluated),
+            portfolio_capital_inr=float(args.portfolio_capital_inr),
+            portfolio_max_positions=int(args.portfolio_max_positions),
+            portfolio_single_position_cap_pct=float(args.portfolio_single_position_cap_pct),
+            portfolio_per_setup_cap_pct=float(args.portfolio_per_setup_cap_pct),
+            portfolio_max_positions_per_overlap_group=int(args.portfolio_max_positions_per_overlap_group),
+            event_model=args.event_model,
+            event_model_artifact_dir=args.event_model_artifact_dir,
+            dry_run=bool(args.dry_run),
+        )
+        advisory_heartbeat = _start_heartbeat("advisory run")
+        _emit_progress("[advisory.master_pipeline] advisory run start")
+        advisory_summary = run_pipeline(advisory_args)
+        advisory_started = _stop_heartbeat(advisory_heartbeat)
+        _emit_progress(
+            f"[advisory.master_pipeline] advisory run done elapsed={_format_elapsed(advisory_started)} stages={len((advisory_summary.get('stages') or {}))}"
+        )
+        _emit_progress(f"[advisory.master_pipeline] pipeline done elapsed={_format_elapsed(pipeline_started)}")
 
-    if args.format == "text":
-        print(format_text(summary))
-    else:
-        print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
-    return 0
+        summary = {
+            "status": "ok" if download_summary.get("status") != "failed" else "warning",
+            "pipeline": "advisory.master_pipeline",
+            "asof_date": None if asof_date is None else asof_date.isoformat(),
+            "dry_run": bool(args.dry_run),
+            "downloads": download_summary,
+            "advisory": _json_ready(advisory_summary),
+        }
+        if research_run_id:
+            finish_research_run(
+                research_run_id,
+                status="completed",
+                data_snapshot=build_research_data_snapshot(asof_date=asof_date, summary=advisory_summary),
+                result_metrics={
+                    **build_research_result_metrics(status="completed", summary=advisory_summary),
+                    "download_status": download_summary.get("status"),
+                },
+            )
+        if args.format == "text":
+            print(format_text(summary))
+        else:
+            print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+        return 0
+    except Exception as exc:
+        if research_run_id:
+            finish_research_run(
+                research_run_id,
+                status="failed",
+                data_snapshot=None,
+                result_metrics={"status": "failed"},
+                error_text=f"{exc.__class__.__name__}: {exc}",
+            )
+        raise
 
 
 if __name__ == "__main__":

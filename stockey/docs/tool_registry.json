@@ -379,6 +379,36 @@
       ]
     },
     {
+      "name": "run_advisory_event_meta_model",
+      "category": "analysis",
+      "description": "Train or score the event meta-model on structured advisory event tensors plus future daily returns.",
+      "command": ["python", "-m", "advisory.event_meta_model"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["train", "--horizon-days", "10"],
+          "description": "Train the event meta-model on a 10-trading-day forward-return label."
+        },
+        {
+          "args": ["score", "--dry-run"],
+          "description": "Score current event rows with the latest trained artifact without writing."
+        }
+      ]
+    },
+    {
+      "name": "run_advisory_adversarial_review",
+      "category": "analysis",
+      "description": "Run the deterministic adversarial reviewer over structured event evaluations and persist clear, penalize, manual-review, or veto decisions.",
+      "command": ["python", "-m", "advisory.adversarial_review"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview adversarial event-review outputs without writing."
+        }
+      ]
+    },
+    {
       "name": "build_advisory_allocations",
       "category": "analysis",
       "description": "Build advisory risk buckets, position sizing, and invalidation guidance from evaluated watch events.",
@@ -465,6 +495,19 @@
         {
           "args": ["--dry-run", "--stop-at", "portfolio"],
           "description": "Preview the master workflow through portfolio planning without writing."
+        }
+      ]
+    },
+    {
+      "name": "list_advisory_research_runs",
+      "category": "analysis",
+      "description": "Inspect the advisory research ledger for recorded experiment runs and their statuses.",
+      "command": ["python", "-m", "advisory.research_ledger"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["--limit", "20"],
+          "description": "Show the 20 most recent recorded research runs."
         }
       ]
     },

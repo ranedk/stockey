@@ -19,80 +19,54 @@ The current system already has:
 - risk, portfolio, lifecycle, and trace/dashboard tools
 - authenticated ad hoc Screener.in raw query support with persisted company-level results
 
-The next weakness is not missing infrastructure. It is setup activation logic:
+The next weakness is not missing infrastructure. It is research discipline and model validation:
 
-- setups are still too tightly tied to single screeners
-- regime handling is still too flat for temporary shock contexts
-- news context is not first-class in setup activation
-- traces do not clearly show which screener pool and overlay drove candidate generation
-- news is still mostly used as an overlay or event adjustment, not as a discovery engine for new opportunity-specific screeners
-- intraday price action is ingested but still underused relative to the daily-only feature stack
+- too much logic is still configuration- and threshold-driven without strong validation controls
+- point-in-time discipline needs to be treated as a first-class constraint, not a cleanup step
+- there is no formal abstain layer, so the system can still over-opine
+- LLM work is useful, but it still risks drifting from extraction into decision-making
+- intraday features exist, but they are not yet part of a properly validated prediction layer
+- there is no research ledger that records what was tried and what failed
 
 ## Objective
 
-Add a stable two-layer activation model:
+Refocus the advisory system into four clean layers:
 
-- one base regime from the existing `advisory_market_regime`
-- one lightweight daily news overlay
+1. extraction
+2. prediction
+3. policy
+4. execution
 
-Then use that pair to:
+Use LLMs mainly in extraction and adversarial review. Keep the alpha engine mostly tabular and statistically validated.
 
-- activate or suppress setups
-- choose multiple screeners per setup
-- add or remove screeners under overlays
-- improve candidate generation without changing data sources
+Concretely:
 
-Also add a separate event-theme discovery path that can:
-
-- detect opportunity themes from major market news
-- suggest Screener.in-compatible screener definitions for those themes
-- pause for operator-created Screener.in links
-- continue the advisory flow once those links are registered
-
-## Product Model
-
-### Base regime
-
-Keep the existing regime model:
-
-- `BULL_RISK_ON`
-- `BULL_NARROW`
-- `STABLE`
-- `STABLE_BUT_TARIFF_RISING`
-- `RISK_OFF`
-- `SHOCK`
-
-### News overlay
-
-Add a second daily layer:
-
-- `NONE`
-- `GEOPOLITICAL_RISK`
-- `OIL_SHOCK`
-- `TARIFF_PRESSURE`
-- `SECTOR_POLICY_SHOCK`
-- `EVENT_CLUSTER`
-
-This is not a replacement for base regime. It is a context overlay.
+- use announcements and news to build structured event tensors
+- use regime models and change-point detectors to describe market state
+- use XGBoost or similar tabular models for ranking or edge prediction
+- use a separate policy layer for abstain, sizing, caps, and execution safety
+- keep ad hoc Screener.in queries as research tools, not autonomous production mutation
 
 ## Scope
 
 In scope:
 
-- multiple screeners per setup
-- overlay-aware setup activation
-- overlay-aware screener expansion or suppression
-- diagnostics for active screeners and overlays
-- provenance fields on candidates and watchlists
+- research ledger and leakage-resistant evaluation
+- structured event extraction from text
+- abstain / do-nothing class and turnover control
+- tabular prediction and ranking
+- regime stack with shock detection
+- policy separation from prediction and execution
+- event memory and decay modeling
 
 Out of scope:
 
 - new vendors
 - broker/feed expansion
-- macro engine rewrite
-- full market-wide news-first discovery
-- turning every headline into a new regime
-- letting the LLM invent unlimited one-off screeners with no taxonomy
+- LLM-led discretionary trading
+- free-form multi-agent debate systems
+- execution authority for LLMs
+- backtest theater without leakage control
 
 ## Current Reality
 
@@ -107,11 +81,12 @@ Already implemented from the previous redesign:
 
 Main gaps now:
 
-- config still defaults to a single screener mental model
-- setups do not read a market overlay
-- rule engine does not expose active screener provenance cleanly
-- dashboard and setup trace do not show overlay-driven activation
-- there is no workflow that turns a major news theme into a concrete Screener.in screener draft for operator review
+- there is no research ledger or false-discovery control
+- abstention is still too informal
+- structured event extraction is richer now, but it is not yet fed into a tabular prediction layer
+- regime handling should evolve from simple labels into a stack of shock detection plus persistent regime estimates
+- prediction and policy are still too entangled in the rule logic
+- the adversarial review layer is deterministic today and should later become a small tabular reviewer or meta-model
 
 Recently implemented:
 
@@ -119,8 +94,20 @@ Recently implemented:
 - theme-linked Screener.in URLs can be registered back into the project
 - `EVENT_OPPORTUNITY_V1` can consume registered theme screeners
 - `data.screenerin.ad_hoc_query` can run authenticated one-off Screener.in raw queries and persist company-level rows
+- recurring downloader flow no longer seeds default Screener.in screeners automatically; registered screeners are now the production-only recurring path
+- the old default-screener bootstrap path and the older fallback theme config have been removed
 - `advisory.intraday_features` can now pull missing Dhan intraday bars on demand and persist daily intraday pattern features for advisory use
 - the intraday layer now supports multi-interval storage/builds (`1`, `5`, `15`, `25`, `60` minutes); model scoring is still a follow-on phase
+- `advisory.research_ledger` can now record experiment configs, as-of dates, validation protocol, and result metrics from `advisory.pipeline` and `advisory.master_pipeline`
+- the advisory stack now has a formal abstain layer via `candidate_state=ABSTAIN` and `allocation_status=abstained`
+- `advisory.llm_event_evaluator` now emits a richer event tensor with direction, surprise, novelty, contradiction, expected decay, source reliability, and affected peers/sectors while keeping `event_class` and state transitions stable for policy
+- `advisory.adversarial_review` now scores those event tensors into `clear`, `penalize`, `review_manual`, or `veto` before risk sizing
+- `advisory.event_meta_model` now provides an explicit train/score scaffold for an XGBoost event meta-model using sign-adjusted forward-return labels from `dhan_ohlcv_daily`
+
+Current model-training blocker:
+
+- there are still too few matured labeled event rows for a statistically useful first fit
+- immediate priority is more historical event evaluations plus fresh daily OHLCV for those symbols, not more model complexity
 
 ## Additional Objective: Intraday Pattern Layer
 
@@ -164,6 +151,26 @@ It should not be:
 
 - fully automatic headline trading
 - unconstrained LLM-generated screener sprawl
+
+## Reset Priority: Validation Over Orchestration
+
+The next phase should de-emphasize agent orchestration and LLM-led workflow design.
+
+Primary priorities:
+
+- false-discovery control and a research ledger for every config tried
+- point-in-time discipline everywhere
+- formal abstention and turnover penalties
+- LLMs as structured event extractors and adversarial reviewers
+- tabular prediction with XGBoost or similar
+- clean separation of extraction -> prediction -> policy -> execution
+
+Deprioritized:
+
+- multi-agent debate systems
+- LLM-led trade selection
+- adding more agent-routing logic to the production pipeline
+- letting research automation mutate production screeners by itself
 
 ## Product Model: News Theme Engine
 

@@ -16,7 +16,6 @@ from utils.db import db_session, sql_to_df, upsert_to_db
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_THEME_CONFIG = REPO_ROOT / "config" / "investment_themes.yaml"
-LEGACY_THEME_CONFIG = REPO_ROOT / "config" / "news_theme_screeners.yaml"
 DEFAULT_LOOKBACK_LIMIT = 25
 THEME_SCREENERS_TABLE = "advisory_news_theme_screeners"
 
@@ -77,20 +76,10 @@ def _normalize_theme_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
     detection = raw.get("detection") if isinstance(raw.get("detection"), dict) else {}
     detection_keywords = detection.get("keywords") if isinstance(detection.get("keywords"), dict) else {}
     detection_match = detection.get("match") if isinstance(detection.get("match"), dict) else {}
-    routing = raw.get("routing") if isinstance(raw.get("routing"), dict) else {}
     portfolio_guidance = raw.get("portfolio_guidance") if isinstance(raw.get("portfolio_guidance"), dict) else {}
     decay = raw.get("decay") if isinstance(raw.get("decay"), dict) else {}
 
     suggested_screeners = _normalize_screener_templates(raw.get("screener_templates") or raw.get("suggested_screeners"))
-    primary_pipeline = str(routing.get("primary_pipeline") or "").strip()
-    if not primary_pipeline and suggested_screeners:
-        primary_pipeline = "event_opportunity_pipeline"
-    recommended_pipeline_branches = _string_list(routing.get("recommended_pipeline_branches") or [])
-    if primary_pipeline and primary_pipeline not in recommended_pipeline_branches:
-        recommended_pipeline_branches.insert(0, primary_pipeline)
-    recommended_agent_roles = _string_list(routing.get("downstream_agents"))
-    if not recommended_agent_roles and suggested_screeners:
-        recommended_agent_roles = ["news_theme_expert", "screener_designer", "advisory_logic_expert"]
 
     positive_sectors = _string_list(
         raw.get("positive_sectors")
@@ -128,17 +117,14 @@ def _normalize_theme_entry(raw: dict[str, Any]) -> dict[str, Any] | None:
         "suggested_screeners": suggested_screeners,
         "ideal_screener_logic": str(portfolio_guidance.get("ideal_screener_logic") or "").strip(),
         "invalidation_signals": _string_list(portfolio_guidance.get("invalidation_signals")),
-        "recommended_agent_roles": recommended_agent_roles,
-        "recommended_pipeline_branches": recommended_pipeline_branches,
-        "output_mode": str(routing.get("output_mode") or ("idea_candidates" if suggested_screeners else "")).strip(),
-        "priority": int(routing.get("priority") or 0),
+        "priority": int((raw.get("routing") or {}).get("priority") or 0) if isinstance(raw.get("routing"), dict) else 0,
         "decay": decay,
     }
 
 
 @lru_cache(maxsize=1)
 def load_theme_config(config_path: str | None = None) -> list[dict[str, Any]]:
-    paths = [Path(config_path)] if config_path else [DEFAULT_THEME_CONFIG, LEGACY_THEME_CONFIG]
+    paths = [Path(config_path)] if config_path else [DEFAULT_THEME_CONFIG]
     merged: dict[str, dict[str, Any]] = {}
     for path in paths:
         if not path.exists():
@@ -221,9 +207,6 @@ def classify_themes(news_rows: pd.DataFrame, themes: list[dict[str, Any]], limit
                 "holding_period_days": theme.get("holding_period_days") or {},
                 "risk_level": theme.get("risk_level") or "",
                 "exit_trigger_types": theme.get("exit_trigger_types") or [],
-                "recommended_agent_roles": theme.get("recommended_agent_roles") or [],
-                "recommended_pipeline_branches": theme.get("recommended_pipeline_branches") or [],
-                "output_mode": theme.get("output_mode") or "",
                 "ideal_screener_logic": theme.get("ideal_screener_logic") or "",
                 "decay": theme.get("decay") or {},
                 "invalidation_signals": theme.get("invalidation_signals") or [],
@@ -334,28 +317,10 @@ def list_theme_screeners(theme_id: str | None = None) -> pd.DataFrame:
 def load_active_theme_screener_mapping(*, asof_date: pd.Timestamp | None = None, config_path: str | None = None) -> dict[str, Any]:
     payload = build_theme_recommendations(asof_date=asof_date, config_path=config_path)
     active_theme_ids = [str(item.get("theme_id") or "").upper() for item in (payload.get("recommendations") or []) if item.get("theme_id")]
-    recommended_agent_roles = sorted(
-        {
-            str(value)
-            for item in (payload.get("recommendations") or [])
-            for value in (item.get("recommended_agent_roles") or [])
-            if value
-        }
-    )
-    recommended_pipeline_branches = sorted(
-        {
-            str(value)
-            for item in (payload.get("recommendations") or [])
-            for value in (item.get("recommended_pipeline_branches") or [])
-            if value
-        }
-    )
     if not active_theme_ids:
         return {
             "theme_ids": [],
             "screener_slugs": [],
-            "recommended_agent_roles": recommended_agent_roles,
-            "recommended_pipeline_branches": recommended_pipeline_branches,
             "themes": payload.get("recommendations") or [],
             "error": payload.get("error"),
         }
@@ -365,8 +330,6 @@ def load_active_theme_screener_mapping(*, asof_date: pd.Timestamp | None = None,
         return {
             "theme_ids": active_theme_ids,
             "screener_slugs": [],
-            "recommended_agent_roles": recommended_agent_roles,
-            "recommended_pipeline_branches": recommended_pipeline_branches,
             "themes": payload.get("recommendations") or [],
             "error": f"failed_to_list_theme_screeners: {exc.__class__.__name__}",
         }
@@ -374,8 +337,6 @@ def load_active_theme_screener_mapping(*, asof_date: pd.Timestamp | None = None,
         return {
             "theme_ids": active_theme_ids,
             "screener_slugs": [],
-            "recommended_agent_roles": recommended_agent_roles,
-            "recommended_pipeline_branches": recommended_pipeline_branches,
             "themes": payload.get("recommendations") or [],
             "error": payload.get("error"),
         }
@@ -388,8 +349,6 @@ def load_active_theme_screener_mapping(*, asof_date: pd.Timestamp | None = None,
     return {
         "theme_ids": active_theme_ids,
         "screener_slugs": slugs,
-        "recommended_agent_roles": recommended_agent_roles,
-        "recommended_pipeline_branches": recommended_pipeline_branches,
         "themes": payload.get("recommendations") or [],
         "error": payload.get("error"),
     }
@@ -417,8 +376,6 @@ def format_text(payload: dict[str, Any]) -> str:
                 f"Positive sectors: {', '.join(item.get('positive_sectors') or [])}",
                 f"Market-cap fit: {', '.join(item.get('market_cap_fit') or []) or '-'}",
                 f"Holding profile: {item.get('holding_profile') or '-'} | risk={item.get('risk_level') or '-'}",
-                f"Pipeline branches: {', '.join(item.get('recommended_pipeline_branches') or []) or '-'}",
-                f"Recommended agent roles: {', '.join(item.get('recommended_agent_roles') or []) or '-'}",
                 f"Ideal screener logic: {item.get('ideal_screener_logic') or '-'}",
             ]
         )

@@ -5,7 +5,7 @@ import json
 
 import pandas as pd
 
-from advisory import announcement_watch, dashboard, execution_engine, intraday_features, llm_event_evaluator, master_pipeline, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, watchlist_builder
+from advisory import adversarial_review, announcement_watch, dashboard, event_meta_model, execution_engine, intraday_features, llm_event_evaluator, master_pipeline, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, watchlist_builder
 from data import download_runner
 
 
@@ -538,6 +538,14 @@ def test_event_normalization_produces_taxonomy_and_transition():
         sentiment="positive",
         materiality="high",
         setup_effect="strengthens",
+        direction="positive",
+        surprise=0.8,
+        novelty=0.7,
+        contradiction=0.0,
+        expected_decay_days=120,
+        source_reliability="high",
+        affected_sectors=["defence"],
+        affected_peers=["BEL"],
         governance_risk="none",
         balance_sheet_risk="none",
         execution_risk="low",
@@ -572,6 +580,14 @@ def test_event_normalization_prefers_llm_event_class_over_keyword_fallback():
         sentiment="mixed",
         materiality="medium",
         setup_effect="neutral",
+        direction="neutral",
+        surprise=0.1,
+        novelty=0.2,
+        contradiction=0.1,
+        expected_decay_days=10,
+        source_reliability="high",
+        affected_sectors=[],
+        affected_peers=[],
         governance_risk="low",
         balance_sheet_risk="none",
         execution_risk="low",
@@ -606,6 +622,14 @@ def test_event_normalization_does_not_misclassify_director_update_as_order_win()
         sentiment="neutral",
         materiality="low",
         setup_effect="neutral",
+        direction="neutral",
+        surprise=0.0,
+        novelty=0.1,
+        contradiction=0.0,
+        expected_decay_days=3,
+        source_reliability="high",
+        affected_sectors=[],
+        affected_peers=[],
         governance_risk="low",
         balance_sheet_risk="none",
         execution_risk="none",
@@ -641,6 +665,14 @@ def test_event_normalization_keeps_positive_non_investable_event_out_of_reject_s
         sentiment="positive",
         materiality="medium",
         setup_effect="strengthens",
+        direction="positive",
+        surprise=0.5,
+        novelty=0.6,
+        contradiction=0.1,
+        expected_decay_days=30,
+        source_reliability="medium",
+        affected_sectors=["pharma"],
+        affected_peers=[],
         governance_risk="none",
         balance_sheet_risk="none",
         execution_risk="medium",
@@ -659,6 +691,82 @@ def test_event_normalization_keeps_positive_non_investable_event_out_of_reject_s
     assert event_class == "OTHER"
     assert transition == "RAISE_SCORE_ONLY"
     assert score_impact > 0
+
+
+def test_event_tensor_builds_richer_fields_into_evaluation_output(monkeypatch):
+    events = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-04-01T10:00:00Z"),
+                "setup_id": "EVENT_OPPORTUNITY_V1",
+                "setup_name": "Event Opportunity",
+                "symbol": "LUPIN",
+                "company_master_id": "lupin",
+                "unique_id": "doc-1",
+                "event_source": "announcement",
+                "subject": "US approval for new product",
+                "filed_under_category": "Press Release",
+                "parse_status": "parsed",
+                "concise_summary_text": "The company received an approval.",
+                "categories_json": "[]",
+                "watch_reasons_json": "[]",
+            }
+        ]
+    )
+
+    parsed = llm_event_evaluator.EventEvaluation(
+        what_happened="The company received a product approval that improves the setup.",
+        sentiment="positive",
+        materiality="high",
+        setup_effect="strengthens",
+        direction="positive",
+        surprise=0.75,
+        novelty=0.65,
+        contradiction=0.05,
+        expected_decay_days=90,
+        source_reliability="high",
+        affected_sectors=["pharma"],
+        affected_peers=["SUNPHARMA", "CIPLA"],
+        governance_risk="none",
+        balance_sheet_risk="none",
+        execution_risk="low",
+        investable_now=True,
+        verdict="continue",
+        event_class="GUIDANCE_UPGRADE",
+        state_transition_hint="UPGRADE_TO_PASS_NOW",
+        score_impact=0.3,
+        confidence=0.88,
+        rationale="Official approval supports a stronger setup with durable relevance.",
+        source_trace=["subject", "summary"],
+        key_risks=[],
+    )
+
+    monkeypatch.setattr(llm_event_evaluator, "load_documents", lambda unique_ids: pd.DataFrame())
+    monkeypatch.setattr(llm_event_evaluator, "build_payload", lambda event_row, document_row: {"stub": True})
+    monkeypatch.setattr(
+        llm_event_evaluator.AdvisoryEventEvaluator,
+        "evaluate_payload",
+        lambda self, payload: parsed,
+    )
+
+    evaluations, risks, meta = llm_event_evaluator.build_outputs(events, model="test-model")
+    assert risks.empty
+    assert meta["evaluated_count"] == 1
+    row = evaluations.iloc[0]
+    assert row["direction"] == "positive"
+    assert row["surprise"] == 0.75
+    assert row["novelty"] == 0.65
+    assert row["contradiction"] == 0.05
+    assert row["expected_decay_days"] == 90
+    assert row["source_reliability"] == "high"
+    assert json.loads(row["affected_sectors_json"]) == ["pharma"]
+    assert json.loads(row["affected_peers_json"]) == ["SUNPHARMA", "CIPLA"]
+    tensor = json.loads(row["event_tensor_json"])
+    assert tensor["event_type"] == "GUIDANCE_UPGRADE"
+    assert tensor["affected_sectors"] == ["pharma"]
+    assert tensor["affected_peers"] == ["SUNPHARMA", "CIPLA"]
+    assert tensor["state_transition_hint"] == "UPGRADE_TO_PASS_NOW"
 
 
 def test_news_theme_engine_normalizes_richer_investment_theme_schema(tmp_path):
@@ -714,31 +822,21 @@ themes:
     assert len(themes) == 1
     theme = themes[0]
     assert theme["theme_id"] == "DEFENSE_INDIGENISATION"
-    assert theme["recommended_agent_roles"] == ["news_theme_expert", "screener_designer"]
-    assert theme["recommended_pipeline_branches"] == ["event_opportunity_pipeline"]
     assert theme["market_cap_fit"] == ["large_cap", "mid_cap"]
     assert theme["ideal_screener_logic"] == "order wins and quality balance sheet"
     assert theme["negative_keywords"] == ["rumor"]
     assert theme["suggested_screeners"][0]["screener_query"] == "Market Capitalization > 1000"
 
 
-def test_news_theme_engine_active_mapping_carries_roles_and_pipeline(monkeypatch):
+def test_news_theme_engine_active_mapping_returns_theme_ids_and_slugs(monkeypatch):
     monkeypatch.setattr(
         news_theme_engine,
         "build_theme_recommendations",
         lambda **kwargs: {
             "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
             "recommendations": [
-                {
-                    "theme_id": "DEFENSE_INDIGENISATION",
-                    "recommended_agent_roles": ["news_theme_expert", "risk_portfolio_expert"],
-                    "recommended_pipeline_branches": ["event_opportunity_pipeline"],
-                },
-                {
-                    "theme_id": "POWER_GRID_STORAGE",
-                    "recommended_agent_roles": ["screener_designer"],
-                    "recommended_pipeline_branches": ["theme_watch_pipeline"],
-                },
+                {"theme_id": "DEFENSE_INDIGENISATION"},
+                {"theme_id": "POWER_GRID_STORAGE"},
             ],
             "error": None,
         },
@@ -757,69 +855,6 @@ def test_news_theme_engine_active_mapping_carries_roles_and_pipeline(monkeypatch
     mapping = news_theme_engine.load_active_theme_screener_mapping(asof_date=pd.Timestamp("2026-03-31T00:00:00Z"))
     assert mapping["theme_ids"] == ["DEFENSE_INDIGENISATION", "POWER_GRID_STORAGE"]
     assert mapping["screener_slugs"] == ["defense-indigenisation-v1", "power-grid-storage-v1"]
-    assert mapping["recommended_agent_roles"] == ["news_theme_expert", "risk_portfolio_expert", "screener_designer"]
-    assert mapping["recommended_pipeline_branches"] == ["event_opportunity_pipeline", "theme_watch_pipeline"]
-
-
-def test_master_pipeline_builds_sub_agent_workflow_with_pending_screeners(monkeypatch):
-    monkeypatch.setattr(
-        master_pipeline,
-        "build_overlay_state",
-        lambda **kwargs: pd.DataFrame(
-            [
-                {
-                    "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
-                    "base_regime": "RISK_OFF",
-                    "overlay_name": "OIL_SHOCK",
-                    "overlay_intensity": 1.0,
-                    "overlay_reason": "oil news cluster",
-                }
-            ]
-        ),
-    )
-    monkeypatch.setattr(
-        master_pipeline,
-        "build_theme_recommendations",
-        lambda **kwargs: {
-            "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
-            "recommendations": [
-                {
-                    "theme_id": "ENERGY_SUPPLY_SHOCK",
-                    "theme_name": "Energy Supply Shock",
-                    "theme_intensity": 0.9,
-                    "theme_reason": "crude spike",
-                    "recommended_agent_roles": ["news_theme_expert", "screener_designer"],
-                    "recommended_pipeline_branches": ["event_opportunity_pipeline"],
-                    "suggested_screeners": [
-                        {
-                            "slug": "news-energy-supply-shock-beneficiaries-v1",
-                            "screener_name": "NEWS ENERGY SUPPLY SHOCK BENEFICIARIES V1",
-                            "screener_query": "Market Capitalization > 2000",
-                        }
-                    ],
-                }
-            ],
-        },
-    )
-    monkeypatch.setattr(
-        master_pipeline,
-        "load_active_theme_screener_mapping",
-        lambda **kwargs: {
-            "theme_ids": ["ENERGY_SUPPLY_SHOCK"],
-            "screener_slugs": [],
-            "recommended_agent_roles": ["news_theme_expert", "screener_designer"],
-            "recommended_pipeline_branches": ["event_opportunity_pipeline"],
-        },
-    )
-    monkeypatch.setattr(master_pipeline, "list_theme_screeners", lambda *args, **kwargs: pd.DataFrame())
-
-    workflow = master_pipeline.build_sub_agent_workflow(asof_date=pd.Timestamp("2026-03-31T00:00:00Z"))
-    assert workflow["base_regime"] == "RISK_OFF"
-    assert workflow["news_overlay"] == "OIL_SHOCK"
-    assert "data_pipeline_expert" in workflow["recommended_agent_roles"]
-    assert "event_opportunity_pipeline" in workflow["pipeline_branches"]
-    assert workflow["themes"][0]["pending_screeners"][0]["slug"] == "news-energy-supply-shock-beneficiaries-v1"
-    assert any(task["agent_role"] == "screener_designer" for task in workflow["tasks"])
 
 
 def test_download_runner_stops_on_failure_when_continue_disabled(monkeypatch):
@@ -845,7 +880,7 @@ def test_download_runner_stops_on_failure_when_continue_disabled(monkeypatch):
     assert [row["module"] for row in payload["results"]] == ["mod.ok", "mod.fail"]
 
 
-def test_download_runner_prioritizes_dhan_and_screener_prechecks():
+def test_download_runner_prioritizes_dhan_and_registered_screener_sync():
     steps = download_runner.DOWNLOAD_STEPS
     modules = [step["module"] for step in steps[:6]]
     assert modules == [
@@ -856,7 +891,61 @@ def test_download_runner_prioritizes_dhan_and_screener_prechecks():
         "data.dhanlive.ohlcv",
         "data.screenerin.screener_parser",
     ]
-    assert steps[5]["args"] == ["--seed-defaults"]
+    assert steps[5]["args"] == []
+    assert steps[5]["purpose"] == "screener_sync_registered"
+
+
+def test_research_ledger_start_and_finish(monkeypatch):
+    writes: list[tuple[str, pd.DataFrame, list[str]]] = []
+
+    monkeypatch.setattr(research_ledger, "ensure_tables", lambda: None)
+    monkeypatch.setattr(research_ledger, "_try_git_rev", lambda: "deadbeef")
+
+    def fake_upsert(df, table_name, unique_keys, **kwargs):
+        writes.append((table_name, df.copy(), list(unique_keys)))
+
+    monkeypatch.setattr(research_ledger, "upsert_to_db", fake_upsert)
+
+    run_id = research_ledger.start_research_run(
+        run_type="advisory_pipeline",
+        entrypoint="advisory.pipeline",
+        config={"alpha": 1, "beta": True},
+        asof_date=pd.Timestamp("2026-04-04T00:00:00Z"),
+        label="baseline-run",
+        objective="test objective",
+        validation_protocol={"split": "purged_walk_forward"},
+    )
+    assert run_id
+    assert writes[0][0] == research_ledger.LEDGER_TABLE
+    assert writes[0][1].iloc[0]["status"] == "running"
+    assert writes[0][1].iloc[0]["git_rev"] == "deadbeef"
+    assert writes[0][1].iloc[0]["validation_protocol_json"]
+
+    research_ledger.finish_research_run(
+        run_id,
+        status="completed",
+        data_snapshot={"asof_date": "2026-04-04"},
+        result_metrics={"sharpe": 1.2},
+    )
+    assert writes[1][0] == research_ledger.LEDGER_TABLE
+    assert writes[1][1].iloc[0]["research_run_id"] == run_id
+    assert writes[1][1].iloc[0]["status"] == "completed"
+
+
+def test_research_ledger_summary_helpers():
+    summary = {
+        "stages": {
+            "rules": {"row_count": 10},
+            "portfolio": {"row_count": 3},
+        }
+    }
+    snapshot = research_ledger.build_data_snapshot(
+        asof_date=pd.Timestamp("2026-04-04T00:00:00Z"),
+        summary=summary,
+    )
+    metrics = research_ledger.build_result_metrics(status="completed", summary=summary)
+    assert snapshot["stage_row_counts"]["rules"] == 10
+    assert metrics["portfolio_row_count"] == 3
 
 
 def test_master_pipeline_run_downloads_uses_python_runner(monkeypatch):
@@ -1149,6 +1238,131 @@ def test_pipeline_stage_alias_watch_spans_ingest_and_match():
     assert not pipeline.stage_enabled("news", start_at="watch", stop_at="watch")
 
 
+def test_pipeline_review_stage_sits_between_evaluate_and_risk():
+    assert pipeline.stage_enabled("review", start_at="evaluate", stop_at="review")
+    assert not pipeline.stage_enabled("risk", start_at="evaluate", stop_at="review")
+
+
+def test_pipeline_event_model_stage_sits_between_evaluate_and_review():
+    assert pipeline.stage_enabled("event_model", start_at="evaluate", stop_at="event_model")
+    assert not pipeline.stage_enabled("review", start_at="evaluate", stop_at="event_model")
+
+
+def test_adversarial_review_flags_stale_contradictory_event_as_veto():
+    row = pd.Series(
+        {
+            "published_on": pd.Timestamp("2026-03-20T00:00:00Z"),
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "event_class": "ORDER_WIN",
+            "verdict": "continue",
+            "setup_effect": "strengthens",
+            "state_transition_hint": "UPGRADE_TO_PASS_NOW",
+            "investable_now": True,
+            "materiality": "high",
+            "source_reliability": "medium",
+            "expected_decay_days": 5,
+            "contradiction": 0.8,
+            "confidence": 0.7,
+            "novelty": 0.7,
+            "surprise": 0.8,
+            "score_impact": 0.3,
+        }
+    )
+    review = adversarial_review.review_event_row(row)
+    assert review["review_action"] == "veto"
+    assert review["veto"] is True
+    assert "high_contradiction" in json.loads(review["review_flags_json"])
+
+
+def test_adversarial_review_penalizes_low_model_edge():
+    row = pd.Series(
+        {
+            "published_on": pd.Timestamp("2026-03-28T00:00:00Z"),
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "event_class": "ORDER_WIN",
+            "verdict": "continue",
+            "setup_effect": "strengthens",
+            "state_transition_hint": "RAISE_SCORE_ONLY",
+            "investable_now": True,
+            "materiality": "medium",
+            "source_reliability": "high",
+            "expected_decay_days": 30,
+            "contradiction": 0.1,
+            "confidence": 0.8,
+            "novelty": 0.7,
+            "surprise": 0.7,
+            "score_impact": 0.25,
+            "event_meta_score": 0.18,
+        }
+    )
+    review = adversarial_review.review_event_row(row)
+    assert review["review_action"] in {"penalize", "review_manual", "veto"}
+    assert "low_model_edge" in json.loads(review["review_flags_json"])
+
+
+def test_event_meta_model_builds_directional_label_from_future_returns(monkeypatch):
+    monkeypatch.setattr(
+        event_meta_model,
+        "load_event_rows",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-03-20T10:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "setup_id": "EVENT_OPPORTUNITY_V1",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "event_source": "announcement",
+                    "sentiment": "positive",
+                    "materiality": "high",
+                    "setup_effect": "strengthens",
+                    "direction": "positive",
+                    "surprise": 0.8,
+                    "novelty": 0.7,
+                    "contradiction": 0.1,
+                    "expected_decay_days": 20,
+                    "source_reliability": "high",
+                    "governance_risk": "none",
+                    "balance_sheet_risk": "none",
+                    "execution_risk": "low",
+                    "investable_now": True,
+                    "verdict": "continue",
+                    "event_class": "ORDER_WIN",
+                    "state_transition_hint": "RAISE_SCORE_ONLY",
+                    "score_impact": 0.2,
+                    "confidence": 0.8,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        event_meta_model,
+        "load_price_history",
+        lambda symbols, start_date, end_date: pd.DataFrame(
+            [
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-21T00:00:00Z"), "close": 100.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-24T00:00:00Z"), "close": 101.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-25T00:00:00Z"), "close": 102.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-26T00:00:00Z"), "close": 103.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-27T00:00:00Z"), "close": 104.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-28T00:00:00Z"), "close": 105.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-31T00:00:00Z"), "close": 106.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-04-01T00:00:00Z"), "close": 107.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-04-02T00:00:00Z"), "close": 108.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-04-03T00:00:00Z"), "close": 109.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-04-04T00:00:00Z"), "close": 110.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-04-07T00:00:00Z"), "close": 111.0},
+            ]
+        ),
+    )
+    dataset = event_meta_model.build_labeled_event_dataset(horizon_days=10, return_threshold=0.02)
+    row = dataset.iloc[0]
+    assert row["direction_sign"] == 1
+    assert row["anchor_date"] == pd.Timestamp("2026-03-21T00:00:00Z")
+    assert row["directional_return_10d"] > 0.02
+    assert int(row["target_label"]) == 1
+
+
 def test_risk_engine_keeps_investable_review_manual_as_allocated(monkeypatch):
     monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr(
@@ -1215,6 +1429,80 @@ def test_risk_engine_keeps_investable_review_manual_as_allocated(monkeypatch):
     assert row["allocation_status"] == "allocated"
     assert row["suggested_allocation_inr"] > 0
     assert "manual review" in str(row["notes"]).lower()
+
+
+def test_risk_engine_rejects_allocation_when_adversarial_review_vetoes(monkeypatch):
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        risk_engine,
+        "load_event_evaluations",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-03-24T00:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "setup_id": "DEFENSIVE_REGIME_POSITION_V1",
+                    "setup_name": "Defensive regime position",
+                    "symbol": "ABC",
+                    "company_master_id": "nse:ABC",
+                    "unique_id": "ABC-1",
+                    "evaluation_status": "completed",
+                    "verdict": "continue",
+                    "investable_now": True,
+                    "materiality": "high",
+                    "setup_effect": "strengthens",
+                    "event_class": "ORDER_WIN",
+                    "state_transition_hint": "UPGRADE_TO_PASS_NOW",
+                    "score_impact": 0.3,
+                    "confidence": 0.8,
+                    "sentiment": "positive",
+                    "governance_risk": "none",
+                    "balance_sheet_risk": "none",
+                    "execution_risk": "low",
+                    "review_action": "veto",
+                    "review_score": -0.6,
+                    "review_veto": True,
+                    "review_reason": "high_contradiction",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        risk_engine,
+        "load_point_in_time_context",
+        lambda symbol, published_on: {
+            "avg_traded_value_20d": 1_000_000_000.0,
+            "adj_close": 100.0,
+            "atr_20": 5.0,
+            "dma_20": 98.0,
+            "dma_50": 95.0,
+            "dma_200": 90.0,
+            "rs_vs_benchmark": 0.1,
+            "rs_vs_sector": 0.1,
+        },
+    )
+    monkeypatch.setattr(
+        risk_engine,
+        "load_watch_states",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "setup_id": "DEFENSIVE_REGIME_POSITION_V1",
+                    "symbol": "ABC",
+                    "candidate_state": "PASS_NOW",
+                    "current_state": "PASS_NOW",
+                    "watch_status": "active",
+                }
+            ]
+        ),
+    )
+
+    df = risk_engine.build_allocations(asof_date=pd.Timestamp("2026-03-20T00:00:00Z"))
+    row = df.iloc[0]
+    assert row["allocation_status"] == "rejected"
+    assert row["suggested_allocation_inr"] == 0.0
+    assert "vetoed" in str(row["notes"]).lower()
 
 
 def test_risk_engine_promoted_pass_now_overrides_conservative_event_investable_flag(monkeypatch):
@@ -1852,6 +2140,134 @@ def test_rule_engine_tactical_primary_can_run_without_fundamentals():
     state, _, rejections = rule_engine.evaluate_setup_row(row, regime_name="STABLE", overlay_name="NONE", setup=setup)
     assert state in {"PASS_NOW", "WATCH_BREAKOUT"}
     assert all(item["reason_code"] != "missing_fundamental_snapshot" for item in rejections)
+
+
+def test_rule_engine_can_emit_explicit_abstain():
+    row = pd.Series(
+        {
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "company_master_id": "nse:ABC",
+            "adj_close": 100.0,
+            "technical_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "fundamentals_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "regime_snapshot_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "fundamentals_freshness_status": "fresh",
+            "market_cap": 100000.0,
+            "avg_traded_value_20d": 1000000000.0,
+            "breakout_extension_pct": 1.0,
+            "dist_52w_high": -4.0,
+            "edge_score": 0.4,
+        }
+    )
+    setup = {
+        "allowed_regimes": ["STABLE"],
+        "blocked_regimes": [],
+        "allowed_overlays": ["NONE"],
+        "blocked_overlays": [],
+        "technical_rules": [{"column": "edge_score", "operator": "gte", "value": 1.0}],
+        "fundamental_rules": [],
+        "intraday_rules": [],
+        "scoring_weights": {"technical": 1.0, "fundamental": 0.0, "regime_fit": 0.0, "event": 0.0},
+        "score_thresholds": {"pass_now": 0.70, "watch_breakout": 0.60, "watch_event": 0.48, "abstain": 0.40, "near_miss_gap": 0.05},
+        "freshness_policy": {"technical_max_age_days": 10, "fundamentals_max_age_days": 180, "regime_max_age_days": 7, "intraday_max_age_days": 2, "fundamentals_required": True},
+    }
+    state, details, rejections = rule_engine.evaluate_setup_row(row, regime_name="STABLE", overlay_name="NONE", setup=setup)
+    assert state == "ABSTAIN"
+    assert "explicit abstain" in str(details.get("watch_reason_detail")).lower()
+    assert any(item["reason_code"] == "abstain_low_edge" for item in rejections)
+
+
+def test_watchlist_builder_marks_abstain_as_not_watch_enabled(monkeypatch):
+    monkeypatch.setattr(
+        watchlist_builder,
+        "load_candidate_rows",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                    "setup_id": "TEST",
+                    "setup_name": "Test",
+                    "regime_name": "STABLE",
+                    "symbol": "ABC",
+                    "company_master_id": "nse:ABC",
+                    "screener_slug": "demo",
+                    "rank": 1,
+                    "candidate_state": "ABSTAIN",
+                    "watch_reason_detail": "explicit abstain",
+                        "watch_reasons": "[]",
+                        "setup_score": 0.42,
+                        "entry_style": pd.NA,
+                        "attractive_price_low": pd.NA,
+                        "attractive_price_high": pd.NA,
+                        "invalidation_price": pd.NA,
+                    "entry_note": "Do nothing",
+                    "near_miss_flag": False,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(watchlist_builder, "load_latest_event_transitions", lambda **kwargs: pd.DataFrame())
+
+    df = watchlist_builder.build_watchlist()
+    row = df.iloc[0]
+    assert row["current_state"] == "ABSTAIN"
+    assert bool(row["watch_enabled"]) is False
+    assert row["watch_status"] == "abstained"
+
+
+def test_risk_engine_emits_abstained_allocation_status(monkeypatch):
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        risk_engine,
+        "load_event_evaluations",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-04-01T00:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                    "setup_id": "MIDCAP_IMPROVER_SWING_V1",
+                    "setup_name": "Midcap improver",
+                    "symbol": "ABC",
+                    "company_master_id": "nse:ABC",
+                    "unique_id": "ABC-abstain",
+                    "evaluation_status": "completed",
+                    "verdict": "continue",
+                    "investable_now": False,
+                    "materiality": "low",
+                    "setup_effect": "neutral",
+                    "event_class": "BASE_CANDIDATE",
+                    "state_transition_hint": "NO_CHANGE",
+                    "score_impact": 0.0,
+                    "confidence": 0.2,
+                    "sentiment": "neutral",
+                    "governance_risk": "none",
+                    "has_review_manual": False,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        risk_engine,
+        "load_watch_states",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                    "setup_id": "MIDCAP_IMPROVER_SWING_V1",
+                    "symbol": "ABC",
+                    "candidate_state": "ABSTAIN",
+                    "current_state": "ABSTAIN",
+                    "watch_status": "abstained",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(risk_engine, "load_point_in_time_context", lambda symbol, published_on: {})
+
+    df = risk_engine.build_allocations(asof_date=pd.Timestamp("2026-04-01T00:00:00Z"))
+    row = df.iloc[0]
+    assert row["allocation_status"] == "abstained"
+    assert float(row["suggested_allocation_inr"]) == 0.0
 
 
 def test_portfolio_engine_uses_setup_cap_override(monkeypatch):

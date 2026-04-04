@@ -5,7 +5,7 @@ import textwrap
 from typing import Any
 
 
-ADVISORY_EVENT_PROMPT_VERSION = "ADVISORY_EVENT_EVAL_V3"
+ADVISORY_EVENT_PROMPT_VERSION = "ADVISORY_EVENT_EVAL_V4"
 
 SYSTEM_PROMPT = textwrap.dedent(
     """\
@@ -15,6 +15,7 @@ SYSTEM_PROMPT = textwrap.dedent(
     If evidence is mixed or incomplete, prefer review_manual over continue.
     Return one concise factual summary and pick exactly one event class from the provided taxonomy.
     Use the taxonomy semantically, not by keyword matching.
+    Return structured numeric fields conservatively. Use 0.0 when the evidence for a numeric signal is weak.
     """
 ).strip()
 
@@ -37,10 +38,23 @@ def render_event_prompt(payload: dict[str, Any]) -> str:
         - whether the stock is investable now
         - whether the pipeline should continue, reject, or review manually
         - which event class best fits this event
+        - the event direction
+        - the event surprise from 0.0 to 1.0
+        - the event novelty from 0.0 to 1.0
+        - the contradiction risk from 0.0 to 1.0
+        - expected decay in days
+        - source reliability
+        - affected sectors and peers if they are evident from the input
         - whether this should upgrade to pass now, downgrade to reject, or only change score
         - the score impact from -1.0 to 1.0
 
         Use short evidence-backed statements. Quote only facts present in the input.
+        Numeric guidance:
+        - surprise: how unexpected this event is relative to a normal flow of disclosures
+        - novelty: how new the information is versus a routine or already-known update
+        - contradiction: how much the event conflicts with the active setup thesis
+        - expected_decay_days: how long this event should matter before its edge likely fades
+        - source_reliability: high for official company or exchange disclosures with clear facts, medium for partially clear items, low for weak or incomplete evidence
         Event taxonomy:
         - RESULTS_POSITIVE
         - RESULTS_NEGATIVE
@@ -58,6 +72,8 @@ def render_event_prompt(payload: dict[str, Any]) -> str:
 
         Prefer OTHER when the document is procedural, administrative, court-process-related,
         board-process-related, or otherwise does not cleanly fit the taxonomy.
+
+        If peers or sectors are not clearly inferable from the input, return empty lists.
 
         Input payload:
         {_stable_json(payload)}

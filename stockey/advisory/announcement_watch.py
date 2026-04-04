@@ -26,6 +26,15 @@ def _emit_progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
 
+def inclusive_end_of_day(ts: pd.Timestamp | None) -> pd.Timestamp | None:
+    if ts is None:
+        return None
+    value = pd.to_datetime(ts, utc=True, errors="coerce")
+    if pd.isna(value):
+        return None
+    return value.normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+
 def ensure_watch_outputs_tables() -> None:
     with db_session() as (_, cur):
         cur.execute(
@@ -250,9 +259,8 @@ def _prepare_watchlist_for_ingest(
     for index, row in working.iterrows():
         last_checked = pd.to_datetime(row.get("last_checked_at"), utc=True, errors="coerce")
         if pd.isna(last_checked):
-            published_from = max(pd.to_datetime(row["asof_date"], utc=True, errors="coerce"), default_floor)
-            if published_from > pd.to_datetime(row["asof_date"], utc=True, errors="coerce"):
-                working.at[index, "published_from_capped"] = True
+            published_from = default_floor
+            working.at[index, "published_from_capped"] = True
         else:
             published_from = last_checked - pd.Timedelta(days=1)
         working.at[index, "published_from"] = published_from
@@ -287,6 +295,8 @@ def run_announcement_ingest(
 
     pipeline = ManagedAnnouncementPipeline()
     effective_to = pd.to_datetime(to_date or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    if to_date is not None:
+        effective_to = inclusive_end_of_day(effective_to)
     ingest_runs: list[dict[str, object]] = []
     watchlist, unique_ingest_targets = _prepare_watchlist_for_ingest(watchlist, effective_to=effective_to)
     total_targets = int(len(unique_ingest_targets))
@@ -415,6 +425,33 @@ def build_watch_updates_from_ingest(ingest_state: dict[str, object]) -> tuple[pd
         )
 
     watch_update_df = pd.DataFrame(watch_updates)
+    if not watch_update_df.empty:
+        watch_update_df["rank"] = pd.to_numeric(watch_update_df["rank"], errors="coerce")
+        for column in [
+            "attractive_price_low",
+            "attractive_price_high",
+            "invalidation_price",
+            "last_event_score_impact",
+        ]:
+            watch_update_df[column] = pd.to_numeric(watch_update_df[column], errors="coerce")
+        for column in [
+            "near_miss_flag",
+            "watch_enabled",
+        ]:
+            watch_update_df[column] = (
+                watch_update_df[column]
+                .map(lambda value: None if pd.isna(value) else bool(value))
+                .astype("boolean")
+            )
+        for column in [
+            "asof_date",
+            "state_updated_at",
+            "watch_started_at",
+            "last_checked_at",
+            "last_document_published_on",
+            "load_ts",
+        ]:
+            watch_update_df[column] = pd.to_datetime(watch_update_df[column], utc=True, errors="coerce")
     events_df = pd.concat(event_frames, ignore_index=True) if event_frames else pd.DataFrame()
     meta = {
         "watch_count": int(len(watchlist)),

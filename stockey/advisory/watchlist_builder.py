@@ -15,6 +15,7 @@ DEFAULT_SCORE_THRESHOLDS = {
     "pass_now": 0.68,
     "watch_breakout": 0.58,
     "watch_event": 0.48,
+    "abstain": 0.40,
 }
 _TRANSITION_CUTOFF = 0.12
 
@@ -244,6 +245,8 @@ def derive_current_state(
 ) -> str:
     state = str(candidate_state or "WATCH_EVENT").upper()
     hint = "" if pd.isna(transition_hint) else str(transition_hint).upper()
+    if state == "ABSTAIN":
+        return "ABSTAIN"
     if hint == "UPGRADE_TO_PASS_NOW":
         return "PASS_NOW"
     if hint == "DOWNGRADE_TO_REJECT":
@@ -330,9 +333,11 @@ def build_watchlist(
         ),
         axis=1,
     )
-    out["watch_enabled"] = out["current_state"] != "REJECT"
+    out["watch_enabled"] = ~out["current_state"].isin(["REJECT", "ABSTAIN"])
     out["watch_reasons_json"] = out["watch_reasons"].astype("string")
-    out["watch_status"] = out["current_state"].map(lambda value: "rejected" if value == "REJECT" else "active")
+    out["watch_status"] = out["current_state"].map(
+        lambda value: "rejected" if value == "REJECT" else ("abstained" if value == "ABSTAIN" else "active")
+    )
     out["has_review_manual"] = out["has_review_manual"].fillna(False).astype(bool)
     out.loc[out["has_review_manual"], "watch_status"] = "review_manual"
     out["last_event_class"] = out["event_class"]

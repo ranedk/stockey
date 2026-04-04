@@ -32,6 +32,9 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/screenerin/screener_parser.py` | `screenerin_screener_snapshots` | Stores parsed Screener.in screener snapshots by screener slug and date |
 | `data/screenerin/screener_registry.py` | `screenerin_screeners` | Registry utility to add/list/remove Screener.in screeners and inspect latest stored snapshots |
 | `data/screenerin/ad_hoc_query.py` | `screenerin_ad_hoc_query_runs`, `screenerin_ad_hoc_query_results` | Authenticated ad hoc Screener.in raw query runner; blocks for manual login if needed and stores parsed company rows plus queried metrics |
+| `advisory/research_ledger.py` | `advisory_research_runs` | Research ledger for recording experiment configs, point-in-time context, validation protocol, and run outcomes |
+| `advisory/event_meta_model.py` | `advisory_event_model_scores` | Train/score scaffold for XGBoost event meta-models using structured event tensors plus future daily returns |
+| `advisory/adversarial_review.py` | `advisory_event_reviews` | Deterministic reviewer over structured event tensors; can clear, penalize, force manual review, or veto event-driven allocations |
 | `utils/ocr` | none | Provider-agnostic PDF OCR utility using Gemini 3 Flash preview and OpenAI GPT-5 nano |
 | `utils/transcribe` | none | Audio transcription utility for remote mp3/wav/mp4 links using Gemini 3 Flash preview and OpenAI transcription APIs |
 | `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives for the legacy/reference NSE pipeline |
@@ -132,11 +135,11 @@ python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
 python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --only daily
 python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
 python -m data.dhanlive.ohlcv --symbols BANKNIFTY --asset-type index --exchange NSE --only intraday
-python -m data.screenerin.screener_registry seed-defaults
+python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-production-screen/"
 python -m data.screenerin.screener_registry list
 python -m data.screenerin.screener_registry query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
-python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1
-python -m data.screenerin.screener_parser --seed-defaults
+python -m data.screenerin.screener_registry latest --screener my-production-screen
+python -m data.screenerin.screener_parser
 python -m advisory.master_pipeline --dry-run
 python -m utils.ocr /tmp/sample.pdf --provider gemini --pages 1
 python -m utils.ocr /tmp/sample.pdf --provider openai --pages 1,3-5
@@ -209,27 +212,30 @@ Ad hoc query runner: `data.screenerin.ad_hoc_query`
 
 Recommended workflow:
 
-1. Register the advisory screeners or seed the defaults.
-2. Verify the registry contents.
-3. Let `./all_advisory.sh` or `python -m advisory.master_pipeline` sync the active registry and run the downstream advisory flow daily.
-4. Inspect latest snapshots with the registry utility.
+1. Use `data.screenerin.ad_hoc_query` for one-off research and idea generation.
+2. Only register a screener when it becomes a recurring production input for a setup or theme.
+3. Let `./all_advisory.sh` or `python -m advisory.master_pipeline` sync the active production registry and run the downstream advisory flow daily.
+4. Inspect latest production snapshots with the registry utility.
 
 Commands:
 
 ```sh
-python -m data.screenerin.screener_registry seed-defaults
+python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-production-screen/"
 python -m data.screenerin.screener_registry list
 python -m data.screenerin.screener_registry query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
 python -m data.screenerin.ad_hoc_query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
-python -m data.screenerin.screener_parser --seed-defaults
+python -m data.screenerin.screener_parser
 python -m data.screenerin.screener_registry latest
-python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1
-python -m data.screenerin.screener_registry latest --screener sme-momentum-screen-v1 --raw
-python -m data.screenerin.screener_registry remove sme-momentum-screen-v1
+python -m data.screenerin.screener_registry latest --screener my-production-screen
+python -m data.screenerin.screener_registry latest --screener my-production-screen --raw
+python -m data.screenerin.screener_registry remove my-production-screen
 ```
 
 Operational notes:
 
+- `./all_downloads.sh` and `./all_advisory.sh` no longer seed default screeners automatically.
+- the recurring downloader only syncs screeners that are already registered as active production inputs.
+- use `data.screenerin.ad_hoc_query` first; register only the queries that graduate into recurring setups or themes.
 - `data.screenerin.screener_parser` uses the active rows in `screenerin_screeners` when run without URL arguments.
 - `data.screenerin.screener_parser` can still be pointed at explicit Screener.in URLs directly.
 - Snapshots are stored in `screenerin_screener_snapshots` by `date + screener_slug`.
@@ -239,6 +245,49 @@ Operational notes:
 - ad hoc runs are stored in `screenerin_ad_hoc_query_runs`.
 - normalized company rows for ad hoc runs are stored in `screenerin_ad_hoc_query_results`.
 - parsed ad hoc output includes `company_name`, `ticker`, `company_url`, `rank`, and `metrics`.
+- theme-to-screener discovery now uses only `config/investment_themes.yaml`; the older fallback theme config was removed.
+
+## Research Priorities
+
+Current research focus is not multi-agent orchestration. It is:
+
+1. point-in-time discipline and validation
+2. structured event extraction from announcements and news
+3. tabular prediction and ranking
+4. abstention and turnover control
+5. strict separation of prediction from policy and execution
+
+Use ad hoc Screener.in queries and normal notebooks or scripts for exploration. Only promote a query into the registered production path after it survives validation.
+
+## Event Meta-Model Training
+
+Before training `advisory.event_meta_model`, make sure:
+
+1. `advisory_event_evaluations` spans enough historical dates.
+2. `dhan_ohlcv_daily` is fresh enough for the event symbols to cover the target horizon.
+3. the chosen horizon has enough labeled rows to clear the minimum training floor.
+
+Useful checks:
+
+```sh
+python scripts/sql_query_runner.py --read-only "select date(published_on) as published_date, count(*) as eval_count from advisory_event_evaluations group by 1 order by 1"
+python scripts/sql_query_runner.py --read-only "select max(date) as max_price_date from dhan_ohlcv_daily"
+python -m advisory.event_meta_model train --horizon-days 1
+python -m advisory.event_meta_model score --dry-run
+```
+
+Research ledger commands:
+
+```sh
+python -m advisory.research_ledger --limit 20
+python -m advisory.pipeline --dry-run --log-research-ledger --ledger-label "baseline-v1" --ledger-objective "daily ranking sanity check"
+python -m advisory.master_pipeline --dry-run --log-research-ledger --ledger-label "full-run-v1" --ledger-validation-protocol '{"split":"purged_walk_forward"}'
+```
+
+Abstain behavior:
+
+- low-edge setups can now be marked `ABSTAIN` instead of being forced into `WATCH_*` or hidden inside generic rejects
+- risk can now emit `allocation_status=abstained`, which makes the do-nothing class measurable
 
 ## Advisory implementation
 

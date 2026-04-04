@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 import threading
 import time
@@ -10,12 +11,21 @@ from typing import Any
 import pandas as pd
 
 from advisory.announcement_watch import build_watch_updates_from_ingest, persist_watch_outputs, run_announcement_ingest
+from advisory.adversarial_review import build_reviews as build_adversarial_reviews
+from advisory.adversarial_review import persist_reviews as persist_adversarial_reviews
 from advisory.execution_engine import (
     build_execution_orders,
     persist_execution_orders,
     persist_reconciliation,
     reconcile_live_orders,
     submit_live_orders,
+)
+from advisory.event_meta_model import (
+    DEFAULT_ARTIFACT_DIR as DEFAULT_EVENT_MODEL_ARTIFACT_DIR,
+    build_labeled_event_dataset,
+    model_artifact_exists,
+    persist_scores as persist_event_model_scores,
+    score_events as score_event_model,
 )
 from advisory.fundamental_snapshot import build_fundamental_snapshot, persist_fundamental_snapshot
 from advisory.intraday_features import (
@@ -33,6 +43,13 @@ from advisory.peer_sync import sync_peer_data
 from advisory.portfolio_engine import build_portfolio_orders, persist_portfolio_orders, PortfolioConfig
 from advisory.position_lifecycle import build_lifecycle_outputs, persist_outputs as persist_lifecycle_outputs
 from advisory.regime_engine import build_regime_snapshot, persist_regime_snapshot
+from advisory.research_ledger import (
+    build_data_snapshot as build_research_data_snapshot,
+    build_result_metrics as build_research_result_metrics,
+    finish_research_run,
+    parse_validation_protocol,
+    start_research_run,
+)
 from advisory.risk_engine import build_allocations, persist_allocations
 from advisory.rule_engine import persist_rule_outputs, run_rule_engine
 from advisory.screener_parser import build_constituents, persist_constituents
@@ -57,6 +74,8 @@ PIPELINE_STAGES = [
     "watch_match",
     "news",
     "evaluate",
+    "event_model",
+    "review",
     "risk",
     "portfolio",
     "lifecycle",
@@ -129,6 +148,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild", action="store_true", help="Use rebuild semantics where supported")
     parser.add_argument("--skip-peer-sync", action="store_true", help="Skip peer preflight before technicals/fundamentals")
     parser.add_argument("--skip-intraday", action="store_true", help="Skip intraday feature sync/build")
+    parser.add_argument("--skip-intraday-prefetch", action="store_true", help="Skip on-demand intraday feature backfill inside the rule engine")
     parser.add_argument("--intraday-lookback-days", type=int, default=180, help="How much recent intraday history to maintain for advisory pattern features")
     parser.add_argument(
         "--intraday-intervals",
@@ -150,6 +170,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--portfolio-per-setup-cap-pct", type=float, default=0.50)
     parser.add_argument("--portfolio-max-positions-per-overlap-group", type=int, default=1)
     parser.add_argument("--event-model", help="Override advisory LLM event evaluation model")
+    parser.add_argument("--event-model-artifact-dir", default=str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR), help="Directory containing trained event meta-model artifacts")
+    parser.add_argument("--log-research-ledger", action="store_true", help="Record this run in the advisory research ledger")
+    parser.add_argument("--ledger-label", help="Optional research-ledger label")
+    parser.add_argument("--ledger-objective", help="Optional research-ledger objective")
+    parser.add_argument("--ledger-validation-protocol", help="Optional JSON string describing validation protocol")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -166,6 +191,16 @@ def stage_enabled(stage: str, start_at: str | None, stop_at: str | None) -> bool
 
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
+    if not hasattr(args, "skip_intraday"):
+        args.skip_intraday = False
+    if not hasattr(args, "intraday_lookback_days"):
+        args.intraday_lookback_days = 180
+    if not hasattr(args, "intraday_intervals"):
+        args.intraday_intervals = [1]
+    if not hasattr(args, "skip_intraday_prefetch"):
+        args.skip_intraday_prefetch = False
+    if not hasattr(args, "event_model_artifact_dir"):
+        args.event_model_artifact_dir = str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR)
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
     summary: dict[str, Any] = {
         "status": "ok",
@@ -315,6 +350,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             asof_date=asof_date,
             setup_ids=setup_ids,
             config_path=None,
+            skip_intraday_prefetch=bool(args.skip_intraday_prefetch),
         )
         effective_date = pd.to_datetime(meta.get("effective_date"), utc=True, errors="coerce")
         if not args.dry_run:
@@ -419,6 +455,55 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             }
             _finish_stage("evaluate", stage_started, f"evaluations={len(eval_df)} risks={len(risks_df)}")
 
+        if stage_enabled("event_model", args.start_at, args.stop_at):
+            stage_started = _start_stage("event_model")
+            artifact_dir = Path(str(args.event_model_artifact_dir))
+            if model_artifact_exists(artifact_dir=artifact_dir):
+                model_dataset = build_labeled_event_dataset(
+                    asof_date=asof_date,
+                    symbols=symbols,
+                    setup_ids=setup_ids,
+                )
+                score_df, score_meta = score_event_model(
+                    dataset=model_dataset,
+                    artifact_dir=artifact_dir,
+                )
+                if not args.dry_run:
+                    persist_event_model_scores(score_df)
+                summary["stages"]["event_model"] = {
+                    "meta": _json_ready(score_meta),
+                    "scores": _json_ready(score_df),
+                }
+                _finish_stage("event_model", stage_started, f"scores={len(score_df)}")
+            else:
+                summary["stages"]["event_model"] = {
+                    "meta": {
+                        "status": "skipped",
+                        "reason": "model_artifact_missing",
+                        "artifact_dir": str(artifact_dir),
+                    }
+                }
+                _finish_stage("event_model", stage_started, "skipped=model_artifact_missing")
+
+        if stage_enabled("review", args.start_at, args.stop_at):
+            stage_started = _start_stage("review")
+            from advisory.adversarial_review import load_event_evaluations as load_review_inputs
+
+            review_inputs = load_review_inputs(
+                asof_date=asof_date,
+                symbols=symbols,
+                setup_ids=setup_ids,
+                include_reviewed=bool(args.eval_include_evaluated),
+            )
+            review_df, review_meta = build_adversarial_reviews(review_inputs)
+            if not args.dry_run:
+                persist_adversarial_reviews(review_df)
+            summary["stages"]["review"] = {
+                "meta": _json_ready(review_meta),
+                "reviews": _json_ready(review_df),
+            }
+            _finish_stage("review", stage_started, f"reviews={len(review_df)}")
+
     if stage_enabled("risk", args.start_at, args.stop_at):
         stage_started = _start_stage("risk")
         allocations_df = build_allocations(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids, include_allocated=bool(args.rebuild))
@@ -489,9 +574,47 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
 def main() -> int:
     args = parse_args()
-    summary = run_pipeline(args)
-    print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
-    return 0
+    if not hasattr(args, "log_research_ledger"):
+        args.log_research_ledger = False
+    if not hasattr(args, "ledger_label"):
+        args.ledger_label = None
+    if not hasattr(args, "ledger_objective"):
+        args.ledger_objective = None
+    if not hasattr(args, "ledger_validation_protocol"):
+        args.ledger_validation_protocol = None
+    asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
+    research_run_id: str | None = None
+    if bool(args.log_research_ledger):
+        research_run_id = start_research_run(
+            run_type="advisory_pipeline",
+            entrypoint="advisory.pipeline",
+            config=vars(args),
+            asof_date=asof_date,
+            label=args.ledger_label,
+            objective=args.ledger_objective,
+            validation_protocol=parse_validation_protocol(args.ledger_validation_protocol),
+        )
+    try:
+        summary = run_pipeline(args)
+        if research_run_id:
+            finish_research_run(
+                research_run_id,
+                status="completed",
+                data_snapshot=build_research_data_snapshot(asof_date=asof_date, summary=summary),
+                result_metrics=build_research_result_metrics(status="completed", summary=summary),
+            )
+        print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+        return 0
+    except Exception as exc:
+        if research_run_id:
+            finish_research_run(
+                research_run_id,
+                status="failed",
+                data_snapshot=None,
+                result_metrics={"status": "failed"},
+                error_text=f"{exc.__class__.__name__}: {exc}",
+            )
+        raise
 
 
 if __name__ == "__main__":

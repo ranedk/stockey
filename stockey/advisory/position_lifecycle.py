@@ -183,7 +183,8 @@ def classify_position(
     stop_price = pd.to_numeric(row.get("stop_price"), errors="coerce")
     invalidation_price = pd.to_numeric(row.get("invalidation_price"), errors="coerce")
     pnl_pct = pd.to_numeric(row.get("pnl_pct"), errors="coerce")
-    days_held = int(pd.to_numeric(row.get("days_held"), errors="coerce") or 0)
+    days_held_value = pd.to_numeric(row.get("days_held"), errors="coerce")
+    days_held = 0 if pd.isna(days_held_value) else int(days_held_value)
 
     if pd.isna(entry_price) or pd.isna(current_price):
         return (
@@ -305,15 +306,32 @@ def build_lifecycle_outputs(
 def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> None:
     ensure_lifecycle_tables()
     if not lifecycle_df.empty:
+        lifecycle_out = lifecycle_df.copy()
+        for column in [
+            "entry_price",
+            "current_price",
+            "pnl_pct",
+            "approved_allocation_inr",
+            "stop_price",
+            "invalidation_price",
+        ]:
+            if column in lifecycle_out.columns:
+                lifecycle_out[column] = pd.to_numeric(lifecycle_out[column], errors="coerce")
+        if "days_held" in lifecycle_out.columns:
+            lifecycle_out["days_held"] = pd.to_numeric(lifecycle_out["days_held"], errors="coerce").astype("Int64")
         upsert_to_db(
-            lifecycle_df,
+            lifecycle_out,
             LIFECYCLE_TABLE,
             unique_keys=["asof_date", "published_on", "setup_id", "symbol", "unique_id"],
             timescaledb_column="asof_date",
         )
     if not actions_df.empty:
+        actions_out = actions_df.copy()
+        for column in ["reference_price", "stop_price", "invalidation_price"]:
+            if column in actions_out.columns:
+                actions_out[column] = pd.to_numeric(actions_out[column], errors="coerce")
         upsert_to_db(
-            actions_df,
+            actions_out,
             REBALANCE_TABLE,
             unique_keys=["asof_date", "published_on", "setup_id", "symbol", "unique_id", "suggested_action"],
             timescaledb_column="asof_date",

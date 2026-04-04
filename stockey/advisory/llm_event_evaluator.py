@@ -38,6 +38,14 @@ class EventEvaluation(BaseModel):
     sentiment: Literal["positive", "negative", "mixed", "neutral"]
     materiality: Literal["low", "medium", "high"]
     setup_effect: Literal["strengthens", "weakens", "neutral", "contradicts"]
+    direction: Literal["positive", "negative", "mixed", "neutral"]
+    surprise: float = Field(ge=0.0, le=1.0)
+    novelty: float = Field(ge=0.0, le=1.0)
+    contradiction: float = Field(ge=0.0, le=1.0)
+    expected_decay_days: int = Field(ge=0, le=3650)
+    source_reliability: Literal["low", "medium", "high"]
+    affected_sectors: list[str] = Field(default_factory=list, max_length=12)
+    affected_peers: list[str] = Field(default_factory=list, max_length=20)
     governance_risk: Literal["none", "low", "medium", "high"]
     balance_sheet_risk: Literal["none", "low", "medium", "high"]
     execution_risk: Literal["none", "low", "medium", "high"]
@@ -102,6 +110,46 @@ def normalize_jsonish(value: Any) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return text
+
+
+def normalize_float(value: Any, *, minimum: float, maximum: float, default: float = 0.0) -> float:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return default
+    return round(float(max(minimum, min(maximum, float(numeric)))), 4)
+
+
+def normalize_int(value: Any, *, minimum: int, maximum: int, default: int) -> int:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return default
+    return int(max(minimum, min(maximum, int(numeric))))
+
+
+def normalize_string_list(value: Any, *, limit: int, item_limit: int = 80) -> list[str]:
+    normalized = normalize_jsonish(value)
+    if normalized is None:
+        return []
+    if isinstance(normalized, list):
+        raw_items = normalized
+    elif isinstance(normalized, str):
+        raw_items = [part.strip() for part in normalized.split(",")]
+    else:
+        raw_items = [normalized]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        text = trim_text(item, item_limit)
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _flatten_jsonish_text(value: Any) -> str:
@@ -287,6 +335,28 @@ def normalize_score_impact(parsed: EventEvaluation) -> float:
     elif parsed.sentiment == "mixed":
         base -= 0.02
 
+    if parsed.setup_effect == "strengthens":
+        base += max(0.0, parsed.surprise - 0.50) * 0.12
+        base += max(0.0, parsed.novelty - 0.50) * 0.10
+    elif parsed.setup_effect in {"weakens", "contradicts"}:
+        base -= max(0.0, parsed.surprise - 0.50) * 0.12
+        base -= max(0.0, parsed.novelty - 0.50) * 0.10
+    base -= parsed.contradiction * 0.18
+
+    if parsed.setup_effect != "neutral":
+        if parsed.source_reliability == "high":
+            base += 0.03 if parsed.setup_effect == "strengthens" else -0.03
+        elif parsed.source_reliability == "low":
+            base -= 0.05 if parsed.setup_effect == "strengthens" else 0.05
+
+    if parsed.setup_effect == "strengthens":
+        if parsed.expected_decay_days <= 2:
+            base -= 0.03
+        elif parsed.expected_decay_days >= 90:
+            base += 0.03
+    elif parsed.setup_effect in {"weakens", "contradicts"} and parsed.expected_decay_days >= 90:
+        base -= 0.03
+
     if parsed.governance_risk == "high":
         base = min(base, -0.60)
     elif parsed.governance_risk == "medium":
@@ -339,6 +409,25 @@ def normalize_event_evaluation(event_row: pd.Series, parsed: EventEvaluation) ->
     score_impact = normalize_score_impact(parsed)
     transition_hint = derive_state_transition_hint(parsed, event_class, score_impact)
     return event_class, transition_hint, score_impact
+
+
+def build_event_tensor(parsed: EventEvaluation, *, event_class: str, score_impact: float, state_transition_hint: str) -> dict[str, Any]:
+    return {
+        "event_type": event_class,
+        "direction": parsed.direction,
+        "surprise": normalize_float(parsed.surprise, minimum=0.0, maximum=1.0, default=0.0),
+        "novelty": normalize_float(parsed.novelty, minimum=0.0, maximum=1.0, default=0.0),
+        "contradiction": normalize_float(parsed.contradiction, minimum=0.0, maximum=1.0, default=0.0),
+        "materiality": parsed.materiality,
+        "setup_effect": parsed.setup_effect,
+        "expected_decay_days": normalize_int(parsed.expected_decay_days, minimum=0, maximum=3650, default=5),
+        "source_reliability": parsed.source_reliability,
+        "affected_sectors": normalize_string_list(parsed.affected_sectors, limit=12),
+        "affected_peers": normalize_string_list(parsed.affected_peers, limit=20),
+        "confidence": normalize_float(parsed.confidence, minimum=0.0, maximum=1.0, default=0.0),
+        "score_impact": normalize_float(score_impact, minimum=-1.0, maximum=1.0, default=0.0),
+        "state_transition_hint": state_transition_hint,
+    }
 
 
 def load_watch_events(
@@ -694,6 +783,14 @@ def build_outputs(
                 sentiment="neutral",
                 materiality="medium",
                 setup_effect="neutral",
+                direction="neutral",
+                surprise=0.0,
+                novelty=0.0,
+                contradiction=0.5,
+                expected_decay_days=5,
+                source_reliability="low",
+                affected_sectors=[],
+                affected_peers=[],
                 governance_risk="none",
                 balance_sheet_risk="none",
                 execution_risk="none",
@@ -710,6 +807,12 @@ def build_outputs(
             evaluation_status = "error"
 
         event_class, state_transition_hint, score_impact = normalize_event_evaluation(event_row, parsed)
+        event_tensor = build_event_tensor(
+            parsed,
+            event_class=event_class,
+            score_impact=score_impact,
+            state_transition_hint=state_transition_hint,
+        )
 
         evaluation_rows.append(
             {
@@ -729,6 +832,14 @@ def build_outputs(
                 "sentiment": parsed.sentiment,
                 "materiality": parsed.materiality,
                 "setup_effect": parsed.setup_effect,
+                "direction": parsed.direction,
+                "surprise": event_tensor["surprise"],
+                "novelty": event_tensor["novelty"],
+                "contradiction": event_tensor["contradiction"],
+                "expected_decay_days": event_tensor["expected_decay_days"],
+                "source_reliability": parsed.source_reliability,
+                "affected_sectors_json": json_dumps(event_tensor["affected_sectors"]),
+                "affected_peers_json": json_dumps(event_tensor["affected_peers"]),
                 "governance_risk": parsed.governance_risk,
                 "balance_sheet_risk": parsed.balance_sheet_risk,
                 "execution_risk": parsed.execution_risk,
@@ -740,6 +851,7 @@ def build_outputs(
                 "confidence": parsed.confidence,
                 "what_happened": parsed.what_happened,
                 "rationale": parsed.rationale,
+                "event_tensor_json": json_dumps(event_tensor),
                 "source_trace_json": json_dumps(parsed.source_trace),
                 "context_snapshot_json": json_dumps(payload),
                 "model_name": model,
@@ -823,6 +935,14 @@ def ensure_output_tables() -> None:
                 sentiment TEXT,
                 materiality TEXT,
                 setup_effect TEXT,
+                direction TEXT,
+                surprise DOUBLE PRECISION,
+                novelty DOUBLE PRECISION,
+                contradiction DOUBLE PRECISION,
+                expected_decay_days INTEGER,
+                source_reliability TEXT,
+                affected_sectors_json TEXT,
+                affected_peers_json TEXT,
                 governance_risk TEXT,
                 balance_sheet_risk TEXT,
                 execution_risk TEXT,
@@ -834,6 +954,7 @@ def ensure_output_tables() -> None:
                 confidence DOUBLE PRECISION,
                 what_happened TEXT,
                 rationale TEXT,
+                event_tensor_json TEXT,
                 source_trace_json TEXT,
                 context_snapshot_json TEXT,
                 model_name TEXT,
@@ -867,6 +988,15 @@ def ensure_output_tables() -> None:
         cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_class TEXT")
         cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS state_transition_hint TEXT")
         cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS score_impact DOUBLE PRECISION")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS direction TEXT")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS surprise DOUBLE PRECISION")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS novelty DOUBLE PRECISION")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS contradiction DOUBLE PRECISION")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS expected_decay_days INTEGER")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS source_reliability TEXT")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_sectors_json TEXT")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_peers_json TEXT")
+        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_tensor_json TEXT")
         cur.execute(f"ALTER TABLE {RISKS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT")
 
 

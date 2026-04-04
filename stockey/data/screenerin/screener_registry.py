@@ -8,7 +8,6 @@ from data.screenerin.screener_parser import (
     list_registered_screeners,
     load_latest_snapshots,
     remove_registered_screener,
-    seed_default_screeners,
     summarize_latest_snapshots,
     upsert_registered_screener,
 )
@@ -42,8 +41,6 @@ def main() -> None:
     query_parser = subparsers.add_parser("query", help="Run an ad hoc authenticated Screener.in raw query and store the results")
     query_parser.add_argument("--query", required=True, help="Screener.in query text")
     query_parser.add_argument("--name", help="Friendly name for the ad hoc query")
-
-    subparsers.add_parser("seed-defaults", help="Register the four advisory Screener.in screeners")
 
     args = parser.parse_args()
 
@@ -83,10 +80,6 @@ def main() -> None:
             flush=True,
         )
         return
-
-    if args.command == "seed-defaults":
-        print(json.dumps(seed_default_screeners(), indent=2, default=str), flush=True)
-
 
 if __name__ == "__main__":
     main()

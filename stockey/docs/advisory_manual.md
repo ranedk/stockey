@@ -28,10 +28,12 @@ The advisory runtime path is:
 7. Watchlist
 8. Official announcements and ET RSS news
 9. LLM event evaluation
-10. Risk sizing
-11. Portfolio planning
-12. Lifecycle tracking
-13. Execution planning
+10. Event meta-model scoring
+11. Adversarial event review
+12. Risk sizing
+13. Portfolio planning
+14. Lifecycle tracking
+15. Execution planning
 
 Important runtime decisions:
 
@@ -40,6 +42,27 @@ Important runtime decisions:
 - official event source: exchange announcement pipeline
 - non-official news source: Economic Times RSS
 - legacy/reference only: NSE bhavcopy plus local adjusted-price pipeline
+
+## Production vs Research
+
+Keep two separate Screener.in modes:
+
+- production mode:
+  - only recurring setup or theme screeners live in `screenerin_screeners`
+  - the daily downloader syncs only those registered screeners
+  - use this path for stable advisory universes and historical reruns
+- research mode:
+  - use [`data/screenerin/ad_hoc_query.py`](/home/rane/code/stockey/data/screenerin/ad_hoc_query.py) for one-off raw queries
+  - do not register every research idea as a recurring screener
+  - only promote a query into the registry when it becomes a stable production input
+
+This keeps the daily advisory pipeline smaller and more deterministic without losing exploratory flexibility.
+
+Theme detection and theme-to-screener mapping now use a single active config:
+
+- [`config/investment_themes.yaml`](/home/rane/code/stockey/config/investment_themes.yaml)
+
+The older fallback theme config was removed.
 
 ## Snapshot policy
 
@@ -94,6 +117,7 @@ These are the main files you will edit when maintaining the advisory system:
 - portfolio planning: [`advisory/portfolio_engine.py`](/home/rane/code/stockey/advisory/portfolio_engine.py)
 - lifecycle: [`advisory/position_lifecycle.py`](/home/rane/code/stockey/advisory/position_lifecycle.py)
 - execution planning: [`advisory/execution_engine.py`](/home/rane/code/stockey/advisory/execution_engine.py)
+- research ledger: [`advisory/research_ledger.py`](/home/rane/code/stockey/advisory/research_ledger.py)
 - master orchestrator: [`advisory/master_pipeline.py`](/home/rane/code/stockey/advisory/master_pipeline.py)
 - component orchestrator: [`advisory/pipeline.py`](/home/rane/code/stockey/advisory/pipeline.py)
 - symbol trace utility: [`advisory/symbol_trace.py`](/home/rane/code/stockey/advisory/symbol_trace.py)
@@ -112,6 +136,8 @@ These are the core advisory tables to know:
 - rule outputs: `advisory_candidates`, `advisory_candidate_rejections`
 - watch layer: `advisory_watchlist`, `advisory_watch_events`, `economictimes_rss_items`, `advisory_news_events`
 - LLM/event layer: `advisory_event_evaluations`, `advisory_event_risks`
+- event meta-model layer: `advisory_event_model_scores`
+- adversarial review layer: `advisory_event_reviews`
 - allocation/execution layer: `advisory_allocations`, `advisory_portfolio_orders`, `advisory_position_lifecycle`, `advisory_rebalance_actions`, `advisory_execution_orders`, `advisory_execution_fills`
 
 ## Day-to-day commands
@@ -153,6 +179,8 @@ python -m advisory.announcement_watch
 python -m data.economictimes.rss
 python -m advisory.news_watch --refresh-feeds
 python -m advisory.llm_event_evaluator
+python -m advisory.event_meta_model score --dry-run
+python -m advisory.adversarial_review
 python -m advisory.risk_engine
 python -m advisory.portfolio_engine
 python -m advisory.position_lifecycle
@@ -169,9 +197,104 @@ python -m pytest tests/test_advisory_regression.py
 python scripts/cleanup_deprecated_tables.py --dry-run
 ```
 
+## Research priorities
+
+The main research priority is validation, not more agent orchestration.
+
+Focus on:
+
+1. point-in-time discipline across screeners, prices, macro, news, and announcements
+2. false-discovery control with a research ledger and leakage-resistant evaluation
+3. structured event extraction from messy text
+4. tabular alpha models with abstention
+5. policy separation from prediction and execution
+
+First concrete implementation now available:
+
+- a research ledger in `advisory_research_runs`
+- opt-in logging from `advisory.pipeline` and `advisory.master_pipeline`
+- stored fields for config, as-of date, validation protocol, result metrics, and status
+- a formal abstain layer with `candidate_state=ABSTAIN` and `allocation_status=abstained` for low-edge or too-mixed setups
+- a richer event tensor in `advisory_event_evaluations` with:
+  - `direction`
+  - `surprise`
+  - `novelty`
+  - `contradiction`
+  - `expected_decay_days`
+  - `source_reliability`
+  - `affected_sectors_json`
+  - `affected_peers_json`
+  - `event_tensor_json`
+
+This keeps the LLM in an extraction role. The stable policy-facing fields like `event_class`, `state_transition_hint`, and `score_impact` still exist for the current watch, risk, and portfolio pipeline.
+
+- a deterministic adversarial reviewer in `advisory_event_reviews` with:
+  - `review_action`
+  - `review_score`
+  - `veto`
+  - `review_reason`
+  - `review_flags_json`
+  - `feature_snapshot_json`
+
+This reviewer can only clear, penalize, force manual review, or veto. It does not create bullish signals on its own.
+
+- a train/score scaffold in `advisory.event_meta_model` that:
+  - builds leakage-safe labels from point-in-time event rows plus later `dhan_ohlcv_daily` closes
+  - trains an XGBoost classifier on sign-adjusted forward returns
+  - stores current event scores in `advisory_event_model_scores`
+
+This model is a research and scoring aid. It is not auto-trained inside the daily advisory pipeline.
+
+## Model training prerequisites
+
+Do not train the event meta-model until all of these are true:
+
+1. `advisory_event_evaluations` has enough historical rows across multiple dates and setups.
+2. The evaluated symbols have enough fresh `dhan_ohlcv_daily` rows to cover the chosen forward-return horizon.
+3. The labeled dataset has enough non-null `target_label` rows to justify training.
+4. The research ledger records the config, horizon, date range, and validation protocol.
+
+Practical operator checklist:
+
+```sh
+python scripts/sql_query_runner.py --read-only "select date(published_on) as published_date, count(*) as eval_count from advisory_event_evaluations group by 1 order by 1"
+python scripts/sql_query_runner.py --read-only "select max(date) as max_price_date from dhan_ohlcv_daily"
+python -m advisory.event_meta_model train --horizon-days 1
+python -m advisory.event_meta_model score --dry-run
+```
+
+The right order is:
+
+1. backfill and evaluate more historical announcements/news
+2. refresh daily OHLCV for the evaluated symbols
+3. train first on the shortest viable horizon, usually `1d`
+4. widen to `3d`, `5d`, or longer horizons only after the label count supports it
+
+Useful commands:
+
+```sh
+python -m advisory.research_ledger --limit 20
+python -m advisory.pipeline --dry-run --log-research-ledger --ledger-label "baseline-v1"
+python -m advisory.master_pipeline --dry-run --log-research-ledger --ledger-label "full-run-v1"
+```
+
+Deprioritized for now:
+
+- multi-agent debate systems
+- LLM-led trading decisions
+- free-form research orchestration inside the production runtime
+
 ## How to add a new screener
 
-The system currently uses Screener.in as the active advisory screener source.
+The system currently uses Screener.in as the active advisory screener source for recurring production universes.
+
+For one-off exploration, prefer ad hoc queries first:
+
+```sh
+python -m data.screenerin.ad_hoc_query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
+```
+
+Only use the registry path below when the screener should become a recurring production input.
 
 ### Step 1: add the URL to the registry
 
@@ -205,7 +328,7 @@ Remove a screener:
 python -m data.screenerin.screener_registry remove my-new-screen
 ```
 
-### Step 2: sync the raw screener snapshot
+### Step 2: sync the raw production screener snapshot
 
 ```sh
 python -m data.screenerin.screener_parser
