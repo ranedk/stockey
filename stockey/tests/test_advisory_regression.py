@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import date
 
 import pandas as pd
 
-from advisory import adversarial_review, announcement_watch, dashboard, event_meta_model, execution_engine, intraday_features, llm_event_evaluator, master_pipeline, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, watchlist_builder
+from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, intraday_features, llm_event_evaluator, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, training_universe, watchlist_builder
+from data.eaindustry import wpi
+from data.dhanlive import dhan_db
 from data import download_runner
 
 
@@ -1363,6 +1366,400 @@ def test_event_meta_model_builds_directional_label_from_future_returns(monkeypat
     assert int(row["target_label"]) == 1
 
 
+def test_event_model_data_prep_summarizes_label_coverage(monkeypatch):
+    def fake_build_labeled_event_dataset(*, horizon_days, **kwargs):
+        if horizon_days == 1:
+            return pd.DataFrame(
+                [
+                    {"target_label": 1},
+                    {"target_label": 0},
+                    {"target_label": pd.NA},
+                ]
+            )
+        if horizon_days == 3:
+            return pd.DataFrame(
+                [
+                    {"target_label": pd.NA},
+                    {"target_label": pd.NA},
+                ]
+            )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(
+        event_model_data_prep,
+        "build_labeled_event_dataset",
+        fake_build_labeled_event_dataset,
+    )
+
+    summary = event_model_data_prep.summarize_label_coverage(horizons=[1, 3, 5], min_labeled_rows=2)
+    coverage = {item["horizon_days"]: item for item in summary["coverage"]}
+
+    assert coverage[1]["dataset_rows"] == 3
+    assert coverage[1]["labeled_rows"] == 2
+    assert coverage[1]["train_ready"] is True
+    assert coverage[3]["dataset_rows"] == 2
+    assert coverage[3]["labeled_rows"] == 0
+    assert coverage[3]["train_ready"] is False
+    assert coverage[5]["dataset_rows"] == 0
+    assert coverage[5]["labeled_rows"] == 0
+    assert summary["any_train_ready"] is True
+
+
+def test_event_meta_model_joins_anchor_day_intraday_features(monkeypatch):
+    monkeypatch.setattr(
+        event_meta_model,
+        "load_event_rows",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-03-20T10:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "setup_id": "EVENT_OPPORTUNITY_V1",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "event_source": "announcement",
+                    "sentiment": "positive",
+                    "materiality": "high",
+                    "setup_effect": "strengthens",
+                    "direction": "positive",
+                    "surprise": 0.8,
+                    "novelty": 0.7,
+                    "contradiction": 0.1,
+                    "expected_decay_days": 20,
+                    "source_reliability": "high",
+                    "governance_risk": "none",
+                    "balance_sheet_risk": "none",
+                    "execution_risk": "low",
+                    "investable_now": True,
+                    "verdict": "continue",
+                    "event_class": "ORDER_WIN",
+                    "state_transition_hint": "RAISE_SCORE_ONLY",
+                    "score_impact": 0.2,
+                    "confidence": 0.8,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        event_meta_model,
+        "load_price_history",
+        lambda symbols, start_date, end_date: pd.DataFrame(
+            [
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-21T00:00:00Z"), "close": 100.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-03-24T00:00:00Z"), "close": 103.0},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        event_meta_model,
+        "load_intraday_event_features",
+        lambda symbols, start_date, end_date: pd.DataFrame(
+            [
+                {
+                    "symbol": "ABC",
+                    "asof_date": pd.Timestamp("2026-03-21T00:00:00Z"),
+                    "intraday_close_vs_vwap_pct": 0.6,
+                    "intraday_pct_bars_above_vwap": 0.72,
+                    "intraday_close_location_pct": 0.81,
+                    "intraday_opening_range_breakout_up": True,
+                    "intraday_prev_day_breakout_up": True,
+                    "intraday_failed_prev_day_breakout": False,
+                    "intraday_first_30m_return_pct": 0.4,
+                    "intraday_last_60m_return_pct": 0.5,
+                    "intraday_volume_vs_20d": 1.4,
+                    "intraday_breakout_score": 0.88,
+                    "intraday_pattern_label": "BREAKOUT_CONFIRMATION",
+                }
+            ]
+        ),
+    )
+
+    dataset = event_meta_model.build_labeled_event_dataset(horizon_days=1, return_threshold=0.02)
+    row = dataset.iloc[0]
+    assert row["anchor_date"] == pd.Timestamp("2026-03-21T00:00:00Z")
+    assert float(row["intraday_close_vs_vwap_pct"]) == 0.6
+    assert float(row["intraday_breakout_score"]) == 0.88
+    assert row["intraday_pattern_label"] == "BREAKOUT_CONFIRMATION"
+
+
+def test_training_universe_normalizes_ad_hoc_payload(monkeypatch):
+    monkeypatch.setattr(
+        training_universe,
+        "load_training_universe_config",
+        lambda config_path=None: [
+            {
+                "screener_slug": "train-largecap-liquid",
+                "screener_name": "TRAIN_LARGECAP_LIQUID",
+                "query_name": "Train Largecap Liquid",
+                "query_text": "Market capitalization > 20000",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        training_universe,
+        "fetch_ad_hoc_payload",
+        lambda **kwargs: {
+            "screener_url": "https://www.screener.in/screen/raw/?query=x",
+            "companies": [
+                {
+                    "s_no": 1,
+                    "name": "ABC Ltd",
+                    "ticker": "ABC",
+                    "page_slug": "ABC",
+                    "metrics": {"cmp_rs": 123.4, "mar_cap_rscr": 25000.0, "p_e": 18.2},
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        training_universe,
+        "resolve_company_master",
+        lambda df: df.assign(company_master_id="nse:ABC", ticker="ABC", exchange="NSE"),
+    )
+
+    summary = training_universe.sync_training_universes(
+        asof_date=pd.Timestamp("2026-04-07T00:00:00Z"),
+        dry_run=True,
+    )
+
+    assert summary["screener_count"] == 1
+    assert summary["row_count"] == 0
+    assert summary["results"][0]["screener_slug"] == "train-largecap-liquid"
+    assert summary["results"][0]["status"] == "planned"
+
+
+def test_rule_engine_excludes_research_only_setups_by_default(monkeypatch):
+    monkeypatch.setattr(
+        rule_engine,
+        "get_effective_dates",
+        lambda asof_date=None: {"screener_date": pd.Timestamp("2026-04-07T00:00:00Z")},
+    )
+    monkeypatch.setattr(
+        rule_engine,
+        "load_regime",
+        lambda asof_date: {"regime_name": "STABLE", "asof_date": pd.Timestamp("2026-04-07T00:00:00Z")},
+    )
+    monkeypatch.setattr(
+        rule_engine,
+        "load_setup_registry",
+        lambda config_path=None: [
+            {
+                "setup_id": "EVENT_MODEL_TRAINING_V1",
+                "setup_name": "Training",
+                "screeners": ["train-largecap-liquid"],
+                "screener_mode": "union",
+                "overlay_screeners": {},
+                "research_only": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(rule_engine, "load_technical", lambda asof_date: pd.DataFrame())
+    monkeypatch.setattr(rule_engine, "load_intraday", lambda asof_date: pd.DataFrame())
+    monkeypatch.setattr(rule_engine, "load_fundamentals", lambda asof_date: pd.DataFrame())
+    monkeypatch.setattr(rule_engine, "load_overlay", lambda *args, **kwargs: {"overlay_name": "NONE", "asof_date": pd.Timestamp("2026-04-07T00:00:00Z")})
+    monkeypatch.setattr(rule_engine, "load_active_theme_screener_mapping", lambda **kwargs: {"theme_ids": [], "screener_slugs": []})
+    monkeypatch.setattr(rule_engine, "load_screener_universe", lambda *args, **kwargs: pd.DataFrame())
+
+    candidates, rejections, meta = rule_engine.run_rule_engine(asof_date=pd.Timestamp("2026-04-07T00:00:00Z"))
+    assert candidates.empty
+    assert rejections.empty
+
+    _, rejections_selected, _ = rule_engine.run_rule_engine(
+        asof_date=pd.Timestamp("2026-04-07T00:00:00Z"),
+        setup_ids=["EVENT_MODEL_TRAINING_V1"],
+    )
+    assert not rejections_selected.empty
+    assert "missing_screener_universe" in set(rejections_selected["reason_code"].astype(str))
+
+
+def test_model_training_runner_horizon_ready():
+    prep_summary = {
+        "label_coverage": {
+            "coverage": [
+                {"horizon_days": 1, "train_ready": True},
+                {"horizon_days": 3, "train_ready": False},
+            ]
+        }
+    }
+    assert model_training_runner._horizon_ready(prep_summary, 1) is True
+    assert model_training_runner._horizon_ready(prep_summary, 3) is False
+    assert model_training_runner._horizon_ready(prep_summary, 5) is False
+
+
+def test_dhan_identity_falls_back_from_nse_to_bse_security(monkeypatch):
+    monkeypatch.setattr(
+        dhan_db,
+        "get_company_master_equity",
+        lambda ticker, exchange: pd.Series(
+            {
+                "company_master_id": "nse:AAYUSHBULL",
+                "nse_ticker": "AAYUSHBULL",
+                "bse_ticker": "540718",
+                "dhan_nse_id": pd.NA,
+                "dhan_bse_id": 540718,
+            }
+        ),
+    )
+    monkeypatch.setattr(dhan_db, "_resolve_nse_fallback_security_id", lambda company: None)
+
+    identity = dhan_db.resolve_dhan_identity("AAYUSHBULL", "NSE", asset_type="stock")
+    assert identity["exchange"] == "BSE"
+    assert identity["ticker"] == "540718"
+    assert identity["security_id"] == 540718
+    assert identity["exchange_segment"] == "BSE_EQ"
+
+
+def test_get_dhan_ohlcv_daily_uses_resolved_exchange(monkeypatch):
+    monkeypatch.setattr(
+        dhan_db,
+        "resolve_dhan_identity",
+        lambda ticker, exchange, asset_type="stock": {
+            "security_id": 540718,
+            "exchange": "BSE",
+            "asset_type": "stock",
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_sql_to_df(query, params=None):
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(dhan_db, "sql_to_df", fake_sql_to_df)
+    dhan_db.get_dhan_ohlcv_daily("AAYUSHBULL", exchange="NSE", asset_type="stock")
+    assert captured["params"]["exchange"] == "BSE"
+
+
+def test_risk_engine_persist_allocations_normalizes_review_veto(monkeypatch):
+    captured: dict[str, pd.DataFrame] = {}
+    monkeypatch.setattr(risk_engine, "ensure_allocations_table", lambda: None)
+
+    class DummyCursor:
+        def execute(self, *args, **kwargs):
+            return None
+
+    class DummySession:
+        def __enter__(self):
+            return (None, DummyCursor())
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(risk_engine, "db_session", lambda *args, **kwargs: DummySession())
+
+    def fake_upsert(df, table_name, unique_keys=None, timescaledb_column=None):
+        captured["df"] = df.copy()
+
+    monkeypatch.setattr(risk_engine, "upsert_to_db", fake_upsert)
+    risk_engine.persist_allocations(
+        pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-04-07T09:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-04-07T00:00:00Z"),
+                    "setup_id": "TEST",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "review_veto": "False",
+                    "review_score": "-0.25",
+                    "investable_now": "True",
+                }
+            ]
+        )
+    )
+    out = captured["df"]
+    assert out["review_veto"].dtype == bool
+    assert out["investable_now"].dtype == bool
+    assert pd.api.types.is_float_dtype(out["review_score"])
+
+
+def test_position_lifecycle_uses_published_day_for_entry_price(monkeypatch):
+    monkeypatch.setattr(
+        position_lifecycle,
+        "load_price_points",
+        lambda symbols, monitor_date: pd.DataFrame(
+            [
+                {"symbol": "ABC", "date": pd.Timestamp("2026-04-07T00:00:00Z"), "close": 101.0},
+                {"symbol": "ABC", "date": pd.Timestamp("2026-04-08T00:00:00Z"), "close": 103.0},
+            ]
+        ),
+    )
+    orders = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "published_on": pd.Timestamp("2026-04-07T15:30:00Z"),
+            }
+        ]
+    )
+    derived = position_lifecycle.derive_entry_and_current_prices(
+        orders,
+        pd.Timestamp("2026-04-08T00:00:00Z"),
+    )
+    row = derived.iloc[0]
+    assert row["entry_date"] == pd.Timestamp("2026-04-07T00:00:00Z")
+    assert float(row["entry_price"]) == 101.0
+    assert float(row["current_price"]) == 103.0
+
+
+def test_position_lifecycle_load_price_points_uses_resolved_bse_identity(monkeypatch):
+    monkeypatch.setattr(
+        position_lifecycle,
+        "resolve_price_identities",
+        lambda symbols: pd.DataFrame(
+            [
+                {
+                    "symbol": "AAYUSHBULL",
+                    "exchange": "BSE",
+                    "security_id": 540718,
+                    "resolved_ticker": "540718",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        position_lifecycle,
+        "sql_to_df",
+        lambda query, params=None: pd.DataFrame(
+            [
+                {
+                    "exchange": "BSE",
+                    "security_id": 540718,
+                    "ticker": "540718",
+                    "date": pd.Timestamp("2026-04-07T00:00:00Z"),
+                    "close": 12.5,
+                }
+            ]
+        ),
+    )
+    prices = position_lifecycle.load_price_points(
+        ["AAYUSHBULL"],
+        pd.Timestamp("2026-04-07T00:00:00Z"),
+    )
+    assert len(prices) == 1
+    row = prices.iloc[0]
+    assert row["symbol"] == "AAYUSHBULL"
+    assert row["exchange"] == "BSE"
+    assert row["ticker"] == "540718"
+
+
+def test_wpi_expected_month_count_for_current_year():
+    assert wpi.expected_month_count_for_year(2026, today=date(2026, 4, 7)) == 3
+    assert wpi.expected_month_count_for_year(2025, today=date(2026, 4, 7)) == 12
+    assert wpi.expected_month_count_for_year(2027, today=date(2026, 4, 7)) == 0
+
+
+def test_wpi_load_completed_items_uses_expected_month_count(monkeypatch):
+    monkeypatch.setattr(
+        wpi,
+        "sql_to_df",
+        lambda query, params=None: pd.DataFrame([{"cname": "A"}, {"cname": "B"}]),
+    )
+    completed = wpi.load_completed_items(2026, expected_months=3)
+    assert completed == {"A", "B"}
+
+
 def test_risk_engine_keeps_investable_review_manual_as_allocated(monkeypatch):
     monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr(
@@ -2317,3 +2714,295 @@ def test_portfolio_engine_uses_setup_cap_override(monkeypatch):
     )
     row = df.iloc[0]
     assert row["approved_allocation_inr"] == 15000.0
+
+
+def test_continuous_watch_build_price_alerts_entry_and_invalidation():
+    watchlist = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "ABC",
+                "current_state": "WATCH_BREAKOUT",
+                "attractive_price_low": 95.0,
+                "attractive_price_high": 105.0,
+                "invalidation_price": 90.0,
+            },
+            {
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "XYZ",
+                "current_state": "PASS_NOW",
+                "attractive_price_low": 50.0,
+                "attractive_price_high": 60.0,
+                "invalidation_price": 48.0,
+            },
+        ]
+    )
+    latest_prices = pd.DataFrame(
+        [
+            {"symbol": "ABC", "timestamp": pd.Timestamp("2026-04-08T09:20:00Z"), "close": 100.0},
+            {"symbol": "XYZ", "timestamp": pd.Timestamp("2026-04-08T09:20:00Z"), "close": 47.5},
+        ]
+    )
+
+    alerts = continuous_watch.build_price_alerts(
+        watchlist,
+        latest_prices,
+        observed_at=pd.Timestamp("2026-04-08T09:21:00Z"),
+    )
+
+    assert set(alerts["alert_type"].tolist()) == {"ENTRY_ZONE_HIT", "INVALIDATION_HIT"}
+    entry_row = alerts[alerts["symbol"] == "ABC"].iloc[0]
+    invalidation_row = alerts[alerts["symbol"] == "XYZ"].iloc[0]
+    assert entry_row["alert_type"] == "ENTRY_ZONE_HIT"
+    assert invalidation_row["alert_type"] == "INVALIDATION_HIT"
+
+
+def test_continuous_watch_build_price_alerts_breakout_above_range():
+    watchlist = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "ABC",
+                "current_state": "WATCH_BREAKOUT",
+                "attractive_price_low": 95.0,
+                "attractive_price_high": 105.0,
+                "invalidation_price": 90.0,
+            }
+        ]
+    )
+    latest_prices = pd.DataFrame(
+        [
+            {"symbol": "ABC", "timestamp": pd.Timestamp("2026-04-08T09:20:00Z"), "close": 110.0},
+        ]
+    )
+
+    alerts = continuous_watch.build_price_alerts(
+        watchlist,
+        latest_prices,
+        observed_at=pd.Timestamp("2026-04-08T09:21:00Z"),
+    )
+
+    assert len(alerts) == 1
+    assert alerts.iloc[0]["alert_type"] == "BREAKOUT_ABOVE_RANGE"
+
+
+def test_continuous_watch_build_price_alerts_for_open_positions_exit_points():
+    watchlist = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "ABC",
+                "current_state": "OPEN_POSITION",
+                "monitor_source": "position",
+                "stop_price": 98.0,
+                "invalidation_price": 95.0,
+            },
+            {
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "XYZ",
+                "current_state": "OPEN_POSITION",
+                "monitor_source": "position",
+                "stop_price": 48.0,
+                "invalidation_price": 45.0,
+            },
+        ]
+    )
+    latest_prices = pd.DataFrame(
+        [
+            {"symbol": "ABC", "timestamp": pd.Timestamp("2026-04-08T09:20:00Z"), "close": 94.5},
+            {"symbol": "XYZ", "timestamp": pd.Timestamp("2026-04-08T09:20:00Z"), "close": 47.5},
+        ]
+    )
+
+    alerts = continuous_watch.build_price_alerts(
+        watchlist,
+        latest_prices,
+        observed_at=pd.Timestamp("2026-04-08T09:21:00Z"),
+    )
+
+    assert set(alerts["alert_type"].tolist()) == {"POSITION_INVALIDATION_HIT", "STOP_HIT"}
+    by_symbol = {row["symbol"]: row for row in alerts.to_dict(orient="records")}
+    assert by_symbol["ABC"]["alert_type"] == "POSITION_INVALIDATION_HIT"
+    assert by_symbol["XYZ"]["alert_type"] == "STOP_HIT"
+
+
+def test_event_router_build_routing_plan_merges_price_and_event_sources():
+    alerts = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "setup_id": "SETUP_A",
+                "alert_type": "ENTRY_ZONE_HIT",
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+            }
+        ]
+    )
+    announcement_events = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "setup_id": "SETUP_A",
+                "load_ts": pd.Timestamp("2026-04-08T10:00:00Z"),
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+            }
+        ]
+    )
+    news_events = pd.DataFrame(
+        [
+            {
+                "symbol": "XYZ",
+                "setup_id": "SETUP_B",
+                "load_ts": pd.Timestamp("2026-04-08T10:01:00Z"),
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+            }
+        ]
+    )
+
+    plan = event_router.build_routing_plan(
+        alerts=alerts,
+        announcement_events=announcement_events,
+        news_events=news_events,
+    )
+
+    assert len(plan) == 2
+    by_symbol = {row["symbol"]: row for row in plan}
+    assert by_symbol["ABC"]["action_type"] == "refresh_symbol_full"
+    assert by_symbol["ABC"]["start_at"] == "technicals"
+    assert by_symbol["ABC"]["include_watch"] is True
+    assert by_symbol["XYZ"]["action_type"] == "refresh_symbol_event"
+    assert by_symbol["XYZ"]["start_at"] == "evaluate"
+
+
+def test_event_router_limits_event_only_actions_and_prioritizes_price_alerts():
+    alerts = pd.DataFrame(
+        [
+            {
+                "symbol": "AAA",
+                "setup_id": "SETUP_A",
+                "alert_type": "INVALIDATION_HIT",
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+            }
+        ]
+    )
+    announcement_events = pd.DataFrame(
+        [
+            {"symbol": "BBB", "setup_id": "SETUP_B", "load_ts": pd.Timestamp("2026-04-08T10:00:00Z"), "asof_date": pd.Timestamp("2026-04-08T00:00:00Z")},
+            {"symbol": "CCC", "setup_id": "SETUP_C", "load_ts": pd.Timestamp("2026-04-08T10:01:00Z"), "asof_date": pd.Timestamp("2026-04-08T00:00:00Z")},
+            {"symbol": "DDD", "setup_id": "SETUP_D", "load_ts": pd.Timestamp("2026-04-08T10:02:00Z"), "asof_date": pd.Timestamp("2026-04-08T00:00:00Z")},
+        ]
+    )
+    watch_priority = pd.DataFrame(
+        [
+            {"symbol": "AAA", "setup_id": "SETUP_A", "rank": 5},
+            {"symbol": "BBB", "setup_id": "SETUP_B", "rank": 1},
+            {"symbol": "CCC", "setup_id": "SETUP_C", "rank": 2},
+            {"symbol": "DDD", "setup_id": "SETUP_D", "rank": 3},
+        ]
+    )
+
+    plan = event_router.build_routing_plan(
+        alerts=alerts,
+        announcement_events=announcement_events,
+        news_events=pd.DataFrame(),
+        watchlist_priority=watch_priority,
+        max_actions=3,
+        max_event_only_actions=1,
+    )
+
+    assert len(plan) == 2
+    assert plan[0]["symbol"] == "AAA"
+    assert plan[0]["action_type"] == "refresh_symbol_price"
+    event_only = [row for row in plan if row["action_type"] == "refresh_symbol_event"]
+    assert len(event_only) == 1
+    assert event_only[0]["symbol"] == "BBB"
+
+
+def test_event_router_position_alerts_include_lifecycle():
+    alerts = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "setup_id": "SETUP_A",
+                "alert_type": "POSITION_INVALIDATION_HIT",
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+            }
+        ]
+    )
+
+    plan = event_router.build_routing_plan(
+        alerts=alerts,
+        announcement_events=pd.DataFrame(),
+        news_events=pd.DataFrame(),
+    )
+
+    assert len(plan) == 1
+    assert plan[0]["action_type"] == "refresh_symbol_price"
+    assert plan[0]["stop_at"] == "lifecycle"
+    assert plan[0]["include_lifecycle"] is True
+
+
+def test_live_notifier_formats_operator_messages():
+    from advisory import live_notifier
+
+    assert "alerts count=2" in live_notifier.format_operator_message(
+        "stockey:continuous_watch:alerts",
+        {
+            "published_at": "2026-04-08T10:00:00Z",
+            "alert_count": 2,
+            "alerts": [{"symbol": "ABC"}, {"symbol": "XYZ"}],
+        },
+    )
+    assert "router planned=3 executed=2" in live_notifier.format_operator_message(
+        "stockey:continuous_watch:router",
+        {
+            "published_at": "2026-04-08T10:00:00Z",
+            "planned_actions": 3,
+            "executed_actions": 2,
+        },
+    )
+
+
+def test_live_notifier_appends_operator_feed(tmp_path):
+    from advisory import live_notifier
+
+    entry = live_notifier.append_operator_event(
+        output_dir=tmp_path,
+        channel="stockey:continuous_watch:alerts",
+        payload={
+            "published_at": "2026-04-08T10:00:00Z",
+            "alert_count": 1,
+            "alerts": [{"symbol": "ABC"}],
+        },
+        max_items=10,
+    )
+
+    assert entry["channel"] == "stockey:continuous_watch:alerts"
+    feed = json.loads((tmp_path / "operator_feed.json").read_text(encoding="utf-8"))
+    assert len(feed) == 1
+    assert "alerts count=1" in feed[0]["message"]
+    assert (tmp_path / "operator_feed.jsonl").exists()
+    assert (tmp_path / "operator_feed.txt").exists()
+
+
+def test_live_dashboard_loads_operator_feed(tmp_path):
+    from advisory import live_dashboard
+
+    operator_feed = [
+        {
+            "received_at": "2026-04-08T10:00:00Z",
+            "channel": "stockey:continuous_watch:alerts",
+            "message": "2026-04-08T10:00:00Z alerts count=1 symbols=ABC",
+        }
+    ]
+    (tmp_path / "operator_feed.json").write_text(json.dumps(operator_feed), encoding="utf-8")
+
+    loaded = live_dashboard.load_operator_feed(output_dir=tmp_path)
+
+    assert len(loaded) == 1
+    assert loaded[0]["channel"] == "stockey:continuous_watch:alerts"
+    assert "alerts count=1" in loaded[0]["message"]

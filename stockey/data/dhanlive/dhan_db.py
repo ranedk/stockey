@@ -33,6 +33,12 @@ def get_bse_equity(ticker: str):
 def get_company_master_equity(ticker: str, exchange: str):
     exchange_upper = exchange.upper()
     company = load_company_master_records(ticker, exchanges=[exchange_upper])
+    if company.empty and exchange_upper == "NSE":
+        company = load_company_master_records(ticker, exchanges=["BSE"])
+    elif company.empty and exchange_upper == "BSE":
+        company = load_company_master_records(ticker, exchanges=["NSE"])
+    if company.empty:
+        company = load_company_master_records(ticker)
     if company.empty:
         raise ValueError(f"No company_master row found for {exchange_upper}:{ticker}")
     return company.iloc[0]
@@ -69,13 +75,25 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
         if exchange_upper == "NSE":
             security_id = company.get("dhan_nse_id")
             resolved_ticker = company.get("nse_ticker")
+            resolved_exchange = "NSE"
             exchange_segment = "NSE_EQ"
             if pd.isna(security_id):
                 security_id = _resolve_nse_fallback_security_id(company)
+            if pd.isna(security_id):
+                security_id = company.get("dhan_bse_id")
+                resolved_ticker = company.get("bse_ticker")
+                resolved_exchange = "BSE"
+                exchange_segment = "BSE_EQ"
         elif exchange_upper == "BSE":
             security_id = company.get("dhan_bse_id")
             resolved_ticker = company.get("bse_ticker")
+            resolved_exchange = "BSE"
             exchange_segment = "BSE_EQ"
+            if pd.isna(security_id):
+                security_id = company.get("dhan_nse_id")
+                resolved_ticker = company.get("nse_ticker")
+                resolved_exchange = "NSE"
+                exchange_segment = "NSE_EQ"
         else:
             raise ValueError(f"Unsupported exchange for stock: {exchange}")
         if pd.isna(security_id):
@@ -83,7 +101,7 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
         return {
             "company_master_id": company["company_master_id"],
             "asset_type": "stock",
-            "exchange": exchange_upper,
+            "exchange": resolved_exchange,
             "ticker": str(resolved_ticker).strip(),
             "security_id": int(security_id),
             "exchange_segment": exchange_segment,
@@ -149,7 +167,7 @@ def get_dhan_ohlcv_daily(
     ]
     params: dict[str, object] = {
         "security_id": identity["security_id"],
-        "exchange": exchange.upper(),
+        "exchange": str(identity["exchange"]).upper(),
         "asset_type": asset_type.lower(),
     }
     if from_date:
@@ -188,7 +206,7 @@ def get_dhan_ohlcv_intraday(
     ]
     params: dict[str, object] = {
         "security_id": identity["security_id"],
-        "exchange": exchange.upper(),
+        "exchange": str(identity["exchange"]).upper(),
         "asset_type": asset_type.lower(),
         "interval_minutes": interval_minutes,
     }

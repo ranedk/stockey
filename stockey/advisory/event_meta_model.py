@@ -16,6 +16,7 @@ from utils.sync import parse_datetime_arg
 
 EVENTS_TABLE = "advisory_event_evaluations"
 SCORES_TABLE = "advisory_event_model_scores"
+INTRADAY_FEATURES_TABLE = "advisory_intraday_features_daily"
 DEFAULT_ARTIFACT_DIR = Path(".cache/advisory_event_meta_model")
 DEFAULT_MODEL_BASENAME = "event_meta_model"
 DEFAULT_HORIZON_DAYS = 10
@@ -165,6 +166,63 @@ def load_price_history(symbols: list[str], start_date: pd.Timestamp, end_date: p
     return df
 
 
+def load_intraday_event_features(symbols: list[str], start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    try:
+        if not table_exists(INTRADAY_FEATURES_TABLE):
+            return pd.DataFrame()
+        df = sql_to_df(
+            f"""
+            SELECT
+                symbol,
+                asof_date,
+                interval_minutes,
+                intraday_close_vs_vwap_pct,
+                intraday_pct_bars_above_vwap,
+                intraday_close_location_pct,
+                intraday_opening_range_breakout_up,
+                intraday_prev_day_breakout_up,
+                intraday_failed_prev_day_breakout,
+                intraday_first_30m_return_pct,
+                intraday_last_60m_return_pct,
+                intraday_volume_vs_20d,
+                intraday_breakout_score,
+                intraday_pattern_label
+            FROM {INTRADAY_FEATURES_TABLE}
+            WHERE interval_minutes = 1
+              AND symbol = ANY(%(symbols)s)
+              AND asof_date BETWEEN %(start_date)s AND %(end_date)s
+            ORDER BY symbol, asof_date
+            """,
+            params={"symbols": symbols, "start_date": start_date, "end_date": end_date},
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["asof_date"] = pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dt.normalize()
+    numeric_columns = [
+        "intraday_close_vs_vwap_pct",
+        "intraday_pct_bars_above_vwap",
+        "intraday_close_location_pct",
+        "intraday_first_30m_return_pct",
+        "intraday_last_60m_return_pct",
+        "intraday_volume_vs_20d",
+        "intraday_breakout_score",
+    ]
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    for column in [
+        "intraday_opening_range_breakout_up",
+        "intraday_prev_day_breakout_up",
+        "intraday_failed_prev_day_breakout",
+    ]:
+        df[column] = df[column].fillna(False).astype(bool)
+    return df
+
+
 def _direction_sign(row: pd.Series) -> int:
     setup_effect = str(row.get("setup_effect") or "").lower()
     direction = str(row.get("direction") or "").lower()
@@ -192,6 +250,16 @@ def build_labeled_event_dataset(
     prices = load_price_history(events["symbol"].astype(str).dropna().unique().tolist(), start_date, end_date)
     if prices.empty:
         return pd.DataFrame()
+    intraday = load_intraday_event_features(
+        events["symbol"].astype(str).dropna().unique().tolist(),
+        start_date,
+        end_date,
+    )
+    intraday_lookup = (
+        intraday.set_index(["symbol", "asof_date"]).to_dict(orient="index")
+        if not intraday.empty
+        else {}
+    )
 
     feature_rows: list[dict[str, Any]] = []
     for symbol, price_group in prices.groupby("symbol", sort=False):
@@ -219,6 +287,9 @@ def build_labeled_event_dataset(
             row["anchor_date"] = anchor["date"]
             row["anchor_close"] = anchor["close"]
             row["direction_sign"] = direction_sign
+            intraday_row = intraday_lookup.get((symbol, anchor["date"]))
+            if intraday_row:
+                row.update(intraday_row)
             for h in [1, 3, 5, 10, 20]:
                 value = pd.to_numeric(anchor.get(f"forward_return_{h}"), errors="coerce")
                 row[f"forward_return_{h}d"] = None if pd.isna(value) else round(float(value), 6)
@@ -233,7 +304,6 @@ def build_labeled_event_dataset(
 
 def _prepare_feature_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     frame = df.copy()
-    frame["investable_now"] = frame["investable_now"].fillna(False).astype(int)
     numeric_cols = [
         "surprise",
         "novelty",
@@ -242,9 +312,25 @@ def _prepare_feature_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         "score_impact",
         "confidence",
         "investable_now",
+        "intraday_close_vs_vwap_pct",
+        "intraday_pct_bars_above_vwap",
+        "intraday_close_location_pct",
+        "intraday_first_30m_return_pct",
+        "intraday_last_60m_return_pct",
+        "intraday_volume_vs_20d",
+        "intraday_breakout_score",
+        "intraday_opening_range_breakout_up",
+        "intraday_prev_day_breakout_up",
+        "intraday_failed_prev_day_breakout",
     ]
+    if "investable_now" not in frame.columns:
+        frame["investable_now"] = False
+    frame["investable_now"] = frame["investable_now"].fillna(False).astype(int)
     for col in numeric_cols:
-        frame[col] = pd.to_numeric(frame.get(col), errors="coerce").fillna(0.0)
+        if col not in frame.columns:
+            frame[col] = pd.Series([0.0] * len(frame), index=frame.index, dtype="float64")
+        else:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0.0)
     categorical_cols = [
         "event_source",
         "sentiment",
@@ -259,7 +345,13 @@ def _prepare_feature_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         "event_class",
         "state_transition_hint",
         "setup_id",
+        "intraday_pattern_label",
     ]
+    for col in categorical_cols:
+        if col not in frame.columns:
+            frame[col] = pd.Series([""] * len(frame), index=frame.index, dtype="string")
+        else:
+            frame[col] = frame[col].astype("string").fillna("")
     feature_df = frame[numeric_cols + categorical_cols].copy()
     feature_df = pd.get_dummies(feature_df, columns=categorical_cols, dummy_na=False)
     return feature_df, list(feature_df.columns)

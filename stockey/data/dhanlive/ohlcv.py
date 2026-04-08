@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime, timedelta, timezone
+import sys
 from typing import Iterable
 
 import pandas as pd
@@ -315,7 +316,8 @@ def sync_daily_ohlcv(
         choose_daily_refresh_start(ticker, exchange, asset_type, from_date),
         to_date,
     )
-    effective_to_date = choose_daily_refresh_end(requested_to_date, exchange=exchange)
+    resolved_exchange = str(identity["exchange"])
+    effective_to_date = choose_daily_refresh_end(requested_to_date, exchange=resolved_exchange)
     if effective_from_date > effective_to_date:
         return pd.DataFrame()
 
@@ -333,7 +335,7 @@ def sync_daily_ohlcv(
             raise
         fallback_to_date = clamp_to_last_trading_day(
             effective_to_date - timedelta(days=1),
-            exchange=exchange,
+            exchange=resolved_exchange,
         )
         if fallback_to_date >= effective_to_date or effective_from_date > fallback_to_date:
             return pd.DataFrame()
@@ -343,11 +345,13 @@ def sync_daily_ohlcv(
                 "ticker": ticker,
                 "asset_type": asset_type,
                 "exchange": exchange.upper(),
+                "resolved_exchange": resolved_exchange,
                 "warning": "dhan_no_data_retry",
                 "from_date": effective_from_date.strftime("%Y-%m-%d"),
                 "requested_to_date": requested_to_date.strftime("%Y-%m-%d"),
                 "retry_to_date": fallback_to_date.strftime("%Y-%m-%d"),
             },
+            file=sys.stderr,
             flush=True,
         )
         payload = api_client.fetch_daily(
@@ -396,7 +400,8 @@ def sync_intraday_ohlcv(
     effective_from_date, effective_to_date = normalize_date_window(from_date, to_date)
     if from_date is None:
         effective_from_date = datetime.now() - timedelta(days=DEFAULT_INTRADAY_DAYS)
-    effective_to_date = choose_intraday_refresh_end(effective_to_date if to_date is not None else None, exchange=exchange)
+    resolved_exchange = str(identity["exchange"])
+    effective_to_date = choose_intraday_refresh_end(effective_to_date if to_date is not None else None, exchange=resolved_exchange)
     if effective_from_date > effective_to_date:
         return pd.DataFrame()
     api_client = client or DhanHistoricalClient()
@@ -420,11 +425,13 @@ def sync_intraday_ohlcv(
                     "ticker": ticker,
                     "asset_type": asset_type,
                     "exchange": exchange.upper(),
+                    "resolved_exchange": resolved_exchange,
                     "interval_minutes": interval_minutes,
                     "warning": "dhan_no_data_skip",
                     "from_datetime": window_start.strftime("%Y-%m-%d %H:%M:%S"),
                     "to_datetime": window_end.strftime("%Y-%m-%d %H:%M:%S"),
                 },
+                file=sys.stderr,
                 flush=True,
             )
             continue

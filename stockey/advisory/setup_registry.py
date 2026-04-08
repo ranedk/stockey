@@ -72,6 +72,7 @@ def load_setup_registry(config_path: str | None = None) -> list[dict[str, Any]]:
                 "risk_profile": dict(setup.get("risk_profile") or {}),
                 "portfolio_cap_pct": setup.get("portfolio_cap_pct"),
                 "single_position_cap_pct": setup.get("single_position_cap_pct"),
+                "research_only": bool(setup.get("research_only", False)),
             }
         )
     return normalized

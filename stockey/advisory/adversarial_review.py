@@ -299,8 +299,22 @@ def persist_reviews(reviews: pd.DataFrame) -> None:
     ensure_output_table()
     if reviews.empty:
         return
+    out = reviews.copy()
+    def _to_bool_series(series: pd.Series) -> pd.Series:
+        normalized = series.map(
+            lambda value: (
+                False if pd.isna(value)
+                else value if isinstance(value, bool)
+                else str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+            )
+        )
+        return normalized.astype(bool)
+    if "veto" in out.columns:
+        out["veto"] = _to_bool_series(out["veto"])
+    if "review_score" in out.columns:
+        out["review_score"] = pd.to_numeric(out["review_score"], errors="coerce")
     upsert_to_db(
-        reviews,
+        out,
         REVIEWS_TABLE,
         unique_keys=["published_on", "setup_id", "symbol", "unique_id"],
         timescaledb_column="published_on",

@@ -569,3 +569,79 @@ setups:
     entry_styles:
       - BREAKOUT_PIVOT
       - RETEST_OF_PRIOR_BREAKOUT
+
+  - setup_id: EVENT_MODEL_TRAINING_V1
+    setup_name: Event model training universe
+    setup_family: RESEARCH_TRAINING
+    research_only: true
+    holding_horizon_note: research-only event harvesting
+    screeners:
+      - train-largecap-liquid
+      - train-midcap-liquid
+      - train-event-sensitive
+    screener_mode: union
+    allowed_regimes:
+      - BULL_RISK_ON
+      - BULL_NARROW
+      - STABLE
+      - STABLE_BUT_TARIFF_RISING
+      - RISK_OFF
+      - SHOCK
+    blocked_regimes: []
+    allowed_overlays:
+      - NONE
+      - EVENT_CLUSTER
+      - SECTOR_POLICY_SHOCK
+      - TARIFF_PRESSURE
+      - OIL_SHOCK
+      - GEOPOLITICAL_RISK
+    blocked_overlays: []
+    market_cap_min: 3000
+    min_avg_traded_value_20d: 15000000
+    max_breakout_extension_pct: 20
+    watch_pullback_extension_pct: 10
+    min_dist_52w_high: -35
+    scoring_weights:
+      technical: 0.30
+      fundamental: 0.20
+      regime_fit: 0.10
+      event: 0.40
+    freshness_policy:
+      technical_max_age_days: 20
+      fundamentals_max_age_days: 180
+      regime_max_age_days: 20
+      intraday_max_age_days: 2
+      fundamentals_required: false
+    intraday_usage_mode: none
+    risk_profile:
+      base_risk_bucket: medium_high
+      max_allocation_inr: 0
+      invalidation_anchor: dma_20
+    portfolio_cap_pct: 0.0
+    score_thresholds:
+      pass_now: 0.58
+      watch_breakout: 0.45
+      watch_pullback: 0.40
+      watch_event: 0.34
+      abstain: 0.28
+      near_miss_gap: 0.08
+    regime_policy:
+      preferred:
+        - STABLE
+        - STABLE_BUT_TARIFF_RISING
+      acceptable:
+        - BULL_RISK_ON
+        - BULL_NARROW
+        - RISK_OFF
+        - SHOCK
+      avoid: []
+    technical_rules:
+      - column: avg_traded_value_20d
+        operator: gte
+        value: 15000000
+    watch_reasons:
+      - research event harvesting
+      - broad announcement coverage
+      - label generation
+    entry_styles:
+      - BREAKOUT_PIVOT

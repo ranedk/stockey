@@ -150,6 +150,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-intraday", action="store_true", help="Skip intraday feature sync/build")
     parser.add_argument("--skip-intraday-prefetch", action="store_true", help="Skip on-demand intraday feature backfill inside the rule engine")
     parser.add_argument("--intraday-lookback-days", type=int, default=180, help="How much recent intraday history to maintain for advisory pattern features")
+    parser.add_argument("--rule-max-snapshot-refresh-age-days", type=int, default=7, help="Only repair missing daily/fundamental snapshots on the fly when the screener date is this recent; use -1 to always allow")
+    parser.add_argument("--rule-max-intraday-prefetch-age-days", type=int, default=14, help="Only prefetch missing intraday features on the fly when the screener date is this recent; use -1 to always allow")
     parser.add_argument(
         "--intraday-intervals",
         nargs="*",
@@ -199,6 +201,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         args.intraday_intervals = [1]
     if not hasattr(args, "skip_intraday_prefetch"):
         args.skip_intraday_prefetch = False
+    if not hasattr(args, "rule_max_snapshot_refresh_age_days"):
+        args.rule_max_snapshot_refresh_age_days = 7
+    if not hasattr(args, "rule_max_intraday_prefetch_age_days"):
+        args.rule_max_intraday_prefetch_age_days = 14
     if not hasattr(args, "event_model_artifact_dir"):
         args.event_model_artifact_dir = str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR)
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
@@ -351,6 +357,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             setup_ids=setup_ids,
             config_path=None,
             skip_intraday_prefetch=bool(args.skip_intraday_prefetch),
+            max_snapshot_refresh_age_days=int(args.rule_max_snapshot_refresh_age_days),
+            max_intraday_prefetch_age_days=int(args.rule_max_intraday_prefetch_age_days),
         )
         effective_date = pd.to_datetime(meta.get("effective_date"), utc=True, errors="coerce")
         if not args.dry_run:

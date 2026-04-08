@@ -269,6 +269,7 @@ def run_news_watch(
     setup_ids: list[str] | None = None,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     to_date: pd.Timestamp | None = None,
+    published_from: pd.Timestamp | None = None,
     feed_names: list[str] | None = None,
     refresh_feeds: bool = False,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -282,8 +283,10 @@ def run_news_watch(
     effective_to = pd.to_datetime(to_date or pd.Timestamp.utcnow(), utc=True, errors="coerce")
     if not pd.isna(effective_to) and effective_to == effective_to.normalize():
         effective_to = effective_to + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
-    lower_bound = watchlist["asof_date"].min()
-    lower_bound = max(lower_bound, effective_to - pd.Timedelta(days=int(lookback_days)))
+    lower_bound = pd.to_datetime(published_from, utc=True, errors="coerce")
+    if pd.isna(lower_bound):
+        lower_bound = watchlist["asof_date"].min()
+        lower_bound = max(lower_bound, effective_to - pd.Timedelta(days=int(lookback_days)))
     news_items = load_recent_news(published_from=lower_bound, published_to=effective_to, feed_names=feed_names)
     events = build_news_events(watchlist=watchlist, news_items=news_items)
     meta = {

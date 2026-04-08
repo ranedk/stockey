@@ -2,7 +2,7 @@
 
 ## Recommended split
 
-Keep the future system as separate tool-owning agents instead of one general agent with full access:
+If you expose this repo to agent workflows, keep it as separate tool-owning agents instead of one general agent with full access:
 
 - `downloader`: runs crawler and downloader modules only
 - `storage-ops`: runs `scripts/sql_query_runner.py`, `scripts/redis_query_runner.py`, `scripts/s3_query_runner.py`
@@ -73,6 +73,6 @@ Before adding more agents, finish these pieces:
 - document per-table date semantics
 - prefer numeric SQL types at ingest time instead of repairing them later
 
-## Advisory system next step
+## Advisory system roadmap
 
-The implementation gap for the investment advisory workflow is tracked in [`todo.md`](/home/rane/code/stockey/todo.md). Use that file as the execution checklist before exposing new advisory tools to agents.
+The current advisory roadmap is tracked in [`todo.md`](/home/rane/code/stockey/todo.md). Use that file for active priorities and bottlenecks before exposing new advisory tools to agents.

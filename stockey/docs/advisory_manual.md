@@ -11,9 +11,11 @@ Use this document when you want to:
 - understand which module owns which behavior
 - inspect outputs and debug failures
 
-Use [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) for the target strategy spec. Use [`todo.md`](/home/rane/code/stockey/todo.md) for current implementation status and remaining gaps.
+Use [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) for the current architecture summary. Use [`todo.md`](/home/rane/code/stockey/todo.md) for the active roadmap and remaining bottlenecks.
 
 For common edits with copy-paste commands, use [`docs/advisory_change_cookbook.md`](/home/rane/code/stockey/docs/advisory_change_cookbook.md).
+
+For the short operator runbook, use [`docs/operators_manual.md`](/home/rane/code/stockey/docs/operators_manual.md).
 
 ## Core design
 
@@ -35,6 +37,79 @@ The advisory runtime path is:
 14. Lifecycle tracking
 15. Execution planning
 
+## End-to-End Summary
+
+1. Run raw ingestion for Dhan, Sharpely, macro, NSE, announcements, and ET RSS.
+2. Sync only registered production Screener.in screeners.
+3. Use ad hoc Screener.in queries separately for research.
+4. Normalize stored Screener snapshots into `advisory_screener_constituents`.
+5. Build daily advisory snapshots for macro, fundamentals, technicals, and optional intraday features.
+6. Build the base regime and the lightweight news overlay.
+7. Detect active investment themes and map them to theme-linked production screeners when available.
+8. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
+9. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
+10. Build the watchlist with screener, regime, overlay, and theme provenance.
+11. Ingest announcements and relevant news for watched names.
+12. Use the LLM only to extract structured event tensors from text.
+13. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
+14. Feed candidate state plus event outputs into risk sizing and allocation.
+15. Rank approved allocations in the portfolio engine with overlap and setup caps.
+16. Build lifecycle and execution-planning outputs.
+17. Record research runs in the research ledger.
+18. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
+19. Train the XGBoost event meta-model only when label coverage is sufficient.
+20. Keep prediction separate from policy and execution.
+
+For the full operator path in one command, use:
+
+```sh
+./all_full_advisory.sh
+```
+
+That wrapper:
+
+1. runs event-model training if the requested horizon is ready
+2. runs the full advisory pipeline
+3. prints the current portfolio summary at the end
+
+Use model training separately when you want research prep or training-only work:
+
+```sh
+./all_model_training.sh
+```
+
+That command runs prep first, checks whether the requested horizon is actually ready, and only then trains and scores.
+
+For the lightweight continuous watch loop, use:
+
+```sh
+./all_continuous_watch.sh --loop
+```
+
+This loop:
+
+1. polls 1-minute intraday OHLCV only for active watchlist symbols
+2. polls announcements and ET/news incrementally
+3. routes fresh alerts and events into symbol-level advisory reevaluation
+4. writes live watch alerts when entry zones or invalidations are hit
+5. rewrites a simple static HTML/JSON dashboard in `live_dashboard/`
+
+For a human-readable operator feed from the Redis bus, use:
+
+```sh
+./all_live_notifier.sh
+```
+
+That process subscribes to the continuous-watch channels and writes rolling operator logs into `live_dashboard/`.
+
+The live router currently prioritizes aggressively but does not impose a default hard cap:
+
+- symbols that remain on the advisory watch path continue to be monitored
+- open positions also stay monitored for exit-related alerts
+- price alerts are still prioritized ahead of event-only items
+- invalidation- and stop-related alerts are prioritized above softer watch hits
+- explicit caps can still be supplied manually to the router CLI if needed for debugging
+
 Important runtime decisions:
 
 - canonical advisory OHLCV source: `dhan_ohlcv_daily`
@@ -42,6 +117,14 @@ Important runtime decisions:
 - official event source: exchange announcement pipeline
 - non-official news source: Economic Times RSS
 - legacy/reference only: NSE bhavcopy plus local adjusted-price pipeline
+
+Continuous-watch constraints:
+
+- the polling layer is incremental and stateful through `advisory_sync_state`
+- it watches only active advisory names, not the full market
+- OHLCV polling is based on recent intraday windows, not deep historical loops
+- announcements and ET/news are still deduped and persisted through the existing watch pipelines
+- the LLM should remain a selective evaluator downstream, not the component that decides raw polling on every cycle
 
 ## Production vs Research
 
@@ -64,26 +147,12 @@ Theme detection and theme-to-screener mapping now use a single active config:
 
 The older fallback theme config was removed.
 
-## Snapshot policy
+For event-model data generation there is also a separate research-only training-universe path:
 
-The advisory system now uses a simple snapshot policy:
-
-- `advisory_screener_constituents.date` is the anchor date for a run
-- regime and overlay use the latest available row on or before that date
-- technicals, fundamentals, and intraday features use the latest available per-symbol row on or before that date
-- setup-level `freshness_policy` decides how stale each input is allowed to be
-
-This is intentional. The system no longer rolls the entire advisory run back to the oldest common snapshot date across all datasets.
-
-## Latest update
-
-The latest advisory change added an intraday confirmation layer on top of the daily setup engine.
-
-- the base advisory logic is still daily-first
-- intraday candles are now pulled on demand from Dhan for the active screener universe
-- derived daily intraday features are persisted in `advisory_intraday_features_daily`
-- setups can reference those fields with `intraday_rules`
-- this is intended as a confirmation layer for breakouts and event setups, not as a full intraday trading engine
+- broad ad hoc Screener.in queries live in [`config/event_model_training_universes.yaml`](/home/rane/code/stockey/config/event_model_training_universes.yaml)
+- they sync directly into normalized `advisory_screener_constituents`
+- they feed the research-only setup `EVENT_MODEL_TRAINING_V1`
+- normal advisory runs exclude that setup unless it is explicitly selected
 
 ## Snapshot policy
 
@@ -95,6 +164,23 @@ The advisory snapshot policy is intentionally simple:
 - stale inputs should usually reduce confidence or move a name to `WATCH_*`, not silently drag the whole run back to an older market date
 
 This avoids the old behavior where the whole advisory run could fall back to one old common date just because one snapshot family was lagging.
+
+## Current roadmap summary
+
+The codebase has moved past the earlier multi-screener and overlay build-out. The main open work now is:
+
+1. increase historical event coverage so the event meta-model has enough mature labels
+2. get the first statistically usable `1d` event-model fit into regular research use
+3. improve the regime stack with better shock detection and persistence
+4. move more prediction logic from hand-tuned thresholds into tabular models
+5. tighten continuous-watch routing with cooldowns and duplicate suppression
+
+LLMs are intentionally kept in:
+
+- structured event extraction
+- adversarial review
+
+They are intentionally not the final trade-decision engine.
 
 ## Main files
 
@@ -199,7 +285,7 @@ python scripts/cleanup_deprecated_tables.py --dry-run
 
 ## Research priorities
 
-The main research priority is validation, not more agent orchestration.
+The main research priority is validation, not orchestration.
 
 Focus on:
 
@@ -209,7 +295,7 @@ Focus on:
 4. tabular alpha models with abstention
 5. policy separation from prediction and execution
 
-First concrete implementation now available:
+Already implemented:
 
 - a research ledger in `advisory_research_runs`
 - opt-in logging from `advisory.pipeline` and `advisory.master_pipeline`
@@ -240,12 +326,41 @@ This reviewer can only clear, penalize, force manual review, or veto. It does no
 
 - a train/score scaffold in `advisory.event_meta_model` that:
   - builds leakage-safe labels from point-in-time event rows plus later `dhan_ohlcv_daily` closes
+  - joins first-trading-day intraday response features from `advisory_intraday_features_daily` onto each event anchor date
   - trains an XGBoost classifier on sign-adjusted forward returns
   - stores current event scores in `advisory_event_model_scores`
 
 This model is a research and scoring aid. It is not auto-trained inside the daily advisory pipeline.
 
 ## Model training prerequisites
+
+Use the prep command first:
+
+```sh
+python -m advisory.event_model_data_prep --format text
+```
+
+That command is the intended operator path for model-training preparation. It:
+
+1. fills missing normalized screener dates from already stored Screener snapshots
+2. reruns historical advisory rules -> watch -> evaluate -> review over those dates
+3. refreshes daily OHLCV for symbols already present in `advisory_event_evaluations`
+4. reports label coverage by horizon so you can decide whether training is justified
+5. syncs broad ad hoc training universes for the current date when you are not running a historical-only window
+
+Runtime constraints are intentional:
+
+- historical model-backfill dates do not try to repair old daily or fundamental snapshot gaps on the fly
+- historical model-backfill dates do not prefetch old intraday features on the fly
+- same-day or very recent production-style runs can still repair missing snapshots when needed
+- the goal is to avoid burning time on low-value historical rehydration while keeping current advisory runs strict
+
+Useful variants:
+
+```sh
+python -m advisory.event_model_data_prep --from-date 2026-03-01 --to-date 2026-04-01 --format text
+python -m advisory.event_model_data_prep --skip-event-backfill --skip-price-refresh --dry-run --format text
+```
 
 Do not train the event meta-model until all of these are true:
 
@@ -278,7 +393,7 @@ python -m advisory.pipeline --dry-run --log-research-ledger --ledger-label "base
 python -m advisory.master_pipeline --dry-run --log-research-ledger --ledger-label "full-run-v1"
 ```
 
-Deprioritized for now:
+Deprioritized:
 
 - multi-agent debate systems
 - LLM-led trading decisions

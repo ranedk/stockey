@@ -965,9 +965,35 @@ def persist_allocations(df: pd.DataFrame) -> None:
     ensure_allocations_table()
     if df.empty:
         return
+    out = df.copy()
+    def _to_bool_series(series: pd.Series) -> pd.Series:
+        normalized = series.map(
+            lambda value: (
+                False if pd.isna(value)
+                else value if isinstance(value, bool)
+                else str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+            )
+        )
+        return normalized.astype(bool)
+    boolean_columns = ["investable_now", "review_veto"]
+    numeric_columns = [
+        "score_impact",
+        "confidence",
+        "review_score",
+        "suggested_allocation_inr",
+        "allocation_pct_of_adv20d",
+        "stop_price",
+        "invalidation_price",
+    ]
+    for column in boolean_columns:
+        if column in out.columns:
+            out[column] = _to_bool_series(out[column])
+    for column in numeric_columns:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
     with db_session() as (_, cur):
         pairs = (
-            df[["asof_date", "setup_id"]]
+            out[["asof_date", "setup_id"]]
             .dropna()
             .drop_duplicates()
             .to_dict(orient="records")
@@ -981,7 +1007,7 @@ def persist_allocations(df: pd.DataFrame) -> None:
                 ),
             )
     upsert_to_db(
-        df,
+        out,
         ALLOCATIONS_TABLE,
         unique_keys=["published_on", "setup_id", "symbol", "unique_id"],
         timescaledb_column="published_on",

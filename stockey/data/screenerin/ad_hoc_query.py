@@ -160,7 +160,7 @@ def payload_to_frames(
                 "query_hash": query_hash,
                 "screener_url": screener_url,
                 "row_count": len(companies),
-                "raw_json": json.dumps(payload, ensure_ascii=False),
+                "raw_json": json.dumps(payload, ensure_ascii=False, default=str),
                 "run_ts": run_ts,
                 "load_ts": pd.Timestamp.utcnow(),
             }
@@ -197,7 +197,7 @@ def persist_query(run_df: pd.DataFrame, results_df: pd.DataFrame) -> None:
         upsert_to_db(results_df, RESULTS_TABLE, unique_keys=["query_run_id", "company_id", "company_name"])
 
 
-def run_ad_hoc_query(*, query_text: str, query_name: str | None = None) -> dict[str, Any]:
+def fetch_ad_hoc_payload(*, query_text: str, query_name: str | None = None, persist: bool = True) -> dict[str, Any]:
     query_name = clean_text(query_name) or "Ad hoc Screener query"
     query_slug = slugify(query_name)
     query_run_id = str(uuid.uuid4())
@@ -219,6 +219,9 @@ def run_ad_hoc_query(*, query_text: str, query_name: str | None = None) -> dict[
     payload["query_text"] = query_text
     payload["query_name"] = query_name
     payload["query_slug"] = query_slug
+    payload["query_run_id"] = query_run_id
+    payload["screener_url"] = screener_url
+    payload["run_ts"] = run_ts
     run_df, results_df = payload_to_frames(
         payload=payload,
         query_run_id=query_run_id,
@@ -228,14 +231,20 @@ def run_ad_hoc_query(*, query_text: str, query_name: str | None = None) -> dict[
         screener_url=screener_url,
         run_ts=run_ts,
     )
-    persist_query(run_df, results_df)
+    if persist:
+        persist_query(run_df, results_df)
+    return payload
+
+
+def run_ad_hoc_query(*, query_text: str, query_name: str | None = None) -> dict[str, Any]:
+    payload = fetch_ad_hoc_payload(query_text=query_text, query_name=query_name)
     return {
         "status": "ok",
-        "query_run_id": query_run_id,
-        "query_name": query_name,
-        "query_slug": query_slug,
-        "row_count": int(len(results_df)),
-        "screener_url": screener_url,
+        "query_run_id": payload.get("query_run_id"),
+        "query_name": payload.get("query_name"),
+        "query_slug": payload.get("query_slug"),
+        "row_count": int(len(payload.get("companies") or [])),
+        "screener_url": payload.get("screener_url"),
         "headers": payload.get("headers") or [],
         "companies": companies_preview(payload.get("companies") or []),
     }

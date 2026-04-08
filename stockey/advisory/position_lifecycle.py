@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from data.dhanlive.dhan_db import resolve_dhan_identity
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
@@ -123,27 +124,53 @@ def load_open_orders(
     return df
 
 
+def resolve_price_identities(symbols: list[str]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for symbol in sorted({str(value).upper() for value in symbols if str(value).strip()}):
+        try:
+            identity = resolve_dhan_identity(symbol, "NSE", asset_type="stock")
+        except Exception:
+            continue
+        rows.append(
+            {
+                "symbol": symbol,
+                "resolved_ticker": str(identity["ticker"]).strip().upper(),
+                "exchange": str(identity["exchange"]).upper(),
+                "security_id": int(identity["security_id"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def load_price_points(symbols: list[str], monitor_date: pd.Timestamp) -> pd.DataFrame:
-    if not symbols:
+    identities = resolve_price_identities(symbols)
+    if identities.empty:
         return pd.DataFrame()
+    security_ids = identities["security_id"].dropna().astype(int).unique().tolist()
     df = sql_to_df(
         """
-        SELECT ticker AS symbol, date, close
+        SELECT exchange, security_id, ticker, date, close
         FROM dhan_ohlcv_daily
-        WHERE exchange = 'NSE'
-          AND asset_type = 'stock'
-          AND ticker = ANY(%(symbols)s)
+        WHERE asset_type = 'stock'
+          AND security_id = ANY(%(security_ids)s)
           AND date <= %(monitor_date)s
-        ORDER BY ticker, date
+        ORDER BY exchange, security_id, date
         """,
-        params={"symbols": symbols, "monitor_date": monitor_date},
+        params={"security_ids": security_ids, "monitor_date": monitor_date},
     )
     if df.empty:
         return df
-    df["symbol"] = df["symbol"].astype("string").str.upper()
-    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    return df
+    merged = df.merge(
+        identities,
+        how="inner",
+        on=["exchange", "security_id"],
+    )
+    if merged.empty:
+        return merged
+    merged["symbol"] = merged["symbol"].astype("string").str.upper()
+    merged["date"] = pd.to_datetime(merged["date"], utc=True, errors="coerce")
+    merged["close"] = pd.to_numeric(merged["close"], errors="coerce")
+    return merged[["symbol", "date", "close", "exchange", "security_id", "ticker"]]
 
 
 def derive_entry_and_current_prices(orders: pd.DataFrame, monitor_date: pd.Timestamp) -> pd.DataFrame:
@@ -159,7 +186,9 @@ def derive_entry_and_current_prices(orders: pd.DataFrame, monitor_date: pd.Times
     rows: list[dict[str, Any]] = []
     for _, row in orders.iterrows():
         symbol_prices = prices[prices["symbol"] == row["symbol"]].copy()
-        entry_slice = symbol_prices[symbol_prices["date"] >= row["published_on"]]
+        published_on = pd.to_datetime(row.get("published_on"), utc=True, errors="coerce")
+        entry_anchor = published_on.normalize() if not pd.isna(published_on) else pd.NaT
+        entry_slice = symbol_prices[symbol_prices["date"] >= entry_anchor] if not pd.isna(entry_anchor) else symbol_prices
         entry = entry_slice.iloc[0] if not entry_slice.empty else None
         current = symbol_prices.iloc[-1] if not symbol_prices.empty else None
         row_dict = row.to_dict()

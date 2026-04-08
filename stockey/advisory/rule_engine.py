@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import timezone
 from typing import Any
 
 import pandas as pd
@@ -216,6 +217,8 @@ DEFAULT_FRESHNESS_POLICY = {
     "intraday_max_age_days": 2,
     "fundamentals_required": True,
 }
+DEFAULT_MAX_SNAPSHOT_REFRESH_AGE_DAYS = 7
+DEFAULT_MAX_INTRADAY_PREFETCH_AGE_DAYS = 14
 
 
 def get_effective_dates(asof_date: pd.Timestamp | None = None) -> dict[str, pd.Timestamp | None]:
@@ -552,6 +555,14 @@ def refresh_missing_snapshots(symbols: list[str], effective_date: pd.Timestamp) 
         "intraday_meta": intraday_meta,
         "fundamental_rows": int(len(fundamentals_df)),
     }
+
+
+def _days_stale_from_today(value: pd.Timestamp | None) -> int | None:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    today = pd.Timestamp.now(tz=timezone.utc).normalize()
+    return int((today - ts.normalize()).days)
 
 
 def compare(value: Any, operator: str, threshold: Any) -> bool:
@@ -1105,6 +1116,8 @@ def run_rule_engine(
     setup_ids: list[str] | None = None,
     config_path: str | None = None,
     skip_intraday_prefetch: bool = False,
+    max_snapshot_refresh_age_days: int = DEFAULT_MAX_SNAPSHOT_REFRESH_AGE_DAYS,
+    max_intraday_prefetch_age_days: int = DEFAULT_MAX_INTRADAY_PREFETCH_AGE_DAYS,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     effective_dates = get_effective_dates(asof_date)
     screener_date = effective_dates.get("screener_date")
@@ -1119,6 +1132,8 @@ def run_rule_engine(
     if setup_ids:
         selected = {value.upper() for value in setup_ids}
         setups = [setup for setup in setups if setup["setup_id"].upper() in selected]
+    else:
+        setups = [setup for setup in setups if not bool(setup.get("research_only"))]
 
     technical = load_technical(screener_date)
     intraday = load_intraday(screener_date)
@@ -1145,6 +1160,8 @@ def run_rule_engine(
     meta["active_theme_ids"] = theme_screener_mapping.get("theme_ids") or []
     meta["theme_screeners"] = theme_screener_mapping.get("screener_slugs") or []
     meta["theme_error"] = theme_screener_mapping.get("error")
+    days_stale = _days_stale_from_today(screener_date)
+    meta["days_stale_from_today"] = days_stale
 
     setup_screeners: dict[str, list[str]] = {}
     setup_screener_modes: dict[str, str] = {}
@@ -1175,21 +1192,44 @@ def run_rule_engine(
         missing_intraday_symbols = [symbol for symbol in symbols_to_refresh if symbol not in set(intraday_symbols)]
         meta["missing_snapshot_symbols"] = missing_symbols
         meta["missing_intraday_symbols"] = missing_intraday_symbols
-        if missing_symbols:
+        allow_snapshot_refresh = (
+            days_stale is None
+            or int(max_snapshot_refresh_age_days) < 0
+            or days_stale <= int(max_snapshot_refresh_age_days)
+        )
+        allow_intraday_prefetch = (
+            not skip_intraday_prefetch
+            and (
+                days_stale is None
+                or int(max_intraday_prefetch_age_days) < 0
+                or days_stale <= int(max_intraday_prefetch_age_days)
+            )
+        )
+        if missing_symbols and allow_snapshot_refresh:
             meta["preflight"] = refresh_missing_snapshots(missing_symbols, screener_date)
             technical = load_technical(screener_date)
             fundamentals = load_fundamentals(screener_date)
             intraday = load_intraday(screener_date)
-        elif missing_intraday_symbols and not skip_intraday_prefetch:
+        elif missing_symbols and not allow_snapshot_refresh:
+            meta["preflight"] = {
+                "status": "skipped",
+                "reason": "historical_snapshot_refresh_disabled",
+                "missing_snapshot_symbols": missing_symbols,
+                "days_stale_from_today": days_stale,
+                "max_snapshot_refresh_age_days": int(max_snapshot_refresh_age_days),
+            }
+        elif missing_intraday_symbols and allow_intraday_prefetch:
             intraday_df, intraday_meta = build_intraday_features(symbols=missing_intraday_symbols, asof_date=screener_date)
             persist_intraday_features(intraday_df, rebuild=False, asof_date=screener_date)
             intraday = load_intraday(screener_date)
             meta["intraday_preflight"] = intraday_meta
-        elif missing_intraday_symbols and skip_intraday_prefetch:
+        elif missing_intraday_symbols and not allow_intraday_prefetch:
             meta["intraday_preflight"] = {
                 "status": "skipped",
-                "reason": "skip_intraday_prefetch",
+                "reason": "historical_intraday_prefetch_disabled" if not skip_intraday_prefetch else "skip_intraday_prefetch",
                 "missing_intraday_symbols": missing_intraday_symbols,
+                "days_stale_from_today": days_stale,
+                "max_intraday_prefetch_age_days": int(max_intraday_prefetch_age_days),
             }
 
     regime_name = str(regime["regime_name"])
@@ -1352,6 +1392,19 @@ def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, 
                 ).astype("boolean")
         upsert_to_db(candidates, CANDIDATES_TABLE, unique_keys=["asof_date", "setup_id", "symbol"], timescaledb_column="asof_date")
     if not rejections.empty:
+        rejections = rejections.copy()
+        if "is_near_miss" in rejections.columns:
+            rejections["is_near_miss"] = rejections["is_near_miss"].map(
+                lambda value: None if pd.isna(value) else str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
+            ).astype("boolean")
+        if "delta_to_pass" in rejections.columns:
+            rejections["delta_to_pass"] = pd.to_numeric(rejections["delta_to_pass"], errors="coerce")
+        if "severity" in rejections.columns:
+            rejections["severity"] = rejections["severity"].astype("string")
+        if "reason_code" in rejections.columns:
+            rejections["reason_code"] = rejections["reason_code"].astype("string")
+        if "reason_detail" in rejections.columns:
+            rejections["reason_detail"] = rejections["reason_detail"].astype("string")
         upsert_to_db(rejections, REJECTIONS_TABLE, unique_keys=["asof_date", "setup_id", "symbol", "reason_code"], timescaledb_column="asof_date")
 
 

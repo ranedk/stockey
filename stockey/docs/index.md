@@ -78,6 +78,45 @@ The repo now has three top-level orchestration layers:
 
 `all_downloader.sh` and `all_features.sh` are kept as compatibility wrappers for the first two flows.
 
+## Advisory Flow Summary
+
+1. Run raw ingestion for Dhan, Sharpely, macro, NSE, announcements, and ET RSS.
+2. Sync only registered production Screener.in screeners.
+3. Use ad hoc Screener.in queries separately for research.
+4. Normalize stored Screener snapshots into `advisory_screener_constituents`.
+5. Build daily advisory snapshots for macro, fundamentals, technicals, and optional intraday features.
+6. Build the base regime and the lightweight news overlay.
+7. Detect active investment themes and map them to theme-linked production screeners when available.
+8. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
+9. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
+10. Build the watchlist with screener, regime, overlay, and theme provenance.
+11. Ingest announcements and relevant news for watched names.
+12. Use the LLM only to extract structured event tensors from text.
+13. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
+14. Feed candidate state plus event outputs into risk sizing and allocation.
+15. Rank approved allocations in the portfolio engine with overlap and setup caps.
+16. Build lifecycle and execution-planning outputs.
+17. Record research runs in the research ledger.
+18. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
+19. Train the XGBoost event meta-model only when label coverage is sufficient.
+20. Keep prediction separate from policy and execution.
+
+Primary operator commands:
+
+```sh
+./all_full_advisory.sh
+./all_model_training.sh
+./all_continuous_watch.sh --loop
+./all_live_notifier.sh
+```
+
+Use:
+
+- `./all_full_advisory.sh` for the main operator flow
+- `./all_model_training.sh` for research prep, readiness checks, model train, and score
+- `./all_continuous_watch.sh --loop` for the lightweight live monitoring loop
+- `./all_live_notifier.sh` for a human-readable operator feed from the Redis bus
+
 ### Dhan master
 
 ```sh
@@ -244,9 +283,11 @@ python scripts/agent_tool_runner.py list --category storage
 
 The runner uses the invoking interpreter for downstream Python commands, so starting it from the project venv keeps the entire agent tool chain in the same environment.
 
-## Advisory implementation checklist
+## Advisory roadmap
 
-Use [`todo.md`](/home/rane/code/stockey/todo.md) as the maintained gap list for the investment advisory system described in [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md). That file is the source of truth for what is already present and what still needs to be built.
+Use [`todo.md`](/home/rane/code/stockey/todo.md) as the maintained roadmap for current priorities, bottlenecks, and next implementation steps.
+
+Use [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) as the current architecture summary for the live advisory stack.
 
 For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](/home/rane/code/stockey/docs/advisory_manual.md). That is the practical runbook for:
 
@@ -255,6 +296,8 @@ For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](/home/
 - changing setup rules
 - understanding stage ownership
 - debugging outputs and failures
+
+For the short command-focused runbook, use [`docs/operators_manual.md`](/home/rane/code/stockey/docs/operators_manual.md).
 
 For copy-paste change recipes, use [`docs/advisory_change_cookbook.md`](/home/rane/code/stockey/docs/advisory_change_cookbook.md).
 

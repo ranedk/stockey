@@ -33,7 +33,15 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/screenerin/screener_registry.py` | `screenerin_screeners` | Registry utility to add/list/remove Screener.in screeners and inspect latest stored snapshots |
 | `data/screenerin/ad_hoc_query.py` | `screenerin_ad_hoc_query_runs`, `screenerin_ad_hoc_query_results` | Authenticated ad hoc Screener.in raw query runner; blocks for manual login if needed and stores parsed company rows plus queried metrics |
 | `advisory/research_ledger.py` | `advisory_research_runs` | Research ledger for recording experiment configs, point-in-time context, validation protocol, and run outcomes |
-| `advisory/event_meta_model.py` | `advisory_event_model_scores` | Train/score scaffold for XGBoost event meta-models using structured event tensors plus future daily returns |
+| `advisory/training_universe.py` | `advisory_screener_constituents` | Sync broad ad hoc Screener.in training universes directly into normalized advisory screener rows for research-only event-model coverage |
+| `advisory/event_meta_model.py` | `advisory_event_model_scores` | Train/score scaffold for XGBoost event meta-models using structured event tensors, anchor-day intraday response features, and future daily returns |
+| `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
+| `advisory/model_training_runner.py` | varies | Gated model-training orchestrator: runs prep, checks label coverage for the requested horizon, then trains and scores only when ready |
+| `advisory/sync_state.py` | `advisory_sync_state` | Shared incremental state storage for continuous polling and dashboard refresh tasks |
+| `advisory/continuous_watch.py` | `advisory_live_watch_alerts`, `advisory_sync_state` | Lightweight watch loop over active watchlist OHLCV, announcements, ET/news, and static dashboard writes |
+| `advisory/event_router.py` | `advisory_live_router_actions`, `advisory_sync_state` | Symbol-level router that turns fresh live alerts and events into targeted advisory reevaluation |
+| `advisory/live_dashboard.py` | files in `live_dashboard/` | Writes a simple static HTML/JSON live dashboard for `python -m http.server` |
+| `advisory/live_notifier.py` | files in `live_dashboard/` | Subscribes to Redis pub-sub from the continuous-watch stack and writes a human-readable operator feed |
 | `advisory/adversarial_review.py` | `advisory_event_reviews` | Deterministic reviewer over structured event tensors; can clear, penalize, force manual review, or veto event-driven allocations |
 | `utils/ocr` | none | Provider-agnostic PDF OCR utility using Gemini 3 Flash preview and OpenAI GPT-5 nano |
 | `utils/transcribe` | none | Audio transcription utility for remote mp3/wav/mp4 links using Gemini 3 Flash preview and OpenAI transcription APIs |
@@ -108,6 +116,10 @@ python -m data.dhanlive.auth_cli clear-cache
 | Script | Purpose | Scope |
 | --- | --- | --- |
 | `all_advisory.sh` | Primary advisory orchestrator | Runs raw ingestion, news/theme routing, advisory, risk, portfolio, lifecycle, and execution in one flow |
+| `all_model_training.sh` | Event-model training orchestrator | Runs prep, trains the event meta-model only when coverage is sufficient, then scores current events |
+| `all_full_advisory.sh` | Single operator wrapper | Runs model training if ready, then the advisory pipeline, then prints the current portfolio summary |
+| `all_continuous_watch.sh` | Continuous monitoring wrapper | Polls active watchlist OHLCV, announcements, and ET/news incrementally and rewrites the static live dashboard |
+| `all_live_notifier.sh` | Live notification wrapper | Subscribes to the continuous-watch Redis bus and writes rolling operator feed files |
 | `all_downloads.sh` | Daily raw ingestion and parsing | Market-wide downloads plus tracked-symbol loaders |
 | `all_daily_derivations.sh` | Daily incremental derived data | Watchlist symbols from `config/watchlist_symbols.txt` |
 | `all_backfill.sh` | On-demand repair and historical rebuilds | `watchlist`, `tracked`, or `all` |
@@ -261,6 +273,111 @@ Use ad hoc Screener.in queries and normal notebooks or scripts for exploration. 
 
 ## Event Meta-Model Training
 
+Recommended one-shot prep flow:
+
+```sh
+python -m advisory.event_model_data_prep --format text
+```
+
+This command is the operator shortcut for:
+
+1. normalizing any missing `advisory_screener_constituents` dates from stored Screener snapshots
+2. rerunning historical advisory event extraction/evaluation over those actual screener dates
+3. refreshing `dhan_ohlcv_daily` for the evaluated event symbols
+4. summarizing label coverage by horizon before training
+5. optionally syncing broad ad hoc training universes for the current date into a research-only setup
+
+Useful variants:
+
+```sh
+python -m advisory.event_model_data_prep --from-date 2026-03-01 --to-date 2026-04-01 --format text
+python -m advisory.event_model_data_prep --skip-price-refresh --dry-run --format text
+python -m advisory.training_universe --dry-run
+```
+
+Training universe notes:
+
+- broad event-model training universes now come from ad hoc Screener.in raw queries, not from manually registered recurring screeners
+- those queries are stored in `config/event_model_training_universes.yaml`
+- the resulting screener rows feed the research-only setup `EVENT_MODEL_TRAINING_V1`
+- normal advisory runs ignore `EVENT_MODEL_TRAINING_V1` unless it is explicitly selected
+
+Recommended model-training flow:
+
+```sh
+./all_model_training.sh
+./all_model_training.sh --prep-only
+./all_model_training.sh --horizon-days 1 --to-date 2026-04-07
+./all_full_advisory.sh
+```
+
+Behavior:
+
+- runs `advisory.event_model_data_prep`
+- checks whether the requested horizon is `train_ready`
+- skips training cleanly if coverage is still insufficient
+- trains `advisory.event_meta_model` only when the readiness gate passes
+- scores current events after training unless `--skip-score` is used
+
+Operational constraints:
+
+- historical prep dates are treated as read-mostly
+- old dates do not trigger on-the-fly daily/fundamental snapshot repair inside the rule engine
+- old dates do not trigger on-the-fly intraday prefetch inside the rule engine
+- current-date prep can still sync the broad training universes and use already stored recent data
+
+Single-command operator flow:
+
+```sh
+./all_full_advisory.sh
+./all_full_advisory.sh --date 2026-04-07
+./all_full_advisory.sh --skip-model-training
+./all_full_advisory.sh --skip-downloads --portfolio-planned
+```
+
+Behavior:
+
+- runs `advisory.model_training_runner`
+- runs `advisory.master_pipeline`
+- prints `advisory.portfolio_engine --format text` at the end
+
+Continuous-watch flow:
+
+```sh
+./all_continuous_watch.sh --loop
+./all_live_notifier.sh
+./all_continuous_watch.sh --loop --sleep-seconds 300
+python -m advisory.live_dashboard --output-dir live_dashboard
+python -m http.server --directory live_dashboard 8000
+```
+
+Behavior:
+
+- keeps incremental source state in `advisory_sync_state`
+- polls 1-minute intraday OHLCV for active advisory watchlist symbols and open positions
+- polls announcements and ET/news on their own intervals
+- routes new alerts and events into symbol-level advisory reevaluation
+- writes live price alerts like `ENTRY_ZONE_HIT` and `INVALIDATION_HIT`
+- rewrites `live_dashboard/index.html` and `live_dashboard/dashboard.json`
+- publishes cycle summaries and alert payloads over Redis pub-sub
+
+Notifier behavior:
+
+- subscribes to `stockey:continuous_watch:*`
+- converts bus messages into short human-readable operator lines
+- writes:
+  - `live_dashboard/operator_feed.json`
+  - `live_dashboard/operator_feed.jsonl`
+  - `live_dashboard/operator_feed.txt`
+- the dashboard page also reads `operator_feed.json` and shows the latest feed items
+
+Routing constraints:
+
+- price-alert symbols are prioritized ahead of event-only symbols
+- `POSITION_INVALIDATION_HIT`, `STOP_HIT`, and `INVALIDATION_HIT` rank above softer breakout-follow alerts
+- lower watchlist rank values are preferred when multiple names compete for the same cycle
+- there is no default hard cap on reevaluation volume; explicit caps are an operator override
+
 Before training `advisory.event_meta_model`, make sure:
 
 1. `advisory_event_evaluations` spans enough historical dates.
@@ -289,9 +406,11 @@ Abstain behavior:
 - low-edge setups can now be marked `ABSTAIN` instead of being forced into `WATCH_*` or hidden inside generic rejects
 - risk can now emit `allocation_status=abstained`, which makes the do-nothing class measurable
 
-## Advisory implementation
+## Advisory docs
 
-The programming checklist for the investment advisory system lives in [`todo.md`](/home/rane/code/stockey/todo.md). It separates what already exists from the missing modules, tables, and agent-safe commands still required to make [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) executable end to end.
+The current roadmap for the investment advisory system lives in [`todo.md`](/home/rane/code/stockey/todo.md). It tracks current bottlenecks and the next implementation priorities rather than historical build phases.
+
+The current architecture summary lives in [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md).
 
 The practical operator guide lives in [`docs/advisory_manual.md`](/home/rane/code/stockey/docs/advisory_manual.md). Use it for:
 

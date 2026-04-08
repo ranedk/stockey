@@ -194,6 +194,70 @@
       ]
     },
     {
+      "name": "run_full_advisory_flow",
+      "category": "orchestration",
+      "description": "Run model training if ready, then the advisory pipeline, then print the portfolio summary.",
+      "command": ["bash", "all_full_advisory.sh"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": [],
+          "description": "Run the full model-training plus advisory operator flow."
+        },
+        {
+          "args": ["--skip-model-training", "--skip-downloads"],
+          "description": "Run only the advisory pipeline and final portfolio summary."
+        }
+      ]
+    },
+    {
+      "name": "run_continuous_watch",
+      "category": "orchestration",
+      "description": "Run the lightweight continuous watch loop for active watchlist names and open positions, with OHLCV, announcements, ET/news, Redis pub-sub updates, and static dashboard writes.",
+      "command": ["bash", "all_continuous_watch.sh"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--loop"],
+          "description": "Run the continuous watch loop with default intervals."
+        },
+        {
+          "args": ["--loop", "--sleep-seconds", "300"],
+          "description": "Run the continuous watch loop every 5 minutes."
+        }
+      ]
+    },
+    {
+      "name": "run_live_notifier",
+      "category": "orchestration",
+      "description": "Subscribe to the continuous-watch Redis channels and write a human-readable operator feed into live_dashboard files.",
+      "command": ["bash", "all_live_notifier.sh"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": [],
+          "description": "Run the live notifier indefinitely."
+        },
+        {
+          "args": ["--duration-seconds", "600"],
+          "description": "Run the live notifier for 10 minutes."
+        }
+      ]
+    },
+    {
+      "name": "route_live_updates",
+      "category": "orchestration",
+      "description": "Route fresh continuous-watch alerts and events into targeted symbol-level advisory reevaluation, including lifecycle-aware reruns for exit alerts.",
+      "command": ["python", "-m", "advisory.event_router"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview the current live-routing plan."
+        }
+      ]
+    },
+    {
       "name": "build_advisory_macro_daily",
       "category": "ingestion",
       "description": "Build the advisory point-in-time macro snapshot table.",
@@ -392,6 +456,53 @@
         {
           "args": ["score", "--dry-run"],
           "description": "Score current event rows with the latest trained artifact without writing."
+        }
+      ]
+    },
+    {
+      "name": "sync_advisory_training_universe",
+      "category": "analysis",
+      "description": "Run broad ad hoc Screener.in training queries and sync the resulting research-only universes into advisory_screener_constituents.",
+      "command": ["python", "-m", "advisory.training_universe"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview the broad training-universe sync without writing."
+        }
+      ]
+    },
+    {
+      "name": "prepare_advisory_event_model_data",
+      "category": "analysis",
+      "description": "Prepare event-model training data by syncing broad ad hoc training universes, normalizing screener dates, backfilling historical event evaluations, refreshing daily OHLCV for event symbols, and summarizing label coverage.",
+      "command": ["python", "-m", "advisory.event_model_data_prep"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--format", "text"],
+          "description": "Run the full event-model data prep flow and print a training-readiness summary."
+        },
+        {
+          "args": ["--from-date", "2026-03-01", "--to-date", "2026-04-01", "--dry-run", "--format", "text"],
+          "description": "Preview the scoped event-model prep window without writing."
+        }
+      ]
+    },
+    {
+      "name": "run_all_model_training",
+      "category": "analysis",
+      "description": "Run event-model prep, check label coverage for the requested horizon, then train and score only when the readiness gate passes.",
+      "command": ["bash", "all_model_training.sh"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": [],
+          "description": "Run the full gated event-model training flow."
+        },
+        {
+          "args": ["--prep-only"],
+          "description": "Run only the prep and readiness-check stage."
         }
       ]
     },

@@ -1,0 +1,520 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from datetime import timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from advisory.announcement_watch import persist_watch_outputs, run_announcement_watch
+from advisory.event_router import route_live_updates
+from advisory.live_dashboard import write_live_dashboard
+from advisory.news_watch import persist_news_events, run_news_watch
+from advisory.sync_state import ensure_sync_state_table, load_sync_state, persist_sync_state, publish_bus_message
+from data.dhanlive.ohlcv import sync_many_intraday
+from utils.db import db_session, sql_to_df, upsert_to_db
+
+
+WATCHLIST_TABLE = "advisory_watchlist"
+ALERTS_TABLE = "advisory_live_watch_alerts"
+
+
+def _emit(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
+
+
+def ensure_alerts_table() -> None:
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {ALERTS_TABLE} (
+                observed_at TIMESTAMPTZ NOT NULL,
+                asof_date TIMESTAMPTZ,
+                setup_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                alert_type TEXT NOT NULL,
+                alert_reason TEXT,
+                monitor_source TEXT,
+                last_price DOUBLE PRECISION,
+                attractive_price_low DOUBLE PRECISION,
+                attractive_price_high DOUBLE PRECISION,
+                stop_price DOUBLE PRECISION,
+                invalidation_price DOUBLE PRECISION,
+                current_state TEXT,
+                load_ts TIMESTAMPTZ,
+                UNIQUE (observed_at, setup_id, symbol, alert_type)
+            )
+            """
+        )
+        cur.execute(f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT")
+        cur.execute(f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS stop_price DOUBLE PRECISION")
+
+
+def load_active_watchlist(asof_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    clauses = ["COALESCE(watch_enabled, TRUE) = TRUE", "COALESCE(watch_status, 'active') IN ('active', 'review_manual')"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append("asof_date = (SELECT MAX(asof_date) FROM advisory_watchlist)")
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM {WATCHLIST_TABLE}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY setup_id, symbol
+        """,
+        params=tuple(params) if params else None,
+    )
+    if df.empty:
+        return df
+    for column in ["asof_date", "state_updated_at", "watch_started_at", "last_checked_at", "last_document_published_on"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["monitor_source"] = "watchlist"
+    return df
+
+
+def load_open_positions(asof_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    queries = [
+        """
+        SELECT
+            l.asof_date,
+            l.setup_id,
+            p.setup_name,
+            p.symbol,
+            p.company_master_id,
+            p.invalidation_price,
+            l.stop_price,
+            l.position_status,
+            l.next_action,
+            l.next_action_reason,
+            TRUE AS watch_enabled,
+            'position_active' AS watch_status,
+            'OPEN_POSITION' AS current_state,
+            NULL::DOUBLE PRECISION AS attractive_price_low,
+            NULL::DOUBLE PRECISION AS attractive_price_high,
+            NULL::BIGINT AS rank
+        FROM advisory_position_lifecycle l
+        JOIN advisory_portfolio_orders p
+          ON p.asof_date = l.asof_date
+         AND p.published_on = l.published_on
+         AND p.setup_id = l.setup_id
+         AND p.symbol = l.symbol
+         AND p.unique_id = l.unique_id
+        WHERE l.asof_date = COALESCE(%s, (SELECT MAX(asof_date) FROM advisory_position_lifecycle))
+          AND l.position_status IN ('open', 'review', 'pending_entry', 'exit_review')
+        """,
+        """
+        SELECT
+            asof_date,
+            setup_id,
+            setup_name,
+            symbol,
+            company_master_id,
+            invalidation_price,
+            stop_price,
+            NULL::TEXT AS position_status,
+            NULL::TEXT AS next_action,
+            NULL::TEXT AS next_action_reason,
+            TRUE AS watch_enabled,
+            'position_active' AS watch_status,
+            'OPEN_POSITION' AS current_state,
+            NULL::DOUBLE PRECISION AS attractive_price_low,
+            NULL::DOUBLE PRECISION AS attractive_price_high,
+            NULL::BIGINT AS rank
+        FROM advisory_portfolio_orders
+        WHERE asof_date = COALESCE(%s, (SELECT MAX(asof_date) FROM advisory_portfolio_orders))
+          AND portfolio_status IN ('approved', 'trimmed')
+        """,
+    ]
+    for query in queries:
+        try:
+            df = sql_to_df(query, params=(asof_date,))
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        for column in ["asof_date"]:
+            if column in df.columns:
+                df[column] = pd.to_datetime(df[column], utc=True, errors="coerce").dt.normalize()
+        for column in ["attractive_price_low", "attractive_price_high", "invalidation_price", "stop_price", "rank"]:
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+        df["symbol"] = df["symbol"].astype("string").str.upper()
+        df["monitor_source"] = "position"
+        return df
+    return pd.DataFrame()
+
+
+def load_monitored_universe(asof_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    watchlist = load_active_watchlist(asof_date=asof_date)
+    positions = load_open_positions(asof_date=asof_date)
+    if watchlist.empty and positions.empty:
+        return pd.DataFrame()
+    if watchlist.empty:
+        out = positions.copy()
+    elif positions.empty:
+        out = watchlist.copy()
+    else:
+        watchlist = watchlist.copy()
+        positions = positions.copy()
+        watchlist["_priority"] = 1
+        positions["_priority"] = 2
+        out = pd.concat([watchlist, positions], ignore_index=True, sort=False)
+        out = out.sort_values(["symbol", "setup_id", "_priority"], ascending=[True, True, False], kind="stable")
+        out = out.drop_duplicates(subset=["setup_id", "symbol"], keep="first")
+        out = out.drop(columns=["_priority"], errors="ignore")
+    return out.reset_index(drop=True)
+
+
+def load_latest_intraday_prices(symbols: list[str], *, interval_minutes: int = 1) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    df = sql_to_df(
+        """
+        SELECT DISTINCT ON (ticker)
+            ticker AS symbol,
+            timestamp,
+            close
+        FROM dhan_ohlcv_intraday
+        WHERE interval_minutes = %s
+          AND exchange = 'NSE'
+          AND ticker = ANY(%s)
+        ORDER BY ticker, timestamp DESC
+        """,
+        params=(int(interval_minutes), [str(value).upper() for value in symbols]),
+    )
+    if df.empty:
+        return df
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    return df
+
+
+def build_price_alerts(watchlist: pd.DataFrame, latest_prices: pd.DataFrame, *, observed_at: pd.Timestamp | None = None) -> pd.DataFrame:
+    if watchlist.empty or latest_prices.empty:
+        return pd.DataFrame()
+    merged = watchlist.merge(latest_prices, how="left", on="symbol")
+    observed = pd.to_datetime(observed_at or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    rows: list[dict[str, Any]] = []
+    for _, row in merged.iterrows():
+        last_price = pd.to_numeric(row.get("close"), errors="coerce")
+        low = pd.to_numeric(row.get("attractive_price_low"), errors="coerce")
+        high = pd.to_numeric(row.get("attractive_price_high"), errors="coerce")
+        stop_price = pd.to_numeric(row.get("stop_price"), errors="coerce")
+        invalidation = pd.to_numeric(row.get("invalidation_price"), errors="coerce")
+        current_state = str(row.get("current_state") or row.get("candidate_state") or "")
+        monitor_source = str(row.get("monitor_source") or "watchlist").lower()
+        if monitor_source == "position":
+            if pd.notna(last_price) and pd.notna(invalidation) and float(last_price) <= float(invalidation):
+                rows.append(
+                    {
+                        "observed_at": observed,
+                        "asof_date": row.get("asof_date"),
+                        "setup_id": row.get("setup_id"),
+                        "symbol": row.get("symbol"),
+                        "alert_type": "POSITION_INVALIDATION_HIT",
+                        "alert_reason": f"last_price={float(last_price):.2f} is below position invalidation",
+                        "monitor_source": monitor_source,
+                        "last_price": float(last_price),
+                        "attractive_price_low": None if pd.isna(low) else float(low),
+                        "attractive_price_high": None if pd.isna(high) else float(high),
+                        "stop_price": None if pd.isna(stop_price) else float(stop_price),
+                        "invalidation_price": None if pd.isna(invalidation) else float(invalidation),
+                        "current_state": current_state,
+                        "load_ts": pd.Timestamp.utcnow(),
+                    }
+                )
+            elif pd.notna(last_price) and pd.notna(stop_price) and float(last_price) <= float(stop_price):
+                rows.append(
+                    {
+                        "observed_at": observed,
+                        "asof_date": row.get("asof_date"),
+                        "setup_id": row.get("setup_id"),
+                        "symbol": row.get("symbol"),
+                        "alert_type": "STOP_HIT",
+                        "alert_reason": f"last_price={float(last_price):.2f} is below stop guidance",
+                        "monitor_source": monitor_source,
+                        "last_price": float(last_price),
+                        "attractive_price_low": None if pd.isna(low) else float(low),
+                        "attractive_price_high": None if pd.isna(high) else float(high),
+                        "stop_price": None if pd.isna(stop_price) else float(stop_price),
+                        "invalidation_price": None if pd.isna(invalidation) else float(invalidation),
+                        "current_state": current_state,
+                        "load_ts": pd.Timestamp.utcnow(),
+                    }
+                )
+            continue
+        if pd.notna(last_price) and pd.notna(low) and pd.notna(high) and float(low) <= float(last_price) <= float(high):
+            rows.append(
+                {
+                    "observed_at": observed,
+                    "asof_date": row.get("asof_date"),
+                    "setup_id": row.get("setup_id"),
+                    "symbol": row.get("symbol"),
+                    "alert_type": "ENTRY_ZONE_HIT",
+                    "alert_reason": f"last_price={float(last_price):.2f} is within attractive range",
+                    "monitor_source": monitor_source,
+                    "last_price": float(last_price),
+                    "attractive_price_low": None if pd.isna(low) else float(low),
+                    "attractive_price_high": None if pd.isna(high) else float(high),
+                    "stop_price": None if pd.isna(stop_price) else float(stop_price),
+                    "invalidation_price": None if pd.isna(invalidation) else float(invalidation),
+                    "current_state": current_state,
+                    "load_ts": pd.Timestamp.utcnow(),
+                }
+            )
+        if pd.notna(last_price) and pd.notna(invalidation) and float(last_price) <= float(invalidation):
+            rows.append(
+                {
+                    "observed_at": observed,
+                    "asof_date": row.get("asof_date"),
+                    "setup_id": row.get("setup_id"),
+                    "symbol": row.get("symbol"),
+                    "alert_type": "INVALIDATION_HIT",
+                    "alert_reason": f"last_price={float(last_price):.2f} is below invalidation",
+                    "monitor_source": monitor_source,
+                    "last_price": float(last_price),
+                    "attractive_price_low": None if pd.isna(low) else float(low),
+                    "attractive_price_high": None if pd.isna(high) else float(high),
+                    "stop_price": None if pd.isna(stop_price) else float(stop_price),
+                    "invalidation_price": None if pd.isna(invalidation) else float(invalidation),
+                    "current_state": current_state,
+                    "load_ts": pd.Timestamp.utcnow(),
+                }
+            )
+        if current_state in {"WATCH_BREAKOUT", "WATCH_PULLBACK", "WATCH_EVENT"} and pd.notna(last_price) and pd.notna(high) and float(last_price) > float(high):
+            rows.append(
+                {
+                    "observed_at": observed,
+                    "asof_date": row.get("asof_date"),
+                    "setup_id": row.get("setup_id"),
+                    "symbol": row.get("symbol"),
+                    "alert_type": "BREAKOUT_ABOVE_RANGE",
+                    "alert_reason": f"last_price={float(last_price):.2f} is above attractive range",
+                    "monitor_source": monitor_source,
+                    "last_price": float(last_price),
+                    "attractive_price_low": None if pd.isna(low) else float(low),
+                    "attractive_price_high": None if pd.isna(high) else float(high),
+                    "stop_price": None if pd.isna(stop_price) else float(stop_price),
+                    "invalidation_price": None if pd.isna(invalidation) else float(invalidation),
+                    "current_state": current_state,
+                    "load_ts": pd.Timestamp.utcnow(),
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).drop_duplicates(subset=["setup_id", "symbol", "alert_type"], keep="last")
+
+
+def persist_alerts(df: pd.DataFrame) -> None:
+    ensure_alerts_table()
+    if df.empty:
+        return
+    upsert_to_db(df, ALERTS_TABLE, unique_keys=["observed_at", "setup_id", "symbol", "alert_type"], timescaledb_column="observed_at")
+    publish_bus_message(
+        "stockey:continuous_watch:alerts",
+        {
+            "published_at": pd.Timestamp.utcnow(),
+            "alert_count": int(len(df)),
+            "alerts": df.head(25).to_dict(orient="records"),
+        },
+    )
+
+
+def _is_due(source_name: str, interval_seconds: int) -> bool:
+    state = load_sync_state(source_name)
+    if state is None:
+        return True
+    last_success_at = pd.to_datetime(state.get("last_success_at"), utc=True, errors="coerce")
+    if pd.isna(last_success_at):
+        return True
+    return (pd.Timestamp.utcnow() - last_success_at).total_seconds() >= int(interval_seconds)
+
+
+def run_ohlcv_cycle(*, interval_seconds: int, intraday_interval_minutes: int = 1, initial_lookback_minutes: int = 120) -> dict[str, Any]:
+    source_name = "continuous_watch:ohlcv"
+    watchlist = load_monitored_universe()
+    if watchlist.empty:
+        persist_sync_state(source_name=source_name, status="ok", state={"reason": "no_watchlist_symbols"}, last_success_at=pd.Timestamp.utcnow())
+        return {"status": "ok", "symbol_count": 0, "sync_results": [], "alert_count": 0}
+    symbols = sorted(watchlist["symbol"].dropna().astype(str).str.upper().unique().tolist())
+    state = load_sync_state(source_name) or {}
+    from_cursor = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
+    if pd.isna(from_cursor):
+        from_cursor = pd.Timestamp.utcnow() - pd.Timedelta(minutes=int(initial_lookback_minutes))
+    else:
+        from_cursor = from_cursor - pd.Timedelta(minutes=5)
+    to_cursor = pd.Timestamp.utcnow()
+    _emit(f"[advisory.continuous_watch] ohlcv start symbols={len(symbols)} from={from_cursor.isoformat()} to={to_cursor.isoformat()}")
+    sync_results = sync_many_intraday(
+        symbols,
+        exchange="NSE",
+        asset_type="stock",
+        interval_minutes=int(intraday_interval_minutes),
+        from_date=from_cursor.to_pydatetime(),
+        to_date=to_cursor.to_pydatetime(),
+    )
+    latest_prices = load_latest_intraday_prices(symbols, interval_minutes=intraday_interval_minutes)
+    alerts = build_price_alerts(watchlist, latest_prices, observed_at=to_cursor)
+    persist_alerts(alerts)
+    last_item_ts = latest_prices["timestamp"].max() if not latest_prices.empty else to_cursor
+    persist_sync_state(
+        source_name=source_name,
+        last_success_at=to_cursor,
+        last_item_ts=last_item_ts,
+        cursor_value=None if pd.isna(last_item_ts) else pd.Timestamp(last_item_ts).isoformat(),
+        state={"symbol_count": len(symbols), "interval_minutes": int(intraday_interval_minutes)},
+        status="ok",
+    )
+    result = {
+        "status": "ok",
+        "symbol_count": len(symbols),
+        "sync_results": sync_results,
+        "alert_count": int(len(alerts)),
+    }
+    publish_bus_message("stockey:continuous_watch:ohlcv", {"published_at": pd.Timestamp.utcnow(), **result})
+    return result
+
+
+def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90) -> dict[str, Any]:
+    source_name = "continuous_watch:news"
+    now = pd.Timestamp.utcnow()
+    state = load_sync_state(source_name) or {}
+    published_from = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
+    if pd.isna(published_from):
+        published_from = now - pd.Timedelta(minutes=int(lookback_minutes))
+    else:
+        published_from = published_from - pd.Timedelta(minutes=15)
+    _emit(f"[advisory.continuous_watch] news start from={published_from.isoformat()} to={now.isoformat()}")
+    events, meta = run_news_watch(
+        lookback_days=1,
+        to_date=now,
+        published_from=published_from,
+        refresh_feeds=True,
+    )
+    persist_news_events(events)
+    last_item_ts = events["published_on"].max() if not events.empty else now
+    persist_sync_state(
+        source_name=source_name,
+        last_success_at=now,
+        last_item_ts=last_item_ts,
+        cursor_value=None if pd.isna(last_item_ts) else pd.Timestamp(last_item_ts).isoformat(),
+        state={"matched_event_count": int(meta.get("matched_event_count") or 0)},
+        status="ok",
+    )
+    result = {"status": "ok", **meta}
+    publish_bus_message("stockey:continuous_watch:news", {"published_at": pd.Timestamp.utcnow(), **result})
+    return result
+
+
+def run_announcement_cycle(*, interval_seconds: int) -> dict[str, Any]:
+    source_name = "continuous_watch:announcements"
+    now = pd.Timestamp.utcnow()
+    _emit(f"[advisory.continuous_watch] announcements start to={now.isoformat()}")
+    watch_updates, events, meta = run_announcement_watch(to_date=now)
+    persist_watch_outputs(watch_updates, events)
+    last_item_ts = events["published_on"].max() if not events.empty else now
+    persist_sync_state(
+        source_name=source_name,
+        last_success_at=now,
+        last_item_ts=last_item_ts,
+        cursor_value=None if pd.isna(last_item_ts) else pd.Timestamp(last_item_ts).isoformat(),
+        state={"match_count": int(meta.get("match_count") or 0)},
+        status="ok",
+    )
+    result = {"status": "ok", **meta}
+    publish_bus_message("stockey:continuous_watch:announcements", {"published_at": pd.Timestamp.utcnow(), **result})
+    return result
+
+
+def run_dashboard_cycle(*, output_dir: str | Path) -> dict[str, Any]:
+    source_name = "continuous_watch:dashboard"
+    now = pd.Timestamp.utcnow()
+    result = write_live_dashboard(output_dir=output_dir)
+    persist_sync_state(
+        source_name=source_name,
+        last_success_at=now,
+        last_item_ts=now,
+        cursor_value=now.isoformat(),
+        state=result,
+        status="ok",
+    )
+    publish_bus_message("stockey:continuous_watch:dashboard", {"published_at": pd.Timestamp.utcnow(), **result})
+    return result
+
+
+def run_once(
+    *,
+    output_dir: str | Path,
+    ohlcv_interval_seconds: int,
+    news_interval_seconds: int,
+    announcement_interval_seconds: int,
+    intraday_interval_minutes: int,
+) -> dict[str, Any]:
+    ensure_sync_state_table()
+    ensure_alerts_table()
+    summary: dict[str, Any] = {"status": "ok", "cycles": {}}
+    if _is_due("continuous_watch:ohlcv", ohlcv_interval_seconds):
+        summary["cycles"]["ohlcv"] = run_ohlcv_cycle(
+            interval_seconds=ohlcv_interval_seconds,
+            intraday_interval_minutes=intraday_interval_minutes,
+        )
+    else:
+        summary["cycles"]["ohlcv"] = {"status": "skipped", "reason": "not_due"}
+    if _is_due("continuous_watch:announcements", announcement_interval_seconds):
+        summary["cycles"]["announcements"] = run_announcement_cycle(interval_seconds=announcement_interval_seconds)
+    else:
+        summary["cycles"]["announcements"] = {"status": "skipped", "reason": "not_due"}
+    if _is_due("continuous_watch:news", news_interval_seconds):
+        summary["cycles"]["news"] = run_news_cycle(interval_seconds=news_interval_seconds)
+    else:
+        summary["cycles"]["news"] = {"status": "skipped", "reason": "not_due"}
+    summary["cycles"]["router"] = route_live_updates()
+    summary["cycles"]["dashboard"] = run_dashboard_cycle(output_dir=output_dir)
+    publish_bus_message("stockey:continuous_watch:summary", {"published_at": pd.Timestamp.utcnow(), **summary})
+    return summary
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the lightweight continuous watch loop for OHLCV, news, announcements, and dashboard refresh.")
+    parser.add_argument("--loop", action="store_true", help="Run continuously instead of once")
+    parser.add_argument("--sleep-seconds", type=int, default=300, help="Loop sleep interval")
+    parser.add_argument("--ohlcv-interval-seconds", type=int, default=300)
+    parser.add_argument("--news-interval-seconds", type=int, default=1800)
+    parser.add_argument("--announcement-interval-seconds", type=int, default=1800)
+    parser.add_argument("--intraday-interval-minutes", type=int, default=1)
+    parser.add_argument("--output-dir", default="live_dashboard")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    while True:
+        started_at = time.monotonic()
+        summary = run_once(
+            output_dir=args.output_dir,
+            ohlcv_interval_seconds=int(args.ohlcv_interval_seconds),
+            news_interval_seconds=int(args.news_interval_seconds),
+            announcement_interval_seconds=int(args.announcement_interval_seconds),
+            intraday_interval_minutes=int(args.intraday_interval_minutes),
+        )
+        print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+        if not args.loop:
+            return 0
+        elapsed = time.monotonic() - started_at
+        remaining = max(0, int(args.sleep_seconds) - elapsed)
+        _emit(f"[advisory.continuous_watch] sleeping seconds={remaining}")
+        time.sleep(remaining)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
