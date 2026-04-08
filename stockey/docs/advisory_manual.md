@@ -11,11 +11,11 @@ Use this document when you want to:
 - understand which module owns which behavior
 - inspect outputs and debug failures
 
-Use [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) for the current architecture summary. Use [`todo.md`](/home/rane/code/stockey/todo.md) for the active roadmap and remaining bottlenecks.
+Use [`docs/implementation.md`](implementation.md) for the current architecture summary. Use [`todo.md`](../todo.md) for the active roadmap and remaining bottlenecks.
 
-For common edits with copy-paste commands, use [`docs/advisory_change_cookbook.md`](/home/rane/code/stockey/docs/advisory_change_cookbook.md).
+For common edits with copy-paste commands, use [`docs/advisory_change_cookbook.md`](advisory_change_cookbook.md).
 
-For the short operator runbook, use [`docs/operators_manual.md`](/home/rane/code/stockey/docs/operators_manual.md).
+For the short operator runbook, use [`docs/operators_manual.md`](operators_manual.md).
 
 ## Core design
 
@@ -113,7 +113,7 @@ The live router currently prioritizes aggressively but does not impose a default
 Important runtime decisions:
 
 - canonical advisory OHLCV source: `dhan_ohlcv_daily`
-- canonical fundamentals source: Sharpely tables from [`data/sharpelydata/sharpely_data.py`](/home/rane/code/stockey/data/sharpelydata/sharpely_data.py)
+- canonical fundamentals source: Sharpely tables from `data/sharpelydata/sharpely_data.py`
 - official event source: exchange announcement pipeline
 - non-official news source: Economic Times RSS
 - legacy/reference only: NSE bhavcopy plus local adjusted-price pipeline
@@ -135,7 +135,7 @@ Keep two separate Screener.in modes:
   - the daily downloader syncs only those registered screeners
   - use this path for stable advisory universes and historical reruns
 - research mode:
-  - use [`data/screenerin/ad_hoc_query.py`](/home/rane/code/stockey/data/screenerin/ad_hoc_query.py) for one-off raw queries
+  - use `data/screenerin/ad_hoc_query.py` for one-off raw queries
   - do not register every research idea as a recurring screener
   - only promote a query into the registry when it becomes a stable production input
 
@@ -143,13 +143,13 @@ This keeps the daily advisory pipeline smaller and more deterministic without lo
 
 Theme detection and theme-to-screener mapping now use a single active config:
 
-- [`config/investment_themes.yaml`](/home/rane/code/stockey/config/investment_themes.yaml)
+- [`config/investment_themes.yaml`](../config/investment_themes.yaml)
 
 The older fallback theme config was removed.
 
 For event-model data generation there is also a separate research-only training-universe path:
 
-- broad ad hoc Screener.in queries live in [`config/event_model_training_universes.yaml`](/home/rane/code/stockey/config/event_model_training_universes.yaml)
+- broad ad hoc Screener.in queries live in [`config/event_model_training_universes.yaml`](../config/event_model_training_universes.yaml)
 - they sync directly into normalized `advisory_screener_constituents`
 - they feed the research-only setup `EVENT_MODEL_TRAINING_V1`
 - normal advisory runs exclude that setup unless it is explicitly selected
@@ -186,29 +186,29 @@ They are intentionally not the final trade-decision engine.
 
 These are the main files you will edit when maintaining the advisory system:
 
-- setup config: [`config/advisory_setups.yaml`](/home/rane/code/stockey/config/advisory_setups.yaml)
-- screener registry: [`data/screenerin/screener_registry.py`](/home/rane/code/stockey/data/screenerin/screener_registry.py)
-- screener sync: [`data/screenerin/screener_parser.py`](/home/rane/code/stockey/data/screenerin/screener_parser.py)
-- advisory screener normalization: [`advisory/screener_parser.py`](/home/rane/code/stockey/advisory/screener_parser.py)
-- technical features: [`advisory/technical_features.py`](/home/rane/code/stockey/advisory/technical_features.py)
-- fundamentals snapshot: [`advisory/fundamental_snapshot.py`](/home/rane/code/stockey/advisory/fundamental_snapshot.py)
-- regime engine: [`advisory/regime_engine.py`](/home/rane/code/stockey/advisory/regime_engine.py)
-- rule engine: [`advisory/rule_engine.py`](/home/rane/code/stockey/advisory/rule_engine.py)
-- watchlist builder: [`advisory/watchlist_builder.py`](/home/rane/code/stockey/advisory/watchlist_builder.py)
-- official announcement watch: [`advisory/announcement_watch.py`](/home/rane/code/stockey/advisory/announcement_watch.py)
-- ET RSS ingest: [`data/economictimes/rss.py`](/home/rane/code/stockey/data/economictimes/rss.py)
-- ET RSS watch matching: [`advisory/news_watch.py`](/home/rane/code/stockey/advisory/news_watch.py)
-- LLM event evaluation: [`advisory/llm_event_evaluator.py`](/home/rane/code/stockey/advisory/llm_event_evaluator.py)
-- risk sizing: [`advisory/risk_engine.py`](/home/rane/code/stockey/advisory/risk_engine.py)
-- portfolio planning: [`advisory/portfolio_engine.py`](/home/rane/code/stockey/advisory/portfolio_engine.py)
-- lifecycle: [`advisory/position_lifecycle.py`](/home/rane/code/stockey/advisory/position_lifecycle.py)
-- execution planning: [`advisory/execution_engine.py`](/home/rane/code/stockey/advisory/execution_engine.py)
-- research ledger: [`advisory/research_ledger.py`](/home/rane/code/stockey/advisory/research_ledger.py)
-- master orchestrator: [`advisory/master_pipeline.py`](/home/rane/code/stockey/advisory/master_pipeline.py)
-- component orchestrator: [`advisory/pipeline.py`](/home/rane/code/stockey/advisory/pipeline.py)
-- symbol trace utility: [`advisory/symbol_trace.py`](/home/rane/code/stockey/advisory/symbol_trace.py)
-- setup trace utility: [`advisory/setup_trace.py`](/home/rane/code/stockey/advisory/setup_trace.py)
-- all-setups dashboard: [`advisory/dashboard.py`](/home/rane/code/stockey/advisory/dashboard.py)
+- setup config: [`config/advisory_setups.yaml`](../config/advisory_setups.yaml)
+- screener registry: `data/screenerin/screener_registry.py`
+- screener sync: `data/screenerin/screener_parser.py`
+- advisory screener normalization: `advisory/screener_parser.py`
+- technical features: `advisory/technical_features.py`
+- fundamentals snapshot: `advisory/fundamental_snapshot.py`
+- regime engine: `advisory/regime_engine.py`
+- rule engine: `advisory/rule_engine.py`
+- watchlist builder: `advisory/watchlist_builder.py`
+- official announcement watch: `advisory/announcement_watch.py`
+- ET RSS ingest: `data/economictimes/rss.py`
+- ET RSS watch matching: `advisory/news_watch.py`
+- LLM event evaluation: `advisory/llm_event_evaluator.py`
+- risk sizing: `advisory/risk_engine.py`
+- portfolio planning: `advisory/portfolio_engine.py`
+- lifecycle: `advisory/position_lifecycle.py`
+- execution planning: `advisory/execution_engine.py`
+- research ledger: `advisory/research_ledger.py`
+- master orchestrator: `advisory/master_pipeline.py`
+- component orchestrator: `advisory/pipeline.py`
+- symbol trace utility: `advisory/symbol_trace.py`
+- setup trace utility: `advisory/setup_trace.py`
+- all-setups dashboard: `advisory/dashboard.py`
 
 ## Main tables
 
@@ -463,7 +463,7 @@ python scripts/sql_query_runner.py --read-only "select date, screener_slug, coun
 
 ## How to add or change a setup
 
-Setups are configured in [`config/advisory_setups.yaml`](/home/rane/code/stockey/config/advisory_setups.yaml).
+Setups are configured in [`config/advisory_setups.yaml`](../config/advisory_setups.yaml).
 
 Each setup supports:
 
@@ -573,14 +573,14 @@ The rule engine currently supports:
 - `lte`
 - `lt`
 
-These are implemented in [`advisory/rule_engine.py`](/home/rane/code/stockey/advisory/rule_engine.py).
+These are implemented in `advisory/rule_engine.py`.
 
 ### How to choose rule columns
 
 Use columns that actually exist in:
 
-- [`advisory_technical_daily`](/home/rane/code/stockey/advisory/technical_features.py)
-- [`advisory_fundamentals_daily`](/home/rane/code/stockey/advisory/fundamental_snapshot.py)
+- `advisory/technical_features.py`
+- `advisory/fundamental_snapshot.py`
 
 Typical technical columns:
 
@@ -658,7 +658,7 @@ Current behavior:
 - missing fundamentals or stock meta: fetched from Sharpely
 - peer data needed for peer-relative features: fetched through Sharpely plus Dhan peer sync
 
-The main preflight logic is in [`advisory/data_sync.py`](/home/rane/code/stockey/advisory/data_sync.py) and [`advisory/peer_sync.py`](/home/rane/code/stockey/advisory/peer_sync.py).
+The main preflight logic is in `advisory/data_sync.py` and `advisory/peer_sync.py`.
 
 ## How news and events work
 
@@ -666,21 +666,21 @@ There are now two event paths.
 
 ### 1. Official exchange announcements
 
-- watch builder: [`advisory/watchlist_builder.py`](/home/rane/code/stockey/advisory/watchlist_builder.py)
-- event ingest: [`advisory/announcement_watch.py`](/home/rane/code/stockey/advisory/announcement_watch.py)
+- watch builder: `advisory/watchlist_builder.py`
+- event ingest: `advisory/announcement_watch.py`
 - upstream storage: `announcement_pipeline_documents`
 - advisory event table: `advisory_watch_events`
 
 ### 2. Economic Times RSS
 
-- raw ingest: [`data/economictimes/rss.py`](/home/rane/code/stockey/data/economictimes/rss.py)
-- watch matching: [`advisory/news_watch.py`](/home/rane/code/stockey/advisory/news_watch.py)
+- raw ingest: `data/economictimes/rss.py`
+- watch matching: `advisory/news_watch.py`
 - raw table: `economictimes_rss_items`
 - advisory event table: `advisory_news_events`
 
 ### LLM evaluation
 
-[`advisory/llm_event_evaluator.py`](/home/rane/code/stockey/advisory/llm_event_evaluator.py) reads both event sources and writes:
+`advisory/llm_event_evaluator.py` reads both event sources and writes:
 
 - `advisory_event_evaluations`
 - `advisory_event_risks`
@@ -770,7 +770,7 @@ When you change the advisory system:
 
 1. update code
 2. update this manual if the operator workflow changed
-3. update [`todo.md`](/home/rane/code/stockey/todo.md) if implementation status changed
+3. update [`todo.md`](../todo.md) if implementation status changed
 4. run:
 
 ```sh

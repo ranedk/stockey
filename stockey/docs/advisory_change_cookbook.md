@@ -2,7 +2,7 @@
 
 This is the short practical guide for common changes.
 
-Use [`docs/advisory_manual.md`](/home/rane/code/stockey/docs/advisory_manual.md) for the full operator manual. Use this file when you want a concrete recipe.
+Use [`docs/advisory_manual.md`](advisory_manual.md) for the full operator manual. Use this file when you want a concrete recipe.
 
 ## 1. Add a new screener and connect it to a setup
 
@@ -24,7 +24,7 @@ python -m data.screenerin.screener_parser
 python -m advisory.screener_parser
 ```
 
-### Add a setup in [config/advisory_setups.yaml](/home/rane/code/stockey/config/advisory_setups.yaml)
+### Add a setup in [config/advisory_setups.yaml](../config/advisory_setups.yaml)
 
 Example:
 
@@ -66,7 +66,7 @@ python -m advisory.watchlist_builder
 
 ## 2. Loosen or tighten one setup’s thresholds
 
-Edit [config/advisory_setups.yaml](/home/rane/code/stockey/config/advisory_setups.yaml).
+Edit [config/advisory_setups.yaml](../config/advisory_setups.yaml).
 
 Common changes:
 

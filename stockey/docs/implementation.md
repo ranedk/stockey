@@ -2,7 +2,7 @@
 
 This document describes the current architecture of the live investment advisory system.
 
-It is not a future-state PRD. Use [`todo.md`](/home/rane/code/stockey/todo.md) for the active roadmap.
+It is not a future-state PRD. Use [`todo.md`](../todo.md) for the active roadmap.
 
 ## Design intent
 
@@ -255,4 +255,4 @@ The main remaining gaps are:
 3. too much prediction still lives inside hand-tuned rule logic
 4. continuous-watch routing can still be tightened further
 
-Use [`todo.md`](/home/rane/code/stockey/todo.md) for the current roadmap on these items.
+Use [`todo.md`](../todo.md) for the current roadmap on these items.

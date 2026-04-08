@@ -49,7 +49,7 @@ Expected prefixes:
 
 ## Data loaders
 
-Symbol-specific loaders default to [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt). Daily derivation jobs can instead use [`config/watchlist_symbols.txt`](/home/rane/code/stockey/config/watchlist_symbols.txt). You can override either flow per run with `--symbols` or the `STOCKEY_SYMBOLS` env var.
+Symbol-specific loaders default to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt). Daily derivation jobs can instead use [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt). You can override either flow per run with `--symbols` or the `STOCKEY_SYMBOLS` env var.
 
 ## Orchestration scripts
 
@@ -265,14 +265,14 @@ Human-readable table summaries:
 python -m utils.db_schema_dump --schemas public
 ```
 
-Use [`docs/crawl_schema.md`](/home/rane/code/stockey/docs/crawl_schema.md) and [`docs/feature_schema.md`](/home/rane/code/stockey/docs/feature_schema.md) as the maintained references. [`docs/schema.sql`](/home/rane/code/stockey/docs/schema.sql) now contains only targeted admin SQL instead of a full `pg_dump`.
+Use [`docs/crawl_schema.md`](crawl_schema.md) and [`docs/feature_schema.md`](feature_schema.md) as the maintained references. [`docs/schema.sql`](schema.sql) now contains only targeted admin SQL instead of a full `pg_dump`.
 
 ## Agent-facing tool surface
 
 The curated agent-safe commands live in:
 
-- [`docs/tool_registry.json`](/home/rane/code/stockey/docs/tool_registry.json)
-- [`scripts/agent_tool_runner.py`](/home/rane/code/stockey/scripts/agent_tool_runner.py)
+- [`docs/tool_registry.json`](tool_registry.json)
+- `scripts/agent_tool_runner.py`
 
 Quick checks:
 
@@ -285,11 +285,11 @@ The runner uses the invoking interpreter for downstream Python commands, so star
 
 ## Advisory roadmap
 
-Use [`todo.md`](/home/rane/code/stockey/todo.md) as the maintained roadmap for current priorities, bottlenecks, and next implementation steps.
+Use [`todo.md`](../todo.md) as the maintained roadmap for current priorities, bottlenecks, and next implementation steps.
 
-Use [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md) as the current architecture summary for the live advisory stack.
+Use [`docs/implementation.md`](implementation.md) as the current architecture summary for the live advisory stack.
 
-For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](/home/rane/code/stockey/docs/advisory_manual.md). That is the practical runbook for:
+For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](advisory_manual.md). That is the practical runbook for:
 
 - running the advisory stack
 - adding or removing screeners
@@ -297,9 +297,9 @@ For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](/home/
 - understanding stage ownership
 - debugging outputs and failures
 
-For the short command-focused runbook, use [`docs/operators_manual.md`](/home/rane/code/stockey/docs/operators_manual.md).
+For the short command-focused runbook, use [`docs/operators_manual.md`](operators_manual.md).
 
-For copy-paste change recipes, use [`docs/advisory_change_cookbook.md`](/home/rane/code/stockey/docs/advisory_change_cookbook.md).
+For copy-paste change recipes, use [`docs/advisory_change_cookbook.md`](advisory_change_cookbook.md).
 
 Current advisory bootstrap commands:
 

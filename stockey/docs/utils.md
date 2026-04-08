@@ -22,7 +22,7 @@ python -m utils.db_schema_dump --schemas public
 
 ## OCR PDFs with LLMs
 
-The OCR utility lives under [`utils/ocr`](/home/rane/code/stockey/utils/ocr).
+The OCR utility lives under [`utils/ocr`](../utils/ocr).
 
 It supports:
 
@@ -48,7 +48,7 @@ python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider openai --pag
 
 ## Transcribe audio from URLs
 
-The transcription utility lives under [`utils/transcribe`](/home/rane/code/stockey/utils/transcribe).
+The transcription utility lives under [`utils/transcribe`](../utils/transcribe).
 
 It:
 

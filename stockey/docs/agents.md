@@ -46,8 +46,8 @@ Do not expose arbitrary shell execution to the model. Keep scrape/download tools
 
 The repository now includes:
 
-- [`docs/tool_registry.json`](/home/rane/code/stockey/docs/tool_registry.json): approved tool definitions
-- [`scripts/agent_tool_runner.py`](/home/rane/code/stockey/scripts/agent_tool_runner.py): a thin registry-based runner
+- [`docs/tool_registry.json`](tool_registry.json): approved tool definitions
+- `scripts/agent_tool_runner.py`: a thin registry-based runner
 
 Usage:
 
@@ -75,4 +75,4 @@ Before adding more agents, finish these pieces:
 
 ## Advisory system roadmap
 
-The current advisory roadmap is tracked in [`todo.md`](/home/rane/code/stockey/todo.md). Use that file for active priorities and bottlenecks before exposing new advisory tools to agents.
+The current advisory roadmap is tracked in [`todo.md`](../todo.md). Use that file for active priorities and bottlenecks before exposing new advisory tools to agents.

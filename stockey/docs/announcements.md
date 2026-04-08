@@ -1,6 +1,6 @@
 # Announcement Pipeline
 
-The announcement pipeline lives under [`data/announcements`](/home/rane/code/stockey/data/announcements) and ingests exchange announcements for a single requested ticker and exchange pair, resolving that identity through `company_master`.
+The announcement pipeline lives under [`data/announcements`](../data/announcements) and ingests exchange announcements for a single requested ticker and exchange pair, resolving that identity through `company_master`.
 
 ## Command
 
@@ -27,7 +27,7 @@ python -m data.announcements.cli \
 
 For a given `ticker`, `exchange`, and date range, the managed pipeline:
 
-1. Resolves the request through [`company_master`](/home/rane/code/stockey/utils/company_master.py).
+1. Resolves the request through `utils/company_master.py`.
 2. Fetches NSE or BSE announcements.
 3. Persists raw metadata into `announcement_pipeline_documents`.
 4. Downloads the attachment and stores it in object storage.
@@ -35,7 +35,7 @@ For a given `ticker`, `exchange`, and date range, the managed pipeline:
 6. Categorizes using exchange text plus the first-pass OCR/transcription.
 7. If any category is present in the keys of `DOCUMENT_PYDANTIC_MAP`, runs full-document OCR and stores it in `full_ocr_text`.
 8. If the category includes `EARNINGS_CALL`, looks for an audio link in the exchange payload or OCR text, downloads it, transcribes it, and stores it in `audio_transcript_text`.
-9. Uses the summarization model to extract structured JSON matching [`data/announcements/schemas.py`](/home/rane/code/stockey/data/announcements/schemas.py), and stores it in `announcement_pipeline_reports` plus `parsed_reports_json` on the document row.
+9. Uses the summarization model to extract structured JSON matching `data/announcements/schemas.py`, and stores it in `announcement_pipeline_reports` plus `parsed_reports_json` on the document row.
 10. Generates a separate short concise summary and stores it in `concise_summary_text`.
 
 ## Identity Model
@@ -44,8 +44,8 @@ The pipeline no longer uses the borrowed `CompanyTarget` / `load_companies_by_ti
 
 It now resolves targets using:
 
-- [`data/announcements/db.py`](/home/rane/code/stockey/data/announcements/db.py)
-- [`utils/company_master.py`](/home/rane/code/stockey/utils/company_master.py)
+- `data/announcements/db.py`
+- `utils/company_master.py`
 
 Each stored announcement row includes:
 
@@ -68,17 +68,17 @@ This lets NSE and BSE announcements for the same company join on a single stable
 
 ## Key Modules
 
-- [`data/announcements/cli.py`](/home/rane/code/stockey/data/announcements/cli.py)
-- [`data/announcements/managed_pipeline.py`](/home/rane/code/stockey/data/announcements/managed_pipeline.py)
-- [`data/announcements/pipeline.py`](/home/rane/code/stockey/data/announcements/pipeline.py)
-- [`data/announcements/state.py`](/home/rane/code/stockey/data/announcements/state.py)
-- [`data/announcements/db.py`](/home/rane/code/stockey/data/announcements/db.py)
+- `data/announcements/cli.py`
+- `data/announcements/managed_pipeline.py`
+- `data/announcements/pipeline.py`
+- `data/announcements/state.py`
+- `data/announcements/db.py`
 ## Required Environment
 
 This path expects working values for:
 
-- PostgreSQL env vars used by [`utils/db.py`](/home/rane/code/stockey/utils/db.py)
-- S3 env vars used by [`utils/store.py`](/home/rane/code/stockey/utils/store.py)
+- PostgreSQL env vars used by `utils/db.py`
+- S3 env vars used by `utils/store.py`
 - `OPENAI_API_KEY` if structured parsing is enabled
 - `GEMINI_KEY` if Gemini is used for OCR or transcription
 
@@ -91,8 +91,8 @@ Required Python packages for the announcement path include:
 
 ## Attachment handling
 
-- PDF attachments are downloaded and OCRed through [`utils/ocr`](/home/rane/code/stockey/utils/ocr).
-- Direct audio attachments such as `mp3`, `wav`, `mp4`, `m4a`, `ogg`, and `webm` are transcribed through [`utils/transcribe`](/home/rane/code/stockey/utils/transcribe) and stored in `three_page_ocr_text`.
+- PDF attachments are downloaded and OCRed through [`utils/ocr`](../utils/ocr).
+- Direct audio attachments such as `mp3`, `wav`, `mp4`, `m4a`, `ogg`, and `webm` are transcribed through [`utils/transcribe`](../utils/transcribe) and stored in `three_page_ocr_text`.
 - Earnings-call documents can also trigger a second audio pass from an extracted audio link; that transcript is stored in `audio_transcript_text`.
 - Full-document OCR is only done for categories mapped in `DOCUMENT_PYDANTIC_MAP`.
 

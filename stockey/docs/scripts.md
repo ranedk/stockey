@@ -89,7 +89,7 @@ python scripts/agent_tool_runner.py list
 - Symbol-scoped loaders fall back in this order:
   1. `--symbols`
   2. `STOCKEY_SYMBOLS`
-  3. [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt)
+  3. [`config/tracked_symbols.txt`](../config/tracked_symbols.txt)
 - Browser-driven loaders require Chrome remote debugging when they connect over CDP:
 
 ```sh
@@ -137,7 +137,7 @@ These modules still work cleanly with `python -m ...`, which is a good fit for c
 If `--symbols` is omitted, they fall back to:
 
 1. `STOCKEY_SYMBOLS`
-2. [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt)
+2. [`config/tracked_symbols.txt`](../config/tracked_symbols.txt)
 
 Examples:
 
@@ -408,11 +408,11 @@ Abstain behavior:
 
 ## Advisory docs
 
-The current roadmap for the investment advisory system lives in [`todo.md`](/home/rane/code/stockey/todo.md). It tracks current bottlenecks and the next implementation priorities rather than historical build phases.
+The current roadmap for the investment advisory system lives in [`todo.md`](../todo.md). It tracks current bottlenecks and the next implementation priorities rather than historical build phases.
 
-The current architecture summary lives in [`docs/implementation.md`](/home/rane/code/stockey/docs/implementation.md).
+The current architecture summary lives in [`docs/implementation.md`](implementation.md).
 
-The practical operator guide lives in [`docs/advisory_manual.md`](/home/rane/code/stockey/docs/advisory_manual.md). Use it for:
+The practical operator guide lives in [`docs/advisory_manual.md`](advisory_manual.md). Use it for:
 
 - daily runs
 - adding screeners
@@ -420,7 +420,7 @@ The practical operator guide lives in [`docs/advisory_manual.md`](/home/rane/cod
 - understanding which modules and tables to inspect
 - debugging rule, watch, event, and execution outputs
 
-For shorter example-driven edits, use [`docs/advisory_change_cookbook.md`](/home/rane/code/stockey/docs/advisory_change_cookbook.md).
+For shorter example-driven edits, use [`docs/advisory_change_cookbook.md`](advisory_change_cookbook.md).
 
 ## OCR usage
 
@@ -533,7 +533,7 @@ TRUNCATE_DERIVED=1 ./all_backfill.sh all 5
 
 Notes:
 
-- `all_daily_derivations.sh` loads symbols from [`config/watchlist_symbols.txt`](/home/rane/code/stockey/config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](/home/rane/code/stockey/config/tracked_symbols.txt)
+- `all_daily_derivations.sh` loads symbols from [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt)
 - `all_backfill.sh` defaults to `watchlist 5`
 - only use `TRUNCATE_DERIVED=1` when you intentionally want a full rebuild of derived price and feature tables
 - `all_advisory.sh` now includes the full raw ingestion flow plus the advisory master pipeline:
@@ -690,6 +690,6 @@ If you expose these through tools or MCP:
 - Prefer `--read-only` on SQL agents that should not mutate state.
 - Pass SQL through `--file` or stdin for multi-line queries.
 - Keep download/scrape agents separate from analysis agents.
-- Prefer the registry in [`docs/tool_registry.json`](/home/rane/code/stockey/docs/tool_registry.json) instead of hard-coding shell commands in prompts.
+- Prefer the registry in [`docs/tool_registry.json`](tool_registry.json) instead of hard-coding shell commands in prompts.
 - Prefer `security_id` over raw `symbol` when stitching history across renames.
 - Prefer `company_master_id` over raw exchange tickers when joining company-level datasets across NSE and BSE.
