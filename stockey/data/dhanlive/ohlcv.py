@@ -467,24 +467,49 @@ def sync_many_daily(
     client = DhanHistoricalClient()
     results: list[dict[str, object]] = []
     for ticker in tickers:
-        df = sync_daily_ohlcv(
-            ticker,
-            exchange=exchange,
-            asset_type=asset_type,
-            from_date=from_date,
-            to_date=to_date,
-            client=client,
-        )
-        results.append(
-            {
-                "ticker": ticker,
-                "asset_type": asset_type,
-                "exchange": exchange.upper(),
-                "rows": len(df),
-                "from_date": None if df.empty else str(df["date"].min()),
-                "to_date": None if df.empty else str(df["date"].max()),
-            }
-        )
+        try:
+            df = sync_daily_ohlcv(
+                ticker,
+                exchange=exchange,
+                asset_type=asset_type,
+                from_date=from_date,
+                to_date=to_date,
+                client=client,
+            )
+            results.append(
+                {
+                    "ticker": ticker,
+                    "asset_type": asset_type,
+                    "exchange": exchange.upper(),
+                    "rows": len(df),
+                    "from_date": None if df.empty else str(df["date"].min()),
+                    "to_date": None if df.empty else str(df["date"].max()),
+                }
+            )
+        except (DhanAPIError, ValueError) as exc:
+            print(
+                {
+                    "mode": "daily",
+                    "ticker": ticker,
+                    "asset_type": asset_type,
+                    "exchange": exchange.upper(),
+                    "warning": "symbol_sync_failed",
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                },
+                file=sys.stderr,
+                flush=True,
+            )
+            results.append(
+                {
+                    "ticker": ticker,
+                    "asset_type": asset_type,
+                    "exchange": exchange.upper(),
+                    "rows": 0,
+                    "from_date": None,
+                    "to_date": None,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
     return results
 
 
@@ -500,26 +525,53 @@ def sync_many_intraday(
     client = DhanHistoricalClient()
     results: list[dict[str, object]] = []
     for ticker in tickers:
-        df = sync_intraday_ohlcv(
-            ticker,
-            exchange=exchange,
-            asset_type=asset_type,
-            interval_minutes=interval_minutes,
-            from_date=from_date,
-            to_date=to_date,
-            client=client,
-        )
-        results.append(
-            {
-                "ticker": ticker,
-                "asset_type": asset_type,
-                "exchange": exchange.upper(),
-                "interval_minutes": interval_minutes,
-                "rows": len(df),
-                "from_timestamp": None if df.empty else str(df["timestamp"].min()),
-                "to_timestamp": None if df.empty else str(df["timestamp"].max()),
-            }
-        )
+        try:
+            df = sync_intraday_ohlcv(
+                ticker,
+                exchange=exchange,
+                asset_type=asset_type,
+                interval_minutes=interval_minutes,
+                from_date=from_date,
+                to_date=to_date,
+                client=client,
+            )
+            results.append(
+                {
+                    "ticker": ticker,
+                    "asset_type": asset_type,
+                    "exchange": exchange.upper(),
+                    "interval_minutes": interval_minutes,
+                    "rows": len(df),
+                    "from_timestamp": None if df.empty else str(df["timestamp"].min()),
+                    "to_timestamp": None if df.empty else str(df["timestamp"].max()),
+                }
+            )
+        except (DhanAPIError, ValueError) as exc:
+            print(
+                {
+                    "mode": "intraday",
+                    "ticker": ticker,
+                    "asset_type": asset_type,
+                    "exchange": exchange.upper(),
+                    "interval_minutes": interval_minutes,
+                    "warning": "symbol_sync_failed",
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                },
+                file=sys.stderr,
+                flush=True,
+            )
+            results.append(
+                {
+                    "ticker": ticker,
+                    "asset_type": asset_type,
+                    "exchange": exchange.upper(),
+                    "interval_minutes": interval_minutes,
+                    "rows": 0,
+                    "from_timestamp": None,
+                    "to_timestamp": None,
+                    "error": f"{exc.__class__.__name__}: {exc}",
+                }
+            )
     return results
 
 

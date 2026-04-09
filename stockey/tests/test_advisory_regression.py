@@ -8,7 +8,8 @@ import pandas as pd
 
 from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, intraday_features, llm_event_evaluator, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, training_universe, watchlist_builder
 from data.eaindustry import wpi
-from data.dhanlive import dhan_db
+from data.dhanlive import client as dhan_client
+from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv
 from data import download_runner
 
 
@@ -3006,3 +3007,55 @@ def test_live_dashboard_loads_operator_feed(tmp_path):
     assert len(loaded) == 1
     assert loaded[0]["channel"] == "stockey:continuous_watch:alerts"
     assert "alerts count=1" in loaded[0]["message"]
+
+
+def test_sync_many_daily_continues_after_symbol_error(monkeypatch):
+    monkeypatch.setattr(dhan_ohlcv, "DhanHistoricalClient", lambda: object())
+
+    def fake_sync_daily_ohlcv(ticker, **kwargs):
+        if ticker == "BAD":
+            raise dhan_client.DhanAPIError("bad values for parameters")
+        return pd.DataFrame(
+            [
+                {
+                    "date": pd.Timestamp("2026-04-09T00:00:00Z"),
+                }
+            ]
+        )
+
+    monkeypatch.setattr(dhan_ohlcv, "sync_daily_ohlcv", fake_sync_daily_ohlcv)
+
+    results = dhan_ohlcv.sync_many_daily(["GOOD", "BAD"], exchange="NSE", asset_type="stock")
+
+    assert len(results) == 2
+    assert results[0]["ticker"] == "GOOD"
+    assert results[0]["rows"] == 1
+    assert results[1]["ticker"] == "BAD"
+    assert results[1]["rows"] == 0
+    assert "DhanAPIError" in results[1]["error"]
+
+
+def test_sync_many_intraday_continues_after_symbol_error(monkeypatch):
+    monkeypatch.setattr(dhan_ohlcv, "DhanHistoricalClient", lambda: object())
+
+    def fake_sync_intraday_ohlcv(ticker, **kwargs):
+        if ticker == "BAD":
+            raise ValueError("no dhan identity")
+        return pd.DataFrame(
+            [
+                {
+                    "timestamp": pd.Timestamp("2026-04-09T09:15:00Z"),
+                }
+            ]
+        )
+
+    monkeypatch.setattr(dhan_ohlcv, "sync_intraday_ohlcv", fake_sync_intraday_ohlcv)
+
+    results = dhan_ohlcv.sync_many_intraday(["GOOD", "BAD"], exchange="NSE", asset_type="stock", interval_minutes=1)
+
+    assert len(results) == 2
+    assert results[0]["ticker"] == "GOOD"
+    assert results[0]["rows"] == 1
+    assert results[1]["ticker"] == "BAD"
+    assert results[1]["rows"] == 0
+    assert "ValueError" in results[1]["error"]

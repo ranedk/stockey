@@ -4,6 +4,75 @@ This is the short runbook for daily use.
 
 Use this file when you want the important commands, when to run them, and what each one is for.
 
+## Python interpreter behavior
+
+All top-level shell wrappers resolve Python in this order:
+
+1. `PYTHON_BIN` if you set it explicitly
+2. the active virtualenv `python` if you already ran `source .xstockey/bin/activate`
+3. the repo-local fallback at `.xstockey/bin/python`
+4. system `python3`, then `python`
+
+That means:
+
+- interactive use after activating the venv works naturally
+- cron can call the shell wrappers directly without activating the venv first, as long as `.xstockey` exists
+- if you want to force a specific interpreter, set `PYTHON_BIN`
+
+Cron example:
+
+```sh
+cd /home/rane/code/stockey && ./all_full_advisory.sh
+```
+
+Bootstrap command:
+
+```sh
+python builder.py
+```
+
+That creates or refreshes the project venv and installs `go-crond` if it is missing.
+
+## Scheduled runs
+
+The repo now ships with a ready cron file at `config/stockey.crontab`.
+
+Install it with system cron:
+
+```sh
+mkdir -p /home/rane/code/stockey/logs/cron
+crontab /home/rane/code/stockey/config/stockey.crontab
+```
+
+Or run it with `go-crond`:
+
+```sh
+mkdir -p /home/rane/code/stockey/logs/cron
+go-crond /home/rane/code/stockey/config/stockey.crontab
+```
+
+Current schedule:
+
+- `07:10` weekdays: `./all_downloads.sh` for the broad raw daily refresh
+- `08:20` Monday, Wednesday, Friday: `./all_full_advisory.sh --skip-model-training --skip-downloads`
+- every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_continuous_watch.sh`
+- `16:05` weekdays: one final post-close `./all_continuous_watch.sh`
+- `18:45` weekdays: `./all_model_training.sh`
+- `09:30` Saturday: optional `./all_backfill.sh watchlist 5`
+
+Why the split looks like this:
+
+- slow daily and model-prep jobs are isolated from the intra-day watch loop
+- CPI, FPI, WPI, macro, masters, and similar sources get covered by the daily raw refresh
+- live OHLCV, news, and announcements are handled by the `10` minute watch cadence
+- the full advisory is not forced on every market tick; it stays a slower batch decision process
+- training remains a once-daily research process
+
+Important constraint:
+
+- the cron file uses `flock` so duplicate overlapping runs are skipped instead of piling up
+- the shell wrappers resolve Python automatically, so cron does not need `source .xstockey/bin/activate`
+
 ## Main operating modes
 
 ### 1. Full advisory run

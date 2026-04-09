@@ -11,6 +11,13 @@ source .xstockey/bin/activate
 
 `builder.py` is now safe to import and only runs when executed directly.
 
+`builder.py` also installs `go-crond` if it is missing. It resolves the binary in this order:
+
+1. existing `go-crond` on `PATH`
+2. install into `GO_CROND_INSTALL_DIR` if that env var is set
+3. install into `/usr/local/bin` if writable
+4. otherwise install into `~/.local/bin`
+
 ## PostgreSQL
 
 ```sh
@@ -109,6 +116,16 @@ Primary operator commands:
 ./all_continuous_watch.sh --loop
 ./all_live_notifier.sh
 ```
+
+Scheduled operator flow:
+
+- install `config/stockey.crontab` with `crontab config/stockey.crontab` or run it with `go-crond`
+- let `all_downloads.sh` handle the once-daily broad refresh
+- let `all_continuous_watch.sh` run every `10` minutes during market hours
+- let `all_model_training.sh` run once daily after market close
+- let `all_full_advisory.sh --skip-model-training --skip-downloads` run a few times a week for the slower batch recommendation cycle
+
+The cron file writes logs under `logs/cron/` and uses `flock` so overlapping runs are skipped instead of stacked.
 
 Use:
 

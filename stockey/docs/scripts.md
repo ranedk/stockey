@@ -126,6 +126,18 @@ python -m data.dhanlive.auth_cli clear-cache
 | `all_downloader.sh` | Compatibility wrapper | Delegates to `all_downloads.sh` |
 | `all_features.sh` | Compatibility wrapper | Delegates to `all_daily_derivations.sh` |
 
+Recommended scheduler file:
+
+- `config/stockey.crontab`
+
+It schedules:
+
+- `all_downloads.sh` once daily on weekdays
+- `all_full_advisory.sh --skip-model-training --skip-downloads` a few times a week
+- `all_continuous_watch.sh` every `10` minutes during market hours
+- `all_model_training.sh` once daily after market close
+- optional `all_backfill.sh` weekly on Saturday
+
 ## Symbol-specific module runs
 
 These modules still work cleanly with `python -m ...`, which is a good fit for cron and shell orchestration. The entrypoints now support:
