@@ -10,6 +10,12 @@ from pathlib import Path
 
 GO_CROND_REPO = "webdevops/go-crond"
 GO_CROND_DEFAULT_VERSION = "22.9.1"
+PROJECT_ROOT = Path(__file__).resolve().parent
+CRON_LOG_DIR = PROJECT_ROOT / "logs" / "cron"
+
+
+def _log(message: str) -> None:
+    print(message, flush=True)
 
 
 def install_requirements(folder, project_name):
@@ -18,16 +24,16 @@ def install_requirements(folder, project_name):
     venv_path = f".x{project_name}"
     try:
         if not os.path.exists(venv_path):
-            print(f"Creating virtual environment for {project_name}...")
+            _log(f"Creating virtual environment for {project_name}...")
             subprocess.check_call(
                 [sys.executable, "-m", "venv", venv_path]
             )  # nosec B603, B404
         else:
-            print(f"Virtual environment already exists for {project_name}.")
+            _log(f"Virtual environment already exists for {project_name}.")
 
         requirements_path = "requirements.txt"
         if os.path.exists(requirements_path):
-            print(f"Installing requirements for {project_name}...")
+            _log(f"Installing requirements for {project_name}...")
             subprocess.check_call(
                 [
                     os.path.join(venv_path, "bin", "pip"),
@@ -37,7 +43,7 @@ def install_requirements(folder, project_name):
                 ]
             )  # nosec B603, B404
     except subprocess.CalledProcessError as e:
-        print(f"Failed to install requirements for {project_name}: {e}")
+        _log(f"Failed to install requirements for {project_name}: {e}")
     finally:
         os.chdir(original_cwd)
 
@@ -103,8 +109,11 @@ def discover_go_crond_version():
         tag_name = str(payload.get("tag_name") or "").strip()
         if tag_name:
             return tag_name
-    except Exception:
-        pass
+    except Exception as exc:
+        _log(
+            f"Could not discover latest go-crond release from GitHub; "
+            f"falling back to {GO_CROND_DEFAULT_VERSION} ({exc.__class__.__name__}: {exc})"
+        )
     return GO_CROND_DEFAULT_VERSION
 
 
@@ -115,22 +124,33 @@ def resolve_go_crond_install_dir():
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    preferred = Path("/usr/local/bin")
-    if preferred.exists() and os.access(preferred, os.W_OK | os.X_OK):
-        return preferred
+    return PROJECT_ROOT
 
-    fallback = Path.home() / ".local" / "bin"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+
+def ensure_runtime_directories() -> None:
+    CRON_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _log(f"Ensured runtime directory: {CRON_LOG_DIR}")
 
 
 def install_go_crond():
+    target_dir = resolve_go_crond_install_dir()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / "go-crond"
+    if target_path.exists() and os.access(target_path, os.X_OK):
+        _log(f"go-crond already installed at {target_path}")
+        return str(target_path)
+
     existing = shutil.which("go-crond")
     if existing:
-        print(f"go-crond already installed at {existing}")
-        return existing
+        existing_path = Path(existing).expanduser().resolve()
+        if existing_path != target_path.resolve():
+            shutil.copy2(existing_path, target_path)
+            target_path.chmod(0o755)
+            _log(f"Copied existing go-crond from {existing_path} -> {target_path}")
+            return str(target_path)
+        _log(f"go-crond already installed at {existing_path}")
+        return str(existing_path)
 
-    target_dir = resolve_go_crond_install_dir()
     version = discover_go_crond_version()
     go_os = map_go_crond_os()
     go_arch = map_go_crond_arch()
@@ -138,26 +158,25 @@ def install_go_crond():
         f"https://github.com/{GO_CROND_REPO}/releases/download/"
         f"{version}/go-crond.{go_os}.{go_arch}"
     )
-    target_path = target_dir / "go-crond"
-    print(f"Installing go-crond {version} from {download_url} -> {target_path}")
+    _log(f"Installing go-crond {version} from {download_url} -> {target_path}")
     with urllib.request.urlopen(download_url, timeout=60) as response:  # nosec B310
         target_path.write_bytes(response.read())
     target_path.chmod(0o755)
-    if str(target_dir) not in os.getenv("PATH", "").split(":"):
-        print(
-            f"go-crond installed at {target_path}. "
-            f"Add {target_dir} to PATH for direct shell usage."
-        )
+    _log(
+        f"go-crond installed at {target_path}. "
+        f"Run it as ./go-crond or add {target_dir} to PATH."
+    )
     return str(target_path)
 
 
-original_dir = str(Path(__file__).resolve().parent)
+original_dir = str(PROJECT_ROOT)
 project_name = "stockey"
 SERVICES = ["notebooks", "live", "backtest", "data"]
 
 
 def setup_env():
     install_requirements(original_dir, "stockey")
+    ensure_runtime_directories()
     install_go_crond()
     vscode_config(original_dir, "stockey")
     venv_config(original_dir, "stockey")

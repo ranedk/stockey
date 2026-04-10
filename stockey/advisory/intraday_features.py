@@ -15,6 +15,7 @@ from utils.sync import load_tracked_symbols, parse_datetime_arg
 TABLE_NAME = "advisory_intraday_features_daily"
 DEFAULT_LOOKBACK_DAYS = 180
 DEFAULT_INTERVAL_MINUTES = 1
+INTRADAY_READ_SYMBOL_CHUNK_SIZE = 40
 SUPPORTED_INTERVAL_MINUTES = (1, 5, 15, 25, 60)
 LOCAL_TIMEZONE = "Asia/Kolkata"
 
@@ -111,6 +112,18 @@ def ensure_intraday_features_table() -> None:
         }
         for column, sql_type in column_defs.items():
             cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dhan_ohlcv_intraday_ticker_window
+            ON dhan_ohlcv_intraday (exchange, asset_type, interval_minutes, ticker, "timestamp")
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_dhan_ohlcv_daily_ticker_window
+            ON dhan_ohlcv_daily (exchange, asset_type, ticker, date)
+            """
+        )
 
 
 def resolve_symbol_universe(
@@ -239,29 +252,37 @@ def load_intraday_history(
 ) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
-    df = sql_to_df(
-        """
-        SELECT
-            company_master_id,
-            ticker AS symbol,
-            interval_minutes,
-            "timestamp",
-            open,
-            high,
-            low,
-            close,
-            volume
-        FROM dhan_ohlcv_intraday
-        WHERE exchange = 'NSE'
-          AND asset_type = 'stock'
-          AND interval_minutes = %s
-          AND ticker = ANY(%s)
-          AND "timestamp" >= %s
-          AND "timestamp" <= %s
-        ORDER BY ticker, "timestamp"
-        """,
-        params=(interval_minutes, symbols, start_timestamp, end_timestamp),
-    )
+    unique_symbols = sorted({str(symbol).upper() for symbol in symbols if str(symbol).strip()})
+    frames: list[pd.DataFrame] = []
+    for offset in range(0, len(unique_symbols), INTRADAY_READ_SYMBOL_CHUNK_SIZE):
+        symbol_chunk = unique_symbols[offset : offset + INTRADAY_READ_SYMBOL_CHUNK_SIZE]
+        frame = sql_to_df(
+            """
+            SELECT
+                company_master_id,
+                ticker AS symbol,
+                interval_minutes,
+                "timestamp",
+                open,
+                high,
+                low,
+                close,
+                volume
+            FROM dhan_ohlcv_intraday
+            WHERE exchange = 'NSE'
+              AND asset_type = 'stock'
+              AND interval_minutes = %s
+              AND ticker = ANY(%s)
+              AND "timestamp" >= %s
+              AND "timestamp" <= %s
+            ORDER BY ticker, "timestamp"
+            """,
+            params=(interval_minutes, symbol_chunk, start_timestamp, end_timestamp),
+            chunksize=25_000,
+        )
+        if not frame.empty:
+            frames.append(frame)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.upper()

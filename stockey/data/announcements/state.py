@@ -180,6 +180,13 @@ def upsert_reports(rows: Iterable[Dict]) -> None:
     if not data:
         return
     df = pd.DataFrame(data)
+    if {"unique_id", "report_name"}.issubset(df.columns):
+        df["unique_id"] = df["unique_id"].astype("string")
+        df["report_name"] = df["report_name"].astype("string")
+        df = df.dropna(subset=["unique_id", "report_name"])
+        df = df.drop_duplicates(subset=["unique_id", "report_name"], keep="last")
+    if df.empty:
+        return
     upsert_to_db(df, REPORT_TABLE, ["unique_id", "report_name"])
 
 

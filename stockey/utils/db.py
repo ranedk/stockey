@@ -1,8 +1,9 @@
 """Database utilities."""
-import io
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime
+import tempfile
+import time
 from typing import List, Sequence, Tuple, Union
 
 import pandas as pd
@@ -21,6 +22,10 @@ DB_PORT = env("POSTGRES_PORT")
 DB_NAME = env("POSTGRES_DB")
 DB_USER = env("POSTGRES_USER")
 DB_PASSWORD = env("POSTGRES_PASSWORD")
+SQL_TO_DF_RETRIES = env.int("SQL_TO_DF_RETRIES", 2)
+SQL_TO_DF_RETRY_SLEEP_SECONDS = env.float("SQL_TO_DF_RETRY_SLEEP_SECONDS", 1.0)
+SQL_TO_DF_STATEMENT_TIMEOUT_MS = env.int("SQL_TO_DF_STATEMENT_TIMEOUT_MS", 0)
+SQL_TO_DF_CHUNK_SIZE = env.int("SQL_TO_DF_CHUNK_SIZE", 0)
 
 # Singleton connection engine for sqlalchemy
 _engine = sa.create_engine(
@@ -34,6 +39,23 @@ def qualified_identifier(name: str) -> sql.Identifier:
     if not parts:
         raise ValueError("Identifier cannot be empty")
     return sql.Identifier(*parts)
+
+
+def _is_transient_db_error(exc: Exception) -> bool:
+    name = exc.__class__.__name__
+    if name in {"QueryCanceled", "OperationalError", "InterfaceError"}:
+        return True
+    message = str(exc).lower()
+    transient_markers = [
+        "statement timeout",
+        "canceling statement due to statement timeout",
+        "server closed the connection",
+        "connection not open",
+        "terminating connection",
+        "could not connect",
+        "timeout expired",
+    ]
+    return any(marker in message for marker in transient_markers)
 
 @contextmanager
 def db_session(dict_factory: bool = False):
@@ -315,16 +337,17 @@ def upsert_to_db(
                 )
             cur.execute(create_temp_sql)
 
-            # 2. COPY data into temp
-            copy_buf = io.StringIO()
-            df.to_csv(copy_buf, header=False, index=False, sep="\t", na_rep="\\N")
-            copy_buf.seek(0)
-            cur.copy_expert(
-                sql.SQL(
-                    "COPY {} ({}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')"
-                ).format(temp_table, sql.SQL(", ").join(col_identifiers)),
-                copy_buf,
-            )
+            # 2. COPY data into temp. Use a local temp file instead of keeping
+            # large CSV payloads in memory.
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8", newline="") as copy_buf:
+                df.to_csv(copy_buf, header=False, index=False, sep="\t", na_rep="\\N")
+                copy_buf.seek(0)
+                cur.copy_expert(
+                    sql.SQL(
+                        "COPY {} ({}) FROM STDIN WITH (FORMAT csv, DELIMITER E'\\t', NULL '\\N')"
+                    ).format(temp_table, sql.SQL(", ").join(col_identifiers)),
+                    copy_buf,
+                )
 
             # 3.a. Ensure unique index (optional if you already have a PK/unique)
             if unique_keys:
@@ -372,16 +395,62 @@ def upsert_to_db(
                 pass
 
 
-def sql_to_df(sql_query: str, params: Tuple | None = None) -> pd.DataFrame:
+def _fetch_sql_to_df_once(
+    sql_query: str,
+    params: Tuple | None = None,
+    *,
+    statement_timeout_ms: int | None = None,
+    chunksize: int | None = None,
+) -> pd.DataFrame:
     """
     Run a parametrised SELECT and return every row as a DataFrame
     (empty DataFrame if no matches).
     """
     with db_session() as (_, cur):
+        timeout_ms = SQL_TO_DF_STATEMENT_TIMEOUT_MS if statement_timeout_ms is None else int(statement_timeout_ms)
+        if timeout_ms and timeout_ms > 0:
+            cur.execute("SET LOCAL statement_timeout = %s", (int(timeout_ms),))
         cur.execute(sql_query, params or ())
-        rows = cur.fetchall()
         columns = [desc[0] for desc in cur.description] if cur.description else []
+        if chunksize and chunksize > 0:
+            frames: list[pd.DataFrame] = []
+            while True:
+                rows = cur.fetchmany(int(chunksize))
+                if not rows:
+                    break
+                frames.append(pd.DataFrame(rows, columns=columns))
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=columns)
+        rows = cur.fetchall()
     return pd.DataFrame(rows, columns=columns)
+
+
+def sql_to_df(
+    sql_query: str,
+    params: Tuple | None = None,
+    *,
+    retries: int | None = None,
+    statement_timeout_ms: int | None = None,
+    chunksize: int | None = None,
+) -> pd.DataFrame:
+    attempts = max(int(SQL_TO_DF_RETRIES if retries is None else retries), 0) + 1
+    chunk_size = SQL_TO_DF_CHUNK_SIZE if chunksize is None else int(chunksize or 0)
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return _fetch_sql_to_df_once(
+                sql_query,
+                params,
+                statement_timeout_ms=statement_timeout_ms,
+                chunksize=chunk_size,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= attempts or not _is_transient_db_error(exc):
+                raise
+            time.sleep(float(SQL_TO_DF_RETRY_SLEEP_SECONDS) * attempt)
+    if last_exc is not None:
+        raise last_exc
+    return pd.DataFrame()
 
 def get_sql( sql_query: str, params: Tuple = ()) -> pd.Series:
     """

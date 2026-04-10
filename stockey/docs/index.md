@@ -11,12 +11,11 @@ source .xstockey/bin/activate
 
 `builder.py` is now safe to import and only runs when executed directly.
 
-`builder.py` also installs `go-crond` if it is missing. It resolves the binary in this order:
+`builder.py` also creates `logs/cron` and installs `go-crond` if it is missing. It resolves the binary in this order:
 
-1. existing `go-crond` on `PATH`
-2. install into `GO_CROND_INSTALL_DIR` if that env var is set
-3. install into `/usr/local/bin` if writable
-4. otherwise install into `~/.local/bin`
+1. use `GO_CROND_INSTALL_DIR` if that env var is set
+2. otherwise install into the repo root as `./go-crond`
+3. if `go-crond` already exists elsewhere on `PATH`, copy that binary into the repo root instead of downloading again
 
 ## PostgreSQL
 
@@ -119,7 +118,7 @@ Primary operator commands:
 
 Scheduled operator flow:
 
-- install `config/stockey.crontab` with `crontab config/stockey.crontab` or run it with `go-crond`
+- install `config/stockey.crontab` with `crontab config/stockey.crontab` or run it with `./go-crond`
 - let `all_downloads.sh` handle the once-daily broad refresh
 - let `all_continuous_watch.sh` run every `10` minutes during market hours
 - let `all_model_training.sh` run once daily after market close
@@ -160,6 +159,7 @@ python -m data.dhanlive.auth_cli validate
 ```sh
 python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
 python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
+python -m data.dhanlive.ohlcv_pull RELIANCE
 ```
 
 By default the loader syncs:

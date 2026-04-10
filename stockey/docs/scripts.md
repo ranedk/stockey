@@ -28,6 +28,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
 | `data/dhanlive/auth_cli.py` | none | Dhan token status, refresh, validate, and cache-clear helper |
 | `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync is 5 years daily plus last 1 day of 1-minute bars |
+| `data/dhanlive/ohlcv_pull.py` | none | Quick operator OHLCV pull utility; defaults to NSE equity, 5-minute candles, and the last 60 minutes |
 | `advisory/intraday_features.py` | `advisory_intraday_features_daily` | On-demand advisory intraday feature builder; pulls missing intraday candles for the active screener universe and persists daily intraday pattern features |
 | `data/screenerin/screener_parser.py` | `screenerin_screener_snapshots` | Stores parsed Screener.in screener snapshots by screener slug and date |
 | `data/screenerin/screener_registry.py` | `screenerin_screeners` | Registry utility to add/list/remove Screener.in screeners and inspect latest stored snapshots |
@@ -74,6 +75,8 @@ python scripts/cleanup_deprecated_tables.py --dry-run
 ## General usage guidelines
 
 - Prefer `python -m ...` from the repo root so relative config and `.env` loading behave consistently.
+- DB reads retry transient statement-timeout and connection errors by default. Tune with `SQL_TO_DF_RETRIES`, `SQL_TO_DF_RETRY_SLEEP_SECONDS`, `SQL_TO_DF_STATEMENT_TIMEOUT_MS`, and `SQL_TO_DF_CHUNK_SIZE` if remote PostgreSQL is unstable.
+- DB upserts use local temporary files for the `COPY` payload, which avoids holding very large CSV buffers fully in memory.
 - Use the project venv when running ingestion jobs manually:
 
 ```sh
@@ -137,6 +140,10 @@ It schedules:
 - `all_continuous_watch.sh` every `10` minutes during market hours
 - `all_model_training.sh` once daily after market close
 - optional `all_backfill.sh` weekly on Saturday
+
+Bootstrap note:
+
+- `python builder.py` creates `logs/cron` and installs `go-crond` locally as `./go-crond` unless `GO_CROND_INSTALL_DIR` overrides the target
 
 ## Symbol-specific module runs
 
@@ -211,6 +218,36 @@ python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange 
 python -m data.dhanlive.ohlcv --symbols BANKNIFTY --asset-type index --exchange NSE --only intraday
 python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --from-date 2025-01-01 --to-date 2025-12-31 --only daily
 ```
+
+### Quick OHLCV utility
+
+Module: `data.dhanlive.ohlcv_pull`
+
+Default behavior:
+
+- defaults to `exchange=NSE`
+- defaults to `asset_type=stock`
+- defaults to `mode=intraday`
+- defaults to `interval_minutes=5`
+- defaults to the last `60` minutes
+- prints a readable text table by default
+
+Common usage:
+
+```sh
+python -m data.dhanlive.ohlcv_pull RELIANCE
+python -m data.dhanlive.ohlcv_pull HDFCBANK --interval-minutes 1
+python -m data.dhanlive.ohlcv_pull RELIANCE --last-minutes 180
+python -m data.dhanlive.ohlcv_pull RELIANCE --mode daily --last-days 90
+python -m data.dhanlive.ohlcv_pull NIFTY --asset-type benchmark
+python -m data.dhanlive.ohlcv_pull RELIANCE --source db --format json
+```
+
+Notes:
+
+- use `--source api` to hit Dhan directly
+- use `--source db` to inspect what is already stored locally
+- use `--help` for the full operator manual and sample values
 
 Operational notes:
 

@@ -5,6 +5,7 @@ import json
 import runpy
 import sys
 import time
+import traceback
 from typing import Any
 
 
@@ -98,6 +99,7 @@ def run_download_module(step: dict[str, Any]) -> dict[str, Any]:
         )
         return result
     except Exception as exc:
+        traceback_text = traceback.format_exc()
         result = {
             "module": module_name,
             "args": module_args,
@@ -110,6 +112,7 @@ def run_download_module(step: dict[str, Any]) -> dict[str, Any]:
         _emit_progress(
             f"[data.download_runner] module={module_name} failed error={exc.__class__.__name__} elapsed={result['elapsed_seconds']:.2f}s"
         )
+        _emit_progress(traceback_text.rstrip())
         return result
     finally:
         sys.argv = original_argv

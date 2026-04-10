@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
+from sqlalchemy.exc import SQLAlchemyError
 
 from advisory.setup_registry import load_setup_registry
 from utils.db import db_session, sql_to_df, upsert_to_db
@@ -625,6 +626,28 @@ def summarize(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def emit_error(*, message: str, detail: str | None = None, as_json: bool) -> None:
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "table": PORTFOLIO_TABLE,
+                    "message": message,
+                    "detail": detail,
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return
+    line = f"Portfolio unavailable: {message}"
+    if detail:
+        line = f"{line} ({detail})"
+    print(line)
+
+
 def main() -> int:
     args = parse_args()
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
@@ -636,22 +659,45 @@ def main() -> int:
         max_positions_per_overlap_group=int(args.max_positions_per_overlap_group),
     )
     include_planned = bool(args.include_planned or not args.dry_run)
-    df = build_portfolio_orders(
-        asof_date=asof_date,
-        symbols=args.symbols,
-        setup_ids=args.setup_ids,
-        include_planned=include_planned,
-        config=config,
-    )
-    if not args.dry_run:
-        persist_portfolio_orders(df)
-    result = summarize(df)
-    result["dry_run"] = bool(args.dry_run)
-    if args.format == "text":
-        print(render_text_table(df))
-    else:
-        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
-    return 0
+    try:
+        df = build_portfolio_orders(
+            asof_date=asof_date,
+            symbols=args.symbols,
+            setup_ids=args.setup_ids,
+            include_planned=include_planned,
+            config=config,
+        )
+        if not args.dry_run:
+            persist_portfolio_orders(df)
+        result = summarize(df)
+        result["dry_run"] = bool(args.dry_run)
+        if args.format == "text":
+            print(render_text_table(df))
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+    except SQLAlchemyError as exc:
+        emit_error(
+            message="database connection failed",
+            detail=f"{exc.__class__.__name__}: {exc}",
+            as_json=args.format == "json",
+        )
+        return 1
+    except Exception as exc:
+        error_name = exc.__class__.__name__
+        if error_name in {"OperationalError", "InterfaceError"}:
+            emit_error(
+                message="database connection failed",
+                detail=f"{error_name}: {exc}",
+                as_json=args.format == "json",
+            )
+            return 1
+        emit_error(
+            message="portfolio build failed",
+            detail=f"{error_name}: {exc}",
+            as_json=args.format == "json",
+        )
+        return 1
 
 
 if __name__ == "__main__":

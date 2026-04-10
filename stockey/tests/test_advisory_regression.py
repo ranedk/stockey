@@ -7,6 +7,7 @@ from datetime import date
 import pandas as pd
 
 from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, intraday_features, llm_event_evaluator, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, training_universe, watchlist_builder
+from data.announcements import state as announcement_state
 from data.eaindustry import wpi
 from data.dhanlive import client as dhan_client
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv
@@ -2715,6 +2716,73 @@ def test_portfolio_engine_uses_setup_cap_override(monkeypatch):
     )
     row = df.iloc[0]
     assert row["approved_allocation_inr"] == 15000.0
+
+
+def test_announcement_upsert_reports_deduplicates_unique_id_and_report_name(monkeypatch):
+    captured = {}
+
+    def fake_upsert_to_db(df, table, unique_keys, timescaledb_column=None):
+        captured["df"] = df.copy()
+        captured["table"] = table
+        captured["unique_keys"] = list(unique_keys)
+
+    monkeypatch.setattr(announcement_state, "upsert_to_db", fake_upsert_to_db)
+
+    announcement_state.upsert_reports(
+        [
+            {
+                "unique_id": "u1",
+                "report_name": "OrderWinReport",
+                "report_json": '{"version": 1}',
+            },
+            {
+                "unique_id": "u1",
+                "report_name": "OrderWinReport",
+                "report_json": '{"version": 2}',
+            },
+            {
+                "unique_id": "u1",
+                "report_name": "PromoterReport",
+                "report_json": '{"version": 1}',
+            },
+        ]
+    )
+
+    df = captured["df"]
+    assert captured["table"] == announcement_state.REPORT_TABLE
+    assert captured["unique_keys"] == ["unique_id", "report_name"]
+    assert len(df) == 2
+    selected = df.set_index(["unique_id", "report_name"])["report_json"].to_dict()
+    assert selected[("u1", "OrderWinReport")] == '{"version": 2}'
+    assert selected[("u1", "PromoterReport")] == '{"version": 1}'
+
+
+def test_rule_engine_refresh_missing_snapshots_can_skip_intraday(monkeypatch):
+    called = {"intraday": False}
+
+    monkeypatch.setattr(rule_engine, "ensure_advisory_symbol_inputs", lambda symbols, to_date: {"status": "ok"})
+    monkeypatch.setattr(rule_engine, "sync_peer_data", lambda symbols, to_date: {"status": "ok"})
+    monkeypatch.setattr(rule_engine, "build_technical_features", lambda **kwargs: pd.DataFrame([{"symbol": "ABC"}]))
+    monkeypatch.setattr(rule_engine, "persist_technical_features", lambda *args, **kwargs: None)
+    monkeypatch.setattr(rule_engine, "build_fundamental_snapshot", lambda **kwargs: pd.DataFrame([{"symbol": "ABC"}]))
+    monkeypatch.setattr(rule_engine, "persist_fundamental_snapshot", lambda *args, **kwargs: None)
+
+    def fake_build_intraday_features(**kwargs):
+        called["intraday"] = True
+        return pd.DataFrame(), {}
+
+    monkeypatch.setattr(rule_engine, "build_intraday_features", fake_build_intraday_features)
+    monkeypatch.setattr(rule_engine, "persist_intraday_features", lambda *args, **kwargs: None)
+
+    result = rule_engine.refresh_missing_snapshots(
+        ["ABC"],
+        pd.Timestamp("2026-04-01T00:00:00Z"),
+        include_intraday=False,
+    )
+
+    assert called["intraday"] is False
+    assert result["intraday_rows"] == 0
+    assert result["intraday_meta"]["reason"] == "intraday_refresh_disabled"
 
 
 def test_continuous_watch_build_price_alerts_entry_and_invalidation():

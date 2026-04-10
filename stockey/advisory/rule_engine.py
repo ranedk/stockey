@@ -534,15 +534,26 @@ def load_fundamentals(asof_date: pd.Timestamp) -> pd.DataFrame:
     return df
 
 
-def refresh_missing_snapshots(symbols: list[str], effective_date: pd.Timestamp) -> dict[str, object]:
+def refresh_missing_snapshots(
+    symbols: list[str],
+    effective_date: pd.Timestamp,
+    *,
+    include_intraday: bool = True,
+) -> dict[str, object]:
     sync_result = ensure_advisory_symbol_inputs(symbols, to_date=effective_date)
     peer_sync_result = sync_peer_data(symbols=symbols, to_date=effective_date)
 
     technical_df = build_technical_features(symbols=symbols, from_date=effective_date, to_date=effective_date, rebuild=False)
     persist_technical_features(technical_df, rebuild=False, symbols=symbols)
 
-    intraday_df, intraday_meta = build_intraday_features(symbols=symbols, asof_date=effective_date)
-    persist_intraday_features(intraday_df, rebuild=False, asof_date=effective_date)
+    intraday_df = pd.DataFrame()
+    intraday_meta: dict[str, object] = {
+        "status": "skipped",
+        "reason": "intraday_refresh_disabled",
+    }
+    if include_intraday:
+        intraday_df, intraday_meta = build_intraday_features(symbols=symbols, asof_date=effective_date)
+        persist_intraday_features(intraday_df, rebuild=False, asof_date=effective_date)
 
     fundamentals_df = build_fundamental_snapshot(symbols=symbols, from_date=effective_date, to_date=effective_date, rebuild=False)
     persist_fundamental_snapshot(fundamentals_df)
@@ -1206,7 +1217,11 @@ def run_rule_engine(
             )
         )
         if missing_symbols and allow_snapshot_refresh:
-            meta["preflight"] = refresh_missing_snapshots(missing_symbols, screener_date)
+            meta["preflight"] = refresh_missing_snapshots(
+                missing_symbols,
+                screener_date,
+                include_intraday=allow_intraday_prefetch,
+            )
             technical = load_technical(screener_date)
             fundamentals = load_fundamentals(screener_date)
             intraday = load_intraday(screener_date)

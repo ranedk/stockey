@@ -107,6 +107,31 @@
       "examples": []
     },
     {
+      "name": "pull_dhan_ohlcv",
+      "category": "utility",
+      "description": "Quick OHLCV pull utility for Dhan instruments. Defaults to NSE stock, 5-minute candles, and the last 60 minutes.",
+      "command": ["python", "-m", "data.dhanlive.ohlcv_pull"],
+      "read_only": true,
+      "examples": [
+        {
+          "args": ["RELIANCE"],
+          "description": "Pull the last 60 minutes of 5-minute NSE equity candles."
+        },
+        {
+          "args": ["HDFCBANK", "--interval-minutes", "1"],
+          "description": "Pull the last 60 minutes of 1-minute candles."
+        },
+        {
+          "args": ["RELIANCE", "--mode", "daily", "--last-days", "90"],
+          "description": "Pull the last 90 days of daily candles."
+        },
+        {
+          "args": ["RELIANCE", "--source", "db", "--format", "json"],
+          "description": "Inspect locally stored OHLCV rows instead of calling Dhan."
+        }
+      ]
+    },
+    {
       "name": "load_economic_times_rss",
       "category": "ingestion",
       "description": "Fetch and store Economic Times RSS items.",

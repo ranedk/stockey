@@ -31,7 +31,7 @@ Bootstrap command:
 python builder.py
 ```
 
-That creates or refreshes the project venv and installs `go-crond` if it is missing.
+That creates or refreshes the project venv, creates `logs/cron`, and installs `go-crond` in the repo root if it is missing.
 
 ## Scheduled runs
 
@@ -48,7 +48,7 @@ Or run it with `go-crond`:
 
 ```sh
 mkdir -p /home/rane/code/stockey/logs/cron
-go-crond /home/rane/code/stockey/config/stockey.crontab
+/home/rane/code/stockey/go-crond /home/rane/code/stockey/config/stockey.crontab
 ```
 
 Current schedule:
@@ -72,6 +72,19 @@ Important constraint:
 
 - the cron file uses `flock` so duplicate overlapping runs are skipped instead of piling up
 - the shell wrappers resolve Python automatically, so cron does not need `source .xstockey/bin/activate`
+
+## Database robustness knobs
+
+Large advisory/model-prep runs can hit transient remote PostgreSQL failures or statement timeouts. The shared DB helper now retries transient read failures and writes large upsert payloads through local temporary files before `COPY`.
+
+Useful environment variables:
+
+- `SQL_TO_DF_RETRIES`: retry count for transient read failures, default `2`
+- `SQL_TO_DF_RETRY_SLEEP_SECONDS`: base sleep between retries, default `1.0`
+- `SQL_TO_DF_STATEMENT_TIMEOUT_MS`: optional per-query statement timeout override, default `0` which leaves server defaults unchanged
+- `SQL_TO_DF_CHUNK_SIZE`: optional fetch chunk size for reads, default `0` which keeps the old fetch-all behavior
+
+Model-training backfills deliberately skip intraday prefetch during snapshot repair. This avoids wasting time on old 1-minute windows when the goal is event-label coverage, not perfect intraday reconstruction.
 
 ## Main operating modes
 
