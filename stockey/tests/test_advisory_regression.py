@@ -6,7 +6,7 @@ from datetime import date
 
 import pandas as pd
 
-from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, intraday_features, llm_event_evaluator, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, training_universe, watchlist_builder
+from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, exchange_events, exchange_features, intraday_features, llm_event_evaluator, macro_features, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, training_universe, watchlist_builder
 from data.announcements import state as announcement_state
 from data.eaindustry import wpi
 from data.dhanlive import client as dhan_client
@@ -1243,6 +1243,450 @@ def test_pipeline_stage_alias_watch_spans_ingest_and_match():
     assert not pipeline.stage_enabled("news", start_at="watch", stop_at="watch")
 
 
+def test_pipeline_stage_order_includes_macro_features_before_regime():
+    assert pipeline.PIPELINE_STAGES.index("macro") < pipeline.PIPELINE_STAGES.index("macro_features")
+    assert pipeline.PIPELINE_STAGES.index("macro_features") < pipeline.PIPELINE_STAGES.index("regime")
+    assert pipeline.PIPELINE_STAGES.index("exchange_events") < pipeline.PIPELINE_STAGES.index("exchange_features")
+    assert pipeline.PIPELINE_STAGES.index("exchange_features") < pipeline.PIPELINE_STAGES.index("evaluate")
+
+
+def test_exchange_events_normalize_block_and_insider_rows():
+    block = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "symbol": "hdfcbank",
+                "client_name": "Long Fund",
+                "buysell": "BUY",
+                "quantity": "10,000",
+                "price": "1500",
+                "company_master_id": "nse:HDFCBANK",
+            }
+        ]
+    )
+    insider = pd.DataFrame(
+        [
+            {
+                "date": pd.Timestamp("2026-04-02T00:00:00Z"),
+                "trade_date_to": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "symbol": "hdfcbank",
+                "insider_name": "Director A",
+                "transaction_type": "Sell",
+                "quantity": "5000",
+                "value_inr": "7500000",
+                "holding_pct_before": "1.2",
+                "holding_pct_after": "1.1",
+                "person_category": "Director",
+                "company_master_id": "nse:HDFCBANK",
+            }
+        ]
+    )
+    block_out = exchange_events.normalize_block_or_bulk(block, source="nse_block_deal")
+    insider_out = exchange_events.normalize_insider_deals(insider)
+    assert block_out.iloc[0]["symbol"] == "HDFCBANK"
+    assert block_out.iloc[0]["value_inr"] == 15_000_000.0
+    assert block_out.iloc[0]["side"] == "BUY"
+    assert insider_out.iloc[0]["side"] == "SELL"
+    assert insider_out.iloc[0]["known_on"] == pd.Timestamp("2026-04-02T00:00:00Z")
+
+
+def test_exchange_features_compute_distribution_and_upcoming_earnings():
+    events = pd.DataFrame(
+        [
+            {
+                "symbol": "HDFCBANK",
+                "company_master_id": "nse:HDFCBANK",
+                "known_on": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "event_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "event_source": "nse_bulk_deal",
+                "event_type": "BULK_DEAL",
+                "side": "SELL",
+                "value_inr": 200_000_000.0,
+                "quantity": 100000,
+                "event_summary": "bulk sell",
+            },
+            {
+                "symbol": "HDFCBANK",
+                "company_master_id": "nse:HDFCBANK",
+                "known_on": pd.Timestamp("2026-04-02T00:00:00Z"),
+                "event_date": pd.Timestamp("2026-04-02T00:00:00Z"),
+                "event_source": "nse_insider_deal",
+                "event_type": "INSIDER_DEAL",
+                "side": "SELL",
+                "value_inr": 50_000_000.0,
+                "quantity": 10000,
+                "event_summary": "insider sell",
+            },
+            {
+                "symbol": "HDFCBANK",
+                "company_master_id": "nse:HDFCBANK",
+                "known_on": pd.Timestamp("2026-04-03T00:00:00Z"),
+                "event_date": pd.Timestamp("2026-04-10T00:00:00Z"),
+                "event_source": "nse_earnings_event",
+                "event_type": "EARNINGS_EVENT",
+                "side": None,
+                "value_inr": None,
+                "quantity": None,
+                "event_summary": "earnings",
+            },
+        ]
+    )
+    dates = pd.DataFrame({"asof_date": [pd.Timestamp("2026-04-04T00:00:00Z")]})
+    out = exchange_features.compute_exchange_feature_columns(events, dates)
+    latest = out.iloc[0]
+    assert latest["bulk_deal_sell_value_20d"] == 200_000_000.0
+    assert latest["insider_net_value_90d"] == -50_000_000.0
+    assert bool(latest["upcoming_earnings_14d"]) is True
+    assert latest["exchange_distribution_score"] > 0
+
+
+def test_macro_features_are_point_in_time_and_null_tolerant():
+    dates = pd.date_range("2026-01-01", periods=100, freq="D", tz="UTC")
+    source = pd.DataFrame(
+        {
+            "asof_date": dates,
+            "vix_close": [18.0] * 99 + [31.0],
+            "broad_usd_index": list(range(100, 200)),
+            "wti_crude_spot": list(range(70, 170)),
+            "inr_usd_spot": list(pd.Series(range(8300, 8400)) / 100.0),
+            "ust10y_yield": [4.0] * 80 + [4.4] * 20,
+            "gsec_2y_yield": [6.5] * 100,
+            "gsec_10y_yield": [7.0] * 80 + [7.4] * 20,
+            "repo_rate": [6.5] * 100,
+            "india_cfpi_combined": [150.0] * 40 + [153.0] * 60,
+            "wpi_crude_petroleum_gas": [120.0] * 40 + [127.0] * 60,
+            "macro_usa_freshness_status": ["FRESH"] * 100,
+            "cpi_freshness_status": ["FRESH"] * 100,
+        }
+    )
+    out = macro_features.compute_macro_feature_columns(source)
+    latest = out.iloc[-1]
+    assert latest["macro_stress_score"] >= 0.65
+    assert latest["macro_risk_state"] == "STRESS"
+    assert latest["macro_sizing_multiplier"] < 1.0
+    assert "india_cpi_change_60d" in out.columns
+    assert out["macro_missing_source_count"].eq(0).all()
+
+
+def test_macro_features_handle_minimal_snapshot_without_crashing():
+    source = pd.DataFrame({"asof_date": pd.date_range("2026-01-01", periods=3, freq="D", tz="UTC")})
+    out = macro_features.compute_macro_feature_columns(source)
+    assert len(out) == 3
+    assert set(out["macro_risk_state"]) == {"NORMAL"}
+    assert out["macro_sizing_multiplier"].eq(1.0).all()
+
+
+def test_macro_feature_builder_uses_history_but_returns_target_window(monkeypatch):
+    dates = pd.date_range("2026-01-01", periods=100, freq="D", tz="UTC")
+    source = pd.DataFrame(
+        {
+            "asof_date": dates,
+            "gsec_10y_yield": [7.0] * 80 + [7.4] * 20,
+            "gsec_2y_yield": [6.5] * 100,
+            "vix_close": [18.0] * 100,
+        }
+    )
+    source.attrs["target_from"] = dates[-1].normalize()
+    source.attrs["target_to"] = dates[-1].normalize()
+    monkeypatch.setattr(macro_features, "load_macro_daily", lambda **kwargs: source)
+
+    out = macro_features.build_macro_features(from_date=dates[-1], to_date=dates[-1])
+    assert len(out) == 1
+    assert out.iloc[0]["asof_date"] == dates[-1].normalize()
+    assert round(float(out.iloc[0]["gsec_10y_change_20d_bps"]), 2) == 40.0
+
+
+def test_event_model_dataset_joins_macro_features_by_anchor_date(monkeypatch):
+    events = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-01-03T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-01-03T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "HDFCBANK",
+                "unique_id": "u1",
+                "event_source": "announcement",
+                "sentiment": "positive",
+                "materiality": "high",
+                "setup_effect": "strengthens",
+                "direction": "positive",
+                "surprise": 0.5,
+                "novelty": 0.5,
+                "contradiction": 0.0,
+                "expected_decay_days": 10,
+                "source_reliability": "high",
+                "governance_risk": "none",
+                "balance_sheet_risk": "none",
+                "execution_risk": "none",
+                "investable_now": True,
+                "verdict": "continue",
+                "event_class": "ORDER_WIN",
+                "state_transition_hint": "UPGRADE_TO_PASS_NOW",
+                "score_impact": 0.2,
+                "confidence": 0.8,
+            }
+        ]
+    )
+    prices = pd.DataFrame(
+        [
+            {"symbol": "HDFCBANK", "date": pd.Timestamp("2026-01-04T00:00:00Z"), "close": 100.0},
+            {"symbol": "HDFCBANK", "date": pd.Timestamp("2026-01-05T00:00:00Z"), "close": 104.0},
+        ]
+    )
+    macro = pd.DataFrame(
+        [
+            {
+                "macro_asof_date": pd.Timestamp("2026-01-04T00:00:00Z"),
+                "macro_stress_score": 0.45,
+                "macro_sizing_multiplier": 0.75,
+            }
+        ]
+    )
+    monkeypatch.setattr(event_meta_model, "load_event_rows", lambda **kwargs: events)
+    monkeypatch.setattr(event_meta_model, "load_price_history", lambda *args, **kwargs: prices)
+    monkeypatch.setattr(event_meta_model, "load_intraday_event_features", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(event_meta_model, "load_macro_event_features", lambda *args, **kwargs: macro)
+
+    out = event_meta_model.build_labeled_event_dataset(horizon_days=1, return_threshold=0.02)
+    assert len(out) == 1
+    assert out.iloc[0]["macro_stress_score"] == 0.45
+    features, feature_cols = event_meta_model._prepare_feature_frame(out)
+    assert "macro_stress_score" in feature_cols
+    assert features.iloc[0]["macro_sizing_multiplier"] == 0.75
+
+
+def test_event_model_dataset_joins_exchange_features_by_anchor_date(monkeypatch):
+    events = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-01-03T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-01-03T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "HDFCBANK",
+                "unique_id": "u1",
+                "event_source": "announcement",
+                "sentiment": "positive",
+                "materiality": "high",
+                "setup_effect": "strengthens",
+                "direction": "positive",
+                "surprise": 0.5,
+                "novelty": 0.5,
+                "contradiction": 0.0,
+                "expected_decay_days": 10,
+                "source_reliability": "high",
+                "governance_risk": "none",
+                "balance_sheet_risk": "none",
+                "execution_risk": "none",
+                "investable_now": True,
+                "verdict": "continue",
+                "event_class": "ORDER_WIN",
+                "state_transition_hint": "UPGRADE_TO_PASS_NOW",
+                "score_impact": 0.2,
+                "confidence": 0.8,
+            }
+        ]
+    )
+    prices = pd.DataFrame(
+        [
+            {"symbol": "HDFCBANK", "date": pd.Timestamp("2026-01-04T00:00:00Z"), "close": 100.0},
+            {"symbol": "HDFCBANK", "date": pd.Timestamp("2026-01-05T00:00:00Z"), "close": 104.0},
+        ]
+    )
+    exchange = pd.DataFrame(
+        [
+            {
+                "symbol": "HDFCBANK",
+                "exchange_asof_date": pd.Timestamp("2026-01-04T00:00:00Z"),
+                "exchange_distribution_score": 0.40,
+                "exchange_event_score": -0.40,
+                "short_selling_event_count_20d": 3,
+            }
+        ]
+    )
+    monkeypatch.setattr(event_meta_model, "load_event_rows", lambda **kwargs: events)
+    monkeypatch.setattr(event_meta_model, "load_price_history", lambda *args, **kwargs: prices)
+    monkeypatch.setattr(event_meta_model, "load_intraday_event_features", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(event_meta_model, "load_macro_event_features", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(event_meta_model, "load_exchange_event_features", lambda *args, **kwargs: exchange)
+
+    out = event_meta_model.build_labeled_event_dataset(horizon_days=1, return_threshold=0.02)
+    assert len(out) == 1
+    assert out.iloc[0]["exchange_distribution_score"] == 0.40
+    features, feature_cols = event_meta_model._prepare_feature_frame(out)
+    assert "exchange_distribution_score" in feature_cols
+    assert features.iloc[0]["short_selling_event_count_20d"] == 3
+
+
+def test_llm_payload_includes_bounded_exchange_context(monkeypatch):
+    event_row = pd.Series(
+        {
+            "published_on": pd.Timestamp("2026-04-01T09:00:00Z"),
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "setup_id": "TEST",
+            "setup_name": "Test",
+            "unique_id": "u1",
+            "event_source": "announcement",
+            "company_master_id": "nse:HDFCBANK",
+            "symbol": "HDFCBANK",
+            "exchange": "NSE",
+            "source_url": "",
+            "subject": "Order win",
+            "filed_under_category": "General",
+            "parse_status": "parsed",
+            "concise_summary_text": "Won order",
+            "categories_json": "[]",
+            "watch_reasons_json": "[]",
+        }
+    )
+    monkeypatch.setattr(llm_event_evaluator, "load_point_in_time_context", lambda *args, **kwargs: {"regime_name": "STABLE"})
+    monkeypatch.setattr(
+        llm_event_evaluator,
+        "load_exchange_context",
+        lambda *args, **kwargs: {
+            "features": {"exchange_distribution_score": 0.4},
+            "recent_events": [{"event_source": "nse_bulk_deal", "side": "SELL"}],
+        },
+    )
+    payload = llm_event_evaluator.build_payload(event_row, None)
+    assert payload["exchange_context"]["features"]["exchange_distribution_score"] == 0.4
+    assert len(payload["exchange_context"]["recent_events"]) == 1
+
+
+def test_risk_engine_macro_multiplier_reduces_allocated_size(monkeypatch):
+    evaluations = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-04-01T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "setup_id": "LARGECAP_BREAKOUT_V1",
+                "setup_name": "Largecap",
+                "symbol": "HDFCBANK",
+                "company_master_id": "nse:HDFCBANK",
+                "unique_id": "u1",
+                "evaluation_status": "completed",
+                "verdict": "continue",
+                "investable_now": True,
+                "materiality": "high",
+                "setup_effect": "strengthens",
+                "sentiment": "positive",
+                "event_class": "ORDER_WIN",
+                "state_transition_hint": "",
+                "score_impact": 0.0,
+                "confidence": 0.9,
+                "governance_risk": "none",
+                "balance_sheet_risk": "none",
+                "execution_risk": "none",
+                "review_action": "",
+                "review_veto": False,
+            }
+        ]
+    )
+    monkeypatch.setattr(risk_engine, "load_event_evaluations", lambda **kwargs: evaluations)
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(risk_engine, "load_watch_states", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        risk_engine,
+        "load_point_in_time_context",
+        lambda *args, **kwargs: {
+            "adj_close": 100.0,
+            "dma_20": 95.0,
+            "dma_50": 90.0,
+            "dma_200": 80.0,
+            "atr_20": 3.0,
+            "avg_traded_value_20d": 100_000_000.0,
+            "macro_sizing_multiplier": 0.50,
+        },
+    )
+    out = risk_engine.build_allocations(include_allocated=True)
+    assert len(out) == 1
+    assert out.iloc[0]["allocation_status"] == "allocated"
+    assert out.iloc[0]["suggested_allocation_inr"] == 42000.0
+    assert "Macro sizing multiplier applied" in out.iloc[0]["notes"]
+
+
+def test_risk_engine_exchange_distribution_reduces_allocated_size(monkeypatch):
+    evaluations = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-04-01T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "setup_id": "LARGECAP_BREAKOUT_V1",
+                "setup_name": "Largecap",
+                "symbol": "HDFCBANK",
+                "company_master_id": "nse:HDFCBANK",
+                "unique_id": "u1",
+                "evaluation_status": "completed",
+                "verdict": "continue",
+                "investable_now": True,
+                "materiality": "high",
+                "setup_effect": "strengthens",
+                "sentiment": "positive",
+                "event_class": "ORDER_WIN",
+                "state_transition_hint": "",
+                "score_impact": 0.0,
+                "confidence": 0.9,
+                "governance_risk": "none",
+                "balance_sheet_risk": "none",
+                "execution_risk": "none",
+                "review_action": "",
+                "review_veto": False,
+            }
+        ]
+    )
+    monkeypatch.setattr(risk_engine, "load_event_evaluations", lambda **kwargs: evaluations)
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(risk_engine, "load_watch_states", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        risk_engine,
+        "load_point_in_time_context",
+        lambda *args, **kwargs: {
+            "adj_close": 100.0,
+            "dma_20": 95.0,
+            "dma_50": 90.0,
+            "dma_200": 80.0,
+            "atr_20": 3.0,
+            "avg_traded_value_20d": 100_000_000.0,
+            "exchange_distribution_score": 0.40,
+            "short_selling_event_count_20d": 3,
+            "insider_net_value_90d": -10_000_000.0,
+        },
+    )
+    out = risk_engine.build_allocations(include_allocated=True)
+    assert len(out) == 1
+    assert out.iloc[0]["allocation_status"] == "allocated"
+    assert out.iloc[0]["suggested_allocation_inr"] == 63000.0
+    assert "Exchange-event risk multiplier applied" in out.iloc[0]["notes"]
+
+
+def test_adversarial_review_penalizes_exchange_distribution_against_positive_event():
+    row = pd.Series(
+        {
+            "published_on": pd.Timestamp("2026-03-28T00:00:00Z"),
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "event_class": "ORDER_WIN",
+            "verdict": "continue",
+            "setup_effect": "strengthens",
+            "state_transition_hint": "RAISE_SCORE_ONLY",
+            "investable_now": True,
+            "materiality": "high",
+            "source_reliability": "high",
+            "expected_decay_days": 20,
+            "contradiction": 0.1,
+            "confidence": 0.8,
+            "novelty": 0.7,
+            "surprise": 0.7,
+            "score_impact": 0.25,
+            "exchange_distribution_score": 0.45,
+            "insider_net_value_90d": -5_000_000.0,
+            "short_selling_event_count_20d": 3,
+        }
+    )
+    review = adversarial_review.review_event_row(row)
+    flags = json.loads(review["review_flags_json"])
+    assert review["review_action"] == "penalize"
+    assert "exchange_distribution_contradicts_positive_event" in flags
+
+
 def test_pipeline_review_stage_sits_between_evaluate_and_risk():
     assert pipeline.stage_enabled("review", start_at="evaluate", stop_at="review")
     assert not pipeline.stage_enabled("risk", start_at="evaluate", stop_at="review")
@@ -1902,6 +2346,92 @@ def test_risk_engine_rejects_allocation_when_adversarial_review_vetoes(monkeypat
     assert row["allocation_status"] == "rejected"
     assert row["suggested_allocation_inr"] == 0.0
     assert "vetoed" in str(row["notes"]).lower()
+
+
+def test_risk_engine_does_not_treat_missing_review_veto_as_true(monkeypatch):
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        risk_engine,
+        "load_event_evaluations",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-03-24T00:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "setup_id": "DEFENSIVE_REGIME_POSITION_V1",
+                    "setup_name": "Defensive regime position",
+                    "symbol": "ABC",
+                    "company_master_id": "nse:ABC",
+                    "unique_id": "ABC-1",
+                    "evaluation_status": "completed",
+                    "verdict": "continue",
+                    "investable_now": True,
+                    "materiality": "high",
+                    "setup_effect": "strengthens",
+                    "event_class": "ORDER_WIN",
+                    "state_transition_hint": "UPGRADE_TO_PASS_NOW",
+                    "score_impact": 0.2,
+                    "confidence": 0.8,
+                    "sentiment": "positive",
+                    "governance_risk": "none",
+                    "balance_sheet_risk": "none",
+                    "execution_risk": "low",
+                    "review_action": pd.NA,
+                    "review_score": pd.NA,
+                    "review_veto": float("nan"),
+                    "review_reason": pd.NA,
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        risk_engine,
+        "load_point_in_time_context",
+        lambda symbol, published_on: {
+            "avg_traded_value_20d": 1_000_000_000.0,
+            "adj_close": 100.0,
+            "atr_20": 5.0,
+            "dma_20": 98.0,
+            "dma_50": 95.0,
+            "dma_200": 90.0,
+            "rs_vs_benchmark": 0.1,
+            "rs_vs_sector": 0.1,
+        },
+    )
+    monkeypatch.setattr(
+        risk_engine,
+        "load_watch_states",
+        lambda **kwargs: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "setup_id": "DEFENSIVE_REGIME_POSITION_V1",
+                    "symbol": "ABC",
+                    "candidate_state": "PASS_NOW",
+                    "current_state": "PASS_NOW",
+                    "watch_status": "active",
+                }
+            ]
+        ),
+    )
+
+    df = risk_engine.build_allocations(asof_date=pd.Timestamp("2026-03-20T00:00:00Z"))
+    row = df.iloc[0]
+    assert row["allocation_status"] == "allocated"
+    assert row["review_veto"] != row["review_veto"] or row["review_veto"] is pd.NA
+    assert "vetoed" not in str(row["notes"]).lower()
+
+
+def test_risk_engine_production_setup_ids_excludes_research_only(monkeypatch):
+    monkeypatch.setattr(
+        risk_engine,
+        "load_setup_registry",
+        lambda: [
+            {"setup_id": "PROD_SETUP", "research_only": False},
+            {"setup_id": "EVENT_MODEL_TRAINING_V1", "research_only": True},
+        ],
+    )
+    assert risk_engine.production_setup_ids() == ["PROD_SETUP"]
 
 
 def test_risk_engine_promoted_pass_now_overrides_conservative_event_investable_flag(monkeypatch):

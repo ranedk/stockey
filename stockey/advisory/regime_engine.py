@@ -12,10 +12,30 @@ from utils.sync import parse_datetime_arg
 
 TABLE_NAME = "advisory_market_regime"
 DEFAULT_BENCHMARK_NAME = "NIFTY"
+MACRO_FEATURES_TABLE = "advisory_macro_features_daily"
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
+
+
+def table_exists(table_name: str) -> bool:
+    schema_name, base_table_name = (
+        table_name.split(".", 1) if "." in table_name else ("public", table_name)
+    )
+    df = sql_to_df(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = %s AND table_name = %s
+        ) AS exists
+        """,
+        params=(schema_name, base_table_name),
+    )
+    if df.empty:
+        return False
+    return bool(df.iloc[0]["exists"])
 
 
 def load_benchmark_history(
@@ -72,28 +92,59 @@ def load_macro_history(
         clauses.append("asof_date <= %(to_date)s")
         params["to_date"] = to_date
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    df = sql_to_df(
-        f"""
-        SELECT
-            asof_date,
-            vix_close,
-            broad_usd_index,
-            wti_crude_spot,
-            inr_usd_spot,
-            gsec_10y_yield,
-            repo_rate,
-            macro_usa_freshness_status,
-            bank_rates_freshness_status,
-            cpi_freshness_status,
-            wpi_freshness_status,
-            gsec_curve_freshness_status,
-            new_macro_source_required
-        FROM advisory_macro_daily
-        {where_sql}
-        ORDER BY asof_date
-        """,
-        params=params or None,
-    )
+    if table_exists(MACRO_FEATURES_TABLE):
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date,
+                vix_close,
+                broad_usd_index,
+                wti_crude_spot,
+                inr_usd_spot,
+                gsec_10y_yield,
+                repo_rate,
+                macro_usa_freshness_status,
+                bank_rates_freshness_status,
+                cpi_freshness_status,
+                wpi_freshness_status,
+                gsec_curve_freshness_status,
+                new_macro_source_required,
+                broad_usd_ret_20d,
+                wti_ret_20d,
+                inr_usd_ret_20d,
+                gsec_10y_change_20d_bps,
+                macro_stress_score,
+                macro_risk_state,
+                macro_sizing_multiplier
+            FROM {MACRO_FEATURES_TABLE}
+            {where_sql}
+            ORDER BY asof_date
+            """,
+            params=params or None,
+        )
+    else:
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date,
+                vix_close,
+                broad_usd_index,
+                wti_crude_spot,
+                inr_usd_spot,
+                gsec_10y_yield,
+                repo_rate,
+                macro_usa_freshness_status,
+                bank_rates_freshness_status,
+                cpi_freshness_status,
+                wpi_freshness_status,
+                gsec_curve_freshness_status,
+                new_macro_source_required
+            FROM advisory_macro_daily
+            {where_sql}
+            ORDER BY asof_date
+            """,
+            params=params or None,
+        )
     if df.empty:
         return df
     df["asof_date"] = normalize_timestamp(df["asof_date"])
@@ -104,12 +155,38 @@ def load_macro_history(
         "inr_usd_spot",
         "gsec_10y_yield",
         "repo_rate",
+        "broad_usd_ret_20d",
+        "wti_ret_20d",
+        "inr_usd_ret_20d",
+        "gsec_10y_change_20d_bps",
+        "macro_stress_score",
+        "macro_sizing_multiplier",
     ]
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in ["broad_usd_index", "wti_crude_spot", "inr_usd_spot"]:
-        df[f"{col}_ret_20d"] = df[col].pct_change(20)
-    df["gsec_10y_change_20d_bps"] = df["gsec_10y_yield"].diff(20) * 100.0
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "broad_usd_ret_20d" not in df.columns:
+        df["broad_usd_ret_20d"] = pd.NA
+    if "wti_ret_20d" not in df.columns:
+        df["wti_ret_20d"] = pd.NA
+    if "inr_usd_ret_20d" not in df.columns:
+        df["inr_usd_ret_20d"] = pd.NA
+    for source_col, out_col in [
+        ("broad_usd_index", "broad_usd_ret_20d"),
+        ("wti_crude_spot", "wti_ret_20d"),
+        ("inr_usd_spot", "inr_usd_ret_20d"),
+    ]:
+        if df[out_col].isna().all():
+            df[out_col] = df[source_col].pct_change(20)
+        df[f"{source_col}_ret_20d"] = df[out_col]
+    if "gsec_10y_change_20d_bps" not in df.columns or df["gsec_10y_change_20d_bps"].isna().all():
+        df["gsec_10y_change_20d_bps"] = df["gsec_10y_yield"].diff(20) * 100.0
+    if "macro_stress_score" not in df.columns:
+        df["macro_stress_score"] = pd.NA
+    if "macro_risk_state" not in df.columns:
+        df["macro_risk_state"] = pd.NA
+    if "macro_sizing_multiplier" not in df.columns:
+        df["macro_sizing_multiplier"] = pd.NA
     return df
 
 
@@ -127,6 +204,7 @@ def classify_regime(row: pd.Series) -> tuple[str, list[str]]:
     wti_ret20 = row.get("wti_crude_spot_ret_20d")
     inr_ret20 = row.get("inr_usd_spot_ret_20d")
     gsec_change_20d = row.get("gsec_10y_change_20d_bps")
+    macro_stress = row.get("macro_stress_score")
 
     above_dma200 = pd.notna(close) and pd.notna(dma200) and close >= dma200
     above_dma50 = pd.notna(close) and pd.notna(dma50) and close >= dma50
@@ -137,17 +215,20 @@ def classify_regime(row: pd.Series) -> tuple[str, list[str]]:
         or (pd.notna(wti_ret20) and wti_ret20 >= 0.12)
         or (pd.notna(inr_ret20) and inr_ret20 >= 0.025)
         or (pd.notna(gsec_change_20d) and gsec_change_20d >= 25.0)
+        or (pd.notna(macro_stress) and macro_stress >= 0.40)
     )
     shock_flag = bool(
         (pd.notna(vix) and vix >= 30.0)
         or (pd.notna(ret20) and ret20 <= -0.10)
         or (pd.notna(drawdown60) and drawdown60 <= -0.15)
+        or (pd.notna(macro_stress) and macro_stress >= 0.75)
     )
     risk_off_flag = bool(
         shock_flag
         or (pd.notna(vix) and vix >= 24.0)
         or (not above_dma200 and pd.notna(ret60) and ret60 < -0.03)
         or (pd.notna(drawdown60) and drawdown60 <= -0.10)
+        or (pd.notna(macro_stress) and macro_stress >= 0.60)
     )
 
     if shock_flag:
@@ -216,6 +297,7 @@ def build_regime_snapshot(
         | (out["wti_crude_spot_ret_20d"] >= 0.12)
         | (out["inr_usd_spot_ret_20d"] >= 0.025)
         | (out["gsec_10y_change_20d_bps"] >= 25.0)
+        | (out["macro_stress_score"] >= 0.40)
     ).fillna(False)
     out["shock_flag"] = out["regime_name"].eq("SHOCK")
     out["risk_off_flag"] = out["regime_name"].isin(["SHOCK", "RISK_OFF"])
@@ -235,6 +317,9 @@ def build_regime_snapshot(
         "wti_crude_spot_ret_20d",
         "inr_usd_spot_ret_20d",
         "gsec_10y_change_20d_bps",
+        "macro_stress_score",
+        "macro_risk_state",
+        "macro_sizing_multiplier",
         "repo_rate",
         "macro_usa_freshness_status",
         "bank_rates_freshness_status",

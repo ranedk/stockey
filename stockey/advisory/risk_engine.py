@@ -14,6 +14,8 @@ from utils.sync import parse_datetime_arg
 
 ALLOCATIONS_TABLE = "advisory_allocations"
 REVIEWS_TABLE = "advisory_event_reviews"
+MACRO_FEATURES_TABLE = "advisory_macro_features_daily"
+EXCHANGE_FEATURES_TABLE = "advisory_exchange_features_daily"
 _TRANSITION_CUTOFF = 0.12
 _MATERIALITY_ORDER = {"low": 1, "medium": 2, "high": 3}
 _RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
@@ -81,6 +83,47 @@ CONVICTION_MULTIPLIER = {
     "medium": 0.70,
     "high": 1.00,
 }
+
+
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _clean_text(value: Any, default: str = "") -> str:
+    if _is_missing_value(value):
+        return default
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "null", "<na>"}:
+        return default
+    return text
+
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if _is_missing_value(value):
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(int(value))
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "", "nan", "none", "null", "<na>"}:
+        return False
+    return default
+
+
+def production_setup_ids() -> list[str]:
+    return [
+        str(setup.get("setup_id") or "").upper()
+        for setup in load_setup_registry()
+        if str(setup.get("setup_id") or "").strip() and not bool(setup.get("research_only"))
+    ]
 
 
 def get_setup_risk_profiles() -> dict[str, SetupRiskProfile]:
@@ -216,6 +259,11 @@ def load_event_evaluations(
     if setup_ids:
         clauses.append("e.setup_id = ANY(%s)")
         params.append([value.upper() for value in setup_ids])
+    else:
+        production_ids = production_setup_ids()
+        if production_ids:
+            clauses.append("e.setup_id = ANY(%s)")
+            params.append(production_ids)
 
     alloc_join = ""
     alloc_select = ""
@@ -395,6 +443,11 @@ def load_watch_states(
     if setup_ids:
         clauses.append("setup_id = ANY(%s)")
         params.append([value.upper() for value in setup_ids])
+    else:
+        production_ids = production_setup_ids()
+        if production_ids:
+            clauses.append("setup_id = ANY(%s)")
+            params.append(production_ids)
 
     df = sql_to_df(
         f"""
@@ -441,6 +494,11 @@ def load_base_candidate_fallbacks(
     if setup_ids:
         clauses.append("w.setup_id = ANY(%s)")
         params.append([value.upper() for value in setup_ids])
+    else:
+        production_ids = production_setup_ids()
+        if production_ids:
+            clauses.append("w.setup_id = ANY(%s)")
+            params.append(production_ids)
 
     df = sql_to_df(
         f"""
@@ -600,6 +658,74 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
     for key in ["technical_asof_date", "fundamentals_asof_date"]:
         if key in out and pd.notna(out[key]):
             out[key] = pd.to_datetime(out[key], utc=True, errors="coerce").isoformat()
+    out.update(load_macro_context(published_on))
+    out.update(load_exchange_feature_context(symbol, published_on))
+    return out
+
+
+def load_macro_context(published_on: pd.Timestamp) -> dict[str, Any]:
+    try:
+        if not table_exists(MACRO_FEATURES_TABLE):
+            return {}
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date AS macro_asof_date,
+                macro_stress_score,
+                macro_risk_state,
+                macro_sizing_multiplier
+            FROM {MACRO_FEATURES_TABLE}
+            WHERE asof_date <= %(published_on)s
+            ORDER BY asof_date DESC
+            LIMIT 1
+            """,
+            params={"published_on": published_on},
+        )
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    out = df.iloc[0].to_dict()
+    if pd.notna(out.get("macro_asof_date")):
+        out["macro_asof_date"] = pd.to_datetime(out["macro_asof_date"], utc=True, errors="coerce").isoformat()
+    return out
+
+
+def load_exchange_feature_context(symbol: str, published_on: pd.Timestamp) -> dict[str, Any]:
+    try:
+        if not table_exists(EXCHANGE_FEATURES_TABLE):
+            return {}
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date AS exchange_asof_date,
+                deal_net_value_20d,
+                deal_cluster_count_20d,
+                insider_net_value_90d,
+                insider_event_count_90d,
+                short_selling_quantity_20d,
+                short_selling_event_count_20d,
+                upcoming_earnings_14d,
+                days_to_earnings,
+                corporate_action_count_30d,
+                exchange_accumulation_score,
+                exchange_distribution_score,
+                exchange_event_score
+            FROM {EXCHANGE_FEATURES_TABLE}
+            WHERE symbol = %(symbol)s
+              AND asof_date <= %(published_on)s
+            ORDER BY asof_date DESC
+            LIMIT 1
+            """,
+            params={"symbol": symbol.upper(), "published_on": published_on},
+        )
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    out = df.iloc[0].to_dict()
+    if pd.notna(out.get("exchange_asof_date")):
+        out["exchange_asof_date"] = pd.to_datetime(out["exchange_asof_date"], utc=True, errors="coerce").isoformat()
     return out
 
 
@@ -802,20 +928,20 @@ def build_allocations(
         conviction_bucket = compute_conviction_bucket(row, context)
         stop_price, invalidation_price, invalidation_rule = compute_invalidation(profile, context)
 
-        verdict = str(row.get("verdict", "")).lower()
-        evaluation_status = str(row.get("evaluation_status", "")).lower()
-        investable_now = bool(row.get("investable_now", False))
-        current_state = str(row.get("current_state", "")).upper()
-        event_class = str(row.get("event_class", "")).upper()
-        state_transition_hint = str(row.get("state_transition_hint", "")).upper()
+        verdict = _clean_text(row.get("verdict")).lower()
+        evaluation_status = _clean_text(row.get("evaluation_status")).lower()
+        investable_now = _safe_bool(row.get("investable_now"), False)
+        current_state = _clean_text(row.get("current_state")).upper()
+        event_class = _clean_text(row.get("event_class")).upper()
+        state_transition_hint = _clean_text(row.get("state_transition_hint")).upper()
         score_impact_raw = pd.to_numeric(row.get("score_impact"), errors="coerce")
         score_impact = 0.0 if pd.isna(score_impact_raw) else float(score_impact_raw)
         review_score_raw = pd.to_numeric(row.get("review_score"), errors="coerce")
         review_score = 0.0 if pd.isna(review_score_raw) else float(review_score_raw)
-        review_action = str(row.get("review_action") or "").lower()
-        review_veto = bool(row.get("review_veto", False))
-        review_reason = str(row.get("review_reason") or "").strip()
-        is_base_candidate_fallback = bool(row.get("is_base_candidate_fallback", False))
+        review_action = _clean_text(row.get("review_action")).lower()
+        review_veto = _safe_bool(row.get("review_veto"), False)
+        review_reason = _clean_text(row.get("review_reason"))
+        is_base_candidate_fallback = _safe_bool(row.get("is_base_candidate_fallback"), False)
         promoted_to_pass_now = current_state == "PASS_NOW" and state_transition_hint != "DOWNGRADE_TO_REJECT" and verdict != "reject"
         actionable_now = investable_now or promoted_to_pass_now
 
@@ -907,14 +1033,39 @@ def build_allocations(
                 notes.append("Computed allocation rounded down to zero.")
             else:
                 allocation_status = "allocated"
-                if state_transition_hint:
-                    notes.append(f"Event transition: {state_transition_hint}.")
-                if event_class:
-                    notes.append(f"Event class: {event_class}.")
-                if promoted_to_pass_now and not investable_now:
-                    notes.append("Watchlist promotion to PASS_NOW overrode a conservative event investable flag.")
-                if bool(row.get("has_review_manual", False)):
-                    notes.append("Another recent event still requires manual review.")
+
+        if allocation_status == "allocated" and suggested_allocation_inr > 0:
+            macro_multiplier = pd.to_numeric(context.get("macro_sizing_multiplier"), errors="coerce")
+            if pd.notna(macro_multiplier) and 0 < float(macro_multiplier) < 1.0:
+                suggested_allocation_inr = round_allocation(float(suggested_allocation_inr) * float(macro_multiplier))
+                notes.append(f"Macro sizing multiplier applied: {float(macro_multiplier):.2f}.")
+                if suggested_allocation_inr <= 0:
+                    allocation_status = "review_manual"
+                    notes.append("Macro-adjusted allocation rounded down to zero.")
+            exchange_distribution_score = pd.to_numeric(context.get("exchange_distribution_score"), errors="coerce")
+            short_event_count = pd.to_numeric(context.get("short_selling_event_count_20d"), errors="coerce")
+            insider_net = pd.to_numeric(context.get("insider_net_value_90d"), errors="coerce")
+            exchange_multiplier = 1.0
+            if pd.notna(exchange_distribution_score) and float(exchange_distribution_score) >= 0.35:
+                exchange_multiplier = min(exchange_multiplier, 0.75)
+            if pd.notna(short_event_count) and float(short_event_count) >= 3:
+                exchange_multiplier = min(exchange_multiplier, 0.85)
+            if pd.notna(insider_net) and float(insider_net) < 0:
+                exchange_multiplier = min(exchange_multiplier, 0.85)
+            if exchange_multiplier < 1.0:
+                suggested_allocation_inr = round_allocation(float(suggested_allocation_inr) * exchange_multiplier)
+                notes.append(f"Exchange-event risk multiplier applied: {exchange_multiplier:.2f}.")
+                if suggested_allocation_inr <= 0:
+                    allocation_status = "review_manual"
+                    notes.append("Exchange-adjusted allocation rounded down to zero.")
+        if state_transition_hint:
+            notes.append(f"Event transition: {state_transition_hint}.")
+        if event_class:
+            notes.append(f"Event class: {event_class}.")
+        if promoted_to_pass_now and not investable_now:
+            notes.append("Watchlist promotion to PASS_NOW overrode a conservative event investable flag.")
+        if bool(row.get("has_review_manual", False)):
+            notes.append("Another recent event still requires manual review.")
 
         adv20 = pd.to_numeric(context.get("avg_traded_value_20d"), errors="coerce")
         allocation_pct_of_adv20d = None

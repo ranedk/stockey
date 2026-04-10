@@ -12,6 +12,7 @@ from utils.sync import parse_datetime_arg
 
 REVIEWS_TABLE = "advisory_event_reviews"
 SCORES_TABLE = "advisory_event_model_scores"
+EXCHANGE_FEATURES_TABLE = "advisory_exchange_features_daily"
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -126,15 +127,41 @@ def load_event_evaluations(
             , m.event_meta_horizon_days
         """
 
+    exchange_join = ""
+    exchange_select = ""
+    if table_exists(EXCHANGE_FEATURES_TABLE):
+        exchange_join = f"""
+        LEFT JOIN LATERAL (
+            SELECT
+                x.exchange_distribution_score,
+                x.insider_net_value_90d,
+                x.short_selling_event_count_20d,
+                x.exchange_event_score
+            FROM {EXCHANGE_FEATURES_TABLE} x
+            WHERE x.symbol = e.symbol
+              AND x.asof_date <= e.published_on
+            ORDER BY x.asof_date DESC
+            LIMIT 1
+        ) x ON true
+        """
+        exchange_select = """
+            , x.exchange_distribution_score
+            , x.insider_net_value_90d
+            , x.short_selling_event_count_20d
+            , x.exchange_event_score
+        """
+
     df = sql_to_df(
         f"""
         SELECT
             e.*
             {review_select}
             {score_select}
+            {exchange_select}
         FROM advisory_event_evaluations e
         {review_join}
         {score_join}
+        {exchange_join}
         WHERE {' AND '.join(clauses)}
         ORDER BY e.published_on, e.setup_id, e.symbol, e.unique_id
         """,
@@ -171,6 +198,9 @@ def review_event_row(row: pd.Series) -> dict[str, Any]:
     surprise = float(pd.to_numeric(row.get("surprise"), errors="coerce") or 0.0)
     score_impact = float(pd.to_numeric(row.get("score_impact"), errors="coerce") or 0.0)
     model_score = pd.to_numeric(row.get("event_meta_score"), errors="coerce")
+    exchange_distribution_score = pd.to_numeric(row.get("exchange_distribution_score"), errors="coerce")
+    insider_net_value_90d = pd.to_numeric(row.get("insider_net_value_90d"), errors="coerce")
+    short_selling_event_count_20d = pd.to_numeric(row.get("short_selling_event_count_20d"), errors="coerce")
     reliability_score = _reliability_score(row.get("source_reliability"))
     materiality_score = _materiality_score(row.get("materiality"))
     event_class = str(row.get("event_class") or "").upper()
@@ -228,6 +258,16 @@ def review_event_row(row: pd.Series) -> dict[str, Any]:
             flags.append("weak_model_edge")
             penalties.append(0.12)
 
+    if pd.notna(exchange_distribution_score) and float(exchange_distribution_score) >= 0.35 and score_impact > 0:
+        flags.append("exchange_distribution_contradicts_positive_event")
+        penalties.append(0.18)
+    if pd.notna(insider_net_value_90d) and float(insider_net_value_90d) < 0 and score_impact > 0:
+        flags.append("recent_insider_net_selling")
+        penalties.append(0.12)
+    if pd.notna(short_selling_event_count_20d) and float(short_selling_event_count_20d) >= 3 and score_impact > 0:
+        flags.append("repeated_short_selling_pressure")
+        penalties.append(0.12)
+
     raw_review_score = -sum(penalties)
     review_score = round(max(-1.0, min(0.0, raw_review_score)), 4)
 
@@ -253,6 +293,9 @@ def review_event_row(row: pd.Series) -> dict[str, Any]:
         "model_score": None if pd.isna(model_score) else float(model_score),
         "reliability_score": reliability_score,
         "materiality_score": materiality_score,
+        "exchange_distribution_score": None if pd.isna(exchange_distribution_score) else float(exchange_distribution_score),
+        "insider_net_value_90d": None if pd.isna(insider_net_value_90d) else float(insider_net_value_90d),
+        "short_selling_event_count_20d": None if pd.isna(short_selling_event_count_20d) else float(short_selling_event_count_20d),
     }
     return {
         "review_status": "completed",

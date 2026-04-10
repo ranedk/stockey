@@ -36,6 +36,8 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/research_ledger.py` | `advisory_research_runs` | Research ledger for recording experiment configs, point-in-time context, validation protocol, and run outcomes |
 | `advisory/training_universe.py` | `advisory_screener_constituents` | Sync broad ad hoc Screener.in training universes directly into normalized advisory screener rows for research-only event-model coverage |
 | `advisory/event_meta_model.py` | `advisory_event_model_scores` | Train/score scaffold for XGBoost event meta-models using structured event tensors, anchor-day intraday response features, and future daily returns |
+| `advisory/exchange_events.py` | `advisory_exchange_events` | Normalizes NSE block/bulk/short-selling/insider/corporate-action/earnings rows into point-in-time exchange events |
+| `advisory/exchange_features.py` | `advisory_exchange_features_daily` | Builds daily symbol-level exchange-event features for LLM context, event-model features, review, and risk sizing |
 | `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
 | `advisory/model_training_runner.py` | varies | Gated model-training orchestrator: runs prep, checks label coverage for the requested horizon, then trains and scores only when ready |
 | `advisory/sync_state.py` | `advisory_sync_state` | Shared incremental state storage for continuous polling and dashboard refresh tasks |
@@ -630,6 +632,9 @@ python scripts/agent_tool_runner.py run load_us_macro --allow-writes
 python scripts/agent_tool_runner.py run load_economic_times_rss --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_screener_constituents --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_macro_daily --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_macro_features_daily --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_exchange_events --allow-writes -- --dry-run
+python scripts/agent_tool_runner.py run build_advisory_exchange_features_daily --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_fundamentals_daily --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run build_advisory_market_regime --allow-writes -- --dry-run
 python scripts/agent_tool_runner.py run sync_advisory_peers --allow-writes -- --symbols HDFCBANK
@@ -657,6 +662,10 @@ python -m advisory.screener_parser --dry-run
 python -m advisory.screener_parser
 python -m advisory.macro_snapshot --dry-run
 python -m advisory.macro_snapshot
+python -m advisory.macro_features --dry-run
+python -m advisory.macro_features
+python -m advisory.exchange_events --dry-run
+python -m advisory.exchange_features --dry-run
 python -m advisory.fundamental_snapshot --dry-run
 python -m advisory.fundamental_snapshot
 python -m advisory.regime_engine --dry-run

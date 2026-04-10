@@ -679,9 +679,93 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
     }
 
 
+def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_days: int = 30, max_events: int = 8) -> dict[str, Any]:
+    out: dict[str, Any] = {"recent_events": []}
+    symbol = symbol.upper()
+    try:
+        if _table_exists("advisory_exchange_features_daily"):
+            features = sql_to_df(
+                """
+                SELECT
+                    asof_date AS exchange_asof_date,
+                    latest_exchange_event_date,
+                    latest_exchange_event_source,
+                    latest_exchange_event_type,
+                    latest_exchange_event_summary,
+                    deal_net_value_20d,
+                    deal_cluster_count_20d,
+                    insider_net_value_90d,
+                    insider_event_count_90d,
+                    short_selling_quantity_20d,
+                    short_selling_event_count_20d,
+                    upcoming_earnings_14d,
+                    days_to_earnings,
+                    corporate_action_count_30d,
+                    exchange_accumulation_score,
+                    exchange_distribution_score,
+                    exchange_event_score
+                FROM advisory_exchange_features_daily
+                WHERE symbol = %(symbol)s
+                  AND asof_date <= %(published_on)s
+                ORDER BY asof_date DESC
+                LIMIT 1
+                """,
+                params={"symbol": symbol, "published_on": published_on},
+            )
+            if not features.empty:
+                out["features"] = {
+                    key: (value.isoformat() if isinstance(value, pd.Timestamp) else value)
+                    for key, value in features.iloc[0].to_dict().items()
+                    if not pd.isna(value)
+                }
+        if _table_exists("advisory_exchange_events"):
+            events = sql_to_df(
+                """
+                SELECT
+                    known_on,
+                    event_date,
+                    event_source,
+                    event_type,
+                    participant,
+                    side,
+                    quantity,
+                    price,
+                    value_inr,
+                    holding_pct_before,
+                    holding_pct_after,
+                    event_summary
+                FROM advisory_exchange_events
+                WHERE symbol = %(symbol)s
+                  AND known_on <= %(published_on)s
+                  AND known_on >= %(start_on)s
+                ORDER BY known_on DESC, value_inr DESC NULLS LAST
+                LIMIT %(max_events)s
+                """,
+                params={
+                    "symbol": symbol,
+                    "published_on": published_on,
+                    "start_on": published_on - pd.Timedelta(days=int(lookback_days)),
+                    "max_events": int(max_events),
+                },
+            )
+            if not events.empty:
+                out["recent_events"] = [
+                    {
+                        key: (value.isoformat() if isinstance(value, pd.Timestamp) else value)
+                        for key, value in row.items()
+                        if not pd.isna(value)
+                    }
+                    for row in events.to_dict(orient="records")
+                ]
+    except Exception as exc:
+        out["error"] = str(exc)
+    return out
+
+
 def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[str, Any]:
     published_on = pd.to_datetime(event_row["published_on"], utc=True, errors="coerce")
     stock_context = load_point_in_time_context(str(event_row["symbol"]), published_on)
+    exchange_context = load_exchange_context(str(event_row["symbol"]), published_on)
 
     document_payload = {
         "unique_id": event_row["unique_id"],
@@ -722,6 +806,7 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
             "watch_reasons_json": normalize_jsonish(event_row.get("watch_reasons_json")),
         },
         "market_context": stock_context,
+        "exchange_context": exchange_context,
         "document_context": document_payload,
     }
 

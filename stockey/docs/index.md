@@ -91,15 +91,17 @@ The repo now has three top-level orchestration layers:
 3. Use ad hoc Screener.in queries separately for research.
 4. Normalize stored Screener snapshots into `advisory_screener_constituents`.
 5. Build daily advisory snapshots for macro, fundamentals, technicals, and optional intraday features.
-6. Build the base regime and the lightweight news overlay.
-7. Detect active investment themes and map them to theme-linked production screeners when available.
-8. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
-9. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
-10. Build the watchlist with screener, regime, overlay, and theme provenance.
-11. Ingest announcements and relevant news for watched names.
-12. Use the LLM only to extract structured event tensors from text.
-13. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
-14. Feed candidate state plus event outputs into risk sizing and allocation.
+6. Convert the macro snapshot into `advisory_macro_features_daily`.
+7. Normalize NSE exchange events and derive `advisory_exchange_features_daily`.
+8. Build the base regime and the lightweight news overlay.
+9. Detect active investment themes and map them to theme-linked production screeners when available.
+10. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
+11. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
+12. Build the watchlist with screener, regime, overlay, and theme provenance.
+13. Ingest announcements and relevant news for watched names.
+14. Use the LLM only to extract structured event tensors from text, with bounded exchange-event context when relevant.
+15. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
+16. Feed candidate state plus event outputs into risk sizing and allocation.
 15. Rank approved allocations in the portfolio engine with overlap and setup caps.
 16. Build lifecycle and execution-planning outputs.
 17. Record research runs in the research ledger.
@@ -323,6 +325,7 @@ Current advisory bootstrap commands:
 ```sh
 python -m advisory.screener_parser
 python -m advisory.macro_snapshot
+python -m advisory.macro_features
 python -m advisory.fundamental_snapshot
 python -m advisory.regime_engine
 python -m advisory.peer_sync --symbols HDFCBANK

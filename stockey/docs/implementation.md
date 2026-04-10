@@ -59,6 +59,9 @@ The advisory stack then builds:
 
 - `advisory_screener_constituents`
 - `advisory_macro_daily`
+- `advisory_macro_features_daily`
+- `advisory_exchange_events`
+- `advisory_exchange_features_daily`
 - `advisory_fundamentals_daily`
 - `advisory_technical_daily`
 - `advisory_intraday_features_daily`

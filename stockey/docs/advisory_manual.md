@@ -44,21 +44,23 @@ The advisory runtime path is:
 3. Use ad hoc Screener.in queries separately for research.
 4. Normalize stored Screener snapshots into `advisory_screener_constituents`.
 5. Build daily advisory snapshots for macro, fundamentals, technicals, and optional intraday features.
-6. Build the base regime and the lightweight news overlay.
-7. Detect active investment themes and map them to theme-linked production screeners when available.
-8. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
-9. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
-10. Build the watchlist with screener, regime, overlay, and theme provenance.
-11. Ingest announcements and relevant news for watched names.
-12. Use the LLM only to extract structured event tensors from text.
-13. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
-14. Feed candidate state plus event outputs into risk sizing and allocation.
-15. Rank approved allocations in the portfolio engine with overlap and setup caps.
-16. Build lifecycle and execution-planning outputs.
-17. Record research runs in the research ledger.
-18. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
-19. Train the XGBoost event meta-model only when label coverage is sufficient.
-20. Keep prediction separate from policy and execution.
+6. Convert the macro snapshot into `advisory_macro_features_daily` for point-in-time regime, model, and risk inputs.
+7. Normalize NSE block/bulk/short/insider/corporate/earnings data into exchange events and features.
+8. Build the base regime and the lightweight news overlay.
+9. Detect active investment themes and map them to theme-linked production screeners when available.
+10. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
+11. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
+12. Build the watchlist with screener, regime, overlay, and theme provenance.
+13. Ingest announcements and relevant news for watched names.
+14. Use the LLM only to extract structured event tensors from text, with bounded exchange-event context where relevant.
+15. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
+16. Feed candidate state plus event outputs into risk sizing and allocation.
+17. Rank approved allocations in the portfolio engine with overlap and setup caps.
+18. Build lifecycle and execution-planning outputs.
+19. Record research runs in the research ledger.
+20. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
+21. Train the XGBoost event meta-model only when label coverage is sufficient.
+22. Keep prediction separate from policy and execution.
 
 For the full operator path in one command, use:
 
@@ -218,13 +220,35 @@ These are the core advisory tables to know:
 - normalized screener universe: `advisory_screener_constituents`
 - price history: `dhan_ohlcv_daily`, `dhan_ohlcv_intraday`
 - Sharpely data: `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `historical_mcap`, `sharpely_stock_meta`, `sharpely_stock_peers`
-- daily snapshots: `advisory_macro_daily`, `advisory_technical_daily`, `advisory_fundamentals_daily`, `advisory_market_regime`
+- daily snapshots: `advisory_macro_daily`, `advisory_macro_features_daily`, `advisory_exchange_events`, `advisory_exchange_features_daily`, `advisory_technical_daily`, `advisory_fundamentals_daily`, `advisory_market_regime`
 - rule outputs: `advisory_candidates`, `advisory_candidate_rejections`
 - watch layer: `advisory_watchlist`, `advisory_watch_events`, `economictimes_rss_items`, `advisory_news_events`
 - LLM/event layer: `advisory_event_evaluations`, `advisory_event_risks`
 - event meta-model layer: `advisory_event_model_scores`
 - adversarial review layer: `advisory_event_reviews`
 - allocation/execution layer: `advisory_allocations`, `advisory_portfolio_orders`, `advisory_position_lifecycle`, `advisory_rebalance_actions`, `advisory_execution_orders`, `advisory_execution_fills`
+
+## Macro Feature Layer
+
+`advisory/macro_snapshot.py` remains the point-in-time as-of join over raw CPI, WPI, RBI, FRED/US macro, and G-sec sources. `advisory/macro_features.py` converts that snapshot into `advisory_macro_features_daily`, which is the feature input used by regime classification, event-model training/scoring, and risk sizing.
+
+The first implemented feature groups are:
+
+- inflation pressure: CPI/CFPI 60-day level changes and selected WPI category changes
+- rates pressure: RBI repo-rate 90-day change, G-sec 10Y change, and 10Y-2Y curve slope
+- global pressure: VIX, US 10Y change, dollar index return, WTI return, and INR/USD move
+- data quality: stale and missing macro source counts from snapshot freshness columns
+- policy input: `macro_stress_score`, `macro_risk_state`, and `macro_sizing_multiplier`
+
+The feature builder loads a historical lookback window for rolling changes but only persists the requested as-of dates. This keeps single-day advisory runs causal without losing 20/60/90-day macro deltas.
+
+## Exchange Event Layer
+
+`advisory/exchange_events.py` normalizes NSE block deals, bulk deals, short-selling rows, insider deals, corporate actions, and earnings-calendar rows into `advisory_exchange_events`. It keeps `event_date` and `known_on` separate so later stages can avoid lookahead.
+
+`advisory/exchange_features.py` converts those events into `advisory_exchange_features_daily`. The current feature set includes block/bulk net value, deal clusters, insider net buying/selling, short-selling pressure, upcoming earnings, corporate-action count, and accumulation/distribution scores.
+
+The LLM receives only bounded exchange context: the latest feature row plus a small recent event list for the symbol being evaluated. This helps classify significance and contradiction without sending unfiltered NSE history or giving the LLM trade authority.
 
 ## Day-to-day commands
 

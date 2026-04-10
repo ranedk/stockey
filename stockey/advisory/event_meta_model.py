@@ -17,6 +17,8 @@ from utils.sync import parse_datetime_arg
 EVENTS_TABLE = "advisory_event_evaluations"
 SCORES_TABLE = "advisory_event_model_scores"
 INTRADAY_FEATURES_TABLE = "advisory_intraday_features_daily"
+MACRO_FEATURES_TABLE = "advisory_macro_features_daily"
+EXCHANGE_FEATURES_TABLE = "advisory_exchange_features_daily"
 DEFAULT_ARTIFACT_DIR = Path(".cache/advisory_event_meta_model")
 DEFAULT_MODEL_BASENAME = "event_meta_model"
 DEFAULT_HORIZON_DAYS = 10
@@ -223,6 +225,125 @@ def load_intraday_event_features(symbols: list[str], start_date: pd.Timestamp, e
     return df
 
 
+def load_macro_event_features(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    try:
+        if not table_exists(MACRO_FEATURES_TABLE):
+            return pd.DataFrame()
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date AS macro_asof_date,
+                macro_stress_score,
+                macro_sizing_multiplier,
+                gsec_10y_change_20d_bps,
+                gsec_curve_10y_2y_bps,
+                broad_usd_ret_20d,
+                wti_ret_20d,
+                inr_usd_ret_20d,
+                india_cpi_change_60d,
+                india_cfpi_change_60d,
+                wpi_food_articles_change_60d,
+                wpi_crude_petroleum_gas_change_60d,
+                macro_missing_source_count,
+                macro_stale_source_count
+            FROM {MACRO_FEATURES_TABLE}
+            WHERE asof_date BETWEEN %(start_date)s AND %(end_date)s
+            ORDER BY asof_date
+            """,
+            params={"start_date": start_date - pd.Timedelta(days=7), "end_date": end_date},
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["macro_asof_date"] = pd.to_datetime(df["macro_asof_date"], utc=True, errors="coerce").dt.normalize()
+    numeric_columns = [
+        "macro_stress_score",
+        "macro_sizing_multiplier",
+        "gsec_10y_change_20d_bps",
+        "gsec_curve_10y_2y_bps",
+        "broad_usd_ret_20d",
+        "wti_ret_20d",
+        "inr_usd_ret_20d",
+        "india_cpi_change_60d",
+        "india_cfpi_change_60d",
+        "wpi_food_articles_change_60d",
+        "wpi_crude_petroleum_gas_change_60d",
+        "macro_missing_source_count",
+        "macro_stale_source_count",
+    ]
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df
+
+
+def load_exchange_event_features(symbols: list[str], start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    try:
+        if not table_exists(EXCHANGE_FEATURES_TABLE):
+            return pd.DataFrame()
+        df = sql_to_df(
+            f"""
+            SELECT
+                symbol,
+                asof_date AS exchange_asof_date,
+                block_deal_buy_value_20d,
+                block_deal_sell_value_20d,
+                bulk_deal_buy_value_20d,
+                bulk_deal_sell_value_20d,
+                deal_net_value_20d,
+                deal_cluster_count_20d,
+                insider_buy_value_90d,
+                insider_sell_value_90d,
+                insider_net_value_90d,
+                insider_event_count_90d,
+                short_selling_quantity_20d,
+                short_selling_event_count_20d,
+                upcoming_earnings_14d,
+                days_to_earnings,
+                corporate_action_count_30d,
+                exchange_accumulation_score,
+                exchange_distribution_score,
+                exchange_event_score
+            FROM {EXCHANGE_FEATURES_TABLE}
+            WHERE symbol = ANY(%(symbols)s)
+              AND asof_date BETWEEN %(start_date)s AND %(end_date)s
+            ORDER BY symbol, asof_date
+            """,
+            params={"symbols": symbols, "start_date": start_date - pd.Timedelta(days=7), "end_date": end_date},
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["exchange_asof_date"] = pd.to_datetime(df["exchange_asof_date"], utc=True, errors="coerce").dt.normalize()
+    numeric_columns = [
+        "block_deal_buy_value_20d",
+        "block_deal_sell_value_20d",
+        "bulk_deal_buy_value_20d",
+        "bulk_deal_sell_value_20d",
+        "deal_net_value_20d",
+        "deal_cluster_count_20d",
+        "insider_buy_value_90d",
+        "insider_sell_value_90d",
+        "insider_net_value_90d",
+        "insider_event_count_90d",
+        "short_selling_quantity_20d",
+        "short_selling_event_count_20d",
+        "days_to_earnings",
+        "corporate_action_count_30d",
+        "exchange_accumulation_score",
+        "exchange_distribution_score",
+        "exchange_event_score",
+    ]
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["upcoming_earnings_14d"] = df["upcoming_earnings_14d"].fillna(False).astype(bool)
+    return df
+
+
 def _direction_sign(row: pd.Series) -> int:
     setup_effect = str(row.get("setup_effect") or "").lower()
     direction = str(row.get("direction") or "").lower()
@@ -260,6 +381,8 @@ def build_labeled_event_dataset(
         if not intraday.empty
         else {}
     )
+    macro = load_macro_event_features(start_date, end_date)
+    exchange_features = load_exchange_event_features(events["symbol"].astype(str).dropna().unique().tolist(), start_date, end_date)
 
     feature_rows: list[dict[str, Any]] = []
     for symbol, price_group in prices.groupby("symbol", sort=False):
@@ -299,6 +422,35 @@ def build_labeled_event_dataset(
     out = pd.DataFrame(feature_rows)
     if out.empty:
         return out
+    if not macro.empty:
+        out = pd.merge_asof(
+            out.sort_values("anchor_date"),
+            macro.sort_values("macro_asof_date"),
+            left_on="anchor_date",
+            right_on="macro_asof_date",
+            direction="backward",
+            allow_exact_matches=True,
+        ).sort_values(["published_on", "setup_id", "symbol", "unique_id"], kind="stable").reset_index(drop=True)
+    if not exchange_features.empty:
+        merged_frames: list[pd.DataFrame] = []
+        for symbol, symbol_rows in out.groupby("symbol", sort=False):
+            symbol_exchange = exchange_features[exchange_features["symbol"].eq(symbol)]
+            if symbol_exchange.empty:
+                merged_frames.append(symbol_rows)
+                continue
+            merged_frames.append(
+                pd.merge_asof(
+                    symbol_rows.sort_values("anchor_date"),
+                    symbol_exchange.drop(columns=["symbol"], errors="ignore").sort_values("exchange_asof_date"),
+                    left_on="anchor_date",
+                    right_on="exchange_asof_date",
+                    direction="backward",
+                    allow_exact_matches=True,
+                )
+            )
+        out = pd.concat(merged_frames, ignore_index=True, sort=False).sort_values(
+            ["published_on", "setup_id", "symbol", "unique_id"], kind="stable"
+        ).reset_index(drop=True)
     return out
 
 
@@ -322,6 +474,37 @@ def _prepare_feature_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         "intraday_opening_range_breakout_up",
         "intraday_prev_day_breakout_up",
         "intraday_failed_prev_day_breakout",
+        "macro_stress_score",
+        "macro_sizing_multiplier",
+        "gsec_10y_change_20d_bps",
+        "gsec_curve_10y_2y_bps",
+        "broad_usd_ret_20d",
+        "wti_ret_20d",
+        "inr_usd_ret_20d",
+        "india_cpi_change_60d",
+        "india_cfpi_change_60d",
+        "wpi_food_articles_change_60d",
+        "wpi_crude_petroleum_gas_change_60d",
+        "macro_missing_source_count",
+        "macro_stale_source_count",
+        "block_deal_buy_value_20d",
+        "block_deal_sell_value_20d",
+        "bulk_deal_buy_value_20d",
+        "bulk_deal_sell_value_20d",
+        "deal_net_value_20d",
+        "deal_cluster_count_20d",
+        "insider_buy_value_90d",
+        "insider_sell_value_90d",
+        "insider_net_value_90d",
+        "insider_event_count_90d",
+        "short_selling_quantity_20d",
+        "short_selling_event_count_20d",
+        "upcoming_earnings_14d",
+        "days_to_earnings",
+        "corporate_action_count_30d",
+        "exchange_accumulation_score",
+        "exchange_distribution_score",
+        "exchange_event_score",
     ]
     if "investable_now" not in frame.columns:
         frame["investable_now"] = False

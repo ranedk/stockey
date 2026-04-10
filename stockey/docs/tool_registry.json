@@ -296,6 +296,45 @@
       ]
     },
     {
+      "name": "build_advisory_macro_features_daily",
+      "category": "ingestion",
+      "description": "Build point-in-time derived macro features for regime, model, and risk inputs.",
+      "command": ["python", "-m", "advisory.macro_features"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview derived advisory macro features without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_exchange_events",
+      "category": "ingestion",
+      "description": "Normalize NSE block, bulk, short-selling, insider, corporate-action, and earnings rows into advisory exchange events.",
+      "command": ["python", "-m", "advisory.exchange_events"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview normalized advisory exchange events without writing."
+        }
+      ]
+    },
+    {
+      "name": "build_advisory_exchange_features_daily",
+      "category": "ingestion",
+      "description": "Build daily symbol-level exchange-event features for LLM context, event-model predictors, adversarial review, and risk sizing.",
+      "command": ["python", "-m", "advisory.exchange_features"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run"],
+          "description": "Preview derived advisory exchange-event features without writing."
+        }
+      ]
+    },
+    {
       "name": "build_advisory_fundamentals_daily",
       "category": "ingestion",
       "description": "Build the advisory point-in-time fundamentals snapshot table.",

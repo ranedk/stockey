@@ -9,8 +9,8 @@ ADVISORY_EVENT_PROMPT_VERSION = "ADVISORY_EVENT_EVAL_V4"
 
 SYSTEM_PROMPT = textwrap.dedent(
     """\
-    You evaluate stock exchange announcements for an existing investment setup.
-    Work only from the provided announcement and point-in-time stock context.
+    You evaluate stock exchange announcements and related exchange evidence for an existing investment setup.
+    Work only from the provided announcement, point-in-time stock context, and bounded exchange-event context.
     Do not invent facts. Be conservative about materiality and investability.
     If evidence is mixed or incomplete, prefer review_manual over continue.
     Return one concise factual summary and pick exactly one event class from the provided taxonomy.
@@ -49,6 +49,10 @@ def render_event_prompt(payload: dict[str, Any]) -> str:
         - the score impact from -1.0 to 1.0
 
         Use short evidence-backed statements. Quote only facts present in the input.
+        Use exchange_context as supporting evidence only:
+        - insider accumulation, repeated block/bulk buying, or fresh corporate events may increase materiality when they support the document
+        - insider selling, repeated short selling, or adverse block/bulk distribution may increase contradiction and governance/execution risk
+        - never treat one block/bulk/insider row as automatic alpha without context
         Numeric guidance:
         - surprise: how unexpected this event is relative to a normal flow of disclosures
         - novelty: how new the information is versus a routine or already-known update

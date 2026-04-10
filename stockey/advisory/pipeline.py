@@ -27,6 +27,8 @@ from advisory.event_meta_model import (
     persist_scores as persist_event_model_scores,
     score_events as score_event_model,
 )
+from advisory.exchange_events import build_exchange_events, persist_exchange_events
+from advisory.exchange_features import build_exchange_features, persist_exchange_features
 from advisory.fundamental_snapshot import build_fundamental_snapshot, persist_fundamental_snapshot
 from advisory.intraday_features import (
     build_intraday_features,
@@ -35,6 +37,7 @@ from advisory.intraday_features import (
 from advisory.llm_event_evaluator import DEFAULT_MODEL as DEFAULT_EVENT_MODEL
 from advisory.llm_event_evaluator import build_outputs as build_event_evaluations
 from advisory.llm_event_evaluator import persist_outputs as persist_event_evaluations
+from advisory.macro_features import build_macro_features, persist_macro_features
 from advisory.macro_snapshot import build_macro_snapshot, persist_macro_snapshot
 from advisory.news_overlay_engine import build_overlay_state, persist_overlay_state
 from advisory.news_theme_engine import build_theme_recommendations, load_active_theme_screener_mapping
@@ -61,6 +64,9 @@ from utils.sync import parse_datetime_arg
 PIPELINE_STAGES = [
     "screeners",
     "macro",
+    "macro_features",
+    "exchange_events",
+    "exchange_features",
     "peer_sync",
     "technicals",
     "intraday",
@@ -245,6 +251,30 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             persist_macro_snapshot(macro_df)
         summary["stages"]["macro"] = _json_ready(macro_df)
         _finish_stage("macro", stage_started, f"rows={len(macro_df)}")
+
+    if stage_enabled("macro_features", args.start_at, args.stop_at):
+        stage_started = _start_stage("macro_features")
+        macro_features_df = build_macro_features(from_date=asof_date, to_date=asof_date, rebuild=bool(args.rebuild))
+        if not args.dry_run:
+            persist_macro_features(macro_features_df)
+        summary["stages"]["macro_features"] = _json_ready(macro_features_df)
+        _finish_stage("macro_features", stage_started, f"rows={len(macro_features_df)}")
+
+    if stage_enabled("exchange_events", args.start_at, args.stop_at):
+        stage_started = _start_stage("exchange_events")
+        exchange_events_df = build_exchange_events(from_date=asof_date, to_date=asof_date)
+        if not args.dry_run:
+            persist_exchange_events(exchange_events_df)
+        summary["stages"]["exchange_events"] = _json_ready(exchange_events_df)
+        _finish_stage("exchange_events", stage_started, f"rows={len(exchange_events_df)}")
+
+    if stage_enabled("exchange_features", args.start_at, args.stop_at):
+        stage_started = _start_stage("exchange_features")
+        exchange_features_df = build_exchange_features(from_date=asof_date, to_date=asof_date, rebuild=bool(args.rebuild))
+        if not args.dry_run:
+            persist_exchange_features(exchange_features_df)
+        summary["stages"]["exchange_features"] = _json_ready(exchange_features_df)
+        _finish_stage("exchange_features", stage_started, f"rows={len(exchange_features_df)}")
 
     if stage_enabled("peer_sync", args.start_at, args.stop_at) and not args.skip_peer_sync:
         stage_started = _start_stage("peer_sync")

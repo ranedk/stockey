@@ -171,6 +171,28 @@ def main() -> int:
                 download_script=Path(args.download_script),
                 continue_on_error=bool(args.continue_on_download_error),
             )
+            if download_summary.get("status") == "failed" and not bool(args.continue_on_download_error):
+                summary = {
+                    "status": "failed",
+                    "pipeline": "advisory.master_pipeline",
+                    "asof_date": None if asof_date is None else asof_date.isoformat(),
+                    "dry_run": bool(args.dry_run),
+                    "downloads": download_summary,
+                    "advisory": {"status": "skipped_download_failed", "stages": {}},
+                }
+                if research_run_id:
+                    finish_research_run(
+                        research_run_id,
+                        status="failed",
+                        data_snapshot=None,
+                        result_metrics={"status": "failed", "download_status": download_summary.get("status")},
+                        error_text="download phase failed; advisory run skipped",
+                    )
+                if args.format == "text":
+                    print(format_text(summary))
+                else:
+                    print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
+                return 1
 
         advisory_args = argparse.Namespace(
             date=args.date,
