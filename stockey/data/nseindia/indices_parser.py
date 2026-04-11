@@ -11,7 +11,7 @@ import redis
 
 from utils.db import upsert_to_db
 from utils import store
-from utils.sync import get_redis_set_members
+from utils.sync import get_redis_client, get_redis_set_members
 
 
 env = Env()
@@ -21,7 +21,7 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 REDIS_SET = "indices:parsed"
 
-rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 
 def is_empty_file(path: str) -> bool:

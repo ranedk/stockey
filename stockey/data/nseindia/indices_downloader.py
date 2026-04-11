@@ -11,7 +11,7 @@ from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import reverse_daterange
 from utils.chrome import restart_chrome
-from utils.sync import get_redis_set_members
+from utils.sync import get_redis_client, get_redis_set_members
 
 
 env = Env()
@@ -112,7 +112,7 @@ def main() -> None:
     parser.add_argument("--to-date", dest="to_date", help="End date in YYYY-MM-DD")
     args = parser.parse_args()
 
-    rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
     failures = 0
     existing_members = get_redis_set_members(rop, REDIS_SET)
     latest_done = latest_downloaded_date(existing_members)

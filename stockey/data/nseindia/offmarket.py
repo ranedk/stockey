@@ -6,7 +6,7 @@ from environs import Env
 from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import daterange
-from utils.sync import get_redis_set_members
+from utils.sync import get_redis_client, get_redis_set_members
 
 env = Env()
 env.read_env()
@@ -134,7 +134,7 @@ def get_next_download_block(rop, dtype, g_start, g_end, skipped_dates=None):
 
 def main() -> None:
     try:
-        rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+        rop = get_redis_client(REDIS_HOST, REDIS_PORT)
         global_start = datetime.strptime("2014-01-01", "%Y-%m-%d")
         global_end = latest_completed_day()
 

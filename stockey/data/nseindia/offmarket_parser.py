@@ -7,6 +7,7 @@ import redis
 from utils.company_master import attach_company_master_id
 from utils.db import db_session, upsert_to_db
 from utils import store
+from utils.sync import get_redis_client
 
 
 env = Env()
@@ -16,7 +17,7 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 REDIS_SET = "bhav:parsed"
 
-rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 
 def ensure_unique_constraint(

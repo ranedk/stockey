@@ -15,7 +15,7 @@ from environs import Env
 
 from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_dynamic_headers, get_with_retries, hidden_inputs_to_dict
-from utils.sync import get_db_max_date
+from utils.sync import get_db_max_date, get_redis_client
 
 env = Env()
 env.read_env()
@@ -23,7 +23,7 @@ env.read_env()
 REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 REDIS_SET = "cpi:downloaded"
-rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 HEADERS = get_dynamic_headers()
 NEW_CPI_START = date(2025, 1, 1)

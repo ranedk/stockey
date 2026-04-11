@@ -8,6 +8,7 @@ import pandas as pd
 import redis
 
 from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.redis_utils import get_redis_client
 
 
 TABLE_NAME = "advisory_sync_state"
@@ -112,7 +113,7 @@ def persist_sync_state(
 
 def publish_bus_message(channel: str, payload: dict[str, Any]) -> bool:
     try:
-        client = redis.Redis(host=DEFAULT_REDIS_HOST, port=DEFAULT_REDIS_PORT, decode_responses=True)
+        client = get_redis_client(host=DEFAULT_REDIS_HOST, port=DEFAULT_REDIS_PORT, decode_responses=True)
         client.publish(str(channel), json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
         client.close()
         return True

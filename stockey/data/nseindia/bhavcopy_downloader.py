@@ -8,7 +8,7 @@ from environs import Env
 from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import reverse_daterange
-from utils.sync import get_redis_set_members, filter_missing_date_members
+from utils.sync import get_redis_client, get_redis_set_members, filter_missing_date_members
 
 env = Env()
 env.read_env()
@@ -83,7 +83,7 @@ def download_bhavcopy_for_date(
 
 
 def main() -> None:
-    rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
     failures = 0
     existing_members = get_redis_set_members(rop, REDIS_SET)
     all_dates = list(

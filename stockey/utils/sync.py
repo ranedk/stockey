@@ -9,7 +9,8 @@ import pandas as pd
 import redis
 from psycopg2 import sql
 
-from utils.db import db_session
+from utils.db import db_session, with_db_retries
+from utils.redis_utils import get_redis_client as get_resilient_redis_client
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -52,7 +53,7 @@ def load_tracked_symbols(symbol_args: Iterable[str] | None = None) -> list[str]:
 
 
 def get_redis_client(host: str, port: int) -> redis.Redis:
-    return redis.Redis(host=host, port=port, decode_responses=True)
+    return get_resilient_redis_client(host=host, port=port, decode_responses=True)
 
 
 def get_redis_cursor(redis_client: redis.Redis, key: str) -> datetime | None:
@@ -102,12 +103,18 @@ def get_db_max_date(
         where_sql,
     )
 
-    try:
+    def _execute() -> dict | None:
         with db_session(dict_factory=True) as (_, cur):
             cur.execute(query, tuple(params))
-            row = cur.fetchone()
-    except Exception:
-        return None
+            return cur.fetchone()
+
+    try:
+        row = with_db_retries(_execute, operation_name=f"get_db_max_date:{table_name}")
+    except Exception as exc:
+        message = str(exc).lower()
+        if exc.__class__.__name__ in {"UndefinedTable", "UndefinedColumn"} or "does not exist" in message:
+            return None
+        raise
 
     if not row or not row["max_date"]:
         return None

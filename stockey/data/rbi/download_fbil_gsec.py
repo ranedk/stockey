@@ -11,6 +11,7 @@ from environs import Env
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers
 from utils.date import daterange
+from utils.sync import get_redis_client
 
 env = Env()
 env.read_env()
@@ -18,7 +19,7 @@ env.read_env()
 REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 DOWNLOADED = "fbilgec:downloaded"
-rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 
 HEADERS = get_dynamic_headers()

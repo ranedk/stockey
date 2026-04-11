@@ -77,7 +77,8 @@ python scripts/cleanup_deprecated_tables.py --dry-run
 ## General usage guidelines
 
 - Prefer `python -m ...` from the repo root so relative config and `.env` loading behave consistently.
-- DB reads retry transient statement-timeout and connection errors by default. Tune with `SQL_TO_DF_RETRIES`, `SQL_TO_DF_RETRY_SLEEP_SECONDS`, `SQL_TO_DF_STATEMENT_TIMEOUT_MS`, and `SQL_TO_DF_CHUNK_SIZE` if remote PostgreSQL is unstable.
+- DB reads, selected metadata calls, DB connects, and DB upserts retry transient statement-timeout and connection errors by default. Tune with `SQL_TO_DF_RETRIES`, `SQL_TO_DF_RETRY_SLEEP_SECONDS`, `SQL_TO_DF_STATEMENT_TIMEOUT_MS`, `SQL_TO_DF_CHUNK_SIZE`, `DB_OPERATION_ATTEMPTS`, and `DB_POOL_RECYCLE_SECONDS` if remote PostgreSQL is unstable.
+- Ingestion Redis cursor/cache operations retry by default and fail soft after retries. Tune with `REDIS_OPERATION_ATTEMPTS`, `REDIS_RETRY_SLEEP_SECONDS`, `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS`, `REDIS_SOCKET_TIMEOUT_SECONDS`, and `REDIS_FAIL_SOFT`.
 - DB upserts use local temporary files for the `COPY` payload, which avoids holding very large CSV buffers fully in memory.
 - Use the project venv when running ingestion jobs manually:
 

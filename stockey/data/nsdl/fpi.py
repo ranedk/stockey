@@ -9,6 +9,7 @@ from environs import Env
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers, hidden_inputs_to_dict
 from utils.parsers import table_to_grid
+from utils.sync import get_redis_client
 
 from . import fpi_utils as futils
 
@@ -198,7 +199,7 @@ def latest_downloaded_date(rop, today: date) -> date | None:
 
 
 def update_fpi_data():
-    rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
     today = date.today()
     latest_done = latest_downloaded_date(rop, today)
     if latest_done is not None:

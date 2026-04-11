@@ -10,7 +10,7 @@ from environs import Env
 
 from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_dynamic_headers
-from utils.sync import get_redis_set_members
+from utils.sync import get_redis_client, get_redis_set_members
 from utils.date import last_of_month
 
 env = Env()
@@ -20,7 +20,7 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 REDIS_SET = "wpi:downloaded"
 REDIS_PROGRESS_PREFIX = "wpi:item_downloaded"
-rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 
 HEADERS = get_dynamic_headers()

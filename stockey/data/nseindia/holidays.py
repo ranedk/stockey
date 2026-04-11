@@ -8,6 +8,7 @@ import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
 from utils.db import upsert_to_db
+from utils.sync import get_redis_client
 
 
 env = Env()
@@ -18,7 +19,7 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:trading_days"
-rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 
 nse_product_info = {

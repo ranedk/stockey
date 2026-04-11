@@ -75,7 +75,7 @@ Important constraint:
 
 ## Database robustness knobs
 
-Large advisory/model-prep runs can hit transient remote PostgreSQL failures or statement timeouts. The shared DB helper now retries transient read failures and writes large upsert payloads through local temporary files before `COPY`.
+Large advisory/model-prep runs can hit transient remote PostgreSQL failures or statement timeouts. The shared DB helper now retries transient read, connect, metadata, and upsert failures, disposes the stale SQLAlchemy pool, reconnects, and writes large upsert payloads through local temporary files before `COPY`.
 
 Useful environment variables:
 
@@ -83,8 +83,24 @@ Useful environment variables:
 - `SQL_TO_DF_RETRY_SLEEP_SECONDS`: base sleep between retries, default `1.0`
 - `SQL_TO_DF_STATEMENT_TIMEOUT_MS`: optional per-query statement timeout override, default `0` which leaves server defaults unchanged
 - `SQL_TO_DF_CHUNK_SIZE`: optional fetch chunk size for reads, default `0` which keeps the old fetch-all behavior
+- `DB_OPERATION_ATTEMPTS`: minimum attempts for DB connects, metadata reads, and upserts, default `3`
+- `DB_POOL_RECYCLE_SECONDS`: SQLAlchemy pool recycle interval, default `300`
 
 Model-training backfills deliberately skip intraday prefetch during snapshot repair. This avoids wasting time on old 1-minute windows when the goal is event-label coverage, not perfect intraday reconstruction.
+
+## Redis robustness knobs
+
+Redis is used for lightweight cursors, parsed/downloaded sets, and live pub-sub. It is not the source of truth for advisory data; PostgreSQL upserts are. Ingestion jobs now retry Redis operations and, by default, continue without Redis state if Redis is unavailable.
+
+Useful environment variables:
+
+- `REDIS_OPERATION_ATTEMPTS`: retry attempts for Redis commands, default `3`
+- `REDIS_RETRY_SLEEP_SECONDS`: base sleep between Redis retries, default `1.0`
+- `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS`: Redis connection timeout, default `2.0`
+- `REDIS_SOCKET_TIMEOUT_SECONDS`: Redis command timeout, default `5.0`
+- `REDIS_FAIL_SOFT`: continue without Redis state after retries, default `true`
+
+Set `REDIS_FAIL_SOFT=false` only for flows where Redis itself is the product, such as live pub-sub debugging. For ingestion, keep it `true` so a Redis outage does not block DB writes.
 
 ## Main operating modes
 

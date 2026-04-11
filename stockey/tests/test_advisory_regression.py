@@ -12,6 +12,8 @@ from data.eaindustry import wpi
 from data.dhanlive import client as dhan_client
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv
 from data import download_runner
+from utils import db as db_utils
+from utils import redis_utils
 
 
 def test_portfolio_engine_overlap_cap(monkeypatch):
@@ -104,6 +106,45 @@ def test_portfolio_engine_overlap_cap(monkeypatch):
     assert status_map["ICICIBANK"] == "deferred"
     assert reason_map["ICICIBANK"] == "overlap_cap"
     assert status_map["RELIANCE"] == "approved"
+
+
+def test_db_retry_wrapper_reconnects_on_transient_error(monkeypatch):
+    calls = {"operation": 0, "dispose": 0}
+
+    class OperationalError(Exception):
+        pass
+
+    def operation():
+        calls["operation"] += 1
+        if calls["operation"] < 3:
+            raise OperationalError("server closed the connection unexpectedly")
+        return "ok"
+
+    monkeypatch.setattr(db_utils, "dispose_db_pool", lambda: calls.__setitem__("dispose", calls["dispose"] + 1))
+    monkeypatch.setattr(db_utils.time, "sleep", lambda *_args, **_kwargs: None)
+
+    assert db_utils.with_db_retries(operation, attempts=3, operation_name="test") == "ok"
+    assert calls == {"operation": 3, "dispose": 2}
+
+
+def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
+    calls = {"attempts": 0}
+
+    class FailingRedis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get(self, key):
+            calls["attempts"] += 1
+            raise redis_utils.redis.ConnectionError("connection refused")
+
+    monkeypatch.setattr(redis_utils, "_ORIGINAL_REDIS_CLASS", FailingRedis)
+    monkeypatch.setattr(redis_utils, "REDIS_OPERATION_ATTEMPTS", 3)
+    monkeypatch.setattr(redis_utils.time, "sleep", lambda *_args, **_kwargs: None)
+    client = redis_utils.ResilientRedis(host="127.0.0.1", port=6379, decode_responses=True, fail_soft=True)
+
+    assert client.get("missing") is None
+    assert calls["attempts"] == 3
 
 
 def test_portfolio_engine_allows_two_sector_names_but_blocks_same_symbol_duplicates(monkeypatch):

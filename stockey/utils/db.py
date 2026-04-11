@@ -2,9 +2,10 @@
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime
+import sys
 import tempfile
 import time
-from typing import List, Sequence, Tuple, Union
+from typing import Callable, List, Sequence, Tuple, TypeVar, Union
 
 import pandas as pd
 import pandas.api.types as pdt
@@ -26,11 +27,17 @@ SQL_TO_DF_RETRIES = env.int("SQL_TO_DF_RETRIES", 2)
 SQL_TO_DF_RETRY_SLEEP_SECONDS = env.float("SQL_TO_DF_RETRY_SLEEP_SECONDS", 1.0)
 SQL_TO_DF_STATEMENT_TIMEOUT_MS = env.int("SQL_TO_DF_STATEMENT_TIMEOUT_MS", 0)
 SQL_TO_DF_CHUNK_SIZE = env.int("SQL_TO_DF_CHUNK_SIZE", 0)
+DB_OPERATION_ATTEMPTS = max(env.int("DB_OPERATION_ATTEMPTS", 3), 3)
+DB_POOL_RECYCLE_SECONDS = env.int("DB_POOL_RECYCLE_SECONDS", 300)
 
 # Singleton connection engine for sqlalchemy
 _engine = sa.create_engine(
-    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+    pool_pre_ping=True,
+    pool_recycle=DB_POOL_RECYCLE_SECONDS,
 )
+
+T = TypeVar("T")
 
 
 def qualified_identifier(name: str) -> sql.Identifier:
@@ -57,6 +64,42 @@ def _is_transient_db_error(exc: Exception) -> bool:
     ]
     return any(marker in message for marker in transient_markers)
 
+
+def dispose_db_pool() -> None:
+    try:
+        _engine.dispose()
+    except Exception:
+        pass
+
+
+def with_db_retries(
+    operation: Callable[[], T],
+    *,
+    attempts: int | None = None,
+    retry_sleep_seconds: float | None = None,
+    operation_name: str = "db_operation",
+) -> T:
+    max_attempts = max(int(attempts or DB_OPERATION_ATTEMPTS), 3)
+    sleep_seconds = SQL_TO_DF_RETRY_SLEEP_SECONDS if retry_sleep_seconds is None else float(retry_sleep_seconds)
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_db_error(exc) or attempt >= max_attempts:
+                raise
+            dispose_db_pool()
+            print(
+                f"[utils.db] transient postgres error in {operation_name}; reconnecting attempt={attempt + 1}/{max_attempts} error={exc.__class__.__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(sleep_seconds * attempt)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{operation_name} failed without exception")
+
 @contextmanager
 def db_session(dict_factory: bool = False):
     """
@@ -69,22 +112,47 @@ def db_session(dict_factory: bool = False):
     conn = None
     cur = None
     try:
-        conn = _engine.raw_connection()
-        if dict_factory:
-            cur = conn.cursor(cursor_factory=RealDictCursor)
-        else:
-            cur = conn.cursor()
+        def _open_session():
+            opened_conn = None
+            try:
+                opened_conn = _engine.raw_connection()
+                if dict_factory:
+                    opened_cur = opened_conn.cursor(cursor_factory=RealDictCursor)
+                else:
+                    opened_cur = opened_conn.cursor()
+                return opened_conn, opened_cur
+            except Exception:
+                if opened_conn:
+                    try:
+                        opened_conn.close()
+                    except Exception:
+                        pass
+                raise
+
+        conn, cur = with_db_retries(_open_session, operation_name="db_session:connect")
         yield conn, cur
         conn.commit()
     except Exception as e:
+        if _is_transient_db_error(e):
+            dispose_db_pool()
         if conn:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception as rollback_exc:
+                if _is_transient_db_error(rollback_exc):
+                    dispose_db_pool()
         raise e
     finally:
         if cur:
-            cur.close()
+            try:
+                cur.close()
+            except Exception:
+                pass
         if conn:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 def pandas_to_postgres_type(dtype: str):
     PANDAS_TO_POSTGRES = {
@@ -260,7 +328,7 @@ def generate_postgres_schema(
     )
 
 
-def upsert_to_db(
+def _upsert_to_db_once(
     df: pd.DataFrame,
     table_name: str,
     unique_keys: List[str],
@@ -395,6 +463,23 @@ def upsert_to_db(
                 pass
 
 
+def upsert_to_db(
+    df: pd.DataFrame,
+    table_name: str,
+    unique_keys: List[str],
+    timescaledb_column: str | None = None,
+) -> None:
+    with_db_retries(
+        lambda: _upsert_to_db_once(
+            df,
+            table_name,
+            unique_keys,
+            timescaledb_column=timescaledb_column,
+        ),
+        operation_name=f"upsert_to_db:{table_name}",
+    )
+
+
 def _fetch_sql_to_df_once(
     sql_query: str,
     params: Tuple | None = None,
@@ -433,6 +518,7 @@ def sql_to_df(
     chunksize: int | None = None,
 ) -> pd.DataFrame:
     attempts = max(int(SQL_TO_DF_RETRIES if retries is None else retries), 0) + 1
+    attempts = max(attempts, 3)
     chunk_size = SQL_TO_DF_CHUNK_SIZE if chunksize is None else int(chunksize or 0)
     last_exc: Exception | None = None
     for attempt in range(1, attempts + 1):
@@ -447,6 +533,12 @@ def sql_to_df(
             last_exc = exc
             if attempt >= attempts or not _is_transient_db_error(exc):
                 raise
+            dispose_db_pool()
+            print(
+                f"[utils.db] transient postgres error in sql_to_df; reconnecting attempt={attempt + 1}/{attempts} error={exc.__class__.__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             time.sleep(float(SQL_TO_DF_RETRY_SLEEP_SECONDS) * attempt)
     if last_exc is not None:
         raise last_exc
@@ -464,9 +556,12 @@ def get_sql( sql_query: str, params: Tuple = ()) -> pd.Series:
     • Use **%s** placeholders in *sql* - that’s what psycopg2 expects.
       Example:  "SELECT * FROM mytable WHERE id = %s"
     """
-    with db_session(dict_factory=True) as (conn, cur):
-        cur.execute(sql_query, params)
-        rows = cur.fetchall()  # list[dict]
+    def _execute() -> list[dict]:
+        with db_session(dict_factory=True) as (conn, cur):
+            cur.execute(sql_query, params)
+            return cur.fetchall()  # list[dict]
+
+    rows = with_db_retries(_execute, operation_name="get_sql")
 
     if not rows:
         raise ValueError("Query returned no rows.")
@@ -496,24 +591,27 @@ def table_has_date(
     ValueError if the column is not of type DATE.
     """
 
-    with db_session(dict_factory=True) as (conn, cur):
-        cur.execute(
-            """
-            SELECT data_type
-            FROM   information_schema.columns
-            WHERE  table_schema = 'public'
-              AND  table_name   = %s
-              AND  column_name  = %s
-            """,
-            (table, column),
-        )
-        row = cur.fetchone()
-        if row is None:
-            raise ValueError(f"{table}.{column} does not exist")
-        if row["data_type"] not in ["date", "timestamp", "timestamp with time zone"]:
-            raise ValueError(
-                f"{table}.{column} is {row['data_type'].upper()}, not DATE"
+    def _fetch_column() -> dict | None:
+        with db_session(dict_factory=True) as (conn, cur):
+            cur.execute(
+                """
+                SELECT data_type
+                FROM   information_schema.columns
+                WHERE  table_schema = 'public'
+                  AND  table_name   = %s
+                  AND  column_name  = %s
+                """,
+                (table, column),
             )
+            return cur.fetchone()
+
+    row = with_db_retries(_fetch_column, operation_name="table_has_date:column")
+    if row is None:
+        raise ValueError(f"{table}.{column} does not exist")
+    if row["data_type"] not in ["date", "timestamp", "timestamp with time zone"]:
+        raise ValueError(
+            f"{table}.{column} is {row['data_type'].upper()}, not DATE"
+        )
 
     date_only = target.date() if isinstance(target, datetime) else target
 
@@ -533,11 +631,14 @@ def table_has_date(
         column=sql.Identifier(column),
     )
 
-    with db_session(dict_factory=True) as (_, cur):
-        cur.execute(query, (date_only,))
-        row = cur.fetchone()
-        has_target = row["has_target"]
-        latest_date = row["latest_date"]
+    def _fetch_date_status() -> dict:
+        with db_session(dict_factory=True) as (_, cur):
+            cur.execute(query, (date_only,))
+            return cur.fetchone()
+
+    row = with_db_retries(_fetch_date_status, operation_name="table_has_date:status")
+    has_target = row["has_target"]
+    latest_date = row["latest_date"]
 
     if latest_date and isinstance(latest_date, datetime):
         latest_date = latest_date.date()

@@ -8,6 +8,8 @@ import time
 import traceback
 from typing import Any
 
+from utils.redis_utils import install_resilient_redis
+
 
 DOWNLOAD_STEPS = [
     {"module": "data.nseindia.holidays", "args": [], "purpose": "holiday_calendar"},
@@ -119,6 +121,7 @@ def run_download_module(step: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_all_downloads(*, continue_on_error: bool = False, dry_run: bool = False) -> dict[str, Any]:
+    install_resilient_redis()
     if dry_run:
         return {
             "status": "skipped_dry_run",

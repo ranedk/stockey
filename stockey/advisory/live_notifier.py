@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-import redis
 
 from advisory.sync_state import DEFAULT_REDIS_HOST, DEFAULT_REDIS_PORT
+from utils.redis_utils import get_redis_client
 
 
 DEFAULT_OUTPUT_DIR = Path("live_dashboard")
@@ -109,7 +109,7 @@ def subscribe_and_run(
     max_feed_items: int = DEFAULT_MAX_FEED_ITEMS,
     duration_seconds: int | None = None,
 ) -> dict[str, Any]:
-    client = redis.Redis(host=redis_host, port=int(redis_port), decode_responses=True)
+    client = get_redis_client(host=redis_host, port=int(redis_port), decode_responses=True, fail_soft=False)
     pubsub = client.pubsub(ignore_subscribe_messages=True)
     pubsub.psubscribe(str(channel_pattern))
     _emit(f"[advisory.live_notifier] subscribed pattern={channel_pattern} redis={redis_host}:{redis_port}")

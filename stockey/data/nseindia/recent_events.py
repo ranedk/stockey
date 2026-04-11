@@ -8,7 +8,7 @@ from environs import Env
 from playwright.sync_api import sync_playwright
 from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
-from utils.sync import get_redis_set_members
+from utils.sync import get_redis_client, get_redis_set_members
 
 
 env = Env()
@@ -72,7 +72,7 @@ def parse_csv(csv_file):
 
 
 def main() -> None:
-    rop = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
     existing_members = get_redis_set_members(rop, REDIS_SET)
 
     with sync_playwright() as p:
