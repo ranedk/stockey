@@ -142,6 +142,21 @@ def ensure_portfolio_table() -> None:
             "execution_notes": "TEXT",
             "context_snapshot_json": "TEXT",
             "load_ts": "TIMESTAMPTZ",
+            "thesis_bucket": "TEXT",
+            "bucket_reason": "TEXT",
+            "target_price": "DOUBLE PRECISION",
+            "target_basis": "TEXT",
+            "target_confidence": "DOUBLE PRECISION",
+            "target_review_date": "TIMESTAMPTZ",
+            "expected_horizon_days": "BIGINT",
+            "horizon_type": "TEXT",
+            "horizon_end_date": "TIMESTAMPTZ",
+            "horizon_basis": "TEXT",
+            "data_dependency_reason": "TEXT",
+            "continue_while": "TEXT",
+            "key_monitor_fields_json": "TEXT",
+            "recheck_frequency": "TEXT",
+            "exit_event_rules_json": "TEXT",
         }
         for column, sql_type in column_defs.items():
             cur.execute(f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
@@ -381,6 +396,88 @@ def build_execution_notes(row: pd.Series, approved_allocation: float, portfolio_
     return " ".join(notes) if notes else None
 
 
+def _parse_horizon_days(note: object) -> int | None:
+    text = str(note or "").strip().lower()
+    mapping = {
+        "same day to 5 trading days": 5,
+        "3 days to 6 weeks": 42,
+        "3 days to 8 weeks": 56,
+        "1 week to 10 weeks": 70,
+        "2 weeks to 3 months": 90,
+    }
+    return mapping.get(text)
+
+
+def derive_thesis_policy(row: pd.Series) -> dict[str, Any]:
+    setup_family = str(row.get("setup_family") or "").upper()
+    holding_horizon_note = str(row.get("holding_horizon_note") or "").strip()
+    event_class = str(row.get("event_class") or "").strip()
+    invalidation_price = pd.to_numeric(row.get("invalidation_price"), errors="coerce")
+    stop_price = pd.to_numeric(row.get("stop_price"), errors="coerce")
+    asof_date = pd.to_datetime(row.get("asof_date"), utc=True, errors="coerce")
+    confidence = pd.to_numeric(row.get("confidence"), errors="coerce")
+
+    thesis_bucket = "DATA_DEPENDENT"
+    bucket_reason = "Keep the position only while the supporting technical, event, and regime evidence remains intact."
+    target_price = None
+    target_basis = None
+    target_confidence = None if pd.isna(confidence) else float(confidence)
+    target_review_date = None
+    expected_horizon_days = _parse_horizon_days(holding_horizon_note)
+    horizon_type = None
+    horizon_end_date = None
+    horizon_basis = None
+    data_dependency_reason = "Evidence-driven idea without a clean fixed target or fixed expiry."
+    continue_while = "No exit event fires and setup/regime support remains valid."
+    key_monitor_fields = ["invalidation_price", "stop_price", "event_class", "state_transition_hint", "portfolio_reason"]
+    recheck_frequency = "daily"
+
+    if setup_family in {"INTRADAY_TACTICAL", "SME_TACTICAL", "MIDCAP_SWING", "EVENT_OPPORTUNITY"} or event_class:
+        thesis_bucket = "TIME_HORIZON"
+        bucket_reason = "This idea is expected to play out inside a bounded swing or event window."
+        horizon_type = "event_window" if event_class else "swing"
+        horizon_basis = holding_horizon_note or ("event-driven window" if event_class else "setup-defined horizon")
+        if pd.notna(asof_date) and expected_horizon_days:
+            horizon_end_date = asof_date + pd.Timedelta(days=int(expected_horizon_days))
+        data_dependency_reason = None
+        continue_while = None
+        recheck_frequency = "intraday" if setup_family == "INTRADAY_TACTICAL" else "daily"
+    elif setup_family in {"LARGECAP_POSITION", "DEFENSIVE_POSITION"}:
+        thesis_bucket = "TARGET"
+        bucket_reason = "This idea is better managed with a target/review frame than a short fixed trade window."
+        target_basis = holding_horizon_note or "Position setup target review"
+        if pd.notna(asof_date) and expected_horizon_days:
+            target_review_date = asof_date + pd.Timedelta(days=int(expected_horizon_days))
+        data_dependency_reason = None
+        continue_while = None
+
+    exit_rules: list[dict[str, Any]] = []
+    if pd.notna(invalidation_price):
+        exit_rules.append({"code": "INVALIDATION_HIT", "priority": 1, "threshold_price": float(invalidation_price)})
+    if pd.notna(stop_price):
+        exit_rules.append({"code": "STOP_HIT", "priority": 2, "threshold_price": float(stop_price)})
+    exit_rules.append({"code": "THESIS_REVERSAL", "priority": 3})
+    exit_rules.append({"code": "REGIME_BREAK", "priority": 4})
+
+    return {
+        "thesis_bucket": thesis_bucket,
+        "bucket_reason": bucket_reason,
+        "target_price": target_price,
+        "target_basis": target_basis,
+        "target_confidence": target_confidence,
+        "target_review_date": target_review_date,
+        "expected_horizon_days": expected_horizon_days,
+        "horizon_type": horizon_type,
+        "horizon_end_date": horizon_end_date,
+        "horizon_basis": horizon_basis,
+        "data_dependency_reason": data_dependency_reason,
+        "continue_while": continue_while,
+        "key_monitor_fields_json": json.dumps(key_monitor_fields, ensure_ascii=False, default=str),
+        "recheck_frequency": recheck_frequency,
+        "exit_event_rules_json": json.dumps(exit_rules, ensure_ascii=False, default=str),
+    }
+
+
 def build_portfolio_orders(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -478,8 +575,7 @@ def build_portfolio_orders(
             overlap_group_counts[overlap_group] = overlap_count + 1
             approved_positions += 1
 
-        rows.append(
-            {
+        portfolio_row = {
                 "published_on": row["published_on"],
                 "asof_date": row["asof_date"],
                 "planned_at": pd.Timestamp.utcnow(),
@@ -509,7 +605,8 @@ def build_portfolio_orders(
                 "context_snapshot_json": row.get("context_snapshot_json"),
                 "load_ts": pd.Timestamp.utcnow(),
             }
-        )
+        portfolio_row.update(derive_thesis_policy(pd.Series({**row.to_dict(), **portfolio_row})))
+        rows.append(portfolio_row)
 
     return pd.DataFrame(rows)
 
@@ -518,9 +615,30 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
     ensure_portfolio_table()
     if df.empty:
         return
+    out = df.copy()
+    for column in [
+        "portfolio_capital_inr",
+        "priority_score",
+        "score_impact",
+        "requested_allocation_inr",
+        "approved_allocation_inr",
+        "remaining_capital_after_inr",
+        "stop_price",
+        "invalidation_price",
+        "target_price",
+        "target_confidence",
+    ]:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
+    for column in ["max_positions", "plan_rank", "expected_horizon_days"]:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce").astype("Int64")
+    for column in ["published_on", "asof_date", "planned_at", "load_ts", "target_review_date", "horizon_end_date"]:
+        if column in out.columns:
+            out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
     with db_session() as (_, cur):
         pairs = (
-            df[["asof_date", "setup_id"]]
+            out[["asof_date", "setup_id"]]
             .dropna()
             .drop_duplicates()
             .to_dict(orient="records")
@@ -534,7 +652,7 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
                 ),
             )
     upsert_to_db(
-        df,
+        out,
         PORTFOLIO_TABLE,
         unique_keys=["published_on", "setup_id", "symbol", "unique_id"],
         timescaledb_column="published_on",
@@ -573,6 +691,7 @@ def render_text_table(df: pd.DataFrame) -> str:
         ("rank", 4),
         ("symbol", 14),
         ("setup_id", 22),
+        ("bucket", 14),
         ("status", 10),
         ("reason", 18),
         ("approved_inr", 12),
@@ -590,6 +709,7 @@ def render_text_table(df: pd.DataFrame) -> str:
             _text_cell(row.get("plan_rank"))[:4],
             _text_cell(row.get("symbol"))[:14],
             _text_cell(row.get("setup_id"))[:22],
+            _text_cell(row.get("thesis_bucket"))[:14],
             _text_cell(row.get("portfolio_status"))[:10],
             _text_cell(row.get("portfolio_reason"))[:18],
             _text_cell(row.get("approved_allocation_inr"))[:12],

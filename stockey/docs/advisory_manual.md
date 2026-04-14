@@ -98,6 +98,10 @@ This loop:
 4. writes live watch alerts when entry zones or invalidations are hit
 5. rewrites a simple static HTML/JSON dashboard in `live_dashboard/`
 
+Separately, the cron file also refreshes the static dashboard every 15 minutes on
+weekdays. That keeps the page current after advisory or portfolio changes even when
+the watch loop is not running continuously.
+
 The live router currently prioritizes aggressively but does not impose a default hard cap:
 
 - symbols that remain on the advisory watch path continue to be monitored

@@ -35,21 +35,29 @@ That creates or refreshes the project venv, creates `logs/cron`, and installs `g
 
 ## Scheduled runs
 
-The repo now ships with a ready cron file at `config/stockey.crontab`.
+The repo now ships with a cron template at `config/stockey.crontab.template`.
+`python builder.py` renders the runnable file at `config/stockey.generated.crontab`.
 
 Install it with system cron:
 
 ```sh
 mkdir -p /home/rane/code/stockey/logs/cron
-crontab /home/rane/code/stockey/config/stockey.crontab
+python builder.py
+crontab /home/rane/code/stockey/config/stockey.generated.crontab
 ```
 
 Or run it with `go-crond`:
 
 ```sh
 mkdir -p /home/rane/code/stockey/logs/cron
-./go-crond config/stockey.crontab --allow-unprivileged
+python builder.py
+./go-crond config/stockey.generated.crontab --allow-unprivileged
 ```
+
+Important:
+
+- `go-crond` reads the generated file in system-crontab format in this setup, so each scheduled line includes the username field.
+- If that field is missing, `go-crond` will treat `cd` as the username and the jobs will not execute even though the runner starts.
 
 Current schedule:
 
@@ -223,10 +231,17 @@ Commands:
 Generate and serve the lightweight dashboard with:
 
 ```sh
+python -m advisory.live_dashboard --output-dir live_dashboard
 python -m http.server --directory live_dashboard 8000
 ```
 
-If the continuous watch loop is already running, it keeps rewriting:
+`python -m http.server` only serves files. The dashboard files themselves are refreshed by:
+
+- `python -m advisory.live_dashboard --output-dir live_dashboard`
+- `./all_watchers.sh` during watch cycles
+- weekday cron refreshes when `./go-crond config/stockey.crontab --allow-unprivileged` is running
+
+The dashboard files are:
 
 - `live_dashboard/index.html`
 - `live_dashboard/dashboard.json`

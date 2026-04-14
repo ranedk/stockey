@@ -59,6 +59,15 @@ def ensure_lifecycle_tables() -> None:
                 overlap_group TEXT,
                 stop_price DOUBLE PRECISION,
                 invalidation_price DOUBLE PRECISION,
+                thesis_bucket TEXT,
+                bucket_reason TEXT,
+                expected_horizon_days BIGINT,
+                target_review_date TIMESTAMPTZ,
+                horizon_end_date TIMESTAMPTZ,
+                exit_event_rules_json TEXT,
+                active_exit_condition TEXT,
+                exit_condition_status TEXT,
+                bucket_status_note TEXT,
                 next_action TEXT,
                 next_action_reason TEXT,
                 context_snapshot_json TEXT,
@@ -67,6 +76,19 @@ def ensure_lifecycle_tables() -> None:
             )
             """
         )
+        lifecycle_column_defs = {
+            "thesis_bucket": "TEXT",
+            "bucket_reason": "TEXT",
+            "expected_horizon_days": "BIGINT",
+            "target_review_date": "TIMESTAMPTZ",
+            "horizon_end_date": "TIMESTAMPTZ",
+            "exit_event_rules_json": "TEXT",
+            "active_exit_condition": "TEXT",
+            "exit_condition_status": "TEXT",
+            "bucket_status_note": "TEXT",
+        }
+        for column, sql_type in lifecycle_column_defs.items():
+            cur.execute(f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {REBALANCE_TABLE} (
@@ -235,6 +257,27 @@ def classify_position(
     return ("open", "Position remains within expected risk bounds.", "hold", "No lifecycle trigger fired.")
 
 
+def derive_bucket_lifecycle_fields(row: pd.Series, monitor_date: pd.Timestamp, next_action: str) -> tuple[str | None, str, str]:
+    thesis_bucket = str(row.get("thesis_bucket") or "").upper()
+    target_review_date = pd.to_datetime(row.get("target_review_date"), utc=True, errors="coerce")
+    horizon_end_date = pd.to_datetime(row.get("horizon_end_date"), utc=True, errors="coerce")
+
+    if next_action in {"exit_invalidation", "exit_stop"}:
+        active = "INVALIDATION_HIT" if next_action == "exit_invalidation" else "STOP_HIT"
+        return active, "triggered", "Exit event overrides target and horizon policy."
+    if thesis_bucket == "TIME_HORIZON" and pd.notna(horizon_end_date):
+        if monitor_date >= horizon_end_date.normalize():
+            return "HORIZON_REVIEW", "review_due", "The planned holding window has ended and needs review."
+        return None, "within_window", "Still inside the intended holding window."
+    if thesis_bucket == "TARGET" and pd.notna(target_review_date):
+        if monitor_date >= target_review_date.normalize():
+            return "TARGET_REVIEW", "review_due", "The target review date has been reached."
+        return None, "awaiting_target_review", "Target bucket remains active until review date or exit event."
+    if thesis_bucket == "DATA_DEPENDENT":
+        return None, "evidence_active", "Continue while evidence remains supportive and no exit event fires."
+    return None, "active", "Bucket remains active."
+
+
 def build_lifecycle_outputs(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -304,12 +347,22 @@ def build_lifecycle_outputs(
                 "overlap_group": row.get("overlap_group"),
                 "stop_price": pd.to_numeric(row.get("stop_price"), errors="coerce"),
                 "invalidation_price": pd.to_numeric(row.get("invalidation_price"), errors="coerce"),
+                "thesis_bucket": row.get("thesis_bucket"),
+                "bucket_reason": row.get("bucket_reason"),
+                "expected_horizon_days": pd.to_numeric(row.get("expected_horizon_days"), errors="coerce"),
+                "target_review_date": pd.to_datetime(row.get("target_review_date"), utc=True, errors="coerce"),
+                "horizon_end_date": pd.to_datetime(row.get("horizon_end_date"), utc=True, errors="coerce"),
+                "exit_event_rules_json": row.get("exit_event_rules_json"),
                 "next_action": next_action,
                 "next_action_reason": action_reason,
                 "context_snapshot_json": json.dumps(context, ensure_ascii=False, default=str, sort_keys=True),
                 "load_ts": pd.Timestamp.utcnow(),
             }
         )
+        active_exit_condition, exit_condition_status, bucket_status_note = derive_bucket_lifecycle_fields(enriched, monitor_date, next_action)
+        rows[-1]["active_exit_condition"] = active_exit_condition
+        rows[-1]["exit_condition_status"] = exit_condition_status
+        rows[-1]["bucket_status_note"] = bucket_status_note
 
         if next_action != "hold":
             actions.append(
@@ -348,6 +401,18 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
                 lifecycle_out[column] = pd.to_numeric(lifecycle_out[column], errors="coerce")
         if "days_held" in lifecycle_out.columns:
             lifecycle_out["days_held"] = pd.to_numeric(lifecycle_out["days_held"], errors="coerce").astype("Int64")
+        if "expected_horizon_days" in lifecycle_out.columns:
+            lifecycle_out["expected_horizon_days"] = pd.to_numeric(lifecycle_out["expected_horizon_days"], errors="coerce").astype("Int64")
+        for column in [
+            "asof_date",
+            "published_on",
+            "entry_date",
+            "target_review_date",
+            "horizon_end_date",
+            "load_ts",
+        ]:
+            if column in lifecycle_out.columns:
+                lifecycle_out[column] = pd.to_datetime(lifecycle_out[column], utc=True, errors="coerce")
         upsert_to_db(
             lifecycle_out,
             LIFECYCLE_TABLE,

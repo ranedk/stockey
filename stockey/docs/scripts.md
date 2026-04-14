@@ -139,7 +139,8 @@ python -m data.dhanlive.auth_cli clear-cache
 
 Recommended scheduler file:
 
-- `config/stockey.crontab`
+- `config/stockey.crontab.template`
+- `config/stockey.generated.crontab`
 
 It schedules:
 
@@ -393,9 +394,9 @@ Recommended operator flow:
 
 Behavior:
 
-- runs the full data refresh
-- runs `advisory.model_training_runner`
 - runs `advisory.master_pipeline --skip-downloads`
+- expects data and model artifacts to have been refreshed separately through `./complete_data.sh` and `./all_ml.sh`
+- writes the advisory outputs consumed by the portfolio view and live dashboard
 
 Continuous-watch flow:
 
@@ -415,6 +416,7 @@ Behavior:
 - writes live price alerts like `ENTRY_ZONE_HIT` and `INVALIDATION_HIT`
 - rewrites `live_dashboard/index.html` and `live_dashboard/dashboard.json`
 - publishes cycle summaries and alert payloads over Redis pub-sub
+- weekday cron also refreshes the static dashboard every 15 minutes outside the watcher loop
 
 Notifier behavior:
 

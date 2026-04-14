@@ -92,7 +92,8 @@ def load_setup_regime(asof_date: pd.Timestamp | None) -> dict[str, Any] | None:
         """
         SELECT *
         FROM advisory_market_regime
-        WHERE asof_date = %s
+        WHERE asof_date <= %s
+        ORDER BY asof_date DESC
         LIMIT 1
         """,
         params=(asof_date,),
@@ -109,7 +110,8 @@ def load_market_overlay(asof_date: pd.Timestamp | None) -> dict[str, Any] | None
         """
         SELECT *
         FROM advisory_market_overlay_daily
-        WHERE asof_date = %s
+        WHERE asof_date <= %s
+        ORDER BY asof_date DESC
         LIMIT 1
         """,
         params=(asof_date,),

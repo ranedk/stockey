@@ -6,12 +6,15 @@ import subprocess  # nosec B603, B404
 import sys
 import urllib.request
 from pathlib import Path
+import getpass
 
 
 GO_CROND_REPO = "webdevops/go-crond"
 GO_CROND_DEFAULT_VERSION = "22.9.1"
 PROJECT_ROOT = Path(__file__).resolve().parent
 CRON_LOG_DIR = PROJECT_ROOT / "logs" / "cron"
+CRON_TEMPLATE_PATH = PROJECT_ROOT / "config" / "stockey.crontab.template"
+GENERATED_CRONTAB_PATH = PROJECT_ROOT / "config" / "stockey.generated.crontab"
 
 
 def _log(message: str) -> None:
@@ -132,6 +135,25 @@ def ensure_runtime_directories() -> None:
     _log(f"Ensured runtime directory: {CRON_LOG_DIR}")
 
 
+def render_crontab() -> str:
+    if not CRON_TEMPLATE_PATH.exists():
+        raise FileNotFoundError(f"Missing cron template: {CRON_TEMPLATE_PATH}")
+    stockey_user = os.getenv("STOCKEY_CRON_USER") or getpass.getuser()
+    rendered = CRON_TEMPLATE_PATH.read_text(encoding="utf-8")
+    replacements = {
+        "{{STOCKEY_USER}}": stockey_user,
+        "{{STOCKEY_DIR}}": str(PROJECT_ROOT),
+        "{{LOG_DIR}}": str(CRON_LOG_DIR),
+        "{{GENERATED_CRONTAB}}": str(GENERATED_CRONTAB_PATH),
+    }
+    for needle, value in replacements.items():
+        rendered = rendered.replace(needle, value)
+    GENERATED_CRONTAB_PATH.write_text(rendered, encoding="utf-8")
+    GENERATED_CRONTAB_PATH.chmod(0o600)
+    _log(f"Rendered cron file: {GENERATED_CRONTAB_PATH}")
+    return str(GENERATED_CRONTAB_PATH)
+
+
 def install_go_crond():
     target_dir = resolve_go_crond_install_dir()
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -178,6 +200,7 @@ def setup_env():
     install_requirements(original_dir, "stockey")
     ensure_runtime_directories()
     install_go_crond()
+    render_crontab()
     vscode_config(original_dir, "stockey")
     venv_config(original_dir, "stockey")
     # for service in SERVICES:

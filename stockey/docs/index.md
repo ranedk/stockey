@@ -133,7 +133,7 @@ Primary operator commands:
 
 Scheduled operator flow:
 
-- install `config/stockey.crontab` with `crontab config/stockey.crontab` or run it with `./go-crond config/stockey.crontab --allow-unprivileged`
+- run `python builder.py` to render `config/stockey.generated.crontab`, then install it with `crontab config/stockey.generated.crontab` or run it with `./go-crond config/stockey.generated.crontab --allow-unprivileged`
 - let `complete_data.sh` handle the once-daily broad refresh
 - let `all_watchers.sh` run every `10` minutes during market hours
 - let `all_ml.sh` run once daily after market close

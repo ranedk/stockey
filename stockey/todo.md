@@ -218,6 +218,56 @@ Integration points:
 - `advisory.event_meta_model`: join exchange features on event anchor date as point-in-time predictors
 - `advisory.llm_event_evaluator`: include recent structured exchange events and exchange features in context so the LLM can classify event significance, materiality, surprise, direction, and expected decay
 - `advisory.adversarial_review`: penalize or veto when insider selling, short pressure, or adverse exchange events contradict a setup
+
+### 5. Add thesis buckets, horizon policy, and exit-event policy
+
+Problem:
+
+- `advisory_portfolio_orders` currently tells us allocation, priority, and invalidation, but not the intended holding contract.
+- Some ideas are target-driven, some are explicitly time-window trades, and some should stay live only while the data continues to support them.
+- The dashboard should show not just what was selected, but why it belongs in a given portfolio bucket and what would exit it.
+
+Target:
+
+- divide portfolio ideas into three thesis buckets:
+  - `TARGET`
+  - `TIME_HORIZON`
+  - `DATA_DEPENDENT`
+- add explicit exit-event rules that override target/time bucket behavior
+- surface bucket rationale, screener provenance, and exit conditions in the dashboard and lifecycle views
+
+Policy model:
+
+- target bucket:
+  - valuation or rerating driven
+  - fields: `target_price`, `target_basis`, `target_confidence`, `target_review_date`
+- time-horizon bucket:
+  - defined event/trade window
+  - fields: `expected_horizon_days`, `horizon_type`, `horizon_end_date`, `horizon_basis`
+- data-dependent bucket:
+  - thesis remains live while evidence remains supportive
+  - fields: `continue_while`, `key_monitor_fields`, `recheck_frequency`
+- exit-event layer:
+  - invalidation hit
+  - stop hit
+  - thesis contradiction
+  - adverse insider / exchange-event cluster
+  - regime deterioration
+  - liquidity breakdown
+
+Implementation slices:
+
+1. Add bucket and exit-policy columns to `advisory_portfolio_orders`.
+2. Add lifecycle fields so exit-event triggers and bucket state are visible in `advisory_position_lifecycle`.
+3. Add first-pass deterministic bucket classification using setup family, holding horizon note, event context, and invalidation guidance.
+4. Show bucket, bucket reason, exit-policy summary, and screener provenance in the live dashboard.
+5. Later: allow richer target-price and horizon inputs from valuation/event models instead of only deterministic defaults.
+
+Do not:
+
+- force all ideas into target-price logic
+- let bucket type replace invalidation/stop/event exits
+- let the LLM invent unconstrained bucket policy without deterministic fields persisted downstream
 - `advisory.rule_engine`: allow optional setup rules for insider accumulation, block-deal accumulation, or short-pressure avoidance
 - `advisory.risk_engine`: reduce sizing when short pressure or insider distribution is elevated; optionally boost review priority for insider accumulation
 - `advisory.watchlist_builder` and `advisory.continuous_watch`: prioritize watched symbols with fresh exchange-event activity
