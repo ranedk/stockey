@@ -6,7 +6,6 @@ from datetime import date
 from io import StringIO
 
 import pandas as pd
-import redis
 import requests
 import urllib3
 from bs4 import BeautifulSoup
@@ -15,21 +14,17 @@ from environs import Env
 
 from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_dynamic_headers, get_with_retries, hidden_inputs_to_dict
-from utils.sync import get_db_max_date, get_redis_client
+from utils.sync import get_db_max_date
 
 env = Env()
 env.read_env()
-
-REDIS_HOST = env("REDIS_HOST")
-REDIS_PORT = env("REDIS_PORT")
-REDIS_SET = "cpi:downloaded"
-rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 HEADERS = get_dynamic_headers()
 NEW_CPI_START = date(2025, 1, 1)
 PAGE_LOG_INTERVAL = 10
 MONTH_RETRY_ATTEMPTS = 3
 MONTH_RETRY_SLEEP_SECONDS = 2
+CPI_LOOKBACK_DAYS = max(env.int("MOSPI_CPI_LOOKBACK_DAYS", 365), 1)
 
 
 def first_of_month(d: date) -> date:
@@ -62,8 +57,12 @@ def load_existing_cpi_months() -> set[date]:
             WHERE cpi_for_month IS NOT NULL
             """
         )
-    except Exception:
-        return set()
+    except Exception as exc:
+        message = str(exc).lower()
+        if exc.__class__.__name__ in {"UndefinedTable", "UndefinedColumn"} or "does not exist" in message:
+            print(f"[cpi] mospi_cpi not available yet while checking existing months: {exc}", flush=True)
+            return set()
+        raise
 
     if df.empty or "cpi_for_month" not in df.columns:
         return set()
@@ -89,15 +88,6 @@ def download_cpi_month(month_start: date):
     if month_start < NEW_CPI_START:
         return download_legacy_cpi_data(month_start, month_end)
     return download_modern_cpi_data(month_start, month_end)
-
-
-def mark_month_downloaded(month_start: date) -> None:
-    rop.sadd(REDIS_SET, month_start.isoformat())
-
-
-def mark_existing_months_downloaded(months: set[date]) -> None:
-    if months:
-        rop.sadd(REDIS_SET, *[month.isoformat() for month in sorted(months)])
 
 
 def download_legacy_cpi_data(from_date: date, to_date: date):
@@ -338,15 +328,13 @@ def sync_cpi_data(
     1. Build the list of months in scope.
     2. Check which months already exist in PostgreSQL.
     3. Download only missing months, one month at a time.
-    4. Mark each completed month in Redis to keep the cursor warm.
     """
     today = date.today()
     last_month = first_of_month(to_date or (today - relativedelta(months=1)))
-    start_month = first_of_month(from_date or (today - relativedelta(years=10)))
+    start_month = first_of_month(from_date or (today - relativedelta(days=CPI_LOOKBACK_DAYS)))
 
     all_months = list(month_iter(start_month, last_month))
     existing_months = load_existing_cpi_months()
-    mark_existing_months_downloaded(existing_months)
     latest_db_month = get_db_max_date("mospi_cpi", date_column="cpi_for_month")
     missing_months = all_months if force else [m for m in all_months if m not in existing_months]
 
@@ -375,7 +363,6 @@ def sync_cpi_data(
                     f"(attempt {attempt}/{MONTH_RETRY_ATTEMPTS})"
                 )
                 download_cpi_month(month_start)
-                mark_month_downloaded(month_start)
                 print(f"[{index}/{len(missing_months)}] Completed CPI for {month_label(month_start)}")
                 completed = True
                 break

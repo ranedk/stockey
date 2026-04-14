@@ -59,8 +59,4 @@ python -m features.price_daily
 
 Do not run the first three in parallel. They touch the same derived identity tables.
 
-For the legacy NSE-derived daily watchlist/reference processing, the same sequence is wrapped by:
-
-```sh
-./all_daily_derivations.sh
-```
+For the current operator flow, use `./complete_data.sh` for the broad refresh or run the individual Python modules directly when debugging identity issues.

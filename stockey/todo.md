@@ -6,10 +6,12 @@ This file is the current roadmap for the live advisory stack. It is not a histor
 
 ## Primary operator paths
 
-- Full production flow: `./all_full_advisory.sh`
+- Downloaders only: `./all_downloaders.sh`
+- Parsers only: `./all_parsers.sh`
+- Download + parse: `./complete_data.sh`
 - Advisory only: `./all_advisory.sh`
-- Model prep and training: `./all_model_training.sh`
-- Continuous monitoring: `./all_continuous_watch.sh --loop`
+- Model prep and training: `./all_ml.sh`
+- Continuous monitoring: `./all_watchers.sh --loop`
 
 Use `python -m advisory.pipeline` only for stage-level debugging and targeted reruns.
 
@@ -81,7 +83,7 @@ Done already:
 - `advisory.event_model_data_prep`
 - `advisory.training_universe`
 - `EVENT_MODEL_TRAINING_V1`
-- `all_model_training.sh`
+- `all_ml.sh`
 
 Still needed:
 

@@ -101,12 +101,31 @@ def load_exchange_events(
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     df = sql_to_df(
         f"""
-        SELECT *
+        SELECT
+            event_id,
+            event_source,
+            event_type,
+            symbol,
+            company_master_id,
+            event_date,
+            known_on,
+            disclosure_date,
+            participant,
+            side,
+            quantity,
+            price,
+            value_inr,
+            holding_pct_before,
+            holding_pct_after,
+            event_summary
         FROM {EVENTS_TABLE}
         {where_sql}
         ORDER BY known_on, symbol, event_source
         """,
         params=params or None,
+        retries=4,
+        statement_timeout_ms=0,
+        chunksize=50000,
     )
     if df.empty:
         return df
@@ -149,10 +168,19 @@ def compute_exchange_feature_columns(events: pd.DataFrame, dates: pd.DataFrame) 
     dates["asof_date"] = normalize_timestamp(dates["asof_date"])
     rows: list[dict[str, Any]] = []
     symbols = events["symbol"].dropna().drop_duplicates().sort_values().tolist()
+    print(
+        f"[advisory.exchange_features] compute start dates={len(dates)} symbols={len(symbols)} events={len(events)}",
+        flush=True,
+    )
     for symbol in symbols:
         symbol_events = events[events["symbol"].eq(symbol)].sort_values("known_on")
         if symbol_events.empty:
             continue
+        if len(rows) % 250 == 0:
+            print(
+                f"[advisory.exchange_features] progress generated_rows={len(rows)} current_symbol={symbol}",
+                flush=True,
+            )
         for asof_date in dates["asof_date"]:
             known = symbol_events[symbol_events["known_on"] <= asof_date]
             if known.empty:
@@ -234,7 +262,15 @@ def build_exchange_features(
         return pd.DataFrame()
     start_date = dates["asof_date"].min() - pd.Timedelta(days=120)
     end_date = dates["asof_date"].max() + pd.Timedelta(days=14)
+    print(
+        f"[advisory.exchange_features] load start start_date={start_date} end_date={end_date} symbols={0 if not symbols else len(symbols)} rebuild={rebuild}",
+        flush=True,
+    )
     events = load_exchange_events(start_date=start_date, end_date=end_date, symbols=symbols)
+    print(
+        f"[advisory.exchange_features] load done events={len(events)} unique_symbols={0 if events.empty else int(events['symbol'].nunique())}",
+        flush=True,
+    )
     return compute_exchange_feature_columns(events, dates)
 
 

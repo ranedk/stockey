@@ -2,7 +2,6 @@ import time
 from datetime import date
 
 import pandas as pd
-import redis
 import requests
 import urllib3
 from bs4 import BeautifulSoup
@@ -10,18 +9,10 @@ from environs import Env
 
 from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_dynamic_headers
-from utils.sync import get_redis_client, get_redis_set_members
 from utils.date import last_of_month
 
 env = Env()
 env.read_env()
-
-REDIS_HOST = env("REDIS_HOST")
-REDIS_PORT = env("REDIS_PORT")
-REDIS_SET = "wpi:downloaded"
-REDIS_PROGRESS_PREFIX = "wpi:item_downloaded"
-rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
-
 
 HEADERS = get_dynamic_headers()
 CATALOG_URL = "https://eaindustry.nic.in/default.asp"
@@ -30,10 +21,7 @@ ITEM_POST_URL = "https://eaindustry.nic.in/display_data_201112.asp"
 MAX_ITEM_ATTEMPTS = 5
 REQUEST_TIMEOUT = 120
 REQUEST_SLEEP_SECONDS = 2.0
-
-
-def progress_key(year: int) -> str:
-    return f"{REDIS_PROGRESS_PREFIX}:{year}"
+WPI_LOOKBACK_DAYS = max(env.int("EAINDUSTRY_WPI_LOOKBACK_DAYS", 365), 1)
 
 
 def expected_month_count_for_year(year: int, today: date | None = None) -> int:
@@ -72,6 +60,33 @@ def load_completed_items(year: int, *, expected_months: int) -> set[str]:
     }
 
 
+def parse_catalog_items(html: bytes | str) -> list[list[str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[list[str]] = []
+    seen: set[str] = set()
+
+    for cname_input in soup.find_all("input", {"name": "cname"}):
+        cname = str(cname_input.get("value") or "").strip()
+        if not cname or cname in seen:
+            continue
+
+        commname_input = None
+        for sibling in cname_input.find_all_next("input", {"name": "commname"}, limit=3):
+            commname_input = sibling
+            break
+        if commname_input is None and cname_input.parent is not None:
+            commname_input = cname_input.parent.find("input", {"name": "commname"})
+
+        commname = str(commname_input.get("value") or "").strip() if commname_input else ""
+        if not commname or not commname.startswith("("):
+            continue
+
+        results.append([cname, commname, commname])
+        seen.add(cname)
+
+    return results
+
+
 def bootstrap_wpi_session() -> tuple[requests.Session, dict[str, str]]:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     session = requests.Session()
@@ -93,17 +108,7 @@ def fetch_wpi_catalog(year: int) -> tuple[requests.Session, dict[str, str], list
         timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
-    soup = BeautifulSoup(response.content, "html.parser")
-
-    results: list[list[str]] = []
-    for li in soup.select("ul.ul-choose-item li"):
-        cname_input = li.find("input", {"name": "cname"})
-        commname_input = li.find("input", {"name": "commname"})
-        if cname_input and commname_input:
-            cname = str(cname_input.get("value") or "").strip()
-            commname = str(commname_input.get("value") or "").strip()
-            if cname and commname and commname.startswith("("):
-                results.append([cname, commname, commname])
+    results = parse_catalog_items(response.content)
     return session, cookies, results
 
 
@@ -156,9 +161,6 @@ def persist_wpi_item(df: pd.DataFrame, *, year: int, cname: str) -> None:
     if df.empty:
         return
     upsert_to_db(df, "eaindustry_wpi", unique_keys=["date", "cname"], timescaledb_column="date")
-    for rdate in df["date"].dropna().tolist():
-        rop.sadd(REDIS_SET, pd.Timestamp(rdate).strftime("%Y-%m-%d"))
-    rop.sadd(progress_key(year), cname)
 
 
 def sync_wpi_for_year(year: int, *, today: date | None = None) -> dict[str, object]:
@@ -167,12 +169,17 @@ def sync_wpi_for_year(year: int, *, today: date | None = None) -> dict[str, obje
     if expected_months <= 0:
         return {"year": year, "status": "skipped", "reason": "no_completed_months"}
 
+    print(
+        f"WPI year {year}: expecting {expected_months} completed month(s) from DB-backed progress",
+        flush=True,
+    )
     session, cookies, items = fetch_wpi_catalog(year)
-    redis_completed = get_redis_set_members(rop, progress_key(year))
     db_completed = load_completed_items(year, expected_months=expected_months)
-    completed = {str(value).strip() for value in redis_completed.union(db_completed) if str(value).strip()}
-    for cname in completed:
-        rop.sadd(progress_key(year), cname)
+    completed = {str(value).strip() for value in db_completed if str(value).strip()}
+    print(
+        f"WPI year {year}: catalog items={len(items)} completed_items={len(completed)}",
+        flush=True,
+    )
 
     if len(completed) >= len(items):
         return {
@@ -192,27 +199,29 @@ def sync_wpi_for_year(year: int, *, today: date | None = None) -> dict[str, obje
         cname = str(item[0]).strip()
         if cname in completed:
             skipped_count += 1
-            print(f"Done for {year}: {item[1]} (resume)")
+            print(f"Done for {year}: {item[1]} (resume)", flush=True)
             continue
 
-        print(f"Downloading WPI for {year} [{position}/{len(items)}]: {item[1]}")
+        print(f"Downloading WPI for {year} [{position}/{len(items)}]: {item[1]}", flush=True)
         last_error: Exception | None = None
         for attempt in range(1, MAX_ITEM_ATTEMPTS + 1):
             try:
                 df = download_wpi_item(year=year, item=item, session=session, cookies=cookies)
                 persist_wpi_item(df, year=year, cname=cname)
-                completed.add(cname)
+                refreshed = load_completed_items(year, expected_months=expected_months)
+                if cname in refreshed:
+                    completed.add(cname)
                 downloaded_count += 1
                 last_error = None
                 time.sleep(0.2)
                 break
             except (requests.RequestException, ValueError) as exc:
                 last_error = exc
-                print(f"WPI retry {attempt}/{MAX_ITEM_ATTEMPTS} for {year} {item[1]}: {exc}")
+                print(f"WPI retry {attempt}/{MAX_ITEM_ATTEMPTS} for {year} {item[1]}: {exc}", flush=True)
                 time.sleep(REQUEST_SLEEP_SECONDS * attempt)
                 session, cookies = bootstrap_wpi_session()
         if last_error is not None:
-            print(f"WPI skip after {MAX_ITEM_ATTEMPTS} attempts for {year}: {item[1]} -> {last_error}")
+            print(f"WPI skip after {MAX_ITEM_ATTEMPTS} attempts for {year}: {item[1]} -> {last_error}", flush=True)
             failed.append({"cname": cname, "name": item[1], "error": str(last_error)})
 
     return {
@@ -228,12 +237,14 @@ def sync_wpi_for_year(year: int, *, today: date | None = None) -> dict[str, obje
 
 def sync_wpi() -> list[dict[str, object]]:
     today = date.today()
+    earliest_date = today - pd.Timedelta(days=WPI_LOOKBACK_DAYS)
+    start_year = earliest_date.year
     results: list[dict[str, object]] = []
-    for year in range(2014, today.year + 1):
+    for year in range(start_year, today.year + 1):
         expected_months = expected_month_count_for_year(year, today=today)
         if expected_months <= 0:
             continue
-        print(f"Checking for {last_of_month(date(year, expected_months, 1))}")
+        print(f"Checking for {last_of_month(date(year, expected_months, 1))}", flush=True)
         results.append(sync_wpi_for_year(year, today=today))
     return results
 

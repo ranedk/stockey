@@ -219,27 +219,27 @@
       ]
     },
     {
-      "name": "run_full_advisory_flow",
+      "name": "run_complete_data",
       "category": "orchestration",
-      "description": "Run model training if ready, then the advisory pipeline, then print the portfolio summary.",
-      "command": ["bash", "all_full_advisory.sh"],
+      "description": "Run all downloader and parser modules in one combined data refresh.",
+      "command": ["bash", "complete_data.sh"],
       "read_only": false,
       "examples": [
         {
           "args": [],
-          "description": "Run the full model-training plus advisory operator flow."
+          "description": "Run the combined downloader and parser flow."
         },
         {
-          "args": ["--skip-model-training", "--skip-downloads"],
-          "description": "Run only the advisory pipeline and final portfolio summary."
+          "args": ["--continue-on-error"],
+          "description": "Continue through later data-refresh modules even if one fails."
         }
       ]
     },
     {
-      "name": "run_continuous_watch",
+      "name": "run_all_watchers",
       "category": "orchestration",
       "description": "Run the lightweight continuous watch loop for active watchlist names and open positions, with OHLCV, announcements, ET/news, Redis pub-sub updates, and static dashboard writes.",
-      "command": ["bash", "all_continuous_watch.sh"],
+      "command": ["bash", "all_watchers.sh"],
       "read_only": false,
       "examples": [
         {
@@ -253,19 +253,53 @@
       ]
     },
     {
-      "name": "run_live_notifier",
+      "name": "run_all_downloaders",
       "category": "orchestration",
-      "description": "Subscribe to the continuous-watch Redis channels and write a human-readable operator feed into live_dashboard files.",
-      "command": ["bash", "all_live_notifier.sh"],
+      "description": "Run the raw downloader modules only, without parser modules.",
+      "command": ["bash", "all_downloaders.sh"],
       "read_only": false,
       "examples": [
         {
           "args": [],
-          "description": "Run the live notifier indefinitely."
+          "description": "Run only the downloader phase."
         },
         {
-          "args": ["--duration-seconds", "600"],
-          "description": "Run the live notifier for 10 minutes."
+          "args": ["--continue-on-error"],
+          "description": "Continue through later downloader modules even if one fails."
+        }
+      ]
+    },
+    {
+      "name": "run_all_parsers",
+      "category": "orchestration",
+      "description": "Run the parser modules only, assuming the raw files are already present.",
+      "command": ["bash", "all_parsers.sh"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": [],
+          "description": "Run only the parser phase."
+        },
+        {
+          "args": ["--continue-on-error"],
+          "description": "Continue through later parser modules even if one fails."
+        }
+      ]
+    },
+    {
+      "name": "run_all_advisory",
+      "category": "orchestration",
+      "description": "Run the advisory pipeline and portfolio generation without the raw download phase.",
+      "command": ["bash", "all_advisory.sh"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": [],
+          "description": "Run the normal advisory and portfolio flow."
+        },
+        {
+          "args": ["--date", "2026-04-13"],
+          "description": "Run the advisory flow for a specific as-of date."
         }
       ]
     },
@@ -554,10 +588,10 @@
       ]
     },
     {
-      "name": "run_all_model_training",
+      "name": "run_all_ml",
       "category": "analysis",
       "description": "Run event-model prep, check label coverage for the requested horizon, then train and score only when the readiness gate passes.",
-      "command": ["bash", "all_model_training.sh"],
+      "command": ["bash", "all_ml.sh"],
       "read_only": false,
       "examples": [
         {

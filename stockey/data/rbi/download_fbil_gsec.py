@@ -23,6 +23,7 @@ rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 
 HEADERS = get_dynamic_headers()
+FBIL_GSEC_LOOKBACK_DAYS = max(env.int("RBI_FBIL_GSEC_LOOKBACK_DAYS", 365), 1)
 
 
 def get_cookies():
@@ -159,7 +160,7 @@ def download_all_gsec_data():
     if from_date:
         from_date = datetime.strptime(from_date, "%Y-%m-%d")
     else:
-        from_date = datetime(2014, 1, 1)
+        from_date = datetime.combine(date.today(), datetime.min.time()) - pd.Timedelta(days=FBIL_GSEC_LOOKBACK_DAYS)
 
     for fdate in daterange(from_date, today):
         download_gsec(fdate, cookies=cookies)

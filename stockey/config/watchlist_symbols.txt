@@ -1,4 +1,4 @@
-# Symbols used by `all_daily_derivations.sh`.
+# Symbols used by advisory watch and symbol-scoped refresh flows.
 # If this file is empty, the script falls back to `config/tracked_symbols.txt`.
 #
 # One symbol per line, for example:

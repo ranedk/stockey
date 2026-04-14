@@ -68,7 +68,8 @@ def set_redis_cursor(redis_client: redis.Redis, key: str, value: datetime) -> No
 def get_redis_set_members(redis_client: redis.Redis, key: str) -> set[str]:
     try:
         return set(redis_client.smembers(key))
-    except Exception:
+    except Exception as exc:
+        print(f"[utils.sync] failed to load redis set members key={key}: {exc.__class__.__name__}: {exc}", flush=True)
         return set()
 
 

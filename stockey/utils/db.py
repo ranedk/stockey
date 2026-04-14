@@ -50,7 +50,14 @@ def qualified_identifier(name: str) -> sql.Identifier:
 
 def _is_transient_db_error(exc: Exception) -> bool:
     name = exc.__class__.__name__
-    if name in {"QueryCanceled", "OperationalError", "InterfaceError"}:
+    if name in {
+        "QueryCanceled",
+        "OperationalError",
+        "InterfaceError",
+        "DeadlockDetected",
+        "SerializationFailure",
+        "LockNotAvailable",
+    }:
         return True
     message = str(exc).lower()
     transient_markers = [
@@ -61,6 +68,9 @@ def _is_transient_db_error(exc: Exception) -> bool:
         "terminating connection",
         "could not connect",
         "timeout expired",
+        "deadlock detected",
+        "could not serialize access",
+        "lock not available",
     ]
     return any(marker in message for marker in transient_markers)
 
@@ -493,7 +503,7 @@ def _fetch_sql_to_df_once(
     """
     with db_session() as (_, cur):
         timeout_ms = SQL_TO_DF_STATEMENT_TIMEOUT_MS if statement_timeout_ms is None else int(statement_timeout_ms)
-        if timeout_ms and timeout_ms > 0:
+        if timeout_ms is not None:
             cur.execute("SET LOCAL statement_timeout = %s", (int(timeout_ms),))
         cur.execute(sql_query, params or ())
         columns = [desc[0] for desc in cur.description] if cur.description else []

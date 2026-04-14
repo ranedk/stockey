@@ -12,6 +12,26 @@ from utils.sync import parse_datetime_arg
 
 
 TABLE_NAME = "advisory_exchange_events"
+EVENT_COLUMNS = [
+    "event_id",
+    "event_source",
+    "event_type",
+    "symbol",
+    "company_master_id",
+    "event_date",
+    "known_on",
+    "disclosure_date",
+    "participant",
+    "side",
+    "quantity",
+    "price",
+    "value_inr",
+    "holding_pct_before",
+    "holding_pct_after",
+    "event_summary",
+    "raw_json",
+    "load_ts",
+]
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -74,7 +94,9 @@ def _numeric(series: pd.Series | None) -> pd.Series:
 
 
 def _normalize_side(value: Any) -> str | None:
-    text = str(value or "").strip().upper()
+    if pd.isna(value):
+        return None
+    text = str(value).strip().upper()
     if text in {"BUY", "B", "PURCHASE", "ACQUIRE", "ACQUISITION"}:
         return "BUY"
     if text in {"SELL", "S", "SALE", "DISPOSE", "DISPOSAL"}:
@@ -110,33 +132,13 @@ def _finish_events(df: pd.DataFrame) -> pd.DataFrame:
     ]
     df["event_id"] = [_event_id(row) for row in df.to_dict(orient="records")]
     df["load_ts"] = pd.Timestamp.utcnow()
-    ordered = [
-        "event_id",
-        "event_source",
-        "event_type",
-        "symbol",
-        "company_master_id",
-        "event_date",
-        "known_on",
-        "disclosure_date",
-        "participant",
-        "side",
-        "quantity",
-        "price",
-        "value_inr",
-        "holding_pct_before",
-        "holding_pct_after",
-        "event_summary",
-        "raw_json",
-        "load_ts",
-    ]
-    return df[ordered].dropna(subset=["event_id", "symbol", "known_on"]).drop_duplicates(subset=["event_id"], keep="last")
+    return df[EVENT_COLUMNS].dropna(subset=["event_id", "symbol", "known_on"]).drop_duplicates(subset=["event_id", "known_on"], keep="last")
 
 
 def normalize_block_or_bulk(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
     if df.empty:
         return df
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
     out["event_source"] = source
     out["event_type"] = "BLOCK_DEAL" if source == "nse_block_deal" else "BULK_DEAL"
     out["symbol"] = df.get("symbol")
@@ -164,7 +166,7 @@ def normalize_block_or_bulk(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
 def normalize_short_selling(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
     out["event_source"] = "nse_short_selling"
     out["event_type"] = "SHORT_SELLING"
     out["symbol"] = df.get("symbol")
@@ -186,7 +188,7 @@ def normalize_short_selling(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_insider_deals(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
     out["event_source"] = "nse_insider_deal"
     out["event_type"] = "INSIDER_DEAL"
     out["symbol"] = df.get("symbol")
@@ -215,7 +217,7 @@ def normalize_insider_deals(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_corporate_actions(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
     out["event_source"] = "nse_corporate_action"
     out["event_type"] = "CORPORATE_ACTION"
     out["symbol"] = df.get("symbol")
@@ -237,7 +239,7 @@ def normalize_corporate_actions(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_earnings_events(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
     out["event_source"] = "nse_earnings_event"
     out["event_type"] = "EARNINGS_EVENT"
     out["symbol"] = df.get("symbol")
@@ -264,7 +266,7 @@ def normalize_earnings_events(df: pd.DataFrame) -> pd.DataFrame:
 def normalize_recent_events(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    out = pd.DataFrame()
+    out = pd.DataFrame(index=df.index)
     out["event_source"] = "nse_event_calendar"
     out["event_type"] = "NSE_EVENT"
     out["symbol"] = df.get("symbol")
@@ -319,13 +321,14 @@ def build_exchange_events(
     frames = [frame for frame in frames if not frame.empty]
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True, sort=False).drop_duplicates(subset=["event_id"], keep="last")
+    normalized_frames = [frame.reindex(columns=EVENT_COLUMNS) for frame in frames]
+    return pd.concat(normalized_frames, ignore_index=True, sort=False).drop_duplicates(subset=["event_id", "known_on"], keep="last")
 
 
 def persist_exchange_events(df: pd.DataFrame) -> None:
     if df.empty:
         return
-    upsert_to_db(df, TABLE_NAME, unique_keys=["event_id"], timescaledb_column="known_on")
+    upsert_to_db(df, TABLE_NAME, unique_keys=["event_id", "known_on"], timescaledb_column="known_on")
 
 
 def summarize(df: pd.DataFrame) -> dict[str, object]:

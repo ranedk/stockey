@@ -6,9 +6,10 @@ from datetime import datetime, timedelta
 import redis
 from environs import Env
 from playwright.sync_api import sync_playwright
+from utils.ingestion_state import get_failed_entries
 from utils import store
 from utils.date import reverse_daterange
-from utils.sync import get_redis_client, get_redis_set_members, filter_missing_date_members
+from utils.sync import get_redis_client, filter_missing_date_members
 
 env = Env()
 env.read_env()
@@ -18,6 +19,27 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:downloaded"
+NSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS = max(env.int("NSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS", 365), 1)
+SOURCE_PREFIX = "bhavcopy"
+
+
+def extract_downloaded_date_from_key(key: str) -> str | None:
+    try:
+        return datetime.strptime(os.path.basename(key), "bhavcopy_%Y-%m-%d.zip").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def load_downloaded_dates_from_store() -> set[str]:
+    failed_keys = {row["object_key"] for row in get_failed_entries(SOURCE_PREFIX)}
+    downloaded: set[str] = set()
+    for key in store.list_files("bhavcopy"):
+        if key in failed_keys:
+            continue
+        parsed = extract_downloaded_date_from_key(key)
+        if parsed:
+            downloaded.add(parsed)
+    return downloaded
 
 
 def get_random(min_ms: int, max_ms: int) -> int:
@@ -85,9 +107,10 @@ def download_bhavcopy_for_date(
 def main() -> None:
     rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
     failures = 0
-    existing_members = get_redis_set_members(rop, REDIS_SET)
+    existing_members = load_downloaded_dates_from_store()
+    start_date = datetime.today() - timedelta(days=NSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS)
     all_dates = list(
-        reverse_daterange(datetime(2014, 1, 1), datetime.today() - timedelta(days=1))
+        reverse_daterange(start_date, datetime.today() - timedelta(days=1))
     )
     missing_dates = filter_missing_date_members(all_dates, existing_members)
 

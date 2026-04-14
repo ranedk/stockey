@@ -14,6 +14,7 @@ but pandas-datareader still works anonymously for these series).
 from __future__ import annotations
 
 import io
+from environs import Env
 from datetime import date, timedelta
 from typing import Dict
 from urllib.parse import urlencode
@@ -22,6 +23,9 @@ import pandas as pd
 
 from utils.db import table_has_date, upsert_to_db
 from utils.http import get_with_retries
+
+env = Env()
+env.read_env()
 
 __FRED_SERIES: Dict[str, str] = {
     # Rates & risk-sentiment
@@ -45,6 +49,7 @@ FRED_RETRIES = 3
 FRED_BACKOFF_FACTOR = 0.5
 ISM_TIMEOUT_SECONDS = 20
 ISM_RETRIES = 3
+FRED_MACRO_LOOKBACK_DAYS = max(env.int("FRED_US_MACRO_LOOKBACK_DAYS", 365), 1)
 
 
 def _fetch_single_fred_series(
@@ -90,9 +95,10 @@ def fetch_fred_series(
     today = date.today()
     try:
         found, latest_date = table_has_date("macro_usa", "date", today)
-    except:
+    except Exception as exc:
+        print(f"FRED table_has_date fallback for macro_usa: {exc.__class__.__name__}: {exc}", flush=True)
         found = False
-        latest_date = date(2014, 1, 1)
+        latest_date = today - timedelta(days=FRED_MACRO_LOOKBACK_DAYS)
 
     start = latest_date - timedelta(
         days=15

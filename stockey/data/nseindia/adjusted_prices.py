@@ -110,8 +110,12 @@ def load_corporate_actions_sources(symbols: Iterable[str] | None = None) -> pd.D
     """
     try:
         frames.append(sql_to_df(bc_query, params=params))
-    except Exception:
-        pass
+    except Exception as exc:
+        message = str(exc).lower()
+        if exc.__class__.__name__ in {"UndefinedTable", "UndefinedColumn"} or "does not exist" in message:
+            print(f"[adjusted_prices] corporate actions bhavcopy table unavailable: {exc}", flush=True)
+        else:
+            raise
 
     non_empty = [frame for frame in frames if not frame.empty]
     return pd.concat(non_empty, ignore_index=True) if non_empty else pd.DataFrame()

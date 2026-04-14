@@ -11,7 +11,7 @@ from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import reverse_daterange
 from utils.chrome import restart_chrome
-from utils.sync import get_redis_client, get_redis_set_members
+from utils.sync import get_redis_client
 
 
 env = Env()
@@ -22,7 +22,23 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:indices:downloaded"
-DEFAULT_START_DATE = datetime(2014, 1, 1)
+NSE_INDICES_DOWNLOAD_LOOKBACK_DAYS = max(env.int("NSE_INDICES_DOWNLOAD_LOOKBACK_DAYS", 365), 1)
+
+
+def extract_downloaded_date_from_key(key: str) -> str | None:
+    try:
+        return datetime.strptime(os.path.basename(key), "indices_%Y-%m-%d.zip").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def load_downloaded_dates_from_store() -> set[str]:
+    downloaded: set[str] = set()
+    for key in store.list_files("indices"):
+        parsed = extract_downloaded_date_from_key(key)
+        if parsed:
+            downloaded.add(parsed)
+    return downloaded
 
 
 def get_random(min_ms: int, max_ms: int) -> int:
@@ -114,14 +130,15 @@ def main() -> None:
 
     rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
     failures = 0
-    existing_members = get_redis_set_members(rop, REDIS_SET)
+    existing_members = load_downloaded_dates_from_store()
     latest_done = latest_downloaded_date(existing_members)
+    default_start_date = datetime.today() - timedelta(days=NSE_INDICES_DOWNLOAD_LOOKBACK_DAYS)
     end_date = parse_datetime_arg(args.to_date) or (datetime.today() - timedelta(days=1))
     if args.backfill:
-        start_date = parse_datetime_arg(args.from_date) or DEFAULT_START_DATE
+        start_date = parse_datetime_arg(args.from_date) or default_start_date
     else:
         start_date = parse_datetime_arg(args.from_date) or (
-            DEFAULT_START_DATE if latest_done is None else latest_done + timedelta(days=1)
+            default_start_date if latest_done is None else latest_done + timedelta(days=1)
         )
 
     if start_date > end_date:

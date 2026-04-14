@@ -125,8 +125,12 @@ def has_recent_adjustment(symbol: str, latest_stored_date: datetime | None) -> b
             """,
             params=(symbol, latest_stored_date),
         )
-    except Exception:
-        return False
+    except Exception as exc:
+        message = str(exc).lower()
+        if exc.__class__.__name__ in {"UndefinedTable", "UndefinedColumn"} or "does not exist" in message:
+            print(f"[dhan.ohlcv] corporate actions normalized table unavailable for adjustment check: {exc}", flush=True)
+            return False
+        raise
     return not df.empty
 
 
@@ -151,8 +155,12 @@ def load_nse_holidays() -> set[date]:
             WHERE type = 'CM'
             """
         )
-    except Exception:
-        return set()
+    except Exception as exc:
+        message = str(exc).lower()
+        if exc.__class__.__name__ in {"UndefinedTable", "UndefinedColumn"} or "does not exist" in message:
+            print(f"[dhan.ohlcv] nseindia_holidays table unavailable; continuing without holiday calendar: {exc}", flush=True)
+            return set()
+        raise
 
     if df.empty or "holiday_date" not in df.columns:
         return set()

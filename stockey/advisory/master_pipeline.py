@@ -23,7 +23,7 @@ from utils.sync import parse_datetime_arg
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DOWNLOAD_SCRIPT = REPO_ROOT / "all_downloads.sh"
+DEFAULT_DOWNLOAD_SCRIPT = REPO_ROOT / "complete_data.sh"
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 

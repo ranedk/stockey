@@ -62,6 +62,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/announcements/cli.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Exchange announcement ingest keyed by `company_master_id` |
 | `data/backfill_company_master_ids.py` | many existing symbol-based tables | Adds and backfills `company_master_id` on historical rows |
 | `scripts/cleanup_deprecated_tables.py` | none | Drops deprecated tables that are no longer used by the active advisory stack |
+| `scripts/ingestion_state_runner.py` | `ingestion_file_state` | Inspect failed/processed ingestion file state and clear specific failed keys before retry |
 
 ## Management scripts
 
@@ -72,6 +73,14 @@ Regression checks:
 ```sh
 python -m pytest tests/test_advisory_regression.py
 python scripts/cleanup_deprecated_tables.py --dry-run
+```
+
+Ingestion state inspection:
+
+```sh
+python scripts/ingestion_state_runner.py list --status failed --limit 50
+python scripts/ingestion_state_runner.py list --source bhavcopy --status failed
+python scripts/ingestion_state_runner.py clear --source bhavcopy --key bhavcopy/bhavcopy_2015-01-16.zip
 ```
 
 ## General usage guidelines
@@ -121,16 +130,12 @@ python -m data.dhanlive.auth_cli clear-cache
 
 | Script | Purpose | Scope |
 | --- | --- | --- |
-| `all_advisory.sh` | Primary advisory orchestrator | Runs raw ingestion, news/theme routing, advisory, risk, portfolio, lifecycle, and execution in one flow |
-| `all_model_training.sh` | Event-model training orchestrator | Runs prep, trains the event meta-model only when coverage is sufficient, then scores current events |
-| `all_full_advisory.sh` | Single operator wrapper | Runs model training if ready, then the advisory pipeline, then prints the current portfolio summary |
-| `all_continuous_watch.sh` | Continuous monitoring wrapper | Polls active watchlist OHLCV, announcements, and ET/news incrementally and rewrites the static live dashboard |
-| `all_live_notifier.sh` | Live notification wrapper | Subscribes to the continuous-watch Redis bus and writes rolling operator feed files |
-| `all_downloads.sh` | Daily raw ingestion and parsing | Market-wide downloads plus tracked-symbol loaders |
-| `all_daily_derivations.sh` | Daily incremental derived data | Watchlist symbols from `config/watchlist_symbols.txt` |
-| `all_backfill.sh` | On-demand repair and historical rebuilds | `watchlist`, `tracked`, or `all` |
-| `all_downloader.sh` | Compatibility wrapper | Delegates to `all_downloads.sh` |
-| `all_features.sh` | Compatibility wrapper | Delegates to `all_daily_derivations.sh` |
+| `all_downloaders.sh` | Download-only ingestion | Runs the raw downloader modules only |
+| `all_parsers.sh` | Parse-only ingestion | Runs the parser modules only |
+| `complete_data.sh` | Combined ingestion | Runs all downloaders and parsers in order |
+| `all_ml.sh` | Event-model training orchestrator | Runs prep, trains the event meta-model only when coverage is sufficient, then scores current events |
+| `all_advisory.sh` | Advisory orchestrator | Runs the advisory pipeline and portfolio generation without raw downloads |
+| `all_watchers.sh` | Continuous monitoring wrapper | Polls active watchlist OHLCV, announcements, and ET/news incrementally |
 
 Recommended scheduler file:
 
@@ -138,11 +143,10 @@ Recommended scheduler file:
 
 It schedules:
 
-- `all_downloads.sh` once daily on weekdays
-- `all_full_advisory.sh --skip-model-training --skip-downloads` a few times a week
-- `all_continuous_watch.sh` every `10` minutes during market hours
-- `all_model_training.sh` once daily after market close
-- optional `all_backfill.sh` weekly on Saturday
+- `complete_data.sh` once daily on weekdays
+- `all_advisory.sh` a few times a week
+- `all_watchers.sh` every `10` minutes during market hours
+- `all_ml.sh` once daily after market close
 
 Bootstrap note:
 
@@ -297,7 +301,7 @@ python -m data.screenerin.screener_registry remove my-production-screen
 
 Operational notes:
 
-- `./all_downloads.sh` and `./all_advisory.sh` no longer seed default screeners automatically.
+- `./complete_data.sh` and `./all_advisory.sh` no longer seed default screeners automatically.
 - the recurring downloader only syncs screeners that are already registered as active production inputs.
 - use `data.screenerin.ad_hoc_query` first; register only the queries that graduate into recurring setups or themes.
 - `data.screenerin.screener_parser` uses the active rows in `screenerin_screeners` when run without URL arguments.
@@ -357,10 +361,10 @@ Training universe notes:
 Recommended model-training flow:
 
 ```sh
-./all_model_training.sh
-./all_model_training.sh --prep-only
-./all_model_training.sh --horizon-days 1 --to-date 2026-04-07
-./all_full_advisory.sh
+./all_ml.sh
+./all_ml.sh --prep-only
+./all_ml.sh --horizon-days 1 --to-date 2026-04-07
+./all_advisory.sh
 ```
 
 Behavior:
@@ -378,27 +382,26 @@ Operational constraints:
 - old dates do not trigger on-the-fly intraday prefetch inside the rule engine
 - current-date prep can still sync the broad training universes and use already stored recent data
 
-Single-command operator flow:
+Recommended operator flow:
 
 ```sh
-./all_full_advisory.sh
-./all_full_advisory.sh --date 2026-04-07
-./all_full_advisory.sh --skip-model-training
-./all_full_advisory.sh --skip-downloads --portfolio-planned
+./complete_data.sh
+./all_ml.sh
+./all_advisory.sh
+./all_advisory.sh --date 2026-04-07
 ```
 
 Behavior:
 
+- runs the full data refresh
 - runs `advisory.model_training_runner`
-- runs `advisory.master_pipeline`
-- prints `advisory.portfolio_engine --format text` at the end
+- runs `advisory.master_pipeline --skip-downloads`
 
 Continuous-watch flow:
 
 ```sh
-./all_continuous_watch.sh --loop
-./all_live_notifier.sh
-./all_continuous_watch.sh --loop --sleep-seconds 300
+./all_watchers.sh --loop
+./all_watchers.sh --loop --sleep-seconds 300
 python -m advisory.live_dashboard --output-dir live_dashboard
 python -m http.server --directory live_dashboard 8000
 ```
@@ -577,25 +580,16 @@ Top-level orchestration examples:
 ```sh
 ./all_advisory.sh
 python -m advisory.master_pipeline --dry-run
-./all_daily_derivations.sh
-./all_backfill.sh watchlist 5
-./all_backfill.sh tracked 5
-TRUNCATE_DERIVED=1 ./all_backfill.sh all 5
+./all_downloaders.sh
+./all_parsers.sh
+./complete_data.sh
 ```
 
 Notes:
 
-- `all_daily_derivations.sh` loads symbols from [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt)
-- `all_backfill.sh` defaults to `watchlist 5`
-- only use `TRUNCATE_DERIVED=1` when you intentionally want a full rebuild of derived price and feature tables
-- `all_advisory.sh` now includes the full raw ingestion flow plus the advisory master pipeline:
-  - market data downloads and parsers
-  - Dhan OHLCV sync
-  - Screener.in registry sync and advisory screener normalization
-  - advisory theme routing
-  - advisory rule, watch, news, event, risk, portfolio, lifecycle, and execution stages
-
-- `all_downloads.sh` remains the lower-level raw ingestion component used by the master pipeline.
+- `all_watchers.sh` loads symbols from [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt) where needed
+- `all_advisory.sh` is advisory-only and skips raw downloads by default
+- `complete_data.sh` is the lower-level raw ingestion component used before advisory runs
 
 ### SQL
 
@@ -725,7 +719,7 @@ For the advisory stack, `dhan_ohlcv_daily` is the canonical OHLCV source. The NS
 
 `advisory.execution_engine` reads approved `advisory_portfolio_orders`, builds broker handoff orders in `advisory_execution_orders`, and can reconcile order/trade state from Dhan into `advisory_execution_orders` plus `advisory_execution_fills`. Use `--live` only when you explicitly want to place live orders through Dhan. Live Dhan order placement requires the API static IP to be whitelisted.
 
-`advisory.master_pipeline` is the single top-level orchestrator over the full repo flow. Use `./all_advisory.sh` for the shell entry point, or run `python -m advisory.master_pipeline` directly. Lower-level modules such as `all_downloads.sh` and `advisory.pipeline` remain available for component runs and targeted debugging.
+`advisory.master_pipeline` is the single top-level advisory orchestrator. Use `./all_advisory.sh` for the shell entry point, or run `python -m advisory.master_pipeline --skip-downloads` directly. Lower-level modules such as `complete_data.sh` and `advisory.pipeline` remain available for component runs and targeted debugging.
 
 The advisory flow now includes an `intraday` stage between daily technicals and rule evaluation. That stage:
 

@@ -231,9 +231,15 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         screener_df = build_constituents(snapshot_date=None if asof_date is None else asof_date.date(), latest_only=asof_date is None)
         if not args.dry_run:
             persist_constituents(screener_df)
-        if not screener_df.empty and "symbol" in screener_df.columns:
+        screener_symbol_col = None
+        if not screener_df.empty:
+            if "symbol" in screener_df.columns:
+                screener_symbol_col = "symbol"
+            elif "ticker" in screener_df.columns:
+                screener_symbol_col = "ticker"
+        if screener_symbol_col is not None:
             screener_symbols = (
-                screener_df["symbol"]
+                screener_df[screener_symbol_col]
                 .astype("string")
                 .dropna()
                 .str.strip()
@@ -243,6 +249,9 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             )
         summary["stages"]["screeners"] = _json_ready(screener_df)
         _finish_stage("screeners", stage_started, f"rows={len(screener_df)}")
+        advisory_symbols = symbols or screener_symbols
+
+    advisory_symbols = symbols or screener_symbols
 
     if stage_enabled("macro", args.start_at, args.stop_at):
         stage_started = _start_stage("macro")
@@ -270,34 +279,44 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
     if stage_enabled("exchange_features", args.start_at, args.stop_at):
         stage_started = _start_stage("exchange_features")
-        exchange_features_df = build_exchange_features(from_date=asof_date, to_date=asof_date, rebuild=bool(args.rebuild))
+        exchange_feature_symbols = advisory_symbols or None
+        exchange_features_df = build_exchange_features(
+            from_date=asof_date,
+            to_date=asof_date,
+            symbols=exchange_feature_symbols,
+            rebuild=bool(args.rebuild),
+        )
         if not args.dry_run:
             persist_exchange_features(exchange_features_df)
         summary["stages"]["exchange_features"] = _json_ready(exchange_features_df)
-        _finish_stage("exchange_features", stage_started, f"rows={len(exchange_features_df)}")
+        _finish_stage(
+            "exchange_features",
+            stage_started,
+            f"rows={len(exchange_features_df)} symbols={0 if exchange_features_df.empty else int(exchange_features_df['symbol'].nunique())}",
+        )
 
     if stage_enabled("peer_sync", args.start_at, args.stop_at) and not args.skip_peer_sync:
         stage_started = _start_stage("peer_sync")
-        peer_result = sync_peer_data(symbols=symbols, to_date=asof_date)
+        peer_result = sync_peer_data(symbols=advisory_symbols, to_date=asof_date)
         summary["stages"]["peer_sync"] = _json_ready(peer_result)
         _finish_stage("peer_sync", stage_started)
 
     if stage_enabled("technicals", args.start_at, args.stop_at):
         stage_started = _start_stage("technicals")
         technical_df = build_technical_features(
-            symbols=symbols,
+            symbols=advisory_symbols,
             from_date=asof_date,
             to_date=asof_date,
             rebuild=bool(args.rebuild),
         )
         if not args.dry_run:
-            persist_technical_features(technical_df, rebuild=bool(args.rebuild), symbols=symbols)
+            persist_technical_features(technical_df, rebuild=bool(args.rebuild), symbols=advisory_symbols)
         summary["stages"]["technicals"] = _json_ready(technical_df)
         _finish_stage("technicals", stage_started, f"rows={len(technical_df)}")
 
     if stage_enabled("intraday", args.start_at, args.stop_at) and not args.skip_intraday:
         stage_started = _start_stage("intraday")
-        intraday_symbols = symbols or screener_symbols or []
+        intraday_symbols = advisory_symbols or []
         intervals = tuple(sorted({int(value) for value in (args.intraday_intervals or [1]) if int(value) > 0}))
         intraday_frames: list[pd.DataFrame] = []
         intraday_meta: list[dict[str, Any]] = []
@@ -330,7 +349,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     if stage_enabled("fundamentals", args.start_at, args.stop_at):
         stage_started = _start_stage("fundamentals")
         fundamental_df = build_fundamental_snapshot(
-            symbols=symbols,
+            symbols=advisory_symbols,
             from_date=asof_date,
             to_date=asof_date,
             rebuild=bool(args.rebuild),

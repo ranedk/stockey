@@ -59,30 +59,43 @@ Symbol-specific loaders default to [`config/tracked_symbols.txt`](../config/trac
 
 ## Orchestration scripts
 
-The repo now has three top-level orchestration layers:
+The repo now has six top-level operator entrypoints:
 
-1. Raw daily downloads:
-
-```sh
-./all_downloads.sh
-```
-
-2. Daily incremental derivations for the watchlist:
+1. Download-only refresh:
 
 ```sh
-./all_daily_derivations.sh
+./all_downloaders.sh
 ```
 
-3. On-demand backfills:
+2. Parse-only refresh:
 
 ```sh
-./all_backfill.sh
-./all_backfill.sh watchlist 5
-./all_backfill.sh tracked 5
-./all_backfill.sh all 5
+./all_parsers.sh
 ```
 
-`all_downloader.sh` and `all_features.sh` are kept as compatibility wrappers for the first two flows.
+3. Download plus parse:
+
+```sh
+./complete_data.sh
+```
+
+4. Model prep and training:
+
+```sh
+./all_ml.sh
+```
+
+5. Advisory and portfolio generation:
+
+```sh
+./all_advisory.sh
+```
+
+6. Continuous market watchers:
+
+```sh
+./all_watchers.sh --loop
+```
 
 ## Advisory Flow Summary
 
@@ -112,28 +125,28 @@ The repo now has three top-level orchestration layers:
 Primary operator commands:
 
 ```sh
-./all_full_advisory.sh
-./all_model_training.sh
-./all_continuous_watch.sh --loop
-./all_live_notifier.sh
+./complete_data.sh
+./all_ml.sh
+./all_advisory.sh
+./all_watchers.sh --loop
 ```
 
 Scheduled operator flow:
 
-- install `config/stockey.crontab` with `crontab config/stockey.crontab` or run it with `./go-crond`
-- let `all_downloads.sh` handle the once-daily broad refresh
-- let `all_continuous_watch.sh` run every `10` minutes during market hours
-- let `all_model_training.sh` run once daily after market close
-- let `all_full_advisory.sh --skip-model-training --skip-downloads` run a few times a week for the slower batch recommendation cycle
+- install `config/stockey.crontab` with `crontab config/stockey.crontab` or run it with `./go-crond config/stockey.crontab --allow-unprivileged`
+- let `complete_data.sh` handle the once-daily broad refresh
+- let `all_watchers.sh` run every `10` minutes during market hours
+- let `all_ml.sh` run once daily after market close
+- let `all_advisory.sh` run a few times a week for the slower batch recommendation cycle
 
 The cron file writes logs under `logs/cron/` and uses `flock` so overlapping runs are skipped instead of stacked.
 
 Use:
 
-- `./all_full_advisory.sh` for the main operator flow
-- `./all_model_training.sh` for research prep, readiness checks, model train, and score
-- `./all_continuous_watch.sh --loop` for the lightweight live monitoring loop
-- `./all_live_notifier.sh` for a human-readable operator feed from the Redis bus
+- `./complete_data.sh` for the full raw-data refresh
+- `./all_ml.sh` for research prep, readiness checks, model train, and score
+- `./all_advisory.sh` for the advisory and portfolio run
+- `./all_watchers.sh --loop` for the lightweight live monitoring loop
 
 ### Dhan master
 
@@ -249,11 +262,9 @@ python -m data.nseindia.insider_deals --symbols RELIANCE TCS
 Recommended cron shape:
 
 ```sh
-./all_downloads.sh
-./all_daily_derivations.sh
+./complete_data.sh
+./all_watchers.sh
 ```
-
-Use `all_backfill.sh` manually or from a separate weekly/repair schedule.
 
 Chrome remote debugging is still required for the Playwright/browser-driven flows:
 
@@ -364,4 +375,4 @@ For live order placement through Dhan, the API static IP must be whitelisted on 
 5. `dim_security_overrides` is where manual merger / demerger / scheme mappings should be curated.
 6. Large runtime artifacts such as `base_chromed_data/` and `http_cache/` should stay out of git.
 7. Run `security_history`, `security_dimension`, `adjusted_prices`, and `features.price_daily` sequentially, not in parallel when you need the legacy NSE identity/adjusted-price reference pipeline.
-8. `all_daily_derivations.sh` uses `config/watchlist_symbols.txt` and falls back to `config/tracked_symbols.txt` if the watchlist file is empty.
+8. `all_watchers.sh` and symbol-scoped runs still use `config/watchlist_symbols.txt` and fall back to `config/tracked_symbols.txt` if the watchlist file is empty.

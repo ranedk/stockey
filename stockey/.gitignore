@@ -214,3 +214,4 @@ chromesetup
 http_cache
 base_chromed_data/
 backups/
+go-crond

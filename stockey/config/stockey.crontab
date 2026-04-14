@@ -13,30 +13,25 @@ LOG_DIR=/home/rane/code/stockey/logs/cron
 #   crontab /home/rane/code/stockey/config/stockey.crontab
 #
 # Or run with go-crond:
-#   /home/rane/code/stockey/go-crond /home/rane/code/stockey/config/stockey.crontab
+#   ./go-crond config/stockey.crontab --allow-unprivileged
 
-# Daily raw data refresh before market open on weekdays.
-10 07 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_downloads.lock ./all_downloads.sh >> "$LOG_DIR/all_downloads.log" 2>&1
+# Daily raw download + parse refresh before market open on weekdays.
+10 07 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
 
-# Full advisory run a few times a week after the raw refresh has completed.
-# This skips downloads and model training because those are scheduled separately.
-20 08 * * 1,3,5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_full_advisory.lock ./all_full_advisory.sh --skip-model-training --skip-downloads >> "$LOG_DIR/all_full_advisory.log" 2>&1
+# Portfolio/advisory run a few times a week after the raw refresh has completed.
+20 08 * * 1,3,5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_advisory.lock ./all_advisory.sh >> "$LOG_DIR/all_advisory.log" 2>&1
 
 # Continuous one-shot watch during market hours on weekdays.
 # Internal sync state keeps news/announcements slower while OHLCV stays more frequent.
-*/10 09-15 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_continuous_watch.lock ./all_continuous_watch.sh >> "$LOG_DIR/all_continuous_watch.log" 2>&1
+*/10 09-15 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
 # One final post-close watch pass for end-of-day alerts and dashboard refresh.
-05 16 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_continuous_watch.lock ./all_continuous_watch.sh >> "$LOG_DIR/all_continuous_watch.log" 2>&1
+05 16 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
 # Event-model prep and training once daily after market close.
-45 18 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_model_training.lock ./all_model_training.sh >> "$LOG_DIR/all_model_training.log" 2>&1
+45 18 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
 
-# Optional weekly repair/backfill sweep on Saturday morning.
-30 09 * * 6 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_backfill.lock ./all_backfill.sh watchlist 5 >> "$LOG_DIR/all_backfill.log" 2>&1
-
-# Optional long-running helper processes if you want them under cron/go-crond.
-# They are commented out by default because cron is not a supervisor.
-#
-# @reboot cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_live_notifier.lock ./all_live_notifier.sh >> "$LOG_DIR/all_live_notifier.log" 2>&1
+# Optional split refreshes if you want explicit control instead of complete_data.sh.
+# 05 07 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
+# 40 07 * * 1-5 cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1
 # @reboot cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_dashboard_http.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m http.server --directory live_dashboard 8000 >> "$LOG_DIR/live_dashboard_http.log" 2>&1

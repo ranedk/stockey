@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import date
+from datetime import datetime
 
 import pandas as pd
 
@@ -11,6 +12,9 @@ from data.announcements import state as announcement_state
 from data.eaindustry import wpi
 from data.dhanlive import client as dhan_client
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv
+from data.nseindia import bhavcopy_downloader, bhavcopy_parser, indices_downloader, indices_parser, offmarket, recent_events
+from data.mospi import cpi
+from data.nsdl import fpi
 from data import download_runner
 from utils import db as db_utils
 from utils import redis_utils
@@ -127,6 +131,45 @@ def test_db_retry_wrapper_reconnects_on_transient_error(monkeypatch):
     assert calls == {"operation": 3, "dispose": 2}
 
 
+def test_db_retry_wrapper_retries_deadlock(monkeypatch):
+    calls = {"operation": 0, "dispose": 0}
+
+    class DeadlockDetected(Exception):
+        pass
+
+    def operation():
+        calls["operation"] += 1
+        if calls["operation"] < 3:
+            raise DeadlockDetected("deadlock detected")
+        return "ok"
+
+    monkeypatch.setattr(db_utils, "dispose_db_pool", lambda: calls.__setitem__("dispose", calls["dispose"] + 1))
+    monkeypatch.setattr(db_utils.time, "sleep", lambda *_args, **_kwargs: None)
+
+    assert db_utils.with_db_retries(operation, attempts=3, operation_name="deadlock_test") == "ok"
+    assert calls == {"operation": 3, "dispose": 2}
+
+
+def test_sql_to_df_retries_query_canceled(monkeypatch):
+    calls = {"count": 0}
+
+    class QueryCanceled(Exception):
+        pass
+
+    def fake_fetch(*_args, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise QueryCanceled("canceling statement due to statement timeout")
+        return pd.DataFrame({"ok": [1]})
+
+    monkeypatch.setattr(db_utils, "_fetch_sql_to_df_once", fake_fetch)
+    monkeypatch.setattr(db_utils.time, "sleep", lambda *_args, **_kwargs: None)
+
+    out = db_utils.sql_to_df("select 1", retries=2)
+    assert out.to_dict(orient="records") == [{"ok": 1}]
+    assert calls["count"] == 3
+
+
 def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
     calls = {"attempts": 0}
 
@@ -145,6 +188,481 @@ def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
 
     assert client.get("missing") is None
     assert calls["attempts"] == 3
+
+
+def test_resilient_redis_enters_cooldown_after_failure(monkeypatch):
+    calls = {"attempts": 0}
+
+    class FailingRedis:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def sadd(self, *_args, **_kwargs):
+            calls["attempts"] += 1
+            raise redis_utils.redis.ConnectionError("connection refused")
+
+    now = {"value": 1000.0}
+
+    monkeypatch.setattr(redis_utils, "_ORIGINAL_REDIS_CLASS", FailingRedis)
+    monkeypatch.setattr(redis_utils, "REDIS_OPERATION_ATTEMPTS", 3)
+    monkeypatch.setattr(redis_utils, "REDIS_RECONNECT_COOLDOWN_SECONDS", 30.0)
+    monkeypatch.setattr(redis_utils.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(redis_utils.time, "time", lambda: now["value"])
+
+    client = redis_utils.ResilientRedis(host="127.0.0.1", port=6379, decode_responses=True, fail_soft=True)
+
+    assert client.sadd("test", "value") == 0
+    assert calls["attempts"] == 3
+
+    assert client.sadd("test", "value2") == 0
+    assert calls["attempts"] == 3
+
+
+def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):
+    processed: list[str] = []
+
+    monkeypatch.setattr(
+        bhavcopy_parser.store,
+        "list_files",
+        lambda prefix: iter(["bhavcopy/bhavcopy_2015-01-16.zip", "bhavcopy/bhavcopy_2015-01-17.zip"]),
+    )
+    monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "sql_to_df",
+        lambda *_args, **_kwargs: pd.DataFrame({"parsed_date": [pd.Timestamp("2015-01-16")]}),
+    )
+    monkeypatch.setattr(bhavcopy_parser.store, "get_as_temp_file", lambda key: f"/tmp/{key.split('/')[-1]}")
+    monkeypatch.setattr(bhavcopy_parser, "unzip_and_process", lambda file_path: processed.append(file_path))
+
+    class DummyRedis:
+        def sadd(self, *_args, **_kwargs):
+            return 1
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(bhavcopy_parser, "rop", DummyRedis())
+
+    bhavcopy_parser.run_parser()
+
+    assert processed == ["/tmp/bhavcopy_2015-01-17.zip"]
+
+
+def test_bhavcopy_parser_cat_turnover_raises_visible_error(monkeypatch):
+    monkeypatch.setattr(
+        bhavcopy_parser.pd,
+        "read_excel",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("corrupt workbook")),
+    )
+
+    try:
+        bhavcopy_parser.parse_cat_turnover("/tmp/cat_turnover_bad.xls")
+    except RuntimeError as exc:
+        assert "CAT Turnover workbook" in str(exc)
+        assert "/tmp/cat_turnover_bad.xls" in str(exc)
+    else:
+        raise AssertionError("expected parse_cat_turnover to raise RuntimeError")
+
+
+def test_bhavcopy_parser_records_failed_key(monkeypatch):
+    failed: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(
+        bhavcopy_parser.store,
+        "list_files",
+        lambda prefix: iter(["bhavcopy/bhavcopy_2015-01-16.zip"]),
+    )
+    monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(bhavcopy_parser, "load_existing_ohlcv_dates", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(bhavcopy_parser.store, "get_as_temp_file", lambda key: "/tmp/failing.zip")
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "unzip_and_process",
+        lambda path: (_ for _ in ()).throw(RuntimeError("broken nested zip")),
+    )
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "mark_failed",
+        lambda source_prefix, object_key, error_message: failed.append((source_prefix, object_key, error_message)),
+    )
+
+    class DummyRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("should not mark redis success for failed parse")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(bhavcopy_parser, "rop", DummyRedis())
+
+    bhavcopy_parser.run_parser()
+
+    assert failed == [("bhavcopy", "bhavcopy/bhavcopy_2015-01-16.zip", "RuntimeError: broken nested zip")]
+
+
+def test_bhavcopy_parser_marks_empty_like_key_processed(monkeypatch):
+    processed: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        bhavcopy_parser.store,
+        "list_files",
+        lambda prefix: iter(["bhavcopy/bhavcopy_2015-10-18.zip"]),
+    )
+    monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(bhavcopy_parser, "load_existing_ohlcv_dates", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(bhavcopy_parser.store, "get_as_temp_file", lambda key: "/tmp/empty_like.zip")
+    monkeypatch.setattr(bhavcopy_parser, "unzip_and_process", lambda path: False)
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "mark_processed",
+        lambda source_prefix, object_key, **_kwargs: processed.append((source_prefix, object_key)),
+    )
+
+    class DummyRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("should not mark redis success for non-ohclv processed key")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(bhavcopy_parser, "rop", DummyRedis())
+
+    bhavcopy_parser.run_parser()
+
+    assert processed == [("bhavcopy", "bhavcopy/bhavcopy_2015-10-18.zip")]
+
+
+def test_bhavcopy_parser_raises_on_bad_zip(monkeypatch, tmp_path):
+    bad_zip = tmp_path / "bad.zip"
+    bad_zip.write_text("not a zip", encoding="utf-8")
+
+    try:
+        bhavcopy_parser.unzip_and_process(str(bad_zip))
+    except RuntimeError as exc:
+        assert "bad_bhavcopy_zip" in str(exc)
+    else:
+        raise AssertionError("expected bad zip to raise RuntimeError")
+
+
+def test_bhavcopy_downloader_uses_s3_keys_as_source_of_truth(monkeypatch):
+    monkeypatch.setattr(
+        bhavcopy_downloader.store,
+        "list_files",
+        lambda prefix: iter(["bhavcopy/bhavcopy_2015-01-16.zip", "bhavcopy/ignore.txt"]),
+    )
+    monkeypatch.setattr(bhavcopy_downloader, "get_failed_entries", lambda *_args, **_kwargs: [])
+
+    assert bhavcopy_downloader.load_downloaded_dates_from_store() == {"2015-01-16"}
+
+
+def test_bhavcopy_downloader_excludes_failed_keys_from_downloaded_set(monkeypatch):
+    monkeypatch.setattr(
+        bhavcopy_downloader.store,
+        "list_files",
+        lambda prefix: iter(["bhavcopy/bhavcopy_2015-01-16.zip", "bhavcopy/bhavcopy_2015-01-17.zip"]),
+    )
+    monkeypatch.setattr(
+        bhavcopy_downloader,
+        "get_failed_entries",
+        lambda *_args, **_kwargs: [{"object_key": "bhavcopy/bhavcopy_2015-01-16.zip"}],
+    )
+
+    assert bhavcopy_downloader.load_downloaded_dates_from_store() == {"2015-01-17"}
+
+
+def test_bhavcopy_parser_only_considers_last_year_keys():
+    today = datetime(2026, 4, 13)
+
+    assert bhavcopy_parser.should_consider_key("bhavcopy/bhavcopy_2026-04-12.zip", today=today)
+    assert bhavcopy_parser.should_consider_key("bhavcopy/bhavcopy_2025-04-13.zip", today=today)
+    assert not bhavcopy_parser.should_consider_key("bhavcopy/bhavcopy_2025-04-12.zip", today=today)
+    assert not bhavcopy_parser.should_consider_key("bhavcopy/invalid.zip", today=today)
+
+
+def test_indices_downloader_uses_s3_keys_as_source_of_truth(monkeypatch):
+    monkeypatch.setattr(
+        indices_downloader.store,
+        "list_files",
+        lambda prefix: iter(["indices/indices_2015-01-16.zip", "indices/ignore.txt"]),
+    )
+
+    assert indices_downloader.load_downloaded_dates_from_store() == {"2015-01-16"}
+
+
+def test_indices_parser_only_considers_last_year_keys():
+    today = datetime(2026, 4, 13)
+
+    assert indices_parser.should_consider_key("indices/indices_2026-04-12.zip", today=today)
+    assert indices_parser.should_consider_key("indices/indices_2025-04-13.zip", today=today)
+    assert not indices_parser.should_consider_key("indices/indices_2025-04-12.zip", today=today)
+    assert not indices_parser.should_consider_key("indices/invalid.zip", today=today)
+
+
+def test_indices_parser_records_failed_key(monkeypatch):
+    failed: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(
+        indices_downloader.store,
+        "list_files",
+        lambda prefix: iter(()),
+    )
+    monkeypatch.setattr(
+        indices_parser.store,
+        "list_files",
+        lambda prefix: iter(["indices/indices_2015-01-16.zip"]),
+    )
+    monkeypatch.setattr(indices_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(indices_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(indices_parser.store, "get_as_temp_file", lambda key: "/tmp/failing_indices.zip")
+    monkeypatch.setattr(
+        indices_parser,
+        "unzip_and_process",
+        lambda path: (_ for _ in ()).throw(RuntimeError("bad indices zip contents")),
+    )
+    monkeypatch.setattr(
+        indices_parser,
+        "mark_failed",
+        lambda source_prefix, object_key, error_message: failed.append((source_prefix, object_key, error_message)),
+    )
+
+    class DummyRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("should not mark redis success for failed indices parse")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(indices_parser, "rop", DummyRedis())
+
+    # mirror module __main__ flow
+    parsed_files = indices_parser.get_processed_keys(indices_parser.SOURCE_PREFIX)
+    for f in indices_parser.store.list_files("indices"):
+        if f in parsed_files:
+            continue
+        file_path = indices_parser.store.get_as_temp_file(f)
+        try:
+            parsed = indices_parser.unzip_and_process(file_path)
+        except Exception as exc:
+            indices_parser.mark_failed(indices_parser.SOURCE_PREFIX, f, f"{exc.__class__.__name__}: {exc}")
+            continue
+        if parsed:
+            raise AssertionError("unexpected parsed success")
+
+    assert failed == [("indices", "indices/indices_2015-01-16.zip", "RuntimeError: bad indices zip contents")]
+
+
+def test_offmarket_downloader_uses_s3_ranges_as_source_of_truth(monkeypatch):
+    monkeypatch.setattr(
+        offmarket.store,
+        "list_files",
+        lambda prefix: iter(
+            [
+                "nsedeals/block_deals_01-01-2015_03-01-2015.csv",
+                "nsedeals/bulk_deals_05-01-2015_05-01-2015.csv",
+                "nsedeals/ignore.txt",
+            ]
+        ),
+    )
+
+    assert offmarket.load_downloaded_dates_from_store("block_deals") == {
+        "2015-01-01",
+        "2015-01-02",
+        "2015-01-03",
+    }
+    assert offmarket.load_downloaded_dates_from_store("bulk_deals") == {"2015-01-05"}
+
+
+def test_recent_events_always_refreshes_today(monkeypatch):
+    calls: list[str] = []
+
+    class DummyPlaywright:
+        def __enter__(self):
+            return "playwright"
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class DummyRedis:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(recent_events, "get_redis_client", lambda *_args, **_kwargs: DummyRedis())
+    monkeypatch.setattr(recent_events, "sync_playwright", lambda: DummyPlaywright())
+    monkeypatch.setattr(
+        recent_events,
+        "dowload_events",
+        lambda playwright, formatted_date, rop: calls.append(formatted_date),
+    )
+
+    recent_events.main()
+
+    assert len(calls) == 1
+
+
+def test_cpi_sync_uses_db_months_only(monkeypatch):
+    downloaded: list[str] = []
+
+    monkeypatch.setattr(cpi, "load_existing_cpi_months", lambda: {date(2026, 1, 1)})
+    monkeypatch.setattr(cpi, "get_db_max_date", lambda *args, **kwargs: pd.Timestamp("2026-01-01"))
+    monkeypatch.setattr(cpi, "download_cpi_month", lambda month_start: downloaded.append(month_start.isoformat()))
+
+    cpi.sync_cpi_data(from_date=date(2026, 1, 1), to_date=date(2026, 3, 1), force=False)
+
+    assert downloaded == ["2026-02-01", "2026-03-01"]
+
+
+def test_fpi_latest_downloaded_date_uses_db_anchor_only(monkeypatch):
+    monkeypatch.setattr(fpi.futils, "downloaded_for", lambda today: (False, date(2026, 4, 10)))
+
+    assert fpi.latest_downloaded_date(date(2026, 4, 11)) == date(2026, 4, 10)
+
+
+def test_exchange_events_normalize_corporate_actions_handles_missing_side():
+    df = pd.DataFrame(
+        [
+            {
+                "symbol": "RELIANCE",
+                "company_master_id": "nse:RELIANCE",
+                "date": pd.Timestamp("2026-04-11"),
+                "record_date": pd.Timestamp("2026-04-15"),
+                "subject": "Dividend",
+            }
+        ]
+    )
+
+    out = exchange_events.normalize_corporate_actions(df)
+
+    assert len(out) == 1
+    assert pd.isna(out.iloc[0]["side"]) or out.iloc[0]["side"] is None
+
+
+def test_exchange_events_persist_uses_timescale_safe_composite_key(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        exchange_events,
+        "upsert_to_db",
+        lambda df, table_name, unique_keys, timescaledb_column=None: calls.append(
+            {
+                "table_name": table_name,
+                "unique_keys": list(unique_keys),
+                "timescaledb_column": timescaledb_column,
+                "rows": len(df),
+            }
+        ),
+    )
+
+    df = pd.DataFrame(
+        [
+            {
+                "event_id": "abc",
+                "event_source": "nse_event_calendar",
+                "event_type": "NSE_EVENT",
+                "symbol": "RELIANCE",
+                "company_master_id": "nse:RELIANCE",
+                "event_date": pd.Timestamp("2026-04-11", tz="UTC"),
+                "known_on": pd.Timestamp("2026-04-11", tz="UTC"),
+                "disclosure_date": pd.Timestamp("2026-04-11", tz="UTC"),
+                "participant": pd.NA,
+                "side": pd.NA,
+                "quantity": pd.NA,
+                "price": pd.NA,
+                "value_inr": pd.NA,
+                "holding_pct_before": pd.NA,
+                "holding_pct_after": pd.NA,
+                "event_summary": "calendar",
+                "raw_json": "{}",
+                "load_ts": pd.Timestamp("2026-04-11", tz="UTC"),
+            }
+        ]
+    )
+
+    exchange_events.persist_exchange_events(df)
+
+    assert calls == [
+        {
+            "table_name": "advisory_exchange_events",
+            "unique_keys": ["event_id", "known_on"],
+            "timescaledb_column": "known_on",
+            "rows": 1,
+        }
+    ]
+
+
+def test_wpi_parse_catalog_items_handles_weird_html():
+    html = b"""
+    <html><body>
+      <ul class="ul-choose-item">
+        <li>
+          <input name="cname" value="A1"/>
+          <span>Food</span>
+          <input name="commname" value="(A). FOOD ARTICLES"/>
+        </li>
+      </ul>
+      <div class="odd-layout">
+        <input name="cname" value="B1"/>
+        <div><input name="commname" value="(B). NON-FOOD ARTICLES"/></div>
+      </div>
+      <div>
+        <input name="cname" value="B1"/>
+        <input name="commname" value="(B). NON-FOOD ARTICLES"/>
+      </div>
+      <div>
+        <input name="cname" value="X1"/>
+        <input name="commname" value="INVALID"/>
+      </div>
+    </body></html>
+    """
+
+    assert wpi.parse_catalog_items(html) == [
+        ["A1", "(A). FOOD ARTICLES", "(A). FOOD ARTICLES"],
+        ["B1", "(B). NON-FOOD ARTICLES", "(B). NON-FOOD ARTICLES"],
+    ]
+
+
+def test_wpi_sync_uses_db_completion(monkeypatch):
+    monkeypatch.setattr(
+        wpi,
+        "fetch_wpi_catalog",
+        lambda year: (
+            "session",
+            {},
+            [
+                ["A1", "(A). FOOD ARTICLES", "(A). FOOD ARTICLES"],
+                ["B1", "(B). NON-FOOD ARTICLES", "(B). NON-FOOD ARTICLES"],
+            ],
+        ),
+    )
+
+    completed_sets = [
+        {"A1"},
+        {"A1", "B1"},
+    ]
+
+    def fake_load_completed_items(year, *, expected_months):
+        return completed_sets[0] if len(completed_sets) == 1 else completed_sets.pop(0)
+
+    downloaded: list[str] = []
+    monkeypatch.setattr(wpi, "load_completed_items", fake_load_completed_items)
+    monkeypatch.setattr(
+        wpi,
+        "download_wpi_item",
+        lambda **kwargs: pd.DataFrame(
+            [{"date": pd.Timestamp("2026-02-28"), "value": 1.0, "cname": kwargs["item"][0], "name": kwargs["item"][1]}]
+        ),
+    )
+    monkeypatch.setattr(wpi, "persist_wpi_item", lambda df, **kwargs: downloaded.append(kwargs["cname"]))
+    monkeypatch.setattr(wpi.time, "sleep", lambda *_args, **_kwargs: None)
+
+    summary = wpi.sync_wpi_for_year(2026, today=date(2026, 3, 25))
+
+    assert downloaded == ["B1"]
+    assert summary["skipped_count"] == 1
+    assert summary["downloaded_count"] == 1
 
 
 def test_portfolio_engine_allows_two_sector_names_but_blocks_same_symbol_duplicates(monkeypatch):
@@ -1012,7 +1530,7 @@ def test_master_pipeline_run_downloads_uses_python_runner(monkeypatch):
     )
     assert payload["status"] == "ok"
     assert payload["results"][0]["module"] == "data.nseindia.holidays"
-    assert payload["download_script"].endswith("all_downloads.sh")
+    assert payload["download_script"].endswith("complete_data.sh")
 
 
 def test_portfolio_priority_rewards_positive_event_transition():
@@ -1324,11 +1842,48 @@ def test_exchange_events_normalize_block_and_insider_rows():
     )
     block_out = exchange_events.normalize_block_or_bulk(block, source="nse_block_deal")
     insider_out = exchange_events.normalize_insider_deals(insider)
+    assert block_out.iloc[0]["event_source"] == "nse_block_deal"
+    assert block_out.iloc[0]["event_type"] == "BLOCK_DEAL"
     assert block_out.iloc[0]["symbol"] == "HDFCBANK"
     assert block_out.iloc[0]["value_inr"] == 15_000_000.0
     assert block_out.iloc[0]["side"] == "BUY"
+    assert insider_out.iloc[0]["event_source"] == "nse_insider_deal"
+    assert insider_out.iloc[0]["event_type"] == "INSIDER_DEAL"
     assert insider_out.iloc[0]["side"] == "SELL"
     assert insider_out.iloc[0]["known_on"] == pd.Timestamp("2026-04-02T00:00:00Z")
+
+
+def test_exchange_events_normalize_recent_and_short_rows_keep_scalar_fields():
+    recent = pd.DataFrame(
+        [
+            {
+                "symbol": "JUSTDIAL",
+                "company_master_id": "nse:JUSTDIAL",
+                "date": pd.Timestamp("2026-04-13T00:00:00Z"),
+                "purpose": "Financial Results",
+                "details": "To consider and approve results",
+            }
+        ]
+    )
+    short = pd.DataFrame(
+        [
+            {
+                "symbol": "BEL",
+                "company_master_id": "nse:BEL",
+                "date": pd.Timestamp("2026-04-09T00:00:00Z"),
+                "quantity": 200,
+            }
+        ]
+    )
+
+    recent_out = exchange_events.normalize_recent_events(recent)
+    short_out = exchange_events.normalize_short_selling(short)
+
+    assert recent_out.iloc[0]["event_source"] == "nse_event_calendar"
+    assert recent_out.iloc[0]["event_type"] == "NSE_EVENT"
+    assert short_out.iloc[0]["event_source"] == "nse_short_selling"
+    assert short_out.iloc[0]["event_type"] == "SHORT_SELLING"
+    assert short_out.iloc[0]["side"] == "SELL"
 
 
 def test_exchange_features_compute_distribution_and_upcoming_earnings():
@@ -3698,3 +4253,103 @@ def test_sync_many_intraday_continues_after_symbol_error(monkeypatch):
     assert results[1]["ticker"] == "BAD"
     assert results[1]["rows"] == 0
     assert "ValueError" in results[1]["error"]
+
+
+def test_wpi_sync_uses_env_backed_lookback_days(monkeypatch):
+    monkeypatch.setattr(wpi, "WPI_LOOKBACK_DAYS", 365)
+    monkeypatch.setattr(wpi, "sync_wpi_for_year", lambda year, today=None: {"year": year})
+    monkeypatch.setattr(wpi, "expected_month_count_for_year", lambda year, today=None: 12)
+
+    results = wpi.sync_wpi()
+
+    expected_start_year = (date.today() - pd.Timedelta(days=365)).year
+    assert results[0]["year"] == expected_start_year
+    assert results[-1]["year"] == date.today().year
+
+
+def test_cpi_sync_uses_env_backed_lookback_days(monkeypatch):
+    monkeypatch.setattr(cpi, "CPI_LOOKBACK_DAYS", 365)
+    monkeypatch.setattr(cpi, "load_existing_cpi_months", lambda: set())
+    monkeypatch.setattr(cpi, "get_db_max_date", lambda *_args, **_kwargs: None)
+    captured = {"months": []}
+
+    def fake_download(month_start):
+        captured["months"].append(month_start)
+
+    monkeypatch.setattr(cpi, "download_cpi_month", fake_download)
+
+    cpi.sync_cpi_data()
+
+    assert captured["months"]
+    assert captured["months"][0] == cpi.first_of_month(date.today() - cpi.relativedelta(days=365))
+
+
+def test_fred_fallback_start_uses_env_backed_lookback_days(monkeypatch):
+    from data.fred import us_macro
+
+    monkeypatch.setattr(us_macro, "FRED_MACRO_LOOKBACK_DAYS", 365)
+
+    def fake_table_has_date(*_args, **_kwargs):
+        raise RuntimeError("db unavailable")
+
+    captured = {"start": None}
+
+    def fake_fetch(series_id, *, start, end):
+        captured["start"] = start
+        series = pd.Series([1.0], index=pd.to_datetime([start]), name=series_id)
+        series.index.name = "date"
+        return series
+
+    monkeypatch.setattr(us_macro, "table_has_date", fake_table_has_date)
+    monkeypatch.setattr(us_macro, "_fetch_single_fred_series", fake_fetch)
+    monkeypatch.setattr(us_macro, "upsert_to_db", lambda *_args, **_kwargs: None)
+
+    us_macro.fetch_fred_series(series={"DGS10": "ust10y_yield"}, resample=None)
+
+    expected_latest = date.today() - pd.Timedelta(days=365)
+    assert captured["start"] == expected_latest - pd.Timedelta(days=15)
+
+
+def test_fpi_update_uses_env_backed_lookback_days(monkeypatch):
+    monkeypatch.setattr(fpi, "FPI_LOOKBACK_DAYS", 365)
+    monkeypatch.setattr(fpi, "latest_downloaded_date", lambda today: None)
+    captured = {"first_target_date": None}
+
+    def fake_downloaded_for(target_date):
+        if captured["first_target_date"] is None:
+            captured["first_target_date"] = target_date
+        return True, None
+
+    monkeypatch.setattr(fpi.futils, "downloaded_for", fake_downloaded_for)
+    calls = []
+    monkeypatch.setattr(fpi, "get_fpi_data", lambda rdate: calls.append(rdate))
+
+    fpi.update_fpi_data()
+
+    assert calls == []
+    expected_start = date.today() - pd.Timedelta(days=365)
+    assert captured["first_target_date"] == min(
+        date(expected_start.year, expected_start.month, fpi.futils.get_last_date(expected_start.year, expected_start.month).day),
+        date.today(),
+    )
+
+
+def test_fbil_gsec_uses_env_backed_lookback_days(monkeypatch):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    monkeypatch.setattr(fbil_gsec, "FBIL_GSEC_LOOKBACK_DAYS", 365)
+    monkeypatch.setattr(fbil_gsec, "get_cookies", lambda: {})
+    monkeypatch.setattr(fbil_gsec.rop, "get", lambda _key: None)
+    captured = {"start": None, "stop": None}
+
+    def fake_daterange(start, stop):
+        captured["start"] = start
+        captured["stop"] = stop
+        return []
+
+    monkeypatch.setattr(fbil_gsec, "daterange", fake_daterange)
+
+    fbil_gsec.download_all_gsec_data()
+
+    expected_start = datetime.combine(date.today(), datetime.min.time()) - pd.Timedelta(days=365)
+    assert captured["start"] == expected_start

@@ -1,7 +1,6 @@
 from datetime import date, datetime, timedelta
 
 import pandas as pd
-import redis
 import requests
 from bs4 import BeautifulSoup
 from environs import Env
@@ -9,18 +8,13 @@ from environs import Env
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers, hidden_inputs_to_dict
 from utils.parsers import table_to_grid
-from utils.sync import get_redis_client
-
 from . import fpi_utils as futils
 
 env = Env()
 env.read_env()
 
-
-REDIS_HOST = env("REDIS_HOST")
-REDIS_PORT = env("REDIS_PORT")
-REDIS_SET = "nsdl:fpi:downloaded"
 HEADERS = get_dynamic_headers()
+FPI_LOOKBACK_DAYS = max(env.int("NSDL_FPI_LOOKBACK_DAYS", 365), 1)
 
 
 def get_fpi_data(rdate: date):
@@ -170,42 +164,19 @@ def parse_html_to_dfs(table_html):
     fii_derivatives_df = parse_derivatives_table(derivatives_table)
     return fii_investments_df, fii_derivatives_df
 
-
-def mark_till_date(rop, end_date):
-    if end_date and isinstance(end_date, datetime):
-        end_date = end_date.date()
-    start = end_date.replace(day=1)
-    days = (end_date - start).days
-    for i in range(days + 1):
-        rop.sadd(REDIS_SET, (start + timedelta(days=i)).strftime("%Y-%m-%d"))
-
-
-def latest_downloaded_date(rop, today: date) -> date | None:
+def latest_downloaded_date(today: date) -> date | None:
     _, latest_db_date = futils.downloaded_for(today)
-    if latest_db_date is not None:
-        return latest_db_date
-
-    has_today = rop.sismember(REDIS_SET, today.strftime("%Y-%m-%d"))
-    if has_today:
-        return today
-
-    latest_redis_date = None
-    members = rop.smembers(REDIS_SET)
-    if members:
-        latest_redis_date = max(datetime.strptime(value, "%Y-%m-%d").date() for value in members)
-
-    candidates = [value for value in [latest_db_date, latest_redis_date] if value is not None]
-    return max(candidates) if candidates else None
+    return latest_db_date
 
 
 def update_fpi_data():
-    rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
     today = date.today()
-    latest_done = latest_downloaded_date(rop, today)
+    latest_done = latest_downloaded_date(today)
     if latest_done is not None:
         year, month = latest_done.year, latest_done.month
     else:
-        year, month = 2014, 1
+        start_date = today - timedelta(days=FPI_LOOKBACK_DAYS)
+        year, month = start_date.year, start_date.month
 
     while (year, month) <= (today.year, today.month):
         last_dom = futils.get_last_date(year, month).day
@@ -213,12 +184,8 @@ def update_fpi_data():
         target_date = min(target_date, today)
 
         found, _ = futils.downloaded_for(target_date)
-        if found:
-            mark_till_date(rop, target_date)
-
         if not found:
             get_fpi_data(target_date)
-            mark_till_date(rop, target_date)
 
         # move to next month
         month += 1

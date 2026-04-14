@@ -11,7 +11,7 @@ from typing import Any
 from utils.redis_utils import install_resilient_redis
 
 
-DOWNLOAD_STEPS = [
+DOWNLOADER_STEPS = [
     {"module": "data.nseindia.holidays", "args": [], "purpose": "holiday_calendar"},
     {"module": "data.dhanlive.scrip_master", "args": [], "purpose": "dhan_master_precheck"},
     {"module": "data.sharpelydata.scrip_master", "args": [], "purpose": "sharpely_master_precheck"},
@@ -29,14 +29,19 @@ DOWNLOAD_STEPS = [
     {"module": "data.nseindia.earnings_events", "args": [], "purpose": "events"},
     {"module": "data.nseindia.insider_deals", "args": [], "purpose": "events"},
     {"module": "data.nseindia.offmarket", "args": [], "purpose": "market_wide"},
-    {"module": "data.nseindia.offmarket_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.bhavcopy_downloader", "args": [], "purpose": "market_wide"},
-    {"module": "data.nseindia.bhavcopy_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.indices_downloader", "args": [], "purpose": "market_wide"},
-    {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.recent_events", "args": [], "purpose": "events"},
     {"module": "data.economictimes.rss", "args": [], "purpose": "news"},
 ]
+
+PARSER_STEPS = [
+    {"module": "data.nseindia.offmarket_parser", "args": [], "purpose": "market_wide"},
+    {"module": "data.nseindia.bhavcopy_parser", "args": [], "purpose": "market_wide"},
+    {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
+]
+
+DOWNLOAD_STEPS = [*DOWNLOADER_STEPS, *PARSER_STEPS]
 
 
 def _emit_progress(message: str) -> None:
@@ -60,6 +65,7 @@ def run_download_module(step: dict[str, Any]) -> dict[str, Any]:
     _emit_progress(f"[data.download_runner] module={module_name} start purpose={purpose or '-'} args={module_args}")
     try:
         sys.argv = [module_name, *module_args]
+        sys.modules.pop(module_name, None)
         runpy.run_module(module_name, run_name="__main__")
         result = {
             "module": module_name,
@@ -120,19 +126,32 @@ def run_download_module(step: dict[str, Any]) -> dict[str, Any]:
         sys.argv = original_argv
 
 
-def run_all_downloads(*, continue_on_error: bool = False, dry_run: bool = False) -> dict[str, Any]:
+def _steps_for_phase(phase: str) -> list[dict[str, Any]]:
+    normalized = str(phase or "all").strip().lower()
+    if normalized == "downloaders":
+        return DOWNLOADER_STEPS
+    if normalized == "parsers":
+        return PARSER_STEPS
+    if normalized == "all":
+        return DOWNLOAD_STEPS
+    raise ValueError(f"Unsupported phase: {phase}")
+
+
+def run_all_downloads(*, continue_on_error: bool = False, dry_run: bool = False, phase: str = "all") -> dict[str, Any]:
     install_resilient_redis()
+    steps = _steps_for_phase(phase)
     if dry_run:
         return {
             "status": "skipped_dry_run",
-            "modules": [step["module"] for step in DOWNLOAD_STEPS],
-            "steps": DOWNLOAD_STEPS,
+            "phase": phase,
+            "modules": [step["module"] for step in steps],
+            "steps": steps,
             "results": [],
         }
 
     results: list[dict[str, Any]] = []
     status = "ok"
-    for step in DOWNLOAD_STEPS:
+    for step in steps:
         result = run_download_module(step)
         results.append(result)
         if result["status"] != "ok":
@@ -141,14 +160,16 @@ def run_all_downloads(*, continue_on_error: bool = False, dry_run: bool = False)
                 break
     return {
         "status": status,
-        "modules": [step["module"] for step in DOWNLOAD_STEPS],
-        "steps": DOWNLOAD_STEPS,
+        "phase": phase,
+        "modules": [step["module"] for step in steps],
+        "steps": steps,
         "results": results,
     }
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run all raw download modules sequentially in-process.")
+    parser = argparse.ArgumentParser(description="Run downloader/parser modules sequentially in-process.")
+    parser.add_argument("--phase", choices=["downloaders", "parsers", "all"], default="all")
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -159,6 +180,7 @@ def main() -> int:
     payload = run_all_downloads(
         continue_on_error=bool(args.continue_on_error),
         dry_run=bool(args.dry_run),
+        phase=str(args.phase),
     )
     print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
     return 0 if payload.get("status") != "failed" else 1

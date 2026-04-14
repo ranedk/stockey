@@ -6,6 +6,7 @@ import redis
 
 from utils.company_master import attach_company_master_id
 from utils.db import db_session, upsert_to_db
+from utils.ingestion_state import get_processed_keys, mark_processed
 from utils import store
 from utils.sync import get_redis_client
 
@@ -15,7 +16,8 @@ env.read_env()
 
 REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
-REDIS_SET = "bhav:parsed"
+REDIS_SET = "nsedeals:parsed"
+SOURCE_PREFIX = "nsedeals"
 
 rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
@@ -122,18 +124,20 @@ def process_csv(file_name, csv_path):
         drop_indexes=drop_indexes,
     )
     upsert_to_db(df, f"nseindia_{dtype}", unique_keys=unique_keys)
+    mark_processed(SOURCE_PREFIX, file_name)
     rop.sadd(REDIS_SET, file_name)
     os.remove(csv_path)
 
 
 if __name__ == "__main__":
+    parsed_files = get_processed_keys(SOURCE_PREFIX)
     for f in store.list_files("nsedeals"):
-        if rop.sismember(REDIS_SET, f):
-            print(f"⏩ Already parsed: {f}")
+        if f in parsed_files:
+            print(f"⏩ Already parsed in DB state: {f}")
             continue
 
         file_path = store.get_as_temp_file(f)
         process_csv(f, file_path)
-        rop.sadd(REDIS_SET, f)
+        parsed_files.add(f)
 
     rop.close()

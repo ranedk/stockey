@@ -1,4 +1,5 @@
 import random
+import os
 from datetime import datetime, timedelta
 
 import redis
@@ -6,7 +7,7 @@ from environs import Env
 from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import daterange
-from utils.sync import get_redis_client, get_redis_set_members
+from utils.sync import get_redis_client
 
 env = Env()
 env.read_env()
@@ -15,6 +16,30 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env.int("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")  # Chromium or webkit won't work with NSE website
 MAX_DOWNLOAD_ATTEMPTS = 2
+NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS = max(env.int("NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS", 365), 1)
+
+
+def extract_downloaded_dates_from_key(key: str, dtype: str) -> set[str]:
+    filename = os.path.basename(key)
+    prefix = f"{dtype}_"
+    suffix = ".csv"
+    if not filename.startswith(prefix) or not filename.endswith(suffix):
+        return set()
+    body = filename[len(prefix):-len(suffix)]
+    try:
+        from_date_str, to_date_str = body.split("_", 1)
+        start_date = datetime.strptime(from_date_str, "%d-%m-%Y")
+        end_date = datetime.strptime(to_date_str, "%d-%m-%Y")
+    except ValueError:
+        return set()
+    return {dt.strftime("%Y-%m-%d") for dt in daterange(start_date, end_date)}
+
+
+def load_downloaded_dates_from_store(dtype: str) -> set[str]:
+    downloaded: set[str] = set()
+    for key in store.list_files("nsedeals"):
+        downloaded.update(extract_downloaded_dates_from_key(key, dtype))
+    return downloaded
 
 
 def get_random(min_ms: int, max_ms: int) -> int:
@@ -98,7 +123,7 @@ def mark_dates_as_downloaded(rop, dtype, start_date, end_date):
 # Check missing dates
 def get_missing_dates(rop, dtype, start_date, end_date, skipped_dates=None):
     skipped_dates = skipped_dates or set()
-    existing_members = get_redis_set_members(rop, f"nse:{dtype}")
+    existing_members = load_downloaded_dates_from_store(dtype)
     return [
         d
         for d in daterange(start_date, end_date)
@@ -135,7 +160,7 @@ def get_next_download_block(rop, dtype, g_start, g_end, skipped_dates=None):
 def main() -> None:
     try:
         rop = get_redis_client(REDIS_HOST, REDIS_PORT)
-        global_start = datetime.strptime("2014-01-01", "%Y-%m-%d")
+        global_start = datetime.today() - timedelta(days=NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS)
         global_end = latest_completed_day()
 
         print(f"Downloading NSE offmarket data through {global_end.strftime('%d-%m-%Y')}")

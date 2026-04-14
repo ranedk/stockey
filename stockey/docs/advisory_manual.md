@@ -62,22 +62,24 @@ The advisory runtime path is:
 21. Train the XGBoost event meta-model only when label coverage is sufficient.
 22. Keep prediction separate from policy and execution.
 
-For the full operator path in one command, use:
+For the main operator path, run:
 
 ```sh
-./all_full_advisory.sh
+./complete_data.sh
+./all_ml.sh
+./all_advisory.sh
 ```
 
-That wrapper:
+That sequence:
 
-1. runs event-model training if the requested horizon is ready
-2. runs the full advisory pipeline
-3. prints the current portfolio summary at the end
+1. refreshes all raw data and parser outputs
+2. runs event-model prep/training if ready
+3. runs the advisory pipeline and portfolio generation
 
 Use model training separately when you want research prep or training-only work:
 
 ```sh
-./all_model_training.sh
+./all_ml.sh
 ```
 
 That command runs prep first, checks whether the requested horizon is actually ready, and only then trains and scores.
@@ -85,7 +87,7 @@ That command runs prep first, checks whether the requested horizon is actually r
 For the lightweight continuous watch loop, use:
 
 ```sh
-./all_continuous_watch.sh --loop
+./all_watchers.sh --loop
 ```
 
 This loop:
@@ -95,14 +97,6 @@ This loop:
 3. routes fresh alerts and events into symbol-level advisory reevaluation
 4. writes live watch alerts when entry zones or invalidations are hit
 5. rewrites a simple static HTML/JSON dashboard in `live_dashboard/`
-
-For a human-readable operator feed from the Redis bus, use:
-
-```sh
-./all_live_notifier.sh
-```
-
-That process subscribes to the continuous-watch channels and writes rolling operator logs into `live_dashboard/`.
 
 The live router currently prioritizes aggressively but does not impose a default hard cap:
 
@@ -264,11 +258,11 @@ python -m ...
 python -m advisory.master_pipeline --dry-run
 ```
 
-### Full advisory write run
+### Advisory write run
 
 ```sh
 ./all_advisory.sh
-python -m advisory.master_pipeline
+python -m advisory.master_pipeline --skip-downloads
 ```
 
 ### Through portfolio only
@@ -715,7 +709,7 @@ There are now two event paths.
 
 ```sh
 ./all_advisory.sh
-python -m advisory.master_pipeline
+python -m advisory.master_pipeline --skip-downloads
 ```
 
 ### If you only changed rules

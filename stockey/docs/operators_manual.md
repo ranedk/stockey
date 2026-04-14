@@ -22,7 +22,7 @@ That means:
 Cron example:
 
 ```sh
-cd /home/rane/code/stockey && ./all_full_advisory.sh
+cd /home/rane/code/stockey && ./all_advisory.sh
 ```
 
 Bootstrap command:
@@ -48,17 +48,16 @@ Or run it with `go-crond`:
 
 ```sh
 mkdir -p /home/rane/code/stockey/logs/cron
-/home/rane/code/stockey/go-crond /home/rane/code/stockey/config/stockey.crontab
+./go-crond config/stockey.crontab --allow-unprivileged
 ```
 
 Current schedule:
 
-- `07:10` weekdays: `./all_downloads.sh` for the broad raw daily refresh
-- `08:20` Monday, Wednesday, Friday: `./all_full_advisory.sh --skip-model-training --skip-downloads`
-- every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_continuous_watch.sh`
-- `16:05` weekdays: one final post-close `./all_continuous_watch.sh`
-- `18:45` weekdays: `./all_model_training.sh`
-- `09:30` Saturday: optional `./all_backfill.sh watchlist 5`
+- `07:10` weekdays: `./complete_data.sh`
+- `08:20` Monday, Wednesday, Friday: `./all_advisory.sh`
+- every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_watchers.sh`
+- `16:05` weekdays: one final post-close `./all_watchers.sh`
+- `18:45` weekdays: `./all_ml.sh`
 
 Why the split looks like this:
 
@@ -104,40 +103,37 @@ Set `REDIS_FAIL_SOFT=false` only for flows where Redis itself is the product, su
 
 ## Main operating modes
 
-### 1. Full advisory run
+### 1. Complete data refresh
 
 Use when:
 
-- you want the current end-to-end advisory output
-- you want the portfolio summary in one command
-- you want model training to run first if the event-model horizon is ready
+- you want all raw downloads and parser steps to run in order
 
 Command:
 
 ```sh
-./all_full_advisory.sh
+./complete_data.sh
 ```
 
 Useful variants:
 
 ```sh
-./all_full_advisory.sh --skip-model-training
-./all_full_advisory.sh --skip-downloads
-./all_full_advisory.sh --date 2026-04-08
+./all_downloaders.sh
+./all_parsers.sh
 ```
 
 What it does:
 
-1. runs model prep and training if ready
-2. runs the advisory pipeline
-3. prints the current portfolio summary
+1. runs every download module
+2. runs every parser module
+3. writes the combined status summary
 
-### 2. Advisory only
+### 2. Advisory and portfolio
 
 Use when:
 
 - raw data is already fresh
-- you want the batch advisory output without model-training prep
+- you want the batch advisory output and current portfolio state
 
 Command:
 
@@ -155,14 +151,14 @@ Use when:
 Command:
 
 ```sh
-./all_model_training.sh
+./all_ml.sh
 ```
 
 Useful variants:
 
 ```sh
-./all_model_training.sh --prep-only
-./all_model_training.sh --horizon-days 1
+./all_ml.sh --prep-only
+./all_ml.sh --horizon-days 1
 ```
 
 What it does:
@@ -183,14 +179,14 @@ Use when:
 Command:
 
 ```sh
-./all_continuous_watch.sh --loop
+./all_watchers.sh --loop
 ```
 
 Useful variants:
 
 ```sh
-./all_continuous_watch.sh --loop --sleep-seconds 300
-./all_continuous_watch.sh --loop --ohlcv-interval-seconds 300 --news-interval-seconds 1800 --announcement-interval-seconds 1800
+./all_watchers.sh --loop --sleep-seconds 300
+./all_watchers.sh --loop --ohlcv-interval-seconds 300 --news-interval-seconds 1800 --announcement-interval-seconds 1800
 ```
 
 What it watches:
@@ -208,33 +204,19 @@ Important behavior:
 - open positions remain monitored for exit-related alerts
 - alerts and cycle summaries are also published over Redis pub-sub
 
-### 5. Live notifier
+### 5. Split refreshes
 
 Use when:
 
-- you want a human-readable operator feed from the Redis pub-sub stream
-- you want a rolling log of live watch activity without reading raw JSON tables
+- you want to separate raw downloads from parser runs
+- you are recovering only one half of the ingestion flow
 
-Command:
-
-```sh
-./all_live_notifier.sh
-```
-
-Useful variants:
+Commands:
 
 ```sh
-./all_live_notifier.sh --output-dir live_dashboard
-./all_live_notifier.sh --duration-seconds 600
+./all_downloaders.sh
+./all_parsers.sh
 ```
-
-What it writes:
-
-- `live_dashboard/operator_feed.json`
-- `live_dashboard/operator_feed.jsonl`
-- `live_dashboard/operator_feed.txt`
-
-The live dashboard page now also shows the latest operator feed entries directly.
 
 ## Dashboard
 
@@ -285,14 +267,15 @@ python -m advisory.event_router --dry-run
 
 ### Batch mode
 
-1. `./all_full_advisory.sh`
-2. inspect portfolio output
-3. inspect any setup or symbol traces that look unusual
+1. `./complete_data.sh`
+2. `./all_ml.sh`
+3. `./all_advisory.sh`
+4. inspect portfolio output and traces if something looks unusual
 
 ### Live monitoring mode
 
-1. `./all_continuous_watch.sh --loop`
-2. `./all_live_notifier.sh`
+1. `./all_watchers.sh --loop`
+2. `python -m advisory.live_dashboard --output-dir live_dashboard`
 3. `python -m http.server --directory live_dashboard 8000`
 4. inspect `advisory.event_router --dry-run` if routing volume looks suspicious
 

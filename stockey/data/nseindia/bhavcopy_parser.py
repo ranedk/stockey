@@ -4,14 +4,16 @@ import tempfile
 import zipfile
 import glob
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+from collections.abc import Iterable
 
 import pandas as pd
 from environs import Env
 import redis
 
 from utils.company_master import attach_company_master_id
-from utils.db import upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.ingestion_state import get_failed_entries, get_processed_keys, mark_failed, mark_processed
 from utils import store
 from utils.date import pd_to_datetime, remove_invalid_dates
 from utils.sync import get_redis_client
@@ -23,8 +25,112 @@ env.read_env()
 REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 REDIS_SET = "bhav:parsed"
+SOURCE_PREFIX = "bhavcopy"
+NSE_BHAVCOPY_PARSE_LOOKBACK_DAYS = max(env.int("NSE_BHAVCOPY_PARSE_LOOKBACK_DAYS", 365), 1)
 
 rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
+
+
+def emit(message: str) -> None:
+    print(message, flush=True)
+
+
+def chunked(values: list[str], size: int) -> Iterable[list[str]]:
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def extract_bhavcopy_date_from_key(key: str) -> pd.Timestamp | None:
+    try:
+        return pd.to_datetime(os.path.basename(key), format="bhavcopy_%Y-%m-%d.zip")
+    except ValueError:
+        return None
+
+
+def should_consider_key(key: str, *, today: datetime | None = None) -> bool:
+    today = today or datetime.today()
+    file_date = extract_bhavcopy_date_from_key(key)
+    if file_date is None:
+        return False
+    cutoff = pd.Timestamp((today - timedelta(days=NSE_BHAVCOPY_PARSE_LOOKBACK_DAYS)).date())
+    return file_date.normalize() >= cutoff
+
+
+def load_existing_ohlcv_dates(target_dates: Iterable[pd.Timestamp]) -> set[str]:
+    normalized = sorted({pd.Timestamp(value).strftime("%Y-%m-%d") for value in target_dates if pd.notna(value)})
+    if not normalized:
+        return set()
+
+    existing: set[str] = set()
+    for batch in chunked(normalized, 500):
+        placeholders = ", ".join(["%s"] * len(batch))
+        query = f"""
+            SELECT DISTINCT date::date AS parsed_date
+            FROM nseindia_ohlcv
+            WHERE date::date IN ({placeholders})
+        """
+        try:
+            frame = sql_to_df(query, params=tuple(batch))
+        except Exception as exc:
+            message = str(exc).lower()
+            if exc.__class__.__name__ == "UndefinedTable" or "does not exist" in message:
+                return set()
+            raise
+        if frame.empty:
+            continue
+        existing.update(
+            pd.to_datetime(frame["parsed_date"], errors="coerce")
+            .dropna()
+            .dt.strftime("%Y-%m-%d")
+            .tolist()
+        )
+    return existing
+
+
+def run_parser() -> None:
+    files = [key for key in store.list_files("bhavcopy") if should_consider_key(key)]
+    keyed_dates = {key: extract_bhavcopy_date_from_key(key) for key in files}
+    processed_keys = get_processed_keys(SOURCE_PREFIX)
+    parsed_dates = load_existing_ohlcv_dates(
+        value for value in keyed_dates.values() if value is not None
+    )
+    failed_entries = {row["object_key"]: row for row in get_failed_entries(SOURCE_PREFIX)}
+
+    if failed_entries:
+        emit(f"⚠️ Found {len(failed_entries)} previously failed bhavcopy key(s) in DB state")
+        for key in sorted(failed_entries)[:10]:
+            row = failed_entries[key]
+            emit(f"⚠️ Prior failure key={key} at={row.get('processed_at')} error={row.get('error_message')}")
+
+    for key in files:
+        if key in processed_keys:
+            emit(f"⏩ Already processed in DB state: {key}")
+            continue
+        parsed_date = keyed_dates.get(key)
+        if parsed_date is not None and parsed_date.strftime("%Y-%m-%d") in parsed_dates:
+            emit(f"⏩ Already parsed in DB: {key}")
+            mark_processed(SOURCE_PREFIX, key)
+            processed_keys.add(key)
+            continue
+        file_path = store.get_as_temp_file(key)
+        emit(f"For: {key}")
+        try:
+            parsed = unzip_and_process(file_path)
+        except Exception as exc:
+            error_message = f"{exc.__class__.__name__}: {exc}"
+            emit(f"❌ Failed to parse bhavcopy key={key}: {error_message}")
+            mark_failed(SOURCE_PREFIX, key, error_message)
+            continue
+        if parsed:
+            mark_processed(SOURCE_PREFIX, key)
+            processed_keys.add(key)
+            rop.sadd(REDIS_SET, key)
+        else:
+            emit(f"⏭️ Marking bhavcopy key as processed without OHLCV rows: {key}")
+            mark_processed(SOURCE_PREFIX, key)
+            processed_keys.add(key)
+
+    rop.close()
 
 
 def with_company_master(df: pd.DataFrame) -> pd.DataFrame:
@@ -32,7 +138,7 @@ def with_company_master(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_mcap(path):
-    print("Processing MCAP")
+    emit("Processing MCAP")
     data = open(path).read()
     lines = [line.strip().rstrip(".") for line in data.strip().split("\n")]
     cleaned_data = "\n".join(lines[:-3])
@@ -64,7 +170,7 @@ def parse_mcap(path):
 
 
 def parse_circuit_hit(path):
-    print("Processing Circuit Hit")
+    emit("Processing Circuit Hit")
     parts = os.path.basename(path)
     try:
         for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
@@ -86,7 +192,7 @@ def parse_circuit_hit(path):
 
 
 def parse_corporate_actions_bc(path):
-    print("Processing Corporate Actions BC")
+    emit("Processing Corporate Actions BC")
     df = pd.read_csv(path)
     df.columns = [
         "series",
@@ -119,7 +225,7 @@ def parse_corporate_actions_bc(path):
     return df
 
 def parse_bhavcopy(csv_path):
-    print("Processing BhavCopy")
+    emit("Processing BhavCopy")
     df = pd.read_csv(csv_path)
     cmap = {
         'TradDt': 'date',
@@ -160,7 +266,7 @@ def parse_bhavcopy(csv_path):
 
 
 def parse_ohlcv(csv_path):
-    print("Processing OHLCV")
+    emit("Processing OHLCV")
     df = pd.read_csv(csv_path, skiprows=1)
     df = df.iloc[:, :13]
     df = df.reset_index(drop=True)
@@ -201,7 +307,7 @@ def parse_ohlcv(csv_path):
 
 
 def parse_reg(path):
-    print("Processing REG")
+    emit("Processing REG")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="IND%d%m%y")
     df = pd.read_csv(path, skiprows=1)
@@ -279,7 +385,7 @@ def parse_reg(path):
 
 
 def parse_pe(path):
-    print("Processing PE")
+    emit("Processing PE")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="%d%m%y")
     df = pd.read_csv(path, skiprows=1)
@@ -296,7 +402,7 @@ def parse_pe(path):
 
 
 def parse_mto(path):
-    print("Processing MTO")
+    emit("Processing MTO")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="%d%m%Y")
     df = pd.read_csv(path, skiprows=4)
@@ -324,7 +430,7 @@ def parse_mto(path):
 
 
 def parse_csqr(path):
-    print("Processing CSQR")
+    emit("Processing CSQR")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="%d%m%Y")
     df = pd.read_csv(path)
@@ -351,7 +457,7 @@ def parse_csqr(path):
 
 
 def parse_cmvolt(path):
-    print("Processing CMVOL")
+    emit("Processing CMVOL")
     df = pd.read_csv(path, skiprows=1)
     df = df.iloc[:, :8]
     df = df.reset_index(drop=True)
@@ -384,7 +490,7 @@ def parse_cmvolt(path):
 
 
 def parse_var1(path):
-    print("Processing VAR1")
+    emit("Processing VAR1")
     with open(path) as f:
         parts = f.readline().strip().split(",")
         for_date = datetime.strptime(parts[1], "%d%m%Y").date()
@@ -427,13 +533,16 @@ def parse_var1(path):
 
 
 def parse_cat_turnover(path):
-    print("Processing CAT Turnover")
+    emit("Processing CAT Turnover")
     try:
         df = pd.read_excel(path, sheet_name="Daily", skiprows=2, header=None)
     except ValueError:
-        df = pd.read_excel(path, skiprows=3, header=None)
-    except:
-        return
+        try:
+            df = pd.read_excel(path, skiprows=3, header=None)
+        except Exception as exc:
+            raise RuntimeError(f"Unable to read CAT Turnover workbook fallback path={path}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Unable to read CAT Turnover workbook path={path}") from exc
 
     df = df.iloc[:, :4]
     df.columns = ["trade_date", "client_category", "buy_rs_cr", "sell_rs_cr"]
@@ -452,7 +561,7 @@ def parse_cat_turnover(path):
 
 
 def parse_catg(path):
-    print("Processing CATG")
+    emit("Processing CATG")
     with open(path) as f:
         header = f.readline().strip().split(",")
         for_month = datetime.strptime(f"01,{header[1]},{header[2]}", "%d,%b,%Y").date()
@@ -484,108 +593,133 @@ def is_empty_zip(path: str) -> bool:
 
 
 def unzip_and_process(zip_path):
-    print("Processing %s" % zip_path)
+    emit("Processing %s" % zip_path)
     if is_empty_zip(zip_path):
-        print(f"⏭️ Skipping empty zip: {zip_path}")
+        emit(f"⏭️ Skipping empty zip: {zip_path}")
         os.remove(zip_path)
-        return
+        return False
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        with zipfile.ZipFile(zip_path, "r") as zip_ref:
-            zip_ref.extractall(tmpdir)
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(tmpdir)
+        except zipfile.BadZipFile as exc:
+            emit(f"❌ Bad bhavcopy zip: {zip_path} - {exc}")
+            os.remove(zip_path)
+            raise RuntimeError(f"bad_bhavcopy_zip:{os.path.basename(zip_path)}") from exc
+
+        failures: list[str] = []
+
+        def _run(label: str, file_path: str, parser) -> None:
+            try:
+                parser(file_path)
+            except Exception as exc:
+                failures.append(f"{label}:{os.path.basename(file_path)}:{exc.__class__.__name__}:{exc}")
+                emit(f"❌ Failed {label} file={file_path}: {exc.__class__.__name__}: {exc}")
 
         catg_files = glob.glob(os.path.join(tmpdir, "**", "C_CATG_*.T*"), recursive=True)
         for file_path in catg_files:
-            parse_catg(file_path)
+            _run("catg", file_path, parse_catg)
 
         var1_files = glob.glob(os.path.join(tmpdir, "**", "C_VAR1_*_*.DAT"), recursive=True)
         for file_path in var1_files:
-            parse_var1(file_path)
+            _run("var1", file_path, parse_var1)
 
         cat_turnover_files = glob.glob(os.path.join(tmpdir, "**", "cat_turnover_*.xls"), recursive=True)
         for file_path in cat_turnover_files:
-            parse_cat_turnover(file_path)
+            _run("cat_turnover", file_path, parse_cat_turnover)
 
         cmvolt_files = glob.glob(os.path.join(tmpdir, "**", "CMVOLT_*.CSV"), recursive=True)
         for file_path in cmvolt_files:
-            parse_cmvolt(file_path)
+            _run("cmvolt", file_path, parse_cmvolt)
 
         csqr_files = glob.glob(os.path.join(tmpdir, "**", "CSQR_*.CSV"), recursive=True)
         for file_path in csqr_files:
-            parse_csqr(file_path)
+            _run("csqr", file_path, parse_csqr)
 
         mto_files = glob.glob(os.path.join(tmpdir, "**", "MTO_*.CSV"), recursive=True)
         for file_path in mto_files:
-            parse_mto(file_path)
+            _run("mto", file_path, parse_mto)
 
         pe_files = glob.glob(os.path.join(tmpdir, "**", "PE_*.CSV"), recursive=True)
         for file_path in pe_files:
-            parse_pe(file_path)
+            _run("pe", file_path, parse_pe)
 
         reg_files = glob.glob(os.path.join(tmpdir, "**", "REG_*.CSV"), recursive=True)
         for file_path in reg_files:
-            parse_reg(file_path)
+            _run("reg", file_path, parse_reg)
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "cm*.zip"), recursive=True)
         for nested_zip in nested_zips:
             if is_empty_zip(nested_zip):
-                print(f"⏭️ Skipping empty nested zip: {nested_zip}")
+                emit(f"⏭️ Skipping empty nested zip: {nested_zip}")
                 continue
             with tempfile.TemporaryDirectory() as nested_tmpdir:
-                with zipfile.ZipFile(nested_zip, "r") as nested_ref:
-                    nested_ref.extractall(nested_tmpdir)
+                try:
+                    with zipfile.ZipFile(nested_zip, "r") as nested_ref:
+                        nested_ref.extractall(nested_tmpdir)
+                except zipfile.BadZipFile as exc:
+                    failures.append(f"nested_cm_zip:{os.path.basename(nested_zip)}:{exc.__class__.__name__}:{exc}")
+                    emit(f"❌ Bad nested CM zip: {nested_zip} - {exc}")
+                    continue
 
                 cm_files = glob.glob(os.path.join(nested_tmpdir, "**", "cm*.csv"), recursive=True)
                 for file_path in cm_files:
                     if not os.path.isdir(file_path):
-                        parse_ohlcv(file_path)
+                        _run("ohlcv", file_path, parse_ohlcv)
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "BhavCopy*.zip"), recursive=True)
         for nested_zip in nested_zips:
             if is_empty_zip(nested_zip):
-                print(f"⏭️ Skipping empty nested zip: {nested_zip}")
+                emit(f"⏭️ Skipping empty nested zip: {nested_zip}")
                 continue
             with tempfile.TemporaryDirectory() as nested_tmpdir:
-                with zipfile.ZipFile(nested_zip, "r") as nested_ref:
-                    nested_ref.extractall(nested_tmpdir)
+                try:
+                    with zipfile.ZipFile(nested_zip, "r") as nested_ref:
+                        nested_ref.extractall(nested_tmpdir)
+                except zipfile.BadZipFile as exc:
+                    failures.append(f"nested_bhavcopy_zip:{os.path.basename(nested_zip)}:{exc.__class__.__name__}:{exc}")
+                    emit(f"❌ Bad nested BhavCopy zip: {nested_zip} - {exc}")
+                    continue
 
                 bhav_files = glob.glob(os.path.join(nested_tmpdir, "**", "BhavCopy*.csv"), recursive=True)
                 for file_path in bhav_files:
                     if not os.path.isdir(file_path):
-                        parse_bhavcopy(file_path)
+                        _run("bhavcopy", file_path, parse_bhavcopy)
 
         nested_zips = glob.glob(os.path.join(tmpdir, "**", "PR*.zip"), recursive=True)
         for nested_zip in nested_zips:
             if is_empty_zip(nested_zip):
-                print(f"⏭️ Skipping empty nested zip: {nested_zip}")
+                emit(f"⏭️ Skipping empty nested zip: {nested_zip}")
                 continue
             with tempfile.TemporaryDirectory() as nested_tmpdir:
-                with zipfile.ZipFile(nested_zip, "r") as nested_ref:
-                    nested_ref.extractall(nested_tmpdir)
+                try:
+                    with zipfile.ZipFile(nested_zip, "r") as nested_ref:
+                        nested_ref.extractall(nested_tmpdir)
+                except zipfile.BadZipFile as exc:
+                    failures.append(f"nested_pr_zip:{os.path.basename(nested_zip)}:{exc.__class__.__name__}:{exc}")
+                    emit(f"❌ Bad nested PR zip: {nested_zip} - {exc}")
+                    continue
 
                 bc_files = glob.glob(os.path.join(nested_tmpdir, "**", "Bc*.csv"), recursive=True)
                 for file_path in bc_files:
-                    parse_corporate_actions_bc(file_path)
+                    _run("corporate_actions_bc", file_path, parse_corporate_actions_bc)
 
                 bh_files = glob.glob(os.path.join(nested_tmpdir, "**", "bh*.csv"), recursive=True)
                 for file_path in bh_files:
-                    parse_circuit_hit(file_path)
+                    _run("circuit_hit", file_path, parse_circuit_hit)
 
                 mcap_files = glob.glob(os.path.join(nested_tmpdir, "**", "MCAP*.csv"), recursive=True)
                 for file_path in mcap_files:
-                    parse_mcap(file_path)
+                    _run("mcap", file_path, parse_mcap)
+
+        if failures:
+            emit(f"⚠️ Completed bhavcopy zip with {len(failures)} file-level failure(s): {zip_path}")
+            raise RuntimeError("; ".join(failures[:20]))
 
     os.remove(zip_path)
+    return True
 
 
 if __name__ == "__main__":
-    parsed_sites = rop.smembers(REDIS_SET)
-    for f in store.list_files("bhavcopy"):
-        if f in parsed_sites:
-            print(f"⏩ Already parsed: {f}")
-            continue
-        file_path = store.get_as_temp_file(f)
-        print(f"For: {f}")
-        unzip_and_process(file_path)
-        rop.sadd(REDIS_SET, f)
-    rop.close()
+    run_parser()

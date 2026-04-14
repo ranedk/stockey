@@ -19,13 +19,15 @@ The main design constraint is that LLMs help with extraction and review, but the
 
 The repository has three primary runtime modes:
 
-1. batch advisory
-   - `./all_full_advisory.sh`
-   - `./all_advisory.sh`
+1. data refresh
+   - `./all_downloaders.sh`
+   - `./all_parsers.sh`
+   - `./complete_data.sh`
 2. model research and training
-   - `./all_model_training.sh`
-3. continuous watch
-   - `./all_continuous_watch.sh --loop`
+   - `./all_ml.sh`
+3. batch advisory and continuous watch
+   - `./all_advisory.sh`
+   - `./all_watchers.sh --loop`
 
 ## Layer 1: Extraction
 

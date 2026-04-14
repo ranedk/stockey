@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--return-threshold", type=float, default=0.02, help="Directional-return threshold for event-model training")
     parser.add_argument("--artifact-dir", default=".cache/advisory_event_meta_model", help="Directory for trained event-model artifacts")
     parser.add_argument("--model-basename", default="event_meta_model", help="Model artifact basename")
-    parser.add_argument("--skip-model-training", action="store_true", help="Skip all_model_training.sh and run only advisory plus portfolio summary")
+    parser.add_argument("--skip-model-training", action="store_true", help="Skip all_ml.sh and run only advisory plus portfolio summary")
     parser.add_argument("--skip-advisory", action="store_true", help="Skip all_advisory.sh and print only the current portfolio summary")
     parser.add_argument("--skip-downloads", action="store_true", help="Skip raw downloads inside the advisory pipeline")
     parser.add_argument("--dry-run", action="store_true", help="Run training and advisory in dry-run mode")
