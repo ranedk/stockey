@@ -10,6 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from advisory.setup_registry import load_setup_registry
 from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.display_time import to_display_value
 from utils.sync import parse_datetime_arg
 
 
@@ -88,6 +89,7 @@ def ensure_portfolio_table() -> None:
             f"""
             CREATE TABLE IF NOT EXISTS {PORTFOLIO_TABLE} (
                 published_on TIMESTAMPTZ NOT NULL,
+                source_published_on TIMESTAMPTZ,
                 asof_date TIMESTAMPTZ,
                 planned_at TIMESTAMPTZ,
                 setup_id TEXT NOT NULL,
@@ -120,6 +122,7 @@ def ensure_portfolio_table() -> None:
             """
         )
         column_defs = {
+            "source_published_on": "TIMESTAMPTZ",
             "setup_name": "TEXT",
             "company_master_id": "TEXT",
             "portfolio_capital_inr": "DOUBLE PRECISION",
@@ -157,6 +160,7 @@ def ensure_portfolio_table() -> None:
             "key_monitor_fields_json": "TEXT",
             "recheck_frequency": "TEXT",
             "exit_event_rules_json": "TEXT",
+            "invest_score_pct": "DOUBLE PRECISION",
         }
         for column, sql_type in column_defs.items():
             cur.execute(f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
@@ -191,7 +195,7 @@ def load_allocations(
     if table_exists(PORTFOLIO_TABLE):
         join_sql = f"""
         LEFT JOIN {PORTFOLIO_TABLE} p
-          ON p.published_on = a.published_on
+          ON p.asof_date = a.asof_date
          AND p.setup_id = a.setup_id
          AND p.symbol = a.symbol
          AND p.unique_id = a.unique_id
@@ -371,6 +375,39 @@ def compute_priority_score(row: pd.Series) -> float:
     return round((confidence * 3.0) + conviction_score - risk_penalty - liquidity_penalty + (allocation_size / 100_000.0) + (score_impact * 2.0) + transition_bonus, 6)
 
 
+def compute_invest_score_pct(row: pd.Series) -> float:
+    confidence = pd.to_numeric(row.get("confidence"), errors="coerce")
+    confidence_component = 0.0 if pd.isna(confidence) else max(0.0, min(float(confidence), 1.0)) * 55.0
+    conviction_bucket = str(row.get("conviction_bucket", "")).lower()
+    conviction_component = {
+        "low": 8.0,
+        "medium": 14.0,
+        "high": 20.0,
+    }.get(conviction_bucket, 10.0)
+    risk_bucket = str(row.get("risk_bucket", "")).lower()
+    risk_component = {
+        "low": 15.0,
+        "medium": 11.0,
+        "medium_high": 7.0,
+        "high": 3.0,
+    }.get(risk_bucket, 8.0)
+    score_impact = pd.to_numeric(row.get("score_impact"), errors="coerce")
+    score_impact_component = 0.0 if pd.isna(score_impact) else max(-8.0, min(8.0, float(score_impact) * 25.0))
+    transition_hint = str(row.get("state_transition_hint") or "").upper()
+    transition_component = {
+        "UPGRADE_TO_PASS_NOW": 8.0,
+        "RAISE_SCORE_ONLY": 4.0,
+        "CUT_SCORE_ONLY": -4.0,
+        "DOWNGRADE_TO_REJECT": -12.0,
+    }.get(transition_hint, 0.0)
+    liquidity_penalty = 0.0
+    adv_pct = pd.to_numeric(row.get("allocation_pct_of_adv20d"), errors="coerce")
+    if pd.notna(adv_pct) and adv_pct > 0.0025:
+        liquidity_penalty = min(float(adv_pct) * 2000.0, 10.0)
+    score = confidence_component + conviction_component + risk_component + score_impact_component + transition_component - liquidity_penalty
+    return round(max(0.0, min(score, 100.0)), 2)
+
+
 def build_execution_notes(row: pd.Series, approved_allocation: float, portfolio_status: str, portfolio_reason: str | None = None) -> str | None:
     notes: list[str] = []
     if portfolio_status == "approved":
@@ -394,6 +431,14 @@ def build_execution_notes(row: pd.Series, approved_allocation: float, portfolio_
     if base_notes:
         notes.append(base_notes)
     return " ".join(notes) if notes else None
+
+
+def select_primary_symbol_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "symbol" not in df.columns:
+        return df
+    working = df.copy()
+    working["symbol"] = working["symbol"].astype("string").str.upper()
+    return working.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
 
 
 def _parse_horizon_days(note: object) -> int | None:
@@ -507,6 +552,7 @@ def build_portfolio_orders(
     working["overlap_group"] = working["symbol"].map(lambda s: overlap_map.get(str(s).upper(), (f"symbol:{s}", "symbol_only"))[0])
     working["overlap_reason"] = working["symbol"].map(lambda s: overlap_map.get(str(s).upper(), (f"symbol:{s}", "symbol_only"))[1])
     working["priority_score"] = working.apply(compute_priority_score, axis=1)
+    working["invest_score_pct"] = working.apply(compute_invest_score_pct, axis=1)
     working["requested_allocation_inr"] = pd.to_numeric(working["suggested_allocation_inr"], errors="coerce").fillna(0.0)
     duplicate_symbols = {
         str(symbol).upper()
@@ -521,12 +567,14 @@ def build_portfolio_orders(
         ascending=[False, False, False, True],
         kind="stable",
     ).reset_index(drop=True)
+    working = select_primary_symbol_rows(working)
 
     remaining_capital = float(config.capital_inr)
     setup_caps_used: dict[str, float] = {}
     overlap_group_counts: dict[str, int] = {}
     approved_positions = 0
     rows: list[dict[str, Any]] = []
+    planned_now = pd.Timestamp.utcnow()
 
     default_single_position_cap = float(config.capital_inr) * float(config.single_position_cap_pct)
     setup_cap_overrides = get_setup_cap_overrides()
@@ -576,9 +624,10 @@ def build_portfolio_orders(
             approved_positions += 1
 
         portfolio_row = {
-                "published_on": row["published_on"],
+                "published_on": planned_now,
+                "source_published_on": row.get("published_on"),
                 "asof_date": row["asof_date"],
-                "planned_at": pd.Timestamp.utcnow(),
+                "planned_at": planned_now,
                 "setup_id": row["setup_id"],
                 "setup_name": row.get("setup_name"),
                 "symbol": row["symbol"],
@@ -590,6 +639,7 @@ def build_portfolio_orders(
                 "portfolio_status": status,
                 "portfolio_reason": portfolio_reason,
                 "priority_score": row["priority_score"],
+                "invest_score_pct": row.get("invest_score_pct"),
                 "overlap_group": overlap_group,
                 "overlap_reason": overlap_reason,
                 "event_class": row.get("event_class"),
@@ -619,6 +669,7 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
     for column in [
         "portfolio_capital_inr",
         "priority_score",
+        "invest_score_pct",
         "score_impact",
         "requested_allocation_inr",
         "approved_allocation_inr",
@@ -633,22 +684,22 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
     for column in ["max_positions", "plan_rank", "expected_horizon_days"]:
         if column in out.columns:
             out[column] = pd.to_numeric(out[column], errors="coerce").astype("Int64")
-    for column in ["published_on", "asof_date", "planned_at", "load_ts", "target_review_date", "horizon_end_date"]:
+    for column in ["published_on", "source_published_on", "asof_date", "planned_at", "load_ts", "target_review_date", "horizon_end_date"]:
         if column in out.columns:
             out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
     with db_session() as (_, cur):
         pairs = (
-            out[["asof_date", "setup_id"]]
+            out[["asof_date", "symbol"]]
             .dropna()
             .drop_duplicates()
             .to_dict(orient="records")
         )
         for item in pairs:
             cur.execute(
-                f"DELETE FROM {PORTFOLIO_TABLE} WHERE asof_date = %s AND setup_id = %s",
+                f"DELETE FROM {PORTFOLIO_TABLE} WHERE asof_date = %s AND symbol = %s",
                 (
                     pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
-                    str(item["setup_id"]),
+                    str(item["symbol"]).upper(),
                 ),
             )
     upsert_to_db(
@@ -742,7 +793,7 @@ def summarize(df: pd.DataFrame) -> dict[str, Any]:
         "trimmed_count": int((df["portfolio_status"] == "trimmed").sum()),
         "deferred_count": int((df["portfolio_status"] == "deferred").sum()),
         "approved_capital_inr": float(pd.to_numeric(df["approved_allocation_inr"], errors="coerce").fillna(0.0).sum()),
-        "sample": df.head(10).to_dict(orient="records"),
+        "sample": to_display_value(df.head(10)),
     }
 
 
@@ -794,7 +845,7 @@ def main() -> int:
         if args.format == "text":
             print(render_text_table(df))
         else:
-            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+            print(json.dumps(to_display_value(result), indent=2, ensure_ascii=False, default=str))
         return 0
     except SQLAlchemyError as exc:
         emit_error(

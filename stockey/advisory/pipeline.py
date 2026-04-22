@@ -22,7 +22,7 @@ from advisory.execution_engine import (
 )
 from advisory.event_meta_model import (
     DEFAULT_ARTIFACT_DIR as DEFAULT_EVENT_MODEL_ARTIFACT_DIR,
-    build_labeled_event_dataset,
+    build_live_event_dataset,
     model_artifact_exists,
     persist_scores as persist_event_model_scores,
     score_events as score_event_model,
@@ -198,6 +198,17 @@ def stage_enabled(stage: str, start_at: str | None, stop_at: str | None) -> bool
     return True
 
 
+def _normalize_utc_arg_timestamp(value: Any) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     if not hasattr(args, "skip_intraday"):
         args.skip_intraday = False
@@ -213,7 +224,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         args.rule_max_intraday_prefetch_age_days = 14
     if not hasattr(args, "event_model_artifact_dir"):
         args.event_model_artifact_dir = str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR)
-    asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
+    asof_date = _normalize_utc_arg_timestamp(args.date)
     summary: dict[str, Any] = {
         "status": "ok",
         "pipeline": "advisory.pipeline",
@@ -516,7 +527,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             stage_started = _start_stage("event_model")
             artifact_dir = Path(str(args.event_model_artifact_dir))
             if model_artifact_exists(artifact_dir=artifact_dir):
-                model_dataset = build_labeled_event_dataset(
+                model_dataset = build_live_event_dataset(
                     asof_date=asof_date,
                     symbols=symbols,
                     setup_ids=setup_ids,
@@ -607,6 +618,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             symbols=symbols,
             setup_ids=setup_ids,
             include_existing=bool(args.rebuild),
+            use_broker_account=bool(args.live_execution),
         )
         if args.live_execution:
             execution_df = submit_live_orders(execution_df)

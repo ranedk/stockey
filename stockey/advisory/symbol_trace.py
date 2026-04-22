@@ -179,6 +179,36 @@ def df_to_records(df: pd.DataFrame, date_cols: list[str] | None = None, limit: i
     return records
 
 
+def _build_symbol_narrative(*, candidate_row: dict[str, Any] | None, watchlist_row: dict[str, Any] | None, aggregated_event: dict[str, Any] | None) -> dict[str, str | None]:
+    base_regime = (candidate_row or {}).get("base_regime") or (watchlist_row or {}).get("base_regime")
+    news_overlay = (candidate_row or {}).get("news_overlay") or (watchlist_row or {}).get("news_overlay")
+    source_screener_slug = (watchlist_row or {}).get("source_screener_slug") or (candidate_row or {}).get("source_screener_slug")
+    source_screener_list = (watchlist_row or {}).get("source_screener_list") or (candidate_row or {}).get("source_screener_list")
+    effective_event_verdict = (aggregated_event or {}).get("effective_event_verdict")
+    effective_event_class = (aggregated_event or {}).get("effective_event_class")
+    effective_state_hint = (aggregated_event or {}).get("effective_state_transition_hint")
+    stage_bits: list[str] = []
+    if base_regime:
+        stage_bits.append(f"Base regime: {base_regime}.")
+    if news_overlay:
+        stage_bits.append(f"Overlay: {news_overlay}.")
+    if source_screener_slug:
+        stage_bits.append(f"Primary screener: {source_screener_slug}.")
+    elif source_screener_list:
+        stage_bits.append(f"Screener list: {source_screener_list}.")
+    event_bits: list[str] = []
+    if effective_event_verdict:
+        event_bits.append(f"Effective event verdict: {effective_event_verdict}.")
+    if effective_event_class:
+        event_bits.append(f"Event class: {effective_event_class}.")
+    if effective_state_hint:
+        event_bits.append(f"State transition hint: {effective_state_hint}.")
+    return {
+        "market_context": " ".join(stage_bits) if stage_bits else None,
+        "event_context": " ".join(event_bits) if event_bits else None,
+    }
+
+
 def load_aggregated_event_decision(symbol: str, setup_id: str | None = None) -> dict[str, Any] | None:
     if not table_exists("advisory_event_evaluations"):
         return None
@@ -334,6 +364,13 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
         "latest_execution_status": (execution_row or {}).get("execution_status"),
         "latest_lifecycle_action": (lifecycle_row or {}).get("next_action"),
     }
+    decision_summary.update(
+        _build_symbol_narrative(
+            candidate_row=candidate_row,
+            watchlist_row=watchlist_row,
+            aggregated_event=aggregated_event,
+        )
+    )
 
     return {
         "status": "ok",
@@ -374,6 +411,8 @@ def format_text(trace: dict[str, Any]) -> str:
             "",
             "Decision summary:",
             f"- latest_setup_id: {trace['decision_summary'].get('latest_setup_id')}",
+            f"- market_context: {trace['decision_summary'].get('market_context')}",
+            f"- event_context: {trace['decision_summary'].get('event_context')}",
             f"- latest_rejection_reasons: {trace['decision_summary'].get('latest_rejection_reasons')}",
             f"- latest_event_verdict: {trace['decision_summary'].get('latest_event_verdict')}",
             f"- latest_event_class: {trace['decision_summary'].get('latest_event_class')}",

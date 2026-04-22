@@ -14,6 +14,7 @@ from advisory.intraday_features import build_intraday_features, persist_intraday
 from advisory.news_theme_engine import load_active_theme_screener_mapping
 from advisory.peer_sync import sync_peer_data
 from advisory.setup_registry import load_setup_registry
+from advisory.technical_engine import evaluate_pre_entry_state as evaluate_technical_pre_entry_state
 from advisory.technical_features import build_technical_features, persist_technical_features
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
@@ -87,6 +88,14 @@ def ensure_rule_output_tables() -> None:
                 rank BIGINT,
                 candidate_state TEXT,
                 watch_reason_detail TEXT,
+                technical_state TEXT,
+                technical_trigger_type TEXT,
+                technical_trigger_note TEXT,
+                technical_trend_score DOUBLE PRECISION,
+                technical_structure_score DOUBLE PRECISION,
+                technical_participation_score DOUBLE PRECISION,
+                technical_relative_strength_score DOUBLE PRECISION,
+                technical_tradability_score DOUBLE PRECISION,
                 technical_score DOUBLE PRECISION,
                 fundamental_score DOUBLE PRECISION,
                 regime_fit_score DOUBLE PRECISION,
@@ -138,6 +147,14 @@ def ensure_rule_output_tables() -> None:
             "rank": "BIGINT",
             "candidate_state": "TEXT",
             "watch_reason_detail": "TEXT",
+            "technical_state": "TEXT",
+            "technical_trigger_type": "TEXT",
+            "technical_trigger_note": "TEXT",
+            "technical_trend_score": "DOUBLE PRECISION",
+            "technical_structure_score": "DOUBLE PRECISION",
+            "technical_participation_score": "DOUBLE PRECISION",
+            "technical_relative_strength_score": "DOUBLE PRECISION",
+            "technical_tradability_score": "DOUBLE PRECISION",
             "technical_score": "DOUBLE PRECISION",
             "fundamental_score": "DOUBLE PRECISION",
             "regime_fit_score": "DOUBLE PRECISION",
@@ -762,54 +779,53 @@ def snapshot_age_days(snapshot_date: Any, asof_date: Any) -> int | None:
 
 
 def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[str, Any]) -> dict[str, float]:
+    technical_engine_eval = evaluate_technical_pre_entry_state(
+        row,
+        thresholds=(setup.get("technical_thresholds") or setup.get("score_thresholds") or {}),
+    )
     intraday_usage_mode = get_intraday_usage_mode(setup)
     technical_rule_defs = list(setup.get("technical_rules", []))
     if intraday_usage_mode != "none":
         technical_rule_defs += list(setup.get("intraday_rules", []))
     technical_scores = [score_rule(row.get(rule["column"]), rule["operator"], rule["value"]) for rule in technical_rule_defs]
     if technical_scores:
-        technical_score = average_score(technical_scores, default=0.0)
+        technical_score = average_score(
+            technical_scores + [(float(technical_engine_eval["technical_total_score"]) / 100.0)],
+            default=0.0,
+        )
     else:
-        technical_parts = [
-            1.0 if bool(row.get("pass_above_dma_20")) else 0.0,
-            1.0 if bool(row.get("pass_above_dma_50")) else 0.0,
-            1.0 if bool(row.get("pass_above_dma_200")) else 0.0,
-            score_rule(row.get("rs_vs_benchmark"), "gte", 0.0),
-            score_rule(row.get("rs_vs_sector"), "gte", 0.0),
+        technical_score = float(technical_engine_eval["technical_total_score"]) / 100.0
+    intraday_available = any(
+        not pd.isna(row.get(column))
+        for column in [
+            "intraday_close_vs_vwap_pct",
+            "intraday_pct_bars_above_vwap",
+            "intraday_close_location_pct",
+            "intraday_volume_vs_20d",
+            "intraday_breakout_score",
         ]
-        intraday_available = any(
-            not pd.isna(row.get(column))
-            for column in [
-                "intraday_close_vs_vwap_pct",
-                "intraday_pct_bars_above_vwap",
-                "intraday_close_location_pct",
-                "intraday_volume_vs_20d",
-                "intraday_breakout_score",
+    )
+    if intraday_available or any(
+        bool(row.get(column))
+        for column in [
+            "intraday_opening_range_breakout_up",
+            "intraday_prev_day_breakout_up",
+            "intraday_failed_prev_day_breakout",
+        ]
+    ):
+        intraday_overlay_score = average_score(
+            [
+                score_rule(row.get("intraday_close_vs_vwap_pct"), "gt", 0.0),
+                score_rule(row.get("intraday_pct_bars_above_vwap"), "gte", 0.55),
+                score_rule(row.get("intraday_close_location_pct"), "gte", 0.65),
+                1.0 if bool(row.get("intraday_opening_range_breakout_up")) else 0.25,
+                1.0 if bool(row.get("intraday_prev_day_breakout_up")) else 0.25,
+                0.0 if bool(row.get("intraday_failed_prev_day_breakout")) else 1.0,
+                score_rule(row.get("intraday_volume_vs_20d"), "gte", 0.8),
+                score_rule(row.get("intraday_breakout_score"), "gte", 0.55),
             ]
         )
-        if intraday_available or any(
-            bool(row.get(column))
-            for column in [
-                "intraday_opening_range_breakout_up",
-                "intraday_prev_day_breakout_up",
-                "intraday_failed_prev_day_breakout",
-            ]
-        ):
-            technical_parts.append(
-                average_score(
-                    [
-                        score_rule(row.get("intraday_close_vs_vwap_pct"), "gt", 0.0),
-                        score_rule(row.get("intraday_pct_bars_above_vwap"), "gte", 0.55),
-                        score_rule(row.get("intraday_close_location_pct"), "gte", 0.65),
-                        1.0 if bool(row.get("intraday_opening_range_breakout_up")) else 0.25,
-                        1.0 if bool(row.get("intraday_prev_day_breakout_up")) else 0.25,
-                        0.0 if bool(row.get("intraday_failed_prev_day_breakout")) else 1.0,
-                        score_rule(row.get("intraday_volume_vs_20d"), "gte", 0.8),
-                        score_rule(row.get("intraday_breakout_score"), "gte", 0.55),
-                    ]
-                )
-            )
-        technical_score = average_score(technical_parts)
+        technical_score = average_score([technical_score, intraday_overlay_score], default=technical_score)
 
     fundamental_rules = setup.get("fundamental_rules", [])
     if fundamental_rules:
@@ -836,6 +852,14 @@ def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[st
         + (event_score * float(weights["event"]))
     ) / total_weight
     return {
+        "technical_state": str(technical_engine_eval["technical_state"]),
+        "technical_trigger_type": technical_engine_eval.get("entry_trigger_type"),
+        "technical_trigger_note": technical_engine_eval.get("entry_trigger_note"),
+        "technical_trend_score": round(float(technical_engine_eval["trend_score"]), 6),
+        "technical_structure_score": round(float(technical_engine_eval["structure_score"]), 6),
+        "technical_participation_score": round(float(technical_engine_eval["participation_score"]), 6),
+        "technical_relative_strength_score": round(float(technical_engine_eval["relative_strength_score"]), 6),
+        "technical_tradability_score": round(float(technical_engine_eval["tradability_score"]), 6),
         "technical_score": round(technical_score, 6),
         "fundamental_score": round(fundamental_score, 6),
         "regime_fit_score": round(regime_fit_score, 6),
@@ -857,12 +881,13 @@ def compute_invalidation_price(row: pd.Series) -> float | None:
     return round(max(anchors), 2)
 
 
-def build_entry_plan(row: pd.Series, candidate_state: str) -> dict[str, Any]:
+def build_entry_plan(row: pd.Series, candidate_state: str, technical_trigger_type: str | None = None) -> dict[str, Any]:
     adj_close = safe_float(row.get("adj_close"))
     atr_20 = safe_float(row.get("atr_20")) or 0.0
     dma_20 = safe_float(row.get("dma_20"))
     dma_50 = safe_float(row.get("dma_50"))
     invalidation_price = compute_invalidation_price(row)
+    trigger = str(technical_trigger_type or "").lower()
 
     if candidate_state == "WATCH_PULLBACK":
         anchor = dma_20 if dma_20 is not None and adj_close is not None and adj_close >= dma_20 else dma_50
@@ -884,6 +909,51 @@ def build_entry_plan(row: pd.Series, candidate_state: str) -> dict[str, Any]:
         }
 
     if candidate_state == "WATCH_BREAKOUT":
+        if trigger == "trend_pullback":
+            anchor = dma_20 if dma_20 is not None and adj_close is not None and adj_close >= dma_20 else dma_50
+            style = "PULLBACK_TO_20DMA" if anchor == dma_20 else "PULLBACK_TO_50DMA"
+            if anchor is None:
+                return {
+                    "entry_style": style,
+                    "attractive_price_low": None,
+                    "attractive_price_high": None,
+                    "invalidation_price": invalidation_price,
+                    "entry_note": "Trend pullback is forming; wait for a clean hold near moving-average support.",
+                }
+            return {
+                "entry_style": style,
+                "attractive_price_low": round(anchor - (0.4 * atr_20), 2),
+                "attractive_price_high": round(anchor + (0.2 * atr_20), 2),
+                "invalidation_price": invalidation_price,
+                "entry_note": "Trend pullback setup is constructive; buy only if support holds and price turns back up.",
+            }
+        if trigger == "breakout_retest":
+            pivot_anchor = adj_close if adj_close is not None else dma_20
+            low = None if pivot_anchor is None else round(max(pivot_anchor - (0.5 * atr_20), 0.0), 2)
+            high = None if pivot_anchor is None else round(pivot_anchor + (0.15 * atr_20), 2)
+            return {
+                "entry_style": "BREAKOUT_RETEST",
+                "attractive_price_low": low,
+                "attractive_price_high": high,
+                "invalidation_price": invalidation_price,
+                "entry_note": "Breakout-retest setup is forming; wait for a confirmed hold around the pivot zone.",
+            }
+        if trigger == "reclaim":
+            if adj_close is None:
+                return {
+                    "entry_style": "RECLAIM_ENTRY",
+                    "attractive_price_low": None,
+                    "attractive_price_high": None,
+                    "invalidation_price": invalidation_price,
+                    "entry_note": "Reclaim setup forming; wait for strong follow-through above the reclaimed level.",
+                }
+            return {
+                "entry_style": "RECLAIM_ENTRY",
+                "attractive_price_low": round(max(adj_close - (0.2 * atr_20), 0.0), 2),
+                "attractive_price_high": round(adj_close + (0.35 * atr_20), 2),
+                "invalidation_price": invalidation_price,
+                "entry_note": "Price is reclaiming a key level; buy only if the reclaim holds and confirms.",
+            }
         if adj_close is None:
             return {
                 "entry_style": "BREAKOUT_PIVOT",
@@ -910,6 +980,56 @@ def build_entry_plan(row: pd.Series, candidate_state: str) -> dict[str, Any]:
         }
 
     if candidate_state == "PASS_NOW":
+        if trigger == "breakout_retest":
+            if adj_close is None:
+                return {
+                    "entry_style": "BREAKOUT_RETEST",
+                    "attractive_price_low": None,
+                    "attractive_price_high": None,
+                    "invalidation_price": invalidation_price,
+                    "entry_note": "Entry acceptable now on a confirmed breakout-retest hold.",
+                }
+            return {
+                "entry_style": "BREAKOUT_RETEST",
+                "attractive_price_low": round(max(adj_close - (0.2 * atr_20), 0.0), 2),
+                "attractive_price_high": round(adj_close + (0.25 * atr_20), 2),
+                "invalidation_price": invalidation_price,
+                "entry_note": "Entry acceptable now on the retest hold; size around the pivot band.",
+            }
+        if trigger == "trend_pullback":
+            anchor = dma_20 if dma_20 is not None and adj_close is not None and adj_close >= dma_20 else dma_50
+            style = "PULLBACK_TO_20DMA" if anchor == dma_20 else "PULLBACK_TO_50DMA"
+            if anchor is None:
+                return {
+                    "entry_style": style,
+                    "attractive_price_low": None,
+                    "attractive_price_high": None,
+                    "invalidation_price": invalidation_price,
+                    "entry_note": "Entry acceptable now if the pullback continues to respect support.",
+                }
+            return {
+                "entry_style": style,
+                "attractive_price_low": round(max(anchor - (0.35 * atr_20), 0.0), 2),
+                "attractive_price_high": round(anchor + (0.2 * atr_20), 2),
+                "invalidation_price": invalidation_price,
+                "entry_note": "Entry acceptable now on a constructive trend pullback into support.",
+            }
+        if trigger == "reclaim":
+            if adj_close is None:
+                return {
+                    "entry_style": "RECLAIM_ENTRY",
+                    "attractive_price_low": None,
+                    "attractive_price_high": None,
+                    "invalidation_price": invalidation_price,
+                    "entry_note": "Entry acceptable now on a strong reclaim setup.",
+                }
+            return {
+                "entry_style": "RECLAIM_ENTRY",
+                "attractive_price_low": round(max(adj_close - (0.2 * atr_20), 0.0), 2),
+                "attractive_price_high": round(adj_close + (0.4 * atr_20), 2),
+                "invalidation_price": invalidation_price,
+                "entry_note": "Entry acceptable now on reclaim follow-through.",
+            }
         if adj_close is None:
             return {
                 "entry_style": "BREAKOUT_PIVOT",
@@ -942,6 +1062,19 @@ def build_entry_plan(row: pd.Series, candidate_state: str) -> dict[str, Any]:
         "invalidation_price": invalidation_price,
         "entry_note": None,
     }
+
+
+def map_technical_state_to_candidate_state(technical_state: str | None) -> str:
+    state = str(technical_state or "").upper()
+    if state == "BUY_TRIGGERED":
+        return "PASS_NOW"
+    if state in {"READY", "NEAR_PIVOT"}:
+        return "WATCH_BREAKOUT"
+    if state == "WATCHLIST":
+        return "WATCH_EVENT"
+    if state == "IGNORE":
+        return "ABSTAIN"
+    return "REJECT"
 
 
 def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, setup: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
@@ -1005,6 +1138,9 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
         rejections.append(build_rejection("overextended_breakout", f"breakout_extension_pct={extension}", severity="hard"))
 
     scores = compute_component_scores(row, regime_name=regime_name, setup=setup)
+    technical_state = str(scores.get("technical_state") or "")
+    technical_trigger_type = scores.get("technical_trigger_type")
+    technical_trigger_note = scores.get("technical_trigger_note")
     score_gap = max(0.0, float(thresholds["pass_now"]) - float(scores["setup_score"]))
     near_miss_flag = score_gap > 0.0 and score_gap <= float(thresholds["near_miss_gap"])
 
@@ -1039,25 +1175,38 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     if hard_rejections:
         return "REJECT", {**scores, "near_miss_flag": near_miss_flag}, hard_rejections
 
+    technical_hard_reject = not bool(row.get("pass_liquidity_20d", True)) or technical_state == "REJECT"
+    if technical_hard_reject:
+        rejections.append(
+            build_rejection(
+                "technical_engine_reject",
+                f"technical_state={technical_state} trigger={technical_trigger_type}",
+                severity="soft",
+                is_near_miss=False,
+                delta_to_pass=score_gap,
+            )
+        )
+        return "REJECT", {**scores, "near_miss_flag": near_miss_flag}, rejections
+
     intraday_rule_failures = [value for value in soft_failures if value.startswith("intraday:")]
     non_intraday_soft_failures = [value for value in soft_failures if not value.startswith("intraday:")]
-    candidate_state = "REJECT"
-    watch_reason_detail = None
+    candidate_state = map_technical_state_to_candidate_state(technical_state)
+    watch_reason_detail = technical_trigger_note
     if max_extension is not None and extension is not None and extension > max_extension:
         candidate_state = "WATCH_PULLBACK"
         watch_reason_detail = f"extended now at {extension:.2f}% above breakout reference"
     elif watch_pullback_extension_pct is not None and extension is not None and extension > watch_pullback_extension_pct:
         candidate_state = "WATCH_PULLBACK"
         watch_reason_detail = f"extended enough to wait for pullback at {extension:.2f}%"
-    elif float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(non_intraday_soft_failures) <= 2:
+    elif candidate_state == "PASS_NOW" and float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(non_intraday_soft_failures) <= 2:
         candidate_state = "PASS_NOW"
-        watch_reason_detail = "qualifies now with acceptable score and entry condition"
-    elif float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
+        watch_reason_detail = technical_trigger_note or "qualifies now with acceptable score and entry condition"
+    elif candidate_state == "WATCH_BREAKOUT" and float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
         candidate_state = "WATCH_BREAKOUT"
-        watch_reason_detail = "quality setup forming but not fully triggered"
-    elif float(scores["setup_score"]) >= float(thresholds["watch_event"]) and len(non_intraday_soft_failures) <= 2:
+        watch_reason_detail = technical_trigger_note or "quality setup forming but not fully triggered"
+    elif candidate_state == "WATCH_EVENT" and float(scores["setup_score"]) >= float(thresholds["watch_event"]) and len(non_intraday_soft_failures) <= 2:
         candidate_state = "WATCH_EVENT"
-        watch_reason_detail = "candidate needs event confirmation before entry"
+        watch_reason_detail = technical_trigger_note or "candidate needs event confirmation before entry"
     elif near_miss_flag:
         candidate_state = "WATCH_EVENT"
         watch_reason_detail = "near miss on score; keep on watch for improvement"
@@ -1303,7 +1452,7 @@ def run_rule_engine(
         for _, row in merged.iterrows():
             candidate_state, evaluation, rejections = evaluate_setup_row(row, regime_name=regime_name, overlay_name=overlay_name, setup=setup)
             if candidate_state != "REJECT":
-                entry_plan = build_entry_plan(row, candidate_state)
+                entry_plan = build_entry_plan(row, candidate_state, evaluation.get("technical_trigger_type"))
                 candidate_rows.append(
                     {
                         "asof_date": screener_date,
@@ -1324,6 +1473,14 @@ def run_rule_engine(
                         "rank": row.get("rank"),
                         "candidate_state": candidate_state,
                         "watch_reason_detail": evaluation.get("watch_reason_detail"),
+                        "technical_state": evaluation.get("technical_state"),
+                        "technical_trigger_type": evaluation.get("technical_trigger_type"),
+                        "technical_trigger_note": evaluation.get("technical_trigger_note"),
+                        "technical_trend_score": evaluation.get("technical_trend_score"),
+                        "technical_structure_score": evaluation.get("technical_structure_score"),
+                        "technical_participation_score": evaluation.get("technical_participation_score"),
+                        "technical_relative_strength_score": evaluation.get("technical_relative_strength_score"),
+                        "technical_tradability_score": evaluation.get("technical_tradability_score"),
                         "technical_score": evaluation["technical_score"],
                         "fundamental_score": evaluation["fundamental_score"],
                         "regime_fit_score": evaluation["regime_fit_score"],
@@ -1393,6 +1550,43 @@ def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, 
             cur.execute(f"DELETE FROM {REJECTIONS_TABLE} WHERE asof_date = %s", (asof_date,))
     if not candidates.empty:
         candidates = candidates.copy()
+        for column in ["asof_date", "screener_date", "load_ts"]:
+            if column in candidates.columns:
+                candidates[column] = pd.to_datetime(candidates[column], utc=True, errors="coerce")
+        for column in [
+            "rank",
+            "intraday_interval_minutes",
+        ]:
+            if column in candidates.columns:
+                candidates[column] = pd.to_numeric(candidates[column], errors="coerce").astype("Int64")
+        for column in [
+            "technical_score",
+            "technical_trend_score",
+            "technical_structure_score",
+            "technical_participation_score",
+            "technical_relative_strength_score",
+            "technical_tradability_score",
+            "fundamental_score",
+            "regime_fit_score",
+            "event_score",
+            "setup_score",
+            "avg_traded_value_20d",
+            "rs_vs_benchmark",
+            "rs_vs_sector",
+            "intraday_close_vs_vwap_pct",
+            "intraday_pct_bars_above_vwap",
+            "intraday_close_location_pct",
+            "intraday_volume_vs_20d",
+            "intraday_breakout_score",
+            "total_revenue_qoq_growth_vs_sector",
+            "profit_after_tax_qoq_growth_vs_sector",
+            "debt_to_equity_vs_sector",
+            "attractive_price_low",
+            "attractive_price_high",
+            "invalidation_price",
+        ]:
+            if column in candidates.columns:
+                candidates[column] = pd.to_numeric(candidates[column], errors="coerce")
         for column in [
             "intraday_opening_range_breakout_up",
             "intraday_prev_day_breakout_up",
@@ -1405,6 +1599,32 @@ def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, 
                 candidates[column] = candidates[column].map(
                     lambda value: None if pd.isna(value) else bool(value)
                 ).astype("boolean")
+        for column in [
+            "setup_id",
+            "setup_name",
+            "setup_family",
+            "holding_horizon_note",
+            "regime_name",
+            "base_regime",
+            "news_overlay",
+            "theme_ids",
+            "symbol",
+            "company_master_id",
+            "screener_slug",
+            "source_screener_slug",
+            "source_screener_list",
+            "candidate_state",
+            "watch_reason_detail",
+            "technical_state",
+            "technical_trigger_type",
+            "technical_trigger_note",
+            "intraday_pattern_label",
+            "entry_style",
+            "entry_note",
+            "watch_reasons",
+        ]:
+            if column in candidates.columns:
+                candidates[column] = candidates[column].astype("string")
         upsert_to_db(candidates, CANDIDATES_TABLE, unique_keys=["asof_date", "setup_id", "symbol"], timescaledb_column="asof_date")
     if not rejections.empty:
         rejections = rejections.copy()

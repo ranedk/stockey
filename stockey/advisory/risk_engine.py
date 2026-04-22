@@ -616,6 +616,7 @@ def load_base_candidate_fallbacks(
 
 
 def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[str, Any]:
+    daily_cutoff = pd.to_datetime(published_on, utc=True, errors="coerce").normalize()
     df = sql_to_df(
         """
         SELECT
@@ -636,7 +637,7 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
             SELECT *
             FROM advisory_technical_daily
             WHERE symbol = %(symbol)s
-              AND asof_date <= %(published_on)s
+              AND asof_date < %(daily_cutoff)s
             ORDER BY asof_date DESC
             LIMIT 1
         ) tech
@@ -644,13 +645,13 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
             SELECT *
             FROM advisory_fundamentals_daily
             WHERE symbol = %(symbol)s
-              AND asof_date <= %(published_on)s
+              AND asof_date < %(daily_cutoff)s
             ORDER BY asof_date DESC
             LIMIT 1
         ) fund
           ON TRUE
         """,
-        params={"symbol": symbol.upper(), "published_on": published_on},
+        params={"symbol": symbol.upper(), "daily_cutoff": daily_cutoff},
     )
     if df.empty:
         return {}
@@ -658,12 +659,12 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
     for key in ["technical_asof_date", "fundamentals_asof_date"]:
         if key in out and pd.notna(out[key]):
             out[key] = pd.to_datetime(out[key], utc=True, errors="coerce").isoformat()
-    out.update(load_macro_context(published_on))
-    out.update(load_exchange_feature_context(symbol, published_on))
+    out.update(load_macro_context(daily_cutoff))
+    out.update(load_exchange_feature_context(symbol, daily_cutoff))
     return out
 
 
-def load_macro_context(published_on: pd.Timestamp) -> dict[str, Any]:
+def load_macro_context(daily_cutoff: pd.Timestamp) -> dict[str, Any]:
     try:
         if not table_exists(MACRO_FEATURES_TABLE):
             return {}
@@ -675,11 +676,11 @@ def load_macro_context(published_on: pd.Timestamp) -> dict[str, Any]:
                 macro_risk_state,
                 macro_sizing_multiplier
             FROM {MACRO_FEATURES_TABLE}
-            WHERE asof_date <= %(published_on)s
+            WHERE asof_date < %(daily_cutoff)s
             ORDER BY asof_date DESC
             LIMIT 1
             """,
-            params={"published_on": published_on},
+            params={"daily_cutoff": daily_cutoff},
         )
     except Exception:
         return {}
@@ -691,7 +692,7 @@ def load_macro_context(published_on: pd.Timestamp) -> dict[str, Any]:
     return out
 
 
-def load_exchange_feature_context(symbol: str, published_on: pd.Timestamp) -> dict[str, Any]:
+def load_exchange_feature_context(symbol: str, daily_cutoff: pd.Timestamp) -> dict[str, Any]:
     try:
         if not table_exists(EXCHANGE_FEATURES_TABLE):
             return {}
@@ -713,11 +714,11 @@ def load_exchange_feature_context(symbol: str, published_on: pd.Timestamp) -> di
                 exchange_event_score
             FROM {EXCHANGE_FEATURES_TABLE}
             WHERE symbol = %(symbol)s
-              AND asof_date <= %(published_on)s
+              AND asof_date < %(daily_cutoff)s
             ORDER BY asof_date DESC
             LIMIT 1
             """,
-            params={"symbol": symbol.upper(), "published_on": published_on},
+            params={"symbol": symbol.upper(), "daily_cutoff": daily_cutoff},
         )
     except Exception:
         return {}

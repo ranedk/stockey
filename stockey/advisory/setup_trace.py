@@ -56,6 +56,37 @@ def df_to_records(df: pd.DataFrame, limit: int = 10) -> list[dict[str, Any]]:
     return records
 
 
+def _format_stage_narrative(*, regime_row: dict[str, Any] | None, overlay_row: dict[str, Any] | None, active_screeners: list[str], active_theme_ids: list[str], candidate_count_by_screener: dict[str, Any]) -> dict[str, str | None]:
+    regime_name = (regime_row or {}).get("regime_name")
+    regime_notes = (regime_row or {}).get("regime_notes")
+    overlay_name = (overlay_row or {}).get("overlay_name")
+    overlay_reason = (overlay_row or {}).get("overlay_reason")
+    market_bits: list[str] = []
+    if regime_name:
+        market_bits.append(f"Base regime is {regime_name}.")
+    if regime_notes:
+        market_bits.append(str(regime_notes))
+    if overlay_name:
+        market_bits.append(f"Active overlay is {overlay_name}.")
+    if overlay_reason:
+        market_bits.append(f"Overlay reason: {overlay_reason}")
+    screener_bits: list[str] = []
+    if active_screeners:
+        screener_bits.append(f"Active screeners: {', '.join(str(v) for v in active_screeners)}.")
+    if active_theme_ids:
+        screener_bits.append(f"Theme-driven expansion: {', '.join(str(v) for v in active_theme_ids)}.")
+    if candidate_count_by_screener:
+        screener_bits.append(
+            "Per-screener candidate contribution: "
+            + " | ".join(f"{key}: {value}" for key, value in candidate_count_by_screener.items())
+            + "."
+        )
+    return {
+        "market_context": " ".join(market_bits) if market_bits else None,
+        "screener_context": " ".join(screener_bits) if screener_bits else None,
+    }
+
+
 def resolve_asof_date(setup_id: str, requested_date: pd.Timestamp | None = None) -> pd.Timestamp | None:
     if requested_date is not None:
         return requested_date.normalize()
@@ -338,6 +369,14 @@ def build_trace(setup_id: str, *, asof_date: pd.Timestamp | None = None) -> dict
         "latest_event_source": (latest_eval_row or {}).get("event_source"),
         "latest_portfolio_status": (latest_portfolio_row or {}).get("portfolio_status"),
     }
+    narratives = _format_stage_narrative(
+        regime_row=regime_row,
+        overlay_row=overlay_row,
+        active_screeners=active_screeners,
+        active_theme_ids=active_theme_ids,
+        candidate_count_by_screener=candidate_count_by_screener,
+    )
+    decision_summary.update(narratives)
 
     return {
         "status": "ok",
@@ -382,6 +421,8 @@ def format_text(trace: dict[str, Any]) -> str:
             "",
             "Decision summary:",
             f"- top_rejection_reasons: {trace['decision_summary'].get('top_rejection_reasons')}",
+            f"- market_context: {trace['decision_summary'].get('market_context')}",
+            f"- screener_context: {trace['decision_summary'].get('screener_context')}",
             f"- overlay_name: {trace['decision_summary'].get('overlay_name')}",
             f"- overlay_reason: {trace['decision_summary'].get('overlay_reason')}",
             f"- active_theme_ids: {trace['decision_summary'].get('active_theme_ids')}",

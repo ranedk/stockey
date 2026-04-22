@@ -355,6 +355,67 @@ def _direction_sign(row: pd.Series) -> int:
     return 0
 
 
+def _merge_event_context(
+    events: pd.DataFrame,
+    *,
+    context_date_col: str,
+    symbols: list[str],
+    start_date: pd.Timestamp,
+    end_date: pd.Timestamp,
+) -> pd.DataFrame:
+    out = events.copy()
+    intraday = load_intraday_event_features(symbols, start_date, end_date)
+    intraday_lookup = (
+        intraday.set_index(["symbol", "asof_date"]).to_dict(orient="index")
+        if not intraday.empty
+        else {}
+    )
+    if intraday_lookup:
+        enriched_rows: list[dict[str, Any]] = []
+        for _, row in out.iterrows():
+            payload = row.to_dict()
+            symbol = str(payload.get("symbol") or "").upper()
+            context_date = payload.get(context_date_col)
+            intraday_row = intraday_lookup.get((symbol, context_date))
+            if intraday_row:
+                payload.update(intraday_row)
+            enriched_rows.append(payload)
+        out = pd.DataFrame(enriched_rows)
+
+    macro = load_macro_event_features(start_date, end_date)
+    if not macro.empty:
+        out = pd.merge_asof(
+            out.sort_values(context_date_col),
+            macro.sort_values("macro_asof_date"),
+            left_on=context_date_col,
+            right_on="macro_asof_date",
+            direction="backward",
+            allow_exact_matches=True,
+        )
+
+    exchange_features = load_exchange_event_features(symbols, start_date, end_date)
+    if not exchange_features.empty:
+        merged_frames: list[pd.DataFrame] = []
+        for symbol, symbol_rows in out.groupby("symbol", sort=False):
+            symbol_exchange = exchange_features[exchange_features["symbol"].eq(symbol)]
+            if symbol_exchange.empty:
+                merged_frames.append(symbol_rows)
+                continue
+            merged_frames.append(
+                pd.merge_asof(
+                    symbol_rows.sort_values(context_date_col),
+                    symbol_exchange.drop(columns=["symbol"], errors="ignore").sort_values("exchange_asof_date"),
+                    left_on=context_date_col,
+                    right_on="exchange_asof_date",
+                    direction="backward",
+                    allow_exact_matches=True,
+                )
+            )
+        out = pd.concat(merged_frames, ignore_index=True, sort=False)
+
+    return out.sort_values(["published_on", "setup_id", "symbol", "unique_id"], kind="stable").reset_index(drop=True)
+
+
 def build_labeled_event_dataset(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -366,23 +427,12 @@ def build_labeled_event_dataset(
     events = load_event_rows(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
     if events.empty:
         return events
+    event_symbols = events["symbol"].astype(str).dropna().unique().tolist()
     start_date = events["published_on"].min().normalize() + pd.Timedelta(days=1)
-    end_date = (events["published_on"].max().normalize() + pd.Timedelta(days=horizon_days + 40))
-    prices = load_price_history(events["symbol"].astype(str).dropna().unique().tolist(), start_date, end_date)
+    end_date = events["published_on"].max().normalize() + pd.Timedelta(days=horizon_days + 40)
+    prices = load_price_history(event_symbols, start_date, end_date)
     if prices.empty:
         return pd.DataFrame()
-    intraday = load_intraday_event_features(
-        events["symbol"].astype(str).dropna().unique().tolist(),
-        start_date,
-        end_date,
-    )
-    intraday_lookup = (
-        intraday.set_index(["symbol", "asof_date"]).to_dict(orient="index")
-        if not intraday.empty
-        else {}
-    )
-    macro = load_macro_event_features(start_date, end_date)
-    exchange_features = load_exchange_event_features(events["symbol"].astype(str).dropna().unique().tolist(), start_date, end_date)
 
     feature_rows: list[dict[str, Any]] = []
     for symbol, price_group in prices.groupby("symbol", sort=False):
@@ -410,9 +460,6 @@ def build_labeled_event_dataset(
             row["anchor_date"] = anchor["date"]
             row["anchor_close"] = anchor["close"]
             row["direction_sign"] = direction_sign
-            intraday_row = intraday_lookup.get((symbol, anchor["date"]))
-            if intraday_row:
-                row.update(intraday_row)
             for h in [1, 3, 5, 10, 20]:
                 value = pd.to_numeric(anchor.get(f"forward_return_{h}"), errors="coerce")
                 row[f"forward_return_{h}d"] = None if pd.isna(value) else round(float(value), 6)
@@ -422,36 +469,43 @@ def build_labeled_event_dataset(
     out = pd.DataFrame(feature_rows)
     if out.empty:
         return out
-    if not macro.empty:
-        out = pd.merge_asof(
-            out.sort_values("anchor_date"),
-            macro.sort_values("macro_asof_date"),
-            left_on="anchor_date",
-            right_on="macro_asof_date",
-            direction="backward",
-            allow_exact_matches=True,
-        ).sort_values(["published_on", "setup_id", "symbol", "unique_id"], kind="stable").reset_index(drop=True)
-    if not exchange_features.empty:
-        merged_frames: list[pd.DataFrame] = []
-        for symbol, symbol_rows in out.groupby("symbol", sort=False):
-            symbol_exchange = exchange_features[exchange_features["symbol"].eq(symbol)]
-            if symbol_exchange.empty:
-                merged_frames.append(symbol_rows)
-                continue
-            merged_frames.append(
-                pd.merge_asof(
-                    symbol_rows.sort_values("anchor_date"),
-                    symbol_exchange.drop(columns=["symbol"], errors="ignore").sort_values("exchange_asof_date"),
-                    left_on="anchor_date",
-                    right_on="exchange_asof_date",
-                    direction="backward",
-                    allow_exact_matches=True,
-                )
-            )
-        out = pd.concat(merged_frames, ignore_index=True, sort=False).sort_values(
-            ["published_on", "setup_id", "symbol", "unique_id"], kind="stable"
-        ).reset_index(drop=True)
-    return out
+    return _merge_event_context(
+        out,
+        context_date_col="anchor_date",
+        symbols=event_symbols,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+
+def build_live_event_dataset(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+) -> pd.DataFrame:
+    events = load_event_rows(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+    if events.empty:
+        return events
+    events = events.copy()
+    events["direction_sign"] = events.apply(_direction_sign, axis=1)
+    events["context_date"] = events["published_on"].dt.normalize()
+    for h in [1, 3, 5, 10, 20]:
+        events[f"forward_return_{h}d"] = pd.NA
+    events["directional_return_10d"] = pd.NA
+    events["anchor_date"] = pd.NaT
+    events["anchor_close"] = pd.NA
+    events["target_label"] = pd.NA
+    event_symbols = events["symbol"].astype(str).dropna().unique().tolist()
+    start_date = events["context_date"].min()
+    end_date = events["context_date"].max()
+    return _merge_event_context(
+        events,
+        context_date_col="context_date",
+        symbols=event_symbols,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
 
 def _prepare_feature_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -724,7 +778,7 @@ def main() -> int:
             print(json.dumps({"status": "ok", "row_count": int(len(dataset)), **metadata}, indent=2, ensure_ascii=False, default=str))
             return 0
 
-        dataset = build_labeled_event_dataset(asof_date=asof_date, symbols=args.symbols, setup_ids=args.setup_ids)
+        dataset = build_live_event_dataset(asof_date=asof_date, symbols=args.symbols, setup_ids=args.setup_ids)
         scores, meta = score_events(dataset=dataset, artifact_dir=artifact_dir, model_basename=args.model_basename)
         if not args.dry_run:
             persist_scores(scores)

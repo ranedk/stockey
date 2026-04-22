@@ -139,6 +139,17 @@ def format_text(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _normalize_utc_arg_timestamp(value: object) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
 def main() -> int:
     args = parse_args()
     if not hasattr(args, "log_research_ledger"):
@@ -149,7 +160,7 @@ def main() -> int:
         args.ledger_objective = None
     if not hasattr(args, "ledger_validation_protocol"):
         args.ledger_validation_protocol = None
-    asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
+    asof_date = _normalize_utc_arg_timestamp(args.date)
     research_run_id: str | None = None
     if bool(args.log_research_ledger):
         research_run_id = start_research_run(

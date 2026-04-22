@@ -21,6 +21,7 @@ LOOKBACK_BUFFER_DAYS = 400
 MIN_AVG_TRADED_VALUE_20D = 1_00_00_000.0
 MAX_BREAKOUT_EXTENSION_PCT = 10.0
 MIN_SECTOR_PEER_COUNT = 3
+MAX_GAP_FREQ_60D = 0.15
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -262,13 +263,27 @@ def compute_group_features(group: pd.DataFrame) -> pd.DataFrame:
     close = group["adj_close"].astype(float).to_numpy()
     high = group["adj_high"].astype(float).to_numpy()
     low = group["adj_low"].astype(float).to_numpy()
+    open_ = group["adj_open"].astype(float)
     volume = group["volume"].astype(float)
     traded_value = group["total_value"].astype(float)
+    close_series = group["adj_close"].astype(float)
+    high_series = group["adj_high"].astype(float)
+    low_series = group["adj_low"].astype(float)
+    close_nonzero = close_series.replace(0, np.nan)
+    volume_nonzero = volume.replace(0, np.nan)
+    traded_value_nonzero = traded_value.replace(0, np.nan)
 
     group["dma_20"] = talib.SMA(close, timeperiod=20)
     group["dma_50"] = talib.SMA(close, timeperiod=50)
+    group["dma_150"] = talib.SMA(close, timeperiod=150)
     group["dma_200"] = talib.SMA(close, timeperiod=200)
     group["atr_20"] = talib.ATR(high, low, close, timeperiod=20)
+    group["atr_pct"] = (pd.Series(group["atr_20"], index=group.index) / close_nonzero) * 100.0
+
+    for period in [20, 50, 150]:
+        dma_col = f"dma_{period}"
+        dma_series = pd.Series(group[dma_col], index=group.index, dtype="float64")
+        group[f"{dma_col}_slope_20d_pct"] = ((dma_series / dma_series.shift(20)) - 1.0) * 100.0
 
     bb_upper, bb_middle, bb_lower = talib.BBANDS(
         close,
@@ -285,31 +300,105 @@ def compute_group_features(group: pd.DataFrame) -> pd.DataFrame:
         (pd.Series(bb_upper) - pd.Series(bb_lower)) / pd.Series(bb_middle),
         np.nan,
     )
+    group["bb_width_rank_252d"] = group["bb_width"].rolling(252, min_periods=60).rank(pct=True)
 
     atr_series = pd.Series(group["atr_20"], index=group.index, dtype="float64")
     group["atr_compression_pct"] = atr_series.rolling(252, min_periods=50).rank(pct=True)
 
     high_20 = group["adj_high"].rolling(20, min_periods=20).max()
     high_50 = group["adj_high"].rolling(50, min_periods=50).max()
+    high_60 = group["adj_high"].rolling(60, min_periods=40).max()
     high_252 = group["adj_high"].rolling(252, min_periods=100).max()
+    low_20 = group["adj_low"].rolling(20, min_periods=20).min()
+    low_60 = group["adj_low"].rolling(60, min_periods=40).min()
     prev_high_20 = high_20.shift(1)
+    prev_high_60 = high_60.shift(1)
 
     group["dist_20d_high"] = (group["adj_close"] / high_20 - 1.0) * 100.0
     group["dist_50d_high"] = (group["adj_close"] / high_50 - 1.0) * 100.0
     group["dist_52w_high"] = (group["adj_close"] / high_252 - 1.0) * 100.0
     group["breakout_extension_pct"] = (group["adj_close"] / prev_high_20 - 1.0) * 100.0
+    group["base_depth_20d_pct"] = ((high_20 - low_20) / high_20.replace(0, np.nan)) * 100.0
+    group["base_depth_60d_pct"] = ((high_60 - low_60) / high_60.replace(0, np.nan)) * 100.0
+    group["pivot_distance_20d_pct"] = ((prev_high_20 - close_series) / prev_high_20.replace(0, np.nan)) * 100.0
+    group["pivot_distance_60d_pct"] = ((prev_high_60 - close_series) / prev_high_60.replace(0, np.nan)) * 100.0
 
     group["avg_traded_value_20d"] = traded_value.rolling(20, min_periods=20).mean()
     group["avg_traded_value_60d"] = traded_value.rolling(60, min_periods=40).mean()
+    group["median_volume_20d"] = volume.rolling(20, min_periods=20).median()
+    group["median_volume_60d"] = volume.rolling(60, min_periods=40).median()
     group["stock_ret_20d"] = group["adj_close"].pct_change(20)
     group["stock_ret_60d"] = group["adj_close"].pct_change(60)
+    group["stock_ret_120d"] = group["adj_close"].pct_change(120)
+
+    tr_pct = ((high_series - low_series) / close_nonzero) * 100.0
+    group["daily_range_pct"] = tr_pct
+    group["range_contraction_20d_pct"] = tr_pct.rolling(20, min_periods=20).mean()
+    group["range_contraction_60d_pct"] = tr_pct.rolling(60, min_periods=40).mean()
+    group["range_contraction_ratio"] = (
+        group["range_contraction_20d_pct"] / group["range_contraction_60d_pct"].replace(0, np.nan)
+    )
+
+    close_location_pct = (close_series - low_series) / (high_series - low_series).replace(0, np.nan)
+    group["close_location_pct"] = close_location_pct.clip(lower=0.0, upper=1.0)
+    group["tight_close_upper_half_20d"] = group["close_location_pct"].rolling(20, min_periods=20).mean()
+    group["tight_close_upper_half_60d"] = group["close_location_pct"].rolling(60, min_periods=40).mean()
+
+    higher_high = high_series.gt(high_series.shift(1))
+    higher_low = low_series.gt(low_series.shift(1))
+    group["higher_high_count_20d"] = higher_high.rolling(20, min_periods=20).sum()
+    group["higher_low_count_20d"] = higher_low.rolling(20, min_periods=20).sum()
+    group["trend_persistence_20d"] = ((close_series > group["dma_50"]) & (group["dma_50"] > group["dma_150"])).rolling(20, min_periods=20).mean()
+    group["trend_persistence_60d"] = ((close_series > group["dma_50"]) & (group["dma_50"] > group["dma_150"])).rolling(60, min_periods=40).mean()
+    group["trend_persistence_120d"] = ((close_series > group["dma_50"]) & (group["dma_50"] > group["dma_150"])).rolling(120, min_periods=80).mean()
+
+    breakout_day = close_series.gt(prev_high_20.fillna(np.inf))
+    group["breakout_day_volume_vs_20d"] = np.where(
+        breakout_day,
+        volume / volume.rolling(20, min_periods=20).mean().replace(0, np.nan),
+        np.nan,
+    )
+    up_day = close_series.gt(close_series.shift(1))
+    down_day = close_series.lt(close_series.shift(1))
+    group["up_volume_20d"] = volume.where(up_day).rolling(20, min_periods=20).sum()
+    group["down_volume_20d"] = volume.where(down_day).rolling(20, min_periods=20).sum()
+    group["up_down_volume_ratio_20d"] = group["up_volume_20d"] / group["down_volume_20d"].replace(0, np.nan)
+    distribution_day = down_day & (volume > volume.rolling(20, min_periods=20).mean()) & (close_location_pct < 0.4)
+    accumulation_day = up_day & (volume > volume.rolling(20, min_periods=20).mean()) & (close_location_pct > 0.6)
+    group["distribution_days_20d"] = distribution_day.rolling(20, min_periods=20).sum()
+    group["accumulation_days_20d"] = accumulation_day.rolling(20, min_periods=20).sum()
+    group["pullback_volume_dryup_ratio_20d"] = (
+        volume.where(down_day).rolling(10, min_periods=5).mean() / volume.rolling(20, min_periods=20).mean().replace(0, np.nan)
+    )
+
+    gap_pct = ((open_ / close_series.shift(1).replace(0, np.nan)) - 1.0).abs() * 100.0
+    group["gap_pct"] = gap_pct
+    gap_flag = gap_pct >= 3.0
+    group["gap_frequency_60d"] = gap_flag.rolling(60, min_periods=40).mean()
+
+    group["support_distance_20d_pct"] = ((close_series - low_20) / close_nonzero) * 100.0
+    support_touch = low_series.le(group["dma_20"] * 1.01) | low_series.le(group["dma_50"] * 1.01)
+    support_hold = support_touch & close_location_pct.ge(0.5)
+    group["support_hold_rate_20d"] = support_hold.rolling(20, min_periods=20).mean()
+    group["volatility_contraction_flag"] = (
+        group["range_contraction_ratio"].lt(0.85)
+        & group["atr_compression_pct"].lt(0.4)
+        & group["bb_width_rank_252d"].lt(0.4)
+    )
 
     group["pass_above_dma_20"] = group["adj_close"] >= group["dma_20"]
     group["pass_above_dma_50"] = group["adj_close"] >= group["dma_50"]
+    group["pass_above_dma_150"] = group["adj_close"] >= group["dma_150"]
     group["pass_above_dma_200"] = group["adj_close"] >= group["dma_200"]
     group["pass_liquidity_20d"] = group["avg_traded_value_20d"] >= MIN_AVG_TRADED_VALUE_20D
     group["pass_near_52w_high"] = group["dist_52w_high"] >= -15.0
     group["pass_breakout_extension"] = group["breakout_extension_pct"] <= MAX_BREAKOUT_EXTENSION_PCT
+    group["pass_gap_behavior"] = group["gap_frequency_60d"] <= MAX_GAP_FREQ_60D
+    group["pass_trend_alignment"] = (
+        group["adj_close"].ge(group["dma_50"])
+        & group["dma_50"].ge(group["dma_150"])
+        & group["dma_150"].ge(group["dma_200"])
+    )
     return group
 
 
@@ -435,26 +524,66 @@ def build_technical_features(
         "total_value",
         "dma_20",
         "dma_50",
+        "dma_150",
         "dma_200",
+        "dma_20_slope_20d_pct",
+        "dma_50_slope_20d_pct",
+        "dma_150_slope_20d_pct",
         "atr_20",
+        "atr_pct",
         "atr_compression_pct",
         "bb_width",
+        "bb_width_rank_252d",
         "dist_20d_high",
         "dist_50d_high",
         "dist_52w_high",
+        "base_depth_20d_pct",
+        "base_depth_60d_pct",
+        "pivot_distance_20d_pct",
+        "pivot_distance_60d_pct",
         "avg_traded_value_20d",
         "avg_traded_value_60d",
+        "median_volume_20d",
+        "median_volume_60d",
+        "stock_ret_120d",
         "rs_vs_benchmark",
         "sector_peer_ret_20d",
         "sector_peer_count",
         "rs_vs_sector",
         "breakout_extension_pct",
+        "daily_range_pct",
+        "range_contraction_20d_pct",
+        "range_contraction_60d_pct",
+        "range_contraction_ratio",
+        "close_location_pct",
+        "tight_close_upper_half_20d",
+        "tight_close_upper_half_60d",
+        "higher_high_count_20d",
+        "higher_low_count_20d",
+        "trend_persistence_20d",
+        "trend_persistence_60d",
+        "trend_persistence_120d",
+        "breakout_day_volume_vs_20d",
+        "up_volume_20d",
+        "down_volume_20d",
+        "up_down_volume_ratio_20d",
+        "distribution_days_20d",
+        "accumulation_days_20d",
+        "pullback_volume_dryup_ratio_20d",
+        "gap_pct",
+        "gap_frequency_60d",
+        "support_distance_20d_pct",
+        "support_hold_rate_20d",
+        "volatility_contraction_flag",
         "pass_above_dma_20",
         "pass_above_dma_50",
+        "pass_above_dma_150",
         "pass_above_dma_200",
         "pass_liquidity_20d",
         "pass_near_52w_high",
         "pass_breakout_extension",
+        "pass_gap_behavior",
+        "pass_trend_alignment",
         "load_ts",
     ]
     out = out[ordered_cols]
@@ -525,18 +654,35 @@ def summarize(df: pd.DataFrame) -> dict[str, object]:
         "adj_close",
         "dma_20",
         "dma_50",
+        "dma_150",
         "dma_200",
+        "dma_20_slope_20d_pct",
+        "dma_50_slope_20d_pct",
+        "dma_150_slope_20d_pct",
         "atr_20",
+        "atr_pct",
         "bb_width",
+        "range_contraction_ratio",
         "dist_52w_high",
+        "base_depth_60d_pct",
+        "pivot_distance_20d_pct",
         "avg_traded_value_20d",
+        "median_volume_20d",
         "rs_vs_benchmark",
         "sector_peer_count",
         "sector_peer_ret_20d",
         "rs_vs_sector",
         "breakout_extension_pct",
+        "trend_persistence_60d",
+        "breakout_day_volume_vs_20d",
+        "up_down_volume_ratio_20d",
+        "distribution_days_20d",
+        "accumulation_days_20d",
+        "gap_frequency_60d",
         "pass_liquidity_20d",
         "pass_breakout_extension",
+        "pass_gap_behavior",
+        "pass_trend_alignment",
     ]
     return {
         "status": "ok",

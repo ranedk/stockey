@@ -258,6 +258,243 @@ Policy model:
 Implementation slices:
 
 1. Add bucket and exit-policy columns to `advisory_portfolio_orders`.
+
+### 6. Build a proper swing technical buy/exit engine
+
+Problem:
+
+- Current technical usage is useful but still too mixed between generic rule checks, intraday confirmation, and event/risk overlays.
+- We need one explicit swing technical engine for Indian equities that answers:
+  - is the stock in a tradable uptrend?
+  - is it forming a constructive structure?
+  - is there accumulation and leadership?
+  - is it executable with sensible risk?
+  - has the setup triggered?
+  - has the technical thesis broken?
+- This is not an intraday trading engine.
+
+Target:
+
+- create a dedicated technical state engine that outputs daily:
+  - pre-entry:
+    - `REJECT`
+    - `IGNORE`
+    - `WATCHLIST`
+    - `NEAR_PIVOT`
+    - `READY`
+    - `BUY_TRIGGERED`
+  - post-entry:
+    - `HOLD`
+    - `ADD_ON_PULLBACK`
+    - `PARTIAL_EXIT`
+    - `FULL_EXIT`
+    - `EMERGENCY_EXIT`
+- make the engine explicitly prefer:
+  - liquid Indian equities
+  - structurally strong names
+  - breakout and trend-continuation setups
+  - clean execution and realistic stop placement
+
+Design rules:
+
+- do not build this around standalone RSI / MACD / stochastic signals
+- do not turn Elliott Wave, candlestick patterns, or Fibonacci into primary buy logic
+- use indicators as tools, not as the edge
+- keep the engine swing-oriented and based on trend, structure, participation, leadership, and tradability
+
+Hard pre-score filters:
+
+- reject before scoring when any of these fail:
+  - minimum average daily traded value
+  - minimum price
+  - minimum median volume
+  - maximum spread percent
+  - maximum recent gap frequency
+  - excessive recent circuit behavior
+  - obvious event hazard for short swing holds
+  - highly erratic chart with no clean structure
+- use config-driven thresholds, not hardcoded literals inside scoring code
+
+Technical score model:
+
+- total score: `100`
+- trend regime score: `25`
+  - price vs 20 / 50 / 150 DMA
+  - slope of moving averages
+  - higher-high / higher-low behavior
+  - distance from 52-week high
+  - 1m / 3m / 6m trend persistence
+- structure quality score: `30`
+  - flat base / tight range / VCP-like contraction / ascending base / breakout shelf / constructive pullback
+  - base duration and depth
+  - volatility contraction
+  - support respect
+  - pivot clarity
+  - overhead supply estimate
+- participation / volume score: `20`
+  - breakout-day volume vs 20-day average
+  - accumulation vs distribution balance
+  - dry-up on pullbacks and contractions
+  - retest behavior
+- relative strength score: `15`
+  - 1m / 3m / 6m performance vs benchmark
+  - sector-relative performance
+  - RS improvement before breakout
+  - resilience during market weakness
+- tradability / risk score: `10`
+  - ATR percent
+  - spread percent
+  - average traded value
+  - gap risk
+  - circuit frequency
+  - realistic stop distance
+
+Suggested V1 thresholds:
+
+- minimum gate before `READY` / `BUY_TRIGGERED`:
+  - trend `>= 15/25`
+  - structure `>= 18/30`
+  - participation `>= 10/20`
+  - relative strength `>= 8/15`
+  - tradability `>= 6/10`
+- state guidance:
+  - total `< 55`: `IGNORE` or `REJECT`
+  - total `55-69`: `WATCHLIST`
+  - total `70-77`: `READY`
+  - total `>= 78`: trigger-eligible, but only `BUY_TRIGGERED` after valid entry confirmation
+
+Entry trigger archetypes:
+
+- breakout entry:
+  - close above valid pivot
+  - meaningful breakout width
+  - strong close
+  - breakout volume confirmation
+- breakout-retest entry:
+  - breakout already happened
+  - muted selling into retest
+  - support hold / reversal confirmation
+- trend-pullback entry:
+  - controlled pullback into 20 / 50 DMA or prior support shelf
+  - volume contraction
+  - reversal / hold confirmation
+- reclaim entry:
+  - reclaim after false breakdown / failed breakout trap
+  - strong close and preferably volume support
+
+Post-entry exit framework:
+
+- full exit:
+  - pivot failure
+  - decisive support break
+  - structure invalidation
+  - leadership collapse
+  - regime deterioration with broken structure
+- partial exit:
+  - sharp extension away from 20 DMA / base
+  - blow-off behavior
+  - event-risk reduction
+  - reward/risk deterioration without thesis break
+- trailing exit:
+  - aggressive: below recent swing support
+  - balanced: below 20 DMA / pivot support
+  - slower: below 50 DMA
+  - optional ATR-based trail
+- abnormal distribution exit:
+  - clustered high-volume down days
+  - repeated failed rebounds
+  - deteriorating RS
+- time-stop:
+  - breakout triggered but no follow-through within configurable bars
+- emergency exit:
+  - severe gap / event shock / execution-risk breach
+
+Conviction and sizing guidance:
+
+- conviction bucket from technical score:
+  - `LOW_CONVICTION`: `70-75`
+  - `MEDIUM_CONVICTION`: `76-84`
+  - `HIGH_CONVICTION`: `85+`
+- do not size from score alone
+- final sizing must still respect:
+  - stop distance
+  - liquidity
+  - event-risk proximity
+
+Context tags:
+
+- allow only low-weight tags:
+  - trend maturity early / middle / late
+  - climax extension risk
+  - broad market favorable / neutral / hostile
+  - earnings proximity
+  - sector momentum strong / weak
+- these are tags, not primary buy logic
+
+Implementation direction:
+
+- add a dedicated module, for example `advisory/technical_engine.py`
+- keep raw daily feature generation in `advisory/technical_features.py`
+- do not move this into `advisory/intraday_features.py`
+- intraday should stay secondary and timing-oriented, not primary swing logic
+
+Required data/model additions:
+
+- extend daily technical feature set with:
+  - 52-week high distance
+  - 20 / 50 / 150 DMA slope features
+  - base duration / depth
+  - range contraction measures
+  - support-touch / pivot clarity metrics
+  - accumulation / distribution day counts
+  - breakout-volume ratios
+  - gap frequency
+  - circuit frequency
+  - spread / tradability metrics where available
+  - benchmark and sector-relative performance windows
+- add explicit technical state outputs to the advisory layer
+
+Pipeline integration points:
+
+- `advisory.technical_features`:
+  - extend feature generation for swing-structure fields
+- new `advisory.technical_engine`:
+  - compute technical sub-scores, technical state, entry type, invalidation candidate, and exit state
+- `advisory.rule_engine`:
+  - consume technical state instead of only generic technical rule fragments
+  - use `WATCHLIST`, `NEAR_PIVOT`, `READY`, `BUY_TRIGGERED` directly
+- `advisory.watchlist_builder`:
+  - preserve technical engine state, pivot, support, and trigger archetype
+- `advisory.position_lifecycle`:
+  - map technical post-entry states to `HOLD`, `ADD_ON_PULLBACK`, `PARTIAL_EXIT`, `FULL_EXIT`, `EMERGENCY_EXIT`
+- `advisory.risk_engine`:
+  - combine conviction with liquidity and stop realism
+- `advisory.live_dashboard`:
+  - show technical state, trigger archetype, structure commentary, and exit reason cleanly
+
+Implementation slices:
+
+1. Add missing swing feature fields in `advisory.technical_features`.
+2. Add config block for hard filters and technical thresholds.
+3. Add `advisory.technical_engine` scoring buckets and state machine.
+4. Add `BUY_TRIGGERED` trigger logic for breakout / retest / pullback / reclaim.
+5. Add post-entry technical exit states and map them into lifecycle.
+6. Replace scattered technical-only rule fragments in `advisory.rule_engine` with the explicit technical engine output.
+7. Surface technical state, pivot, trigger type, and exit condition in dashboard and traces.
+8. Add regression tests for:
+   - clean breakout
+   - near-pivot base
+   - loose / junk structure reject
+   - failed breakout full exit
+   - sharp extension partial exit
+   - dead-money time stop
+
+Do not:
+
+- let intraday confirmation become the primary swing buy engine
+- make oscillator crosses the core logic
+- overfit V1 with too many market-regime branches
+- mix technical trigger confirmation with loose event-driven overrides in a way that hides the actual setup quality
 2. Add lifecycle fields so exit-event triggers and bucket state are visible in `advisory_position_lifecycle`.
 3. Add first-pass deterministic bucket classification using setup family, holding horizon note, event context, and invalidation guidance.
 4. Show bucket, bucket reason, exit-policy summary, and screener provenance in the live dashboard.

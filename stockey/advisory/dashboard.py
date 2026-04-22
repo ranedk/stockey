@@ -14,6 +14,7 @@ from advisory.setup_trace import (
     table_exists,
 )
 from utils.db import sql_to_df
+from utils.display_time import to_display_value
 from utils.sync import parse_datetime_arg
 
 
@@ -403,7 +404,7 @@ def summarize(df: pd.DataFrame) -> dict[str, Any]:
     return {
         "status": "ok",
         "setup_count": int(len(df)),
-        "rows": df.to_dict(orient="records") if not df.empty else [],
+        "rows": to_display_value(df) if not df.empty else [],
     }
 
 
@@ -420,7 +421,7 @@ def main() -> int:
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
     df = build_dashboard(asof_date=asof_date, setup_ids=args.setup_ids)
     if args.format == "json":
-        print(json.dumps(summarize(df), indent=2, ensure_ascii=False, default=str))
+        print(json.dumps(to_display_value(summarize(df)), indent=2, ensure_ascii=False, default=str))
     else:
         print(render_text_table(df))
     return 0

@@ -229,6 +229,27 @@ class DhanTradingClient(DhanHistoricalClient):
         )
         return self._parse_response(response)
 
+    def get_fund_limits(self) -> list[dict[str, Any]] | dict[str, Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/fundlimit",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def get_holdings(self) -> list[dict[str, Any]] | dict[str, Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/holdings",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
+    def get_positions(self) -> list[dict[str, Any]] | dict[str, Any]:
+        response = self.session.get(
+            f"{self.BASE_URL}/positions",
+            timeout=self.timeout,
+        )
+        return self._parse_response(response)
+
 
 def candles_to_df(payload: dict[str, Any]) -> pd.DataFrame:
     if not payload:

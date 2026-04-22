@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, exchange_events, exchange_features, intraday_features, llm_event_evaluator, macro_features, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, training_universe, watchlist_builder
+from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, exchange_events, exchange_features, intraday_features, llm_event_evaluator, macro_features, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, training_universe, watchlist_builder
 from data.announcements import state as announcement_state
 from data.eaindustry import wpi
 from data.dhanlive import client as dhan_client
@@ -665,7 +665,7 @@ def test_wpi_sync_uses_db_completion(monkeypatch):
     assert summary["downloaded_count"] == 1
 
 
-def test_portfolio_engine_allows_two_sector_names_but_blocks_same_symbol_duplicates(monkeypatch):
+def test_portfolio_engine_keeps_only_highest_priority_symbol_owner(monkeypatch):
     allocations = pd.DataFrame(
         [
             {
@@ -748,12 +748,41 @@ def test_portfolio_engine_allows_two_sector_names_but_blocks_same_symbol_duplica
         )
     )
 
-    status_map = df.set_index(["setup_id", "symbol"])["portfolio_status"].to_dict()
-    assert status_map[("LARGECAP_BREAKOUT_POSITION_V1", "ABC")] == "approved"
-    assert status_map[("MIDCAP_IMPROVER_SWING_V1", "XYZ")] == "approved"
-    assert status_map[("INTRADAY_BREAKOUT_TACTICAL_V1", "ABC")] == "deferred"
-    intraday_row = df[(df["setup_id"] == "INTRADAY_BREAKOUT_TACTICAL_V1") & (df["symbol"] == "ABC")].iloc[0]
-    assert intraday_row["overlap_reason"] == "same_symbol"
+    assert sorted(df["symbol"].tolist()) == ["ABC", "XYZ"]
+    owner_row = df[df["symbol"] == "ABC"].iloc[0]
+    assert owner_row["setup_id"] == "LARGECAP_BREAKOUT_POSITION_V1"
+    assert owner_row["portfolio_status"] == "approved"
+
+
+def test_position_lifecycle_load_open_orders_dedupes_same_symbol(monkeypatch):
+    sample = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-04-17T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-04-17T00:00:00Z"),
+                "setup_id": "LOWER",
+                "symbol": "ABC",
+                "portfolio_status": "trimmed",
+                "approved_allocation_inr": 10000.0,
+                "priority_score": 1.0,
+            },
+            {
+                "published_on": pd.Timestamp("2026-04-17T10:00:00Z"),
+                "asof_date": pd.Timestamp("2026-04-17T00:00:00Z"),
+                "setup_id": "HIGHER",
+                "symbol": "ABC",
+                "portfolio_status": "approved",
+                "approved_allocation_inr": 25000.0,
+                "priority_score": 3.0,
+            },
+        ]
+    )
+    monkeypatch.setattr(position_lifecycle, "table_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(position_lifecycle, "sql_to_df", lambda *_args, **_kwargs: sample.copy())
+
+    out = position_lifecycle.load_open_orders(asof_date=pd.Timestamp("2026-04-17T00:00:00Z"))
+
+    assert out[["symbol", "setup_id"]].to_dict(orient="records") == [{"symbol": "ABC", "setup_id": "HIGHER"}]
 
 
 def test_portfolio_engine_overlap_limit_for_reason():
@@ -829,6 +858,7 @@ def test_execution_engine_builds_planned_orders(monkeypatch):
     )
 
     monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: portfolio_orders.copy())
+    monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr(execution_engine, "load_latest_closes", lambda symbols, asof_date: latest_closes.copy())
     monkeypatch.setattr(
         execution_engine,
@@ -846,6 +876,78 @@ def test_execution_engine_builds_planned_orders(monkeypatch):
     assert row["security_id"] == 1333
     assert row["exchange_segment"] == "NSE_EQ"
     assert len(row["correlation_id"]) <= 30
+
+
+def test_execution_engine_uses_broker_cash_cap_and_exit_holdings(monkeypatch):
+    portfolio_orders = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-03-23T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-03-23T00:00:00Z"),
+                "setup_id": "BUY_SETUP",
+                "symbol": "HDFCBANK",
+                "unique_id": "buy-1",
+                "company_master_id": "nse:HDFCBANK",
+                "approved_allocation_inr": 40000.0,
+                "invest_score_pct": 88.0,
+            }
+        ]
+    )
+    exit_actions = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-03-23T11:00:00Z"),
+                "asof_date": pd.Timestamp("2026-03-23T00:00:00Z"),
+                "setup_id": "EXIT_SETUP",
+                "symbol": "ICICIBANK",
+                "unique_id": "exit-1",
+                "suggested_action": "exit_stop",
+            }
+        ]
+    )
+    latest_closes = pd.DataFrame(
+        [
+            {"symbol": "HDFCBANK", "date": pd.Timestamp("2026-03-23T00:00:00Z"), "close": 800.0},
+            {"symbol": "ICICIBANK", "date": pd.Timestamp("2026-03-23T00:00:00Z"), "close": 1200.0},
+        ]
+    )
+
+    monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: portfolio_orders.copy())
+    monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: exit_actions.copy())
+    monkeypatch.setattr(execution_engine, "load_latest_closes", lambda symbols, asof_date: latest_closes.copy())
+    monkeypatch.setattr(
+        execution_engine,
+        "resolve_dhan_identity",
+        lambda symbol, exchange, asset_type="stock": {
+            "security_id": 1333 if symbol == "HDFCBANK" else 1444,
+            "exchange_segment": "NSE_EQ",
+        },
+    )
+
+    class DummyClient:
+        pass
+
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    monkeypatch.setattr(
+        execution_engine,
+        "load_live_account_budget",
+        lambda client: (
+            10000.0,
+            pd.DataFrame([{"symbol": "ICICIBANK", "security_id": 1444, "available_quantity": 7}]),
+        ),
+    )
+
+    df = execution_engine.build_execution_orders(
+        asof_date=pd.Timestamp("2026-03-23T00:00:00Z"),
+        use_broker_account=True,
+    )
+    buy_row = df[df["transaction_type"] == "BUY"].iloc[0]
+    sell_row = df[df["transaction_type"] == "SELL"].iloc[0]
+    assert buy_row["quantity"] == 12
+    assert buy_row["execution_status"] == "planned"
+    assert buy_row["invest_score_pct"] == 88.0
+    assert sell_row["quantity"] == 7
+    assert sell_row["execution_status"] == "planned"
 
 
 def test_pipeline_portfolio_stage_outputs_json(monkeypatch, capsys):
@@ -2113,6 +2215,91 @@ def test_event_model_dataset_joins_exchange_features_by_anchor_date(monkeypatch)
     assert features.iloc[0]["short_selling_event_count_20d"] == 3
 
 
+def test_event_model_live_dataset_uses_event_day_context_not_next_day_anchor(monkeypatch):
+    events = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-01-03T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-01-03T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "HDFCBANK",
+                "unique_id": "u1",
+                "event_source": "announcement",
+                "sentiment": "positive",
+                "materiality": "high",
+                "setup_effect": "strengthens",
+                "direction": "positive",
+                "surprise": 0.5,
+                "novelty": 0.5,
+                "contradiction": 0.0,
+                "expected_decay_days": 10,
+                "source_reliability": "high",
+                "governance_risk": "none",
+                "balance_sheet_risk": "none",
+                "execution_risk": "none",
+                "investable_now": True,
+                "verdict": "continue",
+                "event_class": "ORDER_WIN",
+                "state_transition_hint": "UPGRADE_TO_PASS_NOW",
+                "score_impact": 0.2,
+                "confidence": 0.8,
+            }
+        ]
+    )
+    intraday = pd.DataFrame(
+        [
+            {
+                "symbol": "HDFCBANK",
+                "asof_date": pd.Timestamp("2026-01-03T00:00:00Z"),
+                "intraday_close_vs_vwap_pct": 0.4,
+                "intraday_pct_bars_above_vwap": 0.6,
+                "intraday_close_location_pct": 0.7,
+                "intraday_opening_range_breakout_up": True,
+                "intraday_prev_day_breakout_up": False,
+                "intraday_failed_prev_day_breakout": False,
+                "intraday_first_30m_return_pct": 0.2,
+                "intraday_last_60m_return_pct": 0.1,
+                "intraday_volume_vs_20d": 1.3,
+                "intraday_breakout_score": 0.55,
+                "intraday_pattern_label": "EVENT_DAY_STRENGTH",
+            }
+        ]
+    )
+    macro = pd.DataFrame(
+        [
+            {
+                "macro_asof_date": pd.Timestamp("2026-01-03T00:00:00Z"),
+                "macro_stress_score": 0.2,
+                "macro_sizing_multiplier": 0.9,
+            }
+        ]
+    )
+    exchange = pd.DataFrame(
+        [
+            {
+                "symbol": "HDFCBANK",
+                "exchange_asof_date": pd.Timestamp("2026-01-03T00:00:00Z"),
+                "deal_net_value_20d": 500000.0,
+                "deal_cluster_count_20d": 1.0,
+                "exchange_event_score": 0.25,
+            }
+        ]
+    )
+    monkeypatch.setattr(event_meta_model, "load_event_rows", lambda **kwargs: events)
+    monkeypatch.setattr(event_meta_model, "load_intraday_event_features", lambda *args, **kwargs: intraday)
+    monkeypatch.setattr(event_meta_model, "load_macro_event_features", lambda *args, **kwargs: macro)
+    monkeypatch.setattr(event_meta_model, "load_exchange_event_features", lambda *args, **kwargs: exchange)
+
+    out = event_meta_model.build_live_event_dataset()
+    assert len(out) == 1
+    assert out.iloc[0]["context_date"] == pd.Timestamp("2026-01-03T00:00:00Z")
+    assert pd.isna(out.iloc[0]["anchor_date"])
+    assert pd.isna(out.iloc[0]["target_label"])
+    assert float(out.iloc[0]["intraday_breakout_score"]) == 0.55
+    assert float(out.iloc[0]["macro_stress_score"]) == 0.2
+    assert float(out.iloc[0]["deal_net_value_20d"]) == 500000.0
+
+
 def test_llm_payload_includes_bounded_exchange_context(monkeypatch):
     event_row = pd.Series(
         {
@@ -2252,6 +2439,44 @@ def test_risk_engine_exchange_distribution_reduces_allocated_size(monkeypatch):
     assert out.iloc[0]["allocation_status"] == "allocated"
     assert out.iloc[0]["suggested_allocation_inr"] == 63000.0
     assert "Exchange-event risk multiplier applied" in out.iloc[0]["notes"]
+
+
+def test_risk_engine_point_in_time_context_excludes_same_day_daily_rows(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_sql_to_df(query, params=None, **kwargs):
+        calls.append({"query": query, "params": params})
+        if "advisory_technical_daily" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "technical_asof_date": pd.Timestamp("2026-04-14T00:00:00Z"),
+                        "adj_close": 100.0,
+                        "dma_20": 98.0,
+                        "dma_50": 95.0,
+                        "dma_200": 90.0,
+                        "atr_20": 2.0,
+                        "avg_traded_value_20d": 1000000.0,
+                        "rs_vs_benchmark": 0.1,
+                        "rs_vs_sector": 0.2,
+                        "breakout_extension_pct": 0.03,
+                        "fundamentals_asof_date": pd.Timestamp("2026-04-13T00:00:00Z"),
+                        "debt_to_equity": 0.4,
+                        "debt_to_equity_vs_sector": -0.1,
+                    }
+                ]
+            )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(risk_engine, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(risk_engine, "load_macro_context", lambda cutoff: {"macro_asof_date": cutoff.isoformat()})
+    monkeypatch.setattr(risk_engine, "load_exchange_feature_context", lambda symbol, cutoff: {"exchange_asof_date": cutoff.isoformat()})
+
+    published_on = pd.Timestamp("2026-04-15T10:30:00Z")
+    out = risk_engine.load_point_in_time_context("HDFCBANK", published_on)
+
+    assert out["technical_asof_date"] == "2026-04-14T00:00:00+00:00"
+    assert calls[0]["params"]["daily_cutoff"] == pd.Timestamp("2026-04-15T00:00:00Z")
 
 
 def test_adversarial_review_penalizes_exchange_distribution_against_positive_event():
@@ -3702,6 +3927,99 @@ def test_rule_engine_can_emit_explicit_abstain():
     assert any(item["reason_code"] == "abstain_low_edge" for item in rejections)
 
 
+def _technical_engine_base_row() -> pd.Series:
+    return pd.Series(
+        {
+            "adj_close": 100.0,
+            "avg_traded_value_20d": 250_000_000.0,
+            "median_volume_20d": 500_000.0,
+            "atr_pct": 3.5,
+            "gap_frequency_60d": 0.04,
+            "base_depth_60d_pct": 18.0,
+            "pass_liquidity_20d": True,
+            "pass_gap_behavior": True,
+            "pass_above_dma_20": True,
+            "pass_above_dma_50": True,
+            "pass_above_dma_150": True,
+            "pass_above_dma_200": True,
+            "pass_trend_alignment": True,
+            "dma_50_slope_20d_pct": 4.5,
+            "dma_150_slope_20d_pct": 3.0,
+            "dist_52w_high": -4.0,
+            "trend_persistence_60d": 0.82,
+            "trend_persistence_120d": 0.76,
+            "higher_high_count_20d": 12.0,
+            "higher_low_count_20d": 11.0,
+            "pivot_distance_20d_pct": 0.2,
+            "range_contraction_ratio": 0.72,
+            "volatility_contraction_flag": True,
+            "tight_close_upper_half_20d": 0.68,
+            "support_hold_rate_20d": 0.55,
+            "bb_width_rank_252d": 0.22,
+            "breakout_extension_pct": 3.0,
+            "breakout_day_volume_vs_20d": 2.1,
+            "up_down_volume_ratio_20d": 1.4,
+            "accumulation_days_20d": 5.0,
+            "distribution_days_20d": 1.0,
+            "pullback_volume_dryup_ratio_20d": 0.62,
+            "rs_vs_benchmark": 0.12,
+            "rs_vs_sector": 0.08,
+            "stock_ret_60d": 0.18,
+            "stock_ret_120d": 0.28,
+            "support_distance_20d_pct": 2.0,
+            "close_location_pct": 0.82,
+            "dist_20d_high": 0.3,
+            "gap_pct": 1.2,
+        }
+    )
+
+
+def test_technical_engine_emits_buy_triggered_for_clean_breakout():
+    row = _technical_engine_base_row()
+    out = technical_engine.evaluate_pre_entry_state(row)
+    assert out["technical_state"] == "BUY_TRIGGERED"
+    assert out["entry_trigger_type"] == "breakout"
+    assert out["conviction_bucket"] in {"MEDIUM_CONVICTION", "HIGH_CONVICTION"}
+
+
+def test_technical_engine_emits_near_pivot_for_constructive_setup_without_trigger():
+    row = _technical_engine_base_row()
+    row["breakout_day_volume_vs_20d"] = 0.9
+    row["pivot_distance_20d_pct"] = 1.8
+    out = technical_engine.evaluate_pre_entry_state(row)
+    assert out["technical_state"] == "NEAR_PIVOT"
+
+
+def test_technical_engine_rejects_junk_chart_on_hard_filters():
+    row = _technical_engine_base_row()
+    row["avg_traded_value_20d"] = 1_000_000.0
+    row["median_volume_20d"] = 5_000.0
+    row["gap_frequency_60d"] = 0.35
+    row["pass_liquidity_20d"] = False
+    row["pass_gap_behavior"] = False
+    out = technical_engine.evaluate_pre_entry_state(row)
+    assert out["technical_state"] == "REJECT"
+    assert "low_liquidity" in out["hard_filter_reasons"]
+
+
+def test_technical_engine_emits_full_exit_on_failed_breakout():
+    row = _technical_engine_base_row()
+    row["pass_above_dma_50"] = False
+    row["distribution_days_20d"] = 6.0
+    row["rs_vs_sector"] = -0.08
+    out = technical_engine.evaluate_post_entry_state(row)
+    assert out["technical_state"] == "FULL_EXIT"
+    assert "technical_thesis_failure" in out["technical_reasons"]
+
+
+def test_technical_engine_emits_partial_exit_on_sharp_extension():
+    row = _technical_engine_base_row()
+    row["breakout_extension_pct"] = 14.0
+    out = technical_engine.evaluate_post_entry_state(row)
+    assert out["technical_state"] == "PARTIAL_EXIT"
+    assert "extension_or_distribution" in out["technical_reasons"]
+
+
 def test_watchlist_builder_marks_abstain_as_not_watch_enabled(monkeypatch):
     monkeypatch.setattr(
         watchlist_builder,
@@ -4024,6 +4342,48 @@ def test_continuous_watch_build_price_alerts_for_open_positions_exit_points():
     by_symbol = {row["symbol"]: row for row in alerts.to_dict(orient="records")}
     assert by_symbol["ABC"]["alert_type"] == "POSITION_INVALIDATION_HIT"
     assert by_symbol["XYZ"]["alert_type"] == "STOP_HIT"
+
+
+def test_continuous_watch_load_monitored_universe_dedupes_same_symbol(monkeypatch):
+    watchlist = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-17T00:00:00Z"),
+                "setup_id": "WATCH_A",
+                "symbol": "ABC",
+                "monitor_source": "watchlist",
+                "rank": 3,
+                "state_updated_at": pd.Timestamp("2026-04-17T08:00:00Z"),
+            },
+            {
+                "asof_date": pd.Timestamp("2026-04-17T00:00:00Z"),
+                "setup_id": "WATCH_B",
+                "symbol": "XYZ",
+                "monitor_source": "watchlist",
+                "rank": 1,
+                "state_updated_at": pd.Timestamp("2026-04-17T08:05:00Z"),
+            },
+        ]
+    )
+    positions = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-17T00:00:00Z"),
+                "setup_id": "POS_A",
+                "symbol": "ABC",
+                "monitor_source": "position",
+            }
+        ]
+    )
+    monkeypatch.setattr(continuous_watch, "load_active_watchlist", lambda **kwargs: watchlist.copy())
+    monkeypatch.setattr(continuous_watch, "load_open_positions", lambda **kwargs: positions.copy())
+
+    out = continuous_watch.load_monitored_universe(asof_date=pd.Timestamp("2026-04-17T00:00:00Z"))
+
+    assert out[["symbol", "setup_id", "monitor_source"]].to_dict(orient="records") == [
+        {"symbol": "ABC", "setup_id": "POS_A", "monitor_source": "position"},
+        {"symbol": "XYZ", "setup_id": "WATCH_B", "monitor_source": "watchlist"},
+    ]
 
 
 def test_event_router_build_routing_plan_merges_price_and_event_sources():

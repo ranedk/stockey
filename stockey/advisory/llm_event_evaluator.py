@@ -89,6 +89,22 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
+def _table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+    except Exception:
+        return False
+    return not df.empty
+
+
 def trim_text(value: Any, limit: int) -> str | None:
     if value is None:
         return None
@@ -438,21 +454,6 @@ def load_watch_events(
     include_evaluated: bool = False,
     limit: int | None = None,
 ) -> pd.DataFrame:
-    def _table_exists(table_name: str) -> bool:
-        try:
-            df = sql_to_df(
-                """
-                SELECT 1 AS exists_flag
-                FROM information_schema.tables
-                WHERE table_name = %s
-                LIMIT 1
-                """,
-                params=(table_name,),
-            )
-        except Exception:
-            return False
-        return not df.empty
-
     announcement_exists = _table_exists("advisory_watch_events")
     news_exists = _table_exists(NEWS_EVENTS_TABLE)
     if not announcement_exists and not news_exists:
@@ -610,6 +611,7 @@ def load_documents(unique_ids: list[str]) -> pd.DataFrame:
 
 
 def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[str, Any]:
+    daily_cutoff = pd.to_datetime(published_on, utc=True, errors="coerce").normalize()
     df = sql_to_df(
         """
         SELECT
@@ -648,7 +650,7 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
             SELECT *
             FROM advisory_technical_daily
             WHERE symbol = %(symbol)s
-              AND asof_date <= %(published_on)s
+              AND asof_date < %(daily_cutoff)s
             ORDER BY asof_date DESC
             LIMIT 1
         ) tech ON true
@@ -656,19 +658,19 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
             SELECT *
             FROM advisory_fundamentals_daily
             WHERE symbol = %(symbol)s
-              AND asof_date <= %(published_on)s
+              AND asof_date < %(daily_cutoff)s
             ORDER BY asof_date DESC
             LIMIT 1
         ) fund ON true
         LEFT JOIN LATERAL (
             SELECT *
             FROM advisory_market_regime
-            WHERE asof_date <= %(published_on)s
+            WHERE asof_date < %(daily_cutoff)s
             ORDER BY asof_date DESC
             LIMIT 1
         ) regime ON true
         """,
-        params={"symbol": symbol.upper(), "published_on": published_on},
+        params={"symbol": symbol.upper(), "daily_cutoff": daily_cutoff},
     )
     if df.empty:
         return {}
@@ -682,6 +684,7 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
 def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_days: int = 30, max_events: int = 8) -> dict[str, Any]:
     out: dict[str, Any] = {"recent_events": []}
     symbol = symbol.upper()
+    daily_cutoff = pd.to_datetime(published_on, utc=True, errors="coerce").normalize()
     try:
         if _table_exists("advisory_exchange_features_daily"):
             features = sql_to_df(
@@ -706,11 +709,11 @@ def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_d
                     exchange_event_score
                 FROM advisory_exchange_features_daily
                 WHERE symbol = %(symbol)s
-                  AND asof_date <= %(published_on)s
+                  AND asof_date < %(daily_cutoff)s
                 ORDER BY asof_date DESC
                 LIMIT 1
                 """,
-                params={"symbol": symbol, "published_on": published_on},
+                params={"symbol": symbol, "daily_cutoff": daily_cutoff},
             )
             if not features.empty:
                 out["features"] = {

@@ -168,10 +168,25 @@ def load_monitored_universe(asof_date: pd.Timestamp | None = None) -> pd.DataFra
         watchlist["_priority"] = 1
         positions["_priority"] = 2
         out = pd.concat([watchlist, positions], ignore_index=True, sort=False)
-        out = out.sort_values(["symbol", "setup_id", "_priority"], ascending=[True, True, False], kind="stable")
-        out = out.drop_duplicates(subset=["setup_id", "symbol"], keep="first")
+        out = out.sort_values(
+            ["symbol", "_priority", "rank", "state_updated_at", "setup_id"],
+            ascending=[True, False, True, False, True],
+            kind="stable",
+        )
+        out = out.drop_duplicates(subset=["symbol"], keep="first")
         out = out.drop(columns=["_priority"], errors="ignore")
-    return out.reset_index(drop=True)
+    if "rank" not in out.columns:
+        out["rank"] = pd.NA
+    out["rank"] = pd.to_numeric(out["rank"], errors="coerce")
+    if "state_updated_at" not in out.columns:
+        out["state_updated_at"] = pd.NaT
+    out["state_updated_at"] = pd.to_datetime(out["state_updated_at"], utc=True, errors="coerce")
+    out = out.sort_values(
+        ["symbol", "monitor_source", "rank", "state_updated_at", "setup_id"],
+        ascending=[True, True, True, False, True],
+        kind="stable",
+    )
+    return out.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
 
 
 def load_latest_intraday_prices(symbols: list[str], *, interval_minutes: int = 1) -> pd.DataFrame:
@@ -312,20 +327,33 @@ def build_price_alerts(watchlist: pd.DataFrame, latest_prices: pd.DataFrame, *, 
             )
     if not rows:
         return pd.DataFrame()
-    return pd.DataFrame(rows).drop_duplicates(subset=["setup_id", "symbol", "alert_type"], keep="last")
+    return pd.DataFrame(rows).drop_duplicates(subset=["symbol", "alert_type"], keep="last")
 
 
 def persist_alerts(df: pd.DataFrame) -> None:
     ensure_alerts_table()
     if df.empty:
         return
-    upsert_to_db(df, ALERTS_TABLE, unique_keys=["observed_at", "setup_id", "symbol", "alert_type"], timescaledb_column="observed_at")
+    out = df.copy()
+    for column in [
+        "last_price",
+        "attractive_price_low",
+        "attractive_price_high",
+        "stop_price",
+        "invalidation_price",
+    ]:
+        if column in out.columns:
+            out[column] = pd.to_numeric(out[column], errors="coerce")
+    for column in ["observed_at", "asof_date", "load_ts"]:
+        if column in out.columns:
+            out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
+    upsert_to_db(out, ALERTS_TABLE, unique_keys=["observed_at", "setup_id", "symbol", "alert_type"], timescaledb_column="observed_at")
     publish_bus_message(
         "stockey:continuous_watch:alerts",
         {
             "published_at": pd.Timestamp.utcnow(),
-            "alert_count": int(len(df)),
-            "alerts": df.head(25).to_dict(orient="records"),
+            "alert_count": int(len(out)),
+            "alerts": out.head(25).to_dict(orient="records"),
         },
     )
 

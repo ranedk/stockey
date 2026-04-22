@@ -14,6 +14,7 @@ from utils.sync import parse_datetime_arg
 
 
 PORTFOLIO_TABLE = "advisory_portfolio_orders"
+REBALANCE_TABLE = "advisory_rebalance_actions"
 EXECUTION_TABLE = "advisory_execution_orders"
 FILLS_TABLE = "advisory_execution_fills"
 
@@ -60,6 +61,7 @@ def ensure_execution_tables() -> None:
                 trigger_price DOUBLE PRECISION,
                 reference_price DOUBLE PRECISION,
                 approved_allocation_inr DOUBLE PRECISION,
+                invest_score_pct DOUBLE PRECISION,
                 broker_order_id TEXT,
                 exchange_order_id TEXT,
                 execution_status TEXT,
@@ -95,6 +97,7 @@ def ensure_execution_tables() -> None:
             )
             """
         )
+        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS invest_score_pct DOUBLE PRECISION")
 
 
 def load_portfolio_orders(
@@ -153,6 +156,44 @@ def load_portfolio_orders(
     return df
 
 
+def load_exit_actions(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+) -> pd.DataFrame:
+    if not table_exists(REBALANCE_TABLE):
+        return pd.DataFrame()
+    clauses = ["LOWER(suggested_action) LIKE 'exit_%'"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {REBALANCE_TABLE})")
+    if symbols:
+        clauses.append("symbol = ANY(%s)")
+        params.append([value.upper() for value in symbols])
+    if setup_ids:
+        clauses.append("setup_id = ANY(%s)")
+        params.append([value.upper() for value in setup_ids])
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM {REBALANCE_TABLE}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY published_on DESC, symbol
+        """,
+        params=tuple(params) if params else None,
+    )
+    if df.empty:
+        return df
+    df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    return df.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
+
+
 def load_latest_closes(symbols: list[str], asof_date: pd.Timestamp) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
@@ -181,6 +222,119 @@ def load_latest_closes(symbols: list[str], asof_date: pd.Timestamp) -> pd.DataFr
     df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     return df.drop_duplicates(subset=["symbol"], keep="last")
+
+
+def _payload_rows(payload: list[dict[str, Any]] | dict[str, Any] | None) -> list[dict[str, Any]]:
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict):
+        for key in ["data", "records", "results", "list", "holdings", "positions"]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        return [payload]
+    return []
+
+
+def extract_available_cash(payload: list[dict[str, Any]] | dict[str, Any] | None) -> float | None:
+    rows = _payload_rows(payload)
+    candidate_keys = [
+        "availabelBalance",
+        "availableBalance",
+        "withdrawableBalance",
+        "clearBalance",
+        "balanceAvailable",
+        "tradingBalance",
+        "cashAvailable",
+    ]
+    values: list[float] = []
+    for row in rows:
+        for key in candidate_keys:
+            value = pd.to_numeric(row.get(key), errors="coerce")
+            if pd.notna(value):
+                values.append(float(value))
+    if not values and isinstance(payload, dict):
+        for key in candidate_keys:
+            value = pd.to_numeric(payload.get(key), errors="coerce")
+            if pd.notna(value):
+                values.append(float(value))
+    if not values:
+        return None
+    return max(values)
+
+
+def normalize_live_inventory(payload: list[dict[str, Any]] | dict[str, Any] | None) -> pd.DataFrame:
+    rows = _payload_rows(payload)
+    if not rows:
+        return pd.DataFrame(columns=["symbol", "security_id", "available_quantity"])
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["symbol", "security_id", "available_quantity"])
+    symbol_cols = ["tradingSymbol", "trading_symbol", "securitySymbol", "security_symbol", "ticker", "symbol"]
+    security_id_cols = ["securityId", "security_id"]
+    quantity_cols = ["availableQty", "availableQuantity", "netQty", "netQuantity", "quantity", "qty"]
+    symbol_series = None
+    for col in symbol_cols:
+        if col in df.columns:
+            symbol_series = df[col].astype("string").str.upper()
+            break
+    if symbol_series is None:
+        symbol_series = pd.Series([pd.NA] * len(df), dtype="string")
+    security_series = None
+    for col in security_id_cols:
+        if col in df.columns:
+            security_series = pd.to_numeric(df[col], errors="coerce")
+            break
+    if security_series is None:
+        security_series = pd.Series([pd.NA] * len(df), dtype="float64")
+    quantity_series = None
+    for col in quantity_cols:
+        if col in df.columns:
+            quantity_series = pd.to_numeric(df[col], errors="coerce")
+            break
+    if quantity_series is None:
+        quantity_series = pd.Series([pd.NA] * len(df), dtype="float64")
+    out = pd.DataFrame(
+        {
+            "symbol": symbol_series,
+            "security_id": security_series,
+            "available_quantity": quantity_series.fillna(0).clip(lower=0),
+        }
+    )
+    out = out.dropna(subset=["symbol"])
+    if out.empty:
+        return pd.DataFrame(columns=["symbol", "security_id", "available_quantity"])
+    return out.groupby("symbol", as_index=False, dropna=False).agg(
+        security_id=("security_id", "max"),
+        available_quantity=("available_quantity", "sum"),
+    )
+
+
+def load_live_account_budget(client: DhanTradingClient) -> tuple[float | None, pd.DataFrame]:
+    available_cash = None
+    inventory_frames: list[pd.DataFrame] = []
+    try:
+        available_cash = extract_available_cash(client.get_fund_limits())
+    except Exception:
+        available_cash = None
+    for loader in [client.get_holdings, client.get_positions]:
+        try:
+            frame = normalize_live_inventory(loader())
+        except Exception:
+            continue
+        if not frame.empty:
+            inventory_frames.append(frame)
+    if not inventory_frames:
+        return available_cash, pd.DataFrame(columns=["symbol", "security_id", "available_quantity"])
+    inventory = pd.concat(inventory_frames, ignore_index=True, sort=False)
+    inventory["symbol"] = inventory["symbol"].astype("string").str.upper()
+    inventory["available_quantity"] = pd.to_numeric(inventory["available_quantity"], errors="coerce").fillna(0).clip(lower=0)
+    return available_cash, inventory.groupby("symbol", as_index=False, dropna=False).agg(
+        security_id=("security_id", "max"),
+        available_quantity=("available_quantity", "sum"),
+    )
 
 
 def sanitize_correlation_id(value: str) -> str:
@@ -213,6 +367,7 @@ def build_execution_orders(
     product_type: str = "CNC",
     order_type: str = "MARKET",
     validity: str = "DAY",
+    use_broker_account: bool = False,
 ) -> pd.DataFrame:
     monitor_date = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce").normalize()
     portfolio_orders = load_portfolio_orders(
@@ -221,13 +376,31 @@ def build_execution_orders(
         setup_ids=setup_ids,
         include_existing=include_existing,
     )
-    if portfolio_orders.empty:
+    exit_actions = load_exit_actions(asof_date=monitor_date, symbols=symbols, setup_ids=setup_ids)
+    if portfolio_orders.empty and exit_actions.empty:
         return pd.DataFrame()
 
-    closes = load_latest_closes(portfolio_orders["symbol"].astype(str).unique().tolist(), monitor_date)
+    all_symbols = sorted(
+        {
+            *portfolio_orders.get("symbol", pd.Series(dtype="object")).dropna().astype(str).str.upper().tolist(),
+            *exit_actions.get("symbol", pd.Series(dtype="object")).dropna().astype(str).str.upper().tolist(),
+        }
+    )
+    closes = load_latest_closes(all_symbols, monitor_date)
     close_map = closes.set_index("symbol")["close"].to_dict() if not closes.empty else {}
+    available_cash = None
+    live_inventory = pd.DataFrame(columns=["symbol", "security_id", "available_quantity"])
+    if use_broker_account:
+        client = DhanTradingClient()
+        available_cash, live_inventory = load_live_account_budget(client)
+    inventory_map = (
+        live_inventory.set_index("symbol")[["security_id", "available_quantity"]].to_dict(orient="index")
+        if not live_inventory.empty
+        else {}
+    )
 
     rows: list[dict[str, Any]] = []
+    remaining_cash = None if available_cash is None else float(max(available_cash, 0.0))
     for _, row in portfolio_orders.iterrows():
         reference_price = pd.to_numeric(close_map.get(str(row["symbol"]).upper()), errors="coerce")
         approved_allocation = pd.to_numeric(row.get("approved_allocation_inr"), errors="coerce")
@@ -252,10 +425,15 @@ def build_execution_orders(
             execution_status = "submit_blocked"
             execution_reason = (execution_reason + " " if execution_reason else "") + "Approved allocation is not positive."
         else:
-            quantity = int(float(approved_allocation) // float(reference_price))
+            budget = float(approved_allocation)
+            if remaining_cash is not None:
+                budget = min(budget, remaining_cash)
+            quantity = int(budget // float(reference_price))
             if quantity <= 0:
                 execution_status = "submit_blocked"
-                execution_reason = (execution_reason + " " if execution_reason else "") + "Approved allocation is too small for one share."
+                execution_reason = (execution_reason + " " if execution_reason else "") + "Approved allocation or available cash is too small for one share."
+            elif remaining_cash is not None:
+                remaining_cash = max(remaining_cash - (quantity * float(reference_price)), 0.0)
 
         correlation_id = sanitize_correlation_id(f"{row['setup_id']}-{row['symbol']}-{row['unique_id']}")
         limit_price = None if order_type.upper() == "MARKET" else float(reference_price) if pd.notna(reference_price) else None
@@ -281,6 +459,7 @@ def build_execution_orders(
                 "trigger_price": None,
                 "reference_price": None if pd.isna(reference_price) else float(reference_price),
                 "approved_allocation_inr": None if pd.isna(approved_allocation) else float(approved_allocation),
+                "invest_score_pct": pd.to_numeric(row.get("invest_score_pct"), errors="coerce"),
                 "broker_order_id": None,
                 "exchange_order_id": None,
                 "execution_status": execution_status,
@@ -290,6 +469,64 @@ def build_execution_orders(
                 "broker_update_time": None,
                 "live_mode": False,
                 "raw_broker_json": None,
+                "raw_trade_json": None,
+                "load_ts": pd.Timestamp.utcnow(),
+            }
+        )
+    for _, row in exit_actions.iterrows():
+        symbol = str(row["symbol"]).upper()
+        reference_price = pd.to_numeric(close_map.get(symbol), errors="coerce")
+        execution_status = "planned"
+        execution_reason = None
+        quantity = 0
+        security_id = None
+        exchange_segment = None
+        inventory = inventory_map.get(symbol, {})
+        try:
+            identity = resolve_dhan_identity(symbol, "NSE", asset_type="stock")
+            security_id = int(identity["security_id"])
+            exchange_segment = str(identity["exchange_segment"])
+        except Exception as exc:
+            execution_status = "submit_blocked"
+            execution_reason = f"Identity resolution failed: {exc}"
+        available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
+        if pd.isna(available_qty) or float(available_qty) <= 0:
+            execution_status = "submit_blocked"
+            execution_reason = (execution_reason + " " if execution_reason else "") + "No live holding quantity available to exit."
+        else:
+            quantity = int(float(available_qty))
+        correlation_id = sanitize_correlation_id(f"EXIT-{row['symbol']}-{row['unique_id']}")
+        rows.append(
+            {
+                "asof_date": row["asof_date"],
+                "published_on": row["published_on"],
+                "setup_id": row["setup_id"],
+                "symbol": symbol,
+                "unique_id": row["unique_id"],
+                "company_master_id": None,
+                "correlation_id": correlation_id,
+                "security_id": security_id or inventory.get("security_id"),
+                "exchange_segment": exchange_segment or "NSE_EQ",
+                "transaction_type": "SELL",
+                "product_type": "CNC",
+                "order_type": "MARKET",
+                "validity": "DAY",
+                "quantity": quantity,
+                "filled_quantity": 0,
+                "limit_price": None,
+                "trigger_price": None,
+                "reference_price": None if pd.isna(reference_price) else float(reference_price),
+                "approved_allocation_inr": None,
+                "invest_score_pct": None,
+                "broker_order_id": None,
+                "exchange_order_id": None,
+                "execution_status": execution_status,
+                "execution_reason": execution_reason.strip() if isinstance(execution_reason, str) else execution_reason,
+                "broker_order_status": None,
+                "submitted_at": None,
+                "broker_update_time": None,
+                "live_mode": False,
+                "raw_broker_json": json.dumps({"action_source": row.get("suggested_action")}, ensure_ascii=False, default=str, sort_keys=True),
                 "raw_trade_json": None,
                 "load_ts": pd.Timestamp.utcnow(),
             }
@@ -310,6 +547,7 @@ def persist_execution_orders(df: pd.DataFrame) -> None:
         "trigger_price",
         "reference_price",
         "approved_allocation_inr",
+        "invest_score_pct",
     ]
     for col in numeric_cols:
         if col in out.columns:

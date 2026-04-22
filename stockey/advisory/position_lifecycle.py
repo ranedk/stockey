@@ -8,6 +8,7 @@ import pandas as pd
 
 from data.dhanlive.dhan_db import resolve_dhan_identity
 from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.display_time import to_display_value
 from utils.sync import parse_datetime_arg
 
 
@@ -143,7 +144,12 @@ def load_open_orders(
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
     df["asof_date"] = normalize_timestamp(df["asof_date"])
     df["symbol"] = df["symbol"].astype("string").str.upper()
-    return df
+    df = df.sort_values(
+        ["symbol", "portfolio_status", "approved_allocation_inr", "priority_score", "published_on", "setup_id"],
+        ascending=[True, True, False, False, False, True],
+        kind="stable",
+    )
+    return df.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
 
 
 def resolve_price_identities(symbols: list[str]) -> pd.DataFrame:
@@ -413,6 +419,21 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
         ]:
             if column in lifecycle_out.columns:
                 lifecycle_out[column] = pd.to_datetime(lifecycle_out[column], utc=True, errors="coerce")
+        with db_session() as (_, cur):
+            pairs = (
+                lifecycle_out[["asof_date", "symbol"]]
+                .dropna()
+                .drop_duplicates()
+                .to_dict(orient="records")
+            )
+            for item in pairs:
+                cur.execute(
+                    f"DELETE FROM {LIFECYCLE_TABLE} WHERE asof_date = %s AND symbol = %s",
+                    (
+                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                        str(item["symbol"]).upper(),
+                    ),
+                )
         upsert_to_db(
             lifecycle_out,
             LIFECYCLE_TABLE,
@@ -424,6 +445,24 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
         for column in ["reference_price", "stop_price", "invalidation_price"]:
             if column in actions_out.columns:
                 actions_out[column] = pd.to_numeric(actions_out[column], errors="coerce")
+        for column in ["asof_date", "published_on", "load_ts"]:
+            if column in actions_out.columns:
+                actions_out[column] = pd.to_datetime(actions_out[column], utc=True, errors="coerce")
+        with db_session() as (_, cur):
+            pairs = (
+                actions_out[["asof_date", "symbol"]]
+                .dropna()
+                .drop_duplicates()
+                .to_dict(orient="records")
+            )
+            for item in pairs:
+                cur.execute(
+                    f"DELETE FROM {REBALANCE_TABLE} WHERE asof_date = %s AND symbol = %s",
+                    (
+                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                        str(item["symbol"]).upper(),
+                    ),
+                )
         upsert_to_db(
             actions_out,
             REBALANCE_TABLE,
@@ -462,7 +501,7 @@ def summarize(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> dict[str,
         "action_count": int(len(actions_df)),
         "status_counts": lifecycle_df["position_status"].value_counts(dropna=False).to_dict(),
         "action_counts": actions_df["suggested_action"].value_counts(dropna=False).to_dict() if not actions_df.empty else {},
-        "sample": lifecycle_df.head(10).to_dict(orient="records"),
+        "sample": to_display_value(lifecycle_df.head(10)),
     }
 
 
@@ -481,7 +520,7 @@ def main() -> int:
         persist_outputs(lifecycle_df, actions_df)
     result = summarize(lifecycle_df, actions_df)
     result["dry_run"] = bool(args.dry_run)
-    print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    print(json.dumps(to_display_value(result), indent=2, ensure_ascii=False, default=str))
     return 0
 
 

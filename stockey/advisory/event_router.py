@@ -313,8 +313,8 @@ def route_live_updates(
         announcement_events=announcement_events,
         news_events=news_events,
         watchlist_priority=watchlist_priority,
-        max_actions=int(max_actions),
-        max_event_only_actions=int(max_event_only_actions),
+        max_actions=None if max_actions is None else int(max_actions),
+        max_event_only_actions=None if max_event_only_actions is None else int(max_event_only_actions),
     )
     actions = execute_routing_plan(plan) if plan else pd.DataFrame()
     persist_actions(actions)
