@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from advisory.announcement_watch import build_watch_updates_from_ingest, persist_watch_outputs, run_announcement_ingest
+from advisory.action_recommender import build_action_recommendations, persist_action_recommendations
 from advisory.adversarial_review import build_reviews as build_adversarial_reviews
 from advisory.adversarial_review import persist_reviews as persist_adversarial_reviews
 from advisory.execution_engine import (
@@ -85,6 +86,7 @@ PIPELINE_STAGES = [
     "risk",
     "portfolio",
     "lifecycle",
+    "actions",
     "execution",
 ]
 LEGACY_STAGE_ALIASES = {
@@ -610,6 +612,14 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "rebalance": _json_ready(rebalance_df),
         }
         _finish_stage("lifecycle", stage_started, f"lifecycle_rows={len(lifecycle_df)} rebalance_rows={len(rebalance_df)}")
+
+    if stage_enabled("actions", args.start_at, args.stop_at):
+        stage_started = _start_stage("actions")
+        actions_df = build_action_recommendations(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+        if not args.dry_run:
+            persist_action_recommendations(actions_df)
+        summary["stages"]["actions"] = _json_ready(actions_df)
+        _finish_stage("actions", stage_started, f"rows={len(actions_df)}")
 
     if args.include_execution and stage_enabled("execution", args.start_at, args.stop_at):
         stage_started = _start_stage("execution")

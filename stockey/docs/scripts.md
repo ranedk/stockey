@@ -27,7 +27,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap`, `sharpely_stock_meta`, `sharpely_stock_peers` | Fundamental data plus current stock metadata and peer snapshots |
 | `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
 | `data/dhanlive/auth_cli.py` | none | Dhan token status, refresh, validate, and cache-clear helper |
-| `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync is 5 years daily plus last 1 day of 1-minute bars |
+| `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync resumes from the latest stored candle with overlap, and backfills only when no local data exists |
 | `data/dhanlive/ohlcv_pull.py` | none | Quick operator OHLCV pull utility; defaults to NSE equity, 5-minute candles, and the last 60 minutes |
 | `advisory/intraday_features.py` | `advisory_intraday_features_daily` | On-demand advisory intraday feature builder; pulls missing intraday candles for the active screener universe and persists daily intraday pattern features |
 | `data/screenerin/screener_parser.py` | `screenerin_screener_snapshots` | Stores parsed Screener.in screener snapshots by screener slug and date |
@@ -211,8 +211,9 @@ Module: `data.dhanlive.ohlcv`
 
 Default behavior:
 
-- syncs 5 years of daily candles
-- syncs the last 1 day of 1-minute intraday candles
+- daily sync starts from the latest stored daily candle minus `DHAN_DAILY_REFRESH_OVERLAP_DAYS`
+- intraday sync starts from the latest stored intraday candle minus `DHAN_INTRADAY_REFRESH_OVERLAP_MINUTES`
+- if no local data exists, daily sync backfills 5 years and intraday sync backfills the last 1 day
 - defaults to `asset_type=stock`
 - supports `asset_type=stock|index|benchmark`
 
@@ -692,6 +693,7 @@ python -m advisory.portfolio_engine
 python -m advisory.position_lifecycle --dry-run
 python -m advisory.position_lifecycle
 python -m advisory.execution_engine --dry-run
+python -m advisory.execution_engine --dry-run --use-broker-account
 python -m advisory.execution_engine --reconcile-only --dry-run
 python -m advisory.pipeline --dry-run --stop-at portfolio
 python -m advisory.pipeline --include-watch --include-lifecycle --dry-run
@@ -719,7 +721,18 @@ For the advisory stack, `dhan_ohlcv_daily` is the canonical OHLCV source. The NS
 
 `advisory.position_lifecycle` reads approved `advisory_portfolio_orders`, marks paper entry/current prices from `dhan_ohlcv_daily`, and writes `advisory_position_lifecycle` plus `advisory_rebalance_actions` with hold/trim/exit/review suggestions.
 
-`advisory.execution_engine` reads approved `advisory_portfolio_orders`, builds broker handoff orders in `advisory_execution_orders`, and can reconcile order/trade state from Dhan into `advisory_execution_orders` plus `advisory_execution_fills`. Use `--live` only when you explicitly want to place live orders through Dhan. Live Dhan order placement requires the API static IP to be whitelisted.
+`advisory.execution_engine` reads consolidated `advisory_action_recommendations`, builds broker handoff orders in `advisory_execution_orders`, and can reconcile order/trade state from Dhan into `advisory_execution_orders` plus `advisory_execution_fills`. Staged order sizing prefers fresh `dhan_ohlcv_intraday` prices and falls back to `dhan_ohlcv_daily` close when intraday is unavailable.
+
+Use `--use-broker-account` on a dry run when you want staged quantities capped by live Dhan cash and holdings without submitting orders. `--live` enables the same broker-account sizing automatically before safety checks and submission.
+
+Live Dhan submission is fail-closed. `--live` is not enough by itself; set `STOCKEY_LIVE_TRADING_ENABLED=true` only when you intentionally want broker submission. Keep these caps configured before live use:
+
+- `STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN`, default `5`
+- `STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR`, default `50000`
+- `STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE`, default `true`
+- `STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES`, default `30`
+
+Live Dhan order placement also requires the API static IP to be whitelisted.
 
 `advisory.master_pipeline` is the single top-level advisory orchestrator. Use `./all_advisory.sh` for the shell entry point, or run `python -m advisory.master_pipeline --skip-downloads` directly. Lower-level modules such as `complete_data.sh` and `advisory.pipeline` remain available for component runs and targeted debugging.
 

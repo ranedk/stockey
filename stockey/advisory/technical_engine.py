@@ -79,7 +79,7 @@ def evaluate_hard_filters(row: pd.Series, config: dict[str, Any] | None = None) 
         failures.append("low_liquidity")
     if price is None or price < float(cfg["min_price"]):
         failures.append("low_price")
-    if median_volume is None or median_volume < float(cfg["min_median_volume_20d"]):
+    if "median_volume_20d" in row and median_volume is not None and median_volume < float(cfg["min_median_volume_20d"]):
         failures.append("low_median_volume")
     if atr_pct is not None and atr_pct > float(cfg["max_atr_pct"]):
         failures.append("high_noise_atr")
@@ -87,7 +87,7 @@ def evaluate_hard_filters(row: pd.Series, config: dict[str, Any] | None = None) 
         failures.append("excessive_gap_frequency")
     if base_depth is not None and base_depth > float(cfg["max_base_depth_60d_pct"]):
         failures.append("base_too_deep")
-    if not _bool(row.get("pass_liquidity_20d")):
+    if "pass_liquidity_20d" in row and not _bool(row.get("pass_liquidity_20d")):
         failures.append("liquidity_filter_failed")
     if "pass_gap_behavior" in row and not _bool(row.get("pass_gap_behavior")):
         failures.append("gap_behavior_filter_failed")
@@ -246,11 +246,11 @@ def identify_entry_trigger(row: pd.Series, thresholds: dict[str, Any] | None = N
 
     if breakout_vol >= float(cfg["breakout_volume_min"]) and (pivot_distance is not None and pivot_distance <= 0.5) and close_location >= 0.7:
         return "breakout", "Price is pushing through pivot with strong breakout participation."
-    if pivot_distance is not None and abs(pivot_distance) <= float(cfg["retest_distance_pct"]) and support_hold >= 0.45 and dryup <= 0.8:
+    if breakout_vol >= 1.0 and pivot_distance is not None and abs(pivot_distance) <= float(cfg["retest_distance_pct"]) and support_hold >= 0.45 and dryup <= 0.8:
         return "breakout_retest", "Price is holding near pivot on controlled retest volume."
     if _bool(row.get("pass_trend_alignment")) and support_distance <= float(cfg["trend_add_on_pullback_distance_pct"]) and dryup <= 0.85 and close_location >= 0.55:
         return "trend_pullback", "Trend pullback is holding support with controlled selling."
-    if _bool(row.get("pass_above_dma_20")) and close_location >= 0.75 and breakout_extension <= 4.0 and (safe_float(row.get("dist_20d_high")) or -99.0) >= -1.0:
+    if breakout_vol >= 1.0 and _bool(row.get("pass_above_dma_20")) and close_location >= 0.75 and breakout_extension <= 4.0 and (safe_float(row.get("dist_20d_high")) or -99.0) >= -1.0:
         return "reclaim", "Price has reclaimed a key level and closed strongly."
     return None, None
 

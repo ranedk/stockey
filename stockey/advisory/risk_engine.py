@@ -849,17 +849,29 @@ def compute_invalidation(profile: SetupRiskProfile, context: dict[str, Any]) -> 
     dma_50 = pd.to_numeric(context.get("dma_50"), errors="coerce")
 
     anchor_value = dma_20 if profile.invalidation_anchor == "dma_20" else dma_50
-    candidates = []
+    invalidation_candidates = []
     if pd.notna(anchor_value):
-        candidates.append(float(anchor_value))
+        invalidation_candidates.append(float(anchor_value))
     if pd.notna(adj_close) and pd.notna(atr_20):
-        candidates.append(float(adj_close - (2.0 * atr_20)))
-    if not candidates:
+        invalidation_candidates.append(float(adj_close - (2.0 * atr_20)))
+    if not invalidation_candidates:
         return None, None, "Technical invalidation unavailable: missing ATR/DMA context."
 
-    invalidation_price = max(candidates)
-    stop_price = invalidation_price
-    rule = f"Invalidate if close breaks below {profile.invalidation_anchor} or roughly 2 ATR from current price."
+    invalidation_price = max(invalidation_candidates)
+
+    stop_candidates: list[float] = []
+    if pd.notna(adj_close) and pd.notna(atr_20):
+        stop_candidates.append(float(adj_close - (1.25 * atr_20)))
+    if profile.invalidation_anchor == "dma_50" and pd.notna(dma_20):
+        stop_candidates.append(float(dma_20))
+    elif profile.invalidation_anchor == "dma_20" and pd.notna(adj_close) and pd.notna(atr_20):
+        stop_candidates.append(float(adj_close - (1.0 * atr_20)))
+
+    stop_price = max([invalidation_price, *stop_candidates]) if stop_candidates else invalidation_price
+    rule = (
+        f"Stop if price loses tactical support near 1.25 ATR / short support; "
+        f"invalidate if close breaks below {profile.invalidation_anchor} or roughly 2 ATR from current price."
+    )
     return round(stop_price, 2), round(invalidation_price, 2), rule
 
 

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import sys
 from typing import Any
 
 import pandas as pd
 
+from advisory.action_recommender import TABLE_NAME as ACTIONS_TABLE, build_action_recommendations
 from data.dhanlive.client import DhanAPIError, DhanTradingClient
 from data.dhanlive.dhan_db import resolve_dhan_identity
 from utils.db import db_session, sql_to_df, upsert_to_db
@@ -17,6 +20,36 @@ PORTFOLIO_TABLE = "advisory_portfolio_orders"
 REBALANCE_TABLE = "advisory_rebalance_actions"
 EXECUTION_TABLE = "advisory_execution_orders"
 FILLS_TABLE = "advisory_execution_fills"
+DEFAULT_MAX_LIVE_ORDERS_PER_RUN = 5
+DEFAULT_MAX_LIVE_ORDER_VALUE_INR = 50_000.0
+DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES = 30
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(float(str(raw).strip()))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(str(raw).strip())
+    except ValueError:
+        return default
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -60,8 +93,12 @@ def ensure_execution_tables() -> None:
                 limit_price DOUBLE PRECISION,
                 trigger_price DOUBLE PRECISION,
                 reference_price DOUBLE PRECISION,
+                reference_price_source TEXT,
+                reference_price_asof TIMESTAMPTZ,
                 approved_allocation_inr DOUBLE PRECISION,
                 invest_score_pct DOUBLE PRECISION,
+                estimated_order_value_inr DOUBLE PRECISION,
+                safety_checks_json TEXT,
                 broker_order_id TEXT,
                 exchange_order_id TEXT,
                 execution_status TEXT,
@@ -98,6 +135,10 @@ def ensure_execution_tables() -> None:
             """
         )
         cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS invest_score_pct DOUBLE PRECISION")
+        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS reference_price_source TEXT")
+        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS reference_price_asof TIMESTAMPTZ")
+        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS estimated_order_value_inr DOUBLE PRECISION")
+        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS safety_checks_json TEXT")
 
 
 def load_portfolio_orders(
@@ -164,7 +205,7 @@ def load_exit_actions(
 ) -> pd.DataFrame:
     if not table_exists(REBALANCE_TABLE):
         return pd.DataFrame()
-    clauses = ["LOWER(suggested_action) LIKE 'exit_%'"]
+    clauses = ["(LOWER(suggested_action) LIKE 'exit_%%' OR LOWER(suggested_action) IN ('trim_winner', 'add_on_pullback'))"]
     params: list[object] = []
     if asof_date is not None:
         clauses.append("asof_date = %s")
@@ -190,6 +231,48 @@ def load_exit_actions(
         return df
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
     df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    return df.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
+
+
+def load_action_recommendations(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+) -> pd.DataFrame:
+    if not table_exists(ACTIONS_TABLE):
+        return pd.DataFrame()
+    clauses = []
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {ACTIONS_TABLE})")
+    if symbols:
+        clauses.append("symbol = ANY(%s)")
+        params.append([value.upper() for value in symbols])
+    if setup_ids:
+        clauses.append("setup_id = ANY(%s)")
+        params.append([value.upper() for value in setup_ids])
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM {ACTIONS_TABLE}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY published_on DESC, action_priority DESC, symbol
+        """,
+        params=tuple(params) if params else None,
+    )
+    if df.empty:
+        return df
+    for column in ["asof_date", "published_on", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    for column in ["action_fraction", "approved_allocation_inr", "reference_price", "invest_score_pct"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
     df["symbol"] = df["symbol"].astype("string").str.upper()
     return df.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
 
@@ -222,6 +305,93 @@ def load_latest_closes(symbols: list[str], asof_date: pd.Timestamp) -> pd.DataFr
     df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df["close"] = pd.to_numeric(df["close"], errors="coerce")
     return df.drop_duplicates(subset=["symbol"], keep="last")
+
+
+def _execution_price_cutoff(asof_date: pd.Timestamp) -> pd.Timestamp:
+    timestamp = pd.to_datetime(asof_date, utc=True, errors="coerce")
+    now = pd.Timestamp.utcnow()
+    if pd.isna(timestamp):
+        return now
+    if timestamp.normalize() >= now.normalize():
+        return now
+    return timestamp.normalize() + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+
+
+def load_latest_intraday_prices(
+    symbols: list[str],
+    asof_date: pd.Timestamp,
+    *,
+    max_age_minutes: int = DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES,
+) -> pd.DataFrame:
+    if not symbols or not table_exists("dhan_ohlcv_intraday"):
+        return pd.DataFrame(columns=["symbol", "price", "price_asof", "price_source"])
+    cutoff = _execution_price_cutoff(asof_date)
+    min_timestamp = cutoff - pd.Timedelta(minutes=max(int(max_age_minutes), 1))
+    df = sql_to_df(
+        """
+        WITH ranked AS (
+            SELECT
+                ticker AS symbol,
+                "timestamp" AS price_asof,
+                close AS price,
+                interval_minutes,
+                ROW_NUMBER() OVER (
+                    PARTITION BY ticker
+                    ORDER BY "timestamp" DESC, interval_minutes ASC
+                ) AS rn
+            FROM dhan_ohlcv_intraday
+            WHERE exchange = 'NSE'
+              AND asset_type = 'stock'
+              AND ticker = ANY(%(symbols)s)
+              AND "timestamp" <= %(cutoff)s
+              AND "timestamp" >= %(min_timestamp)s
+              AND close IS NOT NULL
+        )
+        SELECT symbol, price_asof, price, interval_minutes
+        FROM ranked
+        WHERE rn = 1
+        """,
+        params={"symbols": symbols, "cutoff": cutoff, "min_timestamp": min_timestamp},
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["symbol", "price", "price_asof", "price_source"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    df["price_asof"] = pd.to_datetime(df["price_asof"], utc=True, errors="coerce")
+    df["price_source"] = "intraday"
+    return df.dropna(subset=["symbol", "price"]).drop_duplicates(subset=["symbol"], keep="last")
+
+
+def load_latest_execution_prices(
+    symbols: list[str],
+    asof_date: pd.Timestamp,
+    *,
+    max_intraday_age_minutes: int | None = None,
+) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame(columns=["symbol", "price", "price_asof", "price_source"])
+    clean_symbols = sorted({str(symbol).upper() for symbol in symbols if str(symbol or "").strip()})
+    max_age = max_intraday_age_minutes
+    if max_age is None:
+        max_age = _env_int("STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES", DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES)
+    frames: list[pd.DataFrame] = []
+    intraday = load_latest_intraday_prices(clean_symbols, asof_date, max_age_minutes=max_age)
+    if not intraday.empty:
+        frames.append(intraday[["symbol", "price", "price_asof", "price_source"]])
+    missing = clean_symbols
+    if not intraday.empty:
+        missing = sorted(set(clean_symbols) - set(intraday["symbol"].dropna().astype(str).str.upper().tolist()))
+    daily = load_latest_closes(missing, pd.to_datetime(asof_date, utc=True, errors="coerce").normalize())
+    if not daily.empty:
+        daily = daily.rename(columns={"close": "price", "date": "price_asof"})
+        daily["price_source"] = "daily_close"
+        frames.append(daily[["symbol", "price", "price_asof", "price_source"]])
+    if not frames:
+        return pd.DataFrame(columns=["symbol", "price", "price_asof", "price_source"])
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    out["price"] = pd.to_numeric(out["price"], errors="coerce")
+    out["price_asof"] = pd.to_datetime(out["price_asof"], utc=True, errors="coerce")
+    return out.dropna(subset=["symbol", "price"]).drop_duplicates(subset=["symbol"], keep="first")
 
 
 def _payload_rows(payload: list[dict[str, Any]] | dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -312,20 +482,31 @@ def normalize_live_inventory(payload: list[dict[str, Any]] | dict[str, Any] | No
     )
 
 
-def load_live_account_budget(client: DhanTradingClient) -> tuple[float | None, pd.DataFrame]:
+def load_live_account_budget(client: DhanTradingClient, *, strict: bool = False) -> tuple[float | None, pd.DataFrame]:
     available_cash = None
     inventory_frames: list[pd.DataFrame] = []
+    errors: list[str] = []
     try:
         available_cash = extract_available_cash(client.get_fund_limits())
-    except Exception:
+    except Exception as exc:
+        errors.append(f"fund_limits:{exc.__class__.__name__}:{exc}")
         available_cash = None
     for loader in [client.get_holdings, client.get_positions]:
         try:
             frame = normalize_live_inventory(loader())
-        except Exception:
+        except Exception as exc:
+            errors.append(f"{getattr(loader, '__name__', 'inventory_loader')}:{exc.__class__.__name__}:{exc}")
             continue
         if not frame.empty:
             inventory_frames.append(frame)
+    if errors:
+        print(
+            "[advisory.execution_engine] broker account fetch warnings: " + " | ".join(errors),
+            file=sys.stderr,
+            flush=True,
+        )
+    if strict and available_cash is None and not inventory_frames:
+        raise RuntimeError("Dhan broker account data unavailable; refusing broker-account sizing.")
     if not inventory_frames:
         return available_cash, pd.DataFrame(columns=["symbol", "security_id", "available_quantity"])
     inventory = pd.concat(inventory_frames, ignore_index=True, sort=False)
@@ -370,29 +551,45 @@ def build_execution_orders(
     use_broker_account: bool = False,
 ) -> pd.DataFrame:
     monitor_date = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce").normalize()
-    portfolio_orders = load_portfolio_orders(
-        asof_date=monitor_date,
-        symbols=symbols,
-        setup_ids=setup_ids,
-        include_existing=include_existing,
-    )
-    exit_actions = load_exit_actions(asof_date=monitor_date, symbols=symbols, setup_ids=setup_ids)
-    if portfolio_orders.empty and exit_actions.empty:
-        return pd.DataFrame()
+    action_rows = load_action_recommendations(asof_date=monitor_date, symbols=symbols, setup_ids=setup_ids)
+    if action_rows.empty:
+        action_rows = build_action_recommendations(asof_date=monitor_date, symbols=symbols, setup_ids=setup_ids)
+    use_action_table = not action_rows.empty
+    portfolio_orders = pd.DataFrame()
+    exit_actions = pd.DataFrame()
+    if not use_action_table:
+        portfolio_orders = load_portfolio_orders(
+            asof_date=monitor_date,
+            symbols=symbols,
+            setup_ids=setup_ids,
+            include_existing=include_existing,
+        )
+        exit_actions = load_exit_actions(asof_date=monitor_date, symbols=symbols, setup_ids=setup_ids)
+        if portfolio_orders.empty and exit_actions.empty:
+            return pd.DataFrame()
+        if not exit_actions.empty and not portfolio_orders.empty:
+            rebalance_symbols = set(exit_actions["symbol"].dropna().astype(str).str.upper().tolist())
+            if rebalance_symbols:
+                portfolio_orders = portfolio_orders[
+                    ~portfolio_orders["symbol"].astype("string").str.upper().isin(rebalance_symbols)
+                ].copy()
 
     all_symbols = sorted(
         {
+            *action_rows.get("symbol", pd.Series(dtype="object")).dropna().astype(str).str.upper().tolist(),
             *portfolio_orders.get("symbol", pd.Series(dtype="object")).dropna().astype(str).str.upper().tolist(),
             *exit_actions.get("symbol", pd.Series(dtype="object")).dropna().astype(str).str.upper().tolist(),
         }
     )
-    closes = load_latest_closes(all_symbols, monitor_date)
-    close_map = closes.set_index("symbol")["close"].to_dict() if not closes.empty else {}
+    prices = load_latest_execution_prices(all_symbols, monitor_date)
+    price_map = prices.set_index("symbol")["price"].to_dict() if not prices.empty else {}
+    price_source_map = prices.set_index("symbol")["price_source"].to_dict() if not prices.empty else {}
+    price_asof_map = prices.set_index("symbol")["price_asof"].to_dict() if not prices.empty else {}
     available_cash = None
     live_inventory = pd.DataFrame(columns=["symbol", "security_id", "available_quantity"])
     if use_broker_account:
         client = DhanTradingClient()
-        available_cash, live_inventory = load_live_account_budget(client)
+        available_cash, live_inventory = load_live_account_budget(client, strict=True)
     inventory_map = (
         live_inventory.set_index("symbol")[["security_id", "available_quantity"]].to_dict(orient="index")
         if not live_inventory.empty
@@ -401,8 +598,152 @@ def build_execution_orders(
 
     rows: list[dict[str, Any]] = []
     remaining_cash = None if available_cash is None else float(max(available_cash, 0.0))
+    if use_action_table:
+        for _, row in action_rows.iterrows():
+            symbol = str(row["symbol"]).upper()
+            action_code = str(row.get("action_code") or "").upper()
+            transaction = str(row.get("transaction_type") or "").upper()
+            execution_mode = str(row.get("execution_mode") or "").lower()
+            reference_price = pd.to_numeric(price_map.get(symbol), errors="coerce")
+            reference_price_source = price_source_map.get(symbol)
+            reference_price_asof = price_asof_map.get(symbol)
+            if pd.isna(reference_price):
+                reference_price = pd.to_numeric(row.get("reference_price"), errors="coerce")
+                if pd.notna(reference_price):
+                    reference_price_source = "action_reference"
+                    reference_price_asof = row.get("published_on") or row.get("asof_date")
+            quantity = 0
+            execution_status = "planned"
+            execution_reason = None
+            security_id = None
+            exchange_segment = None
+            inventory = inventory_map.get(symbol, {})
+            available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
+            action_fraction = pd.to_numeric(row.get("action_fraction"), errors="coerce")
+            try:
+                identity = resolve_dhan_identity(symbol, "NSE", asset_type="stock")
+                security_id = int(identity["security_id"])
+                exchange_segment = str(identity["exchange_segment"])
+            except Exception as exc:
+                execution_status = "submit_blocked"
+                execution_reason = f"Identity resolution failed: {exc}"
+
+            if execution_mode not in {"", "broker_order"} or transaction not in {"BUY", "SELL"}:
+                continue
+            elif transaction == "BUY" and action_code == "BUY":
+                approved_allocation = pd.to_numeric(row.get("approved_allocation_inr"), errors="coerce")
+                if pd.isna(reference_price) or reference_price <= 0:
+                    execution_status = "submit_blocked"
+                    execution_reason = (execution_reason + " " if execution_reason else "") + "Missing reference close price."
+                elif pd.isna(approved_allocation) or approved_allocation <= 0:
+                    execution_status = "submit_blocked"
+                    execution_reason = (execution_reason + " " if execution_reason else "") + "Approved allocation is not positive."
+                else:
+                    budget = float(approved_allocation)
+                    if remaining_cash is not None:
+                        budget = min(budget, remaining_cash)
+                    quantity = int(budget // float(reference_price))
+                    if quantity <= 0:
+                        execution_status = "submit_blocked"
+                        execution_reason = (execution_reason + " " if execution_reason else "") + "Approved allocation or available cash is too small for one share."
+                    elif remaining_cash is not None:
+                        remaining_cash = max(remaining_cash - (quantity * float(reference_price)), 0.0)
+            elif transaction == "BUY" and action_code == "BUY_MORE":
+                if pd.isna(available_qty) or float(available_qty) <= 0:
+                    execution_status = "submit_blocked"
+                    execution_reason = (execution_reason + " " if execution_reason else "") + "No live holding quantity available to size add-on."
+                elif pd.isna(reference_price) or reference_price <= 0:
+                    execution_status = "submit_blocked"
+                    execution_reason = (execution_reason + " " if execution_reason else "") + "Missing reference close price for add-on order."
+                else:
+                    requested_fraction = float(action_fraction) if pd.notna(action_fraction) else 0.20
+                    quantity = max(1, int(round(int(float(available_qty)) * requested_fraction)))
+                    if remaining_cash is not None:
+                        cash_limited_qty = int(float(remaining_cash) // float(reference_price))
+                        quantity = min(quantity, cash_limited_qty)
+                        if quantity > 0:
+                            remaining_cash = max(remaining_cash - (quantity * float(reference_price)), 0.0)
+                    if quantity <= 0:
+                        execution_status = "submit_blocked"
+                        execution_reason = (execution_reason + " " if execution_reason else "") + "Available cash is too small for one add-on share."
+                    else:
+                        execution_reason = (execution_reason + " " if execution_reason else "") + f"Add-on sized at {requested_fraction:.2f} of live holdings."
+            elif transaction == "SELL":
+                if pd.isna(available_qty) or float(available_qty) <= 0:
+                    execution_status = "submit_blocked"
+                    execution_reason = (execution_reason + " " if execution_reason else "") + "No live holding quantity available to exit."
+                else:
+                    available_qty_int = int(float(available_qty))
+                    requested_fraction = float(action_fraction) if pd.notna(action_fraction) else 1.0
+                    if 0 < requested_fraction < 1:
+                        quantity = max(1, int(round(available_qty_int * requested_fraction)))
+                        quantity = min(quantity, available_qty_int)
+                        execution_reason = (execution_reason + " " if execution_reason else "") + f"Partial sell sized at {requested_fraction:.2f} of live holdings."
+                    else:
+                        quantity = available_qty_int
+
+            correlation_id = sanitize_correlation_id(f"{action_code}-{symbol}-{row.get('unique_id') or 'na'}")
+            limit_price = None if order_type.upper() == "MARKET" else float(reference_price) if pd.notna(reference_price) else None
+            rows.append(
+                {
+                    "asof_date": row["asof_date"],
+                    "published_on": row.get("published_on") or row["asof_date"],
+                    "setup_id": row.get("setup_id"),
+                    "symbol": symbol,
+                    "unique_id": row.get("unique_id") or f"{symbol}-{action_code}",
+                    "company_master_id": None,
+                    "correlation_id": correlation_id,
+                    "security_id": security_id or inventory.get("security_id"),
+                    "exchange_segment": exchange_segment or "NSE_EQ",
+                    "transaction_type": transaction or None,
+                    "product_type": product_type.upper(),
+                    "order_type": order_type.upper(),
+                    "validity": validity.upper(),
+                    "quantity": quantity,
+                    "filled_quantity": 0,
+                    "limit_price": limit_price,
+                    "trigger_price": None,
+                    "reference_price": None if pd.isna(reference_price) else float(reference_price),
+                    "reference_price_source": reference_price_source,
+                    "reference_price_asof": reference_price_asof,
+                    "approved_allocation_inr": pd.to_numeric(row.get("approved_allocation_inr"), errors="coerce"),
+                    "invest_score_pct": pd.to_numeric(row.get("invest_score_pct"), errors="coerce"),
+                    "estimated_order_value_inr": None if pd.isna(reference_price) or quantity <= 0 else float(reference_price) * int(quantity),
+                    "safety_checks_json": None,
+                    "broker_order_id": None,
+                    "exchange_order_id": None,
+                    "execution_status": execution_status,
+                    "execution_reason": execution_reason.strip() if isinstance(execution_reason, str) else execution_reason,
+                    "broker_order_status": None,
+                    "submitted_at": None,
+                    "broker_update_time": None,
+                    "live_mode": False,
+                    "raw_broker_json": json.dumps(
+                        {
+                            "action_code": row.get("action_code"),
+                            "action_source": row.get("action_source"),
+                            "source_action": row.get("source_action"),
+                            "action_fraction": pd.to_numeric(row.get("action_fraction"), errors="coerce"),
+                            "execution_mode": row.get("execution_mode"),
+                            "recommended_stop_price": pd.to_numeric(row.get("recommended_stop_price"), errors="coerce"),
+                            "reference_price_source": reference_price_source,
+                            "reference_price_asof": reference_price_asof,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                        sort_keys=True,
+                    ),
+                    "raw_trade_json": None,
+                    "load_ts": pd.Timestamp.utcnow(),
+                }
+            )
+        return pd.DataFrame(rows)
+
     for _, row in portfolio_orders.iterrows():
-        reference_price = pd.to_numeric(close_map.get(str(row["symbol"]).upper()), errors="coerce")
+        symbol = str(row["symbol"]).upper()
+        reference_price = pd.to_numeric(price_map.get(symbol), errors="coerce")
+        reference_price_source = price_source_map.get(symbol)
+        reference_price_asof = price_asof_map.get(symbol)
         approved_allocation = pd.to_numeric(row.get("approved_allocation_inr"), errors="coerce")
         quantity = 0
         execution_status = "planned"
@@ -458,8 +799,12 @@ def build_execution_orders(
                 "limit_price": limit_price,
                 "trigger_price": None,
                 "reference_price": None if pd.isna(reference_price) else float(reference_price),
+                "reference_price_source": reference_price_source,
+                "reference_price_asof": reference_price_asof,
                 "approved_allocation_inr": None if pd.isna(approved_allocation) else float(approved_allocation),
                 "invest_score_pct": pd.to_numeric(row.get("invest_score_pct"), errors="coerce"),
+                "estimated_order_value_inr": None if pd.isna(reference_price) or quantity <= 0 else float(reference_price) * int(quantity),
+                "safety_checks_json": None,
                 "broker_order_id": None,
                 "exchange_order_id": None,
                 "execution_status": execution_status,
@@ -475,13 +820,18 @@ def build_execution_orders(
         )
     for _, row in exit_actions.iterrows():
         symbol = str(row["symbol"]).upper()
-        reference_price = pd.to_numeric(close_map.get(symbol), errors="coerce")
+        reference_price = pd.to_numeric(price_map.get(symbol), errors="coerce")
+        reference_price_source = price_source_map.get(symbol)
+        reference_price_asof = price_asof_map.get(symbol)
         execution_status = "planned"
         execution_reason = None
         quantity = 0
         security_id = None
         exchange_segment = None
         inventory = inventory_map.get(symbol, {})
+        suggested_action = str(row.get("suggested_action") or "").lower()
+        action_fraction = pd.to_numeric(row.get("action_fraction"), errors="coerce")
+        execution_mode = str(row.get("execution_mode") or "").lower()
         try:
             identity = resolve_dhan_identity(symbol, "NSE", asset_type="stock")
             security_id = int(identity["security_id"])
@@ -490,11 +840,41 @@ def build_execution_orders(
             execution_status = "submit_blocked"
             execution_reason = f"Identity resolution failed: {exc}"
         available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
-        if pd.isna(available_qty) or float(available_qty) <= 0:
+        is_add_on = suggested_action == "add_on_pullback"
+        if execution_mode not in {"", "broker_order"} and suggested_action not in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure", "trim_winner", "add_on_pullback"}:
             execution_status = "submit_blocked"
-            execution_reason = (execution_reason + " " if execution_reason else "") + "No live holding quantity available to exit."
+            execution_reason = (execution_reason + " " if execution_reason else "") + f"Execution mode {execution_mode} is not broker-submittable."
         else:
-            quantity = int(float(available_qty))
+            if pd.isna(available_qty) or float(available_qty) <= 0:
+                execution_status = "submit_blocked"
+                execution_reason = (execution_reason + " " if execution_reason else "") + (
+                    "No live holding quantity available to scale into."
+                    if is_add_on
+                    else "No live holding quantity available to exit."
+                )
+            else:
+                available_qty_int = int(float(available_qty))
+                requested_fraction = float(action_fraction) if pd.notna(action_fraction) else (0.33 if suggested_action == "trim_winner" else (0.20 if is_add_on else 1.0))
+                if is_add_on:
+                    quantity = max(1, int(round(available_qty_int * requested_fraction)))
+                    if pd.isna(reference_price) or float(reference_price) <= 0:
+                        execution_status = "submit_blocked"
+                        execution_reason = (execution_reason + " " if execution_reason else "") + "Missing reference close price for add-on order."
+                    elif remaining_cash is not None:
+                        cash_limited_qty = int(float(remaining_cash) // float(reference_price))
+                        quantity = min(quantity, cash_limited_qty)
+                        if quantity <= 0:
+                            execution_status = "submit_blocked"
+                            execution_reason = (execution_reason + " " if execution_reason else "") + "Available cash is too small for one add-on share."
+                        else:
+                            remaining_cash = max(remaining_cash - (quantity * float(reference_price)), 0.0)
+                    execution_reason = (execution_reason + " " if execution_reason else "") + f"Add-on pullback sized at {requested_fraction:.2f} of live holdings."
+                elif 0 < requested_fraction < 1:
+                    quantity = max(1, int(round(available_qty_int * requested_fraction)))
+                    quantity = min(quantity, available_qty_int)
+                    execution_reason = (execution_reason + " " if execution_reason else "") + f"Partial exit sized at {requested_fraction:.2f} of live holdings."
+                else:
+                    quantity = available_qty_int
         correlation_id = sanitize_correlation_id(f"EXIT-{row['symbol']}-{row['unique_id']}")
         rows.append(
             {
@@ -507,7 +887,7 @@ def build_execution_orders(
                 "correlation_id": correlation_id,
                 "security_id": security_id or inventory.get("security_id"),
                 "exchange_segment": exchange_segment or "NSE_EQ",
-                "transaction_type": "SELL",
+                "transaction_type": "BUY" if is_add_on else "SELL",
                 "product_type": "CNC",
                 "order_type": "MARKET",
                 "validity": "DAY",
@@ -516,8 +896,12 @@ def build_execution_orders(
                 "limit_price": None,
                 "trigger_price": None,
                 "reference_price": None if pd.isna(reference_price) else float(reference_price),
+                "reference_price_source": reference_price_source,
+                "reference_price_asof": reference_price_asof,
                 "approved_allocation_inr": None,
                 "invest_score_pct": None,
+                "estimated_order_value_inr": None if pd.isna(reference_price) or quantity <= 0 else float(reference_price) * int(quantity),
+                "safety_checks_json": None,
                 "broker_order_id": None,
                 "exchange_order_id": None,
                 "execution_status": execution_status,
@@ -526,7 +910,17 @@ def build_execution_orders(
                 "submitted_at": None,
                 "broker_update_time": None,
                 "live_mode": False,
-                "raw_broker_json": json.dumps({"action_source": row.get("suggested_action")}, ensure_ascii=False, default=str, sort_keys=True),
+                "raw_broker_json": json.dumps(
+                    {
+                        "action_source": row.get("suggested_action"),
+                        "exit_fraction": float(action_fraction) if pd.notna(action_fraction) else (0.33 if suggested_action == "trim_winner" else (0.20 if is_add_on else 1.0)),
+                        "execution_mode": row.get("execution_mode"),
+                        "recommended_stop_price": pd.to_numeric(row.get("recommended_stop_price"), errors="coerce"),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                    sort_keys=True,
+                ),
                 "raw_trade_json": None,
                 "load_ts": pd.Timestamp.utcnow(),
             }
@@ -548,11 +942,12 @@ def persist_execution_orders(df: pd.DataFrame) -> None:
         "reference_price",
         "approved_allocation_inr",
         "invest_score_pct",
+        "estimated_order_value_inr",
     ]
     for col in numeric_cols:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
-    datetime_cols = ["asof_date", "published_on", "submitted_at", "broker_update_time", "load_ts"]
+    datetime_cols = ["asof_date", "published_on", "reference_price_asof", "submitted_at", "broker_update_time", "load_ts"]
     for col in datetime_cols:
         if col in out.columns:
             out[col] = pd.to_datetime(out[col], utc=True, errors="coerce")
@@ -564,11 +959,100 @@ def persist_execution_orders(df: pd.DataFrame) -> None:
     )
 
 
+def _append_reason(existing: object, reason: str) -> str:
+    text = str(existing or "").strip()
+    return f"{text} {reason}".strip() if text else reason
+
+
+def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    planned_mask = out["execution_status"].astype(str).eq("planned") if "execution_status" in out.columns else pd.Series(False, index=out.index)
+    if not planned_mask.any():
+        return out
+
+    live_enabled = _env_bool("STOCKEY_LIVE_TRADING_ENABLED", False)
+    max_orders = _env_int("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", DEFAULT_MAX_LIVE_ORDERS_PER_RUN)
+    max_value = _env_float("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", DEFAULT_MAX_LIVE_ORDER_VALUE_INR)
+    require_fresh_intraday = _env_bool("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", True)
+    max_price_age_minutes = _env_int("STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES", DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES)
+
+    def block(idx: int, reason: str, checks: dict[str, Any]) -> None:
+        out.at[idx, "execution_status"] = "submit_blocked"
+        out.at[idx, "execution_reason"] = _append_reason(out.at[idx, "execution_reason"], reason)
+        out.at[idx, "live_mode"] = False
+        out.at[idx, "safety_checks_json"] = json.dumps(checks, ensure_ascii=False, default=str, sort_keys=True)
+
+    planned_indexes = out.index[planned_mask].tolist()
+    base_checks = {
+        "live_enabled": live_enabled,
+        "max_orders_per_run": max_orders,
+        "max_order_value_inr": max_value,
+        "require_fresh_intraday_price": require_fresh_intraday,
+        "max_intraday_price_age_minutes": max_price_age_minutes,
+    }
+    if not live_enabled:
+        for idx in planned_indexes:
+            block(idx, "Live trading disabled; set STOCKEY_LIVE_TRADING_ENABLED=true to submit.", base_checks)
+        return out
+    if max_orders > 0 and len(planned_indexes) > max_orders:
+        checks = {**base_checks, "planned_order_count": len(planned_indexes)}
+        for idx in planned_indexes:
+            block(idx, f"Live order count {len(planned_indexes)} exceeds cap {max_orders}; refusing partial submission.", checks)
+        return out
+
+    now = pd.Timestamp.utcnow()
+    for idx in planned_indexes:
+        quantity = pd.to_numeric(out.at[idx, "quantity"], errors="coerce")
+        reference_price = pd.to_numeric(out.at[idx, "reference_price"], errors="coerce")
+        estimated_value = pd.to_numeric(out.at[idx, "estimated_order_value_inr"], errors="coerce")
+        if pd.isna(estimated_value) and pd.notna(quantity) and pd.notna(reference_price):
+            estimated_value = float(quantity) * float(reference_price)
+            out.at[idx, "estimated_order_value_inr"] = estimated_value
+        checks = {
+            **base_checks,
+            "estimated_order_value_inr": None if pd.isna(estimated_value) else float(estimated_value),
+            "reference_price_source": out.at[idx, "reference_price_source"] if "reference_price_source" in out.columns else None,
+            "reference_price_asof": out.at[idx, "reference_price_asof"] if "reference_price_asof" in out.columns else None,
+        }
+        if pd.isna(quantity) or int(quantity) <= 0:
+            block(idx, "Quantity is not positive.", checks)
+            continue
+        if pd.isna(reference_price) or float(reference_price) <= 0:
+            block(idx, "Missing positive reference price.", checks)
+            continue
+        if pd.isna(out.at[idx, "security_id"]):
+            block(idx, "Missing Dhan security id.", checks)
+            continue
+        if str(out.at[idx, "transaction_type"]).upper() not in {"BUY", "SELL"}:
+            block(idx, "Unsupported transaction type.", checks)
+            continue
+        if max_value > 0 and pd.notna(estimated_value) and float(estimated_value) > max_value:
+            block(idx, f"Estimated order value exceeds live cap {max_value:.2f}.", checks)
+            continue
+        if require_fresh_intraday:
+            price_source = str(out.at[idx, "reference_price_source"] or "")
+            price_asof = pd.to_datetime(out.at[idx, "reference_price_asof"], utc=True, errors="coerce")
+            price_age_minutes = None if pd.isna(price_asof) else (now - price_asof).total_seconds() / 60.0
+            checks["price_age_minutes"] = price_age_minutes
+            if price_source != "intraday":
+                block(idx, "Live submission requires fresh intraday reference price.", checks)
+                continue
+            if price_age_minutes is None or price_age_minutes > max_price_age_minutes:
+                block(idx, f"Intraday reference price is older than {max_price_age_minutes} minutes.", checks)
+                continue
+        out.at[idx, "safety_checks_json"] = json.dumps({**checks, "passed": True}, ensure_ascii=False, default=str, sort_keys=True)
+    return out
+
+
 def submit_live_orders(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
+    out = apply_live_execution_safety(df)
+    if not out["execution_status"].astype(str).eq("planned").any():
+        return out
     client = DhanTradingClient()
-    out = df.copy()
     for idx, row in out.iterrows():
         if str(row.get("execution_status")) != "planned":
             continue
@@ -705,10 +1189,10 @@ def persist_reconciliation(order_df: pd.DataFrame, fills_df: pd.DataFrame) -> No
     ensure_execution_tables()
     if not order_df.empty:
         order_out = order_df.copy()
-        for col in ["security_id", "quantity", "filled_quantity", "limit_price", "trigger_price", "reference_price", "approved_allocation_inr"]:
+        for col in ["security_id", "quantity", "filled_quantity", "limit_price", "trigger_price", "reference_price", "approved_allocation_inr", "invest_score_pct", "estimated_order_value_inr"]:
             if col in order_out.columns:
                 order_out[col] = pd.to_numeric(order_out[col], errors="coerce")
-        for col in ["asof_date", "published_on", "submitted_at", "broker_update_time", "load_ts"]:
+        for col in ["asof_date", "published_on", "reference_price_asof", "submitted_at", "broker_update_time", "load_ts"]:
             if col in order_out.columns:
                 order_out[col] = pd.to_datetime(order_out[col], utc=True, errors="coerce")
         upsert_to_db(
@@ -744,6 +1228,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--product-type", default="CNC")
     parser.add_argument("--order-type", default="MARKET")
     parser.add_argument("--validity", default="DAY")
+    parser.add_argument("--use-broker-account", action="store_true", help="Use Dhan cash/holdings to cap staged order quantities")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -778,6 +1263,7 @@ def main() -> int:
             product_type=args.product_type,
             order_type=args.order_type,
             validity=args.validity,
+            use_broker_account=bool(args.use_broker_account or (args.live and _env_bool("STOCKEY_LIVE_TRADING_ENABLED", False))),
         )
         if args.live:
             planned_df = submit_live_orders(planned_df)

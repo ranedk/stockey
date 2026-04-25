@@ -259,6 +259,94 @@ Implementation slices:
 
 1. Add bucket and exit-policy columns to `advisory_portfolio_orders`.
 
+### 5A. Add consolidated action recommendations
+
+Problem:
+
+- The system now has portfolio rows, lifecycle rows, rebalance rows, and execution rows.
+- Even though portfolio/lifecycle snapshots are mostly deduped to one row per symbol, operator intent is still spread across multiple tables.
+- The execution engine still reasons from separate portfolio and rebalance paths instead of one explicit action contract.
+- The dashboard can show multiple adjacent concepts for the same stock, which is noisy when the operator just needs the single current action.
+
+Target:
+
+- create one point-in-time table, `advisory_action_recommendations`
+- enforce one winning action per `asof_date + symbol`
+- make this the single contract for:
+  - operator dashboard
+  - trading API handoff
+  - execution dry-runs
+
+Canonical action set:
+
+- `BUY`
+- `BUY_MORE`
+- `PARTIAL_SELL`
+- `SELL`
+- `TIGHTEN_STOP`
+- `MANUAL_REVIEW`
+- `HOLD`
+- `WATCH`
+
+Priority model:
+
+- `SELL` outranks everything
+- `PARTIAL_SELL` outranks `BUY_MORE`
+- `MANUAL_REVIEW` outranks `BUY` and `WATCH`
+- `TIGHTEN_STOP` is lower than liquidation actions but higher than passive `HOLD`
+- `BUY_MORE` outranks `BUY`
+- `BUY` outranks `WATCH`
+
+Source mapping:
+
+- `advisory_rebalance_actions`
+  - `exit_*` -> `SELL`
+  - `trim_winner` -> `PARTIAL_SELL`
+  - `add_on_pullback` -> `BUY_MORE`
+  - `tighten_stop` -> `TIGHTEN_STOP`
+  - `review_*` / `review_manual` -> `MANUAL_REVIEW`
+- `advisory_portfolio_orders`
+  - approved live recommendation -> `BUY`
+- `advisory_position_lifecycle`
+  - open with no stronger action -> `HOLD`
+- `advisory_watchlist`
+  - active non-abstain watch row -> `WATCH`
+
+Execution integration:
+
+- `advisory.execution_engine` should plan only from `advisory_action_recommendations`
+- only broker-submittable actions should become order intents:
+  - `BUY`
+  - `BUY_MORE`
+  - `PARTIAL_SELL`
+  - `SELL`
+- review-only actions must remain visible but non-submittable
+
+Dashboard integration:
+
+- show one current `Action Recommendation` per stock
+- explain:
+  - action code
+  - action priority
+  - winning reason
+  - winning source table
+  - action fraction if any
+  - execution mode
+
+Implementation slices:
+
+1. Add `advisory/action_recommender.py`
+2. Persist `advisory_action_recommendations`
+3. Wire `actions` stage into `advisory.pipeline`
+4. Make `advisory.execution_engine` read the consolidated action table
+5. Make the dashboard/operator view prefer the consolidated action over raw rebalance rows
+
+Do not:
+
+- let multiple active actions survive for the same symbol on the same advisory date
+- allow both a plain `BUY` and a `BUY_MORE` execution plan for the same symbol in the same run
+- hide manual-review conflicts; surface them explicitly as the winning action
+
 ### 6. Build a proper swing technical buy/exit engine
 
 Problem:
@@ -495,6 +583,74 @@ Do not:
 - make oscillator crosses the core logic
 - overfit V1 with too many market-regime branches
 - mix technical trigger confirmation with loose event-driven overrides in a way that hides the actual setup quality
+
+### 4A. Rebuild exit policy, stop-loss policy, and profit-booking policy
+
+Problem:
+
+- current lifecycle logic is too shallow
+- `stop_price` and `invalidation_price` are effectively the same number
+- `trim_winner` and `tighten_stop` exist mostly as labels, not as a real management framework
+- post-entry technical states exist in `advisory.technical_engine`, but lifecycle does not use them yet
+- execution only handles full `exit_*` actions and does not translate partial exits into broker behavior
+
+Target:
+
+- separate execution stop from thesis invalidation
+- route lifecycle through `technical_engine.evaluate_post_entry_state(...)`
+- add real profit-booking and stop-tightening rules
+- persist explicit exit-policy metadata and action semantics
+- allow Dhan execution planning to handle:
+  - full exits
+  - partial exits
+  - stop-based exits
+
+Required semantics:
+
+- `invalidation_price`
+  - thesis-level break
+  - wider, slower, structural
+  - if broken, the original setup is wrong
+- `stop_price`
+  - execution/risk-control stop
+  - tighter than invalidation where possible
+  - can be tightened as the trade matures
+- `partial exit`
+  - reduce risk or lock profit without killing the whole position
+- `full exit`
+  - stop hit, invalidation hit, technical failure, emergency gap/event damage
+- `time stop`
+  - setup-family aware
+  - should not be one flat `20 day` rule
+
+Implementation slices:
+
+1. Make `risk_engine.compute_invalidation(...)` return distinct `stop_price` and `invalidation_price`.
+2. In `position_lifecycle`, load latest technical context and use `evaluate_post_entry_state(...)`.
+3. Map post-entry technical states into:
+   - `exit_emergency`
+   - `exit_technical_failure`
+   - `trim_winner`
+   - `add_on_pullback`
+   - `hold`
+4. Keep stop/invalidation exits as highest-priority overrides.
+5. Replace the flat stale-review rule with bucket/setup-aware time-stop logic.
+6. Add action metadata for exit sizing:
+   - full exit
+   - partial exit fraction
+   - no-execution review-only action
+7. Update `execution_engine` so Dhan execution supports:
+   - full `SELL`
+   - partial `SELL`
+   - skip non-executable review-only actions
+8. Surface stop, invalidation, technical exit reason, and partial-exit plan in dashboard/lifecycle views.
+
+Do not:
+
+- treat stop and invalidation as synonyms
+- trigger partial exits only from arbitrary PnL thresholds without technical context
+- let execution auto-submit ambiguous review actions
+- let technical post-entry logic live separately from lifecycle
 2. Add lifecycle fields so exit-event triggers and bucket state are visible in `advisory_position_lifecycle`.
 3. Add first-pass deterministic bucket classification using setup family, holding horizon note, event context, and invalidation guidance.
 4. Show bucket, bucket reason, exit-policy summary, and screener provenance in the live dashboard.

@@ -8,7 +8,10 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.action_recommender import build_action_recommendations
+from advisory.action_recommender import TABLE_NAME as ACTIONS_TABLE
 from advisory.dashboard import build_dashboard
+from advisory.execution_engine import EXECUTION_TABLE
 from advisory.portfolio_engine import PORTFOLIO_TABLE, derive_thesis_policy
 from advisory.position_lifecycle import LIFECYCLE_TABLE, REBALANCE_TABLE
 from advisory.setup_registry import load_setup_registry
@@ -261,14 +264,89 @@ def _active_exit_from_action(next_action: Any) -> str | None:
 def _format_exit_strategy(row: pd.Series | dict[str, Any]) -> str | None:
     stop_price = _as_float(row.get("stop_price"))
     invalidation_price = _as_float(row.get("invalidation_price"))
+    recommended_stop_price = _as_float(row.get("recommended_stop_price"))
+    action_fraction = _as_float(row.get("action_fraction"))
+    execution_mode = _as_text(row.get("execution_mode"))
+    suggested_action = (_as_text(row.get("suggested_action")) or _as_text(row.get("status")) or "").lower()
     policy = _as_text(row.get("exit_policy_summary")) or _summarize_exit_rules(row.get("exit_event_rules_json"))
     parts: list[str] = []
     if invalidation_price is not None:
         parts.append(f"Invalidation {invalidation_price:.2f}")
     if stop_price is not None and (invalidation_price is None or abs(stop_price - invalidation_price) > 1e-9):
         parts.append(f"Stop {stop_price:.2f}")
+    if recommended_stop_price is not None and (stop_price is None or abs(recommended_stop_price - stop_price) > 1e-9):
+        parts.append(f"Recommended stop {recommended_stop_price:.2f}")
+    if action_fraction is not None and 0 < action_fraction < 1:
+        label = "Add size" if suggested_action == "add_on_pullback" else "Scale-out"
+        parts.append(f"{label} {round(action_fraction * 100.0, 1):.1f}%")
+    if execution_mode:
+        parts.append(f"Execution {execution_mode}")
     if policy:
         parts.append(policy)
+    return " | ".join(parts) if parts else None
+
+
+def _format_action_summary(row: pd.Series | dict[str, Any]) -> str | None:
+    action = (_as_text(row.get("suggested_action")) or _as_text(row.get("status")) or "").strip().lower()
+    action_fraction = _as_float(row.get("action_fraction"))
+    recommended_stop_price = _as_float(row.get("recommended_stop_price"))
+    execution_mode = _as_text(row.get("execution_mode"))
+    if not action:
+        return None
+    pct_text = f"{round(action_fraction * 100.0, 1):.1f}%" if action_fraction is not None and 0 < action_fraction <= 1 else None
+    if action == "add_on_pullback":
+        base = "Add on pullback."
+        if pct_text:
+            base += f" Add roughly {pct_text} of current live size."
+    elif action == "trim_winner":
+        base = "Trim winner."
+        if pct_text:
+            base += f" Reduce roughly {pct_text} of current live size."
+    elif action == "tighten_stop":
+        base = "Tighten stop."
+        if recommended_stop_price is not None:
+            base += f" Move stop baseline to {recommended_stop_price:.2f}."
+    elif action.startswith("exit_"):
+        base = "Full exit."
+        if action == "exit_invalidation":
+            base += " Thesis invalidation was hit."
+        elif action == "exit_stop":
+            base += " Stop was hit."
+        elif action == "exit_emergency":
+            base += " Emergency technical failure."
+        elif action == "exit_technical_failure":
+            base += " Technical thesis failure."
+    else:
+        base = action.replace("_", " ").title() + "."
+    if execution_mode:
+        base += f" Execution mode: {execution_mode}."
+    return base
+
+
+def _format_execution_intent(row: pd.Series | dict[str, Any]) -> str | None:
+    transaction_type = (_as_text(row.get("transaction_type")) or "").upper()
+    quantity = pd.to_numeric(row.get("quantity"), errors="coerce")
+    execution_status = _as_text(row.get("execution_status"))
+    execution_reason = _as_text(row.get("execution_reason"))
+    order_type = (_as_text(row.get("order_type")) or "").upper()
+    product_type = (_as_text(row.get("product_type")) or "").upper()
+    reference_price = _as_float(row.get("reference_price"))
+    if not any([transaction_type, execution_status, execution_reason, order_type, product_type, reference_price is not None]):
+        return None
+    parts: list[str] = []
+    if transaction_type:
+        qty_text = f" {int(quantity)}" if pd.notna(quantity) else ""
+        parts.append(f"{transaction_type}{qty_text}")
+    if order_type:
+        parts.append(order_type)
+    if product_type:
+        parts.append(product_type)
+    if reference_price is not None:
+        parts.append(f"Ref {reference_price:.2f}")
+    if execution_status:
+        parts.append(f"Status {execution_status}")
+    if execution_reason:
+        parts.append(execution_reason)
     return " | ".join(parts) if parts else None
 
 
@@ -762,6 +840,9 @@ def load_rebalance_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 2
             reference_price,
             stop_price,
             invalidation_price,
+            recommended_stop_price,
+            action_fraction,
+            execution_mode,
             context_snapshot_json,
             load_ts
         FROM {REBALANCE_TABLE}
@@ -777,11 +858,127 @@ def load_rebalance_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 2
         if column in df.columns:
             df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
     df["symbol"] = df["symbol"].astype("string").str.upper()
+    for column in ["reference_price", "stop_price", "invalidation_price", "recommended_stop_price", "action_fraction"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
     return df.sort_values(
         ["symbol", "published_on", "load_ts", "setup_id"],
         ascending=[True, False, False, True],
         kind="stable",
     ).drop_duplicates(subset=["symbol", "suggested_action"], keep="first").reset_index(drop=True)
+
+
+def load_execution_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 100) -> pd.DataFrame:
+    clauses = ["1 = 1"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {EXECUTION_TABLE})")
+    df = sql_to_df(
+        f"""
+        SELECT
+            asof_date,
+            published_on,
+            setup_id,
+            symbol,
+            unique_id,
+            transaction_type,
+            product_type,
+            order_type,
+            quantity,
+            reference_price,
+            execution_status,
+            execution_reason,
+            broker_order_status,
+            submitted_at,
+            broker_update_time,
+            load_ts
+        FROM {EXECUTION_TABLE}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY COALESCE(submitted_at, load_ts, published_on) DESC, symbol
+        LIMIT {int(limit)}
+        """,
+        params=tuple(params) if params else None,
+    )
+    if df.empty:
+        return df
+    for column in ["asof_date", "published_on", "submitted_at", "broker_update_time", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    for column in ["quantity", "reference_price"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    return df.sort_values(
+        ["symbol", "submitted_at", "load_ts", "published_on"],
+        ascending=[True, False, False, False],
+        kind="stable",
+    ).drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
+
+
+def load_action_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 100) -> pd.DataFrame:
+    if not _table_columns(ACTIONS_TABLE):
+        try:
+            df = build_action_recommendations(asof_date=asof_date)
+        except Exception:
+            return pd.DataFrame()
+        if df.empty:
+            return df
+        return df.head(int(limit)).copy()
+    clauses = ["1 = 1"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {ACTIONS_TABLE})")
+    df = sql_to_df(
+        f"""
+        SELECT
+            asof_date,
+            published_on,
+            symbol,
+            setup_id,
+            unique_id,
+            action_code,
+            action_priority,
+            action_source,
+            source_action,
+            transaction_type,
+            execution_mode,
+            action_fraction,
+            approved_allocation_inr,
+            reference_price,
+            stop_price,
+            invalidation_price,
+            recommended_stop_price,
+            invest_score_pct,
+            action_reason,
+            action_detail,
+            load_ts
+        FROM {ACTIONS_TABLE}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY action_priority DESC, published_on DESC, symbol
+        LIMIT {int(limit)}
+        """,
+        params=tuple(params) if params else None,
+    )
+    if df.empty:
+        return df
+    for column in ["asof_date", "published_on", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    for column in ["action_fraction", "approved_allocation_inr", "reference_price", "stop_price", "invalidation_price", "recommended_stop_price", "invest_score_pct"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    return df.sort_values(
+        ["symbol", "action_priority", "published_on", "setup_id"],
+        ascending=[True, False, False, True],
+        kind="stable",
+    ).drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
 
 
 def load_alert_rows(limit: int = 100) -> pd.DataFrame:
@@ -1076,6 +1273,8 @@ def _build_aux_maps(
         if not frame.empty and "symbol" in frame.columns:
             symbol_pool.update(frame["symbol"].dropna().astype(str).str.upper().tolist())
     price_df = _safe_frame_loader(load_latest_prices, sorted(symbol_pool), asof_date=asof_date)
+    execution_df = _safe_frame_loader(load_execution_rows, asof_date=asof_date, limit=max(len(symbol_pool) * 3, 100))
+    action_df = _safe_frame_loader(load_action_rows, asof_date=asof_date, limit=max(len(symbol_pool) * 3, 100))
     price_map = {
         str(row["symbol"]).upper(): {
             "current_price": _as_float(row.get("adj_close")),
@@ -1083,6 +1282,14 @@ def _build_aux_maps(
         }
         for _, row in price_df.iterrows()
     } if not price_df.empty else {}
+    execution_map = {
+        str(row["symbol"]).upper(): row.to_dict()
+        for _, row in execution_df.iterrows()
+    } if not execution_df.empty else {}
+    action_map = {
+        str(row["symbol"]).upper(): row.to_dict()
+        for _, row in action_df.iterrows()
+    } if not action_df.empty else {}
     news_map = _safe_list_loader(lambda: load_event_digest("advisory_news_events", symbols=sorted(symbol_pool), asof_date=asof_date))
     announcement_map = _safe_list_loader(lambda: load_event_digest("advisory_watch_events", symbols=sorted(symbol_pool), asof_date=asof_date))
     portfolio_map = {
@@ -1095,6 +1302,8 @@ def _build_aux_maps(
     } if not lifecycle_df.empty else {}
     return {
         "price_map": price_map,
+        "action_map": action_map,
+        "execution_map": execution_map,
         "news_map": news_map if isinstance(news_map, dict) else {},
         "announcement_map": announcement_map if isinstance(announcement_map, dict) else {},
         "portfolio_map": portfolio_map,
@@ -1134,6 +1343,8 @@ def _base_recommendation_record(
     screener_context: Any = None,
     setup_context: Any = None,
     technical_context: Any = None,
+    action_summary: Any = None,
+    execution_intent: Any = None,
     sort_ts: Any = None,
 ) -> dict[str, Any]:
     return {
@@ -1159,6 +1370,8 @@ def _base_recommendation_record(
         "screener_context": _as_text(screener_context),
         "setup_context": _as_text(setup_context),
         "technical_context": _as_text(technical_context),
+        "action_summary": _as_text(action_summary),
+        "execution_intent": _as_text(execution_intent),
         "sort_ts": None if pd.isna(pd.to_datetime(sort_ts, utc=True, errors="coerce")) else pd.to_datetime(sort_ts, utc=True, errors="coerce").isoformat(),
     }
 
@@ -1181,6 +1394,29 @@ def _sort_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     return sorted(rows, key=_sort_key, reverse=True)
 
 
+def _sort_action_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    priority_order = {
+        "SELL": 100,
+        "PARTIAL_SELL": 90,
+        "MANUAL_REVIEW": 80,
+        "TIGHTEN_STOP": 70,
+        "BUY_MORE": 60,
+        "BUY": 50,
+        "WATCH": 10,
+        "HOLD": 0,
+    }
+
+    def _sort_key(row: dict[str, Any]) -> tuple[int, pd.Timestamp, str, str]:
+        action = str(row.get("status") or "").upper()
+        action_priority = int(priority_order.get(action, 0))
+        entry_ts = pd.to_datetime(row.get("sort_ts") or row.get("entry_date"), utc=True, errors="coerce")
+        if pd.isna(entry_ts):
+            entry_ts = pd.Timestamp.min.tz_localize("UTC")
+        return (action_priority, entry_ts, str(row.get("setup_id") or ""), str(row.get("symbol") or ""))
+
+    return sorted(rows, key=_sort_key, reverse=True)
+
+
 def build_recommendation_views(
     *,
     asof_date: pd.Timestamp | None,
@@ -1199,6 +1435,8 @@ def build_recommendation_views(
         rebalance_df=rebalance_df,
     )
     price_map = aux["price_map"]
+    action_map = aux["action_map"]
+    execution_map = aux["execution_map"]
     news_map = aux["news_map"]
     announcement_map = aux["announcement_map"]
     portfolio_map = aux["portfolio_map"]
@@ -1248,6 +1486,7 @@ def build_recommendation_views(
             seen_today.add(key)
             context = _parse_json_blob(row.get("context_snapshot_json"))
             price_row = price_map.get(symbol.upper(), {})
+            action_row = action_map.get(symbol.upper(), {})
             entry_price = resolve_entry_price_from_history(
                 symbol,
                 row.get("planned_at") or row.get("published_on"),
@@ -1285,8 +1524,8 @@ def build_recommendation_views(
                     exit_strategy=_format_exit_strategy(row),
                     news_summary=_event_summary(news_map, setup_id, symbol),
                     announcement_summary=_event_summary(announcement_map, setup_id, symbol),
-                    status=row.get("portfolio_status"),
-                    allocation_inr=row.get("approved_allocation_inr"),
+                    status=action_row.get("action_code") or row.get("portfolio_status"),
+                    allocation_inr=action_row.get("approved_allocation_inr") if action_row else row.get("approved_allocation_inr"),
                     current_value_note=row.get("execution_notes"),
                     market_context=_market_context_text(setup_snapshot),
                     screener_context=_screener_context_text(setup_snapshot, setup_meta),
@@ -1297,10 +1536,18 @@ def build_recommendation_views(
                         _technical_score_breakdown(candidate_row),
                         None,
                     ),
+                    action_summary=_format_action_summary(action_row) if action_row else None,
+                    execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
                     sort_ts=row.get("published_on"),
                 )
             )
-            today_rows[-1]["invest_score_pct"] = _coalesce_float(row.get("invest_score_pct"))
+            today_rows[-1]["reason"] = _as_text(action_row.get("action_code")) or today_rows[-1]["reason"]
+            today_rows[-1]["reason_detail"] = _merge_reason_detail(
+                _as_text(action_row.get("action_reason")),
+                _as_text(action_row.get("action_detail")),
+                today_rows[-1]["reason_detail"],
+            )
+            today_rows[-1]["invest_score_pct"] = _coalesce_float(action_row.get("invest_score_pct"), row.get("invest_score_pct"))
 
     current_rows: list[dict[str, Any]] = []
     seen_current: set[tuple[str, str]] = set()
@@ -1318,6 +1565,7 @@ def build_recommendation_views(
             seen_current.add(key)
             portfolio_row = portfolio_map.get((setup_id.upper(), symbol.upper()), {})
             price_row = price_map.get(symbol.upper(), {})
+            action_row = action_map.get(symbol.upper(), {})
             context = _parse_json_blob(row.get("context_snapshot_json") or portfolio_row.get("context_snapshot_json"))
             current_price = _as_float(price_row.get("current_price"))
             if current_price is None:
@@ -1360,8 +1608,8 @@ def build_recommendation_views(
                     exit_strategy=_format_exit_strategy({**portfolio_row, **row.to_dict()}),
                     news_summary=_event_summary(news_map, setup_id, symbol),
                     announcement_summary=_event_summary(announcement_map, setup_id, symbol),
-                    status=row.get("position_status"),
-                    allocation_inr=row.get("approved_allocation_inr") or portfolio_row.get("approved_allocation_inr"),
+                    status=action_row.get("action_code") or row.get("position_status"),
+                    allocation_inr=(action_row.get("approved_allocation_inr") if action_row else None) or row.get("approved_allocation_inr") or portfolio_row.get("approved_allocation_inr"),
                     current_value_note=row.get("next_action_reason"),
                     market_context=_market_context_text(setup_snapshot),
                     screener_context=_screener_context_text(setup_snapshot, setup_meta),
@@ -1372,10 +1620,18 @@ def build_recommendation_views(
                         _technical_score_breakdown(candidate_map.get((setup_id.upper(), symbol.upper()), {})),
                         None,
                     ),
+                    action_summary=_format_action_summary(action_row) if action_row else None,
+                    execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
                     sort_ts=row.get("published_on"),
                 )
             )
-            current_rows[-1]["invest_score_pct"] = _coalesce_float(row.get("invest_score_pct"), portfolio_row.get("invest_score_pct"))
+            current_rows[-1]["reason"] = _as_text(action_row.get("action_code")) or current_rows[-1]["reason"]
+            current_rows[-1]["reason_detail"] = _merge_reason_detail(
+                _as_text(action_row.get("action_reason")),
+                _as_text(action_row.get("action_detail")),
+                current_rows[-1]["reason_detail"],
+            )
+            current_rows[-1]["invest_score_pct"] = _coalesce_float(action_row.get("invest_score_pct"), row.get("invest_score_pct"), portfolio_row.get("invest_score_pct"))
 
     watch_rows: list[dict[str, Any]] = []
     seen_watch: set[tuple[str, str]] = set()
@@ -1402,6 +1658,7 @@ def build_recommendation_views(
             seen_watch.add(key)
             candidate_row = candidate_map.get(key, {})
             price_row = price_map.get(symbol.upper(), {})
+            action_row = action_map.get(symbol.upper(), {})
             current_price = _as_float(price_row.get("current_price"))
             low = _as_float(row.get("attractive_price_low"))
             high = _as_float(row.get("attractive_price_high"))
@@ -1434,7 +1691,7 @@ def build_recommendation_views(
                     exit_strategy=_format_exit_strategy(row),
                     news_summary=_event_summary(news_map, setup_id, symbol),
                     announcement_summary=_event_summary(announcement_map, setup_id, symbol),
-                    status=row.get("watch_status") or row.get("current_state"),
+                    status=action_row.get("action_code") or row.get("watch_status") or row.get("current_state"),
                     allocation_inr=None,
                     current_value_note=gap_note,
                     market_context=_market_context_text(setup_snapshot),
@@ -1446,14 +1703,68 @@ def build_recommendation_views(
                         _technical_score_breakdown(candidate_row),
                         None,
                     ),
+                    action_summary=_format_action_summary(action_row) if action_row else None,
+                    execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
                     sort_ts=row.get("state_updated_at"),
                 )
             )
             setup_score = _as_float(row.get("setup_score"))
+            watch_rows[-1]["reason"] = _as_text(action_row.get("action_code")) or watch_rows[-1]["reason"]
+            watch_rows[-1]["reason_detail"] = _merge_reason_detail(
+                _as_text(action_row.get("action_reason")),
+                _as_text(action_row.get("action_detail")),
+                watch_rows[-1]["reason_detail"],
+            )
             watch_rows[-1]["invest_score_pct"] = _coalesce_float(
+                action_row.get("invest_score_pct"),
                 row.get("invest_score_pct"),
                 (setup_score * 100.0) if setup_score is not None else None,
             )
+
+    top_action_rows: list[dict[str, Any]] = []
+    if action_map:
+        display_candidates: dict[str, dict[str, Any]] = {}
+        for row in current_rows + watch_rows + today_rows:
+            symbol = _as_text(row.get("symbol"))
+            if symbol and symbol.upper() not in display_candidates:
+                display_candidates[symbol.upper()] = row
+        for symbol_key, action_row in action_map.items():
+            action_code = _as_text(action_row.get("action_code"))
+            if action_code in {None, "HOLD", "WATCH"}:
+                continue
+            base_row = display_candidates.get(symbol_key, {})
+            setup_id = _as_text(action_row.get("setup_id")) or _as_text(base_row.get("setup_id"))
+            setup_snapshot = setup_dashboard_map.get((setup_id or "").upper(), {})
+            setup_meta = setup_meta_map.get((setup_id or "").upper(), {})
+            top_action_rows.append(
+                _base_recommendation_record(
+                    kind="action_top",
+                    setup_id=setup_id,
+                    setup_name=_as_text(base_row.get("setup_name")) or setup_meta.get("setup_name"),
+                    setup_family=_as_text(base_row.get("setup_family")) or setup_meta.get("setup_family"),
+                    symbol=symbol_key,
+                    entry_date=action_row.get("published_on") or base_row.get("entry_date"),
+                    entry_price=base_row.get("entry_price"),
+                    current_price=base_row.get("current_price") or price_map.get(symbol_key, {}).get("current_price"),
+                    pnl_pct=base_row.get("pnl_pct"),
+                    reason=action_code,
+                    reason_detail=_merge_reason_detail(action_row.get("action_reason"), action_row.get("action_detail"), base_row.get("reason_detail")),
+                    exit_strategy=_format_exit_strategy(action_row),
+                    news_summary=_event_summary(news_map, setup_id, symbol_key),
+                    announcement_summary=_event_summary(announcement_map, setup_id, symbol_key),
+                    status=action_code,
+                    allocation_inr=action_row.get("approved_allocation_inr") or base_row.get("allocation_inr"),
+                    current_value_note=base_row.get("current_value_note"),
+                    market_context=base_row.get("market_context") or _market_context_text(setup_snapshot),
+                    screener_context=base_row.get("screener_context") or _screener_context_text(setup_snapshot, setup_meta),
+                    setup_context=base_row.get("setup_context") or _setup_context_text(setup_snapshot, setup_meta),
+                    technical_context=base_row.get("technical_context"),
+                    action_summary=_format_action_summary(action_row),
+                    execution_intent=_format_execution_intent(execution_map.get(symbol_key, {})),
+                    sort_ts=action_row.get("published_on"),
+                )
+            )
+            top_action_rows[-1]["invest_score_pct"] = _coalesce_float(action_row.get("invest_score_pct"), base_row.get("invest_score_pct"))
 
     exited_rows: list[dict[str, Any]] = []
     action_rows: list[dict[str, Any]] = []
@@ -1511,6 +1822,8 @@ def build_recommendation_views(
                 market_context=_market_context_text(setup_snapshot),
                 screener_context=_screener_context_text(setup_snapshot, setup_meta),
                 setup_context=_setup_context_text(setup_snapshot, setup_meta),
+                action_summary=_format_action_summary(row),
+                execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
                 sort_ts=row.get("published_on"),
             )
             record["invest_score_pct"] = _coalesce_float(lifecycle_row.get("invest_score_pct"), row.get("invest_score_pct"))
@@ -1529,6 +1842,7 @@ def build_recommendation_views(
                 action_rows.append(record)
 
     return {
+        "top_action_recommendations": _sort_action_rows(top_action_rows),
         "today_recommendations": _sort_recommendation_rows(today_rows),
         "current_recommendations": _sort_recommendation_rows(current_rows),
         "watch_recommendations": _sort_recommendation_rows(watch_rows),
@@ -1540,6 +1854,7 @@ def build_recommendation_views(
 def build_summary_snapshot(
     *,
     dashboard_df: pd.DataFrame,
+    top_action_recommendations: list[dict[str, Any]],
     today_recommendations: list[dict[str, Any]],
     current_recommendations: list[dict[str, Any]],
     watch_recommendations: list[dict[str, Any]],
@@ -1565,6 +1880,7 @@ def build_summary_snapshot(
         "overlays": overlay_names,
         "overlay_reasons": overlay_reasons[:3],
         "today_count": len(today_recommendations),
+        "top_action_count": len(top_action_recommendations),
         "current_count": len(current_recommendations),
         "open_count": open_count,
         "pending_count": pending_count,
@@ -1600,6 +1916,7 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
     )
     summary = build_summary_snapshot(
         dashboard_df=dashboard_df,
+        top_action_recommendations=recommendation_views["top_action_recommendations"],
         today_recommendations=recommendation_views["today_recommendations"],
         current_recommendations=recommendation_views["current_recommendations"],
         watch_recommendations=recommendation_views["watch_recommendations"],
@@ -1611,6 +1928,7 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
         "generated_at": to_display_timestamp(pd.Timestamp.utcnow()),
         "asof_date": None if asof_date is None else _display_dashboard_timestamp(asof_date, prefer_date_for_midnight_utc=True),
         "summary": _json_ready(summary),
+        "top_action_recommendations": _json_ready(recommendation_views["top_action_recommendations"]),
         "today_recommendations": _json_ready(recommendation_views["today_recommendations"]),
         "current_recommendations": _json_ready(recommendation_views["current_recommendations"]),
         "watch_recommendations": _json_ready(recommendation_views["watch_recommendations"]),
@@ -1839,12 +2157,12 @@ def render_html(payload: dict[str, Any]) -> str:
       color: var(--warn);
       border-color: rgba(154, 93, 0, 0.2);
     }
-    .status-trim_winner, .status-tighten_stop {
+    .status-trim_winner, .status-tighten_stop, .status-add_on_pullback {
       background: rgba(15, 76, 92, 0.10);
       color: var(--accent);
       border-color: rgba(15, 76, 92, 0.18);
     }
-    .status-exit_invalidation, .status-exit_stop, .status-triggered, .status-bad {
+    .status-exit_invalidation, .status-exit_stop, .status-exit_emergency, .status-exit_technical_failure, .status-triggered, .status-bad {
       background: var(--bad-soft);
       color: var(--bad);
       border-color: rgba(161, 42, 42, 0.2);
@@ -1860,6 +2178,14 @@ def render_html(payload: dict[str, Any]) -> str:
     .recommendation.action-tighten_stop {
       background: linear-gradient(180deg, rgba(15, 76, 92, 0.08), rgba(255,255,255,0.88));
       border-color: rgba(15, 76, 92, 0.18);
+    }
+    .recommendation.action-add_on_pullback {
+      background: linear-gradient(180deg, rgba(36, 94, 60, 0.08), rgba(255,255,255,0.88));
+      border-color: rgba(36, 94, 60, 0.18);
+    }
+    .recommendation.action-exit_action {
+      background: linear-gradient(180deg, rgba(161, 42, 42, 0.08), rgba(255,255,255,0.88));
+      border-color: rgba(161, 42, 42, 0.18);
     }
     .action-banner {
       margin-top: 2px;
@@ -1884,6 +2210,16 @@ def render_html(payload: dict[str, Any]) -> str:
       background: rgba(15, 76, 92, 0.10);
       color: var(--accent);
       border-color: rgba(15, 76, 92, 0.18);
+    }
+    .action-banner.add_on_pullback {
+      background: rgba(36, 94, 60, 0.10);
+      color: #245e3c;
+      border-color: rgba(36, 94, 60, 0.18);
+    }
+    .action-banner.exit_action {
+      background: var(--bad-soft);
+      color: var(--bad);
+      border-color: rgba(161, 42, 42, 0.2);
     }
     .action-banner.default {
       background: rgba(23, 33, 29, 0.05);
@@ -2028,6 +2364,17 @@ def render_html(payload: dict[str, Any]) -> str:
     <section class="section">
       <div class="section-head">
         <div class="section-title-wrap">
+          <h2 class="section-title">Action Recommendations</h2>
+          <div class="section-note">Single resolved symbol-level actions from the consolidated action engine. This is the operator queue for buy, buy more, partial sell, sell, and high-priority manual intervention.</div>
+        </div>
+        <div class="section-count" id="top-action-count"></div>
+      </div>
+      <div class="recommendation-list" id="top_action_recommendations"></div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div class="section-title-wrap">
           <h2 class="section-title">Today's Recommendations</h2>
           <div class="section-note">Latest portfolio recommendations issued today, shown first with entry, current price, profit since recommendation, and supporting context.</div>
         </div>
@@ -2128,6 +2475,7 @@ def render_html(payload: dict[str, Any]) -> str:
       ].join("");
 
       document.getElementById("summary").innerHTML = [
+        summaryTile("Action Queue", summary.top_action_count || 0, "Resolved buy, buy more, partial sell, sell, and review actions that need attention first."),
         summaryTile("Today", summary.today_count || 0, "Recommendations issued on the latest recommendation date."),
         summaryTile("Current", summary.current_count || 0, `${summary.open_count || 0} open, ${summary.pending_count || 0} pending, ${summary.positive_count || 0} positive since entry.`),
         summaryTile("Watch", summary.watch_count || 0, "Ideas waiting for the right entry, event confirmation, or price location."),
@@ -2135,6 +2483,10 @@ def render_html(payload: dict[str, Any]) -> str:
         summaryTile("Needs Action", summary.action_count || 0, "Manual review, trim, or stop-adjustment actions waiting on operator attention."),
         summaryTile("Live Alerts", summary.alert_count || 0, "Immediate triggers from price or state changes that may need operator attention.")
       ].join("");
+
+      const topActions = Array.isArray(data.top_action_recommendations) ? data.top_action_recommendations : [];
+      document.getElementById("top-action-count").textContent = `${topActions.length} rows`;
+      document.getElementById("top_action_recommendations").innerHTML = renderRecommendationCards(topActions, { showPnl: true, watchMode: false, actionMode: true });
 
       const today = Array.isArray(data.today_recommendations) ? data.today_recommendations : [];
       document.getElementById("today-count").textContent = `${today.length} rows`;
@@ -2254,6 +2606,8 @@ def render_html(payload: dict[str, Any]) -> str:
                 ${detailBlock('Exit Strategy', row.exit_strategy)}
                 ${detailBlock('News Summary', row.news_summary)}
                 ${detailBlock('Announcement Summary', row.announcement_summary)}
+                ${detailBlock('Action Plan', row.action_summary)}
+                ${detailBlock('Execution Intent', row.execution_intent)}
                 ${detailBlock(options.actionMode ? 'Action Note' : 'Performance Note', row.current_value_note)}
               </div>
             </details>
@@ -2265,7 +2619,9 @@ def render_html(payload: dict[str, Any]) -> str:
     function actionCardTone(actionKey) {
       if (actionKey === 'review_manual') return 'review_manual';
       if (actionKey === 'trim_winner') return 'trim_winner';
+      if (actionKey === 'add_on_pullback') return 'add_on_pullback';
       if (actionKey === 'tighten_stop') return 'tighten_stop';
+      if (actionKey.startsWith('exit_')) return 'exit_action';
       return 'default';
     }
 
@@ -2273,13 +2629,17 @@ def render_html(payload: dict[str, Any]) -> str:
       const copyMap = {
         review_manual: 'Manual intervention required before the system can manage this idea automatically.',
         trim_winner: 'Profit has expanded enough that the system wants to reduce exposure.',
+        add_on_pullback: 'The pullback looks constructive enough that the system wants to add exposure.',
         tighten_stop: 'Risk has shifted enough that the stop should be tightened.',
+        exit_action: 'The live position should be closed because the exit condition has already fired.',
       };
       const tone = actionCardTone(actionKey);
       const headline = {
         review_manual: 'Operator review required',
         trim_winner: 'Profit-taking action',
+        add_on_pullback: 'Scale-in action',
         tighten_stop: 'Risk-control action',
+        exit_action: 'Exit action',
         default: 'Lifecycle action',
       }[tone];
       const body = detail || copyMap[tone] || 'The lifecycle engine emitted a follow-up action.';

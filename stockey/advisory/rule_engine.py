@@ -1192,6 +1192,16 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     non_intraday_soft_failures = [value for value in soft_failures if not value.startswith("intraday:")]
     candidate_state = map_technical_state_to_candidate_state(technical_state)
     watch_reason_detail = technical_trigger_note
+    if candidate_state == "ABSTAIN":
+        if float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(non_intraday_soft_failures) <= 2:
+            candidate_state = "PASS_NOW"
+            watch_reason_detail = "aggregate setup score qualifies despite incomplete technical trigger context"
+        elif float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
+            candidate_state = "WATCH_BREAKOUT"
+            watch_reason_detail = "aggregate setup score is strong enough to watch for a clean trigger"
+        elif float(scores["setup_score"]) >= float(thresholds["watch_event"]):
+            candidate_state = "WATCH_EVENT"
+            watch_reason_detail = "aggregate setup score is watchable but needs confirmation"
     if max_extension is not None and extension is not None and extension > max_extension:
         candidate_state = "WATCH_PULLBACK"
         watch_reason_detail = f"extended now at {extension:.2f}% above breakout reference"
@@ -1239,6 +1249,8 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
                 candidate_state = "REJECT"
 
     if candidate_state == "ABSTAIN":
+        if not watch_reason_detail:
+            watch_reason_detail = "explicit abstain: setup is not broken, but edge is too weak or mixed to monitor actively"
         rejections.append(
             build_rejection(
                 "abstain_low_edge",

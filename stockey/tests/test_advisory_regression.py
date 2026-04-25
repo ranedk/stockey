@@ -226,6 +226,7 @@ def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):
         "list_files",
         lambda prefix: iter(["bhavcopy/bhavcopy_2015-01-16.zip", "bhavcopy/bhavcopy_2015-01-17.zip"]),
     )
+    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key: True)
     monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
@@ -235,6 +236,7 @@ def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):
     )
     monkeypatch.setattr(bhavcopy_parser.store, "get_as_temp_file", lambda key: f"/tmp/{key.split('/')[-1]}")
     monkeypatch.setattr(bhavcopy_parser, "unzip_and_process", lambda file_path: processed.append(file_path))
+    monkeypatch.setattr(bhavcopy_parser, "mark_processed", lambda *_args, **_kwargs: None)
 
     class DummyRedis:
         def sadd(self, *_args, **_kwargs):
@@ -274,6 +276,7 @@ def test_bhavcopy_parser_records_failed_key(monkeypatch):
         "list_files",
         lambda prefix: iter(["bhavcopy/bhavcopy_2015-01-16.zip"]),
     )
+    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key: True)
     monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(bhavcopy_parser, "load_existing_ohlcv_dates", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
@@ -311,6 +314,7 @@ def test_bhavcopy_parser_marks_empty_like_key_processed(monkeypatch):
         "list_files",
         lambda prefix: iter(["bhavcopy/bhavcopy_2015-10-18.zip"]),
     )
+    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key: True)
     monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(bhavcopy_parser, "load_existing_ohlcv_dates", lambda *_args, **_kwargs: set())
@@ -853,13 +857,15 @@ def test_execution_engine_builds_planned_orders(monkeypatch):
             }
         ]
     )
-    latest_closes = pd.DataFrame(
-        [{"symbol": "HDFCBANK", "date": pd.Timestamp("2026-03-23T00:00:00Z"), "close": 800.0}]
+    latest_prices = pd.DataFrame(
+        [{"symbol": "HDFCBANK", "price_asof": pd.Timestamp("2026-03-23T09:15:00Z"), "price": 800.0, "price_source": "intraday"}]
     )
 
     monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: portfolio_orders.copy())
     monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: pd.DataFrame())
-    monkeypatch.setattr(execution_engine, "load_latest_closes", lambda symbols, asof_date: latest_closes.copy())
+    monkeypatch.setattr(execution_engine, "load_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "build_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_latest_execution_prices", lambda symbols, asof_date: latest_prices.copy())
     monkeypatch.setattr(
         execution_engine,
         "resolve_dhan_identity",
@@ -873,6 +879,8 @@ def test_execution_engine_builds_planned_orders(monkeypatch):
     row = df.iloc[0]
     assert row["execution_status"] == "planned"
     assert row["quantity"] == 50
+    assert row["reference_price_source"] == "intraday"
+    assert row["estimated_order_value_inr"] == 40000.0
     assert row["security_id"] == 1333
     assert row["exchange_segment"] == "NSE_EQ"
     assert len(row["correlation_id"]) <= 30
@@ -905,16 +913,18 @@ def test_execution_engine_uses_broker_cash_cap_and_exit_holdings(monkeypatch):
             }
         ]
     )
-    latest_closes = pd.DataFrame(
+    latest_prices = pd.DataFrame(
         [
-            {"symbol": "HDFCBANK", "date": pd.Timestamp("2026-03-23T00:00:00Z"), "close": 800.0},
-            {"symbol": "ICICIBANK", "date": pd.Timestamp("2026-03-23T00:00:00Z"), "close": 1200.0},
+            {"symbol": "HDFCBANK", "price_asof": pd.Timestamp("2026-03-23T09:15:00Z"), "price": 800.0, "price_source": "intraday"},
+            {"symbol": "ICICIBANK", "price_asof": pd.Timestamp("2026-03-23T09:15:00Z"), "price": 1200.0, "price_source": "intraday"},
         ]
     )
 
     monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: portfolio_orders.copy())
     monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: exit_actions.copy())
-    monkeypatch.setattr(execution_engine, "load_latest_closes", lambda symbols, asof_date: latest_closes.copy())
+    monkeypatch.setattr(execution_engine, "load_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "build_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_latest_execution_prices", lambda symbols, asof_date: latest_prices.copy())
     monkeypatch.setattr(
         execution_engine,
         "resolve_dhan_identity",
@@ -931,7 +941,7 @@ def test_execution_engine_uses_broker_cash_cap_and_exit_holdings(monkeypatch):
     monkeypatch.setattr(
         execution_engine,
         "load_live_account_budget",
-        lambda client: (
+        lambda client, strict=False: (
             10000.0,
             pd.DataFrame([{"symbol": "ICICIBANK", "security_id": 1444, "available_quantity": 7}]),
         ),
@@ -948,6 +958,74 @@ def test_execution_engine_uses_broker_cash_cap_and_exit_holdings(monkeypatch):
     assert buy_row["invest_score_pct"] == 88.0
     assert sell_row["quantity"] == 7
     assert sell_row["execution_status"] == "planned"
+
+
+def test_submit_live_orders_is_fail_closed_without_env(monkeypatch):
+    called = {"client": False}
+
+    class DummyClient:
+        def __init__(self):
+            called["client"] = True
+
+    monkeypatch.delenv("STOCKEY_LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    df = pd.DataFrame(
+        [
+            {
+                "execution_status": "planned",
+                "execution_reason": None,
+                "transaction_type": "BUY",
+                "security_id": 1333,
+                "quantity": 1,
+                "reference_price": 100.0,
+                "reference_price_source": "intraday",
+                "reference_price_asof": pd.Timestamp.utcnow(),
+                "estimated_order_value_inr": 100.0,
+                "live_mode": False,
+            }
+        ]
+    )
+
+    out = execution_engine.submit_live_orders(df)
+
+    assert out.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Live trading disabled" in out.iloc[0]["execution_reason"]
+    assert called["client"] is False
+
+
+def test_submit_live_orders_enforces_caps_and_fresh_price(monkeypatch):
+    monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "500")
+    monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "true")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES", "30")
+
+    class DummyClient:
+        def place_order(self, **kwargs):
+            raise AssertionError("blocked order should not submit")
+
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    df = pd.DataFrame(
+        [
+            {
+                "execution_status": "planned",
+                "execution_reason": None,
+                "transaction_type": "BUY",
+                "security_id": 1333,
+                "quantity": 10,
+                "reference_price": 100.0,
+                "reference_price_source": "daily_close",
+                "reference_price_asof": pd.Timestamp("2026-03-23T00:00:00Z"),
+                "estimated_order_value_inr": 1000.0,
+                "live_mode": False,
+            }
+        ]
+    )
+
+    out = execution_engine.submit_live_orders(df)
+
+    assert out.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Estimated order value exceeds live cap" in out.iloc[0]["execution_reason"]
 
 
 def test_pipeline_portfolio_stage_outputs_json(monkeypatch, capsys):
@@ -3530,42 +3608,61 @@ def test_dashboard_aggregates_setup_traces(monkeypatch):
             {"setup_id": "B", "setup_name": "Setup B", "screener_slug": "screen-b"},
         ],
     )
+    monkeypatch.setattr(dashboard, "_resolve_dashboard_date", lambda asof_date=None: pd.Timestamp("2026-03-24T00:00:00Z"))
+    monkeypatch.setattr(dashboard, "load_setup_regime", lambda asof_date: {"regime_name": "RISK_OFF"})
+    monkeypatch.setattr(dashboard, "load_market_overlay", lambda asof_date: {"overlay_name": "NONE", "overlay_reason": "no overlay"})
     monkeypatch.setattr(
         dashboard,
-        "build_trace",
-        lambda setup_id, asof_date=None: {
-            "stage_summary": {
-                "asof_date": "2026-03-24T00:00:00+00:00",
-                "regime_name": "RISK_OFF",
-                "screener_universe_count": 10 if setup_id == "A" else 20,
-                "candidate_count": 1,
-                "rejection_count": 3,
-                "watchlist_count": 1,
-                "announcement_event_count": 0,
-                "news_event_count": 0,
-                "evaluation_count": 0,
-                "allocation_count": 0,
-                "portfolio_count": 0,
-                "execution_count": 0,
-                "watch_state_counts": {"PASS_NOW": 1},
-                "avg_setup_score": 0.7,
-                "avg_technical_score": 0.75,
-                "avg_fundamental_score": 0.65,
-                "near_miss_count": 1,
-            },
-            "funnel_summary": {
-                "screener_to_candidate": 0.1,
-                "candidate_to_watchlist": 1.0,
-                "evaluation_to_allocation": None,
-            },
-            "decision_summary": {
-                "latest_event_verdict": None,
-                "latest_event_source": None,
-                "latest_portfolio_status": None,
-                "top_rejection_reasons": {"regime_not_allowed": 2},
-            },
-        },
+        "resolve_setup_screeners",
+        lambda setup_id, overlay_name=None, asof_date=None: ([f"screen-{setup_id.lower()}"], []),
     )
+    monkeypatch.setattr(
+        dashboard,
+        "_load_latest_screener_universe",
+        lambda active: pd.DataFrame(
+            [{"screener_slug": "screen-a", "ticker": f"A{i}"} for i in range(10)]
+            + [{"screener_slug": "screen-b", "ticker": f"B{i}"} for i in range(20)]
+        ),
+    )
+
+    def fake_load_asof_table(table_name, asof_date, columns=None):
+        if table_name == "advisory_candidates":
+            return pd.DataFrame(
+                [
+                    {
+                        "setup_id": "A",
+                        "symbol": "AAA",
+                        "candidate_state": "PASS_NOW",
+                        "setup_score": 0.7,
+                        "technical_score": 0.75,
+                        "fundamental_score": 0.65,
+                        "near_miss_flag": True,
+                        "source_screener_slug": "screen-a",
+                    },
+                    {
+                        "setup_id": "B",
+                        "symbol": "BBB",
+                        "candidate_state": "PASS_NOW",
+                        "setup_score": 0.7,
+                        "technical_score": 0.75,
+                        "fundamental_score": 0.65,
+                        "near_miss_flag": False,
+                        "source_screener_slug": "screen-b",
+                    },
+                ]
+            )
+        if table_name == "advisory_candidate_rejections":
+            return pd.DataFrame(
+                [
+                    {"setup_id": "A", "symbol": "AA2", "reason_code": "regime_not_allowed", "is_near_miss": False},
+                    {"setup_id": "A", "symbol": "AA3", "reason_code": "regime_not_allowed", "is_near_miss": False},
+                ]
+            )
+        if table_name == "advisory_watchlist":
+            return pd.DataFrame([{"setup_id": "A", "symbol": "AAA", "current_state": "PASS_NOW"}])
+        return pd.DataFrame(columns=columns or [])
+
+    monkeypatch.setattr(dashboard, "_load_asof_table", fake_load_asof_table)
 
     df = dashboard.build_dashboard()
     assert len(df) == 2
@@ -3986,6 +4083,7 @@ def test_technical_engine_emits_near_pivot_for_constructive_setup_without_trigge
     row = _technical_engine_base_row()
     row["breakout_day_volume_vs_20d"] = 0.9
     row["pivot_distance_20d_pct"] = 1.8
+    row["support_distance_20d_pct"] = 8.0
     out = technical_engine.evaluate_pre_entry_state(row)
     assert out["technical_state"] == "NEAR_PIVOT"
 

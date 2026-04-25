@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.technical_engine import evaluate_post_entry_state as evaluate_technical_post_entry_state
 from data.dhanlive.dhan_db import resolve_dhan_identity
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.display_time import to_display_value
@@ -19,6 +20,17 @@ REBALANCE_TABLE = "advisory_rebalance_actions"
 DEFAULT_REVIEW_STALE_DAYS = 20
 DEFAULT_TIGHTEN_STOP_GAIN_PCT = 10.0
 DEFAULT_TRIM_WINNER_GAIN_PCT = 15.0
+POST_ENTRY_TECHNICAL_CONTEXT_COLUMNS = {
+    "pass_above_dma_20",
+    "pass_above_dma_50",
+    "pass_trend_alignment",
+    "distribution_days_20d",
+    "rs_vs_sector",
+    "breakout_extension_pct",
+    "support_distance_20d_pct",
+    "pullback_volume_dryup_ratio_20d",
+    "gap_pct",
+}
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -37,6 +49,10 @@ def table_exists(table_name: str) -> bool:
         params=(table_name,),
     )
     return not df.empty
+
+
+def has_post_entry_technical_context(row: pd.Series) -> bool:
+    return any(column in row.index and pd.notna(row.get(column)) for column in POST_ENTRY_TECHNICAL_CONTEXT_COLUMNS)
 
 
 def ensure_lifecycle_tables() -> None:
@@ -103,12 +119,22 @@ def ensure_lifecycle_tables() -> None:
                 reference_price DOUBLE PRECISION,
                 stop_price DOUBLE PRECISION,
                 invalidation_price DOUBLE PRECISION,
+                recommended_stop_price DOUBLE PRECISION,
+                action_fraction DOUBLE PRECISION,
+                execution_mode TEXT,
                 context_snapshot_json TEXT,
                 load_ts TIMESTAMPTZ,
                 UNIQUE (asof_date, published_on, setup_id, symbol, unique_id, suggested_action)
             )
             """
         )
+        rebalance_column_defs = {
+            "recommended_stop_price": "DOUBLE PRECISION",
+            "action_fraction": "DOUBLE PRECISION",
+            "execution_mode": "TEXT",
+        }
+        for column, sql_type in rebalance_column_defs.items():
+            cur.execute(f"ALTER TABLE {REBALANCE_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
 
 
 def load_open_orders(
@@ -201,6 +227,29 @@ def load_price_points(symbols: list[str], monitor_date: pd.Timestamp) -> pd.Data
     return merged[["symbol", "date", "close", "exchange", "security_id", "ticker"]]
 
 
+def load_latest_technical_context(symbols: list[str], monitor_date: pd.Timestamp) -> pd.DataFrame:
+    normalized = sorted({str(value).upper() for value in symbols if str(value).strip()})
+    if not normalized or not table_exists("advisory_technical_daily"):
+        return pd.DataFrame()
+    df = sql_to_df(
+        """
+        SELECT DISTINCT ON (symbol)
+            *
+        FROM advisory_technical_daily
+        WHERE symbol = ANY(%(symbols)s)
+          AND asof_date <= %(monitor_date)s
+        ORDER BY symbol, asof_date DESC
+        """,
+        params={"symbols": normalized, "monitor_date": monitor_date},
+    )
+    if df.empty:
+        return df
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    if "asof_date" in df.columns:
+        df["asof_date"] = pd.to_datetime(df["asof_date"], utc=True, errors="coerce")
+    return df
+
+
 def derive_entry_and_current_prices(orders: pd.DataFrame, monitor_date: pd.Timestamp) -> pd.DataFrame:
     prices = load_price_points(orders["symbol"].astype(str).unique().tolist(), monitor_date)
     if prices.empty:
@@ -228,6 +277,122 @@ def derive_entry_and_current_prices(orders: pd.DataFrame, monitor_date: pd.Times
     return pd.DataFrame(rows)
 
 
+def compute_recommended_stop_price(row: pd.Series) -> float | None:
+    current_price = pd.to_numeric(row.get("current_price"), errors="coerce")
+    stop_price = pd.to_numeric(row.get("stop_price"), errors="coerce")
+    atr_20 = pd.to_numeric(row.get("atr_20"), errors="coerce")
+    dma_20 = pd.to_numeric(row.get("dma_20"), errors="coerce")
+
+    candidates: list[float] = []
+    if pd.notna(stop_price):
+        candidates.append(float(stop_price))
+    if pd.notna(dma_20):
+        candidates.append(float(dma_20))
+    if pd.notna(current_price) and pd.notna(atr_20):
+        candidates.append(float(current_price - (1.25 * atr_20)))
+    if not candidates:
+        return None
+    recommended = max(candidates)
+    if pd.notna(current_price):
+        recommended = min(recommended, float(current_price))
+    return round(recommended, 2)
+
+
+def compute_action_fraction(row: pd.Series, next_action: str) -> float | None:
+    action = str(next_action or "").lower()
+    if not action:
+        return None
+
+    thesis_bucket = str(row.get("thesis_bucket") or "").upper()
+    setup_id = str(row.get("setup_id") or "").upper()
+    pnl_pct = pd.to_numeric(row.get("pnl_pct"), errors="coerce")
+
+    if action == "trim_winner":
+        fraction = 0.33
+        if thesis_bucket == "TIME_HORIZON" or "EVENT" in setup_id:
+            fraction = 0.50
+        elif thesis_bucket == "DATA_DEPENDENT":
+            fraction = 0.25
+        if pd.notna(pnl_pct) and float(pnl_pct) >= 25.0:
+            fraction = max(fraction, 0.50)
+        elif pd.notna(pnl_pct) and float(pnl_pct) >= 18.0:
+            fraction = max(fraction, 0.40)
+        return round(min(max(fraction, 0.10), 0.75), 2)
+
+    if action == "add_on_pullback":
+        fraction = 0.20
+        if thesis_bucket == "DATA_DEPENDENT":
+            fraction = 0.25
+        elif thesis_bucket == "TIME_HORIZON" or "EVENT" in setup_id:
+            fraction = 0.15
+        if pd.notna(pnl_pct) and float(pnl_pct) < 2.0:
+            fraction = min(fraction + 0.05, 0.30)
+        return round(min(max(fraction, 0.10), 0.33), 2)
+
+    if action in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure"}:
+        return 1.0
+    return None
+
+
+def apply_tightened_stop_baseline(actions_df: pd.DataFrame) -> int:
+    if actions_df.empty:
+        return 0
+    required_columns = {"published_on", "setup_id", "symbol", "unique_id", "suggested_action", "recommended_stop_price", "stop_price"}
+    if not required_columns.issubset(actions_df.columns):
+        return 0
+
+    tighten_rows = actions_df.copy()
+    tighten_rows["suggested_action"] = tighten_rows["suggested_action"].astype("string")
+    tighten_rows = tighten_rows[tighten_rows["suggested_action"].str.lower() == "tighten_stop"].copy()
+    if tighten_rows.empty:
+        return 0
+
+    tighten_rows["recommended_stop_price"] = pd.to_numeric(tighten_rows["recommended_stop_price"], errors="coerce")
+    tighten_rows["stop_price"] = pd.to_numeric(tighten_rows["stop_price"], errors="coerce")
+    tighten_rows["published_on"] = pd.to_datetime(tighten_rows["published_on"], utc=True, errors="coerce")
+    tighten_rows["symbol"] = tighten_rows["symbol"].astype("string").str.upper()
+    tighten_rows["setup_id"] = tighten_rows["setup_id"].astype("string")
+    tighten_rows["unique_id"] = tighten_rows["unique_id"].astype("string")
+    tighten_rows = tighten_rows[
+        tighten_rows["published_on"].notna()
+        & tighten_rows["recommended_stop_price"].notna()
+        & (
+            tighten_rows["stop_price"].isna()
+            | (tighten_rows["recommended_stop_price"] > tighten_rows["stop_price"])
+        )
+    ].copy()
+    if tighten_rows.empty:
+        return 0
+
+    updated = 0
+    with db_session() as (_, cur):
+        for _, row in tighten_rows.iterrows():
+            cur.execute(
+                f"""
+                UPDATE {PORTFOLIO_TABLE}
+                SET stop_price = %s
+                WHERE published_on = %s
+                  AND setup_id = %s
+                  AND symbol = %s
+                  AND unique_id = %s
+                  AND (
+                      stop_price IS NULL
+                      OR %s > stop_price
+                  )
+                """,
+                (
+                    float(row["recommended_stop_price"]),
+                    pd.to_datetime(row["published_on"], utc=True, errors="coerce").to_pydatetime(),
+                    str(row["setup_id"]),
+                    str(row["symbol"]).upper(),
+                    str(row["unique_id"]),
+                    float(row["recommended_stop_price"]),
+                ),
+            )
+            updated += int(cur.rowcount or 0)
+    return updated
+
+
 def classify_position(
     row: pd.Series,
     *,
@@ -242,6 +407,19 @@ def classify_position(
     pnl_pct = pd.to_numeric(row.get("pnl_pct"), errors="coerce")
     days_held_value = pd.to_numeric(row.get("days_held"), errors="coerce")
     days_held = 0 if pd.isna(days_held_value) else int(days_held_value)
+    current_date = pd.to_datetime(row.get("current_date"), utc=True, errors="coerce")
+    horizon_end_date = pd.to_datetime(row.get("horizon_end_date"), utc=True, errors="coerce")
+    target_review_date = pd.to_datetime(row.get("target_review_date"), utc=True, errors="coerce")
+    thesis_bucket = str(row.get("thesis_bucket") or "").upper()
+
+    if has_post_entry_technical_context(row):
+        technical_eval = evaluate_technical_post_entry_state(row)
+        technical_state = str(technical_eval.get("technical_state") or "").upper()
+        technical_reasons = [str(value) for value in (technical_eval.get("technical_reasons") or []) if str(value).strip()]
+        technical_reason_text = ", ".join(technical_reasons) if technical_reasons else None
+    else:
+        technical_state = "HOLD"
+        technical_reason_text = None
 
     if pd.isna(entry_price) or pd.isna(current_price):
         return (
@@ -254,11 +432,53 @@ def classify_position(
         return ("exit_review", "Current price breached invalidation.", "exit_invalidation", "Price is below invalidation guidance.")
     if pd.notna(stop_price) and current_price <= stop_price:
         return ("exit_review", "Current price breached stop guidance.", "exit_stop", "Price is below stop guidance.")
+    if technical_state == "EMERGENCY_EXIT":
+        return (
+            "exit_review",
+            "Technical emergency exit fired.",
+            "exit_emergency",
+            f"Technical engine flagged EMERGENCY_EXIT{': ' + technical_reason_text if technical_reason_text else ''}.",
+        )
+    if technical_state == "FULL_EXIT":
+        return (
+            "exit_review",
+            "Technical thesis failure detected.",
+            "exit_technical_failure",
+            f"Technical engine flagged FULL_EXIT{': ' + technical_reason_text if technical_reason_text else ''}.",
+        )
+    if technical_state == "PARTIAL_EXIT":
+        return (
+            "open",
+            "Position is extended or showing distribution.",
+            "trim_winner",
+            f"Technical engine flagged PARTIAL_EXIT{': ' + technical_reason_text if technical_reason_text else ''}.",
+        )
+    if technical_state == "ADD_ON_PULLBACK":
+        return (
+            "open",
+            "Constructive pullback is holding.",
+            "add_on_pullback",
+            f"Technical engine flagged ADD_ON_PULLBACK{': ' + technical_reason_text if technical_reason_text else ''}.",
+        )
+    if thesis_bucket == "TIME_HORIZON" and pd.notna(current_date) and pd.notna(horizon_end_date) and current_date.normalize() >= horizon_end_date.normalize():
+        return (
+            "review",
+            "Holding window ended.",
+            "review_horizon",
+            "Time-horizon thesis reached its planned review window.",
+        )
+    if thesis_bucket == "TARGET" and pd.notna(current_date) and pd.notna(target_review_date) and current_date.normalize() >= target_review_date.normalize():
+        return (
+            "review",
+            "Target review date reached.",
+            "review_target",
+            "Target bucket reached its scheduled review date.",
+        )
     if pd.notna(pnl_pct) and pnl_pct >= trim_winner_gain_pct:
         return ("open", "Position is a strong winner.", "trim_winner", "Unrealized gain exceeded trim threshold.")
     if pd.notna(pnl_pct) and pnl_pct >= tighten_stop_gain_pct:
         return ("open", "Position is in profit and may warrant tighter risk.", "tighten_stop", "Unrealized gain exceeded stop-tightening threshold.")
-    if days_held >= review_stale_days and (pd.isna(pnl_pct) or pnl_pct <= 0):
+    if thesis_bucket != "TIME_HORIZON" and days_held >= review_stale_days and (pd.isna(pnl_pct) or pnl_pct <= 0):
         return ("review", "Position is stale without positive mark-to-market.", "review_stale", "Holding period exceeded stale threshold without gains.")
     return ("open", "Position remains within expected risk bounds.", "hold", "No lifecycle trigger fired.")
 
@@ -299,6 +519,9 @@ def build_lifecycle_outputs(
         return pd.DataFrame(), pd.DataFrame()
 
     derived = derive_entry_and_current_prices(orders, monitor_date)
+    technical_context = load_latest_technical_context(orders["symbol"].astype(str).unique().tolist(), monitor_date)
+    if not technical_context.empty:
+        derived = derived.merge(technical_context, how="left", on="symbol", suffixes=("", "_tech"))
     rows: list[dict[str, Any]] = []
     actions: list[dict[str, Any]] = []
     for _, row in derived.iterrows():
@@ -334,6 +557,24 @@ def build_lifecycle_outputs(
             "portfolio_reason": row.get("portfolio_reason"),
             "overlap_group": row.get("overlap_group"),
         }
+        recommended_stop_price = compute_recommended_stop_price(enriched)
+        action_fraction = compute_action_fraction(enriched, next_action)
+        execution_mode = "review_only"
+        if next_action == "trim_winner":
+            execution_mode = "broker_order"
+        elif next_action == "add_on_pullback":
+            execution_mode = "broker_order"
+        elif next_action in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure"}:
+            execution_mode = "broker_order"
+        elif next_action == "tighten_stop":
+            execution_mode = "review_only"
+            current_stop_price = pd.to_numeric(row.get("stop_price"), errors="coerce")
+            if pd.notna(recommended_stop_price) and (pd.isna(current_stop_price) or float(recommended_stop_price) > float(current_stop_price)):
+                row["stop_price"] = float(recommended_stop_price)
+                enriched["stop_price"] = float(recommended_stop_price)
+                action_reason = (
+                    f"{action_reason.rstrip('.')} Updated stop baseline to {float(recommended_stop_price):.2f}."
+                )
 
         rows.append(
             {
@@ -383,6 +624,9 @@ def build_lifecycle_outputs(
                     "reference_price": None if pd.isna(current_price) else float(current_price),
                     "stop_price": pd.to_numeric(row.get("stop_price"), errors="coerce"),
                     "invalidation_price": pd.to_numeric(row.get("invalidation_price"), errors="coerce"),
+                    "recommended_stop_price": recommended_stop_price,
+                    "action_fraction": action_fraction,
+                    "execution_mode": execution_mode,
                     "context_snapshot_json": json.dumps(context, ensure_ascii=False, default=str, sort_keys=True),
                     "load_ts": pd.Timestamp.utcnow(),
                 }
@@ -442,7 +686,7 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
         )
     if not actions_df.empty:
         actions_out = actions_df.copy()
-        for column in ["reference_price", "stop_price", "invalidation_price"]:
+        for column in ["reference_price", "stop_price", "invalidation_price", "recommended_stop_price", "action_fraction"]:
             if column in actions_out.columns:
                 actions_out[column] = pd.to_numeric(actions_out[column], errors="coerce")
         for column in ["asof_date", "published_on", "load_ts"]:
@@ -469,6 +713,7 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
             unique_keys=["asof_date", "published_on", "setup_id", "symbol", "unique_id", "suggested_action"],
             timescaledb_column="asof_date",
         )
+        apply_tightened_stop_baseline(actions_out)
 
 
 def parse_args() -> argparse.Namespace:

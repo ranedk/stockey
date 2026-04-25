@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import date, datetime, timedelta, timezone
+import os
 import sys
 from typing import Iterable
 
@@ -16,6 +17,8 @@ from utils.sync import load_tracked_symbols, normalize_date_window, parse_dateti
 
 DEFAULT_DAILY_YEARS = 5
 DEFAULT_INTRADAY_DAYS = 1
+DEFAULT_DAILY_OVERLAP_DAYS = int(os.getenv("DHAN_DAILY_REFRESH_OVERLAP_DAYS", "7"))
+DEFAULT_INTRADAY_OVERLAP_MINUTES = int(os.getenv("DHAN_INTRADAY_REFRESH_OVERLAP_MINUTES", "10"))
 INTRADAY_MAX_WINDOW_DAYS = 90
 SUPPORTED_INTRADAY_INTERVALS = (1, 5, 15, 25, 60)
 MARKET_CLOSE_HOUR = 15
@@ -109,6 +112,30 @@ def latest_daily_snapshot(identifier: str, exchange: str, asset_type: str) -> di
     return result
 
 
+def latest_intraday_timestamp(
+    *,
+    security_id: object,
+    exchange: str,
+    asset_type: str,
+    interval_minutes: int,
+) -> datetime | None:
+    df = sql_to_df(
+        f"""
+        SELECT MAX("timestamp") AS max_timestamp
+        FROM {INTRADAY_TABLE}
+        WHERE security_id = %s
+          AND exchange = %s
+          AND asset_type = %s
+          AND interval_minutes = %s
+        """,
+        params=(security_id, exchange.upper(), asset_type.lower(), int(interval_minutes)),
+    )
+    if df.empty:
+        return None
+    value = pd.to_datetime(df.iloc[0].get("max_timestamp"), utc=True, errors="coerce")
+    return None if pd.isna(value) else value.to_pydatetime()
+
+
 def has_recent_adjustment(symbol: str, latest_stored_date: datetime | None) -> bool:
     if latest_stored_date is None:
         return False
@@ -143,6 +170,12 @@ def choose_daily_refresh_start(
 ) -> datetime:
     if explicit_from_date is not None:
         return explicit_from_date
+    snapshot = latest_daily_snapshot(ticker, exchange, asset_type)
+    latest_stored = snapshot.get("max_date")
+    if latest_stored is not None:
+        if has_recent_adjustment(ticker, latest_stored):
+            return datetime.now() - timedelta(days=365 * years)
+        return latest_stored - timedelta(days=max(0, DEFAULT_DAILY_OVERLAP_DAYS))
     return datetime.now() - timedelta(days=365 * years)
 
 
@@ -407,7 +440,16 @@ def sync_intraday_ohlcv(
     identity = resolve_dhan_identity(ticker, exchange, asset_type=asset_type)
     effective_from_date, effective_to_date = normalize_date_window(from_date, to_date)
     if from_date is None:
-        effective_from_date = datetime.now() - timedelta(days=DEFAULT_INTRADAY_DAYS)
+        latest_stored = latest_intraday_timestamp(
+            security_id=identity["security_id"],
+            exchange=str(identity["exchange"]),
+            asset_type=asset_type,
+            interval_minutes=interval_minutes,
+        )
+        if latest_stored is not None:
+            effective_from_date = latest_stored - timedelta(minutes=max(0, DEFAULT_INTRADAY_OVERLAP_MINUTES))
+        else:
+            effective_from_date = datetime.now() - timedelta(days=DEFAULT_INTRADAY_DAYS)
     resolved_exchange = str(identity["exchange"])
     effective_to_date = choose_intraday_refresh_end(effective_to_date if to_date is not None else None, exchange=resolved_exchange)
     if effective_from_date > effective_to_date:
