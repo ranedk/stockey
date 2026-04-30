@@ -390,6 +390,7 @@ Recommended operator flow:
 ./complete_data.sh
 ./all_ml.sh
 ./all_advisory.sh
+./all_advisory.sh --fast
 ./all_advisory.sh --date 2026-04-07
 ```
 
@@ -398,6 +399,7 @@ Behavior:
 - runs `advisory.master_pipeline --skip-downloads`
 - expects data and model artifacts to have been refreshed separately through `./complete_data.sh` and `./all_ml.sh`
 - writes the advisory outputs consumed by the portfolio view and live dashboard
+- `--fast` skips watch/news refresh, peer sync, and on-demand intraday repair; use it for quick portfolio/lifecycle/action refreshes when data is already current
 
 Continuous-watch flow:
 
@@ -592,6 +594,7 @@ Notes:
 
 - `all_watchers.sh` loads symbols from [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt) where needed
 - `all_advisory.sh` is advisory-only and skips raw downloads by default
+- `all_advisory.sh --fast` is the low-latency advisory mode; it avoids slow repair/watch stages and is safer than blindly parallelizing browser-connected work
 - `complete_data.sh` is the lower-level raw ingestion component used before advisory runs
 
 ### SQL

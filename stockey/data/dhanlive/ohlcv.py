@@ -29,6 +29,13 @@ DAILY_TABLE = "dhan_ohlcv_daily"
 INTRADAY_TABLE = "dhan_ohlcv_intraday"
 
 
+def _to_naive_utc_datetime(value: object) -> datetime | None:
+    timestamp = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(timestamp):
+        return None
+    return timestamp.tz_convert("UTC").tz_localize(None).to_pydatetime()
+
+
 def ensure_ohlcv_tables() -> None:
     with db_session() as (_, cur):
         cur.execute(
@@ -107,8 +114,7 @@ def latest_daily_snapshot(identifier: str, exchange: str, asset_type: str) -> di
     row = df.iloc[0]
     result: dict[str, datetime | None] = {}
     for key in ["min_date", "max_date", "max_load_ts"]:
-        value = pd.to_datetime(row.get(key), utc=True, errors="coerce")
-        result[key] = None if pd.isna(value) else value.to_pydatetime()
+        result[key] = _to_naive_utc_datetime(row.get(key))
     return result
 
 
@@ -132,8 +138,7 @@ def latest_intraday_timestamp(
     )
     if df.empty:
         return None
-    value = pd.to_datetime(df.iloc[0].get("max_timestamp"), utc=True, errors="coerce")
-    return None if pd.isna(value) else value.to_pydatetime()
+    return _to_naive_utc_datetime(df.iloc[0].get("max_timestamp"))
 
 
 def has_recent_adjustment(symbol: str, latest_stored_date: datetime | None) -> bool:

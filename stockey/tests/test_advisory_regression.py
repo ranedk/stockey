@@ -843,6 +843,59 @@ def test_position_lifecycle_classification_paths():
     assert action == "exit_invalidation"
 
 
+def test_position_lifecycle_trims_when_target_reached():
+    row = pd.Series(
+        {
+            "entry_price": 100.0,
+            "current_price": 121.0,
+            "stop_price": 95.0,
+            "invalidation_price": 90.0,
+            "pnl_pct": 21.0,
+            "days_held": 12,
+            "recommended_target_price": 120.0,
+        }
+    )
+
+    status, reason, action, action_reason = position_lifecycle.classify_position(
+        row,
+        review_stale_days=20,
+        tighten_stop_gain_pct=10.0,
+        trim_winner_gain_pct=25.0,
+    )
+
+    assert status == "open"
+    assert reason == "Target zone reached."
+    assert action == "trim_winner"
+    assert "120.00" in action_reason
+
+
+def test_position_lifecycle_time_stop_exits_loser_after_horizon():
+    row = pd.Series(
+        {
+            "entry_price": 100.0,
+            "current_price": 98.0,
+            "stop_price": 94.0,
+            "invalidation_price": 90.0,
+            "pnl_pct": -2.0,
+            "days_held": 45,
+            "thesis_bucket": "TIME_HORIZON",
+            "current_date": pd.Timestamp("2026-04-29T00:00:00Z"),
+            "horizon_end_date": pd.Timestamp("2026-04-28T00:00:00Z"),
+        }
+    )
+
+    status, _, action, action_reason = position_lifecycle.classify_position(
+        row,
+        review_stale_days=20,
+        tighten_stop_gain_pct=10.0,
+        trim_winner_gain_pct=15.0,
+    )
+
+    assert status == "review"
+    assert action == "exit_time_stop"
+    assert "no positive follow-through" in action_reason
+
+
 def test_execution_engine_builds_planned_orders(monkeypatch):
     portfolio_orders = pd.DataFrame(
         [
@@ -4685,6 +4738,65 @@ def test_sync_many_daily_continues_after_symbol_error(monkeypatch):
     assert results[1]["ticker"] == "BAD"
     assert results[1]["rows"] == 0
     assert "DhanAPIError" in results[1]["error"]
+
+
+def test_sync_daily_ohlcv_normalizes_mixed_timezone_dates(monkeypatch):
+    captured: dict[str, datetime] = {}
+
+    monkeypatch.setattr(dhan_ohlcv, "ensure_ohlcv_tables", lambda: None)
+    monkeypatch.setattr(
+        dhan_ohlcv,
+        "resolve_dhan_identity",
+        lambda ticker, exchange, asset_type="stock": {
+            "company_master_id": "nse:TEST",
+            "asset_type": "stock",
+            "exchange": "NSE",
+            "ticker": "TEST",
+            "security_id": 123,
+            "exchange_segment": "NSE_EQ",
+            "instrument": "EQUITY",
+        },
+    )
+    monkeypatch.setattr(
+        dhan_ohlcv,
+        "latest_daily_snapshot",
+        lambda ticker, exchange, asset_type: {
+            "min_date": pd.Timestamp("2026-04-01T00:00:00Z").to_pydatetime(),
+            "max_date": pd.Timestamp("2026-04-22T00:00:00Z").to_pydatetime(),
+            "max_load_ts": pd.Timestamp("2026-04-22T10:00:00Z").to_pydatetime(),
+        },
+    )
+    monkeypatch.setattr(dhan_ohlcv, "has_recent_adjustment", lambda symbol, latest_stored_date: False)
+    monkeypatch.setattr(dhan_ohlcv, "load_nse_holidays", lambda: set())
+    monkeypatch.setattr(dhan_ohlcv, "upsert_to_db", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        dhan_ohlcv,
+        "candles_to_df",
+        lambda payload: pd.DataFrame(
+            [
+                {
+                    "source_timestamp": pd.Timestamp("2026-04-23T10:00:00Z"),
+                    "open": 1,
+                    "high": 2,
+                    "low": 1,
+                    "close": 2,
+                    "volume": 10,
+                }
+            ]
+        ),
+    )
+
+    class DummyClient:
+        def fetch_daily(self, **kwargs):
+            captured["from_date"] = kwargs["from_date"]
+            captured["to_date"] = kwargs["to_date"]
+            return {"ok": True}
+
+    df = dhan_ohlcv.sync_daily_ohlcv("TEST", to_date=datetime(2026, 4, 24), client=DummyClient())
+
+    assert not df.empty
+    assert captured["from_date"].tzinfo is None
+    assert captured["to_date"].tzinfo is None
 
 
 def test_sync_many_intraday_continues_after_symbol_error(monkeypatch):

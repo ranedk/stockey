@@ -92,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument("--skip-peer-sync", action="store_true")
     parser.add_argument("--skip-intraday", action="store_true", help="Skip intraday feature sync/build")
+    parser.add_argument("--skip-rule-snapshot-refresh", action="store_true", help="Skip on-demand daily/fundamental repair inside the rule engine")
     parser.add_argument("--skip-intraday-prefetch", action="store_true", help="Skip on-demand intraday feature backfill inside the rule engine")
     parser.add_argument("--intraday-lookback-days", type=int, default=180, help="How much recent intraday history to maintain for advisory pattern features")
     parser.add_argument(
@@ -102,6 +103,7 @@ def parse_args() -> argparse.Namespace:
         help="Intraday candle intervals to fetch/build for advisory intraday features",
     )
     parser.add_argument("--skip-downloads", action="store_true", help="Skip the raw download shell script")
+    parser.add_argument("--fast", action="store_true", help="Run a faster advisory pass by skipping slow repair/watch work")
     parser.add_argument("--skip-watch", action="store_true", help="Skip announcement watchlist stages")
     parser.add_argument("--skip-news", action="store_true", help="Skip ET RSS watch matching stages")
     parser.add_argument("--skip-lifecycle", action="store_true", help="Skip lifecycle stage")
@@ -174,6 +176,15 @@ def main() -> int:
         )
 
     try:
+        if bool(args.fast):
+            args.skip_watch = True
+            args.skip_news = True
+            args.skip_peer_sync = True
+            args.skip_rule_snapshot_refresh = True
+            args.skip_intraday_prefetch = True
+            args.intraday_lookback_days = min(int(args.intraday_lookback_days), 30)
+            if not args.intraday_intervals:
+                args.intraday_intervals = [1]
         pipeline_started = time.monotonic()
         download_summary = {"status": "skipped"}
         if not args.skip_downloads:
@@ -214,6 +225,7 @@ def main() -> int:
             rebuild=bool(args.rebuild),
             skip_peer_sync=bool(args.skip_peer_sync),
             skip_intraday=bool(args.skip_intraday),
+            skip_rule_snapshot_refresh=bool(args.skip_rule_snapshot_refresh),
             skip_intraday_prefetch=bool(args.skip_intraday_prefetch),
             intraday_lookback_days=int(args.intraday_lookback_days),
             intraday_intervals=list(args.intraday_intervals or [1]),

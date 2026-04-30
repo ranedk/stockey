@@ -138,6 +138,7 @@ Scheduled operator flow:
 - let `all_watchers.sh` run every `10` minutes during market hours
 - let `all_ml.sh` run once daily after market close
 - let `all_advisory.sh` run a few times a week for the slower batch recommendation cycle
+- use `all_advisory.sh --fast` for quick intermediate advisory refreshes; it avoids watch/news refresh, peer sync, and on-demand intraday repair
 
 The cron file writes logs under `logs/cron/` and uses `flock` so overlapping runs are skipped instead of stacked.
 
@@ -146,6 +147,7 @@ Use:
 - `./complete_data.sh` for the full raw-data refresh
 - `./all_ml.sh` for research prep, readiness checks, model train, and score
 - `./all_advisory.sh` for the advisory and portfolio run
+- `./all_advisory.sh --fast` for a quicker lifecycle/action/dashboard refresh when data is already current
 - `./all_watchers.sh --loop` for the lightweight live monitoring loop
 
 ### Dhan master

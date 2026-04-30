@@ -1287,6 +1287,7 @@ def run_rule_engine(
     asof_date: pd.Timestamp | None = None,
     setup_ids: list[str] | None = None,
     config_path: str | None = None,
+    skip_snapshot_refresh: bool = False,
     skip_intraday_prefetch: bool = False,
     max_snapshot_refresh_age_days: int = DEFAULT_MAX_SNAPSHOT_REFRESH_AGE_DAYS,
     max_intraday_prefetch_age_days: int = DEFAULT_MAX_INTRADAY_PREFETCH_AGE_DAYS,
@@ -1365,9 +1366,12 @@ def run_rule_engine(
         meta["missing_snapshot_symbols"] = missing_symbols
         meta["missing_intraday_symbols"] = missing_intraday_symbols
         allow_snapshot_refresh = (
-            days_stale is None
-            or int(max_snapshot_refresh_age_days) < 0
-            or days_stale <= int(max_snapshot_refresh_age_days)
+            not skip_snapshot_refresh
+            and (
+                days_stale is None
+                or int(max_snapshot_refresh_age_days) < 0
+                or days_stale <= int(max_snapshot_refresh_age_days)
+            )
         )
         allow_intraday_prefetch = (
             not skip_intraday_prefetch
@@ -1389,7 +1393,7 @@ def run_rule_engine(
         elif missing_symbols and not allow_snapshot_refresh:
             meta["preflight"] = {
                 "status": "skipped",
-                "reason": "historical_snapshot_refresh_disabled",
+                "reason": "skip_snapshot_refresh" if skip_snapshot_refresh else "historical_snapshot_refresh_disabled",
                 "missing_snapshot_symbols": missing_symbols,
                 "days_stale_from_today": days_stale,
                 "max_snapshot_refresh_age_days": int(max_snapshot_refresh_age_days),
@@ -1660,6 +1664,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--date", type=parse_datetime_arg, help="Asof date in YYYY-MM-DD")
     parser.add_argument("--setup", dest="setup_ids", nargs="*", help="Setup ids to evaluate")
     parser.add_argument("--config", help="Override setup registry YAML path")
+    parser.add_argument("--skip-snapshot-refresh", action="store_true", help="Skip on-demand daily/fundamental snapshot repair inside the rule engine")
     parser.add_argument("--skip-intraday-prefetch", action="store_true", help="Skip on-demand intraday feature backfill inside the rule engine")
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -1699,6 +1704,7 @@ def main() -> int:
         asof_date=asof_date,
         setup_ids=args.setup_ids,
         config_path=args.config,
+        skip_snapshot_refresh=bool(args.skip_snapshot_refresh),
         skip_intraday_prefetch=bool(args.skip_intraday_prefetch),
     )
     effective_date = pd.to_datetime(meta.get("effective_date"), utc=True, errors="coerce")

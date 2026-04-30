@@ -10,6 +10,7 @@ This file is the current roadmap for the live advisory stack. It is not a histor
 - Parsers only: `./all_parsers.sh`
 - Download + parse: `./complete_data.sh`
 - Advisory only: `./all_advisory.sh`
+- Fast advisory refresh: `./all_advisory.sh --fast`
 - Model prep and training: `./all_ml.sh`
 - Continuous monitoring: `./all_watchers.sh --loop`
 
@@ -644,6 +645,25 @@ Implementation slices:
    - partial `SELL`
    - skip non-executable review-only actions
 8. Surface stop, invalidation, technical exit reason, and partial-exit plan in dashboard/lifecycle views.
+
+Current implementation status:
+
+- lifecycle now recomputes a deterministic management plan per open position:
+  - target price
+  - expected holding days
+  - horizon end date
+  - target review date
+  - recommended stop
+- target-hit positions become `trim_winner`
+- time-horizon losers after horizon expiry become `exit_time_stop`
+- action recommendations and execution planning understand the time-stop full-exit path
+- `all_advisory.sh --fast` exists for quick refreshes without slow watch/news/repair work
+
+Remaining:
+
+- calibrate target multiples and horizon defaults against realized trade outcomes
+- add optional low-worker parallel execution for pure DB/CPU stages only
+- do not parallelize Chrome/browser-connected scraping in the same browser session
 
 Do not:
 

@@ -64,6 +64,8 @@ def ensure_actions_table() -> None:
                 stop_price DOUBLE PRECISION,
                 invalidation_price DOUBLE PRECISION,
                 recommended_stop_price DOUBLE PRECISION,
+                recommended_target_price DOUBLE PRECISION,
+                expected_horizon_days BIGINT,
                 invest_score_pct DOUBLE PRECISION,
                 action_reason TEXT,
                 action_detail TEXT,
@@ -73,6 +75,8 @@ def ensure_actions_table() -> None:
             )
             """
         )
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS recommended_target_price DOUBLE PRECISION")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS expected_horizon_days BIGINT")
 
 
 def _normalize_asof_date(asof_date: pd.Timestamp | None) -> pd.Timestamp:
@@ -115,6 +119,8 @@ def _build_record(
     stop_price: Any = None,
     invalidation_price: Any = None,
     recommended_stop_price: Any = None,
+    recommended_target_price: Any = None,
+    expected_horizon_days: Any = None,
     invest_score_pct: Any = None,
     action_reason: Any = None,
     action_detail: Any = None,
@@ -139,6 +145,8 @@ def _build_record(
         "stop_price": _num(stop_price),
         "invalidation_price": _num(invalidation_price),
         "recommended_stop_price": _num(recommended_stop_price),
+        "recommended_target_price": _num(recommended_target_price),
+        "expected_horizon_days": None if pd.isna(pd.to_numeric(expected_horizon_days, errors="coerce")) else int(pd.to_numeric(expected_horizon_days, errors="coerce")),
         "invest_score_pct": _num(invest_score_pct),
         "action_reason": _text(action_reason),
         "action_detail": _text(action_detail),
@@ -346,6 +354,7 @@ def build_action_recommendations(
         "exit_stop": ("SELL", "SELL"),
         "exit_emergency": ("SELL", "SELL"),
         "exit_technical_failure": ("SELL", "SELL"),
+        "exit_time_stop": ("SELL", "SELL"),
         "trim_winner": ("PARTIAL_SELL", "SELL"),
         "add_on_pullback": ("BUY_MORE", "BUY"),
         "tighten_stop": ("TIGHTEN_STOP", None),
@@ -374,6 +383,8 @@ def build_action_recommendations(
                 stop_price=row.get("stop_price"),
                 invalidation_price=row.get("invalidation_price"),
                 recommended_stop_price=row.get("recommended_stop_price"),
+                recommended_target_price=row.get("recommended_target_price"),
+                expected_horizon_days=row.get("expected_horizon_days"),
                 action_reason=row.get("action_reason"),
                 action_detail=row.get("suggested_action"),
                 raw_context=row.to_dict(),
@@ -430,10 +441,13 @@ def persist_action_recommendations(df: pd.DataFrame) -> None:
         "stop_price",
         "invalidation_price",
         "recommended_stop_price",
+        "recommended_target_price",
         "invest_score_pct",
     ]:
         if column in out.columns:
             out[column] = pd.to_numeric(out[column], errors="coerce")
+    if "expected_horizon_days" in out.columns:
+        out["expected_horizon_days"] = pd.to_numeric(out["expected_horizon_days"], errors="coerce").astype("Int64")
     for column in ["asof_date", "published_on", "load_ts"]:
         if column in out.columns:
             out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")

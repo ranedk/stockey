@@ -20,6 +20,12 @@ REBALANCE_TABLE = "advisory_rebalance_actions"
 DEFAULT_REVIEW_STALE_DAYS = 20
 DEFAULT_TIGHTEN_STOP_GAIN_PCT = 10.0
 DEFAULT_TRIM_WINNER_GAIN_PCT = 15.0
+DEFAULT_TARGET_BUCKET_HORIZON_DAYS = 90
+DEFAULT_TIME_BUCKET_HORIZON_DAYS = 42
+DEFAULT_DATA_BUCKET_HORIZON_DAYS = 60
+DEFAULT_TARGET_R_MULTIPLE = 2.0
+DEFAULT_TIME_R_MULTIPLE = 1.5
+DEFAULT_DATA_R_MULTIPLE = 2.25
 POST_ENTRY_TECHNICAL_CONTEXT_COLUMNS = {
     "pass_above_dma_20",
     "pass_above_dma_50",
@@ -78,6 +84,9 @@ def ensure_lifecycle_tables() -> None:
                 invalidation_price DOUBLE PRECISION,
                 thesis_bucket TEXT,
                 bucket_reason TEXT,
+                target_price DOUBLE PRECISION,
+                target_basis TEXT,
+                target_confidence DOUBLE PRECISION,
                 expected_horizon_days BIGINT,
                 target_review_date TIMESTAMPTZ,
                 horizon_end_date TIMESTAMPTZ,
@@ -96,6 +105,9 @@ def ensure_lifecycle_tables() -> None:
         lifecycle_column_defs = {
             "thesis_bucket": "TEXT",
             "bucket_reason": "TEXT",
+            "target_price": "DOUBLE PRECISION",
+            "target_basis": "TEXT",
+            "target_confidence": "DOUBLE PRECISION",
             "expected_horizon_days": "BIGINT",
             "target_review_date": "TIMESTAMPTZ",
             "horizon_end_date": "TIMESTAMPTZ",
@@ -119,7 +131,10 @@ def ensure_lifecycle_tables() -> None:
                 reference_price DOUBLE PRECISION,
                 stop_price DOUBLE PRECISION,
                 invalidation_price DOUBLE PRECISION,
+                target_price DOUBLE PRECISION,
                 recommended_stop_price DOUBLE PRECISION,
+                recommended_target_price DOUBLE PRECISION,
+                expected_horizon_days BIGINT,
                 action_fraction DOUBLE PRECISION,
                 execution_mode TEXT,
                 context_snapshot_json TEXT,
@@ -130,6 +145,9 @@ def ensure_lifecycle_tables() -> None:
         )
         rebalance_column_defs = {
             "recommended_stop_price": "DOUBLE PRECISION",
+            "target_price": "DOUBLE PRECISION",
+            "recommended_target_price": "DOUBLE PRECISION",
+            "expected_horizon_days": "BIGINT",
             "action_fraction": "DOUBLE PRECISION",
             "execution_mode": "TEXT",
         }
@@ -298,6 +316,91 @@ def compute_recommended_stop_price(row: pd.Series) -> float | None:
     return round(recommended, 2)
 
 
+def default_horizon_days(row: pd.Series) -> int:
+    explicit = pd.to_numeric(row.get("expected_horizon_days"), errors="coerce")
+    if pd.notna(explicit) and int(explicit) > 0:
+        return int(explicit)
+    thesis_bucket = str(row.get("thesis_bucket") or "").upper()
+    setup_id = str(row.get("setup_id") or "").upper()
+    if thesis_bucket == "TARGET":
+        return DEFAULT_TARGET_BUCKET_HORIZON_DAYS
+    if thesis_bucket == "TIME_HORIZON" or "EVENT" in setup_id or "INTRADAY" in setup_id:
+        return DEFAULT_TIME_BUCKET_HORIZON_DAYS
+    return DEFAULT_DATA_BUCKET_HORIZON_DAYS
+
+
+def risk_multiple_for_row(row: pd.Series) -> float:
+    thesis_bucket = str(row.get("thesis_bucket") or "").upper()
+    if thesis_bucket == "TARGET":
+        return DEFAULT_TARGET_R_MULTIPLE
+    if thesis_bucket == "TIME_HORIZON":
+        return DEFAULT_TIME_R_MULTIPLE
+    return DEFAULT_DATA_R_MULTIPLE
+
+
+def compute_recommended_target_price(row: pd.Series) -> float | None:
+    target_price = pd.to_numeric(row.get("target_price"), errors="coerce")
+    if pd.notna(target_price) and float(target_price) > 0:
+        return round(float(target_price), 2)
+
+    entry_price = pd.to_numeric(row.get("entry_price"), errors="coerce")
+    current_price = pd.to_numeric(row.get("current_price"), errors="coerce")
+    stop_price = pd.to_numeric(row.get("stop_price"), errors="coerce")
+    recommended_stop = compute_recommended_stop_price(row)
+    atr_20 = pd.to_numeric(row.get("atr_20"), errors="coerce")
+    if pd.isna(entry_price) or float(entry_price) <= 0:
+        return None
+
+    stop_anchor = recommended_stop if recommended_stop is not None else (float(stop_price) if pd.notna(stop_price) else None)
+    if stop_anchor is not None and stop_anchor < float(entry_price):
+        risk_per_share = float(entry_price) - float(stop_anchor)
+    elif pd.notna(atr_20) and float(atr_20) > 0:
+        risk_per_share = float(atr_20) * 1.5
+    else:
+        risk_per_share = float(entry_price) * 0.08
+
+    multiple = risk_multiple_for_row(row)
+    target = float(entry_price) + (risk_per_share * multiple)
+    if pd.notna(current_price) and float(current_price) > target:
+        target = float(current_price)
+    return round(target, 2)
+
+
+def enrich_management_policy(row: pd.Series, monitor_date: pd.Timestamp) -> pd.Series:
+    out = row.copy()
+    entry_date = pd.to_datetime(out.get("entry_date"), utc=True, errors="coerce")
+    horizon_days = default_horizon_days(out)
+    target_price = compute_recommended_target_price(out)
+    recommended_stop = compute_recommended_stop_price(out)
+
+    if pd.isna(out.get("expected_horizon_days")):
+        out["expected_horizon_days"] = horizon_days
+    if pd.isna(pd.to_datetime(out.get("horizon_end_date"), utc=True, errors="coerce")) and pd.notna(entry_date):
+        out["horizon_end_date"] = entry_date.normalize() + pd.Timedelta(days=horizon_days)
+    if pd.isna(pd.to_datetime(out.get("target_review_date"), utc=True, errors="coerce")) and pd.notna(entry_date):
+        out["target_review_date"] = entry_date.normalize() + pd.Timedelta(days=max(1, int(horizon_days * 0.75)))
+    if target_price is not None and pd.isna(pd.to_numeric(out.get("target_price"), errors="coerce")):
+        out["target_price"] = target_price
+        out["target_basis"] = f"{risk_multiple_for_row(out):.2f}R target from entry risk."
+    if recommended_stop is not None:
+        out["recommended_stop_price"] = recommended_stop
+    out["recommended_target_price"] = target_price
+    out["management_policy_json"] = json.dumps(
+        {
+            "target_price": target_price,
+            "recommended_stop_price": recommended_stop,
+            "expected_horizon_days": horizon_days,
+            "horizon_end_date": None if pd.isna(pd.to_datetime(out.get("horizon_end_date"), utc=True, errors="coerce")) else pd.to_datetime(out.get("horizon_end_date"), utc=True, errors="coerce").isoformat(),
+            "target_review_date": None if pd.isna(pd.to_datetime(out.get("target_review_date"), utc=True, errors="coerce")) else pd.to_datetime(out.get("target_review_date"), utc=True, errors="coerce").isoformat(),
+            "basis": out.get("target_basis"),
+        },
+        ensure_ascii=False,
+        default=str,
+        sort_keys=True,
+    )
+    return out
+
+
 def compute_action_fraction(row: pd.Series, next_action: str) -> float | None:
     action = str(next_action or "").lower()
     if not action:
@@ -329,7 +432,7 @@ def compute_action_fraction(row: pd.Series, next_action: str) -> float | None:
             fraction = min(fraction + 0.05, 0.30)
         return round(min(max(fraction, 0.10), 0.33), 2)
 
-    if action in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure"}:
+    if action in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure", "exit_time_stop"}:
         return 1.0
     return None
 
@@ -411,6 +514,9 @@ def classify_position(
     horizon_end_date = pd.to_datetime(row.get("horizon_end_date"), utc=True, errors="coerce")
     target_review_date = pd.to_datetime(row.get("target_review_date"), utc=True, errors="coerce")
     thesis_bucket = str(row.get("thesis_bucket") or "").upper()
+    target_price = pd.to_numeric(row.get("recommended_target_price"), errors="coerce")
+    if pd.isna(target_price):
+        target_price = pd.to_numeric(row.get("target_price"), errors="coerce")
 
     if has_post_entry_technical_context(row):
         technical_eval = evaluate_technical_post_entry_state(row)
@@ -460,12 +566,19 @@ def classify_position(
             "add_on_pullback",
             f"Technical engine flagged ADD_ON_PULLBACK{': ' + technical_reason_text if technical_reason_text else ''}.",
         )
+    if pd.notna(target_price) and current_price >= target_price:
+        return (
+            "open",
+            "Target zone reached.",
+            "trim_winner",
+            f"Current price reached target zone {float(target_price):.2f}; book partial profit and trail the remainder.",
+        )
     if thesis_bucket == "TIME_HORIZON" and pd.notna(current_date) and pd.notna(horizon_end_date) and current_date.normalize() >= horizon_end_date.normalize():
         return (
             "review",
             "Holding window ended.",
-            "review_horizon",
-            "Time-horizon thesis reached its planned review window.",
+            "exit_time_stop" if pd.notna(pnl_pct) and float(pnl_pct) <= 0 else "review_horizon",
+            "Time-horizon thesis reached its planned window; exit if there is no positive follow-through.",
         )
     if thesis_bucket == "TARGET" and pd.notna(current_date) and pd.notna(target_review_date) and current_date.normalize() >= target_review_date.normalize():
         return (
@@ -487,10 +600,16 @@ def derive_bucket_lifecycle_fields(row: pd.Series, monitor_date: pd.Timestamp, n
     thesis_bucket = str(row.get("thesis_bucket") or "").upper()
     target_review_date = pd.to_datetime(row.get("target_review_date"), utc=True, errors="coerce")
     horizon_end_date = pd.to_datetime(row.get("horizon_end_date"), utc=True, errors="coerce")
+    current_price = pd.to_numeric(row.get("current_price"), errors="coerce")
+    target_price = pd.to_numeric(row.get("recommended_target_price"), errors="coerce")
+    if pd.isna(target_price):
+        target_price = pd.to_numeric(row.get("target_price"), errors="coerce")
 
-    if next_action in {"exit_invalidation", "exit_stop"}:
-        active = "INVALIDATION_HIT" if next_action == "exit_invalidation" else "STOP_HIT"
+    if next_action in {"exit_invalidation", "exit_stop", "exit_time_stop"}:
+        active = {"exit_invalidation": "INVALIDATION_HIT", "exit_stop": "STOP_HIT", "exit_time_stop": "TIME_STOP"}.get(next_action)
         return active, "triggered", "Exit event overrides target and horizon policy."
+    if next_action == "trim_winner" and pd.notna(target_price) and pd.notna(current_price) and float(current_price) >= float(target_price):
+        return "TARGET_REACHED", "partial_exit_due", "Target zone has been reached; book partial profit and trail the rest."
     if thesis_bucket == "TIME_HORIZON" and pd.notna(horizon_end_date):
         if monitor_date >= horizon_end_date.normalize():
             return "HORIZON_REVIEW", "review_due", "The planned holding window has ended and needs review."
@@ -539,6 +658,7 @@ def build_lifecycle_outputs(
         enriched = row.copy()
         enriched["pnl_pct"] = pnl_pct
         enriched["days_held"] = days_held
+        enriched = enrich_management_policy(enriched, monitor_date)
         position_status, lifecycle_reason, next_action, action_reason = classify_position(
             enriched,
             review_stale_days=review_stale_days,
@@ -556,15 +676,23 @@ def build_lifecycle_outputs(
             "days_held": days_held,
             "portfolio_reason": row.get("portfolio_reason"),
             "overlap_group": row.get("overlap_group"),
+            "target_price": enriched.get("recommended_target_price"),
+            "recommended_stop_price": enriched.get("recommended_stop_price"),
+            "expected_horizon_days": enriched.get("expected_horizon_days"),
+            "horizon_end_date": enriched.get("horizon_end_date"),
+            "target_review_date": enriched.get("target_review_date"),
         }
-        recommended_stop_price = compute_recommended_stop_price(enriched)
+        recommended_stop_price = pd.to_numeric(enriched.get("recommended_stop_price"), errors="coerce")
+        recommended_stop_price = None if pd.isna(recommended_stop_price) else float(recommended_stop_price)
+        recommended_target_price = pd.to_numeric(enriched.get("recommended_target_price"), errors="coerce")
+        recommended_target_price = None if pd.isna(recommended_target_price) else float(recommended_target_price)
         action_fraction = compute_action_fraction(enriched, next_action)
         execution_mode = "review_only"
         if next_action == "trim_winner":
             execution_mode = "broker_order"
         elif next_action == "add_on_pullback":
             execution_mode = "broker_order"
-        elif next_action in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure"}:
+        elif next_action in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure", "exit_time_stop"}:
             execution_mode = "broker_order"
         elif next_action == "tighten_stop":
             execution_mode = "review_only"
@@ -596,9 +724,12 @@ def build_lifecycle_outputs(
                 "invalidation_price": pd.to_numeric(row.get("invalidation_price"), errors="coerce"),
                 "thesis_bucket": row.get("thesis_bucket"),
                 "bucket_reason": row.get("bucket_reason"),
-                "expected_horizon_days": pd.to_numeric(row.get("expected_horizon_days"), errors="coerce"),
-                "target_review_date": pd.to_datetime(row.get("target_review_date"), utc=True, errors="coerce"),
-                "horizon_end_date": pd.to_datetime(row.get("horizon_end_date"), utc=True, errors="coerce"),
+                "target_price": recommended_target_price,
+                "target_basis": enriched.get("target_basis"),
+                "target_confidence": pd.to_numeric(enriched.get("target_confidence"), errors="coerce"),
+                "expected_horizon_days": pd.to_numeric(enriched.get("expected_horizon_days"), errors="coerce"),
+                "target_review_date": pd.to_datetime(enriched.get("target_review_date"), utc=True, errors="coerce"),
+                "horizon_end_date": pd.to_datetime(enriched.get("horizon_end_date"), utc=True, errors="coerce"),
                 "exit_event_rules_json": row.get("exit_event_rules_json"),
                 "next_action": next_action,
                 "next_action_reason": action_reason,
@@ -624,7 +755,10 @@ def build_lifecycle_outputs(
                     "reference_price": None if pd.isna(current_price) else float(current_price),
                     "stop_price": pd.to_numeric(row.get("stop_price"), errors="coerce"),
                     "invalidation_price": pd.to_numeric(row.get("invalidation_price"), errors="coerce"),
+                    "target_price": pd.to_numeric(enriched.get("target_price"), errors="coerce"),
                     "recommended_stop_price": recommended_stop_price,
+                    "recommended_target_price": recommended_target_price,
+                    "expected_horizon_days": pd.to_numeric(enriched.get("expected_horizon_days"), errors="coerce"),
                     "action_fraction": action_fraction,
                     "execution_mode": execution_mode,
                     "context_snapshot_json": json.dumps(context, ensure_ascii=False, default=str, sort_keys=True),
@@ -646,6 +780,8 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
             "approved_allocation_inr",
             "stop_price",
             "invalidation_price",
+            "target_price",
+            "target_confidence",
         ]:
             if column in lifecycle_out.columns:
                 lifecycle_out[column] = pd.to_numeric(lifecycle_out[column], errors="coerce")
@@ -686,9 +822,19 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
         )
     if not actions_df.empty:
         actions_out = actions_df.copy()
-        for column in ["reference_price", "stop_price", "invalidation_price", "recommended_stop_price", "action_fraction"]:
+        for column in [
+            "reference_price",
+            "stop_price",
+            "invalidation_price",
+            "target_price",
+            "recommended_stop_price",
+            "recommended_target_price",
+            "action_fraction",
+        ]:
             if column in actions_out.columns:
                 actions_out[column] = pd.to_numeric(actions_out[column], errors="coerce")
+        if "expected_horizon_days" in actions_out.columns:
+            actions_out["expected_horizon_days"] = pd.to_numeric(actions_out["expected_horizon_days"], errors="coerce").astype("Int64")
         for column in ["asof_date", "published_on", "load_ts"]:
             if column in actions_out.columns:
                 actions_out[column] = pd.to_datetime(actions_out[column], utc=True, errors="coerce")

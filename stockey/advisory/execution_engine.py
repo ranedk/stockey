@@ -841,7 +841,7 @@ def build_execution_orders(
             execution_reason = f"Identity resolution failed: {exc}"
         available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
         is_add_on = suggested_action == "add_on_pullback"
-        if execution_mode not in {"", "broker_order"} and suggested_action not in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure", "trim_winner", "add_on_pullback"}:
+        if execution_mode not in {"", "broker_order"} and suggested_action not in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure", "exit_time_stop", "trim_winner", "add_on_pullback"}:
             execution_status = "submit_blocked"
             execution_reason = (execution_reason + " " if execution_reason else "") + f"Execution mode {execution_mode} is not broker-submittable."
         else:
