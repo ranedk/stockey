@@ -156,6 +156,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild", action="store_true", help="Use rebuild semantics where supported")
     parser.add_argument("--skip-peer-sync", action="store_true", help="Skip peer preflight before technicals/fundamentals")
     parser.add_argument("--skip-intraday", action="store_true", help="Skip intraday feature sync/build")
+    parser.add_argument("--skip-rule-snapshot-refresh", action="store_true", help="Skip on-demand daily/fundamental repair inside the rule engine")
     parser.add_argument("--skip-intraday-prefetch", action="store_true", help="Skip on-demand intraday feature backfill inside the rule engine")
     parser.add_argument("--intraday-lookback-days", type=int, default=180, help="How much recent intraday history to maintain for advisory pattern features")
     parser.add_argument("--rule-max-snapshot-refresh-age-days", type=int, default=7, help="Only repair missing daily/fundamental snapshots on the fly when the screener date is this recent; use -1 to always allow")
@@ -220,6 +221,8 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         args.intraday_intervals = [1]
     if not hasattr(args, "skip_intraday_prefetch"):
         args.skip_intraday_prefetch = False
+    if not hasattr(args, "skip_rule_snapshot_refresh"):
+        args.skip_rule_snapshot_refresh = False
     if not hasattr(args, "rule_max_snapshot_refresh_age_days"):
         args.rule_max_snapshot_refresh_age_days = 7
     if not hasattr(args, "rule_max_intraday_prefetch_age_days"):
@@ -418,6 +421,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             asof_date=asof_date,
             setup_ids=setup_ids,
             config_path=None,
+            skip_snapshot_refresh=bool(args.skip_rule_snapshot_refresh),
             skip_intraday_prefetch=bool(args.skip_intraday_prefetch),
             max_snapshot_refresh_age_days=int(args.rule_max_snapshot_refresh_age_days),
             max_intraday_prefetch_age_days=int(args.rule_max_intraday_prefetch_age_days),

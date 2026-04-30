@@ -265,6 +265,8 @@ def _format_exit_strategy(row: pd.Series | dict[str, Any]) -> str | None:
     stop_price = _as_float(row.get("stop_price"))
     invalidation_price = _as_float(row.get("invalidation_price"))
     recommended_stop_price = _as_float(row.get("recommended_stop_price"))
+    recommended_target_price = _as_float(row.get("recommended_target_price")) or _as_float(row.get("target_price"))
+    horizon_days = _as_float(row.get("expected_horizon_days"))
     action_fraction = _as_float(row.get("action_fraction"))
     execution_mode = _as_text(row.get("execution_mode"))
     suggested_action = (_as_text(row.get("suggested_action")) or _as_text(row.get("status")) or "").lower()
@@ -276,6 +278,10 @@ def _format_exit_strategy(row: pd.Series | dict[str, Any]) -> str | None:
         parts.append(f"Stop {stop_price:.2f}")
     if recommended_stop_price is not None and (stop_price is None or abs(recommended_stop_price - stop_price) > 1e-9):
         parts.append(f"Recommended stop {recommended_stop_price:.2f}")
+    if recommended_target_price is not None:
+        parts.append(f"Target {recommended_target_price:.2f}")
+    if horizon_days is not None and horizon_days > 0:
+        parts.append(f"Hold {int(horizon_days)}d")
     if action_fraction is not None and 0 < action_fraction < 1:
         label = "Add size" if suggested_action == "add_on_pullback" else "Scale-out"
         parts.append(f"{label} {round(action_fraction * 100.0, 1):.1f}%")
@@ -290,6 +296,7 @@ def _format_action_summary(row: pd.Series | dict[str, Any]) -> str | None:
     action = (_as_text(row.get("suggested_action")) or _as_text(row.get("status")) or "").strip().lower()
     action_fraction = _as_float(row.get("action_fraction"))
     recommended_stop_price = _as_float(row.get("recommended_stop_price"))
+    recommended_target_price = _as_float(row.get("recommended_target_price")) or _as_float(row.get("target_price"))
     execution_mode = _as_text(row.get("execution_mode"))
     if not action:
         return None
@@ -302,6 +309,8 @@ def _format_action_summary(row: pd.Series | dict[str, Any]) -> str | None:
         base = "Trim winner."
         if pct_text:
             base += f" Reduce roughly {pct_text} of current live size."
+        if recommended_target_price is not None:
+            base += f" Target zone {recommended_target_price:.2f}."
     elif action == "tighten_stop":
         base = "Tighten stop."
         if recommended_stop_price is not None:
@@ -316,6 +325,8 @@ def _format_action_summary(row: pd.Series | dict[str, Any]) -> str | None:
             base += " Emergency technical failure."
         elif action == "exit_technical_failure":
             base += " Technical thesis failure."
+        elif action == "exit_time_stop":
+            base += " Time stop fired."
     else:
         base = action.replace("_", " ").title() + "."
     if execution_mode:
@@ -494,7 +505,7 @@ def load_portfolio_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 2
     ]
     if "invest_score_pct" in available:
         select_columns.append("invest_score_pct")
-    for optional in ["thesis_bucket", "bucket_reason", "target_review_date", "expected_horizon_days", "exit_event_rules_json"]:
+    for optional in ["thesis_bucket", "bucket_reason", "target_price", "target_review_date", "expected_horizon_days", "exit_event_rules_json"]:
         if optional in available:
             select_columns.insert(4 if optional == "thesis_bucket" else len(select_columns), optional)
     clauses = ["1 = 1"]
@@ -726,7 +737,7 @@ def load_lifecycle_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 2
             clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {PORTFOLIO_TABLE})")
         fallback_df = sql_to_df(
             f"""
-            SELECT unique_id, setup_id, symbol, thesis_bucket, bucket_reason, target_review_date, expected_horizon_days, exit_event_rules_json
+            SELECT unique_id, setup_id, symbol, thesis_bucket, bucket_reason, target_price, target_review_date, expected_horizon_days, exit_event_rules_json
             FROM {PORTFOLIO_TABLE}
             WHERE {' AND '.join(clauses)}
             """,
@@ -743,6 +754,7 @@ def load_lifecycle_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 2
         fallback_cols = [
             "thesis_bucket",
             "bucket_reason",
+            "target_price",
             "target_review_date",
             "expected_horizon_days",
             "exit_event_rules_json",

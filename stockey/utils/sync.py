@@ -147,6 +147,12 @@ def normalize_date_window(
     from_date: datetime | None,
     to_date: datetime | None,
 ) -> tuple[datetime, datetime]:
-    start = pd.Timestamp(from_date or DEFAULT_START_DATE).to_pydatetime()
-    end = pd.Timestamp(to_date or datetime.today()).to_pydatetime()
+    def _as_naive_utc(value: datetime) -> datetime:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is not None:
+            timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+        return timestamp.to_pydatetime()
+
+    start = _as_naive_utc(from_date or DEFAULT_START_DATE)
+    end = _as_naive_utc(to_date or datetime.today())
     return start, end
