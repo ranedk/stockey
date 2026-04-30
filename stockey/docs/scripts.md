@@ -108,7 +108,11 @@ python scripts/agent_tool_runner.py list
 - Browser-driven loaders require Chrome remote debugging when they connect over CDP:
 
 ```sh
+Ubunnt:
 /opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup
+
+OSX:
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome  --remote-debugging-port=9222 --user-data-dir=./chromesetup
 ```
 
 - Dhan OHLCV auth falls back in this order:

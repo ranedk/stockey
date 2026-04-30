@@ -269,7 +269,12 @@ Recommended cron shape:
 Chrome remote debugging is still required for the Playwright/browser-driven flows:
 
 ```sh
+Ubuntu:
 /opt/google/chrome/chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup
+
+OSX:
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=9222 --user-data-dir=./chromesetup
+
 ```
 
 ### RBI

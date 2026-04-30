@@ -1,6 +1,7 @@
 # indices_downloader.py
 import argparse
 import os
+import sys
 import time
 import random
 from datetime import datetime, timedelta
@@ -178,12 +179,7 @@ def main() -> None:
             failures = 0 if success else failures + 1
 
     if failures >= 7:
-        restart_chrome()
-        time.sleep(20)
-        if args.backfill:
-            print("Stopped after 7 consecutive failures during backfill.")
-        else:
-            main()
+        sys.exit("Stopped after 7 consecutive failures during backfill.")
     else:
         print("All caught up! Done")
     rop.close()

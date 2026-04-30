@@ -3,17 +3,17 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/rane/.lo
 CRON_TZ=Asia/Kolkata
 MAILTO=""
 
-STOCKEY_DIR=/home/rane/code/stockey
-LOG_DIR=/home/rane/code/stockey/logs/cron
+STOCKEY_DIR=/Users/rane/code/stockey
+LOG_DIR=/Users/rane/code/stockey/logs/cron
 
 # Create log directory once before enabling the crontab:
-#   mkdir -p /home/rane/code/stockey/logs/cron
+#   mkdir -p /Users/rane/code/stockey/logs/cron
 #
 # Install with:
-#   crontab /home/rane/code/stockey/config/stockey.generated.crontab
+#   crontab /Users/rane/code/stockey/config/stockey.generated.crontab
 #
 # Or run with go-crond:
-#   ./go-crond /home/rane/code/stockey/config/stockey.generated.crontab --allow-unprivileged
+#   ./go-crond /Users/rane/code/stockey/config/stockey.generated.crontab --allow-unprivileged
 
 # Daily raw download + parse refresh before market open on weekdays.
 10 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
