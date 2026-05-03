@@ -11,7 +11,6 @@ from environs import Env
 from playwright.sync_api import sync_playwright
 from utils import store
 from utils.date import reverse_daterange
-from utils.chrome import restart_chrome
 from utils.sync import get_redis_client
 
 

@@ -8,6 +8,7 @@ from datetime import datetime
 import pandas as pd
 
 from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, exchange_events, exchange_features, intraday_features, llm_event_evaluator, macro_features, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, training_universe, watchlist_builder
+from data.announcements import pipeline as announcement_pipeline
 from data.announcements import state as announcement_state
 from data.eaindustry import wpi
 from data.dhanlive import client as dhan_client
@@ -1179,6 +1180,76 @@ def test_news_watch_matches_symbol_in_title(monkeypatch):
     assert row["symbol"] == "IGL"
     assert row["event_source"] == "economic_times_rss"
     assert row["match_score"] >= 4.0
+
+
+def test_announcement_pipeline_retries_nse_timeout(monkeypatch, capsys):
+    calls = {"count": 0, "resets": [], "sleeps": []}
+
+    class DummyResponse:
+        status_code = 200
+
+        class Cookies:
+            def get_dict(self):
+                return {}
+
+        cookies = Cookies()
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    def fake_get(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise announcement_pipeline.requests.ReadTimeout("nse timeout")
+        return DummyResponse()
+
+    pipeline_obj = object.__new__(announcement_pipeline.AnnouncementPipeline)
+    pipeline_obj.request_timeout = 60
+    pipeline_obj._nse_headers = {"accept": "*/*"}
+    pipeline_obj._nse_cookies = {"stale": "cookie"}
+    monkeypatch.setattr(announcement_pipeline, "NSE_HTTP_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(announcement_pipeline, "NSE_HTTP_RETRY_SLEEP_SECONDS", 0.01)
+    monkeypatch.setattr(announcement_pipeline, "NSE_HTTP_RETRY_MAX_SLEEP_SECONDS", 0.01)
+    monkeypatch.setattr(
+        pipeline_obj,
+        "_reset_nse_http_state",
+        lambda *, reason: calls["resets"].append(reason),
+    )
+    monkeypatch.setattr(announcement_pipeline.requests, "get", fake_get)
+    monkeypatch.setattr(announcement_pipeline.time, "sleep", lambda seconds: calls["sleeps"].append(seconds))
+
+    response = pipeline_obj._nse_get_with_retry("https://www.nseindia.com/api/test")
+    captured = capsys.readouterr()
+
+    assert isinstance(response, DummyResponse)
+    assert calls["count"] == 2
+    assert calls["resets"] == ["ReadTimeout: nse timeout"]
+    assert calls["sleeps"] == [0.01]
+    assert "NSE request failed; retrying" in captured.err
+    assert "sleep=0.0s" in captured.err
+
+
+def test_announcement_pipeline_reset_clears_nse_cookies(monkeypatch, capsys):
+    pipeline_obj = object.__new__(announcement_pipeline.AnnouncementPipeline)
+    pipeline_obj.request_timeout = 60
+    pipeline_obj._nse_headers = {"accept": "*/*", "user-agent": "stale"}
+    pipeline_obj._nse_cookies = {"stale": "cookie"}
+
+    def fake_get(*args, **kwargs):
+        raise announcement_pipeline.requests.ReadTimeout("bootstrap timeout")
+
+    monkeypatch.setattr(announcement_pipeline, "get_dynamic_headers", lambda: {"user-agent": "fresh"})
+    monkeypatch.setattr(announcement_pipeline.requests, "get", fake_get)
+
+    pipeline_obj._reset_nse_http_state(reason="test")
+    captured = capsys.readouterr()
+
+    assert pipeline_obj._nse_headers["user-agent"] == "fresh"
+    assert pipeline_obj._nse_cookies == {}
+    assert "Reset NSE HTTP session state; cleared cookies reason=test" in captured.err
 
 
 def test_announcement_watch_deduplicates_ingest_by_symbol(monkeypatch):

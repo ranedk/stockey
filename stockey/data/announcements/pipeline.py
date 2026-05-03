@@ -3,6 +3,7 @@ from __future__ import annotations
 import mimetypes
 import json
 import re
+import sys
 import tempfile
 import textwrap
 import time
@@ -36,6 +37,10 @@ OPENAI_API_KEY = env("OPENAI_API_KEY")
 OCR_USING = env("OCR_USING", default="gemini-3-flash-preview")
 TRANSCRIBE_WITH = env("TRANSCRIBE_WITH", default="gemini-3-flash-preview")
 SUMMARIZE_WITH = env("SUMMARIZE_WITH", default="gpt-5-mini-2025-08-07")
+NSE_HTTP_MAX_ATTEMPTS = env.int("NSE_HTTP_MAX_ATTEMPTS", default=0)
+NSE_HTTP_RETRY_SLEEP_SECONDS = env.float("NSE_HTTP_RETRY_SLEEP_SECONDS", default=5.0)
+NSE_HTTP_RETRY_MAX_SLEEP_SECONDS = env.float("NSE_HTTP_RETRY_MAX_SLEEP_SECONDS", default=120.0)
+NSE_HTTP_RETRY_STATUSES = {429, 500, 502, 503, 504}
 Provider = Literal["openai", "gemini"]
 _AUDIO_EXTENSIONS = {"mp3", "wav", "mp4", "m4a", "aac", "ogg", "webm"}
 _AUDIO_LINK_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
@@ -56,6 +61,64 @@ class AnnouncementPipeline:
         self.request_timeout = request_timeout
         self._bse_headers = self._build_bse_headers()
         self._nse_headers, self._nse_cookies = self._build_nse_session()
+
+    def _nse_get_with_retry(
+        self,
+        url: str,
+        *,
+        params: Dict | None = None,
+        headers: Dict | None = None,
+        cookies: Dict | None = None,
+        max_attempts: int | None = None,
+    ) -> requests.Response:
+        attempt = 0
+        last_error: Exception | None = None
+        attempt_cap = NSE_HTTP_MAX_ATTEMPTS if max_attempts is None else int(max_attempts)
+        while True:
+            attempt += 1
+            try:
+                request_headers = headers if headers is not None else self._nse_headers
+                request_cookies = cookies if cookies is not None else self._nse_cookies
+                response = requests.get(
+                    url,
+                    params=params,
+                    headers=request_headers,
+                    cookies=request_cookies,
+                    timeout=self.request_timeout,
+                )
+                if response.status_code in NSE_HTTP_RETRY_STATUSES:
+                    raise requests.HTTPError(f"NSE transient HTTP {response.status_code}", response=response)
+                response.raise_for_status()
+                return response
+            except (requests.Timeout, requests.ConnectionError, requests.HTTPError) as exc:
+                last_error = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                is_retryable_http = status_code in NSE_HTTP_RETRY_STATUSES
+                is_retryable_network = isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                if not (is_retryable_http or is_retryable_network):
+                    raise
+                if attempt_cap > 0 and attempt >= attempt_cap:
+                    raise
+                sleep_for = min(
+                    NSE_HTTP_RETRY_SLEEP_SECONDS * max(attempt, 1),
+                    NSE_HTTP_RETRY_MAX_SLEEP_SECONDS,
+                )
+                reset_state = headers is None and cookies is None
+                if reset_state:
+                    self._reset_nse_http_state(reason=f"{exc.__class__.__name__}: {exc}")
+                self._log_nse_wait(
+                    "NSE request failed; retrying url=%s attempt=%s max_attempts=%s sleep=%.1fs error=%s: %s",
+                    url,
+                    attempt,
+                    "infinite" if attempt_cap <= 0 else attempt_cap,
+                    sleep_for,
+                    exc.__class__.__name__,
+                    exc,
+                )
+                time.sleep(sleep_for)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"NSE request failed without exception: {url}")
 
     def fetch_announcements(
         self,
@@ -323,7 +386,7 @@ class AnnouncementPipeline:
         return [self._normalize_bse_announcement(company, row) for row in rows]
 
     def _fetch_nse_announcements(self, company: CompanyMasterTarget, since: datetime) -> List[Announcement]:
-        response = requests.get(
+        response = self._nse_get_with_retry(
             "https://www.nseindia.com/api/corporate-disclosure-getquote",
             params={
                 "symbol": company.ticker,
@@ -332,11 +395,7 @@ class AnnouncementPipeline:
                 "from_date": since.astimezone(pytz.UTC).strftime("%d-%m-%Y"),
                 "to_date": datetime.now().strftime("%d-%m-%Y"),
             },
-            headers=self._nse_headers,
-            cookies=self._nse_cookies,
-            timeout=self.request_timeout,
         )
-        response.raise_for_status()
         return [self._normalize_nse_announcement(company, row) for row in response.json()]
 
     def _normalize_bse_announcement(self, company: CompanyMasterTarget, row: Dict) -> Announcement:
@@ -485,39 +544,84 @@ class AnnouncementPipeline:
         headers.update({"origin": "https://www.bseindia.com", "referer": "https://www.bseindia.com/"})
         return headers
 
-    def _build_nse_session(self):
-        last_error: Exception | None = None
+    def _build_nse_headers(self) -> Dict[str, str]:
+        headers = get_dynamic_headers()
+        headers.update(
+            {
+                "accept": "*/*",
+                "origin": "https://www.nseindia.com",
+                "referer": "https://www.nseindia.com",
+            }
+        )
+        return headers
+
+    def _log_nse_wait(self, message: str, *args) -> None:
+        rendered = message % args if args else message
+        logger.warning(rendered)
+        print(f"[announcement_pipeline.nse] {rendered}", file=sys.stderr, flush=True)
+
+    def _bootstrap_nse_cookies_once(self, headers: Dict[str, str]) -> Dict[str, str]:
         bootstrap_urls = [
             "https://www.nseindia.com",
             "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
         ]
-        for attempt in range(1, 6):
-            headers = get_dynamic_headers()
-            headers.update(
-                {
-                    "accept": "*/*",
-                    "origin": "https://www.nseindia.com",
-                    "referer": "https://www.nseindia.com",
-                }
+        last_error: Exception | None = None
+        for bootstrap_url in bootstrap_urls:
+            try:
+                response = requests.get(
+                    bootstrap_url,
+                    headers=headers,
+                    cookies={},
+                    timeout=self.request_timeout,
+                )
+                response.raise_for_status()
+                cookies = response.cookies.get_dict()
+                logger.info("NSE session bootstrap succeeded url=%s cookies=%s", bootstrap_url, len(cookies))
+                return cookies
+            except requests.RequestException as exc:
+                last_error = exc
+                logger.warning("NSE session bootstrap failed url=%s error=%s: %s", bootstrap_url, exc.__class__.__name__, exc)
+        if last_error is not None:
+            raise last_error
+        return {}
+
+    def _reset_nse_http_state(self, *, reason: str) -> None:
+        self._nse_headers = self._build_nse_headers()
+        self._nse_cookies = {}
+        self._log_nse_wait("Reset NSE HTTP session state; cleared cookies reason=%s", reason)
+        try:
+            self._nse_cookies = self._bootstrap_nse_cookies_once(self._nse_headers)
+        except requests.RequestException as exc:
+            self._log_nse_wait(
+                "NSE cookie bootstrap after reset failed; continuing with empty cookies error=%s: %s",
+                exc.__class__.__name__,
+                exc,
             )
-            for bootstrap_url in bootstrap_urls:
-                try:
-                    response = requests.get(bootstrap_url, headers=headers, timeout=self.request_timeout)
-                    response.raise_for_status()
-                    return headers, response.cookies.get_dict()
-                except requests.RequestException as exc:
-                    last_error = exc
-                    logger.warning(
-                        "NSE session bootstrap failed on attempt %s for %s: %s",
-                        attempt,
-                        bootstrap_url,
-                        exc,
-                    )
-            if attempt < 5:
-                sleep_for = min(2 ** (attempt - 1), 8)
-                time.sleep(sleep_for)
-        logger.warning("Proceeding without NSE bootstrap cookies after repeated failures")
-        return headers, {}
+
+    def _build_nse_session(self):
+        attempt = 0
+        while True:
+            attempt += 1
+            headers = self._build_nse_headers()
+            try:
+                return headers, self._bootstrap_nse_cookies_once(headers)
+            except requests.RequestException as exc:
+                self._log_nse_wait(
+                    "NSE session bootstrap failed; retrying attempt=%s max_attempts=%s error=%s: %s",
+                    attempt,
+                    "infinite" if NSE_HTTP_MAX_ATTEMPTS <= 0 else NSE_HTTP_MAX_ATTEMPTS,
+                    exc.__class__.__name__,
+                    exc,
+                )
+            if NSE_HTTP_MAX_ATTEMPTS > 0 and attempt >= NSE_HTTP_MAX_ATTEMPTS:
+                self._log_nse_wait("Proceeding without NSE bootstrap cookies after repeated failures")
+                return headers, {}
+            sleep_for = min(
+                NSE_HTTP_RETRY_SLEEP_SECONDS * max(attempt, 1),
+                NSE_HTTP_RETRY_MAX_SLEEP_SECONDS,
+            )
+            self._log_nse_wait("Waiting before NSE session bootstrap retry sleep=%.1fs", sleep_for)
+            time.sleep(sleep_for)
 
     def _get_openai_client(self) -> OpenAI:
         if self.openai_client is None:

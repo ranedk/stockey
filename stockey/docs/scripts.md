@@ -115,6 +115,8 @@ OSX:
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome  --remote-debugging-port=9222 --user-data-dir=./chromesetup
 ```
 
+- NSE direct HTTP calls retry transient timeouts, connection errors, `429`, and `5xx` responses. `NSE_HTTP_MAX_ATTEMPTS=0` means keep retrying until the site recovers. Use `NSE_HTTP_RETRY_SLEEP_SECONDS` and `NSE_HTTP_RETRY_MAX_SLEEP_SECONDS` to control backoff. Retries are printed to stderr as `[announcement_pipeline.nse] ...` so cron logs show when the process is waiting; before each retry the announcement client clears stale NSE cookies, rebuilds headers, and tries to bootstrap fresh NSE cookies.
+
 - Dhan OHLCV auth falls back in this order:
   1. `DHAN_ACCESS_TOKEN`
   2. cached token at `.cache/dhan_access_token.json`
