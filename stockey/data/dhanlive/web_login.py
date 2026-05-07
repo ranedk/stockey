@@ -16,9 +16,9 @@ env = Env()
 env.read_env()
 
 CDP_ENDPOINT = env("CDP_ENDPOINT", "")
-DHAN_LOGIN_MOBILE = env("DHAN_LOGIN_MOBILE")
-DHAN_LOGIN_PIN = env("DHAN_LOGIN_PIN")
-DHAN_TOTP_SECRET = env("DHAN_TOTP_SECRET")
+DHAN_LOGIN_MOBILE = env("DHAN_LOGIN_MOBILE", "")
+DHAN_LOGIN_PIN = env("DHAN_LOGIN_PIN", "")
+DHAN_TOTP_SECRET = env("DHAN_TOTP_SECRET", "")
 
 MOBILE_INPUT_SELECTOR = "input[type='tel'][maxlength='10'], input[placeholder*='mobile' i]"
 PROCEED_BUTTON_SELECTOR = "button[type='submit']:has-text('Proceed'), button.btn.btn-primary:has-text('Proceed')"
@@ -123,10 +123,7 @@ def run_dhan_consent_login(
     page.wait_for_timeout(1000)
     fill_digit_code(page, generate_totp(totp_secret), selector=CODE_INPUT_SELECTOR, timeout_ms=timeout_ms)
     page.wait_for_timeout(3000)
-    # _click_enabled_proceed(page, timeout_ms=timeout_ms)
 
-
-    pin_inputs = page.locator(PIN_INPUT_SELECTOR)
     # To capture redirection to a non-existent url is tricky
     nav_capture = {
         "requested_url": None,
@@ -150,9 +147,10 @@ def run_dhan_consent_login(
             nav_capture["failed_url"] = request.url
             nav_capture["failure"] = request.failure
 
-    page.on("request", on_request)
-    page.on("response", on_response)
-    page.on("requestfailed", on_request_failed)
+    if hasattr(page, "on"):
+        page.on("request", on_request)
+        page.on("response", on_response)
+        page.on("requestfailed", on_request_failed)
 
     fill_digit_code(
         page,
@@ -167,9 +165,16 @@ def run_dhan_consent_login(
         nav_capture["failed_url"]
         or nav_capture["response_url"]
         or nav_capture["requested_url"]
+        or getattr(page, "url", None)
     )
 
     token_id = extract_token_id(str(actual_url))
+    if not token_id:
+        try:
+            page.wait_for_function(f"() => window.location.href.includes('{TOKEN_URL_MARKER}')", timeout=timeout_ms)
+            token_id = extract_token_id(str(page.url))
+        except PlaywrightTimeoutError:
+            token_id = None
 
     if not token_id:
         raise DhanAuthError(f"Dhan login redirected without tokenId. Current page: {page.url}")
@@ -217,4 +222,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

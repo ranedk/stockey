@@ -137,6 +137,22 @@ def begin_browser_consent() -> str:
     return consent_url
 
 
+def is_auto_login_configured() -> bool:
+    if env.bool("DHAN_AUTO_LOGIN_ENABLED", default=False):
+        return True
+    return all(
+        bool(env(name, default=None))
+        for name in ("CDP_ENDPOINT", "DHAN_LOGIN_MOBILE", "DHAN_LOGIN_PIN", "DHAN_TOTP_SECRET")
+    )
+
+
+def get_token_id_from_auto_login() -> str:
+    from data.dhanlive.web_login import get_token_id_via_automated_login
+
+    consent_url = build_new_consent_url()
+    return get_token_id_via_automated_login(consent_url)
+
+
 def get_access_token() -> str:
     direct = env("DHAN_ACCESS_TOKEN", default=None)
     if direct:
@@ -150,11 +166,8 @@ def get_access_token() -> str:
     if token_id:
         return str(consume_consent_token(token_id)["accessToken"])
 
-    if env.bool("DHAN_AUTO_LOGIN_ENABLED", default=False):
-        from data.dhanlive.web_login import get_token_id_via_automated_login
-
-        consent_url = build_new_consent_url()
-        return str(consume_consent_token(get_token_id_via_automated_login(consent_url))["accessToken"])
+    if is_auto_login_configured():
+        return str(consume_consent_token(get_token_id_from_auto_login())["accessToken"])
     consent_url = begin_browser_consent()
     pasted_token_id = prompt_for_token_id(consent_url)
     return str(consume_consent_token(pasted_token_id)["accessToken"])

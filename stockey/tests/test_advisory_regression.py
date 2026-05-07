@@ -11,6 +11,8 @@ from advisory import adversarial_review, announcement_watch, continuous_watch, d
 from data.announcements import pipeline as announcement_pipeline
 from data.announcements import state as announcement_state
 from data.eaindustry import wpi
+from data.dhanlive import auth as dhan_auth
+from data.dhanlive import auth_cli as dhan_auth_cli
 from data.dhanlive import client as dhan_client
 from data.dhanlive import web_login as dhan_web_login
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv
@@ -357,6 +359,37 @@ def test_dhan_web_login_generates_totp(monkeypatch):
     monkeypatch.setattr(dhan_web_login.pyotp, "TOTP", FakeTOTP)
 
     assert dhan_web_login.generate_totp("abc") == "111222"
+
+
+def test_dhan_access_token_uses_auto_login_when_configured(monkeypatch):
+    class FakeEnv:
+        def __call__(self, name, default=None):
+            return None
+
+    monkeypatch.setattr(dhan_auth, "load_cached_access_token", lambda: None)
+    monkeypatch.setattr(dhan_auth, "normalize_token_id", lambda value: value)
+    monkeypatch.setattr(dhan_auth, "is_auto_login_configured", lambda: True)
+    monkeypatch.setattr(dhan_auth, "get_token_id_from_auto_login", lambda: "TOKEN123")
+    monkeypatch.setattr(dhan_auth, "consume_consent_token", lambda token_id: {"accessToken": f"access:{token_id}"})
+    monkeypatch.setattr(dhan_auth, "begin_browser_consent", lambda: (_ for _ in ()).throw(AssertionError("manual browser opened")))
+    monkeypatch.setattr(dhan_auth, "env", FakeEnv())
+
+    assert dhan_auth.get_access_token() == "access:TOKEN123"
+
+
+def test_dhan_auth_cli_refresh_auto_login_without_manual_browser(monkeypatch):
+    monkeypatch.setattr(dhan_auth_cli, "normalize_token_id", lambda value: None)
+    monkeypatch.setattr(dhan_auth_cli, "is_auto_login_configured", lambda: True)
+    monkeypatch.setattr(dhan_auth_cli, "get_token_id_from_auto_login", lambda: "TOKEN123")
+    monkeypatch.setattr(dhan_auth_cli, "consume_consent_token", lambda token_id: {"accessToken": f"access:{token_id}", "expiryTime": "2026-05-07T10:00:00Z"})
+    monkeypatch.setattr(dhan_auth_cli, "validate_token", lambda access_token: {"status": "ok", "access_token": access_token})
+    monkeypatch.setattr(dhan_auth_cli, "begin_browser_consent", lambda: (_ for _ in ()).throw(AssertionError("manual browser opened")))
+
+    result = dhan_auth_cli.refresh_token()
+
+    assert result["status"] == "ok"
+    assert result["token_id_used"] == "TOKEN123"
+    assert result["validation"] == {"status": "ok", "access_token": "access:TOKEN123"}
 
 
 def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):

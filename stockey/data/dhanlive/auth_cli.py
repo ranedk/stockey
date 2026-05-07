@@ -10,9 +10,10 @@ from data.dhanlive.auth import (
     DEFAULT_TOKEN_CACHE,
     DhanAuthError,
     begin_browser_consent,
-    build_new_consent_url,
     clear_cached_access_token,
     consume_consent_token,
+    get_token_id_from_auto_login,
+    is_auto_login_configured,
     load_cached_access_token_payload,
     normalize_token_id,
     prompt_for_token_id,
@@ -84,13 +85,10 @@ def refresh_token(token_input: str | None = None, *, auto_login: bool = False) -
     normalized = normalize_token_id(token_input)
     consent_url = None
     if not normalized:
-        consent_url = build_new_consent_url() if auto_login else begin_browser_consent()
-        print("Consent Url: ", consent_url)
-        if auto_login:
-            from data.dhanlive.web_login import get_token_id_via_automated_login
-
-            normalized = get_token_id_via_automated_login(consent_url)
+        if auto_login or is_auto_login_configured():
+            normalized = get_token_id_from_auto_login()
         else:
+            consent_url = begin_browser_consent()
             normalized = prompt_for_token_id(consent_url)
     payload = consume_consent_token(normalized)
     validation = validate_token(str(payload["accessToken"]))
@@ -159,9 +157,7 @@ def main() -> int:
     if args.command == "refresh":
         if args.clear_cache_first:
             clear_cached_access_token()
-        # print(json.dumps(refresh_token(args.token_id, auto_login=bool(args.auto_login)), indent=2, ensure_ascii=False, default=str))
-        token_data = refresh_token(args.token_id, auto_login=True)
-        print("Token data> ", token_data)
+        print(json.dumps(refresh_token(args.token_id, auto_login=bool(args.auto_login)), indent=2, ensure_ascii=False, default=str))
         return 0
 
     raise SystemExit(f"Unsupported command: {args.command}")

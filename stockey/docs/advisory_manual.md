@@ -831,6 +831,8 @@ python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login
 python -m data.dhanlive.auth_cli validate
 ```
 
+If `CDP_ENDPOINT`, `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN` are configured, the regular Dhan clients use the automated Playwright login automatically when the cached access token is missing or expired.
+
 ### Screener looks empty
 
 Check:

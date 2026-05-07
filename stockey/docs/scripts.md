@@ -126,7 +126,7 @@ OSX:
   2. cached token at `.cache/dhan_access_token.json`
   3. API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET`
 - In the API key flow, the default path opens the Dhan consent page in the browser and waits for you to paste the redirected URL back into the terminal. The access token is then cached until expiry.
-- Optional Dhan browser automation uses the running Chrome CDP session plus `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN`. It generates the TOTP with `pyotp`, fills the consent login, extracts `tokenId`, and then uses the same official consent-token exchange.
+- Dhan browser automation uses the running Chrome CDP session plus `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN`. When those values and `CDP_ENDPOINT` are configured, Dhan clients auto-refresh through Playwright after token cache expiry instead of asking for manual pasted consent. You can also force this path with `DHAN_AUTO_LOGIN_ENABLED=true`.
 
 Quick Dhan token maintenance:
 

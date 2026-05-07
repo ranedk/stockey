@@ -178,7 +178,7 @@ The Dhan historical loader supports two auth modes:
 - `DHAN_ACCESS_TOKEN` directly, if you already have a valid user token
 - API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, and `DHAN_API_SECRET`
 
-With the API key flow, the default path opens the Dhan consent URL in a normal browser. After login, paste the full redirected URL back into the same terminal; the loader extracts `tokenId`, exchanges it for an access token, and caches that token under `.cache/dhan_access_token.json` for later runs until expiry. Optional Playwright/CDP automation is available with `--auto-login` when `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN` are configured.
+With the API key flow, the default manual path opens the Dhan consent URL in a normal browser. After login, paste the full redirected URL back into the same terminal; the loader extracts `tokenId`, exchanges it for an access token, and caches that token under `.cache/dhan_access_token.json` for later runs until expiry. When `CDP_ENDPOINT`, `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN` are configured, Dhan clients auto-refresh through Playwright after token cache expiry. You can also force that path with `DHAN_AUTO_LOGIN_ENABLED=true`.
 
 If the cached token becomes invalid before its stored expiry, refresh it directly with:
 
