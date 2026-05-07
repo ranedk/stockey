@@ -30,9 +30,10 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync resumes from the latest stored candle with overlap, and backfills only when no local data exists |
 | `data/dhanlive/ohlcv_pull.py` | none | Quick operator OHLCV pull utility; defaults to NSE equity, 5-minute candles, and the last 60 minutes |
 | `advisory/intraday_features.py` | `advisory_intraday_features_daily` | On-demand advisory intraday feature builder; pulls missing intraday candles for the active screener universe and persists daily intraday pattern features |
+| `data/screenerin/auth.py` | Browser session | Ensures Screener.in login through the running Chrome CDP session using `SCREENER_IN_LOGIN` and `SCREENER_IN_PASSWORD` |
 | `data/screenerin/screener_parser.py` | `screenerin_screener_snapshots` | Stores parsed Screener.in screener snapshots by screener slug and date |
 | `data/screenerin/screener_registry.py` | `screenerin_screeners` | Registry utility to add/list/remove Screener.in screeners and inspect latest stored snapshots |
-| `data/screenerin/ad_hoc_query.py` | `screenerin_ad_hoc_query_runs`, `screenerin_ad_hoc_query_results` | Authenticated ad hoc Screener.in raw query runner; blocks for manual login if needed and stores parsed company rows plus queried metrics |
+| `data/screenerin/ad_hoc_query.py` | `screenerin_ad_hoc_query_runs`, `screenerin_ad_hoc_query_results` | Authenticated ad hoc Screener.in raw query runner; auto-logins through CDP when needed and stores parsed company rows plus queried metrics |
 | `advisory/research_ledger.py` | `advisory_research_runs` | Research ledger for recording experiment configs, point-in-time context, validation protocol, and run outcomes |
 | `advisory/training_universe.py` | `advisory_screener_constituents` | Sync broad ad hoc Screener.in training universes directly into normalized advisory screener rows for research-only event-model coverage |
 | `advisory/event_meta_model.py` | `advisory_event_model_scores` | Train/score scaffold for XGBoost event meta-models using structured event tensors, anchor-day intraday response features, and future daily returns |
@@ -124,7 +125,8 @@ OSX:
   1. `DHAN_ACCESS_TOKEN`
   2. cached token at `.cache/dhan_access_token.json`
   3. API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET`
-- In the API key flow, the script opens the Dhan consent page in the browser and waits for you to paste the redirected URL back into the terminal. The access token is then cached until expiry.
+- In the API key flow, the default path opens the Dhan consent page in the browser and waits for you to paste the redirected URL back into the terminal. The access token is then cached until expiry.
+- Optional Dhan browser automation uses the running Chrome CDP session plus `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN`. It generates the TOTP with `pyotp`, fills the consent login, extracts `tokenId`, and then uses the same official consent-token exchange.
 
 Quick Dhan token maintenance:
 
@@ -132,6 +134,8 @@ Quick Dhan token maintenance:
 python -m data.dhanlive.auth_cli status
 python -m data.dhanlive.auth_cli validate
 python -m data.dhanlive.auth_cli refresh --clear-cache-first
+python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login
+python -m data.dhanlive.web_login --consent-url "https://auth.dhan.co/login/consentApp-login?consentAppId=..."
 python -m data.dhanlive.auth_cli clear-cache
 ```
 
@@ -325,16 +329,22 @@ Downloader: `data.screenerin.screener_parser`
 
 Ad hoc query runner: `data.screenerin.ad_hoc_query`
 
+Login helper: `data.screenerin.auth`
+
 Recommended workflow:
 
-1. Use `data.screenerin.ad_hoc_query` for one-off research and idea generation.
-2. Only register a screener when it becomes a recurring production input for a setup or theme.
-3. Let `./all_advisory.sh` or `python -m advisory.master_pipeline` sync the active production registry and run the downstream advisory flow daily.
-4. Inspect latest production snapshots with the registry utility.
+1. Set `CDP_ENDPOINT`, `SCREENER_IN_LOGIN`, and `SCREENER_IN_PASSWORD`.
+2. Use `data.screenerin.auth` to check or establish login when debugging.
+3. Use `data.screenerin.ad_hoc_query` for one-off research and idea generation.
+4. Only register a screener when it becomes a recurring production input for a setup or theme.
+5. Let `./all_advisory.sh` or `python -m advisory.master_pipeline` sync the active production registry and run the downstream advisory flow daily.
+6. Inspect latest production snapshots with the registry utility.
 
 Commands:
 
 ```sh
+python -m data.screenerin.auth --check
+python -m data.screenerin.auth
 python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-production-screen/"
 python -m data.screenerin.screener_registry list
 python -m data.screenerin.screener_registry query --name "Deep Value ROCE" --query "Market capitalization > 500 AND Price to earning < 15 AND Return on capital employed > 22%"
@@ -356,7 +366,10 @@ Operational notes:
 - Snapshots are stored in `screenerin_screener_snapshots` by `date + screener_slug`.
 - `latest` is compact by default; use `--raw` to print the full stored JSON payload.
 - `data.screenerin.ad_hoc_query` assumes Chrome is already running with remote debugging enabled.
-- `data.screenerin.ad_hoc_query` checks `https://www.screener.in/dash/` first and blocks in the terminal if manual login is required.
+- Screener.in flows check `https://www.screener.in/login/`; if already authenticated, it redirects to `/dash/`.
+- If login is required, `data.screenerin.auth` fills the username/password form from env and verifies that `/dash/` is reached.
+- The Screener.in password is never printed.
+- `data.screenerin.ad_hoc_query` and `data.screenerin.screener_parser` ensure logged-in mode before fetching Screener.in data.
 - ad hoc runs are stored in `screenerin_ad_hoc_query_runs`.
 - normalized company rows for ad hoc runs are stored in `screenerin_ad_hoc_query_results`.
 - parsed ad hoc output includes `company_name`, `ticker`, `company_url`, `rank`, and `metrics`.

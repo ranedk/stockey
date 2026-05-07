@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import re
-import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,20 +12,11 @@ from urllib.parse import urlencode
 
 import pandas as pd
 import requests
-from environs import Env
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
 
+from data.screenerin.auth import build_authenticated_requests_session, ensure_screener_logged_in, open_screener_browser_session
 from data.screenerin.screener_parser import SOURCE_NAME, parse_screener_html
 from utils.db import db_session, upsert_to_db
-from utils.http import get_dynamic_headers
 
-
-env = Env()
-env.read_env()
-
-CDP_ENDPOINT = env("CDP_ENDPOINT")
-DASHBOARD_URL = "https://www.screener.in/dash/"
 RAW_SCREEN_URL = "https://www.screener.in/screen/raw/"
 RUNS_TABLE = "screenerin_ad_hoc_query_runs"
 RESULTS_TABLE = "screenerin_ad_hoc_query_results"
@@ -89,40 +79,6 @@ def ensure_tables() -> None:
             """
         )
         cur.execute(f"ALTER TABLE {RESULTS_TABLE} ADD COLUMN IF NOT EXISTS ticker TEXT")
-
-
-def open_logged_in_browser():
-    playwright = sync_playwright().start()
-    browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
-    context = browser.contexts[0] if browser.contexts else browser.new_context()
-    page = context.new_page()
-    return playwright, browser, context, page
-
-
-def ensure_logged_in(context, page) -> None:
-    page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
-    if "login" not in page.url and "/dash/" in page.url:
-        return
-
-    print("Screener.in login required. Complete login in the opened browser tab, then press Enter here.", flush=True)
-    print(f"Current page: {page.url}", flush=True)
-    input()
-    try:
-        page.goto(DASHBOARD_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
-    except PlaywrightTimeoutError:
-        pass
-    if "login" in page.url or "/dash/" not in page.url:
-        raise SystemExit(f"Screener.in login not detected. Current page: {page.url}")
-
-
-def build_requests_session_from_context(context) -> requests.Session:
-    session = requests.Session()
-    session.headers.update(get_dynamic_headers())
-    for cookie in context.cookies():
-        session.cookies.set(cookie["name"], cookie["value"], domain=cookie.get("domain"), path=cookie.get("path"))
-    return session
 
 
 def build_raw_screen_url(query_text: str) -> str:
@@ -203,16 +159,13 @@ def fetch_ad_hoc_payload(*, query_text: str, query_name: str | None = None, pers
     query_run_id = str(uuid.uuid4())
     run_ts = datetime.now(timezone.utc)
 
-    playwright, browser, context, page = open_logged_in_browser()
+    browser_session = open_screener_browser_session()
     try:
-        ensure_logged_in(context, page)
-        session = build_requests_session_from_context(context)
+        ensure_screener_logged_in(browser_session.context, browser_session.page)
+        session = build_authenticated_requests_session(browser_session.context)
         screener_url, html = execute_query(session, query_text)
     finally:
-        page.close()
-        context.close()
-        browser.close()
-        playwright.stop()
+        browser_session.close()
 
     payload = parse_screener_html(html, url=screener_url)
     payload["source_name"] = SOURCE_NAME

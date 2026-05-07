@@ -126,9 +126,13 @@ def build_consent_login_url(consent_app_id: str) -> str:
     return f"{AUTH_BASE_URL}/login/consentApp-login?consentAppId={consent_app_id}"
 
 
-def begin_browser_consent() -> str:
+def build_new_consent_url() -> str:
     consent_app_id = generate_consent_app_id()
-    consent_url = build_consent_login_url(consent_app_id)
+    return build_consent_login_url(consent_app_id)
+
+
+def begin_browser_consent() -> str:
+    consent_url = build_new_consent_url()
     open_browser_url(consent_url)
     return consent_url
 
@@ -146,6 +150,11 @@ def get_access_token() -> str:
     if token_id:
         return str(consume_consent_token(token_id)["accessToken"])
 
+    if env.bool("DHAN_AUTO_LOGIN_ENABLED", default=False):
+        from data.dhanlive.web_login import get_token_id_via_automated_login
+
+        consent_url = build_new_consent_url()
+        return str(consume_consent_token(get_token_id_via_automated_login(consent_url))["accessToken"])
     consent_url = begin_browser_consent()
     pasted_token_id = prompt_for_token_id(consent_url)
     return str(consume_consent_token(pasted_token_id)["accessToken"])

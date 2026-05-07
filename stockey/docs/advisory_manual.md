@@ -501,6 +501,7 @@ Deprioritized:
 ## How to add a new screener
 
 The system currently uses Screener.in as the active advisory screener source for recurring production universes.
+All Screener.in fetches use logged-in mode through the configured Chrome CDP session. Set `CDP_ENDPOINT`, `SCREENER_IN_LOGIN`, and `SCREENER_IN_PASSWORD`, then use `python -m data.screenerin.auth --check` or `python -m data.screenerin.auth` when debugging login state.
 
 For one-off exploration, prefer ad hoc queries first:
 
@@ -826,6 +827,7 @@ Use:
 ```sh
 python -m data.dhanlive.auth_cli status
 python -m data.dhanlive.auth_cli refresh --clear-cache-first
+python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login
 python -m data.dhanlive.auth_cli validate
 ```
 

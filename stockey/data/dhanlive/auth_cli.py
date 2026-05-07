@@ -10,6 +10,7 @@ from data.dhanlive.auth import (
     DEFAULT_TOKEN_CACHE,
     DhanAuthError,
     begin_browser_consent,
+    build_new_consent_url,
     clear_cached_access_token,
     consume_consent_token,
     load_cached_access_token_payload,
@@ -79,12 +80,18 @@ def validate_token(access_token: str) -> dict[str, object]:
         }
 
 
-def refresh_token(token_input: str | None = None) -> dict[str, object]:
+def refresh_token(token_input: str | None = None, *, auto_login: bool = False) -> dict[str, object]:
     normalized = normalize_token_id(token_input)
     consent_url = None
     if not normalized:
-        consent_url = begin_browser_consent()
-        normalized = prompt_for_token_id(consent_url)
+        consent_url = build_new_consent_url() if auto_login else begin_browser_consent()
+        print("Consent Url: ", consent_url)
+        if auto_login:
+            from data.dhanlive.web_login import get_token_id_via_automated_login
+
+            normalized = get_token_id_via_automated_login(consent_url)
+        else:
+            normalized = prompt_for_token_id(consent_url)
     payload = consume_consent_token(normalized)
     validation = validate_token(str(payload["accessToken"]))
     return {
@@ -110,6 +117,7 @@ def parse_args() -> argparse.Namespace:
     refresh_parser = subparsers.add_parser("refresh", help="Refresh the cached Dhan token using browser consent")
     refresh_parser.add_argument("--token-id", help="Optional raw tokenId or redirected URL; skips opening the browser if provided")
     refresh_parser.add_argument("--clear-cache-first", action="store_true", help="Delete the existing cached token before refreshing")
+    refresh_parser.add_argument("--auto-login", action="store_true", help="Use Playwright/CDP plus DHAN_LOGIN_MOBILE, DHAN_TOTP_SECRET, and DHAN_LOGIN_PIN to complete consent login")
 
     subparsers.add_parser("clear-cache", help="Delete the cached Dhan access token file")
     return parser.parse_args()
@@ -151,7 +159,9 @@ def main() -> int:
     if args.command == "refresh":
         if args.clear_cache_first:
             clear_cached_access_token()
-        print(json.dumps(refresh_token(args.token_id), indent=2, ensure_ascii=False, default=str))
+        # print(json.dumps(refresh_token(args.token_id, auto_login=bool(args.auto_login)), indent=2, ensure_ascii=False, default=str))
+        token_data = refresh_token(args.token_id, auto_login=True)
+        print("Token data> ", token_data)
         return 0
 
     raise SystemExit(f"Unsupported command: {args.command}")

@@ -12,8 +12,10 @@ from data.announcements import pipeline as announcement_pipeline
 from data.announcements import state as announcement_state
 from data.eaindustry import wpi
 from data.dhanlive import client as dhan_client
+from data.dhanlive import web_login as dhan_web_login
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv
 from data.nseindia import bhavcopy_downloader, bhavcopy_parser, indices_downloader, indices_parser, offmarket, recent_events
+from data.screenerin import auth as screener_auth
 from data.mospi import cpi
 from data.nsdl import fpi
 from data import download_runner
@@ -218,6 +220,143 @@ def test_resilient_redis_enters_cooldown_after_failure(monkeypatch):
 
     assert client.sadd("test", "value2") == 0
     assert calls["attempts"] == 3
+
+
+def test_screener_auth_auto_login_fills_credentials_and_reaches_dash():
+    class FakePage:
+        def __init__(self):
+            self.url = "https://www.screener.in/login/"
+            self.actions = []
+
+        def goto(self, url, wait_until=None):
+            self.actions.append(("goto", url, wait_until))
+            self.url = url
+
+        def wait_for_timeout(self, value):
+            self.actions.append(("wait", value))
+
+        def fill(self, selector, value):
+            self.actions.append(("fill", selector, value))
+
+        def click(self, selector):
+            self.actions.append(("click", selector))
+            self.url = "https://www.screener.in/dash/"
+
+        def wait_for_url(self, pattern, timeout=None):
+            self.actions.append(("wait_for_url", pattern, timeout))
+
+    page = FakePage()
+
+    screener_auth.auto_login(page, username="user@example.com", password="secret", wait_ms=5000)
+
+    assert ("fill", screener_auth.USERNAME_SELECTOR, "user@example.com") in page.actions
+    assert ("fill", screener_auth.PASSWORD_SELECTOR, "secret") in page.actions
+    assert ("click", screener_auth.SUBMIT_SELECTOR) in page.actions
+    assert page.url == "https://www.screener.in/dash/"
+
+
+def test_screener_auth_is_logged_in_uses_login_redirect_to_dash():
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+
+        def goto(self, url, wait_until=None):
+            self.url = "https://www.screener.in/dash/"
+
+        def wait_for_timeout(self, value):
+            pass
+
+    assert screener_auth.is_logged_in(FakePage()) is True
+
+
+def test_dhan_web_login_fills_mobile_totp_pin_and_extracts_token(monkeypatch):
+    class FakeLocator:
+        def __init__(self, page, name, count=1):
+            self.page = page
+            self.name = name
+            self._count = count
+
+        @property
+        def first(self):
+            return self.nth(0)
+
+        @property
+        def last(self):
+            return self.nth(max(self._count - 1, 0))
+
+        def nth(self, index):
+            return FakeLocator(self.page, f"{self.name}[{index}]", count=1)
+
+        def count(self):
+            return self._count
+
+        def wait_for(self, **kwargs):
+            self.page.actions.append(("wait_for", self.name, kwargs))
+
+        def fill(self, value, **kwargs):
+            self.page.actions.append(("fill", self.name, value))
+
+        def click(self, **kwargs):
+            self.page.actions.append(("click", self.name, kwargs))
+
+        def dispatch_event(self, event):
+            self.page.actions.append(("dispatch", self.name, event))
+
+    class FakePage:
+        def __init__(self):
+            self.url = ""
+            self.actions = []
+
+        def goto(self, url, **kwargs):
+            self.url = url
+            self.actions.append(("goto", url, kwargs))
+
+        def wait_for_timeout(self, value):
+            self.actions.append(("wait", value))
+
+        def locator(self, selector):
+            if selector == dhan_web_login.CODE_INPUT_SELECTOR:
+                return FakeLocator(self, "code", count=6)
+            if selector == dhan_web_login.PIN_INPUT_SELECTOR:
+                return FakeLocator(self, "pin", count=6)
+            if selector == dhan_web_login.PROCEED_BUTTON_SELECTOR:
+                return FakeLocator(self, "proceed", count=1)
+            return FakeLocator(self, selector, count=1)
+
+        def wait_for_function(self, expression, **kwargs):
+            self.actions.append(("wait_for_function", expression, kwargs))
+            self.url = "https://trade.singularity45.ai/dhan/?tokenId=TOKEN123"
+
+    monkeypatch.setattr(dhan_web_login, "generate_totp", lambda _secret=None: "654321")
+    page = FakePage()
+
+    token_id = dhan_web_login.run_dhan_consent_login(
+        page,
+        consent_url="https://auth.dhan.co/login/consentApp-login?consentAppId=abc",
+        mobile="9999999999",
+        pin="123456",
+        totp_secret="secret",
+    )
+
+    assert token_id == "TOKEN123"
+    assert ("fill", f"{dhan_web_login.MOBILE_INPUT_SELECTOR}[0]", "9999999999") in page.actions
+    assert ("fill", "code[0]", "6") in page.actions
+    assert ("fill", "code[5]", "1") in page.actions
+    assert ("fill", "pin[0]", "1") in page.actions
+    assert ("fill", "pin[5]", "6") in page.actions
+
+
+def test_dhan_web_login_generates_totp(monkeypatch):
+    class FakeTOTP:
+        def __init__(self, secret):
+            self.secret = secret
+
+        def now(self):
+            return "111222"
+
+    monkeypatch.setattr(dhan_web_login.pyotp, "TOTP", FakeTOTP)
+
+    assert dhan_web_login.generate_totp("abc") == "111222"
 
 
 def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):

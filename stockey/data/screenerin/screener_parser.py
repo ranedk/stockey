@@ -9,8 +9,8 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from psycopg2.extras import Json
 
+from data.screenerin.auth import ensure_authenticated_requests_session
 from utils.db import db_session, sql_to_df
-from utils.http import get_dynamic_headers, get_with_retries
 
 
 SNAPSHOT_TABLE = "public.screenerin_screener_snapshots"
@@ -109,8 +109,11 @@ def _metric_key(label: str) -> str:
 
 
 def get_screener_html(url: str) -> str:
-    response = get_with_retries(url, headers=get_dynamic_headers())
+    session = ensure_authenticated_requests_session()
+    response = session.get(url, timeout=60, allow_redirects=True)
     response.raise_for_status()
+    if "login" in str(response.url).lower():
+        raise RuntimeError("Screener.in redirected to login while fetching registered screener")
     return response.text
 
 

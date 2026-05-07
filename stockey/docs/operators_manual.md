@@ -59,6 +59,25 @@ If you need to pin a different TimesFM source, set:
 STOCKEY_TIMESFM_PACKAGE='git+https://github.com/google-research/timesfm.git#egg=timesfm[torch]' python builder.py
 ```
 
+## Screener.in login
+
+Screener.in flows use the running Chrome CDP session and auto-login when needed.
+
+Required env:
+
+- `CDP_ENDPOINT`
+- `SCREENER_IN_LOGIN`
+- `SCREENER_IN_PASSWORD`
+
+Commands:
+
+```sh
+python -m data.screenerin.auth --check
+python -m data.screenerin.auth
+```
+
+If `https://www.screener.in/login/` redirects to `/dash/`, the session is already logged in. Otherwise the helper fills the login form from env, submits it, and verifies `/dash/`. Credentials are not printed.
+
 ## Scheduled runs
 
 The repo now ships with a cron template at `config/stockey.crontab.template`.

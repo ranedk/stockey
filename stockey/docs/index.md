@@ -178,13 +178,14 @@ The Dhan historical loader supports two auth modes:
 - `DHAN_ACCESS_TOKEN` directly, if you already have a valid user token
 - API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, and `DHAN_API_SECRET`
 
-With the API key flow, the loader opens the Dhan consent URL in a normal browser. After login, paste the full redirected URL back into the same terminal; the loader extracts `tokenId`, exchanges it for an access token, and caches that token under `.cache/dhan_access_token.json` for later runs until expiry.
+With the API key flow, the default path opens the Dhan consent URL in a normal browser. After login, paste the full redirected URL back into the same terminal; the loader extracts `tokenId`, exchanges it for an access token, and caches that token under `.cache/dhan_access_token.json` for later runs until expiry. Optional Playwright/CDP automation is available with `--auto-login` when `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN` are configured.
 
 If the cached token becomes invalid before its stored expiry, refresh it directly with:
 
 ```sh
 python -m data.dhanlive.auth_cli status
 python -m data.dhanlive.auth_cli refresh --clear-cache-first
+python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login
 python -m data.dhanlive.auth_cli validate
 ```
 
@@ -204,10 +205,13 @@ Supported asset types are `stock`, `index`, and `benchmark`.
 ### Screener.in screeners
 
 The recurring Screener.in downloader reads active production screener URLs from `screenerin_screeners`.
+Screener.in flows require a running Chrome CDP session plus `SCREENER_IN_LOGIN` and `SCREENER_IN_PASSWORD` in `.env`.
 
 Typical flow:
 
 ```sh
+python -m data.screenerin.auth --check
+python -m data.screenerin.auth
 python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-production-screen/"
 python -m data.screenerin.screener_registry list
 python -m data.screenerin.screener_parser
