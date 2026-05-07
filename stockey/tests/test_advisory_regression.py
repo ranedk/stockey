@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, exchange_events, exchange_features, intraday_features, llm_event_evaluator, macro_features, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, training_universe, watchlist_builder
+from advisory import adversarial_review, announcement_watch, continuous_watch, dashboard, event_meta_model, event_model_data_prep, event_router, execution_engine, exchange_events, exchange_features, intraday_features, live_dashboard, llm_event_evaluator, macro_features, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, watchlist_builder
 from data.announcements import pipeline as announcement_pipeline
 from data.announcements import state as announcement_state
 from data.eaindustry import wpi
@@ -18,6 +18,7 @@ from data.mospi import cpi
 from data.nsdl import fpi
 from data import download_runner
 from utils import db as db_utils
+from utils import poppler as poppler_utils
 from utils import redis_utils
 
 
@@ -1250,6 +1251,307 @@ def test_announcement_pipeline_reset_clears_nse_cookies(monkeypatch, capsys):
     assert pipeline_obj._nse_headers["user-agent"] == "fresh"
     assert pipeline_obj._nse_cookies == {}
     assert "Reset NSE HTTP session state; cleared cookies reason=test" in captured.err
+
+
+def test_poppler_resolver_prefers_explicit_directory(monkeypatch, tmp_path):
+    poppler_dir = tmp_path / "poppler"
+    poppler_dir.mkdir()
+    (poppler_dir / "pdfinfo").write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("POPPLER_PATH", str(poppler_dir))
+    monkeypatch.setattr(poppler_utils.shutil, "which", lambda _: None)
+
+    assert poppler_utils.resolve_poppler_path() == str(poppler_dir)
+
+
+def test_ts_forecast_features_builds_experimental_horizon_rows():
+    dates = pd.date_range("2026-01-01", periods=100, freq="D", tz="UTC")
+    history = pd.DataFrame(
+        {
+            "symbol": ["ABC"] * len(dates),
+            "date": dates,
+            "open": [100 + idx for idx in range(len(dates))],
+            "high": [101 + idx for idx in range(len(dates))],
+            "low": [99 + idx for idx in range(len(dates))],
+            "close": [100 + idx for idx in range(len(dates))],
+            "volume": [100_000 + (idx * 100) for idx in range(len(dates))],
+        }
+    )
+
+    df = ts_forecast_features.build_ts_forecasts(
+        symbols=["ABC"],
+        asof_date=pd.Timestamp("2026-04-10T00:00:00Z"),
+        horizons=(5, 20),
+        history=history,
+    )
+
+    assert len(df) == 2
+    assert set(df["forecast_horizon_days"]) == {5, 20}
+    assert set(df["action_hint"]).issubset(
+        {
+            "EXPERIMENTAL_POSITIVE",
+            "EXPERIMENTAL_NEGATIVE",
+            "EXPERIMENTAL_NEUTRAL",
+            "EXPERIMENTAL_WEAK",
+        }
+    )
+    assert (df["forecast_price"] > 0).all()
+    assert df["feature_context_json"].str.contains("Experimental forecast feature only").all()
+
+
+def test_ts_forecast_evaluator_scores_matured_rows_after_costs():
+    forecasts = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "naive_momentum_v1",
+                "forecast_horizon_days": 5,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "forecast_return": 0.05,
+            },
+            {
+                "asof_date": pd.Timestamp("2026-01-08T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "naive_momentum_v1",
+                "forecast_horizon_days": 5,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "forecast_return": 0.02,
+            },
+        ]
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["ABC"] * 12,
+            "date": pd.date_range("2026-01-01", periods=12, freq="D", tz="UTC"),
+            "close": [100, 101, 102, 103, 104, 110, 111, 112, 113, 114, 115, 116],
+        }
+    )
+
+    evaluations = ts_forecast_evaluator.build_forecast_evaluations(
+        forecasts=forecasts,
+        prices=prices,
+        cost_bps=25,
+    )
+    summary = ts_forecast_evaluator.build_evaluation_summary(evaluations, cost_bps=25)
+
+    evaluated = evaluations[evaluations["evaluation_status"].eq("evaluated")]
+    not_matured = evaluations[evaluations["evaluation_status"].eq("not_matured")]
+    assert len(evaluated) == 1
+    assert len(not_matured) == 1
+    row = evaluated.iloc[0]
+    assert round(float(row["realized_return"]), 4) == 0.1
+    assert round(float(row["cost_adjusted_return"]), 4) == 0.0975
+    assert bool(row["direction_hit"]) is True
+    assert len(summary) == 1
+    assert int(summary.iloc[0]["row_count"]) == 1
+    assert round(float(summary.iloc[0]["hit_rate"]), 4) == 1.0
+
+
+def test_ts_forecast_workflow_builds_watchlist_from_positive_forecasts():
+    forecasts = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-30T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 10,
+                "forecast_return": 0.08,
+                "forecast_price": 108.0,
+                "probability_positive": 0.70,
+                "signal_quality": 0.55,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+            },
+            {
+                "asof_date": pd.Timestamp("2026-04-30T00:00:00Z"),
+                "symbol": "XYZ",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 10,
+                "forecast_return": 0.02,
+                "forecast_price": 102.0,
+                "probability_positive": 0.51,
+                "signal_quality": 0.40,
+                "action_hint": "EXPERIMENTAL_NEUTRAL",
+            },
+        ]
+    )
+
+    watchlist = ts_forecast_workflow.build_ts_watchlist(
+        forecasts,
+        asof_date=pd.Timestamp("2026-04-30T00:00:00Z"),
+        source_name="unit_test",
+        source_slug="unit-test",
+    )
+
+    assert len(watchlist) == 1
+    assert watchlist.iloc[0]["symbol"] == "ABC"
+    assert watchlist.iloc[0]["watch_status"] == "TS_WATCH"
+    assert "Experimental TS forecast positive" in watchlist.iloc[0]["watch_reason"]
+
+
+def test_ts_forecast_workflow_falls_back_when_screener_fails(monkeypatch):
+    def fail_screener(**_kwargs):
+        raise ValueError("Could not find Screener.in results table")
+
+    forecasts = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-30T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "naive_momentum_v1",
+                "forecast_horizon_days": 10,
+                "forecast_return": 0.08,
+                "forecast_price": 108.0,
+                "probability_positive": 0.70,
+                "signal_quality": 0.55,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(ts_forecast_workflow, "symbols_from_screener", fail_screener)
+    monkeypatch.setattr(ts_forecast_workflow, "resolve_symbol_universe", lambda symbols: ["ABC", "XYZ"] if symbols is None else symbols)
+    monkeypatch.setattr(ts_forecast_workflow, "build_ts_forecasts", lambda **_kwargs: forecasts.copy())
+
+    result = ts_forecast_workflow.run_workflow(
+        query_text="Market capitalization > 1000",
+        query_name="Unit TS Screener",
+        asof_date=pd.Timestamp("2026-04-30T00:00:00Z"),
+        model_name="naive_momentum_v1",
+        refresh_ohlcv=False,
+        max_symbols=1,
+        dry_run=True,
+    )
+
+    assert result["status"] == "ok"
+    assert result["symbol_count"] == 1
+    assert result["watch_rows"] == 1
+    assert result["warnings"][0].startswith("screener_failed:ValueError")
+    assert result["screener"]["error"].startswith("screener_failed:ValueError")
+
+
+def test_live_dashboard_builds_experimental_ts_forecast_views():
+    watch_df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-30T00:00:00Z"),
+                "symbol": "ABC",
+                "source_name": "TS Forecast Watch",
+                "source_slug": "ts-watch",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 10,
+                "forecast_return": 0.08,
+                "probability_positive": 0.70,
+                "signal_quality": 0.55,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "watch_status": "TS_WATCH",
+                "watch_reason": "Experimental TS forecast positive.",
+                "load_ts": pd.Timestamp("2026-04-30T10:00:00Z"),
+            }
+        ]
+    )
+    eval_df = pd.DataFrame(
+        [
+            {
+                "evaluated_at": pd.Timestamp("2026-05-04T00:00:00Z"),
+                "from_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "to_date": pd.Timestamp("2026-04-30T00:00:00Z"),
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 10,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "row_count": 12,
+                "hit_rate": 0.625,
+                "positive_rate": 0.75,
+                "avg_realized_return": 0.03,
+                "avg_cost_adjusted_return": 0.0275,
+                "median_cost_adjusted_return": 0.02,
+                "sharpe_like": 1.2,
+            }
+        ]
+    )
+
+    views = live_dashboard.build_ts_forecast_views(
+        watch_df=watch_df,
+        forecast_df=pd.DataFrame(),
+        eval_summary_df=eval_df,
+    )
+
+    assert len(views["watch"]) == 1
+    assert views["watch"][0]["symbol"] == "ABC"
+    assert views["watch"][0]["research_only"] is True
+    assert views["watch"][0]["forecast_return_pct"] == 8.0
+    assert views["watch"][0]["probability_positive_pct"] == 70.0
+    assert len(views["recommendations"]) == 1
+    assert views["recommendations"][0]["setup_id"] == "TS_WATCH"
+    assert views["recommendations"][0]["status"] == "SWING_ONLY"
+    assert "research recommendation" in views["recommendations"][0]["reason"].lower()
+    assert len(views["evaluation_summary"]) == 1
+    assert views["evaluation_summary"][0]["row_count"] == 12
+    assert views["evaluation_summary"][0]["hit_rate_pct"] == 62.5
+
+
+def test_live_dashboard_collapses_ts_horizons_into_windows():
+    forecast_df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-04T00:00:00Z"),
+                "symbol": "SHAKTIPUMP",
+                "model_name": "naive_momentum_v1",
+                "forecast_horizon_days": 10,
+                "forecast_return": 0.04,
+                "forecast_price": 584.0,
+                "probability_positive": 0.66,
+                "signal_quality": 0.76,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+            },
+            {
+                "asof_date": pd.Timestamp("2026-05-04T00:00:00Z"),
+                "symbol": "SHAKTIPUMP",
+                "model_name": "naive_momentum_v1",
+                "forecast_horizon_days": 20,
+                "forecast_return": 0.08,
+                "forecast_price": 608.0,
+                "probability_positive": 0.72,
+                "signal_quality": 0.83,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+            },
+            {
+                "asof_date": pd.Timestamp("2026-05-03T00:00:00Z"),
+                "symbol": "SHAKTIPUMP",
+                "model_name": "naive_momentum_v1",
+                "forecast_horizon_days": 10,
+                "forecast_return": 0.02,
+                "forecast_price": 570.0,
+                "probability_positive": 0.61,
+                "signal_quality": 0.70,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+            },
+        ]
+    )
+    latest = forecast_df[forecast_df["asof_date"].eq(pd.Timestamp("2026-05-04T00:00:00Z"))].copy()
+
+    views = live_dashboard.build_ts_forecast_views(
+        watch_df=pd.DataFrame(),
+        forecast_df=latest,
+        eval_summary_df=pd.DataFrame(),
+        history_df=forecast_df,
+    )
+
+    assert len(views["watch"]) == 1
+    row = views["watch"][0]
+    assert row["symbol"] == "SHAKTIPUMP"
+    assert row["combined_state"] == "ALIGNED_POSITIVE"
+    assert row["swing_window"]["state"] == "POSITIVE"
+    assert row["position_window"]["state"] == "POSITIVE"
+    assert "2026-05-04" in row["history_summary"]
+    assert views["recommendations"][0]["status"] == "ALIGNED_POSITIVE"
+
+
+def test_live_dashboard_parses_ps_elapsed_formats():
+    assert live_dashboard._parse_ps_elapsed_seconds("125") == 125
+    assert live_dashboard._parse_ps_elapsed_seconds("02:03") == 123
+    assert live_dashboard._parse_ps_elapsed_seconds("01:02:03") == 3723
+    assert live_dashboard._parse_ps_elapsed_seconds("2-01:02:03") == 176523
 
 
 def test_announcement_watch_deduplicates_ingest_by_symbol(monkeypatch):

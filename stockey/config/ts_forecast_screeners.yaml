@@ -1,0 +1,11 @@
+screeners:
+  - screener_slug: ts-liquid-technical-watch-v1
+    query_name: TS Liquid Technical Watch V1
+    query_text: |
+      Market capitalization > 1000 AND
+      Current price > 50 AND
+      Price to earning > 0 AND
+      Return on capital employed > 8% AND
+      Debt to equity < 2 AND
+      Current price > 50 Day Moving Average AND
+      Current price > 200 Day Moving Average

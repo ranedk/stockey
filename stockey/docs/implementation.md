@@ -128,6 +128,27 @@ Current label target:
 
 The model path is intentionally gated. It only trains when label coverage is sufficient.
 
+### Experimental time-series forecasts
+
+The project now has a separate OHLCV forecast-feature path:
+
+- feature builder: `advisory.ts_forecast_features`
+- destination table: `advisory_ts_forecasts_daily`
+- evaluator: `advisory.ts_forecast_evaluator`
+- workflow: `advisory.ts_forecast_workflow`
+- evaluation tables: `advisory_ts_forecast_evaluations`, `advisory_ts_forecast_eval_summary`
+- experimental watch table: `advisory_ts_forecast_watchlist`
+- current adapter: `naive_momentum_v1`
+- intended future adapters: TimesFM, Chronos, Moirai, or similar time-series foundation models
+
+This layer consumes `dhan_ohlcv_daily` and emits expected return, forecast price, upside/downside quantiles, probability of positive return, volatility, momentum context, signal quality, and an `EXPERIMENTAL_*` hint.
+
+The workflow can also use `config/ts_forecast_screeners.yaml` to fetch a fresh ad hoc Screener.in universe, refresh Dhan daily OHLCV for those symbols, and persist experimental positive names to `advisory_ts_forecast_watchlist`.
+
+TimesFM dependencies are installed by default through `python builder.py`. Use `python builder.py --skip-timesfm-install` or `STOCKEY_SKIP_TIMESFM_INSTALL=true python builder.py` only for lightweight environments where the TS forecast workflow is not needed.
+
+It is not part of live execution. Forecasts must first be evaluated through matured forecast checks, paper portfolios, and research-ledger comparisons against naive momentum, the technical engine, and existing action recommendations.
+
 ## Layer 3: Policy
 
 ### Adversarial review

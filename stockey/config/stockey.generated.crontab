@@ -1,5 +1,5 @@
 SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/rane/.local/bin
+PATH=/opt/homebrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/rane/.local/bin
 CRON_TZ=Asia/Kolkata
 MAILTO=""
 
@@ -16,26 +16,34 @@ LOG_DIR=/Users/rane/code/stockey/logs/cron
 #   ./go-crond /Users/rane/code/stockey/config/stockey.generated.crontab --allow-unprivileged
 
 # Daily raw download + parse refresh before market open on weekdays.
-10 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
+10 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
 
-# Portfolio/advisory run a few times a week after the raw refresh has completed.
-20 08 * * 1,3,5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_advisory.lock ./all_advisory.sh >> "$LOG_DIR/all_advisory.log" 2>&1
+# Portfolio/advisory run daily after market close and model training.
+10 19 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh >> "$LOG_DIR/all_advisory.log" 2>&1
 
 # Continuous one-shot watch during market hours on weekdays.
 # Internal sync state keeps news/announcements slower while OHLCV stays more frequent.
-*/10 09-15 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
+*/10 09-15 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
 # Static dashboard refresh every 15 minutes on weekdays so portfolio/advisory state is visible
 # even outside watcher-triggered rewrites.
-*/15 08-18 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_dashboard_refresh.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.live_dashboard --output-dir live_dashboard >> "$LOG_DIR/live_dashboard.log" 2>&1
+*/15 08-18 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dashboard_refresh.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.live_dashboard --output-dir live_dashboard >> "$LOG_DIR/live_dashboard.log" 2>&1
 
 # One final post-close watch pass for end-of-day alerts and dashboard refresh.
-05 16 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
+05 16 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
-# Event-model prep and training once daily after market close.
-45 18 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
+# Experimental TS forecast workflow. This uses config/ts_forecast_screeners.yaml
+# to select a liquid technical universe, refreshes Dhan daily OHLCV, and writes research-only TS watch rows.
+# Daily OHLCV changes slowly, so this runs a few times a day instead of every watcher tick.
+20 11,14,17,20 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.ts_forecast_workflow --model-name "${TS_FORECAST_MODEL_NAME:-timesfm_2p5_200m}" --max-symbols "${TS_FORECAST_MAX_SYMBOLS:-80}" >> "$LOG_DIR/ts_forecast_workflow.log" 2>&1
+
+# Matured TS forecast evaluation. This validates prior forecast rows after costs; it does not create actions.
+20 18,21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_eval.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.ts_forecast_evaluator --model-name "${TS_FORECAST_MODEL_NAME:-timesfm_2p5_200m}" --cost-bps "${TS_FORECAST_COST_BPS:-25}" >> "$LOG_DIR/ts_forecast_evaluator.log" 2>&1
+
+# Event-model prep and training once daily after 3am.
+10 03 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
 
 # Optional split refreshes if you want explicit control instead of complete_data.sh.
-# 05 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
-# 40 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1
-# @reboot rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && /usr/bin/flock -n /tmp/stockey_dashboard_http.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m http.server --directory live_dashboard 8000 >> "$LOG_DIR/live_dashboard_http.log" 2>&1
+# 05 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
+# 40 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1
+# @reboot rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dashboard_http.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m http.server --directory live_dashboard 8000 >> "$LOG_DIR/live_dashboard_http.log" 2>&1

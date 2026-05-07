@@ -85,6 +85,15 @@ The repo now has six top-level operator entrypoints:
 ./all_ml.sh
 ```
 
+Optional experimental forecast feature run:
+
+```sh
+python builder.py
+python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS
+python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30
+python -m advisory.ts_forecast_workflow --dry-run --symbols RELIANCE TCS --model-name naive_momentum_v1
+```
+
 5. Advisory and portfolio generation:
 
 ```sh
@@ -120,7 +129,8 @@ The repo now has six top-level operator entrypoints:
 17. Record research runs in the research ledger.
 18. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
 19. Train the XGBoost event meta-model only when label coverage is sufficient.
-20. Keep prediction separate from policy and execution.
+20. Optionally build experimental OHLCV forecast features with `python -m advisory.ts_forecast_features`.
+21. Keep prediction separate from policy and execution.
 
 Primary operator commands:
 
@@ -135,17 +145,22 @@ Scheduled operator flow:
 
 - run `python builder.py` to render `config/stockey.generated.crontab`, then install it with `crontab config/stockey.generated.crontab` or run it with `./go-crond config/stockey.generated.crontab --allow-unprivileged`
 - let `complete_data.sh` handle the once-daily broad refresh
+- let `all_ml.sh` run once daily after 3am
 - let `all_watchers.sh` run every `10` minutes during market hours
-- let `all_ml.sh` run once daily after market close
-- let `all_advisory.sh` run a few times a week for the slower batch recommendation cycle
+- let the experimental TS forecast cron run at `11:20`, `14:20`, `17:20`, and `20:20`; evaluator runs at `18:20` and `21:20`
+- let `all_advisory.sh` run once daily after 7pm for the slower batch recommendation cycle
 - use `all_advisory.sh --fast` for quick intermediate advisory refreshes; it avoids watch/news refresh, peer sync, and on-demand intraday repair
 
-The cron file writes logs under `logs/cron/` and uses `flock` so overlapping runs are skipped instead of stacked.
+The cron file writes logs under `logs/cron/` and uses `scripts/with_lock.sh` so overlapping runs are skipped instead of stacked. The wrapper uses `flock` on Linux and `lockf` on macOS.
 
 Use:
 
 - `./complete_data.sh` for the full raw-data refresh
 - `./all_ml.sh` for research prep, readiness checks, model train, and score
+- `python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS` for experimental OHLCV forecast features
+- `python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30` for matured TS forecast evaluation
+- `python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m` for the optional Screener/Dhan/TimesFM/TS-watchlist workflow
+- `python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m --max-symbols 80` for the default TS screener workflow
 - `./all_advisory.sh` for the advisory and portfolio run
 - `./all_advisory.sh --fast` for a quicker lifecycle/action/dashboard refresh when data is already current
 - `./all_watchers.sh --loop` for the lightweight live monitoring loop

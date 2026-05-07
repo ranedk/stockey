@@ -36,6 +36,9 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/research_ledger.py` | `advisory_research_runs` | Research ledger for recording experiment configs, point-in-time context, validation protocol, and run outcomes |
 | `advisory/training_universe.py` | `advisory_screener_constituents` | Sync broad ad hoc Screener.in training universes directly into normalized advisory screener rows for research-only event-model coverage |
 | `advisory/event_meta_model.py` | `advisory_event_model_scores` | Train/score scaffold for XGBoost event meta-models using structured event tensors, anchor-day intraday response features, and future daily returns |
+| `advisory/ts_forecast_features.py` | `advisory_ts_forecasts_daily` | Experimental OHLCV time-series forecast features; starts with `naive_momentum_v1` and is designed to host TimesFM / Chronos / Moirai adapters later |
+| `advisory/ts_forecast_evaluator.py` | `advisory_ts_forecast_evaluations`, `advisory_ts_forecast_eval_summary` | Evaluates matured TS forecast rows against future Dhan OHLCV returns after costs |
+| `advisory/ts_forecast_workflow.py` | `advisory_ts_forecasts_daily`, `advisory_ts_forecast_watchlist` | Optional Screener.in -> Dhan OHLCV refresh -> TimesFM forecast -> experimental TS watchlist workflow |
 | `advisory/exchange_events.py` | `advisory_exchange_events` | Normalizes NSE block/bulk/short-selling/insider/corporate-action/earnings rows into point-in-time exchange events |
 | `advisory/exchange_features.py` | `advisory_exchange_features_daily` | Builds daily symbol-level exchange-event features for LLM context, event-model features, review, and risk sizing |
 | `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
@@ -151,13 +154,15 @@ Recommended scheduler file:
 It schedules:
 
 - `complete_data.sh` once daily on weekdays
-- `all_advisory.sh` a few times a week
+- `all_ml.sh` once daily after 3am on weekdays
 - `all_watchers.sh` every `10` minutes during market hours
-- `all_ml.sh` once daily after market close
+- `all_advisory.sh` once daily after 7pm on weekdays
 
 Bootstrap note:
 
-- `python builder.py` creates `logs/cron` and installs `go-crond` locally as `./go-crond` unless `GO_CROND_INSTALL_DIR` overrides the target
+- `python builder.py` creates `logs/cron`, installs `go-crond` locally as `./go-crond` unless `GO_CROND_INSTALL_DIR` overrides the target, and installs `torch` plus the current Google Research TimesFM package from GitHub for the `timesfm_2p5_200m` forecast adapter.
+- Use `python builder.py --skip-timesfm-install` or `STOCKEY_SKIP_TIMESFM_INSTALL=true python builder.py` for lightweight setup runs without TimesFM.
+- Override the TimesFM source with `STOCKEY_TIMESFM_PACKAGE` if a future release needs a pinned URL or version.
 
 ## Symbol-specific module runs
 
@@ -197,8 +202,42 @@ python -m data.nseindia.adjusted_prices --only all
 python -m data.nseindia.security_history
 python -m data.nseindia.security_dimension
 python -m data.announcements.cli --ticker SHAKTIPUMP --exchange NSE --from-date 2026-03-01 --to-date 2026-03-22
+python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS
+python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30
+python -m advisory.ts_forecast_workflow --dry-run --symbols RELIANCE TCS --model-name naive_momentum_v1
 python -m features.price_daily
 ```
+
+## Experimental time-series forecasts
+
+Module: `advisory.ts_forecast_features`
+
+This is a research-only forecast feature path over `dhan_ohlcv_daily`. It writes to `advisory_ts_forecasts_daily` and currently uses a dependency-free `naive_momentum_v1` baseline. The table schema is intentionally compatible with later TimesFM, Chronos, or Moirai adapters.
+
+The output is not a live action source. It should be evaluated through a paper portfolio and research-ledger comparison before being allowed to affect `advisory_action_recommendations` or Dhan execution.
+
+Useful commands:
+
+```sh
+python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS
+python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 20
+python -m advisory.ts_forecast_features --date 2026-04-30 --horizons 5 20
+python -m advisory.ts_forecast_features --refresh-ohlcv --symbols RELIANCE TCS --model-name timesfm_2p5_200m --horizons 5 10 20
+python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30
+python -m advisory.ts_forecast_evaluator --from-date 2026-04-01 --to-date 2026-04-30 --cost-bps 25
+python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m
+python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m
+```
+
+Current outputs include expected return, forecast price, upside/downside quantiles, probability of positive return, signal quality, and an `EXPERIMENTAL_*` action hint.
+
+Evaluation writes row-level realized-return checks to `advisory_ts_forecast_evaluations` and grouped model/horizon/action-hint metrics to `advisory_ts_forecast_eval_summary`.
+
+The workflow command uses `config/ts_forecast_screeners.yaml` when no symbols or query are supplied. It runs an ad hoc Screener.in query to find liquid/technical candidates, refreshes their Dhan daily OHLCV, runs the selected forecast model, and writes positive experimental names to `advisory_ts_forecast_watchlist`. For TimesFM, install the optional package first; otherwise use `--model-name naive_momentum_v1` for a dependency-free baseline.
+
+The default cron run uses `--max-symbols "${TS_FORECAST_MAX_SYMBOLS:-80}"` and runs a few times per weekday, not every watcher tick, because the current TS workflow consumes daily OHLCV. If Screener.in returns no parseable results or is temporarily unavailable, the workflow logs the failure and falls back to a capped Dhan/tracked symbol universe so the research job still emits an auditable result.
+
+The live dashboard keeps raw forecast rows for evaluation but displays one TS card per symbol. The card separates Swing and Position windows and shows recent update history so a new TS recommendation is interpreted as an update to the prior symbol history, not a duplicate position.
 
 Announcement pipeline model controls:
 

@@ -1,6 +1,6 @@
 # Investment Advisory Roadmap
 
-Updated: `2026-04-10`
+Updated: `2026-05-03`
 
 This file is the current roadmap for the live advisory stack. It is not a historical design log.
 
@@ -68,6 +68,58 @@ The active stack already has:
 4. NSE exchange-event features are now available, but still need dashboard/trace surfacing and optional setup-level rules.
 5. Too much prediction still lives in hand-tuned rule logic.
 6. Continuous watch can be tightened further with cooldowns and duplicate suppression.
+
+### 0. Add an experimental time-series forecast layer
+
+Problem:
+
+- Dhan OHLCV is now available, but the system does not yet evaluate whether time-series foundation models add incremental predictive value.
+- Models such as Google TimesFM, Amazon Chronos, and Salesforce Moirai may be useful, but they should not directly create trades without proof.
+- OHLCV-only forecasts are noisy, so this must start as a research/paper layer rather than another live action source.
+
+Target:
+
+- create a separate forecast feature table, `advisory_ts_forecasts_daily`
+- feed existing Dhan daily OHLCV into forecast adapters
+- forecast multiple horizons, initially `5d`, `10d`, and `20d`
+- store forecast outputs as features:
+  - expected return
+  - forecast price
+  - downside / upside quantiles
+  - probability of positive return
+  - signal quality
+  - explicit experimental action hint
+- compare against simple baselines before trusting any foundation model
+
+Design rules:
+
+- do not let TimesFM / Chronos / Moirai directly issue `BUY` or `SELL`
+- keep outputs out of Dhan execution until paper results are validated
+- forecast returns or relative returns where possible, not just raw price levels
+- use walk-forward validation with costs and slippage
+- compare against naive momentum, technical engine, and XGBoost/event meta-model baselines
+- preserve point-in-time discipline and never train/evaluate with future OHLCV leakage
+
+Integration path:
+
+- `advisory.ts_forecast_features` builds forecast features from `dhan_ohlcv_daily`
+- event/risk/meta-model layers may later consume forecast features as one input
+- dashboard shows TS forecast context under an experimental, non-execution section
+- action recommender may consume TS forecasts only after paper validation shows incremental value
+
+Implementation slices:
+
+1. Done: add `advisory/ts_forecast_features.py` with a dependency-free `naive_momentum_v1` baseline adapter.
+2. Done: add `advisory_ts_forecasts_daily` persistence contract.
+3. Done: add regression coverage for experimental forecast row generation.
+4. Done: add optional TimesFM adapter behind the same output schema.
+5. Done: add `advisory/ts_forecast_evaluator.py` for matured forecast evaluation against future Dhan OHLCV returns after costs.
+6. Done: add `advisory/ts_forecast_workflow.py` for Screener.in selection, Dhan OHLCV refresh, TimesFM forecast generation, and experimental TS watchlist persistence.
+7. Add optional Chronos / Moirai adapters behind the same output schema.
+8. Add paper-portfolio evaluator for forecast-only decisions.
+9. Add research-ledger entries comparing TS forecasts against naive momentum and current advisory actions.
+10. Done: surface forecast context in the dashboard as experimental, non-execution evidence.
+11. Only after validation, add TS forecast features to the event meta-model / risk model as low-weight inputs.
 
 ## Active roadmap
 

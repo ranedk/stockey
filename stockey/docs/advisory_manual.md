@@ -31,11 +31,12 @@ The advisory runtime path is:
 8. Official announcements and ET RSS news
 9. LLM event evaluation
 10. Event meta-model scoring
-11. Adversarial event review
-12. Risk sizing
-13. Portfolio planning
-14. Lifecycle tracking
-15. Execution planning
+11. Experimental OHLCV time-series forecast features
+12. Adversarial event review
+13. Risk sizing
+14. Portfolio planning
+15. Lifecycle tracking
+16. Execution planning
 
 ## End-to-End Summary
 
@@ -60,7 +61,8 @@ The advisory runtime path is:
 19. Record research runs in the research ledger.
 20. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
 21. Train the XGBoost event meta-model only when label coverage is sufficient.
-22. Keep prediction separate from policy and execution.
+22. Optionally build experimental OHLCV forecast features with `python -m advisory.ts_forecast_features`.
+23. Keep prediction separate from policy and execution.
 
 For the main operator path, run:
 
@@ -171,9 +173,10 @@ The codebase has moved past the earlier multi-screener and overlay build-out. Th
 
 1. increase historical event coverage so the event meta-model has enough mature labels
 2. get the first statistically usable `1d` event-model fit into regular research use
-3. improve the regime stack with better shock detection and persistence
-4. move more prediction logic from hand-tuned thresholds into tabular models
-5. tighten continuous-watch routing with cooldowns and duplicate suppression
+3. validate whether OHLCV time-series forecasts add incremental value over the technical engine and naive momentum
+4. improve the regime stack with better shock detection and persistence
+5. move more prediction logic from hand-tuned thresholds into tabular models
+6. tighten continuous-watch routing with cooldowns and duplicate suppression
 
 LLMs are intentionally kept in:
 
@@ -191,6 +194,7 @@ These are the main files you will edit when maintaining the advisory system:
 - screener sync: `data/screenerin/screener_parser.py`
 - advisory screener normalization: `advisory/screener_parser.py`
 - technical features: `advisory/technical_features.py`
+- experimental time-series forecasts: `advisory/ts_forecast_features.py`
 - fundamentals snapshot: `advisory/fundamental_snapshot.py`
 - regime engine: `advisory/regime_engine.py`
 - rule engine: `advisory/rule_engine.py`
@@ -219,6 +223,9 @@ These are the core advisory tables to know:
 - price history: `dhan_ohlcv_daily`, `dhan_ohlcv_intraday`
 - Sharpely data: `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `historical_mcap`, `sharpely_stock_meta`, `sharpely_stock_peers`
 - daily snapshots: `advisory_macro_daily`, `advisory_macro_features_daily`, `advisory_exchange_events`, `advisory_exchange_features_daily`, `advisory_technical_daily`, `advisory_fundamentals_daily`, `advisory_market_regime`
+- experimental forecast features: `advisory_ts_forecasts_daily`
+- experimental forecast evaluation: `advisory_ts_forecast_evaluations`, `advisory_ts_forecast_eval_summary`
+- experimental TS watchlist: `advisory_ts_forecast_watchlist`
 - rule outputs: `advisory_candidates`, `advisory_candidate_rejections`
 - watch layer: `advisory_watchlist`, `advisory_watch_events`, `economictimes_rss_items`, `advisory_news_events`
 - LLM/event layer: `advisory_event_evaluations`, `advisory_event_risks`
@@ -247,6 +254,73 @@ The feature builder loads a historical lookback window for rolling changes but o
 `advisory/exchange_features.py` converts those events into `advisory_exchange_features_daily`. The current feature set includes block/bulk net value, deal clusters, insider net buying/selling, short-selling pressure, upcoming earnings, corporate-action count, and accumulation/distribution scores.
 
 The LLM receives only bounded exchange context: the latest feature row plus a small recent event list for the symbol being evaluated. This helps classify significance and contradiction without sending unfiltered NSE history or giving the LLM trade authority.
+
+## Experimental TS Forecast Layer
+
+`advisory/ts_forecast_features.py` builds research-only time-series forecast features from `dhan_ohlcv_daily` and writes them to `advisory_ts_forecasts_daily`.
+
+The current adapter is `naive_momentum_v1`. It is deliberately simple and dependency-free so it can act as a baseline before TimesFM, Chronos, or Moirai adapters are added.
+
+Current forecast fields include:
+
+- forecast horizon in trading days
+- expected return
+- forecast price
+- downside and upside return quantiles
+- probability of positive return
+- realized 20-day volatility
+- 20-day and 60-day momentum
+- signal quality
+- `EXPERIMENTAL_*` action hint
+
+Important guardrails:
+
+- TS forecasts do not create `BUY`, `SELL`, or `BUY_MORE` actions today.
+- TS forecasts are not sent to Dhan execution.
+- Any foundation-model adapter must first beat the simple baseline and existing technical/action flow in walk-forward paper evaluation after costs and slippage.
+
+`advisory/ts_forecast_evaluator.py` evaluates matured forecast rows against future `dhan_ohlcv_daily` returns. It stores row-level realized results in `advisory_ts_forecast_evaluations` and grouped model/horizon/action-hint metrics in `advisory_ts_forecast_eval_summary`.
+
+`advisory/ts_forecast_workflow.py` ties the research path together: optional Screener.in ad hoc query, Dhan daily OHLCV refresh, forecast generation, and an experimental TS watchlist. If no symbols or query are supplied, it uses `config/ts_forecast_screeners.yaml`.
+
+The live dashboard shows these rows near the top as TS Watch Recommendations and also shows the latest matured forecast evaluation summary in an Experimental TimesFM Watch section. This is display-only research evidence and does not affect the consolidated action queue.
+
+The dashboard collapses multiple forecast horizons into one symbol-level TS card:
+
+- Swing window: 5-day and 10-day forecasts
+- Position window: 20-day forecasts
+- Combined state: `ALIGNED_POSITIVE`, `SWING_ONLY`, `POSITION_ONLY`, `MIXED_TS_SIGNAL`, `TS_WEAK`, or `TS_CLOSED`
+- Update history: recent forecast changes by date and horizon
+
+If the latest forecast state becomes `TS_CLOSED`, `TS_WEAK`, or `MIXED_TS_SIGNAL`, treat the previous TS research watch as closed until a later positive update reopens it.
+
+The default TS screener is intentionally a candidate generator: liquid enough, profitable enough, and above key moving averages. Cron runs it a few times per weekday, not every watcher tick, because the current TS workflow consumes daily OHLCV. Cron caps the run with `TS_FORECAST_MAX_SYMBOLS` so TimesFM is not accidentally run over the full market. If Screener.in fails, the workflow logs the error and falls back to a capped Dhan/tracked universe.
+
+Manual run:
+
+```sh
+python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS
+python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 20
+python -m advisory.ts_forecast_features --refresh-ohlcv --symbols RELIANCE TCS --model-name timesfm_2p5_200m --horizons 5 10 20
+python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30
+python -m advisory.ts_forecast_evaluator --from-date 2026-04-01 --to-date 2026-04-30 --cost-bps 25
+python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m
+python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m
+```
+
+For a dependency-free dry run, use `--model-name naive_momentum_v1`. For TimesFM, install the optional TimesFM torch package first.
+
+Builder setup for TimesFM:
+
+```sh
+python builder.py
+```
+
+This installs `torch` and the current Google Research TimesFM package from GitHub into the project virtualenv by default. It avoids the older PyPI package path that can pull Pax/Lingvo dependencies. For a lightweight setup without TimesFM, run:
+
+```sh
+python builder.py --skip-timesfm-install
+```
 
 ## Day-to-day commands
 
@@ -280,6 +354,9 @@ python -m advisory.pipeline --dry-run --stop-at portfolio
 ```sh
 python -m advisory.screener_parser
 python -m advisory.technical_features
+python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS
+python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30
+python -m advisory.ts_forecast_workflow --dry-run --symbols RELIANCE TCS --model-name naive_momentum_v1
 python -m advisory.fundamental_snapshot
 python -m advisory.rule_engine
 python -m advisory.watchlist_builder

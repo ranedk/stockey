@@ -22,6 +22,9 @@ from utils.sync import parse_datetime_arg
 
 
 ALERTS_TABLE = "advisory_live_watch_alerts"
+TS_FORECAST_TABLE = "advisory_ts_forecasts_daily"
+TS_WATCHLIST_TABLE = "advisory_ts_forecast_watchlist"
+TS_EVAL_SUMMARY_TABLE = "advisory_ts_forecast_eval_summary"
 DEFAULT_OUTPUT_DIR = Path("live_dashboard")
 DEFAULT_OPERATOR_FEED_PATH = DEFAULT_OUTPUT_DIR / "operator_feed.json"
 DEFAULT_CRON_LOG_DIR = Path("logs/cron")
@@ -993,6 +996,517 @@ def load_action_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 100)
     ).drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
 
 
+def load_ts_forecast_watch_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 500) -> pd.DataFrame:
+    if not _table_columns(TS_WATCHLIST_TABLE):
+        return pd.DataFrame()
+    clauses = ["1 = 1"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {TS_WATCHLIST_TABLE})")
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date,
+                symbol,
+                source_name,
+                source_slug,
+                model_name,
+                forecast_horizon_days,
+                forecast_return,
+                probability_positive,
+                signal_quality,
+                action_hint,
+                watch_status,
+                watch_reason,
+                raw_context_json,
+                load_ts
+            FROM {TS_WATCHLIST_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY signal_quality DESC NULLS LAST,
+                     probability_positive DESC NULLS LAST,
+                     forecast_return DESC NULLS LAST,
+                     symbol
+            LIMIT {int(limit)}
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["asof_date", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    for column in ["forecast_horizon_days", "forecast_return", "probability_positive", "signal_quality"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
+    return df.dropna(subset=["symbol"]).reset_index(drop=True)
+
+
+def load_latest_ts_forecasts(*, asof_date: pd.Timestamp | None = None, limit: int = 500) -> pd.DataFrame:
+    if not _table_columns(TS_FORECAST_TABLE):
+        return pd.DataFrame()
+    clauses = ["1 = 1"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date = %s")
+        params.append(asof_date)
+    else:
+        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {TS_FORECAST_TABLE})")
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date,
+                symbol,
+                model_name,
+                forecast_horizon_days,
+                forecast_return,
+                forecast_price,
+                downside_return_p10,
+                upside_return_p90,
+                probability_positive,
+                signal_quality,
+                action_hint,
+                feature_context_json,
+                load_ts
+            FROM {TS_FORECAST_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY CASE WHEN action_hint = 'EXPERIMENTAL_POSITIVE' THEN 0 ELSE 1 END,
+                     signal_quality DESC NULLS LAST,
+                     probability_positive DESC NULLS LAST,
+                     forecast_return DESC NULLS LAST,
+                     symbol
+            LIMIT {int(limit)}
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["asof_date", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    for column in [
+        "forecast_horizon_days",
+        "forecast_return",
+        "forecast_price",
+        "downside_return_p10",
+        "upside_return_p90",
+        "probability_positive",
+        "signal_quality",
+    ]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
+    return df.dropna(subset=["symbol"]).reset_index(drop=True)
+
+
+def load_ts_forecast_history_rows(*, asof_date: pd.Timestamp | None = None, lookback_days: int = 90, limit: int = 1000) -> pd.DataFrame:
+    if not _table_columns(TS_FORECAST_TABLE):
+        return pd.DataFrame()
+    clauses = ["1 = 1"]
+    params: list[object] = []
+    if asof_date is not None:
+        clauses.append("asof_date <= %s")
+        clauses.append("asof_date >= %s")
+        params.extend([asof_date, asof_date - pd.Timedelta(days=int(lookback_days))])
+    else:
+        clauses.append(f"asof_date >= (SELECT MAX(asof_date) FROM {TS_FORECAST_TABLE}) - INTERVAL '{int(lookback_days)} days'")
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date,
+                symbol,
+                model_name,
+                forecast_horizon_days,
+                forecast_return,
+                forecast_price,
+                probability_positive,
+                signal_quality,
+                action_hint,
+                load_ts
+            FROM {TS_FORECAST_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY asof_date DESC, symbol, forecast_horizon_days
+            LIMIT {int(limit)}
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["asof_date", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    for column in ["forecast_horizon_days", "forecast_return", "forecast_price", "probability_positive", "signal_quality"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
+    return df.dropna(subset=["symbol", "asof_date"]).reset_index(drop=True)
+
+
+def load_ts_eval_summary_rows(*, limit: int = 20) -> pd.DataFrame:
+    if not _table_columns(TS_EVAL_SUMMARY_TABLE):
+        return pd.DataFrame()
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                from_date,
+                to_date,
+                model_name,
+                forecast_horizon_days,
+                action_hint,
+                row_count,
+                hit_rate,
+                positive_rate,
+                avg_realized_return,
+                avg_cost_adjusted_return,
+                median_cost_adjusted_return,
+                avg_absolute_error,
+                rmse,
+                sharpe_like,
+                max_drawdown_proxy,
+                config_json,
+                load_ts
+            FROM {TS_EVAL_SUMMARY_TABLE}
+            WHERE evaluated_at = (SELECT MAX(evaluated_at) FROM {TS_EVAL_SUMMARY_TABLE})
+            ORDER BY avg_cost_adjusted_return DESC NULLS LAST,
+                     hit_rate DESC NULLS LAST,
+                     row_count DESC NULLS LAST,
+                     model_name,
+                     forecast_horizon_days
+            LIMIT {int(limit)}
+            """
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["evaluated_at", "from_date", "to_date", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    for column in [
+        "forecast_horizon_days",
+        "row_count",
+        "hit_rate",
+        "positive_rate",
+        "avg_realized_return",
+        "avg_cost_adjusted_return",
+        "median_cost_adjusted_return",
+        "avg_absolute_error",
+        "rmse",
+        "sharpe_like",
+        "max_drawdown_proxy",
+    ]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df.reset_index(drop=True)
+
+
+def _ts_reason_from_context(row: pd.Series | dict[str, Any]) -> str | None:
+    reason = _as_text(row.get("watch_reason"))
+    if reason:
+        return reason
+    context = _parse_json_blob(row.get("raw_context_json")) or _parse_json_blob(row.get("feature_context_json"))
+    feature_context = _parse_json_blob(context.get("feature_context_json")) if isinstance(context.get("feature_context_json"), str) else {}
+    notes = _as_text(feature_context.get("notes")) or _as_text(context.get("notes"))
+    latest_close = _as_float(feature_context.get("latest_close")) or _as_float(context.get("latest_close"))
+    history_rows = feature_context.get("history_rows") or context.get("history_rows")
+    parts: list[str] = []
+    if notes:
+        parts.append(notes)
+    if latest_close is not None:
+        parts.append(f"Latest close used by model {latest_close:.2f}.")
+    if history_rows is not None and not pd.isna(history_rows):
+        parts.append(f"History rows {int(history_rows)}.")
+    return " ".join(parts) if parts else None
+
+
+def _format_ts_view_row(row: pd.Series | dict[str, Any], *, fallback: bool = False) -> dict[str, Any]:
+    forecast_return = _as_float(row.get("forecast_return"))
+    probability_positive = _as_float(row.get("probability_positive"))
+    signal_quality = _as_float(row.get("signal_quality"))
+    horizon = _as_float(row.get("forecast_horizon_days"))
+    return {
+        "symbol": _as_text(row.get("symbol")),
+        "asof_date": _display_dashboard_timestamp(row.get("asof_date"), prefer_date_for_midnight_utc=True),
+        "model_name": _as_text(row.get("model_name")),
+        "horizon_days": int(horizon) if horizon is not None else None,
+        "forecast_return_pct": None if forecast_return is None else round(forecast_return * 100.0, 2),
+        "forecast_price": _as_float(row.get("forecast_price")),
+        "downside_return_p10_pct": None if _as_float(row.get("downside_return_p10")) is None else round((_as_float(row.get("downside_return_p10")) or 0.0) * 100.0, 2),
+        "upside_return_p90_pct": None if _as_float(row.get("upside_return_p90")) is None else round((_as_float(row.get("upside_return_p90")) or 0.0) * 100.0, 2),
+        "probability_positive_pct": None if probability_positive is None else round(probability_positive * 100.0, 1),
+        "signal_quality_pct": None if signal_quality is None else round(signal_quality * 100.0, 1),
+        "action_hint": _as_text(row.get("action_hint")),
+        "watch_status": _as_text(row.get("watch_status")) or ("TS_FORECAST_ONLY" if fallback else None),
+        "watch_reason": _ts_reason_from_context(row) or ("Positive forecast exists but this row is not in the TS watchlist table." if fallback else None),
+        "source_name": _as_text(row.get("source_name")) or ("latest forecast table" if fallback else None),
+        "source_slug": _as_text(row.get("source_slug")),
+        "load_ts": _display_dashboard_timestamp(row.get("load_ts")),
+        "sort_score": round(
+            (0.45 * (probability_positive or 0.0))
+            + (0.35 * (signal_quality or 0.0))
+            + (0.20 * max(forecast_return or 0.0, 0.0)),
+            6,
+        ),
+        "research_only": True,
+    }
+
+
+def _ts_horizon_positive(row: dict[str, Any]) -> bool:
+    return (
+        str(row.get("action_hint") or "").upper() == "EXPERIMENTAL_POSITIVE"
+        and (_as_float(row.get("forecast_return_pct")) or 0.0) > 0
+        and (_as_float(row.get("probability_positive_pct")) or 0.0) >= 58.0
+        and (_as_float(row.get("signal_quality_pct")) or 0.0) >= 35.0
+    )
+
+
+def _ts_horizon_negative(row: dict[str, Any]) -> bool:
+    return str(row.get("action_hint") or "").upper() == "EXPERIMENTAL_NEGATIVE" or (_as_float(row.get("forecast_return_pct")) or 0.0) < 0
+
+
+def _ts_pick_primary(rows: list[dict[str, Any]], preferred: tuple[int, ...]) -> dict[str, Any] | None:
+    if not rows:
+        return None
+    for horizon in preferred:
+        matches = [row for row in rows if row.get("horizon_days") == horizon]
+        if matches:
+            return sorted(matches, key=lambda row: _as_float(row.get("signal_quality_pct")) or 0.0, reverse=True)[0]
+    return sorted(rows, key=lambda row: (_as_float(row.get("signal_quality_pct")) or 0.0, _as_float(row.get("probability_positive_pct")) or 0.0), reverse=True)[0]
+
+
+def _ts_window_summary(label: str, rows: list[dict[str, Any]], preferred: tuple[int, ...]) -> dict[str, Any]:
+    primary = _ts_pick_primary(rows, preferred)
+    if not primary:
+        return {
+            "label": label,
+            "state": "NO_DATA",
+            "summary": f"{label}: no forecast rows.",
+            "horizons": [],
+        }
+    positive_count = sum(1 for row in rows if _ts_horizon_positive(row))
+    negative_count = sum(1 for row in rows if _ts_horizon_negative(row))
+    if positive_count and negative_count:
+        state = "MIXED"
+    elif positive_count:
+        state = "POSITIVE"
+    elif negative_count:
+        state = "NEGATIVE"
+    else:
+        state = "WEAK"
+    horizon_text = ", ".join(
+        f"{row.get('horizon_days')}d {row.get('forecast_return_pct')}% p+ {row.get('probability_positive_pct')} q {row.get('signal_quality_pct')}"
+        for row in sorted(rows, key=lambda item: int(item.get("horizon_days") or 0))
+    )
+    return {
+        "label": label,
+        "state": state,
+        "primary": primary,
+        "summary": f"{label}: {state}. {horizon_text}",
+        "horizons": rows,
+    }
+
+
+def _ts_combined_state(swing: dict[str, Any], position: dict[str, Any]) -> str:
+    swing_state = swing.get("state")
+    position_state = position.get("state")
+    if swing_state == "POSITIVE" and position_state == "POSITIVE":
+        return "ALIGNED_POSITIVE"
+    if swing_state == "POSITIVE" and position_state in {"NO_DATA", "WEAK"}:
+        return "SWING_ONLY"
+    if position_state == "POSITIVE" and swing_state in {"NO_DATA", "WEAK"}:
+        return "POSITION_ONLY"
+    if "MIXED" in {swing_state, position_state} or {swing_state, position_state} == {"POSITIVE", "NEGATIVE"}:
+        return "MIXED_TS_SIGNAL"
+    if swing_state == "NEGATIVE" or position_state == "NEGATIVE":
+        return "TS_CLOSED"
+    return "TS_WEAK"
+
+
+def _ts_state_watchable(state: str) -> bool:
+    return state in {"ALIGNED_POSITIVE", "SWING_ONLY", "POSITION_ONLY"}
+
+
+def _ts_history_summary(symbol: str, history_df: pd.DataFrame, *, limit: int = 6) -> str | None:
+    if history_df.empty or "symbol" not in history_df.columns:
+        return None
+    symbol_history = history_df[history_df["symbol"].astype("string").str.upper().eq(str(symbol).upper())].copy()
+    if symbol_history.empty:
+        return None
+    symbol_history["asof_date"] = pd.to_datetime(symbol_history["asof_date"], utc=True, errors="coerce")
+    rows: list[str] = []
+    for asof_date, group in symbol_history.dropna(subset=["asof_date"]).groupby("asof_date", sort=False):
+        group = group.sort_values("forecast_horizon_days")
+        pieces = []
+        for _, row in group.iterrows():
+            horizon = int(_as_float(row.get("forecast_horizon_days")) or 0)
+            forecast_return = _as_float(row.get("forecast_return"))
+            probability = _as_float(row.get("probability_positive"))
+            quality = _as_float(row.get("signal_quality"))
+            if horizon:
+                pieces.append(
+                    f"{horizon}d {((forecast_return or 0.0) * 100.0):.2f}% p+ {((probability or 0.0) * 100.0):.1f} q {((quality or 0.0) * 100.0):.1f}"
+                )
+        if pieces:
+            rows.append(f"{_display_dashboard_timestamp(asof_date, prefer_date_for_midnight_utc=True)}: {'; '.join(pieces)}")
+        if len(rows) >= int(limit):
+            break
+    return " || ".join(rows) if rows else None
+
+
+def collapse_ts_rows_by_symbol(rows: list[dict[str, Any]], history_df: pd.DataFrame | None = None) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        symbol = _as_text(row.get("symbol"))
+        if not symbol:
+            continue
+        grouped.setdefault(symbol.upper(), []).append(row)
+    collapsed: list[dict[str, Any]] = []
+    for symbol, symbol_rows in grouped.items():
+        swing_rows = [row for row in symbol_rows if int(row.get("horizon_days") or 0) <= 10]
+        position_rows = [row for row in symbol_rows if int(row.get("horizon_days") or 0) > 10]
+        swing = _ts_window_summary("Swing window", swing_rows, (10, 5))
+        position = _ts_window_summary("Position window", position_rows, (20,))
+        state = _ts_combined_state(swing, position)
+        primary = (
+            swing.get("primary")
+            if state in {"ALIGNED_POSITIVE", "SWING_ONLY", "MIXED_TS_SIGNAL"} and swing.get("primary")
+            else position.get("primary")
+            if position.get("primary")
+            else swing.get("primary")
+        )
+        if not primary:
+            continue
+        forecast_return = _as_float(primary.get("forecast_return_pct")) or 0.0
+        probability = _as_float(primary.get("probability_positive_pct")) or 0.0
+        quality = _as_float(primary.get("signal_quality_pct")) or 0.0
+        blended_score = round(min(max((0.45 * probability) + (0.35 * quality) + (0.20 * max(forecast_return, 0.0) * 10.0), 0.0), 100.0), 1)
+        collapsed.append(
+            {
+                **primary,
+                "symbol": symbol,
+                "watch_status": state if _ts_state_watchable(state) else state,
+                "combined_state": state,
+                "is_active_ts_watch": _ts_state_watchable(state),
+                "swing_window": swing,
+                "position_window": position,
+                "window_summary": f"{swing['summary']} | {position['summary']}",
+                "watch_reason": f"{state}. {swing['summary']} | {position['summary']}",
+                "history_summary": _ts_history_summary(symbol, history_df if history_df is not None else pd.DataFrame()),
+                "blended_score_pct": blended_score,
+                "sort_score": blended_score,
+            }
+        )
+    return sorted(collapsed, key=lambda row: (_as_float(row.get("sort_score")) or 0.0, row.get("symbol") or ""), reverse=True)
+
+
+def ts_view_to_recommendation_row(row: dict[str, Any]) -> dict[str, Any]:
+    state = _as_text(row.get("combined_state")) or _as_text(row.get("watch_status")) or "TS_WATCH"
+    swing_summary = _as_text((row.get("swing_window") or {}).get("summary")) if isinstance(row.get("swing_window"), dict) else None
+    position_summary = _as_text((row.get("position_window") or {}).get("summary")) if isinstance(row.get("position_window"), dict) else None
+    forecast_return = row.get("forecast_return_pct")
+    probability = row.get("probability_positive_pct")
+    quality = row.get("signal_quality_pct")
+    reason_bits = [
+        f"TS Watch research recommendation: {state}.",
+        f"Forecast {forecast_return:.2f}%." if isinstance(forecast_return, (int, float)) else None,
+        f"Probability positive {probability:.1f}%." if isinstance(probability, (int, float)) else None,
+        f"Signal quality {quality:.1f}%." if isinstance(quality, (int, float)) else None,
+    ]
+    return {
+        "symbol": row.get("symbol"),
+        "setup_id": "TS_WATCH",
+        "setup_name": f"TS Watch | {row.get('model_name') or 'time-series forecast'}",
+        "setup_family": "experimental_research",
+        "status": state,
+        "entry_date": row.get("asof_date"),
+        "entry_price": row.get("forecast_price"),
+        "current_price": row.get("forecast_price"),
+        "pnl_pct": None,
+        "invest_score_pct": row.get("blended_score_pct") or row.get("signal_quality_pct"),
+        "reason": " ".join(bit for bit in reason_bits if bit),
+        "reason_detail": row.get("watch_reason"),
+        "technical_context": (
+            "OHLCV-only forecast split into Swing and Position windows. "
+            f"{swing_summary or ''} {position_summary or ''}".strip()
+        ),
+        "market_context": "Not routed through the regime/action engine.",
+        "screener_context": row.get("source_name") or row.get("source_slug"),
+        "setup_context": "Source: advisory.ts_forecast_workflow. Identifier: TS_WATCH.",
+        "exit_strategy": "No execution authority. If latest TS state becomes TS_CLOSED, TS_WEAK, or MIXED_TS_SIGNAL, treat the research history as closed until a future positive update reopens it.",
+        "news_summary": None,
+        "announcement_summary": None,
+        "action_summary": "Research-only TS Watch. Do not trade from this row alone.",
+        "execution_intent": "None. Not sent to Dhan.",
+        "current_value_note": "Research-only forecast row.",
+        "ts_history_summary": row.get("history_summary"),
+        "sort_ts": row.get("asof_date"),
+        "published_on": row.get("asof_date"),
+    }
+
+
+def build_ts_forecast_views(
+    *,
+    watch_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    eval_summary_df: pd.DataFrame,
+    history_df: pd.DataFrame | None = None,
+    limit: int = 25,
+) -> dict[str, list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    if not forecast_df.empty:
+        df = forecast_df.copy()
+        rows = [_format_ts_view_row(row, fallback=True) for _, row in df.iterrows()]
+    elif not watch_df.empty:
+        rows = [_format_ts_view_row(row) for _, row in watch_df.iterrows()]
+    rows = [row for row in rows if row.get("symbol")]
+    rows = collapse_ts_rows_by_symbol(rows, history_df=history_df if history_df is not None else pd.DataFrame())
+    rows = sorted(rows, key=lambda row: (_as_float(row.get("sort_score")) or 0.0, _as_text(row.get("symbol")) or ""), reverse=True)[: int(limit)]
+
+    eval_rows: list[dict[str, Any]] = []
+    if not eval_summary_df.empty:
+        for _, row in eval_summary_df.iterrows():
+            hit_rate = _as_float(row.get("hit_rate"))
+            positive_rate = _as_float(row.get("positive_rate"))
+            avg_cost = _as_float(row.get("avg_cost_adjusted_return"))
+            avg_realized = _as_float(row.get("avg_realized_return"))
+            median_cost = _as_float(row.get("median_cost_adjusted_return"))
+            eval_rows.append(
+                {
+                    "evaluated_at": _display_dashboard_timestamp(row.get("evaluated_at")),
+                    "from_date": _display_dashboard_timestamp(row.get("from_date"), prefer_date_for_midnight_utc=True),
+                    "to_date": _display_dashboard_timestamp(row.get("to_date"), prefer_date_for_midnight_utc=True),
+                    "model_name": _as_text(row.get("model_name")),
+                    "horizon_days": int(_as_float(row.get("forecast_horizon_days")) or 0) or None,
+                    "action_hint": _as_text(row.get("action_hint")),
+                    "row_count": int(_as_float(row.get("row_count")) or 0),
+                    "hit_rate_pct": None if hit_rate is None else round(hit_rate * 100.0, 1),
+                    "positive_rate_pct": None if positive_rate is None else round(positive_rate * 100.0, 1),
+                    "avg_realized_return_pct": None if avg_realized is None else round(avg_realized * 100.0, 2),
+                    "avg_cost_adjusted_return_pct": None if avg_cost is None else round(avg_cost * 100.0, 2),
+                    "median_cost_adjusted_return_pct": None if median_cost is None else round(median_cost * 100.0, 2),
+                    "sharpe_like": _as_float(row.get("sharpe_like")),
+                    "max_drawdown_proxy_pct": None if _as_float(row.get("max_drawdown_proxy")) is None else round((_as_float(row.get("max_drawdown_proxy")) or 0.0) * 100.0, 2),
+                    "research_only": True,
+                }
+            )
+    recommendation_rows = [ts_view_to_recommendation_row(row) for row in rows]
+    return {"watch": rows, "recommendations": recommendation_rows, "evaluation_summary": eval_rows}
+
+
 def load_alert_rows(limit: int = 100) -> pd.DataFrame:
     try:
         df = sql_to_df(
@@ -1218,17 +1732,48 @@ def load_operator_feed(*, output_dir: str | Path = DEFAULT_OUTPUT_DIR, limit: in
     return payload[-int(limit) :]
 
 
+def _parse_ps_elapsed_seconds(value: str) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if text.isdigit():
+        return int(text)
+    days = 0
+    time_part = text
+    if "-" in text:
+        day_text, time_part = text.split("-", 1)
+        days = int(day_text) if day_text.isdigit() else 0
+    parts = [int(part) for part in time_part.split(":") if part.isdigit()]
+    if len(parts) == 3:
+        hours, minutes, seconds = parts
+    elif len(parts) == 2:
+        hours, minutes, seconds = 0, parts[0], parts[1]
+    elif len(parts) == 1:
+        hours, minutes, seconds = 0, 0, parts[0]
+    else:
+        return 0
+    return (days * 86400) + (hours * 3600) + (minutes * 60) + seconds
+
+
 def load_runtime_processes(limit: int = 30) -> list[dict[str, Any]]:
-    try:
-        output = subprocess.check_output(
-            [
-                "ps",
-                "-eo",
-                "pid,etimes,args",
-            ],
-            text=True,
-        )
-    except Exception:
+    output = None
+    elapsed_is_seconds = True
+    for elapsed_field in ["etimes", "etime"]:
+        try:
+            output = subprocess.check_output(
+                [
+                    "ps",
+                    "-eo",
+                    f"pid,{elapsed_field},args",
+                ],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            elapsed_is_seconds = elapsed_field == "etimes"
+            break
+        except Exception:
+            continue
+    if output is None:
         return []
     rows: list[dict[str, Any]] = []
     for line in output.splitlines()[1:]:
@@ -1238,10 +1783,11 @@ def load_runtime_processes(limit: int = 30) -> list[dict[str, Any]]:
         pid, etimes, args = parts
         if "stockey" not in args and "advisory." not in args and "data." not in args and "go-crond" not in args:
             continue
+        elapsed_seconds = int(etimes) if elapsed_is_seconds and str(etimes).isdigit() else _parse_ps_elapsed_seconds(etimes)
         rows.append(
             {
                 "pid": int(pid),
-                "elapsed_seconds": int(etimes),
+                "elapsed_seconds": elapsed_seconds,
                 "command": args,
             }
         )
@@ -1913,10 +2459,20 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
     rebalance_df = _safe_frame_loader(load_rebalance_rows, asof_date=asof_date)
     watch_events_df = _safe_frame_loader(load_recent_watch_events)
     alerts_df = _safe_frame_loader(load_alert_rows)
+    ts_watch_df = _safe_frame_loader(load_ts_forecast_watch_rows, asof_date=asof_date)
+    ts_forecast_df = _safe_frame_loader(load_latest_ts_forecasts, asof_date=asof_date)
+    ts_history_df = _safe_frame_loader(load_ts_forecast_history_rows, asof_date=asof_date)
+    ts_eval_df = _safe_frame_loader(load_ts_eval_summary_rows)
     sync_state_df = _safe_frame_loader(load_sync_states)
     operator_feed = _safe_list_loader(load_operator_feed, output_dir=output_dir)
     runtime_processes = _safe_list_loader(load_runtime_processes)
     cron_status = _safe_list_loader(load_cron_status)
+    ts_forecast_views = build_ts_forecast_views(
+        watch_df=ts_watch_df,
+        forecast_df=ts_forecast_df,
+        eval_summary_df=ts_eval_df,
+        history_df=ts_history_df,
+    )
     recommendation_views = build_recommendation_views(
         asof_date=asof_date,
         dashboard_df=dashboard_df,
@@ -1936,6 +2492,9 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
         action_recommendations=recommendation_views["action_recommendations"],
         alerts_df=alerts_df,
     )
+    summary["ts_watch_count"] = len(ts_forecast_views["watch"])
+    summary["ts_recommendation_count"] = len(ts_forecast_views["recommendations"])
+    summary["ts_eval_summary_count"] = len(ts_forecast_views["evaluation_summary"])
     return {
         "generated_at": to_display_timestamp(pd.Timestamp.utcnow()),
         "asof_date": None if asof_date is None else _display_dashboard_timestamp(asof_date, prefer_date_for_midnight_utc=True),
@@ -1946,6 +2505,9 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
         "watch_recommendations": _json_ready(recommendation_views["watch_recommendations"]),
         "exited_recommendations": _json_ready(recommendation_views["exited_recommendations"]),
         "action_recommendations": _json_ready(recommendation_views["action_recommendations"]),
+        "ts_forecast_watch": _json_ready(ts_forecast_views["watch"]),
+        "ts_watch_recommendations": _json_ready(ts_forecast_views["recommendations"]),
+        "ts_forecast_eval_summary": _json_ready(ts_forecast_views["evaluation_summary"]),
         "dashboard": _json_ready(dashboard_df),
         "portfolio": _json_ready(portfolio_df),
         "watchlist": _json_ready(watchlist_df),
@@ -2169,12 +2731,27 @@ def render_html(payload: dict[str, Any]) -> str:
       color: var(--warn);
       border-color: rgba(154, 93, 0, 0.2);
     }
+    .status-ts_watch, .status-ts_forecast_only, .status-experimental_positive {
+      background: rgba(15, 76, 92, 0.10);
+      color: var(--accent);
+      border-color: rgba(15, 76, 92, 0.18);
+    }
+    .status-aligned_positive, .status-swing_only, .status-position_only {
+      background: var(--good-soft);
+      color: var(--good);
+      border-color: rgba(15, 123, 71, 0.2);
+    }
+    .status-mixed_ts_signal, .status-ts_weak {
+      background: var(--warn-soft);
+      color: var(--warn);
+      border-color: rgba(154, 93, 0, 0.2);
+    }
     .status-trim_winner, .status-tighten_stop, .status-add_on_pullback {
       background: rgba(15, 76, 92, 0.10);
       color: var(--accent);
       border-color: rgba(15, 76, 92, 0.18);
     }
-    .status-exit_invalidation, .status-exit_stop, .status-exit_emergency, .status-exit_technical_failure, .status-triggered, .status-bad {
+    .status-exit_invalidation, .status-exit_stop, .status-exit_emergency, .status-exit_technical_failure, .status-triggered, .status-bad, .status-ts_closed {
       background: var(--bad-soft);
       color: var(--bad);
       border-color: rgba(161, 42, 42, 0.2);
@@ -2387,6 +2964,17 @@ def render_html(payload: dict[str, Any]) -> str:
     <section class="section">
       <div class="section-head">
         <div class="section-title-wrap">
+          <h2 class="section-title">TS Watch Recommendations</h2>
+          <div class="section-note">Experimental time-series forecast recommendations, labeled TS Watch. These are research-only and do not enter the portfolio or Dhan execution queue.</div>
+        </div>
+        <div class="section-count" id="ts-recommendation-count"></div>
+      </div>
+      <div class="recommendation-list" id="ts_watch_recommendations"></div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div class="section-title-wrap">
           <h2 class="section-title">Today's Recommendations</h2>
           <div class="section-note">Latest portfolio recommendations issued today, shown first with entry, current price, profit since recommendation, and supporting context.</div>
         </div>
@@ -2415,6 +3003,27 @@ def render_html(payload: dict[str, Any]) -> str:
         <div class="section-count" id="watch-count"></div>
       </div>
       <div class="recommendation-list" id="watch_recommendations"></div>
+    </section>
+
+    <section class="section">
+      <div class="section-head">
+        <div class="section-title-wrap">
+          <h2 class="section-title">Experimental TimesFM Watch</h2>
+          <div class="section-note">Research-only OHLCV forecasts from the time-series workflow. These rows are not buy or sell instructions and are not sent to Dhan execution.</div>
+        </div>
+        <div class="section-count" id="ts-forecast-count"></div>
+      </div>
+      <div class="recommendation-list" id="ts_forecast_watch"></div>
+      <div style="margin-top:18px;">
+        <div class="section-head" style="margin-bottom:12px;">
+          <div class="section-title-wrap">
+            <h3 class="section-title" style="font-size:18px;">Forecast Evaluation Quality</h3>
+            <div class="section-note">Latest matured forecast checks after costs. Treat the forecast section as useful only if this stays healthy over enough rows.</div>
+          </div>
+          <div class="section-count" id="ts-eval-count"></div>
+        </div>
+        <div class="ops-list" id="ts_forecast_eval_summary"></div>
+      </div>
     </section>
 
     <section class="section">
@@ -2491,6 +3100,7 @@ def render_html(payload: dict[str, Any]) -> str:
         summaryTile("Today", summary.today_count || 0, "Recommendations issued on the latest recommendation date."),
         summaryTile("Current", summary.current_count || 0, `${summary.open_count || 0} open, ${summary.pending_count || 0} pending, ${summary.positive_count || 0} positive since entry.`),
         summaryTile("Watch", summary.watch_count || 0, "Ideas waiting for the right entry, event confirmation, or price location."),
+        summaryTile("TS Watch", summary.ts_recommendation_count || summary.ts_watch_count || 0, "Experimental TimesFM/OHLCV positives; research only, no execution."),
         summaryTile("Exited", summary.exited_count || 0, "Positions where the system has emitted an actual exit action."),
         summaryTile("Needs Action", summary.action_count || 0, "Manual review, trim, or stop-adjustment actions waiting on operator attention."),
         summaryTile("Live Alerts", summary.alert_count || 0, "Immediate triggers from price or state changes that may need operator attention.")
@@ -2499,6 +3109,10 @@ def render_html(payload: dict[str, Any]) -> str:
       const topActions = Array.isArray(data.top_action_recommendations) ? data.top_action_recommendations : [];
       document.getElementById("top-action-count").textContent = `${topActions.length} rows`;
       document.getElementById("top_action_recommendations").innerHTML = renderRecommendationCards(topActions, { showPnl: true, watchMode: false, actionMode: true });
+
+      const tsRecommendations = Array.isArray(data.ts_watch_recommendations) ? data.ts_watch_recommendations : [];
+      document.getElementById("ts-recommendation-count").textContent = `${tsRecommendations.length} rows`;
+      document.getElementById("ts_watch_recommendations").innerHTML = renderRecommendationCards(tsRecommendations, { showPnl: false, watchMode: true, actionMode: false });
 
       const today = Array.isArray(data.today_recommendations) ? data.today_recommendations : [];
       document.getElementById("today-count").textContent = `${today.length} rows`;
@@ -2511,6 +3125,14 @@ def render_html(payload: dict[str, Any]) -> str:
       const watch = Array.isArray(data.watch_recommendations) ? data.watch_recommendations : [];
       document.getElementById("watch-count").textContent = `${watch.length} rows`;
       document.getElementById("watch_recommendations").innerHTML = renderRecommendationCards(watch, { showPnl: false, watchMode: true, actionMode: false });
+
+      const tsWatch = Array.isArray(data.ts_forecast_watch) ? data.ts_forecast_watch : [];
+      document.getElementById("ts-forecast-count").textContent = `${tsWatch.length} rows`;
+      document.getElementById("ts_forecast_watch").innerHTML = renderTsForecastCards(tsWatch);
+
+      const tsEval = Array.isArray(data.ts_forecast_eval_summary) ? data.ts_forecast_eval_summary : [];
+      document.getElementById("ts-eval-count").textContent = `${tsEval.length} rows`;
+      document.getElementById("ts_forecast_eval_summary").innerHTML = renderTsEvalRows(tsEval);
 
       const exited = Array.isArray(data.exited_recommendations) ? data.exited_recommendations : [];
       document.getElementById("exited-count").textContent = `${exited.length} rows`;
@@ -2620,12 +3242,97 @@ def render_html(payload: dict[str, Any]) -> str:
                 ${detailBlock('Announcement Summary', row.announcement_summary)}
                 ${detailBlock('Action Plan', row.action_summary)}
                 ${detailBlock('Execution Intent', row.execution_intent)}
+                ${detailBlock('TS Update History', row.ts_history_summary)}
                 ${detailBlock(options.actionMode ? 'Action Note' : 'Performance Note', row.current_value_note)}
               </div>
             </details>
           </article>
         `;
       }).join('');
+    }
+
+    function renderTsForecastCards(rows) {
+      if (!rows.length) {
+        return '<div class="empty">No experimental TS forecast watch rows.</div>';
+      }
+      return rows.map(row => {
+        const statusKey = String(row.watch_status || row.action_hint || 'ts_watch').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+        return `
+          <article class="recommendation">
+            <div class="recommendation-top">
+              <div>
+                <div class="recommendation-symbol">${escapeHtml(row.symbol || '-')}</div>
+                <div class="recommendation-setup">${escapeHtml(row.model_name || '-')} | ${escapeHtml(row.source_name || 'research')}</div>
+              </div>
+              <div class="status-pill status-${statusKey}">${escapeHtml(row.watch_status || row.action_hint || 'TS_WATCH')}</div>
+            </div>
+            <div class="action-banner default">
+              <strong>Research only</strong><br>
+              This forecast is OHLCV-only context. It does not create an action unless future paper validation proves incremental value.
+            </div>
+            <div class="metrics">
+              <div class="metric">
+                <div class="metric-label">Asof</div>
+                <div class="metric-value">${escapeHtml(row.asof_date || '-')}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Horizon</div>
+                <div class="metric-value">${escapeHtml(row.horizon_days ? `${row.horizon_days}d` : '-')}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Forecast</div>
+                <div class="metric-value">${formatPct(row.forecast_return_pct)}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Prob Positive</div>
+                <div class="metric-value">${formatPct(row.probability_positive_pct)}</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">Quality</div>
+                <div class="metric-value">${formatPct(row.signal_quality_pct)}</div>
+              </div>
+            </div>
+            <details class="detail-toggle">
+              <summary>Show forecast details</summary>
+              <div class="detail-grid">
+                ${detailBlock('Forecast Price', formatPrice(row.forecast_price))}
+                ${detailBlock('Swing Window', row.swing_window && row.swing_window.summary)}
+                ${detailBlock('Position Window', row.position_window && row.position_window.summary)}
+                ${detailBlock('Downside P10', formatPct(row.downside_return_p10_pct))}
+                ${detailBlock('Upside P90', formatPct(row.upside_return_p90_pct))}
+                ${detailBlock('Action Hint', row.action_hint)}
+                ${detailBlock('Reason', row.watch_reason)}
+                ${detailBlock('History', row.history_summary)}
+                ${detailBlock('Loaded', row.load_ts)}
+              </div>
+            </details>
+          </article>
+        `;
+      }).join('');
+    }
+
+    function renderTsEvalRows(rows) {
+      if (!rows.length) {
+        return '<div class="empty">No matured forecast evaluation summary yet.</div>';
+      }
+      return rows.map(row => `
+        <div class="ops-item">
+          <div class="recommendation-top" style="margin-bottom:8px;">
+            <div>
+              <div style="font-size:18px; margin-bottom:6px;">${escapeHtml(row.model_name || '-')} | ${escapeHtml(row.horizon_days ? `${row.horizon_days}d` : '-')}</div>
+              <div class="recommendation-setup">${escapeHtml(row.action_hint || '-')} | ${escapeHtml(row.from_date || '-')} to ${escapeHtml(row.to_date || '-')}</div>
+            </div>
+            <div class="status-pill status-ts_watch">${escapeHtml(String(row.row_count || 0))} rows</div>
+          </div>
+          <div class="metrics">
+            <div class="metric"><div class="metric-label">Hit Rate</div><div class="metric-value">${formatPct(row.hit_rate_pct)}</div></div>
+            <div class="metric"><div class="metric-label">Positive Rate</div><div class="metric-value">${formatPct(row.positive_rate_pct)}</div></div>
+            <div class="metric"><div class="metric-label">Avg Cost Adj</div><div class="metric-value">${formatPct(row.avg_cost_adjusted_return_pct)}</div></div>
+            <div class="metric"><div class="metric-label">Median Cost Adj</div><div class="metric-value">${formatPct(row.median_cost_adjusted_return_pct)}</div></div>
+            <div class="metric"><div class="metric-label">Sharpe-like</div><div class="metric-value">${escapeHtml(row.sharpe_like === null || row.sharpe_like === undefined ? '-' : Number(row.sharpe_like).toFixed(2))}</div></div>
+          </div>
+        </div>
+      `).join('');
     }
 
     function actionCardTone(actionKey) {

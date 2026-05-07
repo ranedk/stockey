@@ -89,6 +89,26 @@ Required Python packages for the announcement path include:
 - `pdf2image`
 - `requests`
 
+PDF OCR also requires the Poppler command-line tools used by `pdf2image`.
+
+Install Poppler:
+
+```sh
+brew install poppler
+```
+
+On Ubuntu:
+
+```sh
+sudo apt-get install poppler-utils
+```
+
+If Poppler is installed outside cron's `PATH`, set `POPPLER_PATH` to the directory containing `pdfinfo` and `pdftoppm`, for example:
+
+```sh
+POPPLER_PATH=/opt/homebrew/bin
+```
+
 ## Attachment handling
 
 - PDF attachments are downloaded and OCRed through [`utils/ocr`](../utils/ocr).

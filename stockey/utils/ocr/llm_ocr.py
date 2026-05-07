@@ -13,6 +13,8 @@ from openai import OpenAI
 from pdf2image import convert_from_path
 from PIL import Image
 
+from utils.poppler import poppler_install_hint, resolve_poppler_path
+
 
 env = Env()
 env.read_env()
@@ -64,17 +66,29 @@ def parse_pages_spec(pages: str | int | Iterable[int] = "all") -> list[int] | No
 def render_pdf_pages(pdf_path: str | Path, pages: str | int | Iterable[int] = "all") -> list[tuple[int, Image.Image]]:
     pdf_path = Path(pdf_path)
     page_numbers = parse_pages_spec(pages)
+    poppler_path = resolve_poppler_path()
     if page_numbers is None:
-        images = convert_from_path(str(pdf_path))
+        try:
+            images = convert_from_path(str(pdf_path), poppler_path=poppler_path)
+        except Exception as exc:
+            if "poppler" in str(exc).lower() or "pdfinfo" in str(exc).lower():
+                raise RuntimeError(f"{exc}. {poppler_install_hint()}") from exc
+            raise
         return [(index + 1, image) for index, image in enumerate(images)]
 
     rendered: list[tuple[int, Image.Image]] = []
     for page_number in page_numbers:
-        images = convert_from_path(
-            str(pdf_path),
-            first_page=page_number,
-            last_page=page_number,
-        )
+        try:
+            images = convert_from_path(
+                str(pdf_path),
+                first_page=page_number,
+                last_page=page_number,
+                poppler_path=poppler_path,
+            )
+        except Exception as exc:
+            if "poppler" in str(exc).lower() or "pdfinfo" in str(exc).lower():
+                raise RuntimeError(f"{exc}. {poppler_install_hint()}") from exc
+            raise
         if not images:
             raise ValueError(f"Could not render page {page_number} from {pdf_path}")
         rendered.append((page_number, images[0]))

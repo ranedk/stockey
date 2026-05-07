@@ -33,6 +33,32 @@ python builder.py
 
 That creates or refreshes the project venv, creates `logs/cron`, and installs `go-crond` in the repo root if it is missing.
 
+TimesFM setup:
+
+```sh
+python builder.py
+```
+
+Builder installs `torch` and the current Google Research TimesFM package from GitHub by default because the TS forecast workflow uses TimesFM. It intentionally does not install the old PyPI `timesfm` package path, which can pull Pax/Lingvo dependencies on some Python/platform combinations.
+
+Lightweight setup without TimesFM:
+
+```sh
+python builder.py --skip-timesfm-install
+```
+
+Equivalent env form:
+
+```sh
+STOCKEY_SKIP_TIMESFM_INSTALL=true python builder.py
+```
+
+If you need to pin a different TimesFM source, set:
+
+```sh
+STOCKEY_TIMESFM_PACKAGE='git+https://github.com/google-research/timesfm.git#egg=timesfm[torch]' python builder.py
+```
+
 ## Scheduled runs
 
 The repo now ships with a cron template at `config/stockey.crontab.template`.
@@ -62,22 +88,25 @@ Important:
 Current schedule:
 
 - `07:10` weekdays: `./complete_data.sh`
-- `08:20` Monday, Wednesday, Friday: `./all_advisory.sh`
+- `03:10` weekdays: `./all_ml.sh`
 - every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_watchers.sh`
 - `16:05` weekdays: one final post-close `./all_watchers.sh`
-- `18:45` weekdays: `./all_ml.sh`
+- `11:20`, `14:20`, `17:20`, `20:20` weekdays: experimental TS forecast workflow using `config/ts_forecast_screeners.yaml`
+- `18:20`, `21:20` weekdays: matured TS forecast evaluation after costs
+- `19:10` weekdays: `./all_advisory.sh`
 
 Why the split looks like this:
 
 - slow daily and model-prep jobs are isolated from the intra-day watch loop
 - CPI, FPI, WPI, macro, masters, and similar sources get covered by the daily raw refresh
 - live OHLCV, news, and announcements are handled by the `10` minute watch cadence
-- the full advisory is not forced on every market tick; it stays a slower batch decision process
-- training remains a once-daily research process
+- training remains a once-daily research process after 3am
+- TS forecast rows remain research-only and are refreshed a few times per day; daily OHLCV means they should not run on every watcher tick
+- the full advisory is not forced on every market tick; it runs once daily after 7pm
 
 Important constraint:
 
-- the cron file uses `flock` so duplicate overlapping runs are skipped instead of piling up
+- the cron file uses `scripts/with_lock.sh` so duplicate overlapping runs are skipped instead of piling up; it uses `flock` on Linux and `lockf` on macOS
 - the shell wrappers resolve Python automatically, so cron does not need `source .xstockey/bin/activate`
 
 ## Database robustness knobs
@@ -94,6 +123,22 @@ Useful environment variables:
 - `DB_POOL_RECYCLE_SECONDS`: SQLAlchemy pool recycle interval, default `300`
 
 Model-training backfills deliberately skip intraday prefetch during snapshot repair. This avoids wasting time on old 1-minute windows when the goal is event-label coverage, not perfect intraday reconstruction.
+
+## OCR dependency
+
+Announcement PDF OCR requires Poppler. On macOS:
+
+```sh
+brew install poppler
+```
+
+On Ubuntu:
+
+```sh
+sudo apt-get install poppler-utils
+```
+
+The OCR code resolves Poppler from `POPPLER_PATH`, then `PATH`, then common Homebrew/system locations. The generated cron `PATH` includes `/opt/homebrew/bin` for macOS Homebrew installs.
 
 ## Redis robustness knobs
 
@@ -176,7 +221,48 @@ What it does:
 3. trains only if the requested horizon is ready
 4. scores current events after training unless skipped
 
-### 4. Continuous watch
+### 4. Experimental OHLCV forecasts
+
+Use when:
+
+- you want research-only forecast features from already downloaded Dhan OHLCV
+- you want to compare future TimesFM / Chronos / Moirai-style adapters against a simple baseline
+
+Command:
+
+```sh
+python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS
+```
+
+Useful variants:
+
+```sh
+python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 20
+python -m advisory.ts_forecast_features --date 2026-04-30 --horizons 5 20
+python -m advisory.ts_forecast_features --refresh-ohlcv --symbols RELIANCE TCS --model-name timesfm_2p5_200m --horizons 5 10 20
+python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30
+python -m advisory.ts_forecast_evaluator --from-date 2026-04-01 --to-date 2026-04-30 --cost-bps 25
+python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m
+python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m
+```
+
+Important behavior:
+
+- writes to `advisory_ts_forecasts_daily` when not using `--dry-run`
+- evaluator writes row-level checks to `advisory_ts_forecast_evaluations` and grouped metrics to `advisory_ts_forecast_eval_summary`
+- workflow writes experimental positives to `advisory_ts_forecast_watchlist`
+- live dashboard shows `advisory_ts_forecast_watchlist` positives near the top as TS Watch Recommendations and shows latest `advisory_ts_forecast_eval_summary` quality under Experimental TimesFM Watch
+- dashboard collapses repeated symbol/horizon rows into one TS card with Swing window, Position window, combined state, and update history
+- default dependency-free model is `naive_momentum_v1`
+- optional TimesFM model is `timesfm_2p5_200m` and requires installing the TimesFM torch package
+- when workflow runs without `--symbols` or `--query`, it uses `config/ts_forecast_screeners.yaml`
+- the default TS screener is a liquid technical candidate generator; if Screener.in is unavailable, the workflow logs the failure and falls back to a capped Dhan/tracked universe
+- cron caps the TS run with `TS_FORECAST_MAX_SYMBOLS`, default `80`, to avoid accidentally running TimesFM over the full market
+- does not create buy/sell actions
+- does not submit anything to Dhan
+- should be treated as paper/research evidence until validated after costs and slippage
+
+### 5. Continuous watch
 
 Use when:
 
@@ -212,7 +298,7 @@ Important behavior:
 - open positions remain monitored for exit-related alerts
 - alerts and cycle summaries are also published over Redis pub-sub
 
-### 5. Split refreshes
+### 6. Split refreshes
 
 Use when:
 
@@ -284,8 +370,9 @@ python -m advisory.event_router --dry-run
 
 1. `./complete_data.sh`
 2. `./all_ml.sh`
-3. `./all_advisory.sh`
-4. inspect portfolio output and traces if something looks unusual
+3. optional: `python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 20`
+4. `./all_advisory.sh`
+5. inspect portfolio output and traces if something looks unusual
 
 ### Live monitoring mode
 

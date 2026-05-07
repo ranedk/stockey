@@ -25,6 +25,7 @@ from .schemas import DOCUMENT_PYDANTIC_MAP, MODEL_TYPE_MAP
 from utils.http import get_dynamic_headers
 from utils.log import setup_logger
 from utils.ocr import ocr_pdf_with_gemini, ocr_pdf_with_openai
+from utils.poppler import poppler_install_hint, resolve_poppler_path
 from utils.transcribe import transcribe_audio_bytes
 
 from environs import Env
@@ -176,7 +177,15 @@ class AnnouncementPipeline:
                 if not announcement.is_pdf_attachment():
                     continue
 
-                pdf_info = pdfinfo_from_bytes(announcement.attachment_bytes)
+                try:
+                    pdf_info = pdfinfo_from_bytes(
+                        announcement.attachment_bytes,
+                        poppler_path=resolve_poppler_path(),
+                    )
+                except Exception as exc:
+                    if "poppler" in str(exc).lower() or "pdfinfo" in str(exc).lower():
+                        raise RuntimeError(f"{exc}. {poppler_install_hint()}") from exc
+                    raise
                 announcement.number_of_pages = int(pdf_info.get("Pages", 0))
                 if max_pages <= 0 or not announcement.number_of_pages:
                     page_spec = "all"
