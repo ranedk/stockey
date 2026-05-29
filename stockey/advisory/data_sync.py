@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import sys
 
 import pandas as pd
 
@@ -89,12 +90,25 @@ def ensure_symbol_ohlcv(
                     "reason": "ohlcv_missing_or_stale",
                 }
             )
-        except DhanAPIError as exc:
+        except (DhanAPIError, ValueError) as exc:
             error_text = str(exc).lower()
             if "no data present" in error_text:
                 results.append({"symbol": symbol, "action": "skip", "reason": "ohlcv_no_new_data"})
                 continue
-            results.append({"symbol": symbol, "action": "error", "reason": str(exc)})
+            result = {
+                "symbol": symbol,
+                "action": "issue",
+                "reason": "dhan_daily_sync_failed",
+                "error_type": exc.__class__.__name__,
+                "error": str(exc),
+            }
+            print(
+                f"[advisory.data_sync] daily OHLCV issue symbol={symbol} error_type={exc.__class__.__name__} error={exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            results.append(result)
+            continue
     return results
 
 

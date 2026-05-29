@@ -60,6 +60,31 @@ def load_benchmark_series(
     start_date: pd.Timestamp | None = None,
     to_date: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
+    if benchmark_name.upper() == "NIFTY":
+        fallback_params: dict[str, object] = {"benchmark_name": "Nifty 50"}
+        fallback_clauses = ["index_name = %(benchmark_name)s"]
+        if start_date is not None:
+            fallback_clauses.append("date >= %(start_date)s")
+            fallback_params["start_date"] = start_date
+        if to_date is not None:
+            fallback_clauses.append("date <= %(to_date)s")
+            fallback_params["to_date"] = to_date
+        nse_df = sql_to_df(
+            f"""
+            SELECT index_name AS ticker, date, close
+            FROM nseindia_indices
+            WHERE {' AND '.join(fallback_clauses)}
+            ORDER BY date
+            """,
+            params=fallback_params,
+        )
+        if not nse_df.empty:
+            df = nse_df
+            df["date"] = normalize_timestamp(df["date"])
+            df["benchmark_close"] = pd.to_numeric(df["close"], errors="coerce")
+            df["benchmark_ret_20d"] = df["benchmark_close"].pct_change(20)
+            return df[["date", "benchmark_close", "benchmark_ret_20d"]]
+
     clauses = ["ticker = %(benchmark_name)s", "asset_type = 'benchmark'"]
     params: dict[str, object] = {"benchmark_name": benchmark_name}
     if start_date is not None:
@@ -77,24 +102,6 @@ def load_benchmark_series(
         """,
         params=params,
     )
-    if df.empty and benchmark_name.upper() == "NIFTY":
-        fallback_params: dict[str, object] = {"benchmark_name": "Nifty 50"}
-        fallback_clauses = ["index_name = %(benchmark_name)s"]
-        if start_date is not None:
-            fallback_clauses.append("date >= %(start_date)s")
-            fallback_params["start_date"] = start_date
-        if to_date is not None:
-            fallback_clauses.append("date <= %(to_date)s")
-            fallback_params["to_date"] = to_date
-        df = sql_to_df(
-            f"""
-            SELECT index_name AS ticker, date, close
-            FROM nseindia_indices
-            WHERE {' AND '.join(fallback_clauses)}
-            ORDER BY date
-            """,
-            params=fallback_params,
-        )
     if df.empty:
         return df
     df["date"] = normalize_timestamp(df["date"])
@@ -181,23 +188,43 @@ def load_latest_peer_memberships(anchor_symbols: list[str]) -> pd.DataFrame:
         return pd.DataFrame()
     df = sql_to_df(
         """
-        SELECT p.anchor_symbol, p.peer_symbol, p.sector_code, p.industry_code, p.nse_basic_ind_code
-        FROM sharpely_stock_peers p
-        JOIN (
-            SELECT anchor_symbol, MAX(as_on_date) AS max_as_on_date
-            FROM sharpely_stock_peers
-            WHERE anchor_symbol = ANY(%s)
-            GROUP BY anchor_symbol
-        ) latest
-          ON latest.anchor_symbol = p.anchor_symbol
-         AND latest.max_as_on_date = p.as_on_date
-        WHERE p.anchor_symbol = ANY(%s)
-          AND COALESCE(p.is_self_peer, FALSE) = FALSE
-          AND COALESCE(p.nse_active, 1) = 1
-          AND COALESCE(p.is_exclusion_list, 0) = 0
-        ORDER BY p.anchor_symbol, p.peer_rank, p.peer_symbol
+        WITH sector_counts AS (
+            SELECT
+                UPPER(TRIM(symbol)) AS symbol,
+                TRIM(sector_code) AS sector_code,
+                COUNT(*) AS row_count
+            FROM master_sharpely_equity
+            WHERE NULLIF(TRIM(symbol), '') IS NOT NULL
+              AND NULLIF(TRIM(sector_code), '') IS NOT NULL
+              AND UPPER(TRIM(symbol)) = ANY(%s)
+            GROUP BY UPPER(TRIM(symbol)), TRIM(sector_code)
+        ),
+        ranked AS (
+            SELECT
+                symbol,
+                sector_code,
+                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY row_count DESC, sector_code) AS rn
+            FROM sector_counts
+        ),
+        anchors AS (
+            SELECT symbol AS anchor_symbol, sector_code
+            FROM ranked
+            WHERE rn = 1
+        )
+        SELECT
+            anchors.anchor_symbol,
+            ranked.symbol AS peer_symbol,
+            anchors.sector_code,
+            NULL::text AS industry_code,
+            NULL::text AS nse_basic_ind_code
+        FROM anchors
+        JOIN ranked
+          ON ranked.rn = 1
+         AND ranked.sector_code = anchors.sector_code
+         AND ranked.symbol <> anchors.anchor_symbol
+        ORDER BY anchors.anchor_symbol, ranked.symbol
         """,
-        params=(anchor_symbols, anchor_symbols),
+        params=(anchor_symbols,),
     )
     if df.empty:
         return df

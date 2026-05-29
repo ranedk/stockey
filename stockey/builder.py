@@ -17,6 +17,7 @@ CRON_LOG_DIR = PROJECT_ROOT / "logs" / "cron"
 CRON_TEMPLATE_PATH = PROJECT_ROOT / "config" / "stockey.crontab.template"
 GENERATED_CRONTAB_PATH = PROJECT_ROOT / "config" / "stockey.generated.crontab"
 LOCK_WRAPPER_PATH = PROJECT_ROOT / "scripts" / "with_lock.sh"
+FRONTEND_SCRIPT_PATH = PROJECT_ROOT / "all_frontend.sh"
 OPTIONAL_TS_FORECAST_PACKAGES = [
     "torch",
     os.getenv(
@@ -186,9 +187,10 @@ def ensure_runtime_directories() -> None:
 
 
 def ensure_script_permissions() -> None:
-    if LOCK_WRAPPER_PATH.exists():
-        LOCK_WRAPPER_PATH.chmod(0o755)
-        _log(f"Ensured executable script: {LOCK_WRAPPER_PATH}")
+    for script_path in [LOCK_WRAPPER_PATH, FRONTEND_SCRIPT_PATH]:
+        if script_path.exists():
+            script_path.chmod(0o755)
+            _log(f"Ensured executable script: {script_path}")
 
 
 def render_crontab() -> str:

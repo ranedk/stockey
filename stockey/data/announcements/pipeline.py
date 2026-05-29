@@ -24,7 +24,8 @@ from .prompts import CATEGORY_PROMPTS, REPORT_PROMPTS
 from .schemas import DOCUMENT_PYDANTIC_MAP, MODEL_TYPE_MAP
 from utils.http import get_dynamic_headers
 from utils.log import setup_logger
-from utils.ocr import ocr_pdf_with_gemini, ocr_pdf_with_openai
+from utils.codex_cli import run_codex_cli, run_codex_structured
+from utils.ocr import ocr_pdf_with_codex, ocr_pdf_with_gemini, ocr_pdf_with_openai
 from utils.poppler import poppler_install_hint, resolve_poppler_path
 from utils.transcribe import transcribe_audio_bytes
 
@@ -34,15 +35,17 @@ env = Env()
 env.read_env()
 logger = setup_logger("announcement_pipeline")
 
-OPENAI_API_KEY = env("OPENAI_API_KEY")
-OCR_USING = env("OCR_USING", default="gemini-3-flash-preview")
+OPENAI_API_KEY = env("OPENAI_API_KEY", default=None)
+OCR_USING = env("OCR_USING", default="codex")
 TRANSCRIBE_WITH = env("TRANSCRIBE_WITH", default="gemini-3-flash-preview")
-SUMMARIZE_WITH = env("SUMMARIZE_WITH", default="gpt-5-mini-2025-08-07")
+SUMMARIZE_WITH = env("SUMMARIZE_WITH", default="codex")
+CODEX_CLI_SUMMARIZE_MODEL = env("CODEX_CLI_SUMMARIZE_MODEL", default=env("CODEX_CLI_MODEL", default="gpt-5.4-mini"))
+CODEX_CLI_OCR_MODEL = env("CODEX_CLI_OCR_MODEL", default=env("CODEX_CLI_MODEL", default="gpt-5.4-mini"))
 NSE_HTTP_MAX_ATTEMPTS = env.int("NSE_HTTP_MAX_ATTEMPTS", default=0)
 NSE_HTTP_RETRY_SLEEP_SECONDS = env.float("NSE_HTTP_RETRY_SLEEP_SECONDS", default=5.0)
 NSE_HTTP_RETRY_MAX_SLEEP_SECONDS = env.float("NSE_HTTP_RETRY_MAX_SLEEP_SECONDS", default=120.0)
 NSE_HTTP_RETRY_STATUSES = {429, 500, 502, 503, 504}
-Provider = Literal["openai", "gemini"]
+Provider = Literal["openai", "gemini", "codex"]
 _AUDIO_EXTENSIONS = {"mp3", "wav", "mp4", "m4a", "aac", "ogg", "webm"}
 _AUDIO_LINK_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 _AUDIO_HINT_PATTERN = re.compile(r"(audio|recording|transcript|conference|earnings).{0,80}(mp3|wav|mp4|m4a|aac|ogg|webm)", re.IGNORECASE)
@@ -286,28 +289,11 @@ class AnnouncementPipeline:
                     "AnnouncementParse",
                     **{report_model.__name__: (report_model, ...)},
                 )
-                completion = self._get_openai_client().beta.chat.completions.parse(
-                    model=self.summarize_model,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You extract structured data from stock exchange announcements "
-                                "and OCR text. Return only values that are explicitly supported "
-                                "by the provided document."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": rendered_prompt},
-                                {"type": "text", "text": self._build_document_context(announcement)},
-                            ],
-                        },
-                    ],
-                    response_format=response_model,
+                parsed_response = self._parse_structured_response(
+                    prompt="\n\n".join([rendered_prompt, self._build_document_context(announcement)]),
+                    response_model=response_model,
                 )
-                parsed = getattr(completion.choices[0].message.parsed, report_model.__name__)
+                parsed = getattr(parsed_response, report_model.__name__)
                 parsed_reports.append(
                     ParsedReport(
                         category=category,
@@ -644,6 +630,9 @@ class AnnouncementPipeline:
             handle.flush()
             if provider == "gemini":
                 return ocr_pdf_with_gemini(handle.name, pages=pages, model=self.ocr_model)
+            if provider == "codex":
+                model = self.ocr_model.split(":", 1)[1] if self.ocr_model.startswith("codex:") else CODEX_CLI_OCR_MODEL
+                return ocr_pdf_with_codex(handle.name, pages=pages, model=model)
             return ocr_pdf_with_openai(handle.name, pages=pages, model=self.ocr_model)
 
     def _transcribe_attachment_bytes(self, announcement: Announcement) -> str:
@@ -716,6 +705,23 @@ class AnnouncementPipeline:
 
     def _generate_text(self, *, prompt: str, context: str, model: str) -> str:
         provider = self._model_provider(model)
+        if provider == "codex":
+            codex_model = model.split(":", 1)[1] if model.startswith("codex:") else CODEX_CLI_SUMMARIZE_MODEL
+            return run_codex_cli(
+                textwrap.dedent(
+                    f"""\
+                    You summarize stock exchange announcements faithfully and concisely.
+                    Return only the final summary text. Do not add headings, bullets, or commentary.
+
+                    # Task
+                    {prompt}
+
+                    # Document context
+                    {context}
+                    """
+                ),
+                model=codex_model,
+            ).strip()
         if provider != "openai":
             raise ValueError(f"Unsupported summarization model provider for {model}")
         response = self._get_openai_client().responses.create(
@@ -741,8 +747,45 @@ class AnnouncementPipeline:
         )
         return (response.output_text or "").strip()
 
+    def _parse_structured_response(self, *, prompt: str, response_model: Type[BaseModel]) -> BaseModel:
+        provider = self._model_provider(self.summarize_model)
+        if provider == "codex":
+            codex_model = self.summarize_model.split(":", 1)[1] if self.summarize_model.startswith("codex:") else CODEX_CLI_SUMMARIZE_MODEL
+            return run_codex_structured(
+                prompt,
+                response_model=response_model,
+                model=codex_model,
+                system_prompt=(
+                    "You extract structured data from stock exchange announcements and OCR text. "
+                    "Return only values that are explicitly supported by the provided document."
+                ),
+            )
+        completion = self._get_openai_client().beta.chat.completions.parse(
+            model=self.summarize_model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You extract structured data from stock exchange announcements "
+                        "and OCR text. Return only values that are explicitly supported "
+                        "by the provided document."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            ],
+            response_format=response_model,
+        )
+        return completion.choices[0].message.parsed
+
     @staticmethod
     def _model_provider(model_name: str) -> Provider:
+        if model_name == "codex" or model_name.startswith("codex:"):
+            return "codex"
         if model_name.startswith("gemini"):
             return "gemini"
         if model_name.startswith("gpt-") or model_name.startswith("o"):

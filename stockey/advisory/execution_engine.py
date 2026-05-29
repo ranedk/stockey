@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from advisory.action_recommender import TABLE_NAME as ACTIONS_TABLE, build_action_recommendations
+from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
 from data.dhanlive.client import DhanAPIError, DhanTradingClient
 from data.dhanlive.dhan_db import resolve_dhan_identity
 from utils.db import db_session, sql_to_df, upsert_to_db
@@ -957,6 +958,81 @@ def persist_execution_orders(df: pd.DataFrame) -> None:
         unique_keys=["asof_date", "published_on", "setup_id", "symbol", "unique_id"],
         timescaledb_column="asof_date",
     )
+    _trace_execution_rows(out, stage="execution_planning", step_idx=60)
+
+
+def _jsonish(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        if pd.isna(value):
+            return {}
+    except Exception:
+        pass
+    try:
+        parsed = json.loads(str(value or "{}"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _trace_execution_rows(df: pd.DataFrame, *, stage: str, step_idx: int) -> None:
+    if df.empty:
+        return
+    for _, row in df.iterrows():
+        safety_checks = _jsonish(row.get("safety_checks_json"))
+        raw_broker = _jsonish(row.get("raw_broker_json"))
+        payload = {
+            "execution_status": row.get("execution_status"),
+            "execution_reason": row.get("execution_reason"),
+            "transaction_type": row.get("transaction_type"),
+            "quantity": row.get("quantity"),
+            "filled_quantity": row.get("filled_quantity"),
+            "estimated_order_value_inr": row.get("estimated_order_value_inr"),
+            "reference_price": row.get("reference_price"),
+            "reference_price_source": row.get("reference_price_source"),
+            "reference_price_asof": row.get("reference_price_asof"),
+            "product_type": row.get("product_type"),
+            "order_type": row.get("order_type"),
+            "validity": row.get("validity"),
+            "security_id": row.get("security_id"),
+            "exchange_segment": row.get("exchange_segment"),
+            "broker_order_id": row.get("broker_order_id"),
+            "exchange_order_id": row.get("exchange_order_id"),
+            "broker_order_status": row.get("broker_order_status"),
+            "submitted_at": row.get("submitted_at"),
+            "broker_update_time": row.get("broker_update_time"),
+            "live_mode": row.get("live_mode"),
+            "safety_checks": safety_checks,
+            "raw_broker_action": raw_broker.get("action_code") or raw_broker.get("action_source"),
+            "raw_broker_source": raw_broker.get("action_source"),
+            "raw_broker_execution_mode": raw_broker.get("execution_mode"),
+        }
+        trace_id = safe_trace_call(
+            append_trace,
+            asof_date=row.get("asof_date"),
+            symbol=row.get("symbol"),
+            unique_id=row.get("unique_id"),
+            setup_id=row.get("setup_id"),
+            trigger_type=stage,
+            final_action=row.get("execution_status"),
+            final_reason=row.get("execution_reason"),
+            source_table=EXECUTION_TABLE,
+            source_key=f"{row.get('asof_date')}:{row.get('published_on')}:{row.get('setup_id')}:{row.get('symbol')}:{row.get('unique_id')}",
+            payload=payload,
+        )
+        if trace_id:
+            safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=step_idx,
+                stage=stage,
+                status=str(row.get("execution_status") or "planned"),
+                reason=row.get("execution_reason"),
+                input_payload=raw_broker,
+                output_payload=row.to_dict(),
+                payload=payload,
+            )
 
 
 def _append_reason(existing: object, reason: str) -> str:
@@ -1051,6 +1127,7 @@ def submit_live_orders(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = apply_live_execution_safety(df)
     if not out["execution_status"].astype(str).eq("planned").any():
+        _trace_execution_rows(out, stage="execution_safety", step_idx=61)
         return out
     client = DhanTradingClient()
     for idx, row in out.iterrows():
@@ -1081,6 +1158,7 @@ def submit_live_orders(df: pd.DataFrame) -> pd.DataFrame:
             out.at[idx, "execution_status"] = "submit_error"
             out.at[idx, "execution_reason"] = str(exc)
             out.at[idx, "live_mode"] = True
+    _trace_execution_rows(out, stage="execution_submission", step_idx=62)
     return out
 
 
@@ -1201,6 +1279,7 @@ def persist_reconciliation(order_df: pd.DataFrame, fills_df: pd.DataFrame) -> No
             unique_keys=["asof_date", "published_on", "setup_id", "symbol", "unique_id"],
             timescaledb_column="asof_date",
         )
+        _trace_execution_rows(order_out, stage="execution_reconciliation", step_idx=63)
     if not fills_df.empty:
         fills_out = fills_df.copy()
         for col in ["traded_quantity", "traded_price"]:

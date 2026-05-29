@@ -173,6 +173,16 @@ def get_access_token() -> str:
     return str(consume_consent_token(pasted_token_id)["accessToken"])
 
 
+def force_refresh_access_token() -> str:
+    clear_cached_access_token()
+    if is_auto_login_configured():
+        token_id = get_token_id_from_auto_login()
+    else:
+        consent_url = begin_browser_consent()
+        token_id = prompt_for_token_id(consent_url)
+    return str(consume_consent_token(token_id)["accessToken"])
+
+
 def extract_token_id(url: str) -> str | None:
     parsed = urlparse(url)
     token_values = parse_qs(parsed.query).get("tokenId")

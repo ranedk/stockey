@@ -216,3 +216,6 @@ base_chromed_data/
 backups/
 go-crond
 chromedata/
+logs/
+live_dashboard/
+**/*/.output/

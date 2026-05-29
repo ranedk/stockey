@@ -334,18 +334,77 @@ def build_evaluation_summary(
     return pd.DataFrame(rows)
 
 
+def _prepare_evaluations_for_persist(evaluations: pd.DataFrame) -> pd.DataFrame:
+    if evaluations.empty:
+        return evaluations
+    out = evaluations.copy()
+    for col in ["asof_date", "future_date", "load_ts"]:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], utc=True, errors="coerce")
+    for col in ["forecast_horizon_days", "forecast_direction", "realized_direction"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+    for col in [
+        "forecast_return",
+        "realized_return",
+        "cost_adjusted_return",
+        "absolute_error",
+        "squared_error",
+        "entry_price",
+        "exit_price",
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    for col in ["direction_hit", "positive_realized"]:
+        if col in out.columns:
+            out[col] = out[col].astype("boolean")
+    for col in ["symbol", "model_name", "action_hint", "evaluation_status", "evaluation_detail"]:
+        if col in out.columns:
+            out[col] = out[col].astype("string")
+    return out
+
+
+def _prepare_summary_for_persist(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary.empty:
+        return summary
+    out = summary.copy()
+    for col in ["evaluated_at", "from_date", "to_date", "load_ts"]:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], utc=True, errors="coerce")
+    for col in ["forecast_horizon_days", "row_count"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+    for col in [
+        "hit_rate",
+        "positive_rate",
+        "avg_realized_return",
+        "avg_cost_adjusted_return",
+        "median_cost_adjusted_return",
+        "avg_absolute_error",
+        "rmse",
+        "sharpe_like",
+        "max_drawdown_proxy",
+    ]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    for col in ["model_name", "action_hint", "config_json"]:
+        if col in out.columns:
+            out[col] = out[col].astype("string")
+    return out
+
+
 def persist_evaluations(evaluations: pd.DataFrame, summary: pd.DataFrame) -> None:
     ensure_tables()
     if not evaluations.empty:
         upsert_to_db(
-            evaluations,
+            _prepare_evaluations_for_persist(evaluations),
             EVALUATIONS_TABLE,
             unique_keys=["asof_date", "symbol", "model_name", "forecast_horizon_days"],
             timescaledb_column="asof_date",
         )
     if not summary.empty:
         upsert_to_db(
-            summary,
+            _prepare_summary_for_persist(summary),
             SUMMARY_TABLE,
             unique_keys=["evaluated_at", "model_name", "forecast_horizon_days", "action_hint"],
             timescaledb_column="evaluated_at",

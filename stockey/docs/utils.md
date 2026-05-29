@@ -26,6 +26,7 @@ The OCR utility lives under [`utils/ocr`](../utils/ocr).
 
 It supports:
 
+- Codex CLI via `codex exec` with image input
 - OpenAI via `OPENAI_API_KEY`
 - Gemini via `GEMINI_KEY`
 - page selection using `all`, single pages, comma lists, or ranges
@@ -34,14 +35,20 @@ Examples:
 
 ```sh
 python -m utils.ocr /path/to/file.pdf
+python -m utils.ocr /path/to/file.pdf --provider codex --pages 1
 python -m utils.ocr /path/to/file.pdf --provider gemini --pages 1
 python -m utils.ocr /path/to/file.pdf --provider openai --pages 1,3-5
 python -m utils.ocr /path/to/file.pdf --provider both --pages all
 ```
 
+Announcement ingestion uses Codex CLI for OCR when `OCR_USING=codex` or `OCR_USING=codex:<model>` is set. Use `CODEX_CLI_OCR_MODEL` to choose the default model for this path.
+
+For structured extraction, the Codex adapter asks the CLI to emit strict JSON, then validates it locally with the same Pydantic schemas used by the old hosted structured-output path. Invalid JSON or schema violations fail the row instead of silently writing bad data.
+
 Tested locally with:
 
 ```sh
+python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider codex --pages 1
 python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider gemini --pages 1
 python -m utils.ocr /tmp/stockey_ocr_test/sample_ocr.pdf --provider openai --pages 1
 ```

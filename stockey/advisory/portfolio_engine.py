@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 from sqlalchemy.exc import SQLAlchemyError
 
+from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
 from advisory.setup_registry import load_setup_registry
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.display_time import to_display_value
@@ -229,19 +230,29 @@ def load_symbol_metadata(symbols: list[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=["symbol", "sector_code"])
     meta = sql_to_df(
         """
-        SELECT m.symbol, m.sector_code
-        FROM sharpely_stock_meta m
-        JOIN (
-            SELECT symbol, MAX(as_on_date) AS max_as_on_date
-            FROM sharpely_stock_meta
-            WHERE symbol = ANY(%s)
-            GROUP BY symbol
-        ) latest
-          ON latest.symbol = m.symbol
-         AND latest.max_as_on_date = m.as_on_date
-        WHERE m.symbol = ANY(%s)
+        WITH sector_counts AS (
+            SELECT
+                UPPER(TRIM(symbol)) AS symbol,
+                TRIM(sector_code) AS sector_code,
+                COUNT(*) AS row_count
+            FROM master_sharpely_equity
+            WHERE NULLIF(TRIM(symbol), '') IS NOT NULL
+              AND NULLIF(TRIM(sector_code), '') IS NOT NULL
+              AND UPPER(TRIM(symbol)) = ANY(%s)
+            GROUP BY UPPER(TRIM(symbol)), TRIM(sector_code)
+        ),
+        ranked AS (
+            SELECT
+                symbol,
+                sector_code,
+                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY row_count DESC, sector_code) AS rn
+            FROM sector_counts
+        )
+        SELECT symbol, sector_code
+        FROM ranked
+        WHERE rn = 1
         """,
-        params=(symbols, symbols),
+        params=(symbols,),
     )
     if meta.empty:
         return pd.DataFrame(columns=["symbol", "sector_code"])
@@ -251,33 +262,7 @@ def load_symbol_metadata(symbols: list[str]) -> pd.DataFrame:
 
 
 def load_peer_edges(symbols: list[str]) -> pd.DataFrame:
-    if not symbols:
-        return pd.DataFrame(columns=["anchor_symbol", "peer_symbol"])
-    df = sql_to_df(
-        """
-        SELECT p.anchor_symbol, p.peer_symbol
-        FROM sharpely_stock_peers p
-        JOIN (
-            SELECT anchor_symbol, MAX(as_on_date) AS max_as_on_date
-            FROM sharpely_stock_peers
-            WHERE anchor_symbol = ANY(%s)
-            GROUP BY anchor_symbol
-        ) latest
-          ON latest.anchor_symbol = p.anchor_symbol
-         AND latest.max_as_on_date = p.as_on_date
-        WHERE p.anchor_symbol = ANY(%s)
-          AND p.peer_symbol = ANY(%s)
-          AND COALESCE(p.is_self_peer, FALSE) = FALSE
-          AND COALESCE(p.nse_active, 1) = 1
-          AND COALESCE(p.is_exclusion_list, 0) = 0
-        """,
-        params=(symbols, symbols, symbols),
-    )
-    if df.empty:
-        return pd.DataFrame(columns=["anchor_symbol", "peer_symbol"])
-    for col in ["anchor_symbol", "peer_symbol"]:
-        df[col] = df[col].astype("string").str.upper()
-    return df.drop_duplicates(subset=["anchor_symbol", "peer_symbol"], keep="last")
+    return pd.DataFrame(columns=["anchor_symbol", "peer_symbol"])
 
 
 def build_overlap_map(symbols: list[str]) -> dict[str, tuple[str, str]]:
@@ -708,6 +693,64 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
         unique_keys=["published_on", "setup_id", "symbol", "unique_id"],
         timescaledb_column="published_on",
     )
+    _trace_portfolio_rows(out)
+
+
+def _trace_portfolio_rows(df: pd.DataFrame) -> None:
+    for _, row in df.iterrows():
+        trace_id = safe_trace_call(
+            append_trace,
+            asof_date=row.get("asof_date"),
+            symbol=row.get("symbol"),
+            unique_id=row.get("unique_id"),
+            setup_id=row.get("setup_id"),
+            trigger_type="portfolio_allocation",
+            final_action=row.get("portfolio_status"),
+            final_reason=row.get("portfolio_reason") or row.get("execution_notes"),
+            source_table=PORTFOLIO_TABLE,
+            source_key=f"{row.get('published_on')}:{row.get('setup_id')}:{row.get('symbol')}:{row.get('unique_id')}",
+            payload={
+                "portfolio_status": row.get("portfolio_status"),
+                "portfolio_reason": row.get("portfolio_reason"),
+                "plan_rank": row.get("plan_rank"),
+                "priority_score": row.get("priority_score"),
+                "invest_score_pct": row.get("invest_score_pct"),
+                "requested_allocation_inr": row.get("requested_allocation_inr"),
+                "approved_allocation_inr": row.get("approved_allocation_inr"),
+                "remaining_capital_after_inr": row.get("remaining_capital_after_inr"),
+                "overlap_group": row.get("overlap_group"),
+                "overlap_reason": row.get("overlap_reason"),
+            },
+        )
+        if trace_id:
+            safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=35,
+                stage="portfolio_allocation",
+                status=str(row.get("portfolio_status") or "completed"),
+                reason=row.get("execution_notes") or row.get("portfolio_reason"),
+                input_payload=row.get("context_snapshot_json"),
+                output_payload=row.to_dict(),
+                payload={
+                    "portfolio_status": row.get("portfolio_status"),
+                    "portfolio_reason": row.get("portfolio_reason"),
+                    "plan_rank": row.get("plan_rank"),
+                    "priority_score": row.get("priority_score"),
+                    "invest_score_pct": row.get("invest_score_pct"),
+                    "requested_allocation_inr": row.get("requested_allocation_inr"),
+                    "approved_allocation_inr": row.get("approved_allocation_inr"),
+                    "remaining_capital_after_inr": row.get("remaining_capital_after_inr"),
+                    "overlap_group": row.get("overlap_group"),
+                    "overlap_reason": row.get("overlap_reason"),
+                    "thesis_bucket": row.get("thesis_bucket"),
+                    "bucket_reason": row.get("bucket_reason"),
+                    "expected_horizon_days": row.get("expected_horizon_days"),
+                    "target_price": row.get("target_price"),
+                    "stop_price": row.get("stop_price"),
+                    "invalidation_price": row.get("invalidation_price"),
+                },
+            )
 
 
 def parse_args() -> argparse.Namespace:

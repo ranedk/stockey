@@ -238,7 +238,7 @@
     {
       "name": "run_all_watchers",
       "category": "orchestration",
-      "description": "Run the lightweight continuous watch loop for active watchlist names and open positions, with OHLCV, announcements, ET/news, Redis pub-sub updates, and static dashboard writes.",
+      "description": "Run the lightweight continuous watch loop for active watchlist names and open positions, with OHLCV, announcements, ET/news, Redis pub-sub updates, and operator frontend status.",
       "command": ["bash", "all_watchers.sh"],
       "read_only": false,
       "examples": [

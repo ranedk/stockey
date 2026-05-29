@@ -40,6 +40,7 @@ from advisory.llm_event_evaluator import build_outputs as build_event_evaluation
 from advisory.llm_event_evaluator import persist_outputs as persist_event_evaluations
 from advisory.macro_features import build_macro_features, persist_macro_features
 from advisory.macro_snapshot import build_macro_snapshot, persist_macro_snapshot
+from advisory.market_context import build_market_context, persist_market_context
 from advisory.news_overlay_engine import build_overlay_state, persist_overlay_state
 from advisory.news_theme_engine import build_theme_recommendations, load_active_theme_screener_mapping
 from advisory.news_watch import persist_news_events, run_news_watch
@@ -73,6 +74,7 @@ PIPELINE_STAGES = [
     "intraday",
     "fundamentals",
     "regime",
+    "market_context",
     "overlay",
     "themes",
     "rules",
@@ -382,6 +384,21 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             persist_regime_snapshot(regime_df, rebuild=bool(args.rebuild))
         summary["stages"]["regime"] = _json_ready(regime_df)
         _finish_stage("regime", stage_started, f"rows={len(regime_df)}")
+
+    if stage_enabled("market_context", args.start_at, args.stop_at):
+        stage_started = _start_stage("market_context")
+        market_context_universe_df, market_context_summary_df = build_market_context(asof_date=asof_date)
+        if not args.dry_run:
+            persist_market_context(market_context_universe_df, market_context_summary_df)
+        summary["stages"]["market_context"] = {
+            "universe": _json_ready(market_context_universe_df),
+            "summary": _json_ready(market_context_summary_df),
+        }
+        _finish_stage(
+            "market_context",
+            stage_started,
+            f"universe_rows={len(market_context_universe_df)} summary_rows={len(market_context_summary_df)}",
+        )
 
     if stage_enabled("overlay", args.start_at, args.stop_at):
         stage_started = _start_stage("overlay")

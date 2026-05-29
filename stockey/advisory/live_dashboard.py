@@ -972,6 +972,12 @@ def load_action_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 100)
             invest_score_pct,
             action_reason,
             action_detail,
+            recommendation_reason_json,
+            reason_contract_status,
+            manual_revision_summary,
+            manual_revision_pointers_json,
+            manual_revision_model,
+            manual_revision_status,
             load_ts
         FROM {ACTIONS_TABLE}
         WHERE {' AND '.join(clauses)}
@@ -1903,6 +1909,10 @@ def _base_recommendation_record(
     technical_context: Any = None,
     action_summary: Any = None,
     execution_intent: Any = None,
+    manual_revision_summary: Any = None,
+    manual_revision_pointers: Any = None,
+    recommendation_reason: Any = None,
+    reason_contract_status: Any = None,
     sort_ts: Any = None,
 ) -> dict[str, Any]:
     return {
@@ -1930,6 +1940,10 @@ def _base_recommendation_record(
         "technical_context": _as_text(technical_context),
         "action_summary": _as_text(action_summary),
         "execution_intent": _as_text(execution_intent),
+        "manual_revision_summary": _as_text(manual_revision_summary),
+        "manual_revision_pointers": manual_revision_pointers,
+        "recommendation_reason": recommendation_reason,
+        "reason_contract_status": _as_text(reason_contract_status),
         "sort_ts": None if pd.isna(pd.to_datetime(sort_ts, utc=True, errors="coerce")) else pd.to_datetime(sort_ts, utc=True, errors="coerce").isoformat(),
     }
 
@@ -1940,6 +1954,11 @@ def _coalesce_float(*values: Any) -> float | None:
         if numeric is not None:
             return numeric
     return None
+
+
+def _manual_revision_pointers(row: pd.Series | dict[str, Any]) -> dict[str, Any] | None:
+    payload = _parse_json_blob(row.get("manual_revision_pointers_json") if isinstance(row, dict) else row.get("manual_revision_pointers_json"))
+    return payload if isinstance(payload, dict) and payload else None
 
 
 def _sort_recommendation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2096,6 +2115,10 @@ def build_recommendation_views(
                     ),
                     action_summary=_format_action_summary(action_row) if action_row else None,
                     execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
+                    manual_revision_summary=action_row.get("manual_revision_summary") if action_row else None,
+                    manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
+                    recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
+                    reason_contract_status=action_row.get("reason_contract_status") if action_row else None,
                     sort_ts=row.get("published_on"),
                 )
             )
@@ -2180,6 +2203,10 @@ def build_recommendation_views(
                     ),
                     action_summary=_format_action_summary(action_row) if action_row else None,
                     execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
+                    manual_revision_summary=action_row.get("manual_revision_summary") if action_row else None,
+                    manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
+                    recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
+                    reason_contract_status=action_row.get("reason_contract_status") if action_row else None,
                     sort_ts=row.get("published_on"),
                 )
             )
@@ -2263,6 +2290,10 @@ def build_recommendation_views(
                     ),
                     action_summary=_format_action_summary(action_row) if action_row else None,
                     execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
+                    manual_revision_summary=action_row.get("manual_revision_summary") if action_row else None,
+                    manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
+                    recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
+                    reason_contract_status=action_row.get("reason_contract_status") if action_row else None,
                     sort_ts=row.get("state_updated_at"),
                 )
             )
@@ -2319,6 +2350,10 @@ def build_recommendation_views(
                     technical_context=base_row.get("technical_context"),
                     action_summary=_format_action_summary(action_row),
                     execution_intent=_format_execution_intent(execution_map.get(symbol_key, {})),
+                    manual_revision_summary=action_row.get("manual_revision_summary"),
+                    manual_revision_pointers=_manual_revision_pointers(action_row),
+                    recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")),
+                    reason_contract_status=action_row.get("reason_contract_status"),
                     sort_ts=action_row.get("published_on"),
                 )
             )
@@ -3241,6 +3276,9 @@ def render_html(payload: dict[str, Any]) -> str:
                 ${detailBlock('News Summary', row.news_summary)}
                 ${detailBlock('Announcement Summary', row.announcement_summary)}
                 ${detailBlock('Action Plan', row.action_summary)}
+                ${detailBlock('Reason Contract', formatReasonContract(row.recommendation_reason, row.reason_contract_status))}
+                ${detailBlock('Manual Revision Summary', row.manual_revision_summary)}
+                ${detailBlock('Manual Revision Pointers', formatManualRevisionPointers(row.manual_revision_pointers))}
                 ${detailBlock('Execution Intent', row.execution_intent)}
                 ${detailBlock('TS Update History', row.ts_history_summary)}
                 ${detailBlock(options.actionMode ? 'Action Note' : 'Performance Note', row.current_value_note)}
@@ -3411,6 +3449,39 @@ def render_html(payload: dict[str, Any]) -> str:
           <div class="detail-text">${escapeHtml(value || '-')}</div>
         </div>
       `;
+    }
+
+    function formatManualRevisionPointers(value) {
+      if (!value || typeof value !== 'object') return '';
+      const sections = [];
+      const summary = value.revision_summary || value.summary;
+      if (summary) sections.push(String(summary));
+      const labels = [
+        ['key_reasons', 'Reasons'],
+        ['manual_checks', 'Manual checks'],
+        ['risk_flags', 'Risk flags'],
+        ['missing_data', 'Missing data'],
+        ['operator_questions', 'Questions']
+      ];
+      for (const [key, label] of labels) {
+        const items = Array.isArray(value[key]) ? value[key].filter(Boolean) : [];
+        if (items.length) sections.push(`${label}: ${items.join('; ')}`);
+      }
+      return sections.join('\\n');
+    }
+
+    function formatReasonContract(value, status) {
+      if (!value || typeof value !== 'object') return status || '';
+      const sections = [];
+      sections.push(`Status: ${value.status || status || '-'}`);
+      if (Array.isArray(value.missing_fields) && value.missing_fields.length) {
+        sections.push(`Missing: ${value.missing_fields.join(', ')}`);
+      }
+      if (value.primary_reason) sections.push(`Primary: ${value.primary_reason}`);
+      if (Array.isArray(value.evidence_sections_present) && value.evidence_sections_present.length) {
+        sections.push(`Evidence: ${value.evidence_sections_present.join(', ')}`);
+      }
+      return sections.join('\\n');
     }
 
     function formatPrice(value) {

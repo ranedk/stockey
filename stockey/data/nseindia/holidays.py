@@ -77,6 +77,11 @@ nse_product_info = {
         "category": "Debt Market",
         "name": "Negotiated Trade Reporting Platform",
         "definition": "Off-market debt deals reported for settlement under the new debt platform."
+    },
+    "EGR": {
+        "category": "Electronic Gold Receipts",
+        "name": "Gold Segment",
+        "definition": "All Gold receipts reported for settlement"
     }
 }
 

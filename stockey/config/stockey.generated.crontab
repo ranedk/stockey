@@ -18,18 +18,18 @@ LOG_DIR=/Users/rane/code/stockey/logs/cron
 # Daily raw download + parse refresh before market open on weekdays.
 10 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
 
-# Portfolio/advisory run daily after market close and model training.
+# Portfolio/advisory run daily after market close.
 10 19 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh >> "$LOG_DIR/all_advisory.log" 2>&1
 
 # Continuous one-shot watch during market hours on weekdays.
 # Internal sync state keeps news/announcements slower while OHLCV stays more frequent.
 */10 09-15 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
-# Static dashboard refresh every 15 minutes on weekdays so portfolio/advisory state is visible
-# even outside watcher-triggered rewrites.
-*/15 08-18 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dashboard_refresh.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.live_dashboard --output-dir live_dashboard >> "$LOG_DIR/live_dashboard.log" 2>&1
+# Operator frontend supervisor. Runs API + Nuxt and restarts within 5 minutes if it exits.
+# Static live_dashboard generation is disabled.
+*/5 * * * * rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_frontend.lock ./all_frontend.sh >> "$LOG_DIR/operator_frontend.log" 2>&1
 
-# One final post-close watch pass for end-of-day alerts and dashboard refresh.
+# One final post-close watch pass for end-of-day alerts.
 05 16 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
 # Experimental TS forecast workflow. This uses config/ts_forecast_screeners.yaml
@@ -40,10 +40,9 @@ LOG_DIR=/Users/rane/code/stockey/logs/cron
 # Matured TS forecast evaluation. This validates prior forecast rows after costs; it does not create actions.
 20 18,21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_eval.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.ts_forecast_evaluator --model-name "${TS_FORECAST_MODEL_NAME:-timesfm_2p5_200m}" --cost-bps "${TS_FORECAST_COST_BPS:-25}" >> "$LOG_DIR/ts_forecast_evaluator.log" 2>&1
 
-# Event-model prep and training once daily after 3am.
-10 03 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
+# Optional research-only event-model prep/training. Disabled by default because the live system is playbook/rule driven.
+# 10 03 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
 
 # Optional split refreshes if you want explicit control instead of complete_data.sh.
 # 05 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
 # 40 07 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1
-# @reboot rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_dashboard_http.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m http.server --directory live_dashboard 8000 >> "$LOG_DIR/live_dashboard_http.log" 2>&1

@@ -4,6 +4,7 @@ import argparse
 import base64
 import io
 import json
+import tempfile
 from pathlib import Path
 from typing import Iterable, Literal
 
@@ -13,6 +14,7 @@ from openai import OpenAI
 from pdf2image import convert_from_path
 from PIL import Image
 
+from utils.codex_cli import run_codex_cli
 from utils.poppler import poppler_install_hint, resolve_poppler_path
 
 
@@ -22,7 +24,8 @@ env.read_env()
 
 DEFAULT_OPENAI_MODEL = "gpt-5-nano"
 DEFAULT_GEMINI_MODEL = "gemini-3-flash-preview"
-Provider = Literal["openai", "gemini", "both"]
+DEFAULT_CODEX_MODEL = env("CODEX_CLI_OCR_MODEL", default=env("CODEX_CLI_MODEL", default="gpt-5.4-mini"))
+Provider = Literal["openai", "gemini", "codex", "both"]
 
 
 OCR_PROMPT = (
@@ -166,6 +169,16 @@ def ocr_page_with_gemini(
     return "\n".join(texts).strip()
 
 
+def ocr_page_with_codex(
+    image: Image.Image,
+    *,
+    model: str = DEFAULT_CODEX_MODEL,
+) -> str:
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as handle:
+        image.save(handle.name, format="PNG")
+        return run_codex_cli(OCR_PROMPT, model=model, images=[handle.name]).strip()
+
+
 def ocr_pdf_with_openai(
     pdf_path: str | Path,
     *,
@@ -190,6 +203,18 @@ def ocr_pdf_with_gemini(
     return results
 
 
+def ocr_pdf_with_codex(
+    pdf_path: str | Path,
+    *,
+    pages: str | int | Iterable[int] = "all",
+    model: str = DEFAULT_CODEX_MODEL,
+) -> dict[int, str]:
+    results: dict[int, str] = {}
+    for page_number, image in render_pdf_pages(pdf_path, pages):
+        results[page_number] = ocr_page_with_codex(image, model=model)
+    return results
+
+
 def ocr_pdf(
     pdf_path: str | Path,
     *,
@@ -197,22 +222,25 @@ def ocr_pdf(
     pages: str | int | Iterable[int] = "all",
     openai_model: str = DEFAULT_OPENAI_MODEL,
     gemini_model: str = DEFAULT_GEMINI_MODEL,
+    codex_model: str = DEFAULT_CODEX_MODEL,
 ) -> dict[str, dict[int, str]]:
     results: dict[str, dict[int, str]] = {}
     if provider in {"openai", "both"}:
         results["openai"] = ocr_pdf_with_openai(pdf_path, pages=pages, model=openai_model)
     if provider in {"gemini", "both"}:
         results["gemini"] = ocr_pdf_with_gemini(pdf_path, pages=pages, model=gemini_model)
+    if provider == "codex":
+        results["codex"] = ocr_pdf_with_codex(pdf_path, pages=pages, model=codex_model)
     return results
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="OCR a PDF with OpenAI GPT-5 nano and Gemini 3 Flash")
+    parser = argparse.ArgumentParser(description="OCR a PDF with Codex CLI, OpenAI GPT-5 nano, or Gemini 3 Flash")
     parser.add_argument("pdf_path", help="Path to the PDF")
     parser.add_argument(
         "--provider",
-        choices=["openai", "gemini", "both"],
-        default="both",
+        choices=["openai", "gemini", "codex", "both"],
+        default="codex",
         help="Which provider to use",
     )
     parser.add_argument(
@@ -222,6 +250,7 @@ def main() -> None:
     )
     parser.add_argument("--openai-model", default=DEFAULT_OPENAI_MODEL)
     parser.add_argument("--gemini-model", default=DEFAULT_GEMINI_MODEL)
+    parser.add_argument("--codex-model", default=DEFAULT_CODEX_MODEL)
     args = parser.parse_args()
 
     try:
@@ -231,6 +260,7 @@ def main() -> None:
             pages=args.pages,
             openai_model=args.openai_model,
             gemini_model=args.gemini_model,
+            codex_model=args.codex_model,
         )
     except Exception as exc:
         raise SystemExit(str(exc))

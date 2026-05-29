@@ -42,12 +42,15 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/ts_forecast_workflow.py` | `advisory_ts_forecasts_daily`, `advisory_ts_forecast_watchlist` | Optional Screener.in -> Dhan OHLCV refresh -> TimesFM forecast -> experimental TS watchlist workflow |
 | `advisory/exchange_events.py` | `advisory_exchange_events` | Normalizes NSE block/bulk/short-selling/insider/corporate-action/earnings rows into point-in-time exchange events |
 | `advisory/exchange_features.py` | `advisory_exchange_features_daily` | Builds daily symbol-level exchange-event features for LLM context, event-model features, review, and risk sizing |
+| `advisory/market_context.py` | `advisory_market_context_universe_daily`, `advisory_market_context_summary_daily` | Builds the top-50% market-context universe from technical/liquidity/market-cap data and summarizes breadth, leadership, sector clusters, events, and regime context |
 | `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
 | `advisory/model_training_runner.py` | varies | Gated model-training orchestrator: runs prep, checks label coverage for the requested horizon, then trains and scores only when ready |
-| `advisory/sync_state.py` | `advisory_sync_state` | Shared incremental state storage for continuous polling and dashboard refresh tasks |
-| `advisory/continuous_watch.py` | `advisory_live_watch_alerts`, `advisory_sync_state` | Lightweight watch loop over active watchlist OHLCV, announcements, ET/news, and static dashboard writes |
+| `advisory/sync_state.py` | `advisory_sync_state` | Shared incremental state storage for continuous polling and operator frontend status |
+| `advisory/continuous_watch.py` | `advisory_live_watch_alerts`, `advisory_sync_state` | Lightweight watch loop over active watchlist OHLCV, announcements, ET/news, and operator status |
 | `advisory/event_router.py` | `advisory_live_router_actions`, `advisory_sync_state` | Symbol-level router that turns fresh live alerts and events into targeted advisory reevaluation |
-| `advisory/live_dashboard.py` | files in `live_dashboard/` | Writes a simple static HTML/JSON live dashboard for `python -m http.server` |
+| `advisory/decision_trace.py` | `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts` | Durable trace layer that links ingest, event evaluation, review, lifecycle, action consolidation, and conflicts |
+| `advisory/live_dashboard.py` | JSON payload builder | Legacy static dashboard module; API still reuses its payload builder while Nuxt replaces static generation |
+| `advisory/api/app.py` | read-only HTTP API | Serves operator-facing JSON endpoints and normalized trace summaries for the Nuxt app |
 | `advisory/live_notifier.py` | files in `live_dashboard/` | Subscribes to Redis pub-sub from the continuous-watch stack and writes a human-readable operator feed |
 | `advisory/adversarial_review.py` | `advisory_event_reviews` | Deterministic reviewer over structured event tensors; can clear, penalize, force manual review, or veto event-driven allocations |
 | `utils/ocr` | none | Provider-agnostic PDF OCR utility using Gemini 3 Flash preview and OpenAI GPT-5 nano |
@@ -57,6 +60,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/nseindia/security_history.py` | `dim_security_history`, `dim_security_review_events`, `dim_security_overrides` | Builds canonical security identity history and review queue for renames / identity breaks |
 | `data/nseindia/security_dimension.py` | `dim_security` | Current canonical security dimension keyed by `security_id` |
 | `data/nseindia/indices_parser.py` | `nseindia_indices` | Index history |
+| `data/benchmark_sync.py` | `dhan_ohlcv_daily` | Syncs canonical advisory benchmark rows such as `NIFTY` from parsed NSE index history so benchmark features do not depend on stale Dhan index candles |
 | `data/nseindia/corporate_actions.py` | `nseindia_corporate_actions` | Corporate actions |
 | `data/nseindia/earnings_events.py` | `nseindia_earnings_events` | Earnings calendar |
 | `data/nseindia/insider_deals.py` | `nseindia_insider_deals` | Insider deals |
@@ -121,6 +125,18 @@ OSX:
 
 - NSE direct HTTP calls retry transient timeouts, connection errors, `429`, and `5xx` responses. `NSE_HTTP_MAX_ATTEMPTS=0` means keep retrying until the site recovers. Use `NSE_HTTP_RETRY_SLEEP_SECONDS` and `NSE_HTTP_RETRY_MAX_SLEEP_SECONDS` to control backoff. Retries are printed to stderr as `[announcement_pipeline.nse] ...` so cron logs show when the process is waiting; before each retry the announcement client clears stale NSE cookies, rebuilds headers, and tries to bootstrap fresh NSE cookies.
 
+- Announcement document OCR, concise summaries, structured report parsing, and advisory event evaluation can run through Codex CLI instead of hosted ChatGPT/Gemini APIs. Set `OCR_USING=codex`, `SUMMARIZE_WITH=codex`, and `ADVISORY_EVENT_EVAL_MODEL=codex`; tune `CODEX_CLI_OCR_MODEL`, `CODEX_CLI_SUMMARIZE_MODEL`, `CODEX_CLI_EVENT_MODEL`, `CODEX_CLI_BIN`, and `CODEX_CLI_TIMEOUT_SECONDS` as needed.
+
+- Consolidated action decisions can also get Codex-generated manual revision pointers. Set `ACTION_MANUAL_REVISION_POINTERS_ENABLED=true` and `ACTION_MANUAL_REVISION_POINTERS_MODEL=codex` or `codex:<model>`. The output is persisted on `advisory_action_recommendations` as `manual_revision_summary` and `manual_revision_pointers_json`; if Codex fails, deterministic fallback pointers are written instead.
+
+- Final action rows also persist `recommendation_reason_json` and `reason_contract_status`. If a broker-action row is missing required reason, evidence, execution, or risk fields, action consolidation downgrades it to `MANUAL_REVIEW` before it can reach execution.
+
+- Action consolidation enriches reason contracts from latest `advisory_candidates` and `advisory_market_regime` snapshots before validation. This adds screener provenance, technical state/scores, setup score, candidate state, and macro/regime context without rerunning the full advisory pipeline.
+
+- Event/playbook reason contracts are enriched from latest `advisory_event_evaluations`, `advisory_event_reviews`, and `advisory_playbook_action_plans`. This adds event ids/classes/verdicts/reviewer actions and matched playbook/review-check context before the final action row is accepted.
+
+- Investor playbooks live in `config/hypotheses.yaml`. Import them with `python -m advisory.hypothesis_engine --import-config config/hypotheses.yaml`; preview with `--dry-run`; run matching/action-plan generation with `python -m advisory.hypothesis_engine --run-scan`. Only `status: trusted_overlay` playbooks can affect consolidated actions, and only as `review_only` overlays.
+
 - Dhan OHLCV auth falls back in this order:
   1. `DHAN_ACCESS_TOKEN`
   2. cached token at `.cache/dhan_access_token.json`
@@ -148,7 +164,9 @@ python -m data.dhanlive.auth_cli clear-cache
 | `complete_data.sh` | Combined ingestion | Runs all downloaders and parsers in order |
 | `all_ml.sh` | Event-model training orchestrator | Runs prep, trains the event meta-model only when coverage is sufficient, then scores current events |
 | `all_advisory.sh` | Advisory orchestrator | Runs the advisory pipeline and portfolio generation without raw downloads |
+| `all_advisory_codex.sh` | Codex-supervised advisory orchestrator | Runs `all_advisory.sh`, captures logs, sends the last failure lines to Codex CLI for bounded auto-fix, and reruns |
 | `all_watchers.sh` | Continuous monitoring wrapper | Polls active watchlist OHLCV, announcements, and ET/news incrementally |
+| `all_frontend.sh` | Operator frontend supervisor | Runs `advisory.api.app` and the Nuxt operator app together |
 
 Recommended scheduler file:
 
@@ -161,6 +179,7 @@ It schedules:
 - `all_ml.sh` once daily after 3am on weekdays
 - `all_watchers.sh` every `10` minutes during market hours
 - `all_advisory.sh` once daily after 7pm on weekdays
+- `all_frontend.sh` every `5` minutes under a lock so API/Nuxt are restarted if they exit
 
 Bootstrap note:
 
@@ -188,6 +207,7 @@ python -m data.sharpelydata.sharpely_data --symbols RELIANCE TCS --from-date 202
 python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP
 python -m data.dhanlive.ohlcv --symbols SHAKTIPUMP --only daily
 python -m data.dhanlive.ohlcv --symbols NIFTY --asset-type benchmark --exchange NSE
+python -m data.benchmark_sync --symbols NIFTY
 python -m data.dhanlive.ohlcv --symbols BANKNIFTY --asset-type index --exchange NSE --only intraday
 python -m data.screenerin.screener_registry add "https://www.screener.in/screens/1234567/my-production-screen/"
 python -m data.screenerin.screener_registry list
@@ -456,7 +476,7 @@ Behavior:
 
 - runs `advisory.master_pipeline --skip-downloads`
 - expects data and model artifacts to have been refreshed separately through `./complete_data.sh` and `./all_ml.sh`
-- writes the advisory outputs consumed by the portfolio view and live dashboard
+- writes the advisory outputs consumed by the portfolio and operator frontend views
 - `--fast` skips watch/news refresh, peer sync, and on-demand intraday repair; use it for quick portfolio/lifecycle/action refreshes when data is already current
 
 Continuous-watch flow:
@@ -464,8 +484,6 @@ Continuous-watch flow:
 ```sh
 ./all_watchers.sh --loop
 ./all_watchers.sh --loop --sleep-seconds 300
-python -m advisory.live_dashboard --output-dir live_dashboard
-python -m http.server --directory live_dashboard 8000
 ```
 
 Behavior:
@@ -475,19 +493,25 @@ Behavior:
 - polls announcements and ET/news on their own intervals
 - routes new alerts and events into symbol-level advisory reevaluation
 - writes live price alerts like `ENTRY_ZONE_HIT` and `INVALIDATION_HIT`
-- rewrites `live_dashboard/index.html` and `live_dashboard/dashboard.json`
+- records operator frontend status in `advisory_sync_state`; the Nuxt app reads current data from `advisory.api.app`
 - publishes cycle summaries and alert payloads over Redis pub-sub
-- weekday cron also refreshes the static dashboard every 15 minutes outside the watcher loop
 
 Notifier behavior:
 
 - subscribes to `stockey:continuous_watch:*`
 - converts bus messages into short human-readable operator lines
-- writes:
-  - `live_dashboard/operator_feed.json`
-  - `live_dashboard/operator_feed.jsonl`
-  - `live_dashboard/operator_feed.txt`
-- the dashboard page also reads `operator_feed.json` and shows the latest feed items
+- writes legacy operator-feed files under `live_dashboard/` if you run it directly
+- the Nuxt operator frontend should use API endpoints rather than the static feed files
+
+Trace inspection:
+
+```sh
+python -m advisory.symbol_trace --symbol RELIANCE
+python -m advisory.decision_trace --unique-id <event-id>
+./all_frontend.sh
+```
+
+Use the Nuxt Decision Trace page for readable stage cards. The raw CLI commands are useful when debugging DB rows or API responses.
 
 Routing constraints:
 
@@ -796,6 +820,22 @@ Live Dhan submission is fail-closed. `--live` is not enough by itself; set `STOC
 Live Dhan order placement also requires the API static IP to be whitelisted.
 
 `advisory.master_pipeline` is the single top-level advisory orchestrator. Use `./all_advisory.sh` for the shell entry point, or run `python -m advisory.master_pipeline --skip-downloads` directly. Lower-level modules such as `complete_data.sh` and `advisory.pipeline` remain available for component runs and targeted debugging.
+
+For long unattended advisory runs where Codex CLI should inspect failures and attempt a bounded fix/rerun cycle, use:
+
+```sh
+./all_advisory_codex.sh
+```
+
+It writes command logs, Codex prompts, and Codex outputs to `logs/codex_supervisor/`. Defaults:
+
+- `CODEX_SUPERVISOR_MAX_ATTEMPTS=3`
+- `CODEX_SUPERVISOR_TAIL_LINES=100`
+- `CODEX_SUPERVISOR_TIMEOUT_SECONDS=1800`
+- `CODEX_SUPERVISOR_SANDBOX=danger-full-access`
+- `CODEX_SUPERVISOR_MODEL` or `CODEX_CLI_MODEL` controls the Codex model
+
+Use this only when you are comfortable with Codex making code changes. The supervisor tells Codex not to rerun the long command itself; it reruns the command after Codex exits.
 
 The advisory flow now includes an `intraday` stage between daily technicals and rule evaluation. That stage:
 

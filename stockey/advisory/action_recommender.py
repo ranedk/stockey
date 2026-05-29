@@ -5,16 +5,28 @@ import json
 from typing import Any
 
 import pandas as pd
+from environs import Env
+from pydantic import BaseModel, Field
 
+from advisory.decision_trace import append_trace, append_trace_step, build_action_conflicts, persist_action_conflicts, safe_trace_call
+from advisory.hypothesis_engine import ACTION_PLANS_TABLE, HYPOTHESES_TABLE, ensure_tables as ensure_hypothesis_tables
 from advisory.portfolio_engine import PORTFOLIO_TABLE
 from advisory.position_lifecycle import LIFECYCLE_TABLE, REBALANCE_TABLE
 from advisory.watchlist_builder import TABLE_NAME as WATCHLIST_TABLE
+from utils.codex_cli import run_codex_structured
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.display_time import to_display_value
 from utils.sync import parse_datetime_arg
 
 
+env = Env()
+env.read_env()
+
 TABLE_NAME = "advisory_action_recommendations"
+CANDIDATES_TABLE = "advisory_candidates"
+REGIME_TABLE = "advisory_market_regime"
+EVENT_EVALUATIONS_TABLE = "advisory_event_evaluations"
+EVENT_REVIEWS_TABLE = "advisory_event_reviews"
 
 ACTION_PRIORITY = {
     "SELL": 100,
@@ -26,6 +38,30 @@ ACTION_PRIORITY = {
     "HOLD": 20,
     "WATCH": 10,
 }
+
+PLAYBOOK_LOOKBACK_DAYS = 14
+ACTION_MANUAL_REVISION_POINTERS_ENABLED = env.bool("ACTION_MANUAL_REVISION_POINTERS_ENABLED", default=False)
+ACTION_MANUAL_REVISION_POINTERS_MODEL = env("ACTION_MANUAL_REVISION_POINTERS_MODEL", default="codex")
+ACTION_MANUAL_REVISION_POINTERS_TIMEOUT_SECONDS = env.int("ACTION_MANUAL_REVISION_POINTERS_TIMEOUT_SECONDS", default=180)
+ACTION_MANUAL_REVISION_POINTERS_MAX_CANDIDATES = env.int("ACTION_MANUAL_REVISION_POINTERS_MAX_CANDIDATES", default=8)
+
+PLAYBOOK_ACTION_MAP = {
+    "GO_CASH_REVIEW": ("MANUAL_REVIEW", None),
+    "REDUCE_EXPOSURE_REVIEW": ("MANUAL_REVIEW", None),
+    "SECTOR_REVIEW": ("MANUAL_REVIEW", None),
+    "MANUAL_REVIEW": ("MANUAL_REVIEW", None),
+    "WATCH_SYMBOLS": ("WATCH", None),
+    "NO_ACTION": ("HOLD", None),
+}
+
+
+class ManualRevisionPointers(BaseModel):
+    revision_summary: str = Field(min_length=10, description="One concise operator-facing summary of the final decision.")
+    key_reasons: list[str] = Field(default_factory=list, description="Most important reasons supporting the chosen action.")
+    manual_checks: list[str] = Field(default_factory=list, description="Specific checks the operator should do before acting.")
+    risk_flags: list[str] = Field(default_factory=list, description="Risks, contradictions, stale evidence, or execution issues to verify.")
+    missing_data: list[str] = Field(default_factory=list, description="Data that would improve confidence if available.")
+    operator_questions: list[str] = Field(default_factory=list, description="Questions to answer during manual review.")
 
 
 def table_exists(table_name: str) -> bool:
@@ -40,6 +76,21 @@ def table_exists(table_name: str) -> bool:
         params=(table_name,),
     )
     return not df.empty
+
+
+def table_columns(table_name: str) -> set[str]:
+    df = sql_to_df(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        """,
+        params=(table_name,),
+    )
+    if df.empty or "column_name" not in df.columns:
+        return set()
+    return {str(value) for value in df["column_name"].dropna().tolist()}
 
 
 def ensure_actions_table() -> None:
@@ -69,6 +120,12 @@ def ensure_actions_table() -> None:
                 invest_score_pct DOUBLE PRECISION,
                 action_reason TEXT,
                 action_detail TEXT,
+                recommendation_reason_json TEXT,
+                reason_contract_status TEXT,
+                manual_revision_summary TEXT,
+                manual_revision_pointers_json TEXT,
+                manual_revision_model TEXT,
+                manual_revision_status TEXT,
                 raw_context_json TEXT,
                 load_ts TIMESTAMPTZ,
                 UNIQUE (asof_date, symbol)
@@ -77,6 +134,12 @@ def ensure_actions_table() -> None:
         )
         cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS recommended_target_price DOUBLE PRECISION")
         cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS expected_horizon_days BIGINT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS recommendation_reason_json TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS reason_contract_status TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_summary TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_pointers_json TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_model TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_status TEXT")
 
 
 def _normalize_asof_date(asof_date: pd.Timestamp | None) -> pd.Timestamp:
@@ -290,6 +353,807 @@ def load_watch_actions(*, asof_date: pd.Timestamp, symbols: list[str] | None = N
     )
 
 
+def load_playbook_action_plans(*, asof_date: pd.Timestamp, symbols: list[str] | None = None) -> pd.DataFrame:
+    ensure_hypothesis_tables()
+    if not table_exists(ACTION_PLANS_TABLE):
+        return pd.DataFrame()
+    end_ts = asof_date + pd.Timedelta(days=1)
+    start_ts = asof_date - pd.Timedelta(days=PLAYBOOK_LOOKBACK_DAYS)
+    clauses = [
+        "COALESCE(p.production_allowed, FALSE) = TRUE",
+        "COALESCE(h.status, '') IN ('trusted_overlay', 'production')",
+        "p.planned_at >= %s",
+        "p.planned_at < %s",
+    ]
+    params: list[object] = [start_ts, end_ts]
+    if symbols:
+        clauses.append("(p.symbol IS NULL OR p.symbol = '' OR UPPER(p.symbol) = ANY(%s))")
+        params.append([str(value).upper() for value in symbols])
+    return sql_to_df(
+        f"""
+        SELECT p.*
+        FROM {ACTION_PLANS_TABLE} p
+        JOIN {HYPOTHESES_TABLE} h
+          ON h.hypothesis_id = p.hypothesis_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY planned_at DESC, confidence DESC NULLS LAST
+        """,
+        params=tuple(params),
+    )
+
+
+def _parse_jsonish(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    try:
+        return json.loads(str(value))
+    except Exception:
+        return default
+
+
+def _json_context_value(value: Any) -> Any:
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
+def _merge_context(base: Any, *extras: dict[str, Any]) -> dict[str, Any]:
+    context = _parse_jsonish(base, {})
+    if not isinstance(context, dict):
+        context = {}
+    for extra in extras:
+        for key, value in (extra or {}).items():
+            normalized = _json_context_value(value)
+            if normalized is None:
+                continue
+            existing = context.get(key)
+            if key not in context or existing is None or existing == "":
+                context[key] = normalized
+    return context
+
+
+def _load_latest_candidate_context(asof_date: pd.Timestamp, symbols: list[str]) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, dict[str, Any]]]:
+    normalized_symbols = sorted({str(value).strip().upper() for value in symbols if str(value or "").strip()})
+    if not normalized_symbols or not table_exists(CANDIDATES_TABLE):
+        return {}, {}
+    available = table_columns(CANDIDATES_TABLE)
+    wanted = [
+        "asof_date",
+        "screener_date",
+        "setup_id",
+        "setup_name",
+        "setup_family",
+        "holding_horizon_note",
+        "regime_name",
+        "base_regime",
+        "news_overlay",
+        "theme_ids",
+        "symbol",
+        "screener_slug",
+        "source_screener_slug",
+        "source_screener_list",
+        "rank",
+        "candidate_state",
+        "watch_reason_detail",
+        "technical_state",
+        "technical_trigger_type",
+        "technical_trigger_note",
+        "technical_trend_score",
+        "technical_structure_score",
+        "technical_participation_score",
+        "technical_relative_strength_score",
+        "technical_tradability_score",
+        "technical_score",
+        "fundamental_score",
+        "regime_fit_score",
+        "event_score",
+        "setup_score",
+        "avg_traded_value_20d",
+        "rs_vs_benchmark",
+        "rs_vs_sector",
+        "intraday_breakout_score",
+        "intraday_pattern_label",
+        "entry_style",
+        "attractive_price_low",
+        "attractive_price_high",
+        "invalidation_price",
+        "entry_note",
+        "near_miss_flag",
+        "watch_reasons",
+        "rule_pass",
+        "load_ts",
+    ]
+    selected = [column for column in wanted if column in available]
+    if not {"asof_date", "symbol", "setup_id"}.issubset(set(selected)):
+        return {}, {}
+    order_parts = ["asof_date DESC"]
+    if "setup_score" in available:
+        order_parts.append("setup_score DESC NULLS LAST")
+    if "load_ts" in available:
+        order_parts.append("load_ts DESC NULLS LAST")
+    df = sql_to_df(
+        f"""
+        WITH ranked AS (
+            SELECT
+                {", ".join(selected)},
+                ROW_NUMBER() OVER (
+                    PARTITION BY UPPER(TRIM(symbol)), COALESCE(UPPER(TRIM(setup_id)), '')
+                    ORDER BY {", ".join(order_parts)}
+                ) AS rn
+            FROM {CANDIDATES_TABLE}
+            WHERE asof_date <= %(asof_date)s
+              AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
+        )
+        SELECT {", ".join(selected)}
+        FROM ranked
+        WHERE rn = 1
+        """,
+        params={"asof_date": asof_date, "symbols": normalized_symbols},
+    )
+    if df.empty:
+        return {}, {}
+    for column in ["asof_date", "screener_date", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
+    df["setup_id"] = df["setup_id"].astype("string").str.strip().str.upper()
+    exact: dict[tuple[str, str], dict[str, Any]] = {}
+    by_symbol: dict[str, dict[str, Any]] = {}
+    for _, row in df.iterrows():
+        payload = {key: _json_context_value(value) for key, value in row.to_dict().items() if _json_context_value(value) is not None}
+        symbol = str(payload.get("symbol") or "").upper()
+        setup_id = str(payload.get("setup_id") or "").upper()
+        if symbol and setup_id:
+            exact[(setup_id, symbol)] = payload
+        if symbol and symbol not in by_symbol:
+            by_symbol[symbol] = payload
+        elif symbol and "setup_score" in df.columns:
+            current_score = pd.to_numeric(by_symbol[symbol].get("setup_score"), errors="coerce")
+            next_score = pd.to_numeric(payload.get("setup_score"), errors="coerce")
+            if pd.notna(next_score) and (pd.isna(current_score) or float(next_score) > float(current_score)):
+                by_symbol[symbol] = payload
+    return exact, by_symbol
+
+
+def _load_regime_context(asof_date: pd.Timestamp) -> dict[str, Any]:
+    if not table_exists(REGIME_TABLE):
+        return {}
+    available = table_columns(REGIME_TABLE)
+    wanted = [
+        "asof_date",
+        "regime_name",
+        "regime_notes",
+        "shock_flag",
+        "risk_off_flag",
+        "macro_stress_score",
+        "macro_risk_state",
+        "macro_sizing_multiplier",
+    ]
+    selected = [column for column in wanted if column in available]
+    if "asof_date" not in selected:
+        return {}
+    df = sql_to_df(
+        f"""
+        SELECT {", ".join(selected)}
+        FROM {REGIME_TABLE}
+        WHERE asof_date <= %s
+        ORDER BY asof_date DESC
+        LIMIT 1
+        """,
+        params=(asof_date,),
+    )
+    if df.empty:
+        return {}
+    row = df.iloc[0].to_dict()
+    return {
+        ("regime_asof_date" if key == "asof_date" else key): _json_context_value(value)
+        for key, value in row.items()
+        if _json_context_value(value) is not None
+    }
+
+
+def _load_latest_event_context(asof_date: pd.Timestamp, symbols: list[str]) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[str, dict[str, Any]]]:
+    normalized_symbols = sorted({str(value).strip().upper() for value in symbols if str(value or "").strip()})
+    if not normalized_symbols or not table_exists(EVENT_EVALUATIONS_TABLE):
+        return {}, {}
+    available = table_columns(EVENT_EVALUATIONS_TABLE)
+    wanted = [
+        "published_on",
+        "asof_date",
+        "evaluated_at",
+        "setup_id",
+        "setup_name",
+        "symbol",
+        "unique_id",
+        "event_source",
+        "subject",
+        "evaluation_status",
+        "sentiment",
+        "materiality",
+        "setup_effect",
+        "direction",
+        "surprise",
+        "novelty",
+        "contradiction",
+        "expected_decay_days",
+        "source_reliability",
+        "investable_now",
+        "verdict",
+        "event_class",
+        "state_transition_hint",
+        "score_impact",
+        "confidence",
+        "what_happened",
+        "rationale",
+        "event_tensor_json",
+        "source_trace_json",
+    ]
+    selected = [column for column in wanted if column in available]
+    if not {"published_on", "symbol", "setup_id", "unique_id"}.issubset(set(selected)):
+        return {}, {}
+    review_select = ""
+    review_join = ""
+    if table_exists(EVENT_REVIEWS_TABLE):
+        review_available = table_columns(EVENT_REVIEWS_TABLE)
+        review_cols = [
+            "review_status",
+            "review_action",
+            "review_score",
+            "veto",
+            "review_reason",
+            "review_flags_json",
+        ]
+        selected_review = [column for column in review_cols if column in review_available]
+        if selected_review:
+            review_select = ", " + ", ".join(f"r.{column} AS {column}" for column in selected_review)
+            review_join = f"""
+            LEFT JOIN {EVENT_REVIEWS_TABLE} r
+              ON r.published_on = e.published_on
+             AND r.setup_id = e.setup_id
+             AND r.symbol = e.symbol
+             AND r.unique_id = e.unique_id
+            """
+    df = sql_to_df(
+        f"""
+        WITH ranked AS (
+            SELECT
+                {", ".join(f"e.{column}" for column in selected)}
+                {review_select},
+                ROW_NUMBER() OVER (
+                    PARTITION BY UPPER(TRIM(e.symbol)), COALESCE(UPPER(TRIM(e.setup_id)), '')
+                    ORDER BY e.published_on DESC NULLS LAST, e.evaluated_at DESC NULLS LAST
+                ) AS rn_setup,
+                ROW_NUMBER() OVER (
+                    PARTITION BY UPPER(TRIM(e.symbol))
+                    ORDER BY e.published_on DESC NULLS LAST, e.evaluated_at DESC NULLS LAST
+                ) AS rn_symbol
+            FROM {EVENT_EVALUATIONS_TABLE} e
+            {review_join}
+            WHERE COALESCE(e.asof_date, e.published_on) <= %(asof_date)s
+              AND UPPER(TRIM(e.symbol)) = ANY(%(symbols)s)
+        )
+        SELECT *
+        FROM ranked
+        WHERE rn_setup = 1 OR rn_symbol = 1
+        """,
+        params={"asof_date": asof_date + pd.Timedelta(days=1), "symbols": normalized_symbols},
+    )
+    if df.empty:
+        return {}, {}
+    for column in ["published_on", "asof_date", "evaluated_at"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
+    df["setup_id"] = df["setup_id"].astype("string").str.strip().str.upper()
+    exact: dict[tuple[str, str], dict[str, Any]] = {}
+    by_symbol: dict[str, dict[str, Any]] = {}
+    for _, row in df.iterrows():
+        payload = {
+            f"event_{key}" if key in {"asof_date", "published_on", "setup_id", "unique_id", "source_trace_json"} else key: _json_context_value(value)
+            for key, value in row.to_dict().items()
+            if key not in {"rn_setup", "rn_symbol"} and _json_context_value(value) is not None
+        }
+        symbol = str(row.get("symbol") or "").upper()
+        setup_id = str(row.get("setup_id") or "").upper()
+        if symbol and setup_id and int(row.get("rn_setup") or 0) == 1:
+            exact[(setup_id, symbol)] = payload
+        if symbol and int(row.get("rn_symbol") or 0) == 1:
+            by_symbol[symbol] = payload
+    return exact, by_symbol
+
+
+def _load_latest_playbook_context(asof_date: pd.Timestamp, symbols: list[str]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    normalized_symbols = sorted({str(value).strip().upper() for value in symbols if str(value or "").strip()})
+    if not table_exists(ACTION_PLANS_TABLE):
+        return {}, {}
+    available = table_columns(ACTION_PLANS_TABLE)
+    wanted = [
+        "planned_at",
+        "hypothesis_id",
+        "source_table",
+        "source_key",
+        "symbol",
+        "trigger_scope",
+        "suggested_action",
+        "action_type",
+        "urgency",
+        "confidence",
+        "production_allowed",
+        "operator_summary",
+        "decision_reason",
+        "checks_json",
+        "risk_controls_json",
+        "action_plan_json",
+        "llm_status",
+    ]
+    selected = [column for column in wanted if column in available]
+    if not {"planned_at", "hypothesis_id", "source_key"}.issubset(set(selected)):
+        return {}, {}
+    clauses = ["planned_at <= %(asof_date)s"]
+    params: dict[str, Any] = {"asof_date": asof_date + pd.Timedelta(days=1)}
+    if "symbol" in selected and normalized_symbols:
+        clauses.append("(symbol IS NULL OR symbol = '' OR UPPER(TRIM(symbol)) = ANY(%(symbols)s))")
+        params["symbols"] = normalized_symbols
+    df = sql_to_df(
+        f"""
+        WITH ranked AS (
+            SELECT
+                {", ".join(selected)},
+                ROW_NUMBER() OVER (
+                    PARTITION BY NULLIF(UPPER(TRIM(COALESCE(symbol, ''))), '')
+                    ORDER BY planned_at DESC NULLS LAST, confidence DESC NULLS LAST
+                ) AS rn_symbol,
+                ROW_NUMBER() OVER (
+                    PARTITION BY source_key
+                    ORDER BY planned_at DESC NULLS LAST, confidence DESC NULLS LAST
+                ) AS rn_source
+            FROM {ACTION_PLANS_TABLE}
+            WHERE {' AND '.join(clauses)}
+        )
+        SELECT *
+        FROM ranked
+        WHERE rn_symbol = 1 OR rn_source = 1
+        """,
+        params=params,
+    )
+    if df.empty:
+        return {}, {}
+    if "planned_at" in df.columns:
+        df["planned_at"] = pd.to_datetime(df["planned_at"], utc=True, errors="coerce")
+    by_symbol: dict[str, dict[str, Any]] = {}
+    by_source: dict[str, dict[str, Any]] = {}
+    for _, row in df.iterrows():
+        payload = {
+            ("playbook_id" if key == "hypothesis_id" else f"playbook_{key}" if key in {"source_table", "source_key", "symbol", "planned_at"} else key): _json_context_value(value)
+            for key, value in row.to_dict().items()
+            if key not in {"rn_symbol", "rn_source"} and _json_context_value(value) is not None
+        }
+        symbol = str(row.get("symbol") or "").upper()
+        source_key = str(row.get("source_key") or "")
+        if symbol and int(row.get("rn_symbol") or 0) == 1:
+            by_symbol[symbol] = payload
+        if source_key and int(row.get("rn_source") or 0) == 1:
+            by_source[source_key] = payload
+    return by_symbol, by_source
+
+
+def enrich_action_candidate_context(df: pd.DataFrame, *, asof_date: pd.Timestamp) -> pd.DataFrame:
+    if df.empty or "symbol" not in df.columns:
+        return df
+    out = df.copy()
+    symbols = out["symbol"].dropna().astype(str).str.upper().drop_duplicates().tolist()
+    exact_candidates, symbol_candidates = _load_latest_candidate_context(asof_date, symbols)
+    regime_context = _load_regime_context(asof_date)
+    exact_events, symbol_events = _load_latest_event_context(asof_date, symbols)
+    symbol_playbooks, source_playbooks = _load_latest_playbook_context(asof_date, symbols)
+    enriched_contexts: list[str] = []
+    for _, row in out.iterrows():
+        symbol = str(row.get("symbol") or "").upper()
+        setup_id = str(row.get("setup_id") or "").upper()
+        unique_id = str(row.get("unique_id") or "")
+        candidate_context = symbol_candidates.get(symbol, {})
+        exact_context = exact_candidates.get((setup_id, symbol), {})
+        event_context = symbol_events.get(symbol, {})
+        exact_event_context = exact_events.get((setup_id, symbol), {})
+        playbook_context = symbol_playbooks.get(symbol, {})
+        source_playbook_context = source_playbooks.get(unique_id, {})
+        context = _merge_context(
+            row.get("raw_context_json"),
+            regime_context,
+            candidate_context,
+            exact_context,
+            event_context,
+            exact_event_context,
+            playbook_context,
+            source_playbook_context,
+            {
+                "final_action_source": row.get("action_source"),
+                "final_source_action": row.get("source_action"),
+            },
+        )
+        parsed_sources = _parse_jsonish(context.get("context_sources"), [])
+        context_sources = set(parsed_sources) if isinstance(parsed_sources, list) else set()
+        if regime_context:
+            context_sources.add("market_regime")
+        if candidate_context or exact_context:
+            context_sources.add("advisory_candidates")
+        if event_context or exact_event_context:
+            context_sources.add("advisory_event_evaluations")
+        if playbook_context or source_playbook_context:
+            context_sources.add("advisory_playbook_action_plans")
+        if context_sources:
+            context["context_sources"] = sorted(context_sources)
+        enriched_contexts.append(json.dumps(context, ensure_ascii=False, default=str, sort_keys=True))
+    out["raw_context_json"] = enriched_contexts
+    return out
+
+
+def _json_ready_record(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
+    data = row.to_dict() if isinstance(row, pd.Series) else dict(row)
+    out: dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, str) and key.endswith("_json"):
+            out[key] = _parse_jsonish(value, value)
+            continue
+        if isinstance(value, pd.Timestamp):
+            out[key] = value.isoformat()
+            continue
+        try:
+            if pd.isna(value):
+                out[key] = None
+                continue
+        except Exception:
+            pass
+        out[key] = value
+    return out
+
+
+def _contract_section_from_context(context: dict[str, Any], keys: list[str]) -> dict[str, Any]:
+    return {key: context.get(key) for key in keys if context.get(key) is not None}
+
+
+def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFrame | None = None) -> dict[str, Any]:
+    raw_context = _parse_jsonish(row.get("raw_context_json"), {})
+    if not isinstance(raw_context, dict):
+        raw_context = {}
+    action = str(row.get("action_code") or "").upper()
+    execution_mode = _text(row.get("execution_mode"))
+    action_reason = _text(row.get("action_reason"))
+    action_detail = _text(row.get("action_detail"))
+    risk_fields = {
+        "reference_price": _num(row.get("reference_price")),
+        "stop_price": _num(row.get("stop_price")),
+        "invalidation_price": _num(row.get("invalidation_price")),
+        "recommended_stop_price": _num(row.get("recommended_stop_price")),
+        "recommended_target_price": _num(row.get("recommended_target_price")),
+        "expected_horizon_days": None if pd.isna(pd.to_numeric(row.get("expected_horizon_days"), errors="coerce")) else int(pd.to_numeric(row.get("expected_horizon_days"), errors="coerce")),
+        "action_fraction": _num(row.get("action_fraction")),
+        "approved_allocation_inr": _num(row.get("approved_allocation_inr")),
+    }
+    risk_fields = {key: value for key, value in risk_fields.items() if value is not None}
+    competing: list[dict[str, Any]] = []
+    if isinstance(candidates, pd.DataFrame) and not candidates.empty:
+        for item in candidates.head(max(1, ACTION_MANUAL_REVISION_POINTERS_MAX_CANDIDATES)).to_dict(orient="records"):
+            competing.append(
+                {
+                    "action_code": item.get("action_code"),
+                    "action_source": item.get("action_source"),
+                    "setup_id": item.get("setup_id"),
+                    "source_action": item.get("source_action"),
+                    "action_reason": item.get("action_reason"),
+                    "action_priority": item.get("action_priority"),
+                }
+            )
+    evidence_sections = {
+        "screener": _contract_section_from_context(raw_context, ["source_screener_slug", "source_screener_list", "screener_name"]),
+        "technical": _contract_section_from_context(
+            raw_context,
+            [
+                "technical_state",
+                "technical_total_score",
+                "technical_score",
+                "technical_trigger_type",
+                "pivot_price",
+                "support_price",
+                "setup_score",
+            ],
+        ),
+        "event": _contract_section_from_context(raw_context, ["event_class", "verdict", "state_transition_hint", "score_impact", "review_action"]),
+        "playbook": _contract_section_from_context(raw_context, ["playbook_id", "hypothesis_id", "action_type", "operator_summary", "decision_reason"]),
+        "macro_regime": _contract_section_from_context(raw_context, ["macro_risk_state", "macro_stress_score", "regime_state", "market_regime"]),
+        "risk": risk_fields,
+        "lifecycle": _contract_section_from_context(raw_context, ["position_status", "next_action", "suggested_action", "lifecycle_reason", "next_action_reason"]),
+    }
+    present_sections = [key for key, value in evidence_sections.items() if value]
+    missing: list[str] = []
+    if not action:
+        missing.append("action_code")
+    if not action_reason:
+        missing.append("action_reason")
+    if not row.get("action_source"):
+        missing.append("action_source")
+    if not present_sections:
+        missing.append("evidence_context")
+    if action in {"BUY", "BUY_MORE", "SELL", "PARTIAL_SELL"}:
+        if not execution_mode:
+            missing.append("execution_mode")
+        if action in {"BUY", "BUY_MORE"} and not any(risk_fields.get(key) is not None for key in ["stop_price", "invalidation_price", "recommended_stop_price"]):
+            missing.append("buy_risk_level")
+        if action in {"SELL", "PARTIAL_SELL"} and not (action_detail or raw_context.get("suggested_action") or raw_context.get("next_action")):
+            missing.append("sell_exit_trigger")
+    if str(row.get("action_source") or "").startswith("playbook"):
+        if not (raw_context.get("playbook_id") or raw_context.get("hypothesis_id")):
+            missing.append("playbook_id")
+        if not (row.get("unique_id") or raw_context.get("playbook_source_key") or raw_context.get("event_unique_id")):
+            missing.append("playbook_source_key")
+        if not raw_context.get("checks_json"):
+            missing.append("playbook_review_checks")
+    if action in {"BUY", "BUY_MORE"} and raw_context.get("event_class"):
+        if not raw_context.get("event_unique_id"):
+            missing.append("event_unique_id")
+        if raw_context.get("review_action") is None:
+            missing.append("event_review_action")
+    status = "complete" if not missing else "incomplete"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "missing_fields": missing,
+        "symbol": str(row.get("symbol") or "").upper(),
+        "action_code": action,
+        "original_action_code": str(row.get("original_action_code") or action).upper(),
+        "action_source": _text(row.get("action_source")),
+        "source_action": _text(row.get("source_action")),
+        "setup_id": _text(row.get("setup_id")),
+        "unique_id": _text(row.get("unique_id")),
+        "primary_reason": action_reason,
+        "reason_detail": action_detail,
+        "execution_mode": execution_mode,
+        "transaction_type": _text(row.get("transaction_type")),
+        "evidence_sections_present": present_sections,
+        "evidence": evidence_sections,
+        "competing_candidates": competing,
+    }
+
+
+def add_recommendation_reason_contracts(df: pd.DataFrame, all_candidates: pd.DataFrame | None = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    candidates = all_candidates if isinstance(all_candidates, pd.DataFrame) and not all_candidates.empty else out
+    tmp = candidates.copy()
+    tmp["asof_date"] = pd.to_datetime(tmp["asof_date"], utc=True, errors="coerce")
+    candidate_groups: dict[tuple[Any, Any], pd.DataFrame] = {}
+    for key, group in tmp.groupby(["asof_date", "symbol"], dropna=False):
+        candidate_groups[key] = group.sort_values(["action_priority", "published_on"], ascending=[False, False], kind="stable")
+    contracts: list[str] = []
+    statuses: list[str] = []
+    for idx, row in out.iterrows():
+        asof_date = pd.to_datetime(row.get("asof_date"), utc=True, errors="coerce")
+        group = candidate_groups.get((asof_date, row.get("symbol")), pd.DataFrame())
+        contract = build_recommendation_reason_contract(row, group)
+        if contract["status"] != "complete":
+            original_action = str(row.get("action_code") or "").upper()
+            out.at[idx, "action_code"] = "MANUAL_REVIEW"
+            out.at[idx, "action_priority"] = int(ACTION_PRIORITY["MANUAL_REVIEW"])
+            out.at[idx, "transaction_type"] = None
+            out.at[idx, "execution_mode"] = "review_only"
+            missing_text = ", ".join(contract.get("missing_fields") or [])
+            existing_reason = _text(row.get("action_reason"))
+            out.at[idx, "action_reason"] = f"Manual review required: incomplete reason contract ({missing_text})." if not existing_reason else f"Manual review required: incomplete reason contract ({missing_text}). Original reason: {existing_reason}"
+            contract = build_recommendation_reason_contract(out.loc[idx], group)
+            contract["status"] = "incomplete_downgraded"
+            contract["original_action_code"] = original_action
+            contract["missing_fields"] = contract.get("missing_fields") or []
+            if missing_text and missing_text not in contract["missing_fields"]:
+                contract["missing_fields"] = [*contract["missing_fields"], missing_text]
+        contracts.append(json.dumps(contract, ensure_ascii=False, default=str, sort_keys=True))
+        statuses.append(str(contract["status"]))
+    out["recommendation_reason_json"] = contracts
+    out["reason_contract_status"] = statuses
+    return out
+
+
+def _deterministic_manual_revision_pointers(row: pd.Series, candidates: pd.DataFrame, *, status: str = "deterministic") -> dict[str, Any]:
+    action = str(row.get("action_code") or "ACTION").upper()
+    symbol = str(row.get("symbol") or "").upper()
+    source = str(row.get("action_source") or "unknown")
+    reason = _text(row.get("action_reason")) or "No explicit reason was provided by the winning candidate."
+    losing_actions = []
+    if not candidates.empty:
+        losing_actions = [
+            f"{item.get('action_code')} from {item.get('action_source')}"
+            for item in candidates.to_dict(orient="records")
+            if str(item.get("action_code") or "").upper() != action or str(item.get("action_source") or "") != source
+        ][:5]
+    pointers = {
+        "revision_summary": f"{symbol}: final action is {action} from {source}. {reason}",
+        "key_reasons": [reason, f"Winning source: {source}"],
+        "manual_checks": [
+            "Confirm latest OHLCV/current price before acting.",
+            "Check whether newer news, announcements, or exchange events contradict the decision.",
+            "Verify stop/invalidation and position sizing before broker execution.",
+        ],
+        "risk_flags": losing_actions or ["No conflicting lower-priority candidate was available in the consolidation set."],
+        "missing_data": [],
+        "operator_questions": [
+            "Is the evidence still fresh enough to act on?",
+            "Does the current market/regime context still support this action?",
+            "Would this action violate exposure, liquidity, or sector concentration limits?",
+        ],
+        "status": status,
+    }
+    return pointers
+
+
+def _manual_revision_prompt(row: pd.Series, candidates: pd.DataFrame) -> str:
+    payload = {
+        "instruction": (
+            "Create manual revision pointers for an investment operator. "
+            "Do not change the final action. Do not recommend broker execution. "
+            "Summarize what the operator should manually verify before accepting, rejecting, or modifying the decision."
+        ),
+        "final_decision": _json_ready_record(row),
+        "competing_candidates": [
+            _json_ready_record(item)
+            for item in candidates.head(max(1, ACTION_MANUAL_REVISION_POINTERS_MAX_CANDIDATES)).to_dict(orient="records")
+        ],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
+
+
+def build_manual_revision_pointers(row: pd.Series, candidates: pd.DataFrame, *, use_llm: bool | None = None) -> tuple[dict[str, Any], str, str]:
+    enabled = ACTION_MANUAL_REVISION_POINTERS_ENABLED if use_llm is None else bool(use_llm)
+    model = ACTION_MANUAL_REVISION_POINTERS_MODEL
+    if not enabled or str(model).strip().lower() in {"", "off", "none", "disabled", "false"}:
+        return _deterministic_manual_revision_pointers(row, candidates, status="disabled"), model, "disabled"
+    try:
+        codex_model = model.split(":", 1)[1] if model.startswith("codex:") else None if model == "codex" else model
+        result = run_codex_structured(
+            _manual_revision_prompt(row, candidates),
+            response_model=ManualRevisionPointers,
+            model=codex_model,
+            system_prompt=(
+                "You are a cautious investment-operations reviewer. "
+                "You produce concise manual review pointers for a human operator. "
+                "You never override the decision, submit trades, or invent missing evidence."
+            ),
+            max_attempts=2,
+            timeout_seconds=ACTION_MANUAL_REVISION_POINTERS_TIMEOUT_SECONDS,
+        )
+        pointers = result.model_dump()
+        pointers["status"] = "ok"
+        return pointers, model, "ok"
+    except Exception as exc:
+        pointers = _deterministic_manual_revision_pointers(row, candidates, status="fallback_after_error")
+        pointers["llm_error"] = f"{type(exc).__name__}: {exc}"
+        return pointers, model, "fallback_after_error"
+
+
+def add_manual_revision_pointers(df: pd.DataFrame, all_candidates: pd.DataFrame | None = None, *, use_llm: bool | None = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    candidates = all_candidates if isinstance(all_candidates, pd.DataFrame) and not all_candidates.empty else out
+    candidate_groups: dict[tuple[Any, Any], pd.DataFrame] = {}
+    tmp = candidates.copy()
+    tmp["asof_date"] = pd.to_datetime(tmp["asof_date"], utc=True, errors="coerce")
+    for key, group in tmp.groupby(["asof_date", "symbol"], dropna=False):
+        candidate_groups[key] = group.sort_values(["action_priority", "published_on"], ascending=[False, False], kind="stable")
+    summaries: list[str | None] = []
+    payloads: list[str | None] = []
+    models: list[str | None] = []
+    statuses: list[str | None] = []
+    for _, row in out.iterrows():
+        asof_date = pd.to_datetime(row.get("asof_date"), utc=True, errors="coerce")
+        key = (asof_date, row.get("symbol"))
+        group = candidate_groups.get(key, pd.DataFrame())
+        pointers, model, status = build_manual_revision_pointers(row, group, use_llm=use_llm)
+        summaries.append(_text(pointers.get("revision_summary")))
+        payloads.append(json.dumps(pointers, ensure_ascii=False, default=str, sort_keys=True))
+        models.append(model)
+        statuses.append(status)
+    out["manual_revision_summary"] = summaries
+    out["manual_revision_pointers_json"] = payloads
+    out["manual_revision_model"] = models
+    out["manual_revision_status"] = statuses
+    return out
+
+
+def _follow_up_window_days(row: pd.Series) -> int:
+    plan = _parse_jsonish(row.get("action_plan_json"), {})
+    out = pd.to_numeric(plan.get("follow_up_window_days") if isinstance(plan, dict) else None, errors="coerce")
+    if pd.isna(out):
+        out = 3
+    return max(0, int(out))
+
+
+def _playbook_plan_is_fresh(row: pd.Series, *, asof_date: pd.Timestamp) -> bool:
+    planned_at = pd.to_datetime(row.get("planned_at"), utc=True, errors="coerce")
+    if pd.isna(planned_at):
+        return False
+    expiry = planned_at.normalize() + pd.Timedelta(days=_follow_up_window_days(row) + 1)
+    return asof_date < expiry
+
+
+def _playbook_target_symbols(row: pd.Series, base_symbols: list[str], requested_symbols: list[str] | None) -> list[str]:
+    symbol = _text(row.get("symbol"))
+    if symbol:
+        targets = [symbol.upper()]
+    else:
+        targets = [str(value).upper() for value in base_symbols if _text(value)]
+    if requested_symbols:
+        allowed = {str(value).upper() for value in requested_symbols}
+        targets = [value for value in targets if value in allowed]
+    return sorted(set(targets))
+
+
+def build_playbook_action_candidates(
+    *,
+    asof_date: pd.Timestamp,
+    base_symbols: list[str],
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    plans = load_playbook_action_plans(asof_date=asof_date, symbols=symbols)
+    if plans.empty:
+        return []
+    if setup_ids:
+        allowed_setup_ids = {str(value).upper() for value in setup_ids}
+        plans = plans[plans["hypothesis_id"].astype("string").str.upper().isin(allowed_setup_ids)]
+        if plans.empty:
+            return []
+    rows: list[dict[str, Any]] = []
+    for _, row in plans.iterrows():
+        if not _playbook_plan_is_fresh(row, asof_date=asof_date):
+            continue
+        action_type = str(row.get("action_type") or row.get("suggested_action") or "MANUAL_REVIEW").strip().upper()
+        mapped_action, transaction_type = PLAYBOOK_ACTION_MAP.get(action_type, ("MANUAL_REVIEW", None))
+        targets = _playbook_target_symbols(row, base_symbols, symbols)
+        if not targets:
+            continue
+        risk_controls = _parse_jsonish(row.get("risk_controls_json"), {})
+        checks = _parse_jsonish(row.get("checks_json"), [])
+        for symbol in targets:
+            rows.append(
+                _build_record(
+                    asof_date=asof_date,
+                    published_on=row.get("planned_at"),
+                    setup_id=row.get("hypothesis_id"),
+                    symbol=symbol,
+                    unique_id=row.get("source_key"),
+                    action_code=mapped_action,
+                    action_source="playbook_symbol" if _text(row.get("symbol")) else "playbook_market",
+                    source_action=action_type,
+                    transaction_type=transaction_type,
+                    execution_mode="review_only",
+                    action_fraction=risk_controls.get("max_fraction") if isinstance(risk_controls, dict) else None,
+                    invest_score_pct=float(row.get("confidence") or 0.0) * 100.0,
+                    expected_horizon_days=_follow_up_window_days(row),
+                    action_reason=row.get("decision_reason"),
+                    action_detail=row.get("operator_summary"),
+                    raw_context={
+                        **row.to_dict(),
+                        "checks": checks,
+                        "risk_controls": risk_controls,
+                        "bridge_note": "Production playbook action plans are risk/review overlays only; they do not create broker-executable trades.",
+                    },
+                )
+            )
+    return rows
+
+
 def build_action_recommendations(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -413,27 +1277,71 @@ def build_action_recommendations(
             )
         )
 
+    base_symbols = sorted(
+        {
+            str(row.get("symbol")).upper()
+            for row in candidates
+            if _text(row.get("symbol"))
+        }
+    )
+    candidates.extend(
+        build_playbook_action_candidates(
+            asof_date=monitor_date,
+            base_symbols=base_symbols,
+            symbols=symbols,
+            setup_ids=setup_ids,
+        )
+    )
+
     if not candidates:
         return pd.DataFrame()
 
-    df = pd.DataFrame(candidates)
-    df["symbol"] = df["symbol"].astype("string").str.upper()
-    df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
-    df["action_priority"] = pd.to_numeric(df["action_priority"], errors="coerce").fillna(0).astype(int)
-    df["invest_score_pct"] = pd.to_numeric(df["invest_score_pct"], errors="coerce")
-    df = df.sort_values(
+    candidate_df = enrich_action_candidate_context(pd.DataFrame(candidates), asof_date=monitor_date)
+    winners = rank_action_candidates(candidate_df)
+    winners = add_recommendation_reason_contracts(winners, candidate_df)
+    winners = add_manual_revision_pointers(winners, candidate_df)
+    winners.attrs["all_action_candidates"] = candidate_df
+    return winners
+
+
+def rank_action_candidates(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    ranked = df.copy()
+    ranked["symbol"] = ranked["symbol"].astype("string").str.upper()
+    ranked["published_on"] = pd.to_datetime(ranked["published_on"], utc=True, errors="coerce")
+    ranked["action_priority"] = pd.to_numeric(ranked["action_priority"], errors="coerce").fillna(0).astype(int)
+    if "invest_score_pct" not in ranked.columns:
+        ranked["invest_score_pct"] = pd.NA
+    ranked["invest_score_pct"] = pd.to_numeric(ranked["invest_score_pct"], errors="coerce")
+    ranked = ranked.sort_values(
         ["symbol", "action_priority", "published_on", "invest_score_pct", "setup_id"],
         ascending=[True, False, False, False, True],
         kind="stable",
     )
-    return df.drop_duplicates(subset=["asof_date", "symbol"], keep="first").reset_index(drop=True)
+    return ranked.drop_duplicates(subset=["asof_date", "symbol"], keep="first").reset_index(drop=True)
 
 
 def persist_action_recommendations(df: pd.DataFrame) -> None:
     ensure_actions_table()
     if df.empty:
         return
-    out = df.copy()
+    all_candidates = df.attrs.get("all_action_candidates")
+    if not isinstance(all_candidates, pd.DataFrame) or all_candidates.empty:
+        all_candidates = df
+    asof_series = all_candidates["asof_date"] if "asof_date" in all_candidates.columns else pd.Series([], dtype=object)
+    asof_values = pd.to_datetime(asof_series, utc=True, errors="coerce").dropna()
+    enrich_asof = asof_values.max().normalize() if not asof_values.empty else _normalize_asof_date(None)
+    all_candidates = enrich_action_candidate_context(all_candidates, asof_date=enrich_asof)
+    winners = rank_action_candidates(all_candidates)
+    existing_reason_columns = {"recommendation_reason_json", "reason_contract_status"}
+    if not existing_reason_columns.issubset(set(winners.columns)) or winners["recommendation_reason_json"].isna().any():
+        winners = add_recommendation_reason_contracts(winners, all_candidates)
+    existing_pointer_columns = {"manual_revision_summary", "manual_revision_pointers_json", "manual_revision_model", "manual_revision_status"}
+    if not existing_pointer_columns.issubset(set(winners.columns)) or winners["manual_revision_pointers_json"].isna().any():
+        winners = add_manual_revision_pointers(winners, all_candidates)
+    conflicts = build_action_conflicts(all_candidates, winners)
+    out = winners.copy()
     for column in [
         "action_fraction",
         "approved_allocation_inr",
@@ -472,6 +1380,100 @@ def persist_action_recommendations(df: pd.DataFrame) -> None:
         unique_keys=["asof_date", "symbol"],
         timescaledb_column="asof_date",
     )
+    persist_action_conflicts(conflicts)
+    _trace_action_consolidation(all_candidates, winners, conflicts)
+
+
+def _trace_action_consolidation(all_candidates: pd.DataFrame, winners: pd.DataFrame, conflicts: pd.DataFrame) -> None:
+    if winners.empty:
+        return
+    candidate_groups: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
+    if not all_candidates.empty:
+        tmp = all_candidates.copy()
+        tmp["asof_date"] = pd.to_datetime(tmp["asof_date"], utc=True, errors="coerce")
+        for key, group in tmp.groupby(["asof_date", "symbol"], dropna=False):
+            candidate_groups[key] = group.sort_values("action_priority", ascending=False).head(10).to_dict(orient="records")
+    conflict_counts: dict[tuple[Any, Any], int] = {}
+    if not conflicts.empty:
+        tmp_conflicts = conflicts.copy()
+        tmp_conflicts["asof_date"] = pd.to_datetime(tmp_conflicts["asof_date"], utc=True, errors="coerce")
+        conflict_counts = tmp_conflicts.groupby(["asof_date", "symbol"], dropna=False).size().to_dict()
+    for _, row in winners.iterrows():
+        asof_date = pd.to_datetime(row.get("asof_date"), utc=True, errors="coerce")
+        key = (asof_date, row.get("symbol"))
+        candidate_rows = candidate_groups.get(key, [])
+        trace_id = safe_trace_call(
+            append_trace,
+            asof_date=row.get("asof_date"),
+            symbol=row.get("symbol"),
+            unique_id=row.get("unique_id"),
+            setup_id=row.get("setup_id"),
+            trigger_type="action_consolidation",
+            final_action=row.get("action_code"),
+            final_reason=row.get("action_reason"),
+            source_table=TABLE_NAME,
+            source_key=f"{row.get('asof_date')}:{row.get('symbol')}",
+            payload={
+                "action_source": row.get("action_source"),
+                "action_priority": row.get("action_priority"),
+                "conflict_count": int(conflict_counts.get(key, 0)),
+                "candidate_count": len(candidate_rows),
+                "reason_contract_status": row.get("reason_contract_status"),
+                "recommendation_reason": _parse_jsonish(row.get("recommendation_reason_json"), {}),
+                "manual_revision_summary": row.get("manual_revision_summary"),
+                "manual_revision_pointers": _parse_jsonish(row.get("manual_revision_pointers_json"), {}),
+                "manual_revision_status": row.get("manual_revision_status"),
+            },
+        )
+        if trace_id:
+            if str(row.get("action_source") or "").startswith("playbook"):
+                safe_trace_call(
+                    append_trace_step,
+                    trace_id=trace_id,
+                    step_idx=45,
+                    stage="playbook_action_plan",
+                    status="review_overlay",
+                    reason=row.get("action_reason"),
+                    input_payload=row.get("raw_context_json"),
+                    output_payload=row.to_dict(),
+                    payload={
+                        "playbook_id": row.get("setup_id"),
+                        "source_key": row.get("unique_id"),
+                        "source_action": row.get("source_action"),
+                        "mapped_action": row.get("action_code"),
+                        "production_allowed": True,
+                        "execution_mode": row.get("execution_mode"),
+                        "confidence": row.get("invest_score_pct"),
+                        "operator_summary": row.get("action_detail"),
+                        "review_boundary": "Playbook candidates are review/risk overlays only, not direct broker orders.",
+                        "reason_contract_status": row.get("reason_contract_status"),
+                        "recommendation_reason": _parse_jsonish(row.get("recommendation_reason_json"), {}),
+                        "manual_revision_summary": row.get("manual_revision_summary"),
+                        "manual_revision_pointers": _parse_jsonish(row.get("manual_revision_pointers_json"), {}),
+                    },
+                )
+            safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=50,
+                stage="action_consolidation",
+                status="completed",
+                reason=row.get("action_reason"),
+                input_payload=candidate_rows,
+                output_payload=row.to_dict(),
+                payload={
+                    "winner_action": row.get("action_code"),
+                    "winner_source": row.get("action_source"),
+                    "candidate_count": len(candidate_rows),
+                    "conflict_count": int(conflict_counts.get(key, 0)),
+                    "reason_contract_status": row.get("reason_contract_status"),
+                    "recommendation_reason": _parse_jsonish(row.get("recommendation_reason_json"), {}),
+                    "manual_revision_summary": row.get("manual_revision_summary"),
+                    "manual_revision_pointers": _parse_jsonish(row.get("manual_revision_pointers_json"), {}),
+                    "manual_revision_model": row.get("manual_revision_model"),
+                    "manual_revision_status": row.get("manual_revision_status"),
+                },
+            )
 
 
 def parse_args() -> argparse.Namespace:

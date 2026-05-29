@@ -106,6 +106,7 @@ Important:
 
 Current schedule:
 
+- every `5` minutes: `./all_frontend.sh` under a lock, which keeps the operator API and Nuxt frontend running without duplicates
 - `07:10` weekdays: `./complete_data.sh`
 - `03:10` weekdays: `./all_ml.sh`
 - every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_watchers.sh`
@@ -158,6 +159,8 @@ sudo apt-get install poppler-utils
 ```
 
 The OCR code resolves Poppler from `POPPLER_PATH`, then `PATH`, then common Homebrew/system locations. The generated cron `PATH` includes `/opt/homebrew/bin` for macOS Homebrew installs.
+
+By default, announcement OCR, concise document summaries, structured report parsing, and event evaluation can run through Codex CLI instead of hosted ChatGPT/Gemini APIs. Use `OCR_USING=codex`, `SUMMARIZE_WITH=codex`, `ADVISORY_EVENT_EVAL_MODEL=codex`, `CODEX_CLI_OCR_MODEL`, `CODEX_CLI_SUMMARIZE_MODEL`, and `CODEX_CLI_EVENT_MODEL`.
 
 ## Redis robustness knobs
 
@@ -212,6 +215,14 @@ Command:
 ```sh
 ./all_advisory.sh
 ```
+
+Codex-supervised variant:
+
+```sh
+./all_advisory_codex.sh
+```
+
+Use this for long unattended runs where Codex CLI should inspect a failure, patch the repo, and rerun with a bounded attempt count. Logs, Codex prompts, and Codex outputs are written to `logs/codex_supervisor/`. Tune it with `CODEX_SUPERVISOR_MAX_ATTEMPTS`, `CODEX_SUPERVISOR_TAIL_LINES`, `CODEX_SUPERVISOR_TIMEOUT_SECONDS`, and `CODEX_SUPERVISOR_MODEL`.
 
 ### 3. Model prep and training
 
@@ -287,7 +298,7 @@ Use when:
 
 - you want the live watch loop running during market hours
 - you want active watchlist names and open positions monitored continuously
-- you want the static dashboard refreshed automatically
+- you want live alerts and router updates available to the operator frontend
 
 Command:
 
@@ -331,25 +342,42 @@ Commands:
 ./all_parsers.sh
 ```
 
-## Dashboard
+## Operator Frontend
 
-Generate and serve the lightweight dashboard with:
+Run the operator API and Nuxt app together with:
 
 ```sh
-python -m advisory.live_dashboard --output-dir live_dashboard
-python -m http.server --directory live_dashboard 8000
+./all_frontend.sh
 ```
 
-`python -m http.server` only serves files. The dashboard files themselves are refreshed by:
+This starts `advisory.api.app` on `127.0.0.1:8765` and Nuxt on `127.0.0.1:3000` by default. It loads `nvm use default` before running Node/npm, logs the resolved Node path/version, and installs frontend dependencies automatically if `apps/operator-web/node_modules` is missing.
 
-- `python -m advisory.live_dashboard --output-dir live_dashboard`
-- `./all_watchers.sh` during watch cycles
-- weekday cron refreshes when `./go-crond config/stockey.crontab --allow-unprivileged` is running
+Frontend wrapper controls:
 
-The dashboard files are:
+```sh
+OPERATOR_WEB_USE_NVM=true
+OPERATOR_WEB_NVM_VERSION=default
+OPERATOR_WEB_INSTALL_DEPS=auto
+OPERATOR_WEB_NPM_LEGACY_PEER_DEPS=true
+```
 
-- `live_dashboard/index.html`
-- `live_dashboard/dashboard.json`
+To run them separately:
+
+```sh
+python -m advisory.api.app --host 127.0.0.1 --port 8765
+cd apps/operator-web
+npm install
+NUXT_PUBLIC_API_BASE=http://127.0.0.1:8765 npm run dev
+```
+
+Static `live_dashboard/` generation is deprecated. The frontend reads current state directly from `advisory.api.app`, so cron no longer runs `python -m advisory.live_dashboard`.
+
+Use the Decision Trace page when you need to understand why a symbol changed action or why an event did not change the action. It reads normalized trace summaries from:
+
+```sh
+python -m advisory.symbol_trace --symbol RELIANCE
+python -m advisory.decision_trace --unique-id <event-id>
+```
 
 ## Important inspection commands
 
@@ -396,8 +424,8 @@ python -m advisory.event_router --dry-run
 ### Live monitoring mode
 
 1. `./all_watchers.sh --loop`
-2. `python -m advisory.live_dashboard --output-dir live_dashboard`
-3. `python -m http.server --directory live_dashboard 8000`
+2. `./all_frontend.sh`
+3. open `http://127.0.0.1:3000`
 4. inspect `advisory.event_router --dry-run` if routing volume looks suspicious
 
 ## Redis pub-sub channels

@@ -13,7 +13,7 @@ The project is built around four layers:
 3. policy
 4. execution support
 
-The main design constraint is that LLMs help with extraction and review, but they do not get final trading authority.
+The main design constraint is that LLMs help with extraction, event interpretation, playbook action planning, and review, but they do not get final trading authority. Production decisions are primarily driven by validated investor playbooks, deterministic event policies, macro/regime gates, technical entry/exit timing, and portfolio risk controls. ML training remains optional research, not the default path to signal.
 
 ## Runtime flows
 
@@ -23,11 +23,14 @@ The repository has three primary runtime modes:
    - `./all_downloaders.sh`
    - `./all_parsers.sh`
    - `./complete_data.sh`
-2. model research and training
+2. optional model research and training
    - `./all_ml.sh`
 3. batch advisory and continuous watch
    - `./all_advisory.sh`
    - `./all_watchers.sh --loop`
+4. operator visibility
+   - `./all_frontend.sh`
+   - `python -m advisory.api.app --host 127.0.0.1 --port 8765`
 
 ## Layer 1: Extraction
 
@@ -60,6 +63,8 @@ The active extraction layer pulls from:
 The advisory stack then builds:
 
 - `advisory_screener_constituents`
+- `advisory_market_context_universe`
+- `advisory_market_context_daily`
 - `advisory_macro_daily`
 - `advisory_macro_features_daily`
 - `advisory_exchange_events`
@@ -111,7 +116,7 @@ It outputs scored candidate states such as:
 
 ### Event meta-model
 
-The project also has a research-stage event meta-model:
+The project also has a research-stage event meta-model. It is not the primary production signal path:
 
 - training prep: `advisory.event_model_data_prep`
 - training and scoring: `advisory.event_meta_model`
@@ -126,7 +131,7 @@ Current label target:
 
 - sign-adjusted forward daily return
 
-The model path is intentionally gated. It only trains when label coverage is sufficient.
+The model path is intentionally gated and disabled from the default cron loop. It only trains when explicitly run and when label coverage is sufficient. Event/news action in the live system should come from structured event interpretation, validated playbooks, macro/regime context, and technical timing.
 
 ### Experimental time-series forecasts
 
@@ -187,15 +192,27 @@ Prediction and policy are intentionally separate. A good event or candidate scor
 The final support layer includes:
 
 - `advisory.position_lifecycle`
+- `advisory.action_recommender`
 - `advisory.execution_engine`
-- traces and dashboards
+- `advisory.decision_trace`
+- `advisory.api.app`
+- the Nuxt operator frontend in `apps/operator-web`
 
 This layer is for:
 
 - lifecycle state
 - rebalance suggestions
+- one consolidated action recommendation per symbol/date
 - execution planning
 - operator visibility
+
+Every clean recommendation should carry a persisted reason contract explaining why the stock was screened, why it was selected, which event/playbook/technical/macro/risk evidence mattered, and why the final consolidated action won. Recommendations with incomplete reason contracts should be downgraded to manual review rather than presented as clean investable ideas.
+
+The operator trace UI now consumes normalized trace summaries from `advisory.api.app`. It renders event evaluation, adversarial review, investor playbook overlays, technical state, risk sizing, macro context, exchange-event context, portfolio allocation, lifecycle/exit policy, action consolidation, execution planning, execution safety, submission, and reconciliation as readable cards, while keeping raw payload details expandable for debugging.
+
+The trace UI also supports client-side search, domain/status filters, and quick filters for problems, execution blockers, action changes, and event-driven changes. On the dedicated Decision Trace page, filter state is persisted in URL query params and processing stages, decision rows, and individual steps have copyable deep links.
+
+The market-context stage writes `advisory_market_context_universe_daily` and `advisory_market_context_summary_daily`. It ranks the investable technical universe by market cap where available plus traded value, keeps the top 50%, and summarizes breadth, technical leadership, sector clusters, exchange events, news/announcement activity, and current regime. This is context for interpretation and gating, not a direct buy/sell signal.
 
 ## Continuous watch architecture
 
@@ -206,7 +223,9 @@ It is built from:
 - `advisory.sync_state`
 - `advisory.continuous_watch`
 - `advisory.event_router`
-- `advisory.live_dashboard`
+- `advisory.decision_trace`
+- `advisory.api.app`
+- the Nuxt operator frontend
 
 The design is:
 
@@ -227,7 +246,9 @@ Instead it:
 2. polls announcements and ET/news incrementally
 3. raises live alerts such as `ENTRY_ZONE_HIT` and `INVALIDATION_HIT`
 4. routes the highest-priority symbols into targeted reevaluation
-5. rewrites a static HTML and JSON dashboard
+5. records trace/action state for the operator API and Nuxt frontend
+
+The old static `live_dashboard/` path is deprecated. The API still reuses parts of the historical payload builder for compatibility, but the operator target is now the Nuxt app.
 
 ## Screener model
 
@@ -262,7 +283,7 @@ The main research guardrails are:
 - research ledger logging in `advisory_research_runs`
 - point-in-time dataset construction
 - explicit abstain state
-- gated model training based on label coverage
+- model training is optional research, not required for production event/playbook action
 - separation of extraction, prediction, policy, and execution
 
 The project is intentionally moving toward:
@@ -270,15 +291,19 @@ The project is intentionally moving toward:
 - stronger false-discovery control
 - better regime modeling
 - better event persistence modeling
-- more tabular prediction and less threshold sprawl
+- cleaner deterministic event/playbook policies before adding more tabular prediction
 
 ## Current gaps
 
 The main remaining gaps are:
 
-1. insufficient matured event labels for a strong first event-model fit
-2. regime stack is still simpler than the intended long-run design
-3. too much prediction still lives inside hand-tuned rule logic
-4. continuous-watch routing can still be tightened further
+1. every recommendation needs a mandatory logical reason contract
+2. top-50% market context universe and summaries need to be added
+3. production investor playbook action plans need to be bridged into action consolidation as review/risk-overlay candidates
+4. event-class policies need stronger deterministic mapping from known event types to watch/buy/review/reduce actions
+5. macro/regime state needs to be a first-class gate for event-driven candidates
+6. technical entry/exit timing needs tighter integration with event-driven candidate creation
+7. operator trace UI needs broader coverage for any remaining low-value raw JSON payloads
+8. continuous-watch routing can still be tightened further
 
 Use [`todo.md`](../todo.md) for the current roadmap on these items.

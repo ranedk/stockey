@@ -26,17 +26,19 @@ The advisory runtime path is:
 3. Sharpely fundamentals and peers
 4. Macro snapshot
 5. Regime classification
-6. Rule engine
-7. Watchlist
-8. Official announcements and ET RSS news
-9. LLM event evaluation
-10. Event meta-model scoring
-11. Experimental OHLCV time-series forecast features
-12. Adversarial event review
-13. Risk sizing
-14. Portfolio planning
-15. Lifecycle tracking
-16. Execution planning
+6. Top-50% market context universe
+7. Rule engine
+8. Watchlist
+9. Official announcements and ET RSS news
+10. LLM event evaluation
+11. Event interpretation and optional event meta-model scoring
+12. Experimental OHLCV time-series forecast features
+13. Adversarial event review
+14. Risk sizing
+15. Portfolio planning
+16. Lifecycle tracking
+17. Consolidated action recommendations with mandatory reason contract
+18. Execution planning
 
 ## End-to-End Summary
 
@@ -46,39 +48,39 @@ The advisory runtime path is:
 4. Normalize stored Screener snapshots into `advisory_screener_constituents`.
 5. Build daily advisory snapshots for macro, fundamentals, technicals, and optional intraday features.
 6. Convert the macro snapshot into `advisory_macro_features_daily` for point-in-time regime, model, and risk inputs.
-7. Normalize NSE block/bulk/short/insider/corporate/earnings data into exchange events and features.
-8. Build the base regime and the lightweight news overlay.
-9. Detect active investment themes and map them to theme-linked production screeners when available.
-10. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
-11. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
-12. Build the watchlist with screener, regime, overlay, and theme provenance.
-13. Ingest announcements and relevant news for watched names.
-14. Use the LLM only to extract structured event tensors from text, with bounded exchange-event context where relevant.
-15. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
-16. Feed candidate state plus event outputs into risk sizing and allocation.
-17. Rank approved allocations in the portfolio engine with overlap and setup caps.
-18. Build lifecycle and execution-planning outputs.
-19. Record research runs in the research ledger.
-20. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
-21. Train the XGBoost event meta-model only when label coverage is sufficient.
-22. Optionally build experimental OHLCV forecast features with `python -m advisory.ts_forecast_features`.
-23. Keep prediction separate from policy and execution.
+7. Build the top-50% market context universe from market cap, traded value, liquidity, technical leadership, exchange events, news, announcements, and regime context.
+8. Normalize NSE block/bulk/short/insider/corporate/earnings data into exchange events and features.
+9. Build the base regime and the lightweight news overlay.
+10. Detect active investment themes and map them to theme-linked production screeners when available.
+11. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
+12. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
+13. Build the watchlist with screener, regime, overlay, and theme provenance.
+14. Ingest announcements and relevant news for watched names and use the top-50% market-context summary as background evidence.
+15. Use the LLM only to extract structured event tensors from text, with bounded exchange-event and market-context evidence where relevant.
+16. Run deterministic event/playbook interpretation and adversarial review to clear, penalize, flag manual review, or veto.
+17. Feed candidate state plus event outputs into risk sizing and allocation.
+18. Rank approved allocations in the portfolio engine with overlap and setup caps.
+19. Build lifecycle and rebalance outputs.
+20. Consolidate buy, sell, partial sell, buy-more, hold, watch, and review actions into one action table.
+21. Attach a mandatory logical reason contract explaining why each stock was screened, selected, sized, held, rejected, or exited.
+22. Build execution-planning outputs from consolidated actions.
+23. Record research runs in the research ledger when research-only paths are used.
+24. Optionally prepare/train event models or build TS forecast features for research-only work.
+25. Keep interpretation, prediction, policy, and execution separate.
 
 For the main operator path, run:
 
 ```sh
 ./complete_data.sh
-./all_ml.sh
 ./all_advisory.sh
 ```
 
 That sequence:
 
 1. refreshes all raw data and parser outputs
-2. runs event-model prep/training if ready
-3. runs the advisory pipeline and portfolio generation
+2. runs event interpretation, playbook action planning, technical timing, risk sizing, and portfolio policy
 
-Use model training separately when you want research prep or training-only work:
+Use model training separately only when you want research prep or training-only work:
 
 ```sh
 ./all_ml.sh
@@ -98,11 +100,17 @@ This loop:
 2. polls announcements and ET/news incrementally
 3. routes fresh alerts and events into symbol-level advisory reevaluation
 4. writes live watch alerts when entry zones or invalidations are hit
-5. rewrites a simple static HTML/JSON dashboard in `live_dashboard/`
+5. records operator frontend status in `advisory_sync_state`
 
-Separately, the cron file also refreshes the static dashboard every 15 minutes on
-weekdays. That keeps the page current after advisory or portfolio changes even when
-the watch loop is not running continuously.
+The static `live_dashboard/` refresh path is deprecated. Use the Nuxt operator frontend with `advisory.api.app` for current portfolio, watch, event, trace, and investor playbook views.
+
+Trace inspection now has three operator paths:
+
+- `python -m advisory.symbol_trace --symbol RELIANCE`
+- `python -m advisory.decision_trace --unique-id <event-id>`
+- `./all_frontend.sh`, then open the Decision Trace page in the Nuxt app
+
+Decision Trace currently shows event evaluation, adversarial review, technical state, risk sizing, macro context, exchange-event context, portfolio allocation, lifecycle, rebalance, consolidated action conflicts, execution planning, execution safety, live submission, and reconciliation.
 
 The live router currently prioritizes aggressively but does not impose a default hard cap:
 
@@ -115,6 +123,7 @@ The live router currently prioritizes aggressively but does not impose a default
 Important runtime decisions:
 
 - canonical advisory OHLCV source: `dhan_ohlcv_daily`
+- canonical NIFTY benchmark source: parsed `nseindia_indices` `Nifty 50`, synced into `dhan_ohlcv_daily` by `data.benchmark_sync` after index parsing
 - canonical fundamentals source: Sharpely tables from `data/sharpelydata/sharpely_data.py`
 - official event source: exchange announcement pipeline
 - non-official news source: Economic Times RSS
@@ -171,12 +180,14 @@ This avoids the old behavior where the whole advisory run could fall back to one
 
 The codebase has moved past the earlier multi-screener and overlay build-out. The main open work now is:
 
-1. increase historical event coverage so the event meta-model has enough mature labels
-2. get the first statistically usable `1d` event-model fit into regular research use
-3. validate whether OHLCV time-series forecasts add incremental value over the technical engine and naive momentum
-4. improve the regime stack with better shock detection and persistence
-5. move more prediction logic from hand-tuned thresholds into tabular models
-6. tighten continuous-watch routing with cooldowns and duplicate suppression
+1. make the Nuxt Decision Trace and Event Inbox explain each stage without raw JSON
+2. make every clean stock recommendation carry a complete logical reason contract
+3. build the top-50% market context universe and use its announcements/macro/sector data as decision context
+4. seed the initial production investor playbook config and validate the first 5-10 playbooks
+5. strengthen deterministic event-class policies for earnings beats, growth acceleration, order wins, margin expansion, promoter actions, pledge reduction, regulatory notices, and management changes
+6. make macro/regime state a first-class gate for event-driven candidates
+7. integrate event-driven candidates with technical entry/exit timing
+8. tighten continuous-watch routing with cooldowns and duplicate suppression
 
 LLMs are intentionally kept in:
 
@@ -206,7 +217,11 @@ These are the main files you will edit when maintaining the advisory system:
 - risk sizing: `advisory/risk_engine.py`
 - portfolio planning: `advisory/portfolio_engine.py`
 - lifecycle: `advisory/position_lifecycle.py`
+- action consolidation: `advisory/action_recommender.py`
 - execution planning: `advisory/execution_engine.py`
+- decision traces: `advisory/decision_trace.py`
+- operator API: `advisory/api/app.py`
+- operator frontend: `apps/operator-web`
 - research ledger: `advisory/research_ledger.py`
 - master orchestrator: `advisory/master_pipeline.py`
 - component orchestrator: `advisory/pipeline.py`
@@ -231,7 +246,8 @@ These are the core advisory tables to know:
 - LLM/event layer: `advisory_event_evaluations`, `advisory_event_risks`
 - event meta-model layer: `advisory_event_model_scores`
 - adversarial review layer: `advisory_event_reviews`
-- allocation/execution layer: `advisory_allocations`, `advisory_portfolio_orders`, `advisory_position_lifecycle`, `advisory_rebalance_actions`, `advisory_execution_orders`, `advisory_execution_fills`
+- trace layer: `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts`
+- allocation/execution layer: `advisory_allocations`, `advisory_portfolio_orders`, `advisory_position_lifecycle`, `advisory_rebalance_actions`, `advisory_action_recommendations`, `advisory_execution_orders`, `advisory_execution_fills`
 
 ## Macro Feature Layer
 
@@ -384,15 +400,15 @@ python scripts/cleanup_deprecated_tables.py --dry-run
 
 ## Research priorities
 
-The main research priority is validation, not orchestration.
+The main production priority is not training. The live system should act from structured event extraction, reliability-tracked investor playbooks, macro/regime gates, technical timing, and risk policy. Research remains useful only when it tests whether a model adds incremental value over that knowledge-driven flow.
 
 Focus on:
 
 1. point-in-time discipline across screeners, prices, macro, news, and announcements
 2. false-discovery control with a research ledger and leakage-resistant evaluation
 3. structured event extraction from messy text
-4. tabular alpha models with abstention
-5. policy separation from prediction and execution
+4. deterministic event/playbook action policies with macro-aware risk controls
+5. policy separation from interpretation, prediction, and execution
 
 Already implemented:
 
@@ -431,7 +447,9 @@ This reviewer can only clear, penalize, force manual review, or veto. It does no
 
 This model is a research and scoring aid. It is not auto-trained inside the daily advisory pipeline.
 
-## Model training prerequisites
+## Optional model training prerequisites
+
+The production advisory path does not require event-model training. Use this section only for research experiments or to test whether a tabular event model adds incremental value over playbooks, deterministic event policies, macro gates, and technical timing.
 
 Use the prep command first:
 
@@ -770,6 +788,9 @@ There are now two event paths.
 - event ingest: `advisory/announcement_watch.py`
 - upstream storage: `announcement_pipeline_documents`
 - advisory event table: `advisory_watch_events`
+- OCR, concise document summaries, and structured report extraction: Codex CLI when `OCR_USING=codex` and `SUMMARIZE_WITH=codex`
+
+Set `CODEX_CLI_OCR_MODEL` and `CODEX_CLI_SUMMARIZE_MODEL` to choose the smaller Codex model used for these document tasks.
 
 ### 2. Economic Times RSS
 
@@ -784,6 +805,39 @@ There are now two event paths.
 
 - `advisory_event_evaluations`
 - `advisory_event_risks`
+
+Use `ADVISORY_EVENT_EVAL_MODEL=codex` and `CODEX_CLI_EVENT_MODEL` to run this structured event evaluation through Codex CLI with local Pydantic validation.
+
+Consolidated action decisions can write manual revision pointers through Codex CLI:
+
+- set `ACTION_MANUAL_REVISION_POINTERS_ENABLED=true`
+- set `ACTION_MANUAL_REVISION_POINTERS_MODEL=codex` or `codex:<model>`
+- read `manual_revision_summary` and `manual_revision_pointers_json` from `advisory_action_recommendations`
+
+These pointers are for operator review only. They do not change the final action and do not grant execution authority.
+
+Action consolidation also writes a reason contract:
+
+- `recommendation_reason_json`: machine-readable explanation of source, primary reason, evidence sections, risk fields, and competing candidates
+- `reason_contract_status`: `complete` or `incomplete_downgraded`
+- incomplete broker-action contracts are downgraded to `MANUAL_REVIEW`
+- the operator frontend renders the reason contract as separate screener, technical, event, playbook, macro/regime, risk, and competing-candidate panels on action cards and decision traces
+- before validation, action consolidation enriches candidate raw context from the latest matching `advisory_candidates` row and the latest `advisory_market_regime` row, so screener, technical, setup-score, and macro/regime evidence are available even when the immediate source table is sparse
+- action consolidation also enriches event/playbook decisions from latest matching `advisory_event_evaluations`, `advisory_event_reviews`, and `advisory_playbook_action_plans`, including event id, event class, verdict, reviewer action/veto, playbook id, and review checks
+
+### 3. Investor playbooks
+
+- versioned config: `config/hypotheses.yaml`
+- import command: `python -m advisory.hypothesis_engine --import-config config/hypotheses.yaml`
+- dry run: `python -m advisory.hypothesis_engine --import-config config/hypotheses.yaml --dry-run`
+- scan command: `python -m advisory.hypothesis_engine --run-scan`
+
+Playbook status controls action-overlay behavior:
+
+- `draft`: stored but not scanned by the active run
+- `active_review`: scanned and action-planned, but does not affect action consolidation
+- `trusted_overlay`: can become a `review_only` risk overlay in `advisory_action_recommendations`
+- `retired`: ignored
 
 ## Recommended operating flows
 

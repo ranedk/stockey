@@ -9,7 +9,9 @@ from environs import Env
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from advisory.decision_trace import append_trace, append_trace_step, record_event_processing
 from advisory.prompts import ADVISORY_EVENT_PROMPT_VERSION, SYSTEM_PROMPT, render_event_prompt
+from utils.codex_cli import run_codex_structured
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
@@ -20,7 +22,8 @@ env.read_env()
 EVALUATIONS_TABLE = "advisory_event_evaluations"
 RISKS_TABLE = "advisory_event_risks"
 NEWS_EVENTS_TABLE = "advisory_news_events"
-DEFAULT_MODEL = env("ADVISORY_EVENT_EVAL_MODEL", default="gpt-5-mini-2025-08-07")
+DEFAULT_MODEL = env("ADVISORY_EVENT_EVAL_MODEL", default="codex")
+CODEX_CLI_EVENT_MODEL = env("CODEX_CLI_EVENT_MODEL", default=env("CODEX_CLI_MODEL", default="gpt-5.4-mini"))
 _MAX_DOC_TEXT_CHARS = 12000
 _MAX_JSON_TEXT_CHARS = 6000
 
@@ -114,6 +117,16 @@ def trim_text(value: Any, limit: int) -> str | None:
     return text[:limit]
 
 
+def fallback_what_happened(event_row: pd.Series) -> str:
+    text = trim_text(event_row.get("concise_summary_text") or event_row.get("subject"), 1200)
+    if text and len(text.strip()) >= 10:
+        return text
+    subject = str(event_row.get("subject") or "").strip()
+    if subject:
+        return trim_text(f"Event could not be evaluated automatically. Subject: {subject}", 1200) or "Event could not be evaluated automatically."
+    return "Event could not be evaluated automatically."
+
+
 def normalize_jsonish(value: Any) -> Any:
     if value is None:
         return None
@@ -126,6 +139,13 @@ def normalize_jsonish(value: Any) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return text
+
+
+def _safe_trace_call(func, **kwargs) -> Any | None:
+    try:
+        return func(**kwargs)
+    except Exception:
+        return None
 
 
 def normalize_float(value: Any, *, minimum: float, maximum: float, default: float = 0.0) -> float:
@@ -828,6 +848,14 @@ class AdvisoryEventEvaluator:
         return self.openai_client
 
     def evaluate_payload(self, payload: dict[str, Any]) -> EventEvaluation:
+        if self.model == "codex" or self.model.startswith("codex:"):
+            codex_model = self.model.split(":", 1)[1] if self.model.startswith("codex:") else CODEX_CLI_EVENT_MODEL
+            return run_codex_structured(
+                render_event_prompt(payload),
+                response_model=EventEvaluation,
+                model=codex_model,
+                system_prompt=SYSTEM_PROMPT,
+            )
         completion = self._get_openai_client().beta.chat.completions.parse(
             model=self.model,
             messages=[
@@ -860,14 +888,25 @@ def build_outputs(
     for _, event_row in events.iterrows():
         doc_row = docs_by_id.get(str(event_row["unique_id"]))
         payload = build_payload(event_row, doc_row)
+        trace_id: str | None = None
         try:
             parsed = evaluator.evaluate_payload(payload)
             evaluation_status = "completed"
+            _safe_trace_call(
+                record_event_processing,
+                unique_id=event_row["unique_id"],
+                symbol=event_row.get("symbol"),
+                source_type=event_row.get("event_source"),
+                stage="event_evaluation",
+                status="completed",
+                input_payload=payload,
+                output_payload=parsed.model_dump(),
+                payload={"model": model, "prompt_version": ADVISORY_EVENT_PROMPT_VERSION},
+            )
         except Exception as exc:
             error_count += 1
             parsed = EventEvaluation(
-                what_happened=trim_text(event_row.get("concise_summary_text") or event_row.get("subject"), 1200)
-                or "Document could not be evaluated automatically.",
+                what_happened=fallback_what_happened(event_row),
                 sentiment="neutral",
                 materiality="medium",
                 setup_effect="neutral",
@@ -893,6 +932,18 @@ def build_outputs(
                 key_risks=[],
             )
             evaluation_status = "error"
+            _safe_trace_call(
+                record_event_processing,
+                unique_id=event_row["unique_id"],
+                symbol=event_row.get("symbol"),
+                source_type=event_row.get("event_source"),
+                stage="event_evaluation",
+                status="error",
+                error=str(exc),
+                input_payload=payload,
+                output_payload=parsed.model_dump(),
+                payload={"model": model, "prompt_version": ADVISORY_EVENT_PROMPT_VERSION},
+            )
 
         event_class, state_transition_hint, score_impact = normalize_event_evaluation(event_row, parsed)
         event_tensor = build_event_tensor(
@@ -901,6 +952,38 @@ def build_outputs(
             score_impact=score_impact,
             state_transition_hint=state_transition_hint,
         )
+        trace_id = _safe_trace_call(
+            append_trace,
+            asof_date=event_row["asof_date"],
+            symbol=event_row["symbol"],
+            unique_id=event_row["unique_id"],
+            setup_id=event_row.get("setup_id"),
+            trigger_type="event_evaluation",
+            new_action=state_transition_hint,
+            final_action=parsed.verdict,
+            final_reason=parsed.rationale,
+            source_table="advisory_watch_events",
+            source_key=event_row["unique_id"],
+            payload={
+                "evaluation_status": evaluation_status,
+                "event_class": event_class,
+                "state_transition_hint": state_transition_hint,
+                "score_impact": score_impact,
+                "confidence": parsed.confidence,
+            },
+        )
+        if trace_id:
+            _safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=10,
+                stage="event_evaluation",
+                status=evaluation_status,
+                reason=parsed.rationale,
+                input_payload=payload,
+                output_payload=parsed.model_dump(),
+                payload={"event_tensor": event_tensor},
+            )
 
         evaluation_rows.append(
             {
@@ -1113,7 +1196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", nargs="*", help="Optional symbols")
     parser.add_argument("--setup", dest="setup_ids", nargs="*", help="Optional setup ids")
     parser.add_argument("--limit", type=int, help="Optional max number of events to evaluate")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="OpenAI model name")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Evaluation model name, e.g. codex, codex:gpt-5.4-mini, or an OpenAI model")
     parser.add_argument("--include-evaluated", action="store_true", help="Re-evaluate rows already present in advisory_event_evaluations")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()

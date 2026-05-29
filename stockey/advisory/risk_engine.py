@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
 from advisory.setup_registry import load_setup_registry
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
@@ -1176,6 +1177,122 @@ def persist_allocations(df: pd.DataFrame) -> None:
         unique_keys=["published_on", "setup_id", "symbol", "unique_id"],
         timescaledb_column="published_on",
     )
+    _trace_allocation_rows(out)
+
+
+def _parse_context_snapshot(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        if pd.isna(value):
+            return {}
+    except Exception:
+        pass
+    try:
+        parsed = json.loads(str(value or "{}"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _trace_allocation_rows(df: pd.DataFrame) -> None:
+    for _, row in df.iterrows():
+        context = _parse_context_snapshot(row.get("context_snapshot_json"))
+        trace_id = safe_trace_call(
+            append_trace,
+            asof_date=row.get("asof_date"),
+            symbol=row.get("symbol"),
+            unique_id=row.get("unique_id"),
+            setup_id=row.get("setup_id"),
+            trigger_type="risk_sizing",
+            final_action=row.get("allocation_status"),
+            final_reason=row.get("notes"),
+            source_table=ALLOCATIONS_TABLE,
+            source_key=f"{row.get('published_on')}:{row.get('setup_id')}:{row.get('symbol')}:{row.get('unique_id')}",
+            payload={
+                "allocation_status": row.get("allocation_status"),
+                "risk_bucket": row.get("risk_bucket"),
+                "conviction_bucket": row.get("conviction_bucket"),
+                "suggested_allocation_inr": row.get("suggested_allocation_inr"),
+                "allocation_pct_of_adv20d": row.get("allocation_pct_of_adv20d"),
+                "stop_price": row.get("stop_price"),
+                "invalidation_price": row.get("invalidation_price"),
+            },
+        )
+        if not trace_id:
+            continue
+        safe_trace_call(
+            append_trace_step,
+            trace_id=trace_id,
+            step_idx=30,
+            stage="risk_sizing",
+            status=str(row.get("allocation_status") or "completed"),
+            reason=row.get("notes"),
+            input_payload=context,
+            output_payload=row.to_dict(),
+            payload={
+                "allocation_status": row.get("allocation_status"),
+                "risk_bucket": row.get("risk_bucket"),
+                "conviction_bucket": row.get("conviction_bucket"),
+                "suggested_allocation_inr": row.get("suggested_allocation_inr"),
+                "allocation_pct_of_adv20d": row.get("allocation_pct_of_adv20d"),
+                "stop_price": row.get("stop_price"),
+                "invalidation_price": row.get("invalidation_price"),
+                "invalidation_rule": row.get("invalidation_rule"),
+                "confidence": row.get("confidence"),
+                "score_impact": row.get("score_impact"),
+                "review_action": row.get("review_action"),
+                "review_score": row.get("review_score"),
+            },
+        )
+        macro_payload = {
+            key: context.get(key)
+            for key in ["macro_asof_date", "macro_stress_score", "macro_risk_state", "macro_sizing_multiplier"]
+            if context.get(key) is not None
+        }
+        if macro_payload:
+            safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=31,
+                stage="macro_context",
+                status="completed",
+                reason=f"Macro state {macro_payload.get('macro_risk_state') or 'available'} affected sizing context.",
+                input_payload=context,
+                output_payload=macro_payload,
+                payload=macro_payload,
+            )
+        exchange_payload = {
+            key: context.get(key)
+            for key in [
+                "exchange_asof_date",
+                "deal_net_value_20d",
+                "deal_cluster_count_20d",
+                "insider_net_value_90d",
+                "insider_event_count_90d",
+                "short_selling_quantity_20d",
+                "short_selling_event_count_20d",
+                "upcoming_earnings_14d",
+                "days_to_earnings",
+                "corporate_action_count_30d",
+                "exchange_accumulation_score",
+                "exchange_distribution_score",
+                "exchange_event_score",
+            ]
+            if context.get(key) is not None
+        }
+        if exchange_payload:
+            safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=32,
+                stage="exchange_event_context",
+                status="completed",
+                reason="Exchange-event context was available for risk sizing.",
+                input_payload=context,
+                output_payload=exchange_payload,
+                payload=exchange_payload,
+            )
 
 
 def parse_args() -> argparse.Namespace:

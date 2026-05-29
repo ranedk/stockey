@@ -5,14 +5,12 @@ import json
 import sys
 import time
 from datetime import timedelta
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from advisory.announcement_watch import persist_watch_outputs, run_announcement_watch
 from advisory.event_router import route_live_updates
-from advisory.live_dashboard import write_live_dashboard
 from advisory.news_watch import persist_news_events, run_news_watch
 from advisory.sync_state import ensure_sync_state_table, load_sync_state, persist_sync_state, publish_bus_message
 from data.dhanlive.ohlcv import sync_many_intraday
@@ -464,10 +462,14 @@ def run_announcement_cycle(*, interval_seconds: int) -> dict[str, Any]:
     return result
 
 
-def run_dashboard_cycle(*, output_dir: str | Path) -> dict[str, Any]:
-    source_name = "continuous_watch:dashboard"
+def run_operator_frontend_cycle() -> dict[str, Any]:
+    source_name = "continuous_watch:operator_frontend"
     now = pd.Timestamp.utcnow()
-    result = write_live_dashboard(output_dir=output_dir)
+    result = {
+        "status": "ok",
+        "mode": "api_frontend",
+        "detail": "Static dashboard generation is disabled; operator UI reads from advisory.api.app.",
+    }
     persist_sync_state(
         source_name=source_name,
         last_success_at=now,
@@ -476,13 +478,12 @@ def run_dashboard_cycle(*, output_dir: str | Path) -> dict[str, Any]:
         state=result,
         status="ok",
     )
-    publish_bus_message("stockey:continuous_watch:dashboard", {"published_at": pd.Timestamp.utcnow(), **result})
+    publish_bus_message("stockey:continuous_watch:operator_frontend", {"published_at": pd.Timestamp.utcnow(), **result})
     return result
 
 
 def run_once(
     *,
-    output_dir: str | Path,
     ohlcv_interval_seconds: int,
     news_interval_seconds: int,
     announcement_interval_seconds: int,
@@ -507,20 +508,20 @@ def run_once(
     else:
         summary["cycles"]["news"] = {"status": "skipped", "reason": "not_due"}
     summary["cycles"]["router"] = route_live_updates()
-    summary["cycles"]["dashboard"] = run_dashboard_cycle(output_dir=output_dir)
+    summary["cycles"]["operator_frontend"] = run_operator_frontend_cycle()
     publish_bus_message("stockey:continuous_watch:summary", {"published_at": pd.Timestamp.utcnow(), **summary})
     return summary
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the lightweight continuous watch loop for OHLCV, news, announcements, and dashboard refresh.")
+    parser = argparse.ArgumentParser(description="Run the lightweight continuous watch loop for OHLCV, news, announcements, routing, and operator frontend status.")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of once")
     parser.add_argument("--sleep-seconds", type=int, default=300, help="Loop sleep interval")
     parser.add_argument("--ohlcv-interval-seconds", type=int, default=300)
     parser.add_argument("--news-interval-seconds", type=int, default=1800)
     parser.add_argument("--announcement-interval-seconds", type=int, default=1800)
     parser.add_argument("--intraday-interval-minutes", type=int, default=1)
-    parser.add_argument("--output-dir", default="live_dashboard")
+    parser.add_argument("--output-dir", default=None, help="Deprecated; static dashboard generation has moved to the Nuxt operator frontend.")
     return parser.parse_args()
 
 
@@ -529,7 +530,6 @@ def main() -> int:
     while True:
         started_at = time.monotonic()
         summary = run_once(
-            output_dir=args.output_dir,
             ohlcv_interval_seconds=int(args.ohlcv_interval_seconds),
             news_interval_seconds=int(args.news_interval_seconds),
             announcement_interval_seconds=int(args.announcement_interval_seconds),

@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.decision_trace import append_trace_step, make_trace_id, record_event_processing, safe_trace_call
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
@@ -314,6 +315,7 @@ def build_reviews(events: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for _, row in events.iterrows():
         review = review_event_row(row)
+        _trace_review(row, review)
         rows.append(
             {
                 "published_on": row.get("published_on"),
@@ -336,6 +338,47 @@ def build_reviews(events: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
         "penalize_count": int((out["review_action"] == "penalize").sum()) if not out.empty else 0,
     }
     return out, meta
+
+
+def _trace_review(row: pd.Series, review: dict[str, Any]) -> None:
+    trace_id = make_trace_id(
+        asof_date=row.get("asof_date"),
+        symbol=row.get("symbol"),
+        unique_id=row.get("unique_id"),
+        trigger_type="event_evaluation",
+    )
+    safe_trace_call(
+        record_event_processing,
+        unique_id=row.get("unique_id"),
+        symbol=row.get("symbol"),
+        source_type=row.get("event_source"),
+        stage="adversarial_review",
+        status=review.get("review_status", "completed"),
+        input_payload=row.to_dict(),
+        output_payload=review,
+        payload={
+            "review_action": review.get("review_action"),
+            "review_score": review.get("review_score"),
+            "veto": review.get("veto"),
+            "review_reason": review.get("review_reason"),
+        },
+    )
+    safe_trace_call(
+        append_trace_step,
+        trace_id=trace_id,
+        step_idx=20,
+        stage="adversarial_review",
+        status=review.get("review_status", "completed"),
+        reason=review.get("review_reason"),
+        input_payload=row.to_dict(),
+        output_payload=review,
+        payload={
+            "review_action": review.get("review_action"),
+            "review_score": review.get("review_score"),
+            "veto": review.get("veto"),
+            "flags": review.get("review_flags_json"),
+        },
+    )
 
 
 def persist_reviews(reviews: pd.DataFrame) -> None:

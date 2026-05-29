@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background:
+    radial-gradient(circle at top left, rgba(15, 76, 92, 0.18), transparent 28rem),
+    linear-gradient(135deg, #f6f1e7 0%, #fbfaf4 48%, #eef4ed 100%);
+  color: #17211d;
+}
+
+.glass-panel {
+  @apply border border-black/10 bg-white/70 shadow-soft backdrop-blur;
+}
+

@@ -1,0 +1,301 @@
+hypotheses:
+  - hypothesis_id: MARKET_AUSTERITY_RISK_V1
+    title: Top authority austerity risk
+    description: >
+      A top political, fiscal, or monetary authority calling for austerity,
+      fiscal tightening, or spending cuts can reduce liquidity/risk appetite
+      and should trigger market-level de-risking review.
+    source: investor_interview
+    status: active_review
+    trigger_scope: market
+    trigger_patterns:
+      keywords:
+        include:
+          - austerity
+          - fiscal tightening
+          - spending cuts
+          - expenditure rationalisation
+          - expenditure rationalization
+          - subsidy reduction
+          - deficit reduction
+          - liquidity tightening
+        exclude:
+          - company internal cost cutting
+          - routine expense control
+      authority_roles:
+        - prime minister
+        - finance minister
+        - rbi governor
+        - central bank
+      source_reliability_min: medium
+    expected_effect:
+      effect: reduce_exposure
+      market_direction: negative
+      volatility: higher
+      action_bias: reduce_exposure_review
+    holding_window:
+      horizons_days: [1, 3, 5, 10, 20]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: point_in_time_forward_return
+      benchmark: NIFTY
+      costs_bps: 25
+    promotion_rule: Promote to production only after manual review of at least 10 historical matches.
+
+  - hypothesis_id: PROMOTER_BUYING_CONFIDENCE_V1
+    title: Promoter buying confidence
+    description: >
+      Promoter or insider open-market buying after a long weak period can signal
+      improving confidence, but it must be checked against liquidity, pledged shares,
+      and whether the purchase size is material.
+    source: investor_interview
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - promoter bought
+          - promoter purchase
+          - insider buying
+          - acquisition of shares
+          - open market purchase
+        exclude:
+          - inter se transfer
+          - gift
+          - transmission
+      source_reliability_min: high
+    expected_effect:
+      effect: manual_review
+      symbol_direction: positive
+      action_bias: watch_symbols
+    holding_window:
+      horizons_days: [5, 10, 20, 60]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: event_study_forward_return
+      benchmark: sector_index
+      costs_bps: 35
+    promotion_rule: Promote only when purchase value and promoter history are captured in exchange-event features.
+
+  - hypothesis_id: PLEDGE_REDUCTION_RERATING_V1
+    title: Promoter pledge reduction rerating
+    description: >
+      Material promoter pledge reduction can reduce balance-sheet and governance
+      risk and may support rerating if operating metrics are stable.
+    source: investor_interview
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - pledge reduction
+          - release of pledge
+          - encumbrance reduced
+          - pledged shares reduced
+          - revocation of encumbrance
+        exclude:
+          - creation of pledge
+          - invocation of pledge
+      source_reliability_min: high
+    expected_effect:
+      effect: manual_review
+      symbol_direction: positive
+      action_bias: watch_symbols
+    holding_window:
+      horizons_days: [5, 20, 60]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: event_study_forward_return
+      benchmark: sector_index
+      costs_bps: 35
+    promotion_rule: Promote only after checking remaining pledge percentage and debt/liquidity context.
+
+  - hypothesis_id: LARGE_ORDER_WIN_GROWTH_V1
+    title: Large order win growth signal
+    description: >
+      A large order win can matter when it is material versus revenue, from a credible
+      customer, and improves visibility without destroying margin quality.
+    source: investor_interview
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - order win
+          - letter of award
+          - contract awarded
+          - purchase order
+          - work order
+          - project awarded
+        exclude:
+          - lowest bidder
+          - non binding
+          - memorandum of understanding
+      source_reliability_min: medium
+    expected_effect:
+      effect: manual_review
+      symbol_direction: positive
+      action_bias: watch_symbols
+    holding_window:
+      horizons_days: [3, 10, 30, 90]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: event_study_forward_return
+      benchmark: sector_index
+      costs_bps: 35
+    promotion_rule: Promote only after order value/revenue ratio and margin risk extraction are reliable.
+
+  - hypothesis_id: MARGIN_EXPANSION_OPERATING_LEVERAGE_V1
+    title: Margin expansion operating leverage
+    description: >
+      Sustained margin expansion with revenue growth can indicate operating leverage
+      and should be reviewed for potential continuation or rerating.
+    source: investor_interview
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - margin expansion
+          - ebitda margin improved
+          - operating leverage
+          - gross margin improved
+          - profitability improved
+        exclude:
+          - one time gain
+          - exceptional item
+      source_reliability_min: medium
+    expected_effect:
+      effect: manual_review
+      symbol_direction: positive
+      action_bias: watch_symbols
+    holding_window:
+      horizons_days: [10, 30, 90]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: post_result_forward_return
+      benchmark: sector_index
+      costs_bps: 35
+    promotion_rule: Promote after event extraction separates recurring margin expansion from one-off accounting gains.
+
+  - hypothesis_id: KEY_MANAGEMENT_RESIGNATION_RISK_V1
+    title: Key management resignation risk
+    description: >
+      Resignation of a CEO, CFO, auditor, compliance officer, or key independent
+      director can be a governance or continuity risk and should trigger review.
+    source: investor_interview
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - resignation
+          - stepped down
+          - chief financial officer resigned
+          - auditor resignation
+          - independent director resignation
+          - compliance officer resignation
+        exclude:
+          - retirement by rotation
+          - completed tenure
+      source_reliability_min: high
+    expected_effect:
+      effect: manual_review
+      symbol_direction: negative
+      action_bias: reduce_exposure_review
+    holding_window:
+      horizons_days: [1, 3, 10, 30]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: event_study_forward_return
+      benchmark: sector_index
+      costs_bps: 35
+    promotion_rule: Promote after role criticality and stated resignation reason are reliably extracted.
+
+  - hypothesis_id: REGULATORY_NOTICE_RISK_V1
+    title: Regulatory notice or investigation risk
+    description: >
+      Material regulatory notices, investigations, raids, show-cause notices, or
+      adverse orders can invalidate otherwise good setups until legal/materiality
+      impact is understood.
+    source: investor_interview
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - show cause notice
+          - regulatory notice
+          - investigation
+          - search and seizure
+          - penalty order
+          - adverse order
+          - sebi order
+          - gst demand
+          - income tax demand
+        exclude:
+          - routine clarification
+          - no material impact
+      source_reliability_min: high
+    expected_effect:
+      effect: manual_review
+      symbol_direction: negative
+      action_bias: reduce_exposure_review
+    holding_window:
+      horizons_days: [1, 3, 10, 30]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: event_study_forward_return
+      benchmark: sector_index
+      costs_bps: 35
+    promotion_rule: Promote after demand/penalty materiality and contradiction checks are reliable.
+
+  - hypothesis_id: INSIDER_SELLING_CLUSTER_RISK_V1
+    title: Insider selling cluster risk
+    description: >
+      Repeated insider or promoter selling close to resistance, weak results, or
+      high valuation can indicate distribution risk and should trigger review.
+    source: investor_interview
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - promoter sold
+          - insider selling
+          - disposal of shares
+          - sale of shares
+          - offloaded stake
+        exclude:
+          - esop exercise
+          - inter se transfer
+          - gift
+      source_reliability_min: high
+    expected_effect:
+      effect: manual_review
+      symbol_direction: negative
+      action_bias: reduce_exposure_review
+    holding_window:
+      horizons_days: [3, 10, 30]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: event_study_forward_return
+      benchmark: sector_index
+      costs_bps: 35
+    promotion_rule: Promote only when sale value, seller role, and recent price context are captured.

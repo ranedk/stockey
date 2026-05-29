@@ -7,6 +7,8 @@ from typing import List, Optional, Sequence
 
 import pytz
 
+from advisory.decision_trace import record_event_processing, safe_trace_call
+
 from .db import load_company_master_targets
 from .models import Announcement
 from .pipeline import AnnouncementPipeline
@@ -75,11 +77,42 @@ class ManagedAnnouncementPipeline:
             existing_document = existing_documents.get(announcement.unique_id, {})
             try:
                 self._save_raw_metadata(announcement, existing_document)
+                self._record_stage(
+                    announcement,
+                    "metadata",
+                    "completed",
+                    payload={
+                        "exchange": announcement.exchange,
+                        "attachment_url": announcement.attachment_url,
+                        "existing_document": bool(existing_document),
+                    },
+                )
                 self._hydrate_from_state(announcement, existing_document)
+                self._record_stage(
+                    announcement,
+                    "hydrate",
+                    "completed",
+                    payload={
+                        "has_three_page_ocr": bool(announcement.three_page_ocr_text),
+                        "has_full_ocr": bool(announcement.full_ocr_text),
+                        "has_summary": bool(announcement.concise_summary_text),
+                        "category_count": len(announcement.categories or []),
+                    },
+                )
 
                 if not announcement.three_page_ocr_text and announcement.attachment_url:
                     self._ensure_downloaded(announcement, existing_document)
                     summary.downloaded += 1
+                    self._record_stage(
+                        announcement,
+                        "download",
+                        "completed" if announcement.attachment_bytes else "skipped",
+                        payload={
+                            "attachment_url": announcement.attachment_url,
+                            "content_type": announcement.attachment_content_type,
+                            "bytes": len(announcement.attachment_bytes or b""),
+                        },
+                    )
                     self._persist_document(
                         announcement,
                         existing_document,
@@ -90,6 +123,16 @@ class ManagedAnnouncementPipeline:
                     self.pipeline.ocr_first_pages([announcement])
                     if not announcement.ocr_error:
                         summary.ocred += 1
+                    self._record_stage(
+                        announcement,
+                        "ocr_first_pages",
+                        "failed" if announcement.ocr_error else "completed",
+                        error=announcement.ocr_error,
+                        payload={
+                            "number_of_pages": announcement.number_of_pages,
+                            "text_chars": len(announcement.three_page_ocr_text or ""),
+                        },
+                    )
                     self._persist_document(
                         announcement,
                         existing_document,
@@ -100,6 +143,16 @@ class ManagedAnnouncementPipeline:
                 if announcement.combined_text and not announcement.categories:
                     self.pipeline.categorize([announcement])
                     summary.categorized += 1
+                    self._record_stage(
+                        announcement,
+                        "categorize",
+                        "completed",
+                        output_payload=announcement.categories,
+                        payload={
+                            "category_count": len(announcement.categories or []),
+                            "categories": announcement.categories or [],
+                        },
+                    )
                     self._persist_document(
                         announcement,
                         existing_document,
@@ -114,6 +167,16 @@ class ManagedAnnouncementPipeline:
                 if announcement.categories and self.pipeline.requires_full_ocr(announcement):
                     if not announcement.full_ocr_text and announcement.attachment_bytes:
                         self.pipeline.ocr_full_documents([announcement])
+                        self._record_stage(
+                            announcement,
+                            "ocr_full_document",
+                            "failed" if announcement.ocr_error else "completed",
+                            error=announcement.ocr_error,
+                            payload={
+                                "number_of_pages": announcement.number_of_pages,
+                                "text_chars": len(announcement.full_ocr_text or ""),
+                            },
+                        )
                         self._persist_document(
                             announcement,
                             existing_document,
@@ -122,6 +185,15 @@ class ManagedAnnouncementPipeline:
                         )
                     if self.pipeline.should_transcribe_earnings_audio(announcement) and not announcement.audio_transcript_text:
                         self.pipeline.transcribe_earnings_call_audio([announcement])
+                        self._record_stage(
+                            announcement,
+                            "transcribe_audio",
+                            "completed" if announcement.audio_transcript_text else "skipped",
+                            payload={
+                                "audio_attachment_url": announcement.audio_attachment_url,
+                                "text_chars": len(announcement.audio_transcript_text or ""),
+                            },
+                        )
                         self._persist_document(
                             announcement,
                             existing_document,
@@ -144,6 +216,17 @@ class ManagedAnnouncementPipeline:
                                 "report_name": report.report_name,
                             }
                         summary.parsed += len(announcement.parsed_reports)
+                    self._record_stage(
+                        announcement,
+                        "structured_parse",
+                        "completed" if announcement.parsed_reports else "skipped",
+                        input_payload={"requested_reports": missing_reports},
+                        output_payload=[report.model_dump() for report in announcement.parsed_reports],
+                        payload={
+                            "requested_reports": missing_reports,
+                            "parsed_reports": [report.report_name for report in announcement.parsed_reports],
+                        },
+                    )
                     self._persist_document(
                         announcement,
                         existing_document,
@@ -184,6 +267,14 @@ class ManagedAnnouncementPipeline:
 
                 if announcement.combined_text and not announcement.concise_summary_text:
                     self.pipeline.summarize_concisely([announcement])
+                    self._record_stage(
+                        announcement,
+                        "summary",
+                        "completed" if announcement.concise_summary_text else "skipped",
+                        payload={
+                            "summary_chars": len(announcement.concise_summary_text or ""),
+                        },
+                    )
                     self._persist_document(
                         announcement,
                         existing_document,
@@ -195,6 +286,7 @@ class ManagedAnnouncementPipeline:
                 announcement.attachment_bytes = None
             except Exception as exc:
                 logger.exception("Failed announcement %s", announcement.unique_id)
+                self._record_stage(announcement, "managed_ingest", "error", error=str(exc))
                 summary.failed += 1
                 self._persist_document(
                     announcement,
@@ -206,6 +298,30 @@ class ManagedAnnouncementPipeline:
                 )
 
         return summary
+
+    def _record_stage(
+        self,
+        announcement: Announcement,
+        stage: str,
+        status: str,
+        *,
+        error: object = None,
+        input_payload: object = None,
+        output_payload: object = None,
+        payload: dict | None = None,
+    ) -> None:
+        safe_trace_call(
+            record_event_processing,
+            unique_id=announcement.unique_id,
+            symbol=announcement.ticker,
+            source_type=f"{announcement.exchange}_announcement",
+            stage=stage,
+            status=status,
+            error=error,
+            input_payload=input_payload,
+            output_payload=output_payload,
+            payload=payload or {},
+        )
 
     def _save_raw_metadata(self, announcement: Announcement, existing_document: dict) -> None:
         keys = save_announcement_artifacts(announcement)

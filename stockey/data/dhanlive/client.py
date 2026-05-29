@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+import sys
 from typing import Any
 
 import pandas as pd
 import requests
 
-from data.dhanlive.auth import get_access_token
+from data.dhanlive.auth import force_refresh_access_token, get_access_token
 from environs import Env
 
 
@@ -21,10 +22,15 @@ class DhanAPIError(RuntimeError):
 class DhanHistoricalClient:
     BASE_URL = "https://api.dhan.co/v2"
 
-    def __init__(self, access_token: str | None = None, timeout: int = 60):
+    def __init__(self, access_token: str | None = None, timeout: int = 60, auth_attempts: int | None = None):
         self.access_token = access_token or get_access_token()
         self.timeout = timeout
+        self.auth_attempts = max(int(auth_attempts or env.int("DHAN_API_AUTH_ATTEMPTS", default=3)), 1)
         self.session = requests.Session()
+        self._set_access_token(self.access_token)
+
+    def _set_access_token(self, access_token: str) -> None:
+        self.access_token = access_token
         self.session.headers.update(
             {
                 "Accept": "application/json",
@@ -34,8 +40,7 @@ class DhanHistoricalClient:
         )
 
     def validate_access_token(self) -> dict[str, Any]:
-        response = self.session.get(f"{self.BASE_URL}/profile", timeout=self.timeout)
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/profile")
 
     def fetch_daily(
         self,
@@ -57,12 +62,7 @@ class DhanHistoricalClient:
             "fromDate": from_date.strftime("%Y-%m-%d"),
             "toDate": to_date.strftime("%Y-%m-%d"),
         }
-        response = self.session.post(
-            f"{self.BASE_URL}/charts/historical",
-            json=payload,
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("POST", f"{self.BASE_URL}/charts/historical", json=payload)
 
     def fetch_intraday(
         self,
@@ -84,14 +84,44 @@ class DhanHistoricalClient:
             "fromDate": from_datetime.strftime("%Y-%m-%d %H:%M:%S"),
             "toDate": to_datetime.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        response = self.session.post(
-            f"{self.BASE_URL}/charts/intraday",
-            json=payload,
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("POST", f"{self.BASE_URL}/charts/intraday", json=payload)
 
-    def _parse_response(self, response: requests.Response) -> dict[str, Any]:
+    def _request(self, method: str, url: str, **kwargs) -> dict[str, Any] | list[dict[str, Any]]:
+        last_response: requests.Response | None = None
+        for attempt in range(1, self.auth_attempts + 1):
+            response = self.session.request(method, url, timeout=self.timeout, **kwargs)
+            last_response = response
+            if not self._is_auth_failure(response):
+                return self._parse_response(response)
+            if attempt >= self.auth_attempts:
+                break
+            print(
+                f"[data.dhanlive.client] Dhan auth failed; refreshing token attempt={attempt + 1}/{self.auth_attempts}",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                self._set_access_token(force_refresh_access_token())
+            except Exception as exc:
+                if attempt >= self.auth_attempts - 1:
+                    raise DhanAPIError(f"Dhan auth refresh failed after {self.auth_attempts} attempts: {exc}") from exc
+                print(
+                    f"[data.dhanlive.client] Dhan auth refresh failed; retrying login error={exc.__class__.__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return self._parse_response(last_response)
+
+    @staticmethod
+    def _is_auth_failure(response: requests.Response) -> bool:
+        if response.status_code == 401:
+            return True
+        text = response.text.lower()
+        return response.status_code in {400, 403} and "access token" in text and ("invalid" in text or "expired" in text)
+
+    def _parse_response(self, response: requests.Response | None) -> dict[str, Any] | list[dict[str, Any]]:
+        if response is None:
+            raise DhanAPIError("Dhan API request failed before receiving a response")
         try:
             payload = response.json()
         except ValueError:
@@ -152,12 +182,7 @@ class DhanTradingClient(DhanHistoricalClient):
             "afterMarketOrder": bool(after_market_order),
             "amoTime": amo_time or "",
         }
-        response = self.session.post(
-            f"{self.BASE_URL}/orders",
-            json=payload,
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("POST", f"{self.BASE_URL}/orders", json=payload)
 
     def modify_order(
         self,
@@ -180,75 +205,34 @@ class DhanTradingClient(DhanHistoricalClient):
             payload["disclosedQuantity"] = int(disclosed_quantity)
         if validity is not None:
             payload["validity"] = validity
-        response = self.session.put(
-            f"{self.BASE_URL}/orders/{order_id}",
-            json=payload,
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("PUT", f"{self.BASE_URL}/orders/{order_id}", json=payload)
 
     def cancel_order(self, order_id: str) -> dict[str, Any]:
-        response = self.session.delete(
-            f"{self.BASE_URL}/orders/{order_id}",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("DELETE", f"{self.BASE_URL}/orders/{order_id}")
 
     def get_orders(self) -> list[dict[str, Any]] | dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}/orders",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/orders")
 
     def get_order_by_id(self, order_id: str) -> dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}/orders/{order_id}",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/orders/{order_id}")
 
     def get_order_by_correlation_id(self, correlation_id: str) -> dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}/orders/external/{correlation_id}",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/orders/external/{correlation_id}")
 
     def get_trades(self) -> list[dict[str, Any]] | dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}/trades",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/trades")
 
     def get_trades_by_order_id(self, order_id: str) -> list[dict[str, Any]] | dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}/trades/{order_id}",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/trades/{order_id}")
 
     def get_fund_limits(self) -> list[dict[str, Any]] | dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}/fundlimit",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/fundlimit")
 
     def get_holdings(self) -> list[dict[str, Any]] | dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}/holdings",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/holdings")
 
     def get_positions(self) -> list[dict[str, Any]] | dict[str, Any]:
-        response = self.session.get(
-            f"{self.BASE_URL}/positions",
-            timeout=self.timeout,
-        )
-        return self._parse_response(response)
+        return self._request("GET", f"{self.BASE_URL}/positions")
 
 
 def candles_to_df(payload: dict[str, Any]) -> pd.DataFrame:

@@ -44,8 +44,42 @@ def load_benchmark_history(
     start_date: pd.Timestamp | None = None,
     to_date: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
+    if benchmark_name.upper() == "NIFTY":
+        clauses = ["index_name = %(benchmark_name)s"]
+        params: dict[str, object] = {"benchmark_name": "Nifty 50"}
+        if start_date is not None:
+            clauses.append("date >= %(start_date)s")
+            params["start_date"] = start_date
+        if to_date is not None:
+            clauses.append("date <= %(to_date)s")
+            params["to_date"] = to_date
+        nse_df = sql_to_df(
+            f"""
+            SELECT date, close
+            FROM nseindia_indices
+            WHERE {' AND '.join(clauses)}
+            ORDER BY date
+            """,
+            params=params,
+        )
+        if not nse_df.empty:
+            df = nse_df
+            df["date"] = normalize_timestamp(df["date"])
+            df["benchmark_close"] = pd.to_numeric(df["close"], errors="coerce")
+            df = df[["date", "benchmark_close"]].sort_values("date").reset_index(drop=True)
+            df["benchmark_ret_20d"] = df["benchmark_close"].pct_change(20)
+            df["benchmark_ret_60d"] = df["benchmark_close"].pct_change(60)
+            df["benchmark_dma_50"] = df["benchmark_close"].rolling(50, min_periods=50).mean()
+            df["benchmark_dma_200"] = df["benchmark_close"].rolling(200, min_periods=150).mean()
+            returns = df["benchmark_close"].pct_change()
+            df["benchmark_realized_vol_20d"] = returns.rolling(20, min_periods=15).std() * np.sqrt(252)
+            df["benchmark_drawdown_60d"] = (
+                df["benchmark_close"] / df["benchmark_close"].rolling(60, min_periods=20).max() - 1.0
+            )
+            return df
+
     clauses = ["ticker = %(benchmark_name)s", "asset_type = 'benchmark'"]
-    params: dict[str, object] = {"benchmark_name": benchmark_name}
+    params = {"benchmark_name": benchmark_name}
     if start_date is not None:
         clauses.append("date >= %(start_date)s")
         params["start_date"] = start_date

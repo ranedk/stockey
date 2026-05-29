@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from data.dhanlive.client import DhanAPIError
 from data.dhanlive.ohlcv import sync_intraday_ohlcv
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import load_tracked_symbols, parse_datetime_arg
@@ -222,14 +223,27 @@ def ensure_intraday_history(
             if not needs_sync:
                 results.append({"symbol": symbol, "interval_minutes": current_interval, "action": "skip", "reason": "intraday_present"})
                 continue
-            frame = sync_intraday_ohlcv(
-                symbol,
-                exchange="NSE",
-                asset_type="stock",
-                interval_minutes=current_interval,
-                from_date=target_start,
-                to_date=target_end,
-            )
+            try:
+                frame = sync_intraday_ohlcv(
+                    symbol,
+                    exchange="NSE",
+                    asset_type="stock",
+                    interval_minutes=current_interval,
+                    from_date=target_start,
+                    to_date=target_end,
+                )
+            except (DhanAPIError, ValueError) as exc:
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "interval_minutes": current_interval,
+                        "action": "issue",
+                        "reason": "dhan_intraday_sync_failed",
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    }
+                )
+                continue
             results.append(
                 {
                     "symbol": symbol,
@@ -331,6 +345,11 @@ def load_daily_reference(
     df["date"] = normalize_timestamp(df["date"])
     for column in ["high", "low", "close", "volume"]:
         df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = (
+        df.sort_values(["symbol", "date"])
+        .drop_duplicates(subset=["symbol", "date"], keep="last")
+        .reset_index(drop=True)
+    )
     df["prev_day_high"] = df.groupby("symbol", dropna=False)["high"].shift(1)
     df["prev_day_low"] = df.groupby("symbol", dropna=False)["low"].shift(1)
     df["avg_daily_volume_20d"] = df.groupby("symbol", dropna=False)["volume"].transform(lambda values: values.rolling(20, min_periods=5).mean())
@@ -351,7 +370,11 @@ def compute_intraday_session_features(
     if intraday.empty:
         return intraday
 
-    daily_ref = daily_reference.rename(columns={"date": "asof_date"})
+    daily_ref = daily_reference.rename(columns={"date": "asof_date"}).copy()
+    if not daily_ref.empty:
+        daily_ref["symbol"] = daily_ref["symbol"].astype("string").str.upper()
+        daily_ref["asof_date"] = normalize_timestamp(daily_ref["asof_date"])
+        daily_ref = daily_ref.drop_duplicates(subset=["symbol", "asof_date"], keep="last")
     ref_lookup = daily_ref.set_index(["symbol", "asof_date"]).to_dict(orient="index") if not daily_ref.empty else {}
 
     rows: list[dict[str, Any]] = []

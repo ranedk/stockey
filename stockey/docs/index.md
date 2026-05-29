@@ -125,12 +125,14 @@ python -m advisory.ts_forecast_workflow --dry-run --symbols RELIANCE TCS --model
 15. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
 16. Feed candidate state plus event outputs into risk sizing and allocation.
 15. Rank approved allocations in the portfolio engine with overlap and setup caps.
-16. Build lifecycle and execution-planning outputs.
-17. Record research runs in the research ledger.
-18. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
-19. Train the XGBoost event meta-model only when label coverage is sufficient.
-20. Optionally build experimental OHLCV forecast features with `python -m advisory.ts_forecast_features`.
-21. Keep prediction separate from policy and execution.
+16. Build lifecycle and rebalance outputs.
+17. Consolidate operator intent into `advisory_action_recommendations`.
+18. Build execution-planning outputs from consolidated actions.
+19. Record research runs in the research ledger.
+20. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
+21. Train the XGBoost event meta-model only when label coverage is sufficient.
+22. Optionally build experimental OHLCV forecast features with `python -m advisory.ts_forecast_features`.
+23. Keep prediction separate from policy and execution.
 
 Primary operator commands:
 
@@ -162,8 +164,15 @@ Use:
 - `python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m` for the optional Screener/Dhan/TimesFM/TS-watchlist workflow
 - `python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m --max-symbols 80` for the default TS screener workflow
 - `./all_advisory.sh` for the advisory and portfolio run
-- `./all_advisory.sh --fast` for a quicker lifecycle/action/dashboard refresh when data is already current
+- `./all_advisory.sh --fast` for a quicker lifecycle/action refresh when data is already current
 - `./all_watchers.sh --loop` for the lightweight live monitoring loop
+- `./all_frontend.sh` for the operator API + Nuxt frontend
+
+Operator trace inspection:
+
+- use the Nuxt Decision Trace page for readable symbol/event timelines
+- use `python -m advisory.symbol_trace --symbol RELIANCE` for CLI symbol traces
+- use `python -m advisory.decision_trace --unique-id <event-id>` for CLI event traces
 
 ### Dhan master
 
@@ -352,6 +361,11 @@ For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](adviso
 - changing setup rules
 - understanding stage ownership
 - debugging outputs and failures
+
+Future operator UX and research design:
+
+- operator app and decision trace design: `docs/operator_app_prd.md`
+- hypothesis research design: `docs/hypothesis_lab.md`
 
 For the short command-focused runbook, use [`docs/operators_manual.md`](operators_manual.md).
 

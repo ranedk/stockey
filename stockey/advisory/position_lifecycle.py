@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
 from advisory.technical_engine import evaluate_post_entry_state as evaluate_technical_post_entry_state
 from data.dhanlive.dhan_db import resolve_dhan_identity
 from utils.db import db_session, sql_to_df, upsert_to_db
@@ -820,6 +821,7 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
             unique_keys=["asof_date", "published_on", "setup_id", "symbol", "unique_id"],
             timescaledb_column="asof_date",
         )
+        _trace_lifecycle_rows(lifecycle_out)
     if not actions_df.empty:
         actions_out = actions_df.copy()
         for column in [
@@ -859,7 +861,88 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
             unique_keys=["asof_date", "published_on", "setup_id", "symbol", "unique_id", "suggested_action"],
             timescaledb_column="asof_date",
         )
+        _trace_rebalance_rows(actions_out)
         apply_tightened_stop_baseline(actions_out)
+
+
+def _trace_lifecycle_rows(df: pd.DataFrame) -> None:
+    for _, row in df.iterrows():
+        trace_id = safe_trace_call(
+            append_trace,
+            asof_date=row.get("asof_date"),
+            symbol=row.get("symbol"),
+            unique_id=row.get("unique_id"),
+            setup_id=row.get("setup_id"),
+            trigger_type="lifecycle",
+            final_action=row.get("next_action"),
+            final_reason=row.get("next_action_reason") or row.get("lifecycle_reason"),
+            source_table=LIFECYCLE_TABLE,
+            source_key=f"{row.get('asof_date')}:{row.get('symbol')}:{row.get('unique_id')}",
+            payload={
+                "position_status": row.get("position_status"),
+                "pnl_pct": row.get("pnl_pct"),
+                "days_held": row.get("days_held"),
+                "active_exit_condition": row.get("active_exit_condition"),
+                "exit_condition_status": row.get("exit_condition_status"),
+            },
+        )
+        if trace_id:
+            safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=40,
+                stage="lifecycle",
+                status="completed",
+                reason=row.get("next_action_reason") or row.get("lifecycle_reason"),
+                input_payload=row.get("context_snapshot_json"),
+                output_payload=row.to_dict(),
+                payload={
+                    "position_status": row.get("position_status"),
+                    "next_action": row.get("next_action"),
+                    "pnl_pct": row.get("pnl_pct"),
+                    "days_held": row.get("days_held"),
+                    "bucket_status_note": row.get("bucket_status_note"),
+                },
+            )
+
+
+def _trace_rebalance_rows(df: pd.DataFrame) -> None:
+    for _, row in df.iterrows():
+        trace_id = safe_trace_call(
+            append_trace,
+            asof_date=row.get("asof_date"),
+            symbol=row.get("symbol"),
+            unique_id=row.get("unique_id"),
+            setup_id=row.get("setup_id"),
+            trigger_type="rebalance",
+            final_action=row.get("suggested_action"),
+            final_reason=row.get("action_reason"),
+            source_table=REBALANCE_TABLE,
+            source_key=f"{row.get('asof_date')}:{row.get('symbol')}:{row.get('unique_id')}:{row.get('suggested_action')}",
+            payload={
+                "execution_mode": row.get("execution_mode"),
+                "action_fraction": row.get("action_fraction"),
+                "reference_price": row.get("reference_price"),
+                "recommended_stop_price": row.get("recommended_stop_price"),
+                "recommended_target_price": row.get("recommended_target_price"),
+            },
+        )
+        if trace_id:
+            safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=45,
+                stage="rebalance_action",
+                status="completed",
+                reason=row.get("action_reason"),
+                input_payload=row.get("context_snapshot_json"),
+                output_payload=row.to_dict(),
+                payload={
+                    "suggested_action": row.get("suggested_action"),
+                    "execution_mode": row.get("execution_mode"),
+                    "action_fraction": row.get("action_fraction"),
+                },
+            )
 
 
 def parse_args() -> argparse.Namespace:
