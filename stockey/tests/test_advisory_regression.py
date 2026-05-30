@@ -10,7 +10,9 @@ import pandas as pd
 from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_data_prep, event_router, execution_engine, exchange_events, exchange_features, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, technical_features, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, watchlist_builder
 from advisory.api import app as operator_api
 from data.announcements import pipeline as announcement_pipeline
+from data.announcements import managed_pipeline as announcement_managed_pipeline
 from data.announcements import state as announcement_state
+from data.announcements.models import ParsedReport
 from data.eaindustry import wpi
 from data.dhanlive import auth as dhan_auth
 from data.dhanlive import auth_cli as dhan_auth_cli
@@ -2415,6 +2417,26 @@ def test_announcement_pipeline_structured_parse_uses_codex(monkeypatch):
     assert result.DummyReport.value == "ok"
     assert calls[0][2] == "gpt-test"
     assert "explicitly supported" in calls[0][3]
+
+
+def test_managed_announcement_stage_serializes_dataclass_reports():
+    report = ParsedReport(
+        category="Financial Results",
+        report_name="QuarterlyResult",
+        model_name="codex",
+        data={"revenue": 100},
+    )
+
+    payload = announcement_managed_pipeline.serialize_stage_payload([report])
+
+    assert payload == [
+        {
+            "category": "Financial Results",
+            "report_name": "QuarterlyResult",
+            "model_name": "codex",
+            "data": {"revenue": 100},
+        }
+    ]
 
 
 def test_announcement_pipeline_ocr_uses_codex(monkeypatch):

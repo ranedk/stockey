@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, time
 from typing import List, Optional, Sequence
 
@@ -29,6 +29,20 @@ from .state import (
 from utils.log import setup_logger
 
 logger = setup_logger("announcement_pipeline.managed")
+
+
+def serialize_stage_payload(value: object) -> object:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()  # type: ignore[attr-defined]
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, list):
+        return [serialize_stage_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [serialize_stage_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: serialize_stage_payload(item) for key, item in value.items()}
+    return value
 
 
 @dataclass(slots=True)
@@ -221,7 +235,7 @@ class ManagedAnnouncementPipeline:
                         "structured_parse",
                         "completed" if announcement.parsed_reports else "skipped",
                         input_payload={"requested_reports": missing_reports},
-                        output_payload=[report.model_dump() for report in announcement.parsed_reports],
+                        output_payload=serialize_stage_payload(announcement.parsed_reports),
                         payload={
                             "requested_reports": missing_reports,
                             "parsed_reports": [report.report_name for report in announcement.parsed_reports],
