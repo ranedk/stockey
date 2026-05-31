@@ -63,8 +63,8 @@ The active extraction layer pulls from:
 The advisory stack then builds:
 
 - `advisory_screener_constituents`
-- `advisory_market_context_universe`
-- `advisory_market_context_daily`
+- `advisory_market_context_universe_daily`
+- `advisory_market_context_summary_daily`
 - `advisory_macro_daily`
 - `advisory_macro_features_daily`
 - `advisory_exchange_events`
@@ -154,11 +154,17 @@ TimesFM dependencies are installed by default through `python builder.py`. Use `
 
 It is not part of live execution. Forecasts must first be evaluated through matured forecast checks, paper portfolios, and research-ledger comparisons against naive momentum, the technical engine, and existing action recommendations.
 
+Technical threshold calibration is also research-only. `advisory.technical_threshold_calibration` compares technical threshold grids against realized Dhan OHLCV forward returns after costs and the operator app exposes the latest summary at `/technical-calibration` with copyable config JSON. `advisory.technical_threshold_promotion` can ask Codex/LLM for promotion rationale and a pending patch payload. Operator approval/rejection decisions are recorded in `advisory_technical_threshold_promotion_decisions`, but promotion into live setup thresholds remains a manual config change.
+
 ## Layer 3: Policy
 
 ### Adversarial review
 
 Before risk sizing, the system runs deterministic event review in `advisory.adversarial_review`.
+
+Before final action consolidation, `advisory.event_policy` maps structured event evaluations into bounded operator actions in `advisory_event_policy_actions`. Positive material classes such as `ORDER_WIN`, `RESULTS_POSITIVE`, `GROWTH_ACCELERATION`, `MARGIN_EXPANSION`, `PROMOTER_BUYING`, `PLEDGE_DOWN`, `BUYBACK`, and `GUIDANCE_UPGRADE` can become `BUY_WATCH` only when confidence, materiality, score impact, and risk checks are clean. Negative classes such as `REGULATORY_NOTICE`, `MANAGEMENT_RESIGNATION`, `AUDITOR_GOVERNANCE`, `RESULTS_NEGATIVE`, `PLEDGE_UP`, and `PROMOTER_SELLING` become `REDUCE_EXPOSURE_REVIEW` or `MANUAL_REVIEW`. Informational classes such as dividends, analyst meets, and neutral corporate actions stay `NO_ACTION` unless other evidence overrides them. Action consolidation consumes these as review/risk overlays only.
+
+`MANUAL_REVIEW` is intentionally kept narrow. `advisory.event_policy` downgrades low-information rows to `NO_ACTION` before they reach the operator queue. For the remaining manual-review rows, Codex/LLM can add `operator_notes_json`, including possible action, future events to wait for, and operator questions. The same refinement can downgrade a row to `NO_ACTION` if the LLM sees no realistic path to action.
 
 This layer can:
 
@@ -213,6 +219,10 @@ The operator trace UI now consumes normalized trace summaries from `advisory.api
 The trace UI also supports client-side search, domain/status filters, and quick filters for problems, execution blockers, action changes, and event-driven changes. On the dedicated Decision Trace page, filter state is persisted in URL query params and processing stages, decision rows, and individual steps have copyable deep links.
 
 The market-context stage writes `advisory_market_context_universe_daily` and `advisory_market_context_summary_daily`. It ranks the investable technical universe by market cap where available plus traded value, keeps the top 50%, and summarizes breadth, technical leadership, sector clusters, exchange events, news/announcement activity, and current regime. This is context for interpretation and gating, not a direct buy/sell signal.
+
+Event evaluation payloads now include this broad-market snapshot as `broad_market_context`. Investor playbook action plans also persist `market_context_json` and `market_context_adjustment_json`; positive playbook actions are downgraded to manual watch/review when breadth or regime context is weak, while risk-reduction playbooks are reinforced. This still does not create broker-executable trades.
+
+The continuous watch loop also uses the latest top-context universe as a lower-priority intake source for news and announcements. Active watchlist and open-position symbols win if a symbol appears in multiple sources. Top-context news/announcement rows are stored as `context_observed` unless a deterministic materiality filter sees high-impact terms such as order wins, results, rating actions, regulatory events, promoter/stake changes, buybacks, mergers, or governance issues. Only `triggered` event rows are routed into symbol refresh/evaluation.
 
 ## Continuous watch architecture
 

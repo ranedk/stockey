@@ -34,6 +34,8 @@ logger = setup_logger("announcement_pipeline.managed")
 def serialize_stage_payload(value: object) -> object:
     if hasattr(value, "model_dump"):
         return value.model_dump()  # type: ignore[attr-defined]
+    if hasattr(value, "dict"):
+        return value.dict()  # type: ignore[attr-defined]
     if is_dataclass(value):
         return asdict(value)
     if isinstance(value, list):
@@ -42,6 +44,8 @@ def serialize_stage_payload(value: object) -> object:
         return [serialize_stage_payload(item) for item in value]
     if isinstance(value, dict):
         return {key: serialize_stage_payload(item) for key, item in value.items()}
+    if hasattr(value, "__dict__"):
+        return {key: serialize_stage_payload(item) for key, item in vars(value).items() if not key.startswith("_")}
     return value
 
 

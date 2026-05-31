@@ -60,10 +60,29 @@ def dowload_events(
     browser.close()
 
 
+def parse_event_dates(values: pd.Series) -> pd.Series:
+    raw = values.astype("string").str.strip()
+    parsed = pd.to_datetime(raw, format="%d-%B-%Y", errors="coerce")
+    missing = parsed.isna() & raw.notna() & raw.ne("")
+    if missing.any():
+        parsed.loc[missing] = pd.to_datetime(raw.loc[missing], format="%d-%b-%Y", errors="coerce")
+    missing = parsed.isna() & raw.notna() & raw.ne("")
+    if missing.any():
+        try:
+            parsed.loc[missing] = pd.to_datetime(raw.loc[missing], format="mixed", dayfirst=True, errors="coerce")
+        except ValueError:
+            parsed.loc[missing] = pd.to_datetime(raw.loc[missing], dayfirst=True, errors="coerce")
+    return parsed
+
+
 def parse_csv(csv_file):
     df = pd.read_csv(csv_file)
     df.columns = ['symbol', 'company', 'purpose', 'details', 'date']
-    df['date'] = pd.to_datetime(df['date'])
+    df['date'] = parse_event_dates(df['date'])
+    bad_dates = df[df["date"].isna()]
+    if not bad_dates.empty:
+        sample = bad_dates["date"].head(5).astype(str).tolist()
+        raise ValueError(f"Could not parse recent event dates: {sample}")
     df = df.drop(columns=["company"])
     df = df.drop_duplicates(subset=["date", "symbol", "purpose"], keep='first')
     df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")

@@ -10,6 +10,7 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from advisory.decision_trace import append_trace, append_trace_step, record_event_processing
+from advisory.market_context import load_latest_market_context
 from advisory.prompts import ADVISORY_EVENT_PROMPT_VERSION, SYSTEM_PROMPT, render_event_prompt
 from utils.codex_cli import run_codex_structured
 from utils.db import db_session, sql_to_df, upsert_to_db
@@ -57,12 +58,23 @@ class EventEvaluation(BaseModel):
     event_class: Literal[
         "RESULTS_POSITIVE",
         "RESULTS_NEGATIVE",
+        "RESULTS_MIXED",
+        "GROWTH_ACCELERATION",
+        "MARGIN_EXPANSION",
         "ORDER_WIN",
         "CAPEX_EXPANSION",
         "GUIDANCE_UPGRADE",
         "GUIDANCE_DOWNGRADE",
         "PLEDGE_UP",
         "PLEDGE_DOWN",
+        "PROMOTER_BUYING",
+        "PROMOTER_SELLING",
+        "MANAGEMENT_RESIGNATION",
+        "REGULATORY_NOTICE",
+        "BUYBACK",
+        "DIVIDEND",
+        "ANALYST_MEET",
+        "CORPORATE_ACTION_NEUTRAL",
         "DILUTION",
         "AUDITOR_GOVERNANCE",
         "POLICY_SECTOR_POSITIVE",
@@ -211,12 +223,23 @@ def _contains_any(text: str, tokens: list[str]) -> bool:
 VALID_EVENT_CLASSES = {
     "RESULTS_POSITIVE",
     "RESULTS_NEGATIVE",
+    "RESULTS_MIXED",
+    "GROWTH_ACCELERATION",
+    "MARGIN_EXPANSION",
     "ORDER_WIN",
     "CAPEX_EXPANSION",
     "GUIDANCE_UPGRADE",
     "GUIDANCE_DOWNGRADE",
     "PLEDGE_UP",
     "PLEDGE_DOWN",
+    "PROMOTER_BUYING",
+    "PROMOTER_SELLING",
+    "MANAGEMENT_RESIGNATION",
+    "REGULATORY_NOTICE",
+    "BUYBACK",
+    "DIVIDEND",
+    "ANALYST_MEET",
+    "CORPORATE_ACTION_NEUTRAL",
     "DILUTION",
     "AUDITOR_GOVERNANCE",
     "POLICY_SECTOR_POSITIVE",
@@ -237,6 +260,10 @@ def canonicalize_event_class(value: Any) -> str | None:
         "RESULTS_UPGRADE": "RESULTS_POSITIVE",
         "RESULT_NEGATIVE": "RESULTS_NEGATIVE",
         "NEGATIVE_RESULTS": "RESULTS_NEGATIVE",
+        "MIXED_RESULTS": "RESULTS_MIXED",
+        "REVENUE_ACCELERATION": "GROWTH_ACCELERATION",
+        "SALES_ACCELERATION": "GROWTH_ACCELERATION",
+        "EBITDA_MARGIN_EXPANSION": "MARGIN_EXPANSION",
         "ORDER": "ORDER_WIN",
         "CONTRACT_WIN": "ORDER_WIN",
         "WORK_ORDER": "ORDER_WIN",
@@ -245,6 +272,13 @@ def canonicalize_event_class(value: Any) -> str | None:
         "GUIDANCE_NEGATIVE": "GUIDANCE_DOWNGRADE",
         "PROMOTER_PLEDGE_UP": "PLEDGE_UP",
         "PROMOTER_PLEDGE_DOWN": "PLEDGE_DOWN",
+        "PROMOTER_PURCHASE": "PROMOTER_BUYING",
+        "PROMOTER_BUY": "PROMOTER_BUYING",
+        "PROMOTER_SALE": "PROMOTER_SELLING",
+        "PROMOTER_SELL": "PROMOTER_SELLING",
+        "RESIGNATION": "MANAGEMENT_RESIGNATION",
+        "REGULATORY": "REGULATORY_NOTICE",
+        "SHOW_CAUSE": "REGULATORY_NOTICE",
         "FUND_RAISE": "DILUTION",
         "ESOP_DILUTION": "DILUTION",
         "AUDITOR": "AUDITOR_GOVERNANCE",
@@ -266,8 +300,23 @@ def classify_event_type(event_row: pd.Series, parsed: EventEvaluation) -> str:
 
     if _contains_any(full_haystack, ["auditor", "forensic", "governance", "fraud", "whistleblower"]):
         return "AUDITOR_GOVERNANCE"
+    if _contains_any(full_haystack, ["show cause", "show-cause", "regulatory notice", "sebi notice", "rbi notice", "investigation", "search operation", "raid", "penalty", "fine imposed"]):
+        return "REGULATORY_NOTICE"
+    if _contains_any(full_haystack, ["resignation", "resigns", "stepped down", "steps down"]):
+        if _contains_any(full_haystack, ["auditor", "chief financial officer", "cfo", "chief executive officer", "ceo", "managing director", "compliance officer", "independent director", "key managerial"]):
+            return "MANAGEMENT_RESIGNATION"
+    if _contains_any(full_haystack, ["promoter bought", "promoter purchase", "promoter acquired", "promoter acquisition", "insider buying", "insider purchase"]):
+        return "PROMOTER_BUYING"
+    if _contains_any(full_haystack, ["promoter sold", "promoter sale", "promoter selling", "promoter disposed", "insider selling", "insider sale"]):
+        return "PROMOTER_SELLING"
     if "pledge" in full_haystack:
         return "PLEDGE_UP" if parsed.sentiment == "negative" else "PLEDGE_DOWN"
+    if _contains_any(full_haystack, ["buyback", "buy-back", "share repurchase"]):
+        return "BUYBACK"
+    if _contains_any(full_haystack, ["dividend", "interim dividend", "final dividend", "record date"]):
+        return "DIVIDEND"
+    if _contains_any(full_haystack, ["analyst meet", "analysts/institutional investor", "investor meet", "conference call", "investor presentation", "earnings call"]):
+        return "ANALYST_MEET"
     if _contains_any(full_haystack, ["guidance", "outlook", "revised estimate", "margin guidance"]):
         return "GUIDANCE_UPGRADE" if parsed.sentiment == "positive" else "GUIDANCE_DOWNGRADE"
     if _contains_any(
@@ -305,6 +354,12 @@ def classify_event_type(event_row: pd.Series, parsed: EventEvaluation) -> str:
             "q4",
         ],
     ):
+        if _contains_any(full_haystack, ["margin expansion", "ebitda margin expanded", "operating margin expanded", "margin improved"]):
+            return "MARGIN_EXPANSION"
+        if _contains_any(full_haystack, ["revenue was up", "sales were up", "growth accelerated", "grew", "up ", "increased"]) and parsed.sentiment == "positive":
+            return "GROWTH_ACCELERATION"
+        if parsed.sentiment == "mixed":
+            return "RESULTS_MIXED"
         return "RESULTS_POSITIVE" if parsed.sentiment == "positive" else "RESULTS_NEGATIVE"
     if _contains_any(
         full_haystack,
@@ -326,7 +381,7 @@ def classify_event_type(event_row: pd.Series, parsed: EventEvaluation) -> str:
     if _contains_any(full_haystack, policy_tokens) and not _contains_any(full_haystack, policy_exclusions):
         return "POLICY_SECTOR_POSITIVE" if parsed.sentiment == "positive" else "POLICY_SECTOR_NEGATIVE"
 
-    order_tokens = ["order win", "order award", "work order", "purchase order", "contract award", "letter of award", "loa", "contract win"]
+    order_tokens = ["order win", "order wins", "order award", "orders worth", "received orders", "export orders", "work order", "purchase order", "contract award", "letter of award", "letter of acceptance", "contract win", "contract wins"]
     order_exclusions = [
         "change in director",
         "director",
@@ -343,12 +398,14 @@ def classify_event_type(event_row: pd.Series, parsed: EventEvaluation) -> str:
     if (
         _contains_any(full_haystack, order_tokens)
         or (
-            _contains_any(full_haystack, ["order", "contract", "award"])
+            _contains_any(full_haystack, ["order", "orders", "contract", "award"])
             and not _contains_any(full_haystack, order_exclusions)
             and _contains_any(strong_haystack, ["contract", "order", "award", "work order", "letter of award"])
         )
     ):
         return "ORDER_WIN"
+    if _contains_any(full_haystack, ["stock split", "split of shares", "bonus issue", "rights entitlement"]):
+        return "CORPORATE_ACTION_NEUTRAL"
     return "OTHER"
 
 
@@ -441,7 +498,8 @@ def derive_state_transition_hint(parsed: EventEvaluation, event_class: str, scor
 
 
 def normalize_event_evaluation(event_row: pd.Series, parsed: EventEvaluation) -> tuple[str, str, float]:
-    event_class = canonicalize_event_class(parsed.event_class) or classify_event_type(event_row, parsed)
+    canonical_class = canonicalize_event_class(parsed.event_class)
+    event_class = classify_event_type(event_row, parsed) if canonical_class in {None, "OTHER"} else canonical_class
     score_impact = normalize_score_impact(parsed)
     transition_hint = derive_state_transition_hint(parsed, event_class, score_impact)
     return event_class, transition_hint, score_impact
@@ -785,10 +843,34 @@ def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_d
     return out
 
 
+def load_broad_market_context(symbol: str, published_on: pd.Timestamp) -> dict[str, Any]:
+    daily_cutoff = pd.to_datetime(published_on, utc=True, errors="coerce").normalize()
+    if pd.isna(daily_cutoff):
+        daily_cutoff = pd.Timestamp.utcnow().normalize()
+    try:
+        payload = load_latest_market_context(daily_cutoff, limit=250)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    summary = payload.get("summary") if isinstance(payload, dict) else {}
+    top_universe = payload.get("top_universe") if isinstance(payload, dict) else []
+    symbol_upper = str(symbol or "").strip().upper()
+    symbol_context: dict[str, Any] = {}
+    if symbol_upper and isinstance(top_universe, list):
+        for row in top_universe:
+            if isinstance(row, dict) and str(row.get("symbol") or "").strip().upper() == symbol_upper:
+                symbol_context = row
+                break
+    return {
+        "summary": summary if isinstance(summary, dict) else {},
+        "symbol_context": symbol_context,
+    }
+
+
 def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[str, Any]:
     published_on = pd.to_datetime(event_row["published_on"], utc=True, errors="coerce")
     stock_context = load_point_in_time_context(str(event_row["symbol"]), published_on)
     exchange_context = load_exchange_context(str(event_row["symbol"]), published_on)
+    broad_market_context = load_broad_market_context(str(event_row["symbol"]), published_on)
 
     document_payload = {
         "unique_id": event_row["unique_id"],
@@ -829,6 +911,7 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
             "watch_reasons_json": normalize_jsonish(event_row.get("watch_reasons_json")),
         },
         "market_context": stock_context,
+        "broad_market_context": broad_market_context,
         "exchange_context": exchange_context,
         "document_context": document_payload,
     }

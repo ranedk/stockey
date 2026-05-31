@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from advisory.announcement_watch import persist_watch_outputs, run_announcement_watch
+from advisory.announcement_watch import DEFAULT_MARKET_CONTEXT_WATCH_LIMIT
 from advisory.event_router import route_live_updates
 from advisory.news_watch import persist_news_events, run_news_watch
 from advisory.sync_state import ensure_sync_state_table, load_sync_state, persist_sync_state, publish_bus_message
@@ -426,6 +427,9 @@ def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90) -> dict
         to_date=now,
         published_from=published_from,
         refresh_feeds=True,
+        include_market_context=True,
+        market_context_limit=DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
+        market_context_last_checked_at=published_from,
     )
     persist_news_events(events)
     last_item_ts = events["published_on"].max() if not events.empty else now
@@ -445,8 +449,17 @@ def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90) -> dict
 def run_announcement_cycle(*, interval_seconds: int) -> dict[str, Any]:
     source_name = "continuous_watch:announcements"
     now = pd.Timestamp.utcnow()
+    state = load_sync_state(source_name) or {}
+    last_checked_at = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
+    if pd.isna(last_checked_at):
+        last_checked_at = None
     _emit(f"[advisory.continuous_watch] announcements start to={now.isoformat()}")
-    watch_updates, events, meta = run_announcement_watch(to_date=now)
+    watch_updates, events, meta = run_announcement_watch(
+        to_date=now,
+        include_market_context=True,
+        market_context_limit=DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
+        market_context_last_checked_at=last_checked_at,
+    )
     persist_watch_outputs(watch_updates, events)
     last_item_ts = events["published_on"].max() if not events.empty else now
     persist_sync_state(

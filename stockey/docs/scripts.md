@@ -40,9 +40,14 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/ts_forecast_features.py` | `advisory_ts_forecasts_daily` | Experimental OHLCV time-series forecast features; starts with `naive_momentum_v1` and is designed to host TimesFM / Chronos / Moirai adapters later |
 | `advisory/ts_forecast_evaluator.py` | `advisory_ts_forecast_evaluations`, `advisory_ts_forecast_eval_summary` | Evaluates matured TS forecast rows against future Dhan OHLCV returns after costs |
 | `advisory/ts_forecast_workflow.py` | `advisory_ts_forecasts_daily`, `advisory_ts_forecast_watchlist` | Optional Screener.in -> Dhan OHLCV refresh -> TimesFM forecast -> experimental TS watchlist workflow |
+| `advisory/technical_threshold_calibration.py` | `advisory_technical_threshold_evaluations`, `advisory_technical_threshold_eval_summary` | Research-only calibration of technical-engine thresholds against realized forward Dhan OHLCV returns after costs |
+| `advisory/technical_threshold_promotion.py` | `advisory_technical_threshold_promotion_reviews`, `advisory_technical_threshold_promotion_decisions` | LLM-assisted manual review of calibrated technical thresholds plus operator approval/rejection audit rows; produces patch guidance without applying config changes |
+| `advisory/event_policy.py` | `advisory_event_policy_actions` | Deterministic and bounded Codex-assisted mapping from structured event evaluations to buy-watch, manual review, reduce-exposure review, or no action, including operator notes for actionable manual reviews |
+| `advisory/event_policy_evaluator.py` | `advisory_event_policy_evaluations`, `advisory_event_policy_eval_summary` | Research-only evaluation of event-policy action/classes against realized forward Dhan OHLCV returns after costs |
 | `advisory/exchange_events.py` | `advisory_exchange_events` | Normalizes NSE block/bulk/short-selling/insider/corporate-action/earnings rows into point-in-time exchange events |
 | `advisory/exchange_features.py` | `advisory_exchange_features_daily` | Builds daily symbol-level exchange-event features for LLM context, event-model features, review, and risk sizing |
 | `advisory/market_context.py` | `advisory_market_context_universe_daily`, `advisory_market_context_summary_daily` | Builds the top-50% market-context universe from technical/liquidity/market-cap data and summarizes breadth, leadership, sector clusters, events, and regime context |
+| `advisory/operator_health.py` | read-only checks | Operator smoke-test command for DB, Redis, Dhan token, cron logs, key table freshness, frontend dependencies, Poppler, Codex, and TimesFM; also emits `fix_hints` for the Nuxt health page |
 | `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
 | `advisory/model_training_runner.py` | varies | Gated model-training orchestrator: runs prep, checks label coverage for the requested horizon, then trains and scores only when ready |
 | `advisory/sync_state.py` | `advisory_sync_state` | Shared incremental state storage for continuous polling and operator frontend status |
@@ -129,11 +134,13 @@ OSX:
 
 - Consolidated action decisions can also get Codex-generated manual revision pointers. Set `ACTION_MANUAL_REVISION_POINTERS_ENABLED=true` and `ACTION_MANUAL_REVISION_POINTERS_MODEL=codex` or `codex:<model>`. The output is persisted on `advisory_action_recommendations` as `manual_revision_summary` and `manual_revision_pointers_json`; if Codex fails, deterministic fallback pointers are written instead.
 
-- Final action rows also persist `recommendation_reason_json` and `reason_contract_status`. If a broker-action row is missing required reason, evidence, execution, or risk fields, action consolidation downgrades it to `MANUAL_REVIEW` before it can reach execution.
+- Final action rows also persist `recommendation_reason_json` and `reason_contract_status`. If a broker-action row is missing required reason, evidence, execution, or risk fields, action consolidation downgrades it to `MANUAL_REVIEW` before it can reach execution. The execution planner also blocks stale broker-action rows whose reason contract is missing or incomplete.
 
 - Action consolidation enriches reason contracts from latest `advisory_candidates` and `advisory_market_regime` snapshots before validation. This adds screener provenance, technical state/scores, setup score, candidate state, and macro/regime context without rerunning the full advisory pipeline.
 
 - Event/playbook reason contracts are enriched from latest `advisory_event_evaluations`, `advisory_event_reviews`, and `advisory_playbook_action_plans`. This adds event ids/classes/verdicts/reviewer actions and matched playbook/review-check context before the final action row is accepted.
+
+- `all_watchers.sh` runs `advisory.continuous_watch`, which now augments active watchlist symbols with a lower-priority top-50% market-context queue from `advisory_market_context_universe_daily`. Top-context news and announcements are persisted as `context_observed` unless deterministic materiality keywords mark them `triggered`; only `triggered` rows are routed for advisory refresh/evaluation. Tune breadth with `MARKET_CONTEXT_WATCH_LIMIT` (default `50`).
 
 - Investor playbooks live in `config/hypotheses.yaml`. Import them with `python -m advisory.hypothesis_engine --import-config config/hypotheses.yaml`; preview with `--dry-run`; run matching/action-plan generation with `python -m advisory.hypothesis_engine --run-scan`. Only `status: trusted_overlay` playbooks can affect consolidated actions, and only as `review_only` overlays.
 
@@ -168,6 +175,8 @@ python -m data.dhanlive.auth_cli clear-cache
 | `all_watchers.sh` | Continuous monitoring wrapper | Polls active watchlist OHLCV, announcements, and ET/news incrementally |
 | `all_frontend.sh` | Operator frontend supervisor | Runs `advisory.api.app` and the Nuxt operator app together |
 
+The primary operator scripts call `scripts/run_with_markers.sh`, which emits `[stockey.script]` start/end markers to stdout while preserving the wrapped command's exit code. The health parser uses these markers to classify the latest run as `ok`, `failed`, `interrupted_by_operator`, `ok_after_historical_errors`, or `recovered_after_manual_interrupt`.
+
 Recommended scheduler file:
 
 - `config/stockey.crontab.template`
@@ -176,14 +185,37 @@ Recommended scheduler file:
 It schedules:
 
 - `complete_data.sh` once daily on weekdays
-- `all_ml.sh` once daily after 3am on weekdays
 - `all_watchers.sh` every `10` minutes during market hours
 - `all_advisory.sh` once daily after 7pm on weekdays
 - `all_frontend.sh` every `5` minutes under a lock so API/Nuxt are restarted if they exit
+- `advisory.hypothesis_engine --run-scan` at `10:25`, `13:25`, `16:25`, and `21:25` on weekdays for investor playbook/hypothesis matching over newly collected events
+- `advisory.ts_forecast_workflow` at `11:20`, `14:20`, `17:20`, and `20:20` on weekdays
+- `advisory.ts_forecast_evaluator` at `18:20` and `21:20` on weekdays
+- `advisory.event_policy_evaluator` at `23:10` on weekdays
+- `advisory.technical_threshold_calibration` at `04:20` on Saturdays
+- optional `all_ml.sh` is present but commented out by default because the live path is playbook/rule/policy driven
+
+Hypothesis scans default to Codex-backed action-plan notes. Set `HYPOTHESIS_CRON_ARGS=--no-llm` to keep that cron path deterministic only.
+
+Not scheduled by default:
+
+- `all_ml.sh`: optional event-model research path; enable the commented cron line only when you want model prep/training.
+- `all_advisory_codex.sh`: self-fixing advisory wrapper; keep it manual so cron does not modify code unattended.
+- `advisory.technical_threshold_promotion`: manual review/promotion helper; it creates patch guidance but should not run automatically.
+- live Dhan order submission: controlled by execution settings and should remain explicitly gated; cron only prepares advisory/execution-planning state unless live trading is enabled deliberately.
+
+Operator health and logs:
+
+- `python -m advisory.operator_health --skip-dhan` is the read-only smoke test for DB freshness, Redis, cron logs, optional dependencies, and frontend dependencies.
+- It also checks local operator API latency and Dhan cached-token expiry metadata without initiating broker login.
+- `fix_hints` are emitted in the health payload and rendered at the top of the Nuxt Data Health page.
+- The Data Health page has filters for `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
+- Recovered manual interrupts are detected by comparing mapped output table timestamps against the interrupted log timestamp.
 
 Bootstrap note:
 
 - `python builder.py` creates `logs/cron`, installs `go-crond` locally as `./go-crond` unless `GO_CROND_INSTALL_DIR` overrides the target, and installs `torch` plus the current Google Research TimesFM package from GitHub for the `timesfm_2p5_200m` forecast adapter.
+- The generated crontab includes a user field because it is meant for `go-crond --allow-unprivileged` or a system crontab style runner. Do not install it into a normal per-user `crontab` unless you first remove the user column.
 - Use `python builder.py --skip-timesfm-install` or `STOCKEY_SKIP_TIMESFM_INSTALL=true python builder.py` for lightweight setup runs without TimesFM.
 - Override the TimesFM source with `STOCKEY_TIMESFM_PACKAGE` if a future release needs a pinned URL or version.
 
@@ -756,6 +788,10 @@ python -m advisory.regime_engine
 python -m advisory.peer_sync --symbols HDFCBANK
 python -m advisory.technical_features --dry-run
 python -m advisory.technical_features
+python -m advisory.technical_threshold_calibration --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
+python -m advisory.technical_threshold_promotion --setup-id EVENT_OPPORTUNITY_V1 --config-id CONFIG_ID --dry-run
+python -m advisory.event_policy --dry-run
+python -m advisory.event_policy --dry-run --no-llm
 python -m advisory.rule_engine --dry-run
 python -m advisory.rule_engine
 python -m advisory.watchlist_builder --dry-run

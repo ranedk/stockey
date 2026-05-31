@@ -145,15 +145,19 @@ Primary operator commands:
 
 Scheduled operator flow:
 
-- run `python builder.py` to render `config/stockey.generated.crontab`, then install it with `crontab config/stockey.generated.crontab` or run it with `./go-crond config/stockey.generated.crontab --allow-unprivileged`
+- run `python builder.py` to render `config/stockey.generated.crontab`, then run it with `./go-crond config/stockey.generated.crontab --allow-unprivileged`
 - let `complete_data.sh` handle the once-daily broad refresh
-- let `all_ml.sh` run once daily after 3am
 - let `all_watchers.sh` run every `10` minutes during market hours
+- let investor hypothesis/playbook scans run at `10:25`, `13:25`, `16:25`, and `21:25`; set `HYPOTHESIS_CRON_ARGS=--no-llm` for deterministic-only scans
 - let the experimental TS forecast cron run at `11:20`, `14:20`, `17:20`, and `20:20`; evaluator runs at `18:20` and `21:20`
 - let `all_advisory.sh` run once daily after 7pm for the slower batch recommendation cycle
+- let event-policy realized-return evaluation run at `23:10` on weekdays
+- let technical threshold calibration run weekly at `04:20` on Saturdays
 - use `all_advisory.sh --fast` for quick intermediate advisory refreshes; it avoids watch/news refresh, peer sync, and on-demand intraday repair
 
-The cron file writes logs under `logs/cron/` and uses `scripts/with_lock.sh` so overlapping runs are skipped instead of stacked. The wrapper uses `flock` on Linux and `lockf` on macOS.
+The generated cron file is intended for `./go-crond config/stockey.generated.crontab --allow-unprivileged` or a system-crontab style runner because it includes the user column. A normal per-user `crontab` needs that user column removed first. Logs go under `logs/cron/`, and `scripts/with_lock.sh` skips overlapping runs instead of stacking them. The lock wrapper uses `flock` on Linux and `lockf` on macOS.
+
+Top-level operator scripts also emit deterministic lifecycle markers through `scripts/run_with_markers.sh`, for example `[stockey.script] name=all_ml status=start ...` followed by `done`, `failed`, or `interrupted`. The operator health page uses those markers before falling back to log-text heuristics, so successful reruns can clear older traceback noise correctly.
 
 Use:
 
@@ -163,10 +167,21 @@ Use:
 - `python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30` for matured TS forecast evaluation
 - `python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m` for the optional Screener/Dhan/TimesFM/TS-watchlist workflow
 - `python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m --max-symbols 80` for the default TS screener workflow
+- `python -m advisory.event_policy_evaluator --dry-run --horizons 5 10 20` for event-policy realized-return evidence
+- `python -m advisory.technical_threshold_calibration --dry-run --horizons 5 10 20` for weekly technical threshold evidence
+- `python -m advisory.operator_health --skip-dhan` for a read-only local smoke test
 - `./all_advisory.sh` for the advisory and portfolio run
 - `./all_advisory.sh --fast` for a quicker lifecycle/action refresh when data is already current
 - `./all_watchers.sh --loop` for the lightweight live monitoring loop
 - `./all_frontend.sh` for the operator API + Nuxt frontend
+
+Operator health:
+
+- `fix_hints` show the next concrete command for stale data, dependency problems, active cron failures, and recovered historical errors
+- API latency is checked through `OPERATOR_API_HEALTH_URL`, defaulting to the local FastAPI `/api/health` endpoint
+- Dhan cache metadata shows token cache age, expiry timestamp, and time left without triggering broker login
+- the Nuxt Data Health page filters rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`
+- manual `KeyboardInterrupt` is downgraded to recovered when mapped output tables have fresher rows than the interrupted log
 
 Operator trace inspection:
 

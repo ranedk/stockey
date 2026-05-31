@@ -119,8 +119,11 @@ For each match, the action planner creates:
 - decision reason
 - checks to run before action
 - risk controls and safe boundaries
+- top-50% market-context snapshot and any market-context adjustment
 
 The default planner uses Codex through `utils.codex_cli`. If Codex is unavailable or disabled, the deterministic fallback still creates a conservative action plan and records the LLM status.
+
+The planner receives the latest `advisory_market_context_summary_daily` and matching symbol row from `advisory_market_context_universe_daily`. In weak breadth or risk-off regimes, positive playbook actions are downgraded to `BUY_WATCH`/manual review, and risk-reduction playbooks get higher urgency. Market context is evidence and a safety gate; it is not a standalone buy/sell rule.
 
 It does not auto-trade or auto-liquidate. `active_review` playbooks can be scanned and action-planned for review. Only `trusted_overlay` playbooks are allowed to become `advisory_action_recommendations` candidates, and even then only as `review_only` risk overlays such as `MANUAL_REVIEW` or `WATCH`; they do not create broker-executable orders directly.
 

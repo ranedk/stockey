@@ -1,4 +1,4 @@
-import type { EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, OperatorActions, OperatorEvents, OperatorMarketContext, OperatorPortfolio, OperatorSummary, SymbolTrace, TraceSummary } from '~/types/api'
+import type { EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, OperatorActions, OperatorEvents, OperatorHealthDetails, OperatorMarketContext, OperatorPortfolio, OperatorSummary, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary } from '~/types/api'
 
 export function useOperatorApi() {
   const config = useRuntimeConfig()
@@ -7,16 +7,23 @@ export function useOperatorApi() {
   const get = async <T>(path: string): Promise<T> => {
     return await $fetch<T>(`${apiBase}${path}`)
   }
-  const post = async <T>(path: string, body: unknown): Promise<T> => {
+  const post = async <T>(path: string, body: Record<string, unknown>): Promise<T> => {
     return await $fetch<T>(`${apiBase}${path}`, { method: 'POST', body })
   }
 
   return {
     getSummary: () => get<OperatorSummary>('/api/summary'),
+    getHealthDetails: () => get<OperatorHealthDetails>('/api/health/details'),
     getActions: () => get<OperatorActions>('/api/actions'),
     getPortfolio: () => get<OperatorPortfolio>('/api/portfolio'),
     getMarketContext: (limit = 50) => get<OperatorMarketContext>(`/api/market-context?limit=${limit}`),
+    getTechnicalCalibration: (limit = 25) => get<TechnicalCalibrationPayload>(`/api/technical-calibration?limit=${limit}`),
+    reviewTechnicalCalibration: (body: Record<string, unknown>) => post<TechnicalPromotionReviewResult>('/api/technical-calibration/promotion-review', body),
+    getTechnicalPromotionReviews: (limit = 25) => get<TechnicalPromotionReviewsPayload>(`/api/technical-calibration/promotion-reviews?limit=${limit}`),
+    decideTechnicalPromotionReview: (body: Record<string, unknown>) => post<TechnicalPromotionDecisionResult>('/api/technical-calibration/promotion-review/decision', body),
     getEvents: (limit = 50) => get<OperatorEvents>(`/api/events?limit=${limit}`),
+    getEventPolicy: (limit = 100, actionType = 'ALL') => get<EventPolicyPayload>(`/api/event-policy?limit=${limit}&action_type=${encodeURIComponent(actionType)}`),
+    getEventPolicyEvaluation: (limit = 100) => get<EventPolicyEvaluationPayload>(`/api/event-policy/evaluation?limit=${limit}`),
     getEventTrace: (uniqueId: string) => get<EventTrace>(`/api/events/${encodeURIComponent(uniqueId)}/trace`),
     getEventTraceSummary: (uniqueId: string) => get<TraceSummary>(`/api/events/${encodeURIComponent(uniqueId)}/trace/summary`),
     getSymbolTrace: (symbol: string, limit = 200) => get<SymbolTrace>(`/api/symbols/${encodeURIComponent(symbol)}/trace?limit=${limit}`),

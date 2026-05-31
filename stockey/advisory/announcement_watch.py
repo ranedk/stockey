@@ -5,17 +5,68 @@ import json
 import sys
 import time
 from datetime import timedelta
+from typing import Any
 
 import pandas as pd
+from environs import Env
 
 from data.announcements.managed_pipeline import ManagedAnnouncementPipeline
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
 
+env = Env()
+env.read_env()
 WATCHLIST_TABLE = "advisory_watchlist"
 EVENTS_TABLE = "advisory_watch_events"
+MARKET_CONTEXT_UNIVERSE_TABLE = "advisory_market_context_universe_daily"
+MARKET_CONTEXT_SETUP_ID = "MARKET_CONTEXT_TOP50"
 INITIAL_INGEST_LOOKBACK_DAYS = 3
+DEFAULT_MARKET_CONTEXT_WATCH_LIMIT = env.int("MARKET_CONTEXT_WATCH_LIMIT", default=50)
+MATERIAL_EVENT_KEYWORDS = {
+    "acquisition",
+    "amalgamation",
+    "approval",
+    "arbitration",
+    "bankruptcy",
+    "block deal",
+    "board meeting",
+    "bonus",
+    "buyback",
+    "capex",
+    "cbi",
+    "ceo",
+    "cfo",
+    "chairman",
+    "change in management",
+    "credit rating",
+    "default",
+    "dividend",
+    "earnings",
+    "enforcement directorate",
+    "fraud",
+    "guidance",
+    "income tax",
+    "insolvency",
+    "joint venture",
+    "large order",
+    "merger",
+    "nclt",
+    "order win",
+    "pledge",
+    "promoter",
+    "qip",
+    "quarterly results",
+    "raid",
+    "rating",
+    "regulatory",
+    "resignation",
+    "results",
+    "sebi",
+    "split",
+    "stake sale",
+    "scheme of arrangement",
+}
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -118,12 +169,14 @@ def ensure_watch_outputs_tables() -> None:
                 concise_summary_text TEXT,
                 categories_json TEXT,
                 watch_reasons_json TEXT,
+                monitor_source TEXT,
                 event_status TEXT,
                 load_ts TIMESTAMPTZ,
                 UNIQUE (published_on, setup_id, symbol, unique_id)
             )
             """
         )
+        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT")
 
 
 def load_watchlist(
@@ -161,7 +214,131 @@ def load_watchlist(
         return df
     df["asof_date"] = normalize_timestamp(df["asof_date"])
     df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["monitor_source"] = "watchlist"
     return df
+
+
+def _table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+    except Exception:
+        return False
+    return not df.empty
+
+
+def load_market_context_watchlist(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    limit: int = DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
+    last_checked_at: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if int(limit) <= 0 or not _table_exists(MARKET_CONTEXT_UNIVERSE_TABLE):
+        return pd.DataFrame()
+    effective_asof = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce").normalize()
+    clauses = [
+        "asof_date = (SELECT MAX(asof_date) FROM advisory_market_context_universe_daily WHERE asof_date <= %s)",
+        "in_top_context = TRUE",
+        "NULLIF(TRIM(symbol), '') IS NOT NULL",
+        "NULLIF(TRIM(company_master_id), '') IS NOT NULL",
+    ]
+    params: list[Any] = [effective_asof]
+    if symbols:
+        clauses.append("UPPER(TRIM(symbol)) = ANY(%s)")
+        params.append([str(value).upper() for value in symbols])
+    df = sql_to_df(
+        f"""
+        SELECT
+            asof_date,
+            %s::text AS setup_id,
+            'Top 50%% market context'::text AS setup_name,
+            NULL::text AS regime_name,
+            UPPER(TRIM(symbol)) AS symbol,
+            company_master_id,
+            NULL::text AS screener_slug,
+            context_rank::bigint AS rank,
+            'MARKET_CONTEXT'::text AS candidate_state,
+            'MARKET_CONTEXT'::text AS current_state,
+            'Top-50 market context intake; cheap materiality filter required before LLM evaluation.'::text AS watch_reason_detail,
+            NULL::text AS entry_style,
+            NULL::double precision AS attractive_price_low,
+            NULL::double precision AS attractive_price_high,
+            NULL::double precision AS invalidation_price,
+            NULL::text AS entry_note,
+            FALSE::boolean AS near_miss_flag,
+            NULL::text AS last_event_class,
+            NULL::text AS last_state_transition_hint,
+            NULL::double precision AS last_event_score_impact,
+            TRUE::boolean AS watch_enabled,
+            json_build_object(
+                'source', 'market_context_top50',
+                'context_rank', context_rank,
+                'sector_code', sector_code,
+                'sector_name', sector_name,
+                'technical_leadership_score', technical_leadership_score,
+                'macro_sensitivity_tag', macro_sensitivity_tag
+            )::text AS watch_reasons_json,
+            'market_context'::text AS watch_status,
+            asof_date AS state_updated_at,
+            asof_date AS watch_started_at,
+            %s::timestamptz AS last_checked_at,
+            NULL::timestamptz AS last_document_published_on,
+            load_ts,
+            'market_context'::text AS monitor_source
+        FROM {MARKET_CONTEXT_UNIVERSE_TABLE}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY context_rank ASC, symbol
+        LIMIT %s
+        """,
+        params=(MARKET_CONTEXT_SETUP_ID, last_checked_at, *params, int(limit)),
+    )
+    if df.empty:
+        return df
+    for column in ["asof_date", "state_updated_at", "watch_started_at", "last_checked_at", "last_document_published_on", "load_ts"]:
+        df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    return df
+
+
+def merge_watch_targets(primary: pd.DataFrame, secondary: pd.DataFrame) -> pd.DataFrame:
+    primary = primary.copy() if isinstance(primary, pd.DataFrame) and not primary.empty else pd.DataFrame()
+    secondary = secondary.copy() if isinstance(secondary, pd.DataFrame) and not secondary.empty else pd.DataFrame()
+    if primary.empty and secondary.empty:
+        return pd.DataFrame()
+    if primary.empty:
+        out = secondary
+    elif secondary.empty:
+        out = primary
+    else:
+        primary["symbol"] = primary["symbol"].astype("string").str.upper()
+        secondary["symbol"] = secondary["symbol"].astype("string").str.upper()
+        primary_symbols = set(primary["symbol"].dropna().astype(str).str.upper())
+        secondary = secondary[~secondary["symbol"].astype("string").str.upper().isin(primary_symbols)].copy()
+        out = pd.concat([primary, secondary], ignore_index=True, sort=False)
+    out["symbol"] = out["symbol"].astype("string").str.upper()
+    if "monitor_source" not in out.columns:
+        out["monitor_source"] = "watchlist"
+    out["monitor_source"] = out["monitor_source"].fillna("watchlist")
+    return out.reset_index(drop=True)
+
+
+def is_material_context_event(row: pd.Series) -> bool:
+    text = " ".join(
+        str(row.get(column) or "")
+        for column in ["subject", "filed_under_category", "concise_summary_text", "categories_json"]
+    ).lower()
+    return any(keyword in text for keyword in MATERIAL_EVENT_KEYWORDS)
 
 
 def load_documents_for_company(
@@ -219,11 +396,17 @@ def build_event_rows(watch_row: pd.Series, docs: pd.DataFrame) -> pd.DataFrame:
                 "concise_summary_text": doc["concise_summary_text"],
                 "categories_json": doc["categories_json"],
                 "watch_reasons_json": watch_row["watch_reasons_json"],
+                "monitor_source": watch_row.get("monitor_source") or "watchlist",
                 "event_status": "triggered",
                 "load_ts": pd.Timestamp.utcnow(),
             }
         )
-    return pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
+    market_mask = out["monitor_source"].astype("string").str.lower().eq("market_context")
+    if market_mask.any():
+        material_mask = out.apply(is_material_context_event, axis=1)
+        out.loc[market_mask & ~material_mask, "event_status"] = "context_observed"
+    return out
 
 
 def persist_watch_outputs(watchlist_updates: pd.DataFrame, events: pd.DataFrame) -> None:
@@ -282,8 +465,22 @@ def run_announcement_ingest(
     symbols: list[str] | None = None,
     setup_ids: list[str] | None = None,
     to_date: pd.Timestamp | None = None,
+    include_market_context: bool = False,
+    market_context_limit: int = DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
+    market_context_last_checked_at: pd.Timestamp | None = None,
 ) -> dict[str, object]:
     watchlist = load_watchlist(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+    market_context_watchlist = (
+        load_market_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=market_context_limit,
+            last_checked_at=market_context_last_checked_at,
+        )
+        if include_market_context
+        else pd.DataFrame()
+    )
+    watchlist = merge_watch_targets(watchlist, market_context_watchlist)
     if watchlist.empty:
         return {
             "watchlist": pd.DataFrame(),
@@ -356,6 +553,9 @@ def run_announcement_ingest(
             "watch_count": int(len(watchlist)),
             "unique_ingest_targets": total_targets,
             "initial_lookback_days": INITIAL_INGEST_LOOKBACK_DAYS,
+            "market_context_enabled": bool(include_market_context),
+            "market_context_limit": int(market_context_limit),
+            "market_context_watch_count": int(len(market_context_watchlist)),
             "capped_watch_rows": int(pd.Series(watchlist["published_from_capped"]).fillna(False).astype(bool).sum()),
             "ingest_runs": ingest_runs,
         },
@@ -466,12 +666,18 @@ def run_announcement_watch(
     symbols: list[str] | None = None,
     setup_ids: list[str] | None = None,
     to_date: pd.Timestamp | None = None,
+    include_market_context: bool = False,
+    market_context_limit: int = DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
+    market_context_last_checked_at: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
     ingest_state = run_announcement_ingest(
         asof_date=asof_date,
         symbols=symbols,
         setup_ids=setup_ids,
         to_date=to_date,
+        include_market_context=include_market_context,
+        market_context_limit=market_context_limit,
+        market_context_last_checked_at=market_context_last_checked_at,
     )
     watch_update_df, events_df, match_meta = build_watch_updates_from_ingest(ingest_state)
     meta = dict(ingest_state.get("meta") or {})

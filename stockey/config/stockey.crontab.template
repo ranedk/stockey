@@ -9,11 +9,10 @@ LOG_DIR={{LOG_DIR}}
 # Create log directory once before enabling the crontab:
 #   mkdir -p {{LOG_DIR}}
 #
-# Install with:
-#   crontab {{GENERATED_CRONTAB}}
-#
-# Or run with go-crond:
+# Run with go-crond:
 #   ./go-crond {{GENERATED_CRONTAB}} --allow-unprivileged
+#
+# This file includes a username field. Remove that field before installing into a normal per-user crontab.
 
 # Daily raw download + parse refresh before market open on weekdays.
 10 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
@@ -32,6 +31,10 @@ LOG_DIR={{LOG_DIR}}
 # One final post-close watch pass for end-of-day alerts.
 05 16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
+# Investor hypothesis/playbook scan over newly collected news and announcements.
+# Set HYPOTHESIS_CRON_ARGS="--no-llm" if you want deterministic scans only.
+25 10,13,16,21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_hypothesis_scan.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.hypothesis_engine --run-scan --model "${HYPOTHESIS_ACTION_MODEL:-codex}" ${HYPOTHESIS_CRON_ARGS:-} >> "$LOG_DIR/hypothesis_scan.log" 2>&1
+
 # Experimental TS forecast workflow. This uses config/ts_forecast_screeners.yaml
 # to select a liquid technical universe, refreshes Dhan daily OHLCV, and writes research-only TS watch rows.
 # Daily OHLCV changes slowly, so this runs a few times a day instead of every watcher tick.
@@ -39,6 +42,14 @@ LOG_DIR={{LOG_DIR}}
 
 # Matured TS forecast evaluation. This validates prior forecast rows after costs; it does not create actions.
 20 18,21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_eval.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.ts_forecast_evaluator --model-name "${TS_FORECAST_MODEL_NAME:-timesfm_2p5_200m}" --cost-bps "${TS_FORECAST_COST_BPS:-25}" >> "$LOG_DIR/ts_forecast_evaluator.log" 2>&1
+
+# Research-only event-policy realized-return evaluation. Runs after the post-close advisory window.
+# It writes policy/action/class quality summaries only; it does not change thresholds or actions.
+10 23 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_event_policy_eval.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.event_policy_evaluator --horizons ${EVENT_POLICY_EVAL_HORIZONS:-5 10 20} --cost-bps "${EVENT_POLICY_EVAL_COST_BPS:-25}" --min-matured-rows "${EVENT_POLICY_EVAL_MIN_MATURED_ROWS:-10}" >> "$LOG_DIR/event_policy_evaluator.log" 2>&1
+
+# Weekly research-only technical threshold calibration. This is deliberately not tied to live promotion.
+# Review the operator UI before manually changing config/advisory_setups.yaml.
+20 04 * * 6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_technical_calibration.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.technical_threshold_calibration --horizons ${TECHNICAL_CALIBRATION_HORIZONS:-5 10 20} --cost-bps "${TECHNICAL_CALIBRATION_COST_BPS:-25}" --min-signals "${TECHNICAL_CALIBRATION_MIN_SIGNALS:-10}" >> "$LOG_DIR/technical_threshold_calibration.log" 2>&1
 
 # Optional research-only event-model prep/training. Disabled by default because the live system is playbook/rule driven.
 # 10 03 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1

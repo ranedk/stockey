@@ -263,6 +263,8 @@ The first implemented feature groups are:
 
 The feature builder loads a historical lookback window for rolling changes but only persists the requested as-of dates. This keeps single-day advisory runs causal without losing 20/60/90-day macro deltas.
 
+Macro/regime context is also applied at final action consolidation as a one-way risk control. `advisory/action_recommender.py` can reduce positive broker-action sizing in cautious markets, or block `BUY`/`BUY_MORE` into `MANUAL_REVIEW`/`HOLD` during risk-off or weak-breadth regimes. This layer never upgrades a watch/review/hold into a buy.
+
 ## Exchange Event Layer
 
 `advisory/exchange_events.py` normalizes NSE block deals, bulk deals, short-selling rows, insider deals, corporate actions, and earnings-calendar rows into `advisory_exchange_events`. It keeps `event_date` and `known_on` separate so later stages can avoid lookahead.
@@ -428,6 +430,20 @@ Already implemented:
   - `event_tensor_json`
 
 This keeps the LLM in an extraction role. The stable policy-facing fields like `event_class`, `state_transition_hint`, and `score_impact` still exist for the current watch, risk, and portfolio pipeline.
+
+- a deterministic event-policy layer in `advisory_event_policy_actions` with:
+  - `policy_class`
+  - `action_type`
+  - `action_status`
+  - `policy_score`
+  - `action_reason`
+  - `checks_json`
+
+This layer maps structured event classes into bounded operator actions: `BUY_WATCH`, `MANUAL_REVIEW`, `REDUCE_EXPOSURE_REVIEW`, or `NO_ACTION`. It currently covers order wins, positive/negative/mixed results, growth acceleration, margin expansion, capex, guidance changes, pledge up/down, promoter buying/selling, regulatory notices, management resignations, auditor/governance events, dilution, buybacks, dividends, analyst meets, policy sector events, and neutral corporate actions. These are review/risk overlays only; they do not create broker-executable trades.
+
+Manual-review rows are refined further. Low-information rows are downgraded to `NO_ACTION` deterministically. Remaining `MANUAL_REVIEW` rows can be passed through Codex/LLM, capped by `EVENT_POLICY_LLM_MANUAL_REVIEW_MAX_ROWS`, to produce `operator_notes_json` with possible action, future events to wait for, and questions for the operator. The LLM may also downgrade the row to `NO_ACTION` when review is unlikely to produce a useful decision.
+
+The operator frontend `/events` page exposes this layer directly. Use it to review action counts by class, inspect policy checks, read LLM/operator notes, and open the decision trace for the underlying event.
 
 - a deterministic adversarial reviewer in `advisory_event_reviews` with:
   - `review_action`
@@ -712,6 +728,36 @@ Typical technical columns:
 - `breakout_extension_pct`
 - `dist_52w_high`
 
+### Technical Threshold Calibration
+
+Technical-engine defaults are not promoted automatically. Use the calibration module to compare threshold grids against realized point-in-time forward returns from `dhan_ohlcv_daily`:
+
+```sh
+python -m advisory.technical_threshold_calibration --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
+python -m advisory.technical_threshold_calibration --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
+```
+
+It writes `advisory_technical_threshold_evaluations` and `advisory_technical_threshold_eval_summary`. Treat these as research evidence only; update live setup thresholds manually after checking sample size, hit rate after costs, average return after costs, and spread versus rejected candidates.
+
+Event-policy classes are evaluated separately, also as research-only evidence:
+
+```sh
+python -m advisory.event_policy_evaluator --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
+python -m advisory.event_policy_evaluator --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
+```
+
+It writes row-level realized checks to `advisory_event_policy_evaluations` and grouped metrics to `advisory_event_policy_eval_summary` by action type, policy class, event class, score bucket, confidence bucket, and combined groups. Treat `candidate_policy_strengthen` and `candidate_policy_tighten_or_downgrade` as review prompts only; they do not change live event-policy thresholds automatically.
+
+Ask Codex/LLM for a manual promotion review after choosing a candidate config:
+
+```sh
+python -m advisory.technical_threshold_promotion --setup-id EVENT_OPPORTUNITY_V1 --config-id CONFIG_ID --dry-run
+```
+
+The review writes to `advisory_technical_threshold_promotion_reviews` when not run with `--dry-run`. It produces reviewer rationale and a pending patch payload for `config/advisory_setups.yaml`, but it never applies threshold changes automatically.
+
+The operator frontend `/technical-calibration` page also shows recent promotion reviews. Use its `Approve`, `Needs Data`, or `Reject` controls to write an audit-only decision row to `advisory_technical_threshold_promotion_decisions`. `Approve` means “accepted for manual config editing”; it still does not edit the YAML file or affect live advisory behavior.
+
 Typical fundamental columns:
 
 - `total_revenue_qoq_growth_vs_sector`
@@ -821,8 +867,10 @@ Action consolidation also writes a reason contract:
 - `recommendation_reason_json`: machine-readable explanation of source, primary reason, evidence sections, risk fields, and competing candidates
 - `reason_contract_status`: `complete` or `incomplete_downgraded`
 - incomplete broker-action contracts are downgraded to `MANUAL_REVIEW`
+- execution planning blocks any stale broker-action row whose reason contract is missing or not `complete`
 - the operator frontend renders the reason contract as separate screener, technical, event, playbook, macro/regime, risk, and competing-candidate panels on action cards and decision traces
 - before validation, action consolidation enriches candidate raw context from the latest matching `advisory_candidates` row and the latest `advisory_market_regime` row, so screener, technical, setup-score, and macro/regime evidence are available even when the immediate source table is sparse
+- before ranking, action consolidation applies latest top-context market summary and macro/regime context as a risk-reduction-only adjustment. Positive broker actions can be resized or downgraded, but never upgraded.
 - action consolidation also enriches event/playbook decisions from latest matching `advisory_event_evaluations`, `advisory_event_reviews`, and `advisory_playbook_action_plans`, including event id, event class, verdict, reviewer action/veto, playbook id, and review checks
 
 ### 3. Investor playbooks

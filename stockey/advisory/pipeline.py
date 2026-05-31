@@ -28,6 +28,7 @@ from advisory.event_meta_model import (
     persist_scores as persist_event_model_scores,
     score_events as score_event_model,
 )
+from advisory.event_policy import build_event_policy_actions, load_policy_inputs, persist_event_policy_actions
 from advisory.exchange_events import build_exchange_events, persist_exchange_events
 from advisory.exchange_features import build_exchange_features, persist_exchange_features
 from advisory.fundamental_snapshot import build_fundamental_snapshot, persist_fundamental_snapshot
@@ -85,6 +86,7 @@ PIPELINE_STAGES = [
     "evaluate",
     "event_model",
     "review",
+    "event_policy",
     "risk",
     "portfolio",
     "lifecycle",
@@ -594,6 +596,18 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 "reviews": _json_ready(review_df),
             }
             _finish_stage("review", stage_started, f"reviews={len(review_df)}")
+
+    if stage_enabled("event_policy", args.start_at, args.stop_at):
+        stage_started = _start_stage("event_policy")
+        policy_inputs = load_policy_inputs(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+        policy_df, policy_meta = build_event_policy_actions(policy_inputs)
+        if not args.dry_run:
+            persist_event_policy_actions(policy_df)
+        summary["stages"]["event_policy"] = {
+            "meta": _json_ready(policy_meta),
+            "policy_actions": _json_ready(policy_df),
+        }
+        _finish_stage("event_policy", stage_started, f"rows={len(policy_df)}")
 
     if stage_enabled("risk", args.start_at, args.stop_at):
         stage_started = _start_stage("risk")

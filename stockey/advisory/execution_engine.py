@@ -605,6 +605,7 @@ def build_execution_orders(
             action_code = str(row.get("action_code") or "").upper()
             transaction = str(row.get("transaction_type") or "").upper()
             execution_mode = str(row.get("execution_mode") or "").lower()
+            reason_contract_status = str(row.get("reason_contract_status") or "").strip().lower()
             reference_price = pd.to_numeric(price_map.get(symbol), errors="coerce")
             reference_price_source = price_source_map.get(symbol)
             reference_price_asof = price_asof_map.get(symbol)
@@ -621,17 +622,22 @@ def build_execution_orders(
             inventory = inventory_map.get(symbol, {})
             available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
             action_fraction = pd.to_numeric(row.get("action_fraction"), errors="coerce")
-            try:
-                identity = resolve_dhan_identity(symbol, "NSE", asset_type="stock")
-                security_id = int(identity["security_id"])
-                exchange_segment = str(identity["exchange_segment"])
-            except Exception as exc:
-                execution_status = "submit_blocked"
-                execution_reason = f"Identity resolution failed: {exc}"
 
             if execution_mode not in {"", "broker_order"} or transaction not in {"BUY", "SELL"}:
                 continue
-            elif transaction == "BUY" and action_code == "BUY":
+            if reason_contract_status != "complete":
+                execution_status = "submit_blocked"
+                execution_reason = f"Reason contract is not complete: {reason_contract_status or 'missing'}."
+            else:
+                try:
+                    identity = resolve_dhan_identity(symbol, "NSE", asset_type="stock")
+                    security_id = int(identity["security_id"])
+                    exchange_segment = str(identity["exchange_segment"])
+                except Exception as exc:
+                    execution_status = "submit_blocked"
+                    execution_reason = f"Identity resolution failed: {exc}"
+
+            if execution_status == "planned" and transaction == "BUY" and action_code == "BUY":
                 approved_allocation = pd.to_numeric(row.get("approved_allocation_inr"), errors="coerce")
                 if pd.isna(reference_price) or reference_price <= 0:
                     execution_status = "submit_blocked"
@@ -649,7 +655,7 @@ def build_execution_orders(
                         execution_reason = (execution_reason + " " if execution_reason else "") + "Approved allocation or available cash is too small for one share."
                     elif remaining_cash is not None:
                         remaining_cash = max(remaining_cash - (quantity * float(reference_price)), 0.0)
-            elif transaction == "BUY" and action_code == "BUY_MORE":
+            elif execution_status == "planned" and transaction == "BUY" and action_code == "BUY_MORE":
                 if pd.isna(available_qty) or float(available_qty) <= 0:
                     execution_status = "submit_blocked"
                     execution_reason = (execution_reason + " " if execution_reason else "") + "No live holding quantity available to size add-on."
@@ -669,7 +675,7 @@ def build_execution_orders(
                         execution_reason = (execution_reason + " " if execution_reason else "") + "Available cash is too small for one add-on share."
                     else:
                         execution_reason = (execution_reason + " " if execution_reason else "") + f"Add-on sized at {requested_fraction:.2f} of live holdings."
-            elif transaction == "SELL":
+            elif execution_status == "planned" and transaction == "SELL":
                 if pd.isna(available_qty) or float(available_qty) <= 0:
                     execution_status = "submit_blocked"
                     execution_reason = (execution_reason + " " if execution_reason else "") + "No live holding quantity available to exit."
@@ -726,6 +732,7 @@ def build_execution_orders(
                             "source_action": row.get("source_action"),
                             "action_fraction": pd.to_numeric(row.get("action_fraction"), errors="coerce"),
                             "execution_mode": row.get("execution_mode"),
+                            "reason_contract_status": row.get("reason_contract_status"),
                             "recommended_stop_price": pd.to_numeric(row.get("recommended_stop_price"), errors="coerce"),
                             "reference_price_source": reference_price_source,
                             "reference_price_asof": reference_price_asof,

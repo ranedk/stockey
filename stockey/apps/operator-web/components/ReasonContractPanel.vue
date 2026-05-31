@@ -40,7 +40,7 @@ function humanKey(value: string) {
   return value.replace(/_/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase())
 }
 
-function displayValue(value: unknown) {
+function displayValue(value: unknown): string {
   if (value === null || value === undefined || value === '') return '-'
   if (typeof value === 'number') return Number.isInteger(value) ? String(value) : String(Math.round(value * 100) / 100)
   if (typeof value === 'boolean') return value ? 'yes' : 'no'

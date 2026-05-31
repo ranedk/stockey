@@ -2,11 +2,12 @@
 import type { TraceSummary } from '~/types/api'
 
 const api = useOperatorApi()
-const [{ data: summary }, { data: actions }, { data: portfolio }, { data: marketContext }] = await Promise.all([
+const [{ data: summary }, { data: actions }, { data: portfolio }, { data: marketContext }, { data: technicalCalibration }] = await Promise.all([
   useAsyncData('summary', () => api.getSummary()),
   useAsyncData('actions', () => api.getActions()),
   useAsyncData('portfolio', () => api.getPortfolio()),
-  useAsyncData('market-context', () => api.getMarketContext(20))
+  useAsyncData('market-context', () => api.getMarketContext(20)),
+  useAsyncData('technical-calibration-home', () => api.getTechnicalCalibration(3))
 ])
 
 const summaryValues = computed(() => summary.value?.summary || {})
@@ -14,6 +15,7 @@ const topActions = computed(() => actions.value?.top_action_recommendations || [
 const today = computed(() => portfolio.value?.today_recommendations || [])
 const marketSummary = computed(() => marketContext.value?.summary || {})
 const marketLeaders = computed(() => marketContext.value?.top_universe || [])
+const calibrationSummary = computed(() => technicalCalibration.value?.summary || [])
 const symbolTraces = reactive<Record<string, TraceSummary>>({})
 const loadingSymbolTrace = reactive<Record<string, boolean>>({})
 
@@ -183,6 +185,38 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
         </RecordCard>
         <p v-if="!today.length" class="glass-panel rounded-3xl p-6 text-ink/60">No recommendations for the latest date.</p>
       </div>
+    </div>
+  </section>
+
+  <section class="mt-8 glass-panel rounded-3xl p-6">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-bold uppercase tracking-[0.3em] text-ink/45">Technical Calibration</p>
+        <h2 class="mt-2 text-2xl font-black">Thresholds are research evidence, not auto-promoted</h2>
+        <p class="mt-2 max-w-3xl text-sm leading-6 text-ink/60">
+          Latest realized-outcome checks for the swing technical engine. Review sample size, hit rate after costs, and average return before changing setup thresholds.
+        </p>
+      </div>
+      <NuxtLink class="rounded-full bg-ink px-4 py-2 text-sm font-bold text-paper" to="/technical-calibration">
+        Open calibration
+      </NuxtLink>
+      <NuxtLink class="rounded-full bg-white px-4 py-2 text-sm font-bold text-ink" to="/events">
+        Open event policy
+      </NuxtLink>
+    </div>
+    <div class="mt-5 grid gap-3 md:grid-cols-3">
+      <article v-for="row in calibrationSummary.slice(0, 3)" :key="String(row.horizon_days)" class="rounded-2xl bg-white/70 p-4">
+        <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/45">{{ row.horizon_days }} day horizon</p>
+        <p class="mt-2 font-black text-ink">{{ row.best_config_id || 'No config yet' }}</p>
+        <div class="mt-3 grid gap-2 text-sm">
+          <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Eligible:</b> {{ numberText(row.best_eligible_count) }}</p>
+          <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Hit:</b> {{ pct(Number(row.best_hit_rate_after_cost || 0)) }}</p>
+          <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Avg return:</b> {{ pct(Number(row.best_avg_forward_return_after_cost || 0)) }}</p>
+        </div>
+      </article>
+      <p v-if="!calibrationSummary.length" class="rounded-2xl bg-white/70 p-4 text-sm text-ink/60">
+        No calibration rows yet. Run the technical threshold calibration script.
+      </p>
     </div>
   </section>
 </template>

@@ -83,20 +83,21 @@ If `https://www.screener.in/login/` redirects to `/dash/`, the session is alread
 The repo now ships with a cron template at `config/stockey.crontab.template`.
 `python builder.py` renders the runnable file at `config/stockey.generated.crontab`.
 
-Install it with system cron:
-
-```sh
-mkdir -p /home/rane/code/stockey/logs/cron
-python builder.py
-crontab /home/rane/code/stockey/config/stockey.generated.crontab
-```
-
-Or run it with `go-crond`:
+Recommended: run it with `go-crond`:
 
 ```sh
 mkdir -p /home/rane/code/stockey/logs/cron
 python builder.py
 ./go-crond config/stockey.generated.crontab --allow-unprivileged
+```
+
+If you install it with a normal per-user `crontab`, first remove the username column from every job line. The generated file is system-crontab/go-crond style.
+
+```sh
+mkdir -p /home/rane/code/stockey/logs/cron
+python builder.py
+# only after removing the username column:
+crontab /home/rane/code/stockey/config/stockey.generated.crontab
 ```
 
 Important:
@@ -108,26 +109,82 @@ Current schedule:
 
 - every `5` minutes: `./all_frontend.sh` under a lock, which keeps the operator API and Nuxt frontend running without duplicates
 - `07:10` weekdays: `./complete_data.sh`
-- `03:10` weekdays: `./all_ml.sh`
 - every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_watchers.sh`
 - `16:05` weekdays: one final post-close `./all_watchers.sh`
+- `10:25`, `13:25`, `16:25`, `21:25` weekdays: investor hypothesis/playbook scan over newly collected events
 - `11:20`, `14:20`, `17:20`, `20:20` weekdays: experimental TS forecast workflow using `config/ts_forecast_screeners.yaml`
 - `18:20`, `21:20` weekdays: matured TS forecast evaluation after costs
 - `19:10` weekdays: `./all_advisory.sh`
+- `23:10` weekdays: event-policy realized-return evaluation after costs
+- `04:20` Saturdays: technical threshold calibration after costs
+- optional/commented: `03:10` weekdays `./all_ml.sh` for event-model research training
 
 Why the split looks like this:
 
 - slow daily and model-prep jobs are isolated from the intra-day watch loop
 - CPI, FPI, WPI, macro, masters, and similar sources get covered by the daily raw refresh
 - live OHLCV, news, and announcements are handled by the `10` minute watch cadence
-- training remains a once-daily research process after 3am
+- investor hypothesis scans run after watcher passes so newly collected news/announcements can become playbook matches and operator review notes
+- event-model training is disabled by default because the live path is now playbooks, deterministic policies, technical timing, macro/regime gating, and risk controls
 - TS forecast rows remain research-only and are refreshed a few times per day; daily OHLCV means they should not run on every watcher tick
+- event-policy and technical-threshold evaluators are research-only evidence jobs; they do not change live thresholds or submit actions
 - the full advisory is not forced on every market tick; it runs once daily after 7pm
 
 Important constraint:
 
 - the cron file uses `scripts/with_lock.sh` so duplicate overlapping runs are skipped instead of piling up; it uses `flock` on Linux and `lockf` on macOS
 - the shell wrappers resolve Python automatically, so cron does not need `source .xstockey/bin/activate`
+
+## Operator Health
+
+Use the read-only smoke test before debugging strategy output:
+
+```sh
+python -m advisory.operator_health
+python -m advisory.operator_health --skip-dhan
+```
+
+It checks:
+
+- Postgres query health and freshness of core advisory tables
+- operator API reachability and latency through the read-only health endpoint
+- Redis reachability
+- Dhan token validity through a lightweight profile call; it does not initiate broker login
+- Dhan cached-token metadata including cache age, expiry timestamp, and seconds to expiry
+- recent `logs/cron/*.log` tails for tracebacks, errors, failures, connection refusals, and timeouts
+- Poppler, Codex CLI, Node/npm, TimesFM, and frontend dependency presence
+
+The same data is exposed at `GET /api/health/details` and rendered in the Nuxt `Data Health` page. Warnings mean the system may still run with degraded functionality; errors mean a required dependency or recent cron run likely needs attention.
+
+The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, Redis reachability, and Postgres connectivity. The Nuxt `Data Health` page shows the hints near the top with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix. The page can filter health rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
+
+Useful API/token env knobs:
+
+- `OPERATOR_API_HEALTH_URL`: endpoint checked by operator health, default `http://127.0.0.1:8765/api/health`
+- `OPERATOR_API_HEALTH_TIMEOUT_SECONDS`: API health timeout, default `3`
+
+Cron log health is run-aware. A traceback followed by a later success marker is shown as a warning with `latest_run_status=ok_after_historical_errors`; a traceback or failed status after the latest success marker remains an error. This prevents old failures from keeping the page red after a recovered run while still preserving historical errors for audit.
+
+Manual interrupts are handled separately. If a log ends with `KeyboardInterrupt` but the mapped output tables have fresher rows than the log file timestamp, the status becomes `recovered_after_manual_interrupt` and the UI shows the recovery evidence. This avoids treating an operator-stopped stale cron log as a live code failure after a later successful manual run.
+
+Operator shell scripts emit deterministic lifecycle markers:
+
+```text
+[stockey.script] name=all_ml status=start timestamp=...
+[stockey.script] name=all_ml status=done exit_code=0 timestamp=...
+[stockey.script] name=all_ml status=failed exit_code=1 timestamp=...
+```
+
+The health parser prefers these markers over log-text heuristics. A successful `done` marker after earlier tracebacks is shown as recovered/historical; a `failed` marker is an active error; an `interrupted` marker is treated as operator interruption.
+
+Current marker-enabled wrappers:
+
+- `all_downloaders.sh`
+- `all_parsers.sh`
+- `complete_data.sh`
+- `all_ml.sh`
+- `all_advisory.sh`
+- `all_watchers.sh`
 
 ## Database robustness knobs
 

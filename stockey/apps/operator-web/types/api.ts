@@ -9,6 +9,13 @@ export interface OperatorSummary {
   sync_state: Dict[]
 }
 
+export interface OperatorHealthDetails {
+  generated_at?: string
+  status: string
+  sections: Dict
+  fix_hints?: Dict[]
+}
+
 export interface OperatorActions {
   generated_at?: string
   asof_date?: string
@@ -35,11 +42,70 @@ export interface OperatorEvents {
   alerts: Dict[]
 }
 
+export interface EventPolicyPayload {
+  generated_at?: string
+  status: string
+  asof_date?: string
+  summary: Dict
+  rows: Dict[]
+}
+
+export interface EventPolicyEvaluationPayload {
+  generated_at?: string
+  status: string
+  summary: Dict[]
+}
+
 export interface OperatorMarketContext {
   generated_at?: string
   asof_date?: string
   summary: Dict
   top_universe: Dict[]
+}
+
+export interface TechnicalCalibrationPayload {
+  generated_at?: string
+  status: string
+  summary: Dict[]
+  top_configs: Dict[]
+}
+
+export interface TechnicalPromotionReviewResult {
+  status: string
+  reviewed_at?: string
+  setup_id: string
+  config_id: string
+  horizon_days?: number
+  current_thresholds: Dict
+  candidate_thresholds: Dict
+  calibration_evidence: Dict
+  horizon_summary?: Dict
+  pending_patch: Dict
+  llm_review: Dict
+  review_model?: string
+  review_status?: string
+  review_error?: string
+}
+
+export interface TechnicalPromotionReviewsPayload {
+  generated_at?: string
+  status: string
+  reviews: Dict[]
+}
+
+export interface TechnicalPromotionDecisionResult {
+  status: string
+  decided_at?: string
+  reviewed_at?: string
+  setup_id: string
+  config_id: string
+  decision: string
+  operator_id?: string
+  decision_reason?: string
+  final_patch: Dict
+  review?: Dict
+  applied: boolean
+  note?: string
 }
 
 export interface EventTrace {
@@ -58,6 +124,7 @@ export interface SymbolTrace {
 }
 
 export interface TraceStage {
+  step_idx?: number
   domain?: string
   stage: string
   status: string

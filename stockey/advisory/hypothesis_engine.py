@@ -12,6 +12,7 @@ import yaml
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.market_context import load_latest_market_context
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 from utils.codex_cli import run_codex_structured
@@ -37,6 +38,10 @@ WORD_RE = re.compile(r"[a-z0-9][a-z0-9\-']+", re.IGNORECASE)
 env = Env()
 env.read_env()
 DEFAULT_PLAYBOOK_ACTION_MODEL = env("PLAYBOOK_ACTION_MODEL", default="codex")
+WEAK_MARKET_BREADTH_THRESHOLD = 45.0
+RISK_OFF_STATES = {"HIGH", "STRESS", "RISK_OFF", "DEFENSIVE"}
+POSITIVE_PLAYBOOK_ACTIONS = {"BUY", "BUY_MORE", "BUY_WATCH", "WATCH_SYMBOLS", "ADD_TO_WATCHLIST"}
+NEGATIVE_PLAYBOOK_ACTIONS = {"REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW", "SHORT_RESEARCH_ONLY", "FULL_EXIT", "PARTIAL_EXIT"}
 
 
 class PlaybookCheck(BaseModel):
@@ -143,6 +148,9 @@ def ensure_tables() -> None:
                 checks_json TEXT,
                 risk_controls_json TEXT,
                 action_plan_json TEXT,
+                market_context_json TEXT,
+                market_context_adjustment_json TEXT,
+                market_context_adjustment TEXT,
                 llm_model TEXT,
                 llm_status TEXT,
                 llm_error TEXT,
@@ -213,6 +221,103 @@ def parse_jsonish(value: Any, default: Any) -> Any:
         return json.loads(str(value))
     except Exception:
         return default
+
+
+def _clean_json_record(row: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, pd.Timestamp):
+            out[key] = value.isoformat()
+            continue
+        try:
+            if pd.isna(value):
+                out[key] = None
+                continue
+        except Exception:
+            pass
+        out[key] = value
+    return out
+
+
+def load_playbook_market_context(match: pd.Series) -> dict[str, Any]:
+    published_on = pd.to_datetime(match.get("published_on") or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    if pd.isna(published_on):
+        published_on = pd.Timestamp.utcnow()
+    try:
+        payload = load_latest_market_context(published_on.normalize(), limit=250)
+    except Exception as exc:
+        return {
+            "summary": {},
+            "symbol_context": {},
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    summary = payload.get("summary") or {}
+    top_universe = payload.get("top_universe") or []
+    symbol = str(match.get("symbol") or "").strip().upper()
+    symbol_context = {}
+    if symbol:
+        for row in top_universe:
+            if str(row.get("symbol") or "").strip().upper() == symbol:
+                symbol_context = row
+                break
+    return {
+        "summary": _clean_json_record(summary) if isinstance(summary, dict) else {},
+        "symbol_context": _clean_json_record(symbol_context) if isinstance(symbol_context, dict) else {},
+    }
+
+
+def market_context_adjustment(action_type: str, market_context: dict[str, Any]) -> dict[str, Any]:
+    summary = market_context.get("summary") if isinstance(market_context, dict) else {}
+    if not isinstance(summary, dict):
+        summary = {}
+    action = str(action_type or "").strip().upper()
+    regime_name = str(summary.get("regime_name") or "").strip().upper()
+    macro_risk_state = str(summary.get("macro_risk_state") or "").strip().upper()
+    breadth = pd.to_numeric(summary.get("breadth_trend_alignment_pct"), errors="coerce")
+    risk_off_score = pd.to_numeric(summary.get("risk_off_score"), errors="coerce")
+    weak_breadth = bool(not pd.isna(breadth) and float(breadth) < WEAK_MARKET_BREADTH_THRESHOLD)
+    risk_off = regime_name in RISK_OFF_STATES or macro_risk_state in RISK_OFF_STATES or bool(not pd.isna(risk_off_score) and float(risk_off_score) >= 0.60)
+    adjusted_action = action
+    adjustment = "none"
+    reason = "Market context did not change the playbook action boundary."
+    production_allowed_override: bool | None = None
+    urgency_override: str | None = None
+    confidence_delta = 0.0
+
+    if action in POSITIVE_PLAYBOOK_ACTIONS and (risk_off or weak_breadth):
+        adjusted_action = "BUY_WATCH"
+        adjustment = "positive_event_downgraded_by_market_context"
+        production_allowed_override = False
+        urgency_override = "normal"
+        confidence_delta = -0.10
+        reason = (
+            "Positive playbook evidence was downgraded to watch/manual review because broad market context is weak "
+            f"(regime={regime_name or 'n/a'}, macro_risk={macro_risk_state or 'n/a'}, "
+            f"trend_breadth={None if pd.isna(breadth) else round(float(breadth), 2)}%)."
+        )
+    elif action in NEGATIVE_PLAYBOOK_ACTIONS and (risk_off or weak_breadth):
+        adjustment = "risk_reduction_reinforced_by_market_context"
+        urgency_override = "high"
+        confidence_delta = 0.10
+        reason = (
+            "Risk-reduction playbook evidence is reinforced by weak/risk-off broad market context "
+            f"(regime={regime_name or 'n/a'}, macro_risk={macro_risk_state or 'n/a'}, "
+            f"trend_breadth={None if pd.isna(breadth) else round(float(breadth), 2)}%)."
+        )
+
+    return {
+        "adjustment": adjustment,
+        "original_action_type": action,
+        "adjusted_action_type": adjusted_action,
+        "reason": reason,
+        "regime_name": regime_name or None,
+        "macro_risk_state": macro_risk_state or None,
+        "breadth_trend_alignment_pct": None if pd.isna(breadth) else float(breadth),
+        "risk_off_score": None if pd.isna(risk_off_score) else float(risk_off_score),
+        "production_allowed_override": production_allowed_override,
+        "urgency_override": urgency_override,
+        "confidence_delta": confidence_delta,
+    }
 
 
 def make_hypothesis_id(title: str) -> str:
@@ -989,8 +1094,42 @@ def decision_for_match(hypothesis: pd.Series, matched_terms: list[str], row: pd.
     return action, reason, decision
 
 
-def _fallback_action_plan(match: pd.Series, *, llm_status: str = "fallback", llm_error: str | None = None) -> tuple[PlaybookActionPlan, str, str | None]:
+def apply_market_context_to_plan(plan: PlaybookActionPlan, market_context: dict[str, Any]) -> tuple[PlaybookActionPlan, dict[str, Any]]:
+    adjustment = market_context_adjustment(plan.action_type, market_context)
+    update: dict[str, Any] = {}
+    if adjustment["adjusted_action_type"] != str(plan.action_type or "").upper():
+        update["action_type"] = adjustment["adjusted_action_type"]
+    if adjustment.get("urgency_override"):
+        update["urgency"] = adjustment["urgency_override"]
+    if adjustment.get("production_allowed_override") is not None:
+        update["production_allowed"] = bool(adjustment["production_allowed_override"])
+    confidence_delta = float(adjustment.get("confidence_delta") or 0.0)
+    if confidence_delta:
+        update["confidence"] = max(0.0, min(1.0, float(plan.confidence) + confidence_delta))
+    risk_controls = dict(plan.risk_controls or {})
+    risk_controls["market_context_adjustment"] = adjustment
+    risk_controls["market_context"] = market_context
+    update["risk_controls"] = risk_controls
+    if adjustment["adjustment"] != "none":
+        update["decision_reason"] = f"{plan.decision_reason} Market context adjustment: {adjustment['reason']}"
+        update["operator_summary"] = f"{plan.operator_summary} Market context: {adjustment['reason']}"
+    checks = list(plan.checks or [])
+    checks.append(
+        PlaybookCheck(
+            check_type="market_context",
+            question="Does current top-50% market context support, downgrade, or reinforce this playbook action?",
+            data_sources=["advisory_market_context_summary_daily", "advisory_market_context_universe_daily"],
+            blocking=adjustment["adjustment"] == "positive_event_downgraded_by_market_context",
+            rationale=adjustment["reason"],
+        )
+    )
+    update["checks"] = checks
+    return plan.model_copy(update=update), adjustment
+
+
+def _fallback_action_plan(match: pd.Series, *, market_context: dict[str, Any] | None = None, llm_status: str = "fallback", llm_error: str | None = None) -> tuple[PlaybookActionPlan, str, str | None, dict[str, Any]]:
     suggested_action = str(match.get("suggested_action") or "MANUAL_REVIEW")
+    market_context = market_context or load_playbook_market_context(match)
     expected_effect = parse_jsonish(match.get("expected_effect_json"), {})
     status = normalize_playbook_status(match.get("status"))
     production_allowed = is_trusted_overlay_status(status)
@@ -1049,10 +1188,11 @@ def _fallback_action_plan(match: pd.Series, *, llm_status: str = "fallback", llm
         },
         follow_up_window_days=3,
     )
-    return plan, llm_status, llm_error
+    plan, adjustment = apply_market_context_to_plan(plan, market_context)
+    return plan, llm_status, llm_error, adjustment
 
 
-def _build_action_prompt(match: pd.Series) -> str:
+def _build_action_prompt(match: pd.Series, *, market_context: dict[str, Any]) -> str:
     payload = {
         "playbook_id": match.get("hypothesis_id"),
         "playbook_title": match.get("hypothesis_title"),
@@ -1069,6 +1209,7 @@ def _build_action_prompt(match: pd.Series) -> str:
         "expected_effect": parse_jsonish(match.get("expected_effect_json"), {}),
         "suggested_action": match.get("suggested_action"),
         "action_reason": match.get("action_reason"),
+        "market_context": market_context,
     }
     return (
         "An investor playbook matched a market/news/announcement event. "
@@ -1080,16 +1221,19 @@ def _build_action_prompt(match: pd.Series) -> str:
     )
 
 
-def action_plan_for_match(match: pd.Series, *, model: str | None = None, use_llm: bool = True) -> tuple[PlaybookActionPlan, str, str | None]:
+def action_plan_for_match(match: pd.Series, *, model: str | None = None, use_llm: bool = True) -> tuple[PlaybookActionPlan, str, str | None, dict[str, Any], dict[str, Any]]:
+    market_context = load_playbook_market_context(match)
     if not use_llm:
-        return _fallback_action_plan(match, llm_status="disabled")
+        plan, llm_status, llm_error, adjustment = _fallback_action_plan(match, market_context=market_context, llm_status="disabled")
+        return plan, llm_status, llm_error, adjustment, market_context
     effective_model = model or DEFAULT_PLAYBOOK_ACTION_MODEL
     if effective_model.lower() in {"off", "none", "disabled", "false"}:
-        return _fallback_action_plan(match, llm_status="disabled")
+        plan, llm_status, llm_error, adjustment = _fallback_action_plan(match, market_context=market_context, llm_status="disabled")
+        return plan, llm_status, llm_error, adjustment, market_context
     try:
         codex_model = None if effective_model == "codex" else effective_model.split(":", 1)[1] if effective_model.startswith("codex:") else effective_model
         plan = run_codex_structured(
-            _build_action_prompt(match),
+            _build_action_prompt(match, market_context=market_context),
             response_model=PlaybookActionPlan,
             model=codex_model,
             system_prompt=(
@@ -1099,9 +1243,11 @@ def action_plan_for_match(match: pd.Series, *, model: str | None = None, use_llm
             ),
             max_attempts=2,
         )
-        return plan, "ok", None
+        plan, adjustment = apply_market_context_to_plan(plan, market_context)
+        return plan, "ok", None, adjustment, market_context
     except Exception as exc:
-        return _fallback_action_plan(match, llm_status="fallback_after_error", llm_error=f"{type(exc).__name__}: {exc}")
+        plan, llm_status, llm_error, adjustment = _fallback_action_plan(match, market_context=market_context, llm_status="fallback_after_error", llm_error=f"{type(exc).__name__}: {exc}")
+        return plan, llm_status, llm_error, adjustment, market_context
 
 
 def build_action_plans(matches: pd.DataFrame, *, model: str | None = None, use_llm: bool = True) -> pd.DataFrame:
@@ -1110,7 +1256,7 @@ def build_action_plans(matches: pd.DataFrame, *, model: str | None = None, use_l
     rows: list[dict[str, Any]] = []
     now = pd.Timestamp.utcnow()
     for _, match in matches.iterrows():
-        plan, llm_status, llm_error = action_plan_for_match(match, model=model, use_llm=use_llm)
+        plan, llm_status, llm_error, adjustment, market_context = action_plan_for_match(match, model=model, use_llm=use_llm)
         rows.append(
             {
                 "planned_at": now,
@@ -1129,6 +1275,9 @@ def build_action_plans(matches: pd.DataFrame, *, model: str | None = None, use_l
                 "checks_json": json_dumps([check.model_dump() for check in plan.checks]),
                 "risk_controls_json": json_dumps(plan.risk_controls),
                 "action_plan_json": plan.model_dump_json(),
+                "market_context_json": json_dumps(market_context),
+                "market_context_adjustment_json": json_dumps(adjustment),
+                "market_context_adjustment": adjustment.get("adjustment"),
                 "llm_model": model or DEFAULT_PLAYBOOK_ACTION_MODEL,
                 "llm_status": llm_status,
                 "llm_error": llm_error,

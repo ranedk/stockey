@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from advisory.decision_trace import append_trace, append_trace_step, build_action_conflicts, persist_action_conflicts, safe_trace_call
 from advisory.hypothesis_engine import ACTION_PLANS_TABLE, HYPOTHESES_TABLE, ensure_tables as ensure_hypothesis_tables
+from advisory.market_context import load_latest_market_context
 from advisory.portfolio_engine import PORTFOLIO_TABLE
 from advisory.position_lifecycle import LIFECYCLE_TABLE, REBALANCE_TABLE
 from advisory.watchlist_builder import TABLE_NAME as WATCHLIST_TABLE
@@ -27,6 +28,7 @@ CANDIDATES_TABLE = "advisory_candidates"
 REGIME_TABLE = "advisory_market_regime"
 EVENT_EVALUATIONS_TABLE = "advisory_event_evaluations"
 EVENT_REVIEWS_TABLE = "advisory_event_reviews"
+EVENT_POLICY_TABLE = "advisory_event_policy_actions"
 
 ACTION_PRIORITY = {
     "SELL": 100,
@@ -50,9 +52,24 @@ PLAYBOOK_ACTION_MAP = {
     "REDUCE_EXPOSURE_REVIEW": ("MANUAL_REVIEW", None),
     "SECTOR_REVIEW": ("MANUAL_REVIEW", None),
     "MANUAL_REVIEW": ("MANUAL_REVIEW", None),
+    "BUY_WATCH": ("MANUAL_REVIEW", None),
     "WATCH_SYMBOLS": ("WATCH", None),
+    "ADD_TO_WATCHLIST": ("WATCH", None),
     "NO_ACTION": ("HOLD", None),
 }
+EVENT_POLICY_ACTION_MAP = {
+    "BUY_WATCH": ("MANUAL_REVIEW", None),
+    "REDUCE_EXPOSURE_REVIEW": ("MANUAL_REVIEW", None),
+    "MANUAL_REVIEW": ("MANUAL_REVIEW", None),
+}
+
+RISK_OFF_STATES = {"RISK_OFF", "HIGH", "STRESS", "CRASH", "HOSTILE"}
+POSITIVE_BROKER_ACTIONS = {"BUY", "BUY_MORE"}
+MARKET_CONTEXT_RISK_OFF_SCORE_THRESHOLD = env.float("ACTION_MARKET_CONTEXT_RISK_OFF_SCORE_THRESHOLD", default=0.60)
+MARKET_CONTEXT_WEAK_BREADTH_THRESHOLD = env.float("ACTION_MARKET_CONTEXT_WEAK_BREADTH_THRESHOLD", default=40.0)
+MARKET_CONTEXT_CAUTION_RISK_OFF_SCORE_THRESHOLD = env.float("ACTION_MARKET_CONTEXT_CAUTION_RISK_OFF_SCORE_THRESHOLD", default=0.45)
+MARKET_CONTEXT_CAUTION_BREADTH_THRESHOLD = env.float("ACTION_MARKET_CONTEXT_CAUTION_BREADTH_THRESHOLD", default=50.0)
+MARKET_CONTEXT_CAUTION_SIZE_MULTIPLIER = env.float("ACTION_MARKET_CONTEXT_CAUTION_SIZE_MULTIPLIER", default=0.75)
 
 
 class ManualRevisionPointers(BaseModel):
@@ -377,6 +394,31 @@ def load_playbook_action_plans(*, asof_date: pd.Timestamp, symbols: list[str] | 
           ON h.hypothesis_id = p.hypothesis_id
         WHERE {' AND '.join(clauses)}
         ORDER BY planned_at DESC, confidence DESC NULLS LAST
+        """,
+        params=tuple(params),
+    )
+
+
+def load_event_policy_actions(*, asof_date: pd.Timestamp, symbols: list[str] | None = None, setup_ids: list[str] | None = None) -> pd.DataFrame:
+    if not table_exists(EVENT_POLICY_TABLE):
+        return pd.DataFrame()
+    clauses = [
+        "asof_date = %s",
+        "action_type IN ('BUY_WATCH', 'REDUCE_EXPOSURE_REVIEW', 'MANUAL_REVIEW')",
+    ]
+    params: list[object] = [asof_date]
+    if symbols:
+        clauses.append("UPPER(TRIM(symbol)) = ANY(%s)")
+        params.append([str(value).upper() for value in symbols])
+    if setup_ids:
+        clauses.append("UPPER(TRIM(setup_id)) = ANY(%s)")
+        params.append([str(value).upper() for value in setup_ids])
+    return sql_to_df(
+        f"""
+        SELECT *
+        FROM {EVENT_POLICY_TABLE}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY published_on DESC NULLS LAST, policy_score DESC NULLS LAST
         """,
         params=tuple(params),
     )
@@ -800,6 +842,135 @@ def enrich_action_candidate_context(df: pd.DataFrame, *, asof_date: pd.Timestamp
     return out
 
 
+def _market_symbol_context(market_context: dict[str, Any], symbol: str) -> dict[str, Any]:
+    rows = market_context.get("top_universe") if isinstance(market_context, dict) else []
+    if not isinstance(rows, list):
+        return {}
+    normalized = str(symbol or "").strip().upper()
+    for row in rows:
+        if isinstance(row, dict) and str(row.get("symbol") or "").strip().upper() == normalized:
+            return row
+    return {}
+
+
+def _market_context_adjustment(action_code: str, market_context: dict[str, Any], *, symbol: str | None = None) -> dict[str, Any]:
+    summary = market_context.get("summary") if isinstance(market_context, dict) else {}
+    if not isinstance(summary, dict):
+        summary = {}
+    action = str(action_code or "").strip().upper()
+    regime_name = str(summary.get("regime_name") or "").strip().upper()
+    macro_risk_state = str(summary.get("macro_risk_state") or "").strip().upper()
+    breadth = pd.to_numeric(summary.get("breadth_trend_alignment_pct"), errors="coerce")
+    risk_off_score = pd.to_numeric(summary.get("risk_off_score"), errors="coerce")
+    macro_multiplier = pd.to_numeric(summary.get("macro_sizing_multiplier"), errors="coerce")
+    symbol_context = _market_symbol_context(market_context, symbol or "")
+    weak_breadth = bool(not pd.isna(breadth) and float(breadth) < MARKET_CONTEXT_WEAK_BREADTH_THRESHOLD)
+    caution_breadth = bool(not pd.isna(breadth) and float(breadth) < MARKET_CONTEXT_CAUTION_BREADTH_THRESHOLD)
+    risk_off = (
+        regime_name in RISK_OFF_STATES
+        or macro_risk_state in RISK_OFF_STATES
+        or bool(not pd.isna(risk_off_score) and float(risk_off_score) >= MARKET_CONTEXT_RISK_OFF_SCORE_THRESHOLD)
+    )
+    caution = (
+        not risk_off
+        and (
+            caution_breadth
+            or bool(not pd.isna(risk_off_score) and float(risk_off_score) >= MARKET_CONTEXT_CAUTION_RISK_OFF_SCORE_THRESHOLD)
+            or bool(not pd.isna(macro_multiplier) and float(macro_multiplier) < 1.0)
+        )
+    )
+    adjusted_action = action
+    adjustment = "none"
+    reason = "Market context did not change the action boundary."
+    size_multiplier = 1.0
+    if action in POSITIVE_BROKER_ACTIONS and (risk_off or weak_breadth):
+        adjusted_action = "MANUAL_REVIEW" if action == "BUY" else "HOLD"
+        adjustment = "positive_action_blocked_by_market_context"
+        size_multiplier = 0.0
+        reason = (
+            "Positive broker action was blocked because broad market context is weak or risk-off "
+            f"(regime={regime_name or 'n/a'}, macro_risk={macro_risk_state or 'n/a'}, "
+            f"trend_breadth={None if pd.isna(breadth) else round(float(breadth), 2)}%, "
+            f"risk_off_score={None if pd.isna(risk_off_score) else round(float(risk_off_score), 3)})."
+        )
+    elif action in POSITIVE_BROKER_ACTIONS and caution:
+        adjustment = "positive_action_size_reduced_by_market_context"
+        multiplier_candidates = [MARKET_CONTEXT_CAUTION_SIZE_MULTIPLIER]
+        if not pd.isna(macro_multiplier):
+            multiplier_candidates.append(float(macro_multiplier))
+        size_multiplier = max(0.0, min(1.0, min(multiplier_candidates)))
+        reason = (
+            "Positive broker action size was reduced because broad market context is cautious "
+            f"(regime={regime_name or 'n/a'}, macro_risk={macro_risk_state or 'n/a'}, "
+            f"trend_breadth={None if pd.isna(breadth) else round(float(breadth), 2)}%, "
+            f"risk_off_score={None if pd.isna(risk_off_score) else round(float(risk_off_score), 3)}, "
+            f"size_multiplier={round(size_multiplier, 3)})."
+        )
+    return {
+        "adjustment": adjustment,
+        "original_action_code": action,
+        "adjusted_action_code": adjusted_action,
+        "reason": reason,
+        "size_multiplier": size_multiplier,
+        "regime_name": regime_name or None,
+        "macro_risk_state": macro_risk_state or None,
+        "breadth_trend_alignment_pct": None if pd.isna(breadth) else float(breadth),
+        "risk_off_score": None if pd.isna(risk_off_score) else float(risk_off_score),
+        "macro_sizing_multiplier": None if pd.isna(macro_multiplier) else float(macro_multiplier),
+        "symbol_context": symbol_context,
+    }
+
+
+def apply_market_context_adjustments(df: pd.DataFrame, *, asof_date: pd.Timestamp) -> pd.DataFrame:
+    if df.empty or "action_code" not in df.columns:
+        return df
+    market_context = load_latest_market_context(asof_date, limit=500)
+    summary = market_context.get("summary") if isinstance(market_context, dict) else {}
+    if not isinstance(summary, dict) or not summary:
+        return df
+    out = df.copy()
+    for idx, row in out.iterrows():
+        action = str(row.get("action_code") or "").strip().upper()
+        if action not in POSITIVE_BROKER_ACTIONS:
+            continue
+        adjustment = _market_context_adjustment(action, market_context, symbol=str(row.get("symbol") or ""))
+        if adjustment["adjustment"] == "none":
+            continue
+        raw_context = _merge_context(
+            row.get("raw_context_json"),
+            {
+                "market_context_adjustment": adjustment["adjustment"],
+                "market_context_adjustment_json": adjustment,
+                "market_context_json": {
+                    "summary": summary,
+                    "symbol_context": adjustment.get("symbol_context") or {},
+                },
+            },
+        )
+        out.at[idx, "raw_context_json"] = json.dumps(raw_context, ensure_ascii=False, default=str, sort_keys=True)
+        original_reason = _text(row.get("action_reason")) or "No original action reason supplied."
+        out.at[idx, "action_detail"] = (
+            f"{_text(row.get('action_detail')) or ''} Market context adjustment: {adjustment['reason']}"
+        ).strip()
+        if adjustment["adjustment"] == "positive_action_blocked_by_market_context":
+            adjusted_action = str(adjustment["adjusted_action_code"])
+            out.at[idx, "action_code"] = adjusted_action
+            out.at[idx, "action_priority"] = int(ACTION_PRIORITY.get(adjusted_action, ACTION_PRIORITY["MANUAL_REVIEW"]))
+            out.at[idx, "transaction_type"] = None
+            out.at[idx, "execution_mode"] = "review_only"
+            out.at[idx, "approved_allocation_inr"] = 0.0
+            out.at[idx, "action_fraction"] = None
+            out.at[idx, "action_reason"] = f"{adjustment['reason']} Original reason: {original_reason}"
+        else:
+            size_multiplier = float(adjustment.get("size_multiplier") or 1.0)
+            for column in ["approved_allocation_inr", "action_fraction", "invest_score_pct"]:
+                value = pd.to_numeric(out.at[idx, column], errors="coerce") if column in out.columns else pd.NA
+                if pd.notna(value):
+                    out.at[idx, column] = float(value) * size_multiplier
+            out.at[idx, "action_reason"] = f"{original_reason} Market context reduced sizing: {adjustment['reason']}"
+    return out
+
+
 def _json_ready_record(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     data = row.to_dict() if isinstance(row, pd.Series) else dict(row)
     out: dict[str, Any] = {}
@@ -876,6 +1047,27 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
         "risk": risk_fields,
         "lifecycle": _contract_section_from_context(raw_context, ["position_status", "next_action", "suggested_action", "lifecycle_reason", "next_action_reason"]),
     }
+    market_context = _parse_jsonish(raw_context.get("market_context_json"), {})
+    if not isinstance(market_context, dict):
+        market_context = {}
+    market_summary = market_context.get("summary") if isinstance(market_context.get("summary"), dict) else {}
+    market_symbol_context = market_context.get("symbol_context") if isinstance(market_context.get("symbol_context"), dict) else {}
+    market_adjustment = _parse_jsonish(raw_context.get("market_context_adjustment_json"), {})
+    if not isinstance(market_adjustment, dict):
+        market_adjustment = {}
+    market_context_section = {
+        "market_context_adjustment": raw_context.get("market_context_adjustment"),
+        "market_context_adjustment_reason": market_adjustment.get("reason"),
+        "regime_name": market_adjustment.get("regime_name") or market_summary.get("regime_name"),
+        "macro_risk_state": market_adjustment.get("macro_risk_state") or market_summary.get("macro_risk_state"),
+        "breadth_trend_alignment_pct": market_adjustment.get("breadth_trend_alignment_pct") or market_summary.get("breadth_trend_alignment_pct"),
+        "risk_off_score": market_adjustment.get("risk_off_score") or market_summary.get("risk_off_score"),
+        "top_context_rank_pct": market_symbol_context.get("rank_pct"),
+        "top_context_sector": market_symbol_context.get("sector_name") or market_symbol_context.get("sector_code"),
+    }
+    market_context_section = {key: value for key, value in market_context_section.items() if value is not None}
+    if market_context_section:
+        evidence_sections["macro_regime"] = {**evidence_sections.get("macro_regime", {}), **market_context_section}
     present_sections = [key for key, value in evidence_sections.items() if value]
     missing: list[str] = []
     if not action:
@@ -912,7 +1104,7 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
         "missing_fields": missing,
         "symbol": str(row.get("symbol") or "").upper(),
         "action_code": action,
-        "original_action_code": str(row.get("original_action_code") or action).upper(),
+        "original_action_code": str(row.get("original_action_code") or market_adjustment.get("original_action_code") or action).upper(),
         "action_source": _text(row.get("action_source")),
         "source_action": _text(row.get("source_action")),
         "setup_id": _text(row.get("setup_id")),
@@ -1154,6 +1346,48 @@ def build_playbook_action_candidates(
     return rows
 
 
+def build_event_policy_action_candidates(
+    *,
+    asof_date: pd.Timestamp,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    policies = load_event_policy_actions(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+    if policies.empty:
+        return []
+    rows: list[dict[str, Any]] = []
+    for _, row in policies.iterrows():
+        action_type = str(row.get("action_type") or "MANUAL_REVIEW").strip().upper()
+        mapped_action, transaction_type = EVENT_POLICY_ACTION_MAP.get(action_type, ("MANUAL_REVIEW", None))
+        confidence = _num(row.get("confidence")) or 0.0
+        invest_score_pct = max(0.0, min(100.0, confidence * 100.0 if confidence <= 1.0 else confidence))
+        rows.append(
+            _build_record(
+                asof_date=asof_date,
+                published_on=row.get("published_on"),
+                setup_id=row.get("setup_id"),
+                symbol=row.get("symbol"),
+                unique_id=row.get("unique_id"),
+                action_code=mapped_action,
+                action_source="event_policy",
+                source_action=action_type,
+                transaction_type=transaction_type,
+                execution_mode="review_only",
+                invest_score_pct=invest_score_pct,
+                expected_horizon_days=None,
+                action_reason=row.get("action_reason"),
+                action_detail=row.get("action_detail"),
+                raw_context={
+                    **row.to_dict(),
+                    "event_policy_bridge_note": "Deterministic event policies are review/risk overlays only; they do not create broker-executable trades.",
+                    "policy_checks": _parse_jsonish(row.get("checks_json"), []),
+                    "policy_raw_context": _parse_jsonish(row.get("raw_context_json"), {}),
+                },
+            )
+        )
+    return rows
+
+
 def build_action_recommendations(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -1277,6 +1511,14 @@ def build_action_recommendations(
             )
         )
 
+    candidates.extend(
+        build_event_policy_action_candidates(
+            asof_date=monitor_date,
+            symbols=symbols,
+            setup_ids=setup_ids,
+        )
+    )
+
     base_symbols = sorted(
         {
             str(row.get("symbol")).upper()
@@ -1297,6 +1539,7 @@ def build_action_recommendations(
         return pd.DataFrame()
 
     candidate_df = enrich_action_candidate_context(pd.DataFrame(candidates), asof_date=monitor_date)
+    candidate_df = apply_market_context_adjustments(candidate_df, asof_date=monitor_date)
     winners = rank_action_candidates(candidate_df)
     winners = add_recommendation_reason_contracts(winners, candidate_df)
     winners = add_manual_revision_pointers(winners, candidate_df)
@@ -1333,6 +1576,7 @@ def persist_action_recommendations(df: pd.DataFrame) -> None:
     asof_values = pd.to_datetime(asof_series, utc=True, errors="coerce").dropna()
     enrich_asof = asof_values.max().normalize() if not asof_values.empty else _normalize_asof_date(None)
     all_candidates = enrich_action_candidate_context(all_candidates, asof_date=enrich_asof)
+    all_candidates = apply_market_context_adjustments(all_candidates, asof_date=enrich_asof)
     winners = rank_action_candidates(all_candidates)
     existing_reason_columns = {"recommendation_reason_json", "reason_contract_status"}
     if not existing_reason_columns.issubset(set(winners.columns)) or winners["recommendation_reason_json"].isna().any():

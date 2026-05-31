@@ -88,8 +88,9 @@ This is the recommended current implementation order.
    - done: create a daily market-context universe table for the top 50% of investable Indian equities by configurable ranking, initially market cap plus traded value
    - done: track announcements, news, exchange events, technical leadership, sector movement, and macro sensitivity for this universe even when names are not current recommendations
    - done: summarize this universe into sector breadth, leadership rotation, event clusters, and risk-on/risk-off context
-   - next: feed this context into event/playbook interpretation and macro/regime gates, not directly into trade execution
+   - done: feed this context into event/playbook interpretation and macro/regime gates, not directly into trade execution
    - done: expose “Market Context: Top 50%” in the operator frontend
+   - next: add a lower-priority watcher queue for top-context names so event coverage improves without evaluating every broad-market event with LLMs
 
 3. Investor playbook action framework
    - done: treat these as investor playbooks in the operator UI instead of statistically validated trading policies
@@ -108,18 +109,33 @@ This is the recommended current implementation order.
    - next: rename legacy backend table/API names from promotion-audit to reliability-check once data migration is safe
 
 4. Event-to-action interpretation framework
-   - next: add deterministic event-class policies for earnings beats, growth acceleration, order wins, margin expansion, promoter buying, pledge reduction, regulatory notices, resignations, and capital allocation events
-   - next: make macro/regime state adjust action strength and sizing before a candidate reaches portfolio policy
-   - next: persist why an event became `BUY_WATCH`, `MANUAL_REVIEW`, `REDUCE_EXPOSURE_REVIEW`, or `NO_ACTION`
+   - done: add deterministic event-class policies for earnings beats, growth acceleration, margin expansion, order wins, promoter buying/selling, pledge reduction/increase, regulatory notices, management resignations, buybacks, dividends, dilution, analyst meets, and neutral corporate actions
+   - done: persist why each evaluated event became `BUY_WATCH`, `MANUAL_REVIEW`, `REDUCE_EXPOSURE_REVIEW`, or `NO_ACTION` in `advisory_event_policy_actions`
+   - done: bridge event-policy actions into consolidated action recommendations as review/risk overlays only, never direct broker actions
+   - done: add bounded LLM manual-review refinement so review rows get operator notes, possible actions, future events to wait for, and questions; non-actionable rows are downgraded to `NO_ACTION`
+   - done: expose event-policy action counts, policy checks, LLM notes, wait-for events, and operator questions in the Nuxt Event Inbox
+   - done: make macro/regime state adjust positive action strength and sizing before action consolidation reaches portfolio/execution policy
+   - done: add research-only realized forward-return evaluation for event-policy action types, classes, score buckets, and confidence buckets
+   - next: use event-policy evaluation summaries plus operator review feedback to propose manual threshold/config changes
 
 5. Technical/lifecycle calibration
    - keep `advisory.technical_engine` as the single swing-technical state machine
+   - done: add research-only technical threshold calibration against realized forward OHLCV returns
+   - done: add operator API/page for reviewing latest technical threshold calibration summaries and copying candidate configs
+   - done: add LLM-assisted manual promotion review that writes review evidence and a pending patch but does not apply thresholds automatically
+   - done: add explicit manual approval/rejection audit records for reviewed threshold patches, with copyable final patch guidance and no automatic config edits
    - calibrate target multiples, stop distances, partial-exit rules, and time-stop defaults using realized lifecycle outcomes
+   - next: add optional reviewed-diff generation against `config/advisory_setups.yaml` so approved patches are easier to apply by hand
    - surface technical sub-scores, trigger archetype, stop, invalidation, and exit reason as first-class operator UI fields
 
 6. Runtime robustness and observability
-   - add an operator health page section for cron freshness, API health, Dhan token age, OHLCV freshness, Redis availability, and failed OCR/Codex/NSE calls
-   - add a single smoke-test command for API + DB + frontend dependency checks
+   - done: update generated cron/template to run data refresh, watchers, hypothesis scans, TS workflow/evaluation, advisory, event-policy evaluation, weekly technical calibration, and frontend supervision
+   - done: add read-only operator health smoke test and Nuxt health page for DB, Redis, Dhan token, cron logs, table freshness, and optional dependencies
+   - done: add deterministic `[stockey.script]` lifecycle markers to primary shell wrappers and prefer those in cron-log health parsing
+   - done: add Data Health fix hints plus filters for errors, warnings, recovered rows, and OK rows
+   - done: recover manual `KeyboardInterrupt` logs when mapped output tables have fresher rows than the interrupted log
+   - done: add API self-check latency and Dhan cached-token age/expiry to the operator health payload and Data Health page
+   - next: add a single smoke-test command for API + DB + frontend dependency checks
    - keep cron/frontend logs visible from the operator app without adding write/trading controls
 
 ### 0A. Build a proper Nuxt operator app
@@ -230,10 +246,10 @@ Implementation slices:
 4. Done: reuse the existing `advisory.live_dashboard` payload builder behind an API-compatible JSON contract so the Nuxt app can reuse current data quickly.
 5. Started: build the Overview page first with better hierarchy and filtering; it now shows the action queue and symbol trace loading, but trace rendering is still raw JSON.
 6. Started: build Event Inbox and Decision Trace as readable stage/timeline pages; these are the main debugging gaps.
-7. Add frontend views for TS Watch, research ledger, and richer data health.
+7. Started: richer Data Health now has fix hints, cron latest-run parsing, recovered/manual-interrupt handling, and status filters. Add frontend views for TS Watch and research ledger next.
 8. Add SSE/WebSocket updates from Redis pub-sub once the read-only app is stable.
 9. Done: remove static `live_dashboard/` generation from cron/watch paths; serve operator state through API + Nuxt.
-10. Next: add an operator smoke-test command that validates API, DB reads, Node/npm, and Nuxt dependency health.
+10. Next: add a single operator smoke-test command that validates API, DB reads, Node/npm, and Nuxt dependency health.
 
 Do not:
 
@@ -363,11 +379,12 @@ Suggested `recommendation_reason_json` fields:
 
 Implementation slices:
 
-1. Next: add reason-contract builder utility in advisory code.
-2. Next: attach the reason contract to candidates, portfolio rows, lifecycle rows, action recommendations, and execution plans.
-3. Next: enforce reason completeness before an action can be shown as `BUY`, `ADD`, `HOLD`, `SELL`, or `WATCH`.
-4. Next: show a compact reason summary and expandable full reason contract in the Nuxt Overview and Decision Trace pages.
-5. Next: add regression tests that assert no clean recommendation is emitted without a reason contract.
+1. Done: add reason-contract builder utility in advisory code.
+2. Done: enrich final action reason contracts from candidates, portfolio/lifecycle candidates, event evaluations, playbook action plans, and macro/regime context.
+3. Done: enforce reason completeness before a broker-action row can remain `BUY`, `BUY_MORE`, `SELL`, or `PARTIAL_SELL`; incomplete rows are downgraded to `MANUAL_REVIEW`.
+4. Done: show a compact reason summary and expandable full reason contract in the Nuxt Overview and Decision Trace pages.
+5. Done: add regression tests that assert clean broker actions cannot ship without a reason contract.
+6. Done: add execution-layer defense so stale action rows with missing/incomplete contracts are blocked before broker handoff.
 
 Do not:
 
@@ -420,11 +437,14 @@ Suggested tables:
 
 Implementation slices:
 
-1. Next: build `advisory.market_context_universe` to persist top-50% membership daily.
-2. Next: extend announcement/news watchers to also ingest top-50% market-context names with lower priority than active watchlist names.
-3. Next: build daily context features: sector breadth, leader breakdowns, event clusters, and macro sensitivity.
-4. Next: feed market context into event/playbook action planning as background evidence.
-5. Next: show “Market Context: Top 50%” in the operator frontend.
+1. Done: build `advisory.market_context` to persist top-50% membership and summary rows daily.
+2. Done: extend announcement/news watchers to also ingest top-50% market-context names with lower priority than active watchlist names.
+3. Done: build daily context features: sector breadth, leader breakdowns, event clusters, exchange-event context, and macro/regime summary.
+4. Done: feed market context into event/playbook action planning as background evidence.
+5. Done: show “Market Context: Top 50%” in the operator frontend.
+6. Done: add a lower-priority watcher queue for top-context names so event coverage improves without evaluating every broad-market event with LLMs.
+7. Done: add regression checks that positive playbook actions remain non-executable in weak/risk-off broad-market context.
+8. Next: tune deterministic materiality keywords and add dashboard counts for `triggered` versus `context_observed` top-context events.
 
 Do not:
 
@@ -1064,7 +1084,9 @@ Implementation slices:
    - failed breakout full exit
    - sharp extension partial exit
    - dead-money time stop
-9. Next: calibrate the thresholds against realized outcomes instead of treating V1 defaults as final.
+9. Done: add research-only technical threshold calibration against realized forward OHLCV outcomes after costs.
+10. Done: add operator UI/API views for threshold calibration summaries and copyable configs.
+11. Next: promote thresholds only through an explicit manual config-change workflow after reviewing calibration evidence.
 
 Do not:
 

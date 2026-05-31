@@ -7,7 +7,14 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.announcement_watch import load_watchlist, normalize_timestamp
+from advisory.announcement_watch import (
+    DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
+    is_material_context_event,
+    load_market_context_watchlist,
+    load_watchlist,
+    merge_watch_targets,
+    normalize_timestamp,
+)
 from data.economictimes.rss import build_feed_rows, persist_feed_rows
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
@@ -71,6 +78,7 @@ def ensure_output_table() -> None:
                 watch_reasons_json TEXT,
                 match_reasons_json TEXT,
                 match_score DOUBLE PRECISION,
+                monitor_source TEXT,
                 event_status TEXT,
                 load_ts TIMESTAMPTZ,
                 UNIQUE (published_on, setup_id, symbol, unique_id)
@@ -83,6 +91,7 @@ def ensure_output_table() -> None:
         cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS source_url TEXT")
         cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS match_reasons_json TEXT")
         cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS match_score DOUBLE PRECISION")
+        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT")
 
 
 def load_watch_company_meta(company_master_ids: list[str]) -> pd.DataFrame:
@@ -237,6 +246,7 @@ def build_news_events(
                     "watch_reasons_json": watch_row.get("watch_reasons_json"),
                     "match_reasons_json": json.dumps(reasons, ensure_ascii=False, sort_keys=True),
                     "match_score": float(score),
+                    "monitor_source": watch_row.get("monitor_source") or "watchlist",
                     "event_status": "triggered",
                     "load_ts": pd.Timestamp.utcnow(),
                 }
@@ -245,6 +255,10 @@ def build_news_events(
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
+    market_mask = df["monitor_source"].astype("string").str.lower().eq("market_context")
+    if market_mask.any():
+        material_mask = df.apply(is_material_context_event, axis=1)
+        df.loc[market_mask & ~material_mask, "event_status"] = "context_observed"
     df["asof_date"] = normalize_timestamp(df["asof_date"])
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
     return df.drop_duplicates(subset=["published_on", "setup_id", "symbol", "unique_id"], keep="last")
@@ -272,11 +286,25 @@ def run_news_watch(
     published_from: pd.Timestamp | None = None,
     feed_names: list[str] | None = None,
     refresh_feeds: bool = False,
+    include_market_context: bool = False,
+    market_context_limit: int = DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
+    market_context_last_checked_at: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if refresh_feeds:
         persist_feed_rows(build_feed_rows(feed_names=feed_names))
 
     watchlist = load_watchlist(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+    market_context_watchlist = (
+        load_market_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=market_context_limit,
+            last_checked_at=market_context_last_checked_at,
+        )
+        if include_market_context
+        else pd.DataFrame()
+    )
+    watchlist = merge_watch_targets(watchlist, market_context_watchlist)
     if watchlist.empty:
         return pd.DataFrame(), {"watch_count": 0, "news_item_count": 0, "matched_event_count": 0}
 
@@ -293,7 +321,12 @@ def run_news_watch(
         "watch_count": int(len(watchlist)),
         "news_item_count": int(len(news_items)),
         "matched_event_count": int(len(events)),
+        "triggered_event_count": int(events["event_status"].astype(str).eq("triggered").sum()) if not events.empty and "event_status" in events.columns else 0,
+        "context_observed_count": int(events["event_status"].astype(str).eq("context_observed").sum()) if not events.empty and "event_status" in events.columns else 0,
         "lookback_days": int(lookback_days),
+        "market_context_enabled": bool(include_market_context),
+        "market_context_limit": int(market_context_limit),
+        "market_context_watch_count": int(len(market_context_watchlist)),
         "feed_names": sorted(news_items["feed_name"].dropna().astype(str).unique().tolist()) if not news_items.empty else [],
     }
     return events, meta

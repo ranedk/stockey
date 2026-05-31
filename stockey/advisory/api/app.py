@@ -8,8 +8,15 @@ import pandas as pd
 
 from advisory.decision_trace import load_event_trace, load_symbol_trace
 from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audit, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
+from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
+from advisory.event_policy_evaluator import SUMMARY_TABLE as EVENT_POLICY_EVAL_SUMMARY_TABLE
 from advisory.live_dashboard import DEFAULT_OUTPUT_DIR, build_live_dashboard_payload
 from advisory.market_context import load_latest_market_context
+from advisory.operator_health import build_operator_health
+from advisory.technical_threshold_calibration import EVALUATIONS_TABLE as TECHNICAL_CALIBRATION_EVALUATIONS_TABLE
+from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_CALIBRATION_SUMMARY_TABLE
+from advisory.technical_threshold_promotion import generate_promotion_review, load_promotion_reviews, record_manual_decision
+from utils.db import sql_to_df
 
 
 def _parse_asof_date(value: str | None) -> pd.Timestamp | None:
@@ -103,6 +110,130 @@ def build_market_context_payload(*, asof_date: str | None = None, limit: int = 5
     }
 
 
+def _table_exists(table_name: str) -> bool:
+    df = sql_to_df(
+        """
+        SELECT 1 AS exists_flag
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        LIMIT 1
+        """,
+        params=(table_name,),
+        retries=2,
+    )
+    return not df.empty
+
+
+def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    if df.empty:
+        return []
+    out = df.copy()
+    out = out.astype(object).where(pd.notna(out), None)
+    return out.to_dict(orient="records")
+
+
+def build_technical_calibration_payload(*, limit: int = 25) -> dict[str, Any]:
+    if not _table_exists(TECHNICAL_CALIBRATION_SUMMARY_TABLE):
+        return {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "status": "missing_table",
+            "summary": [],
+            "top_configs": [],
+        }
+    summary = sql_to_df(
+        f"""
+        SELECT *
+        FROM {TECHNICAL_CALIBRATION_SUMMARY_TABLE}
+        WHERE evaluated_at = (
+            SELECT MAX(evaluated_at)
+            FROM {TECHNICAL_CALIBRATION_SUMMARY_TABLE}
+        )
+        ORDER BY horizon_days
+        """,
+        retries=3,
+    )
+    top_configs = pd.DataFrame()
+    if _table_exists(TECHNICAL_CALIBRATION_EVALUATIONS_TABLE):
+        top_configs = sql_to_df(
+            f"""
+            WITH latest AS (
+                SELECT MAX(evaluated_at) AS evaluated_at
+                FROM {TECHNICAL_CALIBRATION_EVALUATIONS_TABLE}
+            ),
+            ranked AS (
+                SELECT
+                    e.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY e.horizon_days
+                        ORDER BY e.objective_score DESC NULLS LAST, e.eligible_count DESC NULLS LAST, e.hit_rate_after_cost DESC NULLS LAST
+                    ) AS rn
+                FROM {TECHNICAL_CALIBRATION_EVALUATIONS_TABLE} e
+                JOIN latest ON latest.evaluated_at = e.evaluated_at
+            )
+            SELECT *
+            FROM ranked
+            WHERE rn <= %(limit)s
+            ORDER BY horizon_days, rn
+            """,
+            params={"limit": max(1, int(limit))},
+            retries=3,
+        )
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "status": "ok",
+        "summary": _records(summary),
+        "top_configs": _records(top_configs),
+    }
+
+
+def build_technical_threshold_promotion_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    setup_id = str(payload.get("setup_id") or "").strip()
+    config_id = str(payload.get("config_id") or "").strip()
+    if not setup_id:
+        raise ValueError("setup_id is required")
+    if not config_id:
+        raise ValueError("config_id is required")
+    return generate_promotion_review(
+        setup_id=setup_id,
+        config_id=config_id,
+        model=str(payload.get("model") or "") or None,
+        use_llm=bool(payload.get("use_llm", True)),
+        persist=True,
+    )
+
+
+def build_technical_threshold_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "status": "ok",
+        "reviews": load_promotion_reviews(limit=limit),
+    }
+
+
+def build_technical_threshold_review_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    reviewed_at = payload.get("reviewed_at")
+    setup_id = str(payload.get("setup_id") or "").strip()
+    config_id = str(payload.get("config_id") or "").strip()
+    decision = str(payload.get("decision") or "").strip().lower()
+    if not reviewed_at:
+        raise ValueError("reviewed_at is required")
+    if not setup_id:
+        raise ValueError("setup_id is required")
+    if not config_id:
+        raise ValueError("config_id is required")
+    if decision not in {"approved", "rejected", "needs_more_data"}:
+        raise ValueError("decision must be approved, rejected, or needs_more_data")
+    return record_manual_decision(
+        reviewed_at=reviewed_at,
+        setup_id=setup_id,
+        config_id=config_id,
+        decision=decision,  # type: ignore[arg-type]
+        operator_id=str(payload.get("operator_id") or "") or None,
+        decision_reason=str(payload.get("decision_reason") or "") or None,
+    )
+
+
 def build_events_payload(*, asof_date: str | None = None, limit: int = 100) -> dict[str, Any]:
     payload = load_operator_payload(asof_date=asof_date)
     events = payload.get("watch_events") or []
@@ -112,6 +243,119 @@ def build_events_payload(*, asof_date: str | None = None, limit: int = 100) -> d
         "events": events[: max(int(limit), 0)],
         "operator_feed": payload.get("operator_feed") or [],
         "alerts": payload.get("alerts") or [],
+    }
+
+
+def build_event_policy_payload(*, asof_date: str | None = None, action_type: str | None = None, limit: int = 100) -> dict[str, Any]:
+    if not _table_exists(EVENT_POLICY_TABLE):
+        return {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "status": "missing_table",
+            "summary": {"action_counts": {}, "policy_class_counts": {}},
+            "rows": [],
+        }
+    clauses = ["1 = 1"]
+    params: dict[str, Any] = {"limit": max(1, int(limit))}
+    parsed_asof = _parse_asof_date(asof_date)
+    if parsed_asof is not None:
+        clauses.append("asof_date = %(asof_date)s")
+        params["asof_date"] = parsed_asof
+    else:
+        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {EVENT_POLICY_TABLE})")
+    normalized_action = str(action_type or "").strip().upper()
+    if normalized_action and normalized_action != "ALL":
+        clauses.append("action_type = %(action_type)s")
+        params["action_type"] = normalized_action
+    where_sql = " AND ".join(clauses)
+    rows = sql_to_df(
+        f"""
+        SELECT *
+        FROM {EVENT_POLICY_TABLE}
+        WHERE {where_sql}
+        ORDER BY
+            CASE action_type
+                WHEN 'REDUCE_EXPOSURE_REVIEW' THEN 1
+                WHEN 'BUY_WATCH' THEN 2
+                WHEN 'MANUAL_REVIEW' THEN 3
+                ELSE 4
+            END,
+            published_on DESC NULLS LAST,
+            ABS(policy_score) DESC NULLS LAST
+        LIMIT %(limit)s
+        """,
+        params=params,
+        retries=3,
+    )
+    summary_df = sql_to_df(
+        f"""
+        SELECT action_type, policy_class, count(*) AS row_count
+        FROM {EVENT_POLICY_TABLE}
+        WHERE {where_sql}
+        GROUP BY action_type, policy_class
+        """,
+        params={key: value for key, value in params.items() if key != "limit"},
+        retries=3,
+    )
+    records = _records(rows)
+    for row in records:
+        row["checks"] = _jsonish(row.get("checks_json"))
+        row["operator_notes"] = _jsonish(row.get("operator_notes_json"))
+        row["llm_review"] = _jsonish(row.get("llm_review_json"))
+        row["raw_context"] = _jsonish(row.get("raw_context_json"))
+    action_counts: dict[str, int] = {}
+    policy_class_counts: dict[str, int] = {}
+    if not summary_df.empty:
+        for item in summary_df.to_dict(orient="records"):
+            count = int(item.get("row_count") or 0)
+            action_counts[str(item.get("action_type") or "UNKNOWN")] = action_counts.get(str(item.get("action_type") or "UNKNOWN"), 0) + count
+            policy_class_counts[str(item.get("policy_class") or "UNKNOWN")] = policy_class_counts.get(str(item.get("policy_class") or "UNKNOWN"), 0) + count
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "status": "ok",
+        "asof_date": asof_date,
+        "summary": {
+            "action_counts": action_counts,
+            "policy_class_counts": policy_class_counts,
+            "row_count": int(sum(action_counts.values())),
+        },
+        "rows": records,
+    }
+
+
+def build_event_policy_evaluation_payload(*, limit: int = 100) -> dict[str, Any]:
+    if not _table_exists(EVENT_POLICY_EVAL_SUMMARY_TABLE):
+        return {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "status": "missing_table",
+            "summary": [],
+        }
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM {EVENT_POLICY_EVAL_SUMMARY_TABLE}
+        WHERE evaluated_at = (
+            SELECT MAX(evaluated_at)
+            FROM {EVENT_POLICY_EVAL_SUMMARY_TABLE}
+        )
+        ORDER BY
+            horizon_days,
+            CASE recommendation
+                WHEN 'candidate_policy_tighten_or_downgrade' THEN 1
+                WHEN 'candidate_policy_strengthen' THEN 2
+                WHEN 'monitor' THEN 3
+                ELSE 4
+            END,
+            matured_count DESC NULLS LAST,
+            avg_forward_return_after_cost DESC NULLS LAST
+        LIMIT %(limit)s
+        """,
+        params={"limit": max(1, int(limit))},
+        retries=3,
+    )
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "status": "ok",
+        "summary": _records(df),
     }
 
 
@@ -564,6 +808,10 @@ def build_data_health_payload(*, asof_date: str | None = None) -> dict[str, Any]
     }
 
 
+def build_operator_health_payload() -> dict[str, Any]:
+    return build_operator_health()
+
+
 def build_hypotheses_payload(*, limit: int = 100) -> dict[str, Any]:
     hypotheses = load_hypotheses().head(max(0, int(limit)))
     matches = load_matches(limit=max(0, int(limit)))
@@ -648,6 +896,10 @@ def create_app():
     def health():
         return build_health_payload()
 
+    @app.get("/api/health/details")
+    def health_details():
+        return _guard(build_operator_health_payload)
+
     @app.get("/api/summary")
     def summary(asof_date: str | None = None):
         return _guard(build_summary_payload, asof_date=asof_date)
@@ -668,9 +920,33 @@ def create_app():
     def market_context(asof_date: str | None = None, limit: int = Query(default=50, ge=0, le=500)):
         return _guard(build_market_context_payload, asof_date=asof_date, limit=limit)
 
+    @app.get("/api/technical-calibration")
+    def technical_calibration(limit: int = Query(default=25, ge=1, le=100)):
+        return _guard(build_technical_calibration_payload, limit=limit)
+
+    @app.post("/api/technical-calibration/promotion-review")
+    def technical_calibration_promotion_review(payload: dict[str, Any]):
+        return _guard(build_technical_threshold_promotion_review_payload, payload=payload)
+
+    @app.get("/api/technical-calibration/promotion-reviews")
+    def technical_calibration_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
+        return _guard(build_technical_threshold_reviews_payload, limit=limit)
+
+    @app.post("/api/technical-calibration/promotion-review/decision")
+    def technical_calibration_promotion_review_decision(payload: dict[str, Any]):
+        return _guard(build_technical_threshold_review_decision_payload, payload=payload)
+
     @app.get("/api/events")
     def events(asof_date: str | None = None, limit: int = Query(default=100, ge=0, le=500)):
         return _guard(build_events_payload, asof_date=asof_date, limit=limit)
+
+    @app.get("/api/event-policy")
+    def event_policy(asof_date: str | None = None, action_type: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
+        return _guard(build_event_policy_payload, asof_date=asof_date, action_type=action_type, limit=limit)
+
+    @app.get("/api/event-policy/evaluation")
+    def event_policy_evaluation(limit: int = Query(default=100, ge=1, le=500)):
+        return _guard(build_event_policy_evaluation_payload, limit=limit)
 
     @app.get("/api/events/{unique_id}/trace")
     def event_trace(unique_id: str):

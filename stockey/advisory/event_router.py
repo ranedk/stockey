@@ -54,6 +54,8 @@ def load_recent_source_rows(table_name: str, *, load_from: pd.Timestamp | None) 
     if load_from is not None and not pd.isna(load_from):
         clauses.append("load_ts > %s")
         params.append(load_from)
+    if table_name in {ANNOUNCEMENT_EVENTS_TABLE, NEWS_EVENTS_TABLE}:
+        clauses.append("COALESCE(event_status, 'triggered') = 'triggered'")
     try:
         df = sql_to_df(
             f"""

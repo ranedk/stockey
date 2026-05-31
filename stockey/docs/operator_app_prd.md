@@ -95,10 +95,14 @@ For a symbol/date/action, display:
 - reason contract status, missing evidence, original action, and grouped rationale sections
 - screener provenance
 - technical state
+- technical threshold calibration summaries with copyable config JSON
+- LLM-assisted technical threshold promotion reviews with manual-only pending patch payloads
+- manual approval/rejection audit state for threshold-review patches
 - regime and macro context
 - exchange-event context
 - news/announcement context
 - event model output
+- event-policy action (`BUY_WATCH`, `MANUAL_REVIEW`, `REDUCE_EXPOSURE_REVIEW`, `NO_ACTION`) with policy class, checks, LLM operator notes, wait-for events, and operator questions
 - adversarial review
 - risk sizing
 - lifecycle and exit policy
@@ -202,6 +206,8 @@ It should consume:
 - `advisory_live_watch_alerts`
 - `advisory_event_evaluations`
 - `advisory_event_risks`
+- `advisory_event_policy_actions`
+- `advisory_event_policy_eval_summary`
 - `advisory_news_events`
 - `advisory_watch_events`
 - `announcement_pipeline_documents`
@@ -216,7 +222,7 @@ It should consume:
 1. Done: add read-only API using the existing static dashboard payload.
 2. Done: scaffold Nuxt app.
 3. Started: build Overview page with action queue, today's recommendations, and symbol trace loading.
-4. Started: build Event Inbox with event trace loading.
+4. Done: build Event Inbox with event trace loading and event-policy action review.
 5. Done: add normalized event and symbol trace summary APIs so the UI does not need raw DB JSON.
 6. Done: backend tracing now covers announcement ingest, event evaluation, adversarial review, lifecycle, rebalance, and action consolidation.
 7. Done: add symbol trace API for action/lifecycle consolidation traces.
@@ -226,7 +232,9 @@ It should consume:
 11. Done: add trace filters by domain, status, problems, execution blockers, action changes, and event-driven changes.
 12. Done: persist trace filter state in the URL and add deep links to specific trace decisions.
 13. Done: build Investor Playbooks creation, scan, action-plan flow, and production-safe action-consolidation bridge.
-14. Add live update stream.
+14. Done: expose event-policy action counts, operator notes, wait-for events, and questions in the Event Inbox.
+15. Done: expose research-only event-policy realized-return summary in the Event Inbox.
+16. Add live update stream.
 
 ## Frontend Commands
 
