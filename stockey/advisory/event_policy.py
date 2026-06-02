@@ -53,7 +53,7 @@ RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
 
 class EventPolicyManualReview(BaseModel):
-    final_action_type: Literal["BUY_WATCH", "MANUAL_REVIEW", "REDUCE_EXPOSURE_REVIEW", "NO_ACTION"]
+    final_action_type: Literal["MANUAL_REVIEW", "NO_ACTION"]
     confidence: float = Field(ge=0.0, le=1.0)
     operator_summary: str = Field(min_length=10, max_length=800)
     possible_action: str = Field(min_length=5, max_length=400)
@@ -397,7 +397,7 @@ def _manual_review_prompt(policy_row: dict[str, Any]) -> str:
         "instruction": (
             "Review this event-policy MANUAL_REVIEW row. "
             "If manual review is unlikely to lead to a useful action, set final_action_type to NO_ACTION. "
-            "Otherwise keep MANUAL_REVIEW, BUY_WATCH, or REDUCE_EXPOSURE_REVIEW and provide exact operator notes, future events to wait for, and questions to answer. "
+            "Otherwise keep MANUAL_REVIEW and provide exact operator notes, future events to wait for, and questions to answer. "
             "Do not recommend immediate broker execution."
         ),
         "policy_row": policy_row,
@@ -469,7 +469,7 @@ def apply_llm_manual_review(policy_row: dict[str, Any], *, model: str | None = N
 
     out = dict(policy_row)
     final_action = str(notes.get("final_action_type") or out.get("action_type") or "MANUAL_REVIEW").upper()
-    if final_action in {"BUY_WATCH", "MANUAL_REVIEW", "REDUCE_EXPOSURE_REVIEW", "NO_ACTION"}:
+    if final_action in {"MANUAL_REVIEW", "NO_ACTION"}:
         out["action_type"] = final_action
     if final_action == "NO_ACTION":
         out["action_status"] = "llm_downgraded_no_action" if status == "ok" else out.get("action_status")

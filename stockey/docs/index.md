@@ -59,7 +59,7 @@ Symbol-specific loaders default to [`config/tracked_symbols.txt`](../config/trac
 
 ## Orchestration scripts
 
-The repo now has six top-level operator entrypoints:
+The repo now has these top-level operator entrypoints:
 
 1. Download-only refresh:
 
@@ -79,7 +79,7 @@ The repo now has six top-level operator entrypoints:
 ./complete_data.sh
 ```
 
-4. Model prep and training:
+4. Optional model prep and training:
 
 ```sh
 ./all_ml.sh
@@ -138,10 +138,12 @@ Primary operator commands:
 
 ```sh
 ./complete_data.sh
-./all_ml.sh
 ./all_advisory.sh
 ./all_watchers.sh --loop
+./all_frontend.sh
 ```
+
+`./all_ml.sh` is available for research/event-model training, but it is not part of the default production decision path.
 
 Scheduled operator flow:
 
@@ -162,7 +164,7 @@ Top-level operator scripts also emit deterministic lifecycle markers through `sc
 Use:
 
 - `./complete_data.sh` for the full raw-data refresh
-- `./all_ml.sh` for research prep, readiness checks, model train, and score
+- `./all_ml.sh` for optional research prep, readiness checks, model train, and score
 - `python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS` for experimental OHLCV forecast features
 - `python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30` for matured TS forecast evaluation
 - `python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m` for the optional Screener/Dhan/TimesFM/TS-watchlist workflow

@@ -17,6 +17,9 @@ const redis = computed(() => asDict(sections.value.redis))
 const dhan = computed(() => asDict(sections.value.dhan))
 const dhanCache = computed(() => asDict(sections.value.dhan_cache))
 const frontend = computed(() => asDict(sections.value.frontend))
+const operatorSnapshot = computed(() => asDict(sections.value.operator_snapshot))
+const slowOperations = computed(() => asDict(sections.value.slow_operations))
+const syncStateFailures = computed(() => asList(sections.value.sync_state_failures))
 const fixHints = computed(() => asList(details.value?.fix_hints))
 const healthFilter = ref('all')
 const healthFilters = [
@@ -29,7 +32,7 @@ const healthFilters = [
 const filteredCronLogs = computed(() => cronLogs.value.filter((row) => matchesHealthFilter(row, healthFilter.value)))
 const filteredFixHints = computed(() => fixHints.value.filter((row) => matchesHealthFilter(row, healthFilter.value)))
 const healthFilterCounts = computed(() => {
-  const rows = [...cronLogs.value, ...fixHints.value]
+  const rows = [...cronLogs.value, ...fixHints.value, ...syncStateFailures.value]
   return Object.fromEntries(healthFilters.map((item) => [item.key, rows.filter((row) => matchesHealthFilter(row, item.key)).length]))
 })
 
@@ -96,10 +99,12 @@ function matchesHealthFilter(row: Dict, filter: string) {
     </div>
   </section>
 
-  <section class="mt-6 grid gap-4 md:grid-cols-7">
+  <section class="mt-6 grid gap-4 md:grid-cols-9">
     <MetricTile label="Overall" :value="statusText(details?.status)" note="Worst current check" />
     <MetricTile label="DB" :value="statusText(database.status)" :note="String(database.message || '-')" />
     <MetricTile label="API" :value="statusText(operatorApi.status)" :note="operatorApi.latency_ms ? `${operatorApi.latency_ms} ms` : String(operatorApi.message || '-')" />
+    <MetricTile label="Snapshot" :value="statusText(operatorSnapshot.status)" :note="operatorSnapshot.age_seconds ? `${Math.round(Number(operatorSnapshot.age_seconds) / 60)}m old` : String(operatorSnapshot.message || '-')" />
+    <MetricTile label="Slowlog" :value="statusText(slowOperations.status)" :note="`${slowOperations.returned_count ?? 0} open`" />
     <MetricTile label="Redis" :value="statusText(redis.status)" :note="String(redis.message || '-')" />
     <MetricTile label="Dhan" :value="statusText(dhan.status)" :note="String(dhan.message || '-')" />
     <MetricTile label="Token" :value="statusText(dhanCache.status)" :note="`expires ${secondsText(dhanCache.seconds_to_expiry)}`" />
@@ -184,7 +189,7 @@ function matchesHealthFilter(row: Dict, filter: string) {
     <div class="space-y-6">
       <div class="glass-panel rounded-3xl p-5">
         <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Runtime Endpoints</p>
-        <h2 class="mt-2 text-2xl font-black">API and broker token</h2>
+        <h2 class="mt-2 text-2xl font-black">API, snapshot, and broker token</h2>
         <div class="mt-4 space-y-3">
           <article class="rounded-2xl bg-white/70 p-4">
             <div class="flex items-start justify-between gap-3">
@@ -199,6 +204,37 @@ function matchesHealthFilter(row: Dict, filter: string) {
               <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Status code:</b> {{ operatorApi.status_code ?? '-' }}</p>
             </div>
             <p class="mt-2 text-sm text-ink/60">{{ operatorApi.message }}</p>
+          </article>
+          <article class="rounded-2xl bg-white/70 p-4">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="font-black text-ink">Operator snapshot</p>
+                <p class="mt-1 break-all text-xs text-ink/50">{{ operatorSnapshot.generated_at || '-' }}</p>
+              </div>
+              <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(operatorSnapshot.status)">{{ statusText(operatorSnapshot.status) }}</span>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-2">
+              <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Age:</b> {{ secondsText(operatorSnapshot.age_seconds) }}</p>
+              <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Bytes:</b> {{ operatorSnapshot.payload_bytes ?? '-' }}</p>
+            </div>
+            <p class="mt-2 text-sm text-ink/60">{{ operatorSnapshot.message }}</p>
+          </article>
+          <article class="rounded-2xl bg-white/70 p-4">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="font-black text-ink">Slow-operation log</p>
+                <p class="mt-1 break-all text-xs text-ink/50">{{ slowOperations.state_file || '-' }}</p>
+              </div>
+              <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(slowOperations.status)">{{ statusText(slowOperations.status) }}</span>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-2">
+              <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Issues:</b> {{ slowOperations.issue_count ?? 0 }}</p>
+              <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Open shown:</b> {{ slowOperations.returned_count ?? 0 }}</p>
+            </div>
+            <details v-if="asList(slowOperations.issues).length" class="mt-3">
+              <summary class="cursor-pointer text-sm font-black text-rust">Show slow issues</summary>
+              <pre class="mt-3 max-h-72 overflow-auto rounded-2xl bg-ink p-4 text-xs leading-5 text-paper">{{ JSON.stringify(slowOperations.issues, null, 2) }}</pre>
+            </details>
           </article>
           <article class="rounded-2xl bg-white/70 p-4">
             <div class="flex items-start justify-between gap-3">
@@ -270,6 +306,27 @@ function matchesHealthFilter(row: Dict, filter: string) {
           <span v-for="row in optionalDeps" :key="String(row.module || row.message)" class="rounded-full px-3 py-2 text-xs font-black" :class="statusClass(row.status)">
             {{ row.module || row.message }}: {{ statusText(row.status) }}
           </span>
+        </div>
+      </div>
+
+      <div class="glass-panel rounded-3xl p-5">
+        <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Sync Failures</p>
+        <h2 class="mt-2 text-2xl font-black">Watcher/router state</h2>
+        <div class="mt-4 space-y-3">
+          <article v-for="row in syncStateFailures" :key="String(row.source_name || row.message)" class="rounded-2xl bg-white/70 p-4">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="break-all text-sm font-black text-ink">{{ row.source_name || 'sync-state' }}</p>
+                <p class="mt-1 text-xs text-ink/50">{{ row.updated_at || '-' }}</p>
+              </div>
+              <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(row.status)">{{ statusText(row.status) }}</span>
+            </div>
+            <p class="mt-2 text-sm text-ink/60">{{ row.error || row.message }}</p>
+            <details v-if="row.state_json" class="mt-3">
+              <summary class="cursor-pointer text-sm font-black text-rust">Show state payload</summary>
+              <pre class="mt-3 max-h-72 overflow-auto rounded-2xl bg-ink p-4 text-xs leading-5 text-paper">{{ row.state_json }}</pre>
+            </details>
+          </article>
         </div>
       </div>
     </div>

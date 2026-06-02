@@ -28,6 +28,10 @@ LOG_DIR={{LOG_DIR}}
 # Static live_dashboard generation is disabled.
 */5 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_frontend.lock ./all_frontend.sh >> "$LOG_DIR/operator_frontend.log" 2>&1
 
+# Operator health snapshot. This writes current failures/fix hints into logs and exercises DB/API/snapshot/cron visibility.
+# Dhan validation is skipped here to avoid triggering broker auth from cron; cached-token freshness is still checked.
+05 08,12,17,22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_operator_health.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.operator_health --skip-dhan >> "$LOG_DIR/operator_health.log" 2>&1
+
 # One final post-close watch pass for end-of-day alerts.
 05 16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 

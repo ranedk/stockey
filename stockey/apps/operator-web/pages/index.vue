@@ -2,17 +2,15 @@
 import type { TraceSummary } from '~/types/api'
 
 const api = useOperatorApi()
-const [{ data: summary }, { data: actions }, { data: portfolio }, { data: marketContext }, { data: technicalCalibration }] = await Promise.all([
-  useAsyncData('summary', () => api.getSummary()),
-  useAsyncData('actions', () => api.getActions()),
-  useAsyncData('portfolio', () => api.getPortfolio()),
+const [{ data: home }, { data: marketContext }, { data: technicalCalibration }] = await Promise.all([
+  useAsyncData('home', () => api.getHome()),
   useAsyncData('market-context', () => api.getMarketContext(20)),
   useAsyncData('technical-calibration-home', () => api.getTechnicalCalibration(3))
 ])
 
-const summaryValues = computed(() => summary.value?.summary || {})
-const topActions = computed(() => actions.value?.top_action_recommendations || [])
-const today = computed(() => portfolio.value?.today_recommendations || [])
+const summaryValues = computed(() => home.value?.summary || {})
+const topActions = computed(() => home.value?.top_action_recommendations || [])
+const today = computed(() => home.value?.today_recommendations || [])
 const marketSummary = computed(() => marketContext.value?.summary || {})
 const marketLeaders = computed(() => marketContext.value?.top_universe || [])
 const calibrationSummary = computed(() => technicalCalibration.value?.summary || [])
@@ -48,7 +46,7 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
     <p class="text-sm font-semibold uppercase tracking-[0.35em] text-paper/55">Read-only operator view</p>
     <h1 class="mt-4 max-w-4xl text-5xl font-black tracking-tight">See actions first. Expand the evidence when something changes.</h1>
     <p class="mt-5 max-w-3xl text-lg leading-8 text-paper/70">
-      Generated {{ summary?.generated_at || '-' }} for {{ summary?.asof_date || 'latest available date' }}.
+      Generated {{ home?.generated_at || '-' }} for {{ home?.asof_date || 'latest available date' }}.
     </p>
   </section>
 

@@ -8,12 +8,12 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_data_prep, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_data_prep, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, watchlist_builder
 from advisory.api import app as operator_api
 from data.announcements import pipeline as announcement_pipeline
 from data.announcements import managed_pipeline as announcement_managed_pipeline
 from data.announcements import state as announcement_state
-from data.announcements.models import ParsedReport
+from data.announcements.models import Announcement, ParsedReport
 from data.eaindustry import wpi
 from data.dhanlive import auth as dhan_auth
 from data.dhanlive import auth_cli as dhan_auth_cli
@@ -1156,6 +1156,7 @@ def test_position_lifecycle_time_stop_exits_loser_after_horizon():
 
 
 def test_execution_engine_builds_planned_orders(monkeypatch):
+    monkeypatch.setattr(execution_engine, "DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK", True)
     portfolio_orders = pd.DataFrame(
         [
             {
@@ -1237,6 +1238,7 @@ def test_execution_engine_blocks_action_rows_without_complete_reason_contract(mo
 
 
 def test_execution_engine_uses_broker_cash_cap_and_exit_holdings(monkeypatch):
+    monkeypatch.setattr(execution_engine, "DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK", True)
     portfolio_orders = pd.DataFrame(
         [
             {
@@ -1674,7 +1676,9 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
 
     monkeypatch.setattr(operator_api, "load_operator_payload", lambda **kwargs: payload)
 
-    assert operator_api.build_health_payload()["read_only"] is True
+    health = operator_api.build_health_payload()
+    assert health["operator_controlled"] is True
+    assert health["read_only"] is False
     assert operator_api.build_summary_payload()["summary"]["action_count"] == 2
     assert len(operator_api.build_actions_payload()["action_recommendations"]) == 2
     assert operator_api.build_portfolio_payload()["today_recommendations"][0]["symbol"] == "ABC"
@@ -1690,6 +1694,9 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
 
     monkeypatch.setattr(operator_health, "check_database", lambda: {"status": "ok", "message": "db ok"})
     monkeypatch.setattr(operator_health, "check_operator_api", lambda: {"status": "ok", "message": "api ok"})
+    monkeypatch.setattr(operator_health, "check_operator_snapshot", lambda: {"status": "ok", "message": "snapshot ok"})
+    monkeypatch.setattr(operator_health, "check_sync_state_failures", lambda: [{"status": "ok", "message": "sync ok"}])
+    monkeypatch.setattr(operator_health, "summarize_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
     monkeypatch.setattr(operator_health, "check_table_freshness", lambda: [{"status": "warn", "message": "stale", "name": "actions"}])
     monkeypatch.setattr(operator_health, "check_redis", lambda: {"status": "ok", "message": "redis ok"})
     monkeypatch.setattr(operator_health, "check_dhan_token", lambda: {"status": "ok", "message": "dhan ok"})
@@ -1704,6 +1711,49 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     assert payload["sections"]["cron_logs"][0]["status"] == "error"
     assert any(hint["title"] == "actions data is stale or missing" for hint in payload["fix_hints"])
     assert any("tail -100" in " ".join(hint["commands"]) for hint in payload["fix_hints"])
+
+
+def test_operator_health_flags_snapshot_and_sync_failures(monkeypatch):
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+
+    def fake_sql(query, params=None, **kwargs):
+        if "advisory_operator_snapshots" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "snapshot_key": "latest",
+                        "generated_at": pd.Timestamp.utcnow() - pd.Timedelta(days=3),
+                        "payload_bytes": 123,
+                        "section_counts_json": "{}",
+                    }
+                ]
+            )
+        if "advisory_sync_state" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "source_name": "continuous_watch:ohlcv",
+                        "scope_key": "default",
+                        "status": "error",
+                        "error_text": "ValueError: sample",
+                        "updated_at": pd.Timestamp.utcnow(),
+                        "last_success_at": pd.Timestamp.utcnow() - pd.Timedelta(hours=1),
+                        "state_json": "{}",
+                    }
+                ]
+            )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_health, "sql_to_df", fake_sql)
+    monkeypatch.setattr(operator_health, "OPERATOR_SNAPSHOT_MAX_AGE_SECONDS", 60)
+
+    snapshot = operator_health.check_operator_snapshot()
+    sync_rows = operator_health.check_sync_state_failures()
+
+    assert snapshot["status"] == "warn"
+    assert "stale" in snapshot["message"].lower()
+    assert sync_rows[0]["status"] == "error"
+    assert sync_rows[0]["source_name"] == "continuous_watch:ohlcv"
 
 
 def test_operator_health_downgrades_recovered_cron_log_error(tmp_path):
@@ -3598,6 +3648,19 @@ def test_live_dashboard_parses_ps_elapsed_formats():
     assert live_dashboard._parse_ps_elapsed_seconds("02:03") == 123
     assert live_dashboard._parse_ps_elapsed_seconds("01:02:03") == 3723
     assert live_dashboard._parse_ps_elapsed_seconds("2-01:02:03") == 176523
+
+
+def test_live_dashboard_safe_loader_records_section_failures():
+    live_dashboard.SECTION_FAILURES.clear()
+
+    def broken_loader():
+        raise ValueError("broken section")
+
+    out = live_dashboard._safe_frame_loader(broken_loader)
+
+    assert out.empty
+    assert live_dashboard.SECTION_FAILURES[-1]["section"] == "broken_loader"
+    assert "ValueError" in live_dashboard.SECTION_FAILURES[-1]["error"]
 
 
 def test_announcement_watch_deduplicates_ingest_by_symbol(monkeypatch):
@@ -7467,6 +7530,117 @@ def test_announcement_upsert_reports_deduplicates_unique_id_and_report_name(monk
     assert selected[("u1", "PromoterReport")] == '{"version": 1}'
 
 
+def test_announcement_document_row_defaults_to_s3_pointer_mode(monkeypatch):
+    monkeypatch.setattr(announcement_state, "POSTGRES_TEXT_MODE", "pointer")
+    monkeypatch.setattr(announcement_state, "POSTGRES_TEXT_EXCERPT_CHARS", 12)
+    announcement = Announcement(
+        company_master_id="cm1",
+        exchange="NSE",
+        ticker="ABC",
+        company_name="ABC Ltd",
+        unique_id="ABC-1",
+        subject="Order win",
+        text="Exchange text",
+        filed_under_category="Updates",
+        exchange_category_id="cat",
+        raw={"id": 1},
+        published_on=datetime(2026, 5, 1),
+        exchange_published_on=datetime(2026, 5, 1),
+        three_page_ocr_text="first page ocr text",
+        full_ocr_text="full ocr text that is longer",
+        audio_transcript_text="audio transcript text",
+        concise_summary_text="Short useful summary.",
+    )
+
+    row = announcement_state.document_row_from_announcement(announcement)
+
+    assert row["three_page_ocr_text"] is None
+    assert row["full_ocr_text"] is None
+    assert row["audio_transcript_text"] is None
+    assert row["ocr_s3_key"].endswith("/ocr_first_3_pages.txt")
+    assert row["full_ocr_s3_key"].endswith("/ocr_full_document.txt")
+    assert row["audio_transcript_s3_key"].endswith("/audio_transcript.txt")
+    assert row["ocr_excerpt"] == "first page o"
+    assert row["full_ocr_chars"] == len("full ocr text that is longer")
+    assert row["concise_summary_text"] == "Short useful summary."
+
+
+def test_announcement_report_rows_store_report_pointer_by_default(monkeypatch):
+    monkeypatch.setattr(announcement_state, "POSTGRES_TEXT_MODE", "pointer")
+    monkeypatch.setattr(announcement_state, "POSTGRES_TEXT_EXCERPT_CHARS", 20)
+    monkeypatch.setattr(
+        announcement_state,
+        "save_report_artifact",
+        lambda announcement, report: f"reports/{announcement.unique_id}/{report.report_name}.json",
+    )
+    announcement = Announcement(
+        company_master_id="cm1",
+        exchange="NSE",
+        ticker="ABC",
+        company_name="ABC Ltd",
+        unique_id="ABC-1",
+        subject="Order win",
+        text="Exchange text",
+        filed_under_category="Updates",
+        exchange_category_id="cat",
+        raw={"id": 1},
+        published_on=datetime(2026, 5, 1),
+        exchange_published_on=datetime(2026, 5, 1),
+        parsed_reports=[
+            ParsedReport(
+                category="ORDER_WIN",
+                report_name="OrderWinReport",
+                model_name="test-model",
+                data={"amount": 100, "customer": "railways"},
+            )
+        ],
+    )
+
+    row = announcement_state.report_rows_from_announcement(announcement)[0]
+
+    assert row["report_json"] is None
+    assert row["report_s3_key"] == "reports/ABC-1/OrderWinReport.json"
+    assert row["report_chars"] > 0
+    assert row["report_excerpt"].startswith("{")
+
+
+def test_performance_slowlog_deduplicates_state(tmp_path):
+    log_file = tmp_path / "slow.jsonl"
+    state_file = tmp_path / "state.json"
+
+    first = performance_slowlog.record_slow_operation(
+        kind="api",
+        operation="GET /api/test",
+        elapsed_ms=100.0,
+        threshold_ms=10.0,
+        details={"route": "/api/test", "query": "a=1"},
+        log_file=log_file,
+        state_file=state_file,
+    )
+    second = performance_slowlog.record_slow_operation(
+        kind="api",
+        operation="GET /api/test",
+        elapsed_ms=150.0,
+        threshold_ms=10.0,
+        details={"route": "/api/test", "query": "a=2"},
+        log_file=log_file,
+        state_file=state_file,
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first["fingerprint"] == second["fingerprint"]
+    assert first["is_new"] is True
+    assert second["is_new"] is False
+
+    summary = performance_slowlog.summarize_slow_operations(state_file=state_file)
+    issue = summary["issues"][0]
+    assert issue["count"] == 2
+    assert issue["max_elapsed_ms"] == 150.0
+    assert issue["last_details"]["query"] == "a=2"
+    assert len(log_file.read_text(encoding="utf-8").splitlines()) == 2
+
+
 def test_rule_engine_refresh_missing_snapshots_can_skip_intraday(monkeypatch):
     called = {"intraday": False}
 
@@ -7808,6 +7982,32 @@ def test_live_notifier_appends_operator_feed(tmp_path):
     assert "alerts count=1" in feed[0]["message"]
     assert (tmp_path / "operator_feed.jsonl").exists()
     assert (tmp_path / "operator_feed.txt").exists()
+
+
+def test_continuous_watch_records_failed_cycle_in_sync_state(monkeypatch):
+    persisted = []
+    published = []
+
+    monkeypatch.setattr(continuous_watch, "ensure_sync_state_table", lambda: None)
+    monkeypatch.setattr(continuous_watch, "ensure_alerts_table", lambda: None)
+    monkeypatch.setattr(continuous_watch, "_is_due", lambda source_name, interval_seconds: source_name == "continuous_watch:ohlcv")
+    monkeypatch.setattr(continuous_watch, "run_ohlcv_cycle", lambda **kwargs: (_ for _ in ()).throw(ValueError("bad ohlcv")))
+    monkeypatch.setattr(continuous_watch, "route_live_updates", lambda: {"status": "ok"})
+    monkeypatch.setattr(continuous_watch, "run_operator_frontend_cycle", lambda: {"status": "ok"})
+    monkeypatch.setattr(continuous_watch, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+    monkeypatch.setattr(continuous_watch, "publish_bus_message", lambda channel, payload: published.append((channel, payload)) or True)
+
+    summary = continuous_watch.run_once(
+        ohlcv_interval_seconds=1,
+        news_interval_seconds=1,
+        announcement_interval_seconds=1,
+        intraday_interval_minutes=1,
+    )
+
+    assert summary["status"] == "error"
+    assert summary["cycles"]["ohlcv"]["status"] == "error"
+    assert any(row["source_name"] == "continuous_watch:ohlcv" and row["status"] == "error" for row in persisted)
+    assert any(channel == "stockey:continuous_watch:ohlcv" and payload["status"] == "error" for channel, payload in published)
 
 
 def test_live_dashboard_loads_operator_feed(tmp_path):

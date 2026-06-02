@@ -1,6 +1,6 @@
 # Investment Advisory Roadmap
 
-Updated: `2026-05-27`
+Updated: `2026-06-02`
 
 This file is the current roadmap for the live advisory stack. It is not a historical design log.
 
@@ -36,7 +36,8 @@ The active stack already has:
 - intraday feature persistence and intraday-aware advisory rules
 - event-model data prep, train, and score scaffolding retained for research only
 - broad research-only training universes from ad hoc Screener queries, disabled from the default operating loop
-- continuous watch, live alerting, event routing, consolidated action recommendations, and a Nuxt operator frontend backed by the read-only Python API
+- continuous watch, live alerting, event routing, consolidated action recommendations, and a Nuxt operator frontend backed by an operator-controlled Python API
+- DB-backed operator snapshots, slow-operation logging, health fix hints, and visible sync-state failure reporting
 
 ## What is working now
 
@@ -64,13 +65,13 @@ The active stack already has:
 
 ## Current bottlenecks
 
-1. Every recommendation must have a complete logical reason chain: why it was screened, why it was selected, what event/playbook/technical/fundamental/macro evidence mattered, and why alternatives were rejected.
-2. Investor playbook action plans are not yet wired into action consolidation as review/risk-overlay candidates.
-3. The system does not yet maintain a broad “top 50% market” context universe for announcements, macro sensitivity, sector leadership, and risk-on/risk-off interpretation.
-4. Macro/regime context needs to be a first-class gate for otherwise positive events.
-5. Event interpretation needs stronger deterministic mapping from known event classes, such as exceptional earnings growth, order wins, promoter actions, and regulatory risks.
-6. Technical entry/exit timing needs clearer integration with event-driven candidate creation.
-7. Continuous watch can be tightened further with cooldowns and duplicate suppression.
+1. Remaining high-risk gaps are now observability and correctness gaps, not missing major architecture blocks.
+2. Some non-home API endpoints still return large raw rows and need pagination/compaction.
+3. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
+4. NSE ingestion still needs a single-lane queue so retries, cookie resets, and rate limits are centrally managed.
+5. Continuous watch should add stronger cooldowns, duplicate suppression, and explicit per-source failure counters.
+6. Approved technical threshold reviews still require manual config edits; reviewed-diff generation would reduce operator mistakes.
+7. Legacy “promotion audit” naming should be migrated to “reliability check” once DB migration is safe.
 
 ## Next development set
 
@@ -135,8 +136,43 @@ This is the recommended current implementation order.
    - done: add Data Health fix hints plus filters for errors, warnings, recovered rows, and OK rows
    - done: recover manual `KeyboardInterrupt` logs when mapped output tables have fresher rows than the interrupted log
    - done: add API self-check latency and Dhan cached-token age/expiry to the operator health payload and Data Health page
+   - done: surface operator snapshot freshness, slow-operation issues, and failed watcher/router sync-state rows in operator health and the Nuxt Health page
+   - done: record dashboard section-loader failures in payloads instead of only printing them
+   - done: make watcher cycle failures persist `advisory_sync_state.status=error` and publish error messages before returning
    - next: add a single smoke-test command for API + DB + frontend dependency checks
+   - next: add a health section for recent fallback usage by module/model/source so fallback spikes are visible without grepping logs
    - keep cron/frontend logs visible from the operator app without adding write/trading controls
+
+## Next Most Important Tasks
+
+1. Compact or paginate non-home operator API endpoints.
+   - `/api/events`, `/api/actions`, `/api/portfolio`, and trace endpoints should return summary rows by default and detail rows on demand.
+   - Add response-size tests and slowlog thresholds per endpoint.
+
+2. Add a single operator smoke command.
+   - Target command: `python -m advisory.operator_smoke`.
+   - It should run API health, DB freshness, snapshot freshness, frontend type/dependency checks, and selected pure-Python regression smoke tests.
+
+3. Add fallback telemetry.
+   - Persist fallback events for LLM disabled/fallback, Codex fallback, Redis fail-soft, live-builder fallback, and Dhan identity fallback.
+   - Surface fallback counts on the Health page and in fix hints when they spike.
+
+4. Build trace summary materialization.
+   - Precompute symbol/event trace summaries after advisory/watchers.
+   - Keep raw trace tables for audit, but serve summary tables to frontend by default.
+
+5. Implement hot/cold retention for intraday and trace rows.
+   - Keep recent rows in hot Postgres tables.
+   - Archive old rows to S3-compatible storage or compact tables.
+   - Add retention reports before delete/archive.
+
+6. Build the NSE ingestion queue.
+   - One worker should drain queued NSE work with conservative rate limits.
+   - Persist attempt count, next retry, last error, and cookie/session reset events.
+
+7. Generate reviewed config diffs for technical threshold approvals.
+   - Use approved `advisory_technical_threshold_promotion_decisions` rows to generate a copyable patch against `config/advisory_setups.yaml`.
+   - Do not auto-apply config changes until operator review remains clean over multiple runs.
 
 ### 0A. Build a proper Nuxt operator app
 
@@ -223,7 +259,7 @@ Core pages:
 Backend/API target:
 
 - add a small Python API service, likely FastAPI, under `advisory/api` or `server/api`
-- initial endpoints can be read-only:
+- initial endpoints should be mostly read-only, with explicit operator/audit write controls:
   - `/api/summary`
   - `/api/actions`
   - `/api/portfolio`
@@ -242,12 +278,12 @@ Implementation slices:
 
 1. Done: add `docs/operator_app_prd.md` with UX, data contracts, and safety boundaries.
 2. Done: scaffold `apps/operator-web` with Nuxt 3, Vue 3, TypeScript, Tailwind, Pinia, and starter pages.
-3. Done: add read-only FastAPI service with `/api/health`, `/api/summary`, `/api/actions`, `/api/portfolio`, `/api/watchlist`, `/api/events`, and `/api/data-health`.
+3. Done: add FastAPI operator service with read endpoints plus controlled operator/audit write endpoints.
 4. Done: reuse the existing `advisory.live_dashboard` payload builder behind an API-compatible JSON contract so the Nuxt app can reuse current data quickly.
 5. Started: build the Overview page first with better hierarchy and filtering; it now shows the action queue and symbol trace loading, but trace rendering is still raw JSON.
 6. Started: build Event Inbox and Decision Trace as readable stage/timeline pages; these are the main debugging gaps.
 7. Started: richer Data Health now has fix hints, cron latest-run parsing, recovered/manual-interrupt handling, and status filters. Add frontend views for TS Watch and research ledger next.
-8. Add SSE/WebSocket updates from Redis pub-sub once the read-only app is stable.
+8. Add SSE/WebSocket updates from Redis pub-sub once the operator app is stable.
 9. Done: remove static `live_dashboard/` generation from cron/watch paths; serve operator state through API + Nuxt.
 10. Next: add a single operator smoke-test command that validates API, DB reads, Node/npm, and Nuxt dependency health.
 

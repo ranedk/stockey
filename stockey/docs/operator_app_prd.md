@@ -28,9 +28,9 @@ The app should answer:
 
 ## Safety
 
-V1 is read-only.
+The app is operator-controlled, not auto-trading controlled.
 
-Do not add live trading buttons in V1. Broker execution should remain in the Python execution engine and CLI/operator workflow. The app may display staged execution orders and Dhan readiness, but it must not submit orders.
+Broker execution remains in the Python execution engine and CLI/operator workflow. The app may display staged execution orders and Dhan readiness, but it must not submit orders. Current write paths are limited to operator/audit workflows such as hypothesis creation, hypothesis scans, and technical-calibration review decisions.
 
 ## Pages
 
@@ -133,17 +133,15 @@ V1 has a controlled write path for playbooks:
 - show sector excess-return evidence using `master_sharpely_equity.sector_code`
 - bridge trusted playbook action plans into action consolidation as `review_only` risk-overlay/manual-review candidates
 
-### Research Ledger
+### Research And Calibration
 
-Shows:
+Shows research and calibration evidence without changing live strategy thresholds automatically:
 
-- research runs
-- objective
-- config
-- as-of range
-- validation protocol
-- status
-- result metrics
+- event-policy realized-return evidence
+- technical threshold calibration summaries
+- LLM-assisted threshold promotion reviews
+- operator approval/rejection audit rows
+- optional research run records where present
 
 ### Data Health
 
@@ -159,7 +157,7 @@ Shows:
 
 ## Backend
 
-Start with a read-only FastAPI service.
+Use the FastAPI operator service:
 
 Initial implementation:
 
@@ -167,25 +165,35 @@ Initial implementation:
 python -m advisory.api.app --host 127.0.0.1 --port 8765
 ```
 
-The first API version reuses the existing `advisory.live_dashboard` payload builder so the Nuxt app can become useful before the trace tables are complete.
+The API serves from `advisory_operator_snapshots` first and falls back to the live payload builder when no fresh snapshot is available. The Nuxt landing page uses compact `/api/home` payloads to avoid repeatedly loading full dashboard sections.
 
-Suggested endpoints:
+Current endpoints:
 
 - `GET /api/health`
+- `GET /api/health/details`
+- `GET /api/home`
 - `GET /api/summary`
 - `GET /api/actions`
 - `GET /api/portfolio`
 - `GET /api/watchlist`
 - `GET /api/market-context`
+- `GET /api/technical-calibration`
+- `POST /api/technical-calibration/promotion-review`
+- `GET /api/technical-calibration/promotion-reviews`
+- `POST /api/technical-calibration/promotion-review/decision`
 - `GET /api/events`
+- `GET /api/event-policy`
+- `GET /api/event-policy/evaluation`
 - `GET /api/events/{unique_id}/trace`
 - `GET /api/events/{unique_id}/trace/summary`
 - `GET /api/symbols/{symbol}/trace`
 - `GET /api/symbols/{symbol}/trace/summary`
 - `GET /api/hypotheses`
-- `GET /api/hypotheses/{hypothesis_id}/matches`
-- `GET /api/hypotheses/{hypothesis_id}/evaluations`
-- `GET /api/research-runs`
+- `POST /api/hypotheses`
+- `POST /api/hypotheses/preview`
+- `POST /api/hypotheses/{hypothesis_id}`
+- `POST /api/hypotheses/{hypothesis_id}/promotion-audit`
+- `POST /api/hypotheses/run`
 - `GET /api/data-health`
 
 Later:
@@ -219,9 +227,9 @@ It should consume:
 
 ## Build Order
 
-1. Done: add read-only API using the existing static dashboard payload.
+1. Done: add operator API using DB snapshots first and the live payload builder as fallback.
 2. Done: scaffold Nuxt app.
-3. Started: build Overview page with action queue, today's recommendations, and symbol trace loading.
+3. Done: build Overview page with action queue, today's recommendations, TS watch, health summary, and symbol trace loading.
 4. Done: build Event Inbox with event trace loading and event-policy action review.
 5. Done: add normalized event and symbol trace summary APIs so the UI does not need raw DB JSON.
 6. Done: backend tracing now covers announcement ingest, event evaluation, adversarial review, lifecycle, rebalance, and action consolidation.

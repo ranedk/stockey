@@ -22,6 +22,7 @@ from utils.sync import parse_datetime_arg
 
 
 ALERTS_TABLE = "advisory_live_watch_alerts"
+SECTION_FAILURES: list[dict[str, Any]] = []
 TS_FORECAST_TABLE = "advisory_ts_forecasts_daily"
 TS_WATCHLIST_TABLE = "advisory_ts_forecast_watchlist"
 TS_EVAL_SUMMARY_TABLE = "advisory_ts_forecast_eval_summary"
@@ -670,7 +671,10 @@ def _safe_frame_loader(loader, *args, **kwargs) -> pd.DataFrame:
     try:
         return loader(*args, **kwargs)
     except Exception as exc:
-        print(f"[advisory.live_dashboard] section loader failed {loader.__name__}: {exc}", flush=True)
+        name = getattr(loader, "__name__", str(loader))
+        error = f"{type(exc).__name__}: {exc}"
+        SECTION_FAILURES.append({"section": name, "status": "error", "error": error})
+        print(f"[advisory.live_dashboard] section loader failed {name}: {error}", flush=True)
         return pd.DataFrame()
 
 
@@ -678,7 +682,10 @@ def _safe_list_loader(loader, *args, **kwargs) -> list[dict[str, Any]]:
     try:
         return loader(*args, **kwargs)
     except Exception as exc:
-        print(f"[advisory.live_dashboard] section loader failed {loader.__name__}: {exc}", flush=True)
+        name = getattr(loader, "__name__", str(loader))
+        error = f"{type(exc).__name__}: {exc}"
+        SECTION_FAILURES.append({"section": name, "status": "error", "error": error})
+        print(f"[advisory.live_dashboard] section loader failed {name}: {error}", flush=True)
         return []
 
 
@@ -2486,6 +2493,7 @@ def build_summary_snapshot(
 
 
 def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, output_dir: str | Path = DEFAULT_OUTPUT_DIR) -> dict[str, Any]:
+    SECTION_FAILURES.clear()
     dashboard_df = _safe_frame_loader(build_dashboard, asof_date=asof_date)
     portfolio_df = _safe_frame_loader(load_portfolio_rows, asof_date=asof_date)
     watchlist_df = _safe_frame_loader(load_watchlist_rows, asof_date=asof_date)
@@ -2555,6 +2563,7 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
         "sync_state": _json_ready(sync_state_df),
         "runtime_processes": _json_ready(runtime_processes),
         "cron_status": _json_ready(cron_status),
+        "section_failures": _json_ready(SECTION_FAILURES),
     }
 
 

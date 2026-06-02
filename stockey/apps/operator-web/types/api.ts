@@ -9,6 +9,17 @@ export interface OperatorSummary {
   sync_state: Dict[]
 }
 
+export interface OperatorHome {
+  generated_at?: string
+  asof_date?: string
+  summary: Dict
+  runtime_processes: Dict[]
+  cron_status: Dict[]
+  sync_state: Dict[]
+  top_action_recommendations: Dict[]
+  today_recommendations: Dict[]
+}
+
 export interface OperatorHealthDetails {
   generated_at?: string
   status: string

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from typing import Any
 
 import pandas as pd
+from environs import Env
 
 from advisory.decision_trace import load_event_trace, load_symbol_trace
 from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audit, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
@@ -13,10 +15,24 @@ from advisory.event_policy_evaluator import SUMMARY_TABLE as EVENT_POLICY_EVAL_S
 from advisory.live_dashboard import DEFAULT_OUTPUT_DIR, build_live_dashboard_payload
 from advisory.market_context import load_latest_market_context
 from advisory.operator_health import build_operator_health
+from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
+from advisory.operator_snapshot import load_operator_snapshot
+from advisory.performance_slowlog import record_slow_operation
 from advisory.technical_threshold_calibration import EVALUATIONS_TABLE as TECHNICAL_CALIBRATION_EVALUATIONS_TABLE
 from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_CALIBRATION_SUMMARY_TABLE
 from advisory.technical_threshold_promotion import generate_promotion_review, load_promotion_reviews, record_manual_decision
 from utils.db import sql_to_df
+
+
+env = Env()
+env.read_env()
+
+OPERATOR_API_USE_SNAPSHOT = env.bool("OPERATOR_API_USE_SNAPSHOT", True)
+OPERATOR_API_SLOW_REQUEST_MS = env.float("OPERATOR_API_SLOW_REQUEST_MS", 750.0)
+OPERATOR_API_PAYLOAD_CACHE_SECONDS = env.float("OPERATOR_API_PAYLOAD_CACHE_SECONDS", 15.0)
+OPERATOR_API_LARGE_RESPONSE_BYTES = env.int("OPERATOR_API_LARGE_RESPONSE_BYTES", 250_000)
+
+_PAYLOAD_CACHE: dict[tuple[str, str | None], tuple[float, dict[str, Any]]] = {}
 
 
 def _parse_asof_date(value: str | None) -> pd.Timestamp | None:
@@ -39,14 +55,32 @@ def _parse_timestamp(value: str | None) -> pd.Timestamp | None:
 
 def load_operator_payload(*, asof_date: str | pd.Timestamp | None = None) -> dict[str, Any]:
     parsed_asof = _parse_asof_date(asof_date) if isinstance(asof_date, str) else asof_date
-    return build_live_dashboard_payload(asof_date=parsed_asof, output_dir=DEFAULT_OUTPUT_DIR)
+    cache_key = ("operator_payload", None if parsed_asof is None else pd.to_datetime(parsed_asof, utc=True).normalize().strftime("%Y-%m-%d"))
+    now = time.monotonic()
+    cached = _PAYLOAD_CACHE.get(cache_key)
+    if cached and OPERATOR_API_PAYLOAD_CACHE_SECONDS > 0 and (now - cached[0]) <= OPERATOR_API_PAYLOAD_CACHE_SECONDS:
+        return cached[1]
+    if OPERATOR_API_USE_SNAPSHOT:
+        snapshot = load_operator_snapshot(
+            asof_date=parsed_asof,
+            max_age_seconds=OPERATOR_SNAPSHOT_MAX_AGE_SECONDS,
+        )
+        if snapshot is not None:
+            _PAYLOAD_CACHE[cache_key] = (now, snapshot)
+            return snapshot
+    payload = build_live_dashboard_payload(asof_date=parsed_asof, output_dir=DEFAULT_OUTPUT_DIR)
+    payload["_snapshot"] = {"source": "live_builder", "reason": "missing_or_stale_snapshot"}
+    _PAYLOAD_CACHE[cache_key] = (now, payload)
+    return payload
 
 
 def build_health_payload() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "stockey-operator-api",
-        "read_only": True,
+        "operator_controlled": True,
+        "read_only": False,
+        "write_scope": "operator_audit_and_research_controls",
     }
 
 
@@ -59,6 +93,133 @@ def build_summary_payload(*, asof_date: str | None = None) -> dict[str, Any]:
         "runtime_processes": payload.get("runtime_processes") or [],
         "cron_status": payload.get("cron_status") or [],
         "sync_state": payload.get("sync_state") or [],
+    }
+
+
+HOME_CARD_FIELDS = [
+    "symbol",
+    "kind",
+    "status",
+    "action_summary",
+    "reason",
+    "reason_detail",
+    "recommendation_reason",
+    "reason_contract_status",
+    "setup_id",
+    "setup_name",
+    "setup_family",
+    "entry_date",
+    "entry_price",
+    "current_price",
+    "pnl_pct",
+    "invest_score_pct",
+    "allocation_inr",
+    "execution_intent",
+    "exit_strategy",
+    "technical_context",
+    "announcement_summary",
+    "news_summary",
+    "manual_revision_summary",
+    "manual_revision_pointers",
+    "sort_ts",
+]
+
+
+def _trim_home_value(value: Any, *, max_text: int = 700, max_list: int = 4, max_depth: int = 3) -> Any:
+    if max_depth <= 0:
+        if isinstance(value, (dict, list)):
+            return None
+        return _text(value) if not isinstance(value, (int, float, bool)) else value
+    if isinstance(value, str):
+        text = value.strip()
+        return text if len(text) <= max_text else f"{text[:max_text].rstrip()}..."
+    if isinstance(value, list):
+        return [_trim_home_value(item, max_text=max_text, max_list=max_list, max_depth=max_depth - 1) for item in value[:max_list]]
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            trimmed = _trim_home_value(item, max_text=max_text, max_list=max_list, max_depth=max_depth - 1)
+            if trimmed is not None:
+                out[str(key)] = trimmed
+        return out
+    return value
+
+
+def _compact_reason_contract(value: Any) -> dict[str, Any] | str | None:
+    parsed = _jsonish(value)
+    if not isinstance(parsed, dict):
+        return _trim_home_value(value, max_text=500, max_depth=1)
+    out: dict[str, Any] = {}
+    for key in [
+        "status",
+        "action_code",
+        "final_action",
+        "new_action",
+        "action_source",
+        "execution_action",
+        "setup_id",
+        "primary_reason",
+        "reason",
+        "reason_detail",
+        "missing_fields",
+    ]:
+        if parsed.get(key) is not None:
+            out[key] = _trim_home_value(parsed.get(key), max_text=320, max_list=4, max_depth=2)
+    evidence = parsed.get("evidence")
+    if isinstance(evidence, dict):
+        compact_evidence: dict[str, Any] = {}
+        for section_key, section_value in evidence.items():
+            if not isinstance(section_value, dict):
+                continue
+            compact_section: dict[str, Any] = {}
+            for item_key, item_value in list(section_value.items())[:5]:
+                trimmed = _trim_home_value(item_value, max_text=160, max_list=3, max_depth=1)
+                if trimmed is not None:
+                    compact_section[str(item_key)] = trimmed
+            if compact_section:
+                compact_evidence[str(section_key)] = compact_section
+        if compact_evidence:
+            out["evidence"] = compact_evidence
+    return out or None
+
+
+def _compact_home_field(key: str, value: Any) -> Any:
+    if key == "recommendation_reason":
+        return _compact_reason_contract(value)
+    if key == "manual_revision_pointers":
+        return _trim_home_value(value, max_text=220, max_list=3, max_depth=2)
+    if key in {"announcement_summary", "news_summary", "reason_detail", "exit_strategy", "manual_revision_summary"}:
+        return _trim_home_value(value, max_text=360, max_list=3, max_depth=2)
+    return _trim_home_value(value, max_text=500, max_list=4, max_depth=3)
+
+
+def _compact_home_rows(rows: Any, *, limit: int) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not isinstance(rows, list):
+        return out
+    for row in rows[: max(0, int(limit))]:
+        if not isinstance(row, dict):
+            continue
+        compact = {
+            key: _compact_home_field(key, row.get(key))
+            for key in HOME_CARD_FIELDS
+            if row.get(key) is not None
+        }
+        out.append({key: value for key, value in compact.items() if value not in (None, "", [], {})})
+    return out
+
+
+def build_home_payload(*, asof_date: str | None = None) -> dict[str, Any]:
+    payload = load_operator_payload(asof_date=asof_date)
+    return {
+        "generated_at": payload.get("generated_at"),
+        "asof_date": payload.get("asof_date"),
+        "summary": payload.get("summary") or {},
+        "runtime_processes": payload.get("runtime_processes") or [],
+        "cron_status": payload.get("cron_status") or [],
+        "sync_state": payload.get("sync_state") or [],
+        "top_action_recommendations": _compact_home_rows(payload.get("top_action_recommendations"), limit=25),
+        "today_recommendations": _compact_home_rows(payload.get("today_recommendations"), limit=25),
     }
 
 
@@ -884,6 +1045,57 @@ def create_app():
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def slow_request_logger(request, call_next):
+        started = time.perf_counter()
+        status_code = 500
+        response = None
+        try:
+            response = await call_next(request)
+            status_code = int(response.status_code)
+            return response
+        finally:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            response_bytes = None
+            if response is not None:
+                content_length = response.headers.get("content-length")
+                if content_length:
+                    try:
+                        response_bytes = int(content_length)
+                    except ValueError:
+                        response_bytes = None
+            try:
+                record_slow_operation(
+                    kind="operator_api_request",
+                    operation=f"{request.method} {request.url.path}",
+                    elapsed_ms=elapsed_ms,
+                    threshold_ms=OPERATOR_API_SLOW_REQUEST_MS,
+                    details={
+                        "method": request.method,
+                        "route": request.url.path,
+                        "query": str(request.url.query or ""),
+                        "status_code": status_code,
+                        "response_bytes": response_bytes,
+                    },
+                )
+                if response_bytes is not None:
+                    record_slow_operation(
+                        kind="operator_api_large_response",
+                        operation=f"{request.method} {request.url.path}",
+                        elapsed_ms=float(response_bytes),
+                        threshold_ms=float(OPERATOR_API_LARGE_RESPONSE_BYTES),
+                        details={
+                            "method": request.method,
+                            "route": request.url.path,
+                            "query": str(request.url.query or ""),
+                            "status_code": status_code,
+                            "response_bytes": response_bytes,
+                        },
+                    )
+            except Exception:
+                # Slow logging must never turn a successful operator API response into a failure.
+                pass
+
     def _guard(callable_obj, **kwargs):
         try:
             return callable_obj(**kwargs)
@@ -903,6 +1115,10 @@ def create_app():
     @app.get("/api/summary")
     def summary(asof_date: str | None = None):
         return _guard(build_summary_payload, asof_date=asof_date)
+
+    @app.get("/api/home")
+    def home(asof_date: str | None = None):
+        return _guard(build_home_payload, asof_date=asof_date)
 
     @app.get("/api/actions")
     def actions(asof_date: str | None = None):

@@ -386,6 +386,37 @@ def _upsert_to_db_once(
         temporary=True,
     )
 
+    def has_matching_unique_index(cur) -> bool:
+        schema_name, base_table_name = (
+            table_name.split(".", 1) if "." in table_name else ("public", table_name)
+        )
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_index i
+                JOIN pg_class t ON t.oid = i.indrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = %s
+                  AND t.relname = %s
+                  AND i.indisunique
+                  AND i.indisvalid
+                  AND i.indisready
+                  AND i.indimmediate
+                  AND i.indpred IS NULL
+                  AND (
+                      SELECT array_agg(a.attname::text ORDER BY key_cols.ord)
+                      FROM unnest(i.indkey) WITH ORDINALITY AS key_cols(attnum, ord)
+                      JOIN pg_attribute a
+                        ON a.attrelid = t.oid
+                       AND a.attnum = key_cols.attnum
+                  ) = %s::text[]
+            )
+            """,
+            (schema_name, base_table_name, list(unique_keys)),
+        )
+        return bool(cur.fetchone()[0])
+
     # --- execute ------------------------------------------------------------
     with db_session() as (conn, cur):
         try:
@@ -430,15 +461,16 @@ def _upsert_to_db_once(
             # 3.a. Ensure unique index (optional if you already have a PK/unique)
             if unique_keys:
                 idx_name = f"idx_{table_name.replace('.', '_')}_{'_'.join(unique_keys)}"
-                cur.execute(
-                    sql.SQL(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})"
-                    ).format(
-                        sql.Identifier(idx_name),
-                        full_table,
-                        sql.SQL(", ").join(conflict_identifiers),
+                if not has_matching_unique_index(cur):
+                    cur.execute(
+                        sql.SQL(
+                            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})"
+                        ).format(
+                            sql.Identifier(idx_name),
+                            full_table,
+                            sql.SQL(", ").join(conflict_identifiers),
+                        )
                     )
-                )
 
             # 3.b. Promote to TimescaleDB hypertable (optional)
             if timescaledb_column:

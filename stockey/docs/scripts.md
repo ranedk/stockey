@@ -55,7 +55,9 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/event_router.py` | `advisory_live_router_actions`, `advisory_sync_state` | Symbol-level router that turns fresh live alerts and events into targeted advisory reevaluation |
 | `advisory/decision_trace.py` | `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts` | Durable trace layer that links ingest, event evaluation, review, lifecycle, action consolidation, and conflicts |
 | `advisory/live_dashboard.py` | JSON payload builder | Legacy static dashboard module; API still reuses its payload builder while Nuxt replaces static generation |
-| `advisory/api/app.py` | read-only HTTP API | Serves operator-facing JSON endpoints and normalized trace summaries for the Nuxt app |
+| `advisory/operator_snapshot.py` | `advisory_operator_snapshots` | Builds the compact DB-backed operator dashboard snapshot used by the API to avoid rebuilding the full dashboard payload on every frontend request |
+| `advisory/performance_slowlog.py` | files under `logs/performance/` | Deduped slow-operation logger and state manager for API latency, snapshot builds, and future slow pipeline sections |
+| `advisory/api/app.py` | operator HTTP API | Serves operator-facing JSON endpoints, normalized trace summaries, hypothesis write/audit endpoints, and technical-calibration review endpoints for the Nuxt app |
 | `advisory/live_notifier.py` | files in `live_dashboard/` | Subscribes to Redis pub-sub from the continuous-watch stack and writes a human-readable operator feed |
 | `advisory/adversarial_review.py` | `advisory_event_reviews` | Deterministic reviewer over structured event tensors; can clear, penalize, force manual review, or veto event-driven allocations |
 | `utils/ocr` | none | Provider-agnostic PDF OCR utility using Gemini 3 Flash preview and OpenAI GPT-5 nano |
@@ -76,6 +78,13 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/backfill_company_master_ids.py` | many existing symbol-based tables | Adds and backfills `company_master_id` on historical rows |
 | `scripts/cleanup_deprecated_tables.py` | none | Drops deprecated tables that are no longer used by the active advisory stack |
 | `scripts/ingestion_state_runner.py` | `ingestion_file_state` | Inspect failed/processed ingestion file state and clear specific failed keys before retry |
+| `scripts/db_size_report.py` | read-only Postgres stats | Reports largest tables, largest indexes, and text/json columns so performance work can be measured before and after changes |
+| `scripts/db_table_retention_report.py` | read-only Postgres stats | Fast retention report for legacy NSE tables using indexed date bounds by default; exact counts are opt-in |
+| `scripts/db_duplicate_index_report.py` | read-only Postgres stats | Finds exact duplicate indexes and emits reviewable `DROP INDEX CONCURRENTLY` candidates; does not drop anything |
+| `scripts/drop_duplicate_indexes.py` | duplicate Postgres indexes | Guarded duplicate-index cleanup utility; dry-run by default and requires `--execute` to drop non-constraint duplicate indexes |
+| `scripts/offload_announcement_text_to_s3.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Migrates heavy announcement OCR/transcript/report text to object storage while keeping S3 keys, hashes, counts, and excerpts in Postgres |
+| `scripts/api_latency_probe.py` | operator API | Probes operator API endpoint latency and records slow endpoints through the deduped slow-operation log |
+| `scripts/archive_legacy_nse_tables.py` | legacy NSE tables | Dry-run, S3 archive, and optional delete utility for old legacy NSE rows, chunked by month |
 
 ## Management scripts
 
@@ -95,6 +104,42 @@ python scripts/ingestion_state_runner.py list --status failed --limit 50
 python scripts/ingestion_state_runner.py list --source bhavcopy --status failed
 python scripts/ingestion_state_runner.py clear --source bhavcopy --key bhavcopy/bhavcopy_2015-01-16.zip
 ```
+
+Performance inspection and text offload:
+
+```sh
+python scripts/db_size_report.py --limit 30
+python scripts/db_table_retention_report.py --retention-days 365
+python scripts/db_duplicate_index_report.py --limit 20
+python scripts/drop_duplicate_indexes.py --limit 20 --min-mb 1
+python scripts/api_latency_probe.py
+python -m advisory.performance_slowlog report --limit 20
+python scripts/offload_announcement_text_to_s3.py --dry-run --limit 100
+python scripts/offload_announcement_text_to_s3.py --limit 500
+```
+
+Only run the duplicate-index cleanup with `--execute` after reviewing the dry-run output:
+
+```sh
+python scripts/drop_duplicate_indexes.py --limit 20 --min-mb 1 --execute
+```
+
+Slow-operation tracking writes:
+
+- `logs/performance/slow_operations.jsonl`: append-only event log, one row per slow occurrence.
+- `logs/performance/slow_operation_state.json`: deduped issue state keyed by fingerprint with first seen, last seen, count, max latency, and status.
+
+Use `python -m advisory.performance_slowlog mark <fingerprint> triaged --note "..."` after adding a TODO or fix plan, so recurring slow events are counted but not treated as new work.
+
+Legacy NSE retention workflow:
+
+```sh
+python scripts/db_table_retention_report.py --table nseindia_var1 --retention-days 365
+python scripts/archive_legacy_nse_tables.py --table nseindia_var1 --retention-days 365 --max-chunks 3
+python scripts/archive_legacy_nse_tables.py --table nseindia_var1 --retention-days 365 --archive-s3 --max-chunks 1 --execute
+```
+
+Only add `--delete` after validating the S3 archive. Deleting old rows does not immediately shrink the underlying Postgres files; schedule `VACUUM FULL` or `pg_repack` later if the goal is to return disk to the OS.
 
 ## General usage guidelines
 
@@ -135,6 +180,7 @@ OSX:
 - Consolidated action decisions can also get Codex-generated manual revision pointers. Set `ACTION_MANUAL_REVISION_POINTERS_ENABLED=true` and `ACTION_MANUAL_REVISION_POINTERS_MODEL=codex` or `codex:<model>`. The output is persisted on `advisory_action_recommendations` as `manual_revision_summary` and `manual_revision_pointers_json`; if Codex fails, deterministic fallback pointers are written instead.
 
 - Final action rows also persist `recommendation_reason_json` and `reason_contract_status`. If a broker-action row is missing required reason, evidence, execution, or risk fields, action consolidation downgrades it to `MANUAL_REVIEW` before it can reach execution. The execution planner also blocks stale broker-action rows whose reason contract is missing or incomplete.
+- Execution planning is action-contract first. If `advisory_action_recommendations` is empty, the planner returns no broker orders by default instead of falling back to raw portfolio/rebalance rows. Set `EXECUTION_ALLOW_LEGACY_PORTFOLIO_FALLBACK=true` only for legacy debugging.
 
 - Action consolidation enriches reason contracts from latest `advisory_candidates` and `advisory_market_regime` snapshots before validation. This adds screener provenance, technical state/scores, setup score, candidate state, and macro/regime context without rerunning the full advisory pipeline.
 
@@ -188,6 +234,8 @@ It schedules:
 - `all_watchers.sh` every `10` minutes during market hours
 - `all_advisory.sh` once daily after 7pm on weekdays
 - `all_frontend.sh` every `5` minutes under a lock so API/Nuxt are restarted if they exit
+- `all_advisory.sh` and `all_watchers.sh` refresh `advisory.operator_snapshot` after a successful run so frontend endpoints can serve cached dashboard sections quickly
+- `advisory.operator_health --skip-dhan` at `08:05`, `12:05`, `17:05`, and `22:05` on weekdays
 - `advisory.hypothesis_engine --run-scan` at `10:25`, `13:25`, `16:25`, and `21:25` on weekdays for investor playbook/hypothesis matching over newly collected events
 - `advisory.ts_forecast_workflow` at `11:20`, `14:20`, `17:20`, and `20:20` on weekdays
 - `advisory.ts_forecast_evaluator` at `18:20` and `21:20` on weekdays

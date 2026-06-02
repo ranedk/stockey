@@ -505,23 +505,45 @@ def run_once(
     ensure_sync_state_table()
     ensure_alerts_table()
     summary: dict[str, Any] = {"status": "ok", "cycles": {}}
+    def _run_cycle(source_name: str, cycle_name: str, func, **kwargs) -> dict[str, Any]:
+        try:
+            return func(**kwargs)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            _emit(f"[advisory.continuous_watch] {cycle_name} failed error={error}")
+            persist_sync_state(
+                source_name=source_name,
+                status="error",
+                error_text=error,
+                state={"cycle": cycle_name, "error": error},
+            )
+            publish_bus_message(
+                f"stockey:continuous_watch:{cycle_name}",
+                {"published_at": pd.Timestamp.utcnow(), "status": "error", "error": error},
+            )
+            summary["status"] = "error"
+            return {"status": "error", "error": error}
+
     if _is_due("continuous_watch:ohlcv", ohlcv_interval_seconds):
-        summary["cycles"]["ohlcv"] = run_ohlcv_cycle(
+        summary["cycles"]["ohlcv"] = _run_cycle(
+            "continuous_watch:ohlcv",
+            "ohlcv",
+            run_ohlcv_cycle,
             interval_seconds=ohlcv_interval_seconds,
             intraday_interval_minutes=intraday_interval_minutes,
         )
     else:
         summary["cycles"]["ohlcv"] = {"status": "skipped", "reason": "not_due"}
     if _is_due("continuous_watch:announcements", announcement_interval_seconds):
-        summary["cycles"]["announcements"] = run_announcement_cycle(interval_seconds=announcement_interval_seconds)
+        summary["cycles"]["announcements"] = _run_cycle("continuous_watch:announcements", "announcements", run_announcement_cycle, interval_seconds=announcement_interval_seconds)
     else:
         summary["cycles"]["announcements"] = {"status": "skipped", "reason": "not_due"}
     if _is_due("continuous_watch:news", news_interval_seconds):
-        summary["cycles"]["news"] = run_news_cycle(interval_seconds=news_interval_seconds)
+        summary["cycles"]["news"] = _run_cycle("continuous_watch:news", "news", run_news_cycle, interval_seconds=news_interval_seconds)
     else:
         summary["cycles"]["news"] = {"status": "skipped", "reason": "not_due"}
-    summary["cycles"]["router"] = route_live_updates()
-    summary["cycles"]["operator_frontend"] = run_operator_frontend_cycle()
+    summary["cycles"]["router"] = _run_cycle("continuous_watch:router", "router", route_live_updates)
+    summary["cycles"]["operator_frontend"] = _run_cycle("continuous_watch:operator_frontend", "operator_frontend", run_operator_frontend_cycle)
     publish_bus_message("stockey:continuous_watch:summary", {"published_at": pd.Timestamp.utcnow(), **summary})
     return summary
 
@@ -550,7 +572,7 @@ def main() -> int:
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
         if not args.loop:
-            return 0
+            return 1 if summary.get("status") == "error" else 0
         elapsed = time.monotonic() - started_at
         remaining = max(0, int(args.sleep_seconds) - elapsed)
         _emit(f"[advisory.continuous_watch] sleeping seconds={remaining}")

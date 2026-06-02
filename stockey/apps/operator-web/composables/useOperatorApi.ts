@@ -1,4 +1,4 @@
-import type { EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, OperatorActions, OperatorEvents, OperatorHealthDetails, OperatorMarketContext, OperatorPortfolio, OperatorSummary, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary } from '~/types/api'
+import type { EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, OperatorActions, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorSummary, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary } from '~/types/api'
 
 export function useOperatorApi() {
   const config = useRuntimeConfig()
@@ -12,6 +12,7 @@ export function useOperatorApi() {
   }
 
   return {
+    getHome: () => get<OperatorHome>('/api/home'),
     getSummary: () => get<OperatorSummary>('/api/summary'),
     getHealthDetails: () => get<OperatorHealthDetails>('/api/health/details'),
     getActions: () => get<OperatorActions>('/api/actions'),

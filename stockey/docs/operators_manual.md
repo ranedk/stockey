@@ -111,6 +111,7 @@ Current schedule:
 - `07:10` weekdays: `./complete_data.sh`
 - every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_watchers.sh`
 - `16:05` weekdays: one final post-close `./all_watchers.sh`
+- `08:05`, `12:05`, `17:05`, `22:05` weekdays: `python -m advisory.operator_health --skip-dhan`
 - `10:25`, `13:25`, `16:25`, `21:25` weekdays: investor hypothesis/playbook scan over newly collected events
 - `11:20`, `14:20`, `17:20`, `20:20` weekdays: experimental TS forecast workflow using `config/ts_forecast_screeners.yaml`
 - `18:20`, `21:20` weekdays: matured TS forecast evaluation after costs
@@ -124,6 +125,7 @@ Why the split looks like this:
 - slow daily and model-prep jobs are isolated from the intra-day watch loop
 - CPI, FPI, WPI, macro, masters, and similar sources get covered by the daily raw refresh
 - live OHLCV, news, and announcements are handled by the `10` minute watch cadence
+- operator health runs a few times per day so stale data, cron errors, dependency failures, and fix hints stay visible without waiting for a manual check
 - investor hypothesis scans run after watcher passes so newly collected news/announcements can become playbook matches and operator review notes
 - event-model training is disabled by default because the live path is now playbooks, deterministic policies, technical timing, macro/regime gating, and risk controls
 - TS forecast rows remain research-only and are refreshed a few times per day; daily OHLCV means they should not run on every watcher tick
@@ -409,6 +411,33 @@ Run the operator API and Nuxt app together with:
 
 This starts `advisory.api.app` on `127.0.0.1:8765` and Nuxt on `127.0.0.1:3000` by default. It loads `nvm use default` before running Node/npm, logs the resolved Node path/version, and installs frontend dependencies automatically if `apps/operator-web/node_modules` is missing.
 
+The operator API reads `advisory_operator_snapshots` by default. `all_advisory.sh` and `all_watchers.sh` refresh this snapshot after successful runs. To refresh it manually:
+
+```sh
+python -m advisory.operator_snapshot
+```
+
+Set `OPERATOR_API_USE_SNAPSHOT=false` only when debugging the live dashboard builder directly. `OPERATOR_SNAPSHOT_MAX_AGE_SECONDS=86400` means the API accepts snapshots generated in the last day by default; set it lower for stricter freshness or `0` only for deliberate “latest regardless of age” debugging. `OPERATOR_API_PAYLOAD_CACHE_SECONDS=15` keeps the parsed snapshot in API memory briefly so dashboard pages do not reload the same JSON for every section. `OPERATOR_API_LARGE_RESPONSE_BYTES=250000` records oversized API responses in the slow-operation log so endpoints can be compacted or paginated deliberately.
+
+Slow API and snapshot operations are recorded under `logs/performance/`:
+
+```sh
+python scripts/api_latency_probe.py
+python -m advisory.performance_slowlog report --limit 20
+python -m advisory.performance_slowlog mark <fingerprint> triaged --note "tracked in performance_todo.md"
+```
+
+The JSONL file keeps every slow occurrence. The state file dedupes by fingerprint, so the same slow endpoint or snapshot stage is counted repeatedly but does not create a new issue every run.
+
+Legacy NSE retention and archive:
+
+```sh
+python scripts/db_table_retention_report.py --retention-days 365
+python scripts/archive_legacy_nse_tables.py --table nseindia_var1 --retention-days 365 --max-chunks 3
+```
+
+The archive script is dry-run unless `--execute` is passed. Use `--archive-s3` first, validate the uploaded monthly CSV.GZ chunks, and only then add `--delete`. A delete lowers live row count but does not shrink the physical Postgres table file until a table rewrite such as `VACUUM FULL` or `pg_repack`.
+
 Frontend wrapper controls:
 
 ```sh
@@ -473,10 +502,10 @@ python -m advisory.event_router --dry-run
 ### Batch mode
 
 1. `./complete_data.sh`
-2. `./all_ml.sh`
-3. optional: `python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 20`
-4. `./all_advisory.sh`
-5. inspect portfolio output and traces if something looks unusual
+2. `./all_advisory.sh`
+3. inspect portfolio output and traces if something looks unusual
+4. optional research: `./all_ml.sh`
+5. optional research: `python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 20`
 
 ### Live monitoring mode
 
@@ -494,7 +523,7 @@ The continuous-watch stack publishes lightweight messages on these channels:
 - `stockey:continuous_watch:news`
 - `stockey:continuous_watch:announcements`
 - `stockey:continuous_watch:router`
-- `stockey:continuous_watch:dashboard`
+- `stockey:continuous_watch:operator_frontend`
 - `stockey:continuous_watch:summary`
 
 These are for loose coordination and observability. The database remains the source of truth.

@@ -15,6 +15,9 @@ import pandas as pd
 import requests
 from environs import Env
 
+from advisory.performance_slowlog import summarize_slow_operations
+from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
+from advisory.operator_snapshot import SNAPSHOT_NAME, TABLE_NAME as OPERATOR_SNAPSHOT_TABLE
 from utils.db import sql_to_df
 from utils.redis_utils import get_redis_client
 
@@ -61,6 +64,7 @@ TABLE_FRESHNESS_CHECKS = [
     {"name": "market_context", "table": "advisory_market_context_summary_daily", "column": "asof_date", "max_age_days": 7},
     {"name": "ts_forecasts", "table": "advisory_ts_forecasts_daily", "column": "asof_date", "max_age_days": 7},
     {"name": "sync_state", "table": "advisory_sync_state", "column": "updated_at", "max_age_days": 1},
+    {"name": "operator_snapshot", "table": "advisory_operator_snapshots", "column": "generated_at", "max_age_days": 1},
 ]
 CRON_RECOVERY_OUTPUTS = {
     "all_advisory.log": [
@@ -254,6 +258,83 @@ def check_redis() -> dict[str, Any]:
         return _status("ok", "Redis ping succeeded.", host=host, port=port, pong=bool(pong))
     except Exception as exc:
         return _status("warn", "Redis ping failed. Runtime can continue if Redis fail-soft is enabled.", host=host, port=port, error=f"{type(exc).__name__}: {exc}")
+
+
+def check_operator_snapshot() -> dict[str, Any]:
+    try:
+        if not table_exists(OPERATOR_SNAPSHOT_TABLE):
+            return _status("warn", "Operator snapshot table does not exist yet.", table=OPERATOR_SNAPSHOT_TABLE)
+        df = sql_to_df(
+            f"""
+            SELECT snapshot_key, generated_at, payload_bytes, section_counts_json
+            FROM {OPERATOR_SNAPSHOT_TABLE}
+            WHERE snapshot_name = %s
+            ORDER BY generated_at DESC
+            LIMIT 1
+            """,
+            params=(SNAPSHOT_NAME,),
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+        if df.empty:
+            return _status("warn", "No operator snapshot rows exist yet.", table=OPERATOR_SNAPSHOT_TABLE)
+        row = df.iloc[0]
+        generated_at = pd.to_datetime(row.get("generated_at"), utc=True, errors="coerce")
+        age_seconds = None if pd.isna(generated_at) else max((pd.Timestamp.utcnow() - generated_at).total_seconds(), 0.0)
+        max_age_seconds = int(OPERATOR_SNAPSHOT_MAX_AGE_SECONDS)
+        status = "ok" if age_seconds is not None and (max_age_seconds <= 0 or age_seconds <= max_age_seconds) else "warn"
+        return _status(
+            status,
+            "Operator snapshot is fresh enough." if status == "ok" else "Operator snapshot is missing or stale; API will fall back to the live builder if enabled.",
+            table=OPERATOR_SNAPSHOT_TABLE,
+            snapshot_key=str(row.get("snapshot_key") or ""),
+            generated_at=_json_ready(generated_at),
+            age_seconds=None if age_seconds is None else round(age_seconds, 2),
+            max_age_seconds=max_age_seconds,
+            payload_bytes=int(row.get("payload_bytes") or 0),
+            section_counts_json=str(row.get("section_counts_json") or "{}")[:1000],
+        )
+    except Exception as exc:
+        return _status("error", "Operator snapshot health check failed.", table=OPERATOR_SNAPSHOT_TABLE, error=f"{type(exc).__name__}: {exc}")
+
+
+def check_sync_state_failures(limit: int = 25) -> list[dict[str, Any]]:
+    try:
+        if not table_exists("advisory_sync_state"):
+            return [_status("warn", "Sync-state table does not exist yet.", table="advisory_sync_state")]
+        df = sql_to_df(
+            """
+            SELECT source_name, scope_key, status, error_text, updated_at, last_success_at, state_json
+            FROM advisory_sync_state
+            WHERE COALESCE(status, '') NOT IN ('', 'ok', 'skipped')
+               OR error_text IS NOT NULL
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT %s
+            """,
+            params=(int(limit),),
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+        if df.empty:
+            return [_status("ok", "No failed sync-state rows found.", table="advisory_sync_state")]
+        rows = []
+        for _, row in df.iterrows():
+            rows.append(
+                _status(
+                    "error" if str(row.get("status") or "").lower() == "error" else "warn",
+                    "A watcher/router sync cycle has a non-ok status.",
+                    source_name=row.get("source_name"),
+                    scope_key=row.get("scope_key"),
+                    sync_status=row.get("status"),
+                    error=row.get("error_text"),
+                    updated_at=_json_ready(pd.to_datetime(row.get("updated_at"), utc=True, errors="coerce")),
+                    last_success_at=_json_ready(pd.to_datetime(row.get("last_success_at"), utc=True, errors="coerce")),
+                    state_json=str(row.get("state_json") or "{}")[:1000],
+                )
+            )
+        return rows
+    except Exception as exc:
+        return [_status("error", "Sync-state failure check failed.", table="advisory_sync_state", error=f"{type(exc).__name__}: {exc}")]
 
 
 def check_dhan_token() -> dict[str, Any]:
@@ -622,6 +703,26 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             details={"url": operator_api.get("url"), "latency_ms": operator_api.get("latency_ms"), "status_code": operator_api.get("status_code")},
         )
 
+    snapshot = sections.get("operator_snapshot") if isinstance(sections.get("operator_snapshot"), dict) else {}
+    if snapshot.get("status") in {"warn", "error"}:
+        add(
+            status=str(snapshot.get("status") or "warn"),
+            title="Operator snapshot is stale or unavailable",
+            reason=str(snapshot.get("error") or snapshot.get("message") or "Snapshot health check did not pass."),
+            commands=["python -m advisory.operator_snapshot", "./all_frontend.sh", "python -m advisory.operator_health --skip-dhan"],
+            details={"generated_at": snapshot.get("generated_at"), "age_seconds": snapshot.get("age_seconds"), "max_age_seconds": snapshot.get("max_age_seconds")},
+        )
+
+    slow = sections.get("slow_operations") if isinstance(sections.get("slow_operations"), dict) else {}
+    if slow.get("status") in {"warn", "error"}:
+        add(
+            status=str(slow.get("status") or "warn"),
+            title="Open slow-operation issues exist",
+            reason=f"{slow.get('returned_count', 0)} open slow-operation issue(s) returned from {slow.get('state_file')}.",
+            commands=["python -m advisory.performance_slowlog report --limit 20"],
+            details={"issue_count": slow.get("issue_count"), "returned_count": slow.get("returned_count"), "state_file": slow.get("state_file")},
+        )
+
     redis = sections.get("redis") if isinstance(sections.get("redis"), dict) else {}
     if redis.get("status") in {"warn", "error"}:
         add(
@@ -707,6 +808,17 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             },
         )
 
+    for row in sections.get("sync_state_failures") or []:
+        if not isinstance(row, dict) or row.get("status") == "ok":
+            continue
+        add(
+            status=str(row.get("status") or "warn"),
+            title=f"Sync cycle issue: {row.get('source_name') or 'unknown'}",
+            reason=str(row.get("error") or row.get("message") or "Sync-state row is not OK."),
+            commands=["./all_watchers.sh", "python -m advisory.operator_health --skip-dhan"],
+            details={"source_name": row.get("source_name"), "sync_status": row.get("sync_status"), "updated_at": row.get("updated_at")},
+        )
+
     for row in sections.get("optional_dependencies") or []:
         if not isinstance(row, dict) or row.get("status") == "ok":
             continue
@@ -756,7 +868,10 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
     sections: dict[str, Any] = {
         "database": check_database(),
         "operator_api": check_operator_api(),
+        "slow_operations": summarize_slow_operations(limit=20),
+        "operator_snapshot": check_operator_snapshot(),
         "table_freshness": check_table_freshness(),
+        "sync_state_failures": check_sync_state_failures(),
         "redis": check_redis(),
         "cron_logs": check_cron_logs(log_dir),
         "optional_dependencies": check_optional_dependencies(),

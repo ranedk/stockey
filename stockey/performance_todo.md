@@ -90,8 +90,8 @@ Problem: the Nuxt frontend should not force expensive joins every refresh.
 
 Tasks:
 
-- Add `advisory_operator_snapshot_daily` or `advisory_operator_snapshot_latest`.
-- Store compact JSON sections for:
+- Done: added `advisory_operator_snapshots` through `advisory/operator_snapshot.py`.
+- Current implementation stores one compact dashboard payload per snapshot key. Future work can split this into section tables for:
   - summary
   - actions
   - portfolio
@@ -100,14 +100,17 @@ Tasks:
   - health
   - market context
   - TS watch
-- Add `python -m advisory.operator_snapshot_builder` to refresh snapshots after advisory/watchers.
-- Update API to read snapshot first, then fall back to live builders.
-- Add payload size limit warnings.
+- Done: `python -m advisory.operator_snapshot` refreshes snapshots after advisory/watchers.
+- Done: API reads snapshots first, then falls back to live builders.
+- Done: payload size limit warnings are recorded in the slow-operation log.
+- Done: process-local API payload cache avoids reparsing the same snapshot repeatedly.
+- Done: compact `/api/home` endpoint serves the Nuxt landing page.
 
 Acceptance:
 
 - Main dashboard endpoint responds from a compact snapshot in under 500 ms on local network.
 - API can still force live rebuild for debugging with a flag.
+- Landing page avoids separate `/api/summary`, `/api/actions`, and `/api/portfolio` snapshot loads.
 
 ### 4. Index and Partition Audit
 
@@ -370,18 +373,27 @@ Potential improvement:
 
 ### P0
 
-- [ ] Add DB size report script.
-- [ ] Add API latency probe script.
-- [ ] Identify top large text/json columns.
-- [ ] Add frontend snapshot table and snapshot builder.
-- [ ] Update API to serve from snapshots first.
-- [ ] Add S3/blob pointer migration for announcement OCR/full text/transcripts.
+- [x] Add DB size report script.
+- [x] Add legacy NSE retention report and guarded monthly archive/delete script.
+- [x] Archive old legacy NSE rows to S3 and delete rows older than the 365-day retention boundary.
+- [x] Run `VACUUM FULL`, `REINDEX`, and `ANALYZE` on cleaned NSE tables to reclaim physical disk.
+- [x] Add duplicate-index report/cleanup scripts and stop generic upserts from creating duplicate unique indexes.
+- [x] Add deduped slow-operation log/state files and API latency probe.
+- [x] Add API latency probe script.
+- [x] Identify top large text/json columns.
+- [x] Add frontend snapshot table and snapshot builder.
+- [x] Update API to serve from snapshots first.
+- [x] Add process-local parsed snapshot cache for operator API.
+- [x] Add compact `/api/home` for the Nuxt landing page.
+- [x] Add S3/blob pointer migration for announcement OCR/full text/transcripts.
 - [ ] Add missing indexes for current API queries.
+- [x] Review `scripts/db_duplicate_index_report.py` output and drop confirmed duplicate indexes during a maintenance window.
 
 ### P1
 
 - [ ] Add hot/cold retention policy for old intraday and trace rows.
-- [ ] Add payload size logging to API responses.
+- [x] Add payload size logging to API responses.
+- [ ] Compact or paginate non-home API responses that still return full raw rows.
 - [ ] Add trace summary materialization.
 - [ ] Add `nse_ingestion_queue` and single-lane worker.
 - [ ] Parallelize non-NSE feature jobs with bounded worker count and DB connection cap.

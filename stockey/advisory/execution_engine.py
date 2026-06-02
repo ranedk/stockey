@@ -53,6 +53,9 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK = _env_bool("EXECUTION_ALLOW_LEGACY_PORTFOLIO_FALLBACK", False)
+
+
 def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
 
@@ -559,6 +562,8 @@ def build_execution_orders(
     portfolio_orders = pd.DataFrame()
     exit_actions = pd.DataFrame()
     if not use_action_table:
+        if not DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK:
+            return pd.DataFrame()
         portfolio_orders = load_portfolio_orders(
             asof_date=monitor_date,
             symbols=symbols,

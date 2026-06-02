@@ -5,15 +5,65 @@ from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
+from environs import Env
 from sqlalchemy.exc import ProgrammingError
 
 from .models import Announcement, ParsedReport
+from utils.blob_store import text_blob_metadata
 from utils.db import sql_to_df, upsert_to_db
 from utils.store import get_file_content, save_file_content
 
 
 DOCUMENT_TABLE = "announcement_pipeline_documents"
 REPORT_TABLE = "announcement_pipeline_reports"
+
+env = Env()
+env.read_env()
+
+POSTGRES_TEXT_MODE = env.str("ANNOUNCEMENT_POSTGRES_TEXT_MODE", "pointer").strip().lower()
+POSTGRES_TEXT_EXCERPT_CHARS = env.int("ANNOUNCEMENT_POSTGRES_TEXT_EXCERPT_CHARS", 1200)
+
+
+def _inline_text_enabled() -> bool:
+    return POSTGRES_TEXT_MODE in {"inline", "legacy", "full"}
+
+
+def _excerpt(text: str | None) -> str | None:
+    if not text:
+        return None
+    return text[: max(int(POSTGRES_TEXT_EXCERPT_CHARS), 0)]
+
+
+def _text_metadata(prefix: str, key: str | None, text: str | None) -> Dict[str, object]:
+    if not key or not text:
+        return {
+            f"{prefix}_sha256": None,
+            f"{prefix}_chars": None,
+            f"{prefix}_bytes": None,
+            f"{prefix}_excerpt": _excerpt(text),
+        }
+    metadata = text_blob_metadata(text, key=key, excerpt_chars=POSTGRES_TEXT_EXCERPT_CHARS)
+    return {
+        f"{prefix}_sha256": metadata.sha256,
+        f"{prefix}_chars": metadata.char_count,
+        f"{prefix}_bytes": metadata.byte_count,
+        f"{prefix}_excerpt": metadata.excerpt,
+    }
+
+
+def _postgres_text_value(
+    *,
+    new_text: str | None,
+    existing_row: Dict,
+    existing_text_column: str,
+    s3_key: str | None,
+) -> str | None:
+    if _inline_text_enabled():
+        return new_text or existing_row.get(existing_text_column)
+    if s3_key:
+        return None
+    # Do not erase legacy rows before a migration has uploaded their text.
+    return existing_row.get(existing_text_column)
 
 
 def build_storage_prefix(announcement: Announcement) -> str:
@@ -203,6 +253,14 @@ def document_row_from_announcement(
     now = datetime.now(timezone.utc)
     storage_keys = storage_keys or build_artifact_keys(announcement)
     existing_row = existing_row or {}
+    ocr_s3_key = existing_row.get("ocr_s3_key") or (storage_keys["ocr"] if announcement.three_page_ocr_text else None)
+    full_ocr_s3_key = existing_row.get("full_ocr_s3_key") or (storage_keys["full_ocr"] if announcement.full_ocr_text else None)
+    audio_transcript_s3_key = existing_row.get("audio_transcript_s3_key") or (
+        storage_keys["audio_transcript"] if announcement.audio_transcript_text else None
+    )
+    concise_summary_s3_key = existing_row.get("concise_summary_s3_key") or (
+        storage_keys["concise_summary"] if announcement.concise_summary_text else None
+    )
     return {
         "unique_id": announcement.unique_id,
         "company_master_id": announcement.company_master_id,
@@ -224,22 +282,43 @@ def document_row_from_announcement(
         "raw_s3_key": storage_keys["raw"],
         "pdf_s3_key": existing_row.get("pdf_s3_key")
         or (storage_keys["pdf"] if announcement.attachment_bytes else None),
-        "ocr_s3_key": existing_row.get("ocr_s3_key")
-        or (storage_keys["ocr"] if announcement.three_page_ocr_text else None),
-        "full_ocr_s3_key": existing_row.get("full_ocr_s3_key")
-        or (storage_keys["full_ocr"] if announcement.full_ocr_text else None),
-        "audio_transcript_s3_key": existing_row.get("audio_transcript_s3_key")
-        or (storage_keys["audio_transcript"] if announcement.audio_transcript_text else None),
-        "concise_summary_s3_key": existing_row.get("concise_summary_s3_key")
-        or (storage_keys["concise_summary"] if announcement.concise_summary_text else None),
+        "ocr_s3_key": ocr_s3_key,
+        "full_ocr_s3_key": full_ocr_s3_key,
+        "audio_transcript_s3_key": audio_transcript_s3_key,
+        "concise_summary_s3_key": concise_summary_s3_key,
         "number_of_pages": announcement.number_of_pages,
-        "three_page_ocr_text": announcement.three_page_ocr_text
-        or existing_row.get("three_page_ocr_text"),
-        "full_ocr_text": announcement.full_ocr_text or existing_row.get("full_ocr_text"),
-        "audio_transcript_text": announcement.audio_transcript_text
-        or existing_row.get("audio_transcript_text"),
+        "three_page_ocr_text": _postgres_text_value(
+            new_text=announcement.three_page_ocr_text,
+            existing_row=existing_row,
+            existing_text_column="three_page_ocr_text",
+            s3_key=ocr_s3_key,
+        ),
+        "full_ocr_text": _postgres_text_value(
+            new_text=announcement.full_ocr_text,
+            existing_row=existing_row,
+            existing_text_column="full_ocr_text",
+            s3_key=full_ocr_s3_key,
+        ),
+        "audio_transcript_text": _postgres_text_value(
+            new_text=announcement.audio_transcript_text,
+            existing_row=existing_row,
+            existing_text_column="audio_transcript_text",
+            s3_key=audio_transcript_s3_key,
+        ),
         "concise_summary_text": announcement.concise_summary_text
         or existing_row.get("concise_summary_text"),
+        **_text_metadata("ocr", ocr_s3_key, announcement.three_page_ocr_text or existing_row.get("three_page_ocr_text")),
+        **_text_metadata("full_ocr", full_ocr_s3_key, announcement.full_ocr_text or existing_row.get("full_ocr_text")),
+        **_text_metadata(
+            "audio_transcript",
+            audio_transcript_s3_key,
+            announcement.audio_transcript_text or existing_row.get("audio_transcript_text"),
+        ),
+        **_text_metadata(
+            "concise_summary",
+            concise_summary_s3_key,
+            announcement.concise_summary_text or existing_row.get("concise_summary_text"),
+        ),
         "categories_json": json.dumps(announcement.categories),
         "parsed_reports_json": json.dumps(
             [
@@ -274,6 +353,12 @@ def report_rows_from_announcement(announcement: Announcement) -> List[Dict]:
     rows: List[Dict] = []
     for report in announcement.parsed_reports:
         report_s3_key = save_report_artifact(announcement, report)
+        report_json = json.dumps(report.data, ensure_ascii=True, default=str)
+        report_metadata = text_blob_metadata(
+            report_json,
+            key=report_s3_key,
+            excerpt_chars=POSTGRES_TEXT_EXCERPT_CHARS,
+        )
         rows.append(
             {
                 "unique_id": announcement.unique_id,
@@ -285,8 +370,12 @@ def report_rows_from_announcement(announcement: Announcement) -> List[Dict]:
                 "category": report.category,
                 "report_name": report.report_name,
                 "model_name": report.model_name,
-                "report_json": json.dumps(report.data, ensure_ascii=True, default=str),
+                "report_json": report_json if _inline_text_enabled() else None,
                 "report_s3_key": report_s3_key,
+                "report_sha256": report_metadata.sha256,
+                "report_chars": report_metadata.char_count,
+                "report_bytes": report_metadata.byte_count,
+                "report_excerpt": report_metadata.excerpt,
                 "created_at": now,
                 "updated_at": now,
             }

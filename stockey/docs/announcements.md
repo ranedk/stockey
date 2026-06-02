@@ -31,11 +31,11 @@ For a given `ticker`, `exchange`, and date range, the managed pipeline:
 2. Fetches NSE or BSE announcements.
 3. Persists raw metadata into `announcement_pipeline_documents`.
 4. Downloads the attachment and stores it in object storage.
-5. Runs OCR on the first three pages for PDFs, or transcription for direct audio attachments, and stores that text in `three_page_ocr_text`.
+5. Runs OCR on the first three pages for PDFs, or transcription for direct audio attachments, and stores the full text in object storage.
 6. Categorizes using exchange text plus the first-pass OCR/transcription.
-7. If any category is present in the keys of `DOCUMENT_PYDANTIC_MAP`, runs full-document OCR and stores it in `full_ocr_text`.
-8. If the category includes `EARNINGS_CALL`, looks for an audio link in the exchange payload or OCR text, downloads it, transcribes it, and stores it in `audio_transcript_text`.
-9. Uses the summarization model to extract structured JSON matching `data/announcements/schemas.py`, and stores it in `announcement_pipeline_reports` plus `parsed_reports_json` on the document row.
+7. If any category is present in the keys of `DOCUMENT_PYDANTIC_MAP`, runs full-document OCR and stores the full text in object storage.
+8. If the category includes `EARNINGS_CALL`, looks for an audio link in the exchange payload or OCR text, downloads it, transcribes it, and stores the transcript in object storage.
+9. Uses the summarization model to extract structured JSON matching `data/announcements/schemas.py`, and stores the parsed report payload in object storage with metadata on `announcement_pipeline_reports`.
 10. Generates a separate short concise summary and stores it in `concise_summary_text`.
 
 ## Identity Model
@@ -65,6 +65,7 @@ This lets NSE and BSE announcements for the same company join on a single stable
   - `SUMMARIZE_WITH=gpt-5-mini-2025-08-07`
 - OCR/transcription is best-effort. Failures are logged, `ocr_status = failed` is recorded, and the ingest continues.
 - `announcement_pipeline_documents` and `announcement_pipeline_reports` are created lazily by the upsert layer. The first run no longer assumes the tables already exist.
+- Heavy OCR/transcript/report text defaults to pointer mode: S3 keys, hashes, byte counts, character counts, and excerpts are kept in Postgres, while the full text stays in object storage. Set `ANNOUNCEMENT_POSTGRES_TEXT_MODE=inline` only for debugging or legacy behavior.
 
 ## Key Modules
 
@@ -112,8 +113,8 @@ POPPLER_PATH=/opt/homebrew/bin
 ## Attachment handling
 
 - PDF attachments are downloaded and OCRed through [`utils/ocr`](../utils/ocr).
-- Direct audio attachments such as `mp3`, `wav`, `mp4`, `m4a`, `ogg`, and `webm` are transcribed through [`utils/transcribe`](../utils/transcribe) and stored in `three_page_ocr_text`.
-- Earnings-call documents can also trigger a second audio pass from an extracted audio link; that transcript is stored in `audio_transcript_text`.
+- Direct audio attachments such as `mp3`, `wav`, `mp4`, `m4a`, `ogg`, and `webm` are transcribed through [`utils/transcribe`](../utils/transcribe) and stored through object storage pointers.
+- Earnings-call documents can also trigger a second audio pass from an extracted audio link; that transcript is stored through object storage pointers.
 - Full-document OCR is only done for categories mapped in `DOCUMENT_PYDANTIC_MAP`.
 
 ## Stored State
@@ -128,11 +129,23 @@ POPPLER_PATH=/opt/homebrew/bin
 - `pdf_status`
 - `ocr_status`
 - `parse_status`
-- `three_page_ocr_text`
-- `full_ocr_text`
-- `audio_transcript_text`
+- `ocr_s3_key`, `ocr_sha256`, `ocr_chars`, `ocr_bytes`, `ocr_excerpt`
+- `full_ocr_s3_key`, `full_ocr_sha256`, `full_ocr_chars`, `full_ocr_bytes`, `full_ocr_excerpt`
+- `audio_transcript_s3_key`, `audio_transcript_sha256`, `audio_transcript_chars`, `audio_transcript_bytes`, `audio_transcript_excerpt`
 - `concise_summary_text`
+- `concise_summary_s3_key`, `concise_summary_sha256`, `concise_summary_chars`, `concise_summary_bytes`, `concise_summary_excerpt`
 - `parsed_reports_json`
 - `last_error`
 
-`announcement_pipeline_reports` stores one row per parsed report output and also carries `company_master_id`.
+`announcement_pipeline_reports` stores one row per parsed report output and also carries `company_master_id`, `report_s3_key`, `report_sha256`, `report_chars`, `report_bytes`, and `report_excerpt`.
+
+## Text Offload Migration
+
+Existing rows that still have large inline OCR/transcript/report JSON can be migrated incrementally:
+
+```sh
+python scripts/offload_announcement_text_to_s3.py --dry-run --limit 100
+python scripts/offload_announcement_text_to_s3.py --limit 500
+```
+
+Use `--keep-inline` if you want to upload and add metadata first without nulling the heavy inline columns.
