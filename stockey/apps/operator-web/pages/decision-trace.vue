@@ -8,9 +8,11 @@ const uniqueId = ref(String(route.query.unique_id || ''))
 const trace = ref<TraceSummary | null>(null)
 const loading = ref(false)
 const error = ref('')
+const apiError = ref<unknown>(null)
 
 async function loadTrace() {
   error.value = ''
+  apiError.value = null
   trace.value = null
   const normalizedSymbol = symbol.value.trim().toUpperCase()
   const normalizedUniqueId = uniqueId.value.trim()
@@ -26,6 +28,7 @@ async function loadTrace() {
       trace.value = await api.getSymbolTraceSummary(normalizedSymbol, 200)
     }
   } catch (err) {
+    apiError.value = err
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
     loading.value = false
@@ -63,6 +66,8 @@ if (symbol.value || uniqueId.value) {
     <p class="mt-3 text-sm text-ink/55">If both fields are present, event unique id wins.</p>
     <p v-if="error" class="mt-4 rounded-2xl bg-ember/10 p-3 text-sm font-semibold text-ember">{{ error }}</p>
   </section>
+
+  <ApiErrorBanner v-if="apiError" class="mt-5" title="Decision trace failed" :error="apiError" />
 
   <TraceTimeline v-if="trace" class="mt-8" :trace="trace" sync-url />
   <p v-else-if="!loading" class="mt-8 glass-panel rounded-3xl p-6 text-ink/60">No trace loaded yet.</p>

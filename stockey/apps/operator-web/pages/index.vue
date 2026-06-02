@@ -1,21 +1,70 @@
 <script setup lang="ts">
-import type { TraceSummary } from '~/types/api'
+import type { Dict, TraceSummary } from '~/types/api'
 
 const api = useOperatorApi()
-const [{ data: home }, { data: marketContext }, { data: technicalCalibration }] = await Promise.all([
+const actionLimit = ref(25)
+const actionOffset = ref(0)
+const actionSymbol = ref('')
+const actionType = ref('ALL')
+const actionStatus = ref('all')
+const actionSearch = ref('')
+const portfolioLimit = ref(25)
+const portfolioOffset = ref(0)
+const portfolioSymbol = ref('')
+const portfolioStatus = ref('all')
+const portfolioSearch = ref('')
+const portfolioBucket = ref('today_recommendations')
+
+const [{ data: home }, { data: marketContext }, { data: technicalCalibration }, { data: actionsData, refresh: refreshActions, error: actionsError }, { data: portfolioData, refresh: refreshPortfolio, error: portfolioError }] = await Promise.all([
   useAsyncData('home', () => api.getHome()),
   useAsyncData('market-context', () => api.getMarketContext(20)),
-  useAsyncData('technical-calibration-home', () => api.getTechnicalCalibration(3))
+  useAsyncData('technical-calibration-home', () => api.getTechnicalCalibration(3)),
+  useAsyncData('home-actions-paged', () => api.getActions({
+    limit: actionLimit.value,
+    offset: actionOffset.value,
+    symbol: actionSymbol.value.trim().toUpperCase(),
+    action: actionType.value,
+    status: actionStatus.value,
+    search: actionSearch.value.trim(),
+    compact: true
+  }), { watch: [actionLimit, actionOffset, actionType, actionStatus] }),
+  useAsyncData('home-portfolio-paged', () => api.getPortfolio({
+    limit: portfolioLimit.value,
+    offset: portfolioOffset.value,
+    symbol: portfolioSymbol.value.trim().toUpperCase(),
+    status: portfolioStatus.value,
+    search: portfolioSearch.value.trim(),
+    compact: true
+  }), { watch: [portfolioLimit, portfolioOffset, portfolioStatus] })
 ])
 
 const summaryValues = computed(() => home.value?.summary || {})
-const topActions = computed(() => home.value?.top_action_recommendations || [])
-const today = computed(() => home.value?.today_recommendations || [])
+const topActions = computed(() => [...(actionsData.value?.top_action_recommendations || []), ...(actionsData.value?.action_recommendations || [])])
+const actionMeta = computed(() => asDict(actionsData.value?.meta?.action_recommendations))
+const portfolioMeta = computed(() => asDict(portfolioData.value?.meta?.portfolio))
+const today = computed(() => portfolioRowsForBucket(portfolioBucket.value))
 const marketSummary = computed(() => marketContext.value?.summary || {})
 const marketLeaders = computed(() => marketContext.value?.top_universe || [])
 const calibrationSummary = computed(() => technicalCalibration.value?.summary || [])
 const symbolTraces = reactive<Record<string, TraceSummary>>({})
 const loadingSymbolTrace = reactive<Record<string, boolean>>({})
+const portfolioBuckets = [
+  { key: 'today_recommendations', label: 'Today' },
+  { key: 'current_recommendations', label: 'Current' },
+  { key: 'portfolio', label: 'Portfolio' },
+  { key: 'lifecycle', label: 'Lifecycle' },
+  { key: 'exited_recommendations', label: 'Exited' }
+]
+
+function asDict(value: unknown): Dict {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
+}
+
+function portfolioRowsForBucket(bucket: string): Dict[] {
+  const payload = portfolioData.value as Record<string, unknown> | null | undefined
+  const rows = payload?.[bucket]
+  return Array.isArray(rows) ? rows.filter((row) => typeof row === 'object' && row !== null) as Dict[] : []
+}
 
 function pct(value: unknown) {
   const num = Number(value)
@@ -38,6 +87,45 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
   } finally {
     loadingSymbolTrace[symbol] = false
   }
+}
+
+async function applyActionFilters() {
+  actionOffset.value = 0
+  await refreshActions()
+}
+
+async function applyPortfolioFilters() {
+  portfolioOffset.value = 0
+  await refreshPortfolio()
+}
+
+function loadNextActions() {
+  const next = Number(actionMeta.value.next_offset)
+  if (Number.isFinite(next)) actionOffset.value = next
+}
+
+function loadNextPortfolio() {
+  const next = Number(portfolioMeta.value.next_offset)
+  if (Number.isFinite(next)) portfolioOffset.value = next
+}
+
+function bucketCount(bucket: string) {
+  const meta = asDict(portfolioData.value?.meta?.[bucket])
+  return Number(meta.total ?? portfolioRowsForBucket(bucket).length)
+}
+
+function actionDetailPath(row: Record<string, unknown>) {
+  const params = new URLSearchParams()
+  if (row.symbol) params.set('symbol', String(row.symbol))
+  if (row.unique_id) params.set('unique_id', String(row.unique_id))
+  if (row.setup_id) params.set('setup_id', String(row.setup_id))
+  const query = params.toString()
+  return `/api/actions/detail${query ? `?${query}` : ''}`
+}
+
+function portfolioDetailPath(row: Record<string, unknown>) {
+  const symbol = String(row.symbol || row.ticker || '').toUpperCase()
+  return symbol ? `/api/portfolio/${encodeURIComponent(symbol)}/detail` : ''
 }
 </script>
 
@@ -83,7 +171,7 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
         <article v-for="row in marketLeaders.slice(0, 10)" :key="String(row.symbol)" class="rounded-2xl bg-white/70 p-4">
           <div class="flex items-start justify-between gap-3">
             <div>
-              <p class="font-black text-ink">{{ row.symbol }}</p>
+              <SymbolLink :symbol="row.symbol" />
               <p class="text-xs text-ink/50">{{ row.sector_code || 'sector n/a' }} · rank {{ row.context_rank || '-' }}</p>
             </div>
             <span class="rounded-full bg-moss px-3 py-1 text-xs font-bold text-white">
@@ -102,17 +190,66 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
 
   <section class="mt-8 grid gap-6 lg:grid-cols-[1.1fr_0.9fr]">
     <div>
-      <h2 class="mb-3 text-xl font-black">Action Queue</h2>
+      <div class="mb-3 flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 class="text-xl font-black">Action Queue</h2>
+          <p class="mt-1 text-sm font-semibold text-ink/50">
+            Showing {{ actionMeta.returned || topActions.length }} of {{ actionMeta.total ?? topActions.length }} action rows.
+          </p>
+        </div>
+      </div>
+      <ApiErrorBanner v-if="actionsError" class="mb-3" title="Action queue failed" :error="actionsError" />
+      <div class="mb-4 glass-panel rounded-3xl p-4">
+        <div class="grid gap-3 md:grid-cols-[0.75fr_0.75fr_0.75fr_1fr_auto]">
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Symbol
+            <input v-model="actionSymbol" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="Optional" @keyup.enter="applyActionFilters" />
+          </label>
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Action
+            <select v-model="actionType" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss">
+              <option value="ALL">All</option>
+              <option value="BUY">Buy</option>
+              <option value="SELL">Sell</option>
+              <option value="EXIT">Exit</option>
+              <option value="HOLD">Hold</option>
+              <option value="WATCH">Watch</option>
+              <option value="MANUAL">Manual</option>
+            </select>
+          </label>
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Status
+            <select v-model="actionStatus" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss">
+              <option value="all">All</option>
+              <option value="error">Error</option>
+              <option value="manual">Manual</option>
+              <option value="approved">Approved</option>
+              <option value="blocked">Blocked</option>
+            </select>
+          </label>
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Search
+            <input v-model="actionSearch" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="reason, setup, event..." @keyup.enter="applyActionFilters" />
+          </label>
+          <button class="self-end rounded-full bg-ink px-4 py-2 text-sm font-black text-paper" type="button" @click="applyActionFilters">
+            Apply
+          </button>
+        </div>
+      </div>
       <div class="space-y-3">
         <RecordCard
           v-for="(row, idx) in topActions"
           :key="idx"
-          :title="String(row.symbol || row.action_code || 'Action')"
+          :title="String(row.action_code || row.action || 'Action')"
           :subtitle="String(row.action_reason || row.next_action_reason || row.reason || '')"
           :record="row"
+          :detail-path="actionDetailPath(row)"
         >
           <template #badge>
-            <span class="rounded-full bg-moss px-3 py-1 text-xs font-bold text-white">{{ row.action_code || row.action || 'ACTION' }}</span>
+            <div class="flex flex-wrap gap-2">
+              <SymbolLink :symbol="row.symbol" subtle />
+              <span class="rounded-full bg-moss px-3 py-1 text-xs font-bold text-white">{{ row.action_code || row.action || 'ACTION' }}</span>
+            </div>
           </template>
           <ReasonContractPanel
             v-if="row.recommendation_reason || row.reason_contract_status"
@@ -121,6 +258,7 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
             :status="row.reason_contract_status"
             compact
           />
+          <TechnicalDecisionPanel class="mt-4" :record="row" compact />
           <button
             class="mt-4 rounded-full bg-ink px-4 py-2 text-sm font-bold text-paper"
             type="button"
@@ -130,9 +268,9 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
           </button>
           <NuxtLink
             class="ml-2 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink"
-            :to="`/decision-trace?symbol=${encodeURIComponent(String(row.symbol || '').toUpperCase())}`"
+            :to="`/symbols/${encodeURIComponent(String(row.symbol || '').toUpperCase())}`"
           >
-            Open trace page
+            Open symbol page
           </NuxtLink>
           <TraceTimeline
             v-if="symbolTraces[String(row.symbol || '').toUpperCase()]"
@@ -143,17 +281,67 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
         </RecordCard>
         <p v-if="!topActions.length" class="glass-panel rounded-3xl p-6 text-ink/60">No current action rows.</p>
       </div>
+      <button v-if="actionMeta.has_more" class="mt-4 rounded-full bg-moss px-5 py-3 text-sm font-black text-paper" type="button" @click="loadNextActions">
+        Show next {{ actionLimit }} actions
+      </button>
     </div>
     <div>
-      <h2 class="mb-3 text-xl font-black">Today's Recommendations</h2>
+      <div class="mb-3">
+        <h2 class="text-xl font-black">Portfolio & Recommendations</h2>
+        <p class="mt-1 text-sm font-semibold text-ink/50">
+          {{ portfolioBuckets.find((item) => item.key === portfolioBucket)?.label || 'Selected' }}: {{ today.length }} shown.
+        </p>
+      </div>
+      <ApiErrorBanner v-if="portfolioError" class="mb-3" title="Portfolio payload failed" :error="portfolioError" />
+      <div class="mb-4 glass-panel rounded-3xl p-4">
+        <div class="flex flex-wrap gap-2">
+          <button
+            v-for="bucket in portfolioBuckets"
+            :key="bucket.key"
+            class="rounded-full px-3 py-2 text-xs font-black"
+            :class="portfolioBucket === bucket.key ? 'bg-ink text-paper' : 'bg-white/80 text-ink/60'"
+            type="button"
+            @click="portfolioBucket = bucket.key"
+          >
+            {{ bucket.label }} · {{ bucketCount(bucket.key) }}
+          </button>
+        </div>
+        <div class="mt-3 grid gap-3 md:grid-cols-[0.75fr_0.75fr_1fr_auto]">
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Symbol
+            <input v-model="portfolioSymbol" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="Optional" @keyup.enter="applyPortfolioFilters" />
+          </label>
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Status
+            <select v-model="portfolioStatus" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss">
+              <option value="all">All</option>
+              <option value="current">Current</option>
+              <option value="exit">Exit</option>
+              <option value="manual">Manual</option>
+              <option value="watch">Watch</option>
+            </select>
+          </label>
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Search
+            <input v-model="portfolioSearch" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="reason, bucket, exit..." @keyup.enter="applyPortfolioFilters" />
+          </label>
+          <button class="self-end rounded-full bg-ink px-4 py-2 text-sm font-black text-paper" type="button" @click="applyPortfolioFilters">
+            Apply
+          </button>
+        </div>
+      </div>
       <div class="space-y-3">
         <RecordCard
           v-for="(row, idx) in today"
           :key="idx"
-          :title="String(row.symbol || 'Recommendation')"
+          :title="String(row.action_summary || row.kind || 'Recommendation')"
           :subtitle="String(row.reason || row.action_summary || row.bucket_summary || '')"
           :record="row"
+          :detail-path="portfolioDetailPath(row)"
         >
+          <template #badge>
+            <SymbolLink :symbol="row.symbol" subtle />
+          </template>
           <ReasonContractPanel
             v-if="row.recommendation_reason || row.reason_contract_status"
             class="mt-4"
@@ -161,6 +349,7 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
             :status="row.reason_contract_status"
             compact
           />
+          <TechnicalDecisionPanel class="mt-4" :record="row" compact />
           <button
             class="mt-4 rounded-full bg-ink px-4 py-2 text-sm font-bold text-paper"
             type="button"
@@ -170,9 +359,9 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
           </button>
           <NuxtLink
             class="ml-2 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink"
-            :to="`/decision-trace?symbol=${encodeURIComponent(String(row.symbol || '').toUpperCase())}`"
+            :to="`/symbols/${encodeURIComponent(String(row.symbol || '').toUpperCase())}`"
           >
-            Open trace page
+            Open symbol page
           </NuxtLink>
           <TraceTimeline
             v-if="symbolTraces[String(row.symbol || '').toUpperCase()]"
@@ -181,8 +370,11 @@ async function loadSymbolTrace(row: Record<string, unknown>) {
             title="Symbol trace"
           />
         </RecordCard>
-        <p v-if="!today.length" class="glass-panel rounded-3xl p-6 text-ink/60">No recommendations for the latest date.</p>
+        <p v-if="!today.length" class="glass-panel rounded-3xl p-6 text-ink/60">No rows for this portfolio bucket and filter.</p>
       </div>
+      <button v-if="portfolioBucket === 'portfolio' && portfolioMeta.has_more" class="mt-4 rounded-full bg-moss px-5 py-3 text-sm font-black text-paper" type="button" @click="loadNextPortfolio">
+        Show next {{ portfolioLimit }} portfolio rows
+      </button>
     </div>
   </section>
 

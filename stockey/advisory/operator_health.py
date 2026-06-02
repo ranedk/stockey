@@ -29,6 +29,8 @@ DEFAULT_LOG_DIR = Path("logs/cron")
 DEFAULT_LOG_TAIL_LINES = 80
 DEFAULT_LOG_ANALYSIS_LINES = 5000
 DEFAULT_OPERATOR_API_URL = "http://127.0.0.1:8765/api/health"
+OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
+TRACE_SUMMARIES_TABLE = "advisory_trace_summaries"
 DHAN_TOKEN_EXPIRY_WARN_SECONDS = 6 * 60 * 60
 ERROR_PATTERNS = [
     re.compile(r"traceback", re.IGNORECASE),
@@ -54,6 +56,57 @@ SCRIPT_MARKER_PATTERN = re.compile(
     r"\[stockey\.script\]\s+name=(?P<name>\S+)\s+status=(?P<status>\S+)(?:\s+exit_code=(?P<exit_code>\d+))?(?:\s+timestamp=(?P<timestamp>\S+))?",
     re.IGNORECASE,
 )
+DEGRADATION_PATTERNS = [
+    {
+        "kind": "dhan_master_miss",
+        "severity": "error",
+        "pattern": re.compile(r"No Dhan security id mapped for (?P<exchange>[A-Z]+):(?P<symbol>[A-Z0-9&\-.]+)", re.IGNORECASE),
+        "title": "Symbol missing from Dhan master",
+        "suggested_fix": "Refresh Dhan scrip master and verify NSE/BSE fallback mapping for the symbol.",
+    },
+    {
+        "kind": "dhan_no_data",
+        "severity": "warn",
+        "pattern": re.compile(r"dhan_no_data_(?P<mode>retry|skip).*?'ticker': '?(?P<symbol>[A-Z0-9&\-.]+)'?", re.IGNORECASE),
+        "title": "Dhan returned no OHLCV rows",
+        "suggested_fix": "Check whether the symbol is suspended/newly listed, retry with BSE fallback, or reduce requested date window.",
+    },
+    {
+        "kind": "llm_fallback",
+        "severity": "warn",
+        "pattern": re.compile(r"fallback_after_error|Deterministic fallback", re.IGNORECASE),
+        "title": "LLM fallback was used",
+        "suggested_fix": "Inspect the source row and model/provider logs; output may be deterministic fallback rather than LLM-reviewed.",
+    },
+    {
+        "kind": "nse_retry",
+        "severity": "warn",
+        "pattern": re.compile(r"NSE .*retrying|NSE .*bootstrap failed|nseindia.*timed out", re.IGNORECASE),
+        "title": "NSE request retry or bootstrap issue",
+        "suggested_fix": "Let the retry loop continue; if persistent, clear NSE session/cookies and run complete_data again.",
+    },
+    {
+        "kind": "db_reconnect",
+        "severity": "warn",
+        "pattern": re.compile(r"transient postgres error|server closed the connection|statement timeout", re.IGNORECASE),
+        "title": "Postgres reconnect or timeout",
+        "suggested_fix": "Check slow-operation log, DB connection limits, and whether the query should be paginated/materialized.",
+    },
+    {
+        "kind": "redis_unavailable",
+        "severity": "warn",
+        "pattern": re.compile(r"redis unavailable|connection refused.*6379", re.IGNORECASE),
+        "title": "Redis unavailable",
+        "suggested_fix": "Start Redis or verify fail-soft mode; watcher pub/sub and state updates may be degraded.",
+    },
+    {
+        "kind": "ocr_parse_failure",
+        "severity": "warn",
+        "pattern": re.compile(r"OCR/transcription failed|parse_status.*failed|poppler", re.IGNORECASE),
+        "title": "Announcement OCR/parse failure",
+        "suggested_fix": "Install Poppler or inspect the attachment; affected event summaries may be incomplete.",
+    },
+]
 
 TABLE_FRESHNESS_CHECKS = [
     {"name": "dhan_daily", "table": "dhan_ohlcv_daily", "column": "date", "max_age_days": 3},
@@ -591,6 +644,11 @@ def check_cron_logs(log_dir: str | Path = DEFAULT_LOG_DIR, *, tail_lines: int = 
         analysis = recover_interrupted_cron_status(path, modified_at, analysis)
         status = str(analysis.pop("status"))
         message = str(analysis.pop("message"))
+        degradation_markers = [
+            line
+            for line in analysis_lines
+            if any(spec["pattern"].search(line) for spec in DEGRADATION_PATTERNS)
+        ][-12:]
         rows.append(
             _status(
                 status,
@@ -601,10 +659,204 @@ def check_cron_logs(log_dir: str | Path = DEFAULT_LOG_DIR, *, tail_lines: int = 
                 tail_lines=len(lines),
                 analyzed_lines=len(analysis_lines),
                 recent_tail_errors=[line for line in lines if any(pattern.search(line) for pattern in FAILURE_PATTERNS)][-8:],
+                degradation_markers=degradation_markers,
                 **analysis,
             )
         )
     return rows or [_status("warn", "Cron log directory has no .log files.", log_dir=str(root))]
+
+
+def _extract_degradation_from_line(line: str, *, source: str, observed_at: Any = None, recovered: bool = False) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for spec in DEGRADATION_PATTERNS:
+        match = spec["pattern"].search(line)
+        if not match:
+            continue
+        symbol = str(match.groupdict().get("symbol") or "").upper() or None
+        row = {
+            "status": "recovered" if recovered else spec["severity"],
+            "severity": spec["severity"],
+            "kind": spec["kind"],
+            "title": spec["title"],
+            "message": line.strip()[:700],
+            "source": source,
+            "symbol": symbol,
+            "exchange": match.groupdict().get("exchange"),
+            "observed_at": _json_ready(pd.to_datetime(observed_at, utc=True, errors="coerce")) if observed_at is not None else None,
+            "suggested_fix": spec["suggested_fix"],
+            "recovered": bool(recovered),
+        }
+        rows.append(row)
+    return rows
+
+
+def _dedupe_degradations(rows: list[dict[str, Any]], *, limit: int = 100) -> list[dict[str, Any]]:
+    deduped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("kind") or ""), str(row.get("symbol") or ""), str(row.get("source") or ""))
+        existing = deduped.get(key)
+        if existing is None or str(row.get("observed_at") or "") >= str(existing.get("observed_at") or ""):
+            deduped[key] = row
+    out = list(deduped.values())
+    out.sort(key=lambda row: (str(row.get("status") or ""), str(row.get("observed_at") or "")), reverse=True)
+    return out[: max(1, int(limit))]
+
+
+def check_announcement_document_failures(limit: int = 25) -> list[dict[str, Any]]:
+    table = "announcement_pipeline_documents"
+    try:
+        if not table_exists(table):
+            return []
+        columns = table_columns(table)
+        if not {"ocr_status", "parse_status"}.intersection(columns):
+            return []
+        order_column = "updated_at" if "updated_at" in columns else "published_at" if "published_at" in columns else "load_ts" if "load_ts" in columns else None
+        select_columns = [col for col in ["unique_id", "ticker", "symbol", "ocr_status", "parse_status", "last_error", "published_at", "updated_at", "load_ts"] if col in columns]
+        order_sql = f'ORDER BY "{order_column}" DESC NULLS LAST' if order_column else ""
+        df = sql_to_df(
+            f"""
+            SELECT {", ".join(f'"{col}"' for col in select_columns)}
+            FROM {table}
+            WHERE COALESCE(ocr_status, '') = 'failed'
+               OR COALESCE(parse_status, '') = 'failed'
+               OR last_error IS NOT NULL
+            {order_sql}
+            LIMIT %s
+            """,
+            params=(int(limit),),
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+        rows = []
+        for item in _records(df):
+            symbol = str(item.get("ticker") or item.get("symbol") or "").strip().upper() or None
+            rows.append(
+                {
+                    "status": "warn",
+                    "severity": "warn",
+                    "kind": "announcement_document_failure",
+                    "title": "Announcement document OCR/parse issue",
+                    "message": str(item.get("last_error") or f"ocr={item.get('ocr_status')} parse={item.get('parse_status')}"),
+                    "source": table,
+                    "symbol": symbol,
+                    "unique_id": item.get("unique_id"),
+                    "observed_at": item.get("updated_at") or item.get("published_at") or item.get("load_ts"),
+                    "suggested_fix": "Install Poppler if needed, rerun announcement ingest, or inspect the attachment manually.",
+                    "recovered": False,
+                }
+            )
+        return rows
+    except Exception as exc:
+        return [
+            {
+                "status": "error",
+                "severity": "error",
+                "kind": "announcement_failure_check_error",
+                "title": "Could not inspect announcement document failures",
+                "message": f"{type(exc).__name__}: {exc}",
+                "source": table,
+                "suggested_fix": "Run python -m advisory.operator_health --skip-dhan and inspect DB connectivity.",
+                "recovered": False,
+            }
+        ]
+
+
+def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DEFAULT_LOG_DIR, limit: int = 100) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for row in sections.get("sync_state_failures") or []:
+        if not isinstance(row, dict) or row.get("status") == "ok":
+            continue
+        message = str(row.get("error") or row.get("message") or row.get("state_json") or "")
+        extracted = _extract_degradation_from_line(message, source=str(row.get("source_name") or "advisory_sync_state"), observed_at=row.get("updated_at"))
+        if extracted:
+            rows.extend(extracted)
+        else:
+            rows.append(
+                {
+                    "status": row.get("status") or "warn",
+                    "severity": row.get("status") or "warn",
+                    "kind": "sync_state_issue",
+                    "title": f"Sync-state issue: {row.get('source_name') or 'unknown'}",
+                    "message": message or "Sync-state row is non-ok.",
+                    "source": row.get("source_name") or "advisory_sync_state",
+                    "observed_at": row.get("updated_at"),
+                    "suggested_fix": "Run the relevant watcher/data script and then python -m advisory.operator_health --skip-dhan.",
+                    "recovered": False,
+                }
+            )
+
+    for row in sections.get("cron_logs") or []:
+        if not isinstance(row, dict):
+            continue
+        source = str(row.get("log_file") or "cron")
+        observed_at = row.get("modified_at")
+        for line in list(row.get("recent_errors") or []) + list(row.get("recent_tail_errors") or []) + list(row.get("degradation_markers") or []):
+            rows.extend(_extract_degradation_from_line(str(line), source=source, observed_at=observed_at, recovered=False))
+        for line in list(row.get("historical_errors") or []):
+            rows.extend(_extract_degradation_from_line(str(line), source=source, observed_at=observed_at, recovered=True))
+
+    api_errors = sections.get("operator_api_errors") if isinstance(sections.get("operator_api_errors"), dict) else {}
+    for row in api_errors.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        status_code = int(row.get("status_code") or 500)
+        message_text = str(row.get("error_message") or "")
+        is_trace_cache_miss = "trace_summary_cache_miss" in message_text
+        rows.append(
+            {
+                "status": "error" if status_code >= 500 else "warn",
+                "severity": "error" if status_code >= 500 else "warn",
+                "kind": "trace_summary_cache_miss" if is_trace_cache_miss else "operator_api_error",
+                "title": "Trace summary cache miss" if is_trace_cache_miss else "Operator API endpoint failed",
+                "message": f"{row.get('route') or row.get('operation')}: {row.get('error_type')}: {row.get('error_message')}",
+                "source": row.get("route") or "operator_api",
+                "observed_at": row.get("occurred_at"),
+                "suggested_fix": "Run the trace summary rebuild command from Operations." if is_trace_cache_miss else "Open Operations or Health, inspect the API error traceback tail, then rerun the failed endpoint after fixing the source issue.",
+                "recovered": False,
+                "details": {
+                    "error_id": row.get("error_id"),
+                    "operation": row.get("operation"),
+                    "status_code": status_code,
+                    "traceback_tail": row.get("traceback_tail"),
+                },
+            }
+        )
+
+    slow = sections.get("slow_operations") if isinstance(sections.get("slow_operations"), dict) else {}
+    for issue in slow.get("issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        rows.append(
+            {
+                "status": "warn",
+                "severity": "warn",
+                "kind": "slow_operation",
+                "title": "Slow operation open",
+                "message": str(issue.get("operation") or issue.get("kind") or "Slow operation"),
+                "source": "slow_operation_state",
+                "observed_at": issue.get("last_seen_at"),
+                "suggested_fix": "Inspect slow-operation report and materialize/paginate expensive endpoints or queries.",
+                "recovered": False,
+                "details": issue,
+            }
+        )
+
+    rows.extend(check_announcement_document_failures())
+    rows = _dedupe_degradations(rows, limit=limit)
+    active = [row for row in rows if not row.get("recovered")]
+    recovered = [row for row in rows if row.get("recovered")]
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = str(row.get("kind") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    status = "error" if any(row.get("status") == "error" for row in active) else "warn" if active else "ok"
+    return {
+        "status": status,
+        "active_count": len(active),
+        "recovered_count": len(recovered),
+        "counts_by_kind": counts,
+        "rows": rows,
+    }
 
 
 def check_optional_dependencies() -> list[dict[str, Any]]:
@@ -645,6 +897,77 @@ def check_frontend_dependencies() -> dict[str, Any]:
         package_lock=package_lock.exists(),
         node_version=node_version.stdout.strip(),
         npm_version=npm_version.stdout.strip(),
+    )
+
+
+def check_operator_api_errors(limit: int = 25) -> dict[str, Any]:
+    if not table_exists(OPERATOR_API_ERRORS_TABLE):
+        return _status("ok", "No operator API errors have been recorded yet.", rows=[], returned_count=0)
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {OPERATOR_API_ERRORS_TABLE}
+            ORDER BY occurred_at DESC
+            LIMIT %(limit)s
+            """,
+            params={"limit": max(1, int(limit))},
+            retries=3,
+        )
+    except Exception as exc:
+        return _status("error", "Could not inspect operator API errors.", error=f"{type(exc).__name__}: {exc}", rows=[])
+    rows = _records(df)
+    for row in rows:
+        try:
+            row["request_context"] = json.loads(str(row.pop("request_context_json") or "{}"))
+        except Exception:
+            row["request_context"] = {}
+    active_errors = [row for row in rows if int(row.get("status_code") or 500) >= 500]
+    active_warnings = [row for row in rows if int(row.get("status_code") or 500) < 500]
+    status = "error" if active_errors else "warn" if active_warnings else "ok"
+    return _status(
+        status,
+        "Recent operator API errors found." if rows else "No recent operator API errors.",
+        rows=rows,
+        returned_count=len(rows),
+        error_count=len(active_errors),
+        warning_count=len(active_warnings),
+    )
+
+
+def check_trace_summaries() -> dict[str, Any]:
+    if not table_exists(TRACE_SUMMARIES_TABLE):
+        return _status("warn", "Trace summary cache table is missing.", row_count=0)
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                entity_type,
+                count(*) AS row_count,
+                max(generated_at) AS latest_generated_at,
+                max(source_max_ts) AS latest_source_max_ts
+            FROM {TRACE_SUMMARIES_TABLE}
+            GROUP BY entity_type
+            ORDER BY entity_type
+            """,
+            retries=3,
+        )
+    except Exception as exc:
+        return _status("error", "Could not inspect trace summary cache.", error=f"{type(exc).__name__}: {exc}")
+    rows = _records(df)
+    total = sum(int(row.get("row_count") or 0) for row in rows)
+    latest_values = pd.to_datetime([row.get("latest_generated_at") for row in rows], utc=True, errors="coerce")
+    latest_values = latest_values[~pd.isna(latest_values)]
+    latest_at = latest_values.max() if len(latest_values) else None
+    age_hours = None if latest_at is None else (pd.Timestamp.utcnow() - latest_at).total_seconds() / 3600.0
+    status = "warn" if total == 0 or (age_hours is not None and age_hours > 24) else "ok"
+    return _status(
+        status,
+        "Trace summary cache is warm." if status == "ok" else "Trace summary cache is missing, empty, or stale.",
+        row_count=total,
+        latest_generated_at=None if latest_at is None else latest_at.isoformat(),
+        age_hours=age_hours,
+        rows=rows,
     )
 
 
@@ -701,6 +1024,16 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             reason=str(operator_api.get("error") or operator_api.get("message") or "Operator API health check failed."),
             commands=["./all_frontend.sh", "python -m advisory.operator_health --skip-dhan"],
             details={"url": operator_api.get("url"), "latency_ms": operator_api.get("latency_ms"), "status_code": operator_api.get("status_code")},
+        )
+
+    trace_summaries = sections.get("trace_summaries") if isinstance(sections.get("trace_summaries"), dict) else {}
+    if trace_summaries.get("status") in {"warn", "error"}:
+        add(
+            status=str(trace_summaries.get("status") or "warn"),
+            title="Trace summary cache is stale or unavailable",
+            reason=str(trace_summaries.get("error") or trace_summaries.get("message") or "Trace summary materialization did not pass."),
+            commands=["python -m advisory.trace_summary_store --symbol-limit 100 --event-limit 100", "python -m advisory.operator_health --skip-dhan"],
+            details={"row_count": trace_summaries.get("row_count"), "latest_generated_at": trace_summaries.get("latest_generated_at"), "age_hours": trace_summaries.get("age_hours")},
         )
 
     snapshot = sections.get("operator_snapshot") if isinstance(sections.get("operator_snapshot"), dict) else {}
@@ -844,6 +1177,30 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             details={"module": module},
         )
 
+    degradation_feed = sections.get("degradation_feed") if isinstance(sections.get("degradation_feed"), dict) else {}
+    for row in degradation_feed.get("rows") or []:
+        if not isinstance(row, dict) or row.get("recovered"):
+            continue
+        kind = str(row.get("kind") or "")
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if kind == "dhan_master_miss":
+            commands = ["python -m data.dhanlive.scrip_master", f"python -m data.dhanlive.ohlcv --symbol {symbol}" if symbol else "python -m data.dhanlive.ohlcv", "python -m advisory.operator_health --skip-dhan"]
+        elif kind == "announcement_document_failure":
+            commands = ["brew install poppler", "python -m data.announcements.cli", "python -m advisory.operator_health --skip-dhan"]
+        elif kind == "slow_operation":
+            commands = ["python -m advisory.performance_slowlog report --limit 20"]
+        elif kind == "trace_summary_cache_miss":
+            commands = ["python -m advisory.trace_summary_store --symbol-limit 150 --event-limit 150 --trace-limit 100", "python -m advisory.operator_health --skip-dhan"]
+        else:
+            commands = ["python -m advisory.operator_health --skip-dhan"]
+        add(
+            status=str(row.get("status") or row.get("severity") or "warn"),
+            title=str(row.get("title") or "Runtime degradation detected"),
+            reason=str(row.get("message") or row.get("suggested_fix") or "A fallback/error marker was found."),
+            commands=commands,
+            details={key: row.get(key) for key in ["kind", "source", "symbol", "unique_id", "observed_at", "suggested_fix"] if row.get(key) is not None},
+        )
+
     frontend = sections.get("frontend") if isinstance(sections.get("frontend"), dict) else {}
     if frontend.get("status") in {"warn", "error"}:
         add(
@@ -868,10 +1225,12 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
     sections: dict[str, Any] = {
         "database": check_database(),
         "operator_api": check_operator_api(),
+        "trace_summaries": check_trace_summaries(),
         "slow_operations": summarize_slow_operations(limit=20),
         "operator_snapshot": check_operator_snapshot(),
         "table_freshness": check_table_freshness(),
         "sync_state_failures": check_sync_state_failures(),
+        "operator_api_errors": check_operator_api_errors(),
         "redis": check_redis(),
         "cron_logs": check_cron_logs(log_dir),
         "optional_dependencies": check_optional_dependencies(),
@@ -882,6 +1241,7 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
         sections["dhan"] = check_dhan_token()
     else:
         sections["dhan"] = _status("warn", "Dhan token validation skipped by request.")
+    sections["degradation_feed"] = build_degradation_feed(sections, log_dir=log_dir)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "status": summarize_status(sections),

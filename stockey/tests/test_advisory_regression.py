@@ -1696,6 +1696,7 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
 
     monkeypatch.setattr(operator_health, "check_database", lambda: {"status": "ok", "message": "db ok"})
     monkeypatch.setattr(operator_health, "check_operator_api", lambda: {"status": "ok", "message": "api ok"})
+    monkeypatch.setattr(operator_health, "check_trace_summaries", lambda: {"status": "ok", "message": "trace cache ok", "row_count": 1})
     monkeypatch.setattr(operator_health, "check_operator_snapshot", lambda: {"status": "ok", "message": "snapshot ok"})
     monkeypatch.setattr(operator_health, "check_sync_state_failures", lambda: [{"status": "ok", "message": "sync ok"}])
     monkeypatch.setattr(operator_health, "summarize_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
@@ -1756,6 +1757,54 @@ def test_operator_health_flags_snapshot_and_sync_failures(monkeypatch):
     assert "stale" in snapshot["message"].lower()
     assert sync_rows[0]["status"] == "error"
     assert sync_rows[0]["source_name"] == "continuous_watch:ohlcv"
+
+
+def test_operator_health_degradation_feed_extracts_dhan_master_miss(monkeypatch, tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory.log").write_text(
+        "[stockey.script] name=all_advisory status=failed\nValueError: No Dhan security id mapped for NSE:HUIL\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
+
+    cron_rows = operator_health.check_cron_logs(log_dir)
+    feed = operator_health.build_degradation_feed({"cron_logs": cron_rows, "sync_state_failures": [], "slow_operations": {"issues": []}}, log_dir=log_dir)
+
+    assert feed["status"] == "error"
+    assert feed["active_count"] == 1
+    row = feed["rows"][0]
+    assert row["kind"] == "dhan_master_miss"
+    assert row["symbol"] == "HUIL"
+    assert "Dhan master" in row["title"]
+
+
+def test_operator_health_degradation_feed_includes_announcement_failures(monkeypatch):
+    monkeypatch.setattr(
+        operator_health,
+        "check_announcement_document_failures",
+        lambda limit=25: [
+            {
+                "status": "warn",
+                "severity": "warn",
+                "kind": "announcement_document_failure",
+                "title": "Announcement document OCR/parse issue",
+                "message": "poppler missing",
+                "source": "announcement_pipeline_documents",
+                "symbol": "ABC",
+                "unique_id": "ABC-1",
+                "observed_at": "2026-05-30T10:00:00+00:00",
+                "suggested_fix": "Install Poppler.",
+                "recovered": False,
+            }
+        ],
+    )
+
+    feed = operator_health.build_degradation_feed({"cron_logs": [], "sync_state_failures": [], "slow_operations": {"issues": []}})
+
+    assert feed["status"] == "warn"
+    assert feed["rows"][0]["kind"] == "announcement_document_failure"
+    assert feed["rows"][0]["symbol"] == "ABC"
 
 
 def test_operator_health_downgrades_recovered_cron_log_error(tmp_path):
@@ -1903,6 +1952,28 @@ def test_operator_api_symbol_trace_payload(monkeypatch):
     payload = operator_api.build_symbol_trace_payload("abc", limit=10)
 
     assert payload == {"symbol": "ABC", "traces": [{"final_action": "SELL"}], "limit": 10}
+
+
+def test_operator_api_trace_summary_uses_materialized_cache(monkeypatch):
+    cached = {"symbol": "ABC", "decisions": [], "_trace_summary_cache": {"source": "materialized"}}
+    monkeypatch.setattr(operator_api, "load_materialized_trace_summary", lambda entity_type, entity_key, limit=100: cached)
+    monkeypatch.setattr(operator_api, "load_symbol_trace", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("live trace should not be called")))
+
+    payload = operator_api.build_symbol_trace_summary_payload("ABC", limit=100)
+
+    assert payload["_trace_summary_cache"]["source"] == "materialized"
+
+
+def test_operator_api_trace_summary_falls_back_and_marks(monkeypatch):
+    markers = []
+    monkeypatch.setattr(operator_api, "load_materialized_trace_summary", lambda entity_type, entity_key, limit=100: None)
+    monkeypatch.setattr(operator_api, "record_operator_api_marker", lambda **kwargs: markers.append(kwargs))
+    monkeypatch.setattr(operator_api, "load_event_trace", lambda unique_id: {"unique_id": unique_id, "processing": [], "traces": [], "steps": []})
+
+    payload = operator_api.build_event_trace_summary_payload("event-1")
+
+    assert payload["_trace_summary_cache"]["source"] == "live_fallback"
+    assert markers[0]["message"] == "trace_summary_cache_miss:event"
 
 
 def test_operator_api_hypothesis_payloads(monkeypatch):
@@ -2991,6 +3062,12 @@ def test_hypothesis_engine_previews_payload_without_db_write():
     assert result["normalized_payload"]["trigger_patterns"]["exclude_keywords"] == ["routine clarification"]
     assert result["db_row_preview"]["status"] == "trusted_overlay"
     assert "review_only" in result["production_note"]
+
+
+def test_hypothesis_engine_normalizes_paused_playbook_status():
+    assert hypothesis_engine.normalize_playbook_status("paused") == "paused"
+    assert hypothesis_engine.normalize_playbook_status("disabled") == "paused"
+    assert hypothesis_engine.normalize_playbook_status("pause") == "paused"
 
 
 def test_hypothesis_engine_update_preserves_id_and_created_at(monkeypatch):
@@ -7408,6 +7485,253 @@ def test_operator_api_builds_event_policy_payload(monkeypatch):
     assert payload["rows"][0]["llm_review"]["recommended_action"] == "MANUAL_REVIEW"
 
 
+def test_operator_api_builds_manual_review_payload(monkeypatch):
+    action_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "updated_at": pd.Timestamp("2026-05-30T09:10:00Z"),
+                "symbol": "ABC",
+                "setup_id": "SETUP",
+                "action_code": "MANUAL_REVIEW",
+                "action_reason": "conflicting evidence",
+                "reason_contract_status": "needs_review",
+            }
+        ]
+    )
+    policy_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "unique_id": "event-1",
+                "symbol": "ABC",
+                "action_type": "MANUAL_REVIEW",
+                "action_status": "needs_operator_review",
+                "action_reason": "order win needs valuation check",
+                "published_on": pd.Timestamp("2026-05-30T09:00:00Z"),
+            }
+        ]
+    )
+    conflict_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "updated_at": pd.Timestamp("2026-05-30T09:30:00Z"),
+                "symbol": "ABC",
+                "winning_action_code": "BUY",
+                "losing_action_code": "SELL",
+                "lost_reason": "higher priority technical setup",
+            }
+        ]
+    )
+    execution_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "updated_at": pd.Timestamp("2026-05-30T10:00:00Z"),
+                "symbol": "ABC",
+                "execution_status": "submit_blocked",
+                "execution_reason": "broker disabled",
+                "execution_id": "exec-1",
+            }
+        ]
+    )
+    processing_rows = pd.DataFrame(
+        [
+            {
+                "unique_id": "event-2",
+                "symbol": "XYZ",
+                "stage": "event_evaluation",
+                "status": "failed",
+                "error": "LLM schema mismatch",
+                "completed_at": pd.Timestamp("2026-05-30T08:00:00Z"),
+            }
+        ]
+    )
+    document_rows = pd.DataFrame(
+        [
+            {
+                "unique_id": "doc-1",
+                "ticker": "XYZ",
+                "ocr_status": "failed",
+                "parse_status": "pending",
+                "last_error": "poppler missing",
+                "updated_at": pd.Timestamp("2026-05-30T07:00:00Z"),
+            }
+        ]
+    )
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda _table_name: True)
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        operator_api,
+        "load_promotion_reviews",
+        lambda limit=100: [
+            {
+                "reviewed_at": pd.Timestamp("2026-05-30T06:00:00Z"),
+                "setup_id": "TECH",
+                "config_id": "cfg-1",
+                "review_status": "ready_for_operator_review",
+                "manual_decision": None,
+            }
+        ],
+    )
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        if operator_api.EXECUTION_TABLE in query:
+            return execution_rows.copy()
+        if operator_api.ACTION_RECOMMENDATIONS_TABLE in query:
+            return action_rows.copy()
+        if operator_api.EVENT_POLICY_TABLE in query:
+            return policy_rows.copy()
+        if operator_api.ACTION_CONFLICTS_TABLE in query:
+            return conflict_rows.copy()
+        if "advisory_event_processing_runs" in query:
+            return processing_rows.copy()
+        if "announcement_pipeline_documents" in query:
+            return document_rows.copy()
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+
+    payload = operator_api.build_manual_review_payload(limit=20)
+
+    assert payload["status"] == "ok"
+    assert payload["summary"]["total_items"] == 7
+    assert payload["summary"]["by_type"]["action_manual_review"] == 1
+    assert payload["summary"]["by_type"]["event_policy_manual_review"] == 1
+    assert payload["summary"]["by_type"]["action_conflict"] == 1
+    assert payload["summary"]["by_type"]["threshold_review"] == 1
+    assert payload["summary"]["by_type"]["execution_blocker"] == 1
+    assert payload["summary"]["by_type"]["event_processing_failure"] == 1
+    assert payload["summary"]["by_type"]["announcement_failure"] == 1
+    assert payload["summary"]["by_severity"]["error"] == 2
+    assert payload["items"][0]["item_type"] == "execution_blocker"
+    assert payload["items"][0]["raw"]["updated_at"] == "2026-05-30T10:00:00+00:00"
+
+
+def test_operator_api_records_manual_review_decision(monkeypatch):
+    writes: list[pd.DataFrame] = []
+
+    monkeypatch.setattr(operator_api, "ensure_manual_review_decisions_table", lambda: None)
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+
+    payload = operator_api.record_manual_review_decision_payload(
+        {
+            "item_id": "action_manual_review:table:key",
+            "item": {
+                "item_id": "action_manual_review:table:key",
+                "item_type": "action_manual_review",
+                "source_table": "advisory_action_recommendations",
+                "source_key": "key",
+                "symbol": "ABC",
+                "setup_id": "SETUP",
+            },
+            "decision": "watch_for_event",
+            "rationale": "Need confirmation from next exchange filing.",
+            "follow_up_event": "Management clarification",
+            "operator_id": "rane",
+        }
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["closing_decision"] is False
+    assert writes
+    row = writes[0].iloc[0].to_dict()
+    assert row["item_id"] == "action_manual_review:table:key"
+    assert row["decision"] == "watch_for_event"
+    assert row["symbol"] == "ABC"
+    assert "Management clarification" in row["note_json"]
+
+
+def test_operator_api_filters_closed_manual_review_items(monkeypatch):
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.ACTION_RECOMMENDATIONS_TABLE)
+    monkeypatch.setattr(
+        operator_api,
+        "sql_to_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                    "updated_at": pd.Timestamp("2026-05-30T09:10:00Z"),
+                    "symbol": "ABC",
+                    "setup_id": "SETUP",
+                    "action_code": "MANUAL_REVIEW",
+                    "action_reason": "conflicting evidence",
+                }
+            ]
+        ),
+    )
+
+    def fake_decisions(**_kwargs):
+        item_id = "action_manual_review:advisory_action_recommendations:2026-05-30 00:00:00+00:00:ABC:SETUP"
+        return {item_id: {"item_id": item_id, "decision": "ignore", "decided_at": pd.Timestamp("2026-05-30T10:00:00Z")}}
+
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", fake_decisions)
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+
+    payload = operator_api.build_manual_review_payload(limit=20)
+
+    assert payload["summary"]["closed_by_operator"] == 1
+    assert payload["items"] == []
+
+
+def test_operator_api_lists_operator_commands(monkeypatch):
+    monkeypatch.setattr(operator_api, "ensure_operator_command_runs_table", lambda: None)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: pd.DataFrame([{"run_id": "run-1", "command_key": "operator_health_skip_dhan", "status": "ok", "command_args_json": '["python"]'}]))
+
+    payload = operator_api.build_operator_commands_payload(limit=10)
+
+    assert payload["status"] == "ok"
+    assert any(row["key"] == "operator_health_skip_dhan" for row in payload["commands"])
+    assert payload["recent_runs"][0]["command_args"] == ["python"]
+
+
+def test_operator_api_runs_whitelisted_command_with_audit(monkeypatch):
+    writes: list[pd.DataFrame] = []
+
+    class Completed:
+        returncode = 0
+        stdout = "health ok"
+        stderr = ""
+
+    monkeypatch.setattr(operator_api, "ensure_operator_command_runs_table", lambda: None)
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+    monkeypatch.setattr(operator_api.subprocess, "run", lambda *args, **kwargs: Completed())
+
+    payload = operator_api.run_operator_command_payload(
+        {
+            "command_key": "operator_health_skip_dhan",
+            "confirm": True,
+            "operator_id": "rane",
+            "requested_reason": "check health",
+        }
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["run"]["stdout_tail"] == "health ok"
+    assert len(writes) == 2
+    assert writes[0].iloc[0]["status"] == "running"
+    assert writes[1].iloc[0]["status"] == "ok"
+    assert writes[1].iloc[0]["operator_id"] == "rane"
+
+
+def test_operator_api_blocks_unknown_or_unconfirmed_operator_command():
+    try:
+        operator_api.run_operator_command_payload({"command_key": "operator_health_skip_dhan"})
+    except ValueError as exc:
+        assert "confirm=true" in str(exc)
+    else:
+        raise AssertionError("expected confirm error")
+
+    try:
+        operator_api.run_operator_command_payload({"command_key": "all_advisory", "confirm": True})
+    except ValueError as exc:
+        assert "Unknown command_key" in str(exc)
+    else:
+        raise AssertionError("expected unknown command error")
+
+
 def test_operator_api_builds_event_policy_evaluation_payload(monkeypatch):
     summary = pd.DataFrame(
         [
@@ -7860,6 +8184,31 @@ def test_performance_slowlog_deduplicates_state(tmp_path):
     assert issue["max_elapsed_ms"] == 150.0
     assert issue["last_details"]["query"] == "a=2"
     assert len(log_file.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_operator_api_updates_slow_issue_status(monkeypatch):
+    calls = []
+
+    def fake_update(fingerprint, *, status, note=None):
+        calls.append({"fingerprint": fingerprint, "status": status, "note": note})
+        return {"fingerprint": fingerprint, "status": status, "status_note": note}
+
+    monkeypatch.setattr(operator_api, "update_slow_issue_status", fake_update)
+
+    result = operator_api.update_slow_issue_payload({"fingerprint": "abc", "status": "triaged", "operator_id": "qa"})
+
+    assert result["status"] == "ok"
+    assert calls[0]["status"] == "triaged"
+    assert calls[0]["note"] == "operator=qa"
+
+
+def test_operator_api_requires_note_for_fixed_slow_issue():
+    try:
+        operator_api.update_slow_issue_payload({"fingerprint": "abc", "status": "fixed"})
+    except ValueError as exc:
+        assert "note is required" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
 
 
 def test_rule_engine_refresh_missing_snapshots_can_skip_intraday(monkeypatch):

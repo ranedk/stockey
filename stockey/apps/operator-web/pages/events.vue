@@ -3,13 +3,29 @@ import type { Dict } from '~/types/api'
 import type { TraceSummary } from '~/types/api'
 
 const api = useOperatorApi()
-const { data } = await useAsyncData('events', () => api.getEvents(100))
+const eventLimit = ref(50)
+const eventOffset = ref(0)
+const eventSymbol = ref('')
+const eventStatus = ref('all')
+const eventSearch = ref('')
+const { data, refresh: refreshEvents, error: eventsError } = await useAsyncData(
+  'events',
+  () => api.getEvents(eventLimit.value, {
+    offset: eventOffset.value,
+    symbol: eventSymbol.value.trim().toUpperCase(),
+    status: eventStatus.value,
+    search: eventSearch.value.trim(),
+    compact: true
+  }),
+  { watch: [eventLimit, eventOffset, eventStatus] }
+)
 const selectedActionType = ref('ALL')
 const { data: policyData, refresh: refreshPolicy } = await useAsyncData('event-policy', () => api.getEventPolicy(100, selectedActionType.value), {
   watch: [selectedActionType]
 })
 const { data: policyEvalData } = await useAsyncData('event-policy-evaluation', () => api.getEventPolicyEvaluation(80))
 const events = computed(() => data.value?.events || [])
+const eventMeta = computed(() => data.value?.meta?.events as Dict || {})
 const policyRows = computed(() => policyData.value?.rows || [])
 const policyEvalRows = computed(() => policyEvalData.value?.summary || [])
 const policySummary = computed(() => policyData.value?.summary || {})
@@ -60,6 +76,22 @@ async function loadTrace(row: Record<string, unknown>) {
   } finally {
     loadingTrace[uniqueId] = false
   }
+}
+
+async function applyEventFilters() {
+  eventOffset.value = 0
+  await refreshEvents()
+}
+
+async function loadNextEvents() {
+  const next = Number(eventMeta.value.next_offset)
+  if (!Number.isFinite(next)) return
+  eventOffset.value = next
+}
+
+function eventDetailPath(row: Record<string, unknown>) {
+  const uniqueId = String(row.unique_id || '')
+  return uniqueId ? `/api/events/${encodeURIComponent(uniqueId)}/detail` : ''
 }
 </script>
 
@@ -150,12 +182,15 @@ async function loadTrace(row: Record<string, unknown>) {
     <RecordCard
       v-for="(row, idx) in policyRows"
       :key="`${row.unique_id}-${row.setup_id}-${idx}`"
-      :title="String(row.symbol || row.unique_id || 'Policy event')"
+      :title="String(row.unique_id || 'Policy event')"
       :subtitle="String(row.action_reason || row.action_detail || '')"
       :record="row"
     >
       <template #badge>
-        <span class="rounded-full px-3 py-1 text-xs font-bold" :class="tone(row.action_type)">{{ row.action_type || 'POLICY' }}</span>
+        <div class="flex flex-wrap gap-2">
+          <SymbolLink :symbol="row.symbol" subtle />
+          <span class="rounded-full px-3 py-1 text-xs font-bold" :class="tone(row.action_type)">{{ row.action_type || 'POLICY' }}</span>
+        </div>
       </template>
 
       <div class="mt-4 grid gap-3 md:grid-cols-4">
@@ -201,6 +236,13 @@ async function loadTrace(row: Record<string, unknown>) {
         {{ loadingTrace[String(row.unique_id || '')] ? 'Loading trace...' : 'Load decision trace' }}
       </button>
       <NuxtLink
+        v-if="row.symbol"
+        class="ml-2 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink"
+        :to="`/symbols/${encodeURIComponent(String(row.symbol || '').toUpperCase())}`"
+      >
+        Open symbol page
+      </NuxtLink>
+      <NuxtLink
         v-if="row.unique_id"
         class="ml-2 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink"
         :to="`/decision-trace?unique_id=${encodeURIComponent(String(row.unique_id || ''))}`"
@@ -222,16 +264,51 @@ async function loadTrace(row: Record<string, unknown>) {
     <h2 class="mt-3 text-3xl font-black">Latest news and announcements</h2>
   </section>
 
+  <ApiErrorBanner v-if="eventsError" class="mt-5" title="Raw event feed failed" :error="eventsError" />
+
+  <section class="mt-5 glass-panel rounded-3xl p-5">
+    <div class="grid gap-3 md:grid-cols-[0.8fr_0.7fr_1.4fr_auto]">
+      <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+        Symbol
+        <input v-model="eventSymbol" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="Optional" @keyup.enter="applyEventFilters" />
+      </label>
+      <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+        Status
+        <select v-model="eventStatus" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss">
+          <option value="all">All</option>
+          <option value="error">Error</option>
+          <option value="warn">Warn</option>
+          <option value="parsed">Parsed</option>
+          <option value="review">Review</option>
+        </select>
+      </label>
+      <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+        Search
+        <input v-model="eventSearch" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="subject, id, event class..." @keyup.enter="applyEventFilters" />
+      </label>
+      <button class="self-end rounded-full bg-ink px-5 py-2 text-sm font-black text-paper" type="button" @click="applyEventFilters">
+        Apply
+      </button>
+    </div>
+    <p class="mt-3 text-sm font-semibold text-ink/55">
+      Showing {{ eventMeta.returned || events.length }} of {{ eventMeta.total ?? events.length }} rows. Offset {{ eventMeta.offset || 0 }}.
+    </p>
+  </section>
+
   <section class="mt-5 grid gap-4">
     <RecordCard
       v-for="(row, idx) in events"
       :key="idx"
-      :title="String(row.symbol || row.unique_id || 'Event')"
+      :title="String(row.unique_id || 'Event')"
       :subtitle="String(row.subject || row.concise_summary_text || '')"
       :record="row"
+      :detail-path="eventDetailPath(row)"
     >
       <template #badge>
-        <span class="rounded-full bg-ember px-3 py-1 text-xs font-bold text-white">{{ row.event_status || row.parse_status || 'EVENT' }}</span>
+        <div class="flex flex-wrap gap-2">
+          <SymbolLink :symbol="row.symbol || row.ticker" subtle />
+          <span class="rounded-full bg-ember px-3 py-1 text-xs font-bold text-white">{{ row.event_status || row.parse_status || 'EVENT' }}</span>
+        </div>
       </template>
       <button
         class="mt-4 rounded-full bg-ink px-4 py-2 text-sm font-bold text-paper"
@@ -240,6 +317,13 @@ async function loadTrace(row: Record<string, unknown>) {
       >
         {{ loadingTrace[String(row.unique_id || '')] ? 'Loading trace...' : 'Load decision trace' }}
       </button>
+      <NuxtLink
+        v-if="row.symbol || row.ticker"
+        class="ml-2 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink"
+        :to="`/symbols/${encodeURIComponent(String(row.symbol || row.ticker || '').toUpperCase())}`"
+      >
+        Open symbol page
+      </NuxtLink>
       <NuxtLink
         v-if="row.unique_id"
         class="ml-2 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink"
@@ -256,4 +340,10 @@ async function loadTrace(row: Record<string, unknown>) {
     </RecordCard>
     <p v-if="!events.length" class="glass-panel rounded-3xl p-6 text-ink/60">No event rows found.</p>
   </section>
+
+  <div v-if="eventMeta.has_more" class="mt-5 flex justify-center">
+    <button class="rounded-full bg-moss px-6 py-3 text-sm font-black text-paper" type="button" @click="loadNextEvents">
+      Load next {{ eventLimit }} events
+    </button>
+  </div>
 </template>

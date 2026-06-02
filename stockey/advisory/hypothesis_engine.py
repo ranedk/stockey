@@ -31,6 +31,7 @@ DEFAULT_PROMOTION_MIN_MATCHES = 3
 DEFAULT_PROMOTION_HORIZONS = [1, 3, 5, 10, 20]
 ACTIVE_REVIEW_STATUS = "active_review"
 TRUSTED_OVERLAY_STATUS = "trusted_overlay"
+PAUSED_STATUS = "paused"
 RETIRED_STATUS = "retired"
 TRUSTED_OVERLAY_STATUSES = {TRUSTED_OVERLAY_STATUS, "production"}
 ACTIVE_SCAN_STATUSES = {"testing", "validated", ACTIVE_REVIEW_STATUS, TRUSTED_OVERLAY_STATUS, "production"}
@@ -337,6 +338,8 @@ def normalize_playbook_status(value: Any) -> str:
         "testing": ACTIVE_REVIEW_STATUS,
         "validated": ACTIVE_REVIEW_STATUS,
         "production": TRUSTED_OVERLAY_STATUS,
+        "pause": PAUSED_STATUS,
+        "disabled": PAUSED_STATUS,
         "rejected": RETIRED_STATUS,
         "inactive": RETIRED_STATUS,
     }

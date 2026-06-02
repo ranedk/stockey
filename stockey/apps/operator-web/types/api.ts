@@ -27,12 +27,90 @@ export interface OperatorHealthDetails {
   fix_hints?: Dict[]
 }
 
+export interface OperatorSmokePayload {
+  generated_at?: string
+  status: string
+  operator_health: Dict
+  fix_hints?: Dict[]
+  read_only: boolean
+  note?: string
+}
+
+export interface CronLogsPayload {
+  generated_at?: string
+  status: string
+  log_dir: string
+  logs: Dict[]
+}
+
+export interface OperatorCommandsPayload {
+  generated_at?: string
+  status: string
+  commands: Dict[]
+  recent_runs: Dict[]
+}
+
+export interface OperatorApiErrorsPayload {
+  generated_at?: string
+  status: string
+  summary: Dict
+  errors: Dict[]
+}
+
+export interface OperatorCommandRunResult {
+  generated_at?: string
+  status: string
+  run: Dict
+  note?: string
+}
+
+export interface EventModelPromotionCheckPayload {
+  generated_at?: string
+  status: string
+  decision: string
+  ready_for_operator_review: boolean
+  promotion_mode: string
+  artifact: Dict
+  metadata?: Dict
+  coverage: Dict
+  weekly_runs: Dict
+  score_freshness: Dict
+  gates: Dict[]
+  failed_gates: string[]
+  notes: string[]
+}
+
+export interface EventModelArtifactsPayload {
+  generated_at?: string
+  status: string
+  artifact: Dict
+  latest_s3_heads: Dict[]
+  read_only: boolean
+}
+
+export interface ManualReviewPayload {
+  generated_at?: string
+  status: string
+  summary: Dict
+  items: Dict[]
+}
+
+export interface ManualReviewDecisionResult {
+  status: string
+  decided_at?: string
+  item_id: string
+  decision: string
+  closing_decision: boolean
+  note?: string
+}
+
 export interface OperatorActions {
   generated_at?: string
   asof_date?: string
   top_action_recommendations: Dict[]
   action_recommendations: Dict[]
   alerts: Dict[]
+  meta?: Dict
 }
 
 export interface OperatorPortfolio {
@@ -43,6 +121,7 @@ export interface OperatorPortfolio {
   exited_recommendations: Dict[]
   portfolio: Dict[]
   lifecycle: Dict[]
+  meta?: Dict
 }
 
 export interface OperatorEvents {
@@ -51,6 +130,7 @@ export interface OperatorEvents {
   events: Dict[]
   operator_feed: Dict[]
   alerts: Dict[]
+  meta?: Dict
 }
 
 export interface EventPolicyPayload {

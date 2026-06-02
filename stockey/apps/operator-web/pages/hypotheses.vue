@@ -33,6 +33,9 @@ const editingId = ref('')
 const updatingStatusId = ref('')
 const checkingId = ref('')
 const checkResult = ref<Record<string, unknown> | null>(null)
+const statusFilter = ref('all')
+const reliabilityFilter = ref('all')
+const scopeFilter = ref('all')
 const checkSettings = reactive({
   lookbackDays: 365,
   minMatches: 3,
@@ -43,6 +46,20 @@ const hypotheses = computed(() => data.value?.hypotheses || [])
 const matches = computed(() => data.value?.matches || [])
 const actionPlans = computed(() => data.value?.action_plans || [])
 const reliabilityChecks = computed(() => data.value?.promotion_audits || [])
+const statusOptions = [
+  { key: 'all', label: 'All' },
+  { key: 'draft', label: 'Draft' },
+  { key: 'active_review', label: 'Active Review' },
+  { key: 'trusted_overlay', label: 'Trusted Overlay' },
+  { key: 'paused', label: 'Paused' },
+  { key: 'retired', label: 'Retired' }
+]
+const reliabilityOptions = [
+  { key: 'all', label: 'All' },
+  { key: 'missing', label: 'No Check' },
+  { key: 'sufficient_history', label: 'Sufficient History' },
+  { key: 'insufficient_history', label: 'Insufficient History' }
+]
 const reliabilityByHypothesis = computed(() => {
   const out: Record<string, Record<string, unknown>> = {}
   for (const row of reliabilityChecks.value) {
@@ -51,6 +68,29 @@ const reliabilityByHypothesis = computed(() => {
   }
   return out
 })
+const matchesByHypothesis = computed(() => groupRows(matches.value, 'hypothesis_id'))
+const plansByHypothesis = computed(() => groupRows(actionPlans.value, 'hypothesis_id'))
+const scopeOptions = computed(() => {
+  const scopes = new Set(['all'])
+  for (const row of hypotheses.value) scopes.add(String(row.trigger_scope || 'market'))
+  return [...scopes].map((key) => ({ key, label: key === 'all' ? 'All Scopes' : titleCase(key) }))
+})
+const lifecycleCounts = computed(() => {
+  const counts: Record<string, number> = {}
+  for (const row of hypotheses.value) {
+    const status = normalizedStatus(row.status)
+    counts[status] = (counts[status] || 0) + 1
+  }
+  return counts
+})
+const filteredHypotheses = computed(() => hypotheses.value.filter((row) => {
+  const status = normalizedStatus(row.status)
+  const reliability = reliabilityStatus(row)
+  const scope = String(row.trigger_scope || 'market')
+  return (statusFilter.value === 'all' || status === statusFilter.value)
+    && (reliabilityFilter.value === 'all' || reliability === reliabilityFilter.value)
+    && (scopeFilter.value === 'all' || scope === scopeFilter.value)
+}))
 
 function parseKeywords(value: string) {
   return value
@@ -59,11 +99,11 @@ function parseKeywords(value: string) {
     .filter(Boolean)
 }
 
-function parseJsonish(value: unknown, fallback: Record<string, unknown> = {}) {
+function parseJsonish<T = Record<string, unknown>>(value: unknown, fallback: T = {} as T): T {
   if (!value) return fallback
-  if (typeof value === 'object') return value as Record<string, unknown>
+  if (typeof value === 'object') return value as T
   try {
-    return JSON.parse(String(value)) as Record<string, unknown>
+    return JSON.parse(String(value)) as T
   } catch {
     return fallback
   }
@@ -88,6 +128,83 @@ function pct(value: unknown) {
   const num = Number(value)
   if (!Number.isFinite(num)) return '-'
   return `${Math.round(num * 10000) / 100}%`
+}
+
+function groupRows(rows: Record<string, unknown>[], key: string) {
+  const out: Record<string, Record<string, unknown>[]> = {}
+  for (const row of rows) {
+    const id = String(row[key] || '')
+    if (!id) continue
+    out[id] ||= []
+    out[id].push(row)
+  }
+  return out
+}
+
+function titleCase(value: unknown) {
+  return String(value || '').replaceAll('_', ' ').replace(/\b\w/g, (char) => char.toUpperCase())
+}
+
+function normalizedStatus(value: unknown) {
+  const status = String(value || 'active_review').toLowerCase()
+  if (status === 'production') return 'trusted_overlay'
+  if (status === 'testing' || status === 'validated') return 'active_review'
+  if (status === 'disabled') return 'paused'
+  if (status === 'inactive' || status === 'rejected') return 'retired'
+  return status
+}
+
+function statusClass(value: unknown) {
+  const status = normalizedStatus(value)
+  if (status === 'trusted_overlay') return 'bg-ember text-white'
+  if (status === 'active_review') return 'bg-moss text-white'
+  if (status === 'draft') return 'bg-sun text-ink'
+  if (status === 'paused') return 'bg-ink/20 text-ink'
+  return 'bg-ink text-paper'
+}
+
+function reliabilityStatus(row: Record<string, unknown>) {
+  const check = reliabilityByHypothesis.value[String(row.hypothesis_id || '')]
+  return String(check?.audit_status || 'missing').toLowerCase()
+}
+
+function reliabilityClass(value: unknown) {
+  const status = String(value || '').toLowerCase()
+  if (status === 'sufficient_history') return 'bg-moss text-white'
+  if (status === 'missing') return 'bg-ink/20 text-ink'
+  return 'bg-ember text-white'
+}
+
+function actionBoundary(row: Record<string, unknown>) {
+  const status = normalizedStatus(row.status)
+  if (status === 'trusted_overlay') return 'review-only overlay can influence consolidated actions'
+  if (status === 'active_review') return 'research/review only until trusted'
+  if (status === 'draft') return 'not scanned by default'
+  if (status === 'paused') return 'temporarily excluded from active scans'
+  return 'retired and excluded'
+}
+
+function expectedEffect(row: Record<string, unknown>) {
+  const effect = parseJsonish(row.expected_effect_json)
+  return String(effect.effect || effect.action_bias || 'manual_review')
+}
+
+function triggerKeywords(row: Record<string, unknown>) {
+  const triggerPatterns = parseJsonish(row.trigger_patterns_json)
+  return listText(triggerPatterns.keywords || triggerPatterns.required_terms || [])
+}
+
+function latestPlans(row: Record<string, unknown>) {
+  return (plansByHypothesis.value[String(row.hypothesis_id || '')] || []).slice(0, 3)
+}
+
+function latestMatches(row: Record<string, unknown>) {
+  return (matchesByHypothesis.value[String(row.hypothesis_id || '')] || []).slice(0, 3)
+}
+
+function actionPlanChecks(row: Record<string, unknown>) {
+  const checks = parseJsonish(row.checks_json, [])
+  return Array.isArray(checks) ? checks as Record<string, unknown>[] : []
 }
 
 function buildHypothesisPayload() {
@@ -247,7 +364,21 @@ async function runReliabilityCheck(row: Record<string, unknown>) {
   }
 }
 
-async function runScan(hypothesisId?: unknown) {
+async function setLifecycle(row: Record<string, unknown>, status: string) {
+  if (status === 'trusted_overlay') {
+    const check = reliabilityByHypothesis.value[String(row.hypothesis_id || '')]
+    const checkStatus = String(check?.audit_status || '').toLowerCase()
+    const confirmed = window.confirm(
+      checkStatus === 'sufficient_history'
+        ? `Mark ${row.hypothesis_id} as a trusted review overlay? It remains review-only and cannot create broker orders.`
+        : `This playbook does not have sufficient reliability history. Mark it trusted overlay anyway? It remains review-only and cannot create broker orders.`
+    )
+    if (!confirmed) return
+  }
+  await updateStatus(row, status)
+}
+
+async function runScan(hypothesisId?: unknown, persist = true) {
   error.value = ''
   running.value = true
   try {
@@ -258,7 +389,7 @@ async function runScan(hypothesisId?: unknown) {
       sources: scan.sources,
       build_actions: true,
       use_llm: scan.useLlm,
-      persist: true
+      persist
     })
     await refresh()
   } catch (err) {
@@ -338,6 +469,7 @@ async function runScan(hypothesisId?: unknown) {
               <option value="draft">Draft</option>
               <option value="active_review">Active review</option>
               <option value="trusted_overlay">Trusted overlay</option>
+              <option value="paused">Paused</option>
               <option value="retired">Retired</option>
             </select>
           </label>
@@ -436,26 +568,88 @@ async function runScan(hypothesisId?: unknown) {
     </div>
   </section>
 
-  <section class="mt-8 grid gap-6 lg:grid-cols-2">
-    <div>
-      <h2 class="mb-3 text-xl font-black">Saved Playbooks</h2>
-      <div class="space-y-3">
-        <RecordCard
-          v-for="row in hypotheses"
-          :key="String(row.hypothesis_id)"
-          :title="String(row.title || row.hypothesis_id)"
-          :subtitle="String(row.description || '')"
-          :record="row"
+  <section class="mt-8 grid gap-4 md:grid-cols-5">
+    <MetricTile label="Draft" :value="String(lifecycleCounts.draft || 0)" note="Saved but not scanned by default" />
+    <MetricTile label="Active Review" :value="String(lifecycleCounts.active_review || 0)" note="Research and review queue" />
+    <MetricTile label="Trusted" :value="String(lifecycleCounts.trusted_overlay || 0)" note="Review-only action overlay" />
+    <MetricTile label="Paused" :value="String(lifecycleCounts.paused || 0)" note="Temporarily excluded" />
+    <MetricTile label="Retired" :value="String(lifecycleCounts.retired || 0)" note="Historical only" />
+  </section>
+
+  <section class="mt-8 grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
+    <div class="glass-panel rounded-3xl p-6">
+      <div class="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Lifecycle</p>
+          <h2 class="mt-2 text-2xl font-black">Saved Playbooks</h2>
+          <p class="mt-2 max-w-3xl text-sm leading-6 text-ink/60">
+            Promotion audit is now operator-facing reliability check. Trusted overlays can influence consolidated actions only as review-only evidence.
+          </p>
+        </div>
+        <span class="rounded-full bg-ink px-3 py-1 text-xs font-black text-paper">{{ filteredHypotheses.length }} shown</span>
+      </div>
+      <div class="mt-5 flex flex-wrap gap-2">
+        <button
+          v-for="option in statusOptions"
+          :key="option.key"
+          class="rounded-full px-4 py-2 text-sm font-black transition"
+          :class="statusFilter === option.key ? 'bg-ink text-paper' : 'bg-white/80 text-ink/60 hover:bg-white'"
+          type="button"
+          @click="statusFilter = option.key"
         >
-          <template #badge>
-            <span class="rounded-full bg-moss px-3 py-1 text-xs font-bold text-white">{{ row.status || 'active_review' }}</span>
-          </template>
-          <div class="mt-4 flex flex-wrap gap-2">
+          {{ option.label }} · {{ option.key === 'all' ? hypotheses.length : lifecycleCounts[option.key] || 0 }}
+        </button>
+      </div>
+      <div class="mt-3 flex flex-wrap gap-2">
+        <button
+          v-for="option in reliabilityOptions"
+          :key="option.key"
+          class="rounded-full px-4 py-2 text-sm font-black transition"
+          :class="reliabilityFilter === option.key ? 'bg-moss text-paper' : 'bg-white/80 text-ink/60 hover:bg-white'"
+          type="button"
+          @click="reliabilityFilter = option.key"
+        >
+          {{ option.label }}
+        </button>
+        <button
+          v-for="option in scopeOptions"
+          :key="option.key"
+          class="rounded-full px-4 py-2 text-sm font-black transition"
+          :class="scopeFilter === option.key ? 'bg-sun text-ink' : 'bg-white/80 text-ink/60 hover:bg-white'"
+          type="button"
+          @click="scopeFilter = option.key"
+        >
+          {{ option.label }}
+        </button>
+      </div>
+      <div class="mt-6 space-y-4">
+        <article v-for="row in filteredHypotheses" :key="String(row.hypothesis_id)" class="rounded-3xl bg-white/75 p-5">
+          <div class="flex flex-wrap items-start justify-between gap-4">
+            <div class="max-w-3xl">
+              <div class="flex flex-wrap gap-2">
+                <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(row.status)">{{ titleCase(normalizedStatus(row.status)) }}</span>
+                <span class="rounded-full px-3 py-1 text-xs font-black" :class="reliabilityClass(reliabilityStatus(row))">{{ titleCase(reliabilityStatus(row)) }}</span>
+                <span class="rounded-full bg-ink/10 px-3 py-1 text-xs font-black text-ink/60">{{ titleCase(row.trigger_scope || 'market') }}</span>
+              </div>
+              <h3 class="mt-3 text-2xl font-black text-ink">{{ row.title || row.hypothesis_id }}</h3>
+              <p class="mt-2 text-sm leading-6 text-ink/65">{{ row.description || 'No thesis description recorded.' }}</p>
+            </div>
             <button class="rounded-full bg-white px-4 py-2 text-sm font-bold text-ink" type="button" @click="editHypothesis(row)">
               Edit
             </button>
-          <button class="rounded-full bg-ink px-4 py-2 text-sm font-bold text-paper" type="button" @click="runScan(row.hypothesis_id)">
-              Run this playbook
+          </div>
+
+          <div class="mt-4 grid gap-2 text-sm md:grid-cols-4">
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Effect:</b> {{ titleCase(expectedEffect(row)) }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Matches:</b> {{ matchesByHypothesis[String(row.hypothesis_id || '')]?.length || 0 }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Plans:</b> {{ plansByHypothesis[String(row.hypothesis_id || '')]?.length || 0 }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Boundary:</b> {{ actionBoundary(row) }}</p>
+          </div>
+          <p class="mt-3 text-sm text-ink/55"><b>Triggers:</b> {{ triggerKeywords(row) || 'No trigger terms recorded.' }}</p>
+
+          <div class="mt-4 flex flex-wrap gap-2">
+            <button class="rounded-full bg-ink px-4 py-2 text-sm font-bold text-paper" type="button" @click="runScan(row.hypothesis_id, false)">
+              Dry-run this playbook
             </button>
             <button
               class="rounded-full bg-white px-4 py-2 text-sm font-bold text-ink disabled:opacity-50"
@@ -463,56 +657,77 @@ async function runScan(hypothesisId?: unknown) {
               :disabled="checkingId === row.hypothesis_id"
               @click="runReliabilityCheck(row)"
             >
-              {{ checkingId === row.hypothesis_id ? 'Checking...' : 'Check reliability' }}
+              {{ checkingId === row.hypothesis_id ? 'Checking...' : 'Run reliability check' }}
             </button>
-            <button
-              v-if="row.status !== 'trusted_overlay'"
-              class="rounded-full bg-ember px-4 py-2 text-sm font-bold text-white disabled:opacity-50"
-              type="button"
-              :disabled="updatingStatusId === row.hypothesis_id"
-              @click="updateStatus(row, 'trusted_overlay')"
-            >
-              Trust overlay
+            <button v-if="normalizedStatus(row.status) !== 'active_review'" class="rounded-full bg-moss px-4 py-2 text-sm font-bold text-white disabled:opacity-50" type="button" :disabled="updatingStatusId === row.hypothesis_id" @click="setLifecycle(row, 'active_review')">
+              Activate review
             </button>
-            <button
-              v-if="row.status === 'trusted_overlay'"
-              class="rounded-full bg-sun px-4 py-2 text-sm font-bold text-ink disabled:opacity-50"
-              type="button"
-              :disabled="updatingStatusId === row.hypothesis_id"
-              @click="updateStatus(row, 'active_review')"
-            >
-              Move to review
+            <button v-if="normalizedStatus(row.status) !== 'trusted_overlay'" class="rounded-full bg-ember px-4 py-2 text-sm font-bold text-white disabled:opacity-50" type="button" :disabled="updatingStatusId === row.hypothesis_id" @click="setLifecycle(row, 'trusted_overlay')">
+              Mark trusted overlay
+            </button>
+            <button v-if="normalizedStatus(row.status) !== 'paused'" class="rounded-full bg-sun px-4 py-2 text-sm font-bold text-ink disabled:opacity-50" type="button" :disabled="updatingStatusId === row.hypothesis_id" @click="setLifecycle(row, 'paused')">
+              Pause
+            </button>
+            <button v-if="normalizedStatus(row.status) !== 'retired'" class="rounded-full bg-ink/10 px-4 py-2 text-sm font-bold text-ink disabled:opacity-50" type="button" :disabled="updatingStatusId === row.hypothesis_id" @click="setLifecycle(row, 'retired')">
+              Retire
             </button>
           </div>
-          <div v-if="reliabilityByHypothesis[String(row.hypothesis_id || '')]" class="mt-4 rounded-2xl border border-black/10 bg-white/70 p-3 text-sm">
+
+          <div v-if="reliabilityByHypothesis[String(row.hypothesis_id || '')]" class="mt-4 rounded-2xl border border-black/10 bg-paper/70 p-4 text-sm">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <b>Latest reliability check</b>
-              <span
-                class="rounded-full px-3 py-1 text-xs font-black"
-                :class="String(reliabilityByHypothesis[String(row.hypothesis_id || '')].audit_status || '').toLowerCase() === 'sufficient_history' ? 'bg-moss text-white' : 'bg-ember text-white'"
-              >
-                {{ reliabilityByHypothesis[String(row.hypothesis_id || '')].audit_status }}
+              <span class="rounded-full px-3 py-1 text-xs font-black" :class="reliabilityClass(reliabilityStatus(row))">
+                {{ titleCase(reliabilityStatus(row)) }}
               </span>
             </div>
             <p class="mt-2 text-ink/65">{{ reliabilityByHypothesis[String(row.hypothesis_id || '')].audit_reason }}</p>
             <p class="mt-2 text-xs text-ink/45">
               Matches: {{ reliabilityByHypothesis[String(row.hypothesis_id || '')].match_count || 0 }} ·
               Sources: {{ reliabilityByHypothesis[String(row.hypothesis_id || '')].source_type_count || 0 }} ·
-              Symbols: {{ reliabilityByHypothesis[String(row.hypothesis_id || '')].symbol_count || 0 }}
+              Symbols: {{ reliabilityByHypothesis[String(row.hypothesis_id || '')].symbol_count || 0 }} ·
+              Checked: {{ reliabilityByHypothesis[String(row.hypothesis_id || '')].audited_at || '-' }}
             </p>
             <div v-if="reliabilityForwardSummary(reliabilityByHypothesis[String(row.hypothesis_id || '')]).length" class="mt-3 grid gap-2 md:grid-cols-2">
-              <div
-                v-for="summary in reliabilityForwardSummary(reliabilityByHypothesis[String(row.hypothesis_id || '')])"
-                :key="String(summary.horizon_days)"
-                class="rounded-xl bg-paper/70 px-3 py-2 text-xs"
-              >
+              <div v-for="summary in reliabilityForwardSummary(reliabilityByHypothesis[String(row.hypothesis_id || '')])" :key="String(summary.horizon_days)" class="rounded-xl bg-white/70 px-3 py-2 text-xs">
                 <b>{{ summary.horizon_days }}d:</b>
                 {{ summary.evaluated_count }} eval · mean {{ pct(summary.mean_forward_return) }} · hit {{ pct(summary.positive_hit_rate) }} · NIFTY excess {{ pct(summary.mean_excess_return_vs_benchmark) }} · sector excess {{ pct(summary.mean_excess_return_vs_sector_proxy) }}
               </div>
             </div>
           </div>
-        </RecordCard>
-        <p v-if="!hypotheses.length" class="glass-panel rounded-3xl p-6 text-ink/60">No playbooks saved yet.</p>
+
+          <details v-if="latestPlans(row).length" class="mt-4">
+            <summary class="cursor-pointer text-sm font-black text-moss">Latest action plans and operator questions</summary>
+            <div class="mt-3 space-y-3">
+              <div v-for="plan in latestPlans(row)" :key="`${plan.source_table}-${plan.source_key}`" class="rounded-2xl bg-paper/70 p-4">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <p class="font-black text-ink">{{ plan.action_type || plan.suggested_action }}</p>
+                  <span class="rounded-full bg-ink/10 px-3 py-1 text-xs font-black text-ink/60">{{ plan.llm_status || 'planner' }}</span>
+                </div>
+                <p class="mt-2 text-sm text-ink/65">{{ plan.operator_summary || plan.decision_reason }}</p>
+                <div v-if="actionPlanChecks(plan).length" class="mt-3 grid gap-2">
+                  <p v-for="check in actionPlanChecks(plan)" :key="String(check.question)" class="rounded-xl bg-white/70 px-3 py-2 text-xs text-ink/70">
+                    <b>{{ titleCase(check.check_type) }}:</b> {{ check.question }}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </details>
+
+          <details v-if="latestMatches(row).length" class="mt-4">
+            <summary class="cursor-pointer text-sm font-black text-moss">Latest matched evidence</summary>
+            <div class="mt-3 grid gap-2">
+              <p v-for="match in latestMatches(row)" :key="`${match.source_table}-${match.source_key}`" class="rounded-xl bg-paper/70 px-3 py-2 text-xs text-ink/70">
+                <b>{{ match.source_type }}:</b> {{ match.subject || match.evidence_text || match.action_reason }}
+              </p>
+            </div>
+          </details>
+
+          <details class="mt-4">
+            <summary class="cursor-pointer text-sm font-black text-moss">Show raw playbook row</summary>
+            <pre class="mt-3 max-h-64 overflow-auto rounded-2xl bg-ink p-4 text-xs leading-5 text-paper">{{ JSON.stringify(row, null, 2) }}</pre>
+          </details>
+        </article>
+        <p v-if="!filteredHypotheses.length" class="rounded-3xl bg-white/75 p-6 text-ink/60">No playbooks match the current filters.</p>
       </div>
     </div>
     <div>

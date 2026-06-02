@@ -56,6 +56,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/continuous_watch.py` | `advisory_live_watch_alerts`, `advisory_sync_state` | Lightweight watch loop over active watchlist OHLCV, announcements, ET/news, and operator status |
 | `advisory/event_router.py` | `advisory_live_router_actions`, `advisory_sync_state` | Symbol-level router that turns fresh live alerts and events into targeted advisory reevaluation |
 | `advisory/decision_trace.py` | `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts` | Durable trace layer that links ingest, event evaluation, review, lifecycle, action consolidation, and conflicts |
+| `advisory/trace_summary_store.py` | `advisory_trace_summaries` | Materializes compact symbol/event trace summaries so the operator frontend does not rebuild large traces live on every page load |
 | `advisory/live_dashboard.py` | JSON payload builder | Legacy static dashboard module; API still reuses its payload builder while Nuxt replaces static generation |
 | `advisory/operator_snapshot.py` | `advisory_operator_snapshots` | Builds the compact DB-backed operator dashboard snapshot used by the API to avoid rebuilding the full dashboard payload on every frontend request |
 | `advisory/performance_slowlog.py` | files under `logs/performance/` | Deduped slow-operation logger and state manager for API latency, snapshot builds, and future slow pipeline sections |
@@ -236,10 +237,16 @@ It schedules:
 - `all_watchers.sh` every `10` minutes during market hours
 - `all_advisory.sh` once daily after 7pm on weekdays
 - `all_frontend.sh` every `5` minutes under a lock so API/Nuxt are restarted if they exit
-- `all_advisory.sh` and `all_watchers.sh` refresh `advisory.operator_snapshot` after a successful run so frontend endpoints can serve cached dashboard sections quickly
+- `all_advisory.sh` and `all_watchers.sh` refresh `advisory.operator_snapshot` and `advisory.trace_summary_store` after a successful run so frontend endpoints can serve cached dashboard and trace sections quickly
 - `advisory.operator_health --skip-dhan` at `08:05`, `12:05`, `17:05`, and `22:05` on weekdays
 - `advisory.hypothesis_engine --run-scan` at `10:25`, `13:25`, `16:25`, and `21:25` on weekdays for investor playbook/hypothesis matching over newly collected events
 - `advisory.ts_forecast_workflow` at `11:20`, `14:20`, `17:20`, and `20:20` on weekdays
+
+Trace summary cache:
+
+- Rebuild warm cache: `python -m advisory.trace_summary_store --symbol-limit 150 --event-limit 150 --trace-limit 100`
+- Check cleanup candidates: `python -m advisory.trace_summary_store --cleanup --keep-latest-per-entity 1 --older-than-days 14 --dry-run`
+- The Operations UI exposes these as safe audited commands; cache rebuild writes only `advisory_trace_summaries` and does not touch broker or recommendation state.
 - `advisory.ts_forecast_evaluator` at `18:20` and `21:20` on weekdays
 - `advisory.event_policy_evaluator` at `23:10` on weekdays
 - `advisory.technical_threshold_calibration` at `04:20` on Saturdays
