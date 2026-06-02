@@ -118,7 +118,7 @@ Current schedule:
 - `19:10` weekdays: `./all_advisory.sh`
 - `23:10` weekdays: event-policy realized-return evaluation after costs
 - `04:20` Saturdays: technical threshold calibration after costs
-- optional/commented: `03:10` weekdays `./all_ml.sh` for event-model research training
+- `03:10` Sundays: weekly `./all_ml.sh` for event-model research training
 
 Why the split looks like this:
 
@@ -127,7 +127,7 @@ Why the split looks like this:
 - live OHLCV, news, and announcements are handled by the `10` minute watch cadence
 - operator health runs a few times per day so stale data, cron errors, dependency failures, and fix hints stay visible without waiting for a manual check
 - investor hypothesis scans run after watcher passes so newly collected news/announcements can become playbook matches and operator review notes
-- event-model training is disabled by default because the live path is now playbooks, deterministic policies, technical timing, macro/regime gating, and risk controls
+- event-model training runs weekly as research evidence only because the live path is still playbooks, deterministic policies, technical timing, macro/regime gating, and risk controls
 - TS forecast rows remain research-only and are refreshed a few times per day; daily OHLCV means they should not run on every watcher tick
 - event-policy and technical-threshold evaluators are research-only evidence jobs; they do not change live thresholds or submit actions
 - the full advisory is not forced on every market tick; it runs once daily after 7pm

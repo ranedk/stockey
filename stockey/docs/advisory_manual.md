@@ -518,6 +518,41 @@ The right order is:
 3. train first on the shortest viable horizon, usually `1d`
 4. widen to `3d`, `5d`, or longer horizons only after the label count supports it
 
+Promotion gate:
+
+Keep `all_ml.sh` as research evidence until all of these hold for several weekly runs:
+
+1. Label coverage is broad enough across dates, sectors, event classes, and market regimes; avoid judging the model from one cluster of similar events.
+2. Out-of-sample or walk-forward results beat simple baselines after costs, including passive benchmark, current deterministic event policy, and naive momentum.
+3. The model improves precision in the top score buckets without increasing false positives in low-liquidity or stale-evidence names.
+4. Results remain stable across at least `1d`, `5d`, and `10d` horizons, or the model is explicitly scoped to only the horizon where it works.
+5. Feature importance and examples are explainable enough for operator review; no single leaky timestamp, source, or symbol artifact should dominate.
+6. The research ledger records config, train/test dates, validation protocol, costs, baseline comparison, and known failure cases.
+7. The model is first promoted only as a low-weight input into review/risk/action context, not as direct buy/sell authority.
+
+If any of these fail, use the weekly run only to improve extraction quality, label coverage, feature design, and evaluation discipline.
+
+Use the read-only gate command after weekly runs:
+
+```sh
+python -m advisory.event_model_promotion_check
+python -m advisory.event_model_promotion_check --format json
+```
+
+The command returns `review_candidate` only when artifact metrics, label diversity, recent score freshness, and repeated successful weekly runs all pass the configured thresholds. A passing result means “review for possible low-weight integration”; it does not mean “auto-promote”.
+
+After successful training, `all_ml.sh` uploads the trained model artifact, metadata, and manifest to S3-compatible storage. This is backup/reproducibility only; it does not promote the model into live policy.
+
+Useful controls:
+
+```sh
+EVENT_MODEL_ARTIFACT_UPLOAD_ENABLED=false ./all_ml.sh
+./all_ml.sh --skip-s3-upload
+python -m advisory.event_model_artifact_store --dry-run
+```
+
+Default prefix: `models/advisory_event_meta_model`, configurable with `EVENT_MODEL_ARTIFACT_S3_PREFIX` or `--s3-prefix`.
+
 Useful commands:
 
 ```sh

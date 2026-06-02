@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+import types
 from datetime import date
 from datetime import datetime
 
 import pandas as pd
 
-from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_data_prep, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, watchlist_builder
 from advisory.api import app as operator_api
 from data.announcements import pipeline as announcement_pipeline
 from data.announcements import managed_pipeline as announcement_managed_pipeline
@@ -5715,6 +5717,225 @@ def test_model_training_runner_horizon_ready():
     assert model_training_runner._horizon_ready(prep_summary, 1) is True
     assert model_training_runner._horizon_ready(prep_summary, 3) is False
     assert model_training_runner._horizon_ready(prep_summary, 5) is False
+
+
+def test_event_model_promotion_check_passes_for_strong_evidence(monkeypatch):
+    metadata = {
+        "model_name": "xgboost_event_meta_model",
+        "model_version": "event_meta_model_h1",
+        "horizon_days": 1,
+        "return_threshold": 0.02,
+        "metrics": {
+            "train_rows": 120,
+            "test_rows": 35,
+            "precision": 0.72,
+            "positive_rate_test": 0.45,
+            "roc_auc": 0.64,
+        },
+    }
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "load_artifact_metadata",
+        lambda artifact_dir, model_basename: (metadata, {"model_exists": True, "meta_exists": True}),
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_label_coverage",
+        lambda **kwargs: {
+            "horizon_days": 1,
+            "dataset_rows": 180,
+            "labeled_rows": 150,
+            "date_count": 30,
+            "symbol_count": 45,
+            "event_class_count": 8,
+            "positive_rate": 0.48,
+        },
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_successful_runs",
+        lambda *args, **kwargs: {
+            "successful_runs": 4,
+            "since_days": 35,
+            "latest_status": "done",
+            "latest_timestamp": "2026-06-01T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_score_freshness",
+        lambda **kwargs: {"score_rows": 40, "latest_scored_at": "2026-06-01T00:00:00+00:00", "fresh": True},
+    )
+
+    payload = event_model_promotion_check.build_promotion_check(
+        argparse.Namespace(
+            artifact_dir=".cache/advisory_event_meta_model",
+            model_basename="event_meta_model",
+            horizon_days=1,
+            return_threshold=0.02,
+            log_path="logs/cron/all_ml.log",
+            run_window_days=35,
+            max_score_age_days=14,
+            min_successful_runs=3,
+            min_train_rows=80,
+            min_test_rows=20,
+            min_labeled_rows=100,
+            min_dates=20,
+            min_symbols=25,
+            min_event_classes=4,
+            min_score_rows=10,
+            min_precision=0.55,
+            min_precision_lift=0.10,
+            min_roc_auc=0.55,
+        )
+    )
+
+    assert payload["decision"] == "review_candidate"
+    assert payload["ready_for_operator_review"] is True
+    assert payload["failed_gates"] == []
+
+
+def test_event_model_promotion_check_holds_when_gates_fail(monkeypatch):
+    metadata = {
+        "model_name": "xgboost_event_meta_model",
+        "model_version": "event_meta_model_h1",
+        "horizon_days": 1,
+        "return_threshold": 0.02,
+        "metrics": {
+            "train_rows": 50,
+            "test_rows": 8,
+            "precision": 0.50,
+            "positive_rate_test": 0.48,
+            "roc_auc": 0.51,
+        },
+    }
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "load_artifact_metadata",
+        lambda artifact_dir, model_basename: (metadata, {"model_exists": True, "meta_exists": True}),
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_label_coverage",
+        lambda **kwargs: {
+            "horizon_days": 1,
+            "dataset_rows": 60,
+            "labeled_rows": 58,
+            "date_count": 8,
+            "symbol_count": 12,
+            "event_class_count": 2,
+            "positive_rate": 0.48,
+        },
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_successful_runs",
+        lambda *args, **kwargs: {"successful_runs": 1, "since_days": 35, "latest_status": "failed"},
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_score_freshness",
+        lambda **kwargs: {"score_rows": 0, "latest_scored_at": None, "fresh": False},
+    )
+
+    payload = event_model_promotion_check.build_promotion_check(
+        argparse.Namespace(
+            artifact_dir=".cache/advisory_event_meta_model",
+            model_basename="event_meta_model",
+            horizon_days=1,
+            return_threshold=0.02,
+            log_path="logs/cron/all_ml.log",
+            run_window_days=35,
+            max_score_age_days=14,
+            min_successful_runs=3,
+            min_train_rows=80,
+            min_test_rows=20,
+            min_labeled_rows=100,
+            min_dates=20,
+            min_symbols=25,
+            min_event_classes=4,
+            min_score_rows=10,
+            min_precision=0.55,
+            min_precision_lift=0.10,
+            min_roc_auc=0.55,
+        )
+    )
+
+    assert payload["decision"] == "hold_research_only"
+    assert payload["ready_for_operator_review"] is False
+    assert "precision_lift_vs_positive_rate_test" in payload["failed_gates"]
+    assert "latest_ml_run_not_failed" in payload["failed_gates"]
+
+
+def test_event_model_artifact_store_builds_manifest(tmp_path):
+    artifact_dir = tmp_path / "model"
+    artifact_dir.mkdir()
+    (artifact_dir / "event_meta_model.json").write_text("model-bytes", encoding="utf-8")
+    (artifact_dir / "event_meta_model.meta.json").write_text(
+        json.dumps(
+            {
+                "model_name": "xgboost_event_meta_model",
+                "model_version": "event_meta_model_h1",
+                "horizon_days": 1,
+                "return_threshold": 0.02,
+                "metrics": {"precision": 0.7},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    manifest = event_model_artifact_store.build_artifact_manifest(
+        artifact_dir=artifact_dir,
+        model_basename="event_meta_model",
+        s3_prefix="models/test",
+    )
+
+    assert manifest["model_version"] == "event_meta_model_h1"
+    assert manifest["version_prefix"].startswith("models/test/event_meta_model/event_meta_model_h1/")
+    assert manifest["latest_prefix"] == "models/test/event_meta_model/latest"
+    assert {item["role"] for item in manifest["files"]} == {"model", "metadata"}
+    assert all(item["sha256"] for item in manifest["files"])
+
+
+def test_event_model_artifact_store_uploads_versioned_and_latest(tmp_path, monkeypatch):
+    artifact_dir = tmp_path / "model"
+    artifact_dir.mkdir()
+    model_path = artifact_dir / "event_meta_model.json"
+    meta_path = artifact_dir / "event_meta_model.meta.json"
+    model_path.write_text("model-bytes", encoding="utf-8")
+    meta_path.write_text(
+        json.dumps(
+            {
+                "model_name": "xgboost_event_meta_model",
+                "model_version": "event_meta_model_h1",
+                "horizon_days": 1,
+                "return_threshold": 0.02,
+                "metrics": {"precision": 0.7},
+            }
+        ),
+        encoding="utf-8",
+    )
+    uploaded_files = []
+    uploaded_content = []
+    fake_store = types.SimpleNamespace(
+        save_file=lambda path, key: uploaded_files.append((str(path), key)),
+        save_file_content=lambda key, content: uploaded_content.append((key, content)),
+    )
+    monkeypatch.setitem(sys.modules, "utils.store", fake_store)
+
+    result = event_model_artifact_store.publish_event_model_artifacts(
+        artifact_dir=artifact_dir,
+        model_basename="event_meta_model",
+        s3_prefix="models/test",
+    )
+
+    assert result["status"] == "uploaded"
+    assert len(uploaded_files) == 4
+    assert len(uploaded_content) == 2
+    uploaded_keys = [key for _, key in uploaded_files] + [key for key, _ in uploaded_content]
+    assert "models/test/event_meta_model/latest/event_meta_model.json" in uploaded_keys
+    assert "models/test/event_meta_model/latest/event_meta_model.meta.json" in uploaded_keys
+    assert "models/test/event_meta_model/latest/manifest.json" in uploaded_keys
 
 
 def test_dhan_identity_falls_back_from_nse_to_bse_security(monkeypatch):

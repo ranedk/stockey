@@ -32,6 +32,13 @@ The app is operator-controlled, not auto-trading controlled.
 
 Broker execution remains in the Python execution engine and CLI/operator workflow. The app may display staged execution orders and Dhan readiness, but it must not submit orders. Current write paths are limited to operator/audit workflows such as hypothesis creation, hypothesis scans, and technical-calibration review decisions.
 
+The target operating model is UI-first:
+
+- normal operator work should happen from the Nuxt app
+- CLI commands remain available for cron, debugging, and emergency repair
+- every UI write must be explicit, versioned, and auditable
+- no UI workflow should hide failed extraction, stale data, fallback usage, skipped stages, or execution blockers
+
 ## Pages
 
 ### Overview
@@ -199,6 +206,7 @@ Current endpoints:
 Later:
 
 - Server-Sent Events or WebSocket updates from Redis pub-sub.
+- operations endpoints for read-only smoke checks, event-model promotion checks, S3 artifact inspection, bounded cron log tails, fallback telemetry, and reviewed config-diff generation.
 
 ## Data Contracts
 
@@ -242,7 +250,21 @@ It should consume:
 13. Done: build Investor Playbooks creation, scan, action-plan flow, and production-safe action-consolidation bridge.
 14. Done: expose event-policy action counts, operator notes, wait-for events, and questions in the Event Inbox.
 15. Done: expose research-only event-policy realized-return summary in the Event Inbox.
-16. Add live update stream.
+16. Next: add UI-first operations workbench.
+17. Add live update stream.
+
+## UI-First Operations Workbench
+
+Remaining gaps before the project can be managed almost entirely from UI:
+
+- Health action: run a read-only smoke check and render fix hints, stale sources, cron failures, dependency failures, and fallback spikes.
+- Manual Review queue: merge action conflicts, event-policy manual rows, failed extraction rows, execution blockers, and threshold-review decisions into one operator queue.
+- Hypothesis/playbook lifecycle: create, preview, edit, version, activate/deactivate, run scans, inspect reliability checks, and mark trusted overlays from UI.
+- Research evidence: show event-model promotion-check gates, S3 artifact upload status, TS forecast evaluation, event-policy evaluation, technical calibration, and research ledger runs.
+- Config-change assistant: generate reviewed copyable diffs for approved technical/playbook/config changes without auto-applying YAML edits.
+- Cron/log viewer: show schedule, next/last run, lock status, bounded log tails, recovered/manual-interrupt state, and latest tracebacks.
+- Data lineage: show raw event -> OCR/summary -> tensor -> policy/review -> action -> lifecycle/execution plan.
+- API performance: use summary-first/paginated endpoints for events, actions, portfolio, traces, research runs, and logs.
 
 ## Frontend Commands
 

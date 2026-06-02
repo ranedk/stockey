@@ -8,9 +8,17 @@ import time
 from pathlib import Path
 from typing import Any
 
+from environs import Env
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYTHON_BIN = Path(sys.executable)
+env = Env()
+env.read_env()
+
+
+DEFAULT_S3_UPLOAD_ENABLED = env.bool("EVENT_MODEL_ARTIFACT_UPLOAD_ENABLED", True)
+DEFAULT_S3_PREFIX = env.str("EVENT_MODEL_ARTIFACT_S3_PREFIX", "models/advisory_event_meta_model")
 
 
 def _emit(message: str) -> None:
@@ -63,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-event-backfill", action="store_true")
     parser.add_argument("--skip-price-refresh", action="store_true")
     parser.add_argument("--skip-score", action="store_true")
+    parser.add_argument("--skip-s3-upload", action="store_true")
+    parser.add_argument("--s3-prefix", default=DEFAULT_S3_PREFIX)
     parser.add_argument("--prep-only", action="store_true")
     return parser.parse_args()
 
@@ -138,6 +148,28 @@ def main() -> int:
     if train_code != 0:
         return train_code
     _emit(f"[all_model_training] train done elapsed={time.monotonic() - train_started_at:.2f}s")
+
+    should_upload = bool(DEFAULT_S3_UPLOAD_ENABLED) and not bool(args.skip_s3_upload)
+    if should_upload:
+        upload_cmd = [
+            str(PYTHON_BIN),
+            "-m",
+            "advisory.event_model_artifact_store",
+            "--artifact-dir",
+            args.artifact_dir,
+            "--model-basename",
+            args.model_basename,
+            "--s3-prefix",
+            args.s3_prefix,
+        ]
+        upload_started_at = time.monotonic()
+        _emit("[all_model_training] s3_upload start")
+        upload_code = _run_streaming_command(upload_cmd)
+        if upload_code != 0:
+            return upload_code
+        _emit(f"[all_model_training] s3_upload done elapsed={time.monotonic() - upload_started_at:.2f}s")
+    else:
+        _emit("[all_model_training] s3_upload skipped")
 
     if args.skip_score:
         _emit(f"[all_model_training] skip_score requested total_elapsed={time.monotonic() - started_at:.2f}s")

@@ -50,6 +50,8 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/operator_health.py` | read-only checks | Operator smoke-test command for DB, Redis, Dhan token, cron logs, key table freshness, frontend dependencies, Poppler, Codex, and TimesFM; also emits `fix_hints` for the Nuxt health page |
 | `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
 | `advisory/model_training_runner.py` | varies | Gated model-training orchestrator: runs prep, checks label coverage for the requested horizon, then trains and scores only when ready |
+| `advisory/event_model_artifact_store.py` | S3/object store | Uploads trained event-model JSON, metadata JSON, and manifest JSON to versioned and `latest` S3 prefixes |
+| `advisory/event_model_promotion_check.py` | read-only checks | Conservative evidence gate for deciding whether weekly event-model results are ready for manual operator review as a low-weight input |
 | `advisory/sync_state.py` | `advisory_sync_state` | Shared incremental state storage for continuous polling and operator frontend status |
 | `advisory/continuous_watch.py` | `advisory_live_watch_alerts`, `advisory_sync_state` | Lightweight watch loop over active watchlist OHLCV, announcements, ET/news, and operator status |
 | `advisory/event_router.py` | `advisory_live_router_actions`, `advisory_sync_state` | Symbol-level router that turns fresh live alerts and events into targeted advisory reevaluation |
@@ -241,13 +243,12 @@ It schedules:
 - `advisory.ts_forecast_evaluator` at `18:20` and `21:20` on weekdays
 - `advisory.event_policy_evaluator` at `23:10` on weekdays
 - `advisory.technical_threshold_calibration` at `04:20` on Saturdays
-- optional `all_ml.sh` is present but commented out by default because the live path is playbook/rule/policy driven
+- `all_ml.sh` at `03:10` on Sundays for research-only event-model prep/training
 
 Hypothesis scans default to Codex-backed action-plan notes. Set `HYPOTHESIS_CRON_ARGS=--no-llm` to keep that cron path deterministic only.
 
 Not scheduled by default:
 
-- `all_ml.sh`: optional event-model research path; enable the commented cron line only when you want model prep/training.
 - `all_advisory_codex.sh`: self-fixing advisory wrapper; keep it manual so cron does not modify code unattended.
 - `advisory.technical_threshold_promotion`: manual review/promotion helper; it creates patch guidance but should not run automatically.
 - live Dhan order submission: controlled by execution settings and should remain explicitly gated; cron only prepares advisory/execution-planning state unless live trading is enabled deliberately.
@@ -524,6 +525,7 @@ Recommended model-training flow:
 ./all_ml.sh
 ./all_ml.sh --prep-only
 ./all_ml.sh --horizon-days 1 --to-date 2026-04-07
+python -m advisory.event_model_promotion_check
 ./all_advisory.sh
 ```
 
@@ -533,7 +535,19 @@ Behavior:
 - checks whether the requested horizon is `train_ready`
 - skips training cleanly if coverage is still insufficient
 - trains `advisory.event_meta_model` only when the readiness gate passes
+- uploads trained model artifacts to S3 after successful training unless `--skip-s3-upload` or `EVENT_MODEL_ARTIFACT_UPLOAD_ENABLED=false` is set
 - scores current events after training unless `--skip-score` is used
+- use `python -m advisory.event_model_promotion_check --format json` after weekly runs to see whether the evidence is ready for manual review
+
+Event-model artifact upload:
+
+```sh
+python -m advisory.event_model_artifact_store --dry-run
+python -m advisory.event_model_artifact_store --s3-prefix models/advisory_event_meta_model
+./all_ml.sh --skip-s3-upload
+```
+
+The upload writes versioned keys and `latest` keys under `EVENT_MODEL_ARTIFACT_S3_PREFIX`, default `models/advisory_event_meta_model`. A failed upload fails the ML run so cron does not silently train a model that was not backed up.
 
 Operational constraints:
 

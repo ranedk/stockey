@@ -108,31 +108,18 @@ python -m advisory.ts_forecast_workflow --dry-run --symbols RELIANCE TCS --model
 
 ## Advisory Flow Summary
 
-1. Run raw ingestion for Dhan, Sharpely, macro, NSE, announcements, and ET RSS.
-2. Sync only registered production Screener.in screeners.
-3. Use ad hoc Screener.in queries separately for research.
-4. Normalize stored Screener snapshots into `advisory_screener_constituents`.
-5. Build daily advisory snapshots for macro, fundamentals, technicals, and optional intraday features.
-6. Convert the macro snapshot into `advisory_macro_features_daily`.
-7. Normalize NSE exchange events and derive `advisory_exchange_features_daily`.
-8. Build the base regime and the lightweight news overlay.
-9. Detect active investment themes and map them to theme-linked production screeners when available.
-10. Run the rule engine on each setup using screener universe plus snapshots, regime, overlay, and optional intraday confirmation.
-11. Score candidates and assign states like `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
-12. Build the watchlist with screener, regime, overlay, and theme provenance.
-13. Ingest announcements and relevant news for watched names.
-14. Use the LLM only to extract structured event tensors from text, with bounded exchange-event context when relevant.
-15. Run deterministic adversarial review to clear, penalize, flag manual review, or veto.
-16. Feed candidate state plus event outputs into risk sizing and allocation.
-15. Rank approved allocations in the portfolio engine with overlap and setup caps.
-16. Build lifecycle and rebalance outputs.
-17. Consolidate operator intent into `advisory_action_recommendations`.
-18. Build execution-planning outputs from consolidated actions.
-19. Record research runs in the research ledger.
-20. Prepare event-model training data with `python -m advisory.event_model_data_prep`.
-21. Train the XGBoost event meta-model only when label coverage is sufficient.
-22. Optionally build experimental OHLCV forecast features with `python -m advisory.ts_forecast_features`.
-23. Keep prediction separate from policy and execution.
+1. `complete_data.sh` downloads and parses Dhan, Sharpely, macro, NSE, announcements, and news data.
+2. Screener.in production screeners and ad hoc research queries create symbol universes.
+3. Snapshot builders create macro, regime, fundamental, technical, intraday, exchange-event, and market-context rows.
+4. Rule and technical engines score setups into `PASS_NOW`, `WATCH_*`, `ABSTAIN`, or `REJECT`.
+5. Watchers refresh active watchlist and open-position symbols with OHLCV, news, and announcements.
+6. The router reevaluates only symbols whose watched evidence changed.
+7. LLM/Codex usage stays bounded to extraction, summaries, playbook notes, and manual-review context.
+8. Event policy, adversarial review, regime, risk, and lifecycle layers convert evidence into entry, hold, add, partial-exit, or full-exit intent.
+9. Action consolidation produces one final action per symbol in `advisory_action_recommendations`.
+10. Execution planning converts only complete, validated action contracts into broker-order plans.
+11. Operator snapshots, FastAPI, and Nuxt expose recommendations, traces, health, errors, fallbacks, and fix hints.
+12. Research jobs evaluate TimesFM forecasts, event-policy outcomes, technical thresholds, and optional event-model training without changing live policy automatically.
 
 Primary operator commands:
 
@@ -152,9 +139,11 @@ Scheduled operator flow:
 - let `all_watchers.sh` run every `10` minutes during market hours
 - let investor hypothesis/playbook scans run at `10:25`, `13:25`, `16:25`, and `21:25`; set `HYPOTHESIS_CRON_ARGS=--no-llm` for deterministic-only scans
 - let the experimental TS forecast cron run at `11:20`, `14:20`, `17:20`, and `20:20`; evaluator runs at `18:20` and `21:20`
+- let operator health run at `08:05`, `12:05`, `17:05`, and `22:05` so fix hints and stale-data warnings stay current
 - let `all_advisory.sh` run once daily after 7pm for the slower batch recommendation cycle
 - let event-policy realized-return evaluation run at `23:10` on weekdays
 - let technical threshold calibration run weekly at `04:20` on Saturdays
+- let `all_ml.sh` run weekly at `03:10` on Sundays for event-model research evidence
 - use `all_advisory.sh --fast` for quick intermediate advisory refreshes; it avoids watch/news refresh, peer sync, and on-demand intraday repair
 
 The generated cron file is intended for `./go-crond config/stockey.generated.crontab --allow-unprivileged` or a system-crontab style runner because it includes the user column. A normal per-user `crontab` needs that user column removed first. Logs go under `logs/cron/`, and `scripts/with_lock.sh` skips overlapping runs instead of stacking them. The lock wrapper uses `flock` on Linux and `lockf` on macOS.

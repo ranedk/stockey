@@ -55,8 +55,8 @@ LOG_DIR={{LOG_DIR}}
 # Review the operator UI before manually changing config/advisory_setups.yaml.
 20 04 * * 6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_technical_calibration.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.technical_threshold_calibration --horizons ${TECHNICAL_CALIBRATION_HORIZONS:-5 10 20} --cost-bps "${TECHNICAL_CALIBRATION_COST_BPS:-25}" --min-signals "${TECHNICAL_CALIBRATION_MIN_SIGNALS:-10}" >> "$LOG_DIR/technical_threshold_calibration.log" 2>&1
 
-# Optional research-only event-model prep/training. Disabled by default because the live system is playbook/rule driven.
-# 10 03 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
+# Weekly research-only event-model prep/training. It refreshes event-model evidence but does not change live policy automatically.
+10 03 * * 0 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
 
 # Optional split refreshes if you want explicit control instead of complete_data.sh.
 # 05 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1

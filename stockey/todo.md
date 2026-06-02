@@ -65,13 +65,74 @@ The active stack already has:
 
 ## Current bottlenecks
 
-1. Remaining high-risk gaps are now observability and correctness gaps, not missing major architecture blocks.
-2. Some non-home API endpoints still return large raw rows and need pagination/compaction.
-3. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
-4. NSE ingestion still needs a single-lane queue so retries, cookie resets, and rate limits are centrally managed.
-5. Continuous watch should add stronger cooldowns, duplicate suppression, and explicit per-source failure counters.
-6. Approved technical threshold reviews still require manual config edits; reviewed-diff generation would reduce operator mistakes.
-7. Legacy “promotion audit” naming should be migrated to “reliability check” once DB migration is safe.
+1. The highest-priority gap is now UI-first operations: every normal operator action should be visible, explainable, and auditable from the Nuxt app.
+2. Remaining high-risk gaps are observability and correctness gaps, not missing major architecture blocks.
+3. Some manual workflows still require CLI/manual edits: operator smoke checks, event-model promotion checks, approved technical config diffs, S3 artifact inspection, cron log inspection, and some research-ledger review.
+4. Some non-home API endpoints still return large raw rows and need pagination/compaction.
+5. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
+6. NSE ingestion still needs a single-lane queue so retries, cookie resets, and rate limits are centrally managed.
+7. Continuous watch should add stronger cooldowns, duplicate suppression, and explicit per-source failure counters.
+8. Approved technical threshold reviews still require manual config edits; reviewed-diff generation would reduce operator mistakes.
+9. Legacy “promotion audit” naming should be migrated to “reliability check” once DB migration is safe.
+
+## Highest Priority: UI-First Operations
+
+Goal:
+
+- manage the whole project from the operator UI for normal workflows
+- keep CLI commands available for debugging, cron, and emergency repair
+- make every write action explicit, versioned, auditable, and non-trading by default
+- never hide failures, fallbacks, stale data, or skipped stages
+
+Required operator UI coverage:
+
+1. System health and fix hints
+   - show current status for Postgres, Redis, Dhan token/cache, API, Nuxt, cron jobs, source freshness, slow operations, and fallback spikes
+   - add a UI action to run the read-only smoke check and display the resulting fix hints
+   - expose recent cron logs with latest-run status, recovered/manual-interrupt state, and traceback snippets
+
+2. Hypothesis and investor playbook management
+   - create, preview, edit, version, activate/deactivate, and mark trusted-overlay playbooks from UI
+   - run deterministic/LLM scans from UI with clear dry-run versus write mode
+   - show reliability checks, matched evidence, action plans, safe action boundaries, and operator questions
+   - rename operator-facing “promotion audit” language to “reliability check” everywhere once backend migration is safe
+
+3. Manual-review workbench
+   - one queue for `MANUAL_REVIEW`, event-policy review rows, action conflicts, technical threshold reviews, failed extraction rows, and execution blockers
+   - allow operator decisions such as `approve_for_manual_config`, `needs_more_data`, `ignore`, `downgrade_to_no_action`, and `watch_for_event`
+   - persist every decision with user, timestamp, rationale, before/after payload, and trace links
+
+4. Model/research evidence UI
+   - show `advisory.event_model_promotion_check` output in UI: passed gates, failed gates, label coverage, precision lift, ROC-AUC, score freshness, and weekly run count
+   - show S3 artifact upload status and latest artifact keys for event-model runs
+   - show TS forecast evaluation, event-policy evaluation, technical threshold calibration, and research ledger runs in one research evidence area
+   - no model or threshold should become live policy from UI without an explicit manual review/audit trail
+
+5. Config-change assistant, not auto-config
+   - generate reviewed diffs for approved technical threshold changes and playbook/config changes
+   - show copyable patch, expected impact, affected setup ids, and rollback notes
+   - do not auto-apply production YAML changes until the review workflow is proven safe over multiple runs
+
+6. Operations dashboard
+   - show the full cron schedule, next/last run, current lock status, and log file links/snippets
+   - show safe dry-run buttons for selected jobs: health, hypothesis scan, event-model promotion check, technical calibration review, S3 artifact dry-run
+   - block or warn on expensive/long-running jobs from UI unless explicitly confirmed
+
+7. Data/debug visibility
+   - paginate and compact events/actions/portfolio/trace APIs so the UI remains fast
+   - materialize trace summaries after advisory/watchers instead of rebuilding large traces live
+   - show source-to-output lineage: raw event -> OCR/summary -> tensor -> policy/review -> action -> lifecycle/execution plan
+
+Next implementation slices:
+
+1. Add `/api/operations/smoke` and a Nuxt Health action that runs the read-only smoke command and renders fix hints.
+2. Add `/api/research/event-model-promotion-check` and a Research Evidence page card for the weekly ML gate.
+3. Add `/api/research/event-model-artifacts` to show latest local/S3 artifact metadata and upload status.
+4. Add a Manual Review page that merges action conflicts, event-policy manual rows, failed extraction rows, execution blockers, and threshold-review decisions.
+5. Add reviewed-diff generation for approved technical threshold decisions.
+6. Add cron/log viewer endpoints with bounded log tails and latest marker parsing.
+7. Add fallback telemetry persistence and Health-page fallback spike cards.
+8. Add pagination/summary-first APIs for events, actions, portfolio, trace, research runs, and logs.
 
 ## Next development set
 
@@ -619,7 +680,7 @@ Priority:
 
 - keep the code available for research-only experiments
 - do not make event-model training a blocker for live advisory
-- do not run `all_ml.sh` in default cron
+- run `all_ml.sh` weekly as evidence generation only; do not let it change live policy automatically
 
 Done already:
 
@@ -627,12 +688,23 @@ Done already:
 - `advisory.training_universe`
 - `EVENT_MODEL_TRAINING_V1`
 - `all_ml.sh`
+- weekly Sunday cron for `all_ml.sh`
+- `advisory.event_model_promotion_check` read-only gate for deciding whether weekly ML evidence is ready for manual operator review
+- S3 artifact upload after successful training via `advisory.event_model_artifact_store`
 
 Still needed:
 
-- only if this path is explicitly resumed: more matured labeled rows
-- only if this path is explicitly resumed: statistically usable training run
-- only if this path is explicitly resumed: validation results recorded in the research ledger
+- more matured labeled rows across dates, sectors, event classes, and regimes
+- statistically usable walk-forward validation after costs
+- baseline comparison against passive benchmark, deterministic event policy, and naive momentum
+- research-ledger records for config, validation protocol, costs, baselines, and known failure cases
+- promotion only as a low-weight review/risk/action input after repeated encouraging weekly runs
+
+Pick this up when:
+
+- `python -m advisory.event_model_promotion_check` returns `Decision: review_candidate`
+- no failed gates are shown for label coverage, diversity, score freshness, successful weekly runs, precision lift, or ROC-AUC
+- the operator review still confirms no leakage, no obvious event-class overfit, and no concentration in one symbol/date cluster
 
 ### 2. Improve the regime stack
 
