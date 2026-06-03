@@ -5,8 +5,8 @@ Stockey is an Indian-equity advisory research and operator system.
 Core flow:
 
 1. `./complete_data.sh` downloads and parses raw data.
-2. `./all_watchers.sh` incrementally watches OHLCV, news, and announcements.
-3. `./all_advisory.sh` runs the batch advisory, lifecycle, risk, action consolidation, and execution-planning flow.
+2. `./all_watchers.sh` incrementally watches OHLCV, news, and announcements, matches hypothesis Wait Signals, and writes fast per-symbol signal refresh rows.
+3. `./all_advisory.sh` runs the authoritative batch advisory, lifecycle, risk, action consolidation, and execution-planning flow.
 4. `./all_frontend.sh` runs the FastAPI operator API and Nuxt operator frontend.
 5. `./all_ml.sh` is optional research for event-model training; it is not the default production decision path.
 

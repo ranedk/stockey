@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
 
-from advisory.pipeline import run_pipeline
 from advisory.sync_state import load_sync_state, persist_sync_state, publish_bus_message
 from utils.db import db_session, sql_to_df, upsert_to_db
 
@@ -231,42 +229,19 @@ def build_routing_plan(
 
 
 def execute_routing_plan(plan: list[dict[str, Any]]) -> pd.DataFrame:
+    from advisory.signal_refresh import refresh_symbol
+
     rows: list[dict[str, Any]] = []
     for item in plan:
         routed_at = pd.Timestamp.utcnow()
         asof_date = pd.to_datetime(item.get("asof_date"), utc=True, errors="coerce")
         try:
-            summary = run_pipeline(
-                SimpleNamespace(
-                    date=None if pd.isna(asof_date) else asof_date.to_pydatetime(),
-                    symbols=[item["symbol"]],
-                    setup_ids=item.get("setup_ids") or None,
-                    start_at=item["start_at"],
-                    stop_at=item["stop_at"],
-                    rebuild=False,
-                    skip_peer_sync=True,
-                    skip_intraday=False,
-                    skip_intraday_prefetch=True,
-                    intraday_lookback_days=30,
-                    intraday_intervals=[1],
-                    include_watch=bool(item["include_watch"]),
-                    include_news=False,
-                    include_lifecycle=bool(item.get("include_lifecycle")),
-                    include_execution=False,
-                    live_execution=False,
-                    execution_reconcile=False,
-                    eval_include_evaluated=False,
-                    portfolio_capital_inr=300000.0,
-                    portfolio_max_positions=5,
-                    portfolio_single_position_cap_pct=0.35,
-                    portfolio_per_setup_cap_pct=0.50,
-                    portfolio_max_positions_per_overlap_group=1,
-                    event_model=None,
-                    event_model_artifact_dir=".cache/advisory_event_meta_model",
-                    dry_run=False,
-                    rule_max_snapshot_refresh_age_days=1,
-                    rule_max_intraday_prefetch_age_days=1,
-                )
+            summary = refresh_symbol(
+                symbol=item["symbol"],
+                reason=f"router:{','.join(item.get('source_types') or [])}:{item.get('action_type')}",
+                asof_date=None if pd.isna(asof_date) else asof_date,
+                dry_run=False,
+                refresh_trace_summary=False,
             )
             status = "ok"
             action_reason = ",".join(item.get("reasons") or [])

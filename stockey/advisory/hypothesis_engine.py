@@ -1387,6 +1387,13 @@ def run_hypothesis_scan(
     action_plans = build_action_plans(matches, model=model, use_llm=use_llm) if build_actions else pd.DataFrame()
     if persist:
         persist_action_plans(action_plans)
+        if not action_plans.empty:
+            try:
+                from advisory.wait_signals import generate_wait_signals
+
+                generate_wait_signals(hypothesis_id=hypothesis_id, limit=max(len(action_plans), 1), persist=True)
+            except Exception:
+                pass
     return {
         "status": "ok",
         "hypothesis_count": int(len(hypotheses)),

@@ -385,7 +385,59 @@ Important behavior:
 - there is no default cap on how many symbols the router may reevaluate
 - symbols stop being watched once advisory removes them from the watch path
 - open positions remain monitored for exit-related alerts
+- watcher/router updates now write fast per-symbol rows to `advisory_signal_refresh_actions`
+- signal refresh is for live visibility and manual/operator reaction; the full post-close advisory remains the authoritative portfolio reconciliation
 - alerts and cycle summaries are also published over Redis pub-sub
+
+### Fast signal refresh
+
+Use when:
+
+- a watcher found fresh OHLCV/news/announcement data and you want a quick symbol-level decision
+- you want to inspect one symbol without running full advisory
+- you want to replay recent router intents into the live signal table
+
+Commands:
+
+```sh
+python -m advisory.signal_refresh --symbol RELIANCE --reason manual --format text
+python -m advisory.signal_refresh --symbol RELIANCE --unique-id <event-id> --reason announcement --format json
+python -m advisory.signal_refresh --from-router --limit 25 --format text
+```
+
+What it does:
+
+- reads the latest consolidated action, lifecycle/rebalance, and event-policy rows for the symbol
+- checks matched hypothesis Wait Signals for the symbol
+- gives priority to exit/reduce lifecycle signals over stale buy/watch signals
+- writes `advisory_signal_refresh_actions`
+- appends decision trace rows and refreshes materialized symbol/event trace summaries
+- does not run cross-sectional portfolio allocation or mutate the authoritative portfolio
+
+### Hypothesis Wait Signals
+
+Use when:
+
+- a playbook action plan says “wait for price/news/announcement confirmation”
+- you want to see or manually check what conditions are currently active
+- you want watcher-triggered matches to become visible without running full advisory
+
+Commands:
+
+```sh
+python -m advisory.wait_signals --generate --format text
+python -m advisory.wait_signals --match --format text
+python -m advisory.wait_signals --match --symbol RELIANCE --format json
+```
+
+Behavior:
+
+- hypothesis scans generate `advisory_wait_signals` after action plans are persisted
+- price waits are matched against `dhan_ohlcv_daily`
+- news/announcement waits are matched against persisted advisory news and announcement event tables
+- matches are written to `advisory_wait_signal_matches`
+- `./all_watchers.sh` runs a lightweight wait-signal match pass after each watcher cycle
+- the Nuxt Playbooks page shows active, matched, and manually checked waits
 
 ### 6. Split refreshes
 
@@ -495,6 +547,7 @@ python -m advisory.research_ledger --limit 20
 
 ```sh
 python -m advisory.event_router --dry-run
+python -m advisory.signal_refresh --from-router --limit 25 --dry-run --format text
 ```
 
 ## Recommended daily order
@@ -513,6 +566,7 @@ python -m advisory.event_router --dry-run
 2. `./all_frontend.sh`
 3. open `http://127.0.0.1:3000`
 4. inspect `advisory.event_router --dry-run` if routing volume looks suspicious
+5. inspect `python -m advisory.signal_refresh --from-router --limit 25 --dry-run --format text` if live signal rows look stale
 
 ## Redis pub-sub channels
 

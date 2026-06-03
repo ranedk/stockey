@@ -30,11 +30,13 @@ from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPS
 from advisory.operator_snapshot import load_operator_snapshot
 from advisory.performance_slowlog import record_slow_operation
 from advisory.performance_slowlog import update_slow_issue_status
+from advisory.signal_refresh import TABLE_NAME as SIGNAL_REFRESH_TABLE
 from advisory.technical_threshold_calibration import EVALUATIONS_TABLE as TECHNICAL_CALIBRATION_EVALUATIONS_TABLE
 from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_CALIBRATION_SUMMARY_TABLE
 from advisory.technical_threshold_promotion import generate_promotion_review, load_promotion_reviews, record_manual_decision
 from advisory.trace_summary_store import DEFAULT_LIMIT as TRACE_SUMMARY_DEFAULT_LIMIT
 from advisory.trace_summary_store import load_summary as load_materialized_trace_summary
+from advisory.wait_signals import load_wait_signal_matches, load_wait_signals, match_wait_signals
 from utils.db import db_session, sql_to_df, upsert_to_db
 
 
@@ -276,6 +278,76 @@ def build_actions_payload(
             "action_recommendations": action_meta,
             "alerts": {"total": len(alert_rows), "returned": min(len(alert_rows), _bounded_limit(limit, default=25))},
             "filters": {"symbol": symbol, "action": action, "status": status, "search": search, "compact": compact},
+        },
+    }
+
+
+def build_signal_refresh_payload(
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    symbol: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    compact: bool = False,
+) -> dict[str, Any]:
+    if not _table_exists(SIGNAL_REFRESH_TABLE):
+        return {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "status": "ok",
+            "signals": [],
+            "meta": {"signals": {"total": 0, "returned": 0}, "filters": {"symbol": symbol, "status": status, "search": search, "compact": compact}},
+        }
+    clauses = ["1 = 1"]
+    params: list[Any] = []
+    if symbol:
+        clauses.append("UPPER(TRIM(symbol)) = %s")
+        params.append(str(symbol).strip().upper())
+    if status and str(status).lower() not in {"all", "*"}:
+        clauses.append("LOWER(COALESCE(signal_status, signal_action, '')) LIKE %s")
+        params.append(f"%{str(status).strip().lower()}%")
+    if search:
+        clauses.append("(symbol ILIKE %s OR COALESCE(signal_action, '') ILIKE %s OR COALESCE(action_reason, '') ILIKE %s OR COALESCE(reason, '') ILIKE %s)")
+        needle = f"%{str(search).strip()}%"
+        params.extend([needle, needle, needle, needle])
+    where_sql = " AND ".join(clauses)
+    total_df = sql_to_df(f"SELECT COUNT(*) AS total FROM {SIGNAL_REFRESH_TABLE} WHERE {where_sql}", params=tuple(params) if params else None)
+    total = int(total_df["total"].iloc[0]) if not total_df.empty else 0
+    row_limit = _bounded_limit(limit, default=50)
+    row_offset = max(0, int(offset))
+    rows = sql_to_df(
+        f"""
+        SELECT
+            refresh_id,
+            refreshed_at,
+            asof_date,
+            symbol,
+            unique_id,
+            reason,
+            signal_action,
+            signal_status,
+            signal_source,
+            confidence,
+            action_reason,
+            trace_id,
+            dry_run,
+            load_ts
+        FROM {SIGNAL_REFRESH_TABLE}
+        WHERE {where_sql}
+        ORDER BY refreshed_at DESC NULLS LAST, load_ts DESC NULLS LAST
+        LIMIT %s OFFSET %s
+        """,
+        params=tuple([*params, row_limit, row_offset]),
+    )
+    page_rows = rows.to_dict(orient="records") if not rows.empty else []
+    next_offset = row_offset + row_limit if row_offset + row_limit < total else None
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "status": "ok",
+        "signals": _compact_list_rows(page_rows, compact=compact),
+        "meta": {
+            "signals": {"total": total, "returned": len(page_rows), "offset": row_offset, "limit": row_limit, "next_offset": next_offset},
+            "filters": {"symbol": symbol, "status": status, "search": search, "compact": compact},
         },
     }
 
@@ -2291,6 +2363,8 @@ def build_hypotheses_payload(*, limit: int = 100) -> dict[str, Any]:
     hypotheses = load_hypotheses().head(max(0, int(limit)))
     matches = load_matches(limit=max(0, int(limit)))
     action_plans = load_action_plans(limit=max(0, int(limit)))
+    wait_signals = load_wait_signals(limit=max(0, int(limit)))
+    wait_signal_matches = load_wait_signal_matches(limit=max(0, int(limit)))
     promotion_audits = []
     if not hypotheses.empty:
         for hypothesis_id in hypotheses["hypothesis_id"].dropna().astype(str).head(max(0, int(limit))).tolist():
@@ -2301,7 +2375,22 @@ def build_hypotheses_payload(*, limit: int = 100) -> dict[str, Any]:
         "hypotheses": hypotheses.to_dict(orient="records") if not hypotheses.empty else [],
         "matches": matches.to_dict(orient="records") if not matches.empty else [],
         "action_plans": action_plans.to_dict(orient="records") if not action_plans.empty else [],
+        "wait_signals": wait_signals.to_dict(orient="records") if not wait_signals.empty else [],
+        "wait_signal_matches": wait_signal_matches.to_dict(orient="records") if not wait_signal_matches.empty else [],
         "promotion_audits": promotion_audits,
+    }
+
+
+def build_wait_signals_payload(*, limit: int = 100, status: str | None = None, symbol: str | None = None, run_match: bool = False) -> dict[str, Any]:
+    match_result = match_wait_signals(symbols=[symbol] if symbol else None, limit=limit, persist=True) if run_match else None
+    signals = load_wait_signals(status=status, symbol=symbol, limit=limit)
+    signal_matches = load_wait_signal_matches(limit=limit)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "status": "ok",
+        "signals": signals.to_dict(orient="records") if not signals.empty else [],
+        "matches": signal_matches.to_dict(orient="records") if not signal_matches.empty else [],
+        "match_result": match_result,
     }
 
 
@@ -2512,6 +2601,17 @@ def create_app():
     def action_detail(symbol: str | None = None, unique_id: str | None = None, setup_id: str | None = None, asof_date: str | None = None):
         return _guard(build_action_detail_payload, route="/api/actions/detail", symbol=symbol, unique_id=unique_id, setup_id=setup_id, asof_date=asof_date)
 
+    @app.get("/api/signal-refresh")
+    def signal_refresh(
+        limit: int = Query(default=50, ge=0, le=500),
+        offset: int = Query(default=0, ge=0),
+        symbol: str | None = None,
+        status: str | None = None,
+        search: str | None = None,
+        compact: bool = Query(default=False),
+    ):
+        return _guard(build_signal_refresh_payload, route="/api/signal-refresh", limit=limit, offset=offset, symbol=symbol, status=status, search=search, compact=compact)
+
     @app.get("/api/portfolio")
     def portfolio(
         asof_date: str | None = None,
@@ -2599,6 +2699,10 @@ def create_app():
     @app.get("/api/hypotheses")
     def hypotheses(limit: int = Query(default=100, ge=0, le=500)):
         return _guard(build_hypotheses_payload, route="/api/hypotheses", limit=limit)
+
+    @app.get("/api/wait-signals")
+    def wait_signals(limit: int = Query(default=100, ge=1, le=500), status: str | None = None, symbol: str | None = None, run_match: bool = Query(default=False)):
+        return _guard(build_wait_signals_payload, route="/api/wait-signals", limit=limit, status=status, symbol=symbol, run_match=run_match)
 
     @app.post("/api/hypotheses")
     def hypothesis_create(payload: dict[str, Any] = Body(...)):

@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
 from advisory.api import app as operator_api
 from data.announcements import pipeline as announcement_pipeline
 from data.announcements import managed_pipeline as announcement_managed_pipeline
@@ -8509,6 +8509,137 @@ def test_event_router_position_alerts_include_lifecycle():
     assert plan[0]["action_type"] == "refresh_symbol_price"
     assert plan[0]["stop_at"] == "lifecycle"
     assert plan[0]["include_lifecycle"] is True
+
+
+def test_signal_refresh_prioritizes_exit_lifecycle_over_buy_action():
+    signal = signal_refresh.choose_signal(
+        symbol="ABC",
+        reason="ohlcv",
+        action={"action_code": "BUY", "invest_score_pct": 85, "action_reason": "Old buy thesis"},
+        lifecycle={"next_action": "FULL_EXIT", "next_action_reason": "Pivot failed on high volume", "target_confidence": 0.7},
+        rebalance=None,
+        events=[],
+    )
+
+    assert signal["signal_action"] == "FULL_EXIT"
+    assert signal["signal_status"] == "exit_or_reduce"
+    assert signal["signal_source"] == "lifecycle"
+    assert "Pivot failed" in signal["action_reason"]
+
+
+def test_signal_refresh_maps_event_buy_watch_to_watch():
+    signal = signal_refresh.choose_signal(
+        symbol="ABC",
+        reason="announcement",
+        action=None,
+        lifecycle=None,
+        rebalance=None,
+        events=[
+            {
+                "action_type": "BUY_WATCH",
+                "confidence": 0.62,
+                "action_reason": "Fresh order-win event needs technical trigger confirmation.",
+            }
+        ],
+    )
+
+    assert signal["signal_action"] == "WATCH"
+    assert signal["signal_status"] == "watch_or_review"
+    assert signal["signal_source"] == "event_policy"
+
+
+def test_wait_signals_generate_price_and_event_waits(monkeypatch):
+    monkeypatch.setattr(
+        wait_signals,
+        "load_recent_price",
+        lambda symbol, asof=None: {
+            "symbol": symbol,
+            "date": pd.Timestamp("2026-04-08T00:00:00Z"),
+            "close": 100.0,
+        },
+    )
+    plans = pd.DataFrame(
+        [
+            {
+                "planned_at": pd.Timestamp("2026-04-08T10:00:00Z"),
+                "hypothesis_id": "HYP1",
+                "source_table": "advisory_news_events",
+                "source_key": "N1",
+                "symbol": "ABC",
+                "action_type": "BUY_WATCH",
+                "operator_summary": "Wait for confirmation.",
+                "action_plan_json": json.dumps({"follow_up_window_days": 5}),
+            }
+        ]
+    )
+    matches = pd.DataFrame(
+        [
+            {
+                "hypothesis_id": "HYP1",
+                "hypothesis_title": "Order win playbook",
+                "source_table": "advisory_news_events",
+                "source_key": "N1",
+                "symbol": "ABC",
+                "matched_terms_json": json.dumps(["order win", "large contract"]),
+            }
+        ]
+    )
+
+    out = wait_signals.build_wait_signals_from_action_plans(plans, matches)
+
+    assert set(out["signal_type"]) == {"price_close", "event_keywords"}
+    price_row = out[out["signal_type"] == "price_close"].iloc[0]
+    condition = json.loads(price_row["condition_json"])
+    assert condition["operator"] == "close_above"
+    assert condition["threshold"] == 102.0
+
+
+def test_signal_refresh_prioritizes_wait_signal_match():
+    signal = signal_refresh.choose_signal(
+        symbol="ABC",
+        reason="news",
+        action={"action_code": "WATCH", "action_reason": "Old watch"},
+        lifecycle=None,
+        rebalance=None,
+        events=[],
+        wait_matches=[
+            {
+                "expected_action": "REDUCE_EXPOSURE_REVIEW",
+                "match_score": 1.0,
+                "match_reason": "Price broke the wait-signal threshold.",
+            }
+        ],
+    )
+
+    assert signal["signal_action"] == "REDUCE_EXPOSURE_REVIEW"
+    assert signal["signal_source"] == "wait_signal"
+    assert signal["signal_status"] == "exit_or_reduce"
+
+
+def test_event_router_execute_uses_signal_refresh(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_refresh_symbol(**kwargs):
+        calls.append(kwargs)
+        return {"symbol": kwargs["symbol"], "signal_action": "WATCH", "signal_status": "watch_or_review"}
+
+    monkeypatch.setattr(signal_refresh, "refresh_symbol", fake_refresh_symbol)
+    actions = event_router.execute_routing_plan(
+        [
+            {
+                "symbol": "ABC",
+                "setup_ids": ["SETUP_A"],
+                "source_types": ["price_alert"],
+                "action_type": "refresh_symbol_price",
+                "asof_date": "2026-04-08T00:00:00Z",
+                "reasons": ["ENTRY_ZONE_HIT"],
+            }
+        ]
+    )
+
+    assert calls[0]["symbol"] == "ABC"
+    assert str(calls[0]["reason"]).startswith("router:price_alert")
+    assert actions.iloc[0]["action_status"] == "ok"
 
 
 def test_live_notifier_formats_operator_messages():

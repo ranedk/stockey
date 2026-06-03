@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+import argparse
+import json
+import uuid
+from typing import Any
+
+import pandas as pd
+
+from advisory.action_recommender import TABLE_NAME as ACTIONS_TABLE
+from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
+from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
+from advisory.position_lifecycle import LIFECYCLE_TABLE, REBALANCE_TABLE
+from advisory.sync_state import persist_sync_state, publish_bus_message
+from advisory.trace_summary_store import build_event_summary, build_symbol_summary
+from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, match_wait_signals
+from utils.db import db_session, sql_to_df, upsert_to_db
+
+
+TABLE_NAME = "advisory_signal_refresh_actions"
+ROUTER_ACTIONS_TABLE = "advisory_live_router_actions"
+STATE_SOURCE_NAME = "advisory:signal_refresh"
+
+EXIT_ACTIONS = {"SELL", "FULL_EXIT", "EMERGENCY_EXIT", "PARTIAL_SELL", "PARTIAL_EXIT", "REDUCE", "REDUCE_REVIEW", "REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW"}
+BUY_ACTIONS = {"BUY", "BUY_MORE", "ADD_ON_PULLBACK", "BUY_TRIGGERED"}
+WATCH_ACTIONS = {"WATCH", "WATCHLIST", "NEAR_PIVOT", "READY", "MANUAL_REVIEW"}
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _text(value: Any, default: str | None = None) -> str | None:
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "null", "<na>"}:
+        return default
+    return text
+
+
+def _num(value: Any) -> float | None:
+    out = pd.to_numeric(value, errors="coerce")
+    return None if pd.isna(out) else float(out)
+
+
+def _ts(value: Any) -> pd.Timestamp | None:
+    out = pd.to_datetime(value, utc=True, errors="coerce")
+    return None if pd.isna(out) else out
+
+
+def _date(value: Any = None) -> pd.Timestamp:
+    out = pd.to_datetime(value or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    if pd.isna(out):
+        out = pd.Timestamp.utcnow()
+    return out.normalize()
+
+
+def table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+        return not df.empty
+    except Exception:
+        return False
+
+
+def ensure_table() -> None:
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                refresh_id TEXT PRIMARY KEY,
+                refreshed_at TIMESTAMPTZ NOT NULL,
+                asof_date TIMESTAMPTZ,
+                symbol TEXT NOT NULL,
+                unique_id TEXT,
+                reason TEXT,
+                signal_action TEXT NOT NULL,
+                signal_status TEXT,
+                signal_source TEXT,
+                confidence DOUBLE PRECISION,
+                action_reason TEXT,
+                action_payload_json TEXT,
+                trace_id TEXT,
+                dry_run BOOLEAN,
+                load_ts TIMESTAMPTZ
+            )
+            """
+        )
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_symbol_refreshed ON {TABLE_NAME} (symbol, refreshed_at DESC)")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_unique_id ON {TABLE_NAME} (unique_id)")
+
+
+def _latest_row(table_name: str, symbol: str, *, asof_date: pd.Timestamp | None = None, date_column: str = "asof_date") -> dict[str, Any] | None:
+    if not table_exists(table_name):
+        return None
+    clauses = ["UPPER(TRIM(symbol)) = %s"]
+    params: list[Any] = [symbol.upper()]
+    if asof_date is not None:
+        clauses.append(f"{date_column} <= %s")
+        params.append(asof_date)
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {table_name}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY {date_column} DESC NULLS LAST, load_ts DESC NULLS LAST
+            LIMIT 1
+            """,
+            params=tuple(params),
+        )
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def load_latest_action(symbol: str, *, asof_date: pd.Timestamp | None = None) -> dict[str, Any] | None:
+    return _latest_row(ACTIONS_TABLE, symbol, asof_date=asof_date, date_column="asof_date")
+
+
+def load_latest_lifecycle(symbol: str, *, asof_date: pd.Timestamp | None = None) -> dict[str, Any] | None:
+    return _latest_row(LIFECYCLE_TABLE, symbol, asof_date=asof_date, date_column="asof_date")
+
+
+def load_latest_rebalance(symbol: str, *, asof_date: pd.Timestamp | None = None) -> dict[str, Any] | None:
+    return _latest_row(REBALANCE_TABLE, symbol, asof_date=asof_date, date_column="asof_date")
+
+
+def load_event_policy(symbol: str, *, unique_id: str | None = None, asof_date: pd.Timestamp | None = None, limit: int = 5) -> list[dict[str, Any]]:
+    if not table_exists(EVENT_POLICY_TABLE):
+        return []
+    clauses = ["UPPER(TRIM(symbol)) = %s"]
+    params: list[Any] = [symbol.upper()]
+    if unique_id:
+        clauses.append("unique_id = %s")
+        params.append(unique_id)
+    if asof_date is not None:
+        clauses.append("COALESCE(asof_date, published_on) <= %s")
+        params.append(asof_date)
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {EVENT_POLICY_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY COALESCE(policy_at, asof_date, published_on) DESC NULLS LAST, load_ts DESC NULLS LAST
+            LIMIT %s
+            """,
+            params=tuple([*params, max(1, min(int(limit), 50))]),
+        )
+    except Exception:
+        return []
+    return df.to_dict(orient="records") if not df.empty else []
+
+
+def load_recent_router_actions(*, limit: int = 25) -> list[dict[str, Any]]:
+    if not table_exists(ROUTER_ACTIONS_TABLE):
+        return []
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM {ROUTER_ACTIONS_TABLE}
+        WHERE symbol IS NOT NULL
+        ORDER BY routed_at DESC NULLS LAST, load_ts DESC NULLS LAST
+        LIMIT %s
+        """,
+        params=(max(1, min(int(limit), 250)),),
+    )
+    if df.empty:
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in df.to_dict(orient="records"):
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        rows.append(item)
+    return rows
+
+
+def _normalized_action(value: Any) -> str | None:
+    text = _text(value)
+    return None if text is None else text.upper()
+
+
+def _row_confidence(row: dict[str, Any] | None, *columns: str) -> float | None:
+    if not row:
+        return None
+    for column in columns:
+        value = _num(row.get(column))
+        if value is not None:
+            return value / 100.0 if value > 1.0 and column.endswith("_pct") else value
+    return None
+
+
+def _extract_action_payload(*, action: dict[str, Any] | None, lifecycle: dict[str, Any] | None, rebalance: dict[str, Any] | None, events: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "action": action or {},
+        "lifecycle": lifecycle or {},
+        "rebalance": rebalance or {},
+        "event_policy": events,
+    }
+
+
+def choose_signal(
+    *,
+    symbol: str,
+    reason: str,
+    action: dict[str, Any] | None,
+    lifecycle: dict[str, Any] | None,
+    rebalance: dict[str, Any] | None,
+    events: list[dict[str, Any]],
+    wait_matches: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    lifecycle_action = _normalized_action((lifecycle or {}).get("next_action"))
+    rebalance_action = _normalized_action((rebalance or {}).get("suggested_action"))
+    action_code = _normalized_action((action or {}).get("action_code"))
+
+    wait_matches = wait_matches or []
+    if lifecycle_action in EXIT_ACTIONS or rebalance_action in EXIT_ACTIONS:
+        source = "lifecycle"
+        signal_action = rebalance_action or lifecycle_action or "SELL"
+        action_reason = _text((rebalance or {}).get("action_reason")) or _text((lifecycle or {}).get("next_action_reason")) or _text((lifecycle or {}).get("active_exit_condition"))
+        confidence = _row_confidence(lifecycle, "target_confidence") or _row_confidence(action, "invest_score_pct")
+    elif wait_matches:
+        top_wait = wait_matches[0]
+        source = "wait_signal"
+        signal_action = _normalized_action(top_wait.get("expected_action")) or "MANUAL_REVIEW"
+        action_reason = _text(top_wait.get("match_reason")) or "A hypothesis wait signal matched fresh data."
+        confidence = _row_confidence(top_wait, "match_score")
+    elif events:
+        top_event = events[0]
+        event_action = _normalized_action(top_event.get("action_type")) or "MANUAL_REVIEW"
+        source = "event_policy"
+        signal_action = "WATCH" if event_action == "BUY_WATCH" else "MANUAL_REVIEW" if event_action in {"MANUAL_REVIEW", "REDUCE_EXPOSURE_REVIEW"} else event_action
+        action_reason = _text(top_event.get("action_reason")) or _text(top_event.get("action_detail")) or f"Latest event policy action: {event_action}"
+        confidence = _row_confidence(top_event, "confidence", "policy_score")
+    elif action_code:
+        source = "action_recommendation"
+        signal_action = action_code
+        action_reason = _text(action.get("action_reason")) or _text(action.get("action_detail")) or f"Latest consolidated advisory action: {action_code}"
+        confidence = _row_confidence(action, "invest_score_pct")
+    elif lifecycle_action:
+        source = "lifecycle"
+        signal_action = lifecycle_action
+        action_reason = _text((lifecycle or {}).get("next_action_reason")) or _text((lifecycle or {}).get("lifecycle_reason"))
+        confidence = _row_confidence(lifecycle, "target_confidence")
+    else:
+        source = "none"
+        signal_action = "NO_CHANGE"
+        action_reason = "No latest action, lifecycle, or event-policy row found for symbol."
+        confidence = None
+
+    normalized = _normalized_action(signal_action) or "NO_CHANGE"
+    if normalized in EXIT_ACTIONS:
+        status = "exit_or_reduce"
+    elif normalized in BUY_ACTIONS:
+        status = "entry_or_add"
+    elif normalized in WATCH_ACTIONS:
+        status = "watch_or_review"
+    elif normalized == "NO_CHANGE":
+        status = "no_change"
+    else:
+        status = "review"
+
+    return {
+        "symbol": symbol.upper(),
+        "signal_action": normalized,
+        "signal_status": status,
+        "signal_source": source,
+        "confidence": confidence,
+        "action_reason": action_reason or f"Signal refresh from {reason}.",
+    }
+
+
+def make_refresh_id(*, refreshed_at: Any, symbol: str, unique_id: str | None, reason: str) -> str:
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, json_dumps({"refreshed_at": str(refreshed_at), "symbol": symbol.upper(), "unique_id": unique_id, "reason": reason})))
+
+
+def persist_signal_rows(rows: list[dict[str, Any]]) -> None:
+    ensure_table()
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    for column in ["refreshed_at", "asof_date", "load_ts"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    if "confidence" in df.columns:
+        df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
+    if "dry_run" in df.columns:
+        df["dry_run"] = df["dry_run"].astype("boolean")
+    upsert_to_db(df, TABLE_NAME, unique_keys=["refresh_id"])
+
+
+def refresh_symbol(
+    *,
+    symbol: str,
+    reason: str = "manual",
+    unique_id: str | None = None,
+    asof_date: Any = None,
+    dry_run: bool = False,
+    refresh_trace_summary: bool = True,
+) -> dict[str, Any]:
+    ensure_table()
+    normalized_symbol = str(symbol).strip().upper()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    effective_asof = _date(asof_date)
+    action = load_latest_action(normalized_symbol, asof_date=effective_asof)
+    lifecycle = load_latest_lifecycle(normalized_symbol, asof_date=effective_asof)
+    rebalance = load_latest_rebalance(normalized_symbol, asof_date=effective_asof)
+    events = load_event_policy(normalized_symbol, unique_id=unique_id, asof_date=effective_asof)
+    wait_result = match_wait_signals(symbols=[normalized_symbol], limit=100, persist=not bool(dry_run))
+    wait_matches = wait_result.get("matches") or []
+    signal = choose_signal(symbol=normalized_symbol, reason=reason, action=action, lifecycle=lifecycle, rebalance=rebalance, events=events, wait_matches=wait_matches)
+    refreshed_at = pd.Timestamp.utcnow()
+    refresh_id = make_refresh_id(refreshed_at=refreshed_at, symbol=normalized_symbol, unique_id=unique_id, reason=reason)
+    payload = _extract_action_payload(action=action, lifecycle=lifecycle, rebalance=rebalance, events=events)
+    payload["wait_signal_matches"] = wait_matches
+    payload["wait_signal_match_table"] = WAIT_SIGNAL_MATCHES_TABLE
+    trace_id = None
+    if not dry_run:
+        trace_id = safe_trace_call(
+            append_trace,
+            asof_date=effective_asof,
+            symbol=normalized_symbol,
+            unique_id=unique_id,
+            trigger_type=f"signal_refresh:{reason}",
+            previous_action=None,
+            new_action=signal["signal_action"],
+            final_action=signal["signal_action"],
+            final_reason=signal["action_reason"],
+            source_table=TABLE_NAME,
+            source_key=refresh_id,
+            payload={"signal": signal, "context": payload},
+        )
+        if trace_id:
+            safe_trace_call(
+                append_trace_step,
+                trace_id=trace_id,
+                step_idx=1,
+                stage="signal_refresh",
+                status=signal["signal_status"],
+                reason=signal["action_reason"],
+                input_payload={"symbol": normalized_symbol, "reason": reason, "unique_id": unique_id, "asof_date": str(effective_asof)},
+                output_payload=signal,
+                payload={"source_tables": [ACTIONS_TABLE, LIFECYCLE_TABLE, REBALANCE_TABLE, EVENT_POLICY_TABLE]},
+            )
+
+    row = {
+        "refresh_id": refresh_id,
+        "refreshed_at": refreshed_at,
+        "asof_date": effective_asof,
+        "symbol": normalized_symbol,
+        "unique_id": unique_id,
+        "reason": reason,
+        "signal_action": signal["signal_action"],
+        "signal_status": signal["signal_status"],
+        "signal_source": signal["signal_source"],
+        "confidence": signal["confidence"],
+        "action_reason": signal["action_reason"],
+        "action_payload_json": json_dumps(payload),
+        "trace_id": trace_id,
+        "dry_run": bool(dry_run),
+        "load_ts": pd.Timestamp.utcnow(),
+    }
+    if not dry_run:
+        persist_signal_rows([row])
+        if refresh_trace_summary:
+            try:
+                build_symbol_summary(normalized_symbol, persist=True)
+                if unique_id:
+                    build_event_summary(str(unique_id), persist=True)
+            except Exception:
+                pass
+    return row
+
+
+def refresh_from_router(*, limit: int = 25, dry_run: bool = False) -> dict[str, Any]:
+    router_rows = load_recent_router_actions(limit=limit)
+    output_rows: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for item in router_rows:
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        reason_bits = [_text(item.get("source_type")), _text(item.get("action_type"))]
+        reason = "router:" + ":".join([bit for bit in reason_bits if bit])
+        try:
+            output_rows.append(
+                refresh_symbol(
+                    symbol=symbol,
+                    reason=reason,
+                    asof_date=_ts(item.get("asof_date")),
+                    dry_run=dry_run,
+                    refresh_trace_summary=False,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - runtime guard
+            errors.append({"symbol": symbol, "error": f"{exc.__class__.__name__}: {exc}"})
+    if not dry_run:
+        persist_sync_state(
+            source_name=STATE_SOURCE_NAME,
+            last_success_at=pd.Timestamp.utcnow(),
+            last_item_ts=max([pd.to_datetime(row.get("refreshed_at"), utc=True, errors="coerce") for row in output_rows], default=pd.Timestamp.utcnow()),
+            state={"router_rows": len(router_rows), "signal_rows": len(output_rows), "errors": errors[:20]},
+            status="ok" if not errors else "partial",
+            error_text=json_dumps(errors[:20]) if errors else None,
+        )
+        publish_bus_message(
+            "stockey:signal_refresh",
+            {"published_at": pd.Timestamp.utcnow(), "signal_rows": len(output_rows), "errors": errors[:20], "sample": output_rows[:10]},
+        )
+    return {
+        "status": "ok" if not errors else "partial",
+        "router_rows": len(router_rows),
+        "signal_rows": len(output_rows),
+        "errors": errors,
+        "sample": output_rows[:10],
+        "dry_run": bool(dry_run),
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Fast symbol-scoped signal refresh for watcher/router events.")
+    parser.add_argument("--symbol", action="append", default=[], help="Symbol to refresh. Can be passed multiple times.")
+    parser.add_argument("--unique-id", default=None, help="Optional event unique id for event-scoped refresh.")
+    parser.add_argument("--reason", default="manual", help="Refresh reason, for example ohlcv, announcement, news, router.")
+    parser.add_argument("--asof-date", default=None, help="Advisory date. Defaults to today UTC-normalized.")
+    parser.add_argument("--from-router", action="store_true", help="Refresh latest symbols from advisory_live_router_actions.")
+    parser.add_argument("--limit", type=int, default=25, help="Router symbol limit for --from-router.")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--format", choices=["json", "text"], default="json")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.from_router:
+        result = refresh_from_router(limit=args.limit, dry_run=bool(args.dry_run))
+    else:
+        symbols = [str(value).strip().upper() for value in args.symbol if str(value).strip()]
+        if not symbols:
+            raise SystemExit("--symbol is required unless --from-router is used")
+        rows = [
+            refresh_symbol(
+                symbol=symbol,
+                reason=args.reason,
+                unique_id=args.unique_id,
+                asof_date=args.asof_date,
+                dry_run=bool(args.dry_run),
+            )
+            for symbol in symbols
+        ]
+        result = {"status": "ok", "signal_rows": len(rows), "rows": rows, "dry_run": bool(args.dry_run)}
+    if args.format == "text":
+        print(f"status={result.get('status')} signal_rows={result.get('signal_rows', 0)} dry_run={result.get('dry_run')}")
+        for row in result.get("rows") or result.get("sample") or []:
+            print(f"{row.get('symbol')} {row.get('signal_action')} {row.get('signal_status')} source={row.get('signal_source')} reason={row.get('action_reason')}")
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

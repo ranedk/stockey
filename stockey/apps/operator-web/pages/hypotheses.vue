@@ -25,10 +25,12 @@ const scan = reactive({
 const saving = ref(false)
 const previewing = ref(false)
 const running = ref(false)
+const checkingWaits = ref(false)
 const error = ref('')
 const lastCreated = ref<Record<string, unknown> | null>(null)
 const previewResult = ref<Awaited<ReturnType<ReturnType<typeof useOperatorApi>['previewHypothesis']>> | null>(null)
 const runResult = ref<Awaited<ReturnType<ReturnType<typeof useOperatorApi>['runHypotheses']>> | null>(null)
+const waitRunResult = ref<Awaited<ReturnType<ReturnType<typeof useOperatorApi>['getWaitSignals']>> | null>(null)
 const editingId = ref('')
 const updatingStatusId = ref('')
 const checkingId = ref('')
@@ -45,6 +47,10 @@ const checkSettings = reactive({
 const hypotheses = computed(() => data.value?.hypotheses || [])
 const matches = computed(() => data.value?.matches || [])
 const actionPlans = computed(() => data.value?.action_plans || [])
+const waitSignals = computed(() => data.value?.wait_signals || [])
+const waitSignalMatches = computed(() => data.value?.wait_signal_matches || [])
+const activeWaitSignals = computed(() => waitSignals.value.filter((row) => String(row.status || '').toLowerCase() === 'active'))
+const matchedWaitSignals = computed(() => waitSignals.value.filter((row) => String(row.status || '').toLowerCase() === 'matched'))
 const reliabilityChecks = computed(() => data.value?.promotion_audits || [])
 const statusOptions = [
   { key: 'all', label: 'All' },
@@ -70,6 +76,7 @@ const reliabilityByHypothesis = computed(() => {
 })
 const matchesByHypothesis = computed(() => groupRows(matches.value, 'hypothesis_id'))
 const plansByHypothesis = computed(() => groupRows(actionPlans.value, 'hypothesis_id'))
+const waitsByHypothesis = computed(() => groupRows(waitSignals.value, 'hypothesis_id'))
 const scopeOptions = computed(() => {
   const scopes = new Set(['all'])
   for (const row of hypotheses.value) scopes.add(String(row.trigger_scope || 'market'))
@@ -398,6 +405,30 @@ async function runScan(hypothesisId?: unknown, persist = true) {
     running.value = false
   }
 }
+
+async function runWaitSignalMatch() {
+  error.value = ''
+  checkingWaits.value = true
+  try {
+    waitRunResult.value = await api.getWaitSignals({ limit: 100, run_match: true })
+    await refresh()
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    checkingWaits.value = false
+  }
+}
+
+function conditionSummary(row: Record<string, unknown>) {
+  const condition = parseJsonish(row.condition_json)
+  if (row.signal_type === 'price_close') {
+    return `${condition.operator || 'price'} ${condition.threshold || '-'}`
+  }
+  if (Array.isArray(condition.keywords)) {
+    return condition.keywords.slice(0, 5).join(', ')
+  }
+  return String(row.wait_question || row.operator_summary || '-')
+}
 </script>
 
 <template>
@@ -576,6 +607,51 @@ async function runScan(hypothesisId?: unknown, persist = true) {
     <MetricTile label="Retired" :value="String(lifecycleCounts.retired || 0)" note="Historical only" />
   </section>
 
+  <section class="mt-8 glass-panel rounded-3xl p-6">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Wait Signals</p>
+        <h2 class="mt-2 text-2xl font-black">What the system is waiting for next</h2>
+        <p class="mt-2 max-w-3xl text-sm leading-6 text-ink/60">
+          Playbook action plans now generate deterministic wait conditions. Live signal refresh checks these against OHLCV, news, and announcements before escalating a symbol.
+        </p>
+      </div>
+      <button class="rounded-full bg-ink px-5 py-3 text-sm font-black text-paper disabled:opacity-50" type="button" :disabled="checkingWaits" @click="runWaitSignalMatch">
+        {{ checkingWaits ? 'Checking...' : 'Check active waits now' }}
+      </button>
+    </div>
+    <div class="mt-5 grid gap-4 md:grid-cols-4">
+      <MetricTile label="Active Waits" :value="String(activeWaitSignals.length)" note="Open conditions" />
+      <MetricTile label="Matched Waits" :value="String(matchedWaitSignals.length)" note="Already triggered" />
+      <MetricTile label="Match Rows" :value="String(waitSignalMatches.length)" note="Fresh evidence hits" />
+      <MetricTile label="Last Check" :value="String(waitRunResult?.match_result?.matched_rows ?? '-')" note="Matched in manual check" />
+    </div>
+    <div class="mt-5 grid gap-3 xl:grid-cols-3">
+      <article v-for="row in waitSignals.slice(0, 9)" :key="String(row.signal_id)" class="rounded-3xl bg-white/75 p-4">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <SymbolLink v-if="row.symbol" :symbol="row.symbol" />
+            <p v-else class="text-sm font-black text-ink">Market-wide</p>
+            <p class="mt-1 text-xs text-ink/45">{{ row.hypothesis_title || row.hypothesis_id }}</p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="String(row.status).toLowerCase() === 'matched' ? 'bg-moss text-white' : 'bg-sun text-ink'">
+            {{ row.status || 'active' }}
+          </span>
+        </div>
+        <p class="mt-3 text-sm font-semibold leading-6 text-ink/70">{{ row.wait_question || row.operator_summary }}</p>
+        <div class="mt-3 grid gap-2 text-xs text-ink/55">
+          <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Condition:</b> {{ conditionSummary(row) }}</p>
+          <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Expected action:</b> {{ row.expected_action || 'MANUAL_REVIEW' }}</p>
+          <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Valid until:</b> {{ row.valid_until || '-' }}</p>
+        </div>
+      </article>
+      <p v-if="!waitSignals.length" class="rounded-3xl bg-white/75 p-6 text-ink/60 xl:col-span-3">
+        No wait signals yet. Run a playbook scan with persisted action plans; the scan will generate wait conditions automatically.
+      </p>
+    </div>
+    <pre v-if="waitRunResult" class="mt-4 max-h-64 overflow-auto rounded-2xl bg-ink p-4 text-xs leading-5 text-paper">{{ JSON.stringify(waitRunResult.match_result, null, 2) }}</pre>
+  </section>
+
   <section class="mt-8 grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
     <div class="glass-panel rounded-3xl p-6">
       <div class="flex flex-wrap items-start justify-between gap-4">
@@ -643,8 +719,9 @@ async function runScan(hypothesisId?: unknown, persist = true) {
             <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Effect:</b> {{ titleCase(expectedEffect(row)) }}</p>
             <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Matches:</b> {{ matchesByHypothesis[String(row.hypothesis_id || '')]?.length || 0 }}</p>
             <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Plans:</b> {{ plansByHypothesis[String(row.hypothesis_id || '')]?.length || 0 }}</p>
-            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Boundary:</b> {{ actionBoundary(row) }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Waits:</b> {{ waitsByHypothesis[String(row.hypothesis_id || '')]?.length || 0 }}</p>
           </div>
+          <p class="mt-2 rounded-xl bg-paper/70 px-3 py-2 text-sm"><b>Boundary:</b> {{ actionBoundary(row) }}</p>
           <p class="mt-3 text-sm text-ink/55"><b>Triggers:</b> {{ triggerKeywords(row) || 'No trigger terms recorded.' }}</p>
 
           <div class="mt-4 flex flex-wrap gap-2">

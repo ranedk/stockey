@@ -11,6 +11,7 @@ This file is the current roadmap for the live advisory stack. It is not a histor
 - Download + parse: `./complete_data.sh`
 - Advisory only: `./all_advisory.sh`
 - Fast advisory refresh: `./all_advisory.sh --fast`
+- Symbol signal refresh: `python -m advisory.signal_refresh --symbol RELIANCE --reason manual`
 - Optional research-only model prep/training: `./all_ml.sh`
 - Continuous monitoring: `./all_watchers.sh --loop`
 
@@ -37,6 +38,8 @@ The active stack already has:
 - event-model data prep, train, and score scaffolding retained for research only
 - broad research-only training universes from ad hoc Screener queries, disabled from the default operating loop
 - continuous watch, live alerting, event routing, consolidated action recommendations, and a Nuxt operator frontend backed by an operator-controlled Python API
+- watcher-triggered signal refresh in `advisory_signal_refresh_actions`, which gives fast per-symbol buy/watch/review/exit visibility without rerunning full advisory
+- hypothesis/playbook Wait Signals in `advisory_wait_signals` and `advisory_wait_signal_matches`, generated from action plans and matched by watchers/signal refresh
 - DB-backed operator snapshots, slow-operation logging, health fix hints, and visible sync-state failure reporting
 
 ## What is working now
@@ -59,7 +62,8 @@ The active stack already has:
 
 4. Execution support
    - lifecycle and execution-planning outputs exist
-   - continuous watch can trigger symbol-level reevaluation
+   - continuous watch can trigger fast symbol-level signal refresh
+   - hypothesis playbooks can create explicit price/news/announcement conditions to wait for before escalation
    - consolidated action recommendations are the current operator/execution handoff
    - the Nuxt operator frontend replaces the old static HTML dashboard path
 
@@ -68,6 +72,7 @@ The active stack already has:
 1. The highest-priority gap is now UI-first operations: every normal operator action should be visible, explainable, and auditable from the Nuxt app.
 2. Remaining high-risk gaps are observability and correctness gaps, not missing major architecture blocks.
 3. Some manual workflows still require CLI/manual edits: operator smoke checks, event-model promotion checks, approved technical config diffs, S3 artifact inspection, cron log inspection, and some research-ledger review.
+4. Fast signal refresh is intentionally not the authoritative portfolio allocator. Daily `all_advisory.sh` remains the reconciliation path until enough evidence proves incremental advisory is safe.
 4. Some non-home API endpoints still return large raw rows and need pagination/compaction.
 5. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
 6. NSE ingestion still needs a single-lane queue so retries, cookie resets, and rate limits are centrally managed.
@@ -1382,6 +1387,19 @@ For all serious model work:
 - log validation protocol
 - keep point-in-time discipline
 - prefer abstention over forced opinions
+
+### 9. Low Priority: advisory scaling safeguards
+
+These are intentionally tracked in docs only, not in Postgres. Full daily advisory remains the authoritative path; incremental advisory is not trusted enough to become the default workflow.
+
+Low-priority performance backlog:
+
+- bound the advisory candidate universe per run so expensive stages do not scan unbounded historical/cross-sectional data
+- add stage-level freshness checks so unchanged macro, exchange, technical, intraday, trace, and snapshot outputs can be reused safely
+- move heavy text/blob payloads out of hot Postgres rows, keeping excerpts, hashes, classifications, and object-store pointers hot
+- add DB indexes only from slow-operation and slow-query evidence, while keeping duplicate-index reports clean
+- add hot/cold retention for trace, intraday, event, and alert rows with dry-run cleanup reports
+- evaluate incremental advisory only as research-only for watch/update/exit/manual-review flows, not as the source of truth
 
 ## Deprioritized or intentionally avoided
 

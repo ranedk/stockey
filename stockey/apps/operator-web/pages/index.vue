@@ -15,10 +15,11 @@ const portfolioStatus = ref('all')
 const portfolioSearch = ref('')
 const portfolioBucket = ref('today_recommendations')
 
-const [{ data: home }, { data: marketContext }, { data: technicalCalibration }, { data: actionsData, refresh: refreshActions, error: actionsError }, { data: portfolioData, refresh: refreshPortfolio, error: portfolioError }] = await Promise.all([
+const [{ data: home }, { data: marketContext }, { data: technicalCalibration }, { data: signalRefresh, error: signalRefreshError }, { data: actionsData, refresh: refreshActions, error: actionsError }, { data: portfolioData, refresh: refreshPortfolio, error: portfolioError }] = await Promise.all([
   useAsyncData('home', () => api.getHome()),
   useAsyncData('market-context', () => api.getMarketContext(20)),
   useAsyncData('technical-calibration-home', () => api.getTechnicalCalibration(3)),
+  useAsyncData('signal-refresh-home', () => api.getSignalRefresh({ limit: 12, compact: true })),
   useAsyncData('home-actions-paged', () => api.getActions({
     limit: actionLimit.value,
     offset: actionOffset.value,
@@ -39,6 +40,8 @@ const [{ data: home }, { data: marketContext }, { data: technicalCalibration }, 
 ])
 
 const summaryValues = computed(() => home.value?.summary || {})
+const liveSignals = computed(() => signalRefresh.value?.signals || [])
+const signalMeta = computed(() => asDict(signalRefresh.value?.meta?.signals))
 const topActions = computed(() => [...(actionsData.value?.top_action_recommendations || []), ...(actionsData.value?.action_recommendations || [])])
 const actionMeta = computed(() => asDict(actionsData.value?.meta?.action_recommendations))
 const portfolioMeta = computed(() => asDict(portfolioData.value?.meta?.portfolio))
@@ -127,6 +130,14 @@ function portfolioDetailPath(row: Record<string, unknown>) {
   const symbol = String(row.symbol || row.ticker || '').toUpperCase()
   return symbol ? `/api/portfolio/${encodeURIComponent(symbol)}/detail` : ''
 }
+
+function signalTone(row: Record<string, unknown>) {
+  const status = String(row.signal_status || row.signal_action || '').toLowerCase()
+  if (status.includes('exit') || status.includes('reduce') || status.includes('sell')) return 'bg-rust text-white'
+  if (status.includes('entry') || status.includes('buy')) return 'bg-moss text-white'
+  if (status.includes('review') || status.includes('watch')) return 'bg-sun text-ink'
+  return 'bg-white text-ink/70'
+}
 </script>
 
 <template>
@@ -143,6 +154,44 @@ function portfolioDetailPath(row: Record<string, unknown>) {
     <MetricTile label="Today" :value="String(summaryValues.today_count || 0)" note="Latest recommendation date" />
     <MetricTile label="Watch" :value="String(summaryValues.watch_count || 0)" note="Waiting for trigger or confirmation" />
     <MetricTile label="Alerts" :value="String(summaryValues.alert_count || 0)" note="Live watcher alerts" />
+  </section>
+
+  <section class="mt-8 glass-panel rounded-3xl p-6">
+    <div class="flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <p class="text-xs font-bold uppercase tracking-[0.3em] text-ink/45">Live Signal Refresh</p>
+        <h2 class="mt-2 text-2xl font-black">Watcher-triggered symbol decisions</h2>
+        <p class="mt-2 max-w-3xl text-sm leading-6 text-ink/60">
+          These are fast symbol-scoped signals from OHLCV/news/announcement watcher routes. The daily advisory remains the authoritative reconciliation.
+        </p>
+      </div>
+      <span class="rounded-full bg-white px-3 py-1 text-xs font-black text-ink/60">
+        {{ signalMeta.total || 0 }} recent
+      </span>
+    </div>
+    <ApiErrorBanner v-if="signalRefreshError" class="mt-4" title="Live signal refresh failed" :error="signalRefreshError" />
+    <div v-if="liveSignals.length" class="mt-5 grid gap-3 xl:grid-cols-3">
+      <article v-for="row in liveSignals" :key="String(row.refresh_id || `${row.symbol}-${row.refreshed_at}`)" class="rounded-3xl bg-white/75 p-4 shadow-soft">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <SymbolLink :symbol="row.symbol" />
+            <p class="mt-1 text-xs font-semibold text-ink/45">{{ row.refreshed_at || row.load_ts || '-' }}</p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="signalTone(row)">
+            {{ row.signal_action || 'NO_CHANGE' }}
+          </span>
+        </div>
+        <p class="mt-3 text-sm leading-6 text-ink/70">{{ row.action_reason || 'No reason captured.' }}</p>
+        <div class="mt-3 flex flex-wrap gap-2 text-xs font-bold text-ink/50">
+          <span class="rounded-full bg-paper px-3 py-1">status: {{ row.signal_status || '-' }}</span>
+          <span class="rounded-full bg-paper px-3 py-1">source: {{ row.signal_source || '-' }}</span>
+          <span class="rounded-full bg-paper px-3 py-1">reason: {{ row.reason || '-' }}</span>
+        </div>
+      </article>
+    </div>
+    <p v-else class="mt-5 rounded-2xl bg-white/70 p-4 text-sm font-semibold text-ink/55">
+      No live signal-refresh rows yet. Run `./all_watchers.sh` or `python -m advisory.signal_refresh --symbol RELIANCE --reason manual`.
+    </p>
   </section>
 
   <section class="mt-8 glass-panel rounded-3xl p-6">

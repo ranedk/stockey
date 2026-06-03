@@ -1,4 +1,4 @@
-import type { CronLogsPayload, EventModelArtifactsPayload, EventModelPromotionCheckPayload, EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, ManualReviewDecisionResult, ManualReviewPayload, OperatorActions, OperatorApiErrorsPayload, OperatorCommandRunResult, OperatorCommandsPayload, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorSmokePayload, OperatorSummary, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary } from '~/types/api'
+import type { CronLogsPayload, EventModelArtifactsPayload, EventModelPromotionCheckPayload, EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, ManualReviewDecisionResult, ManualReviewPayload, OperatorActions, OperatorApiErrorsPayload, OperatorCommandRunResult, OperatorCommandsPayload, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorSmokePayload, OperatorSummary, SignalRefreshPayload, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary, WaitSignalsPayload } from '~/types/api'
 
 export function useOperatorApi() {
   const config = useRuntimeConfig()
@@ -36,6 +36,7 @@ export function useOperatorApi() {
     decideManualReview: (body: Record<string, unknown>) => post<ManualReviewDecisionResult>('/api/manual-review/decision', body),
     getActions: (params: Record<string, unknown> = {}) => get<OperatorActions>(`/api/actions${query(params)}`),
     getActionDetail: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/actions/detail${query(params)}`),
+    getSignalRefresh: (params: Record<string, unknown> = {}) => get<SignalRefreshPayload>(`/api/signal-refresh${query(params)}`),
     getPortfolio: (params: Record<string, unknown> = {}) => get<OperatorPortfolio>(`/api/portfolio${query(params)}`),
     getPortfolioDetail: (symbol: string, params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/portfolio/${encodeURIComponent(symbol)}/detail${query(params)}`),
     getMarketContext: (limit = 50) => get<OperatorMarketContext>(`/api/market-context?limit=${limit}`),
@@ -52,6 +53,7 @@ export function useOperatorApi() {
     getSymbolTrace: (symbol: string, limit = 200) => get<SymbolTrace>(`/api/symbols/${encodeURIComponent(symbol)}/trace?limit=${limit}`),
     getSymbolTraceSummary: (symbol: string, limit = 200) => get<TraceSummary>(`/api/symbols/${encodeURIComponent(symbol)}/trace/summary?limit=${limit}`),
     getHypotheses: (limit = 100) => get<HypothesesPayload>(`/api/hypotheses?limit=${limit}`),
+    getWaitSignals: (params: Record<string, unknown> = {}) => get<WaitSignalsPayload>(`/api/wait-signals${query(params)}`),
     createHypothesis: (body: Record<string, unknown>) => post<HypothesisCreateResult>('/api/hypotheses', body),
     updateHypothesis: (hypothesisId: string, body: Record<string, unknown>) => post<HypothesisCreateResult>(`/api/hypotheses/${encodeURIComponent(hypothesisId)}`, body),
     previewHypothesis: (body: Record<string, unknown>) => post<HypothesisPreviewResult>('/api/hypotheses/preview', body),

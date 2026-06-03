@@ -54,7 +54,9 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/event_model_promotion_check.py` | read-only checks | Conservative evidence gate for deciding whether weekly event-model results are ready for manual operator review as a low-weight input |
 | `advisory/sync_state.py` | `advisory_sync_state` | Shared incremental state storage for continuous polling and operator frontend status |
 | `advisory/continuous_watch.py` | `advisory_live_watch_alerts`, `advisory_sync_state` | Lightweight watch loop over active watchlist OHLCV, announcements, ET/news, and operator status |
-| `advisory/event_router.py` | `advisory_live_router_actions`, `advisory_sync_state` | Symbol-level router that turns fresh live alerts and events into targeted advisory reevaluation |
+| `advisory/event_router.py` | `advisory_live_router_actions`, `advisory_sync_state` | Symbol-level router that turns fresh live alerts and events into fast signal-refresh intents |
+| `advisory/signal_refresh.py` | `advisory_signal_refresh_actions`, `advisory_decision_traces` | Fast per-symbol live decision layer that reads latest action, lifecycle/rebalance, and event-policy rows without running full portfolio allocation |
+| `advisory/wait_signals.py` | `advisory_wait_signals`, `advisory_wait_signal_matches` | Converts hypothesis/playbook action plans into machine-checkable price/news/announcement wait conditions and matches them deterministically |
 | `advisory/decision_trace.py` | `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts` | Durable trace layer that links ingest, event evaluation, review, lifecycle, action consolidation, and conflicts |
 | `advisory/trace_summary_store.py` | `advisory_trace_summaries` | Materializes compact symbol/event trace summaries so the operator frontend does not rebuild large traces live on every page load |
 | `advisory/live_dashboard.py` | JSON payload builder | Legacy static dashboard module; API still reuses its payload builder while Nuxt replaces static generation |
@@ -234,7 +236,7 @@ Recommended scheduler file:
 It schedules:
 
 - `complete_data.sh` once daily on weekdays
-- `all_watchers.sh` every `10` minutes during market hours
+- `all_watchers.sh` every `10` minutes during market hours; watcher routing writes fast live rows to `advisory_signal_refresh_actions` and matches active hypothesis wait signals
 - `all_advisory.sh` once daily after 7pm on weekdays
 - `all_frontend.sh` every `5` minutes under a lock so API/Nuxt are restarted if they exit
 - `all_advisory.sh` and `all_watchers.sh` refresh `advisory.operator_snapshot` and `advisory.trace_summary_store` after a successful run so frontend endpoints can serve cached dashboard and trace sections quickly

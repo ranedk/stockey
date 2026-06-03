@@ -113,6 +113,13 @@ export interface OperatorActions {
   meta?: Dict
 }
 
+export interface SignalRefreshPayload {
+  generated_at?: string
+  status: string
+  signals: Dict[]
+  meta?: Dict
+}
+
 export interface OperatorPortfolio {
   generated_at?: string
   asof_date?: string
@@ -269,13 +276,24 @@ export interface TraceSummary {
   decisions: TraceDecision[]
   action_conflicts: TraceConflict[]
   raw_counts: Dict
+  _trace_summary_cache?: Dict
 }
 
 export interface HypothesesPayload {
   hypotheses: Dict[]
   matches: Dict[]
   action_plans: Dict[]
+  wait_signals?: Dict[]
+  wait_signal_matches?: Dict[]
   promotion_audits?: Dict[]
+}
+
+export interface WaitSignalsPayload {
+  generated_at?: string
+  status: string
+  signals: Dict[]
+  matches: Dict[]
+  match_result?: Dict | null
 }
 
 export interface HypothesisCreateResult {

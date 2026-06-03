@@ -279,6 +279,21 @@ const counters = computed(() => {
     visibleProcessing: filteredProcessing.value.length
   }
 })
+const cacheMeta = computed(() => (props.trace?._trace_summary_cache || {}) as Dict)
+const cacheSource = computed(() => String(cacheMeta.value.source || 'unknown'))
+const isLiveFallback = computed(() => cacheSource.value === 'live_fallback')
+
+function cacheLabel() {
+  if (cacheSource.value === 'materialized') return 'Materialized cache'
+  if (cacheSource.value === 'live_fallback') return 'Live fallback'
+  return 'Cache unknown'
+}
+
+function cacheClass() {
+  if (cacheSource.value === 'materialized') return 'bg-moss text-paper'
+  if (cacheSource.value === 'live_fallback') return 'bg-rust text-paper'
+  return 'bg-sun text-ink'
+}
 
 function setQuickFilter(value: string) {
   quickFilter.value = quickFilter.value === value ? '' : value
@@ -306,7 +321,23 @@ function clearFilters() {
             {{ trace.raw_counts.action_conflicts || 0 }} conflicts
           </p>
         </div>
-        <span v-if="trace.unique_id" class="rounded-full bg-white px-3 py-1 text-xs font-bold text-ink/65">{{ trace.unique_id }}</span>
+        <div class="flex flex-wrap justify-end gap-2">
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="cacheClass()">{{ cacheLabel() }}</span>
+          <span v-if="trace.unique_id" class="rounded-full bg-white px-3 py-1 text-xs font-bold text-ink/65">{{ trace.unique_id }}</span>
+        </div>
+      </div>
+      <div class="mt-4 grid gap-2 text-xs md:grid-cols-4">
+        <p class="rounded-xl bg-white/70 px-3 py-2"><b>Cache generated:</b> {{ formatWhen(String(cacheMeta.generated_at || '')) }}</p>
+        <p class="rounded-xl bg-white/70 px-3 py-2"><b>Source max:</b> {{ formatWhen(String(cacheMeta.source_max_ts || '')) }}</p>
+        <p class="rounded-xl bg-white/70 px-3 py-2"><b>Rows limit:</b> {{ textValue(cacheMeta.limit_rows) }}</p>
+        <p class="rounded-xl bg-white/70 px-3 py-2"><b>Entity:</b> {{ textValue(cacheMeta.entity_type) }} / {{ textValue(cacheMeta.entity_key) }}</p>
+      </div>
+      <div v-if="isLiveFallback" class="mt-4 rounded-2xl bg-rust/10 p-4">
+        <p class="text-sm font-black text-rust">This trace was built live because the materialized summary cache was missing.</p>
+        <p class="mt-1 text-sm leading-6 text-ink/65">Run “Rebuild Trace Summaries” from Operations to make this trace load through the fast path.</p>
+        <NuxtLink class="mt-3 inline-flex rounded-full bg-ink px-4 py-2 text-sm font-black text-paper" to="/operations">
+          Open Operations
+        </NuxtLink>
       </div>
     </div>
 
