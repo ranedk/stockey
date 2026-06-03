@@ -108,14 +108,17 @@ Important:
 Current schedule:
 
 - every `5` minutes: `./all_frontend.sh` under a lock, which keeps the operator API and Nuxt frontend running without duplicates
-- `07:10` weekdays: `./complete_data.sh`
+- `07:10` weekdays: `./complete_data.sh` broad morning safety net
+- `08:30`, `12:30`, `16:30` weekdays: `./all_downloaders_queue.sh` to enqueue single-client NSE/Dhan/Screener downloader work while running safe downloader modules inline
+- `08:35`, `12:35`, `16:35` weekdays: `./all_external_workers.sh` to drain Dhan, Screener, and NSE queues serially
 - every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_watchers.sh`
 - `16:05` weekdays: one final post-close `./all_watchers.sh`
 - `08:05`, `12:05`, `17:05`, `22:05` weekdays: `python -m advisory.operator_health --skip-dhan`
 - `10:25`, `13:25`, `16:25`, `21:25` weekdays: investor hypothesis/playbook scan over newly collected events
 - `11:20`, `14:20`, `17:20`, `20:20` weekdays: experimental TS forecast workflow using `config/ts_forecast_screeners.yaml`
 - `18:20`, `21:20` weekdays: matured TS forecast evaluation after costs
-- `19:10` weekdays: `./all_advisory.sh`
+- `17:30` weekdays: `./complete_data.sh` end-of-day catch-up before advisory
+- `19:10` weekdays: `./all_advisory.sh`, after waiting for data catch-up and external worker locks to clear
 - `23:10` weekdays: event-policy realized-return evaluation after costs
 - `04:20` Saturdays: technical threshold calibration after costs
 - `03:10` Sundays: weekly `./all_ml.sh` for event-model research training
@@ -132,9 +135,17 @@ Why the split looks like this:
 - event-policy and technical-threshold evaluators are research-only evidence jobs; they do not change live thresholds or submit actions
 - the full advisory is not forced on every market tick; it runs once daily after 7pm
 
+Script groups:
+
+- recurring cron scripts: `all_frontend.sh`, `all_watchers.sh`, `all_downloaders_queue.sh`, `all_external_workers.sh`, morning and pre-advisory `complete_data.sh`, post-close `all_advisory.sh`, and weekly research `all_ml.sh` if enabled
+- manual / catch-up / long-running scripts: `all_downloaders.sh`, `all_parsers.sh`, manual `complete_data.sh`, manual `all_ml.sh`, and `all_advisory_codex.sh`
+- use the manual group end-of-day, after missed runs, before major reruns, or during debugging; do not add them to high-frequency cron
+
 Important constraint:
 
-- the cron file uses `scripts/with_lock.sh` so duplicate overlapping runs are skipped instead of piling up; it uses `flock` on Linux and `lockf` on macOS
+- cron commands use `scripts/with_lock.sh` where needed so duplicate overlapping runs are skipped instead of piling up
+- `all_watchers.sh` also self-locks with `/tmp/stockey_watchers.lock`, so manual and cron watcher runs cannot overlap
+- watcher source cursors live in `advisory_sync_state`; if a watcher tick is skipped because the previous run is still active, the next run resumes from the last successful cursor instead of only checking the last `10` minutes
 - the shell wrappers resolve Python automatically, so cron does not need `source .xstockey/bin/activate`
 
 ## Operator Health
@@ -256,6 +267,15 @@ Useful variants:
 ./all_parsers.sh
 ```
 
+Queued downloader mode:
+
+```sh
+./all_downloaders_queue.sh
+./all_external_workers.sh
+```
+
+Use queued mode during normal operation when NSE/Dhan/Screener work should be serialized. Use direct `./all_downloaders.sh` or `./complete_data.sh` as the catch-up/backfill path when a day was missed or you explicitly want a broad refresh.
+
 What it does:
 
 1. runs every download module
@@ -274,6 +294,22 @@ Command:
 ```sh
 ./all_advisory.sh
 ```
+
+Default performance behavior:
+
+- runs independent local/DB feature stages with bounded threads
+- skips hidden rule-engine daily/intraday repair by default
+- expects data gaps to be handled by `complete_data.sh`, watchers, or the external task queue
+
+Useful overrides:
+
+```sh
+ADVISORY_LOCAL_STAGE_WORKERS=2 ./all_advisory.sh
+ADVISORY_PARALLEL_LOCAL_STAGES=0 ./all_advisory.sh
+ADVISORY_DISABLE_RULE_REPAIR=0 ./all_advisory.sh
+```
+
+Use `ADVISORY_DISABLE_RULE_REPAIR=0` only when you deliberately want the advisory batch to repair missing Dhan/fundamental inputs inline. That can make the run much slower.
 
 Codex-supervised variant:
 
@@ -382,6 +418,11 @@ What it watches:
 
 Important behavior:
 
+- the script self-locks via `scripts/with_lock.sh`; if another watcher is still running, the new run logs `[stockey.lock] skip already_running` and exits `0`
+- OHLCV, news, and announcements use persisted cursors in `advisory_sync_state`, not cron wall-clock assumptions
+- OHLCV keeps a small overlap on every pull and does not advance `last_item_ts` when no fresh intraday candle was actually observed
+- if a run fails before cursor persistence, the next due run retries from the previous successful cursor
+- `complete_data.sh` or `all_downloaders.sh` remains the broad end-of-day catch-up path if a full day was missed
 - there is no default cap on how many symbols the router may reevaluate
 - symbols stop being watched once advisory removes them from the watch path
 - open positions remain monitored for exit-related alerts
@@ -489,6 +530,26 @@ python scripts/archive_legacy_nse_tables.py --table nseindia_var1 --retention-da
 ```
 
 The archive script is dry-run unless `--execute` is passed. Use `--archive-s3` first, validate the uploaded monthly CSV.GZ chunks, and only then add `--delete`. A delete lowers live row count but does not shrink the physical Postgres table file until a table rewrite such as `VACUUM FULL` or `pg_repack`.
+
+Serialized external task queue:
+
+```sh
+python -m advisory.external_task_queue --queue nse --enqueue --task-type smoke --task-args-json '{}'
+python -m advisory.external_task_queue --queue nse --worker --once
+python -m advisory.external_task_queue --queue nse --status
+```
+
+Concrete task types:
+
+```sh
+python -m advisory.external_task_queue --queue dhan --enqueue --task-type dhan_daily_ohlcv --task-args-json '{"symbols":["RELIANCE"],"exchange":"NSE","asset_type":"stock"}'
+python -m advisory.external_task_queue --queue dhan --enqueue --task-type dhan_intraday_ohlcv --task-args-json '{"symbols":["RELIANCE"],"interval_minutes":5}'
+python -m advisory.external_task_queue --queue dhan --enqueue --task-type dhan_scrip_master --task-args-json '{}'
+python -m advisory.external_task_queue --queue screener --enqueue --task-type screener_login --task-args-json '{"check_only":false}'
+python -m advisory.external_task_queue --queue nse --enqueue --task-type nse_module --task-args-json '{"module":"data.nseindia.recent_events","args":[]}'
+```
+
+This queue is the foundation for single-client NSE/Dhan/Screener work. Keep these queues single-lane; do not parallelize Chrome/CDP-heavy or broker-token-heavy work from the advisory process.
 
 Frontend wrapper controls:
 

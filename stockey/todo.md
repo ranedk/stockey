@@ -7,6 +7,7 @@ This file is the current roadmap for the live advisory stack. It is not a histor
 ## Primary operator paths
 
 - Downloaders only: `./all_downloaders.sh`
+- Queued downloader refresh: `./all_downloaders_queue.sh` followed by `./all_external_workers.sh`
 - Parsers only: `./all_parsers.sh`
 - Download + parse: `./complete_data.sh`
 - Advisory only: `./all_advisory.sh`
@@ -73,12 +74,13 @@ The active stack already has:
 2. Remaining high-risk gaps are observability and correctness gaps, not missing major architecture blocks.
 3. Some manual workflows still require CLI/manual edits: operator smoke checks, event-model promotion checks, approved technical config diffs, S3 artifact inspection, cron log inspection, and some research-ledger review.
 4. Fast signal refresh is intentionally not the authoritative portfolio allocator. Daily `all_advisory.sh` remains the reconciliation path until enough evidence proves incremental advisory is safe.
-4. Some non-home API endpoints still return large raw rows and need pagination/compaction.
-5. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
-6. NSE ingestion still needs a single-lane queue so retries, cookie resets, and rate limits are centrally managed.
-7. Continuous watch should add stronger cooldowns, duplicate suppression, and explicit per-source failure counters.
-8. Approved technical threshold reviews still require manual config edits; reviewed-diff generation would reduce operator mistakes.
-9. Legacy “promotion audit” naming should be migrated to “reliability check” once DB migration is safe.
+5. Some non-home API endpoints still return large raw rows and need pagination/compaction.
+6. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
+7. The serialized external task queue now has concrete NSE/Dhan/Screener handlers plus a queued downloader/worker cron path; direct `all_downloaders.sh` and `complete_data.sh` remain the catch-up/backfill path when a day is missed.
+8. `all_advisory.sh` now defaults to bounded local-stage parallelism and skips hidden rule repair; next performance work is stage-budget reporting and moving remaining external repair into queue workers where safe.
+9. Continuous watch should add stronger cooldowns, duplicate suppression, and explicit per-source failure counters.
+10. Approved technical threshold reviews still require manual config edits; reviewed-diff generation would reduce operator mistakes.
+11. Legacy “promotion audit” naming should be migrated to “reliability check” once DB migration is safe.
 
 ## Highest Priority: UI-First Operations
 

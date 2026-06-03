@@ -14,15 +14,31 @@ LOG_DIR={{LOG_DIR}}
 #
 # This file includes a username field. Remove that field before installing into a normal per-user crontab.
 
-# Daily raw download + parse refresh before market open on weekdays.
+# ---------------------------------------------------------------------------
+# Recurring cron-managed jobs.
+# ---------------------------------------------------------------------------
+
+# Daily broad raw download + parse safety net before market open on weekdays.
+# A second end-of-day complete_data.sh run below repairs anything intraday jobs missed before advisory.
 10 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
 
-# Portfolio/advisory run daily after market close.
-10 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh >> "$LOG_DIR/all_advisory.log" 2>&1
+# Queue single-client downloader work and drain it without parallel NSE/Dhan/Screener sessions.
+# The direct complete_data.sh path remains the broad catch-up/backfill safety net.
+30 08,12,16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_download_queue.lock ./all_downloaders_queue.sh >> "$LOG_DIR/all_downloaders_queue.log" 2>&1
+35 08,12,16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_external_workers.lock ./all_external_workers.sh >> "$LOG_DIR/external_workers.log" 2>&1
+
+# End-of-day broad catch-up before advisory. This intentionally runs the full
+# download+parse path so missed downloader/parser work is repaired before
+# portfolio/action reconciliation.
+30 17 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
+
+# Portfolio/advisory run daily after market close. Wait for end-of-day data
+# catch-up and queued single-client workers before reconciling actions.
+10 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${ADVISORY_WAIT_FOR_DATA_TIMEOUT_SECONDS:-7200}" /tmp/stockey_complete_data.lock /tmp/stockey_download_queue.lock /tmp/stockey_external_workers.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh; } >> "$LOG_DIR/all_advisory.log" 2>&1
 
 # Continuous one-shot watch during market hours on weekdays.
 # Internal sync state keeps news/announcements slower while OHLCV stays more frequent.
-*/10 09-15 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
+*/10 09-15 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
 # Operator frontend supervisor. Runs API + Nuxt and restarts within 5 minutes if it exits.
 # Static live_dashboard generation is disabled.
@@ -33,7 +49,7 @@ LOG_DIR={{LOG_DIR}}
 05 08,12,17,22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_operator_health.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.operator_health --skip-dhan >> "$LOG_DIR/operator_health.log" 2>&1
 
 # One final post-close watch pass for end-of-day alerts.
-05 16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_watchers.lock ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
+05 16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
 
 # Investor hypothesis/playbook scan over newly collected news and announcements.
 # Set HYPOTHESIS_CRON_ARGS="--no-llm" if you want deterministic scans only.
@@ -55,9 +71,15 @@ LOG_DIR={{LOG_DIR}}
 # Review the operator UI before manually changing config/advisory_setups.yaml.
 20 04 * * 6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_technical_calibration.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.technical_threshold_calibration --horizons ${TECHNICAL_CALIBRATION_HORIZONS:-5 10 20} --cost-bps "${TECHNICAL_CALIBRATION_COST_BPS:-25}" --min-signals "${TECHNICAL_CALIBRATION_MIN_SIGNALS:-10}" >> "$LOG_DIR/technical_threshold_calibration.log" 2>&1
 
-# Weekly research-only event-model prep/training. It refreshes event-model evidence but does not change live policy automatically.
+# Weekly long-running research-only event-model prep/training.
+# It refreshes event-model evidence but does not change live policy automatically.
 10 03 * * 0 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
 
+# ---------------------------------------------------------------------------
+# Manual / catch-up / long-running scripts. Keep these commented unless you
+# intentionally want extra end-of-day repair jobs.
+# ---------------------------------------------------------------------------
+#
 # Optional split refreshes if you want explicit control instead of complete_data.sh.
 # 05 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_downloaders.lock ./all_downloaders.sh >> "$LOG_DIR/all_downloaders.log" 2>&1
 # 40 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_parsers.lock ./all_parsers.sh >> "$LOG_DIR/all_parsers.log" 2>&1

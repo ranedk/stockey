@@ -367,6 +367,17 @@ def _is_due(source_name: str, interval_seconds: int) -> bool:
     return (pd.Timestamp.utcnow() - last_success_at).total_seconds() >= int(interval_seconds)
 
 
+def _next_cursor_after_pull(previous_cursor: pd.Timestamp | None, requested_from: pd.Timestamp, candidate_latest: object) -> pd.Timestamp:
+    previous = pd.to_datetime(previous_cursor, utc=True, errors="coerce")
+    requested = pd.to_datetime(requested_from, utc=True, errors="coerce")
+    candidate = pd.to_datetime(candidate_latest, utc=True, errors="coerce")
+    if pd.notna(candidate) and (pd.isna(previous) or candidate > previous):
+        return pd.Timestamp(candidate)
+    if pd.notna(previous):
+        return pd.Timestamp(previous)
+    return pd.Timestamp(requested)
+
+
 def run_ohlcv_cycle(*, interval_seconds: int, intraday_interval_minutes: int = 1, initial_lookback_minutes: int = 120) -> dict[str, Any]:
     source_name = "continuous_watch:ohlcv"
     watchlist = load_monitored_universe()
@@ -375,11 +386,11 @@ def run_ohlcv_cycle(*, interval_seconds: int, intraday_interval_minutes: int = 1
         return {"status": "ok", "symbol_count": 0, "sync_results": [], "alert_count": 0}
     symbols = sorted(watchlist["symbol"].dropna().astype(str).str.upper().unique().tolist())
     state = load_sync_state(source_name) or {}
-    from_cursor = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
-    if pd.isna(from_cursor):
+    previous_cursor = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
+    if pd.isna(previous_cursor):
         from_cursor = pd.Timestamp.utcnow() - pd.Timedelta(minutes=int(initial_lookback_minutes))
     else:
-        from_cursor = from_cursor - pd.Timedelta(minutes=5)
+        from_cursor = previous_cursor - pd.Timedelta(minutes=5)
     to_cursor = pd.Timestamp.utcnow()
     _emit(f"[advisory.continuous_watch] ohlcv start symbols={len(symbols)} from={from_cursor.isoformat()} to={to_cursor.isoformat()}")
     sync_results = sync_many_intraday(
@@ -393,7 +404,8 @@ def run_ohlcv_cycle(*, interval_seconds: int, intraday_interval_minutes: int = 1
     latest_prices = load_latest_intraday_prices(symbols, interval_minutes=intraday_interval_minutes)
     alerts = build_price_alerts(watchlist, latest_prices, observed_at=to_cursor)
     persist_alerts(alerts)
-    last_item_ts = latest_prices["timestamp"].max() if not latest_prices.empty else to_cursor
+    candidate_latest = latest_prices["timestamp"].max() if not latest_prices.empty else pd.NaT
+    last_item_ts = _next_cursor_after_pull(previous_cursor, from_cursor, candidate_latest)
     persist_sync_state(
         source_name=source_name,
         last_success_at=to_cursor,

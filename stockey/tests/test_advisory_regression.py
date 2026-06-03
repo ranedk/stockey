@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
 from advisory.api import app as operator_api
 from data.announcements import pipeline as announcement_pipeline
 from data.announcements import managed_pipeline as announcement_managed_pipeline
@@ -26,7 +26,7 @@ from data.nseindia import bhavcopy_downloader, bhavcopy_parser, indices_download
 from data.screenerin import auth as screener_auth
 from data.mospi import cpi
 from data.nsdl import fpi
-from data import benchmark_sync, download_runner
+from data import benchmark_sync, download_runner, download_queue
 from utils import codex_cli
 from utils import db as db_utils
 from utils.ocr import llm_ocr
@@ -8396,6 +8396,21 @@ def test_continuous_watch_load_monitored_universe_dedupes_same_symbol(monkeypatc
     ]
 
 
+def test_continuous_watch_ohlcv_cursor_does_not_advance_on_empty_pull():
+    previous = pd.Timestamp("2026-04-08T09:20:00Z")
+    requested_from = pd.Timestamp("2026-04-08T09:15:00Z")
+
+    assert continuous_watch._next_cursor_after_pull(previous, requested_from, pd.NaT) == previous
+    assert continuous_watch._next_cursor_after_pull(previous, requested_from, pd.Timestamp("2026-04-08T09:18:00Z")) == previous
+    assert continuous_watch._next_cursor_after_pull(previous, requested_from, pd.Timestamp("2026-04-08T09:25:00Z")) == pd.Timestamp("2026-04-08T09:25:00Z")
+
+
+def test_continuous_watch_ohlcv_cursor_repeats_initial_window_when_no_data():
+    requested_from = pd.Timestamp("2026-04-08T09:15:00Z")
+
+    assert continuous_watch._next_cursor_after_pull(pd.NaT, requested_from, pd.NaT) == requested_from
+
+
 def test_event_router_build_routing_plan_merges_price_and_event_sources():
     alerts = pd.DataFrame(
         [
@@ -8592,6 +8607,71 @@ def test_wait_signals_generate_price_and_event_waits(monkeypatch):
     condition = json.loads(price_row["condition_json"])
     assert condition["operator"] == "close_above"
     assert condition["threshold"] == 102.0
+
+
+def test_external_task_queue_stable_task_id():
+    row_a = external_task_queue.enqueue_task.__globals__["json_dumps"]({"symbol": "ABC"})
+    row_b = external_task_queue.enqueue_task.__globals__["json_dumps"]({"symbol": "ABC"})
+
+    assert row_a == row_b
+    assert "ABC" in row_a
+
+
+def test_external_task_queue_executes_registered_handler(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_handler(args):
+        calls.append(args)
+        return {"status": "ok", "rows": 3}
+
+    monkeypatch.setitem(external_task_queue.TASK_HANDLERS, "fake_task", fake_handler)
+    result = external_task_queue.execute_task(
+        {
+            "task_type": "fake_task",
+            "task_args_json": json.dumps({"symbol": "ABC"}),
+        }
+    )
+
+    assert result == {"status": "ok", "rows": 3}
+    assert calls == [{"symbol": "ABC"}]
+
+
+def test_external_task_queue_rejects_unknown_handler():
+    try:
+        external_task_queue.execute_task({"task_type": "missing", "task_args_json": "{}"})
+    except ValueError as exc:
+        assert "No external task handler" in str(exc)
+    else:
+        raise AssertionError("Expected ValueError")
+
+
+def test_download_queue_classifies_single_client_modules():
+    dhan_daily = download_queue.classify_step({"module": "data.dhanlive.ohlcv", "purpose": "ohlcv", "args": ["--daily"]})
+    dhan_master = download_queue.classify_step({"module": "data.dhanlive.scrip_master", "purpose": "master", "args": []})
+    nse_module = download_queue.classify_step({"module": "data.nseindia.bhavcopy_downloader", "purpose": "bhavcopy", "args": []})
+    screener_module = download_queue.classify_step({"module": "data.screenerin.screener_parser", "purpose": "screener", "args": []})
+    safe_module = download_queue.classify_step({"module": "data.mospi.cpi", "purpose": "cpi", "args": []})
+
+    assert dhan_daily["queue"] == "dhan"
+    assert dhan_daily["task_type"] == "download_module"
+    assert dhan_master["queue"] == "dhan"
+    assert dhan_master["task_type"] == "dhan_scrip_master"
+    assert nse_module["queue"] == "nse"
+    assert nse_module["task_type"] == "nse_module"
+    assert screener_module["queue"] == "screener"
+    assert screener_module["task_type"] == "download_module"
+    assert safe_module is None
+
+
+def test_download_queue_dry_run_no_inline():
+    result = download_queue.enqueue_download_work(phase="downloaders", run_non_queued=False, dry_run=True)
+
+    assert result["status"] == "ok"
+    assert result["dry_run"] is True
+    assert result["queued_count"] > 0
+    assert result["inline_count"] == 0
+    assert result["skipped_inline_count"] > 0
+    assert {row["queue_name"] for row in result["queued"]} & {"dhan", "nse"}
 
 
 def test_signal_refresh_prioritizes_wait_signal_match():

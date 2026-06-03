@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -191,6 +193,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ledger-objective", help="Optional research-ledger objective")
     parser.add_argument("--ledger-validation-protocol", help="Optional JSON string describing validation protocol")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--parallel-local-stages", action="store_true", help="Run independent DB/local feature stages with bounded threads")
+    parser.add_argument("--local-stage-workers", type=int, default=int(os.getenv("ADVISORY_LOCAL_STAGE_WORKERS", "3")), help="Max workers for --parallel-local-stages")
     return parser.parse_args()
 
 
@@ -233,6 +237,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         args.rule_max_intraday_prefetch_age_days = 14
     if not hasattr(args, "event_model_artifact_dir"):
         args.event_model_artifact_dir = str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR)
+    if not hasattr(args, "parallel_local_stages"):
+        args.parallel_local_stages = False
+    if not hasattr(args, "local_stage_workers"):
+        args.local_stage_workers = int(os.getenv("ADVISORY_LOCAL_STAGE_WORKERS", "3"))
     asof_date = _normalize_utc_arg_timestamp(args.date)
     summary: dict[str, Any] = {
         "status": "ok",
@@ -321,7 +329,84 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         summary["stages"]["peer_sync"] = _json_ready(peer_result)
         _finish_stage("peer_sync", stage_started)
 
-    if stage_enabled("technicals", args.start_at, args.stop_at):
+    parallel_stage_names = ["technicals", "fundamentals", "regime", "overlay", "themes"]
+    if bool(args.parallel_local_stages):
+        enabled_parallel_stages = [
+            stage
+            for stage in parallel_stage_names
+            if stage_enabled(stage, args.start_at, args.stop_at)
+        ]
+        if enabled_parallel_stages:
+            _emit_progress(
+                f"[advisory.pipeline] parallel_local_stages start workers={max(1, int(args.local_stage_workers))} stages={','.join(enabled_parallel_stages)}"
+            )
+
+            def _run_parallel_stage(stage: str) -> tuple[str, Any, str]:
+                stage_started = _start_stage(stage)
+                if stage == "technicals":
+                    technical_df = build_technical_features(
+                        symbols=advisory_symbols,
+                        from_date=asof_date,
+                        to_date=asof_date,
+                        rebuild=bool(args.rebuild),
+                    )
+                    if not args.dry_run:
+                        persist_technical_features(technical_df, rebuild=bool(args.rebuild), symbols=advisory_symbols)
+                    _finish_stage(stage, stage_started, f"rows={len(technical_df)}")
+                    return stage, _json_ready(technical_df), f"rows={len(technical_df)}"
+                if stage == "fundamentals":
+                    fundamental_df = build_fundamental_snapshot(
+                        symbols=advisory_symbols,
+                        from_date=asof_date,
+                        to_date=asof_date,
+                        rebuild=bool(args.rebuild),
+                    )
+                    if not args.dry_run:
+                        persist_fundamental_snapshot(fundamental_df)
+                    _finish_stage(stage, stage_started, f"rows={len(fundamental_df)}")
+                    return stage, _json_ready(fundamental_df), f"rows={len(fundamental_df)}"
+                if stage == "regime":
+                    regime_df = build_regime_snapshot(from_date=asof_date, to_date=asof_date)
+                    if not args.dry_run:
+                        persist_regime_snapshot(regime_df, rebuild=bool(args.rebuild))
+                    _finish_stage(stage, stage_started, f"rows={len(regime_df)}")
+                    return stage, _json_ready(regime_df), f"rows={len(regime_df)}"
+                if stage == "overlay":
+                    overlay_df = build_overlay_state(asof_date=asof_date)
+                    if not args.dry_run:
+                        persist_overlay_state(
+                            overlay_df,
+                            rebuild=bool(args.rebuild),
+                            asof_date=asof_date or (overlay_df["asof_date"].max() if not overlay_df.empty else None),
+                        )
+                    _finish_stage(stage, stage_started, f"rows={len(overlay_df)}")
+                    return stage, _json_ready(overlay_df), f"rows={len(overlay_df)}"
+                if stage == "themes":
+                    theme_payload = build_theme_recommendations(asof_date=asof_date)
+                    theme_mapping = load_active_theme_screener_mapping(asof_date=asof_date)
+                    payload = {
+                        "meta": _json_ready(
+                            {
+                                "asof_date": theme_payload.get("asof_date"),
+                                "news_count": theme_payload.get("news_count"),
+                                "error": theme_payload.get("error"),
+                            }
+                        ),
+                        "recommendations": _json_ready(theme_payload.get("recommendations") or []),
+                        "active_mapping": _json_ready(theme_mapping),
+                    }
+                    _finish_stage(stage, stage_started, f"active_themes={len(theme_payload.get('recommendations') or [])}")
+                    return stage, payload, f"active_themes={len(theme_payload.get('recommendations') or [])}"
+                raise ValueError(f"Unsupported parallel stage: {stage}")
+
+            with ThreadPoolExecutor(max_workers=max(1, int(args.local_stage_workers)), thread_name_prefix="advisory-local") as pool:
+                futures = {pool.submit(_run_parallel_stage, stage): stage for stage in enabled_parallel_stages}
+                for future in as_completed(futures):
+                    stage, payload, _detail = future.result()
+                    summary["stages"][stage] = payload
+            _emit_progress("[advisory.pipeline] parallel_local_stages done")
+
+    if stage_enabled("technicals", args.start_at, args.stop_at) and "technicals" not in summary["stages"]:
         stage_started = _start_stage("technicals")
         technical_df = build_technical_features(
             symbols=advisory_symbols,
@@ -366,7 +451,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         }
         _finish_stage("intraday", stage_started, f"rows={len(intraday_df)} symbols={len(intraday_symbols)}")
 
-    if stage_enabled("fundamentals", args.start_at, args.stop_at):
+    if stage_enabled("fundamentals", args.start_at, args.stop_at) and "fundamentals" not in summary["stages"]:
         stage_started = _start_stage("fundamentals")
         fundamental_df = build_fundamental_snapshot(
             symbols=advisory_symbols,
@@ -379,7 +464,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         summary["stages"]["fundamentals"] = _json_ready(fundamental_df)
         _finish_stage("fundamentals", stage_started, f"rows={len(fundamental_df)}")
 
-    if stage_enabled("regime", args.start_at, args.stop_at):
+    if stage_enabled("regime", args.start_at, args.stop_at) and "regime" not in summary["stages"]:
         stage_started = _start_stage("regime")
         regime_df = build_regime_snapshot(from_date=asof_date, to_date=asof_date)
         if not args.dry_run:
@@ -402,7 +487,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             f"universe_rows={len(market_context_universe_df)} summary_rows={len(market_context_summary_df)}",
         )
 
-    if stage_enabled("overlay", args.start_at, args.stop_at):
+    if stage_enabled("overlay", args.start_at, args.stop_at) and "overlay" not in summary["stages"]:
         stage_started = _start_stage("overlay")
         overlay_df = build_overlay_state(asof_date=asof_date)
         if not args.dry_run:
@@ -414,7 +499,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         summary["stages"]["overlay"] = _json_ready(overlay_df)
         _finish_stage("overlay", stage_started, f"rows={len(overlay_df)}")
 
-    if stage_enabled("themes", args.start_at, args.stop_at):
+    if stage_enabled("themes", args.start_at, args.stop_at) and "themes" not in summary["stages"]:
         stage_started = _start_stage("themes")
         theme_payload = build_theme_recommendations(asof_date=asof_date)
         theme_mapping = load_active_theme_screener_mapping(asof_date=asof_date)

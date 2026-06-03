@@ -395,8 +395,12 @@ Potential improvement:
 - [x] Add payload size logging to API responses.
 - [ ] Compact or paginate non-home API responses that still return full raw rows.
 - [ ] Add trace summary materialization.
-- [ ] Add `nse_ingestion_queue` and single-lane worker.
-- [ ] Parallelize non-NSE feature jobs with bounded worker count and DB connection cap.
+- [x] Add serialized external task queue scaffold and single-lane worker CLI for NSE/Dhan/Screener work.
+- [x] Register concrete NSE/Dhan/Screener task handlers on the external task queue.
+- [x] Add queued downloader/worker cron path while preserving direct `all_downloaders.sh` and `complete_data.sh` catch-up/backfill scripts.
+- [ ] Convert remaining inline single-client repair/download call sites to queue-only where safe after observing queue logs.
+- [x] Parallelize non-NSE feature jobs with bounded worker count and DB connection cap.
+- [ ] Add per-stage runtime budget reporting to prove parallel mode is improving wall-clock time.
 
 ### P2
 

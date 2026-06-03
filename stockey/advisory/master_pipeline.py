@@ -125,6 +125,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--download-script", default=str(DEFAULT_DOWNLOAD_SCRIPT))
     parser.add_argument("--continue-on-download-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--parallel-local-stages", action="store_true", help="Run independent DB/local feature stages with bounded threads")
+    parser.add_argument("--local-stage-workers", type=int, default=3, help="Max workers for --parallel-local-stages")
     parser.add_argument("--format", choices=["json", "text"], default="json")
     return parser.parse_args()
 
@@ -243,6 +245,8 @@ def main() -> int:
             portfolio_max_positions_per_overlap_group=int(args.portfolio_max_positions_per_overlap_group),
             event_model=args.event_model,
             event_model_artifact_dir=args.event_model_artifact_dir,
+            parallel_local_stages=bool(args.parallel_local_stages),
+            local_stage_workers=int(args.local_stage_workers),
             dry_run=bool(args.dry_run),
         )
         advisory_heartbeat = _start_heartbeat("advisory run")
