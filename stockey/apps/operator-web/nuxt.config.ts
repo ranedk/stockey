@@ -7,7 +7,8 @@ export default defineNuxtConfig({
   },
   runtimeConfig: {
     public: {
-      apiBase: process.env.NUXT_PUBLIC_API_BASE || 'http://127.0.0.1:8765'
+      apiBase: process.env.NUXT_PUBLIC_API_BASE || 'http://127.0.0.1:8765',
+      apiTimeoutMs: Number(process.env.NUXT_PUBLIC_API_TIMEOUT_MS || '12000')
     }
   },
   app: {
@@ -19,4 +20,3 @@ export default defineNuxtConfig({
     }
   }
 })
-

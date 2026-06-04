@@ -15,29 +15,41 @@ const portfolioStatus = ref('all')
 const portfolioSearch = ref('')
 const portfolioBucket = ref('today_recommendations')
 
-const [{ data: home }, { data: marketContext }, { data: technicalCalibration }, { data: signalRefresh, error: signalRefreshError }, { data: actionsData, refresh: refreshActions, error: actionsError }, { data: portfolioData, refresh: refreshPortfolio, error: portfolioError }] = await Promise.all([
-  useAsyncData('home', () => api.getHome()),
+const [{ data: marketContext }, { data: technicalCalibration }, { data: signalRefresh, error: signalRefreshError }] = await Promise.all([
   useAsyncData('market-context', () => api.getMarketContext(20)),
   useAsyncData('technical-calibration-home', () => api.getTechnicalCalibration(3)),
-  useAsyncData('signal-refresh-home', () => api.getSignalRefresh({ limit: 12, compact: true })),
-  useAsyncData('home-actions-paged', () => api.getActions({
-    limit: actionLimit.value,
-    offset: actionOffset.value,
-    symbol: actionSymbol.value.trim().toUpperCase(),
-    action: actionType.value,
-    status: actionStatus.value,
-    search: actionSearch.value.trim(),
-    compact: true
-  }), { watch: [actionLimit, actionOffset, actionType, actionStatus] }),
-  useAsyncData('home-portfolio-paged', () => api.getPortfolio({
-    limit: portfolioLimit.value,
-    offset: portfolioOffset.value,
-    symbol: portfolioSymbol.value.trim().toUpperCase(),
-    status: portfolioStatus.value,
-    search: portfolioSearch.value.trim(),
-    compact: true
-  }), { watch: [portfolioLimit, portfolioOffset, portfolioStatus] })
+  useAsyncData('signal-refresh-home', () => api.getSignalRefresh({ limit: 12, compact: true }))
 ])
+
+const { data: home } = useAsyncData('home', () => api.getHome(), {
+  lazy: true,
+  server: false
+})
+const { data: actionsData, refresh: refreshActions, error: actionsError } = useAsyncData('home-actions-paged', () => api.getActions({
+  limit: actionLimit.value,
+  offset: actionOffset.value,
+  symbol: actionSymbol.value.trim().toUpperCase(),
+  action: actionType.value,
+  status: actionStatus.value,
+  search: actionSearch.value.trim(),
+  compact: true
+}), {
+  lazy: true,
+  server: false,
+  watch: [actionLimit, actionOffset, actionType, actionStatus]
+})
+const { data: portfolioData, refresh: refreshPortfolio, error: portfolioError } = useAsyncData('home-portfolio-paged', () => api.getPortfolio({
+  limit: portfolioLimit.value,
+  offset: portfolioOffset.value,
+  symbol: portfolioSymbol.value.trim().toUpperCase(),
+  status: portfolioStatus.value,
+  search: portfolioSearch.value.trim(),
+  compact: true
+}), {
+  lazy: true,
+  server: false,
+  watch: [portfolioLimit, portfolioOffset, portfolioStatus]
+})
 
 const summaryValues = computed(() => home.value?.summary || {})
 const liveSignals = computed(() => signalRefresh.value?.signals || [])

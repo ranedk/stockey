@@ -3,12 +3,13 @@ import type { CronLogsPayload, EventModelArtifactsPayload, EventModelPromotionCh
 export function useOperatorApi() {
   const config = useRuntimeConfig()
   const apiBase = String(config.public.apiBase || '').replace(/\/$/, '')
+  const apiTimeoutMs = Number(config.public.apiTimeoutMs || 12000)
 
   const get = async <T>(path: string): Promise<T> => {
-    return await $fetch<T>(`${apiBase}${path}`)
+    return await $fetch<T>(`${apiBase}${path}`, { timeout: apiTimeoutMs })
   }
   const post = async <T>(path: string, body: Record<string, unknown>): Promise<T> => {
-    return await $fetch<T>(`${apiBase}${path}`, { method: 'POST', body })
+    return await $fetch<T>(`${apiBase}${path}`, { method: 'POST', body, timeout: apiTimeoutMs })
   }
   const query = (params: Record<string, unknown>) => {
     const search = new URLSearchParams()
