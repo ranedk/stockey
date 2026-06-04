@@ -44,8 +44,6 @@ def run_codex_cli(
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
-            "--ask-for-approval",
-            "never",
             "--model",
             effective_model,
             "--output-last-message",

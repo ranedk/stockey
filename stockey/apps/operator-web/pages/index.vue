@@ -109,6 +109,12 @@ function numberText(value: unknown) {
   return Intl.NumberFormat('en-IN', { maximumFractionDigits: 1 }).format(num)
 }
 
+function priceText(value: unknown) {
+  const num = Number(value)
+  if (!Number.isFinite(num)) return '-'
+  return Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(num)
+}
+
 function ageText(value: unknown) {
   const seconds = Number(value)
   if (!Number.isFinite(seconds)) return '-'
@@ -161,6 +167,57 @@ function actionDetailPath(row: Record<string, unknown>) {
   if (row.setup_id) params.set('setup_id', String(row.setup_id))
   const query = params.toString()
   return `/api/actions/detail${query ? `?${query}` : ''}`
+}
+
+function nestedValue(source: unknown, path: string[]): unknown {
+  let current = source
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return null
+    current = (current as Dict)[key]
+  }
+  return current
+}
+
+function firstActionValue(row: Record<string, unknown>, keys: string[], nestedPaths: string[][] = []) {
+  for (const key of keys) {
+    const value = row[key]
+    if (value !== null && value !== undefined && value !== '') return value
+  }
+  for (const path of nestedPaths) {
+    const value = nestedValue(row, path)
+    if (value !== null && value !== undefined && value !== '') return value
+  }
+  return null
+}
+
+function actionPriceFacts(row: Record<string, unknown>) {
+  const latest = firstActionValue(row, ['current_price', 'last_price', 'reference_price'], [
+    ['recommendation_reason', 'evidence', 'risk', 'reference_price']
+  ])
+  const trigger = firstActionValue(row, ['trigger_price', 'pivot_price'], [
+    ['recommendation_reason', 'evidence', 'technical', 'trigger_price'],
+    ['recommendation_reason', 'evidence', 'technical', 'pivot_price']
+  ])
+  const zoneLow = firstActionValue(row, ['attractive_price_low'])
+  const zoneHigh = firstActionValue(row, ['attractive_price_high'])
+  const entry = firstActionValue(row, ['entry_price'])
+  const stop = firstActionValue(row, ['stop_price', 'recommended_stop_price', 'invalidation_price'], [
+    ['recommendation_reason', 'evidence', 'risk', 'stop_price'],
+    ['recommendation_reason', 'evidence', 'risk', 'recommended_stop_price'],
+    ['recommendation_reason', 'evidence', 'risk', 'invalidation_price']
+  ])
+  const target = firstActionValue(row, ['target_price', 'recommended_target_price'])
+  const facts = [
+    { label: 'Latest', value: latest, tone: 'bg-ink text-paper' },
+    { label: 'Trigger', value: trigger, tone: 'bg-white text-ink/75' },
+    { label: 'Entry', value: entry, tone: 'bg-white text-ink/75' },
+    { label: 'Stop', value: stop, tone: 'bg-rust/10 text-rust' },
+    { label: 'Target', value: target, tone: 'bg-moss/10 text-moss' }
+  ].filter((item) => item.value !== null && item.value !== undefined && item.value !== '')
+  if (zoneLow !== null && zoneLow !== undefined && zoneLow !== '' && zoneHigh !== null && zoneHigh !== undefined && zoneHigh !== '') {
+    facts.splice(1, 0, { label: 'Zone', value: `${priceText(zoneLow)} - ${priceText(zoneHigh)}`, tone: 'bg-sun/20 text-ink' })
+  }
+  return facts
 }
 
 function portfolioDetailPath(row: Record<string, unknown>) {
@@ -357,6 +414,21 @@ function signalTone(row: Record<string, unknown>) {
               <span class="rounded-full bg-moss px-3 py-1 text-xs font-bold text-white">{{ row.action_code || row.action || row.alert_type || 'ALERT' }}</span>
             </div>
           </template>
+          <div class="mt-4 grid gap-2 text-xs font-black sm:grid-cols-2 xl:grid-cols-3">
+            <p
+              v-for="fact in actionPriceFacts(row)"
+              :key="`${fact.label}-${String(fact.value)}`"
+              class="rounded-2xl px-3 py-2"
+              :class="fact.tone"
+            >
+              <span class="block uppercase tracking-[0.18em] opacity-60">{{ fact.label }}</span>
+              <span class="mt-1 block text-sm">{{ fact.label === 'Zone' ? fact.value : priceText(fact.value) }}</span>
+            </p>
+            <p v-if="row.pnl_pct !== null && row.pnl_pct !== undefined && row.pnl_pct !== ''" class="rounded-2xl bg-white px-3 py-2 text-ink/75">
+              <span class="block uppercase tracking-[0.18em] opacity-60">P&L</span>
+              <span class="mt-1 block text-sm">{{ pct(row.pnl_pct) }}</span>
+            </p>
+          </div>
           <ReasonContractPanel
             v-if="row.recommendation_reason || row.reason_contract_status"
             class="mt-4"

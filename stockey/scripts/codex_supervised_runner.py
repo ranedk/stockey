@@ -107,8 +107,6 @@ def run_codex_fix(
         "--skip-git-repo-check",
         "--sandbox",
         sandbox,
-        "--ask-for-approval",
-        "never",
         "--output-last-message",
         str(output_path),
     ]

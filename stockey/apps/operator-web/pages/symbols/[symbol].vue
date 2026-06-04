@@ -21,10 +21,21 @@ const loadErrors = computed(() => [
 ].filter((row) => row.error))
 const actionRows = computed(() => filterSymbolRows([...(actions.value?.top_action_recommendations || []), ...(actions.value?.action_recommendations || [])]))
 const alertRows = computed(() => filterSymbolRows(actions.value?.alerts || []))
-const recommendationRows = computed(() => filterSymbolRows([...(portfolio.value?.today_recommendations || []), ...(portfolio.value?.current_recommendations || []), ...(portfolio.value?.portfolio || []), ...(portfolio.value?.lifecycle || [])]))
+const todayRows = computed(() => filterSymbolRows(portfolio.value?.today_recommendations || []))
+const currentRows = computed(() => filterSymbolRows(portfolio.value?.current_recommendations || []))
+const portfolioRows = computed(() => filterSymbolRows(portfolio.value?.portfolio || []))
+const lifecycleRows = computed(() => filterSymbolRows(portfolio.value?.lifecycle || []))
+const recommendationRows = computed(() => [...todayRows.value, ...currentRows.value, ...portfolioRows.value, ...lifecycleRows.value])
 const exitedRows = computed(() => filterSymbolRows(portfolio.value?.exited_recommendations || []))
 const eventRows = computed(() => filterSymbolRows([...(events.value?.events || []), ...(events.value?.operator_feed || []), ...(events.value?.alerts || [])]))
-const finalAction = computed(() => actionRows.value[0] || recommendationRows.value[0] || {})
+const finalAction = computed(() => mergeRows(
+  actionRows.value[0],
+  alertRows.value[0],
+  currentRows.value[0],
+  todayRows.value[0],
+  portfolioRows.value[0],
+  lifecycleRows.value[0]
+))
 const reasonContract = computed(() => finalAction.value.recommendation_reason || finalAction.value.reason_contract || finalAction.value.recommendation_reason_json)
 const reasonStatus = computed(() => finalAction.value.reason_contract_status || finalAction.value.status)
 
@@ -43,7 +54,8 @@ function display(value: unknown) {
 function pct(value: unknown) {
   const num = Number(value)
   if (!Number.isFinite(num)) return '-'
-  return `${Math.round(num * 1000) / 10}%`
+  const percent = Math.abs(num) <= 1 ? num * 100 : num
+  return `${Math.round(percent * 10) / 10}%`
 }
 
 function money(value: unknown) {
@@ -60,6 +72,19 @@ function firstValue(keys: string[]) {
   return null
 }
 
+function mergeRows(...rows: Array<Dict | undefined>): Dict {
+  const merged: Dict = {}
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue
+    for (const [key, value] of Object.entries(row)) {
+      if (merged[key] !== null && merged[key] !== undefined && merged[key] !== '') continue
+      if (value === null || value === undefined || value === '') continue
+      merged[key] = value
+    }
+  }
+  return merged
+}
+
 function statusClass(value: unknown) {
   const status = String(value || '').toUpperCase()
   if (status.includes('SELL') || status.includes('EXIT') || status.includes('REDUCE')) return 'bg-rust text-paper'
@@ -69,7 +94,7 @@ function statusClass(value: unknown) {
 }
 
 function actionLabel(row: Dict) {
-  return row.action_code || row.action || row.next_action || row.portfolio_status || row.status || 'ACTION'
+  return row.action_code || row.action || row.next_action || row.reason || row.alert_type || row.portfolio_status || row.status || 'NO ACTION'
 }
 
 function eventTitle(row: Dict) {
@@ -103,7 +128,7 @@ function eventSubtitle(row: Dict) {
 
   <section class="mt-6 grid gap-4 md:grid-cols-5">
     <MetricTile label="Final Action" :value="String(actionLabel(finalAction)).toUpperCase()" note="Consolidated latest row" />
-    <MetricTile label="Current Price" :value="money(firstValue(['current_price', 'reference_price', 'entry_price']))" note="Best available payload price" />
+    <MetricTile label="Current Price" :value="money(firstValue(['current_price', 'last_price', 'reference_price', 'entry_price']))" note="Best available payload price" />
     <MetricTile label="P&L" :value="pct(firstValue(['pnl_pct', 'return_pct']))" note="Since recommendation when available" />
     <MetricTile label="Target" :value="money(firstValue(['target_price', 'recommended_target_price']))" note="Lifecycle/portfolio target" />
     <MetricTile label="Stop" :value="money(firstValue(['stop_price', 'recommended_stop_price', 'invalidation_price']))" note="Exit or invalidation" />

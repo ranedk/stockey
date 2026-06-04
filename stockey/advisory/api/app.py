@@ -176,6 +176,8 @@ HOME_CARD_FIELDS = [
     "entry_date",
     "entry_price",
     "current_price",
+    "last_price",
+    "reference_price",
     "pnl_pct",
     "invest_score_pct",
     "allocation_inr",
@@ -305,13 +307,23 @@ def build_actions_payload(
     action_rows = _filter_rows(payload.get("action_recommendations") or [], symbol=symbol, action=action, status=status, search=search)
     alert_rows = _filter_rows(payload.get("alerts") or [], symbol=symbol, status=status, search=search)
     action_page, action_meta = _page_rows(action_rows, limit=limit, offset=offset)
+    top_action_raw = top_actions[: _bounded_limit(limit, default=25)]
+    alert_raw = alert_rows[: _bounded_limit(limit, default=25)]
+    latest_prices = _latest_ohlcv_prices([
+        str(row.get("symbol") or row.get("ticker") or "")
+        for row in [*top_action_raw, *action_page, *alert_raw]
+        if isinstance(row, dict)
+    ])
+    top_action_page = _with_latest_prices(top_action_raw, price_field="current_price", prices=latest_prices)
+    action_page = _with_latest_prices(action_page, price_field="current_price", prices=latest_prices)
+    alert_page = _with_latest_prices(alert_raw, price_field="last_price", prices=latest_prices)
     return {
         "generated_at": payload.get("generated_at"),
         "asof_date": payload.get("asof_date"),
         "snapshot": _snapshot_payload(payload),
-        "top_action_recommendations": _compact_list_rows(top_actions[: _bounded_limit(limit, default=25)], compact=compact),
+        "top_action_recommendations": _compact_list_rows(top_action_page, compact=compact),
         "action_recommendations": _compact_list_rows(action_page, compact=compact),
-        "alerts": _compact_list_rows(alert_rows[: _bounded_limit(limit, default=25)], compact=compact),
+        "alerts": _compact_list_rows(alert_page, compact=compact),
         "meta": {
             "top_action_recommendations": {"total": len(top_actions), "returned": min(len(top_actions), _bounded_limit(limit, default=25))},
             "action_recommendations": action_meta,
@@ -564,6 +576,80 @@ def _page_rows(rows: list[dict[str, Any]], *, limit: int, offset: int = 0) -> tu
     }
 
 
+def _latest_ohlcv_prices(symbols: list[str]) -> dict[str, dict[str, Any]]:
+    normalized = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+    if not normalized:
+        return {}
+    prices: dict[str, dict[str, Any]] = {}
+    if _table_exists("dhan_ohlcv_daily"):
+        try:
+            daily = sql_to_df(
+                """
+                SELECT DISTINCT ON (UPPER(ticker))
+                    UPPER(ticker) AS symbol,
+                    close AS price,
+                    date AS price_asof
+                FROM dhan_ohlcv_daily
+                WHERE UPPER(ticker) = ANY(%(symbols)s)
+                  AND close IS NOT NULL
+                ORDER BY UPPER(ticker), date DESC, load_ts DESC
+                """,
+                params={"symbols": normalized},
+                retries=2,
+            )
+            for row in daily.to_dict(orient="records"):
+                symbol = str(row.get("symbol") or "").upper()
+                if symbol:
+                    prices[symbol] = {"price": row.get("price"), "price_asof": row.get("price_asof"), "price_source": "dhan_ohlcv_daily"}
+        except Exception as exc:
+            print(f"[advisory.api] latest daily price enrichment failed error={type(exc).__name__}: {exc}", flush=True)
+    use_intraday = env.bool("OPERATOR_API_INTRADAY_PRICE_FALLBACK", False)
+    if use_intraday and _table_exists("dhan_ohlcv_intraday"):
+        try:
+            intraday = sql_to_df(
+                """
+                SELECT DISTINCT ON (UPPER(ticker))
+                    UPPER(ticker) AS symbol,
+                    close AS price,
+                    timestamp AS price_asof
+                FROM dhan_ohlcv_intraday
+                WHERE UPPER(ticker) = ANY(%(symbols)s)
+                  AND close IS NOT NULL
+                ORDER BY UPPER(ticker), timestamp DESC, load_ts DESC
+                """,
+                params={"symbols": normalized},
+                retries=2,
+            )
+            for row in intraday.to_dict(orient="records"):
+                symbol = str(row.get("symbol") or "").upper()
+                if symbol:
+                    prices[symbol] = {"price": row.get("price"), "price_asof": row.get("price_asof"), "price_source": "dhan_ohlcv_intraday"}
+        except Exception as exc:
+            print(f"[advisory.api] latest intraday price enrichment failed error={type(exc).__name__}: {exc}", flush=True)
+    return prices
+
+
+def _with_latest_prices(rows: list[dict[str, Any]], *, price_field: str = "current_price", prices: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    prices = prices if prices is not None else _latest_ohlcv_prices([str(row.get("symbol") or row.get("ticker") or "") for row in rows if isinstance(row, dict)])
+    if not prices:
+        return rows
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        symbol = str(item.get("symbol") or item.get("ticker") or "").strip().upper()
+        price = prices.get(symbol)
+        if price and item.get(price_field) in (None, "") and item.get("current_price") in (None, "") and item.get("last_price") in (None, ""):
+            item[price_field] = price.get("price")
+            item.setdefault("price_source", price.get("price_source"))
+            item.setdefault("price_asof", price.get("price_asof"))
+        out.append(item)
+    return out
+
+
 COMPACT_LIST_FIELDS = {
     "symbol",
     "ticker",
@@ -592,6 +678,10 @@ COMPACT_LIST_FIELDS = {
     "entry_date",
     "entry_price",
     "current_price",
+    "last_price",
+    "reference_price",
+    "price_source",
+    "price_asof",
     "pnl_pct",
     "invest_score_pct",
     "allocation_inr",
@@ -608,6 +698,8 @@ COMPACT_LIST_FIELDS = {
     "technical_tradability_score",
     "pivot_price",
     "trigger_price",
+    "attractive_price_low",
+    "attractive_price_high",
     "stop_price",
     "recommended_stop_price",
     "invalidation_price",
@@ -1985,9 +2077,18 @@ def _manual_review_item(
     unique_id_text = _text(unique_id if unique_id is not None else raw.get("unique_id"))
     setup_id_text = _text(setup_id if setup_id is not None else raw.get("setup_id"))
     source_key_text = _text(source_key) or unique_id_text or symbol_text or setup_id_text or title
+    context = _manual_review_context(item_type=item_type, raw=raw, reason=reason)
     return {
         "item_id": f"{item_type}:{source_table}:{source_key_text}",
         "item_type": item_type,
+        "review_lane": context["review_lane"],
+        "is_technical_issue": context["is_technical_issue"],
+        "operator_summary": context["operator_summary"],
+        "operator_questions": context["operator_questions"],
+        "wait_for_events": context["wait_for_events"],
+        "possible_action": context["possible_action"],
+        "suggested_decision": context["suggested_decision"],
+        "decision_hint": context["decision_hint"],
         "severity": severity,
         "status": status,
         "title": title,
@@ -2000,6 +2101,57 @@ def _manual_review_item(
         "asof_date": _ts(asof_date if asof_date is not None else raw.get("asof_date")),
         "updated_at": _ts(updated_at if updated_at is not None else raw.get("updated_at") or raw.get("load_ts") or raw.get("created_at") or raw.get("reviewed_at")),
         "raw": raw,
+    }
+
+
+def _manual_review_context(*, item_type: str, raw: dict[str, Any], reason: Any = None) -> dict[str, Any]:
+    technical_types = {"event_processing_failure", "announcement_failure", "execution_blocker"}
+    research_types = {"threshold_review"}
+    is_technical = item_type in technical_types
+    if is_technical:
+        lane = "technical_issue"
+        suggested = "mark_fixed"
+        hint = "Operational/data failure. Fix the pipeline or mark fixed after rerun confirms it is resolved."
+    elif item_type in research_types:
+        lane = "research_config"
+        suggested = "needs_more_data"
+        hint = "Research/config review. This does not affect portfolio unless a later code/config change is made."
+    else:
+        lane = "investment_review"
+        suggested = "watch_for_event"
+        hint = "Investment judgment review. Recording a decision annotates/closes this item only; it does not place trades or add portfolio rows."
+
+    notes = _jsonish(raw.get("operator_notes_json"))
+    if not isinstance(notes, dict):
+        notes = _jsonish(raw.get("llm_review_json"))
+    if not isinstance(notes, dict):
+        raw_context = _jsonish(raw.get("raw_context_json"))
+        notes = raw_context.get("operator_notes") if isinstance(raw_context, dict) and isinstance(raw_context.get("operator_notes"), dict) else {}
+
+    questions = notes.get("operator_questions") if isinstance(notes, dict) else None
+    wait_for = notes.get("wait_for_events") if isinstance(notes, dict) else None
+    if not isinstance(questions, list):
+        questions = []
+    if not isinstance(wait_for, list):
+        wait_for = []
+
+    summary = None
+    possible_action = None
+    if isinstance(notes, dict):
+        summary = notes.get("operator_summary") or notes.get("revision_summary") or notes.get("rationale")
+        possible_action = notes.get("possible_action") or notes.get("final_action_type")
+    summary = _text(summary) or _text(raw.get("manual_revision_summary")) or _text(raw.get("action_detail")) or _text(reason)
+    possible_action = _text(possible_action)
+
+    return {
+        "review_lane": lane,
+        "is_technical_issue": is_technical,
+        "operator_summary": summary,
+        "operator_questions": [_text(value) for value in questions if _text(value)],
+        "wait_for_events": [_text(value) for value in wait_for if _text(value)],
+        "possible_action": possible_action,
+        "suggested_decision": suggested,
+        "decision_hint": hint,
     }
 
 
@@ -2078,7 +2230,7 @@ def _append_latest_action_review_items(items: list[dict[str, Any]], skipped: lis
           )
         ORDER BY
             CASE action_code WHEN 'MANUAL_REVIEW' THEN 1 ELSE 2 END,
-            updated_at DESC NULLS LAST,
+            published_on DESC NULLS LAST,
             load_ts DESC NULLS LAST
         LIMIT %(limit)s
         """,
@@ -2153,7 +2305,7 @@ def _append_action_conflict_items(items: list[dict[str, Any]], skipped: list[dic
         SELECT *
         FROM {table}
         WHERE asof_date = (SELECT MAX(asof_date) FROM {table})
-        ORDER BY updated_at DESC NULLS LAST, asof_date DESC NULLS LAST
+        ORDER BY load_ts DESC NULLS LAST, asof_date DESC NULLS LAST
         LIMIT %(limit)s
         """,
         params={"limit": max(1, int(limit))},
@@ -2212,7 +2364,7 @@ def _append_execution_blocker_items(items: list[dict[str, Any]], skipped: list[d
         FROM {table}
         WHERE asof_date = (SELECT MAX(asof_date) FROM {table})
           AND execution_status IN ('submit_blocked', 'submit_error', 'reconcile_error', 'invalid_order')
-        ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST
+        ORDER BY published_on DESC NULLS LAST, submitted_at DESC NULLS LAST, load_ts DESC NULLS LAST
         LIMIT %(limit)s
         """,
         params={"limit": max(1, int(limit))},
@@ -2279,7 +2431,7 @@ def _append_announcement_failure_items(items: list[dict[str, Any]], skipped: lis
         WHERE ocr_status = 'failed'
            OR parse_status = 'failed'
            OR last_error IS NOT NULL
-        ORDER BY COALESCE(published_at, created_at, updated_at) DESC NULLS LAST
+        ORDER BY COALESCE(published_on, created_at, updated_at) DESC NULLS LAST
         LIMIT %(limit)s
         """,
         params={"limit": max(1, int(limit))},
@@ -2297,7 +2449,7 @@ def _append_announcement_failure_items(items: list[dict[str, Any]], skipped: lis
                 source_key=row.get("unique_id"),
                 row=row,
                 symbol=row.get("ticker") or row.get("symbol"),
-                updated_at=row.get("updated_at") or row.get("published_at"),
+                updated_at=row.get("updated_at") or row.get("published_on"),
             )
         )
 
