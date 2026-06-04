@@ -15,7 +15,7 @@ from advisory.api import app as operator_api
 from data.announcements import pipeline as announcement_pipeline
 from data.announcements import managed_pipeline as announcement_managed_pipeline
 from data.announcements import state as announcement_state
-from data.announcements.models import Announcement, ParsedReport
+from data.announcements.models import Announcement, CompanyMasterTarget, ParsedReport
 from data.eaindustry import wpi
 from data.dhanlive import auth as dhan_auth
 from data.dhanlive import auth_cli as dhan_auth_cli
@@ -6950,11 +6950,13 @@ def test_intraday_features_builds_multiple_intervals(monkeypatch):
 
     monkeypatch.setattr(intraday_features, "ensure_intraday_features_table", lambda: None)
     monkeypatch.setattr(intraday_features, "resolve_symbol_universe", lambda symbols, asof_date=None: ["ABC"])
-    monkeypatch.setattr(
-        intraday_features,
-        "load_intraday_history",
-        lambda symbols, start_timestamp, end_timestamp, interval_minutes: intraday_base[intraday_base["interval_minutes"] == interval_minutes].copy(),
-    )
+    read_windows: list[tuple[pd.Timestamp, pd.Timestamp, int]] = []
+
+    def fake_load_intraday_history(symbols, start_timestamp, end_timestamp, interval_minutes):
+        read_windows.append((start_timestamp, end_timestamp, interval_minutes))
+        return intraday_base[intraday_base["interval_minutes"] == interval_minutes].copy()
+
+    monkeypatch.setattr(intraday_features, "load_intraday_history", fake_load_intraday_history)
     monkeypatch.setattr(intraday_features, "load_daily_reference", lambda symbols, start_date, end_date: daily_reference.copy())
 
     df, meta = intraday_features.build_intraday_features(
@@ -6967,6 +6969,7 @@ def test_intraday_features_builds_multiple_intervals(monkeypatch):
     assert len(df) == 2
     assert sorted(df["interval_minutes"].tolist()) == [1, 5]
     assert meta["intervals"] == [1, 5]
+    assert {window[0] for window in read_windows} == {asof_date}
 
 
 def test_intraday_history_records_dhan_mapping_issue(monkeypatch):
@@ -8411,6 +8414,24 @@ def test_continuous_watch_ohlcv_cursor_repeats_initial_window_when_no_data():
     assert continuous_watch._next_cursor_after_pull(pd.NaT, requested_from, pd.NaT) == requested_from
 
 
+def test_continuous_watch_ohlcv_from_cursor_caps_stale_backfill():
+    to_cursor = pd.Timestamp("2026-04-08T10:00:00Z")
+    stale_from = pd.Timestamp("2026-04-07T10:00:00Z")
+    capped, truncated = continuous_watch._bounded_intraday_from_cursor(stale_from, to_cursor, 240)
+
+    assert truncated is True
+    assert capped == pd.Timestamp("2026-04-08T06:00:00Z")
+
+
+def test_continuous_watch_ohlcv_from_cursor_keeps_recent_backfill():
+    to_cursor = pd.Timestamp("2026-04-08T10:00:00Z")
+    recent_from = pd.Timestamp("2026-04-08T09:00:00Z")
+    capped, truncated = continuous_watch._bounded_intraday_from_cursor(recent_from, to_cursor, 240)
+
+    assert truncated is False
+    assert capped == recent_from
+
+
 def test_event_router_build_routing_plan_merges_price_and_event_sources():
     alerts = pd.DataFrame(
         [
@@ -8645,6 +8666,25 @@ def test_external_task_queue_rejects_unknown_handler():
         raise AssertionError("Expected ValueError")
 
 
+def test_external_task_queue_enqueue_uses_timestamp_dtypes(monkeypatch):
+    captured: dict[str, pd.DataFrame] = {}
+
+    monkeypatch.setattr(external_task_queue, "ensure_table", lambda: None)
+
+    def fake_upsert(df, table_name, unique_keys):
+        captured["df"] = df.copy()
+        captured["table_name"] = table_name
+        captured["unique_keys"] = unique_keys
+
+    monkeypatch.setattr(external_task_queue, "upsert_to_db", fake_upsert)
+    row = external_task_queue.enqueue_task(queue_name="nse", task_type="smoke", task_args={})
+
+    assert row["task_id"]
+    assert captured["table_name"] == external_task_queue.TABLE_NAME
+    assert str(captured["df"]["claimed_at"].dtype).startswith("datetime64")
+    assert str(captured["df"]["completed_at"].dtype).startswith("datetime64")
+
+
 def test_download_queue_classifies_single_client_modules():
     dhan_daily = download_queue.classify_step({"module": "data.dhanlive.ohlcv", "purpose": "ohlcv", "args": ["--daily"]})
     dhan_master = download_queue.classify_step({"module": "data.dhanlive.scrip_master", "purpose": "master", "args": []})
@@ -8672,6 +8712,63 @@ def test_download_queue_dry_run_no_inline():
     assert result["inline_count"] == 0
     assert result["skipped_inline_count"] > 0
     assert {row["queue_name"] for row in result["queued"]} & {"dhan", "nse"}
+
+
+def test_dhan_ohlcv_table_setup_runs_once_per_process(monkeypatch):
+    calls = {"execute": 0}
+
+    class FakeCursor:
+        def execute(self, *_args, **_kwargs):
+            calls["execute"] += 1
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(dhan_ohlcv, "_OHLCV_TABLES_ENSURED", False)
+    monkeypatch.setattr(dhan_ohlcv, "db_session", lambda: FakeSession())
+
+    dhan_ohlcv.ensure_ohlcv_tables()
+    first_call_count = calls["execute"]
+    dhan_ohlcv.ensure_ohlcv_tables()
+
+    assert first_call_count > 0
+    assert calls["execute"] == first_call_count
+
+
+def test_announcement_pipeline_skips_malformed_nse_rows(monkeypatch):
+    from data.announcements import pipeline as announcement_pipeline_module
+
+    class FakeResponse:
+        def json(self):
+            return [
+                "bad-row",
+                {
+                    "attchmntFile": "",
+                    "exchdisstime": "08-Apr-2026 10:00:00",
+                    "sort_date": "08-Apr-2026 10:00:00",
+                    "desc": "Board Meeting",
+                    "attchmntText": "Board meeting update",
+                },
+            ]
+
+    pipe = object.__new__(announcement_pipeline_module.AnnouncementPipeline)
+    monkeypatch.setattr(pipe, "_nse_get_with_retry", lambda *args, **kwargs: FakeResponse())
+    company = CompanyMasterTarget(
+        company_master_id="cm1",
+        ticker="ABC",
+        exchange="NSE",
+        company_name="ABC Ltd",
+    )
+
+    rows = pipe._fetch_nse_announcements(company, pd.Timestamp("2026-04-08T00:00:00Z").to_pydatetime())
+
+    assert len(rows) == 1
+    assert rows[0].ticker == "ABC"
+    assert rows[0].subject == "Board Meeting"
 
 
 def test_signal_refresh_prioritizes_wait_signal_match():
@@ -8783,6 +8880,7 @@ def test_continuous_watch_records_failed_cycle_in_sync_state(monkeypatch):
         news_interval_seconds=1,
         announcement_interval_seconds=1,
         intraday_interval_minutes=1,
+        ohlcv_max_lookback_minutes=240,
     )
 
     assert summary["status"] == "error"

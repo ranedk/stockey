@@ -98,7 +98,10 @@ def enqueue_task(
         "updated_at": now,
         "load_ts": now,
     }
-    upsert_to_db(pd.DataFrame([row]), TABLE_NAME, unique_keys=["task_id"])
+    df = pd.DataFrame([row])
+    for column in ["next_attempt_at", "claimed_at", "completed_at", "created_at", "updated_at", "load_ts"]:
+        df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    upsert_to_db(df, TABLE_NAME, unique_keys=["task_id"])
     return row
 
 

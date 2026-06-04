@@ -391,7 +391,15 @@ class AnnouncementPipeline:
                 "to_date": datetime.now().strftime("%d-%m-%Y"),
             },
         )
-        return [self._normalize_nse_announcement(company, row) for row in response.json()]
+        payload = response.json()
+        rows = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
+        normalized_rows: List[Announcement] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                logger.warning("Skipping malformed NSE announcement row ticker=%s row_type=%s", company.ticker, type(row).__name__)
+                continue
+            normalized_rows.append(self._normalize_nse_announcement(company, row))
+        return normalized_rows
 
     def _normalize_bse_announcement(self, company: CompanyMasterTarget, row: Dict) -> Announcement:
         attachment_name = (row.get("ATTACHMENTNAME") or "").strip() or None

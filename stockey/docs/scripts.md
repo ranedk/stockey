@@ -257,6 +257,7 @@ It schedules:
 - `all_advisory.sh` once daily after 7pm on weekdays, after `scripts/wait_for_locks.sh` confirms data catch-up and external worker locks are clear
 - `all_frontend.sh` every `5` minutes under a lock so API/Nuxt are restarted if they exit
 - `all_advisory.sh` and `all_watchers.sh` refresh `advisory.operator_snapshot` and `advisory.trace_summary_store` after a successful run so frontend endpoints can serve cached dashboard and trace sections quickly
+- `all_advisory.sh` passes `--intraday-lookback-days ${ADVISORY_INTRADAY_LOOKBACK_DAYS:-30}`; intraday feature reads are session-scoped for the target date so advisory does not scan months of 1-minute candles on every run
 - `advisory.operator_health --skip-dhan` at `08:05`, `12:05`, `17:05`, and `22:05` on weekdays
 - `advisory.hypothesis_engine --run-scan` at `10:25`, `13:25`, `16:25`, and `21:25` on weekdays for investor playbook/hypothesis matching over newly collected events
 - `advisory.ts_forecast_workflow` at `11:20`, `14:20`, `17:20`, and `20:20` on weekdays
@@ -613,6 +614,7 @@ Behavior:
 - polls announcements and ET/news on their own intervals
 - self-locks so cron/manual overlap cannot create multiple watcher processes
 - resumes from last successful source cursors; missed cron ticks are caught up by the next successful watcher run
+- caps stale intraday catch-up with `WATCHER_OHLCV_MAX_LOOKBACK_MINUTES` so live watchers stay bounded; use `complete_data.sh` for broad repair
 - routes new alerts and events into symbol-level advisory reevaluation
 - writes live price alerts like `ENTRY_ZONE_HIT` and `INVALIDATION_HIT`
 - records operator frontend status in `advisory_sync_state`; the Nuxt app reads current data from `advisory.api.app`

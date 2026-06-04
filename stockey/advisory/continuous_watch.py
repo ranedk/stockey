@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import timedelta
@@ -378,7 +379,21 @@ def _next_cursor_after_pull(previous_cursor: pd.Timestamp | None, requested_from
     return pd.Timestamp(requested)
 
 
-def run_ohlcv_cycle(*, interval_seconds: int, intraday_interval_minutes: int = 1, initial_lookback_minutes: int = 120) -> dict[str, Any]:
+def _bounded_intraday_from_cursor(from_cursor: pd.Timestamp, to_cursor: pd.Timestamp, max_lookback_minutes: int) -> tuple[pd.Timestamp, bool]:
+    max_lookback = max(1, int(max_lookback_minutes))
+    earliest_allowed = pd.Timestamp(to_cursor) - pd.Timedelta(minutes=max_lookback)
+    if pd.Timestamp(from_cursor) < earliest_allowed:
+        return earliest_allowed, True
+    return pd.Timestamp(from_cursor), False
+
+
+def run_ohlcv_cycle(
+    *,
+    interval_seconds: int,
+    intraday_interval_minutes: int = 1,
+    initial_lookback_minutes: int = 120,
+    max_lookback_minutes: int | None = None,
+) -> dict[str, Any]:
     source_name = "continuous_watch:ohlcv"
     watchlist = load_monitored_universe()
     if watchlist.empty:
@@ -392,6 +407,14 @@ def run_ohlcv_cycle(*, interval_seconds: int, intraday_interval_minutes: int = 1
     else:
         from_cursor = previous_cursor - pd.Timedelta(minutes=5)
     to_cursor = pd.Timestamp.utcnow()
+    effective_max_lookback = int(max_lookback_minutes or os.getenv("WATCHER_OHLCV_MAX_LOOKBACK_MINUTES", "240"))
+    from_cursor, catchup_truncated = _bounded_intraday_from_cursor(from_cursor, to_cursor, effective_max_lookback)
+    if catchup_truncated:
+        _emit(
+            "[advisory.continuous_watch] ohlcv catchup truncated "
+            f"symbols={len(symbols)} max_lookback_minutes={effective_max_lookback} "
+            f"from={from_cursor.isoformat()} to={to_cursor.isoformat()}"
+        )
     _emit(f"[advisory.continuous_watch] ohlcv start symbols={len(symbols)} from={from_cursor.isoformat()} to={to_cursor.isoformat()}")
     sync_results = sync_many_intraday(
         symbols,
@@ -411,7 +434,12 @@ def run_ohlcv_cycle(*, interval_seconds: int, intraday_interval_minutes: int = 1
         last_success_at=to_cursor,
         last_item_ts=last_item_ts,
         cursor_value=None if pd.isna(last_item_ts) else pd.Timestamp(last_item_ts).isoformat(),
-        state={"symbol_count": len(symbols), "interval_minutes": int(intraday_interval_minutes)},
+        state={
+            "symbol_count": len(symbols),
+            "interval_minutes": int(intraday_interval_minutes),
+            "max_lookback_minutes": effective_max_lookback,
+            "catchup_truncated": bool(catchup_truncated),
+        },
         status="ok",
     )
     result = {
@@ -419,6 +447,8 @@ def run_ohlcv_cycle(*, interval_seconds: int, intraday_interval_minutes: int = 1
         "symbol_count": len(symbols),
         "sync_results": sync_results,
         "alert_count": int(len(alerts)),
+        "catchup_truncated": bool(catchup_truncated),
+        "max_lookback_minutes": effective_max_lookback,
     }
     publish_bus_message("stockey:continuous_watch:ohlcv", {"published_at": pd.Timestamp.utcnow(), **result})
     return result
@@ -513,6 +543,7 @@ def run_once(
     news_interval_seconds: int,
     announcement_interval_seconds: int,
     intraday_interval_minutes: int,
+    ohlcv_max_lookback_minutes: int,
 ) -> dict[str, Any]:
     ensure_sync_state_table()
     ensure_alerts_table()
@@ -543,6 +574,7 @@ def run_once(
             run_ohlcv_cycle,
             interval_seconds=ohlcv_interval_seconds,
             intraday_interval_minutes=intraday_interval_minutes,
+            max_lookback_minutes=ohlcv_max_lookback_minutes,
         )
     else:
         summary["cycles"]["ohlcv"] = {"status": "skipped", "reason": "not_due"}
@@ -568,6 +600,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--news-interval-seconds", type=int, default=1800)
     parser.add_argument("--announcement-interval-seconds", type=int, default=1800)
     parser.add_argument("--intraday-interval-minutes", type=int, default=1)
+    parser.add_argument("--ohlcv-max-lookback-minutes", type=int, default=int(os.getenv("WATCHER_OHLCV_MAX_LOOKBACK_MINUTES", "240")))
     parser.add_argument("--output-dir", default=None, help="Deprecated; static dashboard generation has moved to the Nuxt operator frontend.")
     return parser.parse_args()
 
@@ -581,6 +614,7 @@ def main() -> int:
             news_interval_seconds=int(args.news_interval_seconds),
             announcement_interval_seconds=int(args.announcement_interval_seconds),
             intraday_interval_minutes=int(args.intraday_interval_minutes),
+            ohlcv_max_lookback_minutes=int(args.ohlcv_max_lookback_minutes),
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
         if not args.loop:

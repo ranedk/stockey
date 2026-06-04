@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import timedelta
 from typing import Any
 
@@ -14,7 +15,7 @@ from utils.sync import load_tracked_symbols, parse_datetime_arg
 
 
 TABLE_NAME = "advisory_intraday_features_daily"
-DEFAULT_LOOKBACK_DAYS = 180
+DEFAULT_LOOKBACK_DAYS = int(os.getenv("ADVISORY_INTRADAY_LOOKBACK_DAYS", "30"))
 DEFAULT_INTERVAL_MINUTES = 1
 INTRADAY_READ_SYMBOL_CHUNK_SIZE = 40
 SUPPORTED_INTERVAL_MINUTES = (1, 5, 15, 25, 60)
@@ -522,7 +523,7 @@ def build_intraday_features(
             intervals=interval_values,
         )
 
-    start_timestamp = effective_asof - pd.Timedelta(days=lookback_days)
+    feature_start_timestamp = effective_asof
     end_timestamp = effective_asof + pd.Timedelta(days=1)
     daily_reference = load_daily_reference(
         symbol_universe,
@@ -533,7 +534,7 @@ def build_intraday_features(
     for current_interval in interval_values:
         intraday = load_intraday_history(
             symbol_universe,
-            start_timestamp=start_timestamp,
+            start_timestamp=feature_start_timestamp,
             end_timestamp=end_timestamp,
             interval_minutes=current_interval,
         )

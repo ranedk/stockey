@@ -421,9 +421,16 @@ Important behavior:
 - the script self-locks via `scripts/with_lock.sh`; if another watcher is still running, the new run logs `[stockey.lock] skip already_running` and exits `0`
 - OHLCV, news, and announcements use persisted cursors in `advisory_sync_state`, not cron wall-clock assumptions
 - OHLCV keeps a small overlap on every pull and does not advance `last_item_ts` when no fresh intraday candle was actually observed
+- OHLCV watcher catch-up is capped by `WATCHER_OHLCV_MAX_LOOKBACK_MINUTES` to avoid a stale cursor making every `10` minute cron run download days of 1-minute candles; `complete_data.sh` remains the broad catch-up path
 - if a run fails before cursor persistence, the next due run retries from the previous successful cursor
 - `complete_data.sh` or `all_downloaders.sh` remains the broad end-of-day catch-up path if a full day was missed
 - there is no default cap on how many symbols the router may reevaluate
+
+Advisory intraday behavior:
+
+- `ADVISORY_INTRADAY_LOOKBACK_DAYS` defaults to `30`; this is the history window maintained/refreshed for advisory intraday inputs
+- feature construction reads only the target `asof_date` session from `dhan_ohlcv_intraday`, because the persisted advisory feature row is daily
+- use `complete_data.sh` for broad intraday repair instead of increasing the live advisory lookback by default
 - symbols stop being watched once advisory removes them from the watch path
 - open positions remain monitored for exit-related alerts
 - watcher/router updates now write fast per-symbol rows to `advisory_signal_refresh_actions`

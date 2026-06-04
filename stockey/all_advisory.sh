@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="$("${SCRIPT_DIR}/scripts/resolve_python.sh")"
 
-ADVISORY_ARGS=(--skip-downloads)
+ADVISORY_ARGS=(--skip-downloads --intraday-lookback-days "${ADVISORY_INTRADAY_LOOKBACK_DAYS:-30}")
 
 if [[ "${ADVISORY_PARALLEL_LOCAL_STAGES:-1}" != "0" && "${ADVISORY_PARALLEL_LOCAL_STAGES:-true}" != "false" ]]; then
   ADVISORY_ARGS+=(--parallel-local-stages --local-stage-workers "${ADVISORY_LOCAL_STAGE_WORKERS:-3}")

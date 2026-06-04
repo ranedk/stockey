@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -94,7 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-intraday", action="store_true", help="Skip intraday feature sync/build")
     parser.add_argument("--skip-rule-snapshot-refresh", action="store_true", help="Skip on-demand daily/fundamental repair inside the rule engine")
     parser.add_argument("--skip-intraday-prefetch", action="store_true", help="Skip on-demand intraday feature backfill inside the rule engine")
-    parser.add_argument("--intraday-lookback-days", type=int, default=180, help="How much recent intraday history to maintain for advisory pattern features")
+    parser.add_argument(
+        "--intraday-lookback-days",
+        type=int,
+        default=int(os.getenv("ADVISORY_INTRADAY_LOOKBACK_DAYS", "30")),
+        help="How much recent intraday history to maintain for advisory pattern features",
+    )
     parser.add_argument(
         "--intraday-intervals",
         nargs="*",

@@ -27,6 +27,7 @@ MARKET_CLOSE_MINUTE = 30
 
 DAILY_TABLE = "dhan_ohlcv_daily"
 INTRADAY_TABLE = "dhan_ohlcv_intraday"
+_OHLCV_TABLES_ENSURED = False
 
 
 def _to_naive_utc_datetime(value: object) -> datetime | None:
@@ -37,6 +38,9 @@ def _to_naive_utc_datetime(value: object) -> datetime | None:
 
 
 def ensure_ohlcv_tables() -> None:
+    global _OHLCV_TABLES_ENSURED
+    if _OHLCV_TABLES_ENSURED:
+        return
     with db_session() as (_, cur):
         cur.execute(
             f"""
@@ -92,6 +96,7 @@ def ensure_ohlcv_tables() -> None:
         cur.execute(f"UPDATE {INTRADAY_TABLE} SET asset_type = 'stock' WHERE asset_type IS NULL")
         cur.execute(f"ALTER TABLE {DAILY_TABLE} ALTER COLUMN asset_type SET NOT NULL")
         cur.execute(f"ALTER TABLE {INTRADAY_TABLE} ALTER COLUMN asset_type SET NOT NULL")
+    _OHLCV_TABLES_ENSURED = True
 
 
 def latest_daily_snapshot(identifier: str, exchange: str, asset_type: str) -> dict[str, datetime | None]:
