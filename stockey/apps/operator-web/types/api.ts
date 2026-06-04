@@ -3,6 +3,7 @@ export type Dict = Record<string, unknown>
 export interface OperatorSummary {
   generated_at?: string
   asof_date?: string
+  snapshot?: Dict
   summary: Dict
   runtime_processes: Dict[]
   cron_status: Dict[]
@@ -12,6 +13,7 @@ export interface OperatorSummary {
 export interface OperatorHome {
   generated_at?: string
   asof_date?: string
+  snapshot?: Dict
   summary: Dict
   runtime_processes: Dict[]
   cron_status: Dict[]
@@ -107,6 +109,7 @@ export interface ManualReviewDecisionResult {
 export interface OperatorActions {
   generated_at?: string
   asof_date?: string
+  snapshot?: Dict
   top_action_recommendations: Dict[]
   action_recommendations: Dict[]
   alerts: Dict[]
@@ -123,6 +126,7 @@ export interface SignalRefreshPayload {
 export interface OperatorPortfolio {
   generated_at?: string
   asof_date?: string
+  snapshot?: Dict
   today_recommendations: Dict[]
   current_recommendations: Dict[]
   exited_recommendations: Dict[]

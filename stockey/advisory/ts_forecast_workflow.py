@@ -19,7 +19,7 @@ from advisory.ts_forecast_features import (
     resolve_symbol_universe,
 )
 from data.dhanlive.ohlcv import sync_many_daily
-from data.screenerin.ad_hoc_query import fetch_ad_hoc_payload
+from data.screenerin.ad_hoc_query import build_raw_screen_url, fetch_ad_hoc_payload
 from utils.db import db_session, upsert_to_db
 from utils.sync import parse_datetime_arg
 
@@ -200,13 +200,20 @@ def run_workflow(
         try:
             screener_symbols, screener_meta = symbols_from_screener(query_text=query_text or "", query_name=query_name or "TS Forecast Watch")
         except Exception as exc:
-            warning = f"screener_failed:{type(exc).__name__}:{exc}"
+            planned_query_name = query_name or "TS Forecast Watch"
+            planned_url = build_raw_screen_url(query_text or "")
+            warning = (
+                f"screener_failed:{type(exc).__name__}:{exc}; "
+                f"query_name={planned_query_name!r}; source_slug={source_slug!r}; screener_url={planned_url!r}"
+            )
             warnings.append(warning)
             print(f"[advisory.ts_forecast_workflow] {warning}; falling back to Dhan/tracked symbol universe", file=sys.stderr, flush=True)
             screener_symbols = []
             screener_meta = {
-                "query_name": query_name or "TS Forecast Watch",
+                "query_name": planned_query_name,
                 "query_slug": source_slug,
+                "screener_url": planned_url,
+                "query_text": query_text or "",
                 "row_count": 0,
                 "error": warning,
             }

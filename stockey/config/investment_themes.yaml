@@ -42,7 +42,7 @@ themes:
           Profit growth 3Years > 10 AND
           Return on capital employed > 14 AND
           Debt to equity < 1.2 AND
-          Current price > 200 Day Moving Average
+          Current price > DMA 200
     decay:
       model: slow
       half_life_days: 60
@@ -98,7 +98,7 @@ themes:
           Return on capital employed > 14 AND
           Debt to equity < 1 AND
           Promoter holding > 45 AND
-          Current price > 200 Day Moving Average
+          Current price > DMA 200
     decay:
       model: medium
       half_life_days: 45
@@ -153,7 +153,7 @@ themes:
           Profit growth 3Years > 12 AND
           Return on capital employed > 12 AND
           Debt to equity < 1.2 AND
-          Current price > 50 Day Moving Average
+          Current price > DMA 50
     decay:
       model: medium
       half_life_days: 45
@@ -208,7 +208,7 @@ themes:
           Sales growth 3Years > 10 AND
           Return on capital employed > 12 AND
           Debt to equity < 1.5 AND
-          Current price > 200 Day Moving Average
+          Current price > DMA 200
     decay:
       model: medium
       half_life_days: 45
@@ -318,7 +318,7 @@ themes:
           Sales growth 3Years > 8 AND
           Return on capital employed > 12 AND
           Debt to equity < 1.5 AND
-          Current price > 50 Day Moving Average
+          Current price > DMA 50
     decay:
       model: medium
       half_life_days: 35
@@ -372,7 +372,7 @@ themes:
           Return on equity > 12 AND
           Profit growth 3Years > 10 AND
           Sales growth 3Years > 8 AND
-          Current price > 200 Day Moving Average
+          Current price > DMA 200
     decay:
       model: medium
       half_life_days: 45
@@ -426,8 +426,8 @@ themes:
           Market Capitalization > 1000 AND
           Return on capital employed > 10 AND
           Debt to equity < 2 AND
-          Current price > 50 Day Moving Average AND
-          Current price > 200 Day Moving Average
+          Current price > DMA 50 AND
+          Current price > DMA 200
     decay:
       model: fast
       half_life_days: 20
@@ -482,7 +482,7 @@ themes:
           Sales growth 3Years > 10 AND
           Debt to equity < 1.5 AND
           Profit growth 3Years > 8 AND
-          Current price > 200 Day Moving Average
+          Current price > DMA 200
     decay:
       model: medium
       half_life_days: 45
@@ -536,8 +536,8 @@ themes:
           Market Capitalization > 300 AND
           Sales growth 3Years > 12 AND
           Debt to equity < 1.2 AND
-          Current price > 50 Day Moving Average AND
-          Current price > 200 Day Moving Average
+          Current price > DMA 50 AND
+          Current price > DMA 200
     decay:
       model: fast
       half_life_days: 15
@@ -592,7 +592,7 @@ themes:
           Sales growth 3Years > 10 AND
           Profit growth 3Years > 10 AND
           Debt to equity < 1.5 AND
-          Current price > 50 Day Moving Average
+          Current price > DMA 50
     decay:
       model: fast
       half_life_days: 15
@@ -646,7 +646,7 @@ themes:
           Sales growth 3Years > 12 AND
           Debt to equity < 1.5 AND
           Profit growth 3Years > 10 AND
-          Current price > 50 Day Moving Average
+          Current price > DMA 50
     decay:
       model: fast
       half_life_days: 15
@@ -702,7 +702,7 @@ themes:
           Profit growth 3Years > 10 AND
           Return on capital employed > 12 AND
           Debt to equity < 1.5 AND
-          Current price > 50 Day Moving Average
+          Current price > DMA 50
     decay:
       model: fast
       half_life_days: 15

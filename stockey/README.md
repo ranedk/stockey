@@ -45,7 +45,7 @@ Important docs:
 - `docs/operators_manual.md`: daily runbook and cron behavior.
 - `docs/scripts.md`: script and table inventory.
 - `docs/operator_app_prd.md`: operator frontend/API contract.
-- `performance_todo.md`: performance roadmap and completed cleanup work.
+- `todo.md`: current roadmap, including the long-term performance architecture backlog.
 
 Current architecture keeps LLM use bounded to extraction, review notes, hypothesis/playbook assistance, and manual-review context. Production action decisions are consolidated through deterministic policy, technical, risk, lifecycle, and reason-contract layers before any execution planning.
 

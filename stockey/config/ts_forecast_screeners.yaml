@@ -7,5 +7,5 @@ screeners:
       Price to earning > 0 AND
       Return on capital employed > 8% AND
       Debt to equity < 2 AND
-      Current price > 50 Day Moving Average AND
-      Current price > 200 Day Moving Average
+      Current price > DMA 50 AND
+      Current price > DMA 200

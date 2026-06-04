@@ -120,6 +120,7 @@ def get_screener_html(url: str) -> str:
 def parse_screener_html(html: str, *, url: str | None = None) -> dict[str, object]:
     soup = BeautifulSoup(html, "html.parser")
 
+    page_title = clean_text(soup.title.get_text(" ", strip=True)) if soup.title else None
     title_el = soup.select_one("#screen-info h1")
     desc_el = soup.select_one("div[style*='max-width: 750px'] > p")
     author_el = soup.select_one("div[style*='max-width: 750px'] .sub a")
@@ -127,7 +128,17 @@ def parse_screener_html(html: str, *, url: str | None = None) -> dict[str, objec
     query_el = soup.select_one("#query-builder textarea, #query-builder pre, #query-builder")
     table = soup.select_one("div[data-page-results] table")
     if not table:
-        raise ValueError("Could not find Screener.in results table")
+        body_text = clean_text(soup.get_text(" ", strip=True)) or ""
+        context = {
+            "url": url,
+            "page_title": page_title,
+            "has_login_form": bool(soup.select_one("form[action*='login'], input[name='username'], input[name='password']")),
+            "has_query_builder": bool(query_el),
+            "has_page_results_container": bool(soup.select_one("div[data-page-results]")),
+            "body_excerpt": body_text[:240],
+        }
+        details = " ".join(f"{key}={value!r}" for key, value in context.items() if value not in (None, "", False))
+        raise ValueError(f"Could not find Screener.in results table; {details}")
 
     headers: list[str] = []
     companies: list[dict[str, object]] = []

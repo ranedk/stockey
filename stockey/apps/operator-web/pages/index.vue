@@ -54,10 +54,26 @@ const { data: portfolioData, refresh: refreshPortfolio, error: portfolioError } 
 const summaryValues = computed(() => home.value?.summary || {})
 const liveSignals = computed(() => signalRefresh.value?.signals || [])
 const signalMeta = computed(() => asDict(signalRefresh.value?.meta?.signals))
-const topActions = computed(() => [...(actionsData.value?.top_action_recommendations || []), ...(actionsData.value?.action_recommendations || [])])
+const topActions = computed(() => [
+  ...(actionsData.value?.top_action_recommendations || []),
+  ...(actionsData.value?.action_recommendations || []),
+  ...(actionsData.value?.alerts || [])
+])
 const actionMeta = computed(() => asDict(actionsData.value?.meta?.action_recommendations))
+const actionQueueMeta = computed(() => {
+  const topMeta = asDict(actionsData.value?.meta?.top_action_recommendations)
+  const rowMeta = asDict(actionsData.value?.meta?.action_recommendations)
+  const alertMeta = asDict(actionsData.value?.meta?.alerts)
+  const returned = Number(topMeta.returned || 0) + Number(rowMeta.returned || 0) + Number(alertMeta.returned || 0)
+  const total = Number(topMeta.total || 0) + Number(rowMeta.total || 0) + Number(alertMeta.total || 0)
+  return { returned, total }
+})
 const portfolioMeta = computed(() => asDict(portfolioData.value?.meta?.portfolio))
 const today = computed(() => portfolioRowsForBucket(portfolioBucket.value))
+const snapshotMeta = computed(() => asDict(home.value?.snapshot || actionsData.value?.snapshot || portfolioData.value?.snapshot))
+const snapshotIsStale = computed(() => String(snapshotMeta.value.freshness || '').toLowerCase() === 'stale')
+const snapshotGeneratedAt = computed(() => String(snapshotMeta.value.generated_at || home.value?.generated_at || '-'))
+const snapshotAgeText = computed(() => ageText(snapshotMeta.value.age_seconds))
 const marketSummary = computed(() => marketContext.value?.summary || {})
 const marketLeaders = computed(() => marketContext.value?.top_universe || [])
 const calibrationSummary = computed(() => technicalCalibration.value?.summary || [])
@@ -91,6 +107,15 @@ function numberText(value: unknown) {
   const num = Number(value)
   if (Number.isNaN(num)) return String(value || '-')
   return Intl.NumberFormat('en-IN', { maximumFractionDigits: 1 }).format(num)
+}
+
+function ageText(value: unknown) {
+  const seconds = Number(value)
+  if (!Number.isFinite(seconds)) return '-'
+  if (seconds < 60) return `${Math.round(seconds)}s old`
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m old`
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h old`
+  return `${Math.round((seconds / 86400) * 10) / 10}d old`
 }
 
 async function loadSymbolTrace(row: Record<string, unknown>) {
@@ -159,6 +184,26 @@ function signalTone(row: Record<string, unknown>) {
     <p class="mt-5 max-w-3xl text-lg leading-8 text-paper/70">
       Generated {{ home?.generated_at || '-' }} for {{ home?.asof_date || 'latest available date' }}.
     </p>
+  </section>
+
+  <section
+    v-if="snapshotMeta.generated_at || snapshotMeta.source"
+    class="mt-4 rounded-3xl border p-4 shadow-soft"
+    :class="snapshotIsStale ? 'border-sun/60 bg-sun/20 text-ink' : 'border-moss/20 bg-moss/10 text-ink/70'"
+  >
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div>
+        <p class="text-xs font-black uppercase tracking-[0.28em]" :class="snapshotIsStale ? 'text-rust' : 'text-moss'">
+          {{ snapshotIsStale ? 'Stale operator snapshot' : 'Fresh operator snapshot' }}
+        </p>
+        <p class="mt-1 text-sm font-semibold">
+          Created {{ snapshotGeneratedAt }} · {{ snapshotAgeText }} · source {{ snapshotMeta.source || 'unknown' }}
+        </p>
+      </div>
+      <p v-if="snapshotIsStale" class="max-w-2xl text-sm leading-6 text-ink/65">
+        The API is serving the latest cached operator snapshot because a fresh snapshot is missing. Run `python -m advisory.operator_snapshot` or wait for the next advisory/watchers cycle.
+      </p>
+    </div>
   </section>
 
   <section class="mt-6 grid gap-4 md:grid-cols-4">
@@ -255,7 +300,7 @@ function signalTone(row: Record<string, unknown>) {
         <div>
           <h2 class="text-xl font-black">Action Queue</h2>
           <p class="mt-1 text-sm font-semibold text-ink/50">
-            Showing {{ actionMeta.returned || topActions.length }} of {{ actionMeta.total ?? topActions.length }} action rows.
+            Showing {{ actionQueueMeta.returned || topActions.length }} of {{ actionQueueMeta.total || topActions.length }} action rows.
           </p>
         </div>
       </div>
@@ -301,7 +346,7 @@ function signalTone(row: Record<string, unknown>) {
         <RecordCard
           v-for="(row, idx) in topActions"
           :key="idx"
-          :title="String(row.action_code || row.action || 'Action')"
+          :title="String(row.action_code || row.action || row.alert_type || row.source_type || 'Action')"
           :subtitle="String(row.action_reason || row.next_action_reason || row.reason || '')"
           :record="row"
           :detail-path="actionDetailPath(row)"
@@ -309,7 +354,7 @@ function signalTone(row: Record<string, unknown>) {
           <template #badge>
             <div class="flex flex-wrap gap-2">
               <SymbolLink :symbol="row.symbol" subtle />
-              <span class="rounded-full bg-moss px-3 py-1 text-xs font-bold text-white">{{ row.action_code || row.action || 'ACTION' }}</span>
+              <span class="rounded-full bg-moss px-3 py-1 text-xs font-bold text-white">{{ row.action_code || row.action || row.alert_type || 'ALERT' }}</span>
             </div>
           </template>
           <ReasonContractPanel

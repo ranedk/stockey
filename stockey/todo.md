@@ -1,6 +1,6 @@
 # Investment Advisory Roadmap
 
-Updated: `2026-06-02`
+Updated: `2026-06-04`
 
 This file is the current roadmap for the live advisory stack. It is not a historical design log.
 
@@ -1390,18 +1390,57 @@ For all serious model work:
 - keep point-in-time discipline
 - prefer abstention over forced opinions
 
-### 9. Low Priority: advisory scaling safeguards
+### 9. Long-Term Performance Architecture
 
-These are intentionally tracked in docs only, not in Postgres. Full daily advisory remains the authoritative path; incremental advisory is not trusted enough to become the default workflow.
+Postgres is currently doing too much: OLTP state, time-series storage, text/blob storage, frontend serving, research warehouse, and audit logging. Keep Postgres as the control plane and latest-state store, not the warehouse for every raw artifact.
 
-Low-priority performance backlog:
+Current constraints:
 
-- bound the advisory candidate universe per run so expensive stages do not scan unbounded historical/cross-sectional data
+- do not use DuckDB as the core store because prior Postgres compatibility issues made it fragile
+- do not increase NSE browser concurrency; NSE should stay behind one controlled queue/session
+- do not move to a complex lakehouse stack before simpler wins are exhausted
+- full daily advisory remains the authoritative path; incremental advisory is research-only until proven safe
+
+Target shape:
+
+- PostgreSQL: current state, latest serving rows, action queue, audit IDs, compact event tensors, trace metadata
+- S3-compatible object storage: raw PDFs, OCR text, full transcripts, full document summaries, raw JSON payloads, old logs, cold historical exports
+- frontend-serving cache: compact snapshot/latest tables for health, actions, portfolio, watchlist, event inbox, trace summaries, market context, TS watch
+- optional analytical store later: ClickHouse or BigQuery only after measuring remaining slow queries after slimming Postgres
+
+Design rules:
+
+- keep hot API paths snapshot-first; never rebuild the full `live_dashboard` payload inside normal `/api/home`, `/api/actions`, or `/api/portfolio` requests
+- store large text once in object storage and keep only pointers, hashes, excerpts, parse status, and small classifications in Postgres
+- separate latest state from history so frontend routes do not scan raw historical rows
+- keep list endpoints compact, paginated, and bounded by latency/response-size tests
+- use live builders only through explicit debug/repair commands with slowlog visibility
+- add indexes only from slow-operation and slow-query evidence, while keeping duplicate-index reports clean
+
+Completed performance work:
+
+- `advisory_operator_snapshots` stores compact operator payloads
+- operator API reads snapshots first and can serve stale snapshots instead of hanging on a live rebuild
+- stale snapshot metadata is exposed to the frontend and health checks
+- payload size warnings are recorded in the slow-operation log
+- process-local API payload cache avoids repeatedly reparsing the same snapshot
+- compact `/api/home` keeps the Nuxt landing page fast
+- DB duplicate index and heavy-text cleanup scripts exist for periodic maintenance
+
+Next performance backlog:
+
+- split monolithic operator snapshots into section-serving tables when endpoint payload size justifies it: summary, actions, portfolio, health, watchlist, event inbox, trace summaries, market context, TS watch
+- add detail-only fetches for full reason contracts, OCR text, raw events, and traces
+- refresh frontend snapshots after successful advisory/watchers and expose a one-click repair command when stale or missing
+- run API latency probes from cron or health checks and surface regressions in the Health page
+- bound advisory candidate universe per run so expensive stages do not scan unbounded historical/cross-sectional data
 - add stage-level freshness checks so unchanged macro, exchange, technical, intraday, trace, and snapshot outputs can be reused safely
-- move heavy text/blob payloads out of hot Postgres rows, keeping excerpts, hashes, classifications, and object-store pointers hot
-- add DB indexes only from slow-operation and slow-query evidence, while keeping duplicate-index reports clean
-- add hot/cold retention for trace, intraday, event, and alert rows with dry-run cleanup reports
-- evaluate incremental advisory only as research-only for watch/update/exit/manual-review flows, not as the source of truth
+- move heavy text/blob payloads out of hot Postgres rows with dry-run migration reports and object-store pointer validation
+- add hot/cold retention for trace, intraday, event, alert, and raw crawler rows with dry-run cleanup reports
+- evaluate Timescale compression/continuous aggregates for OHLCV and intraday if available
+- evaluate ClickHouse as the preferred self-hosted analytical companion for historical OHLCV/features/events/evaluations if Postgres remains slow after offload
+- evaluate BigQuery only for guarded research scans over exported Parquet/CSV, not low-latency frontend serving
+- consider Go only after profiling shows Python CPU/serving code is the bottleneck rather than DB scans or payload size
 
 ## Deprioritized or intentionally avoided
 

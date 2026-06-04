@@ -517,14 +517,14 @@ The operator API reads `advisory_operator_snapshots` by default. `all_advisory.s
 python -m advisory.operator_snapshot
 ```
 
-Set `OPERATOR_API_USE_SNAPSHOT=false` only when debugging the live dashboard builder directly. `OPERATOR_SNAPSHOT_MAX_AGE_SECONDS=86400` means the API accepts snapshots generated in the last day by default; set it lower for stricter freshness or `0` only for deliberate “latest regardless of age” debugging. `OPERATOR_API_PAYLOAD_CACHE_SECONDS=15` keeps the parsed snapshot in API memory briefly so dashboard pages do not reload the same JSON for every section. `OPERATOR_API_LARGE_RESPONSE_BYTES=250000` records oversized API responses in the slow-operation log so endpoints can be compacted or paginated deliberately.
+Set `OPERATOR_API_USE_SNAPSHOT=false` only when debugging the live dashboard builder directly. `OPERATOR_SNAPSHOT_MAX_AGE_SECONDS=86400` means the API treats snapshots generated in the last day as fresh. With `OPERATOR_API_ALLOW_STALE_SNAPSHOT=true`, the operator UI still serves the latest stale snapshot instead of blocking a page load on a live rebuild; the payload metadata marks it as stale. `OPERATOR_API_PAYLOAD_CACHE_SECONDS=15` keeps the parsed snapshot in API memory briefly so dashboard pages do not reload the same JSON for every section. `OPERATOR_API_LARGE_RESPONSE_BYTES=250000` records oversized API responses in the slow-operation log so endpoints can be compacted or paginated deliberately.
 
 Slow API and snapshot operations are recorded under `logs/performance/`:
 
 ```sh
 python scripts/api_latency_probe.py
 python -m advisory.performance_slowlog report --limit 20
-python -m advisory.performance_slowlog mark <fingerprint> triaged --note "tracked in performance_todo.md"
+python -m advisory.performance_slowlog mark <fingerprint> triaged --note "tracked in todo.md"
 ```
 
 The JSONL file keeps every slow occurrence. The state file dedupes by fingerprint, so the same slow endpoint or snapshot stage is counted repeatedly but does not create a new issue every run.

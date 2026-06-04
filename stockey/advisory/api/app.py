@@ -44,6 +44,7 @@ env = Env()
 env.read_env()
 
 OPERATOR_API_USE_SNAPSHOT = env.bool("OPERATOR_API_USE_SNAPSHOT", True)
+OPERATOR_API_ALLOW_STALE_SNAPSHOT = env.bool("OPERATOR_API_ALLOW_STALE_SNAPSHOT", True)
 OPERATOR_API_SLOW_REQUEST_MS = env.float("OPERATOR_API_SLOW_REQUEST_MS", 750.0)
 OPERATOR_API_PAYLOAD_CACHE_SECONDS = env.float("OPERATOR_API_PAYLOAD_CACHE_SECONDS", 15.0)
 OPERATOR_API_LARGE_RESPONSE_BYTES = env.int("OPERATOR_API_LARGE_RESPONSE_BYTES", 250_000)
@@ -81,6 +82,22 @@ def _parse_timestamp(value: str | None) -> pd.Timestamp | None:
     return ts
 
 
+def _snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    snapshot = payload.get("_snapshot")
+    if not isinstance(snapshot, dict):
+        return {"source": "unknown", "freshness": "unknown", "age_seconds": None}
+    out = dict(snapshot)
+    generated_at = pd.to_datetime(out.get("generated_at"), utc=True, errors="coerce")
+    if not pd.isna(generated_at):
+        age_seconds = max(0, int((pd.Timestamp.now(tz="UTC") - generated_at).total_seconds()))
+        out["generated_at"] = generated_at.isoformat()
+        out["age_seconds"] = age_seconds
+    else:
+        out["age_seconds"] = None
+    out.setdefault("freshness", "fresh")
+    return out
+
+
 def load_operator_payload(*, asof_date: str | pd.Timestamp | None = None) -> dict[str, Any]:
     parsed_asof = _parse_asof_date(asof_date) if isinstance(asof_date, str) else asof_date
     cache_key = ("operator_payload", None if parsed_asof is None else pd.to_datetime(parsed_asof, utc=True).normalize().strftime("%Y-%m-%d"))
@@ -96,8 +113,27 @@ def load_operator_payload(*, asof_date: str | pd.Timestamp | None = None) -> dic
         if snapshot is not None:
             _PAYLOAD_CACHE[cache_key] = (now, snapshot)
             return snapshot
+        if OPERATOR_API_ALLOW_STALE_SNAPSHOT:
+            stale_snapshot = load_operator_snapshot(
+                asof_date=parsed_asof,
+                max_age_seconds=0,
+            )
+            if stale_snapshot is not None:
+                stale_snapshot["_snapshot"] = {
+                    **(stale_snapshot.get("_snapshot") or {}),
+                    "freshness": "stale",
+                    "reason": "fresh_snapshot_missing",
+                    "max_age_seconds": OPERATOR_SNAPSHOT_MAX_AGE_SECONDS,
+                }
+                _PAYLOAD_CACHE[cache_key] = (now, stale_snapshot)
+                return stale_snapshot
     payload = build_live_dashboard_payload(asof_date=parsed_asof, output_dir=DEFAULT_OUTPUT_DIR)
-    payload["_snapshot"] = {"source": "live_builder", "reason": "missing_or_stale_snapshot"}
+    payload["_snapshot"] = {
+        "source": "live_builder",
+        "freshness": "live",
+        "reason": "missing_or_stale_snapshot",
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+    }
     _PAYLOAD_CACHE[cache_key] = (now, payload)
     return payload
 
@@ -117,6 +153,7 @@ def build_summary_payload(*, asof_date: str | None = None) -> dict[str, Any]:
     return {
         "generated_at": payload.get("generated_at"),
         "asof_date": payload.get("asof_date"),
+        "snapshot": _snapshot_payload(payload),
         "summary": payload.get("summary") or {},
         "runtime_processes": payload.get("runtime_processes") or [],
         "cron_status": payload.get("cron_status") or [],
@@ -242,6 +279,7 @@ def build_home_payload(*, asof_date: str | None = None) -> dict[str, Any]:
     return {
         "generated_at": payload.get("generated_at"),
         "asof_date": payload.get("asof_date"),
+        "snapshot": _snapshot_payload(payload),
         "summary": payload.get("summary") or {},
         "runtime_processes": payload.get("runtime_processes") or [],
         "cron_status": payload.get("cron_status") or [],
@@ -270,6 +308,7 @@ def build_actions_payload(
     return {
         "generated_at": payload.get("generated_at"),
         "asof_date": payload.get("asof_date"),
+        "snapshot": _snapshot_payload(payload),
         "top_action_recommendations": _compact_list_rows(top_actions[: _bounded_limit(limit, default=25)], compact=compact),
         "action_recommendations": _compact_list_rows(action_page, compact=compact),
         "alerts": _compact_list_rows(alert_rows[: _bounded_limit(limit, default=25)], compact=compact),
@@ -372,6 +411,7 @@ def build_portfolio_payload(
     return {
         "generated_at": payload.get("generated_at"),
         "asof_date": payload.get("asof_date"),
+        "snapshot": _snapshot_payload(payload),
         "today_recommendations": _compact_list_rows(today_rows[: _bounded_limit(limit, default=25)], compact=compact),
         "current_recommendations": _compact_list_rows(current_rows[: _bounded_limit(limit, default=25)], compact=compact),
         "exited_recommendations": _compact_list_rows(exited_rows[: _bounded_limit(limit, default=25)], compact=compact),
@@ -1906,6 +1946,11 @@ def _json_ready(value: Any) -> Any:
         return [_json_ready(item) for item in value]
     if isinstance(value, pd.Timestamp):
         return _ts(value)
+    if hasattr(value, "item") and not isinstance(value, (str, bytes, bytearray)):
+        try:
+            return _json_ready(value.item())
+        except Exception:
+            pass
     if hasattr(value, "isoformat") and not isinstance(value, str):
         try:
             return value.isoformat()
@@ -2502,7 +2547,7 @@ def create_app():
     def _guard(callable_obj, *, route: str | None = None, **kwargs):
         operation = getattr(callable_obj, "__name__", str(callable_obj))
         try:
-            return callable_obj(**kwargs)
+            return _json_ready(callable_obj(**kwargs))
         except ValueError as exc:
             record_operator_api_error(
                 exc=exc,

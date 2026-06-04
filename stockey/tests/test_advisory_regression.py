@@ -3602,7 +3602,10 @@ def test_ts_forecast_workflow_falls_back_when_screener_fails(monkeypatch):
     assert result["symbol_count"] == 1
     assert result["watch_rows"] == 1
     assert result["warnings"][0].startswith("screener_failed:ValueError")
+    assert "query_name='Unit TS Screener'" in result["warnings"][0]
+    assert "screener_url='https://www.screener.in/screen/raw/" in result["warnings"][0]
     assert result["screener"]["error"].startswith("screener_failed:ValueError")
+    assert result["screener"]["screener_url"].startswith("https://www.screener.in/screen/raw/")
 
 
 def test_live_dashboard_builds_experimental_ts_forecast_views():
