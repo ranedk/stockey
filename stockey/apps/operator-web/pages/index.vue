@@ -115,6 +115,96 @@ function priceText(value: unknown) {
   return Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(num)
 }
 
+function actionLabel(row: Record<string, unknown>) {
+  return String(
+    row.action_code
+    || row.action
+    || row.next_action
+    || row.reason
+    || row.status
+    || row.action_status
+    || row.alert_type
+    || row.source_type
+    || (row.last_price || row.attractive_price_low || row.invalidation_price ? 'ALERT' : null)
+    || 'NO_ACTION'
+  ).toUpperCase()
+}
+
+function actionTone(row: Record<string, unknown>) {
+  const label = actionLabel(row).toLowerCase()
+  if (label.includes('sell') || label.includes('exit') || label.includes('reduce')) return 'bg-rust text-paper'
+  if (label.includes('buy') || label.includes('add')) return 'bg-moss text-paper'
+  if (label.includes('manual') || label.includes('review')) return 'bg-sun text-ink'
+  if (label.includes('watch') || label.includes('alert')) return 'bg-ink text-paper'
+  return 'bg-white text-ink/70'
+}
+
+function actionLane(row: Record<string, unknown>) {
+  const label = actionLabel(row).toLowerCase()
+  const detail = String([
+    row.reason_detail,
+    row.action_reason,
+    row.next_action_reason,
+    row.exit_strategy,
+    row.action_summary
+  ].filter(Boolean).join(' ')).toLowerCase()
+  if (label.includes('sell') || label.includes('exit') || label.includes('trim') || label.includes('partial')) {
+    return 'Executable exit / profit action'
+  }
+  if (label.includes('buy') || label.includes('add')) {
+    return 'Executable entry action'
+  }
+  if (label.includes('alert') || label.includes('hit') || label.includes('breakout')) {
+    return 'Watcher alert'
+  }
+  if (label.includes('manual') || label.includes('review')) {
+    if (detail.includes('market context') || detail.includes('risk-off') || detail.includes('risk_off') || detail.includes('broad market')) {
+      return 'Manual review: market regime gate'
+    }
+    if (detail.includes('missing entry/current price') || detail.includes('missing price') || detail.includes('missing data')) {
+      return 'Manual review: data/price issue'
+    }
+    return 'Manual review: event/operator judgment'
+  }
+  if (label.includes('watch') || label.includes('hold')) {
+    return 'Watch / hold'
+  }
+  return 'Other'
+}
+
+function actionLaneTone(row: Record<string, unknown>) {
+  const lane = actionLane(row).toLowerCase()
+  if (lane.includes('executable exit')) return 'bg-rust/10 text-rust'
+  if (lane.includes('executable entry')) return 'bg-moss/10 text-moss'
+  if (lane.includes('market regime')) return 'bg-sun/25 text-ink'
+  if (lane.includes('data')) return 'bg-ember/10 text-ember'
+  if (lane.includes('event')) return 'bg-white text-ink/65'
+  if (lane.includes('alert')) return 'bg-ink text-paper'
+  return 'bg-white text-ink/60'
+}
+
+const actionLaneCounts = computed(() => {
+  const counts: Record<string, number> = {}
+  for (const row of topActions.value) {
+    const lane = actionLane(row)
+    counts[lane] = (counts[lane] || 0) + 1
+  }
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])
+})
+
+const actionEmptyHint = computed(() => {
+  if (topActions.value.length) return ''
+  const action = actionType.value.toUpperCase()
+  const status = actionStatus.value.toLowerCase()
+  if (action === 'BUY' && status === 'approved') {
+    return 'No approved BUY rows are available right now. The current market-regime gate is blocking positive broker actions, so buy candidates remain manual review or watch until breadth/regime improves.'
+  }
+  if (status === 'approved') {
+    return 'Approved means executable or broker-order style rows. If this is empty, the current filtered lane has no executable action.'
+  }
+  return 'Try clearing filters or inspect Manual / Watch lanes; the queue may be blocked by market regime, event-policy review, or data/price issues.'
+})
+
 function ageText(value: unknown) {
   const seconds = Number(value)
   if (!Number.isFinite(seconds)) return '-'
@@ -400,18 +490,28 @@ function signalTone(row: Record<string, unknown>) {
         </div>
       </div>
       <div class="space-y-3">
+        <div v-if="actionLaneCounts.length" class="flex flex-wrap gap-2">
+          <span
+            v-for="[lane, count] in actionLaneCounts"
+            :key="lane"
+            class="rounded-full bg-white/80 px-3 py-1 text-xs font-black text-ink/60"
+          >
+            {{ lane }} · {{ count }}
+          </span>
+        </div>
         <RecordCard
           v-for="(row, idx) in topActions"
           :key="idx"
-          :title="String(row.action_code || row.action || row.alert_type || row.source_type || 'Action')"
+          :title="`${String(row.symbol || row.ticker || 'UNKNOWN').toUpperCase()} · Final action: ${actionLabel(row)}`"
           :subtitle="String(row.action_reason || row.next_action_reason || row.reason || '')"
           :record="row"
           :detail-path="actionDetailPath(row)"
+          :show-symbol="false"
         >
           <template #badge>
             <div class="flex flex-wrap gap-2">
-              <SymbolLink :symbol="row.symbol" subtle />
-              <span class="rounded-full bg-moss px-3 py-1 text-xs font-bold text-white">{{ row.action_code || row.action || row.alert_type || 'ALERT' }}</span>
+              <span class="rounded-full px-3 py-1 text-xs font-bold" :class="actionTone(row)">{{ actionLabel(row) }}</span>
+              <span class="rounded-full px-3 py-1 text-xs font-bold" :class="actionLaneTone(row)">{{ actionLane(row) }}</span>
             </div>
           </template>
           <div class="mt-4 grid gap-2 text-xs font-black sm:grid-cols-2 xl:grid-cols-3">
@@ -457,7 +557,9 @@ function signalTone(row: Record<string, unknown>) {
             title="Symbol trace"
           />
         </RecordCard>
-        <p v-if="!topActions.length" class="glass-panel rounded-3xl p-6 text-ink/60">No current action rows.</p>
+        <p v-if="!topActions.length" class="glass-panel rounded-3xl p-6 text-ink/60">
+          {{ actionEmptyHint || 'No current action rows.' }}
+        </p>
       </div>
       <button v-if="actionMeta.has_more" class="mt-4 rounded-full bg-moss px-5 py-3 text-sm font-black text-paper" type="button" @click="loadNextActions">
         Show next {{ actionLimit }} actions

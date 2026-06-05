@@ -271,6 +271,11 @@ export interface TraceConflict {
   losing_setup_id?: string
   losing_unique_id?: string
   lost_reason?: string
+  resolution_status?: string
+  resolution_rule_id?: string
+  resolution_action?: string
+  resolution_reason?: string
+  requires_manual_resolution?: boolean
 }
 
 export interface TraceSummary {

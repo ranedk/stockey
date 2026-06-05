@@ -246,7 +246,7 @@ These are the core advisory tables to know:
 - LLM/event layer: `advisory_event_evaluations`, `advisory_event_risks`
 - event meta-model layer: `advisory_event_model_scores`
 - adversarial review layer: `advisory_event_reviews`
-- trace layer: `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts`
+- trace/conflict layer: `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts`, `advisory_action_conflict_rules`
 - allocation/execution layer: `advisory_allocations`, `advisory_portfolio_orders`, `advisory_position_lifecycle`, `advisory_rebalance_actions`, `advisory_action_recommendations`, `advisory_execution_orders`, `advisory_execution_fills`
 
 ## Macro Feature Layer
@@ -782,6 +782,16 @@ python -m advisory.event_policy_evaluator --from-date 2026-01-01 --to-date 2026-
 ```
 
 It writes row-level realized checks to `advisory_event_policy_evaluations` and grouped metrics to `advisory_event_policy_eval_summary` by action type, policy class, event class, score bucket, confidence bucket, and combined groups. Treat `candidate_policy_strengthen` and `candidate_policy_tighten_or_downgrade` as review prompts only; they do not change live event-policy thresholds automatically.
+
+Action-conflict rules can be re-applied after editing `advisory_action_conflict_rules`:
+
+```sh
+python -m advisory.action_conflict_resolver --dry-run --format json
+python -m advisory.action_conflict_resolver --format json
+python -m advisory.action_conflict_resolver --symbol BSE --unresolved-only --format text
+```
+
+This updates `advisory_action_conflicts` resolution fields and buckets unresolved combinations for manual resolution. It does not yet change action ranking; live winners still come from `advisory.action_recommender`.
 
 Ask Codex/LLM for a manual promotion review after choosing a candidate config:
 

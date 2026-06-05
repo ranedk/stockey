@@ -632,6 +632,21 @@ function clearFilters() {
             <span class="rounded-full bg-ember px-3 py-1 text-xs font-bold text-white">{{ conflict.losing_action_code }}</span>
           </div>
           <p class="mt-3 text-sm text-ink/65">{{ conflict.lost_reason }}</p>
+          <div class="mt-3 flex flex-wrap gap-2">
+            <span
+              v-if="conflict.resolution_status"
+              class="rounded-full px-3 py-1 text-xs font-black"
+              :class="conflict.requires_manual_resolution ? 'bg-sun text-ink' : 'bg-moss/10 text-moss'"
+            >
+              {{ conflict.resolution_status }}
+            </span>
+            <span v-if="conflict.resolution_rule_id" class="rounded-full bg-white px-3 py-1 text-xs font-black text-ink/55">
+              {{ conflict.resolution_rule_id }}
+            </span>
+          </div>
+          <p v-if="conflict.resolution_reason" class="mt-2 rounded-2xl bg-paper/70 p-3 text-xs leading-5 text-ink/60">
+            {{ conflict.resolution_reason }}
+          </p>
           <p class="mt-2 text-xs text-ink/45">{{ formatWhen(conflict.asof_date) }} · {{ conflict.losing_source }}</p>
         </article>
         <p v-if="!filteredConflicts.length" class="rounded-2xl bg-white/60 p-4 text-sm text-ink/55">No action conflicts match the current filters.</p>

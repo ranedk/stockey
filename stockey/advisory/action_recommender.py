@@ -8,6 +8,7 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.decision_trace import ACTION_CONFLICT_RULES_TABLE
 from advisory.decision_trace import append_trace, append_trace_step, build_action_conflicts, persist_action_conflicts, safe_trace_call
 from advisory.hypothesis_engine import ACTION_PLANS_TABLE, HYPOTHESES_TABLE, ensure_tables as ensure_hypothesis_tables
 from advisory.market_context import load_latest_market_context
@@ -971,6 +972,103 @@ def apply_market_context_adjustments(df: pd.DataFrame, *, asof_date: pd.Timestam
     return out
 
 
+def load_enabled_conflict_rule_ids() -> set[str]:
+    if not table_exists(ACTION_CONFLICT_RULES_TABLE):
+        return {
+            "EXIT_BEATS_ENTRY_OR_WATCH",
+            "MARKET_GATE_MANUAL_BEATS_POSITIVE",
+            "SAME_ACTION_DUPLICATE_COLLAPSE",
+            "WATCH_LOSES_TO_HIGHER_PRIORITY",
+        }
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT rule_id
+            FROM {ACTION_CONFLICT_RULES_TABLE}
+            WHERE COALESCE(enabled, TRUE)
+            """,
+            retries=2,
+        )
+    except Exception:
+        return {
+            "EXIT_BEATS_ENTRY_OR_WATCH",
+            "MARKET_GATE_MANUAL_BEATS_POSITIVE",
+            "SAME_ACTION_DUPLICATE_COLLAPSE",
+            "WATCH_LOSES_TO_HIGHER_PRIORITY",
+        }
+    return {str(value) for value in df["rule_id"].dropna().tolist()} if not df.empty else set()
+
+
+def conflict_precedence_for_row(row: pd.Series, enabled_rules: set[str]) -> dict[str, Any]:
+    action = str(row.get("action_code") or "").strip().upper()
+    raw_context = _parse_jsonish(row.get("raw_context_json"), {})
+    if not isinstance(raw_context, dict):
+        raw_context = {}
+    context_text = json.dumps(raw_context, ensure_ascii=False, default=str).lower()
+    if "EXIT_BEATS_ENTRY_OR_WATCH" in enabled_rules and action in {"SELL", "PARTIAL_SELL", "TIGHTEN_STOP"}:
+        return {
+            "score": 400,
+            "rule_id": "EXIT_BEATS_ENTRY_OR_WATCH",
+            "reason": "Risk-management actions are selected before entry/watch/manual signals.",
+        }
+    if (
+        "MARKET_GATE_MANUAL_BEATS_POSITIVE" in enabled_rules
+        and action == "MANUAL_REVIEW"
+        and ("market_context_adjustment" in context_text or "risk-off" in context_text or "risk_off" in context_text)
+    ):
+        return {
+            "score": 300,
+            "rule_id": "MARKET_GATE_MANUAL_BEATS_POSITIVE",
+            "reason": "Risk-off market context keeps positive actions in manual review.",
+        }
+    if "WATCH_LOSES_TO_HIGHER_PRIORITY" in enabled_rules and action == "WATCH":
+        return {
+            "score": -100,
+            "rule_id": "WATCH_LOSES_TO_HIGHER_PRIORITY",
+            "reason": "Watch rows are informational unless no stronger action exists.",
+        }
+    return {"score": 0, "rule_id": None, "reason": None}
+
+
+def apply_conflict_rule_precedence(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    enabled_rules = load_enabled_conflict_rule_ids()
+    if not enabled_rules:
+        return df
+    out = df.copy()
+    scores: list[int] = []
+    rule_ids: list[str | None] = []
+    reasons: list[str | None] = []
+    for _, row in out.iterrows():
+        result = conflict_precedence_for_row(row, enabled_rules)
+        scores.append(int(result.get("score") or 0))
+        rule_ids.append(_text(result.get("rule_id")))
+        reasons.append(_text(result.get("reason")))
+    out["_conflict_rule_precedence"] = scores
+    out["_conflict_precedence_rule_id"] = rule_ids
+    out["_conflict_precedence_reason"] = reasons
+    for idx, row in out.iterrows():
+        rule_id = _text(row.get("_conflict_precedence_rule_id"))
+        reason = _text(row.get("_conflict_precedence_reason"))
+        if not rule_id:
+            continue
+        out.at[idx, "raw_context_json"] = json.dumps(
+            _merge_context(
+                row.get("raw_context_json"),
+                {
+                    "conflict_precedence_rule_id": rule_id,
+                    "conflict_precedence_reason": reason,
+                    "conflict_precedence_score": int(row.get("_conflict_rule_precedence") or 0),
+                },
+            ),
+            ensure_ascii=False,
+            default=str,
+            sort_keys=True,
+        )
+    return out
+
+
 def _json_ready_record(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
     data = row.to_dict() if isinstance(row, pd.Series) else dict(row)
     out: dict[str, Any] = {}
@@ -1044,6 +1142,10 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
         "event": _contract_section_from_context(raw_context, ["event_class", "verdict", "state_transition_hint", "score_impact", "review_action"]),
         "playbook": _contract_section_from_context(raw_context, ["playbook_id", "hypothesis_id", "action_type", "operator_summary", "decision_reason"]),
         "macro_regime": _contract_section_from_context(raw_context, ["macro_risk_state", "macro_stress_score", "regime_state", "market_regime"]),
+        "conflict_resolution": _contract_section_from_context(
+            raw_context,
+            ["conflict_precedence_rule_id", "conflict_precedence_reason", "conflict_precedence_score"],
+        ),
         "risk": risk_fields,
         "lifecycle": _contract_section_from_context(raw_context, ["position_status", "next_action", "suggested_action", "lifecycle_reason", "next_action_reason"]),
     }
@@ -1550,19 +1652,23 @@ def build_action_recommendations(
 def rank_action_candidates(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-    ranked = df.copy()
+    ranked = apply_conflict_rule_precedence(df)
     ranked["symbol"] = ranked["symbol"].astype("string").str.upper()
     ranked["published_on"] = pd.to_datetime(ranked["published_on"], utc=True, errors="coerce")
     ranked["action_priority"] = pd.to_numeric(ranked["action_priority"], errors="coerce").fillna(0).astype(int)
+    if "_conflict_rule_precedence" not in ranked.columns:
+        ranked["_conflict_rule_precedence"] = 0
+    ranked["_conflict_rule_precedence"] = pd.to_numeric(ranked["_conflict_rule_precedence"], errors="coerce").fillna(0).astype(int)
     if "invest_score_pct" not in ranked.columns:
         ranked["invest_score_pct"] = pd.NA
     ranked["invest_score_pct"] = pd.to_numeric(ranked["invest_score_pct"], errors="coerce")
     ranked = ranked.sort_values(
-        ["symbol", "action_priority", "published_on", "invest_score_pct", "setup_id"],
-        ascending=[True, False, False, False, True],
+        ["symbol", "_conflict_rule_precedence", "action_priority", "published_on", "invest_score_pct", "setup_id"],
+        ascending=[True, False, False, False, False, True],
         kind="stable",
     )
-    return ranked.drop_duplicates(subset=["asof_date", "symbol"], keep="first").reset_index(drop=True)
+    winners = ranked.drop_duplicates(subset=["asof_date", "symbol"], keep="first").reset_index(drop=True)
+    return winners.drop(columns=[column for column in ["_conflict_rule_precedence", "_conflict_precedence_rule_id", "_conflict_precedence_reason"] if column in winners.columns])
 
 
 def persist_action_recommendations(df: pd.DataFrame) -> None:
@@ -1577,6 +1683,7 @@ def persist_action_recommendations(df: pd.DataFrame) -> None:
     enrich_asof = asof_values.max().normalize() if not asof_values.empty else _normalize_asof_date(None)
     all_candidates = enrich_action_candidate_context(all_candidates, asof_date=enrich_asof)
     all_candidates = apply_market_context_adjustments(all_candidates, asof_date=enrich_asof)
+    all_candidates = apply_conflict_rule_precedence(all_candidates)
     winners = rank_action_candidates(all_candidates)
     existing_reason_columns = {"recommendation_reason_json", "reason_contract_status"}
     if not existing_reason_columns.issubset(set(winners.columns)) or winners["recommendation_reason_json"].isna().any():
@@ -1586,6 +1693,7 @@ def persist_action_recommendations(df: pd.DataFrame) -> None:
         winners = add_manual_revision_pointers(winners, all_candidates)
     conflicts = build_action_conflicts(all_candidates, winners)
     out = winners.copy()
+    out = out.drop(columns=[column for column in ["_conflict_rule_precedence", "_conflict_precedence_rule_id", "_conflict_precedence_reason"] if column in out.columns])
     for column in [
         "action_fraction",
         "approved_allocation_inr",

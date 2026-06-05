@@ -962,7 +962,10 @@ Implementation slices:
 3. Done: wire `actions` stage into `advisory.pipeline`
 4. Done: make `advisory.execution_engine` read the consolidated action table
 5. Done: make the dashboard/operator view prefer the consolidated action over raw rebalance rows
-6. Next: make action conflicts readable in the Nuxt Decision Trace page instead of only persisting them.
+6. Done: make action conflicts readable in the Nuxt Decision Trace page instead of only persisting them.
+7. Done: add `advisory_action_conflict_rules` and `advisory/action_conflict_resolver.py` so conflict rules can be re-applied after rule edits.
+8. Next: add a Nuxt conflict-rules page to edit/disable rules and promote unresolved manual decisions into new deterministic rules.
+9. Later: decide which approved conflict rules should influence `rank_action_candidates()` directly instead of only annotating the selected winner.
 
 Do not:
 

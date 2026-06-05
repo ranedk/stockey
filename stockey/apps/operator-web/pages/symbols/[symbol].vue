@@ -38,6 +38,10 @@ const finalAction = computed(() => mergeRows(
 ))
 const reasonContract = computed(() => finalAction.value.recommendation_reason || finalAction.value.reason_contract || finalAction.value.recommendation_reason_json)
 const reasonStatus = computed(() => finalAction.value.reason_contract_status || finalAction.value.status)
+const explicitTarget = computed(() => numericFirstValue(['target_price', 'recommended_target_price']))
+const derivedTarget = computed(() => computeDerivedTarget())
+const displayTarget = computed(() => explicitTarget.value ?? derivedTarget.value)
+const runupRead = computed(() => buildRunupRead())
 
 function filterSymbolRows(rows: Dict[]): Dict[] {
   const target = symbol.value
@@ -52,6 +56,7 @@ function display(value: unknown) {
 }
 
 function pct(value: unknown) {
+  if (value === null || value === undefined || value === '') return '-'
   const num = Number(value)
   if (!Number.isFinite(num)) return '-'
   const percent = Math.abs(num) <= 1 ? num * 100 : num
@@ -70,6 +75,68 @@ function firstValue(keys: string[]) {
     if (value !== null && value !== undefined && value !== '') return value
   }
   return null
+}
+
+function numericFirstValue(keys: string[]) {
+  for (const key of keys) {
+    const value = Number(finalAction.value[key])
+    if (Number.isFinite(value) && value > 0) return value
+  }
+  return null
+}
+
+function computeDerivedTarget() {
+  const entry = numericFirstValue(['entry_price'])
+  const stop = numericFirstValue(['recommended_stop_price', 'stop_price', 'invalidation_price'])
+  if (!entry || !stop || stop >= entry) return null
+  const riskPerShare = entry - stop
+  return Math.round((entry + riskPerShare * 2) * 100) / 100
+}
+
+function buildRunupRead() {
+  const entry = numericFirstValue(['entry_price'])
+  const current = numericFirstValue(['current_price', 'last_price', 'reference_price'])
+  const stop = numericFirstValue(['recommended_stop_price', 'stop_price', 'invalidation_price'])
+  const target = displayTarget.value
+  const zoneLow = numericFirstValue(['attractive_price_low'])
+  const zoneHigh = numericFirstValue(['attractive_price_high'])
+  const gainPct = entry && current ? ((current / entry) - 1) * 100 : null
+  const riskPct = entry && stop && stop < entry ? ((entry / stop) - 1) * 100 : null
+  const targetProgressPct = entry && current && target && target > entry ? ((current - entry) / (target - entry)) * 100 : null
+  const zoneDistancePct = current && zoneHigh ? ((current / zoneHigh) - 1) * 100 : null
+  let status = 'Insufficient price context.'
+  let tone = 'bg-white/75 text-ink/65'
+  if (targetProgressPct !== null && targetProgressPct >= 100) {
+    status = 'Target zone has been reached. New participation should wait for a fresh setup or partial-exit review.'
+    tone = 'bg-rust/10 text-rust'
+  } else if (targetProgressPct !== null && targetProgressPct >= 75) {
+    status = 'Most of the implied target move is already done. Avoid chasing full size; wait for pullback or a new trigger.'
+    tone = 'bg-sun/25 text-ink'
+  } else if (targetProgressPct !== null && targetProgressPct >= 50) {
+    status = 'This has already moved meaningfully from entry. Participation is possible only with reduced size and a clear stop.'
+    tone = 'bg-sun/15 text-ink'
+  } else if (targetProgressPct !== null) {
+    status = 'Move is still below halfway to the implied target, but use the displayed stop and entry-zone context.'
+    tone = 'bg-moss/10 text-moss'
+  }
+  if (zoneDistancePct !== null && zoneDistancePct > 5) {
+    status = `${status} Current price is ${Math.round(zoneDistancePct * 10) / 10}% above the attractive zone high.`
+  }
+  return {
+    entry,
+    current,
+    stop,
+    target,
+    targetIsDerived: explicitTarget.value === null && derivedTarget.value !== null,
+    gainPct,
+    riskPct,
+    targetProgressPct,
+    zoneLow,
+    zoneHigh,
+    zoneDistancePct,
+    status,
+    tone
+  }
 }
 
 function mergeRows(...rows: Array<Dict | undefined>): Dict {
@@ -130,8 +197,28 @@ function eventSubtitle(row: Dict) {
     <MetricTile label="Final Action" :value="String(actionLabel(finalAction)).toUpperCase()" note="Consolidated latest row" />
     <MetricTile label="Current Price" :value="money(firstValue(['current_price', 'last_price', 'reference_price', 'entry_price']))" note="Best available payload price" />
     <MetricTile label="P&L" :value="pct(firstValue(['pnl_pct', 'return_pct']))" note="Since recommendation when available" />
-    <MetricTile label="Target" :value="money(firstValue(['target_price', 'recommended_target_price']))" note="Lifecycle/portfolio target" />
+    <MetricTile label="Target" :value="money(displayTarget)" :note="runupRead.targetIsDerived ? 'Derived 2R target; formal target missing' : 'Lifecycle/portfolio target'" />
     <MetricTile label="Stop" :value="money(firstValue(['stop_price', 'recommended_stop_price', 'invalidation_price']))" note="Exit or invalidation" />
+  </section>
+
+  <section class="mt-6 rounded-3xl border border-black/10 p-5 shadow-soft" :class="runupRead.tone">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-black uppercase tracking-[0.25em] opacity-60">Participation Read</p>
+        <h2 class="mt-2 text-2xl font-black">Can I still participate?</h2>
+        <p class="mt-2 max-w-4xl text-sm leading-6">{{ runupRead.status }}</p>
+      </div>
+      <span v-if="runupRead.targetIsDerived" class="rounded-full bg-white/80 px-3 py-1 text-xs font-black text-ink/60">
+        formal target missing
+      </span>
+    </div>
+    <div class="mt-4 grid gap-3 md:grid-cols-5">
+      <p class="rounded-2xl bg-white/75 p-3 text-sm"><b>Entry:</b> {{ money(runupRead.entry) }}</p>
+      <p class="rounded-2xl bg-white/75 p-3 text-sm"><b>Latest:</b> {{ money(runupRead.current) }}</p>
+      <p class="rounded-2xl bg-white/75 p-3 text-sm"><b>Gain:</b> {{ pct(runupRead.gainPct) }}</p>
+      <p class="rounded-2xl bg-white/75 p-3 text-sm"><b>Target progress:</b> {{ pct(runupRead.targetProgressPct) }}</p>
+      <p class="rounded-2xl bg-white/75 p-3 text-sm"><b>Entry zone:</b> {{ runupRead.zoneLow && runupRead.zoneHigh ? `${money(runupRead.zoneLow)} - ${money(runupRead.zoneHigh)}` : '-' }}</p>
+    </div>
   </section>
 
   <section class="mt-8 grid gap-6 lg:grid-cols-[1.05fr_0.95fr]">

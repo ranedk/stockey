@@ -6,6 +6,7 @@ const props = defineProps<{
   subtitle?: string
   record: Dict
   detailPath?: string
+  showSymbol?: boolean
 }>()
 
 const config = useRuntimeConfig()
@@ -42,7 +43,7 @@ const rawPayload = computed(() => detailPayload.value || props.record)
         <p v-if="subtitle" class="mt-1 text-sm text-ink/60">{{ subtitle }}</p>
       </div>
       <div class="flex flex-wrap justify-end gap-2">
-        <SymbolLink v-if="symbol" :symbol="symbol" subtle />
+        <SymbolLink v-if="symbol && props.showSymbol !== false" :symbol="symbol" subtle />
         <slot name="badge" />
       </div>
     </div>

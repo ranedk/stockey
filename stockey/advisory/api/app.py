@@ -16,7 +16,7 @@ from environs import Env
 
 from advisory.action_recommender import TABLE_NAME as ACTION_RECOMMENDATIONS_TABLE
 from advisory.decision_trace import load_event_trace, load_symbol_trace
-from advisory.decision_trace import ACTION_CONFLICTS_TABLE
+from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
 from advisory.event_model_artifact_store import build_artifact_manifest
 from advisory.event_model_promotion_check import build_promotion_check
 from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audit, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
@@ -333,6 +333,24 @@ def build_actions_payload(
     }
 
 
+def build_action_conflict_rules_payload() -> dict[str, Any]:
+    if not _table_exists(ACTION_CONFLICT_RULES_TABLE):
+        return {"generated_at": pd.Timestamp.utcnow().isoformat(), "rules": [], "row_count": 0}
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM {ACTION_CONFLICT_RULES_TABLE}
+        ORDER BY enabled DESC, priority DESC, rule_id
+        """,
+        retries=2,
+    )
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "rules": _json_ready(df.to_dict(orient="records")),
+        "row_count": int(len(df)),
+    }
+
+
 def build_signal_refresh_payload(
     *,
     limit: int = 50,
@@ -507,6 +525,73 @@ def _row_text(row: dict[str, Any], keys: list[str]) -> str:
     return " ".join(str(row.get(key) or "") for key in keys).lower()
 
 
+def _action_label(row: dict[str, Any]) -> str:
+    label = (
+        row.get("action_code")
+        or row.get("action")
+        or row.get("next_action")
+        or row.get("reason")
+        or row.get("status")
+        or row.get("action_status")
+        or row.get("alert_type")
+        or row.get("source_type")
+    )
+    if not label and any(row.get(key) not in (None, "", [], {}) for key in ["last_price", "attractive_price_low", "invalidation_price"]):
+        label = "ALERT"
+    return str(label or "").strip().upper()
+
+
+def _row_matches_status(row: dict[str, Any], normalized_status: str) -> bool:
+    if not normalized_status or normalized_status == "all":
+        return True
+    label = _action_label(row).lower()
+    row_text = _row_text(
+        row,
+        [
+            "status",
+            "action_status",
+            "portfolio_status",
+            "reason_contract_status",
+            "event_status",
+            "review_action",
+            "severity",
+            "execution_mode",
+            "exit_strategy",
+            "reason_detail",
+        ],
+    )
+    if normalized_status == "approved":
+        return (
+            "approved" in row_text
+            or "broker_order" in row_text
+            or label in {"BUY", "BUY_MORE", "ADD_ON_PULLBACK", "SELL", "PARTIAL_SELL", "EXIT"}
+        )
+    if normalized_status == "manual":
+        return "manual" in row_text or "review" in row_text or "manual" in label.lower() or "review" in label.lower()
+    if normalized_status == "blocked":
+        return "blocked" in row_text or "risk-off" in row_text or "risk_off" in row_text
+    return normalized_status in row_text or normalized_status in label.lower()
+
+
+def _row_matches_action(row: dict[str, Any], normalized_action: str) -> bool:
+    if not normalized_action or normalized_action == "ALL":
+        return True
+    label = _action_label(row)
+    row_text = " ".join(
+        [
+            label,
+            _row_text(row, ["action_code", "action", "next_action", "action_type", "portfolio_action", "execution_intent", "reason", "status"]),
+        ]
+    ).upper()
+    if normalized_action == "BUY":
+        return any(token in row_text for token in ["BUY", "BUY_MORE", "ADD_ON_PULLBACK"])
+    if normalized_action == "EXIT":
+        return any(token in row_text for token in ["EXIT", "SELL", "PARTIAL_SELL", "TRIM_WINNER", "REDUCE"])
+    if normalized_action == "MANUAL":
+        return "MANUAL" in row_text or "REVIEW" in row_text
+    return normalized_action in row_text
+
+
 def _filter_rows(
     rows: list[dict[str, Any]],
     *,
@@ -521,23 +606,10 @@ def _filter_rows(
         out = [row for row in out if str(row.get("symbol") or row.get("ticker") or "").strip().upper() == normalized_symbol]
     normalized_status = str(status or "").strip().lower()
     if normalized_status and normalized_status != "all":
-        out = [
-            row
-            for row in out
-            if normalized_status
-            in _row_text(
-                row,
-                ["status", "action_status", "portfolio_status", "reason_contract_status", "event_status", "review_action", "severity"],
-            )
-        ]
+        out = [row for row in out if _row_matches_status(row, normalized_status)]
     normalized_action = str(action or "").strip().upper()
     if normalized_action and normalized_action != "ALL":
-        out = [
-            row
-            for row in out
-            if normalized_action
-            in _row_text(row, ["action_code", "action", "next_action", "action_type", "portfolio_action", "execution_intent"]).upper()
-        ]
+        out = [row for row in out if _row_matches_action(row, normalized_action)]
     normalized_search = str(search or "").strip().lower()
     if normalized_search:
         search_keys = [
@@ -1575,6 +1647,11 @@ def normalize_trace_payload(raw: dict[str, Any]) -> dict[str, Any]:
                 "losing_setup_id": _text(row.get("losing_setup_id")),
                 "losing_unique_id": _text(row.get("losing_unique_id")),
                 "lost_reason": _text(row.get("lost_reason")),
+                "resolution_status": _text(row.get("resolution_status")),
+                "resolution_rule_id": _text(row.get("resolution_rule_id")),
+                "resolution_action": _text(row.get("resolution_action")),
+                "resolution_reason": _text(row.get("resolution_reason")),
+                "requires_manual_resolution": _boolish(row.get("requires_manual_resolution")),
             }
         )
 
@@ -2797,6 +2874,10 @@ def create_app():
     @app.get("/api/actions/detail")
     def action_detail(symbol: str | None = None, unique_id: str | None = None, setup_id: str | None = None, asof_date: str | None = None):
         return _guard(build_action_detail_payload, route="/api/actions/detail", symbol=symbol, unique_id=unique_id, setup_id=setup_id, asof_date=asof_date)
+
+    @app.get("/api/action-conflict-rules")
+    def action_conflict_rules():
+        return _guard(build_action_conflict_rules_payload, route="/api/action-conflict-rules")
 
     @app.get("/api/signal-refresh")
     def signal_refresh(

@@ -16,6 +16,42 @@ TRACES_TABLE = "advisory_decision_traces"
 TRACE_STEPS_TABLE = "advisory_decision_trace_steps"
 EVENT_PROCESSING_TABLE = "advisory_event_processing_runs"
 ACTION_CONFLICTS_TABLE = "advisory_action_conflicts"
+ACTION_CONFLICT_RULES_TABLE = "advisory_action_conflict_rules"
+
+ACTION_CONFLICT_RULES = [
+    {
+        "rule_id": "EXIT_BEATS_ENTRY_OR_WATCH",
+        "rule_name": "Exit/profit action beats entry, watch, and manual review",
+        "rule_scope": "risk_management",
+        "resolution_status": "resolved",
+        "resolution_action": "keep_winner",
+        "reason": "Risk management actions such as SELL, PARTIAL_SELL, or TIGHTEN_STOP override entry/watch/manual signals.",
+    },
+    {
+        "rule_id": "MARKET_GATE_MANUAL_BEATS_POSITIVE",
+        "rule_name": "Risk-off market gate keeps positive actions manual",
+        "rule_scope": "market_context",
+        "resolution_status": "resolved",
+        "resolution_action": "keep_winner",
+        "reason": "When broad market context blocks positive broker actions, MANUAL_REVIEW remains the winner until regime breadth improves.",
+    },
+    {
+        "rule_id": "SAME_ACTION_DUPLICATE_COLLAPSE",
+        "rule_name": "Same-action duplicate collapse",
+        "rule_scope": "dedupe",
+        "resolution_status": "resolved",
+        "resolution_action": "collapse_duplicate",
+        "reason": "Same final action from multiple sources is not a decision conflict; keep the ranked/freshest source.",
+    },
+    {
+        "rule_id": "WATCH_LOSES_TO_HIGHER_PRIORITY",
+        "rule_name": "Watch loses to higher-priority action",
+        "rule_scope": "priority",
+        "resolution_status": "resolved",
+        "resolution_action": "keep_winner",
+        "reason": "WATCH is informational and loses to any higher-priority action for the same symbol/date.",
+    },
+]
 
 logger = setup_logger("advisory.decision_trace")
 
@@ -117,6 +153,54 @@ def ensure_trace_tables() -> None:
             )
             """
         )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {ACTION_CONFLICT_RULES_TABLE} (
+                rule_id TEXT PRIMARY KEY,
+                rule_name TEXT NOT NULL,
+                rule_scope TEXT,
+                resolution_action TEXT NOT NULL,
+                resolution_reason TEXT,
+                enabled BOOLEAN DEFAULT TRUE,
+                priority BIGINT DEFAULT 100,
+                created_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ
+            )
+            """
+        )
+        for column, sql_type in {
+            "resolution_status": "TEXT",
+            "resolution_rule_id": "TEXT",
+            "resolution_action": "TEXT",
+            "resolution_reason": "TEXT",
+            "requires_manual_resolution": "BOOLEAN",
+        }.items():
+            cur.execute(f"ALTER TABLE {ACTION_CONFLICTS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+        now = pd.Timestamp.utcnow()
+        for idx, rule in enumerate(ACTION_CONFLICT_RULES):
+            cur.execute(
+                f"""
+                INSERT INTO {ACTION_CONFLICT_RULES_TABLE}
+                    (rule_id, rule_name, rule_scope, resolution_action, resolution_reason, enabled, priority, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s)
+                ON CONFLICT (rule_id) DO UPDATE SET
+                    rule_name = EXCLUDED.rule_name,
+                    rule_scope = EXCLUDED.rule_scope,
+                    resolution_action = EXCLUDED.resolution_action,
+                    resolution_reason = EXCLUDED.resolution_reason,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (
+                    str(rule["rule_id"]),
+                    str(rule["rule_name"]),
+                    str(rule["rule_scope"]),
+                    str(rule["resolution_action"]),
+                    str(rule["reason"]),
+                    int(100 - idx),
+                    now.to_pydatetime(),
+                    now.to_pydatetime(),
+                ),
+            )
 
 
 def make_trace_id(*, asof_date: Any, symbol: Any, unique_id: Any = None, trigger_type: Any = None) -> str:
@@ -294,15 +378,60 @@ def build_action_conflicts(all_candidates: pd.DataFrame, winners: pd.DataFrame) 
     return pd.DataFrame(rows)
 
 
+def classify_action_conflict(row: dict[str, Any]) -> dict[str, Any]:
+    winning = str(row.get("winning_action_code") or "").strip().upper()
+    losing = str(row.get("losing_action_code") or "").strip().upper()
+    winning_source = str(row.get("winning_source") or "").strip().lower()
+    context_text = " ".join(str(row.get(key) or "") for key in ["lost_reason", "raw_context_json"]).lower()
+    exit_actions = {"SELL", "PARTIAL_SELL", "TIGHTEN_STOP", "EXIT", "REDUCE_EXPOSURE"}
+    low_priority_actions = {"WATCH", "HOLD", "MANUAL_REVIEW"}
+
+    if winning == losing and winning:
+        rule = ACTION_CONFLICT_RULES[2]
+    elif winning in exit_actions and losing in low_priority_actions:
+        rule = ACTION_CONFLICT_RULES[0]
+    elif winning == "MANUAL_REVIEW" and ("market_context_adjustment" in context_text or "risk-off" in context_text or "risk_off" in context_text or winning_source in {"portfolio", "event_policy"}):
+        rule = ACTION_CONFLICT_RULES[1]
+    elif losing == "WATCH" and winning:
+        rule = ACTION_CONFLICT_RULES[3]
+    else:
+        return {
+            "resolution_status": "unresolved",
+            "resolution_rule_id": None,
+            "resolution_action": "manual_resolution_required",
+            "resolution_reason": "No deterministic conflict rule matched this action combination.",
+            "requires_manual_resolution": True,
+        }
+    return {
+        "resolution_status": str(rule["resolution_status"]),
+        "resolution_rule_id": str(rule["rule_id"]),
+        "resolution_action": str(rule["resolution_action"]),
+        "resolution_reason": str(rule["reason"]),
+        "requires_manual_resolution": False,
+    }
+
+
+def apply_action_conflict_resolution_rules(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    resolutions = [classify_action_conflict(row) for row in out.to_dict(orient="records")]
+    for key in ["resolution_status", "resolution_rule_id", "resolution_action", "resolution_reason", "requires_manual_resolution"]:
+        out[key] = [item.get(key) for item in resolutions]
+    return out
+
+
 def persist_action_conflicts(df: pd.DataFrame) -> None:
     ensure_trace_tables()
     if df.empty:
         return
-    out = df.copy()
+    out = apply_action_conflict_resolution_rules(df)
     for column in ["asof_date", "load_ts"]:
         out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
     for column in ["winning_priority", "losing_priority"]:
         out[column] = pd.to_numeric(out[column], errors="coerce").astype("Int64")
+    if "requires_manual_resolution" in out.columns:
+        out["requires_manual_resolution"] = out["requires_manual_resolution"].astype("boolean")
     upsert_to_db(
         out,
         ACTION_CONFLICTS_TABLE,
