@@ -105,7 +105,8 @@ Required operator UI coverage:
    - rename operator-facing “promotion audit” language to “reliability check” everywhere once backend migration is safe
 
 3. Manual-review workbench
-   - one queue for `MANUAL_REVIEW`, event-policy review rows, action conflicts, technical threshold reviews, failed extraction rows, and execution blockers
+   - one action-required queue for `MANUAL_REVIEW`, event-policy review rows, unresolved/manual-required action conflicts, technical threshold reviews, failed extraction rows, and execution blockers
+   - resolved action conflicts must stay audit-only in Decision Trace, symbol detail, and Conflict Rules pages, not in Manual Review
    - allow operator decisions such as `approve_for_manual_config`, `needs_more_data`, `ignore`, `downgrade_to_no_action`, and `watch_for_event`
    - persist every decision with user, timestamp, rationale, before/after payload, and trace links
 
@@ -964,14 +965,16 @@ Implementation slices:
 5. Done: make the dashboard/operator view prefer the consolidated action over raw rebalance rows
 6. Done: make action conflicts readable in the Nuxt Decision Trace page instead of only persisting them.
 7. Done: add `advisory_action_conflict_rules` and `advisory/action_conflict_resolver.py` so conflict rules can be re-applied after rule edits.
-8. Next: add a Nuxt conflict-rules page to edit/disable rules and promote unresolved manual decisions into new deterministic rules.
-9. Later: decide which approved conflict rules should influence `rank_action_candidates()` directly instead of only annotating the selected winner.
+8. Done: add a Nuxt conflict-rules page to inspect enabled rules, recent matched conflicts, and unresolved/manual-required combinations.
+9. Next: add edit/disable controls and a promotion workflow that turns unresolved manual decisions into new deterministic rules.
+10. Later: decide which approved conflict rules should influence `rank_action_candidates()` directly instead of only annotating the selected winner.
 
 Do not:
 
 - let multiple active actions survive for the same symbol on the same advisory date
 - allow both a plain `BUY` and a `BUY_MORE` execution plan for the same symbol in the same run
-- hide manual-review conflicts; surface them explicitly as the winning action
+- hide unresolved/manual-required conflicts; surface them explicitly as the winning action
+- show resolved conflicts as audit/debug records in trace and conflict-rule views, not as Manual Review work
 
 ### 6. Build a proper swing technical buy/exit engine
 

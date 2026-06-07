@@ -16,6 +16,12 @@ const scoreKeys = [
 
 const visible = computed(() => Boolean(
   first(['technical_context', 'technical_state', 'technical_trigger_type', 'technical_score', 'setup_score', 'stop_price', 'recommended_stop_price', 'invalidation_price', 'target_price', 'technical_trigger_note', 'active_exit_condition', 'exit_strategy'])
+  || nestedFirst([
+    ['recommendation_reason', 'evidence', 'technical', 'technical_state'],
+    ['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type'],
+    ['recommendation_reason', 'evidence', 'technical', 'technical_score'],
+    ['recommendation_reason', 'evidence', 'technical', 'setup_score']
+  ])
 ))
 
 function first(keys: string[]) {
@@ -24,6 +30,27 @@ function first(keys: string[]) {
     if (value !== null && value !== undefined && value !== '') return value
   }
   return null
+}
+
+function nested(path: string[]) {
+  let current: unknown = props.record
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return null
+    current = (current as Dict)[key]
+  }
+  return current === null || current === undefined || current === '' ? null : current
+}
+
+function nestedFirst(paths: string[][]) {
+  for (const path of paths) {
+    const value = nested(path)
+    if (value !== null) return value
+  }
+  return null
+}
+
+function value(keys: string[], paths: string[][] = []) {
+  return first(keys) ?? nestedFirst(paths)
 }
 
 function numberText(value: unknown, digits = 2) {
@@ -45,48 +72,52 @@ function priceText(value: unknown) {
   return Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(num)
 }
 
-function toneClass(value: unknown) {
-  const text = String(value || '').toLowerCase()
-  if (text.includes('buy') || text.includes('ready') || text.includes('trigger')) return 'bg-moss text-paper'
-  if (text.includes('exit') || text.includes('fail') || text.includes('reject')) return 'bg-rust text-paper'
-  if (text.includes('watch') || text.includes('manual') || text.includes('near')) return 'bg-sun text-ink'
-  return 'bg-ink text-paper'
+function scoreValue(key: string) {
+  return first([key]) ?? nested(['recommendation_reason', 'evidence', 'technical', key])
 }
 </script>
 
 <template>
-  <section v-if="visible" class="rounded-2xl bg-paper/70 p-4">
+  <section v-if="visible" class="rounded-2xl border border-moss/15 bg-gradient-to-br from-moss/10 via-white/80 to-sun/10 p-4">
     <div class="flex flex-wrap items-start justify-between gap-3">
       <div>
-        <p class="text-xs font-black uppercase tracking-[0.22em] text-ink/45">Technical Decision</p>
+        <p class="text-xs font-black uppercase tracking-[0.22em] text-moss">Technical Decision</p>
         <p class="mt-1 text-sm leading-6 text-ink/65">
-          {{ first(['technical_context', 'technical_trigger_note', 'technical_state']) || 'Technical context available.' }}
+          {{ value(['technical_context', 'technical_trigger_note', 'technical_state'], [
+            ['recommendation_reason', 'evidence', 'technical', 'technical_trigger_note'],
+            ['recommendation_reason', 'evidence', 'technical', 'technical_state']
+          ]) || 'Technical context available.' }}
         </p>
       </div>
-      <span class="rounded-full px-3 py-1 text-xs font-black" :class="toneClass(first(['technical_state', 'technical_trigger_type', 'action_code', 'status']))">
-        {{ first(['technical_state', 'technical_trigger_type']) || 'TECHNICAL' }}
-      </span>
+      <StatusPill :tone="String(value(['technical_state', 'technical_trigger_type', 'action_code', 'status'], [['recommendation_reason', 'evidence', 'technical', 'technical_state']]) || '').toLowerCase().includes('reject') ? 'danger' : 'info'">
+        {{ value(['technical_state', 'technical_trigger_type'], [['recommendation_reason', 'evidence', 'technical', 'technical_state'], ['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type']]) || 'TECHNICAL' }}
+      </StatusPill>
     </div>
 
     <div class="mt-3 grid gap-2 text-sm md:grid-cols-4">
-      <p class="rounded-xl bg-white/75 px-3 py-2"><b>Total:</b> {{ scoreText(first(['technical_score', 'setup_score'])) }}</p>
-      <p class="rounded-xl bg-white/75 px-3 py-2"><b>Trigger:</b> {{ first(['technical_trigger_type', 'entry_type', 'trigger_type']) || '-' }}</p>
-      <p class="rounded-xl bg-white/75 px-3 py-2"><b>Pivot:</b> {{ priceText(first(['pivot_price', 'trigger_price', 'entry_price'])) }}</p>
-      <p class="rounded-xl bg-white/75 px-3 py-2"><b>Stop:</b> {{ priceText(first(['recommended_stop_price', 'stop_price', 'invalidation_price'])) }}</p>
+      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Total:</b> {{ scoreText(value(['technical_score', 'setup_score'], [['recommendation_reason', 'evidence', 'technical', 'technical_score'], ['recommendation_reason', 'evidence', 'technical', 'setup_score']])) }}</p>
+      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Trigger:</b> {{ value(['technical_trigger_type', 'entry_type', 'trigger_type'], [['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type']]) || '-' }}</p>
+      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Pivot:</b> {{ priceText(value(['pivot_price', 'trigger_price', 'entry_price'], [['recommendation_reason', 'evidence', 'technical', 'pivot_price'], ['recommendation_reason', 'evidence', 'technical', 'trigger_price']])) }}</p>
+      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Stop:</b> {{ priceText(value(['recommended_stop_price', 'stop_price', 'invalidation_price'], [['recommendation_reason', 'evidence', 'risk', 'recommended_stop_price'], ['recommendation_reason', 'evidence', 'risk', 'stop_price'], ['recommendation_reason', 'evidence', 'risk', 'invalidation_price']])) }}</p>
     </div>
 
-    <div v-if="!compact" class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+    <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
       <p class="rounded-xl bg-white/75 px-3 py-2"><b>Invalidation:</b> {{ first(['invalidation_rule', 'active_exit_condition']) || priceText(first(['invalidation_price'])) }}</p>
-      <p class="rounded-xl bg-white/75 px-3 py-2"><b>Target:</b> {{ priceText(first(['target_price', 'recommended_target_price'])) }}</p>
-      <p class="rounded-xl bg-white/75 px-3 py-2"><b>Exit plan:</b> {{ first(['exit_strategy', 'partial_exit_plan', 'exit_condition_status']) || '-' }}</p>
+      <p class="rounded-xl bg-white/75 px-3 py-2"><b>Target:</b> {{ priceText(value(['target_price', 'recommended_target_price'], [['recommendation_reason', 'evidence', 'risk', 'recommended_target_price']])) }}</p>
+      <p class="rounded-xl bg-white/75 px-3 py-2"><b>Algorithm:</b> {{ value(['technical_algorithm', 'setup_id', 'setup_name'], [['recommendation_reason', 'setup_id']]) || '-' }}</p>
     </div>
 
-    <details v-if="!compact" class="mt-3">
-      <summary class="cursor-pointer text-sm font-black text-moss">Show technical score buckets</summary>
+    <details class="mt-3" :open="!compact">
+      <summary class="cursor-pointer text-sm font-black text-moss">Show score buckets and exit context</summary>
       <div class="mt-3 grid gap-2 text-sm md:grid-cols-5">
         <p v-for="[label, key] in scoreKeys" :key="key" class="rounded-xl bg-white/75 px-3 py-2">
-          <b>{{ label }}:</b> {{ scoreText(record[key]) }}
+          <b>{{ label }}:</b> {{ scoreText(scoreValue(key)) }}
         </p>
+      </div>
+      <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+        <p class="rounded-xl bg-white/75 px-3 py-2"><b>Invalidation:</b> {{ value(['invalidation_rule', 'active_exit_condition'], [['recommendation_reason', 'evidence', 'lifecycle', 'next_action_reason']]) || priceText(value(['invalidation_price'], [['recommendation_reason', 'evidence', 'risk', 'invalidation_price']])) }}</p>
+        <p class="rounded-xl bg-white/75 px-3 py-2"><b>Exit plan:</b> {{ first(['exit_strategy', 'partial_exit_plan', 'exit_condition_status']) || '-' }}</p>
+        <p class="rounded-xl bg-white/75 px-3 py-2"><b>Setup score:</b> {{ scoreText(value(['setup_score'], [['recommendation_reason', 'evidence', 'technical', 'setup_score']])) }}</p>
       </div>
     </details>
   </section>

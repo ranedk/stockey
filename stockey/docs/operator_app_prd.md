@@ -115,6 +115,33 @@ For a symbol/date/action, display:
 - lifecycle and exit policy
 - execution eligibility
 
+Resolved action conflicts are shown here for audit/debug. They should not appear in Manual Review unless the conflict still requires operator action.
+
+Event-policy rows refined to `NO_ACTION` are also audit/debug records, not Manual Review work. If action consolidation created a generic manual-review row for the same event, the Manual Review API should suppress that shadow row and keep only the detailed actionable event-policy item when one exists.
+
+Manual Review copy must be written for an operator, not for a developer. The visible card title, reason, summary, questions, and wait signals should use plain English. Internal labels and enums belong in the source-row drawer or trace details, not in the primary decision text.
+
+The Manual Review page defaults to the `Investment review` lane. Operational failures such as OCR/parser/API/Codex errors remain available under `Technical issues`, but they should not be mixed into the primary investment-decision queue.
+
+Manual Review decisions have bounded effects:
+
+- `downgrade_to_no_action`, `ignore`, `approve_for_manual_config`, and `mark_fixed` are closing decisions. They remove the item from the active Manual Review queue through `advisory_manual_review_decisions`; they do not mutate portfolio, action recommendations, or broker orders.
+- `watch_for_event` is non-closing. It records the operator note and creates an active `advisory_wait_signals` row from the `Event to wait for` text. Watchers/signal refresh can later match that wait signal against fresh news, announcements, and announcement documents.
+- `needs_more_data` and `add_operator_note` annotate the item only.
+
+### Conflict Rules
+
+Shows deterministic action-conflict rules and recent conflict outcomes.
+
+Use this page to inspect:
+
+- enabled conflict-resolution rules
+- priority and resolution action for each rule
+- recent conflicts matched by each rule
+- unresolved/manual-required conflict combinations that need a new deterministic rule or explicit operator decision
+
+Resolved conflicts are audit records, not manual-review tasks. Manual Review should only contain conflicts where `requires_manual_resolution = true` or `resolution_status` is `unresolved` / `manual_required`.
+
 ### Investor Playbooks
 
 Allows the operator to manage investor playbooks as reliability-tracked overlays and convert matched evidence into bounded action plans.

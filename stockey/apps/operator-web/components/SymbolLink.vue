@@ -12,10 +12,10 @@ const href = computed(() => `/symbols/${encodeURIComponent(normalizedSymbol.valu
   <NuxtLink
     v-if="normalizedSymbol"
     :to="href"
-    class="inline-flex items-center rounded-full font-black transition hover:translate-y-[-1px]"
-    :class="subtle ? 'bg-ink/10 px-2.5 py-1 text-xs text-ink/70 hover:bg-ink hover:text-paper' : 'bg-ink px-3 py-1.5 text-sm text-paper hover:bg-moss'"
+    class="inline-flex items-center gap-1 border-b-2 border-moss/35 font-black text-moss transition hover:border-moss hover:text-ink"
+    :class="subtle ? 'text-xs' : 'text-sm'"
   >
-    {{ normalizedSymbol }}
+    {{ normalizedSymbol }} <span aria-hidden="true">-&gt;</span>
   </NuxtLink>
   <span v-else>-</span>
 </template>

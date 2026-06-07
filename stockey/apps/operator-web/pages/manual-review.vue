@@ -4,6 +4,7 @@ import type { Dict } from '~/types/api'
 const api = useOperatorApi()
 const { data, refresh, pending, error: loadError } = await useAsyncData('manual-review', () => api.getManualReview(150))
 
+const selectedLane = ref('investment_review')
 const selectedType = ref('all')
 const selectedSeverity = ref('all')
 const decisionByItem = ref<Record<string, string>>({})
@@ -25,7 +26,7 @@ const decisionOptions = [
     key: 'watch_for_event',
     label: 'Watch for event',
     closes: false,
-    effect: 'Keeps this item active and records the future evidence to wait for. It does not add the stock to portfolio by itself.',
+    effect: 'Keeps this item active, records the future evidence to wait for, and creates an active wait signal for watchers/signal refresh. It does not add the stock to portfolio by itself.',
     useFor: 'You know the exact trigger needed: management clarification, price reaction, support break, result update, or follow-up announcement.'
   },
   {
@@ -53,7 +54,7 @@ const decisionOptions = [
     key: 'downgrade_to_no_action',
     label: 'Downgrade to no action',
     closes: true,
-    effect: 'Closes this item and records that your decision is explicitly no action. It does not sell/buy anything.',
+    effect: 'Closes this item and records that your decision is explicitly no action. It removes the item from the active Manual Review queue but does not sell/buy anything.',
     useFor: 'Investment review where the evidence is weak, already priced in, contradictory, or not actionable.'
   },
   {
@@ -72,6 +73,13 @@ const bySeverity = computed(() => asDict(summary.value.by_severity))
 const skippedSources = computed(() => asList(summary.value.skipped_sources))
 const technicalItems = computed(() => items.value.filter((item) => Boolean(item.is_technical_issue) || String(item.review_lane || '') === 'technical_issue'))
 const investmentItems = computed(() => items.value.filter((item) => String(item.review_lane || '') === 'investment_review'))
+const researchItems = computed(() => items.value.filter((item) => String(item.review_lane || '') === 'research_config'))
+const laneFilters = computed(() => [
+  { key: 'investment_review', label: 'Investment review', count: investmentItems.value.length },
+  { key: 'technical_issue', label: 'Technical issues', count: technicalItems.value.length },
+  { key: 'research_config', label: 'Research/config', count: researchItems.value.length },
+  { key: 'all', label: 'All lanes', count: items.value.length }
+])
 const typeFilters = computed(() => [
   { key: 'all', label: 'All', count: items.value.length },
   ...Object.entries(byType.value).map(([key, count]) => ({ key, label: typeLabel(key), count: Number(count || 0) }))
@@ -81,9 +89,10 @@ const severityFilters = computed(() => [
   ...Object.entries(bySeverity.value).map(([key, count]) => ({ key, label: String(key).toUpperCase(), count: Number(count || 0) }))
 ])
 const filteredItems = computed(() => items.value.filter((item) => {
+  const laneOk = selectedLane.value === 'all' || String(item.review_lane || '') === selectedLane.value
   const typeOk = selectedType.value === 'all' || String(item.item_type || '') === selectedType.value
   const severityOk = selectedSeverity.value === 'all' || String(item.severity || '') === selectedSeverity.value
-  return typeOk && severityOk
+  return laneOk && typeOk && severityOk
 }))
 
 function asDict(value: unknown): Dict {
@@ -265,6 +274,18 @@ async function submitDecision(item: Dict) {
     <p v-if="saveSuccess" class="mt-4 rounded-2xl bg-moss/10 p-3 text-sm font-bold text-moss">{{ saveSuccess }}</p>
     <div class="mt-5 flex flex-wrap gap-2">
       <button
+        v-for="filter in laneFilters"
+        :key="filter.key"
+        class="rounded-full px-4 py-2 text-sm font-black transition"
+        :class="selectedLane === filter.key ? 'bg-moss text-paper' : 'bg-white/80 text-ink/60 hover:bg-white'"
+        type="button"
+        @click="selectedLane = filter.key"
+      >
+        {{ filter.label }} · {{ filter.count }}
+      </button>
+    </div>
+    <div class="mt-5 flex flex-wrap gap-2">
+      <button
         v-for="filter in typeFilters"
         :key="filter.key"
         class="rounded-full px-4 py-2 text-sm font-black transition"
@@ -360,6 +381,9 @@ async function submitDecision(item: Dict) {
               <select :value="selectedDecision(item)" class="rounded-2xl border border-black/10 bg-white px-4 py-3 text-ink outline-none focus:border-moss" @change="decisionByItem[itemId(item)] = String(($event.target as HTMLSelectElement).value)">
                 <option v-for="option in decisionOptions" :key="option.key" :value="option.key">{{ option.label }}</option>
               </select>
+              <span class="rounded-2xl border border-black/10 bg-paper/80 p-3 text-xs font-semibold normal-case leading-5 tracking-normal text-ink/65">
+                <b class="text-ink">What happens:</b> {{ selectedDecisionMeta(item).effect }}
+              </span>
             </label>
             <label class="grid gap-2 text-sm font-bold text-ink/70">
               Rationale

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from typing import Any
 
 import pandas as pd
@@ -23,6 +24,7 @@ from utils.sync import parse_datetime_arg
 
 env = Env()
 env.read_env()
+logger = logging.getLogger(__name__)
 
 TABLE_NAME = "advisory_action_recommendations"
 CANDIDATES_TABLE = "advisory_candidates"
@@ -40,6 +42,12 @@ ACTION_PRIORITY = {
     "BUY": 50,
     "HOLD": 20,
     "WATCH": 10,
+}
+DEFAULT_CONFLICT_RULE_IDS = {
+    "EXIT_BEATS_ENTRY_OR_WATCH",
+    "MARKET_GATE_MANUAL_BEATS_POSITIVE",
+    "SAME_ACTION_DUPLICATE_COLLAPSE",
+    "WATCH_LOSES_TO_HIGHER_PRIORITY",
 }
 
 PLAYBOOK_LOOKBACK_DAYS = 14
@@ -973,13 +981,22 @@ def apply_market_context_adjustments(df: pd.DataFrame, *, asof_date: pd.Timestam
 
 
 def load_enabled_conflict_rule_ids() -> set[str]:
-    if not table_exists(ACTION_CONFLICT_RULES_TABLE):
-        return {
-            "EXIT_BEATS_ENTRY_OR_WATCH",
-            "MARKET_GATE_MANUAL_BEATS_POSITIVE",
-            "SAME_ACTION_DUPLICATE_COLLAPSE",
-            "WATCH_LOSES_TO_HIGHER_PRIORITY",
-        }
+    try:
+        exists = table_exists(ACTION_CONFLICT_RULES_TABLE)
+    except Exception as exc:
+        logger.warning(
+            "conflict rule table lookup failed; using default deterministic rules table=%s error=%s: %s",
+            ACTION_CONFLICT_RULES_TABLE,
+            type(exc).__name__,
+            exc,
+        )
+        return set(DEFAULT_CONFLICT_RULE_IDS)
+    if not exists:
+        logger.warning(
+            "conflict rule table missing; using default deterministic rules table=%s",
+            ACTION_CONFLICT_RULES_TABLE,
+        )
+        return set(DEFAULT_CONFLICT_RULE_IDS)
     try:
         df = sql_to_df(
             f"""
@@ -989,13 +1006,14 @@ def load_enabled_conflict_rule_ids() -> set[str]:
             """,
             retries=2,
         )
-    except Exception:
-        return {
-            "EXIT_BEATS_ENTRY_OR_WATCH",
-            "MARKET_GATE_MANUAL_BEATS_POSITIVE",
-            "SAME_ACTION_DUPLICATE_COLLAPSE",
-            "WATCH_LOSES_TO_HIGHER_PRIORITY",
-        }
+    except Exception as exc:
+        logger.warning(
+            "conflict rule load failed; using default deterministic rules table=%s error=%s: %s",
+            ACTION_CONFLICT_RULES_TABLE,
+            type(exc).__name__,
+            exc,
+        )
+        return set(DEFAULT_CONFLICT_RULE_IDS)
     return {str(value) for value in df["rule_id"].dropna().tolist()} if not df.empty else set()
 
 

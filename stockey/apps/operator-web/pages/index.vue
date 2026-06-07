@@ -130,15 +130,6 @@ function actionLabel(row: Record<string, unknown>) {
   ).toUpperCase()
 }
 
-function actionTone(row: Record<string, unknown>) {
-  const label = actionLabel(row).toLowerCase()
-  if (label.includes('sell') || label.includes('exit') || label.includes('reduce')) return 'bg-rust text-paper'
-  if (label.includes('buy') || label.includes('add')) return 'bg-moss text-paper'
-  if (label.includes('manual') || label.includes('review')) return 'bg-sun text-ink'
-  if (label.includes('watch') || label.includes('alert')) return 'bg-ink text-paper'
-  return 'bg-white text-ink/70'
-}
-
 function actionLane(row: Record<string, unknown>) {
   const label = actionLabel(row).toLowerCase()
   const detail = String([
@@ -170,17 +161,6 @@ function actionLane(row: Record<string, unknown>) {
     return 'Watch / hold'
   }
   return 'Other'
-}
-
-function actionLaneTone(row: Record<string, unknown>) {
-  const lane = actionLane(row).toLowerCase()
-  if (lane.includes('executable exit')) return 'bg-rust/10 text-rust'
-  if (lane.includes('executable entry')) return 'bg-moss/10 text-moss'
-  if (lane.includes('market regime')) return 'bg-sun/25 text-ink'
-  if (lane.includes('data')) return 'bg-ember/10 text-ember'
-  if (lane.includes('event')) return 'bg-white text-ink/65'
-  if (lane.includes('alert')) return 'bg-ink text-paper'
-  return 'bg-white text-ink/60'
 }
 
 const actionLaneCounts = computed(() => {
@@ -308,6 +288,101 @@ function actionPriceFacts(row: Record<string, unknown>) {
     facts.splice(1, 0, { label: 'Zone', value: `${priceText(zoneLow)} - ${priceText(zoneHigh)}`, tone: 'bg-sun/20 text-ink' })
   }
   return facts
+}
+
+function technicalEvidence(row: Record<string, unknown>) {
+  const technical = asDict(nestedValue(row, ['recommendation_reason', 'evidence', 'technical']))
+  const risk = asDict(nestedValue(row, ['recommendation_reason', 'evidence', 'risk']))
+  const screener = asDict(nestedValue(row, ['recommendation_reason', 'evidence', 'screener']))
+  return {
+    state: firstActionValue(row, ['technical_state'], [['recommendation_reason', 'evidence', 'technical', 'technical_state']]),
+    trigger: firstActionValue(row, ['technical_trigger_type', 'entry_type', 'trigger_type'], [['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type']]),
+    score: firstActionValue(row, ['technical_score', 'setup_score'], [['recommendation_reason', 'evidence', 'technical', 'technical_score'], ['recommendation_reason', 'evidence', 'technical', 'setup_score']]),
+    pivot: firstActionValue(row, ['pivot_price', 'trigger_price'], [['recommendation_reason', 'evidence', 'technical', 'pivot_price'], ['recommendation_reason', 'evidence', 'technical', 'trigger_price']]),
+    stop: firstActionValue(row, ['recommended_stop_price', 'stop_price', 'invalidation_price'], [['recommendation_reason', 'evidence', 'risk', 'recommended_stop_price'], ['recommendation_reason', 'evidence', 'risk', 'stop_price'], ['recommendation_reason', 'evidence', 'risk', 'invalidation_price']]),
+    target: firstActionValue(row, ['recommended_target_price', 'target_price'], [['recommendation_reason', 'evidence', 'risk', 'recommended_target_price']]),
+    setup: firstActionValue(row, ['setup_name', 'setup_id'], [['recommendation_reason', 'setup_id']]),
+    screener: firstActionValue(row, ['source_screener_slug', 'screener_slug'], [['recommendation_reason', 'evidence', 'screener', 'source_screener_slug']]),
+    note: firstActionValue(row, ['technical_trigger_note', 'entry_note', 'watch_reason_detail', 'action_detail', 'reason_detail']),
+    hasData: Object.keys(technical).length > 0 || Object.keys(risk).length > 0 || Object.keys(screener).length > 0 || Boolean(row.technical_state || row.technical_score || row.setup_score)
+  }
+}
+
+function actionSourceLabel(row: Record<string, unknown>) {
+  return firstActionValue(row, ['action_source', 'source'], [['recommendation_reason', 'action_source']])
+}
+
+function actionSourceAction(row: Record<string, unknown>) {
+  return firstActionValue(row, ['source_action'], [['recommendation_reason', 'source_action']])
+}
+
+function actionPillTitle(row: Record<string, unknown>) {
+  const action = actionLabel(row)
+  const execution = firstActionValue(row, ['execution_mode'], [['recommendation_reason', 'execution_mode']]) || 'unknown'
+  const transaction = firstActionValue(row, ['transaction_type'], [['recommendation_reason', 'transaction_type']]) || 'none'
+  return `Final consolidated action: ${action}. Execution mode: ${execution}. Transaction type: ${transaction}. This is the action queue decision after portfolio, lifecycle, watchlist, event, and conflict rules are consolidated.`
+}
+
+function lanePillTitle(row: Record<string, unknown>) {
+  return `Queue lane: ${actionLane(row)}. This explains why the row is grouped here; it is not the same as broker approval or portfolio membership.`
+}
+
+function sourceTitle(row: Record<string, unknown>) {
+  const source = actionSourceLabel(row) || 'unknown'
+  if (source === 'portfolio') return 'Source: portfolio engine. The row originated from an approved/deferred portfolio candidate, but later gates may still downgrade it to manual review.'
+  if (source === 'rebalance') return 'Source: rebalance/lifecycle engine. Usually an exit, trim, stop, or manual-review action for an existing or previously approved idea; it is not a new portfolio approval.'
+  if (source === 'watchlist') return 'Source: watchlist. This is monitoring only; it is not an approved trade.'
+  if (source === 'event_policy') return 'Source: event policy. This is an event-risk or event-opportunity overlay, usually requiring manual review.'
+  if (String(source).startsWith('playbook')) return 'Source: hypothesis/playbook. This is an LLM/playbook overlay, not direct broker execution.'
+  return `Source: ${source}. This identifies the subsystem that produced the winning action candidate.`
+}
+
+function sourceActionTitle(row: Record<string, unknown>) {
+  const source = actionSourceLabel(row) || 'unknown'
+  const sourceAction = actionSourceAction(row) || 'unknown'
+  if (sourceAction === 'approved' && source !== 'portfolio') {
+    return `Source action: ${sourceAction}. This label came from the source subsystem, but because source is ${source}, do not read it as portfolio-engine approval.`
+  }
+  if (sourceAction === 'approved') {
+    return 'Source action: approved by the portfolio engine before action consolidation. Market/regime gates or conflict rules may still turn the final action into manual review.'
+  }
+  return `Source action: ${sourceAction}. This is the original action emitted by ${source} before final consolidation.`
+}
+
+function setupTitle(row: Record<string, unknown>) {
+  const setup = row.setup_id || nestedValue(row, ['recommendation_reason', 'setup_id']) || 'unknown'
+  return `Setup/strategy id: ${setup}. Multiple setups can nominate the same symbol; the action queue keeps one final action per symbol after conflict resolution.`
+}
+
+function reasonContractTitle(row: Record<string, unknown>) {
+  const status = row.reason_contract_status || nestedValue(row, ['recommendation_reason', 'status']) || 'unknown'
+  return `Reason contract status: ${status}. Complete means the explanation has required fields; it does not mean the trade is approved.`
+}
+
+function scoreBadge(value: unknown) {
+  const num = Number(value)
+  if (!Number.isFinite(num)) return '-'
+  return num <= 1 ? `${numberText(num * 100)} / 100` : `${numberText(num)} / 100`
+}
+
+function actionPillTone(row: Record<string, unknown>): 'success' | 'warning' | 'danger' | 'info' | 'dark' | 'neutral' {
+  const label = actionLabel(row).toLowerCase()
+  if (label.includes('sell') || label.includes('exit') || label.includes('reduce')) return 'danger'
+  if (label.includes('buy') || label.includes('add')) return 'success'
+  if (label.includes('manual') || label.includes('review')) return 'warning'
+  if (label.includes('watch') || label.includes('alert')) return 'info'
+  if (label.includes('hold')) return 'dark'
+  return 'neutral'
+}
+
+function lanePillTone(row: Record<string, unknown>): 'success' | 'warning' | 'danger' | 'info' | 'dark' | 'neutral' {
+  const lane = actionLane(row).toLowerCase()
+  if (lane.includes('exit')) return 'danger'
+  if (lane.includes('entry')) return 'success'
+  if (lane.includes('market') || lane.includes('manual')) return 'warning'
+  if (lane.includes('alert') || lane.includes('watch')) return 'info'
+  if (lane.includes('data')) return 'danger'
+  return 'neutral'
 }
 
 function portfolioDetailPath(row: Record<string, unknown>) {
@@ -491,13 +566,14 @@ function signalTone(row: Record<string, unknown>) {
       </div>
       <div class="space-y-3">
         <div v-if="actionLaneCounts.length" class="flex flex-wrap gap-2">
-          <span
+          <MetaChip
             v-for="[lane, count] in actionLaneCounts"
             :key="lane"
-            class="rounded-full bg-white/80 px-3 py-1 text-xs font-black text-ink/60"
+            label="lane"
+            tone="blue"
           >
             {{ lane }} · {{ count }}
-          </span>
+          </MetaChip>
         </div>
         <RecordCard
           v-for="(row, idx) in topActions"
@@ -510,10 +586,16 @@ function signalTone(row: Record<string, unknown>) {
         >
           <template #badge>
             <div class="flex flex-wrap gap-2">
-              <span class="rounded-full px-3 py-1 text-xs font-bold" :class="actionTone(row)">{{ actionLabel(row) }}</span>
-              <span class="rounded-full px-3 py-1 text-xs font-bold" :class="actionLaneTone(row)">{{ actionLane(row) }}</span>
+              <StatusPill :tone="actionPillTone(row)" :title="actionPillTitle(row)">{{ actionLabel(row) }}</StatusPill>
+              <StatusPill :tone="lanePillTone(row)" :title="lanePillTitle(row)">{{ actionLane(row) }}</StatusPill>
             </div>
           </template>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <MetaChip v-if="actionSourceLabel(row)" label="source" tone="blue" :title="sourceTitle(row)">{{ actionSourceLabel(row) }}</MetaChip>
+            <MetaChip v-if="actionSourceAction(row)" label="source action" tone="yellow" :title="sourceActionTitle(row)">{{ actionSourceAction(row) }}</MetaChip>
+            <MetaChip v-if="row.setup_id" label="setup" :title="setupTitle(row)">{{ row.setup_id }}</MetaChip>
+            <MetaChip v-if="row.reason_contract_status" label="reason" :title="reasonContractTitle(row)" :tone="String(row.reason_contract_status).includes('complete') ? 'green' : 'yellow'">{{ row.reason_contract_status }}</MetaChip>
+          </div>
           <div class="mt-4 grid gap-2 text-xs font-black sm:grid-cols-2 xl:grid-cols-3">
             <p
               v-for="fact in actionPriceFacts(row)"
@@ -529,6 +611,28 @@ function signalTone(row: Record<string, unknown>) {
               <span class="mt-1 block text-sm">{{ pct(row.pnl_pct) }}</span>
             </p>
           </div>
+          <section
+            v-if="technicalEvidence(row).hasData"
+            class="mt-4 rounded-2xl border border-sky/20 bg-sky/10 p-4"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-black uppercase tracking-[0.22em] text-sky">Why technical</p>
+                <p class="mt-1 text-sm leading-6 text-ink/65">
+                  {{ technicalEvidence(row).note || 'Technical evidence contributed to this action queue item.' }}
+                </p>
+              </div>
+              <StatusPill tone="info">{{ technicalEvidence(row).state || technicalEvidence(row).trigger || 'TECHNICAL' }}</StatusPill>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Trigger:</b> {{ technicalEvidence(row).trigger || '-' }}</p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Score:</b> {{ scoreBadge(technicalEvidence(row).score) }}</p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Setup:</b> {{ technicalEvidence(row).setup || '-' }}</p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Screener:</b> {{ technicalEvidence(row).screener || '-' }}</p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Pivot:</b> {{ priceText(technicalEvidence(row).pivot) }}</p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Stop:</b> {{ priceText(technicalEvidence(row).stop) }}</p>
+            </div>
+          </section>
           <ReasonContractPanel
             v-if="row.recommendation_reason || row.reason_contract_status"
             class="mt-4"
@@ -544,12 +648,14 @@ function signalTone(row: Record<string, unknown>) {
           >
             {{ loadingSymbolTrace[String(row.symbol || '').toUpperCase()] ? 'Loading trace...' : 'Load symbol trace' }}
           </button>
-          <NuxtLink
-            class="ml-2 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink"
+          <LinkButton
+            v-if="row.symbol"
+            class="ml-2"
+            variant="secondary"
             :to="`/symbols/${encodeURIComponent(String(row.symbol || '').toUpperCase())}`"
           >
             Open symbol page
-          </NuxtLink>
+          </LinkButton>
           <TraceTimeline
             v-if="symbolTraces[String(row.symbol || '').toUpperCase()]"
             class="mt-4"
@@ -637,12 +743,14 @@ function signalTone(row: Record<string, unknown>) {
           >
             {{ loadingSymbolTrace[String(row.symbol || '').toUpperCase()] ? 'Loading trace...' : 'Load symbol trace' }}
           </button>
-          <NuxtLink
-            class="ml-2 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink"
+          <LinkButton
+            v-if="row.symbol"
+            class="ml-2"
+            variant="secondary"
             :to="`/symbols/${encodeURIComponent(String(row.symbol || '').toUpperCase())}`"
           >
             Open symbol page
-          </NuxtLink>
+          </LinkButton>
           <TraceTimeline
             v-if="symbolTraces[String(row.symbol || '').toUpperCase()]"
             class="mt-4"
@@ -667,12 +775,12 @@ function signalTone(row: Record<string, unknown>) {
           Latest realized-outcome checks for the swing technical engine. Review sample size, hit rate after costs, and average return before changing setup thresholds.
         </p>
       </div>
-      <NuxtLink class="rounded-full bg-ink px-4 py-2 text-sm font-bold text-paper" to="/technical-calibration">
+      <LinkButton to="/technical-calibration">
         Open calibration
-      </NuxtLink>
-      <NuxtLink class="rounded-full bg-white px-4 py-2 text-sm font-bold text-ink" to="/events">
+      </LinkButton>
+      <LinkButton variant="ghost" to="/events">
         Open event policy
-      </NuxtLink>
+      </LinkButton>
     </div>
     <div class="mt-5 grid gap-3 md:grid-cols-3">
       <article v-for="row in calibrationSummary.slice(0, 3)" :key="String(row.horizon_days)" class="rounded-2xl bg-white/70 p-4">

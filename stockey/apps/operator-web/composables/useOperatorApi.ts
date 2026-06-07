@@ -37,6 +37,7 @@ export function useOperatorApi() {
     decideManualReview: (body: Record<string, unknown>) => post<ManualReviewDecisionResult>('/api/manual-review/decision', body),
     getActions: (params: Record<string, unknown> = {}) => get<OperatorActions>(`/api/actions${query(params)}`),
     getActionDetail: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/actions/detail${query(params)}`),
+    getActionConflictRules: () => get<Record<string, unknown>>('/api/action-conflict-rules'),
     getSignalRefresh: (params: Record<string, unknown> = {}) => get<SignalRefreshPayload>(`/api/signal-refresh${query(params)}`),
     getPortfolio: (params: Record<string, unknown> = {}) => get<OperatorPortfolio>(`/api/portfolio${query(params)}`),
     getPortfolioDetail: (symbol: string, params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/portfolio/${encodeURIComponent(symbol)}/detail${query(params)}`),

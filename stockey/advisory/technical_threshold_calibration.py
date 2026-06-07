@@ -80,8 +80,43 @@ def ensure_tables() -> None:
                 sample_start TIMESTAMPTZ,
                 sample_end TIMESTAMPTZ,
                 load_ts TIMESTAMPTZ,
-                UNIQUE (config_id, horizon_days)
+                UNIQUE (evaluated_at, config_id, horizon_days)
             )
+            """
+        )
+        cur.execute(
+            f"""
+            DO $$
+            DECLARE
+                rec RECORD;
+            BEGIN
+                FOR rec IN
+                    SELECT
+                        con.conname AS constraint_name,
+                        idx.relname AS index_name
+                    FROM pg_index i
+                    JOIN pg_class tbl ON tbl.oid = i.indrelid
+                    JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+                    JOIN pg_class idx ON idx.oid = i.indexrelid
+                    LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
+                    WHERE ns.nspname = 'public'
+                      AND tbl.relname = '{EVALUATIONS_TABLE}'
+                      AND i.indisunique
+                      AND (
+                          SELECT array_agg(att.attname::text ORDER BY keys.ord)
+                          FROM unnest(i.indkey) WITH ORDINALITY AS keys(attnum, ord)
+                          JOIN pg_attribute att
+                            ON att.attrelid = tbl.oid
+                           AND att.attnum = keys.attnum
+                      ) = ARRAY['config_id', 'horizon_days']::text[]
+                LOOP
+                    IF rec.constraint_name IS NOT NULL THEN
+                        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', '{EVALUATIONS_TABLE}', rec.constraint_name);
+                    ELSE
+                        EXECUTE format('DROP INDEX IF EXISTS %I', rec.index_name);
+                    END IF;
+                END LOOP;
+            END $$;
             """
         )
         cur.execute(
@@ -452,7 +487,7 @@ def calibrate_thresholds(
 def persist_outputs(evaluations: pd.DataFrame, summary: pd.DataFrame) -> None:
     ensure_tables()
     if not evaluations.empty:
-        upsert_to_db(evaluations, EVALUATIONS_TABLE, unique_keys=["config_id", "horizon_days"], timescaledb_column="evaluated_at")
+        upsert_to_db(evaluations, EVALUATIONS_TABLE, unique_keys=["evaluated_at", "config_id", "horizon_days"], timescaledb_column="evaluated_at")
     if not summary.empty:
         upsert_to_db(summary, SUMMARY_TABLE, unique_keys=["evaluated_at", "horizon_days"], timescaledb_column="evaluated_at")
 

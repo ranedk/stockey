@@ -14,6 +14,7 @@ export default {
         paper: '#f6f1e7',
         moss: '#0f4c5c',
         ember: '#b45309',
+        rust: '#9a3412',
         sun: '#d6a84f',
         sky: '#316f92',
         danger: '#a12a2a'

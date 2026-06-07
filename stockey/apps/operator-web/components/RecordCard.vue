@@ -36,7 +36,7 @@ const rawPayload = computed(() => detailPayload.value || props.record)
 </script>
 
 <template>
-  <article class="glass-panel rounded-3xl p-5">
+  <article class="rounded-3xl border border-black/10 bg-gradient-to-br from-white/85 via-white/70 to-sky/10 p-5 shadow-soft backdrop-blur">
     <div class="flex items-start justify-between gap-4">
       <div>
         <h3 class="text-base font-black text-ink">{{ title }}</h3>
@@ -48,8 +48,8 @@ const rawPayload = computed(() => detailPayload.value || props.record)
       </div>
     </div>
     <slot />
-    <details class="mt-4" @toggle="loadDetail">
-      <summary class="cursor-pointer text-sm font-semibold text-moss">
+    <details class="mt-4 rounded-2xl border border-black/10 bg-white/55 px-4 py-3" @toggle="loadDetail">
+      <summary class="cursor-pointer text-sm font-black text-moss">
         {{ detailPath ? 'Load raw details' : 'Show raw details' }}
       </summary>
       <p v-if="detailLoading" class="mt-3 rounded-2xl bg-white/70 p-3 text-sm font-bold text-ink/60">Loading detail payload...</p>

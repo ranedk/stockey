@@ -6,6 +6,7 @@
         <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/">Overview</NuxtLink>
         <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/events">Event Inbox</NuxtLink>
         <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/manual-review">Manual Review</NuxtLink>
+        <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/action-conflict-rules">Conflict Rules</NuxtLink>
         <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/decision-trace">Decision Trace</NuxtLink>
         <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/hypotheses">Playbooks</NuxtLink>
         <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/health">Data Health</NuxtLink>

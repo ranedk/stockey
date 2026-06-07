@@ -443,6 +443,12 @@ This layer maps structured event classes into bounded operator actions: `BUY_WAT
 
 Manual-review rows are refined further. Low-information rows are downgraded to `NO_ACTION` deterministically. Remaining `MANUAL_REVIEW` rows can be passed through Codex/LLM, capped by `EVENT_POLICY_LLM_MANUAL_REVIEW_MAX_ROWS`, to produce `operator_notes_json` with possible action, future events to wait for, and questions for the operator. The LLM may also downgrade the row to `NO_ACTION` when review is unlikely to produce a useful decision.
 
+The Manual Review UI should not show event-policy rows whose refinement says `final_action_type = NO_ACTION`. It should also suppress generic `advisory_action_recommendations` shadow rows when a detailed event-policy review row exists for the same `unique_id`. This keeps the queue focused on actionable operator decisions rather than duplicate or already-downgraded informational events such as routine analyst meets.
+
+Operator-facing text must be human-readable. Internal enums such as `REGULATORY_NOTICE`, `REDUCE_EXPOSURE_REVIEW`, `MANUAL_REVIEW`, or `event_policy` may remain in raw source rows and trace payloads, but the Manual Review cards should lead with plain English: what happened, why it matters, what to check, and what action boundary applies.
+
+Manual Review operator decisions are intentionally bounded. Closing decisions such as `downgrade_to_no_action` remove the item from the active Manual Review queue but do not change portfolio/action tables or submit trades. `watch_for_event` keeps the item annotated and creates an active row in `advisory_wait_signals`; the watcher/signal-refresh path can later match that row against fresh news, announcements, and announcement documents.
+
 The operator frontend `/events` page exposes this layer directly. Use it to review action counts by class, inspect policy checks, read LLM/operator notes, and open the decision trace for the underlying event.
 
 - a deterministic adversarial reviewer in `advisory_event_reviews` with:
@@ -792,6 +798,8 @@ python -m advisory.action_conflict_resolver --symbol BSE --unresolved-only --for
 ```
 
 This updates `advisory_action_conflicts` resolution fields and buckets unresolved combinations for manual resolution. It does not yet change action ranking; live winners still come from `advisory.action_recommender`.
+
+Resolved action conflicts are intentionally not sent to Manual Review. Manual Review is an action-required queue and should only include conflicts where `requires_manual_resolution = true` or `resolution_status` is `unresolved` / `manual_required`. Resolved conflicts remain available for audit/debug through Decision Trace, symbol detail pages, and the operator Conflict Rules page.
 
 Ask Codex/LLM for a manual promotion review after choosing a candidate config:
 

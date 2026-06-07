@@ -48,6 +48,37 @@ NEGATIVE_CLASSES = {
 }
 REVIEW_CLASSES = {"DILUTION", "RESULTS_MIXED", "CAPEX_EXPANSION"}
 LOW_ACTION_CLASSES = {"DIVIDEND", "ANALYST_MEET", "CORPORATE_ACTION_NEUTRAL", "OTHER"}
+
+EVENT_CLASS_LABELS = {
+    "REGULATORY_NOTICE": "regulatory or tax notice",
+    "POLICY_SECTOR_NEGATIVE": "sector policy risk",
+    "POLICY_SECTOR_POSITIVE": "sector policy support",
+    "ANALYST_MEET": "analyst or investor meeting",
+    "ORDER_WIN": "order win",
+    "RESULTS_POSITIVE": "positive results",
+    "RESULTS_NEGATIVE": "weak results",
+    "RESULTS_MIXED": "mixed results",
+    "GROWTH_ACCELERATION": "growth acceleration",
+    "MARGIN_EXPANSION": "margin expansion",
+    "GUIDANCE_UPGRADE": "guidance upgrade",
+    "GUIDANCE_DOWNGRADE": "guidance downgrade",
+    "PLEDGE_UP": "promoter pledge increase",
+    "PLEDGE_DOWN": "promoter pledge reduction",
+    "PROMOTER_BUYING": "promoter buying",
+    "PROMOTER_SELLING": "promoter selling",
+    "MANAGEMENT_RESIGNATION": "senior management resignation",
+    "AUDITOR_GOVERNANCE": "auditor or governance concern",
+    "DILUTION": "dilution or fund raise",
+    "BUYBACK": "buyback",
+    "DIVIDEND": "dividend",
+    "CORPORATE_ACTION_NEUTRAL": "routine corporate action",
+    "OTHER": "company event",
+}
+
+
+def _event_label(policy_class: str) -> str:
+    key = _text(policy_class).upper()
+    return EVENT_CLASS_LABELS.get(key, key.replace("_", " ").lower() if key else "company event")
 MATERIALITY_ORDER = {"low": 1, "medium": 2, "high": 3}
 RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
@@ -307,9 +338,9 @@ def build_policy_for_event(row: pd.Series) -> dict[str, Any]:
     elif policy_class in NEGATIVE_CLASSES:
         action_type = "REDUCE_EXPOSURE_REVIEW" if mat_score >= 2 or score_impact <= -0.12 else "MANUAL_REVIEW"
         action_status = "risk_overlay"
-        reason = f"{policy_class} can invalidate or weaken the thesis; review exposure, stop, and event freshness."
+        reason = f"This {_event_label(policy_class)} may weaken the thesis. Review materiality, current exposure, stop level, and whether the event is fresh before changing the position."
         policy_score = min(policy_score, -0.2)
-        checks.append({"check_type": "negative_event_class", "blocking": action_type == "REDUCE_EXPOSURE_REVIEW", "rationale": policy_class})
+        checks.append({"check_type": "negative_event_class", "blocking": action_type == "REDUCE_EXPOSURE_REVIEW", "rationale": _event_label(policy_class)})
     elif policy_class == "DILUTION":
         action_type = "MANUAL_REVIEW"
         action_status = "capital_structure_review"
@@ -320,17 +351,17 @@ def build_policy_for_event(row: pd.Series) -> dict[str, Any]:
         if verdict == "continue" and setup_effect == "strengthens" and mat_score >= 2 and confidence >= 0.55 and score_impact >= 0.12 and not _has_high_risk(row):
             action_type = "BUY_WATCH"
             action_status = "positive_watch_overlay"
-            reason = f"{policy_class} is material and strengthens the setup; add as buy-watch evidence, pending technical/risk confirmation."
+            reason = f"This {_event_label(policy_class)} looks material and supportive. Treat it as watchlist evidence until technical and risk checks confirm an entry."
             checks.append({"check_type": "technical_confirmation", "blocking": True, "rationale": "Do not buy solely on the event; require technical trigger and liquidity checks."})
         else:
             action_type = "MANUAL_REVIEW"
             action_status = "positive_but_incomplete"
-            reason = f"{policy_class} is potentially positive but lacks enough clean evidence for a buy-watch overlay."
+            reason = f"This {_event_label(policy_class)} may be positive, but the evidence is not clean enough yet. Check materiality, confidence, risks, and whether the move is already priced in."
             checks.append({"check_type": "evidence_quality", "blocking": True, "rationale": "Check materiality, confidence, risks, and whether the event is already priced in."})
     elif policy_class in REVIEW_CLASSES or verdict == "review_manual":
         action_type = "MANUAL_REVIEW"
         action_status = "manual_review_required"
-        reason = f"{policy_class} needs operator interpretation before it can affect action strength."
+        reason = f"This {_event_label(policy_class)} needs human interpretation before it can affect the recommendation."
         checks.append({"check_type": "manual_interpretation", "blocking": True, "rationale": "Event class is mixed or context-sensitive."})
 
     if action_type == "MANUAL_REVIEW" and policy_class in LOW_ACTION_CLASSES and mat_score <= 1 and confidence < 0.55 and abs(score_impact) < 0.12:

@@ -7618,9 +7618,11 @@ def test_operator_api_builds_manual_review_payload(monkeypatch):
 
 def test_operator_api_records_manual_review_decision(monkeypatch):
     writes: list[pd.DataFrame] = []
+    wait_signal_writes: list[pd.DataFrame] = []
 
     monkeypatch.setattr(operator_api, "ensure_manual_review_decisions_table", lambda: None)
     monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+    monkeypatch.setattr(operator_api, "persist_wait_signals", lambda df: wait_signal_writes.append(df.copy()))
 
     payload = operator_api.record_manual_review_decision_payload(
         {
@@ -7642,12 +7644,19 @@ def test_operator_api_records_manual_review_decision(monkeypatch):
 
     assert payload["status"] == "ok"
     assert payload["closing_decision"] is False
+    assert payload["wait_signal"]["table"] == operator_api.WAIT_SIGNALS_TABLE
     assert writes
     row = writes[0].iloc[0].to_dict()
     assert row["item_id"] == "action_manual_review:table:key"
     assert row["decision"] == "watch_for_event"
     assert row["symbol"] == "ABC"
     assert "Management clarification" in row["note_json"]
+    assert wait_signal_writes
+    signal = wait_signal_writes[0].iloc[0].to_dict()
+    assert signal["symbol"] == "ABC"
+    assert signal["signal_type"] == "event_keywords"
+    assert signal["generated_by"] == "manual_review_decision"
+    assert "Management clarification" in signal["wait_question"]
 
 
 def test_operator_api_filters_closed_manual_review_items(monkeypatch):

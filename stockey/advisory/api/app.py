@@ -36,7 +36,7 @@ from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_
 from advisory.technical_threshold_promotion import generate_promotion_review, load_promotion_reviews, record_manual_decision
 from advisory.trace_summary_store import DEFAULT_LIMIT as TRACE_SUMMARY_DEFAULT_LIMIT
 from advisory.trace_summary_store import load_summary as load_materialized_trace_summary
-from advisory.wait_signals import load_wait_signal_matches, load_wait_signals, match_wait_signals
+from advisory.wait_signals import WAIT_SIGNALS_TABLE, make_signal_id, load_wait_signal_matches, load_wait_signals, match_wait_signals, persist_wait_signals
 from utils.db import db_session, sql_to_df, upsert_to_db
 
 
@@ -59,9 +59,36 @@ OPERATOR_COMMAND_TIMEOUT_SECONDS = env.int("OPERATOR_COMMAND_TIMEOUT_SECONDS", 1
 OPERATOR_COMMAND_OUTPUT_TAIL_CHARS = env.int("OPERATOR_COMMAND_OUTPUT_TAIL_CHARS", 12_000)
 OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
 OPERATOR_API_ERROR_TRACE_CHARS = env.int("OPERATOR_API_ERROR_TRACE_CHARS", 4_000)
+MANUAL_REVIEW_WAIT_SIGNAL_DAYS = env.int("MANUAL_REVIEW_WAIT_SIGNAL_DAYS", 30)
 SLOW_ISSUE_ALLOWED_STATUSES = {"open", "triaged", "fixed", "ignored"}
 
 _PAYLOAD_CACHE: dict[tuple[str, str | None], tuple[float, dict[str, Any]]] = {}
+
+EVENT_CLASS_LABELS = {
+    "REGULATORY_NOTICE": "regulatory or tax notice",
+    "POLICY_SECTOR_NEGATIVE": "sector policy risk",
+    "POLICY_SECTOR_POSITIVE": "sector policy support",
+    "ANALYST_MEET": "analyst or investor meeting",
+    "ORDER_WIN": "order win",
+    "RESULTS_POSITIVE": "positive results",
+    "RESULTS_NEGATIVE": "weak results",
+    "RESULTS_MIXED": "mixed results",
+    "GROWTH_ACCELERATION": "growth acceleration",
+    "MARGIN_EXPANSION": "margin expansion",
+    "GUIDANCE_UPGRADE": "guidance upgrade",
+    "GUIDANCE_DOWNGRADE": "guidance downgrade",
+    "PLEDGE_UP": "promoter pledge increase",
+    "PLEDGE_DOWN": "promoter pledge reduction",
+    "PROMOTER_BUYING": "promoter buying",
+    "PROMOTER_SELLING": "promoter selling",
+    "MANAGEMENT_RESIGNATION": "senior management resignation",
+    "AUDITOR_GOVERNANCE": "auditor or governance concern",
+    "DILUTION": "dilution or fund raise",
+    "BUYBACK": "buyback",
+    "DIVIDEND": "dividend",
+    "CORPORATE_ACTION_NEUTRAL": "routine corporate action",
+    "OTHER": "company event",
+}
 
 
 def _parse_asof_date(value: str | None) -> pd.Timestamp | None:
@@ -2198,12 +2225,7 @@ def _manual_review_context(*, item_type: str, raw: dict[str, Any], reason: Any =
         suggested = "watch_for_event"
         hint = "Investment judgment review. Recording a decision annotates/closes this item only; it does not place trades or add portfolio rows."
 
-    notes = _jsonish(raw.get("operator_notes_json"))
-    if not isinstance(notes, dict):
-        notes = _jsonish(raw.get("llm_review_json"))
-    if not isinstance(notes, dict):
-        raw_context = _jsonish(raw.get("raw_context_json"))
-        notes = raw_context.get("operator_notes") if isinstance(raw_context, dict) and isinstance(raw_context.get("operator_notes"), dict) else {}
+    notes = _manual_review_notes(raw)
 
     questions = notes.get("operator_questions") if isinstance(notes, dict) else None
     wait_for = notes.get("wait_for_events") if isinstance(notes, dict) else None
@@ -2220,6 +2242,24 @@ def _manual_review_context(*, item_type: str, raw: dict[str, Any], reason: Any =
     summary = _text(summary) or _text(raw.get("manual_revision_summary")) or _text(raw.get("action_detail")) or _text(reason)
     possible_action = _text(possible_action)
 
+    action_source = (_text(raw.get("action_source")) or "").lower()
+    if item_type in {"action_manual_review", "event_policy_manual_review"} and action_source == "event_policy":
+        human = _event_policy_review_text(raw, fallback_reason=reason)
+        summary = human["operator_summary"]
+        possible_action = human["possible_action"]
+        if not questions:
+            questions = human["operator_questions"]
+        if not wait_for:
+            wait_for = human["wait_for_events"]
+    elif item_type == "event_policy_manual_review":
+        human = _event_policy_review_text(raw, fallback_reason=reason)
+        summary = human["operator_summary"]
+        possible_action = human["possible_action"]
+        if not questions:
+            questions = human["operator_questions"]
+        if not wait_for:
+            wait_for = human["wait_for_events"]
+
     return {
         "review_lane": lane,
         "is_technical_issue": is_technical,
@@ -2230,6 +2270,156 @@ def _manual_review_context(*, item_type: str, raw: dict[str, Any], reason: Any =
         "suggested_decision": suggested,
         "decision_hint": hint,
     }
+
+
+def _manual_review_notes(raw: dict[str, Any]) -> dict[str, Any]:
+    notes = _jsonish(raw.get("operator_notes_json"))
+    if isinstance(notes, dict):
+        return notes
+    notes = _jsonish(raw.get("llm_review_json"))
+    if isinstance(notes, dict):
+        return notes
+    raw_context = _jsonish(raw.get("raw_context_json"))
+    if isinstance(raw_context, dict) and isinstance(raw_context.get("operator_notes"), dict):
+        return raw_context["operator_notes"]
+    return {}
+
+
+def _manual_review_final_action(raw: dict[str, Any]) -> str:
+    notes = _manual_review_notes(raw)
+    return _text(notes.get("final_action_type")).upper() if notes else ""
+
+
+def _manual_review_detail(raw: dict[str, Any]) -> str:
+    reason_payload = _jsonish(raw.get("recommendation_reason_json"))
+    detail = ""
+    if isinstance(reason_payload, dict):
+        detail = _text(reason_payload.get("reason_detail")) or _text(reason_payload.get("primary_reason"))
+    return detail or _text(raw.get("action_detail")) or _text(raw.get("what_happened")) or _text(raw.get("summary"))
+
+
+def _human_label(value: Any) -> str:
+    text = (_text(value) or "").upper()
+    if not text:
+        return "event"
+    return EVENT_CLASS_LABELS.get(text, text.replace("_", " ").lower())
+
+
+def _action_boundary_for_source_action(value: Any) -> str:
+    action = (_text(value) or "").upper()
+    if action == "REDUCE_EXPOSURE_REVIEW":
+        return "Review risk first. This is not an automatic sell; reduce or exit only if the issue is material, fresh, and price/technical evidence confirms weakness."
+    if action == "BUY_WATCH":
+        return "Treat as watchlist evidence only. Do not buy unless price, volume, liquidity, and risk checks confirm the setup."
+    if action == "MANUAL_REVIEW":
+        return "Use judgment before changing the action. This row is review-only and will not place a trade by itself."
+    return "Review-only evidence. It does not place trades or change portfolio state by itself."
+
+
+def _extract_event_policy_context(raw: dict[str, Any]) -> dict[str, Any]:
+    reason_payload = _jsonish(raw.get("recommendation_reason_json"))
+    raw_context = _jsonish(raw.get("raw_context_json"))
+    policy_raw = raw_context.get("policy_raw_context") if isinstance(raw_context, dict) and isinstance(raw_context.get("policy_raw_context"), dict) else {}
+    evidence = reason_payload.get("evidence") if isinstance(reason_payload, dict) and isinstance(reason_payload.get("evidence"), dict) else {}
+    event_evidence = evidence.get("event") if isinstance(evidence.get("event"), dict) else {}
+    event_class = _text(raw.get("policy_class")) or _text(raw.get("event_class"))
+    if not event_class and isinstance(raw_context, dict):
+        event_class = _text(raw_context.get("policy_class")) or _text(raw_context.get("event_class"))
+    event_class = event_class or _text(policy_raw.get("policy_class")) or _text(event_evidence.get("event_class"))
+    source_action = _text(raw.get("source_action"))
+    if not source_action and isinstance(raw_context, dict):
+        source_action = _text(raw_context.get("final_source_action")) or _text(raw_context.get("action_type"))
+    return {
+        "event_class": event_class,
+        "event_label": _human_label(event_class),
+        "source_action": source_action,
+        "detail": _manual_review_detail(raw),
+        "policy_score": raw_context.get("policy_score") if isinstance(raw_context, dict) else raw.get("policy_score"),
+        "confidence": raw_context.get("confidence") if isinstance(raw_context, dict) else raw.get("confidence"),
+        "materiality": raw_context.get("materiality") if isinstance(raw_context, dict) else raw.get("materiality"),
+        "published_on": raw_context.get("event_published_on") if isinstance(raw_context, dict) else raw.get("published_on"),
+    }
+
+
+def _event_policy_review_text(raw: dict[str, Any], fallback_reason: Any = None) -> dict[str, Any]:
+    context = _extract_event_policy_context(raw)
+    label = context["event_label"]
+    detail = _text(context.get("detail"))
+    fallback = _text(fallback_reason) or "The event may affect the current thesis."
+    summary = f"This is a {label} that needs a risk check before it affects the recommendation."
+    if detail:
+        summary = f"{summary} What happened: {detail}"
+    else:
+        summary = f"{summary} {fallback}"
+    questions = [
+        "Is the amount or issue material relative to revenue, profit, market cap, or current position size?",
+        "Does management say the impact is immaterial, disputed, already provided for, or likely to recur?",
+        "Has the stock reacted with abnormal price/volume weakness after the event?",
+        "If already holding, is the current stop or invalidation level still appropriate?",
+    ]
+    wait_for = [
+        "Company clarification, appeal outcome, or follow-up exchange filing",
+        "Price closing below support/invalidation with volume",
+        "Evidence that the issue is larger, recurring, or affects operations/cash flow",
+    ]
+    possible_action = _action_boundary_for_source_action(context.get("source_action"))
+    return {
+        "reason": summary,
+        "operator_summary": summary,
+        "possible_action": possible_action,
+        "operator_questions": questions,
+        "wait_for_events": wait_for,
+    }
+
+
+def _load_event_policy_no_action_unique_ids(skipped: list[dict[str, str]]) -> set[str]:
+    table = EVENT_POLICY_TABLE
+    if not _table_exists(table):
+        return set()
+    df = _safe_manual_query(
+        f"{table}:no_action_notes",
+        f"""
+        SELECT unique_id, operator_notes_json, llm_review_json, raw_context_json
+        FROM {table}
+        WHERE asof_date = (SELECT MAX(asof_date) FROM {table})
+          AND unique_id IS NOT NULL
+          AND (
+            action_type = 'MANUAL_REVIEW'
+            OR action_status ILIKE '%%review%%'
+            OR action_status ILIKE '%%blocked%%'
+          )
+        """,
+        skipped=skipped,
+    )
+    out: set[str] = set()
+    for row in _records(df):
+        if _manual_review_final_action(row) == "NO_ACTION":
+            uid = _text(row.get("unique_id"))
+            if uid:
+                out.add(uid)
+    return out
+
+
+def _suppress_shadow_manual_review_items(items: list[dict[str, Any]], skipped: list[dict[str, str]]) -> list[dict[str, Any]]:
+    detailed_event_uids = {
+        _text(item.get("unique_id"))
+        for item in items
+        if item.get("item_type") == "event_policy_manual_review" and _text(item.get("unique_id"))
+    }
+    no_action_event_uids = _load_event_policy_no_action_unique_ids(skipped)
+    if not detailed_event_uids and not no_action_event_uids:
+        return items
+    out: list[dict[str, Any]] = []
+    for item in items:
+        uid = _text(item.get("unique_id"))
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        source = (_text(raw.get("action_source")) or "").lower() if isinstance(raw, dict) else ""
+        if item.get("item_type") == "event_policy_manual_review" and uid in no_action_event_uids:
+            continue
+        if item.get("item_type") == "action_manual_review" and source == "event_policy" and uid in (detailed_event_uids | no_action_event_uids):
+            continue
+        out.append(item)
+    return out
 
 
 def _safe_manual_query(source_name: str, query: str, *, params: dict[str, Any] | None = None, skipped: list[dict[str, str]]) -> pd.DataFrame:
@@ -2289,6 +2479,99 @@ def load_latest_manual_review_decisions(*, limit: int = 1000) -> dict[str, dict[
     return decisions
 
 
+def _manual_wait_signal_keywords(text: str) -> list[str]:
+    stopwords = {
+        "and",
+        "the",
+        "for",
+        "with",
+        "from",
+        "that",
+        "this",
+        "then",
+        "than",
+        "company",
+        "stock",
+        "price",
+        "event",
+        "wait",
+        "follow",
+        "follow-up",
+    }
+    parts = [part.strip().lower() for part in str(text or "").replace("\n", ";").split(";") if part.strip()]
+    words = [
+        "".join(char for char in word.lower() if char.isalnum() or char in {"-", "_"}).strip("-_")
+        for word in str(text or "").replace("/", " ").replace(",", " ").replace(";", " ").split()
+    ]
+    keywords = [part for part in parts if len(part) >= 4]
+    keywords.extend(word for word in words if len(word) >= 5 and word not in stopwords)
+    out: list[str] = []
+    seen: set[str] = set()
+    for keyword in keywords:
+        normalized = " ".join(keyword.split())
+        if normalized and normalized not in seen:
+            out.append(normalized)
+            seen.add(normalized)
+    return out[:16]
+
+
+def persist_manual_review_wait_signal(
+    *,
+    item_id: str,
+    item: dict[str, Any],
+    decision: str,
+    rationale: str | None,
+    follow_up_event: str | None,
+    decided_at: pd.Timestamp,
+    operator_id: str | None,
+) -> dict[str, Any] | None:
+    if decision != "watch_for_event":
+        return None
+    wait_text = _text(follow_up_event) or _text(item.get("possible_action")) or _text(item.get("reason"))
+    if not wait_text:
+        return None
+    symbol = (_text(item.get("symbol")) or "").upper() or None
+    valid_from = decided_at
+    valid_until = decided_at + pd.Timedelta(days=max(1, int(MANUAL_REVIEW_WAIT_SIGNAL_DAYS)))
+    condition = {
+        "keywords": _manual_wait_signal_keywords(wait_text),
+        "sources": ["news", "announcements", "announcement_documents"],
+        "manual_review_item_id": item_id,
+        "operator_id": operator_id,
+        "rationale": rationale,
+        "follow_up_event": wait_text,
+    }
+    row = {
+        "created_at": decided_at,
+        "hypothesis_id": "manual_review",
+        "hypothesis_title": "Operator manual-review follow-up",
+        "source_table": MANUAL_REVIEW_DECISIONS_TABLE,
+        "source_key": item_id,
+        "symbol": symbol,
+        "scope": "symbol" if symbol else "market",
+        "signal_type": "event_keywords",
+        "status": "active",
+        "priority": 75,
+        "expected_action": "MANUAL_REVIEW",
+        "operator_summary": rationale or _text(item.get("operator_summary")) or "Operator asked to watch for follow-up evidence.",
+        "wait_question": wait_text,
+        "condition_json": json.dumps(condition, ensure_ascii=False, sort_keys=True, default=str),
+        "valid_from": valid_from,
+        "valid_until": valid_until,
+        "generated_by": "manual_review_decision",
+        "load_ts": decided_at,
+    }
+    row["signal_id"] = make_signal_id(row)
+    frame = pd.DataFrame([row])
+    persist_wait_signals(frame)
+    return {
+        "signal_id": row["signal_id"],
+        "table": WAIT_SIGNALS_TABLE,
+        "valid_until": valid_until.isoformat(),
+        "keywords": condition["keywords"],
+    }
+
+
 def _append_latest_action_review_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
     table = ACTION_RECOMMENDATIONS_TABLE
     if not _table_exists(table):
@@ -2317,12 +2600,14 @@ def _append_latest_action_review_items(items: list[dict[str, Any]], skipped: lis
     for row in _records(df):
         status = _text(row.get("action_code")) or "manual_review"
         reason = row.get("action_reason") or row.get("reason") or row.get("reason_detail") or row.get("recommendation_reason")
+        if (_text(row.get("action_source")) or "").lower() == "event_policy":
+            reason = _event_policy_review_text(row, fallback_reason=reason)["reason"]
         items.append(
             _manual_review_item(
                 item_type="action_manual_review",
                 severity="review",
                 status=status,
-                title=f"{row.get('symbol') or 'Symbol'} action needs review",
+                title=f"{row.get('symbol') or 'Symbol'} event risk needs review" if (_text(row.get("action_source")) or "").lower() == "event_policy" else f"{row.get('symbol') or 'Symbol'} action needs review",
                 reason=reason,
                 source_table=table,
                 source_key=f"{row.get('asof_date')}:{row.get('symbol')}:{row.get('setup_id')}",
@@ -2354,9 +2639,17 @@ def _append_event_policy_review_items(items: list[dict[str, Any]], skipped: list
         skipped=skipped,
     )
     for row in _records(df):
+        if _manual_review_final_action(row) == "NO_ACTION":
+            continue
         checks = _jsonish(row.get("checks_json"))
         notes = _jsonish(row.get("operator_notes_json"))
-        reason = row.get("action_reason") or row.get("reason") or (notes.get("summary") if isinstance(notes, dict) else None) or (checks.get("reason") if isinstance(checks, dict) else None)
+        reason = (
+            _text(notes.get("operator_summary")) if isinstance(notes, dict) else ""
+        ) or row.get("action_reason") or row.get("reason") or (checks.get("reason") if isinstance(checks, dict) else None)
+        detail = _manual_review_detail(row)
+        if detail and detail != _text(reason):
+            reason = f"{_text(reason)} Detail: {detail}" if _text(reason) else detail
+        reason = _event_policy_review_text(row, fallback_reason=reason)["reason"]
         items.append(
             _manual_review_item(
                 item_type="event_policy_manual_review",
@@ -2376,12 +2669,18 @@ def _append_action_conflict_items(items: list[dict[str, Any]], skipped: list[dic
     if not _table_exists(table):
         skipped.append({"source": table, "error": "missing_table"})
         return
+    # Manual Review is an action-required queue. Resolved conflicts are audit-only
+    # and stay visible via decision traces, symbol pages, and conflict-rules views.
     df = _safe_manual_query(
         table,
         f"""
         SELECT *
         FROM {table}
         WHERE asof_date = (SELECT MAX(asof_date) FROM {table})
+          AND (
+            COALESCE(requires_manual_resolution, FALSE) = TRUE
+            OR COALESCE(resolution_status, '') IN ('unresolved', 'manual_required')
+          )
         ORDER BY load_ts DESC NULLS LAST, asof_date DESC NULLS LAST
         LIMIT %(limit)s
         """,
@@ -2394,7 +2693,7 @@ def _append_action_conflict_items(items: list[dict[str, Any]], skipped: list[dic
             _manual_review_item(
                 item_type="action_conflict",
                 severity="warning",
-                status="conflict_resolved",
+                status=_text(row.get("resolution_status")) or "manual_required",
                 title=f"{row.get('symbol') or 'Symbol'} had conflicting action signals",
                 reason=reason,
                 source_table=table,
@@ -2542,6 +2841,21 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
     _append_threshold_review_items(items, skipped, limit=per_source_limit)
     _append_processing_failure_items(items, skipped, limit=per_source_limit)
     _append_announcement_failure_items(items, skipped, limit=per_source_limit)
+    items = _suppress_shadow_manual_review_items(items, skipped)
+    deduped: dict[str, dict[str, Any]] = {}
+    for item in items:
+        item_id = str(item.get("item_id") or "")
+        if not item_id:
+            continue
+        existing = deduped.get(item_id)
+        if not existing:
+            deduped[item_id] = item
+            continue
+        existing_ts = str(existing.get("updated_at") or existing.get("asof_date") or "")
+        item_ts = str(item.get("updated_at") or item.get("asof_date") or "")
+        if item_ts >= existing_ts:
+            deduped[item_id] = item
+    items = list(deduped.values())
     latest_decisions: dict[str, dict[str, Any]] = {}
     try:
         latest_decisions = load_latest_manual_review_decisions(limit=max(per_source_limit * 5, 1000))
@@ -2623,13 +2937,27 @@ def record_manual_review_decision_payload(payload: dict[str, Any]) -> dict[str, 
     )
     ensure_manual_review_decisions_table()
     upsert_to_db(row, MANUAL_REVIEW_DECISIONS_TABLE, unique_keys=["item_id", "decided_at"], timescaledb_column="decided_at")
+    wait_signal = persist_manual_review_wait_signal(
+        item_id=item_id,
+        item=item,
+        decision=decision,
+        rationale=rationale,
+        follow_up_event=_text(payload.get("follow_up_event")),
+        decided_at=decided_at,
+        operator_id=_text(payload.get("operator_id")),
+    )
     return {
         "status": "ok",
         "decided_at": decided_at.isoformat(),
         "item_id": item_id,
         "decision": decision,
         "closing_decision": decision in MANUAL_REVIEW_CLOSING_DECISIONS,
-        "note": "Decision recorded only. No config, strategy, broker, or trading behavior was changed.",
+        "wait_signal": wait_signal,
+        "note": (
+            "Decision recorded and a wait signal was created. No broker or trading behavior was changed."
+            if wait_signal
+            else "Decision recorded only. No config, strategy, broker, or trading behavior was changed."
+        ),
     }
 
 
