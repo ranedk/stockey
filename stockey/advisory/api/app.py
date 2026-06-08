@@ -16,6 +16,8 @@ from environs import Env
 from pydantic import BaseModel, ConfigDict, Field
 
 from advisory.action_recommender import TABLE_NAME as ACTION_RECOMMENDATIONS_TABLE
+from advisory.company_memory_review import TABLE_NAME as COMPANY_MEMORY_REVIEWS_TABLE
+from advisory.config_change_assistant import build_signal_quality_overlay_preview, build_technical_threshold_preview, load_previews as load_config_change_previews
 from advisory.decision_trace import ensure_trace_tables, load_event_trace, load_symbol_trace
 from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
 from advisory.event_model_artifact_store import build_artifact_manifest
@@ -40,7 +42,14 @@ from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPS
 from advisory.operator_snapshot import load_operator_snapshot
 from advisory.performance_slowlog import record_slow_operation
 from advisory.performance_slowlog import update_slow_issue_status
+from advisory.prompt_registry import build_prompt_registry_payload
 from advisory.signal_refresh import TABLE_NAME as SIGNAL_REFRESH_TABLE
+from advisory.signal_quality_evaluator import EVALUATIONS_TABLE as SIGNAL_QUALITY_EVALUATIONS_TABLE
+from advisory.signal_quality_evaluator import SUMMARY_TABLE as SIGNAL_QUALITY_SUMMARY_TABLE
+from advisory.signal_quality_promotion import generate_promotion_review as generate_signal_quality_promotion_review
+from advisory.signal_quality_promotion import load_promotion_reviews as load_signal_quality_promotion_reviews
+from advisory.signal_quality_promotion import record_manual_decision as record_signal_quality_manual_decision
+from advisory.operator_smoke import build_operator_smoke
 from advisory.technical_threshold_calibration import EVALUATIONS_TABLE as TECHNICAL_CALIBRATION_EVALUATIONS_TABLE
 from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_CALIBRATION_SUMMARY_TABLE
 from advisory.technical_threshold_promotion import generate_promotion_review, load_promotion_reviews, record_manual_decision
@@ -436,11 +445,45 @@ class TechnicalCalibrationResponse(OperatorApiResponseModel):
     top_configs: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class SignalQualityResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    latest_evaluated_at: str | None = None
+    summary: list[dict[str, Any]] = Field(default_factory=list)
+    examples: list[dict[str, Any]] = Field(default_factory=list)
+    coverage: list[dict[str, Any]] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
 class TechnicalPromotionReviewsResponse(OperatorApiResponseModel):
     generated_at: str | None = None
     api_schema: OperatorApiSchemaModel
     status: str
     reviews: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SignalQualityPromotionReviewsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    reviews: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ConfigChangePreviewsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    previews: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class PromptRegistryResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    contracts: list[dict[str, Any]] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
 
 
 class EventPolicyResponse(OperatorApiResponseModel):
@@ -850,6 +893,7 @@ HOME_CARD_FIELDS = [
     "news_summary",
     "manual_revision_summary",
     "manual_revision_pointers",
+    "company_memory_review",
     "sort_ts",
 ]
 
@@ -983,9 +1027,36 @@ def _compact_reason_contract(value: Any) -> dict[str, Any] | str | None:
     return out or None
 
 
+def _compact_company_memory_review(value: Any) -> dict[str, Any] | None:
+    parsed = _jsonish(value)
+    if not isinstance(parsed, dict) or not parsed:
+        return None
+    out: dict[str, Any] = {}
+    for key in [
+        "review_date",
+        "recommended_signal",
+        "confidence",
+        "conviction_score",
+        "summary",
+        "thesis",
+        "risk_flags",
+        "evidence_used",
+        "wait_for",
+        "authority_scope",
+        "review_status",
+        "fallback_used",
+        "model_name",
+    ]:
+        if parsed.get(key) is not None:
+            out[key] = _trim_home_value(parsed.get(key), max_text=280, max_list=4, max_depth=2)
+    return out or None
+
+
 def _compact_home_field(key: str, value: Any) -> Any:
     if key == "recommendation_reason":
         return _compact_reason_contract(value)
+    if key == "company_memory_review":
+        return _compact_company_memory_review(value)
     if key == "manual_revision_pointers":
         return _trim_home_value(value, max_text=220, max_list=3, max_depth=2)
     if key in {"reason", "reason_detail", "action_reason"}:
@@ -1047,6 +1118,98 @@ def _with_execution_safety_contracts(rows: list[dict[str, Any]]) -> list[dict[st
     return out
 
 
+def _load_latest_company_memory_reviews(symbols: list[str]) -> dict[str, dict[str, Any]]:
+    normalized = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+    if not normalized:
+        return {}
+    try:
+        if not _table_exists(COMPANY_MEMORY_REVIEWS_TABLE):
+            return {}
+    except Exception:
+        return {}
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT DISTINCT ON (UPPER(TRIM(symbol)))
+                review_date,
+                symbol,
+                recommended_signal,
+                confidence,
+                conviction_score,
+                summary,
+                thesis,
+                risk_flags_json,
+                evidence_used_json,
+                wait_for_json,
+                deterministic_boundary,
+                authority_scope,
+                model_name,
+                review_status,
+                fallback_used,
+                error,
+                load_ts
+            FROM {COMPANY_MEMORY_REVIEWS_TABLE}
+            WHERE UPPER(TRIM(symbol)) = ANY(%s)
+            ORDER BY UPPER(TRIM(symbol)), review_date DESC, load_ts DESC NULLS LAST
+            """,
+            params=(normalized,),
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    if df.empty:
+        return out
+    for row in df.to_dict(orient="records"):
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        review = {
+            "review_date": _ts(row.get("review_date")),
+            "recommended_signal": _text(row.get("recommended_signal")),
+            "confidence": row.get("confidence"),
+            "conviction_score": row.get("conviction_score"),
+            "summary": _text(row.get("summary")),
+            "thesis": _text(row.get("thesis")),
+            "risk_flags": _jsonish(row.get("risk_flags_json")) or [],
+            "evidence_used": _jsonish(row.get("evidence_used_json")) or [],
+            "wait_for": _jsonish(row.get("wait_for_json")) or [],
+            "deterministic_boundary": _text(row.get("deterministic_boundary")),
+            "authority_scope": _text(row.get("authority_scope")) or "review_input_only",
+            "model_name": _text(row.get("model_name")),
+            "review_status": _text(row.get("review_status")),
+            "fallback_used": _boolish(row.get("fallback_used")),
+            "error": _text(row.get("error")),
+            "load_ts": _ts(row.get("load_ts")),
+        }
+        out[symbol] = {key: value for key, value in review.items() if value not in (None, "", [], {})}
+    return out
+
+
+def _with_company_memory_reviews(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    symbols = [str(row.get("symbol") or row.get("ticker") or "") for row in rows if isinstance(row, dict)]
+    reviews = _load_latest_company_memory_reviews(symbols)
+    if not reviews:
+        return rows
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        symbol = str(item.get("symbol") or item.get("ticker") or "").strip().upper()
+        review = reviews.get(symbol)
+        if review:
+            item["company_memory_review"] = review
+            reason = _jsonish(item.get("recommendation_reason"))
+            if isinstance(reason, dict):
+                evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+                reason["evidence"] = {**evidence, "company_memory": review}
+                item["recommendation_reason"] = reason
+        out.append(item)
+    return out
+
+
 def build_home_payload(*, asof_date: str | None = None) -> dict[str, Any]:
     payload = load_operator_payload(asof_date=asof_date)
     return {
@@ -1087,8 +1250,8 @@ def build_actions_payload(
         for row in [*top_action_raw, *action_page, *alert_raw]
         if isinstance(row, dict)
     ])
-    top_action_page = _with_execution_safety_contracts(_with_latest_prices(top_action_raw, price_field="current_price", prices=latest_prices))
-    action_page = _with_execution_safety_contracts(_with_latest_prices(action_page, price_field="current_price", prices=latest_prices))
+    top_action_page = _with_company_memory_reviews(_with_execution_safety_contracts(_with_latest_prices(top_action_raw, price_field="current_price", prices=latest_prices)))
+    action_page = _with_company_memory_reviews(_with_execution_safety_contracts(_with_latest_prices(action_page, price_field="current_price", prices=latest_prices)))
     alert_page = _with_latest_prices(alert_raw, price_field="last_price", prices=latest_prices)
     return {
         "generated_at": payload.get("generated_at"),
@@ -1767,6 +1930,7 @@ COMPACT_LIST_FIELDS = {
     "manual_revision_summary",
     "manual_revision_pointers",
     "manual_revision_status",
+    "company_memory_review",
     "portfolio_status",
     "entry_date",
     "entry_price",
@@ -2076,6 +2240,133 @@ def build_technical_calibration_payload(*, limit: int = 25) -> dict[str, Any]:
     }
 
 
+def build_signal_quality_payload(*, limit: int = 25) -> dict[str, Any]:
+    if not _table_exists(SIGNAL_QUALITY_SUMMARY_TABLE):
+        return {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/signal-quality", schema_name="signal_quality"),
+            "status": "missing_table",
+            "latest_evaluated_at": None,
+            "summary": [],
+            "examples": [],
+            "coverage": [],
+            "meta": {
+                "note": "Run python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20",
+                "research_only": True,
+            },
+        }
+
+    latest_df = sql_to_df(
+        f"""
+        SELECT MAX(evaluated_at) AS latest_evaluated_at
+        FROM {SIGNAL_QUALITY_SUMMARY_TABLE}
+        """,
+        retries=3,
+    )
+    latest = None if latest_df.empty else pd.to_datetime(latest_df.iloc[0].get("latest_evaluated_at"), utc=True, errors="coerce")
+    if latest is None or pd.isna(latest):
+        return {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/signal-quality", schema_name="signal_quality"),
+            "status": "empty",
+            "latest_evaluated_at": None,
+            "summary": [],
+            "examples": [],
+            "coverage": [],
+            "meta": {"research_only": True},
+        }
+
+    summary = sql_to_df(
+        f"""
+        SELECT *
+        FROM {SIGNAL_QUALITY_SUMMARY_TABLE}
+        WHERE evaluated_at = %(latest)s
+        ORDER BY horizon_days, variant
+        """,
+        params={"latest": latest},
+        retries=3,
+    )
+
+    examples = pd.DataFrame()
+    coverage = pd.DataFrame()
+    if _table_exists(SIGNAL_QUALITY_EVALUATIONS_TABLE):
+        examples = sql_to_df(
+            f"""
+            WITH ranked AS (
+                SELECT
+                    e.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY e.horizon_days, e.variant
+                        ORDER BY e.forward_return_after_cost DESC NULLS LAST, e.technical_total_score DESC NULLS LAST, e.symbol
+                    ) AS rn
+                FROM {SIGNAL_QUALITY_EVALUATIONS_TABLE} e
+                WHERE e.evaluated_at = %(latest)s
+                  AND e.selected IS TRUE
+                  AND e.matured IS TRUE
+            )
+            SELECT *
+            FROM ranked
+            WHERE rn <= %(limit)s
+            ORDER BY horizon_days, variant, rn
+            """,
+            params={"latest": latest, "limit": max(1, int(limit))},
+            retries=3,
+        )
+        coverage = sql_to_df(
+            f"""
+            SELECT
+                horizon_days,
+                COUNT(*) AS candidate_rows,
+                SUM(CASE WHEN event_action_type IS NOT NULL THEN 1 ELSE 0 END) AS event_policy_rows,
+                SUM(CASE WHEN bhavcopy_deal_pressure IS NOT NULL THEN 1 ELSE 0 END) AS bhavcopy_rows,
+                SUM(CASE WHEN company_memory_signal IS NOT NULL THEN 1 ELSE 0 END) AS company_memory_rows,
+                SUM(CASE WHEN event_positive IS TRUE THEN 1 ELSE 0 END) AS event_positive_rows,
+                SUM(CASE WHEN event_negative IS TRUE THEN 1 ELSE 0 END) AS event_negative_rows,
+                SUM(CASE WHEN bhavcopy_positive IS TRUE THEN 1 ELSE 0 END) AS bhavcopy_positive_rows,
+                SUM(CASE WHEN bhavcopy_negative IS TRUE THEN 1 ELSE 0 END) AS bhavcopy_negative_rows,
+                SUM(CASE WHEN company_memory_positive IS TRUE THEN 1 ELSE 0 END) AS company_memory_positive_rows,
+                SUM(CASE WHEN company_memory_negative IS TRUE THEN 1 ELSE 0 END) AS company_memory_negative_rows
+            FROM {SIGNAL_QUALITY_EVALUATIONS_TABLE}
+            WHERE evaluated_at = %(latest)s
+              AND variant = 'technical_only'
+            GROUP BY horizon_days
+            ORDER BY horizon_days
+            """,
+            params={"latest": latest},
+            retries=3,
+        )
+
+    summary_records = _records(summary)
+    best_by_horizon: dict[str, dict[str, Any]] = {}
+    for row in summary_records:
+        horizon_key = str(row.get("horizon_days") or "")
+        if not horizon_key:
+            continue
+        if str(row.get("variant") or "") == "technical_only":
+            continue
+        current = best_by_horizon.get(horizon_key)
+        lift = pd.to_numeric(row.get("lift_vs_technical_only"), errors="coerce")
+        current_lift = pd.to_numeric(current.get("lift_vs_technical_only"), errors="coerce") if current else pd.NA
+        if current is None or (pd.notna(lift) and (pd.isna(current_lift) or float(lift) > float(current_lift))):
+            best_by_horizon[horizon_key] = row
+
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/signal-quality", schema_name="signal_quality"),
+        "status": "ok",
+        "latest_evaluated_at": latest.isoformat(),
+        "summary": summary_records,
+        "examples": _records(examples),
+        "coverage": _records(coverage),
+        "meta": {
+            "research_only": True,
+            "best_overlay_by_horizon": best_by_horizon,
+            "example_limit_per_variant": max(1, int(limit)),
+            "production_policy_changed": False,
+        },
+    }
+
+
 def build_technical_threshold_promotion_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
     setup_id = str(payload.get("setup_id") or "").strip()
     config_id = str(payload.get("config_id") or "").strip()
@@ -2122,6 +2413,120 @@ def build_technical_threshold_review_decision_payload(payload: dict[str, Any]) -
         operator_id=str(payload.get("operator_id") or "") or None,
         decision_reason=str(payload.get("decision_reason") or "") or None,
     )
+
+
+def build_signal_quality_promotion_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    evaluated_at = payload.get("evaluated_at")
+    horizon_days = payload.get("horizon_days")
+    variant = str(payload.get("variant") or "").strip()
+    if not evaluated_at:
+        raise ValueError("evaluated_at is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    if not variant:
+        raise ValueError("variant is required")
+    result = generate_signal_quality_promotion_review(
+        evaluated_at=evaluated_at,
+        horizon_days=int(horizon_days),
+        variant=variant,
+        persist=True,
+    )
+    result["api_schema"] = _operator_api_schema("/api/signal-quality/promotion-review", schema_name="signal_quality_promotion_review")
+    return result
+
+
+def build_signal_quality_promotion_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/signal-quality/promotion-reviews", schema_name="signal_quality_promotion_reviews"),
+        "status": "ok",
+        "reviews": load_signal_quality_promotion_reviews(limit=limit),
+    }
+
+
+def build_signal_quality_promotion_review_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    reviewed_at = payload.get("reviewed_at")
+    evaluated_at = payload.get("evaluated_at")
+    horizon_days = payload.get("horizon_days")
+    variant = str(payload.get("variant") or "").strip()
+    decision = str(payload.get("decision") or "").strip().lower()
+    if not reviewed_at:
+        raise ValueError("reviewed_at is required")
+    if not evaluated_at:
+        raise ValueError("evaluated_at is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    if not variant:
+        raise ValueError("variant is required")
+    if decision not in {"approved", "rejected", "needs_more_data"}:
+        raise ValueError("decision must be approved, rejected, or needs_more_data")
+    result = record_signal_quality_manual_decision(
+        reviewed_at=reviewed_at,
+        evaluated_at=evaluated_at,
+        horizon_days=int(horizon_days),
+        variant=variant,
+        decision=decision,  # type: ignore[arg-type]
+        operator_id=str(payload.get("operator_id") or "") or None,
+        decision_reason=str(payload.get("decision_reason") or "") or None,
+    )
+    result["api_schema"] = _operator_api_schema(
+        "/api/signal-quality/promotion-review/decision",
+        schema_name="signal_quality_promotion_decision",
+    )
+    return result
+
+
+def build_config_change_previews_payload(*, limit: int = 25) -> dict[str, Any]:
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/config-change/previews", schema_name="config_change_previews"),
+        "status": "ok",
+        "previews": load_config_change_previews(limit=limit),
+    }
+
+
+def build_technical_config_change_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    setup_id = str(payload.get("setup_id") or "").strip()
+    config_id = str(payload.get("config_id") or "").strip()
+    if not setup_id:
+        raise ValueError("setup_id is required")
+    if not config_id:
+        raise ValueError("config_id is required")
+    result = build_technical_threshold_preview(
+        setup_id=setup_id,
+        config_id=config_id,
+        reviewed_at=payload.get("reviewed_at"),
+        persist=bool(payload.get("persist", True)),
+    )
+    result["api_schema"] = _operator_api_schema("/api/config-change/technical-threshold-preview", schema_name="technical_threshold_config_change_preview")
+    return result
+
+
+def build_signal_quality_config_change_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    evaluated_at = payload.get("evaluated_at")
+    horizon_days = payload.get("horizon_days")
+    variant = str(payload.get("variant") or "").strip()
+    if not evaluated_at:
+        raise ValueError("evaluated_at is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    if not variant:
+        raise ValueError("variant is required")
+    result = build_signal_quality_overlay_preview(
+        evaluated_at=evaluated_at,
+        horizon_days=int(horizon_days),
+        variant=variant,
+        reviewed_at=payload.get("reviewed_at"),
+        persist=bool(payload.get("persist", True)),
+    )
+    result["api_schema"] = _operator_api_schema("/api/config-change/signal-quality-preview", schema_name="signal_quality_config_change_preview")
+    return result
+
+
+def build_prompt_registry_api_payload(*, owner_area: str | None = None, authority_scope: str | None = None) -> dict[str, Any]:
+    payload = build_prompt_registry_payload(owner_area=owner_area, authority_scope=authority_scope)
+    payload["api_schema"] = _operator_api_schema("/api/research/prompt-registry", schema_name="prompt_registry")
+    return payload
 
 
 def build_events_payload(
@@ -2829,15 +3234,19 @@ def build_operator_health_payload() -> dict[str, Any]:
 
 
 def build_operations_smoke_payload() -> dict[str, Any]:
-    payload = build_operator_health()
+    payload = build_operator_smoke(include_dhan=False)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/operations/smoke", schema_name="operations_smoke"),
         "status": payload.get("status"),
-        "operator_health": payload,
+        "operator_smoke": payload,
         "fix_hints": payload.get("fix_hints") or [],
+        "trust_level": payload.get("trust_level"),
+        "trust_status": payload.get("trust_status"),
+        "recommendation": payload.get("recommendation"),
+        "next_commands": payload.get("next_commands") or [],
         "read_only": True,
-        "note": "This endpoint runs the same read-only health checks used by the operator CLI; it does not start ingestion, advisory, broker, or trading jobs.",
+        "note": "This endpoint runs the compact read-only operator smoke checks. It does not start ingestion, advisory, broker, or trading jobs.",
     }
 
 
@@ -3006,6 +3415,14 @@ def _python_cmd(*args: str) -> list[str]:
 
 
 OPERATOR_COMMAND_REGISTRY: dict[str, dict[str, Any]] = {
+    "operator_smoke": {
+        "label": "Operator Smoke Check",
+        "description": "Single compact read-only preflight for API, DB, frontend, freshness, identity, signal-quality, cron logs, and trust gate.",
+        "args": _python_cmd("-m", "advisory.operator_smoke"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 180,
+    },
     "operator_health_skip_dhan": {
         "label": "Operator Health",
         "description": "Read-only health check for DB, Redis, cron logs, snapshots, optional dependencies, and frontend dependencies without initiating Dhan login.",
@@ -4725,6 +5142,10 @@ def create_app():
     def research_event_model_artifacts():
         return _guard(build_event_model_artifacts_payload, route="/api/research/event-model-artifacts")
 
+    @app.get("/api/research/prompt-registry", response_model=PromptRegistryResponse)
+    def research_prompt_registry(owner_area: str | None = None, authority_scope: str | None = None):
+        return _guard(build_prompt_registry_api_payload, route="/api/research/prompt-registry", owner_area=owner_area, authority_scope=authority_scope)
+
     @app.get("/api/manual-review", response_model=ManualReviewResponse)
     def manual_review(limit: int = Query(default=100, ge=1, le=500)):
         return _guard(build_manual_review_payload, route="/api/manual-review", limit=limit)
@@ -4812,6 +5233,34 @@ def create_app():
     @app.get("/api/technical-calibration", response_model=TechnicalCalibrationResponse)
     def technical_calibration(limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_technical_calibration_payload, route="/api/technical-calibration", limit=limit)
+
+    @app.get("/api/signal-quality", response_model=SignalQualityResponse)
+    def signal_quality(limit: int = Query(default=10, ge=1, le=100)):
+        return _guard(build_signal_quality_payload, route="/api/signal-quality", limit=limit)
+
+    @app.post("/api/signal-quality/promotion-review")
+    def signal_quality_promotion_review(payload: dict[str, Any]):
+        return _guard(build_signal_quality_promotion_review_payload, route="/api/signal-quality/promotion-review", payload=payload)
+
+    @app.get("/api/signal-quality/promotion-reviews", response_model=SignalQualityPromotionReviewsResponse)
+    def signal_quality_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
+        return _guard(build_signal_quality_promotion_reviews_payload, route="/api/signal-quality/promotion-reviews", limit=limit)
+
+    @app.post("/api/signal-quality/promotion-review/decision")
+    def signal_quality_promotion_review_decision(payload: dict[str, Any]):
+        return _guard(build_signal_quality_promotion_review_decision_payload, route="/api/signal-quality/promotion-review/decision", payload=payload)
+
+    @app.get("/api/config-change/previews", response_model=ConfigChangePreviewsResponse)
+    def config_change_previews(limit: int = Query(default=25, ge=1, le=100)):
+        return _guard(build_config_change_previews_payload, route="/api/config-change/previews", limit=limit)
+
+    @app.post("/api/config-change/technical-threshold-preview")
+    def technical_threshold_config_change_preview(payload: dict[str, Any]):
+        return _guard(build_technical_config_change_preview_payload, route="/api/config-change/technical-threshold-preview", payload=payload)
+
+    @app.post("/api/config-change/signal-quality-preview")
+    def signal_quality_config_change_preview(payload: dict[str, Any]):
+        return _guard(build_signal_quality_config_change_preview_payload, route="/api/config-change/signal-quality-preview", payload=payload)
 
     @app.post("/api/technical-calibration/promotion-review")
     def technical_calibration_promotion_review(payload: dict[str, Any]):

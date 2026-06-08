@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from advisory.decision_trace import append_trace, append_trace_step, record_event_processing
 from advisory.market_context import load_latest_market_context
+from advisory.prompt_registry import response_schema_version
 from advisory.prompts import ADVISORY_EVENT_PROMPT_VERSION, SYSTEM_PROMPT, render_event_prompt
 from utils.codex_cli import run_codex_structured
 from utils.db import db_session, sql_to_df, upsert_to_db
@@ -23,8 +24,12 @@ env.read_env()
 EVALUATIONS_TABLE = "advisory_event_evaluations"
 RISKS_TABLE = "advisory_event_risks"
 NEWS_EVENTS_TABLE = "advisory_news_events"
+ANNOUNCEMENT_EVIDENCE_TABLE = "advisory_announcement_evidence"
+BHAVCOPY_EVIDENCE_TABLE = "advisory_bhavcopy_evidence_daily"
 DEFAULT_MODEL = env("ADVISORY_EVENT_EVAL_MODEL", default="codex")
 CODEX_CLI_EVENT_MODEL = env("CODEX_CLI_EVENT_MODEL", default=env("CODEX_CLI_MODEL", default="gpt-5.4-mini"))
+PROMPT_ID = "advisory_event_evaluation"
+PROMPT_SCHEMA_VERSION = response_schema_version(PROMPT_ID)
 _MAX_DOC_TEXT_CHARS = 12000
 _MAX_JSON_TEXT_CHARS = 6000
 
@@ -120,13 +125,37 @@ def _table_exists(table_name: str) -> bool:
     return not df.empty
 
 
-def trim_text(value: Any, limit: int) -> str | None:
+def _is_missing_scalar(value: Any) -> bool:
     if value is None:
+        return True
+    if isinstance(value, (dict, list, tuple, set)):
+        return False
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def trim_text(value: Any, limit: int) -> str | None:
+    if _is_missing_scalar(value):
         return None
     text = str(value).strip()
     if not text:
         return None
     return text[:limit]
+
+
+def normalize_bool(value: Any, *, default: bool = False) -> bool:
+    if _is_missing_scalar(value):
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n"}:
+        return False
+    return default
 
 
 def fallback_what_happened(event_row: pd.Series) -> str:
@@ -688,6 +717,54 @@ def load_documents(unique_ids: list[str]) -> pd.DataFrame:
     return df
 
 
+def load_announcement_evidence(unique_ids: list[str]) -> pd.DataFrame:
+    if not unique_ids or not _table_exists(ANNOUNCEMENT_EVIDENCE_TABLE):
+        return pd.DataFrame()
+    df = sql_to_df(
+        f"""
+        SELECT
+            evidence_id,
+            unique_id,
+            company_master_id,
+            symbol,
+            company_name,
+            exchange,
+            subject,
+            filed_under_category,
+            published_on,
+            parse_status,
+            ocr_status,
+            pdf_status,
+            source_reliability,
+            has_text_evidence,
+            has_s3_evidence,
+            evidence_chars,
+            evidence_excerpt,
+            evidence_summary,
+            event_source,
+            event_class,
+            direction,
+            materiality,
+            surprise,
+            novelty,
+            contradiction,
+            confidence,
+            verdict,
+            what_happened,
+            rationale,
+            event_tensor_json,
+            prompt_version
+        FROM {ANNOUNCEMENT_EVIDENCE_TABLE}
+        WHERE unique_id = ANY(%s)
+        """,
+        params=(unique_ids,),
+    )
+    if df.empty:
+        return df
+    df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
+    return df
+
+
 def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[str, Any]:
     daily_cutoff = pd.to_datetime(published_on, utc=True, errors="coerce").normalize()
     df = sql_to_df(
@@ -799,6 +876,45 @@ def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_d
                     for key, value in features.iloc[0].to_dict().items()
                     if not pd.isna(value)
                 }
+        if _table_exists(BHAVCOPY_EVIDENCE_TABLE):
+            bhavcopy = sql_to_df(
+                f"""
+                SELECT
+                    asof_date AS bhavcopy_asof_date,
+                    close,
+                    daily_return,
+                    volume,
+                    avg_volume_20d,
+                    turnover_value_inr,
+                    avg_turnover_value_20d,
+                    number_of_trades,
+                    close_volatility_20d,
+                    annualized_volatility,
+                    applicable_margin,
+                    deal_net_value_inr,
+                    block_deal_count,
+                    bulk_deal_count,
+                    short_selling_quantity,
+                    short_selling_count,
+                    circuit_hit_count,
+                    circuit_hit_types,
+                    deal_pressure,
+                    evidence_score,
+                    evidence_summary
+                FROM {BHAVCOPY_EVIDENCE_TABLE}
+                WHERE symbol = %(symbol)s
+                  AND asof_date < %(daily_cutoff)s
+                ORDER BY asof_date DESC
+                LIMIT 1
+                """,
+                params={"symbol": symbol, "daily_cutoff": daily_cutoff},
+            )
+            if not bhavcopy.empty:
+                out["bhavcopy_evidence"] = {
+                    key: (value.isoformat() if isinstance(value, pd.Timestamp) else value)
+                    for key, value in bhavcopy.iloc[0].to_dict().items()
+                    if not pd.isna(value)
+                }
         if _table_exists("advisory_exchange_events"):
             events = sql_to_df(
                 """
@@ -886,21 +1002,53 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
         "concise_summary_text": trim_text(event_row.get("concise_summary_text"), 2000),
         "categories_json": normalize_jsonish(event_row.get("categories_json")),
         "watch_reasons_json": normalize_jsonish(event_row.get("watch_reasons_json")),
+        "context_source": "event_row",
     }
 
     if document_row is not None:
-        document_payload.update(
-            {
-                "company_name": document_row.get("company_name"),
-                "document_parse_status": document_row.get("parse_status"),
-                "document_summary_text": trim_text(document_row.get("concise_summary_text"), 2000),
-                "document_text_excerpt": trim_text(document_row.get("text"), _MAX_DOC_TEXT_CHARS),
-                "document_categories_json": normalize_jsonish(document_row.get("categories_json")),
-                "parsed_reports_json": normalize_jsonish(
-                    trim_text(document_row.get("parsed_reports_json"), _MAX_JSON_TEXT_CHARS)
-                ),
-            }
-        )
+        source_table = str(document_row.get("_source_table") or "")
+        if source_table == ANNOUNCEMENT_EVIDENCE_TABLE:
+            document_payload.update(
+                {
+                    "context_source": "compact_announcement_evidence",
+                    "evidence_table": ANNOUNCEMENT_EVIDENCE_TABLE,
+                    "evidence_id": document_row.get("evidence_id"),
+                    "company_name": document_row.get("company_name"),
+                    "document_parse_status": document_row.get("parse_status"),
+                    "document_ocr_status": document_row.get("ocr_status"),
+                    "source_reliability": document_row.get("source_reliability"),
+                    "has_text_evidence": normalize_bool(document_row.get("has_text_evidence")),
+                    "has_s3_evidence": normalize_bool(document_row.get("has_s3_evidence")),
+                    "evidence_chars": document_row.get("evidence_chars"),
+                    "document_summary_text": trim_text(document_row.get("evidence_summary"), 2000),
+                    "document_text_excerpt": trim_text(document_row.get("evidence_excerpt"), _MAX_DOC_TEXT_CHARS),
+                    "latest_event_class": document_row.get("event_class"),
+                    "latest_event_direction": document_row.get("direction"),
+                    "latest_event_verdict": document_row.get("verdict"),
+                    "latest_event_confidence": document_row.get("confidence"),
+                    "latest_event_tensor_json": normalize_jsonish(
+                        trim_text(document_row.get("event_tensor_json"), _MAX_JSON_TEXT_CHARS)
+                    ),
+                    "latest_event_prompt_version": document_row.get("prompt_version"),
+                    "fallback_used": False,
+                }
+            )
+        else:
+            document_payload.update(
+                {
+                    "context_source": "raw_announcement_document_fallback",
+                    "evidence_table": "announcement_pipeline_documents",
+                    "company_name": document_row.get("company_name"),
+                    "document_parse_status": document_row.get("parse_status"),
+                    "document_summary_text": trim_text(document_row.get("concise_summary_text"), 2000),
+                    "document_text_excerpt": trim_text(document_row.get("text"), _MAX_DOC_TEXT_CHARS),
+                    "document_categories_json": normalize_jsonish(document_row.get("categories_json")),
+                    "parsed_reports_json": normalize_jsonish(
+                        trim_text(document_row.get("parsed_reports_json"), _MAX_JSON_TEXT_CHARS)
+                    ),
+                    "fallback_used": True,
+                }
+            )
 
     return {
         "prompt_version": ADVISORY_EVENT_PROMPT_VERSION,
@@ -958,11 +1106,22 @@ def build_outputs(
     if events.empty:
         return pd.DataFrame(), pd.DataFrame(), {"input_event_count": 0, "evaluated_count": 0, "error_count": 0}
 
-    docs = load_documents(events["unique_id"].dropna().astype(str).unique().tolist())
+    unique_ids = events["unique_id"].dropna().astype(str).unique().tolist()
+    compact_docs = load_announcement_evidence(unique_ids)
+    if not compact_docs.empty:
+        compact_docs["_source_table"] = ANNOUNCEMENT_EVIDENCE_TABLE
+    compact_ids = set(compact_docs["unique_id"].dropna().astype(str).tolist()) if not compact_docs.empty else set()
+    raw_fallback_ids = [unique_id for unique_id in unique_ids if unique_id not in compact_ids]
+    raw_docs = load_documents(raw_fallback_ids)
+    if not raw_docs.empty:
+        raw_docs["_source_table"] = "announcement_pipeline_documents"
+    docs = pd.concat([compact_docs, raw_docs], ignore_index=True, sort=False) if not compact_docs.empty or not raw_docs.empty else pd.DataFrame()
     docs_by_id = {
         str(row["unique_id"]): row
         for _, row in docs.iterrows()
     }
+    compact_context_count = int(len(compact_docs))
+    raw_fallback_context_count = int(len(raw_docs))
     evaluator = AdvisoryEventEvaluator(model=model)
     evaluation_rows: list[dict[str, Any]] = []
     risk_rows: list[dict[str, Any]] = []
@@ -984,7 +1143,12 @@ def build_outputs(
                 status="completed",
                 input_payload=payload,
                 output_payload=parsed.model_dump(),
-                payload={"model": model, "prompt_version": ADVISORY_EVENT_PROMPT_VERSION},
+                payload={
+                    "model": model,
+                    "prompt_id": PROMPT_ID,
+                    "prompt_version": ADVISORY_EVENT_PROMPT_VERSION,
+                    "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+                },
             )
         except Exception as exc:
             error_count += 1
@@ -1025,7 +1189,12 @@ def build_outputs(
                 error=str(exc),
                 input_payload=payload,
                 output_payload=parsed.model_dump(),
-                payload={"model": model, "prompt_version": ADVISORY_EVENT_PROMPT_VERSION},
+                payload={
+                    "model": model,
+                    "prompt_id": PROMPT_ID,
+                    "prompt_version": ADVISORY_EVENT_PROMPT_VERSION,
+                    "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+                },
             )
 
         event_class, state_transition_hint, score_impact = normalize_event_evaluation(event_row, parsed)
@@ -1109,7 +1278,9 @@ def build_outputs(
                 "source_trace_json": json_dumps(parsed.source_trace),
                 "context_snapshot_json": json_dumps(payload),
                 "model_name": model,
+                "prompt_id": PROMPT_ID,
                 "prompt_version": ADVISORY_EVENT_PROMPT_VERSION,
+                "prompt_schema_version": PROMPT_SCHEMA_VERSION,
                 "load_ts": pd.Timestamp.utcnow(),
             }
         )
@@ -1138,8 +1309,12 @@ def build_outputs(
         "evaluated_count": int(len(evaluation_rows)),
         "error_count": int(error_count),
         "document_count": int(len(docs)),
+        "compact_context_count": compact_context_count,
+        "raw_fallback_context_count": raw_fallback_context_count,
         "model_name": model,
+        "prompt_id": PROMPT_ID,
         "prompt_version": ADVISORY_EVENT_PROMPT_VERSION,
+        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
     }
     return pd.DataFrame(evaluation_rows), pd.DataFrame(risk_rows), meta
 
@@ -1212,12 +1387,19 @@ def ensure_output_tables() -> None:
                 source_trace_json TEXT,
                 context_snapshot_json TEXT,
                 model_name TEXT,
+                prompt_id TEXT,
                 prompt_version TEXT,
+                prompt_schema_version TEXT,
                 load_ts TIMESTAMPTZ,
                 UNIQUE (published_on, setup_id, symbol, unique_id)
             )
             """
         )
+        for column, sql_type in {
+            "prompt_id": "TEXT",
+            "prompt_schema_version": "TEXT",
+        }.items():
+            cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {RISKS_TABLE} (

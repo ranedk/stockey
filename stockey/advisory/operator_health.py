@@ -18,6 +18,10 @@ from environs import Env
 from advisory.performance_slowlog import summarize_slow_operations
 from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
 from advisory.operator_snapshot import SNAPSHOT_NAME, TABLE_NAME as OPERATOR_SNAPSHOT_TABLE
+from advisory.event_data_quality import build_event_data_quality_report
+from advisory.identity_issues import IDENTITY_ISSUES_TABLE
+from advisory.signal_quality_evaluator import EVALUATIONS_TABLE as SIGNAL_QUALITY_EVALUATIONS_TABLE
+from advisory.signal_quality_evaluator import SUMMARY_TABLE as SIGNAL_QUALITY_SUMMARY_TABLE
 from advisory.superseded_failures import cleanup_superseded_failures
 from utils.db import sql_to_df
 from utils.redis_utils import get_redis_client
@@ -33,6 +37,9 @@ DEFAULT_OPERATOR_API_URL = "http://127.0.0.1:8765/api/health"
 OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
 TRACE_SUMMARIES_TABLE = "advisory_trace_summaries"
 DHAN_TOKEN_EXPIRY_WARN_SECONDS = 6 * 60 * 60
+SIGNAL_QUALITY_MAX_AGE_DAYS = env.float("SIGNAL_QUALITY_MAX_AGE_DAYS", default=14.0)
+SIGNAL_QUALITY_MIN_MATURED_ROWS = env.int("SIGNAL_QUALITY_MIN_MATURED_ROWS", default=30)
+SIGNAL_QUALITY_MIN_OVERLAY_ROWS = env.int("SIGNAL_QUALITY_MIN_OVERLAY_ROWS", default=10)
 ERROR_PATTERNS = [
     re.compile(r"traceback", re.IGNORECASE),
     re.compile(r"\bERROR\b"),
@@ -119,6 +126,7 @@ TABLE_FRESHNESS_CHECKS = [
     {"name": "ts_forecasts", "table": "advisory_ts_forecasts_daily", "column": "asof_date", "max_age_days": 7},
     {"name": "sync_state", "table": "advisory_sync_state", "column": "updated_at", "max_age_days": 1},
     {"name": "operator_snapshot", "table": "advisory_operator_snapshots", "column": "generated_at", "max_age_days": 1},
+    {"name": "signal_quality", "table": "advisory_signal_quality_eval_summary", "column": "evaluated_at", "max_age_days": 14},
 ]
 CRON_RECOVERY_OUTPUTS = {
     "all_advisory.log": [
@@ -1058,6 +1066,139 @@ def check_trace_summaries() -> dict[str, Any]:
     )
 
 
+def check_identity_issues(limit: int = 10) -> dict[str, Any]:
+    if not table_exists(IDENTITY_ISSUES_TABLE):
+        return _status("ok", "No identity issue table exists yet.", open_count=0, rows=[])
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {IDENTITY_ISSUES_TABLE}
+            WHERE COALESCE(status, 'open') IN ('open', 'active')
+            ORDER BY last_seen_at DESC NULLS LAST, first_seen_at DESC NULLS LAST
+            LIMIT %(limit)s
+            """,
+            params={"limit": max(1, int(limit))},
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        count_df = sql_to_df(
+            f"""
+            SELECT COUNT(*) AS open_count
+            FROM {IDENTITY_ISSUES_TABLE}
+            WHERE COALESCE(status, 'open') IN ('open', 'active')
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        return _status("error", "Could not inspect identity issues.", error=f"{type(exc).__name__}: {exc}", open_count=None, rows=[])
+    open_count = int(count_df.iloc[0].get("open_count") or 0) if not count_df.empty else len(df)
+    status = "warn" if open_count else "ok"
+    return _status(
+        status,
+        "Open Dhan/company identity issues exist." if open_count else "No open identity issues.",
+        open_count=open_count,
+        rows=_records(df),
+    )
+
+
+def check_signal_quality() -> dict[str, Any]:
+    if not table_exists(SIGNAL_QUALITY_SUMMARY_TABLE):
+        return _status(
+            "warn",
+            "Signal-quality evaluator has not been run yet.",
+            usable=False,
+            reasons=["missing_summary_table"],
+            command="python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20",
+        )
+    try:
+        latest_df = sql_to_df(
+            f"SELECT MAX(evaluated_at) AS latest_evaluated_at FROM {SIGNAL_QUALITY_SUMMARY_TABLE}",
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        return _status("error", "Could not inspect signal-quality summary.", error=f"{type(exc).__name__}: {exc}", usable=False)
+    latest = pd.to_datetime(latest_df.iloc[0].get("latest_evaluated_at"), utc=True, errors="coerce") if not latest_df.empty else pd.NaT
+    if pd.isna(latest):
+        return _status("warn", "Signal-quality summary table has no evaluated rows.", usable=False, reasons=["empty_summary_table"])
+
+    try:
+        summary = sql_to_df(
+            f"""
+            SELECT *
+            FROM {SIGNAL_QUALITY_SUMMARY_TABLE}
+            WHERE evaluated_at = %(latest)s
+            ORDER BY horizon_days, variant
+            """,
+            params={"latest": latest},
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        return _status("error", "Could not read latest signal-quality rows.", error=f"{type(exc).__name__}: {exc}", usable=False)
+
+    coverage = pd.DataFrame()
+    if table_exists(SIGNAL_QUALITY_EVALUATIONS_TABLE):
+        try:
+            coverage = sql_to_df(
+                f"""
+                SELECT
+                    horizon_days,
+                    COUNT(*) AS candidate_rows,
+                    SUM(CASE WHEN event_action_type IS NOT NULL THEN 1 ELSE 0 END) AS event_policy_rows,
+                    SUM(CASE WHEN bhavcopy_deal_pressure IS NOT NULL THEN 1 ELSE 0 END) AS bhavcopy_rows,
+                    SUM(CASE WHEN company_memory_signal IS NOT NULL THEN 1 ELSE 0 END) AS company_memory_rows
+                FROM {SIGNAL_QUALITY_EVALUATIONS_TABLE}
+                WHERE evaluated_at = %(latest)s
+                  AND variant = 'technical_only'
+                GROUP BY horizon_days
+                ORDER BY horizon_days
+                """,
+                params={"latest": latest},
+                retries=3,
+                statement_timeout_ms=10000,
+            )
+        except Exception:
+            coverage = pd.DataFrame()
+
+    now = pd.Timestamp.utcnow()
+    age_days = float((now - latest).total_seconds() / 86400.0)
+    matured = pd.to_numeric(summary.get("matured_count", pd.Series(dtype=float)), errors="coerce")
+    max_matured = int(matured.max()) if not matured.dropna().empty else 0
+    overlay_rows = 0
+    if not coverage.empty:
+        for column in ["event_policy_rows", "bhavcopy_rows", "company_memory_rows"]:
+            if column in coverage.columns:
+                overlay_rows += int(pd.to_numeric(coverage[column], errors="coerce").fillna(0).max())
+    reasons: list[str] = []
+    if age_days > SIGNAL_QUALITY_MAX_AGE_DAYS:
+        reasons.append("stale_signal_quality_run")
+    if max_matured < SIGNAL_QUALITY_MIN_MATURED_ROWS:
+        reasons.append("insufficient_matured_rows")
+    if overlay_rows < SIGNAL_QUALITY_MIN_OVERLAY_ROWS:
+        reasons.append("insufficient_overlay_coverage")
+    status = "ok" if not reasons else "warn"
+    return _status(
+        status,
+        "Latest signal-quality run is usable for manual review." if status == "ok" else "Latest signal-quality run is not strong enough for promotion decisions.",
+        usable=status == "ok",
+        reasons=reasons,
+        latest_evaluated_at=_json_ready(latest),
+        age_days=round(age_days, 3),
+        max_age_days=SIGNAL_QUALITY_MAX_AGE_DAYS,
+        summary_rows=int(len(summary)),
+        max_matured_rows=max_matured,
+        min_matured_rows=SIGNAL_QUALITY_MIN_MATURED_ROWS,
+        overlay_rows=overlay_rows,
+        min_overlay_rows=SIGNAL_QUALITY_MIN_OVERLAY_ROWS,
+        coverage=_records(coverage),
+        summary=_records(summary.head(20)),
+        command="python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20",
+    )
+
+
 def summarize_status(sections: dict[str, Any]) -> str:
     statuses: list[str] = []
     for value in sections.values():
@@ -1141,6 +1282,49 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             reason=f"{slow.get('returned_count', 0)} open slow-operation issue(s) returned from {slow.get('state_file')}.",
             commands=["python -m advisory.performance_slowlog report --limit 20"],
             details={"issue_count": slow.get("issue_count"), "returned_count": slow.get("returned_count"), "state_file": slow.get("state_file")},
+        )
+
+    event_quality = sections.get("event_data_quality") if isinstance(sections.get("event_data_quality"), dict) else {}
+    if event_quality.get("status") in {"warn", "error"}:
+        summary = event_quality.get("summary") if isinstance(event_quality.get("summary"), dict) else {}
+        add(
+            status=str(event_quality.get("status") or "warn"),
+            title="Announcement and bhavcopy evidence need attention",
+            reason=str(event_quality.get("message") or "Event evidence quality gate found stale, missing, or incomplete inputs."),
+            commands=["python -m advisory.event_data_quality --format json", "./complete_data.sh", "./all_advisory.sh"],
+            details={
+                "section": "event_data_quality",
+                "issue_count": summary.get("issue_count"),
+                "error_count": summary.get("error_count"),
+                "warn_count": summary.get("warn_count"),
+                "llm_signal_authority": summary.get("llm_signal_authority"),
+            },
+        )
+
+    identity = sections.get("identity_issues") if isinstance(sections.get("identity_issues"), dict) else {}
+    if identity.get("status") in {"warn", "error"}:
+        add(
+            status=str(identity.get("status") or "warn"),
+            title="Open Dhan/security identity issues exist",
+            reason=str(identity.get("error") or identity.get("message") or "Some active symbols do not resolve cleanly to broker/security identity."),
+            commands=["python -m data.dhanlive.scrip_master", "python -m advisory.operator_health --skip-dhan"],
+            details={"section": "identity_issues", "open_count": identity.get("open_count")},
+        )
+
+    signal_quality = sections.get("signal_quality") if isinstance(sections.get("signal_quality"), dict) else {}
+    if signal_quality.get("status") in {"warn", "error"}:
+        add(
+            status=str(signal_quality.get("status") or "warn"),
+            title="Signal-quality evidence is not usable for promotion",
+            reason=str(signal_quality.get("error") or signal_quality.get("message") or "Signal-quality evaluator needs a fresher or better-covered run."),
+            commands=[str(signal_quality.get("command") or "python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20")],
+            details={
+                "section": "signal_quality",
+                "latest_evaluated_at": signal_quality.get("latest_evaluated_at"),
+                "reasons": signal_quality.get("reasons"),
+                "max_matured_rows": signal_quality.get("max_matured_rows"),
+                "overlay_rows": signal_quality.get("overlay_rows"),
+            },
         )
 
     redis = sections.get("redis") if isinstance(sections.get("redis"), dict) else {}
@@ -1314,6 +1498,10 @@ TRUST_BLOCKER_SECTION_TITLES = {
     "trace_summaries": "Trace summary cache",
     "operator_snapshot": "Operator snapshot freshness",
     "slow_operations": "Slow operator paths",
+    "event_data_quality": "Announcement/bhavcopy evidence readiness",
+    "identity_issues": "Security identity readiness",
+    "signal_quality": "Signal-quality evidence readiness",
+    "trust_gate": "Advisory trust gate",
     "redis": "Redis runtime state",
     "dhan": "Dhan token validation",
     "dhan_cache": "Dhan token cache",
@@ -1331,6 +1519,12 @@ def _blocker_category(row: dict[str, Any]) -> str:
         return "runtime"
     if section in {"dhan", "dhan_cache"} or kind.startswith("dhan") or "dhan" in title:
         return "broker_data"
+    if section == "identity_issues" or "identity" in title:
+        return "broker_data"
+    if section == "signal_quality" or "signal-quality" in title:
+        return "research_evidence"
+    if section == "trust_gate":
+        return "advisory_trust"
     if section in {"operator_snapshot", "trace_summaries"} or "snapshot" in title or "trace" in title:
         return "operator_visibility"
     if "stale" in title or "freshness" in title or "data is stale" in title:
@@ -1355,9 +1549,147 @@ def _trust_impact(row: dict[str, Any]) -> str:
         return "Recent pipeline runs may have failed or skipped required updates."
     if category == "data_quality":
         return "Some evidence may be fallback, partial, or unresolved."
+    if category == "research_evidence":
+        return "Research evidence is not strong enough to promote overlays or thresholds."
+    if category == "advisory_trust":
+        return "Use this to decide whether today’s recommendations are usable, review-only, or blocked."
     if status == "error":
         return "A required health check is failing."
     return "This warning should be triaged before relying on fresh advisory output."
+
+
+def build_trust_gate(sections: dict[str, Any]) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    def add_check(
+        key: str,
+        status: str,
+        title: str,
+        reason: str,
+        *,
+        impact: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        checks.append(
+            {
+                "key": key,
+                "status": status,
+                "title": title,
+                "reason": reason,
+                "impact": impact,
+                "details": details or {},
+            }
+        )
+
+    def section(name: str) -> dict[str, Any]:
+        value = sections.get(name)
+        return value if isinstance(value, dict) else {}
+
+    for name, title, impact in [
+        ("database", "Postgres is reachable", "Without DB access, advisory state cannot be trusted."),
+        ("operator_api", "Operator API is reachable", "Without API access, UI state may be stale or incomplete."),
+        ("dhan", "Dhan token validates", "Without broker data access, prices/identity/execution planning may be stale."),
+    ]:
+        row = section(name)
+        if row.get("status") == "error":
+            add_check(name, "error", title, str(row.get("error") or row.get("message") or "Check failed."), impact=impact, details=row)
+
+    freshness_rows = sections.get("table_freshness") if isinstance(sections.get("table_freshness"), list) else []
+    required_freshness = {"dhan_daily", "actions", "event_policy", "operator_snapshot"}
+    for row in freshness_rows:
+        if not isinstance(row, dict) or row.get("status") == "ok":
+            continue
+        name = str(row.get("name") or "")
+        if name in required_freshness:
+            add_check(
+                f"freshness:{name}",
+                str(row.get("status") or "warn"),
+                f"{name.replace('_', ' ').title()} freshness",
+                str(row.get("message") or "Input is stale or missing."),
+                impact="Advisory may be using stale or missing core inputs.",
+                details=row,
+            )
+
+    event_quality = section("event_data_quality")
+    if event_quality.get("status") in {"warn", "error"}:
+        event_summary = event_quality.get("summary") if isinstance(event_quality.get("summary"), dict) else {}
+        add_check(
+            "event_data_quality",
+            str(event_quality.get("status") or "warn"),
+            "Announcement/bhavcopy evidence readiness",
+            str(event_quality.get("message") or "Event evidence quality gate found issues."),
+            impact="Event-driven decisions may miss or misinterpret evidence.",
+            details={
+                "summary": event_summary,
+                "issue_count": event_summary.get("issue_count"),
+                "error_count": event_summary.get("error_count"),
+                "warn_count": event_summary.get("warn_count"),
+                "llm_signal_authority": event_summary.get("llm_signal_authority"),
+            },
+        )
+
+    identity = section("identity_issues")
+    if int(identity.get("open_count") or 0) > 0 or identity.get("status") == "error":
+        add_check(
+            "identity_issues",
+            "warn" if identity.get("status") != "error" else "error",
+            "Open security identity issues",
+            str(identity.get("message") or "Some symbols cannot be mapped cleanly."),
+            impact="Affected symbols may be skipped from Dhan prices or broker execution planning.",
+            details={"open_count": identity.get("open_count"), "rows": (identity.get("rows") or [])[:5]},
+        )
+
+    signal_quality = section("signal_quality")
+    if signal_quality.get("status") in {"warn", "error"}:
+        add_check(
+            "signal_quality",
+            str(signal_quality.get("status") or "warn"),
+            "Signal-quality evidence readiness",
+            str(signal_quality.get("message") or "Signal-quality run is not usable for promotion decisions."),
+            impact="Do not promote overlays/thresholds from this evidence yet.",
+            details={
+                "reasons": signal_quality.get("reasons"),
+                "latest_evaluated_at": signal_quality.get("latest_evaluated_at"),
+                "max_matured_rows": signal_quality.get("max_matured_rows"),
+                "overlay_rows": signal_quality.get("overlay_rows"),
+            },
+        )
+
+    degradation = section("degradation_feed")
+    active_count = int(degradation.get("active_count") or 0)
+    if active_count:
+        add_check(
+            "degradation_feed",
+            str(degradation.get("status") or "warn"),
+            "Active degradation rows",
+            f"{active_count} active degradation row(s) are visible.",
+            impact="Some data may be fallback, partial, missing, or slow.",
+            details={"active_count": active_count, "counts_by_kind": degradation.get("counts_by_kind")},
+        )
+
+    error_count = sum(1 for row in checks if row["status"] == "error")
+    warn_count = sum(1 for row in checks if row["status"] == "warn")
+    if error_count:
+        status = "error"
+        trust_level = "blocked"
+        recommendation = "Do not rely on today’s advisory output until error blockers are fixed."
+    elif warn_count:
+        status = "warn"
+        trust_level = "review_required"
+        recommendation = "Use recommendations as review-only; do not promote new rules or submit broker actions from this state."
+    else:
+        status = "ok"
+        trust_level = "usable"
+        recommendation = "No active trust blockers detected. Normal operator review still applies."
+    return {
+        "status": status,
+        "trust_level": trust_level,
+        "recommendation": recommendation,
+        "error_count": error_count,
+        "warn_count": warn_count,
+        "count": len(checks),
+        "checks": checks,
+    }
 
 
 def build_current_blockers(sections: dict[str, Any], fix_hints: list[dict[str, Any]], *, limit: int = 8) -> dict[str, Any]:
@@ -1452,6 +1784,9 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
         "trace_summaries": check_trace_summaries(),
         "slow_operations": summarize_slow_operations(limit=20),
         "operator_snapshot": check_operator_snapshot(),
+        "event_data_quality": build_event_data_quality_report(limit=20),
+        "identity_issues": check_identity_issues(limit=10),
+        "signal_quality": check_signal_quality(),
         "table_freshness": check_table_freshness(),
         "sync_state_failures": check_sync_state_failures(),
         "operator_api_errors": check_operator_api_errors(),
@@ -1466,6 +1801,7 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
     else:
         sections["dhan"] = _status("warn", "Dhan token validation skipped by request.")
     sections["degradation_feed"] = build_degradation_feed(sections, log_dir=log_dir)
+    sections["trust_gate"] = build_trust_gate(sections)
     fix_hints = build_fix_hints(sections)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),

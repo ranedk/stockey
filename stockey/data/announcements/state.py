@@ -9,6 +9,8 @@ from environs import Env
 from sqlalchemy.exc import ProgrammingError
 
 from .models import Announcement, ParsedReport
+from advisory.prompt_registry import prompt_version as registry_prompt_version
+from advisory.prompt_registry import response_schema_version
 from utils.blob_store import text_blob_metadata
 from utils.db import sql_to_df, upsert_to_db
 from utils.store import get_file_content, save_file_content
@@ -22,6 +24,15 @@ env.read_env()
 
 POSTGRES_TEXT_MODE = env.str("ANNOUNCEMENT_POSTGRES_TEXT_MODE", "pointer").strip().lower()
 POSTGRES_TEXT_EXCERPT_CHARS = env.int("ANNOUNCEMENT_POSTGRES_TEXT_EXCERPT_CHARS", 1200)
+ANNOUNCEMENT_SUMMARY_PROMPT_ID = "announcement_summary"
+ANNOUNCEMENT_SUMMARY_PROMPT_VERSION = registry_prompt_version(ANNOUNCEMENT_SUMMARY_PROMPT_ID)
+ANNOUNCEMENT_SUMMARY_PROMPT_SCHEMA_VERSION = response_schema_version(ANNOUNCEMENT_SUMMARY_PROMPT_ID)
+ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID = "announcement_structured_report"
+ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_VERSION = registry_prompt_version(ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID)
+ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_SCHEMA_VERSION = response_schema_version(ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID)
+OCR_PDF_PAGE_PROMPT_ID = "ocr_pdf_page"
+OCR_PDF_PAGE_PROMPT_VERSION = registry_prompt_version(OCR_PDF_PAGE_PROMPT_ID)
+OCR_PDF_PAGE_PROMPT_SCHEMA_VERSION = response_schema_version(OCR_PDF_PAGE_PROMPT_ID)
 
 
 def _inline_text_enabled() -> bool:
@@ -319,6 +330,22 @@ def document_row_from_announcement(
             concise_summary_s3_key,
             announcement.concise_summary_text or existing_row.get("concise_summary_text"),
         ),
+        "ocr_model_name": announcement.ocr_model_name or existing_row.get("ocr_model_name"),
+        "ocr_prompt_id": announcement.ocr_prompt_id or existing_row.get("ocr_prompt_id") or (OCR_PDF_PAGE_PROMPT_ID if announcement.three_page_ocr_text or announcement.full_ocr_text else None),
+        "ocr_prompt_version": announcement.ocr_prompt_version or existing_row.get("ocr_prompt_version") or (OCR_PDF_PAGE_PROMPT_VERSION if announcement.three_page_ocr_text or announcement.full_ocr_text else None),
+        "ocr_prompt_schema_version": announcement.ocr_prompt_schema_version
+        or existing_row.get("ocr_prompt_schema_version")
+        or (OCR_PDF_PAGE_PROMPT_SCHEMA_VERSION if announcement.three_page_ocr_text or announcement.full_ocr_text else None),
+        "concise_summary_model_name": announcement.concise_summary_model_name or existing_row.get("concise_summary_model_name"),
+        "concise_summary_prompt_id": announcement.concise_summary_prompt_id
+        or existing_row.get("concise_summary_prompt_id")
+        or (ANNOUNCEMENT_SUMMARY_PROMPT_ID if announcement.concise_summary_text else None),
+        "concise_summary_prompt_version": announcement.concise_summary_prompt_version
+        or existing_row.get("concise_summary_prompt_version")
+        or (ANNOUNCEMENT_SUMMARY_PROMPT_VERSION if announcement.concise_summary_text else None),
+        "concise_summary_prompt_schema_version": announcement.concise_summary_prompt_schema_version
+        or existing_row.get("concise_summary_prompt_schema_version")
+        or (ANNOUNCEMENT_SUMMARY_PROMPT_SCHEMA_VERSION if announcement.concise_summary_text else None),
         "categories_json": json.dumps(announcement.categories),
         "parsed_reports_json": json.dumps(
             [
@@ -326,6 +353,9 @@ def document_row_from_announcement(
                     "category": report.category,
                     "report_name": report.report_name,
                     "model_name": report.model_name,
+                    "prompt_id": report.prompt_id,
+                    "prompt_version": report.prompt_version,
+                    "prompt_schema_version": report.prompt_schema_version,
                     "data": report.data,
                 }
                 for report in announcement.parsed_reports
@@ -370,6 +400,9 @@ def report_rows_from_announcement(announcement: Announcement) -> List[Dict]:
                 "category": report.category,
                 "report_name": report.report_name,
                 "model_name": report.model_name,
+                "prompt_id": report.prompt_id or ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID,
+                "prompt_version": report.prompt_version or ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_VERSION,
+                "prompt_schema_version": report.prompt_schema_version or ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_SCHEMA_VERSION,
                 "report_json": report_json if _inline_text_enabled() else None,
                 "report_s3_key": report_s3_key,
                 "report_sha256": report_metadata.sha256,

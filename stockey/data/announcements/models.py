@@ -27,6 +27,9 @@ class ParsedReport:
     report_name: str
     model_name: str
     data: Dict[str, Any]
+    prompt_id: Optional[str] = None
+    prompt_version: Optional[str] = None
+    prompt_schema_version: Optional[str] = None
 
 
 @dataclass(slots=True)
@@ -54,6 +57,14 @@ class Announcement:
     audio_attachment_name: Optional[str] = None
     audio_transcript_text: str = ""
     concise_summary_text: str = ""
+    concise_summary_model_name: Optional[str] = None
+    concise_summary_prompt_id: Optional[str] = None
+    concise_summary_prompt_version: Optional[str] = None
+    concise_summary_prompt_schema_version: Optional[str] = None
+    ocr_model_name: Optional[str] = None
+    ocr_prompt_id: Optional[str] = None
+    ocr_prompt_version: Optional[str] = None
+    ocr_prompt_schema_version: Optional[str] = None
     ocr_error: Optional[str] = None
     categories: List[str] = field(default_factory=list)
     parsed_reports: List[ParsedReport] = field(default_factory=list)

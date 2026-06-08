@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from utils.db import sql_to_df, upsert_to_db
+from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
 
@@ -52,6 +52,20 @@ def table_exists(table_name: str) -> bool:
         )
     except Exception:
         return False
+    return not df.empty
+
+
+def require_table_exists(table_name: str) -> bool:
+    df = sql_to_df(
+        """
+        SELECT 1 AS exists_flag
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        LIMIT 1
+        """,
+        params=(table_name,),
+    )
     return not df.empty
 
 
@@ -219,20 +233,23 @@ def normalize_corporate_actions(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = pd.DataFrame(index=df.index)
     out["event_source"] = "nse_corporate_action"
-    out["event_type"] = "CORPORATE_ACTION"
+    action_type = df.get("action_type", pd.Series("CORPORATE_ACTION", index=df.index)).fillna("CORPORATE_ACTION")
+    out["event_type"] = action_type.astype(str).str.strip().str.upper().replace({"": "CORPORATE_ACTION"})
     out["symbol"] = df.get("symbol")
     out["company_master_id"] = df.get("company_master_id")
     out["event_date"] = df.get("date")
-    out["known_on"] = df.get("ca_broadcast_date", df.get("date"))
+    out["known_on"] = df.get("ca_broadcast_date", df.get("record_date", df.get("date")))
     out["disclosure_date"] = out["known_on"]
-    out["participant"] = df.get("company")
+    out["participant"] = df.get("company", df.get("security_name"))
     out["side"] = pd.NA
     out["quantity"] = pd.NA
     out["price"] = pd.NA
     out["value_inr"] = pd.NA
     out["holding_pct_before"] = pd.NA
     out["holding_pct_after"] = pd.NA
-    out["event_summary"] = df.get("subject", pd.Series("Corporate action", index=df.index)).fillna("Corporate action")
+    subject = df.get("subject", pd.Series("Corporate action", index=df.index)).fillna("Corporate action").astype(str)
+    source = df.get("source", pd.Series("", index=df.index)).fillna("").astype(str)
+    out["event_summary"] = ("Corporate action " + out["event_type"].astype(str) + " " + subject + " source=" + source).str.strip()
     return _finish_events(out)
 
 
@@ -309,12 +326,17 @@ def build_exchange_events(
     from_date: pd.Timestamp | None = None,
     to_date: pd.Timestamp | None = None,
 ) -> pd.DataFrame:
+    corporate_action_frames = [
+        normalize_corporate_actions(_load_table("nseindia_corporate_actions_normalized", from_date=from_date, to_date=to_date)),
+        normalize_corporate_actions(_load_table("nseindia_corporate_actions", from_date=from_date, to_date=to_date)),
+        normalize_corporate_actions(_load_table("nseindia_corporate_actions_bc_raw", from_date=from_date, to_date=to_date)),
+    ]
     frames = [
         normalize_block_or_bulk(_load_table("nseindia_block_deals", from_date=from_date, to_date=to_date), source="nse_block_deal"),
         normalize_block_or_bulk(_load_table("nseindia_bulk_deals", from_date=from_date, to_date=to_date), source="nse_bulk_deal"),
         normalize_short_selling(_load_table("nseindia_short_selling", from_date=from_date, to_date=to_date)),
         normalize_insider_deals(_load_table("nseindia_insider_deals", from_date=from_date, to_date=to_date)),
-        normalize_corporate_actions(_load_table("nseindia_corporate_actions", from_date=from_date, to_date=to_date)),
+        *corporate_action_frames,
         normalize_earnings_events(_load_table("nseindia_earnings_events", from_date=from_date, to_date=to_date)),
         normalize_recent_events(_load_table("nseindia_events", from_date=from_date, to_date=to_date)),
     ]
@@ -329,6 +351,121 @@ def persist_exchange_events(df: pd.DataFrame) -> None:
     if df.empty:
         return
     upsert_to_db(df, TABLE_NAME, unique_keys=["event_id", "known_on"], timescaledb_column="known_on")
+
+
+def repair_missing_event_types(*, dry_run: bool = True) -> dict[str, object]:
+    if not require_table_exists(TABLE_NAME):
+        return {"status": "missing_table", "table": TABLE_NAME, "dry_run": bool(dry_run), "matched_rows": 0, "updated_rows": 0}
+    preview_deals = sql_to_df(
+        f"""
+        SELECT COUNT(*) AS matched_rows
+        FROM {TABLE_NAME}
+        WHERE (event_source IS NULL OR event_type IS NULL)
+          AND side IN ('BUY', 'SELL')
+          AND participant IS NOT NULL
+          AND quantity IS NOT NULL
+          AND price IS NOT NULL
+        """,
+        retries=2,
+        statement_timeout_ms=15000,
+    )
+    preview_shorts = sql_to_df(
+        f"""
+        SELECT COUNT(*) AS matched_rows
+        FROM {TABLE_NAME}
+        WHERE (event_source IS NULL OR event_type IS NULL)
+          AND event_summary LIKE 'Short selling quantity%%'
+          AND quantity IS NOT NULL
+        """,
+        retries=2,
+        statement_timeout_ms=15000,
+    )
+    preview_unclassified = sql_to_df(
+        f"""
+        SELECT COUNT(*) AS matched_rows
+        FROM {TABLE_NAME}
+        WHERE event_source IS NULL OR event_type IS NULL
+        """,
+        retries=2,
+        statement_timeout_ms=15000,
+    )
+    deal_rows = 0 if preview_deals.empty else int(preview_deals.iloc[0].get("matched_rows") or 0)
+    short_rows = 0 if preview_shorts.empty else int(preview_shorts.iloc[0].get("matched_rows") or 0)
+    raw_unclassified_rows = 0 if preview_unclassified.empty else int(preview_unclassified.iloc[0].get("matched_rows") or 0)
+    unclassified_rows = max(0, raw_unclassified_rows - deal_rows - short_rows)
+    matched_rows = deal_rows + short_rows + unclassified_rows
+    if dry_run or matched_rows == 0:
+        return {
+            "status": "dry_run" if dry_run else "ok",
+            "table": TABLE_NAME,
+            "dry_run": bool(dry_run),
+            "matched_rows": matched_rows,
+            "deal_rows": deal_rows,
+            "short_selling_rows": short_rows,
+            "unclassified_rows": unclassified_rows,
+            "updated_rows": 0,
+            "repair_source": "nse_legacy_deal",
+            "repair_type": "LEGACY_DEAL",
+        }
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            UPDATE {TABLE_NAME}
+            SET
+                event_source = COALESCE(event_source, 'nse_legacy_deal'),
+                event_type = COALESCE(event_type, 'LEGACY_DEAL'),
+                event_summary = CASE
+                    WHEN event_summary IS NULL OR event_summary LIKE 'nan %%'
+                    THEN CONCAT('Legacy NSE deal ', side, ' by ', participant)
+                    ELSE event_summary
+                END
+            WHERE (event_source IS NULL OR event_type IS NULL)
+              AND side IN ('BUY', 'SELL')
+              AND participant IS NOT NULL
+              AND quantity IS NOT NULL
+              AND price IS NOT NULL
+            """
+        )
+        updated_deals = int(cur.rowcount or 0)
+        cur.execute(
+            f"""
+            UPDATE {TABLE_NAME}
+            SET
+                event_source = COALESCE(event_source, 'nse_short_selling'),
+                event_type = COALESCE(event_type, 'SHORT_SELLING')
+            WHERE (event_source IS NULL OR event_type IS NULL)
+              AND event_summary LIKE 'Short selling quantity%%'
+              AND quantity IS NOT NULL
+            """
+        )
+        updated_shorts = int(cur.rowcount or 0)
+        cur.execute(
+            f"""
+            UPDATE {TABLE_NAME}
+            SET
+                event_source = COALESCE(event_source, 'nse_unclassified_event'),
+                event_type = COALESCE(event_type, 'UNCLASSIFIED_EVENT'),
+                event_summary = COALESCE(event_summary, 'Unclassified legacy NSE event')
+            WHERE event_source IS NULL OR event_type IS NULL
+            """
+        )
+        updated_unclassified = int(cur.rowcount or 0)
+        updated_rows = updated_deals + updated_shorts + updated_unclassified
+    return {
+        "status": "applied",
+        "table": TABLE_NAME,
+        "dry_run": False,
+        "matched_rows": matched_rows,
+        "deal_rows": deal_rows,
+        "short_selling_rows": short_rows,
+        "unclassified_rows": unclassified_rows,
+        "updated_rows": updated_rows,
+        "updated_deal_rows": updated_deals,
+        "updated_short_selling_rows": updated_shorts,
+        "updated_unclassified_rows": updated_unclassified,
+        "repair_source": "nse_legacy_deal",
+        "repair_type": "LEGACY_DEAL",
+    }
 
 
 def summarize(df: pd.DataFrame) -> dict[str, object]:
@@ -350,11 +487,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--from-date", type=parse_datetime_arg)
     parser.add_argument("--to-date", type=parse_datetime_arg)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--repair-missing-types", action="store_true", help="Repair legacy rows with null event_source/event_type.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.repair_missing_types:
+        result = repair_missing_event_types(dry_run=bool(args.dry_run))
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
     df = build_exchange_events(
         from_date=pd.Timestamp(args.from_date, tz="UTC") if args.from_date else None,
         to_date=pd.Timestamp(args.to_date, tz="UTC") if args.to_date else None,

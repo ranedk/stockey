@@ -8,6 +8,8 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.prompt_registry import prompt_version as registry_prompt_version
+from advisory.prompt_registry import response_schema_version
 from advisory.setup_registry import load_setup_registry
 from advisory.technical_threshold_calibration import EVALUATIONS_TABLE, SUMMARY_TABLE
 from utils.codex_cli import run_codex_structured
@@ -20,6 +22,9 @@ env.read_env()
 REVIEWS_TABLE = "advisory_technical_threshold_promotion_reviews"
 DECISIONS_TABLE = "advisory_technical_threshold_promotion_decisions"
 DEFAULT_PROMOTION_REVIEW_MODEL = env("TECHNICAL_THRESHOLD_PROMOTION_REVIEW_MODEL", default="codex")
+PROMPT_ID = "technical_threshold_promotion_review"
+PROMPT_VERSION = registry_prompt_version(PROMPT_ID)
+PROMPT_SCHEMA_VERSION = response_schema_version(PROMPT_ID)
 
 
 class TechnicalThresholdPromotionReview(BaseModel):
@@ -57,6 +62,9 @@ def ensure_tables() -> None:
                 recommendation TEXT,
                 confidence DOUBLE PRECISION,
                 patch_json TEXT,
+                prompt_id TEXT,
+                prompt_version TEXT,
+                prompt_schema_version TEXT,
                 review_model TEXT,
                 review_status TEXT,
                 review_error TEXT,
@@ -65,6 +73,12 @@ def ensure_tables() -> None:
             )
             """
         )
+        for column, sql_type in {
+            "prompt_id": "TEXT",
+            "prompt_version": "TEXT",
+            "prompt_schema_version": "TEXT",
+        }.items():
+            cur.execute(f"ALTER TABLE {REVIEWS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {DECISIONS_TABLE} (
@@ -311,6 +325,9 @@ def generate_promotion_review(
         "horizon_summary": summary,
         "pending_patch": pending_patch,
         "llm_review": review.model_dump(),
+        "prompt_id": PROMPT_ID,
+        "prompt_version": PROMPT_VERSION,
+        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
         "review_model": effective_model,
         "review_status": review_status,
         "review_error": review_error,
@@ -337,6 +354,9 @@ def persist_review(result: dict[str, Any]) -> None:
                 "recommendation": result["llm_review"].get("recommendation"),
                 "confidence": result["llm_review"].get("confidence"),
                 "patch_json": json_dumps(result["pending_patch"]),
+                "prompt_id": result.get("prompt_id") or PROMPT_ID,
+                "prompt_version": result.get("prompt_version") or PROMPT_VERSION,
+                "prompt_schema_version": result.get("prompt_schema_version") or PROMPT_SCHEMA_VERSION,
                 "review_model": result["review_model"],
                 "review_status": result["review_status"],
                 "review_error": result["review_error"],

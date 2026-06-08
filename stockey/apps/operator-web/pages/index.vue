@@ -334,6 +334,27 @@ function actionExplanation(row: Record<string, unknown>) {
   }
 }
 
+function companyMemoryReview(row: Record<string, unknown>) {
+  const review = asDict(row.company_memory_review || nestedValue(row, ['recommendation_reason', 'evidence', 'company_memory']))
+  const riskFlags = stringArray(review.risk_flags)
+  const evidenceUsed = stringArray(review.evidence_used)
+  const waitFor = stringArray(review.wait_for)
+  return {
+    hasData: Object.keys(review).length > 0,
+    signal: String(review.recommended_signal || '').toUpperCase(),
+    confidence: review.confidence,
+    conviction: review.conviction_score,
+    summary: String(review.summary || '').trim(),
+    thesis: String(review.thesis || '').trim(),
+    authority: String(review.authority_scope || 'review_input_only'),
+    status: String(review.review_status || '').trim(),
+    reviewDate: String(review.review_date || '').trim(),
+    riskFlags,
+    evidenceUsed,
+    waitFor
+  }
+}
+
 function actionSourceLabel(row: Record<string, unknown>) {
   return firstActionValue(row, ['action_source', 'source'], [['recommendation_reason', 'action_source']])
 }
@@ -730,6 +751,49 @@ function effectLabel(row: Record<string, unknown>) {
             :status="row.reason_contract_status"
             compact
           />
+          <section
+            v-if="companyMemoryReview(row).hasData"
+            class="mt-4 rounded-2xl border border-moss/25 bg-moss/10 p-4"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-black uppercase tracking-[0.22em] text-moss">Company memory review</p>
+                <p v-if="companyMemoryReview(row).summary" class="mt-2 text-sm font-semibold leading-6 text-ink/75">
+                  {{ companyMemoryReview(row).summary }}
+                </p>
+                <p v-if="companyMemoryReview(row).thesis" class="mt-1 text-sm leading-6 text-ink/60">
+                  {{ companyMemoryReview(row).thesis }}
+                </p>
+              </div>
+              <StatusPill tone="info">{{ companyMemoryReview(row).signal || 'REVIEW' }}</StatusPill>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-4">
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Confidence:</b> {{ pct(companyMemoryReview(row).confidence) }}</p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Conviction:</b> {{ scoreBadge(companyMemoryReview(row).conviction) }}</p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Status:</b> {{ companyMemoryReview(row).status || '-' }}</p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Authority:</b> {{ companyMemoryReview(row).authority }}</p>
+            </div>
+            <div class="mt-3 grid gap-3 md:grid-cols-3">
+              <div v-if="companyMemoryReview(row).evidenceUsed.length" class="rounded-xl bg-white/80 p-3">
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Evidence used</p>
+                <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+                  <li v-for="item in companyMemoryReview(row).evidenceUsed.slice(0, 3)" :key="item">{{ item }}</li>
+                </ul>
+              </div>
+              <div v-if="companyMemoryReview(row).riskFlags.length" class="rounded-xl bg-white/80 p-3">
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Risk flags</p>
+                <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+                  <li v-for="item in companyMemoryReview(row).riskFlags.slice(0, 3)" :key="item">{{ item }}</li>
+                </ul>
+              </div>
+              <div v-if="companyMemoryReview(row).waitFor.length" class="rounded-xl bg-white/80 p-3">
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Wait for</p>
+                <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+                  <li v-for="item in companyMemoryReview(row).waitFor.slice(0, 3)" :key="item">{{ item }}</li>
+                </ul>
+              </div>
+            </div>
+          </section>
           <section
             v-if="actionExplanation(row).hasData"
             class="mt-4 rounded-2xl border border-sun/40 bg-sun/10 p-4"

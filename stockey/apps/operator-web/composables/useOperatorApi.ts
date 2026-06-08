@@ -1,4 +1,4 @@
-import type { ActionConflictRulesPayload, ActionConflictRuleWriteResult, CronLogsPayload, EventDetailPayload, EventModelArtifactsPayload, EventModelPromotionCheckPayload, EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, IdentityIssuesPayload, ManualReviewDecisionResult, ManualReviewPayload, OperatorActions, OperatorApiErrorsPayload, OperatorCommandRunResult, OperatorCommandsPayload, OperatorDetailPayload, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorRuntime, OperatorSmokePayload, OperatorSummary, SignalRefreshPayload, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary, WaitSignalMatchPayload, WaitSignalsPayload } from '~/types/api'
+import type { ActionConflictRulesPayload, ActionConflictRuleWriteResult, ConfigChangePreviewResult, ConfigChangePreviewsPayload, CronLogsPayload, EventDetailPayload, EventModelArtifactsPayload, EventModelPromotionCheckPayload, EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, IdentityIssuesPayload, ManualReviewDecisionResult, ManualReviewPayload, OperatorActions, OperatorApiErrorsPayload, OperatorCommandRunResult, OperatorCommandsPayload, OperatorDetailPayload, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorRuntime, OperatorSmokePayload, OperatorSummary, PromptRegistryPayload, SignalQualityPayload, SignalQualityPromotionDecisionResult, SignalQualityPromotionReviewResult, SignalQualityPromotionReviewsPayload, SignalRefreshPayload, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary, WaitSignalMatchPayload, WaitSignalsPayload } from '~/types/api'
 
 export function useOperatorApi() {
   const config = useRuntimeConfig()
@@ -34,6 +34,7 @@ export function useOperatorApi() {
     updateSlowIssueStatus: (body: Record<string, unknown>) => post<Record<string, unknown>>('/api/operations/slow-issues/status', body),
     getEventModelPromotionCheck: () => get<EventModelPromotionCheckPayload>('/api/research/event-model-promotion-check'),
     getEventModelArtifacts: () => get<EventModelArtifactsPayload>('/api/research/event-model-artifacts'),
+    getPromptRegistry: (params: Record<string, unknown> = {}) => get<PromptRegistryPayload>(`/api/research/prompt-registry${query(params)}`),
     getManualReview: (limit = 100) => get<ManualReviewPayload>(`/api/manual-review?limit=${limit}`),
     getIdentityIssues: (params: Record<string, unknown> = {}) => get<IdentityIssuesPayload>(`/api/identity-issues${query(params)}`),
     decideManualReview: (body: Record<string, unknown>) => post<ManualReviewDecisionResult>('/api/manual-review/decision', body),
@@ -47,6 +48,13 @@ export function useOperatorApi() {
     getPortfolioDetail: (symbol: string, params: Record<string, unknown> = {}) => get<OperatorDetailPayload>(`/api/portfolio/${encodeURIComponent(symbol)}/detail${query(params)}`),
     getMarketContext: (limit = 50) => get<OperatorMarketContext>(`/api/market-context?limit=${limit}`),
     getTechnicalCalibration: (limit = 25) => get<TechnicalCalibrationPayload>(`/api/technical-calibration?limit=${limit}`),
+    getSignalQuality: (limit = 10) => get<SignalQualityPayload>(`/api/signal-quality?limit=${limit}`),
+    reviewSignalQualityOverlay: (body: Record<string, unknown>) => post<SignalQualityPromotionReviewResult>('/api/signal-quality/promotion-review', body),
+    getSignalQualityPromotionReviews: (limit = 25) => get<SignalQualityPromotionReviewsPayload>(`/api/signal-quality/promotion-reviews?limit=${limit}`),
+    decideSignalQualityPromotionReview: (body: Record<string, unknown>) => post<SignalQualityPromotionDecisionResult>('/api/signal-quality/promotion-review/decision', body),
+    getConfigChangePreviews: (limit = 25) => get<ConfigChangePreviewsPayload>(`/api/config-change/previews?limit=${limit}`),
+    previewTechnicalThresholdConfigChange: (body: Record<string, unknown>) => post<ConfigChangePreviewResult>('/api/config-change/technical-threshold-preview', body),
+    previewSignalQualityConfigChange: (body: Record<string, unknown>) => post<ConfigChangePreviewResult>('/api/config-change/signal-quality-preview', body),
     reviewTechnicalCalibration: (body: Record<string, unknown>) => post<TechnicalPromotionReviewResult>('/api/technical-calibration/promotion-review', body),
     getTechnicalPromotionReviews: (limit = 25) => get<TechnicalPromotionReviewsPayload>(`/api/technical-calibration/promotion-reviews?limit=${limit}`),
     decideTechnicalPromotionReview: (body: Record<string, unknown>) => post<TechnicalPromotionDecisionResult>('/api/technical-calibration/promotion-review/decision', body),

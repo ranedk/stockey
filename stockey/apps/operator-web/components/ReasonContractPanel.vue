@@ -112,6 +112,7 @@ const sections = computed<Section[]>(() => {
     ['screener', 'Screener'],
     ['technical', 'Technical'],
     ['event', 'Event'],
+    ['company_memory', 'Company Memory'],
     ['playbook', 'Playbook'],
     ['wait_signal', 'Wait Signal'],
     ['macro_regime', 'Macro / Regime'],

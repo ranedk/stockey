@@ -70,8 +70,13 @@ export interface OperatorSmokePayload {
   generated_at?: string
   api_schema?: OperatorApiSchema
   status: string
-  operator_health: Dict
+  operator_health?: Dict
+  operator_smoke?: Dict
   fix_hints?: Dict[]
+  trust_level?: string
+  trust_status?: string
+  recommendation?: string
+  next_commands?: string[]
   read_only: boolean
   note?: string
 }
@@ -266,6 +271,91 @@ export interface TechnicalCalibrationPayload {
   status: string
   summary: Dict[]
   top_configs: Dict[]
+}
+
+export interface SignalQualityPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  latest_evaluated_at?: string | null
+  summary: Dict[]
+  examples: Dict[]
+  coverage: Dict[]
+  meta?: Dict
+}
+
+export interface SignalQualityPromotionReviewResult {
+  status: string
+  api_schema?: OperatorApiSchema
+  reviewed_at?: string
+  evaluated_at?: string
+  horizon_days?: number
+  variant: string
+  signal_quality_evidence: Dict
+  coverage?: Dict
+  pending_patch: Dict
+  llm_review: Dict
+  review_model?: string
+  review_status?: string
+  review_error?: string
+}
+
+export interface SignalQualityPromotionReviewsPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  reviews: Dict[]
+}
+
+export interface SignalQualityPromotionDecisionResult {
+  status: string
+  api_schema?: OperatorApiSchema
+  decided_at?: string
+  reviewed_at?: string
+  evaluated_at?: string
+  horizon_days?: number
+  variant: string
+  decision: string
+  operator_id?: string
+  decision_reason?: string
+  final_patch: Dict
+  review?: Dict
+  applied: boolean
+  note?: string
+}
+
+export interface ConfigChangePreviewResult {
+  status: string
+  api_schema?: OperatorApiSchema
+  preview_id?: string
+  generated_at?: string
+  source_type: string
+  source_key?: string
+  config_path: string
+  review_status?: string
+  decision_status?: string
+  patch_payload?: Dict
+  unified_diff: string
+  rollback_note?: string
+  safety_checks?: string[]
+  applied: boolean
+  decision?: Dict
+}
+
+export interface ConfigChangePreviewsPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  previews: Dict[]
+}
+
+export interface PromptRegistryPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  contracts: Dict[]
+  summary: Dict
+  notes?: string[]
 }
 
 export interface TechnicalPromotionReviewResult {

@@ -42,12 +42,20 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/ts_forecast_workflow.py` | `advisory_ts_forecasts_daily`, `advisory_ts_forecast_watchlist` | Optional Screener.in -> Dhan OHLCV refresh -> TimesFM forecast -> experimental TS watchlist workflow |
 | `advisory/technical_threshold_calibration.py` | `advisory_technical_threshold_evaluations`, `advisory_technical_threshold_eval_summary` | Research-only calibration of technical-engine thresholds against realized forward Dhan OHLCV returns after costs |
 | `advisory/technical_threshold_promotion.py` | `advisory_technical_threshold_promotion_reviews`, `advisory_technical_threshold_promotion_decisions` | LLM-assisted manual review of calibrated technical thresholds plus operator approval/rejection audit rows; produces patch guidance without applying config changes |
+| `advisory/config_change_assistant.py` | `advisory_config_change_previews` | Generates reviewed unified diffs from approved technical-threshold or signal-quality promotion decisions; preview/audit only, never applies config changes |
+| `advisory/prompt_registry.py` | read-only metadata | Central inventory of LLM/Codex prompt contracts, schemas, model env vars, source files, authority scope, fallbacks, and migration status |
 | `advisory/event_policy.py` | `advisory_event_policy_actions` | Deterministic and bounded Codex-assisted mapping from structured event evaluations to buy-watch, manual review, reduce-exposure review, or no action, including operator notes for actionable manual reviews |
 | `advisory/event_policy_evaluator.py` | `advisory_event_policy_evaluations`, `advisory_event_policy_eval_summary` | Research-only evaluation of event-policy action/classes against realized forward Dhan OHLCV returns after costs |
+| `advisory/company_memory_review.py` | `advisory_company_memory_reviews` | Review-only company-memory signal summaries from compact announcement evidence, bhavcopy evidence, technical state, event policy, wait signals, and latest action rows; deterministic by default, optional Codex |
+| `advisory/signal_quality_evaluator.py` | `advisory_signal_quality_evaluations`, `advisory_signal_quality_eval_summary` | Research-only comparison of technical-only signals versus technical signals enriched with event-policy, bhavcopy, and company-memory overlays after costs |
+| `advisory/signal_quality_promotion.py` | `advisory_signal_quality_promotion_reviews`, `advisory_signal_quality_promotion_decisions` | Manual review of signal-quality overlay lift plus operator approval/rejection audit rows; produces review-only overlay rule guidance without changing live policy |
 | `advisory/exchange_events.py` | `advisory_exchange_events` | Normalizes NSE block/bulk/short-selling/insider/corporate-action/earnings rows into point-in-time exchange events |
 | `advisory/exchange_features.py` | `advisory_exchange_features_daily` | Builds daily symbol-level exchange-event features for LLM context, event-model features, review, and risk sizing |
+| `advisory/event_data_quality.py` | read-only checks | Reports announcement and NSE/bhavcopy evidence readiness: source freshness, parse/OCR/text coverage, exchange-event typing, exchange-feature coverage, and raw-table scan risk |
+| `advisory/event_evidence_store.py` | `advisory_bhavcopy_evidence_daily`, `advisory_announcement_evidence` | Builds compact query-friendly evidence stores from NSE bhavcopy/deals/short/circuit/volatility/margin rows and exchange announcements plus latest event evaluation fields |
 | `advisory/market_context.py` | `advisory_market_context_universe_daily`, `advisory_market_context_summary_daily` | Builds the top-50% market-context universe from technical/liquidity/market-cap data and summarizes breadth, leadership, sector clusters, events, and regime context |
-| `advisory/operator_health.py` | read-only checks | Operator smoke-test command for DB, Redis, Dhan token, cron logs, key table freshness, frontend dependencies, Poppler, Codex, and TimesFM; also emits `fix_hints` for the Nuxt health page |
+| `advisory/operator_health.py` | read-only checks | Operator smoke-test command for DB, Redis, Dhan token, cron logs, key table freshness, identity issues, signal-quality evidence, frontend dependencies, Poppler, Codex, and TimesFM; emits `fix_hints` plus an Advisory Trust Gate for the Nuxt health page |
+| `advisory/operator_smoke.py` | read-only checks | Compact one-command operator preflight over Health that returns status, trust level, fix hints, current blockers, and next commands; also available as an audited Operations UI command |
 | `advisory/superseded_failures.py` | `advisory_event_processing_runs`, `announcement_pipeline_documents` | Previews recovered failure rows that can be marked superseded; default is dry-run JSON, and `--apply` requires explicit operator intent before writing superseded metadata |
 | `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
 | `advisory/model_training_runner.py` | varies | Gated model-training orchestrator: runs prep, checks label coverage for the requested horizon, then trains and scores only when ready |
@@ -187,6 +195,10 @@ OSX:
 
 - Announcement document OCR, concise summaries, structured report parsing, and advisory event evaluation can run through Codex CLI instead of hosted ChatGPT/Gemini APIs. Set `OCR_USING=codex`, `SUMMARIZE_WITH=codex`, and `ADVISORY_EVENT_EVAL_MODEL=codex`; tune `CODEX_CLI_OCR_MODEL`, `CODEX_CLI_SUMMARIZE_MODEL`, `CODEX_CLI_EVENT_MODEL`, `CODEX_CLI_BIN`, and `CODEX_CLI_TIMEOUT_SECONDS` as needed.
 
+- LLM/Codex prompt contracts are inventoried in `advisory.prompt_registry`. Use `python -m advisory.prompt_registry` or the Nuxt `/prompt-registry` page to review prompt ids, schema models, source files, model env vars, authority boundaries, output tables, and fallback behavior. This registry is audit metadata only; it does not execute prompts or grant trading authority.
+
+- Core LLM/Codex output rows persist prompt-contract metadata so later audits can tell which prompt and response schema produced a row. Current coverage includes `advisory_event_evaluations.prompt_id/prompt_version/prompt_schema_version`, `advisory_event_policy_actions.llm_prompt_*`, `advisory_playbook_action_plans.prompt_*`, `advisory_company_memory_reviews.prompt_*`, `advisory_action_recommendations.manual_revision_prompt_*`, `advisory_technical_threshold_promotion_reviews.prompt_*`, `announcement_pipeline_documents` summary/OCR prompt metadata, and `announcement_pipeline_reports.prompt_*`.
+
 - Consolidated action decisions can also get Codex-generated manual revision pointers. Set `ACTION_MANUAL_REVISION_POINTERS_ENABLED=true` and `ACTION_MANUAL_REVISION_POINTERS_MODEL=codex` or `codex:<model>`. The output is persisted on `advisory_action_recommendations` as `manual_revision_summary` and `manual_revision_pointers_json`; if Codex fails, deterministic fallback pointers are written instead.
 
 - Final action rows also persist `recommendation_reason_json` and `reason_contract_status`. If a broker-action row is missing required reason, evidence, execution, or risk fields, action consolidation downgrades it to `MANUAL_REVIEW` before it can reach execution. The execution planner also blocks stale broker-action rows whose reason contract is missing or incomplete.
@@ -241,7 +253,7 @@ Cron also runs selected Python modules directly for operator health, hypothesis 
 | --- | --- | --- |
 | `all_downloaders.sh` | Download-only ingestion | Manual broad catch-up for missing raw data |
 | `all_parsers.sh` | Parse-only ingestion | Manual parser catch-up after raw files already exist |
-| `complete_data.sh` | Combined ingestion | Full download + parse catch-up/backfill; useful end-of-day, after a missed day, or before a major rerun |
+| `complete_data.sh` | Combined ingestion and compact evidence refresh | Full download + parse catch-up/backfill plus `advisory.event_evidence_store`; useful end-of-day, after a missed day, or before a major rerun |
 | `all_ml.sh` | Event-model training orchestrator | Long-running research training; use outputs only after validation/promotion checks |
 | `all_advisory_codex.sh` | Codex-supervised advisory orchestrator | Manual debug/repair wrapper that runs `all_advisory.sh`, captures logs, sends failure lines to Codex CLI, and reruns |
 | `all_analysis_codex.sh` | Codex analysis-development loop | Manual bounded loop that uses `analysis.md` and `docs/analysis_agent_board.md` to pick the next slice, implement it, validate it, and update docs |
@@ -255,8 +267,8 @@ Recommended scheduler file:
 
 It schedules:
 
-- `complete_data.sh` before market as a broad ingestion safety net
-- `complete_data.sh` again end-of-day before advisory to catch missed downloader/parser work
+- `complete_data.sh` before market as a broad ingestion safety net and compact evidence refresh
+- `complete_data.sh` again end-of-day before advisory to catch missed downloader/parser work and rebuild compact announcement/bhavcopy evidence
 - `all_downloaders_queue.sh` plus `all_external_workers.sh` during the day for serialized single-client refreshes
 - `all_watchers.sh` every `10` minutes during market hours; the script self-locks, skipped overlaps exit `0`, and watcher routing writes fast live rows to `advisory_signal_refresh_actions` while matching active hypothesis wait signals
 - `all_advisory.sh` once daily after 7pm on weekdays, after `scripts/wait_for_locks.sh` confirms data catch-up and external worker locks are clear
@@ -288,7 +300,7 @@ Not scheduled by default:
 
 Operator health and logs:
 
-- `python -m advisory.operator_health --skip-dhan` is the read-only smoke test for DB freshness, Redis, cron logs, optional dependencies, and frontend dependencies.
+- `python -m advisory.operator_smoke` is the compact read-only preflight for DB/API/frontend/freshness/identity/signal-quality/cron trust. Use `python -m advisory.operator_health --skip-dhan` when you need the full detailed diagnostic payload.
 - It also checks local operator API latency and Dhan cached-token expiry metadata without initiating broker login.
 - `fix_hints` are emitted in the health payload and rendered at the top of the Nuxt Data Health page.
 - The Data Health page has filters for `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
@@ -807,7 +819,10 @@ Notes:
 - `all_watchers.sh` loads symbols from [`config/watchlist_symbols.txt`](../config/watchlist_symbols.txt), then falls back to [`config/tracked_symbols.txt`](../config/tracked_symbols.txt) where needed
 - `all_advisory.sh` is advisory-only and skips raw downloads by default
 - `all_advisory.sh --fast` is the low-latency advisory mode; it avoids slow repair/watch stages and is safer than blindly parallelizing browser-connected work
-- `complete_data.sh` is the lower-level raw ingestion component used before advisory runs
+- `complete_data.sh` is the lower-level ingestion component used before advisory runs. It now also builds `advisory_bhavcopy_evidence_daily` and `advisory_announcement_evidence` so UI/LLM/advisory paths can read compact evidence instead of scanning raw bhavcopy or announcement text tables.
+- `advisory.llm_event_evaluator` uses `advisory_announcement_evidence` first for official filing context and falls back to `announcement_pipeline_documents` only for missing compact rows. Its exchange context also includes the latest point-in-time `advisory_bhavcopy_evidence_daily` row for the symbol.
+- Repair legacy exchange-event typing after old parser bugs with `python -m advisory.exchange_events --repair-missing-types --dry-run`, then `python -m advisory.exchange_events --repair-missing-types` after reviewing the matched row counts. The repair is explicit and classifies known legacy deals, short-selling rows, and otherwise unclassified rows rather than leaving `event_source` or `event_type` null.
+- Sparse NSE event crawlers for corporate actions, earnings events, and insider deals write `advisory_sync_state` rows after each run. `advisory.event_data_quality` uses these rows to distinguish “source checked recently but no new event rows existed” from genuinely stale ingestion.
 
 ### SQL
 
@@ -888,8 +903,10 @@ python -m advisory.technical_features --dry-run
 python -m advisory.technical_features
 python -m advisory.technical_threshold_calibration --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
 python -m advisory.technical_threshold_promotion --setup-id EVENT_OPPORTUNITY_V1 --config-id CONFIG_ID --dry-run
+python -m advisory.config_change_assistant --source-type technical_threshold --setup-id EVENT_OPPORTUNITY_V1 --config-id CONFIG_ID --dry-run
 python -m advisory.event_policy --dry-run
 python -m advisory.event_policy --dry-run --no-llm
+python -m advisory.signal_quality_evaluator --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
 python -m advisory.rule_engine --dry-run
 python -m advisory.rule_engine
 python -m advisory.watchlist_builder --dry-run
@@ -932,7 +949,43 @@ For the advisory stack, `dhan_ohlcv_daily` is the canonical OHLCV source. The NS
 
 `advisory.dashboard` shows all configured setups in one compact table or JSON payload using the same setup-trace logic underneath.
 
-`advisory.llm_event_evaluator` reads both `advisory_watch_events` and `advisory_news_events`, joins `announcement_pipeline_documents` when official filings exist, and adds point-in-time regime, technical, and fundamentals context before writing `advisory_event_evaluations` and `advisory_event_risks`.
+`advisory.llm_event_evaluator` reads both `advisory_watch_events` and `advisory_news_events`, joins `advisory_announcement_evidence` when official filings exist, and explicitly falls back to `announcement_pipeline_documents` only when compact evidence has not been built for that `unique_id`. It adds point-in-time regime, technical, fundamentals, exchange-feature, and compact bhavcopy evidence context before writing `advisory_event_evaluations` and `advisory_event_risks`.
+
+`advisory.company_memory_review` writes `advisory_company_memory_reviews` as a review-only company-memory input. It reads compact evidence plus latest technical, event-policy, wait-signal, and action rows for a bounded symbol set. It defaults to deterministic V1 and only uses Codex when `--llm` or `COMPANY_MEMORY_REVIEW_LLM_ENABLED=true` is set. These rows do not grant execution authority.
+
+```sh
+python -m advisory.company_memory_review --dry-run --symbols RELIANCE --limit 1
+python -m advisory.company_memory_review --dry-run --limit 12
+python -m advisory.company_memory_review --dry-run --symbols RELIANCE --llm
+```
+
+The operator API attaches the latest company-memory review to matching action rows, including compact `/api/actions?compact=true` responses. The Nuxt Action Queue and Symbol Detail pages show this as read-only company-memory evidence.
+
+`advisory.signal_quality_evaluator` is the research comparator for deciding whether non-price evidence is helping. It starts from `advisory_candidates`, joins only point-in-time rows from event policy, compact bhavcopy evidence, and company-memory review tables, attaches future Dhan OHLCV returns, and writes variant-level results for `technical_only`, `technical_plus_event`, `technical_plus_bhavcopy`, `technical_plus_company_memory`, and `technical_plus_all`. It does not change live action policy or broker execution.
+
+```sh
+python -m advisory.signal_quality_evaluator --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
+python -m advisory.signal_quality_evaluator --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
+```
+
+The operator API exposes the latest persisted signal-quality run at `/api/signal-quality`. The Nuxt operator app shows it at `/signal-quality`, including overlay coverage, lift versus `technical_only`, and selected matured examples. Treat this as manual review evidence only; production action rules are unchanged until a separate explicit config/rule change is approved.
+
+Use `advisory.signal_quality_promotion` only after the evaluator has enough matured rows. It writes manual review/decision audit rows and copyable patch guidance; it does not edit config, action rules, portfolio rows, or broker behavior.
+
+```sh
+python -m advisory.signal_quality_promotion --evaluated-at 2026-05-01T00:00:00Z --horizon-days 5 --variant technical_plus_all --dry-run
+```
+
+The operator API exposes this workflow at `/api/signal-quality/promotion-review`, `/api/signal-quality/promotion-reviews`, and `/api/signal-quality/promotion-review/decision`. The Nuxt `/signal-quality` page can create a review, show the Advisory Trust Gate context, record an approve/reject/needs-more-data decision, and copy patch guidance for a separate reviewed code/config change.
+
+`advisory.config_change_assistant` turns approved review decisions into reviewed unified diffs. It is intentionally one step short of applying the change: the generated diff is an audit artifact and copyable operator aid only.
+
+```sh
+python -m advisory.config_change_assistant --source-type technical_threshold --setup-id EVENT_OPPORTUNITY_V1 --config-id CONFIG_ID --dry-run
+python -m advisory.config_change_assistant --source-type signal_quality_overlay --evaluated-at 2026-05-01T00:00:00Z --horizon-days 5 --variant technical_plus_all --dry-run
+```
+
+The operator API exposes recent previews at `/api/config-change/previews` and diff generation at `/api/config-change/technical-threshold-preview` and `/api/config-change/signal-quality-preview`. The Nuxt Technical Calibration and Signal Quality pages show `Reviewed Diff` actions for approved decisions.
 
 `advisory.risk_engine` reads `advisory_event_evaluations`, joins the latest point-in-time technical and fundamental context, and writes `advisory_allocations` with risk bucket, conviction bucket, suggested INR allocation, and invalidation guidance.
 

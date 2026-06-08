@@ -12,6 +12,11 @@ const [{ data: smoke, refresh: refreshSmoke, pending: smokePending, error: smoke
 ])
 
 const fixHints = computed(() => asList(smoke.value?.fix_hints))
+const smokeContract = computed(() => typeof smoke.value?.operator_smoke === 'object' && smoke.value?.operator_smoke !== null ? smoke.value.operator_smoke as Dict : {})
+const smokeCommand = computed(() => commandList.value.find((command) => String(command.key) === 'operator_smoke') || null)
+const otherCommands = computed(() => commandList.value.filter((command) => String(command.key) !== 'operator_smoke'))
+const smokeCounts = computed(() => asDict(smokeContract.value.counts))
+const smokeNextCommands = computed(() => asStringList(smoke.value?.next_commands || smokeContract.value.next_commands))
 const logs = computed(() => asList(cronLogs.value?.logs))
 const failedGates = computed(() => mlGate.value?.failed_gates || [])
 const gates = computed(() => asList(mlGate.value?.gates))
@@ -35,6 +40,10 @@ const latestRunResult = ref<Dict | null>(null)
 
 function asList(value: unknown): Dict[] {
   return Array.isArray(value) ? value.filter((item) => typeof item === 'object' && item !== null) as Dict[] : []
+}
+
+function asDict(value: unknown): Dict {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
 }
 
 function asStringList(value: unknown): string[] {
@@ -99,6 +108,11 @@ async function runCommand(command: Dict) {
     runningCommand.value = ''
   }
 }
+
+async function runSmokeCommand() {
+  if (!smokeCommand.value) return
+  await runCommand(smokeCommand.value)
+}
 </script>
 
 <template>
@@ -123,9 +137,41 @@ async function runCommand(command: Dict) {
 
   <section class="mt-6 grid gap-4 md:grid-cols-4">
     <MetricTile label="Smoke" :value="String(smoke?.status || '-').toUpperCase()" :note="smoke?.generated_at || '-'" />
+    <MetricTile label="Trust" :value="String(smoke?.trust_level || smokeContract.trust_level || '-').replaceAll('_', ' ').toUpperCase()" :note="String(smoke?.trust_status || smokeContract.trust_status || '-')" />
     <MetricTile label="Fix Hints" :value="String(fixHints.length)" note="Errors and stale-data next steps" />
     <MetricTile label="ML Gate" :value="String(mlGate?.decision || '-')" :note="mlGate?.ready_for_operator_review ? 'Ready for manual review' : 'Research-only for now'" />
     <MetricTile label="API Errors" :value="String(operatorApiErrors.length)" :note="`${recentRuns.length} command runs`" />
+  </section>
+
+  <section class="mt-8 rounded-[2rem] border border-moss/25 bg-moss/10 p-6 shadow-soft">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-black uppercase tracking-[0.3em] text-ink/45">One-click preflight</p>
+        <h2 class="mt-2 text-3xl font-black">Run Operator Smoke Check</h2>
+        <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/70">
+          {{ smoke?.recommendation || smokeContract.recommendation || 'Runs the compact read-only trust preflight and records the run in the audited command table.' }}
+        </p>
+      </div>
+      <button
+        class="rounded-full bg-ink px-5 py-3 text-sm font-black text-paper disabled:opacity-50"
+        type="button"
+        :disabled="Boolean(runningCommand) || !smokeCommand"
+        @click="runSmokeCommand"
+      >
+        {{ runningCommand === 'operator_smoke' ? 'Running smoke...' : 'Run Smoke Check' }}
+      </button>
+    </div>
+    <div class="mt-5 grid gap-3 md:grid-cols-4">
+      <MetricTile label="Trust Level" :value="String(smoke?.trust_level || smokeContract.trust_level || '-').replaceAll('_', ' ').toUpperCase()" note="Current use boundary" />
+      <MetricTile label="Trust Status" :value="String(smoke?.trust_status || smokeContract.trust_status || '-').toUpperCase()" note="Worst trust check" />
+      <MetricTile label="Blockers" :value="String(smokeCounts.current_blockers ?? '-')" note="Current blocker count" />
+      <MetricTile label="Next Commands" :value="String(smokeNextCommands.length)" note="Suggested fixes" />
+    </div>
+    <div v-if="smokeNextCommands.length" class="mt-4 grid gap-2">
+      <code v-for="command in smokeNextCommands.slice(0, 4)" :key="command" class="block overflow-auto rounded-xl bg-ink px-3 py-2 text-xs text-paper">
+        {{ command }}
+      </code>
+    </div>
   </section>
 
   <section class="mt-8 glass-panel rounded-3xl p-6">
@@ -184,7 +230,7 @@ async function runCommand(command: Dict) {
       <p class="mt-1 text-xs text-ink/55">Run id: {{ latestRunResult.run_id }} · elapsed {{ display(latestRunResult.elapsed_ms) }} ms</p>
     </div>
     <div class="mt-5 grid gap-4 lg:grid-cols-2">
-      <article v-for="command in commandList" :key="String(command.key)" class="rounded-3xl bg-white/75 p-5">
+      <article v-for="command in otherCommands" :key="String(command.key)" class="rounded-3xl bg-white/75 p-5">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div>
             <p class="font-black text-ink">{{ command.label }}</p>

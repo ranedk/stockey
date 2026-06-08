@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import action_recommender, adversarial_review, announcement_watch, continuous_watch, dashboard, decision_trace, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
 from advisory import manual_review_state
 from advisory import superseded_failures
 from advisory.api import app as operator_api
@@ -805,6 +805,86 @@ def test_exchange_events_normalize_corporate_actions_handles_missing_side():
 
     assert len(out) == 1
     assert pd.isna(out.iloc[0]["side"]) or out.iloc[0]["side"] is None
+
+
+def test_exchange_events_normalize_corporate_actions_uses_action_type():
+    df = pd.DataFrame(
+        [
+            {
+                "source": "bc",
+                "symbol": "RELIANCE",
+                "date": pd.Timestamp("2026-04-11"),
+                "record_date": pd.Timestamp("2026-04-15"),
+                "subject": "Bonus 1:1",
+                "action_type": "bonus",
+            }
+        ]
+    )
+
+    out = exchange_events.normalize_corporate_actions(df)
+
+    assert out.iloc[0]["event_source"] == "nse_corporate_action"
+    assert out.iloc[0]["event_type"] == "BONUS"
+    assert "source=bc" in out.iloc[0]["event_summary"]
+
+
+def test_exchange_events_repair_missing_event_types_dry_run(monkeypatch):
+    queries: list[str] = []
+
+    monkeypatch.setattr(exchange_events, "require_table_exists", lambda table_name: table_name == exchange_events.TABLE_NAME)
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        queries.append(str(query))
+        return pd.DataFrame([{"matched_rows": 3}])
+
+    monkeypatch.setattr(exchange_events, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(exchange_events, "db_session", lambda: (_ for _ in ()).throw(AssertionError("dry-run should not write")))
+
+    result = exchange_events.repair_missing_event_types(dry_run=True)
+
+    assert result["status"] == "dry_run"
+    assert result["deal_rows"] == 3
+    assert result["short_selling_rows"] == 3
+    assert result["unclassified_rows"] == 0
+    assert result["matched_rows"] == 6
+    assert result["updated_rows"] == 0
+    assert "event_source IS NULL OR event_type IS NULL" in queries[0]
+
+
+def test_exchange_events_repair_missing_event_types_apply(monkeypatch):
+    executed: list[str] = []
+
+    class FakeCursor:
+        rowcount = 2
+
+        def execute(self, query, params=None):
+            executed.append(str(query))
+
+    class FakeSession:
+        def __enter__(self):
+            return object(), FakeCursor()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(exchange_events, "require_table_exists", lambda table_name: table_name == exchange_events.TABLE_NAME)
+    query_counts = iter([pd.DataFrame([{"matched_rows": 2}]), pd.DataFrame([{"matched_rows": 4}]), pd.DataFrame([{"matched_rows": 10}])])
+    monkeypatch.setattr(exchange_events, "sql_to_df", lambda *args, **kwargs: next(query_counts))
+    monkeypatch.setattr(exchange_events, "db_session", lambda: FakeSession())
+
+    result = exchange_events.repair_missing_event_types(dry_run=False)
+
+    assert result["status"] == "applied"
+    assert result["deal_rows"] == 2
+    assert result["short_selling_rows"] == 4
+    assert result["unclassified_rows"] == 4
+    assert result["updated_rows"] == 6
+    assert "nse_legacy_deal" in executed[0]
+    assert "LEGACY_DEAL" in executed[0]
+    assert "nse_short_selling" in executed[1]
+    assert "SHORT_SELLING" in executed[1]
+    assert "nse_unclassified_event" in executed[2]
+    assert "UNCLASSIFIED_EVENT" in executed[2]
 
 
 def test_exchange_events_persist_uses_timescale_safe_composite_key(monkeypatch):
@@ -2172,6 +2252,25 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
     }
 
     monkeypatch.setattr(operator_api, "load_operator_payload", lambda **kwargs: payload)
+    monkeypatch.setattr(
+        operator_api,
+        "_load_latest_company_memory_reviews",
+        lambda symbols: {
+            "ABC": {
+                "review_date": "2026-06-07T00:00:00+00:00",
+                "recommended_signal": "WATCH",
+                "confidence": 0.62,
+                "conviction_score": 68.0,
+                "summary": "ABC memory review suggests WATCH.",
+                "thesis": "Technical setup is constructive, but market context blocks action.",
+                "risk_flags": ["Risk-off context"],
+                "evidence_used": ["latest consolidated action is MANUAL_REVIEW"],
+                "wait_for": ["wait for breadth recovery"],
+                "authority_scope": "review_input_only",
+                "review_status": "completed",
+            }
+        },
+    )
 
     health = operator_api.build_health_payload()
     assert health["operator_controlled"] is True
@@ -2187,6 +2286,9 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
     assert compact_action["manual_revision_summary"] == "ABC final action needs operator checks."
     assert compact_action["manual_revision_pointers"]["manual_checks"] == ["Confirm latest price."]
     assert compact_action["manual_revision_status"] == "disabled"
+    assert compact_action["company_memory_review"]["recommended_signal"] == "WATCH"
+    assert compact_action["company_memory_review"]["authority_scope"] == "review_input_only"
+    assert compact_action["recommendation_reason"]["evidence"]["company_memory"]["summary"] == "ABC memory review suggests WATCH."
     assert compact_action["execution_safety_contract"]["operator_approval_status"] == "missing"
     assert compact_action["execution_safety_contract"]["broker_reconciliation_status"] == "not_run"
     assert compact_action["execution_safety_contract"]["live_submission_allowed"] is False
@@ -2248,6 +2350,87 @@ def test_operator_api_compact_signal_refresh_keeps_effect_fields():
             "effect_summary": "Created a wait-signal match.",
         }
     ]
+
+
+def test_operator_api_builds_signal_quality_payload(monkeypatch):
+    latest = pd.Timestamp("2026-06-01T00:00:00Z")
+
+    def fake_table_exists(table_name: str) -> bool:
+        return table_name in {
+            signal_quality_evaluator.SUMMARY_TABLE,
+            signal_quality_evaluator.EVALUATIONS_TABLE,
+        }
+
+    def fake_sql_to_df(query: str, params=None, **kwargs):
+        if "MAX(evaluated_at)" in query:
+            return pd.DataFrame([{"latest_evaluated_at": latest}])
+        if signal_quality_evaluator.SUMMARY_TABLE in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "evaluated_at": latest,
+                        "horizon_days": 5,
+                        "variant": "technical_only",
+                        "sample_count": 10,
+                        "selected_count": 4,
+                        "matured_count": 4,
+                        "avg_forward_return_after_cost": 0.01,
+                        "lift_vs_technical_only": 0.0,
+                        "recommendation": "baseline",
+                    },
+                    {
+                        "evaluated_at": latest,
+                        "horizon_days": 5,
+                        "variant": "technical_plus_all",
+                        "sample_count": 10,
+                        "selected_count": 3,
+                        "matured_count": 3,
+                        "avg_forward_return_after_cost": 0.04,
+                        "lift_vs_technical_only": 0.03,
+                        "recommendation": "candidate_overlay_improves",
+                    },
+                ]
+            )
+        if "ROW_NUMBER()" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "evaluated_at": latest,
+                        "horizon_days": 5,
+                        "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                        "variant": "technical_plus_all",
+                        "symbol": "ABC",
+                        "selected": True,
+                        "matured": True,
+                        "forward_return_after_cost": 0.04,
+                    }
+                ]
+            )
+        if "candidate_rows" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "horizon_days": 5,
+                        "candidate_rows": 10,
+                        "event_policy_rows": 6,
+                        "bhavcopy_rows": 4,
+                        "company_memory_rows": 2,
+                    }
+                ]
+            )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_api, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+
+    payload = operator_api.build_signal_quality_payload(limit=2)
+
+    assert payload["status"] == "ok"
+    assert len(payload["summary"]) == 2
+    assert payload["coverage"][0]["event_policy_rows"] == 6
+    assert payload["examples"][0]["symbol"] == "ABC"
+    assert payload["meta"]["best_overlay_by_horizon"]["5"]["variant"] == "technical_plus_all"
+    assert payload["meta"]["production_policy_changed"] is False
 
 
 def test_operator_api_compact_actions_keep_raw_broker_execution_safety_contract(monkeypatch):
@@ -2349,6 +2532,9 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     monkeypatch.setattr(operator_health, "check_operator_api", lambda: {"status": "ok", "message": "api ok"})
     monkeypatch.setattr(operator_health, "check_trace_summaries", lambda: {"status": "ok", "message": "trace cache ok", "row_count": 1})
     monkeypatch.setattr(operator_health, "check_operator_snapshot", lambda: {"status": "ok", "message": "snapshot ok"})
+    monkeypatch.setattr(operator_health, "build_event_data_quality_report", lambda limit=20: {"status": "ok", "message": "event quality ok", "summary": {}})
+    monkeypatch.setattr(operator_health, "check_identity_issues", lambda limit=10: {"status": "ok", "message": "identity ok", "open_count": 0, "rows": []})
+    monkeypatch.setattr(operator_health, "check_signal_quality", lambda: {"status": "ok", "message": "signal quality ok", "usable": True})
     monkeypatch.setattr(operator_health, "check_sync_state_failures", lambda: [{"status": "ok", "message": "sync ok"}])
     monkeypatch.setattr(operator_health, "summarize_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
     monkeypatch.setattr(operator_health, "check_table_freshness", lambda: [{"status": "warn", "message": "stale", "name": "actions"}])
@@ -2368,6 +2554,8 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     assert payload["current_blockers"]["status"] == "error"
     assert payload["current_blockers"]["error_count"] >= 1
     assert any(row["category"] == "pipeline" for row in payload["current_blockers"]["rows"])
+    assert payload["sections"]["trust_gate"]["status"] == "warn"
+    assert payload["sections"]["trust_gate"]["trust_level"] == "review_required"
 
 
 def test_operator_health_current_blockers_prioritize_active_trust_issues():
@@ -2413,6 +2601,129 @@ def test_operator_health_current_blockers_prioritize_active_trust_issues():
     assert blockers["rows"][0]["category"] == "runtime"
     assert any(row["category"] == "data_freshness" for row in blockers["rows"])
     assert all("Historical cron errors recovered" not in row["title"] for row in blockers["rows"])
+
+
+def test_operator_health_trust_gate_blocks_on_runtime_and_warns_on_signal_quality():
+    blocked = operator_health.build_trust_gate(
+        {
+            "database": {"status": "error", "message": "db down"},
+            "operator_api": {"status": "ok", "message": "api ok"},
+            "dhan": {"status": "ok", "message": "dhan ok"},
+            "table_freshness": [],
+            "event_data_quality": {"status": "ok", "message": "event ok"},
+            "identity_issues": {"status": "ok", "open_count": 0},
+            "signal_quality": {"status": "ok", "usable": True},
+            "degradation_feed": {"status": "ok", "active_count": 0},
+        }
+    )
+    review = operator_health.build_trust_gate(
+        {
+            "database": {"status": "ok", "message": "db ok"},
+            "operator_api": {"status": "ok", "message": "api ok"},
+            "dhan": {"status": "ok", "message": "dhan ok"},
+            "table_freshness": [],
+            "event_data_quality": {"status": "ok", "message": "event ok"},
+            "identity_issues": {"status": "ok", "open_count": 0},
+            "signal_quality": {
+                "status": "warn",
+                "message": "Latest signal-quality run is not strong enough for promotion decisions.",
+                "reasons": ["insufficient_overlay_coverage"],
+                "max_matured_rows": 100,
+                "overlay_rows": 0,
+            },
+            "degradation_feed": {"status": "ok", "active_count": 0},
+        }
+    )
+
+    assert blocked["status"] == "error"
+    assert blocked["trust_level"] == "blocked"
+    assert review["status"] == "warn"
+    assert review["trust_level"] == "review_required"
+    assert any(row["key"] == "signal_quality" for row in review["checks"])
+
+
+def test_operator_health_signal_quality_flags_sparse_overlay_coverage(monkeypatch):
+    latest = pd.Timestamp.utcnow() - pd.Timedelta(days=1)
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+
+    def fake_sql(query, params=None, **kwargs):
+        if "MAX(evaluated_at)" in query:
+            return pd.DataFrame([{"latest_evaluated_at": latest}])
+        if "advisory_signal_quality_eval_summary" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "evaluated_at": latest,
+                        "horizon_days": 5,
+                        "variant": "technical_only",
+                        "matured_count": 80,
+                        "selected_count": 10,
+                    }
+                ]
+            )
+        if "advisory_signal_quality_evaluations" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "horizon_days": 5,
+                        "candidate_rows": 100,
+                        "event_policy_rows": 2,
+                        "bhavcopy_rows": 0,
+                        "company_memory_rows": 0,
+                    }
+                ]
+            )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_health, "sql_to_df", fake_sql)
+
+    payload = operator_health.check_signal_quality()
+
+    assert payload["status"] == "warn"
+    assert payload["usable"] is False
+    assert "insufficient_overlay_coverage" in payload["reasons"]
+
+
+def test_operator_smoke_builds_compact_trust_contract(monkeypatch):
+    monkeypatch.setattr(
+        operator_smoke,
+        "build_operator_health",
+        lambda log_dir="logs/cron", include_dhan=False: {
+            "generated_at": "2026-06-08T00:00:00Z",
+            "status": "warn",
+            "sections": {
+                "database": {"status": "ok"},
+                "operator_api": {"status": "ok"},
+                "frontend": {"status": "ok"},
+                "operator_snapshot": {"status": "warn"},
+                "signal_quality": {"status": "warn"},
+                "identity_issues": {"status": "ok"},
+                "cron_logs": [{"status": "ok"}],
+                "trust_gate": {
+                    "status": "warn",
+                    "trust_level": "review_required",
+                    "recommendation": "Use as review-only.",
+                    "count": 2,
+                    "error_count": 0,
+                    "warn_count": 2,
+                },
+            },
+            "current_blockers": {"count": 2, "rows": [{"title": "Snapshot stale"}]},
+            "fix_hints": [
+                {"status": "warn", "title": "Snapshot stale", "commands": ["python -m advisory.operator_snapshot"]},
+                {"status": "warn", "title": "Signal quality sparse", "commands": ["python -m advisory.signal_quality_evaluator --dry-run"]},
+            ],
+        },
+    )
+
+    payload = operator_smoke.build_operator_smoke(fix_hint_limit=1)
+
+    assert payload["status"] == "warn"
+    assert payload["trust_level"] == "review_required"
+    assert payload["read_only"] is True
+    assert payload["broker_execution_enabled"] is False
+    assert payload["counts"]["current_blockers"] == 2
+    assert payload["next_commands"] == ["python -m advisory.operator_snapshot"]
 
 
 def test_operator_health_flags_snapshot_and_sync_failures(monkeypatch):
@@ -2775,10 +3086,13 @@ def test_operator_api_critical_routes_publish_typed_response_models():
     research_expected = {
         ("/api/research/event-model-promotion-check", "get"): "EventModelPromotionCheckResponse",
         ("/api/research/event-model-artifacts", "get"): "EventModelArtifactsResponse",
+        ("/api/research/prompt-registry", "get"): "PromptRegistryResponse",
     }
     calibration_expected = {
         ("/api/technical-calibration", "get"): "TechnicalCalibrationResponse",
         ("/api/technical-calibration/promotion-reviews", "get"): "TechnicalPromotionReviewsResponse",
+        ("/api/signal-quality/promotion-reviews", "get"): "SignalQualityPromotionReviewsResponse",
+        ("/api/config-change/previews", "get"): "ConfigChangePreviewsResponse",
     }
     event_policy_expected = {
         ("/api/event-policy", "get"): "EventPolicyResponse",
@@ -3482,11 +3796,33 @@ def test_operator_api_technical_calibration_read_routes_smoke_with_typed_payload
             "reviews": [{"setup_id": "SWING", "config_id": "cfg-1", "review_status": "pending_operator_decision"}],
         },
     )
+    monkeypatch.setattr(
+        operator_api,
+        "build_signal_quality_promotion_reviews_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/signal-quality/promotion-reviews", "signal_quality_promotion_reviews"),
+            "status": "ok",
+            "reviews": [{"variant": "technical_plus_all", "review_status": "ok"}],
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "build_config_change_previews_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/config-change/previews", "config_change_previews"),
+            "status": "ok",
+            "previews": [{"preview_id": "p1", "applied": False}],
+        },
+    )
 
     client = TestClient(operator_api.create_app())
     responses = [
         client.get("/api/technical-calibration?limit=1"),
         client.get("/api/technical-calibration/promotion-reviews?limit=1"),
+        client.get("/api/signal-quality/promotion-reviews?limit=1"),
+        client.get("/api/config-change/previews?limit=1"),
     ]
 
     for response in responses:
@@ -3498,6 +3834,8 @@ def test_operator_api_technical_calibration_read_routes_smoke_with_typed_payload
 
     assert responses[0].json()["summary"][0]["best_config_id"] == "cfg-1"
     assert responses[1].json()["reviews"][0]["review_status"] == "pending_operator_decision"
+    assert responses[2].json()["reviews"][0]["variant"] == "technical_plus_all"
+    assert responses[3].json()["previews"][0]["applied"] is False
 
 
 def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads(monkeypatch):
@@ -3544,11 +3882,24 @@ def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads
             "read_only": True,
         },
     )
+    monkeypatch.setattr(
+        operator_api,
+        "build_prompt_registry_api_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/research/prompt-registry", "prompt_registry"),
+            "status": "ok",
+            "contracts": [{"prompt_id": "advisory_event_evaluation", "broker_execution_allowed": False}],
+            "summary": {"contract_count": 1, "broker_execution_allowed_count": 0},
+            "notes": ["Registry is audit metadata."],
+        },
+    )
 
     client = TestClient(operator_api.create_app())
     responses = [
         client.get("/api/research/event-model-promotion-check"),
         client.get("/api/research/event-model-artifacts"),
+        client.get("/api/research/prompt-registry"),
     ]
 
     for response in responses:
@@ -3560,6 +3911,7 @@ def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads
 
     assert responses[0].json()["decision"] == "hold_research_only"
     assert responses[1].json()["read_only"] is True
+    assert responses[2].json()["summary"]["broker_execution_allowed_count"] == 0
 
 
 def test_operator_api_event_policy_read_routes_smoke_with_typed_payloads(monkeypatch):
@@ -6071,6 +6423,186 @@ def test_action_recommender_blocks_positive_broker_action_in_risk_off_market(mon
     assert macro["top_context_sector"] == "IT"
 
 
+def test_action_recommender_market_gated_manual_review_beats_watch_with_contract(monkeypatch):
+    monkeypatch.setattr(action_recommender, "load_enabled_conflict_rule_ids", lambda: set(action_recommender.DEFAULT_CONFLICT_RULE_IDS))
+    monkeypatch.setattr(action_recommender, "load_enabled_dynamic_conflict_rules_for_ranking", lambda: [])
+    asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:00:00Z"),
+                "symbol": "TCS",
+                "setup_id": "PORT",
+                "unique_id": "BUY-1",
+                "action_code": "BUY",
+                "action_priority": 50,
+                "action_source": "portfolio",
+                "source_action": "approved",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "approved_allocation_inr": 100000.0,
+                "stop_price": 118.0,
+                "action_reason": "Portfolio model approves the breakout entry.",
+                "raw_context_json": json.dumps({"technical_state": "BUY_TRIGGERED", "source_screener_slug": "breakouts"}),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:20:00Z"),
+                "symbol": "TCS",
+                "setup_id": "WATCH",
+                "unique_id": "WATCH-1",
+                "action_code": "WATCH",
+                "action_priority": 10,
+                "action_source": "watchlist",
+                "source_action": "READY",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Watchlist setup is near pivot but not independently actionable.",
+                "raw_context_json": json.dumps({"technical_state": "READY", "watch_reasons": ["near pivot"]}),
+                "load_ts": asof_date,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        action_recommender,
+        "load_latest_market_context",
+        lambda *args, **kwargs: {
+            "summary": {
+                "regime_name": "RISK_OFF",
+                "macro_risk_state": "HIGH",
+                "breadth_trend_alignment_pct": 31.0,
+                "risk_off_score": 0.74,
+            },
+            "top_universe": [{"symbol": "TCS", "rank_pct": 4.0, "sector_name": "IT"}],
+        },
+    )
+
+    adjusted = action_recommender.apply_market_context_adjustments(rows, asof_date=asof_date)
+    winners = action_recommender.rank_action_candidates(adjusted)
+    with_contract = action_recommender.add_recommendation_reason_contracts(winners, adjusted)
+    contract = json.loads(with_contract.iloc[0]["recommendation_reason_json"])
+    manual_review = contract["evidence"]["manual_review"]
+    macro = contract["evidence"]["macro_regime"]
+    conflict = contract["evidence"]["conflict_resolution"]
+
+    assert with_contract.iloc[0]["action_code"] == "MANUAL_REVIEW"
+    assert with_contract.iloc[0]["action_source"] == "portfolio"
+    assert with_contract.iloc[0]["source_action"] == "approved"
+    assert with_contract.iloc[0]["transaction_type"] is None
+    assert with_contract.iloc[0]["execution_mode"] == "review_only"
+    assert with_contract.iloc[0]["reason_contract_status"] == "complete"
+    assert contract["original_action_code"] == "BUY"
+    assert set(contract["evidence_sections_present"]) >= {"manual_review", "macro_regime", "conflict_resolution"}
+    assert manual_review["manual_review_boundary"] == "market_context_positive_action_review_required"
+    assert manual_review["manual_review_effect"] == "review_only_no_broker_execution"
+    assert manual_review["blocked_original_action_code"] == "BUY"
+    assert manual_review["manual_review_action_source"] == "portfolio"
+    assert manual_review["broker_execution_allowed"] is False
+    assert macro["market_context_adjustment"] == "positive_action_blocked_by_market_context"
+    assert macro["risk_off_score"] == 0.74
+    assert conflict["same_symbol_conflict_count"] == 1
+    assert conflict["winning_action_code"] == "MANUAL_REVIEW"
+    assert conflict["winning_action_source"] == "portfolio"
+    assert conflict["losing_candidates"][0]["action_code"] == "WATCH"
+    assert conflict["losing_candidates"][0]["action_source"] == "watchlist"
+    assert conflict["losing_candidates"][0]["source_action"] == "READY"
+
+
+def test_action_recommender_market_gated_buy_more_beats_watch_with_contract(monkeypatch):
+    monkeypatch.setattr(action_recommender, "load_enabled_conflict_rule_ids", lambda: set(action_recommender.DEFAULT_CONFLICT_RULE_IDS))
+    monkeypatch.setattr(action_recommender, "load_enabled_dynamic_conflict_rules_for_ranking", lambda: [])
+    asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:00:00Z"),
+                "symbol": "TCS",
+                "setup_id": "ADD_ON",
+                "unique_id": "BUY-MORE-1",
+                "action_code": "BUY_MORE",
+                "action_priority": 60,
+                "action_source": "portfolio",
+                "source_action": "add_on_pullback",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "approved_allocation_inr": 50000.0,
+                "stop_price": 118.0,
+                "action_reason": "Portfolio model approves an add-on pullback entry.",
+                "raw_context_json": json.dumps(
+                    {
+                        "technical_state": "ADD_ON_PULLBACK",
+                        "source_screener_slug": "portfolio-add-ons",
+                    }
+                ),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:20:00Z"),
+                "symbol": "TCS",
+                "setup_id": "WATCH",
+                "unique_id": "WATCH-1",
+                "action_code": "WATCH",
+                "action_priority": 10,
+                "action_source": "watchlist",
+                "source_action": "READY",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Watchlist setup is near pivot but not independently actionable.",
+                "raw_context_json": json.dumps({"technical_state": "READY", "watch_reasons": ["near pivot"]}),
+                "load_ts": asof_date,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        action_recommender,
+        "load_latest_market_context",
+        lambda *args, **kwargs: {
+            "summary": {
+                "regime_name": "RISK_OFF",
+                "macro_risk_state": "HIGH",
+                "breadth_trend_alignment_pct": 29.0,
+                "risk_off_score": 0.78,
+            },
+            "top_universe": [{"symbol": "TCS", "rank_pct": 4.0, "sector_name": "IT"}],
+        },
+    )
+
+    adjusted = action_recommender.apply_market_context_adjustments(rows, asof_date=asof_date)
+    winners = action_recommender.rank_action_candidates(adjusted)
+    with_contract = action_recommender.add_recommendation_reason_contracts(winners, adjusted)
+    contract = json.loads(with_contract.iloc[0]["recommendation_reason_json"])
+    manual_review = contract["evidence"]["manual_review"]
+    macro = contract["evidence"]["macro_regime"]
+    conflict = contract["evidence"]["conflict_resolution"]
+
+    assert with_contract.iloc[0]["action_code"] == "MANUAL_REVIEW"
+    assert with_contract.iloc[0]["action_source"] == "portfolio"
+    assert with_contract.iloc[0]["source_action"] == "add_on_pullback"
+    assert with_contract.iloc[0]["transaction_type"] is None
+    assert with_contract.iloc[0]["execution_mode"] == "review_only"
+    assert with_contract.iloc[0]["approved_allocation_inr"] == 0.0
+    assert with_contract.iloc[0]["reason_contract_status"] == "complete"
+    assert contract["original_action_code"] == "BUY_MORE"
+    assert set(contract["evidence_sections_present"]) >= {"manual_review", "macro_regime", "conflict_resolution"}
+    assert manual_review["manual_review_boundary"] == "market_context_positive_action_review_required"
+    assert manual_review["manual_review_effect"] == "review_only_no_broker_execution"
+    assert manual_review["blocked_original_action_code"] == "BUY_MORE"
+    assert manual_review["manual_review_action_source"] == "portfolio"
+    assert manual_review["broker_execution_allowed"] is False
+    assert macro["market_context_adjustment"] == "positive_action_blocked_by_market_context"
+    assert macro["risk_off_score"] == 0.78
+    assert conflict["same_symbol_conflict_count"] == 1
+    assert conflict["winning_action_code"] == "MANUAL_REVIEW"
+    assert conflict["winning_action_source"] == "portfolio"
+    assert conflict["losing_candidates"][0]["action_code"] == "WATCH"
+    assert conflict["losing_candidates"][0]["action_source"] == "watchlist"
+    assert conflict["losing_candidates"][0]["source_action"] == "READY"
+
+
 def test_action_recommender_reduces_positive_action_size_in_cautious_market(monkeypatch):
     asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
     rows = pd.DataFrame(
@@ -6118,6 +6650,485 @@ def test_action_recommender_reduces_positive_action_size_in_cautious_market(monk
     assert out.iloc[0]["action_fraction"] == 0.6
     assert out.iloc[0]["invest_score_pct"] == 48.0
     assert context["market_context_adjustment"] == "positive_action_size_reduced_by_market_context"
+
+
+def test_action_recommender_cautious_buy_more_beats_watch_with_sizing_contract(monkeypatch):
+    monkeypatch.setattr(action_recommender, "load_enabled_conflict_rule_ids", lambda: set(action_recommender.DEFAULT_CONFLICT_RULE_IDS))
+    monkeypatch.setattr(action_recommender, "load_enabled_dynamic_conflict_rules_for_ranking", lambda: [])
+    asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:00:00Z"),
+                "symbol": "TCS",
+                "setup_id": "ADD_ON",
+                "unique_id": "BUY-MORE-1",
+                "action_code": "BUY_MORE",
+                "action_priority": 60,
+                "action_source": "portfolio",
+                "source_action": "add_on_pullback",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "approved_allocation_inr": 80000.0,
+                "action_fraction": 0.4,
+                "invest_score_pct": 75.0,
+                "stop_price": 118.0,
+                "action_reason": "Portfolio model approves an add-on pullback entry.",
+                "raw_context_json": json.dumps(
+                    {
+                        "technical_state": "ADD_ON_PULLBACK",
+                        "source_screener_slug": "portfolio-add-ons",
+                        "position_status": "open",
+                        "suggested_action": "add_on_pullback",
+                        "lifecycle_reason": "Open position remains valid and pullback is constructive.",
+                    }
+                ),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:20:00Z"),
+                "symbol": "TCS",
+                "setup_id": "WATCH",
+                "unique_id": "WATCH-1",
+                "action_code": "WATCH",
+                "action_priority": 10,
+                "action_source": "watchlist",
+                "source_action": "READY",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Watchlist setup is near pivot but not independently actionable.",
+                "raw_context_json": json.dumps({"technical_state": "READY", "watch_reasons": ["near pivot"]}),
+                "load_ts": asof_date,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        action_recommender,
+        "load_latest_market_context",
+        lambda *args, **kwargs: {
+            "summary": {
+                "regime_name": "STABLE",
+                "macro_risk_state": "NORMAL",
+                "breadth_trend_alignment_pct": 46.0,
+                "risk_off_score": 0.50,
+                "macro_sizing_multiplier": 0.60,
+            },
+            "top_universe": [{"symbol": "TCS", "rank_pct": 6.0, "sector_name": "IT"}],
+        },
+    )
+
+    adjusted = action_recommender.apply_market_context_adjustments(rows, asof_date=asof_date)
+    winners = action_recommender.rank_action_candidates(adjusted)
+    with_contract = action_recommender.add_recommendation_reason_contracts(winners, adjusted)
+    contract = json.loads(with_contract.iloc[0]["recommendation_reason_json"])
+    macro = contract["evidence"]["macro_regime"]
+    conflict = contract["evidence"]["conflict_resolution"]
+
+    assert with_contract.iloc[0]["action_code"] == "BUY_MORE"
+    assert with_contract.iloc[0]["action_source"] == "portfolio"
+    assert with_contract.iloc[0]["source_action"] == "add_on_pullback"
+    assert with_contract.iloc[0]["transaction_type"] == "BUY"
+    assert with_contract.iloc[0]["execution_mode"] == "broker_order"
+    assert with_contract.iloc[0]["approved_allocation_inr"] == 48000.0
+    assert with_contract.iloc[0]["action_fraction"] == 0.24
+    assert with_contract.iloc[0]["invest_score_pct"] == 45.0
+    assert with_contract.iloc[0]["reason_contract_status"] == "complete"
+    assert contract["original_action_code"] == "BUY_MORE"
+    assert set(contract["evidence_sections_present"]) >= {
+        "screener",
+        "technical",
+        "risk",
+        "lifecycle",
+        "macro_regime",
+        "conflict_resolution",
+    }
+    assert macro["market_context_adjustment"] == "positive_action_size_reduced_by_market_context"
+    assert macro["market_context_adjustment_reason"].startswith("Positive broker action size was reduced")
+    assert macro["size_multiplier"] == 0.60
+    assert macro["macro_sizing_multiplier"] == 0.60
+    assert macro["risk_off_score"] == 0.50
+    assert macro["top_context_rank_pct"] == 6.0
+    assert macro["top_context_sector"] == "IT"
+    assert conflict["same_symbol_conflict_count"] == 1
+    assert conflict["winning_action_code"] == "BUY_MORE"
+    assert conflict["winning_action_source"] == "portfolio"
+    assert conflict["losing_candidates"][0]["action_code"] == "WATCH"
+    assert conflict["losing_candidates"][0]["action_source"] == "watchlist"
+    assert conflict["losing_candidates"][0]["source_action"] == "READY"
+    assert "conflict-rule precedence" in conflict["source_precedence_reason"]
+
+
+def test_action_recommender_event_policy_manual_review_beats_market_adjusted_buy_more_watch(monkeypatch):
+    monkeypatch.setattr(action_recommender, "load_enabled_conflict_rule_ids", lambda: set(action_recommender.DEFAULT_CONFLICT_RULE_IDS))
+    monkeypatch.setattr(action_recommender, "load_enabled_dynamic_conflict_rules_for_ranking", lambda: [])
+    asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:30:00Z"),
+                "symbol": "TCS",
+                "setup_id": "EVENT",
+                "unique_id": "EVENT-REVIEW-1",
+                "action_code": "MANUAL_REVIEW",
+                "action_priority": 80,
+                "action_source": "event_policy",
+                "source_action": "BUY_WATCH",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Large order win needs operator review before increasing exposure.",
+                "action_detail": "Check order size, margin profile, execution period, and price reaction.",
+                "raw_context_json": json.dumps(
+                    {
+                        "event_class": "ORDER_WIN",
+                        "verdict": "manual_review",
+                        "state_transition_hint": "strengthens",
+                        "score_impact": 0.28,
+                        "review_action": "clear",
+                    }
+                ),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:00:00Z"),
+                "symbol": "TCS",
+                "setup_id": "ADD_ON",
+                "unique_id": "BUY-MORE-1",
+                "action_code": "BUY_MORE",
+                "action_priority": 60,
+                "action_source": "portfolio",
+                "source_action": "add_on_pullback",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "approved_allocation_inr": 80000.0,
+                "action_fraction": 0.4,
+                "invest_score_pct": 75.0,
+                "stop_price": 118.0,
+                "action_reason": "Portfolio model approves an add-on pullback entry.",
+                "raw_context_json": json.dumps(
+                    {
+                        "technical_state": "ADD_ON_PULLBACK",
+                        "source_screener_slug": "portfolio-add-ons",
+                        "position_status": "open",
+                        "suggested_action": "add_on_pullback",
+                        "lifecycle_reason": "Open position remains valid and pullback is constructive.",
+                    }
+                ),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:20:00Z"),
+                "symbol": "TCS",
+                "setup_id": "WATCH",
+                "unique_id": "WATCH-1",
+                "action_code": "WATCH",
+                "action_priority": 10,
+                "action_source": "watchlist",
+                "source_action": "READY",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Watchlist setup is near pivot but not independently actionable.",
+                "raw_context_json": json.dumps({"technical_state": "READY", "watch_reasons": ["near pivot"]}),
+                "load_ts": asof_date,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        action_recommender,
+        "load_latest_market_context",
+        lambda *args, **kwargs: {
+            "summary": {
+                "regime_name": "STABLE",
+                "macro_risk_state": "NORMAL",
+                "breadth_trend_alignment_pct": 46.0,
+                "risk_off_score": 0.50,
+                "macro_sizing_multiplier": 0.60,
+            },
+            "top_universe": [{"symbol": "TCS", "rank_pct": 6.0, "sector_name": "IT"}],
+        },
+    )
+
+    adjusted = action_recommender.apply_market_context_adjustments(rows, asof_date=asof_date)
+    winners = action_recommender.rank_action_candidates(adjusted)
+    with_contract = action_recommender.add_recommendation_reason_contracts(winners, adjusted)
+    contract = json.loads(with_contract.iloc[0]["recommendation_reason_json"])
+    event_evidence = contract["evidence"]["event"]
+    manual_review = contract["evidence"]["manual_review"]
+    conflict = contract["evidence"]["conflict_resolution"]
+    losing_by_source = {item["action_source"]: item for item in conflict["losing_candidates"]}
+
+    assert with_contract.iloc[0]["action_code"] == "MANUAL_REVIEW"
+    assert with_contract.iloc[0]["action_source"] == "event_policy"
+    assert with_contract.iloc[0]["transaction_type"] is None
+    assert with_contract.iloc[0]["execution_mode"] == "review_only"
+    assert with_contract.iloc[0]["reason_contract_status"] == "complete"
+    assert set(contract["evidence_sections_present"]) >= {"event", "manual_review", "conflict_resolution"}
+    assert event_evidence["event_class"] == "ORDER_WIN"
+    assert manual_review["manual_review_boundary"] == "event_policy_review_required"
+    assert manual_review["manual_review_effect"] == "review_only_no_broker_execution"
+    assert manual_review["broker_execution_allowed"] is False
+    assert conflict["same_symbol_conflict_count"] == 2
+    assert conflict["winning_action_code"] == "MANUAL_REVIEW"
+    assert conflict["winning_action_source"] == "event_policy"
+    assert losing_by_source["portfolio"]["action_code"] == "BUY_MORE"
+    assert losing_by_source["portfolio"]["source_action"] == "add_on_pullback"
+    assert losing_by_source["portfolio"]["market_context_adjustment"] == "positive_action_size_reduced_by_market_context"
+    assert losing_by_source["portfolio"]["original_action_code"] == "BUY_MORE"
+    assert losing_by_source["portfolio"]["size_multiplier"] == 0.60
+    assert losing_by_source["watchlist"]["action_code"] == "WATCH"
+    assert losing_by_source["watchlist"]["source_action"] == "READY"
+
+
+def test_action_recommender_adversarial_veto_beats_market_gated_buy_more_watch(monkeypatch):
+    monkeypatch.setattr(action_recommender, "load_enabled_conflict_rule_ids", lambda: set(action_recommender.DEFAULT_CONFLICT_RULE_IDS))
+    monkeypatch.setattr(action_recommender, "load_enabled_dynamic_conflict_rules_for_ranking", lambda: [])
+    asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:30:00Z"),
+                "symbol": "TCS",
+                "setup_id": "EVENT",
+                "unique_id": "EVT-VETO",
+                "action_code": "MANUAL_REVIEW",
+                "action_priority": 5,
+                "action_source": "event_policy",
+                "source_action": "BUY_WATCH",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Adversarial review vetoed the otherwise positive event.",
+                "action_detail": "Operator must resolve contradictory evidence before any add-on.",
+                "raw_context_json": json.dumps(
+                    {
+                        "event_class": "ORDER_WIN",
+                        "verdict": "continue",
+                        "state_transition_hint": "strengthens",
+                        "score_impact": -0.5,
+                        "review_action": "veto",
+                        "veto": True,
+                        "review_reason": "Order details conflict with prior disclosure.",
+                        "action_status": "blocked_by_adversarial_review",
+                    }
+                ),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:00:00Z"),
+                "symbol": "TCS",
+                "setup_id": "ADD_ON",
+                "unique_id": "BUY-MORE-1",
+                "action_code": "BUY_MORE",
+                "action_priority": 60,
+                "action_source": "portfolio",
+                "source_action": "add_on_pullback",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "approved_allocation_inr": 80000.0,
+                "action_fraction": 0.4,
+                "invest_score_pct": 75.0,
+                "stop_price": 118.0,
+                "action_reason": "Portfolio model approves an add-on pullback entry.",
+                "raw_context_json": json.dumps(
+                    {
+                        "technical_state": "ADD_ON_PULLBACK",
+                        "source_screener_slug": "portfolio-add-ons",
+                        "position_status": "open",
+                        "suggested_action": "add_on_pullback",
+                        "lifecycle_reason": "Open position remains valid and pullback is constructive.",
+                    }
+                ),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:20:00Z"),
+                "symbol": "TCS",
+                "setup_id": "WATCH",
+                "unique_id": "WATCH-1",
+                "action_code": "WATCH",
+                "action_priority": 10,
+                "action_source": "watchlist",
+                "source_action": "READY",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Watchlist setup is near pivot but not independently actionable.",
+                "raw_context_json": json.dumps({"technical_state": "READY", "watch_reasons": ["near pivot"]}),
+                "load_ts": asof_date,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        action_recommender,
+        "load_latest_market_context",
+        lambda *args, **kwargs: {
+            "summary": {
+                "regime_name": "RISK_OFF",
+                "macro_risk_state": "HIGH",
+                "breadth_trend_alignment_pct": 29.0,
+                "risk_off_score": 0.78,
+            },
+            "top_universe": [{"symbol": "TCS", "rank_pct": 4.0, "sector_name": "IT"}],
+        },
+    )
+
+    adjusted = action_recommender.apply_market_context_adjustments(rows, asof_date=asof_date)
+    winners = action_recommender.rank_action_candidates(adjusted)
+    with_contract = action_recommender.add_recommendation_reason_contracts(winners, adjusted)
+    contract = json.loads(with_contract.iloc[0]["recommendation_reason_json"])
+    event_evidence = contract["evidence"]["event"]
+    manual_review = contract["evidence"]["manual_review"]
+    conflict = contract["evidence"]["conflict_resolution"]
+    losing_by_source = {item["action_source"]: item for item in conflict["losing_candidates"]}
+
+    assert with_contract.iloc[0]["action_code"] == "MANUAL_REVIEW"
+    assert with_contract.iloc[0]["action_source"] == "event_policy"
+    assert with_contract.iloc[0]["transaction_type"] is None
+    assert with_contract.iloc[0]["execution_mode"] == "review_only"
+    assert with_contract.iloc[0]["reason_contract_status"] == "complete"
+    assert set(contract["evidence_sections_present"]) >= {"event", "manual_review", "conflict_resolution"}
+    assert event_evidence["review_action"] == "veto"
+    assert event_evidence["veto"] is True
+    assert event_evidence["action_status"] == "blocked_by_adversarial_review"
+    assert manual_review["manual_review_boundary"] == "event_policy_review_required"
+    assert manual_review["manual_review_effect"] == "review_only_no_broker_execution"
+    assert manual_review["broker_execution_allowed"] is False
+    assert conflict["conflict_precedence_rule_id"] == "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH"
+    assert conflict["same_symbol_conflict_count"] == 2
+    assert conflict["winning_action_code"] == "MANUAL_REVIEW"
+    assert conflict["winning_action_source"] == "event_policy"
+    assert losing_by_source["portfolio"]["action_code"] == "MANUAL_REVIEW"
+    assert losing_by_source["portfolio"]["source_action"] == "add_on_pullback"
+    assert losing_by_source["portfolio"]["market_context_adjustment"] == "positive_action_blocked_by_market_context"
+    assert losing_by_source["portfolio"]["original_action_code"] == "BUY_MORE"
+    assert losing_by_source["portfolio"]["size_multiplier"] == 0.0
+    assert losing_by_source["watchlist"]["action_code"] == "WATCH"
+    assert losing_by_source["watchlist"]["source_action"] == "READY"
+
+
+def test_action_recommender_rebalance_sell_beats_market_gated_buy_more_watch(monkeypatch):
+    monkeypatch.setattr(action_recommender, "load_enabled_conflict_rule_ids", lambda: set(action_recommender.DEFAULT_CONFLICT_RULE_IDS))
+    monkeypatch.setattr(action_recommender, "load_enabled_dynamic_conflict_rules_for_ranking", lambda: [])
+    asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:10:00Z"),
+                "symbol": "TCS",
+                "setup_id": "REBALANCE",
+                "unique_id": "SELL-1",
+                "action_code": "SELL",
+                "action_priority": 100,
+                "action_source": "rebalance",
+                "source_action": "full_exit",
+                "transaction_type": "SELL",
+                "execution_mode": "broker_order",
+                "reference_price": 124.0,
+                "stop_price": 118.0,
+                "action_reason": "Lifecycle engine requires a full exit after stop invalidation.",
+                "action_detail": "Exit trigger: close below invalidation and sector risk has deteriorated.",
+                "raw_context_json": json.dumps(
+                    {
+                        "technical_state": "FULL_EXIT",
+                        "position_status": "open",
+                        "suggested_action": "full_exit",
+                        "lifecycle_reason": "Close below invalidation triggered full exit.",
+                        "next_action_reason": "Sell-side risk action takes precedence over add-on entries.",
+                    }
+                ),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:30:00Z"),
+                "symbol": "TCS",
+                "setup_id": "ADD_ON",
+                "unique_id": "BUY-MORE-1",
+                "action_code": "BUY_MORE",
+                "action_priority": 60,
+                "action_source": "portfolio",
+                "source_action": "add_on_pullback",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "approved_allocation_inr": 80000.0,
+                "action_fraction": 0.4,
+                "invest_score_pct": 75.0,
+                "stop_price": 118.0,
+                "action_reason": "Portfolio model approves an add-on pullback entry.",
+                "raw_context_json": json.dumps(
+                    {
+                        "technical_state": "ADD_ON_PULLBACK",
+                        "source_screener_slug": "portfolio-add-ons",
+                        "position_status": "open",
+                        "suggested_action": "add_on_pullback",
+                        "lifecycle_reason": "Open position remains valid and pullback is constructive.",
+                    }
+                ),
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T10:20:00Z"),
+                "symbol": "TCS",
+                "setup_id": "WATCH",
+                "unique_id": "WATCH-1",
+                "action_code": "WATCH",
+                "action_priority": 10,
+                "action_source": "watchlist",
+                "source_action": "READY",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Watchlist setup is near pivot but not independently actionable.",
+                "raw_context_json": json.dumps({"technical_state": "READY", "watch_reasons": ["near pivot"]}),
+                "load_ts": asof_date,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        action_recommender,
+        "load_latest_market_context",
+        lambda *args, **kwargs: {
+            "summary": {
+                "regime_name": "RISK_OFF",
+                "macro_risk_state": "HIGH",
+                "breadth_trend_alignment_pct": 29.0,
+                "risk_off_score": 0.78,
+            },
+            "top_universe": [{"symbol": "TCS", "rank_pct": 4.0, "sector_name": "IT"}],
+        },
+    )
+
+    adjusted = action_recommender.apply_market_context_adjustments(rows, asof_date=asof_date)
+    winners = action_recommender.rank_action_candidates(adjusted)
+    with_contract = action_recommender.add_recommendation_reason_contracts(winners, adjusted)
+    contract = json.loads(with_contract.iloc[0]["recommendation_reason_json"])
+    conflict = contract["evidence"]["conflict_resolution"]
+    losing_by_source = {item["action_source"]: item for item in conflict["losing_candidates"]}
+
+    assert with_contract.iloc[0]["action_code"] == "SELL"
+    assert with_contract.iloc[0]["action_source"] == "rebalance"
+    assert with_contract.iloc[0]["source_action"] == "full_exit"
+    assert with_contract.iloc[0]["transaction_type"] == "SELL"
+    assert with_contract.iloc[0]["execution_mode"] == "broker_order"
+    assert with_contract.iloc[0]["reason_contract_status"] == "complete"
+    assert set(contract["evidence_sections_present"]) >= {"technical", "risk", "lifecycle", "conflict_resolution"}
+    assert conflict["conflict_precedence_rule_id"] == "EXIT_BEATS_ENTRY_OR_WATCH"
+    assert conflict["winning_action_code"] == "SELL"
+    assert conflict["winning_action_source"] == "rebalance"
+    assert conflict["same_symbol_conflict_count"] == 2
+    assert losing_by_source["portfolio"]["action_code"] == "MANUAL_REVIEW"
+    assert losing_by_source["portfolio"]["source_action"] == "add_on_pullback"
+    assert losing_by_source["portfolio"]["market_context_adjustment"] == "positive_action_blocked_by_market_context"
+    assert losing_by_source["portfolio"]["original_action_code"] == "BUY_MORE"
+    assert losing_by_source["portfolio"]["size_multiplier"] == 0.0
+    assert losing_by_source["watchlist"]["action_code"] == "WATCH"
+    assert losing_by_source["watchlist"]["source_action"] == "READY"
 
 
 def test_action_recommender_does_not_upgrade_action_in_risk_on_market(monkeypatch):
@@ -6666,6 +7677,33 @@ def test_action_recommender_manual_revision_pointers_use_codex(monkeypatch):
     assert pointers["revision_summary"] == "Review TCS buy before execution."
 
 
+def test_action_recommender_manual_revision_pointers_persist_prompt_metadata(monkeypatch):
+    monkeypatch.setattr(
+        action_recommender,
+        "build_manual_revision_pointers",
+        lambda row, candidates, **kwargs: ({"revision_summary": "Review before action."}, "codex", "ok"),
+    )
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "symbol": "TCS",
+                "action_code": "BUY",
+                "action_source": "portfolio",
+                "action_reason": "Breakout confirmed.",
+                "action_priority": 50,
+            }
+        ]
+    )
+
+    out = action_recommender.add_manual_revision_pointers(rows, rows, use_llm=True)
+
+    assert out.iloc[0]["manual_revision_prompt_id"] == "manual_revision_pointers"
+    assert out.iloc[0]["manual_revision_prompt_version"] == action_recommender.MANUAL_REVISION_PROMPT_VERSION
+    assert out.iloc[0]["manual_revision_prompt_schema_version"] == action_recommender.MANUAL_REVISION_PROMPT_SCHEMA_VERSION
+
+
 def test_event_policy_maps_order_win_to_buy_watch_overlay():
     events = pd.DataFrame(
         [
@@ -6776,6 +7814,9 @@ def test_event_policy_llm_downgrades_non_actionable_manual_review(monkeypatch):
     assert out["action_type"] == "NO_ACTION"
     assert out["action_status"] == "llm_downgraded_no_action"
     assert out["llm_review_status"] == "ok"
+    assert out["llm_prompt_id"] == "event_policy_manual_review"
+    assert out["llm_prompt_version"] == event_policy.PROMPT_VERSION
+    assert out["llm_prompt_schema_version"] == event_policy.PROMPT_SCHEMA_VERSION
     assert notes["wait_for_events"] == ["Guidance upgrade", "Material order win"]
 
 
@@ -6819,6 +7860,7 @@ def test_event_policy_llm_adds_questions_to_manual_review(monkeypatch):
 
     assert out.iloc[0]["action_type"] == "MANUAL_REVIEW"
     assert out.iloc[0]["llm_review_status"] == "ok"
+    assert out.iloc[0]["llm_prompt_id"] == "event_policy_manual_review"
     assert "Issue price disclosure" in notes["wait_for_events"]
     assert meta["llm_manual_review_rows"] == 1
 
@@ -7035,6 +8077,37 @@ def test_hypothesis_engine_builds_matches_and_decision():
     assert row["suggested_action"] == "REDUCE_EXPOSURE_REVIEW_TESTING"
     assert row["match_score"] > 0
     assert "austerity" in row["matched_terms_json"]
+
+
+def test_hypothesis_engine_action_plans_persist_prompt_metadata(monkeypatch):
+    monkeypatch.setattr(hypothesis_engine, "load_playbook_market_context", lambda match: {})
+    matches = pd.DataFrame(
+        [
+            {
+                "hypothesis_id": "H1",
+                "hypothesis_title": "Austerity risk",
+                "status": "testing",
+                "source_type": "news",
+                "source_table": "advisory_news_events",
+                "source_key": "N1",
+                "published_on": pd.Timestamp("2026-05-14T10:00:00Z"),
+                "symbol": "NIFTY",
+                "subject": "Prime Minister calls for austerity",
+                "evidence_text": "Austerity and spending cuts were discussed.",
+                "matched_terms_json": json.dumps(["austerity", "spending cuts"]),
+                "match_score": 0.75,
+                "expected_effect_json": json.dumps({"effect": "risk off"}),
+                "suggested_action": "REDUCE_EXPOSURE_REVIEW_TESTING",
+                "action_reason": "Risk-off hypothesis matched.",
+            }
+        ]
+    )
+
+    plans = hypothesis_engine.build_action_plans(matches, use_llm=False)
+
+    assert plans.iloc[0]["prompt_id"] == "playbook_action_plan"
+    assert plans.iloc[0]["prompt_version"] == hypothesis_engine.PLAYBOOK_ACTION_PROMPT_VERSION
+    assert plans.iloc[0]["prompt_schema_version"] == hypothesis_engine.PLAYBOOK_ACTION_PROMPT_SCHEMA_VERSION
 
 
 def test_hypothesis_engine_create_hypothesis_normalizes_payload(monkeypatch):
@@ -7444,6 +8517,9 @@ def test_managed_announcement_stage_serializes_dataclass_reports():
             "category": "Financial Results",
             "report_name": "QuarterlyResult",
             "model_name": "codex",
+            "prompt_id": None,
+            "prompt_version": None,
+            "prompt_schema_version": None,
             "data": {"revenue": 100},
         }
     ]
@@ -8295,6 +9371,7 @@ def test_event_tensor_builds_richer_fields_into_evaluation_output(monkeypatch):
         key_risks=[],
     )
 
+    monkeypatch.setattr(llm_event_evaluator, "load_announcement_evidence", lambda unique_ids: pd.DataFrame())
     monkeypatch.setattr(llm_event_evaluator, "load_documents", lambda unique_ids: pd.DataFrame())
     monkeypatch.setattr(llm_event_evaluator, "build_payload", lambda event_row, document_row: {"stub": True})
     monkeypatch.setattr(
@@ -8308,6 +9385,9 @@ def test_event_tensor_builds_richer_fields_into_evaluation_output(monkeypatch):
     assert meta["evaluated_count"] == 1
     row = evaluations.iloc[0]
     assert row["direction"] == "positive"
+    assert row["prompt_id"] == "advisory_event_evaluation"
+    assert row["prompt_version"] == llm_event_evaluator.ADVISORY_EVENT_PROMPT_VERSION
+    assert row["prompt_schema_version"] == llm_event_evaluator.PROMPT_SCHEMA_VERSION
     assert row["surprise"] == 0.75
     assert row["novelty"] == 0.65
     assert row["contradiction"] == 0.05
@@ -8320,6 +9400,145 @@ def test_event_tensor_builds_richer_fields_into_evaluation_output(monkeypatch):
     assert tensor["affected_sectors"] == ["pharma"]
     assert tensor["affected_peers"] == ["SUNPHARMA", "CIPLA"]
     assert tensor["state_transition_hint"] == "UPGRADE_TO_PASS_NOW"
+
+
+def test_llm_event_evaluator_prefers_compact_evidence_and_marks_raw_fallback(monkeypatch):
+    events = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-04-01T10:00:00Z"),
+                "setup_id": "EVENT_OPPORTUNITY_V1",
+                "setup_name": "Event Opportunity",
+                "symbol": "LUPIN",
+                "company_master_id": "lupin",
+                "unique_id": "compact-1",
+                "event_source": "announcement",
+                "exchange": "NSE",
+                "source_url": "https://example.test/compact",
+                "subject": "US approval for new product",
+                "filed_under_category": "Press Release",
+                "parse_status": "parsed",
+                "concise_summary_text": "Event-row summary should be secondary.",
+                "categories_json": "[]",
+                "watch_reasons_json": "[]",
+            },
+            {
+                "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-04-01T11:00:00Z"),
+                "setup_id": "EVENT_OPPORTUNITY_V1",
+                "setup_name": "Event Opportunity",
+                "symbol": "SUNPHARMA",
+                "company_master_id": "sunpharma",
+                "unique_id": "raw-1",
+                "event_source": "announcement",
+                "exchange": "NSE",
+                "source_url": "https://example.test/raw",
+                "subject": "Board meeting update",
+                "filed_under_category": "Board Meeting",
+                "parse_status": "parsed",
+                "concise_summary_text": "Raw event-row summary should be secondary.",
+                "categories_json": "[]",
+                "watch_reasons_json": "[]",
+            },
+        ]
+    )
+    compact_docs = pd.DataFrame(
+        [
+            {
+                "evidence_id": "ev-compact-1",
+                "unique_id": "compact-1",
+                "company_name": "Lupin Ltd",
+                "parse_status": "parsed",
+                "ocr_status": "not_required",
+                "source_reliability": "high",
+                "has_text_evidence": True,
+                "has_s3_evidence": False,
+                "evidence_chars": 84,
+                "evidence_summary": "Compact evidence says the company received a material approval.",
+                "evidence_excerpt": "Compact excerpt with the important official filing text.",
+                "event_class": "GUIDANCE_UPGRADE",
+                "direction": "positive",
+                "verdict": "continue",
+                "confidence": 0.82,
+                "event_tensor_json": json.dumps({"event_type": "GUIDANCE_UPGRADE"}),
+                "prompt_version": "v-test",
+            }
+        ]
+    )
+    raw_docs = pd.DataFrame(
+        [
+            {
+                "unique_id": "raw-1",
+                "company_name": "Sun Pharma",
+                "parse_status": "parsed",
+                "concise_summary_text": "Raw document summary from announcement documents.",
+                "text": "Raw document text used only when compact evidence is unavailable.",
+                "categories_json": '["board_meeting"]',
+                "parsed_reports_json": "[]",
+            }
+        ]
+    )
+    requested_raw_ids = []
+    payloads = []
+    parsed = llm_event_evaluator.EventEvaluation(
+        what_happened="The official filing provides enough information for structured evaluation.",
+        sentiment="positive",
+        materiality="high",
+        setup_effect="strengthens",
+        direction="positive",
+        surprise=0.7,
+        novelty=0.6,
+        contradiction=0.0,
+        expected_decay_days=60,
+        source_reliability="high",
+        affected_sectors=[],
+        affected_peers=[],
+        governance_risk="none",
+        balance_sheet_risk="none",
+        execution_risk="low",
+        investable_now=True,
+        verdict="continue",
+        event_class="GUIDANCE_UPGRADE",
+        state_transition_hint="RAISE_SCORE_ONLY",
+        score_impact=0.2,
+        confidence=0.8,
+        rationale="The evidence is compact, recent, and suitable for event scoring.",
+        source_trace=["document_context"],
+        key_risks=[],
+    )
+
+    monkeypatch.setattr(llm_event_evaluator, "load_announcement_evidence", lambda unique_ids: compact_docs)
+
+    def fake_load_documents(unique_ids):
+        requested_raw_ids.extend(unique_ids)
+        return raw_docs
+
+    def fake_evaluate(self, payload):
+        payloads.append(payload)
+        return parsed
+
+    monkeypatch.setattr(llm_event_evaluator, "load_documents", fake_load_documents)
+    monkeypatch.setattr(llm_event_evaluator, "load_point_in_time_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(llm_event_evaluator, "load_exchange_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(llm_event_evaluator, "load_broad_market_context", lambda *args, **kwargs: {})
+    monkeypatch.setattr(llm_event_evaluator, "_safe_trace_call", lambda *args, **kwargs: None)
+    monkeypatch.setattr(llm_event_evaluator.AdvisoryEventEvaluator, "evaluate_payload", fake_evaluate)
+
+    evaluations, risks, meta = llm_event_evaluator.build_outputs(events, model="test-model")
+
+    assert len(evaluations) == 2
+    assert risks.empty
+    assert meta["compact_context_count"] == 1
+    assert meta["raw_fallback_context_count"] == 1
+    assert requested_raw_ids == ["raw-1"]
+    assert payloads[0]["document_context"]["context_source"] == "compact_announcement_evidence"
+    assert payloads[0]["document_context"]["fallback_used"] is False
+    assert payloads[0]["document_context"]["document_summary_text"] == compact_docs.iloc[0]["evidence_summary"]
+    assert payloads[0]["document_context"]["document_text_excerpt"] == compact_docs.iloc[0]["evidence_excerpt"]
+    assert payloads[1]["document_context"]["context_source"] == "raw_announcement_document_fallback"
+    assert payloads[1]["document_context"]["fallback_used"] is True
+    assert payloads[1]["document_context"]["document_summary_text"] == raw_docs.iloc[0]["concise_summary_text"]
 
 
 def test_advisory_event_evaluator_uses_codex_structured(monkeypatch):
@@ -9394,6 +10613,55 @@ def test_llm_payload_includes_bounded_exchange_context(monkeypatch):
     assert len(payload["exchange_context"]["recent_events"]) == 1
     assert payload["broad_market_context"]["summary"]["regime_name"] == "RISK_OFF"
     assert payload["broad_market_context"]["symbol_context"]["rank_pct"] == 2.0
+
+
+def test_llm_exchange_context_reads_compact_bhavcopy_evidence(monkeypatch):
+    calls = []
+
+    def fake_table_exists(table_name):
+        return table_name == llm_event_evaluator.BHAVCOPY_EVIDENCE_TABLE
+
+    def fake_sql_to_df(sql, params=None):
+        calls.append((sql, params))
+        assert llm_event_evaluator.BHAVCOPY_EVIDENCE_TABLE in sql
+        return pd.DataFrame(
+            [
+                {
+                    "bhavcopy_asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+                    "close": 100.5,
+                    "daily_return": 0.04,
+                    "volume": 500000,
+                    "avg_volume_20d": 250000,
+                    "turnover_value_inr": 50000000,
+                    "avg_turnover_value_20d": 22000000,
+                    "number_of_trades": 12000,
+                    "close_volatility_20d": 0.025,
+                    "annualized_volatility": 0.39,
+                    "applicable_margin": 12.5,
+                    "deal_net_value_inr": 15000000,
+                    "block_deal_count": 1,
+                    "bulk_deal_count": 0,
+                    "short_selling_quantity": 2000,
+                    "short_selling_count": 1,
+                    "circuit_hit_count": 0,
+                    "circuit_hit_types": None,
+                    "deal_pressure": "accumulation",
+                    "evidence_score": 0.72,
+                    "evidence_summary": "High turnover with net accumulation and no circuit stress.",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(llm_event_evaluator, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(llm_event_evaluator, "sql_to_df", fake_sql_to_df)
+
+    context = llm_event_evaluator.load_exchange_context("HDFCBANK", pd.Timestamp("2026-04-01T09:00:00Z"))
+
+    assert len(calls) == 1
+    assert context["recent_events"] == []
+    assert context["bhavcopy_evidence"]["deal_pressure"] == "accumulation"
+    assert context["bhavcopy_evidence"]["evidence_summary"] == "High turnover with net accumulation and no circuit stress."
+    assert context["bhavcopy_evidence"]["bhavcopy_asof_date"] == "2026-03-31T00:00:00+00:00"
 
 
 def test_risk_engine_macro_multiplier_reduces_allocated_size(monkeypatch):
@@ -11512,6 +12780,159 @@ def test_technical_threshold_calibration_selects_profitable_threshold_config():
     assert row["objective_score"] > 0
 
 
+def test_signal_quality_evaluator_compares_overlay_variants():
+    dataset = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "setup_id": "TECH_V1",
+                "symbol": "WIN",
+                "technical_total_score": 72.0,
+                "technical_state": "READY",
+                "candidate_state": "READY",
+                "technical_trigger_type": "breakout",
+                "event_action_type": "BUY_WATCH",
+                "event_policy_class": "POSITIVE",
+                "event_policy_score": 0.55,
+                "event_confidence": 0.8,
+                "bhavcopy_deal_pressure": "accumulation",
+                "bhavcopy_evidence_score": 0.25,
+                "company_memory_signal": "BUY",
+                "company_memory_confidence": 0.75,
+                "company_memory_conviction_score": 82.0,
+                "entry_date_h5": pd.Timestamp("2026-05-04T00:00:00Z"),
+                "exit_date_h5": pd.Timestamp("2026-05-08T00:00:00Z"),
+                "entry_close_h5": 100.0,
+                "exit_close_h5": 112.0,
+                "forward_return_h5": 0.12,
+            },
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "setup_id": "TECH_V1",
+                "symbol": "RISK",
+                "technical_total_score": 72.0,
+                "technical_state": "READY",
+                "candidate_state": "READY",
+                "technical_trigger_type": "breakout",
+                "event_action_type": "REDUCE_EXPOSURE_REVIEW",
+                "event_policy_class": "RISK",
+                "event_policy_score": -0.5,
+                "event_confidence": 0.8,
+                "bhavcopy_deal_pressure": "distribution_or_pressure",
+                "bhavcopy_evidence_score": -0.25,
+                "company_memory_signal": "SELL_PARTIAL",
+                "company_memory_confidence": 0.75,
+                "company_memory_conviction_score": 35.0,
+                "entry_date_h5": pd.Timestamp("2026-05-04T00:00:00Z"),
+                "exit_date_h5": pd.Timestamp("2026-05-08T00:00:00Z"),
+                "entry_close_h5": 100.0,
+                "exit_close_h5": 90.0,
+                "forward_return_h5": -0.10,
+            },
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "setup_id": "TECH_V1",
+                "symbol": "NEAR",
+                "technical_total_score": 66.0,
+                "technical_state": "WATCHLIST",
+                "candidate_state": "WATCHLIST",
+                "technical_trigger_type": "",
+                "event_action_type": "BUY_WATCH",
+                "event_policy_class": "POSITIVE",
+                "event_policy_score": 0.4,
+                "event_confidence": 0.7,
+                "bhavcopy_deal_pressure": "accumulation",
+                "bhavcopy_evidence_score": 0.2,
+                "company_memory_signal": "WATCH",
+                "company_memory_confidence": 0.65,
+                "company_memory_conviction_score": 70.0,
+                "entry_date_h5": pd.Timestamp("2026-05-04T00:00:00Z"),
+                "exit_date_h5": pd.Timestamp("2026-05-08T00:00:00Z"),
+                "entry_close_h5": 100.0,
+                "exit_close_h5": 108.0,
+                "forward_return_h5": 0.08,
+            },
+        ]
+    )
+
+    evaluations = signal_quality_evaluator.build_evaluation_rows(
+        dataset,
+        horizons=[5],
+        cost_bps=0.0,
+        return_threshold=0.03,
+        technical_min=70.0,
+        near_technical_min=65.0,
+        evaluated_at=pd.Timestamp("2026-06-01T00:00:00Z"),
+    )
+
+    selected = evaluations[evaluations["selected"].fillna(False).astype(bool)]
+    technical_selected = selected[selected["variant"] == "technical_only"]["symbol"].tolist()
+    all_selected = selected[selected["variant"] == "technical_plus_all"]["symbol"].tolist()
+
+    assert technical_selected == ["WIN", "RISK"]
+    assert all_selected == ["WIN", "NEAR"]
+    risk_event = evaluations[(evaluations["symbol"] == "RISK") & (evaluations["variant"] == "technical_plus_event")].iloc[0]
+    assert bool(risk_event["event_negative"]) is True
+    assert bool(risk_event["selected"]) is False
+
+
+def test_signal_quality_evaluator_summary_reports_lift_vs_technical_only():
+    evaluations = signal_quality_evaluator.build_evaluation_rows(
+        pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                    "setup_id": "TECH_V1",
+                    "symbol": "WIN",
+                    "technical_total_score": 72.0,
+                    "technical_state": "READY",
+                    "candidate_state": "READY",
+                    "event_action_type": "BUY_WATCH",
+                    "event_policy_class": "POSITIVE",
+                    "event_policy_score": 0.5,
+                    "bhavcopy_deal_pressure": "accumulation",
+                    "bhavcopy_evidence_score": 0.2,
+                    "company_memory_signal": "BUY",
+                    "company_memory_confidence": 0.7,
+                    "forward_return_h5": 0.10,
+                },
+                {
+                    "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                    "setup_id": "TECH_V1",
+                    "symbol": "RISK",
+                    "technical_total_score": 72.0,
+                    "technical_state": "READY",
+                    "candidate_state": "READY",
+                    "event_action_type": "REDUCE_EXPOSURE_REVIEW",
+                    "event_policy_class": "RISK",
+                    "event_policy_score": -0.5,
+                    "bhavcopy_deal_pressure": "distribution_or_pressure",
+                    "bhavcopy_evidence_score": -0.2,
+                    "company_memory_signal": "SELL",
+                    "company_memory_confidence": 0.7,
+                    "forward_return_h5": -0.10,
+                },
+            ]
+        ),
+        horizons=[5],
+        cost_bps=0.0,
+        return_threshold=0.03,
+        evaluated_at=pd.Timestamp("2026-06-01T00:00:00Z"),
+    )
+
+    summary = signal_quality_evaluator.summarize_evaluations(
+        evaluations,
+        evaluated_at=pd.Timestamp("2026-06-01T00:00:00Z"),
+        min_matured_rows=1,
+    )
+    all_row = summary[summary["variant"] == "technical_plus_all"].iloc[0]
+
+    assert round(float(all_row["baseline_avg_forward_return_after_cost"]), 4) == 0.0
+    assert round(float(all_row["avg_forward_return_after_cost"]), 4) == 0.1
+    assert round(float(all_row["lift_vs_technical_only"]), 4) == 0.1
+    assert all_row["recommendation"] == "candidate_overlay_improves"
+
+
 def test_operator_api_builds_technical_calibration_payload(monkeypatch):
     summary = pd.DataFrame(
         [
@@ -11903,7 +13324,7 @@ def test_superseded_failure_cleanup_dry_run_discovers_recovered_rows(monkeypatch
             table_name = params[0] if isinstance(params, tuple) else params
             if table_name == superseded_failures.EVENT_PROCESSING_TABLE:
                 return pd.DataFrame({"column_name": ["unique_id", "stage", "status", "started_at", "completed_at", "load_ts", "error"]})
-            return pd.DataFrame({"column_name": ["unique_id", "ticker", "ocr_status", "parse_status", "last_error", "updated_at", "load_ts"]})
+            return pd.DataFrame({"column_name": ["unique_id", "ticker", "ocr_status", "parse_status", "last_error", "updated_at", "published_on"]})
         if superseded_failures.EVENT_PROCESSING_TABLE in query_text:
             assert "failed.superseded_at IS NULL" not in query_text
             return pd.DataFrame(
@@ -11924,6 +13345,9 @@ def test_superseded_failure_cleanup_dry_run_discovers_recovered_rows(monkeypatch
             )
         if superseded_failures.ANNOUNCEMENT_DOCUMENTS_TABLE in query_text:
             assert "last_error_superseded_at IS NULL" not in query_text
+            assert " symbol" not in query_text
+            assert "load_ts" not in query_text
+            assert "COALESCE(updated_at, published_on)" in query_text
             return pd.DataFrame(
                 [
                     {
@@ -11933,7 +13357,6 @@ def test_superseded_failure_cleanup_dry_run_discovers_recovered_rows(monkeypatch
                         "parse_status": "completed",
                         "last_error": "old poppler error",
                         "updated_at": pd.Timestamp("2026-05-30T09:00:00Z"),
-                        "load_ts": pd.Timestamp("2026-05-30T09:01:00Z"),
                     }
                 ]
             )
@@ -11999,6 +13422,281 @@ def test_superseded_failure_cleanup_apply_marks_candidates(monkeypatch):
     assert executed[0][1][4:7] == ("event-old", "event_evaluation", pd.Timestamp("2026-05-30T08:00:00Z"))
     assert "SET last_error_superseded_at" in executed[1][0]
     assert executed[1][1][2] == "doc-old"
+
+
+def test_event_data_quality_reports_schema_tolerant_issues(monkeypatch):
+    table_columns = {
+        "nseindia_ohlcv": {"date", "symbol"},
+        "nseindia_indices": {"date", "symbol"},
+        "nseindia_cmvolt": {"date", "symbol"},
+        "nseindia_block_deals": {"date", "symbol"},
+        "nseindia_bulk_deals": {"date", "symbol"},
+        "nseindia_short_selling": {"date", "symbol"},
+        "nseindia_circuit_hit": {"date", "symbol"},
+        "nseindia_corporate_actions": {"date", "symbol"},
+        "nseindia_corporate_actions_bc_raw": {"date", "symbol"},
+        "nseindia_corporate_actions_normalized": {"date", "symbol"},
+        "nseindia_earnings_events": {"event_date", "symbol"},
+        "nseindia_insider_deals": {"date", "symbol"},
+        event_data_quality.ANNOUNCEMENT_DOCUMENTS_TABLE: {"unique_id", "symbol", "published_on", "parse_status", "ocr_status", "concise_summary_s3_key"},
+        event_data_quality.ANNOUNCEMENT_REPORTS_TABLE: {"unique_id", "symbol", "published_on"},
+        event_data_quality.EXCHANGE_EVENTS_TABLE: {"event_id", "symbol", "known_on", "event_source", "event_type"},
+        event_data_quality.EXCHANGE_FEATURES_TABLE: {"symbol", "asof_date", "exchange_event_score", "deal_cluster_count_20d", "corporate_action_count_30d"},
+        event_data_quality.BHAVCOPY_EVIDENCE_TABLE: {"asof_date", "symbol"},
+        event_data_quality.ANNOUNCEMENT_EVIDENCE_TABLE: {"published_on", "symbol"},
+        "nseindia_var1": {"date", "symbol"},
+    }
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        query_text = str(query)
+        params = kwargs.get("params")
+        if "information_schema.tables" in query_text:
+            table_name = params[0] if isinstance(params, tuple) else params
+            return pd.DataFrame({"exists_flag": [1]}) if table_name in table_columns else pd.DataFrame()
+        if "information_schema.columns" in query_text:
+            table_name = params[0] if isinstance(params, tuple) else params
+            return pd.DataFrame({"column_name": sorted(table_columns.get(table_name, set()))})
+        if "announcement_pipeline_documents" in query_text and "SUM(CASE" in query_text:
+            assert '"ticker"' not in query_text
+            assert '"symbol"' in query_text
+            return pd.DataFrame(
+                [
+                    {
+                        "row_count": 10,
+                        "min_published_on": pd.Timestamp("2026-05-01T00:00:00Z"),
+                        "max_published_on": pd.Timestamp("2026-06-01T00:00:00Z"),
+                        "distinct_entities": 5,
+                        "parsed_rows": 9,
+                        "parse_failed_rows": 1,
+                        "ocr_failed_rows": 0,
+                        "rows_with_text": 0,
+                        "rows_with_s3_pointer": 8,
+                    }
+                ]
+            )
+        if "advisory_exchange_events" in query_text and "GROUP BY" not in query_text:
+            return pd.DataFrame(
+                [
+                    {
+                        "row_count": 3,
+                        "distinct_symbols": 2,
+                        "min_known_on": pd.Timestamp("2026-05-01T00:00:00Z"),
+                        "max_known_on": pd.Timestamp("2026-06-01T00:00:00Z"),
+                        "null_source_rows": 1,
+                        "null_type_rows": 1,
+                        "corporate_action_rows": 0,
+                        "earnings_rows": 1,
+                    }
+                ]
+            )
+        if "advisory_exchange_events" in query_text and "GROUP BY" in query_text:
+            return pd.DataFrame([{"event_source": "missing", "event_type": "missing", "rows": 1}])
+        if "advisory_exchange_features_daily" in query_text:
+            assert "short_selling_event_count_20d" not in query_text
+            assert "NULL::bigint AS \"short_feature_rows\"" in query_text
+            return pd.DataFrame(
+                [
+                    {
+                        "row_count": 4,
+                        "distinct_symbols": 2,
+                        "min_asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                        "max_asof_date": pd.Timestamp("2026-06-01T00:00:00Z"),
+                        "nonzero_score_rows": 2,
+                        "deal_feature_rows": 1,
+                        "short_feature_rows": None,
+                        "corporate_action_feature_rows": 0,
+                        "earnings_feature_rows": None,
+                    }
+                ]
+            )
+        if "COUNT(*) AS row_count" in query_text and "MIN(" in query_text:
+            return pd.DataFrame(
+                [
+                    {
+                        "row_count": 10,
+                        "min_at": pd.Timestamp("2026-05-01T00:00:00Z"),
+                        "latest_at": pd.Timestamp("2026-06-01T00:00:00Z"),
+                        "distinct_entities": 3,
+                    }
+                ]
+            )
+        if "SELECT COUNT(*) AS row_count FROM" in query_text:
+            return pd.DataFrame({"row_count": [10]})
+        return pd.DataFrame()
+
+    monkeypatch.setattr(event_data_quality, "sql_to_df", fake_sql_to_df)
+
+    payload = event_data_quality.build_event_data_quality_report(limit=50, now=pd.Timestamp("2026-06-08T00:00:00Z"))
+
+    assert payload["status"] == "warn"
+    issue_codes = {row["issue_code"] for row in payload["issues"]}
+    assert f"announcement_readiness:{event_data_quality.ANNOUNCEMENT_DOCUMENTS_TABLE}" in issue_codes
+    assert f"exchange_event_readiness:{event_data_quality.EXCHANGE_EVENTS_TABLE}" in issue_codes
+    assert f"exchange_feature_readiness:{event_data_quality.EXCHANGE_FEATURES_TABLE}" in issue_codes
+    feature_section = payload["sections"]["exchange_feature_readiness"]
+    assert feature_section["missing_feature_columns"] == ["short_selling_event_count_20d", "upcoming_earnings_14d"]
+    assert feature_section["corporate_action_feature_rows"] == 0
+
+
+def test_event_evidence_store_orchestrates_compact_tables(monkeypatch):
+    writes: list[tuple[str, pd.DataFrame, list[str], str | None]] = []
+    bhavcopy = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-01T00:00:00Z"),
+                "symbol": "ABC",
+                "deal_net_value_inr": 20_000_000.0,
+                "short_selling_quantity": 0.0,
+                "circuit_hit_count": 0,
+            }
+        ]
+    )
+    announcements = pd.DataFrame(
+        [
+            {
+                "evidence_id": "ev1",
+                "published_on": pd.Timestamp("2026-06-01T09:00:00Z"),
+                "symbol": "ABC",
+                "subject": "Order win",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(event_evidence_store, "build_bhavcopy_evidence", lambda **_kwargs: bhavcopy.copy())
+    monkeypatch.setattr(event_evidence_store, "build_announcement_evidence", lambda **_kwargs: announcements.copy())
+
+    def fake_upsert_to_db(df, table, unique_keys, timescaledb_column=None):
+        writes.append((table, df.copy(), list(unique_keys), timescaledb_column))
+
+    monkeypatch.setattr(event_evidence_store, "upsert_to_db", fake_upsert_to_db)
+
+    payload = event_evidence_store.build_event_evidence_store(from_date="2026-06-01", to_date="2026-06-01")
+
+    assert payload["status"] == "ok"
+    assert payload["bhavcopy"]["rows"] == 1
+    assert payload["announcements"]["rows"] == 1
+    assert writes[0][0] == event_evidence_store.BHAVCOPY_EVIDENCE_TABLE
+    assert writes[0][2] == ["asof_date", "symbol"]
+    assert writes[1][0] == event_evidence_store.ANNOUNCEMENT_EVIDENCE_TABLE
+    assert writes[1][2] == ["published_on", "evidence_id"]
+
+
+def test_event_evidence_store_dry_run_does_not_persist(monkeypatch):
+    monkeypatch.setattr(
+        event_evidence_store,
+        "build_bhavcopy_evidence",
+        lambda **_kwargs: pd.DataFrame([{"asof_date": pd.Timestamp("2026-06-01T00:00:00Z"), "symbol": "ABC"}]),
+    )
+    monkeypatch.setattr(
+        event_evidence_store,
+        "build_announcement_evidence",
+        lambda **_kwargs: pd.DataFrame([{"published_on": pd.Timestamp("2026-06-01T09:00:00Z"), "symbol": "ABC"}]),
+    )
+    monkeypatch.setattr(event_evidence_store, "upsert_to_db", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dry-run must not write")))
+
+    payload = event_evidence_store.build_event_evidence_store(dry_run=True)
+
+    assert payload["dry_run"] is True
+    assert payload["bhavcopy"]["rows"] == 1
+    assert payload["announcements"]["rows"] == 1
+
+
+def test_company_memory_deterministic_review_is_review_input_only():
+    context = {
+        "symbol": "LUPIN",
+        "technical": [{"rs_vs_benchmark": 0.08}],
+        "candidates": [{"technical_score": 82.0, "setup_score": 78.0}],
+        "announcement_evidence": [{"direction": "positive", "confidence": 0.8, "evidence_summary": "Material approval"}],
+        "bhavcopy_evidence": [{"deal_pressure": "accumulation", "evidence_summary": "Net accumulation"}],
+        "event_policy": [],
+        "actions": [],
+        "wait_signals": [],
+    }
+
+    review = company_memory_review.deterministic_review(context)
+
+    assert review.recommended_signal == "BUY"
+    assert review.confidence >= 0.65
+    assert "Review input only" in review.deterministic_boundary
+    assert any("technical score" in item for item in review.evidence_used)
+    assert any("accumulation" in item for item in review.evidence_used)
+
+
+def test_company_memory_deterministic_review_downgrades_buy_on_distribution_pressure():
+    context = {
+        "symbol": "ABC",
+        "technical": [{"rs_vs_benchmark": 0.02}],
+        "candidates": [{"technical_score": 84.0}],
+        "announcement_evidence": [{"direction": "positive", "confidence": 0.9}],
+        "bhavcopy_evidence": [{"deal_pressure": "distribution_or_pressure"}],
+        "event_policy": [],
+        "actions": [],
+        "wait_signals": [],
+    }
+
+    review = company_memory_review.deterministic_review(context)
+
+    assert review.recommended_signal == "WATCH"
+    assert any("distribution" in item for item in review.risk_flags)
+
+
+def test_company_memory_build_reviews_uses_bounded_symbols_and_persists_contract(monkeypatch):
+    contexts = {
+        "AAA": {
+            "symbol": "AAA",
+            "technical": [],
+            "candidates": [{"technical_score": 70.0}],
+            "announcement_evidence": [],
+            "bhavcopy_evidence": [],
+            "event_policy": [],
+            "actions": [],
+            "wait_signals": [],
+        },
+        "BBB": {
+            "symbol": "BBB",
+            "technical": [],
+            "candidates": [{"technical_score": 90.0}],
+            "announcement_evidence": [{"direction": "positive", "confidence": 0.9}],
+            "bhavcopy_evidence": [],
+            "event_policy": [],
+            "actions": [],
+            "wait_signals": [],
+        },
+    }
+    writes = []
+
+    monkeypatch.setattr(company_memory_review, "load_review_symbols", lambda **kwargs: ["AAA", "BBB"])
+    monkeypatch.setattr(
+        company_memory_review,
+        "load_company_memory_context",
+        lambda symbol, **kwargs: contexts[symbol],
+    )
+    monkeypatch.setattr(company_memory_review, "ensure_table", lambda: None)
+    monkeypatch.setattr(company_memory_review, "upsert_to_db", lambda df, table, unique_keys: writes.append((df.copy(), table, unique_keys)))
+
+    reviews, meta = company_memory_review.build_company_memory_reviews(
+        asof_date=pd.Timestamp("2026-06-01T00:00:00Z"),
+        limit=2,
+        use_llm=False,
+    )
+    company_memory_review.persist_company_memory_reviews(reviews)
+
+    assert meta["authority_scope"] == "review_input_only"
+    assert len(reviews) == 2
+    assert set(reviews["authority_scope"]) == {"review_input_only"}
+    assert set(reviews["model_name"]) == {"deterministic_company_memory_v1"}
+    assert set(reviews["prompt_id"]) == {"company_memory_review"}
+    assert set(reviews["prompt_version"]) == {company_memory_review.PROMPT_VERSION}
+    assert set(reviews["prompt_schema_version"]) == {company_memory_review.PROMPT_SCHEMA_VERSION}
+    assert writes[0][1] == company_memory_review.TABLE_NAME
+    assert writes[0][2] == ["review_date", "symbol"]
+    assert str(writes[0][0]["fallback_used"].dtype) == "boolean"
+
+
+def test_company_memory_stage_is_registered_before_risk():
+    assert "company_memory" in pipeline.PIPELINE_STAGES
+    assert pipeline.PIPELINE_STAGES.index("event_policy") < pipeline.PIPELINE_STAGES.index("company_memory")
+    assert pipeline.PIPELINE_STAGES.index("company_memory") < pipeline.PIPELINE_STAGES.index("risk")
 
 
 def test_operator_api_records_manual_review_decision(monkeypatch):
@@ -12748,6 +14446,8 @@ def test_operator_api_lists_operator_commands(monkeypatch):
     payload = operator_api.build_operator_commands_payload(limit=10)
 
     assert payload["status"] == "ok"
+    assert payload["commands"][0]["key"] == "operator_smoke"
+    assert payload["commands"][0]["risk"] == "safe_read_only"
     assert any(row["key"] == "operator_health_skip_dhan" for row in payload["commands"])
     superseded_command = next(row for row in payload["commands"] if row["key"] == "superseded_failure_cleanup_dry_run")
     assert superseded_command["dry_run"] is True
@@ -12874,6 +14574,9 @@ def test_technical_threshold_promotion_review_is_manual_only(monkeypatch):
     assert result["review_status"] == "disabled"
     assert result["pending_patch"]["mode"] == "manual_review_only"
     assert result["pending_patch"]["path"] == "config/advisory_setups.yaml"
+    assert result["prompt_id"] == "technical_threshold_promotion_review"
+    assert result["prompt_version"] == technical_threshold_promotion.PROMPT_VERSION
+    assert result["prompt_schema_version"] == technical_threshold_promotion.PROMPT_SCHEMA_VERSION
     assert result["llm_review"]["recommendation"] == "needs_more_data"
     assert len(persisted) == 1
 
@@ -12971,6 +14674,275 @@ def test_operator_api_records_technical_promotion_manual_decision(monkeypatch):
     assert payload["applied"] is False
     assert called["decision"] == "approved"
     assert called["operator_id"] == "tester"
+
+
+def test_signal_quality_promotion_review_is_manual_only(monkeypatch):
+    persisted = []
+    monkeypatch.setattr(
+        signal_quality_promotion,
+        "load_signal_quality_summary",
+        lambda **_kwargs: {
+            "evaluated_at": pd.Timestamp("2026-05-01T00:00:00Z"),
+            "horizon_days": 5,
+            "variant": "technical_plus_all",
+            "selected_count": 35,
+            "matured_count": 35,
+            "avg_forward_return_after_cost": 0.04,
+            "hit_rate_after_cost": 0.55,
+            "lift_vs_technical_only": 0.025,
+        },
+    )
+    monkeypatch.setattr(signal_quality_promotion, "persist_review", lambda result: persisted.append(result))
+
+    result = signal_quality_promotion.generate_promotion_review(
+        evaluated_at="2026-05-01T00:00:00Z",
+        horizon_days=5,
+        variant="technical_plus_all",
+        persist=True,
+    )
+
+    assert result["review_model"] == "deterministic_signal_quality_v1"
+    assert result["pending_patch"]["mode"] == "manual_review_only"
+    assert result["pending_patch"]["rule_suggestion"]["broker_execution_allowed"] is False
+    assert result["llm_review"]["recommendation"] == "promote_overlay_review"
+    assert len(persisted) == 1
+
+
+def test_signal_quality_promotion_manual_decision_does_not_apply_patch(monkeypatch):
+    writes = []
+    monkeypatch.setattr(signal_quality_promotion, "ensure_tables", lambda: None)
+    monkeypatch.setattr(
+        signal_quality_promotion,
+        "find_review",
+        lambda **_kwargs: {
+            "reviewed_at": pd.Timestamp("2026-05-30T00:00:00Z"),
+            "evaluated_at": pd.Timestamp("2026-05-01T00:00:00Z"),
+            "horizon_days": 5,
+            "variant": "technical_plus_all",
+            "recommendation": "promote_overlay_review",
+            "confidence": 0.55,
+            "llm_review": {"recommendation": "promote_overlay_review"},
+            "signal_quality_evidence": {"matured_count": 35},
+            "patch": {
+                "path": "config/advisory_setups.yaml",
+                "mode": "manual_review_only",
+                "variant": "technical_plus_all",
+                "rule_suggestion": {"signal_quality_overlay": "technical_plus_all"},
+            },
+        },
+    )
+    monkeypatch.setattr(signal_quality_promotion, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+
+    result = signal_quality_promotion.record_manual_decision(
+        reviewed_at="2026-05-30T00:00:00Z",
+        evaluated_at="2026-05-01T00:00:00Z",
+        horizon_days=5,
+        variant="technical_plus_all",
+        decision="approved",
+        operator_id="tester",
+        decision_reason="stable lift across manual checks",
+    )
+
+    assert result["applied"] is False
+    assert result["final_patch"]["mode"] == "manual_apply_required"
+    assert "signal_quality_overlay_rules:" in result["final_patch"]["manual_patch_text"]
+    assert writes[0].iloc[0]["decision"] == "approved"
+
+
+def test_operator_api_builds_signal_quality_promotion_review_payload(monkeypatch):
+    called = {}
+
+    def fake_review(**kwargs):
+        called.update(kwargs)
+        return {
+            "status": "ok",
+            "evaluated_at": kwargs["evaluated_at"],
+            "horizon_days": kwargs["horizon_days"],
+            "variant": kwargs["variant"],
+            "pending_patch": {"mode": "manual_review_only"},
+            "llm_review": {"recommendation": "promote_overlay_review"},
+        }
+
+    monkeypatch.setattr(operator_api, "generate_signal_quality_promotion_review", fake_review)
+
+    payload = operator_api.build_signal_quality_promotion_review_payload(
+        {"evaluated_at": "2026-05-01T00:00:00Z", "horizon_days": 5, "variant": "technical_plus_all"}
+    )
+
+    assert payload["api_schema"]["endpoint"] == "/api/signal-quality/promotion-review"
+    assert payload["pending_patch"]["mode"] == "manual_review_only"
+    assert called["persist"] is True
+    assert called["variant"] == "technical_plus_all"
+
+
+def test_operator_api_records_signal_quality_promotion_manual_decision(monkeypatch):
+    called = {}
+
+    def fake_decision(**kwargs):
+        called.update(kwargs)
+        return {
+            "status": "ok",
+            "decision": kwargs["decision"],
+            "evaluated_at": kwargs["evaluated_at"],
+            "horizon_days": kwargs["horizon_days"],
+            "variant": kwargs["variant"],
+            "final_patch": {"mode": "manual_apply_required"},
+            "applied": False,
+        }
+
+    monkeypatch.setattr(operator_api, "record_signal_quality_manual_decision", fake_decision)
+
+    payload = operator_api.build_signal_quality_promotion_review_decision_payload(
+        {
+            "reviewed_at": "2026-05-30T00:00:00Z",
+            "evaluated_at": "2026-05-01T00:00:00Z",
+            "horizon_days": 5,
+            "variant": "technical_plus_all",
+            "decision": "approved",
+            "operator_id": "tester",
+        }
+    )
+
+    assert payload["applied"] is False
+    assert payload["api_schema"]["endpoint"] == "/api/signal-quality/promotion-review/decision"
+    assert called["decision"] == "approved"
+    assert called["operator_id"] == "tester"
+
+
+def test_config_change_assistant_renders_technical_threshold_diff(tmp_path):
+    config_path = tmp_path / "advisory_setups.yaml"
+    config_path.write_text(
+        """setups:
+  - setup_id: EVENT_OPPORTUNITY_V1
+    setup_name: Event Opportunity
+    score_thresholds:
+      pass_now: 0.70
+      watch_event: 0.50
+    technical_rules:
+      - column: pass_above_dma_50
+        operator: eq
+        value: true
+""",
+        encoding="utf-8",
+    )
+
+    result = config_change_assistant.build_preview_from_patch(
+        source_type="technical_threshold",
+        source_key="review-1",
+        config_path=config_path,
+        patch_payload={
+            "setup_id": "EVENT_OPPORTUNITY_V1",
+            "technical_thresholds": {"buy_total_min": 78, "structure_min": 18},
+        },
+        persist=False,
+    )
+
+    assert result["applied"] is False
+    assert "technical_thresholds:" in result["unified_diff"]
+    assert "+      buy_total_min: 78" in result["unified_diff"]
+    assert "Preview only" in result["safety_checks"][0]
+
+
+def test_config_change_assistant_renders_signal_quality_overlay_diff(tmp_path):
+    config_path = tmp_path / "advisory_setups.yaml"
+    config_path.write_text("setups:\n  - setup_id: TEST\n    setup_name: Test\n", encoding="utf-8")
+
+    result = config_change_assistant.build_preview_from_patch(
+        source_type="signal_quality_overlay",
+        source_key="review-2",
+        config_path=config_path,
+        patch_payload={
+            "rule_suggestion": {
+                "signal_quality_overlay": "technical_plus_all",
+                "minimum_horizon_days": 5,
+                "minimum_matured_rows": 40,
+                "minimum_lift_vs_technical_only": 0.02,
+            }
+        },
+        persist=False,
+    )
+
+    assert result["applied"] is False
+    assert "signal_quality_overlay_rules:" in result["unified_diff"]
+    assert "+  - authority: review_input_only" in result["unified_diff"]
+    assert "+    broker_execution_allowed: false" in result["unified_diff"]
+
+
+def test_operator_api_builds_config_change_previews(monkeypatch):
+    technical_called = {}
+    signal_called = {}
+
+    def fake_technical(**kwargs):
+        technical_called.update(kwargs)
+        return {
+            "status": "ok",
+            "source_type": "technical_threshold",
+            "config_path": "config/advisory_setups.yaml",
+            "unified_diff": "---\n+++",
+            "applied": False,
+        }
+
+    def fake_signal(**kwargs):
+        signal_called.update(kwargs)
+        return {
+            "status": "ok",
+            "source_type": "signal_quality_overlay",
+            "config_path": "config/advisory_setups.yaml",
+            "unified_diff": "---\n+++",
+            "applied": False,
+        }
+
+    monkeypatch.setattr(operator_api, "build_technical_threshold_preview", fake_technical)
+    monkeypatch.setattr(operator_api, "build_signal_quality_overlay_preview", fake_signal)
+
+    technical_payload = operator_api.build_technical_config_change_preview_payload(
+        {"reviewed_at": "2026-05-30T00:00:00Z", "setup_id": "EVENT_OPPORTUNITY_V1", "config_id": "cfg-1"}
+    )
+    signal_payload = operator_api.build_signal_quality_config_change_preview_payload(
+        {
+            "reviewed_at": "2026-05-30T00:00:00Z",
+            "evaluated_at": "2026-05-01T00:00:00Z",
+            "horizon_days": 5,
+            "variant": "technical_plus_all",
+        }
+    )
+
+    assert technical_payload["applied"] is False
+    assert technical_payload["api_schema"]["endpoint"] == "/api/config-change/technical-threshold-preview"
+    assert technical_called["setup_id"] == "EVENT_OPPORTUNITY_V1"
+    assert signal_payload["applied"] is False
+    assert signal_payload["api_schema"]["endpoint"] == "/api/config-change/signal-quality-preview"
+    assert signal_called["variant"] == "technical_plus_all"
+
+
+def test_prompt_registry_lists_prompt_contracts_with_no_broker_authority():
+    payload = prompt_registry.build_prompt_registry_payload()
+    prompt_ids = {row["prompt_id"] for row in payload["contracts"]}
+
+    assert payload["status"] == "ok"
+    assert "advisory_event_evaluation" in prompt_ids
+    assert "company_memory_review" in prompt_ids
+    assert "manual_revision_pointers" in prompt_ids
+    assert payload["summary"]["broker_execution_allowed_count"] == 0
+    assert all(row["broker_execution_allowed"] is False for row in payload["contracts"])
+
+
+def test_prompt_registry_filters_by_owner_and_scope():
+    owner_payload = prompt_registry.build_prompt_registry_payload(owner_area="company_memory")
+    scope_payload = prompt_registry.build_prompt_registry_payload(authority_scope="extraction_only")
+
+    assert {row["owner_area"] for row in owner_payload["contracts"]} == {"company_memory"}
+    assert scope_payload["contracts"]
+    assert {row["authority_scope"] for row in scope_payload["contracts"]} == {"extraction_only"}
+
+
+def test_operator_api_builds_prompt_registry_payload():
+    payload = operator_api.build_prompt_registry_api_payload(authority_scope="review_input_only")
+
+    assert payload["api_schema"]["endpoint"] == "/api/research/prompt-registry"
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["summary"]["broker_execution_allowed_count"] == 0
+    assert {row["authority_scope"] for row in payload["contracts"]} == {"review_input_only"}
 
 
 def test_watchlist_builder_marks_abstain_as_not_watch_enabled(monkeypatch):

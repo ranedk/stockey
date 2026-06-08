@@ -22,6 +22,8 @@ from .categorize import report_category_map
 from .models import Announcement, CompanyMasterTarget, ParsedReport
 from .prompts import CATEGORY_PROMPTS, REPORT_PROMPTS
 from .schemas import DOCUMENT_PYDANTIC_MAP, MODEL_TYPE_MAP
+from advisory.prompt_registry import prompt_version as registry_prompt_version
+from advisory.prompt_registry import response_schema_version
 from utils.http import get_dynamic_headers
 from utils.log import setup_logger
 from utils.codex_cli import run_codex_cli, run_codex_structured
@@ -41,6 +43,15 @@ TRANSCRIBE_WITH = env("TRANSCRIBE_WITH", default="gemini-3-flash-preview")
 SUMMARIZE_WITH = env("SUMMARIZE_WITH", default="codex")
 CODEX_CLI_SUMMARIZE_MODEL = env("CODEX_CLI_SUMMARIZE_MODEL", default=env("CODEX_CLI_MODEL", default="gpt-5.4-mini"))
 CODEX_CLI_OCR_MODEL = env("CODEX_CLI_OCR_MODEL", default=env("CODEX_CLI_MODEL", default="gpt-5.4-mini"))
+ANNOUNCEMENT_SUMMARY_PROMPT_ID = "announcement_summary"
+ANNOUNCEMENT_SUMMARY_PROMPT_VERSION = registry_prompt_version(ANNOUNCEMENT_SUMMARY_PROMPT_ID)
+ANNOUNCEMENT_SUMMARY_PROMPT_SCHEMA_VERSION = response_schema_version(ANNOUNCEMENT_SUMMARY_PROMPT_ID)
+ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID = "announcement_structured_report"
+ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_VERSION = registry_prompt_version(ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID)
+ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_SCHEMA_VERSION = response_schema_version(ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID)
+OCR_PDF_PAGE_PROMPT_ID = "ocr_pdf_page"
+OCR_PDF_PAGE_PROMPT_VERSION = registry_prompt_version(OCR_PDF_PAGE_PROMPT_ID)
+OCR_PDF_PAGE_PROMPT_SCHEMA_VERSION = response_schema_version(OCR_PDF_PAGE_PROMPT_ID)
 NSE_HTTP_MAX_ATTEMPTS = env.int("NSE_HTTP_MAX_ATTEMPTS", default=0)
 NSE_HTTP_RETRY_SLEEP_SECONDS = env.float("NSE_HTTP_RETRY_SLEEP_SECONDS", default=5.0)
 NSE_HTTP_RETRY_MAX_SLEEP_SECONDS = env.float("NSE_HTTP_RETRY_MAX_SLEEP_SECONDS", default=120.0)
@@ -203,6 +214,11 @@ class AnnouncementPipeline:
                     announcement.three_page_ocr_text = "\n\n".join(
                         text for _, text in sorted(retry_page_texts.items()) if text
                     )
+                if announcement.three_page_ocr_text:
+                    announcement.ocr_model_name = self.ocr_model
+                    announcement.ocr_prompt_id = OCR_PDF_PAGE_PROMPT_ID
+                    announcement.ocr_prompt_version = OCR_PDF_PAGE_PROMPT_VERSION
+                    announcement.ocr_prompt_schema_version = OCR_PDF_PAGE_PROMPT_SCHEMA_VERSION
             except Exception as exc:
                 announcement.ocr_error = str(exc)
                 logger.warning("OCR/transcription failed for %s: %s", announcement.unique_id, exc)
@@ -222,6 +238,11 @@ class AnnouncementPipeline:
                 announcement.full_ocr_text = "\n\n".join(
                     text for _, text in sorted(page_texts.items()) if text
                 )
+                if announcement.full_ocr_text:
+                    announcement.ocr_model_name = self.ocr_model
+                    announcement.ocr_prompt_id = OCR_PDF_PAGE_PROMPT_ID
+                    announcement.ocr_prompt_version = OCR_PDF_PAGE_PROMPT_VERSION
+                    announcement.ocr_prompt_schema_version = OCR_PDF_PAGE_PROMPT_SCHEMA_VERSION
             except Exception as exc:
                 announcement.ocr_error = str(exc)
                 logger.warning("Full OCR failed for %s: %s", announcement.unique_id, exc)
@@ -300,6 +321,9 @@ class AnnouncementPipeline:
                         report_name=report_model.__name__,
                         model_name=MODEL_TYPE_MAP[report_model],
                         data=parsed.model_dump(),
+                        prompt_id=ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID,
+                        prompt_version=ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_VERSION,
+                        prompt_schema_version=ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_SCHEMA_VERSION,
                     )
                 )
             announcement.parsed_reports = parsed_reports
@@ -319,6 +343,11 @@ class AnnouncementPipeline:
                 context=self._build_document_context(announcement),
                 model=self.summarize_model,
             ).strip()
+            if announcement.concise_summary_text:
+                announcement.concise_summary_model_name = self.summarize_model
+                announcement.concise_summary_prompt_id = ANNOUNCEMENT_SUMMARY_PROMPT_ID
+                announcement.concise_summary_prompt_version = ANNOUNCEMENT_SUMMARY_PROMPT_VERSION
+                announcement.concise_summary_prompt_schema_version = ANNOUNCEMENT_SUMMARY_PROMPT_SCHEMA_VERSION
         return list(announcements)
 
     def process(

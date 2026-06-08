@@ -8,6 +8,7 @@ import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
 
+from advisory.sync_state import persist_sync_state
 from data.dhanlive.dhan_db import get_nse_equity
 from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
@@ -20,6 +21,7 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env.int("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:earnings_events"
+SYNC_SOURCE_NAME = "data.nseindia.earnings_events"
 
 
 def get_random(min_ms: int, max_ms: int) -> int:
@@ -89,47 +91,57 @@ def fetch_earnings_events(page, symbol: str, issuer: str, from_date: datetime, t
 def sync_earnings_events(symbols: List[str], from_date: datetime | None = None, to_date: datetime | None = None) -> None:
     _, to_date = normalize_date_window(from_date, to_date)
     redis_client = get_redis_client(REDIS_HOST, REDIS_PORT)
+    rows_written = 0
+    latest_item_ts = None
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = context.new_page()
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.new_page()
 
-        counter = 0
-        try:
-            for symbol in symbols:
-                eqt = get_nse_equity(symbol)
-                issuer = eqt.display_name
+            counter = 0
+            try:
+                for symbol in symbols:
+                    eqt = get_nse_equity(symbol)
+                    issuer = eqt.display_name
 
-                effective_from_date = choose_from_date(
-                    from_date,
-                    [
-                        get_redis_cursor(redis_client, f"{REDIS_SET}:{symbol}"),
-                        get_db_max_date("nseindia_earnings_events", filters={"symbol": symbol}),
-                    ],
-                )
-                if effective_from_date > to_date:
-                    continue
-
-                if counter % 10 == 0:
-                    page.goto("https://www.nseindia.com")
-                    page.wait_for_timeout(get_random(1000, 3000))
-
-                df = fetch_earnings_events(page, symbol, issuer, effective_from_date, to_date)
-                if not df.empty:
-                    df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
-                    upsert_to_db(
-                        df,
-                        "nseindia_earnings_events",
-                        unique_keys=["date", "symbol", "reporting_date", "period"],
-                        timescaledb_column="date",
+                    effective_from_date = choose_from_date(
+                        from_date,
+                        [
+                            get_redis_cursor(redis_client, f"{REDIS_SET}:{symbol}"),
+                            get_db_max_date("nseindia_earnings_events", filters={"symbol": symbol}),
+                        ],
                     )
-                set_redis_cursor(redis_client, f"{REDIS_SET}:{symbol}", to_date)
-                counter += 1
-        finally:
-            page.close()
-            browser.close()
-            redis_client.close()
+                    if effective_from_date > to_date:
+                        continue
+
+                    if counter % 10 == 0:
+                        page.goto("https://www.nseindia.com")
+                        page.wait_for_timeout(get_random(1000, 3000))
+
+                    df = fetch_earnings_events(page, symbol, issuer, effective_from_date, to_date)
+                    if not df.empty:
+                        df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
+                        rows_written += int(len(df))
+                        max_date = pd.to_datetime(df["date"], utc=True, errors="coerce").max()
+                        latest_item_ts = max_date if latest_item_ts is None or max_date > latest_item_ts else latest_item_ts
+                        upsert_to_db(
+                            df,
+                            "nseindia_earnings_events",
+                            unique_keys=["date", "symbol", "reporting_date", "period"],
+                            timescaledb_column="date",
+                        )
+                    set_redis_cursor(redis_client, f"{REDIS_SET}:{symbol}", to_date)
+                    counter += 1
+            finally:
+                page.close()
+                browser.close()
+                redis_client.close()
+    except Exception as exc:
+        persist_sync_state(source_name=SYNC_SOURCE_NAME, status="error", error_text=f"{type(exc).__name__}: {exc}", state={"symbols": len(symbols), "rows_written": rows_written})
+        raise
+    persist_sync_state(source_name=SYNC_SOURCE_NAME, status="ok", last_success_at=pd.Timestamp.utcnow(), last_item_ts=latest_item_ts, state={"symbols": len(symbols), "rows_written": rows_written})
 
 
 def main():

@@ -8,6 +8,8 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.prompt_registry import prompt_version as registry_prompt_version
+from advisory.prompt_registry import response_schema_version
 from utils.codex_cli import run_codex_structured
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
@@ -19,6 +21,9 @@ env.read_env()
 TABLE_NAME = "advisory_event_policy_actions"
 EVALUATIONS_TABLE = "advisory_event_evaluations"
 REVIEWS_TABLE = "advisory_event_reviews"
+PROMPT_ID = "event_policy_manual_review"
+PROMPT_VERSION = registry_prompt_version(PROMPT_ID)
+PROMPT_SCHEMA_VERSION = response_schema_version(PROMPT_ID)
 EVENT_POLICY_LLM_MANUAL_REVIEW_ENABLED = env.bool("EVENT_POLICY_LLM_MANUAL_REVIEW_ENABLED", default=True)
 EVENT_POLICY_LLM_MANUAL_REVIEW_MODEL = env("EVENT_POLICY_LLM_MANUAL_REVIEW_MODEL", default="codex")
 EVENT_POLICY_LLM_MANUAL_REVIEW_MAX_ROWS = env.int("EVENT_POLICY_LLM_MANUAL_REVIEW_MAX_ROWS", default=25)
@@ -172,6 +177,9 @@ def ensure_tables() -> None:
                 checks_json TEXT,
                 operator_notes_json TEXT,
                 llm_review_json TEXT,
+                llm_prompt_id TEXT,
+                llm_prompt_version TEXT,
+                llm_prompt_schema_version TEXT,
                 llm_review_status TEXT,
                 llm_review_model TEXT,
                 llm_review_error TEXT,
@@ -184,6 +192,9 @@ def ensure_tables() -> None:
         column_defs = {
             "operator_notes_json": "TEXT",
             "llm_review_json": "TEXT",
+            "llm_prompt_id": "TEXT",
+            "llm_prompt_version": "TEXT",
+            "llm_prompt_schema_version": "TEXT",
             "llm_review_status": "TEXT",
             "llm_review_model": "TEXT",
             "llm_review_error": "TEXT",
@@ -415,6 +426,9 @@ def build_policy_for_event(row: pd.Series) -> dict[str, Any]:
         "checks_json": json_dumps(checks),
         "operator_notes_json": json_dumps({}),
         "llm_review_json": json_dumps({}),
+        "llm_prompt_id": None,
+        "llm_prompt_version": None,
+        "llm_prompt_schema_version": None,
         "llm_review_status": "not_requested",
         "llm_review_model": None,
         "llm_review_error": None,
@@ -514,11 +528,19 @@ def apply_llm_manual_review(policy_row: dict[str, Any], *, model: str | None = N
         out["action_reason"] = _text(notes.get("operator_summary"), out.get("action_reason"))
     out["operator_notes_json"] = json_dumps(notes)
     out["llm_review_json"] = json_dumps(notes)
+    out["llm_prompt_id"] = PROMPT_ID
+    out["llm_prompt_version"] = PROMPT_VERSION
+    out["llm_prompt_schema_version"] = PROMPT_SCHEMA_VERSION
     out["llm_review_status"] = status
     out["llm_review_model"] = effective_model
     out["llm_review_error"] = error
     raw_context = json.loads(out.get("raw_context_json") or "{}")
     raw_context["operator_notes"] = notes
+    raw_context["prompt_contract"] = {
+        "prompt_id": PROMPT_ID,
+        "prompt_version": PROMPT_VERSION,
+        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+    }
     out["raw_context_json"] = json_dumps(raw_context)
     return out
 

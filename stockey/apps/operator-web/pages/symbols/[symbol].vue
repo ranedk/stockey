@@ -38,6 +38,7 @@ const finalAction = computed(() => mergeRows(
 ))
 const reasonContract = computed(() => finalAction.value.recommendation_reason || finalAction.value.reason_contract || finalAction.value.recommendation_reason_json)
 const reasonStatus = computed(() => finalAction.value.reason_contract_status || finalAction.value.status)
+const companyMemory = computed(() => companyMemoryReview(finalAction.value))
 const explicitTarget = computed(() => numericFirstValue(['target_price', 'recommended_target_price']))
 const derivedTarget = computed(() => computeDerivedTarget())
 const displayTarget = computed(() => explicitTarget.value ?? derivedTarget.value)
@@ -47,6 +48,20 @@ const snapshotWarning = computed(() => asDict(actions.value?.snapshot_warning ||
 
 function asDict(value: unknown): Dict {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
+}
+
+function nestedValue(source: unknown, path: string[]): unknown {
+  let current = source
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return null
+    current = (current as Dict)[key]
+  }
+  return current
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.map((item) => String(item || '').trim()).filter(Boolean)
 }
 
 function filterSymbolRows(rows: Dict[]): Dict[] {
@@ -177,6 +192,27 @@ function eventTitle(row: Dict) {
 function eventSubtitle(row: Dict) {
   return row.concise_summary_text || row.summary || row.action_reason || row.reason || row.source_type || ''
 }
+
+function companyMemoryReview(row: Dict) {
+  const review = asDict(row.company_memory_review || nestedValue(row, ['recommendation_reason', 'evidence', 'company_memory']))
+  const riskFlags = stringArray(review.risk_flags)
+  const evidenceUsed = stringArray(review.evidence_used)
+  const waitFor = stringArray(review.wait_for)
+  return {
+    hasData: Object.keys(review).length > 0,
+    signal: String(review.recommended_signal || '').toUpperCase(),
+    confidence: review.confidence,
+    conviction: review.conviction_score,
+    summary: String(review.summary || '').trim(),
+    thesis: String(review.thesis || '').trim(),
+    authority: String(review.authority_scope || 'review_input_only'),
+    status: String(review.review_status || '').trim(),
+    reviewDate: String(review.review_date || '').trim(),
+    riskFlags,
+    evidenceUsed,
+    waitFor
+  }
+}
 </script>
 
 <template>
@@ -242,6 +278,52 @@ function eventSubtitle(row: Dict) {
         {{ finalAction.action_reason || finalAction.reason || finalAction.reason_detail || finalAction.action_summary || 'No final action reason was available in the compact payload.' }}
       </p>
       <ReasonContractPanel v-if="reasonContract || reasonStatus" class="mt-4" :contract="reasonContract" :status="reasonStatus" />
+      <section
+        class="mt-4 rounded-2xl border p-4"
+        :class="companyMemory.hasData ? 'border-moss/25 bg-moss/10' : 'border-black/10 bg-white/65'"
+      >
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.22em] text-moss">Company Memory Review</p>
+            <h3 class="mt-1 text-lg font-black">
+              {{ companyMemory.hasData ? (companyMemory.signal || 'Review input') : 'Not generated yet' }}
+            </h3>
+            <p class="mt-2 text-sm leading-6 text-ink/65">
+              {{ companyMemory.hasData ? (companyMemory.summary || companyMemory.thesis || 'Review generated without summary.') : 'Run advisory/company_memory stage to generate compact read-only company evidence for this symbol.' }}
+            </p>
+          </div>
+          <span class="rounded-full bg-white px-3 py-1 text-xs font-black text-ink/60">{{ companyMemory.authority || 'review_input_only' }}</span>
+        </div>
+        <div v-if="companyMemory.hasData" class="mt-3 grid gap-2 text-sm md:grid-cols-4">
+          <p class="rounded-xl bg-white/80 px-3 py-2"><b>Confidence:</b> {{ pct(companyMemory.confidence) }}</p>
+          <p class="rounded-xl bg-white/80 px-3 py-2"><b>Conviction:</b> {{ display(companyMemory.conviction) }}</p>
+          <p class="rounded-xl bg-white/80 px-3 py-2"><b>Status:</b> {{ companyMemory.status || '-' }}</p>
+          <p class="rounded-xl bg-white/80 px-3 py-2"><b>Date:</b> {{ companyMemory.reviewDate || '-' }}</p>
+        </div>
+        <p v-if="companyMemory.hasData && companyMemory.thesis && companyMemory.thesis !== companyMemory.summary" class="mt-3 rounded-xl bg-white/75 p-3 text-sm leading-6 text-ink/70">
+          {{ companyMemory.thesis }}
+        </p>
+        <div v-if="companyMemory.hasData" class="mt-3 grid gap-3 md:grid-cols-3">
+          <div v-if="companyMemory.evidenceUsed.length" class="rounded-xl bg-white/80 p-3">
+            <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Evidence used</p>
+            <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+              <li v-for="item in companyMemory.evidenceUsed" :key="item">{{ item }}</li>
+            </ul>
+          </div>
+          <div v-if="companyMemory.riskFlags.length" class="rounded-xl bg-white/80 p-3">
+            <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Risk flags</p>
+            <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+              <li v-for="item in companyMemory.riskFlags" :key="item">{{ item }}</li>
+            </ul>
+          </div>
+          <div v-if="companyMemory.waitFor.length" class="rounded-xl bg-white/80 p-3">
+            <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Wait for</p>
+            <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+              <li v-for="item in companyMemory.waitFor" :key="item">{{ item }}</li>
+            </ul>
+          </div>
+        </div>
+      </section>
       <TechnicalDecisionPanel class="mt-4" :record="finalAction" />
       <details class="mt-4">
         <summary class="cursor-pointer text-sm font-black text-moss">Show final action row</summary>

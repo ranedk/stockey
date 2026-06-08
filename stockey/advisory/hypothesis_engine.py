@@ -13,6 +13,8 @@ from environs import Env
 from pydantic import BaseModel, Field
 
 from advisory.market_context import load_latest_market_context
+from advisory.prompt_registry import prompt_version as registry_prompt_version
+from advisory.prompt_registry import response_schema_version
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 from utils.codex_cli import run_codex_structured
@@ -39,6 +41,9 @@ WORD_RE = re.compile(r"[a-z0-9][a-z0-9\-']+", re.IGNORECASE)
 env = Env()
 env.read_env()
 DEFAULT_PLAYBOOK_ACTION_MODEL = env("PLAYBOOK_ACTION_MODEL", default="codex")
+PLAYBOOK_ACTION_PROMPT_ID = "playbook_action_plan"
+PLAYBOOK_ACTION_PROMPT_VERSION = registry_prompt_version(PLAYBOOK_ACTION_PROMPT_ID)
+PLAYBOOK_ACTION_PROMPT_SCHEMA_VERSION = response_schema_version(PLAYBOOK_ACTION_PROMPT_ID)
 WEAK_MARKET_BREADTH_THRESHOLD = 45.0
 RISK_OFF_STATES = {"HIGH", "STRESS", "RISK_OFF", "DEFENSIVE"}
 POSITIVE_PLAYBOOK_ACTIONS = {"BUY", "BUY_MORE", "BUY_WATCH", "WATCH_SYMBOLS", "ADD_TO_WATCHLIST"}
@@ -152,6 +157,9 @@ def ensure_tables() -> None:
                 market_context_json TEXT,
                 market_context_adjustment_json TEXT,
                 market_context_adjustment TEXT,
+                prompt_id TEXT,
+                prompt_version TEXT,
+                prompt_schema_version TEXT,
                 llm_model TEXT,
                 llm_status TEXT,
                 llm_error TEXT,
@@ -160,6 +168,12 @@ def ensure_tables() -> None:
             )
             """
         )
+        for column, sql_type in {
+            "prompt_id": "TEXT",
+            "prompt_version": "TEXT",
+            "prompt_schema_version": "TEXT",
+        }.items():
+            cur.execute(f"ALTER TABLE {ACTION_PLANS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
         cur.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {PROMOTION_AUDITS_TABLE} (
@@ -1281,6 +1295,9 @@ def build_action_plans(matches: pd.DataFrame, *, model: str | None = None, use_l
                 "market_context_json": json_dumps(market_context),
                 "market_context_adjustment_json": json_dumps(adjustment),
                 "market_context_adjustment": adjustment.get("adjustment"),
+                "prompt_id": PLAYBOOK_ACTION_PROMPT_ID,
+                "prompt_version": PLAYBOOK_ACTION_PROMPT_VERSION,
+                "prompt_schema_version": PLAYBOOK_ACTION_PROMPT_SCHEMA_VERSION,
                 "llm_model": model or DEFAULT_PLAYBOOK_ACTION_MODEL,
                 "llm_status": llm_status,
                 "llm_error": llm_error,

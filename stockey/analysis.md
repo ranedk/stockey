@@ -24,7 +24,7 @@ Highest-priority gaps:
 
 - `Partial`: formal state machine for manual interventions and their downstream effects. Decision effects, matched wait-signal reopen/suppression, durable review-only action-candidate linkage, and a mocked end-to-end operator journey are enforced; broader superseded/downstream state coverage still needs work.
 - `Done`: regression tests for every manual-review decision type and the core watch-signal downstream journey now cover decision recording, wait-signal creation, matching, Manual Review reopening, and review-only action-candidate creation.
-- `Partial`: action/reason contract tests covering event-policy, playbook, lifecycle, execution, and wait-signal paths. Matched Manual Review wait-signal candidates now carry explicit wait-signal evidence, same-symbol source-precedence contracts expose losing candidates, enabled promoted exact-match conflict rules affect candidate ranking and preserve rule attribution in reason contracts, incomplete broker-capable rows downgrade with explicit Manual Review/no-broker boundary evidence, event-policy/playbook/lifecycle/generic Manual Review rows carry explicit review-only/no-broker boundary evidence, and compact API rows preserve execution-safety contracts even when only persisted in raw broker JSON; duplicate BUY screener collapse, portfolio BUY-over-WATCH, lifecycle HOLD-over-WATCH, portfolio BUY_MORE-over-portfolio BUY, portfolio BUY_MORE-over-WATCH, portfolio SELL-over-portfolio BUY, SELL-over-WATCH, generic MANUAL_REVIEW-over-portfolio BUY, PARTIAL_SELL-over-portfolio BUY, PARTIAL_SELL-over-WATCH, review-only TIGHTEN_STOP-over-portfolio BUY, review-only TIGHTEN_STOP-over-WATCH, MANUAL_REVIEW-over-WATCH, and event-policy/playbook/lifecycle matrix permutations now have focused coverage, but broader contract coverage remains.
+- `Partial`: action/reason contract tests covering event-policy, playbook, lifecycle, execution, and wait-signal paths. Matched Manual Review wait-signal candidates now carry explicit wait-signal evidence, same-symbol source-precedence contracts expose losing candidates including market-adjustment context, enabled promoted exact-match conflict rules affect candidate ranking and preserve rule attribution in reason contracts, incomplete broker-capable rows downgrade with explicit Manual Review/no-broker boundary evidence, event-policy/playbook/lifecycle/generic Manual Review rows carry explicit review-only/no-broker boundary evidence, and compact API rows preserve execution-safety contracts even when only persisted in raw broker JSON; duplicate BUY screener collapse, portfolio BUY-over-WATCH, lifecycle HOLD-over-WATCH, market-gated portfolio BUY and BUY_MORE Manual Review-over-WATCH, cautious-market portfolio BUY_MORE-over-WATCH sizing reduction, event-policy Manual Review-over-market-adjusted BUY_MORE plus WATCH, adversarial-veto Manual Review-over-market-gated BUY_MORE plus WATCH, rebalance SELL-over-market-gated BUY_MORE plus WATCH, portfolio BUY_MORE-over-portfolio BUY, portfolio BUY_MORE-over-WATCH, portfolio SELL-over-portfolio BUY, SELL-over-WATCH, generic MANUAL_REVIEW-over-portfolio BUY, PARTIAL_SELL-over-portfolio BUY, PARTIAL_SELL-over-WATCH, review-only TIGHTEN_STOP-over-portfolio BUY, review-only TIGHTEN_STOP-over-WATCH, MANUAL_REVIEW-over-WATCH, and event-policy/playbook/lifecycle matrix permutations now have focused coverage, but broader contract coverage remains.
 - `Done`: adversarial-review veto reasons are visible in compact Action Queue reason contracts/UI, not only trace/detail views.
 - `Done`: compact Action Queue/API reason fields now humanize internal status/reason codes before display while preserving machine action codes.
 - `Done`: stale operator snapshot warnings now use a shared API warning payload and render consistently on snapshot-backed operator pages, including symbol detail. Non-snapshot Manual Review, Wait Signals, and Identity Issues pages now expose source-specific freshness/unavailable-source warnings derived from their visible rows, and home/portfolio/events read APIs now publish explicit broker-disabled schema contracts.
@@ -189,6 +189,51 @@ Gaps:
 - `To do`: reduce expensive full-table feature queries with materialized/current snapshots.
 - `To do`: add feature-level tests for point-in-time behavior and no lookahead.
 
+## 7A. Announcement, Bhavcopy, And LLM Signal Intelligence
+
+Status: `Partial`
+
+This is the next quality-upgrade program. The current Dhan OHLCV technical spine is the strongest part of the system. The weaker part is turning corporate announcements and NSE/bhavcopy-derived data into compact, point-in-time evidence that can be used by deterministic rules, LLM reviewers, action consolidation, and the operator UI.
+
+Done:
+
+- Dhan OHLCV is the canonical price source for active technical analysis.
+- Exchange event and exchange feature tables exist and are consumed by event/risk/model paths.
+- Announcement ingestion, OCR/transcription, summarization, structured reports, event evaluation, event policy, wait signals, and action consolidation exist.
+- LLM/Codex usage is bounded to extraction/review/signal explanation, not direct broker authority.
+- `advisory.event_evidence_store` builds compact V1 tables: `advisory_bhavcopy_evidence_daily` for liquidity/deals/short/circuit/volatility/margin evidence and `advisory_announcement_evidence` for announcement metadata plus latest LLM evaluation fields.
+- `advisory.llm_event_evaluator` now consumes `advisory_announcement_evidence` before raw announcement documents, marks raw-document fallback explicitly, and adds latest point-in-time `advisory_bhavcopy_evidence_daily` into exchange context.
+- `advisory.company_memory_review` writes review-only company-memory summaries into `advisory_company_memory_reviews` from compact announcement evidence, compact bhavcopy evidence, technical/candidate state, event policy, wait signals, and latest action rows. It is deterministic by default and Codex is opt-in.
+- `advisory.signal_quality_evaluator` compares realized outcomes for `technical_only`, `technical_plus_event`, `technical_plus_bhavcopy`, `technical_plus_company_memory`, and `technical_plus_all` variants using point-in-time overlays and future Dhan OHLCV returns after costs. It is research-only and does not change live action policy.
+- `/api/signal-quality` and the Nuxt `/signal-quality` page expose the latest signal-quality run with overlay coverage, lift versus technical-only, and selected matured examples for manual review.
+- `advisory.exchange_events` now reads normalized and bhavcopy corporate-action sources, maps corporate-action `action_type` into stable event types, and exposes `--repair-missing-types` for legacy null-typed deal/short-selling/unclassified rows.
+- Sparse NSE crawlers for corporate actions, earnings, and insider deals now persist `advisory_sync_state`, and `advisory.event_data_quality` uses that state to avoid confusing “checked recently, no new sparse events” with failed ingestion.
+
+Current findings:
+
+- Legacy `advisory_exchange_events` null typing is now repairable by command. A first live repair classified legacy deal and short-selling rows, but the final catch-all repair still needs to be rerun after Postgres is stable because the DB was shutting down during verification.
+- NSE block deals, bulk deals, short selling, circuit hits, CMVOLT, indices, and OHLCV have useful recent coverage, but they are not yet prepared as a broad queryable evidence layer.
+- Earnings source coverage is stale in the current DB. Corporate-action and insider false positives are resolved by correct table mapping plus sparse-source sync-state support. Corporate-action feature influence is now proven nonzero on a rebuilt 2025-10-28 smoke day; broader historical/current rebuild coverage remains.
+- Announcement documents and reports are recent and rich, but event-policy output is still too coarse for some cases; many rows become Manual Review without enough actionability context.
+- Raw announcement text and large bhavcopy tables are too heavy for direct UI/advisory querying. V1 compact cached evidence tables now exist, and the event LLM path has switched to compact announcement/bhavcopy context. Remaining downstream consumers still need to switch from raw scans to these stores consistently.
+
+Gaps:
+
+- `To do`: add more OHLCV technical algorithms on top of Dhan data: breakout/retest/pullback state detection, volatility compression, relative strength, stop/target/time-horizon logic, partial-exit rules, and realized-outcome validation.
+- `To do`: create a complete corporate-announcement taxonomy that maps every announcement into one of three storage forms: compact structured event, structured event plus summary text, or archived raw/unstructured evidence with metadata and source pointers.
+- `To do`: create an announcement evidence tensor with materiality, direction, surprise, novelty, contradiction, confidence, expected decay, source reliability, affected peers/sectors, price reaction, current exposure, and suggested next evidence.
+- `Partial`: create a bhavcopy evidence store that the LLM and deterministic rules can query without scanning raw tables. V1 exposes liquidity, turnover, circuit behavior, block/bulk accumulation, short-selling pressure, volatility, margins, and abnormal participation; the event LLM path consumes the latest row. Corporate actions, index/sector context, broader deterministic rules, and UI explainability consumption remain.
+- `Partial`: add an LLM company-memory review flow that can inspect historical company events, prior decisions, current technical state, bhavcopy evidence, latest announcements, and wait signals to propose `BUY`, `SELL`, `HOLD`, `SELL_PARTIAL`, `BUY_MORE`, `WATCH`, or `NO_ACTION`. V1 is implemented as `review_input_only`, deterministic by default, persisted to `advisory_company_memory_reviews`, wired as the `company_memory` pipeline stage, attached to action API rows, and visible in Action Queue plus Symbol Detail. Outcome comparison is available through `advisory.signal_quality_evaluator`; review-only overlay promotion decisions are available through `advisory.signal_quality_promotion`; approved decisions can generate reviewed config diffs through `advisory.config_change_assistant`. Remaining work is action-consolidation influence rules after evidence proves lift and an operator manually applies a reviewed config/rule change.
+- `To do`: keep final broker-executable action authority in deterministic action consolidation. LLM signal output must be an input with rationale/confidence, not the final execution decision.
+- `Done`: centralize LLM/Codex prompt contracts in `advisory.prompt_registry` with prompt ids, versions, schema names, model env vars, source files, authority scopes, output tables, fallbacks, and migration status; expose it through `/api/research/prompt-registry` and the Nuxt `/prompt-registry` page.
+- `To do`: progressively migrate prompt callers to reference registry ids/version constants directly and record prompt ids/schema versions on every LLM output row.
+- `To do`: surface this evidence in the operator UI: what happened, what data was used, what the LLM concluded, what deterministic rules accepted/rejected, what evidence is stale/missing, and why the final action differs from raw signals.
+- `Done`: add an evaluator that compares technical-only outcomes against technical-plus-event-policy, bhavcopy, and company-memory outcomes after costs, using point-in-time data.
+- `Done`: add operator UI/API summaries for `advisory_signal_quality_eval_summary` so overlay lift/worsening can be reviewed before any production rule change.
+- `Done`: add a manual signal-quality overlay-promotion review workflow that writes review/decision audit rows, shows Trust Gate context in the Nuxt `/signal-quality` page, and emits copyable patch guidance without changing live policy.
+- `Done`: add reviewed config-change diff generation for approved threshold and signal-quality overlay decisions without applying the change.
+- `To do`: add deterministic action-consolidation influence rules only after a generated diff is manually reviewed and applied.
+
 ## 8. Screener And Candidate Universe
 
 Status: `Partial`
@@ -249,6 +294,8 @@ Gaps:
 - `To do`: add a source-quality model for news versus exchange announcements versus OCR documents.
 - `To do`: require “actionability” fields on every manual-review event: materiality, freshness, current holding exposure, price reaction, and suggested next evidence.
 - `To do`: make event-policy rows explicitly symbol/date/current-state aware, not just event aware.
+- `To do`: separate LLM outputs into extraction, company-memory review, proposed signal, adversarial challenge, and final deterministic policy input so prompts and schemas are auditable.
+- `To do`: store prompt/skill version, input evidence IDs, output schema version, and deterministic acceptance/rejection reason for every LLM-generated signal.
 
 ## 11. Adversarial Review
 
@@ -264,7 +311,7 @@ Done:
 
 Gaps:
 
-- `Partial`: define exact precedence between adversarial review, event policy, market context, technical signals, and lifecycle exits. Adversarial veto over BUY/WATCH is now pinned; broader cross-system precedence remains.
+- `Partial`: define exact precedence between adversarial review, event policy, market context, technical signals, and lifecycle exits. Adversarial veto over BUY/WATCH and over a risk-off market-gated BUY_MORE plus WATCH collision is now pinned; broader cross-system precedence remains.
 - `Done`: add regression tests for veto beating buy/watch candidates.
 - `Done`: show adversarial-review reason in the action queue, not only trace/details.
 - `To do`: evaluate veto precision and false positives over realized outcomes.
@@ -335,7 +382,7 @@ Done:
 - Reason contracts exist and can downgrade incomplete broker actions.
 - Matched Manual Review wait-signal action candidates now satisfy the reason contract through explicit `wait_signal` evidence while remaining review-only.
 - Reason contracts now include same-symbol conflict/source-precedence evidence with winning source, losing candidates, and deterministic precedence reason; compact Action Queue rows preserve and render that conflict evidence.
-- Reason contracts now carry explicit market-gate evidence when positive broker actions are blocked by weak/risk-off market context, including the review-only Manual Review boundary and blocked original action; compact Action Queue rows preserve the original action plus gate reason and breadth/risk metrics.
+- Reason contracts now carry explicit market-gate evidence when positive broker actions are blocked by weak/risk-off market context, including BUY and BUY_MORE review-only Manual Review boundaries and blocked original action; compact Action Queue rows preserve the original action plus gate reason and breadth/risk metrics.
 - Compact Action Queue/API display payloads now humanize internal reason/status codes such as `blocked_by_adversarial_review`, `positive_action_blocked_by_market_context`, and missing-field names before they reach the UI, while keeping action codes machine-readable.
 - Broker-capable candidates downgraded by incomplete reason contracts now persist explicit Manual Review boundary evidence in the reason contract: original blocked action, missing fields, operator question, review-only effect, and `broker_execution_allowed=false`.
 - Event-policy, playbook, market-gated portfolio, generic action-consolidation, and lifecycle/rebalance Manual Review rows now infer explicit Manual Review reason-contract evidence with source-specific or generic review boundaries, operator question/reason, review-only effect, source attribution, and `broker_execution_allowed=false`; lifecycle/rebalance review states distinguish manual, stale, horizon, and target review boundaries.
@@ -350,8 +397,8 @@ Gaps:
 - `Done`: enabled conflict rules influence `rank_action_candidates()` directly, with a focused regression for exit precedence overriding a misleading lower raw priority and disabled rules falling back to ordinary ranking.
 - `Done`: enabled promoted exact-match conflict rules influence `rank_action_candidates()` directly for same-symbol action/source pairs, with regression coverage that nonmatching source conditions fall back to ordinary ranking.
 - `Partial`: add UI controls to edit/disable conflict rules and promote manual resolutions into deterministic rules. Enable/disable controls, explanation editing, disabled-by-default exact-match manual promotion, resolver consumption, ranking consumption, and exact-match condition editing are wired; broader semantic rule types remain.
-- `Partial`: every final action should show winning candidate, losing candidates, rule used, and why the loser lost. Backend reason contracts and compact Action Queue UI now show same-symbol source-precedence evidence, and winning rows touched by deterministic or promoted exact-match conflict precedence carry the rule id/reason/score into the reason contract; broader action-row attribution remains.
-- `Partial`: add tests for same-symbol duplicate screeners, conflicting buy/sell/manual/watch rows, and market-gate downgrades. Market-gate blocking, compact market-gate visibility, explicit market-gated Manual Review boundary evidence, incomplete-contract Manual Review downgrade boundaries, event-policy/playbook/lifecycle/generic Manual Review boundary evidence, wait-signal, duplicate BUY screener collapse, portfolio BUY-over-WATCH precedence, lifecycle HOLD-over-WATCH precedence, portfolio BUY_MORE-over-portfolio BUY precedence, portfolio BUY_MORE-over-WATCH precedence, portfolio SELL-over-portfolio BUY precedence, SELL-over-WATCH precedence, generic MANUAL_REVIEW-over-portfolio BUY, PARTIAL_SELL-over-portfolio BUY, PARTIAL_SELL-over-WATCH, review-only TIGHTEN_STOP-over-portfolio BUY, review-only TIGHTEN_STOP-over-WATCH, MANUAL_REVIEW-over-WATCH precedence, BUY/SELL/MANUAL_REVIEW/WATCH collision attribution, event-policy/playbook/lifecycle source matrix, lifecycle exit over review overlays, event review over lifecycle hold, equal-priority freshness tie-breaks, source-precedence reason-contract paths, conflict-rule enablement/explanation updates, promoted exact-match resolver rules, promoted exact-match ranking rules, and promoted exact-match reason-contract attribution have focused coverage; broader action-source permutations remain.
+- `Partial`: every final action should show winning candidate, losing candidates, rule used, and why the loser lost. Backend reason contracts and compact Action Queue UI now show same-symbol source-precedence evidence, losing market-adjustment evidence, and winning rows touched by deterministic or promoted exact-match conflict precedence carry the rule id/reason/score into the reason contract; broader action-row attribution remains.
+- `Partial`: add tests for same-symbol duplicate screeners, conflicting buy/sell/manual/watch rows, and market-gate downgrades. Market-gate blocking, compact market-gate visibility, explicit market-gated Manual Review boundary evidence, market-gated portfolio BUY and BUY_MORE Manual Review-over-WATCH source precedence, cautious-market portfolio BUY_MORE-over-WATCH sizing-reduction source precedence, event-policy Manual Review-over-market-adjusted BUY_MORE plus WATCH source precedence, adversarial-veto Manual Review-over-market-gated BUY_MORE plus WATCH source precedence, rebalance SELL-over-market-gated BUY_MORE plus WATCH source precedence, incomplete-contract Manual Review downgrade boundaries, event-policy/playbook/lifecycle/generic Manual Review boundary evidence, wait-signal, duplicate BUY screener collapse, portfolio BUY-over-WATCH precedence, lifecycle HOLD-over-WATCH precedence, portfolio BUY_MORE-over-portfolio BUY precedence, portfolio BUY_MORE-over-WATCH precedence, portfolio SELL-over-portfolio BUY precedence, SELL-over-WATCH precedence, generic MANUAL_REVIEW-over-portfolio BUY, PARTIAL_SELL-over-portfolio BUY, PARTIAL_SELL-over-WATCH, review-only TIGHTEN_STOP-over-portfolio BUY, review-only TIGHTEN_STOP-over-WATCH, MANUAL_REVIEW-over-WATCH precedence, BUY/SELL/MANUAL_REVIEW/WATCH collision attribution, event-policy/playbook/lifecycle source matrix, lifecycle exit over review overlays, event review over lifecycle hold, equal-priority freshness tie-breaks, source-precedence reason-contract paths, conflict-rule enablement/explanation updates, promoted exact-match resolver rules, promoted exact-match ranking rules, and promoted exact-match reason-contract attribution have focused coverage; broader action-source permutations remain.
 - `Done`: humanize compact Action Queue/API action reason fields before they reach the UI without rewriting stored recommendations or broker/execution contracts.
 
 ## 15. Manual Review Workbench
@@ -474,6 +521,7 @@ Done:
 - Symbol trace and symbol trace summary routes now publish permissive FastAPI/Pydantic response models, with route-level smoke coverage for success, query validation, and guarded 400/500 error paths.
 - Event detail, event trace, and event trace summary routes now publish permissive FastAPI/Pydantic response models, with route-level smoke coverage for success and guarded 400/500 builder failures.
 - Read-only Operations API routes for smoke checks, cron logs, command registry, and API errors now publish permissive FastAPI/Pydantic response models, include `api_schema` read-only/broker-disabled metadata, and have mocked route-level smoke coverage that avoids command execution.
+- `python -m advisory.operator_smoke` now provides the canonical compact read-only preflight for status, trust level, fix hints, current blockers, and exact next commands. It is registered as an audited Operations UI command and skips Dhan validation by default to avoid login side effects.
 - Read-only technical calibration GET routes now publish permissive FastAPI/Pydantic response models, include `api_schema` read-only/broker-disabled metadata, and have mocked route-level smoke coverage that avoids promotion-review writes.
 - Read-only event-model research GET routes for promotion-check and artifact manifest now publish permissive FastAPI/Pydantic response models, include `api_schema` read-only/broker-disabled metadata, and have mocked route-level smoke coverage that avoids model promotion, S3 writes, command execution, and broker paths.
 - Read-only hypotheses GET route now publishes a permissive FastAPI/Pydantic response model, includes `api_schema` read-only/broker-disabled metadata, and has mocked route-level smoke coverage that avoids hypothesis create/update/scan writes.
@@ -508,7 +556,8 @@ Status: `Partial`
 Done:
 
 - Nuxt/Vue/Tailwind operator app exists.
-- Main dashboard, events, symbol page, decision trace, health, hypotheses, manual review, operations, technical calibration, and conflict rules pages exist.
+- Main dashboard, events, symbol page, decision trace, health, hypotheses, manual review, operations, technical calibration, signal quality, and conflict rules pages exist.
+- Operations now has a first-class “Run Operator Smoke Check” action backed by the audited command-run table.
 - Manual review now explains selected dropdown effects.
 - Manual Review now shows item-impact badges and decision-boundary panels so operators can distinguish closing, annotating, and wait-signal decisions before save.
 - Symbol links and UI chips have improved visual distinction.
@@ -543,7 +592,7 @@ Done:
 
 - Operator health exists with fix hints.
 - Health page shows skipped/fallback/partial-data concepts.
-- Health payload and page now show a prioritized “current blockers before advisory can be trusted” summary derived from active health sections, degradation rows, and fix hints.
+- Health payload and page now show a prioritized “current blockers before advisory can be trusted” summary plus an Advisory Trust Gate derived from runtime/API state, core freshness, event evidence readiness, identity issues, signal-quality usability, and active degradation rows.
 - Cron logs are written under `logs/cron`.
 - Slow-operation log exists.
 - Decision traces exist.
@@ -556,8 +605,9 @@ Gaps:
 - `To do`: all failures and fallbacks should have a durable row, not only log lines.
 - `To do`: health page should group failures by active/recovered/superseded.
 - `Partial`: old resolved errors should be closeable or auto-superseded. Read-time suppression, Health active/recovered/superseded-ready grouping, Health cleanup preview samples/commands, scheduled/audited dry-run visibility, and durable superseded marking exist for event-processing and recovered announcement-document errors, but operator bulk close/apply remains.
-- `Done`: add “current blockers before advisory can be trusted” summary.
+- `Done`: add “current blockers before advisory can be trusted” summary and Advisory Trust Gate with `blocked`, `review_required`, and `usable` operating states.
 - `Done`: trace should link manual decisions and wait signals directly.
+- `Done`: add health checks for announcement/bhavcopy evidence readiness and LLM prompt/schema visibility. `advisory.event_data_quality` reports stale source tables, compact evidence freshness, announcement parse/OCR/text/S3 coverage, null exchange-event typing, missing corporate-action/earnings/deal feature influence, and raw-table scan risk, and `operator_health` surfaces these as fix hints/current blockers. The prompt registry is visible in API/UI, and core LLM/Codex output rows now persist prompt id, prompt version, and response schema version.
 
 ## 22. Testing
 
@@ -577,6 +627,7 @@ Gaps:
 - `Partial`: add tests that prevent stale/manual-closed/incomplete-contract rows from becoming actions or orders. Execution planning blocks stale/manual-closed rows, and incomplete reason-contract broker actions are downgraded with explicit review-only/no-broker boundary evidence; broader stale/manual-closed action/order permutations remain.
 - `To do`: add tests for all action conflict precedence cases.
 - `Partial`: add frontend unit/e2e tests for Manual Review, Action Queue, Symbol page, and Health. All four now have page-level safety smoke coverage for read-only safety evidence; write-flow interactions and full browser E2E remain open.
+- `Partial`: add tests for announcement/bhavcopy evidence point-in-time behavior, exchange-event normalization, compact evidence table freshness, LLM signal schema validation, prompt-version recording, and technical-only versus technical-plus-evidence evaluation. Prompt contract metadata now has focused regression coverage across event evaluation, event-policy manual review, playbook action plans, company-memory reviews, announcement parsing, and technical-threshold promotion reviews; broader evidence/outcome tests remain.
 
 ## 23. Security And Safety
 
@@ -617,18 +668,19 @@ Gaps:
 
 ## 25. Recommended Next Development Order
 
-1. `Partial`: formalize the operator/manual-review state machine. Decision effects, incomplete-contract Manual Review downgrades, matched wait-signal reopen/suppression, and durable review-only action-candidate linkage are enforced; superseded downstream states remain.
-2. `Done`: add tests for every manual-review decision and the core wait-signal downstream effect.
-3. `Done`: connect matched wait signals back to the original manual-review item/action-candidate workflow. Original item suppression, Manual Review follow-up, and durable review-only action-candidate linkage are integrated.
-4. `Partial`: add superseded-error cleanup for old processing failures. Active Manual Review/Health suppression, Health grouping, Health preview samples/commands, scheduled/audited dry-run visibility, and durable dry-run/apply marking exist; operator bulk close/apply remains.
-5. `Partial`: add action conflict edit/promote UI and wire approved conflict rules into candidate ranking where appropriate. Built-in and promoted exact-match ranking influence, enable/disable UI, explanation editing, disabled-by-default manual-resolution promotion, and validated exact-match condition editing are covered; broader semantic rule types remain.
-6. `Done`: add “why not approved buy/sell” explanation to Action Queue.
-7. `Done`: add stale API/code version indicator to frontend.
-8. `To do`: add current-blockers health card: what prevents trusting today’s advisory output.
-9. `Done`: add full mocked state-machine tests for recommendation -> action -> manual decision -> wait signal -> match -> refreshed review-only action. Production/UI journey coverage remains broader follow-up work.
-10. `Partial`: keep live broker execution disabled until dry-run, reconciliation, and operator approval flows are tested end to end. Backend order previews and live-safety checks now require approval/reconciliation, mocked broker account/order reconciliation plus persisted reconciliation safety-contract coverage exist, and compact API rows preserve raw broker safety contracts; UI approval workflow remains.
-11. `Done`: add focused adversarial-review precedence regression for veto beating BUY/WATCH candidates. The deterministic ranking rule is explicit and reason-contract evidence carries veto/review-reason context.
-12. `Done`: add focused market-gate reason-contract visibility for positive actions downgraded to Manual Review. Compact API rows preserve the original action, gate reason, breadth, risk-off score, and symbol context for the Action Queue panel.
+1. `Done`: build the announcement/bhavcopy evidence quality gate, compact evidence store, and centralized LLM prompt/skill registry before increasing signal authority. The read-only quality gate is implemented and wired into Health, V1 compact evidence tables now exist, the prompt registry is visible in API/UI, and core LLM/Codex output rows persist prompt ids, prompt versions, and response schema versions for audit.
+2. `Partial`: formalize the operator/manual-review state machine. Decision effects, incomplete-contract Manual Review downgrades, matched wait-signal reopen/suppression, and durable review-only action-candidate linkage are enforced; superseded downstream states remain.
+3. `Done`: add tests for every manual-review decision and the core wait-signal downstream effect.
+4. `Done`: connect matched wait signals back to the original manual-review item/action-candidate workflow. Original item suppression, Manual Review follow-up, and durable review-only action-candidate linkage are integrated.
+5. `Partial`: add superseded-error cleanup for old processing failures. Active Manual Review/Health suppression, Health grouping, Health preview samples/commands, scheduled/audited dry-run visibility, and durable dry-run/apply marking exist; operator bulk close/apply remains.
+6. `Partial`: add action conflict edit/promote UI and wire approved conflict rules into candidate ranking where appropriate. Built-in and promoted exact-match ranking influence, enable/disable UI, explanation editing, disabled-by-default manual-resolution promotion, and validated exact-match condition editing are covered; broader semantic rule types remain.
+7. `Done`: add “why not approved buy/sell” explanation to Action Queue.
+8. `Done`: add stale API/code version indicator to frontend.
+9. `Done`: add current-blockers health card and Advisory Trust Gate: Health now explains what prevents trusting today’s advisory output and whether recommendations are usable, review-only, or blocked.
+10. `Done`: add full mocked state-machine tests for recommendation -> action -> manual decision -> wait signal -> match -> refreshed review-only action. Production/UI journey coverage remains broader follow-up work.
+11. `Partial`: keep live broker execution disabled until dry-run, reconciliation, and operator approval flows are tested end to end. Backend order previews and live-safety checks now require approval/reconciliation, mocked broker account/order reconciliation plus persisted reconciliation safety-contract coverage exist, and compact API rows preserve raw broker safety contracts; UI approval workflow remains.
+12. `Done`: add focused adversarial-review precedence regression for veto beating BUY/WATCH and risk-off market-gated BUY_MORE/WATCH candidates. The deterministic ranking rule is explicit and reason-contract evidence carries veto/review-reason context while losing market-gate context remains visible.
+13. `Done`: add focused market-gate reason-contract visibility for positive actions downgraded to Manual Review. Compact API rows preserve the original action, gate reason, breadth, risk-off score, and symbol context for the Action Queue panel.
 
 ## 26. Immediate Confidence Statement
 
@@ -638,11 +690,12 @@ Trust level today:
 
 - Data ingestion: medium, with source-specific fragility.
 - Technical/rule scoring: medium, needs more validation and state tests.
-- Event extraction/policy: medium-low until LLM failures, stale failures, and actionability are better controlled.
+- Event extraction/policy: medium. LLM failures, stale failures, and actionability remain important, but event-evidence quality gates and prompt/schema version visibility are now materially better controlled.
+- Announcement/bhavcopy intelligence: medium-low. Useful data exists, but compact evidence stores, null typing repair, corporate-action influence, and LLM company-memory signal review are not yet complete.
 - Action consolidation: medium, with conflict precedence now pinned for enabled-rule ranking and an enable/disable UI; edit/promote workflows and broader permutations still need tests.
 - Manual review: improving, with explicit decision effects and matched wait reopen handling, but still needs durable downstream state tests.
 - Wait signals: newly wired for manual review, but matching is still basic.
 - Execution: low for live trading; keep in dry-run/manual approval mode.
 - UI/debuggability: improving, but not yet complete enough to explain every decision without opening raw rows.
 
-The next safest path is not adding more models or more signals. The next safest path is making every state transition explicit, tested, visible, and reversible.
+The next safest path is not giving more authority to more models. The next safest path is upgrading announcement and bhavcopy data into clean, compact, point-in-time evidence, making LLM signal proposals auditable, and keeping final action authority inside explicit, tested, visible deterministic policy.

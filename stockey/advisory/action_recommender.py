@@ -15,6 +15,8 @@ from advisory.hypothesis_engine import ACTION_PLANS_TABLE, HYPOTHESES_TABLE, ens
 from advisory.market_context import load_latest_market_context
 from advisory.portfolio_engine import PORTFOLIO_TABLE
 from advisory.position_lifecycle import LIFECYCLE_TABLE, REBALANCE_TABLE
+from advisory.prompt_registry import prompt_version as registry_prompt_version
+from advisory.prompt_registry import response_schema_version
 from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, WAIT_SIGNALS_TABLE
 from advisory.watchlist_builder import TABLE_NAME as WATCHLIST_TABLE
 from utils.codex_cli import run_codex_structured
@@ -28,6 +30,9 @@ env.read_env()
 logger = logging.getLogger(__name__)
 
 TABLE_NAME = "advisory_action_recommendations"
+MANUAL_REVISION_PROMPT_ID = "manual_revision_pointers"
+MANUAL_REVISION_PROMPT_VERSION = registry_prompt_version(MANUAL_REVISION_PROMPT_ID)
+MANUAL_REVISION_PROMPT_SCHEMA_VERSION = response_schema_version(MANUAL_REVISION_PROMPT_ID)
 CANDIDATES_TABLE = "advisory_candidates"
 REGIME_TABLE = "advisory_market_regime"
 EVENT_EVALUATIONS_TABLE = "advisory_event_evaluations"
@@ -153,6 +158,9 @@ def ensure_actions_table() -> None:
                 reason_contract_status TEXT,
                 manual_revision_summary TEXT,
                 manual_revision_pointers_json TEXT,
+                manual_revision_prompt_id TEXT,
+                manual_revision_prompt_version TEXT,
+                manual_revision_prompt_schema_version TEXT,
                 manual_revision_model TEXT,
                 manual_revision_status TEXT,
                 raw_context_json TEXT,
@@ -167,6 +175,9 @@ def ensure_actions_table() -> None:
         cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS reason_contract_status TEXT")
         cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_summary TEXT")
         cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_pointers_json TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_id TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_version TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_schema_version TEXT")
         cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_model TEXT")
         cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_status TEXT")
 
@@ -956,7 +967,7 @@ def _market_context_adjustment(action_code: str, market_context: dict[str, Any],
     reason = "Market context did not change the action boundary."
     size_multiplier = 1.0
     if action in POSITIVE_BROKER_ACTIONS and (risk_off or weak_breadth):
-        adjusted_action = "MANUAL_REVIEW" if action == "BUY" else "HOLD"
+        adjusted_action = "MANUAL_REVIEW"
         adjustment = "positive_action_blocked_by_market_context"
         size_multiplier = 0.0
         reason = (
@@ -1368,17 +1379,31 @@ def _same_symbol_conflict_section(row: pd.Series, candidates: pd.DataFrame | Non
     for item in candidates.to_dict(orient="records"):
         if _same_action_candidate(row, item):
             continue
-        losing_candidates.append(
-            {
-                "action_code": item.get("action_code"),
-                "action_source": item.get("action_source"),
-                "setup_id": item.get("setup_id"),
-                "source_action": item.get("source_action"),
-                "action_reason": item.get("action_reason"),
-                "action_priority": item.get("action_priority"),
-                "published_on": _json_context_value(item.get("published_on")),
-            }
-        )
+        raw_context = _parse_jsonish(item.get("raw_context_json"), {})
+        if not isinstance(raw_context, dict):
+            raw_context = {}
+        market_adjustment = _parse_jsonish(raw_context.get("market_context_adjustment_json"), {})
+        if not isinstance(market_adjustment, dict):
+            market_adjustment = {}
+        losing_candidate = {
+            "action_code": item.get("action_code"),
+            "action_source": item.get("action_source"),
+            "setup_id": item.get("setup_id"),
+            "source_action": item.get("source_action"),
+            "action_reason": item.get("action_reason"),
+            "action_priority": item.get("action_priority"),
+            "published_on": _json_context_value(item.get("published_on")),
+        }
+        if raw_context.get("market_context_adjustment"):
+            losing_candidate.update(
+                {
+                    "market_context_adjustment": raw_context.get("market_context_adjustment"),
+                    "original_action_code": market_adjustment.get("original_action_code"),
+                    "market_context_adjustment_reason": market_adjustment.get("reason"),
+                    "size_multiplier": market_adjustment.get("size_multiplier"),
+                }
+            )
+        losing_candidates.append({key: value for key, value in losing_candidate.items() if value is not None})
     if not losing_candidates:
         return {}
     return {
@@ -1477,6 +1502,8 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
         "macro_risk_state": market_adjustment.get("macro_risk_state") or market_summary.get("macro_risk_state"),
         "breadth_trend_alignment_pct": market_adjustment.get("breadth_trend_alignment_pct") or market_summary.get("breadth_trend_alignment_pct"),
         "risk_off_score": market_adjustment.get("risk_off_score") or market_summary.get("risk_off_score"),
+        "size_multiplier": market_adjustment.get("size_multiplier"),
+        "macro_sizing_multiplier": market_adjustment.get("macro_sizing_multiplier") or market_summary.get("macro_sizing_multiplier"),
         "top_context_rank_pct": market_symbol_context.get("rank_pct"),
         "top_context_sector": market_symbol_context.get("sector_name") or market_symbol_context.get("sector_code"),
     }
@@ -1676,6 +1703,9 @@ def add_manual_revision_pointers(df: pd.DataFrame, all_candidates: pd.DataFrame 
         candidate_groups[key] = group.sort_values(["action_priority", "published_on"], ascending=[False, False], kind="stable")
     summaries: list[str | None] = []
     payloads: list[str | None] = []
+    prompt_ids: list[str | None] = []
+    prompt_versions: list[str | None] = []
+    prompt_schema_versions: list[str | None] = []
     models: list[str | None] = []
     statuses: list[str | None] = []
     for _, row in out.iterrows():
@@ -1685,10 +1715,16 @@ def add_manual_revision_pointers(df: pd.DataFrame, all_candidates: pd.DataFrame 
         pointers, model, status = build_manual_revision_pointers(row, group, use_llm=use_llm)
         summaries.append(_text(pointers.get("revision_summary")))
         payloads.append(json.dumps(pointers, ensure_ascii=False, default=str, sort_keys=True))
+        prompt_ids.append(MANUAL_REVISION_PROMPT_ID)
+        prompt_versions.append(MANUAL_REVISION_PROMPT_VERSION)
+        prompt_schema_versions.append(MANUAL_REVISION_PROMPT_SCHEMA_VERSION)
         models.append(model)
         statuses.append(status)
     out["manual_revision_summary"] = summaries
     out["manual_revision_pointers_json"] = payloads
+    out["manual_revision_prompt_id"] = prompt_ids
+    out["manual_revision_prompt_version"] = prompt_versions
+    out["manual_revision_prompt_schema_version"] = prompt_schema_versions
     out["manual_revision_model"] = models
     out["manual_revision_status"] = statuses
     return out
@@ -2093,7 +2129,15 @@ def persist_action_recommendations(df: pd.DataFrame) -> None:
     existing_reason_columns = {"recommendation_reason_json", "reason_contract_status"}
     if not existing_reason_columns.issubset(set(winners.columns)) or winners["recommendation_reason_json"].isna().any():
         winners = add_recommendation_reason_contracts(winners, all_candidates)
-    existing_pointer_columns = {"manual_revision_summary", "manual_revision_pointers_json", "manual_revision_model", "manual_revision_status"}
+    existing_pointer_columns = {
+        "manual_revision_summary",
+        "manual_revision_pointers_json",
+        "manual_revision_prompt_id",
+        "manual_revision_prompt_version",
+        "manual_revision_prompt_schema_version",
+        "manual_revision_model",
+        "manual_revision_status",
+    }
     if not existing_pointer_columns.issubset(set(winners.columns)) or winners["manual_revision_pointers_json"].isna().any():
         winners = add_manual_revision_pointers(winners, all_candidates)
     conflicts = build_action_conflicts(all_candidates, winners)

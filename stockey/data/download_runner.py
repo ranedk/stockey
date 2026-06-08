@@ -40,6 +40,7 @@ PARSER_STEPS = [
     {"module": "data.nseindia.bhavcopy_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.benchmark_sync", "args": [], "purpose": "benchmark_sync"},
+    {"module": "advisory.event_evidence_store", "args": [], "purpose": "compact_event_evidence"},
 ]
 
 DOWNLOAD_STEPS = [*DOWNLOADER_STEPS, *PARSER_STEPS]

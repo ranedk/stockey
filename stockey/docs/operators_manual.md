@@ -150,26 +150,54 @@ Important constraint:
 
 ## Operator Health
 
-Use the read-only smoke test before debugging strategy output:
+Use the compact read-only smoke test before debugging strategy output:
 
 ```sh
-python -m advisory.operator_health
-python -m advisory.operator_health --skip-dhan
+python -m advisory.operator_smoke
+python -m advisory.operator_smoke --format text
 ```
 
-It checks:
+It returns the current `status`, `trust_level`, Advisory Trust Gate recommendation, top blockers, fix hints, and exact next commands. It skips Dhan token validation by default so it does not trigger broker login side effects.
+
+Use the detailed health command when you need the full diagnostic payload:
+
+```sh
+python -m advisory.operator_health --skip-dhan
+python -m advisory.operator_health
+```
+
+Together these checks cover:
 
 - Postgres query health and freshness of core advisory tables
 - operator API reachability and latency through the read-only health endpoint
 - Redis reachability
 - Dhan token validity through a lightweight profile call; it does not initiate broker login
 - Dhan cached-token metadata including cache age, expiry timestamp, and seconds to expiry
+- announcement and NSE/bhavcopy evidence readiness through `advisory.event_data_quality`
 - recent `logs/cron/*.log` tails for tracebacks, errors, failures, connection refusals, and timeouts
 - Poppler, Codex CLI, Node/npm, TimesFM, and frontend dependency presence
 
 The same data is exposed at `GET /api/health/details` and rendered in the Nuxt `Data Health` page. Warnings mean the system may still run with degraded functionality; errors mean a required dependency or recent cron run likely needs attention.
 
-The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, Redis reachability, and Postgres connectivity. The Nuxt `Data Health` page shows the hints near the top with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix. The page can filter health rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
+The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, Redis reachability, Postgres connectivity, and event-evidence quality issues. The Nuxt `Data Health` page shows the hints near the top with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix. The page can filter health rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
+
+Run the event-evidence quality gate directly when announcement/bhavcopy inputs look suspicious:
+
+```sh
+python -m advisory.event_data_quality --format json
+python -m advisory.event_data_quality --format text
+```
+
+This check is read-only. It does not change portfolio state or action authority. It reports whether source tables are fresh, announcement documents have parse/OCR/text coverage, exchange events are typed, corporate-action/earnings/deal features are visible, and raw tables are large enough that UI/LLM paths should use compact evidence caches instead of direct scans.
+
+Compact event evidence is rebuilt by `complete_data.sh` through `advisory.event_evidence_store`. Run it directly for targeted repair:
+
+```sh
+python -m advisory.event_evidence_store --from-date 2026-06-01 --to-date 2026-06-08
+python -m advisory.event_evidence_store --dry-run --lookback-days 30
+```
+
+It writes `advisory_bhavcopy_evidence_daily` and `advisory_announcement_evidence`. These are intended for UI, LLM context, and future deterministic event intelligence so those paths do not scan raw bhavcopy tables or large announcement text columns.
 
 The Health page also shows a read-only superseded cleanup preview when recovered event-processing failures or recovered announcement-document errors can be marked superseded. Inspect the sample rows first, then run `python -m advisory.superseded_failures --limit 500` or `./all_superseded_cleanup_audit.sh` for the dry-run JSON. Cron runs `./all_superseded_cleanup_audit.sh` after market close as a preview-only audit, and the Operations page exposes the same dry-run through `superseded_failure_cleanup_dry_run`. Only run `python -m advisory.superseded_failures --apply --limit 500` after explicit operator intent; this marks durable superseded metadata and does not submit broker orders or change portfolio/action/config state.
 
@@ -332,6 +360,13 @@ Use this when you want Codex CLI to continue development from `analysis.md`. The
 Operational guardrails:
 
 - Default max cycles is `1`; increase deliberately, for example `ANALYSIS_AGENT_MAX_CYCLES=3 ./all_analysis_codex.sh`.
+- Runs above the hard cap, default `3`, are refused unless you pass `--allow-large-runs` or set `ANALYSIS_AGENT_ALLOW_LARGE_RUNS=true`.
+- A single cycle is capped at `ANALYSIS_AGENT_MAX_FILES_PER_CYCLE`, default `20`, to prevent broad unattended diffs. Split larger work manually.
+- If both `apps/operator-web/package-lock.json` and `apps/operator-web/yarn.lock` change in one cycle, the wrapper stops unless `--allow-lockfile-drift` is explicitly passed. Prefer one package manager path before accepting frontend dependency changes.
+- After each completed Codex cycle, the wrapper now runs deterministic gates before continuing: `git diff --check`, Python compile for changed `.py` files, full `pytest -q tests/test_advisory_regression.py` when backend/Python paths changed, and Nuxt typecheck/tests when `apps/operator-web` changed.
+- The loop stops if root-level generated NSE CSV artifacts are visible to git. Move them under an approved data/download path or add a specific ignore rule before continuing.
+- The loop requires every Codex response to include `CYCLE_STATUS: complete`, `CYCLE_STATUS: blocked`, or `CYCLE_STATUS: no_open_slices`; missing markers stop the run.
+- Prompts require Planner, Builder, Reviewer, and Integrator phases. If Codex CLI has subagent tools in that environment, it may use them for bounded planner/reviewer sidecars, but the wrapper still treats local post-checks as the source of truth.
 - Logs, prompts, stdout, and last Codex messages are written to `logs/analysis_agents/`.
 - It fails closed on Codex errors and is prompted to stop instead of editing broker execution, destructive DB/data cleanup, credential-dependent work, or unclear production-safety changes.
 - After each cycle, review `docs/analysis_agent_board.md`, `analysis.md`, `git diff`, and the validation lines before running another cycle.

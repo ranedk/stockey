@@ -34,6 +34,8 @@ const degradations = computed(() => asList(degradationFeed.value.rows))
 const fixHints = computed(() => asList(details.value?.fix_hints))
 const currentBlockers = computed(() => asDict(details.value?.current_blockers))
 const currentBlockerRows = computed(() => asList(currentBlockers.value.rows))
+const trustGate = computed(() => asDict(sections.value.trust_gate))
+const trustGateChecks = computed(() => asList(trustGate.value.checks))
 const healthFilter = ref('all')
 const degradationFilter = ref('active')
 const degradationKindFilter = ref('all')
@@ -106,6 +108,10 @@ function statusClass(value: unknown) {
 
 function statusText(value: unknown) {
   return String(value || 'unknown').toUpperCase()
+}
+
+function trustLevelText(value: unknown) {
+  return String(value || 'unknown').replaceAll('_', ' ').replace(/\b\w/g, (char) => char.toUpperCase())
 }
 
 function titleCase(value: unknown) {
@@ -210,6 +216,48 @@ async function updateSlowIssue(issue: Dict, status: string) {
     <MetricTile label="Dhan" :value="statusText(dhan.status)" :note="String(dhan.message || '-')" />
     <MetricTile label="Token" :value="statusText(dhanCache.status)" :note="`expires ${secondsText(dhanCache.seconds_to_expiry)}`" />
     <MetricTile label="Frontend" :value="statusText(frontend.status)" :note="String(frontend.message || '-')" />
+  </section>
+
+  <section class="mt-8 rounded-[2rem] border p-6 shadow-soft" :class="trustGate.status === 'error' ? 'border-rust/25 bg-rust/10' : trustGate.status === 'warn' ? 'border-sun/30 bg-sun/15' : 'border-moss/25 bg-moss/10'">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-black uppercase tracking-[0.3em] text-ink/45">Advisory Trust Gate</p>
+        <h2 class="mt-2 text-3xl font-black">{{ trustLevelText(trustGate.trust_level) }}</h2>
+        <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/70">
+          {{ trustGate.recommendation || 'Health has not produced a trust-gate recommendation yet.' }}
+        </p>
+      </div>
+      <span class="rounded-full px-4 py-2 text-sm font-black" :class="statusClass(trustGate.status)">
+        {{ statusText(trustGate.status) }}
+      </span>
+    </div>
+    <div class="mt-5 grid gap-3 md:grid-cols-4">
+      <MetricTile label="Checks" :value="String(trustGate.count || 0)" note="Open trust checks" />
+      <MetricTile label="Errors" :value="String(trustGate.error_count || 0)" note="Block usage" />
+      <MetricTile label="Warnings" :value="String(trustGate.warn_count || 0)" note="Review-only" />
+      <MetricTile label="Decision" :value="trustLevelText(trustGate.trust_level)" note="Use boundary" />
+    </div>
+    <div v-if="trustGateChecks.length" class="mt-5 grid gap-3 lg:grid-cols-2">
+      <article v-for="row in trustGateChecks" :key="String(row.key || row.title)" class="rounded-2xl bg-white/75 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="font-black text-ink">{{ row.title || 'Trust check' }}</p>
+            <p class="mt-1 text-sm leading-6 text-ink/60">{{ row.reason || '-' }}</p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(row.status)">{{ statusText(row.status) }}</span>
+        </div>
+        <p class="mt-3 rounded-2xl bg-paper/80 p-3 text-sm font-semibold text-ink/70">
+          {{ row.impact || 'Triage this before relying on the latest advisory output.' }}
+        </p>
+        <details v-if="Object.keys(asDict(row.details)).length" class="mt-3">
+          <summary class="cursor-pointer text-sm font-black text-moss">Show check details</summary>
+          <pre class="mt-3 max-h-56 overflow-auto rounded-2xl bg-paper/80 p-3 text-xs">{{ JSON.stringify(row.details, null, 2) }}</pre>
+        </details>
+      </article>
+    </div>
+    <p v-else class="mt-5 rounded-2xl bg-white/75 p-4 text-sm text-ink/65">
+      No trust-gate blockers. Normal operator review and broker-safety gates still apply.
+    </p>
   </section>
 
   <section class="mt-8 glass-panel rounded-3xl p-5">

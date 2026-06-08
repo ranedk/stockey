@@ -72,7 +72,7 @@ The active stack already has:
 
 1. The highest-priority gap is now UI-first operations: every normal operator action should be visible, explainable, and auditable from the Nuxt app.
 2. Remaining high-risk gaps are observability and correctness gaps, not missing major architecture blocks.
-3. Some manual workflows still require CLI/manual edits: operator smoke checks, event-model promotion checks, approved technical config diffs, S3 artifact inspection, cron log inspection, and some research-ledger review.
+3. Some manual workflows still require CLI/manual edits: event-model promotion checks, approved technical config diffs, S3 artifact inspection, cron log inspection, and some research-ledger review.
 4. Fast signal refresh is intentionally not the authoritative portfolio allocator. Daily `all_advisory.sh` remains the reconciliation path until enough evidence proves incremental advisory is safe.
 5. Some non-home API endpoints still return large raw rows and need pagination/compaction.
 6. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
@@ -95,7 +95,7 @@ Required operator UI coverage:
 
 1. System health and fix hints
    - show current status for Postgres, Redis, Dhan token/cache, API, Nuxt, cron jobs, source freshness, slow operations, and fallback spikes
-   - add a UI action to run the read-only smoke check and display the resulting fix hints
+   - done: add a UI action to run the read-only smoke check and display the resulting fix hints
    - expose recent cron logs with latest-run status, recovered/manual-interrupt state, and traceback snippets
 
 2. Hypothesis and investor playbook management
@@ -133,7 +133,7 @@ Required operator UI coverage:
 
 Next implementation slices:
 
-1. Add `/api/operations/smoke` and a Nuxt Health action that runs the read-only smoke command and renders fix hints.
+1. Done: add `/api/operations/smoke`, `python -m advisory.operator_smoke`, and a Nuxt Operations action that runs the read-only smoke command and renders fix hints/trust level.
 2. Add `/api/research/event-model-promotion-check` and a Research Evidence page card for the weekly ML gate.
 3. Add `/api/research/event-model-artifacts` to show latest local/S3 artifact metadata and upload status.
 4. Add a Manual Review page that merges action conflicts, event-policy manual rows, failed extraction rows, execution blockers, and threshold-review decisions.
@@ -194,8 +194,9 @@ This is the recommended current implementation order.
    - done: add operator API/page for reviewing latest technical threshold calibration summaries and copying candidate configs
    - done: add LLM-assisted manual promotion review that writes review evidence and a pending patch but does not apply thresholds automatically
    - done: add explicit manual approval/rejection audit records for reviewed threshold patches, with copyable final patch guidance and no automatic config edits
+   - done: add reviewed-diff generation against `config/advisory_setups.yaml` for approved threshold and signal-quality overlay decisions
    - calibrate target multiples, stop distances, partial-exit rules, and time-stop defaults using realized lifecycle outcomes
-   - next: add optional reviewed-diff generation against `config/advisory_setups.yaml` so approved patches are easier to apply by hand
+   - next: keep actual production config application manual until reviewed-diff workflow remains clean across multiple runs
    - surface technical sub-scores, trigger archetype, stop, invalidation, and exit reason as first-class operator UI fields
 
 6. Runtime robustness and observability
@@ -206,9 +207,10 @@ This is the recommended current implementation order.
    - done: recover manual `KeyboardInterrupt` logs when mapped output tables have fresher rows than the interrupted log
    - done: add API self-check latency and Dhan cached-token age/expiry to the operator health payload and Data Health page
    - done: surface operator snapshot freshness, slow-operation issues, and failed watcher/router sync-state rows in operator health and the Nuxt Health page
+   - done: add Advisory Trust Gate to Health so the UI says whether today’s recommendations are usable, review-only, or blocked by runtime, freshness, event evidence, identity, signal-quality, or degradation issues
    - done: record dashboard section-loader failures in payloads instead of only printing them
    - done: make watcher cycle failures persist `advisory_sync_state.status=error` and publish error messages before returning
-   - next: add a single smoke-test command for API + DB + frontend dependency checks
+   - done: add a single smoke-test command for API + DB + frontend dependency checks
    - next: add a health section for recent fallback usage by module/model/source so fallback spikes are visible without grepping logs
    - keep cron/frontend logs visible from the operator app without adding write/trading controls
 
@@ -218,9 +220,9 @@ This is the recommended current implementation order.
    - `/api/events`, `/api/actions`, `/api/portfolio`, and trace endpoints should return summary rows by default and detail rows on demand.
    - Add response-size tests and slowlog thresholds per endpoint.
 
-2. Add a single operator smoke command.
+2. Done: add a single operator smoke command.
    - Target command: `python -m advisory.operator_smoke`.
-   - It should run API health, DB freshness, snapshot freshness, frontend type/dependency checks, and selected pure-Python regression smoke tests.
+   - It runs compact API, DB, snapshot, frontend dependency, identity, signal-quality, cron, and trust-gate checks.
 
 3. Add fallback telemetry.
    - Persist fallback events for LLM disabled/fallback, Codex fallback, Redis fail-soft, live-builder fallback, and Dhan identity fallback.
@@ -354,7 +356,7 @@ Implementation slices:
 7. Started: richer Data Health now has fix hints, cron latest-run parsing, recovered/manual-interrupt handling, and status filters. Add frontend views for TS Watch and research ledger next.
 8. Add SSE/WebSocket updates from Redis pub-sub once the operator app is stable.
 9. Done: remove static `live_dashboard/` generation from cron/watch paths; serve operator state through API + Nuxt.
-10. Next: add a single operator smoke-test command that validates API, DB reads, Node/npm, and Nuxt dependency health.
+10. Done: add a single operator smoke-test command that validates API, DB reads, Node/npm, and Nuxt dependency health.
 
 Do not:
 
@@ -1207,7 +1209,12 @@ Implementation slices:
    - dead-money time stop
 9. Done: add research-only technical threshold calibration against realized forward OHLCV outcomes after costs.
 10. Done: add operator UI/API views for threshold calibration summaries and copyable configs.
-11. Next: promote thresholds only through an explicit manual config-change workflow after reviewing calibration evidence.
+11. Done: add research-only comparison of technical-only signals versus technical plus event-policy, bhavcopy, and company-memory overlays after costs.
+12. Done: add operator UI/API views for signal-quality overlay summaries before allowing any overlay to influence production action rules.
+13. Done: add review-only signal-quality overlay promotion workflow with operator decisions and copyable patch guidance; no live policy is changed.
+14. Done: add reviewed config-change diff generation for approved technical-threshold and signal-quality overlay decisions; no live policy is changed.
+15. Done: add read-only LLM/Codex prompt registry with API/UI visibility for prompt ids, schemas, env vars, source files, authority scopes, and fallbacks.
+16. Done: persist prompt ids, prompt versions, and response schema versions on core LLM/Codex output rows and migrate callers to registry constants. Covered rows include advisory event evaluations, event-policy LLM manual reviews, playbook action plans, company-memory reviews, manual-revision pointers, technical-threshold promotion reviews, announcement summaries/OCR metadata, and structured announcement reports.
 
 Do not:
 

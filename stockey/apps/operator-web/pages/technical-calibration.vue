@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Dict, TechnicalPromotionReviewResult } from '~/types/api'
+import type { ConfigChangePreviewResult, Dict, TechnicalPromotionReviewResult } from '~/types/api'
 
 const api = useOperatorApi()
 const { data, refresh } = await useAsyncData('technical-calibration', () => api.getTechnicalCalibration(12))
@@ -12,6 +12,9 @@ const decisionReviewKey = ref('')
 const decisionReason = ref('')
 const decisionResult = ref<Dict | null>(null)
 const decisionError = ref('')
+const configPreviewKey = ref('')
+const configPreviewResult = ref<ConfigChangePreviewResult | null>(null)
+const configPreviewError = ref('')
 
 const summaryRows = computed(() => data.value?.summary || [])
 const configRows = computed(() => data.value?.top_configs || [])
@@ -69,6 +72,11 @@ function copyPatchText(row: Dict) {
   navigator.clipboard?.writeText(patchText(row) || JSON.stringify(row.patch || row.pending_patch || {}, null, 2))
 }
 
+function copyDiff(value: unknown) {
+  if (!import.meta.client) return
+  navigator.clipboard?.writeText(String(value || ''))
+}
+
 function configsForHorizon(horizon: unknown) {
   return configRows.value.filter((row) => Number(row.horizon_days) === Number(horizon))
 }
@@ -121,6 +129,24 @@ async function recordDecision(row: Dict, decision: 'approved' | 'rejected' | 'ne
     decisionReviewKey.value = ''
   }
 }
+
+async function previewConfigChange(row: Dict) {
+  const key = reviewKey(row)
+  configPreviewKey.value = key
+  configPreviewError.value = ''
+  configPreviewResult.value = null
+  try {
+    configPreviewResult.value = await api.previewTechnicalThresholdConfigChange({
+      reviewed_at: row.reviewed_at,
+      setup_id: row.setup_id,
+      config_id: row.config_id
+    })
+  } catch (error) {
+    configPreviewError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    configPreviewKey.value = ''
+  }
+}
 </script>
 
 <template>
@@ -136,6 +162,9 @@ async function recordDecision(row: Dict, decision: 'approved' | 'rejected' | 'ne
       <button class="rounded-full bg-paper px-5 py-3 text-sm font-black text-ink" type="button" @click="refresh()">
         Refresh
       </button>
+      <LinkButton to="/signal-quality">
+        Open signal quality
+      </LinkButton>
     </div>
   </section>
 
@@ -311,9 +340,23 @@ async function recordDecision(row: Dict, decision: 'approved' | 'rejected' | 'ne
       </div>
 
       <p v-if="decisionError" class="mt-4 rounded-2xl bg-rust/15 p-4 text-sm font-bold text-rust">{{ decisionError }}</p>
+      <p v-if="configPreviewError" class="mt-4 rounded-2xl bg-rust/15 p-4 text-sm font-bold text-rust">{{ configPreviewError }}</p>
       <p v-if="decisionResult" class="mt-4 rounded-2xl bg-moss/15 p-4 text-sm font-bold text-moss">
         Decision recorded: {{ decisionResult.decision }}. No config change was applied.
       </p>
+      <article v-if="configPreviewResult" class="mt-4 rounded-2xl bg-ink p-4 text-paper">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.24em] text-paper/45">Reviewed config diff</p>
+            <h3 class="mt-1 text-xl font-black">{{ configPreviewResult.config_path }}</h3>
+            <p class="mt-2 text-sm text-paper/65">{{ configPreviewResult.rollback_note }}</p>
+          </div>
+          <button class="rounded-full bg-paper px-4 py-2 text-xs font-black text-ink" type="button" @click="copyDiff(configPreviewResult.unified_diff)">
+            Copy Diff
+          </button>
+        </div>
+        <pre class="mt-4 max-h-96 overflow-auto rounded-2xl bg-black/40 p-4 text-xs leading-5">{{ configPreviewResult.unified_diff }}</pre>
+      </article>
 
       <div class="mt-5 space-y-4">
         <div v-for="row in reviewRows" :key="reviewKey(row)" class="rounded-3xl bg-white/70 p-5">
@@ -340,6 +383,14 @@ async function recordDecision(row: Dict, decision: 'approved' | 'rejected' | 'ne
               </button>
               <button class="rounded-full bg-ink px-3 py-2 text-xs font-black text-paper" type="button" @click="copyPatchText(row)">
                 Copy Patch
+              </button>
+              <button
+                class="rounded-full bg-ink/80 px-3 py-2 text-xs font-black text-paper disabled:opacity-50"
+                type="button"
+                :disabled="row.manual_decision !== 'approved' || configPreviewKey === reviewKey(row)"
+                @click="previewConfigChange(row)"
+              >
+                {{ configPreviewKey === reviewKey(row) ? 'Generating' : 'Reviewed Diff' }}
               </button>
             </div>
           </div>

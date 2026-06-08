@@ -16,6 +16,14 @@ from advisory.announcement_watch import build_watch_updates_from_ingest, persist
 from advisory.action_recommender import build_action_recommendations, persist_action_recommendations
 from advisory.adversarial_review import build_reviews as build_adversarial_reviews
 from advisory.adversarial_review import persist_reviews as persist_adversarial_reviews
+from advisory.company_memory_review import (
+    DEFAULT_LOOKBACK_DAYS as DEFAULT_COMPANY_MEMORY_LOOKBACK_DAYS,
+    DEFAULT_MAX_SYMBOLS as DEFAULT_COMPANY_MEMORY_MAX_SYMBOLS,
+    DEFAULT_MODEL as DEFAULT_COMPANY_MEMORY_MODEL,
+    LLM_ENABLED as COMPANY_MEMORY_LLM_ENABLED,
+    build_company_memory_reviews,
+    persist_company_memory_reviews,
+)
 from advisory.execution_engine import (
     build_execution_orders,
     persist_execution_orders,
@@ -89,6 +97,7 @@ PIPELINE_STAGES = [
     "event_model",
     "review",
     "event_policy",
+    "company_memory",
     "risk",
     "portfolio",
     "lifecycle",
@@ -193,6 +202,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--portfolio-max-positions-per-overlap-group", type=int, default=1)
     parser.add_argument("--event-model", help="Override advisory LLM event evaluation model")
     parser.add_argument("--event-model-artifact-dir", default=str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR), help="Directory containing trained event meta-model artifacts")
+    parser.add_argument("--skip-company-memory", action="store_true", help="Skip review-only company-memory summaries")
+    parser.add_argument("--company-memory-limit", type=int, default=DEFAULT_COMPANY_MEMORY_MAX_SYMBOLS)
+    parser.add_argument("--company-memory-lookback-days", type=int, default=DEFAULT_COMPANY_MEMORY_LOOKBACK_DAYS)
+    parser.add_argument("--company-memory-model", default=DEFAULT_COMPANY_MEMORY_MODEL)
+    parser.add_argument("--company-memory-llm", action="store_true", default=COMPANY_MEMORY_LLM_ENABLED, help="Use Codex for company-memory reviews; deterministic V1 is default")
     parser.add_argument("--log-research-ledger", action="store_true", help="Record this run in the advisory research ledger")
     parser.add_argument("--ledger-label", help="Optional research-ledger label")
     parser.add_argument("--ledger-objective", help="Optional research-ledger objective")
@@ -698,6 +712,24 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             "policy_actions": _json_ready(policy_df),
         }
         _finish_stage("event_policy", stage_started, f"rows={len(policy_df)}")
+
+    if not args.skip_company_memory and stage_enabled("company_memory", args.start_at, args.stop_at):
+        stage_started = _start_stage("company_memory")
+        memory_df, memory_meta = build_company_memory_reviews(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=int(args.company_memory_limit),
+            lookback_days=int(args.company_memory_lookback_days),
+            model=str(args.company_memory_model),
+            use_llm=bool(args.company_memory_llm),
+        )
+        if not args.dry_run:
+            persist_company_memory_reviews(memory_df)
+        summary["stages"]["company_memory"] = {
+            "meta": _json_ready(memory_meta),
+            "reviews": _json_ready(memory_df),
+        }
+        _finish_stage("company_memory", stage_started, f"rows={len(memory_df)}")
 
     if stage_enabled("risk", args.start_at, args.stop_at):
         stage_started = _start_stage("risk")

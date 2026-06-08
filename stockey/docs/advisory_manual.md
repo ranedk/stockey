@@ -907,7 +907,18 @@ Set `CODEX_CLI_OCR_MODEL` and `CODEX_CLI_SUMMARIZE_MODEL` to choose the smaller 
 - `advisory_event_evaluations`
 - `advisory_event_risks`
 
+For official filings, the evaluator reads `advisory_announcement_evidence` first so Codex/LLM context is compact, point-in-time, and source-attributed. It falls back to `announcement_pipeline_documents` only when a compact evidence row is missing, and that fallback is marked in the persisted context snapshot. The same payload also carries latest compact bhavcopy evidence from `advisory_bhavcopy_evidence_daily` when available.
+
 Use `ADVISORY_EVENT_EVAL_MODEL=codex` and `CODEX_CLI_EVENT_MODEL` to run this structured event evaluation through Codex CLI with local Pydantic validation.
+
+Company-memory review is a separate review-only signal layer. `advisory/company_memory_review.py` writes `advisory_company_memory_reviews` by combining compact announcement evidence, compact bhavcopy evidence, current technical/candidate state, recent event-policy rows, wait signals, and latest action rows for each symbol. It defaults to deterministic V1 and only calls Codex when explicitly enabled. Its `authority_scope` is always `review_input_only`; deterministic action consolidation and execution safety gates remain authoritative.
+
+```sh
+python -m advisory.company_memory_review --dry-run --symbols RELIANCE --limit 1
+python -m advisory.company_memory_review --dry-run --symbols RELIANCE --llm
+```
+
+The operator API enriches visible action rows with the latest matching `company_memory_review`. The Nuxt Action Queue and Symbol Detail pages render the review signal, confidence, thesis, evidence used, risk flags, wait-for items, and `review_input_only` authority boundary. This is display evidence only; it does not approve broker actions.
 
 Consolidated action decisions can write manual revision pointers through Codex CLI:
 
