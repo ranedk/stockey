@@ -19,12 +19,21 @@ const dhan = computed(() => asDict(sections.value.dhan))
 const dhanCache = computed(() => asDict(sections.value.dhan_cache))
 const frontend = computed(() => asDict(sections.value.frontend))
 const operatorSnapshot = computed(() => asDict(sections.value.operator_snapshot))
+const summarySnapshot = computed(() => asDict(summary.value?.snapshot))
+const summarySnapshotWarning = computed(() => asDict(summary.value?.snapshot_warning))
 const slowOperations = computed(() => asDict(sections.value.slow_operations))
 const slowIssues = computed(() => asList(slowOperations.value.issues))
 const syncStateFailures = computed(() => asList(sections.value.sync_state_failures))
 const degradationFeed = computed(() => asDict(sections.value.degradation_feed))
+const degradationLifecycle = computed(() => asDict(degradationFeed.value.lifecycle))
+const degradationLifecycleGroups = computed(() => asList(degradationLifecycle.value.groups))
+const supersededPreview = computed(() => asDict(degradationLifecycle.value.superseded_preview))
+const supersededEventSamples = computed(() => asList(supersededPreview.value.event_processing_sample))
+const supersededDocumentSamples = computed(() => asList(supersededPreview.value.announcement_document_sample))
 const degradations = computed(() => asList(degradationFeed.value.rows))
 const fixHints = computed(() => asList(details.value?.fix_hints))
+const currentBlockers = computed(() => asDict(details.value?.current_blockers))
+const currentBlockerRows = computed(() => asList(currentBlockers.value.rows))
 const healthFilter = ref('all')
 const degradationFilter = ref('active')
 const degradationKindFilter = ref('all')
@@ -184,6 +193,8 @@ async function updateSlowIssue(issue: Dict, status: string) {
     </div>
   </section>
 
+  <SnapshotWarning class="mt-4" :snapshot="summarySnapshot" :warning="summarySnapshotWarning" :generated-at="summary?.generated_at" />
+
   <section v-if="loadErrors.length" class="mt-6 grid gap-3">
     <ApiErrorBanner v-for="row in loadErrors" :key="row.title" :title="row.title" :error="row.error" />
   </section>
@@ -199,6 +210,55 @@ async function updateSlowIssue(issue: Dict, status: string) {
     <MetricTile label="Dhan" :value="statusText(dhan.status)" :note="String(dhan.message || '-')" />
     <MetricTile label="Token" :value="statusText(dhanCache.status)" :note="`expires ${secondsText(dhanCache.seconds_to_expiry)}`" />
     <MetricTile label="Frontend" :value="statusText(frontend.status)" :note="String(frontend.message || '-')" />
+  </section>
+
+  <section class="mt-8 glass-panel rounded-3xl p-5">
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Current Blockers</p>
+        <h2 class="mt-2 text-2xl font-black">What blocks advisory trust now</h2>
+        <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/60">
+          Prioritized from active health errors, stale inputs, pipeline failures, degradation rows, and fix hints.
+        </p>
+      </div>
+      <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(currentBlockers.status)">
+        {{ statusText(currentBlockers.status) }} · {{ currentBlockers.count || 0 }} open
+      </span>
+    </div>
+    <div class="mt-5 grid gap-3 md:grid-cols-4">
+      <MetricTile label="Open" :value="String(currentBlockers.count || 0)" note="Trust blockers" />
+      <MetricTile label="Errors" :value="String(currentBlockers.error_count || 0)" note="Highest priority" />
+      <MetricTile label="Warnings" :value="String(currentBlockers.warn_count || 0)" note="Needs triage" />
+      <MetricTile label="Categories" :value="String(Object.keys(asDict(currentBlockers.counts_by_category)).length)" note="Affected areas" />
+    </div>
+    <div class="mt-5 grid gap-3 lg:grid-cols-2">
+      <article v-for="row in currentBlockerRows" :key="`${row.category}-${row.title}-${row.reason}`" class="rounded-2xl bg-white/75 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="font-black text-ink">{{ row.title || 'Health blocker' }}</p>
+            <p class="mt-1 text-sm leading-6 text-ink/60">{{ row.reason || '-' }}</p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(row.status)">{{ statusText(row.status) }}</span>
+        </div>
+        <div class="mt-3 grid gap-2 text-xs md:grid-cols-2">
+          <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Category:</b> {{ titleCase(row.category) }}</p>
+          <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Source:</b> {{ row.source || '-' }}</p>
+        </div>
+        <p class="mt-3 rounded-2xl bg-sun/15 p-3 text-sm font-semibold text-ink/70">
+          {{ row.trust_impact || 'Triage before relying on fresh advisory output.' }}
+        </p>
+        <div v-if="asStringList(row.commands).length" class="mt-3 space-y-2">
+          <code v-for="command in asStringList(row.commands).slice(0, 3)" :key="command" class="block overflow-auto rounded-xl bg-ink px-3 py-2 text-xs text-paper">
+            {{ command }}
+          </code>
+        </div>
+        <details v-if="Object.keys(asDict(row.details)).length" class="mt-3">
+          <summary class="cursor-pointer text-sm font-black text-moss">Show blocker details</summary>
+          <pre class="mt-3 max-h-56 overflow-auto rounded-2xl bg-paper/80 p-3 text-xs">{{ JSON.stringify(row.details, null, 2) }}</pre>
+        </details>
+      </article>
+      <p v-if="!currentBlockerRows.length" class="rounded-2xl bg-white/75 p-4 text-sm text-ink/60">No active advisory trust blockers.</p>
+    </div>
   </section>
 
   <section class="mt-8 glass-panel rounded-3xl p-5">
@@ -302,6 +362,68 @@ async function updateSlowIssue(issue: Dict, status: string) {
       <MetricTile label="Recovered" :value="String(degradationFeed.recovered_count || 0)" note="Historical markers" />
       <MetricTile label="Kinds" :value="String(Object.keys(asDict(degradationFeed.counts_by_kind)).length)" note="Degradation categories" />
       <MetricTile label="Shown" :value="String(filteredDegradations.length)" note="After filters" />
+    </div>
+    <div v-if="degradationLifecycleGroups.length" class="mt-5 grid gap-3 lg:grid-cols-3">
+      <article v-for="group in degradationLifecycleGroups" :key="String(group.key)" class="rounded-2xl bg-white/75 p-4">
+        <div class="flex items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">{{ group.label }}</p>
+            <p class="mt-2 text-3xl font-black text-ink">{{ group.count ?? 0 }}</p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(group.status)">
+            {{ statusText(group.status) }}
+          </span>
+        </div>
+        <p class="mt-3 text-sm leading-6 text-ink/60">{{ group.description || '-' }}</p>
+        <p class="mt-3 rounded-2xl bg-paper/70 p-3 text-sm font-semibold text-ink/70">
+          {{ group.next_action || '-' }}
+        </p>
+        <details v-if="Object.keys(asDict(group.details)).length" class="mt-3">
+          <summary class="cursor-pointer text-sm font-black text-moss">Show lifecycle details</summary>
+          <pre class="mt-3 max-h-48 overflow-auto rounded-2xl bg-ink p-3 text-xs text-paper">{{ JSON.stringify(group.details, null, 2) }}</pre>
+        </details>
+      </article>
+    </div>
+    <div v-if="Number(supersededPreview.event_processing_candidates || 0) || Number(supersededPreview.announcement_document_candidates || 0)" class="mt-5 rounded-2xl bg-white/75 p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Superseded Cleanup Preview</p>
+          <p class="mt-2 text-sm leading-6 text-ink/60">
+            Candidate rows are read-only here. Marking them superseded requires an explicit shell apply command after reviewing the dry-run output.
+          </p>
+        </div>
+        <span class="rounded-full bg-sun px-3 py-1 text-xs font-black text-ink">
+          {{ Number(supersededPreview.event_processing_candidates || 0) + Number(supersededPreview.announcement_document_candidates || 0) }} ready
+        </span>
+      </div>
+      <div class="mt-4 grid gap-3 md:grid-cols-2">
+        <p class="rounded-xl bg-paper/70 px-3 py-2 text-xs font-semibold text-ink/70">
+          Dry run: <code class="font-black">{{ supersededPreview.dry_run_command || 'python -m advisory.superseded_failures --limit 500' }}</code>
+        </p>
+        <p class="rounded-xl bg-paper/70 px-3 py-2 text-xs font-semibold text-ink/70">
+          Apply: <code class="font-black">{{ supersededPreview.apply_command || 'python -m advisory.superseded_failures --apply --limit 500' }}</code>
+        </p>
+      </div>
+      <div class="mt-4 grid gap-3 lg:grid-cols-2">
+        <div>
+          <p class="text-sm font-black text-ink">Event processing candidates · {{ supersededPreview.event_processing_candidates || 0 }}</p>
+          <div class="mt-2 grid gap-2">
+            <p v-for="row in supersededEventSamples" :key="`event-${row.unique_id}-${row.stage}-${row.started_at}`" class="rounded-xl bg-paper/70 px-3 py-2 text-xs text-ink/70">
+              <b>{{ row.symbol || row.unique_id || '-' }}</b> · {{ row.stage || '-' }} · superseded by {{ row.superseded_by_status || '-' }}
+            </p>
+            <p v-if="!supersededEventSamples.length" class="rounded-xl bg-paper/70 px-3 py-2 text-xs text-ink/50">No event-processing samples in the preview.</p>
+          </div>
+        </div>
+        <div>
+          <p class="text-sm font-black text-ink">Announcement document candidates · {{ supersededPreview.announcement_document_candidates || 0 }}</p>
+          <div class="mt-2 grid gap-2">
+            <p v-for="row in supersededDocumentSamples" :key="`doc-${row.unique_id}-${row.updated_at || row.load_ts}`" class="rounded-xl bg-paper/70 px-3 py-2 text-xs text-ink/70">
+              <b>{{ row.symbol || row.ticker || row.unique_id || '-' }}</b> · OCR {{ row.ocr_status || '-' }} · Parse {{ row.parse_status || '-' }}
+            </p>
+            <p v-if="!supersededDocumentSamples.length" class="rounded-xl bg-paper/70 px-3 py-2 text-xs text-ink/50">No announcement-document samples in the preview.</p>
+          </div>
+        </div>
+      </div>
     </div>
     <div class="mt-5 flex flex-wrap gap-2">
       <button

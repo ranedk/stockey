@@ -1,9 +1,20 @@
 export type Dict = Record<string, unknown>
 
+export interface OperatorApiSchema {
+  name: string
+  version: string
+  endpoint: string
+  generated_at?: string
+  read_only: boolean
+  broker_execution_enabled: boolean
+}
+
 export interface OperatorSummary {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   asof_date?: string
   snapshot?: Dict
+  snapshot_warning?: Dict | null
   summary: Dict
   runtime_processes: Dict[]
   cron_status: Dict[]
@@ -12,8 +23,10 @@ export interface OperatorSummary {
 
 export interface OperatorHome {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   asof_date?: string
   snapshot?: Dict
+  snapshot_warning?: Dict | null
   summary: Dict
   runtime_processes: Dict[]
   cron_status: Dict[]
@@ -24,13 +37,38 @@ export interface OperatorHome {
 
 export interface OperatorHealthDetails {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   sections: Dict
   fix_hints?: Dict[]
+  current_blockers?: Dict
+}
+
+export interface OperatorRuntime {
+  api_schema?: OperatorApiSchema
+  generated_at?: string
+  status: string
+  service: string
+  process_started_at?: string
+  uptime_seconds?: number
+  git_rev?: string
+  git_branch?: string
+  git_dirty?: boolean
+  latest_source_mtime?: string
+  latest_source_path?: string
+  stale_code?: boolean
+  stale_reason?: string
+  operator_action?: string
+  live_trading_enabled?: boolean
+  live_trading_disabled?: boolean
+  live_trading_env_var?: string
+  live_trading_operator_note?: string
+  read_only: boolean
 }
 
 export interface OperatorSmokePayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   operator_health: Dict
   fix_hints?: Dict[]
@@ -40,6 +78,7 @@ export interface OperatorSmokePayload {
 
 export interface CronLogsPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   log_dir: string
   logs: Dict[]
@@ -47,6 +86,7 @@ export interface CronLogsPayload {
 
 export interface OperatorCommandsPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   commands: Dict[]
   recent_runs: Dict[]
@@ -54,6 +94,7 @@ export interface OperatorCommandsPayload {
 
 export interface OperatorApiErrorsPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   summary: Dict
   errors: Dict[]
@@ -68,6 +109,7 @@ export interface OperatorCommandRunResult {
 
 export interface EventModelPromotionCheckPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   decision: string
   ready_for_operator_review: boolean
@@ -84,6 +126,7 @@ export interface EventModelPromotionCheckPayload {
 
 export interface EventModelArtifactsPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   artifact: Dict
   latest_s3_heads: Dict[]
@@ -92,12 +135,25 @@ export interface EventModelArtifactsPayload {
 
 export interface ManualReviewPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   summary: Dict
+  source_warnings?: Dict[]
   items: Dict[]
 }
 
+export interface IdentityIssuesPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  summary: Dict
+  source_warnings?: Dict[]
+  issues: Dict[]
+  skipped?: Dict[]
+}
+
 export interface ManualReviewDecisionResult {
+  api_schema?: OperatorApiSchema
   status: string
   decided_at?: string
   item_id: string
@@ -106,10 +162,30 @@ export interface ManualReviewDecisionResult {
   note?: string
 }
 
+export interface ActionConflictRulesPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  rules: Dict[]
+  unresolved_conflicts: Dict[]
+  row_count: number
+  unresolved_count?: number
+}
+
+export interface ActionConflictRuleWriteResult {
+  status: string
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  rule: Dict
+  condition?: Dict | null
+  note?: string
+}
+
 export interface OperatorActions {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   asof_date?: string
   snapshot?: Dict
+  snapshot_warning?: Dict | null
   top_action_recommendations: Dict[]
   action_recommendations: Dict[]
   alerts: Dict[]
@@ -118,6 +194,7 @@ export interface OperatorActions {
 
 export interface SignalRefreshPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   signals: Dict[]
   meta?: Dict
@@ -125,8 +202,10 @@ export interface SignalRefreshPayload {
 
 export interface OperatorPortfolio {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   asof_date?: string
   snapshot?: Dict
+  snapshot_warning?: Dict | null
   today_recommendations: Dict[]
   current_recommendations: Dict[]
   exited_recommendations: Dict[]
@@ -135,9 +214,22 @@ export interface OperatorPortfolio {
   meta?: Dict
 }
 
+export interface OperatorDetailPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  kind: string
+  filters: Dict
+  rows: Dict[]
+  row_count: number
+}
+
 export interface OperatorEvents {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   asof_date?: string
+  snapshot?: Dict
+  snapshot_warning?: Dict | null
   events: Dict[]
   operator_feed: Dict[]
   alerts: Dict[]
@@ -146,6 +238,7 @@ export interface OperatorEvents {
 
 export interface EventPolicyPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   asof_date?: string
   summary: Dict
@@ -154,12 +247,14 @@ export interface EventPolicyPayload {
 
 export interface EventPolicyEvaluationPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   summary: Dict[]
 }
 
 export interface OperatorMarketContext {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   asof_date?: string
   summary: Dict
   top_universe: Dict[]
@@ -167,6 +262,7 @@ export interface OperatorMarketContext {
 
 export interface TechnicalCalibrationPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   summary: Dict[]
   top_configs: Dict[]
@@ -191,6 +287,7 @@ export interface TechnicalPromotionReviewResult {
 
 export interface TechnicalPromotionReviewsPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
   reviews: Dict[]
 }
@@ -210,7 +307,18 @@ export interface TechnicalPromotionDecisionResult {
   note?: string
 }
 
+export interface EventDetailPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  kind: string
+  filters: Dict
+  rows: Dict[]
+  row_count: number
+}
+
 export interface EventTrace {
+  api_schema?: OperatorApiSchema
   unique_id: string
   processing: Dict[]
   traces: Dict[]
@@ -218,6 +326,7 @@ export interface EventTrace {
 }
 
 export interface SymbolTrace {
+  api_schema?: OperatorApiSchema
   symbol: string
   processing: Dict[]
   traces: Dict[]
@@ -278,17 +387,55 @@ export interface TraceConflict {
   requires_manual_resolution?: boolean
 }
 
+export interface ManualReviewWaitSignalLink {
+  decided_at?: string
+  manual_review_item_id?: string
+  manual_review_item_type?: string
+  manual_review_source_table?: string
+  manual_review_source_key?: string
+  symbol?: string
+  unique_id?: string
+  setup_id?: string
+  decision?: string
+  rationale?: string
+  follow_up_event?: string
+  operator_id?: string
+  wait_signal_created_at?: string
+  signal_id?: string
+  wait_signal_status?: string
+  signal_type?: string
+  expected_action?: string
+  operator_summary?: string
+  wait_question?: string
+  condition?: Dict
+  valid_until?: string
+  generated_by?: string
+  matched_at?: string
+  match_status?: string
+  match_score?: unknown
+  match_source_table?: string
+  match_source_key?: string
+  observed_at?: string
+  match_reason?: string
+  evidence?: Dict
+}
+
 export interface TraceSummary {
+  api_schema?: OperatorApiSchema
   symbol?: string
   unique_id?: string
   processing: TraceStage[]
   decisions: TraceDecision[]
   action_conflicts: TraceConflict[]
+  manual_review_wait_signal_links?: ManualReviewWaitSignalLink[]
   raw_counts: Dict
   _trace_summary_cache?: Dict
 }
 
 export interface HypothesesPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status?: string
   hypotheses: Dict[]
   matches: Dict[]
   action_plans: Dict[]
@@ -299,10 +446,21 @@ export interface HypothesesPayload {
 
 export interface WaitSignalsPayload {
   generated_at?: string
+  api_schema?: OperatorApiSchema
   status: string
+  summary?: Dict
+  source_warnings?: Dict[]
+  sections?: Record<string, Dict[]>
   signals: Dict[]
   matches: Dict[]
   match_result?: Dict | null
+}
+
+export interface WaitSignalMatchPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  match_result: Dict
 }
 
 export interface HypothesisCreateResult {

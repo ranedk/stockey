@@ -365,6 +365,26 @@ def _format_execution_intent(row: pd.Series | dict[str, Any]) -> str | None:
     return " | ".join(parts) if parts else None
 
 
+def _execution_safety_contract(row: pd.Series | dict[str, Any]) -> dict[str, Any] | None:
+    safety = _parse_json_blob(row.get("safety_checks_json"))
+    if not safety:
+        raw_broker = _parse_json_blob(row.get("raw_broker_json"))
+        candidate = raw_broker.get("execution_safety_contract")
+        safety = candidate if isinstance(candidate, dict) else {}
+    if not safety:
+        return None
+    issues = safety.get("issues")
+    return {
+        "operator_approval_required": bool(safety.get("operator_approval_required")),
+        "operator_approval_status": _as_text(safety.get("operator_approval_status")) or "missing",
+        "broker_reconciliation_required": bool(safety.get("broker_reconciliation_required")),
+        "broker_reconciliation_status": _as_text(safety.get("broker_reconciliation_status")) or "not_run",
+        "live_submission_allowed": bool(safety.get("live_submission_allowed")),
+        "source": _as_text(safety.get("source")),
+        "issues": [str(item) for item in issues if str(item or "").strip()] if isinstance(issues, list) else [],
+    }
+
+
 def _recommendation_reason(row: pd.Series | dict[str, Any]) -> str | None:
     for key in ["lifecycle_reason", "portfolio_reason", "watch_reason_detail", "candidate_state", "next_action_reason"]:
         text = _as_text(row.get(key))
@@ -913,6 +933,8 @@ def load_execution_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 1
             reference_price,
             execution_status,
             execution_reason,
+            safety_checks_json,
+            raw_broker_json,
             broker_order_status,
             submitted_at,
             broker_update_time,
@@ -1916,6 +1938,7 @@ def _base_recommendation_record(
     technical_context: Any = None,
     action_summary: Any = None,
     execution_intent: Any = None,
+    execution_safety_contract: dict[str, Any] | None = None,
     manual_revision_summary: Any = None,
     manual_revision_pointers: Any = None,
     recommendation_reason: Any = None,
@@ -1947,6 +1970,7 @@ def _base_recommendation_record(
         "technical_context": _as_text(technical_context),
         "action_summary": _as_text(action_summary),
         "execution_intent": _as_text(execution_intent),
+        "execution_safety_contract": execution_safety_contract,
         "manual_revision_summary": _as_text(manual_revision_summary),
         "manual_revision_pointers": manual_revision_pointers,
         "recommendation_reason": recommendation_reason,
@@ -2122,6 +2146,7 @@ def build_recommendation_views(
                     ),
                     action_summary=_format_action_summary(action_row) if action_row else None,
                     execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
+                    execution_safety_contract=_execution_safety_contract(execution_map.get(symbol.upper(), {})),
                     manual_revision_summary=action_row.get("manual_revision_summary") if action_row else None,
                     manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
                     recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
@@ -2210,6 +2235,7 @@ def build_recommendation_views(
                     ),
                     action_summary=_format_action_summary(action_row) if action_row else None,
                     execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
+                    execution_safety_contract=_execution_safety_contract(execution_map.get(symbol.upper(), {})),
                     manual_revision_summary=action_row.get("manual_revision_summary") if action_row else None,
                     manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
                     recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
@@ -2297,6 +2323,7 @@ def build_recommendation_views(
                     ),
                     action_summary=_format_action_summary(action_row) if action_row else None,
                     execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
+                    execution_safety_contract=_execution_safety_contract(execution_map.get(symbol.upper(), {})),
                     manual_revision_summary=action_row.get("manual_revision_summary") if action_row else None,
                     manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
                     recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
@@ -2357,6 +2384,7 @@ def build_recommendation_views(
                     technical_context=base_row.get("technical_context"),
                     action_summary=_format_action_summary(action_row),
                     execution_intent=_format_execution_intent(execution_map.get(symbol_key, {})),
+                    execution_safety_contract=_execution_safety_contract(execution_map.get(symbol_key, {})),
                     manual_revision_summary=action_row.get("manual_revision_summary"),
                     manual_revision_pointers=_manual_revision_pointers(action_row),
                     recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")),
@@ -2424,6 +2452,7 @@ def build_recommendation_views(
                 setup_context=_setup_context_text(setup_snapshot, setup_meta),
                 action_summary=_format_action_summary(row),
                 execution_intent=_format_execution_intent(execution_map.get(symbol.upper(), {})),
+                execution_safety_contract=_execution_safety_contract(execution_map.get(symbol.upper(), {})),
                 sort_ts=row.get("published_on"),
             )
             record["invest_score_pct"] = _coalesce_float(lifecycle_row.get("invest_score_pct"), row.get("invest_score_pct"))

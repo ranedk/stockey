@@ -18,6 +18,7 @@ from environs import Env
 from advisory.performance_slowlog import summarize_slow_operations
 from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
 from advisory.operator_snapshot import SNAPSHOT_NAME, TABLE_NAME as OPERATOR_SNAPSHOT_TABLE
+from advisory.superseded_failures import cleanup_superseded_failures
 from utils.db import sql_to_df
 from utils.redis_utils import get_redis_client
 
@@ -702,6 +703,83 @@ def _dedupe_degradations(rows: list[dict[str, Any]], *, limit: int = 100) -> lis
     return out[: max(1, int(limit))]
 
 
+def build_degradation_lifecycle_groups(rows: list[dict[str, Any]], *, limit: int = 100) -> dict[str, Any]:
+    active_count = sum(1 for row in rows if not row.get("recovered"))
+    recovered_count = sum(1 for row in rows if row.get("recovered"))
+    superseded_preview: dict[str, Any] = {"status": "unavailable", "error": None}
+    superseded_count = 0
+    try:
+        preview = cleanup_superseded_failures(apply=False, limit=max(1, int(limit)))
+        event_processing = preview.get("event_processing") if isinstance(preview.get("event_processing"), dict) else {}
+        announcement_documents = preview.get("announcement_documents") if isinstance(preview.get("announcement_documents"), dict) else {}
+        superseded_count = int(event_processing.get("candidates") or 0) + int(announcement_documents.get("candidates") or 0)
+        superseded_preview = {
+            "status": preview.get("status") or "dry_run",
+            "event_processing_candidates": int(event_processing.get("candidates") or 0),
+            "announcement_document_candidates": int(announcement_documents.get("candidates") or 0),
+            "sample_count": len(event_processing.get("sample") or []) + len(announcement_documents.get("sample") or []),
+            "event_processing_sample": event_processing.get("sample") or [],
+            "announcement_document_sample": announcement_documents.get("sample") or [],
+            "dry_run_command": "python -m advisory.superseded_failures --limit 500",
+            "apply_command": "python -m advisory.superseded_failures --apply --limit 500",
+            "apply_requires_operator_intent": True,
+        }
+    except Exception as exc:
+        superseded_preview = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+    groups = [
+        {
+            "key": "active",
+            "label": "Active",
+            "status": "error" if any(row.get("status") == "error" and not row.get("recovered") for row in rows) else "warn" if active_count else "ok",
+            "count": active_count,
+            "description": "Current degradation rows that still need investigation before trusting advisory output.",
+            "next_action": "Fix source issue, rerun the relevant pipeline, then refresh Health.",
+        },
+        {
+            "key": "recovered",
+            "label": "Recovered",
+            "status": "warn" if recovered_count else "ok",
+            "count": recovered_count,
+            "description": "Historical errors followed by a successful marker or newer recovered output.",
+            "next_action": "Keep for audit unless they continue to obscure current issues.",
+        },
+        {
+            "key": "superseded",
+            "label": "Superseded Ready",
+            "status": "error" if superseded_preview.get("status") == "error" else "warn" if superseded_count else "ok",
+            "count": superseded_count,
+            "description": "Recovered processing/document failures that can be marked superseded after operator review.",
+            "next_action": "Review the Health sample, run the dry-run command, and apply only with explicit operator intent.",
+            "details": superseded_preview,
+        },
+    ]
+    status = "error" if groups[0]["status"] == "error" or superseded_preview.get("status") == "error" else "warn" if any(group["status"] == "warn" for group in groups) else "ok"
+    return {
+        "status": status,
+        "counts": {
+            "active": active_count,
+            "recovered": recovered_count,
+            "superseded": superseded_count,
+        },
+        "groups": groups,
+        "superseded_preview": superseded_preview,
+    }
+
+
+_RECOVERED_DOCUMENT_STATUSES = {"completed", "success", "ok", "processed", "skipped", "unavailable"}
+
+
+def _announcement_failure_is_active(row: dict[str, Any]) -> bool:
+    ocr_status = str(row.get("ocr_status") or "").strip().lower()
+    parse_status = str(row.get("parse_status") or "").strip().lower()
+    if ocr_status == "failed" or parse_status == "failed":
+        return True
+    if row.get("last_error") is None:
+        return False
+    return not (ocr_status in _RECOVERED_DOCUMENT_STATUSES and parse_status in _RECOVERED_DOCUMENT_STATUSES)
+
+
 def check_announcement_document_failures(limit: int = 25) -> list[dict[str, Any]]:
     table = "announcement_pipeline_documents"
     try:
@@ -719,7 +797,13 @@ def check_announcement_document_failures(limit: int = 25) -> list[dict[str, Any]
             FROM {table}
             WHERE COALESCE(ocr_status, '') = 'failed'
                OR COALESCE(parse_status, '') = 'failed'
-               OR last_error IS NOT NULL
+               OR (
+                    last_error IS NOT NULL
+                    AND NOT (
+                        LOWER(COALESCE(ocr_status, '')) IN ('completed', 'success', 'ok', 'processed', 'skipped', 'unavailable')
+                        AND LOWER(COALESCE(parse_status, '')) IN ('completed', 'success', 'ok', 'processed', 'skipped', 'unavailable')
+                    )
+               )
             {order_sql}
             LIMIT %s
             """,
@@ -729,6 +813,8 @@ def check_announcement_document_failures(limit: int = 25) -> list[dict[str, Any]
         )
         rows = []
         for item in _records(df):
+            if not _announcement_failure_is_active(item):
+                continue
             symbol = str(item.get("ticker") or item.get("symbol") or "").strip().upper() or None
             rows.append(
                 {
@@ -855,6 +941,7 @@ def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DE
         "active_count": len(active),
         "recovered_count": len(recovered),
         "counts_by_kind": counts,
+        "lifecycle": build_degradation_lifecycle_groups(rows, limit=limit),
         "rows": rows,
     }
 
@@ -1221,6 +1308,143 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
     return hints
 
 
+TRUST_BLOCKER_SECTION_TITLES = {
+    "database": "Postgres health",
+    "operator_api": "Operator API health",
+    "trace_summaries": "Trace summary cache",
+    "operator_snapshot": "Operator snapshot freshness",
+    "slow_operations": "Slow operator paths",
+    "redis": "Redis runtime state",
+    "dhan": "Dhan token validation",
+    "dhan_cache": "Dhan token cache",
+    "frontend": "Operator frontend dependencies",
+    "degradation_feed": "Runtime degradation feed",
+}
+
+
+def _blocker_category(row: dict[str, Any]) -> str:
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    section = str(details.get("section") or "").lower()
+    kind = str(details.get("kind") or "").lower()
+    title = str(row.get("title") or "").lower()
+    if section in {"database", "operator_api"} or "postgres" in title or "operator api" in title:
+        return "runtime"
+    if section in {"dhan", "dhan_cache"} or kind.startswith("dhan") or "dhan" in title:
+        return "broker_data"
+    if section in {"operator_snapshot", "trace_summaries"} or "snapshot" in title or "trace" in title:
+        return "operator_visibility"
+    if "stale" in title or "freshness" in title or "data is stale" in title:
+        return "data_freshness"
+    if "cron" in title or "sync" in title:
+        return "pipeline"
+    if kind or "fallback" in title or "degradation" in title or "ocr" in title:
+        return "data_quality"
+    return "operations"
+
+
+def _trust_impact(row: dict[str, Any]) -> str:
+    category = _blocker_category(row)
+    status = str(row.get("status") or "").lower()
+    if category in {"runtime", "operator_visibility"}:
+        return "Operator cannot trust the advisory UI until this is cleared."
+    if category == "broker_data":
+        return "Broker/security identity or token state may block validation and execution planning."
+    if category == "data_freshness":
+        return "Advisory decisions may be using stale or missing inputs."
+    if category == "pipeline":
+        return "Recent pipeline runs may have failed or skipped required updates."
+    if category == "data_quality":
+        return "Some evidence may be fallback, partial, or unresolved."
+    if status == "error":
+        return "A required health check is failing."
+    return "This warning should be triaged before relying on fresh advisory output."
+
+
+def build_current_blockers(sections: dict[str, Any], fix_hints: list[dict[str, Any]], *, limit: int = 8) -> dict[str, Any]:
+    """Summarize the smallest active set that blocks operator trust."""
+    candidates: list[dict[str, Any]] = []
+    for hint in fix_hints:
+        if not isinstance(hint, dict):
+            continue
+        status = str(hint.get("status") or "ok").lower()
+        if status == "ok" or "historical cron errors recovered" in str(hint.get("title") or "").lower():
+            continue
+        candidates.append(
+            {
+                "status": status if status in {"error", "warn"} else "warn",
+                "title": str(hint.get("title") or "Health blocker"),
+                "reason": str(hint.get("reason") or "Health check needs attention."),
+                "category": _blocker_category(hint),
+                "trust_impact": _trust_impact(hint),
+                "commands": hint.get("commands") if isinstance(hint.get("commands"), list) else [],
+                "details": hint.get("details") if isinstance(hint.get("details"), dict) else {},
+                "source": "fix_hint",
+            }
+        )
+
+    for key, value in sections.items():
+        rows = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "ok").lower()
+            if status not in {"error", "warn"}:
+                continue
+            if row.get("recovered") or str(row.get("latest_run_status") or "") in {"ok_after_historical_errors", "recovered_after_manual_interrupt"}:
+                continue
+            title = TRUST_BLOCKER_SECTION_TITLES.get(key, str(row.get("name") or row.get("title") or key))
+            candidates.append(
+                {
+                    "status": status,
+                    "title": title,
+                    "reason": str(row.get("error") or row.get("message") or row.get("title") or "Health row needs attention."),
+                    "category": _blocker_category({"title": title, "details": {"section": key}}),
+                    "trust_impact": _trust_impact({"status": status, "title": title, "details": {"section": key}}),
+                    "commands": ["python -m advisory.operator_health --skip-dhan"],
+                    "details": {
+                        "section": key,
+                        **{field: row.get(field) for field in ["name", "table", "latest_at", "age_hours", "row_count", "log_file", "source_name", "kind", "symbol", "observed_at"] if row.get(field) is not None},
+                    },
+                    "source": key,
+                }
+            )
+
+    deduped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in candidates:
+        details = row.get("details") if isinstance(row.get("details"), dict) else {}
+        dedupe_name = str(details.get("section") or details.get("table") or details.get("kind") or row.get("title") or "")
+        key = (str(row.get("status") or ""), str(row.get("category") or ""), dedupe_name)
+        existing = deduped.get(key)
+        if existing is None or (existing.get("source") != "fix_hint" and row.get("source") == "fix_hint"):
+            deduped[key] = row
+    rows = list(deduped.values())
+    severity_rank = {"error": 0, "warn": 1}
+    category_rank = {
+        "runtime": 0,
+        "operator_visibility": 1,
+        "data_freshness": 2,
+        "pipeline": 3,
+        "broker_data": 4,
+        "data_quality": 5,
+        "operations": 6,
+    }
+    rows.sort(key=lambda row: (severity_rank.get(str(row.get("status")), 9), category_rank.get(str(row.get("category")), 9), str(row.get("title") or "")))
+    rows = rows[: max(1, int(limit))]
+    status = "error" if any(row.get("status") == "error" for row in rows) else "warn" if rows else "ok"
+    counts_by_category: dict[str, int] = {}
+    for row in rows:
+        category = str(row.get("category") or "unknown")
+        counts_by_category[category] = counts_by_category.get(category, 0) + 1
+    return {
+        "status": status,
+        "count": len(rows),
+        "error_count": sum(1 for row in rows if row.get("status") == "error"),
+        "warn_count": sum(1 for row in rows if row.get("status") == "warn"),
+        "counts_by_category": counts_by_category,
+        "rows": rows,
+    }
+
+
 def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan: bool = True) -> dict[str, Any]:
     sections: dict[str, Any] = {
         "database": check_database(),
@@ -1242,11 +1466,13 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
     else:
         sections["dhan"] = _status("warn", "Dhan token validation skipped by request.")
     sections["degradation_feed"] = build_degradation_feed(sections, log_dir=log_dir)
+    fix_hints = build_fix_hints(sections)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "status": summarize_status(sections),
         "sections": sections,
-        "fix_hints": build_fix_hints(sections),
+        "fix_hints": fix_hints,
+        "current_blockers": build_current_blockers(sections, fix_hints),
     }
 
 

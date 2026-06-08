@@ -387,6 +387,28 @@ def _bounded_intraday_from_cursor(from_cursor: pd.Timestamp, to_cursor: pd.Times
     return pd.Timestamp(from_cursor), False
 
 
+def _bounded_event_from_cursor(
+    previous_cursor: pd.Timestamp | None,
+    to_cursor: pd.Timestamp,
+    *,
+    initial_lookback_minutes: int,
+    replay_minutes: int,
+    max_lookback_minutes: int,
+) -> tuple[pd.Timestamp, bool]:
+    to_ts = pd.to_datetime(to_cursor, utc=True, errors="coerce")
+    if pd.isna(to_ts):
+        to_ts = pd.Timestamp.utcnow()
+    previous = pd.to_datetime(previous_cursor, utc=True, errors="coerce")
+    if pd.isna(previous):
+        from_cursor = to_ts - pd.Timedelta(minutes=max(1, int(initial_lookback_minutes)))
+    else:
+        from_cursor = pd.Timestamp(previous) - pd.Timedelta(minutes=max(0, int(replay_minutes)))
+    earliest_allowed = to_ts - pd.Timedelta(minutes=max(1, int(max_lookback_minutes)))
+    if from_cursor < earliest_allowed:
+        return earliest_allowed, True
+    return pd.Timestamp(from_cursor), False
+
+
 def run_ohlcv_cycle(
     *,
     interval_seconds: int,
@@ -454,15 +476,24 @@ def run_ohlcv_cycle(
     return result
 
 
-def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90) -> dict[str, Any]:
+def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90, max_lookback_minutes: int | None = None) -> dict[str, Any]:
     source_name = "continuous_watch:news"
     now = pd.Timestamp.utcnow()
     state = load_sync_state(source_name) or {}
-    published_from = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
-    if pd.isna(published_from):
-        published_from = now - pd.Timedelta(minutes=int(lookback_minutes))
-    else:
-        published_from = published_from - pd.Timedelta(minutes=15)
+    previous_cursor = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
+    effective_max_lookback = int(max_lookback_minutes or os.getenv("WATCHER_NEWS_MAX_LOOKBACK_MINUTES", "1440"))
+    published_from, catchup_truncated = _bounded_event_from_cursor(
+        previous_cursor,
+        now,
+        initial_lookback_minutes=int(lookback_minutes),
+        replay_minutes=15,
+        max_lookback_minutes=effective_max_lookback,
+    )
+    if catchup_truncated:
+        _emit(
+            "[advisory.continuous_watch] news catchup truncated "
+            f"max_lookback_minutes={effective_max_lookback} from={published_from.isoformat()} to={now.isoformat()}"
+        )
     _emit(f"[advisory.continuous_watch] news start from={published_from.isoformat()} to={now.isoformat()}")
     events, meta = run_news_watch(
         lookback_days=1,
@@ -480,22 +511,47 @@ def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90) -> dict
         last_success_at=now,
         last_item_ts=last_item_ts,
         cursor_value=None if pd.isna(last_item_ts) else pd.Timestamp(last_item_ts).isoformat(),
-        state={"matched_event_count": int(meta.get("matched_event_count") or 0)},
+        state={
+            "matched_event_count": int(meta.get("matched_event_count") or 0),
+            "requested_from": published_from.isoformat(),
+            "requested_to": now.isoformat(),
+            "replay_minutes": 15,
+            "max_lookback_minutes": effective_max_lookback,
+            "catchup_truncated": bool(catchup_truncated),
+        },
         status="ok",
     )
-    result = {"status": "ok", **meta}
+    result = {
+        "status": "ok",
+        **meta,
+        "requested_from": published_from.isoformat(),
+        "requested_to": now.isoformat(),
+        "catchup_truncated": bool(catchup_truncated),
+        "max_lookback_minutes": effective_max_lookback,
+    }
     publish_bus_message("stockey:continuous_watch:news", {"published_at": pd.Timestamp.utcnow(), **result})
     return result
 
 
-def run_announcement_cycle(*, interval_seconds: int) -> dict[str, Any]:
+def run_announcement_cycle(*, interval_seconds: int, initial_lookback_minutes: int = 720, max_lookback_minutes: int | None = None) -> dict[str, Any]:
     source_name = "continuous_watch:announcements"
     now = pd.Timestamp.utcnow()
     state = load_sync_state(source_name) or {}
-    last_checked_at = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
-    if pd.isna(last_checked_at):
-        last_checked_at = None
-    _emit(f"[advisory.continuous_watch] announcements start to={now.isoformat()}")
+    previous_cursor = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
+    effective_max_lookback = int(max_lookback_minutes or os.getenv("WATCHER_ANNOUNCEMENT_MAX_LOOKBACK_MINUTES", "1440"))
+    last_checked_at, catchup_truncated = _bounded_event_from_cursor(
+        previous_cursor,
+        now,
+        initial_lookback_minutes=int(initial_lookback_minutes),
+        replay_minutes=15,
+        max_lookback_minutes=effective_max_lookback,
+    )
+    if catchup_truncated:
+        _emit(
+            "[advisory.continuous_watch] announcements catchup truncated "
+            f"max_lookback_minutes={effective_max_lookback} from={last_checked_at.isoformat()} to={now.isoformat()}"
+        )
+    _emit(f"[advisory.continuous_watch] announcements start from={last_checked_at.isoformat()} to={now.isoformat()}")
     watch_updates, events, meta = run_announcement_watch(
         to_date=now,
         include_market_context=True,
@@ -509,10 +565,24 @@ def run_announcement_cycle(*, interval_seconds: int) -> dict[str, Any]:
         last_success_at=now,
         last_item_ts=last_item_ts,
         cursor_value=None if pd.isna(last_item_ts) else pd.Timestamp(last_item_ts).isoformat(),
-        state={"match_count": int(meta.get("match_count") or 0)},
+        state={
+            "match_count": int(meta.get("match_count") or 0),
+            "requested_from": last_checked_at.isoformat(),
+            "requested_to": now.isoformat(),
+            "replay_minutes": 15,
+            "max_lookback_minutes": effective_max_lookback,
+            "catchup_truncated": bool(catchup_truncated),
+        },
         status="ok",
     )
-    result = {"status": "ok", **meta}
+    result = {
+        "status": "ok",
+        **meta,
+        "requested_from": last_checked_at.isoformat(),
+        "requested_to": now.isoformat(),
+        "catchup_truncated": bool(catchup_truncated),
+        "max_lookback_minutes": effective_max_lookback,
+    }
     publish_bus_message("stockey:continuous_watch:announcements", {"published_at": pd.Timestamp.utcnow(), **result})
     return result
 
@@ -537,6 +607,34 @@ def run_operator_frontend_cycle() -> dict[str, Any]:
     return result
 
 
+def publish_lock_skipped_cycle(*, lock_file: str | None = None, lock_pid: str | None = None) -> dict[str, Any]:
+    published_at = pd.Timestamp.utcnow()
+    result = {
+        "status": "skipped",
+        "reason": "lock_already_running",
+        "lock_file": lock_file,
+        "lock_pid": lock_pid,
+    }
+    cycles = {
+        "ohlcv": result.copy(),
+        "announcements": result.copy(),
+        "news": result.copy(),
+        "router": result.copy(),
+        "operator_frontend": result.copy(),
+        "wait_signals": result.copy(),
+        "operator_snapshot": result.copy(),
+        "trace_summary_store": result.copy(),
+    }
+    for cycle_name, payload in cycles.items():
+        publish_bus_message(
+            f"stockey:continuous_watch:{cycle_name}",
+            {"published_at": published_at, **payload},
+        )
+    summary = {"status": "skipped", "reason": "lock_already_running", "cycles": cycles}
+    publish_bus_message("stockey:continuous_watch:summary", {"published_at": published_at, **summary})
+    return summary
+
+
 def run_once(
     *,
     ohlcv_interval_seconds: int,
@@ -548,6 +646,7 @@ def run_once(
     ensure_sync_state_table()
     ensure_alerts_table()
     summary: dict[str, Any] = {"status": "ok", "cycles": {}}
+
     def _run_cycle(source_name: str, cycle_name: str, func, **kwargs) -> dict[str, Any]:
         try:
             return func(**kwargs)
@@ -567,6 +666,14 @@ def run_once(
             summary["status"] = "error"
             return {"status": "error", "error": error}
 
+    def _skip_cycle(cycle_name: str, reason: str) -> dict[str, Any]:
+        result = {"status": "skipped", "reason": reason}
+        publish_bus_message(
+            f"stockey:continuous_watch:{cycle_name}",
+            {"published_at": pd.Timestamp.utcnow(), **result},
+        )
+        return result
+
     if _is_due("continuous_watch:ohlcv", ohlcv_interval_seconds):
         summary["cycles"]["ohlcv"] = _run_cycle(
             "continuous_watch:ohlcv",
@@ -577,15 +684,15 @@ def run_once(
             max_lookback_minutes=ohlcv_max_lookback_minutes,
         )
     else:
-        summary["cycles"]["ohlcv"] = {"status": "skipped", "reason": "not_due"}
+        summary["cycles"]["ohlcv"] = _skip_cycle("ohlcv", "not_due")
     if _is_due("continuous_watch:announcements", announcement_interval_seconds):
         summary["cycles"]["announcements"] = _run_cycle("continuous_watch:announcements", "announcements", run_announcement_cycle, interval_seconds=announcement_interval_seconds)
     else:
-        summary["cycles"]["announcements"] = {"status": "skipped", "reason": "not_due"}
+        summary["cycles"]["announcements"] = _skip_cycle("announcements", "not_due")
     if _is_due("continuous_watch:news", news_interval_seconds):
         summary["cycles"]["news"] = _run_cycle("continuous_watch:news", "news", run_news_cycle, interval_seconds=news_interval_seconds)
     else:
-        summary["cycles"]["news"] = {"status": "skipped", "reason": "not_due"}
+        summary["cycles"]["news"] = _skip_cycle("news", "not_due")
     summary["cycles"]["router"] = _run_cycle("continuous_watch:router", "router", route_live_updates)
     summary["cycles"]["operator_frontend"] = _run_cycle("continuous_watch:operator_frontend", "operator_frontend", run_operator_frontend_cycle)
     publish_bus_message("stockey:continuous_watch:summary", {"published_at": pd.Timestamp.utcnow(), **summary})
@@ -594,6 +701,9 @@ def run_once(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the lightweight continuous watch loop for OHLCV, news, announcements, routing, and operator frontend status.")
+    parser.add_argument("--publish-lock-skipped", action="store_true", help="Publish watcher skip events when an external lock prevents this run.")
+    parser.add_argument("--lock-file", default=None, help="Lock file responsible for a published lock-skipped watcher cycle.")
+    parser.add_argument("--lock-pid", default=None, help="PID currently holding the published watcher lock, when known.")
     parser.add_argument("--loop", action="store_true", help="Run continuously instead of once")
     parser.add_argument("--sleep-seconds", type=int, default=300, help="Loop sleep interval")
     parser.add_argument("--ohlcv-interval-seconds", type=int, default=300)
@@ -607,6 +717,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.publish_lock_skipped:
+        summary = publish_lock_skipped_cycle(lock_file=args.lock_file, lock_pid=args.lock_pid)
+        print(json.dumps(summary, ensure_ascii=False, sort_keys=True, default=str))
+        return 0
     while True:
         started_at = time.monotonic()
         summary = run_once(

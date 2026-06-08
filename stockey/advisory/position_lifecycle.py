@@ -667,26 +667,48 @@ def build_lifecycle_outputs(
             trim_winner_gain_pct=trim_winner_gain_pct,
         )
 
+        recommended_stop_price = pd.to_numeric(enriched.get("recommended_stop_price"), errors="coerce")
+        recommended_stop_price = None if pd.isna(recommended_stop_price) else float(recommended_stop_price)
+        recommended_target_price = pd.to_numeric(enriched.get("recommended_target_price"), errors="coerce")
+        recommended_target_price = None if pd.isna(recommended_target_price) else float(recommended_target_price)
+        price_status = "priced"
+        if pd.isna(entry_price) or pd.isna(current_price):
+            price_status = "missing_entry_or_current_price"
+        entry_assumption = (
+            "Paper entry uses the first available close on or after portfolio published_on."
+            if pd.notna(entry_date)
+            else "No paper entry assumed because no close exists on or after portfolio published_on."
+        )
+        current_stop_price = pd.to_numeric(row.get("stop_price"), errors="coerce")
+        stop_status = "stop_available" if pd.notna(current_stop_price) else "stop_missing"
+        if recommended_stop_price is not None and pd.notna(current_stop_price) and recommended_stop_price > float(current_stop_price):
+            stop_status = "stop_tightening_available"
+        target_status = "target_available" if recommended_target_price is not None else "target_missing"
+        operator_question = None
+        if next_action in {"review_manual", "review_stale", "review_horizon", "review_target"}:
+            operator_question = action_reason
+
         context = {
             "published_on": str(row.get("published_on")),
             "entry_date": None if pd.isna(entry_date) else entry_date.isoformat(),
             "current_date": None if pd.isna(current_date) else current_date.isoformat(),
             "entry_price": None if pd.isna(entry_price) else float(entry_price),
             "current_price": None if pd.isna(current_price) else float(current_price),
+            "price_status": price_status,
+            "entry_assumption": entry_assumption,
             "pnl_pct": pnl_pct,
             "days_held": days_held,
             "portfolio_reason": row.get("portfolio_reason"),
             "overlap_group": row.get("overlap_group"),
             "target_price": enriched.get("recommended_target_price"),
             "recommended_stop_price": enriched.get("recommended_stop_price"),
+            "stop_status": stop_status,
+            "target_status": target_status,
             "expected_horizon_days": enriched.get("expected_horizon_days"),
             "horizon_end_date": enriched.get("horizon_end_date"),
             "target_review_date": enriched.get("target_review_date"),
+            "operator_question": operator_question,
         }
-        recommended_stop_price = pd.to_numeric(enriched.get("recommended_stop_price"), errors="coerce")
-        recommended_stop_price = None if pd.isna(recommended_stop_price) else float(recommended_stop_price)
-        recommended_target_price = pd.to_numeric(enriched.get("recommended_target_price"), errors="coerce")
-        recommended_target_price = None if pd.isna(recommended_target_price) else float(recommended_target_price)
         action_fraction = compute_action_fraction(enriched, next_action)
         execution_mode = "review_only"
         if next_action == "trim_winner":

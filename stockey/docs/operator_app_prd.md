@@ -126,8 +126,14 @@ The Manual Review page defaults to the `Investment review` lane. Operational fai
 Manual Review decisions have bounded effects:
 
 - `downgrade_to_no_action`, `ignore`, `approve_for_manual_config`, and `mark_fixed` are closing decisions. They remove the item from the active Manual Review queue through `advisory_manual_review_decisions`; they do not mutate portfolio, action recommendations, or broker orders.
-- `watch_for_event` is non-closing. It records the operator note and creates an active `advisory_wait_signals` row from the `Event to wait for` text. Watchers/signal refresh can later match that wait signal against fresh news, announcements, and announcement documents.
+- `watch_for_event` is non-closing. It requires an explicit `Event to wait for`, records the operator note, and creates an active `advisory_wait_signals` row from that text. Watchers/signal refresh can later match that wait signal against fresh news, announcements, and announcement documents.
 - `needs_more_data` and `add_operator_note` annotate the item only.
+
+### Wait Signals
+
+The `/wait-signals` page is the operator view for conditions created by playbooks and Manual Review `watch_for_event` decisions. It separates active, matched, expired, and closed waits, labels whether a row came from Manual Review or a playbook action plan, and shows the latest matched evidence in plain language. A match is evidence that a condition fired; it is not a trade by itself.
+
+When a Manual Review-created wait signal matches, the API keeps the original `manual_review_item_id`, source key, wait question, and matched evidence together. The Manual Review page surfaces that matched wait as follow-up work so the operator can close it, keep watching, or run a refresh/advisory flow. This follow-up item does not mutate portfolio rows, action recommendations, or broker execution.
 
 ### Conflict Rules
 

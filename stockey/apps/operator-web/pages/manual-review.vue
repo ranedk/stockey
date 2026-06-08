@@ -71,6 +71,7 @@ const summary = computed(() => asDict(data.value?.summary))
 const byType = computed(() => asDict(summary.value.by_type))
 const bySeverity = computed(() => asDict(summary.value.by_severity))
 const skippedSources = computed(() => asList(summary.value.skipped_sources))
+const sourceWarnings = computed(() => asList(data.value?.source_warnings || summary.value.source_warnings))
 const technicalItems = computed(() => items.value.filter((item) => Boolean(item.is_technical_issue) || String(item.review_lane || '') === 'technical_issue'))
 const investmentItems = computed(() => items.value.filter((item) => String(item.review_lane || '') === 'investment_review'))
 const researchItems = computed(() => items.value.filter((item) => String(item.review_lane || '') === 'research_config'))
@@ -133,6 +134,59 @@ function laneClass(value: unknown) {
   return 'bg-moss text-paper'
 }
 
+function impactMeta(item: Dict) {
+  const itemType = String(item.item_type || '').toLowerCase()
+  const lane = String(item.review_lane || '').toLowerCase()
+  const raw = asDict(item.raw)
+  const actionCode = String(raw.action_code || raw.action_type || raw.source_action || item.status || '').toUpperCase()
+  if (itemType === 'execution_blocker') {
+    return {
+      label: 'Execution-blocking',
+      tone: 'bg-rust text-paper',
+      boundary: 'Blocks order planning or submission until fixed. Manual Review still does not submit orders.',
+      next: 'Fix the execution blocker, verify reconciliation/dry-run status, then close it as fixed.'
+    }
+  }
+  if (lane === 'technical_issue' || Boolean(item.is_technical_issue)) {
+    return {
+      label: 'Operational',
+      tone: 'bg-rust text-paper',
+      boundary: 'Affects pipeline/data trust, not investment intent or broker state.',
+      next: 'Fix the upstream issue, rerun the source if needed, then mark fixed after the row is no longer current.'
+    }
+  }
+  if (lane === 'research_config') {
+    return {
+      label: 'Research-only',
+      tone: 'bg-ink text-paper',
+      boundary: 'Can approve a later manual config/code change; it does not apply that change here.',
+      next: 'Record the review decision, then make any config/code change through the normal manual workflow.'
+    }
+  }
+  if (itemType === 'wait_signal_followup') {
+    return {
+      label: 'Investment follow-up',
+      tone: 'bg-blue-700 text-paper',
+      boundary: 'A watched condition matched. This is review-only until a later refresh/advisory pass changes action state.',
+      next: 'Decide whether the match is actionable, needs more evidence, or should be closed as noise.'
+    }
+  }
+  if (actionCode.includes('REDUCE') || actionCode.includes('SELL') || actionCode.includes('EXIT')) {
+    return {
+      label: 'Investment-impacting',
+      tone: 'bg-sun text-ink',
+      boundary: 'May affect future risk/action review, but this click does not change portfolio or submit orders.',
+      next: 'Answer the operator questions and record whether to wait, close as no action, or keep reviewing.'
+    }
+  }
+  return {
+    label: 'Investment-impacting',
+    tone: 'bg-moss text-paper',
+    boundary: 'May affect future advisory state, but this page only records review state.',
+    next: 'Record the review decision; future action changes require the normal advisory or signal-refresh flow.'
+  }
+}
+
 function statusClass(value: unknown) {
   const status = String(value || '').toLowerCase()
   if (status === 'error' || status === 'failed' || status.includes('blocked')) return 'bg-rust text-paper'
@@ -166,6 +220,29 @@ function selectedDecisionMeta(item: Dict) {
   return decisionOptions.find((option) => option.key === selected) || decisionOptions[0]
 }
 
+function decisionBoundaryMeta(item: Dict) {
+  const decision = selectedDecisionMeta(item)
+  if (decision.key === 'watch_for_event') {
+    return {
+      label: 'Creates wait signal',
+      tone: 'border-blue-500/25 bg-blue-500/10 text-blue-800',
+      summary: 'Keeps this review open and creates a watcher condition from the follow-up event.'
+    }
+  }
+  if (decision.closes) {
+    return {
+      label: 'Closing decision',
+      tone: 'border-rust/25 bg-rust/10 text-rust',
+      summary: 'Removes this item from the active Manual Review queue after the decision is saved.'
+    }
+  }
+  return {
+    label: 'Annotating decision',
+    tone: 'border-sun/40 bg-sun/10 text-ink',
+    summary: 'Keeps this item active and adds operator context for the next review pass.'
+  }
+}
+
 function selectedDecision(item: Dict) {
   return decisionByItem.value[itemId(item)] || String(item.suggested_decision || 'needs_more_data')
 }
@@ -178,6 +255,11 @@ function waitForEvents(item: Dict) {
   return asStringList(item.wait_for_events)
 }
 
+function waitSignalFollowup(item: Dict): Dict {
+  const raw = asDict(item.raw)
+  return asDict(raw.wait_signal_followup)
+}
+
 async function submitDecision(item: Dict) {
   const id = itemId(item)
   if (!id) return
@@ -187,6 +269,10 @@ async function submitDecision(item: Dict) {
   const rationale = (rationaleByItem.value[id] || '').trim()
   if (decision !== 'add_operator_note' && !rationale) {
     saveError.value = 'Rationale is required before recording this decision.'
+    return
+  }
+  if (decision === 'watch_for_event' && !(followUpByItem.value[id] || '').trim()) {
+    saveError.value = 'Event to wait for is required when choosing Watch for event.'
     return
   }
   savingItemId.value = id
@@ -231,6 +317,8 @@ async function submitDecision(item: Dict) {
   <section v-if="loadError" class="mt-6">
     <ApiErrorBanner title="Manual review queue failed" :error="loadError" />
   </section>
+
+  <SourceWarnings :warnings="sourceWarnings" />
 
   <section class="mt-6 grid gap-4 md:grid-cols-5">
     <MetricTile label="Open Items" :value="String(summary.total_items || 0)" :note="`${summary.untrimmed_items || 0} before limit`" />
@@ -316,6 +404,7 @@ async function submitDecision(item: Dict) {
             <div class="flex flex-wrap gap-2">
               <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(item.severity)">{{ String(item.severity || 'review').toUpperCase() }}</span>
               <span class="rounded-full px-3 py-1 text-xs font-black" :class="laneClass(item.review_lane)">{{ laneLabel(item.review_lane) }}</span>
+              <span class="rounded-full px-3 py-1 text-xs font-black" :class="impactMeta(item).tone">{{ impactMeta(item).label }}</span>
               <span class="rounded-full bg-ink/10 px-3 py-1 text-xs font-black text-ink">{{ typeLabel(item.item_type) }}</span>
               <span class="rounded-full bg-white/80 px-3 py-1 text-xs font-black text-ink/65">{{ display(item.status) }}</span>
             </div>
@@ -356,6 +445,34 @@ async function submitDecision(item: Dict) {
             <p v-else class="mt-2 text-sm leading-6 text-ink/55">{{ item.possible_action || 'No specific wait signal was generated.' }}</p>
           </div>
         </div>
+        <div class="mt-4 grid gap-3 lg:grid-cols-2">
+          <div class="rounded-2xl border border-black/10 bg-white/75 p-4">
+            <div class="flex flex-wrap items-center gap-2">
+              <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Item Impact</p>
+              <span class="rounded-full px-3 py-1 text-xs font-black" :class="impactMeta(item).tone">{{ impactMeta(item).label }}</span>
+            </div>
+            <p class="mt-2 text-sm leading-6 text-ink/65">{{ impactMeta(item).boundary }}</p>
+          </div>
+          <div class="rounded-2xl border border-black/10 bg-white/75 p-4">
+            <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Likely Next Step</p>
+            <p class="mt-2 text-sm leading-6 text-ink/65">{{ impactMeta(item).next }}</p>
+          </div>
+        </div>
+        <div v-if="waitSignalFollowup(item).signal_id" class="mt-4 rounded-3xl border border-blue-500/20 bg-blue-500/10 p-4">
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-blue-700">Matched Wait Signal</p>
+          <p class="mt-2 text-sm leading-6 text-ink/70">
+            This item exists because a wait condition previously created from Manual Review has matched fresh evidence. It is a follow-up review only; it does not buy, sell, alter portfolio rows, or change action recommendations by itself.
+          </p>
+          <div class="mt-3 grid gap-2 text-sm md:grid-cols-2">
+            <p class="rounded-2xl bg-white/75 px-4 py-3"><b>Original review item:</b> {{ display(waitSignalFollowup(item).manual_review_item_id) }}</p>
+            <p class="rounded-2xl bg-white/75 px-4 py-3"><b>Condition type:</b> {{ typeLabel(waitSignalFollowup(item).condition_type) }}</p>
+            <p class="rounded-2xl bg-white/75 px-4 py-3"><b>Waited for:</b> {{ display(waitSignalFollowup(item).wait_question) }}</p>
+            <p class="rounded-2xl bg-white/75 px-4 py-3"><b>Matched at:</b> {{ display(waitSignalFollowup(item).matched_at) }}</p>
+          </div>
+          <p class="mt-3 rounded-2xl bg-white/75 px-4 py-3 text-sm leading-6 text-ink/70">
+            <b>Evidence:</b> {{ waitSignalFollowup(item).evidence_summary || waitSignalFollowup(item).match_reason || 'Matched evidence was recorded.' }}
+          </p>
+        </div>
         <p class="mt-3 break-all text-xs font-semibold text-ink/45">{{ item.source_table }} · {{ item.source_key }}</p>
         <div v-if="latestDecision(item).decision" class="mt-4 rounded-2xl bg-ink/5 p-4">
           <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Latest operator annotation</p>
@@ -374,6 +491,13 @@ async function submitDecision(item: Dict) {
             <span class="rounded-full px-3 py-1 text-xs font-black" :class="selectedDecisionMeta(item).closes ? 'bg-rust text-paper' : 'bg-sun text-ink'">
               {{ selectedDecisionMeta(item).closes ? 'CLOSES ITEM' : 'ANNOTATES ITEM' }}
             </span>
+          </div>
+          <div class="mt-4 rounded-2xl border p-4" :class="decisionBoundaryMeta(item).tone">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <p class="text-sm font-black">{{ decisionBoundaryMeta(item).label }}</p>
+              <p class="text-xs font-black uppercase tracking-[0.18em]">Portfolio unchanged · Broker unchanged</p>
+            </div>
+            <p class="mt-1 text-sm leading-6">{{ decisionBoundaryMeta(item).summary }}</p>
           </div>
           <div class="mt-4 grid gap-3 lg:grid-cols-[0.8fr_1.2fr_1fr_auto]">
             <label class="grid gap-2 text-sm font-bold text-ink/70">

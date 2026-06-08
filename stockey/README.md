@@ -39,6 +39,7 @@ Use these when a day was missed, data looks stale, or you explicitly want a broa
 | `./complete_data.sh` | Full download + parse catch-up/backfill; useful end-of-day, after a missed day, or before a major advisory rerun |
 | `./all_ml.sh` | Long-running research/model-training flow; run manually when validating model quality or rerun weekly in a dedicated research cron window |
 | `./all_advisory_codex.sh` | Debug/repair wrapper for advisory failures; use manually, not as normal cron |
+| `./all_analysis_codex.sh` | Manual bounded Codex development loop that picks the next `analysis.md` slice, implements it, validates it, and updates the board |
 
 Important docs:
 

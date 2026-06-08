@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Dict, TraceDecision, TraceStage, TraceSummary } from '~/types/api'
+import type { Dict, ManualReviewWaitSignalLink, TraceDecision, TraceStage, TraceSummary } from '~/types/api'
 
 const props = defineProps<{
   trace?: TraceSummary | null
@@ -259,6 +259,16 @@ const filteredConflicts = computed(() => {
     return true
   })
 })
+const filteredManualWaitLinks = computed(() => {
+  const search = searchText.value.trim().toLowerCase()
+  return (props.trace?.manual_review_wait_signal_links || []).filter((link) => {
+    if (selectedDomain.value && !['review', 'playbook', 'action'].includes(selectedDomain.value)) return false
+    if (selectedStatus.value && !JSON.stringify(link).toLowerCase().includes(selectedStatus.value)) return false
+    if (quickFilter.value && !['problems', 'action_changes', 'event_driven'].includes(quickFilter.value)) return false
+    if (search && !JSON.stringify(link).toLowerCase().includes(search)) return false
+    return true
+  })
+})
 const allTraceItems = computed(() => {
   const decisions = props.trace?.decisions || []
   return [
@@ -275,6 +285,7 @@ const counters = computed(() => {
     actionChanges: (props.trace?.decisions || []).filter(isActionChange).length,
     eventDriven: items.filter(isEventDriven).length,
     conflicts: props.trace?.action_conflicts?.length || 0,
+    manualWaitLinks: props.trace?.manual_review_wait_signal_links?.length || 0,
     visibleDecisions: filteredDecisions.value.length,
     visibleProcessing: filteredProcessing.value.length
   }
@@ -305,6 +316,10 @@ function clearFilters() {
   quickFilter.value = ''
   searchText.value = ''
 }
+
+function waitLinkStatus(link: ManualReviewWaitSignalLink) {
+  return link.match_status || link.wait_signal_status || link.decision || 'recorded'
+}
 </script>
 
 <template>
@@ -318,7 +333,8 @@ function clearFilters() {
             {{ trace.raw_counts.processing || 0 }} processing rows,
             {{ trace.raw_counts.traces || 0 }} decisions,
             {{ trace.raw_counts.steps || 0 }} steps,
-            {{ trace.raw_counts.action_conflicts || 0 }} conflicts
+            {{ trace.raw_counts.action_conflicts || 0 }} conflicts,
+            {{ trace.raw_counts.manual_review_wait_signal_links || 0 }} manual waits
           </p>
         </div>
         <div class="flex flex-wrap justify-end gap-2">
@@ -385,6 +401,39 @@ function clearFilters() {
         <button class="rounded-full px-4 py-2 text-sm font-bold" :class="quickFilter === 'event_driven' ? 'bg-sky text-white' : 'bg-white text-ink'" type="button" @click="setQuickFilter('event_driven')">Event-driven changes</button>
       </div>
       <p v-if="syncUrl" class="mt-3 text-xs font-semibold text-ink/45">Filters and copied trace links are stored in the URL for reloads and sharing.</p>
+    </div>
+
+    <div v-if="trace.manual_review_wait_signal_links?.length" class="glass-panel rounded-3xl p-5">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p class="text-xs font-bold uppercase tracking-[0.24em] text-ink/45">Manual Review Waits</p>
+          <h3 class="mt-1 text-lg font-black">Decision to Wait Signal Links</h3>
+        </div>
+        <span class="rounded-full bg-sun px-3 py-1 text-xs font-black text-ink">{{ counters.manualWaitLinks }}</span>
+      </div>
+      <div class="mt-4 grid gap-3 md:grid-cols-2">
+        <article v-for="link in filteredManualWaitLinks" :key="`${link.manual_review_item_id || 'manual'}-${link.signal_id || 'signal'}-${link.match_source_key || 'pending'}`" class="rounded-2xl border border-sun/40 bg-white/75 p-4">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="rounded-full bg-ink px-3 py-1 text-xs font-black text-paper">{{ link.decision || 'manual decision' }}</span>
+            <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(waitLinkStatus(link))">{{ waitLinkStatus(link) }}</span>
+            <span v-if="link.expected_action" class="rounded-full bg-sun/20 px-3 py-1 text-xs font-black text-ink">{{ link.expected_action }}</span>
+          </div>
+          <p v-if="link.rationale" class="mt-3 text-sm leading-6 text-ink/70">{{ link.rationale }}</p>
+          <p v-if="link.wait_question || link.follow_up_event" class="mt-2 rounded-2xl bg-paper/70 p-3 text-sm font-semibold text-ink/70">
+            {{ link.wait_question || link.follow_up_event }}
+          </p>
+          <div class="mt-3 grid gap-2 text-xs md:grid-cols-2">
+            <p class="rounded-xl bg-white px-3 py-2"><b>Manual item:</b> {{ textValue(link.manual_review_item_id) }}</p>
+            <p class="rounded-xl bg-white px-3 py-2"><b>Wait signal:</b> {{ textValue(link.signal_id) }}</p>
+            <p class="rounded-xl bg-white px-3 py-2"><b>Decided:</b> {{ formatWhen(link.decided_at) }}</p>
+            <p class="rounded-xl bg-white px-3 py-2"><b>Matched:</b> {{ formatWhen(link.matched_at) }}</p>
+            <p class="rounded-xl bg-white px-3 py-2"><b>Condition:</b> {{ textValue(link.signal_type || link.condition?.condition_type) }}</p>
+            <p class="rounded-xl bg-white px-3 py-2"><b>Evidence:</b> {{ textValue(link.match_source_table) }} / {{ textValue(link.match_source_key) }}</p>
+          </div>
+          <p v-if="link.match_reason" class="mt-3 rounded-2xl bg-moss/10 p-3 text-sm font-semibold text-moss">{{ link.match_reason }}</p>
+        </article>
+        <p v-if="!filteredManualWaitLinks.length" class="rounded-2xl bg-white/60 p-4 text-sm text-ink/55">No manual-review wait links match the current filters.</p>
+      </div>
     </div>
 
     <div class="grid gap-5 lg:grid-cols-[0.9fr_1.1fr]">

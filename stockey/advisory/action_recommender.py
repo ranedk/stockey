@@ -15,6 +15,7 @@ from advisory.hypothesis_engine import ACTION_PLANS_TABLE, HYPOTHESES_TABLE, ens
 from advisory.market_context import load_latest_market_context
 from advisory.portfolio_engine import PORTFOLIO_TABLE
 from advisory.position_lifecycle import LIFECYCLE_TABLE, REBALANCE_TABLE
+from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, WAIT_SIGNALS_TABLE
 from advisory.watchlist_builder import TABLE_NAME as WATCHLIST_TABLE
 from utils.codex_cli import run_codex_structured
 from utils.db import db_session, sql_to_df, upsert_to_db
@@ -45,6 +46,7 @@ ACTION_PRIORITY = {
 }
 DEFAULT_CONFLICT_RULE_IDS = {
     "EXIT_BEATS_ENTRY_OR_WATCH",
+    "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH",
     "MARKET_GATE_MANUAL_BEATS_POSITIVE",
     "SAME_ACTION_DUPLICATE_COLLAPSE",
     "WATCH_LOSES_TO_HIGHER_PRIORITY",
@@ -71,6 +73,7 @@ EVENT_POLICY_ACTION_MAP = {
     "REDUCE_EXPOSURE_REVIEW": ("MANUAL_REVIEW", None),
     "MANUAL_REVIEW": ("MANUAL_REVIEW", None),
 }
+MANUAL_REVIEW_WAIT_SIGNAL_SETUP_ID = "MANUAL_REVIEW_WAIT_SIGNAL"
 
 RISK_OFF_STATES = {"RISK_OFF", "HIGH", "STRESS", "CRASH", "HOSTILE"}
 POSITIVE_BROKER_ACTIONS = {"BUY", "BUY_MORE"}
@@ -430,6 +433,66 @@ def load_event_policy_actions(*, asof_date: pd.Timestamp, symbols: list[str] | N
         ORDER BY published_on DESC NULLS LAST, policy_score DESC NULLS LAST
         """,
         params=tuple(params),
+    )
+
+
+def load_matched_manual_review_wait_signals(*, asof_date: pd.Timestamp, symbols: list[str] | None = None, setup_ids: list[str] | None = None) -> pd.DataFrame:
+    if not table_exists(WAIT_SIGNALS_TABLE) or not table_exists(WAIT_SIGNAL_MATCHES_TABLE):
+        return pd.DataFrame()
+    if setup_ids:
+        allowed_setup_ids = {str(value).strip().upper() for value in setup_ids if str(value or "").strip()}
+        if MANUAL_REVIEW_WAIT_SIGNAL_SETUP_ID not in allowed_setup_ids and "MANUAL_REVIEW" not in allowed_setup_ids:
+            return pd.DataFrame()
+    end_ts = asof_date + pd.Timedelta(days=1)
+    clauses = [
+        "s.generated_by = 'manual_review_decision'",
+        "COALESCE(m.match_status, 'matched') = 'matched'",
+        "m.matched_at < %(end_ts)s",
+    ]
+    params: dict[str, Any] = {"end_ts": end_ts}
+    if symbols:
+        normalized_symbols = [str(value).strip().upper() for value in symbols if str(value or "").strip()]
+        if normalized_symbols:
+            clauses.append("UPPER(TRIM(COALESCE(s.symbol, m.symbol, ''))) = ANY(%(symbols)s)")
+            params["symbols"] = normalized_symbols
+    return sql_to_df(
+        f"""
+        SELECT DISTINCT ON (m.signal_id)
+            m.matched_at,
+            m.signal_id,
+            m.hypothesis_id,
+            m.symbol AS match_symbol,
+            m.signal_type,
+            m.expected_action,
+            m.match_status,
+            m.match_score,
+            m.source_table AS match_source_table,
+            m.source_key AS match_source_key,
+            m.observed_at,
+            m.observed_value,
+            m.threshold_value,
+            m.match_reason,
+            m.evidence_json,
+            s.created_at AS signal_created_at,
+            s.hypothesis_title,
+            s.source_table AS signal_source_table,
+            s.source_key AS signal_source_key,
+            s.symbol AS signal_symbol,
+            s.status AS signal_status,
+            s.priority,
+            s.expected_action AS signal_expected_action,
+            s.operator_summary,
+            s.wait_question,
+            s.condition_json,
+            s.valid_until,
+            s.generated_by
+        FROM {WAIT_SIGNAL_MATCHES_TABLE} m
+        JOIN {WAIT_SIGNALS_TABLE} s
+          ON s.signal_id = m.signal_id
+        WHERE {' AND '.join(clauses)}
+        ORDER BY m.signal_id, m.matched_at DESC NULLS LAST
+        """,
+        params=params,
     )
 
 
@@ -1017,12 +1080,101 @@ def load_enabled_conflict_rule_ids() -> set[str]:
     return {str(value) for value in df["rule_id"].dropna().tolist()} if not df.empty else set()
 
 
-def conflict_precedence_for_row(row: pd.Series, enabled_rules: set[str]) -> dict[str, Any]:
+def _norm_conflict_value(value: Any, *, upper: bool = True) -> str:
+    text = "" if value is None else str(value).strip()
+    return text.upper() if upper else text.lower()
+
+
+def load_enabled_dynamic_conflict_rules_for_ranking() -> list[dict[str, Any]]:
+    try:
+        exists = table_exists(ACTION_CONFLICT_RULES_TABLE)
+    except Exception as exc:
+        logger.warning(
+            "dynamic conflict rule table lookup failed; promoted conflict rules will not affect ranking table=%s error=%s: %s",
+            ACTION_CONFLICT_RULES_TABLE,
+            type(exc).__name__,
+            exc,
+        )
+        return []
+    if not exists:
+        return []
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {ACTION_CONFLICT_RULES_TABLE}
+            WHERE COALESCE(enabled, TRUE)
+              AND condition_json IS NOT NULL
+            ORDER BY priority DESC, rule_id
+            """,
+            retries=2,
+        )
+    except Exception as exc:
+        logger.warning(
+            "dynamic conflict rule load failed; promoted conflict rules will not affect ranking table=%s error=%s: %s",
+            ACTION_CONFLICT_RULES_TABLE,
+            type(exc).__name__,
+            exc,
+        )
+        return []
+    return df.to_dict(orient="records") if not df.empty else []
+
+
+def _dynamic_conflict_rule_matches_candidate(row: pd.Series, peer: pd.Series, rule: dict[str, Any]) -> bool:
+    condition = _parse_jsonish(rule.get("condition_json"), {})
+    if not isinstance(condition, dict):
+        return False
+    if str(condition.get("condition_type") or "") != "action_pair_exact":
+        return False
+    if str(rule.get("resolution_action") or "keep_winner").strip() != "keep_winner":
+        return False
+    checks = [
+        ("winning_action_code", row.get("action_code"), True),
+        ("losing_action_code", peer.get("action_code"), True),
+        ("winning_source", row.get("action_source"), False),
+        ("losing_source", peer.get("action_source"), False),
+    ]
+    for field, actual, upper in checks:
+        expected = condition.get(field)
+        if expected in (None, ""):
+            continue
+        if _norm_conflict_value(actual, upper=upper) != _norm_conflict_value(expected, upper=upper):
+            return False
+    return True
+
+
+def dynamic_conflict_precedence_for_row(row: pd.Series, peers: pd.DataFrame, dynamic_rules: list[dict[str, Any]]) -> dict[str, Any]:
+    for rule in dynamic_rules:
+        for _, peer in peers.iterrows():
+            if peer.name == row.name:
+                continue
+            if not _dynamic_conflict_rule_matches_candidate(row, peer, rule):
+                continue
+            priority = pd.to_numeric(rule.get("priority"), errors="coerce")
+            priority_score = 0 if pd.isna(priority) else int(priority)
+            return {
+                "score": 200 + priority_score,
+                "rule_id": str(rule.get("rule_id") or ""),
+                "reason": str(rule.get("resolution_reason") or "Matched operator-promoted exact conflict rule."),
+            }
+    return {"score": 0, "rule_id": None, "reason": None}
+
+
+def conflict_precedence_for_row(
+    row: pd.Series,
+    enabled_rules: set[str],
+    *,
+    peers: pd.DataFrame | None = None,
+    dynamic_rules: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     action = str(row.get("action_code") or "").strip().upper()
     raw_context = _parse_jsonish(row.get("raw_context_json"), {})
     if not isinstance(raw_context, dict):
         raw_context = {}
     context_text = json.dumps(raw_context, ensure_ascii=False, default=str).lower()
+    dynamic_result = {"score": 0, "rule_id": None, "reason": None}
+    if dynamic_rules and peers is not None and not peers.empty:
+        dynamic_result = dynamic_conflict_precedence_for_row(row, peers, dynamic_rules)
     if "EXIT_BEATS_ENTRY_OR_WATCH" in enabled_rules and action in {"SELL", "PARTIAL_SELL", "TIGHTEN_STOP"}:
         return {
             "score": 400,
@@ -1039,6 +1191,24 @@ def conflict_precedence_for_row(row: pd.Series, enabled_rules: set[str]) -> dict
             "rule_id": "MARKET_GATE_MANUAL_BEATS_POSITIVE",
             "reason": "Risk-off market context keeps positive actions in manual review.",
         }
+    if (
+        "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH" in enabled_rules
+        and action == "MANUAL_REVIEW"
+        and (
+            raw_context.get("veto") is True
+            or str(raw_context.get("review_action") or "").strip().lower() == "veto"
+            or str(raw_context.get("action_status") or "").strip().lower() == "blocked_by_adversarial_review"
+            or "adversarial review veto" in context_text
+            or "blocked_by_adversarial_review" in context_text
+        )
+    ):
+        return {
+            "score": 350,
+            "rule_id": "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH",
+            "reason": "Adversarial-review veto keeps the symbol in manual review ahead of buy/watch candidates.",
+        }
+    if int(dynamic_result.get("score") or 0) > 0:
+        return dynamic_result
     if "WATCH_LOSES_TO_HIGHER_PRIORITY" in enabled_rules and action == "WATCH":
         return {
             "score": -100,
@@ -1052,14 +1222,21 @@ def apply_conflict_rule_precedence(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     enabled_rules = load_enabled_conflict_rule_ids()
-    if not enabled_rules:
+    dynamic_rules = load_enabled_dynamic_conflict_rules_for_ranking()
+    if not enabled_rules and not dynamic_rules:
         return df
     out = df.copy()
+    out["_conflict_group_symbol"] = out["symbol"].astype("string").str.upper() if "symbol" in out.columns else ""
+    out["_conflict_group_asof"] = pd.to_datetime(out["asof_date"], utc=True, errors="coerce") if "asof_date" in out.columns else pd.NaT
     scores: list[int] = []
     rule_ids: list[str | None] = []
     reasons: list[str | None] = []
     for _, row in out.iterrows():
-        result = conflict_precedence_for_row(row, enabled_rules)
+        peers = out[
+            (out["_conflict_group_symbol"] == row.get("_conflict_group_symbol"))
+            & (out["_conflict_group_asof"] == row.get("_conflict_group_asof"))
+        ]
+        result = conflict_precedence_for_row(row, enabled_rules, peers=peers, dynamic_rules=dynamic_rules)
         scores.append(int(result.get("score") or 0))
         rule_ids.append(_text(result.get("rule_id")))
         reasons.append(_text(result.get("reason")))
@@ -1084,7 +1261,7 @@ def apply_conflict_rule_precedence(df: pd.DataFrame) -> pd.DataFrame:
             default=str,
             sort_keys=True,
         )
-    return out
+    return out.drop(columns=["_conflict_group_symbol", "_conflict_group_asof"], errors="ignore")
 
 
 def _json_ready_record(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
@@ -1109,6 +1286,114 @@ def _json_ready_record(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
 
 def _contract_section_from_context(context: dict[str, Any], keys: list[str]) -> dict[str, Any]:
     return {key: context.get(key) for key in keys if context.get(key) is not None}
+
+
+def _manual_review_contract_section(row: pd.Series, raw_context: dict[str, Any], action: str) -> dict[str, Any]:
+    existing = _contract_section_from_context(
+        raw_context,
+        [
+            "manual_review_boundary",
+            "manual_review_effect",
+            "operator_question",
+            "review_reason",
+            "blocked_original_action_code",
+            "blocked_reason_contract_missing_fields",
+            "broker_execution_allowed",
+        ],
+    )
+    if action != "MANUAL_REVIEW":
+        return existing
+
+    action_source = _text(row.get("action_source"))
+    source_action = _text(row.get("source_action"))
+    execution_mode = _text(row.get("execution_mode"))
+    transaction_type = _text(row.get("transaction_type"))
+    review_only = execution_mode == "review_only" or not transaction_type
+    inferred = {
+        "manual_review_boundary": existing.get("manual_review_boundary") or "action_consolidation_manual_review",
+        "manual_review_effect": existing.get("manual_review_effect") or "review_only_no_broker_execution",
+        "operator_question": existing.get("operator_question")
+        or raw_context.get("operator_question")
+        or row.get("action_detail")
+        or "Review the candidate evidence before any downstream portfolio, config, or execution change.",
+        "review_reason": existing.get("review_reason") or row.get("action_reason"),
+        "broker_execution_allowed": existing.get("broker_execution_allowed") if "broker_execution_allowed" in existing else (False if review_only else None),
+        "manual_review_action_source": action_source or None,
+        "manual_review_source_action": source_action or None,
+    }
+    rebalance_review_boundaries = {
+        "review_manual": "lifecycle_rebalance_manual_review_required",
+        "review_stale": "lifecycle_rebalance_stale_review_required",
+        "review_horizon": "lifecycle_rebalance_horizon_review_required",
+        "review_target": "lifecycle_rebalance_target_review_required",
+    }
+    if action_source == "rebalance" and source_action.lower() in rebalance_review_boundaries:
+        inferred["manual_review_boundary"] = existing.get("manual_review_boundary") or rebalance_review_boundaries[source_action.lower()]
+    elif action_source == "event_policy":
+        inferred["manual_review_boundary"] = existing.get("manual_review_boundary") or "event_policy_review_required"
+    elif action_source.startswith("playbook"):
+        inferred["manual_review_boundary"] = existing.get("manual_review_boundary") or "playbook_review_required"
+    market_adjustment = _parse_jsonish(raw_context.get("market_context_adjustment_json"), {})
+    if not isinstance(market_adjustment, dict):
+        market_adjustment = {}
+    if raw_context.get("market_context_adjustment") == "positive_action_blocked_by_market_context":
+        inferred["manual_review_boundary"] = (
+            existing.get("manual_review_boundary") or "market_context_positive_action_review_required"
+        )
+        inferred["blocked_original_action_code"] = (
+            existing.get("blocked_original_action_code") or market_adjustment.get("original_action_code") or None
+        )
+    if not existing.get("boundary") and inferred.get("manual_review_boundary"):
+        inferred["boundary"] = inferred["manual_review_boundary"]
+    if not existing.get("effect") and inferred.get("manual_review_effect"):
+        inferred["effect"] = inferred["manual_review_effect"]
+    if not existing.get("blocked_original_action"):
+        inferred["blocked_original_action"] = inferred.get("blocked_original_action_code") or action
+    return {key: value for key, value in {**existing, **inferred}.items() if value is not None}
+
+
+def _same_action_candidate(row: pd.Series, item: dict[str, Any]) -> bool:
+    for key in ["action_code", "action_source", "setup_id", "unique_id"]:
+        left = _text(row.get(key))
+        right = _text(item.get(key))
+        if left != right:
+            return False
+    return True
+
+
+def _same_symbol_conflict_section(row: pd.Series, candidates: pd.DataFrame | None) -> dict[str, Any]:
+    if not isinstance(candidates, pd.DataFrame) or candidates.empty:
+        return {}
+    losing_candidates: list[dict[str, Any]] = []
+    for item in candidates.to_dict(orient="records"):
+        if _same_action_candidate(row, item):
+            continue
+        losing_candidates.append(
+            {
+                "action_code": item.get("action_code"),
+                "action_source": item.get("action_source"),
+                "setup_id": item.get("setup_id"),
+                "source_action": item.get("source_action"),
+                "action_reason": item.get("action_reason"),
+                "action_priority": item.get("action_priority"),
+                "published_on": _json_context_value(item.get("published_on")),
+            }
+        )
+    if not losing_candidates:
+        return {}
+    return {
+        "same_symbol_candidate_count": int(len(candidates)),
+        "same_symbol_conflict_count": int(len(losing_candidates)),
+        "winning_action_code": row.get("action_code"),
+        "winning_action_source": row.get("action_source"),
+        "winning_action_priority": row.get("action_priority"),
+        "source_precedence_reason": (
+            f"Selected {row.get('action_code')} from {row.get('action_source')} over "
+            f"{len(losing_candidates)} same-symbol candidate(s) by deterministic action priority, "
+            "conflict-rule precedence, and freshness tie-breaks."
+        ),
+        "losing_candidates": losing_candidates[:5],
+    }
 
 
 def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFrame | None = None) -> dict[str, Any]:
@@ -1143,6 +1428,11 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
                     "action_priority": item.get("action_priority"),
                 }
             )
+    conflict_resolution = _contract_section_from_context(
+        raw_context,
+        ["conflict_precedence_rule_id", "conflict_precedence_reason", "conflict_precedence_score"],
+    )
+    conflict_resolution = {**conflict_resolution, **_same_symbol_conflict_section(row, candidates)}
     evidence_sections = {
         "screener": _contract_section_from_context(raw_context, ["source_screener_slug", "source_screener_list", "screener_name"]),
         "technical": _contract_section_from_context(
@@ -1157,13 +1447,18 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
                 "setup_score",
             ],
         ),
-        "event": _contract_section_from_context(raw_context, ["event_class", "verdict", "state_transition_hint", "score_impact", "review_action"]),
-        "playbook": _contract_section_from_context(raw_context, ["playbook_id", "hypothesis_id", "action_type", "operator_summary", "decision_reason"]),
-        "macro_regime": _contract_section_from_context(raw_context, ["macro_risk_state", "macro_stress_score", "regime_state", "market_regime"]),
-        "conflict_resolution": _contract_section_from_context(
+        "event": _contract_section_from_context(
             raw_context,
-            ["conflict_precedence_rule_id", "conflict_precedence_reason", "conflict_precedence_score"],
+            ["event_class", "verdict", "state_transition_hint", "score_impact", "review_action", "veto", "review_reason", "action_status"],
         ),
+        "playbook": _contract_section_from_context(raw_context, ["playbook_id", "hypothesis_id", "action_type", "operator_summary", "decision_reason"]),
+        "wait_signal": _contract_section_from_context(
+            raw_context,
+            ["wait_signal_followup", "signal_id", "match_reason", "condition_json", "wait_question"],
+        ),
+        "manual_review": _manual_review_contract_section(row, raw_context, action),
+        "macro_regime": _contract_section_from_context(raw_context, ["macro_risk_state", "macro_stress_score", "regime_state", "market_regime"]),
+        "conflict_resolution": conflict_resolution,
         "risk": risk_fields,
         "lifecycle": _contract_section_from_context(raw_context, ["position_status", "next_action", "suggested_action", "lifecycle_reason", "next_action_reason"]),
     }
@@ -1210,7 +1505,7 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
             missing.append("playbook_id")
         if not (row.get("unique_id") or raw_context.get("playbook_source_key") or raw_context.get("event_unique_id")):
             missing.append("playbook_source_key")
-        if not raw_context.get("checks_json"):
+        if not (raw_context.get("checks_json") or raw_context.get("checks")):
             missing.append("playbook_review_checks")
     if action in {"BUY", "BUY_MORE"} and raw_context.get("event_class"):
         if not raw_context.get("event_unique_id"):
@@ -1257,10 +1552,26 @@ def add_recommendation_reason_contracts(df: pd.DataFrame, all_candidates: pd.Dat
         contract = build_recommendation_reason_contract(row, group)
         if contract["status"] != "complete":
             original_action = str(row.get("action_code") or "").upper()
+            original_context = _parse_jsonish(row.get("raw_context_json"), {})
+            if not isinstance(original_context, dict):
+                original_context = {}
+            raw_missing = [str(value) for value in contract.get("missing_fields") or []]
+            original_context.update(
+                {
+                    "manual_review_boundary": "incomplete_reason_contract",
+                    "manual_review_effect": "review_only_no_broker_execution",
+                    "operator_question": "Resolve the missing reason-contract fields before this recommendation can become broker-executable.",
+                    "review_reason": "Recommendation was downgraded because required action evidence or risk controls were missing.",
+                    "blocked_original_action_code": original_action,
+                    "blocked_reason_contract_missing_fields": raw_missing,
+                    "broker_execution_allowed": False,
+                }
+            )
             out.at[idx, "action_code"] = "MANUAL_REVIEW"
             out.at[idx, "action_priority"] = int(ACTION_PRIORITY["MANUAL_REVIEW"])
             out.at[idx, "transaction_type"] = None
             out.at[idx, "execution_mode"] = "review_only"
+            out.at[idx, "raw_context_json"] = json.dumps(original_context, ensure_ascii=False, default=str, sort_keys=True)
             missing_text = ", ".join(contract.get("missing_fields") or [])
             existing_reason = _text(row.get("action_reason"))
             out.at[idx, "action_reason"] = f"Manual review required: incomplete reason contract ({missing_text})." if not existing_reason else f"Manual review required: incomplete reason contract ({missing_text}). Original reason: {existing_reason}"
@@ -1508,6 +1819,75 @@ def build_event_policy_action_candidates(
     return rows
 
 
+def _matched_wait_signal_context(row: pd.Series) -> dict[str, Any]:
+    evidence = _parse_jsonish(row.get("evidence_json"), {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+    wait_signal_context = evidence.get("wait_signal") if isinstance(evidence.get("wait_signal"), dict) else {}
+    condition = _parse_jsonish(row.get("condition_json"), {})
+    if not isinstance(condition, dict):
+        condition = {}
+    return {
+        "signal_id": row.get("signal_id"),
+        "match_source_table": row.get("match_source_table"),
+        "match_source_key": row.get("match_source_key"),
+        "match_reason": row.get("match_reason"),
+        "manual_review_item_id": wait_signal_context.get("manual_review_item_id") or row.get("signal_source_key"),
+        "manual_review_source_table": wait_signal_context.get("manual_review_source_table") or row.get("signal_source_table"),
+        "manual_review_source_key": wait_signal_context.get("manual_review_source_key") or row.get("signal_source_key"),
+        "wait_question": wait_signal_context.get("wait_question") or row.get("wait_question"),
+        "condition_type": condition.get("condition_type") or row.get("signal_type"),
+        "condition": condition,
+        "evidence": evidence,
+        "bridge_note": "Matched Manual Review wait signals become review-only action candidates; they do not create broker-executable trades.",
+    }
+
+
+def build_matched_wait_signal_action_candidates(
+    *,
+    asof_date: pd.Timestamp,
+    symbols: list[str] | None = None,
+    setup_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    matches = load_matched_manual_review_wait_signals(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+    if matches.empty:
+        return []
+    rows: list[dict[str, Any]] = []
+    for _, row in matches.iterrows():
+        symbol = _text(row.get("signal_symbol")) or _text(row.get("match_symbol"))
+        if not symbol:
+            continue
+        context = _matched_wait_signal_context(row)
+        confidence = _num(row.get("match_score"))
+        invest_score_pct = None if confidence is None else max(0.0, min(100.0, confidence * 100.0 if confidence <= 1.0 else confidence))
+        wait_question = _text(context.get("wait_question"))
+        reason_bits = [
+            "Manual Review wait signal matched fresh evidence.",
+            _text(row.get("match_reason")),
+        ]
+        if wait_question:
+            reason_bits.append(f"Original wait: {wait_question}")
+        rows.append(
+            _build_record(
+                asof_date=asof_date,
+                published_on=row.get("matched_at") or row.get("observed_at"),
+                setup_id=MANUAL_REVIEW_WAIT_SIGNAL_SETUP_ID,
+                symbol=symbol,
+                unique_id=f"{row.get('signal_id')}:{row.get('match_source_table')}:{row.get('match_source_key')}",
+                action_code="MANUAL_REVIEW",
+                action_source="manual_review_wait_signal",
+                source_action=row.get("signal_expected_action") or row.get("expected_action") or "MANUAL_REVIEW",
+                transaction_type=None,
+                execution_mode="review_only",
+                invest_score_pct=invest_score_pct,
+                action_reason=" ".join(part for part in reason_bits if part),
+                action_detail=row.get("operator_summary"),
+                raw_context={**row.to_dict(), "wait_signal_followup": context},
+            )
+        )
+    return rows
+
+
 def build_action_recommendations(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -1633,6 +2013,13 @@ def build_action_recommendations(
 
     candidates.extend(
         build_event_policy_action_candidates(
+            asof_date=monitor_date,
+            symbols=symbols,
+            setup_ids=setup_ids,
+        )
+    )
+    candidates.extend(
+        build_matched_wait_signal_action_candidates(
             asof_date=monitor_date,
             symbols=symbols,
             setup_ids=setup_ids,

@@ -42,6 +42,12 @@ const explicitTarget = computed(() => numericFirstValue(['target_price', 'recomm
 const derivedTarget = computed(() => computeDerivedTarget())
 const displayTarget = computed(() => explicitTarget.value ?? derivedTarget.value)
 const runupRead = computed(() => buildRunupRead())
+const snapshotMeta = computed(() => asDict(actions.value?.snapshot || portfolio.value?.snapshot || events.value?.snapshot))
+const snapshotWarning = computed(() => asDict(actions.value?.snapshot_warning || portfolio.value?.snapshot_warning || events.value?.snapshot_warning))
+
+function asDict(value: unknown): Dict {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
+}
 
 function filterSymbolRows(rows: Dict[]): Dict[] {
   const target = symbol.value
@@ -188,6 +194,8 @@ function eventSubtitle(row: Dict) {
       </NuxtLink>
     </div>
   </section>
+
+  <SnapshotWarning class="mt-4" :snapshot="snapshotMeta" :warning="snapshotWarning" :generated-at="actions?.generated_at || portfolio?.generated_at || events?.generated_at" />
 
   <section v-if="loadErrors.length" class="mt-6 grid gap-3">
     <ApiErrorBanner v-for="row in loadErrors" :key="row.title" :title="row.title" :error="row.error" />

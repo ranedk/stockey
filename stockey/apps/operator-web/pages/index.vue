@@ -71,9 +71,7 @@ const actionQueueMeta = computed(() => {
 const portfolioMeta = computed(() => asDict(portfolioData.value?.meta?.portfolio))
 const today = computed(() => portfolioRowsForBucket(portfolioBucket.value))
 const snapshotMeta = computed(() => asDict(home.value?.snapshot || actionsData.value?.snapshot || portfolioData.value?.snapshot))
-const snapshotIsStale = computed(() => String(snapshotMeta.value.freshness || '').toLowerCase() === 'stale')
-const snapshotGeneratedAt = computed(() => String(snapshotMeta.value.generated_at || home.value?.generated_at || '-'))
-const snapshotAgeText = computed(() => ageText(snapshotMeta.value.age_seconds))
+const snapshotWarning = computed(() => asDict(home.value?.snapshot_warning || actionsData.value?.snapshot_warning || portfolioData.value?.snapshot_warning))
 const marketSummary = computed(() => marketContext.value?.summary || {})
 const marketLeaders = computed(() => marketContext.value?.top_universe || [])
 const calibrationSummary = computed(() => technicalCalibration.value?.summary || [])
@@ -184,15 +182,6 @@ const actionEmptyHint = computed(() => {
   }
   return 'Try clearing filters or inspect Manual / Watch lanes; the queue may be blocked by market regime, event-policy review, or data/price issues.'
 })
-
-function ageText(value: unknown) {
-  const seconds = Number(value)
-  if (!Number.isFinite(seconds)) return '-'
-  if (seconds < 60) return `${Math.round(seconds)}s old`
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m old`
-  if (seconds < 86400) return `${Math.round(seconds / 3600)}h old`
-  return `${Math.round((seconds / 86400) * 10) / 10}d old`
-}
 
 async function loadSymbolTrace(row: Record<string, unknown>) {
   const symbol = String(row.symbol || '').toUpperCase()
@@ -308,6 +297,43 @@ function technicalEvidence(row: Record<string, unknown>) {
   }
 }
 
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.map((item) => String(item || '').trim()).filter(Boolean)
+}
+
+function manualRevisionPointers(row: Record<string, unknown>) {
+  return asDict(row.manual_revision_pointers)
+}
+
+function actionExplanation(row: Record<string, unknown>) {
+  const pointers = manualRevisionPointers(row)
+  const contract = asDict(row.recommendation_reason)
+  const status = String(row.reason_contract_status || contract.status || '').toLowerCase()
+  const action = actionLabel(row)
+  const original = String(contract.original_action_code || contract.original_action || '').toUpperCase()
+  const isFinalApproved = ['BUY', 'BUY_MORE', 'SELL', 'PARTIAL_SELL'].includes(action) && !status.includes('incomplete') && !status.includes('downgrade')
+  const missingFields = stringArray(contract.missing_fields)
+  const keyReasons = stringArray(pointers.key_reasons)
+  const checks = stringArray(pointers.manual_checks)
+  const riskFlags = stringArray(pointers.risk_flags)
+  const questions = stringArray(pointers.operator_questions)
+  const summary = String(row.manual_revision_summary || pointers.revision_summary || '').trim()
+  let title = 'Operator checks before action'
+  if (!isFinalApproved) title = original && original !== action ? `Why not approved ${original}` : 'Why not approved'
+  if (action.includes('MANUAL') || action.includes('REVIEW')) title = original && original !== action ? `Why manual review instead of ${original}` : 'Why manual review'
+  return {
+    title,
+    summary,
+    missingFields,
+    keyReasons,
+    checks,
+    riskFlags,
+    questions,
+    hasData: Boolean(summary || missingFields.length || keyReasons.length || checks.length || riskFlags.length || questions.length)
+  }
+}
+
 function actionSourceLabel(row: Record<string, unknown>) {
   return firstActionValue(row, ['action_source', 'source'], [['recommendation_reason', 'action_source']])
 }
@@ -359,6 +385,29 @@ function reasonContractTitle(row: Record<string, unknown>) {
   return `Reason contract status: ${status}. Complete means the explanation has required fields; it does not mean the trade is approved.`
 }
 
+function executionSafetyGate(row: Record<string, unknown>) {
+  const contract = asDict(row.execution_safety_contract)
+  const issues = Array.isArray(contract.issues) ? contract.issues.map((item) => String(item || '').trim()).filter(Boolean) : []
+  return {
+    hasData: Object.keys(contract).length > 0,
+    approvalRequired: contract.operator_approval_required === true,
+    approvalStatus: String(contract.operator_approval_status || 'missing'),
+    reconciliationRequired: contract.broker_reconciliation_required === true,
+    reconciliationStatus: String(contract.broker_reconciliation_status || 'not_run'),
+    liveAllowed: contract.live_submission_allowed === true,
+    source: String(contract.source || 'execution_plan'),
+    issues
+  }
+}
+
+function executionGateTone(row: Record<string, unknown>): 'success' | 'warning' | 'danger' | 'info' | 'dark' | 'neutral' {
+  const gate = executionSafetyGate(row)
+  if (!gate.hasData) return 'neutral'
+  if (gate.liveAllowed) return 'success'
+  if (gate.approvalRequired || gate.reconciliationRequired || gate.issues.length) return 'warning'
+  return 'info'
+}
+
 function scoreBadge(value: unknown) {
   const num = Number(value)
   if (!Number.isFinite(num)) return '-'
@@ -397,6 +446,21 @@ function signalTone(row: Record<string, unknown>) {
   if (status.includes('review') || status.includes('watch')) return 'bg-sun text-ink'
   return 'bg-white text-ink/70'
 }
+
+function effectTone(row: Record<string, unknown>) {
+  const effect = String(row.effect_type || '').toLowerCase()
+  if (effect.includes('wait_match')) return 'bg-sun text-ink'
+  if (effect.includes('action_changed')) return 'bg-moss text-white'
+  return 'bg-paper text-ink/65'
+}
+
+function effectLabel(row: Record<string, unknown>) {
+  const effect = String(row.effect_type || '').toLowerCase()
+  if (effect === 'wait_match_created') return 'Wait match'
+  if (effect === 'action_changed') return 'Action changed'
+  if (effect === 'evidence_only') return 'Evidence only'
+  return 'Effect unknown'
+}
 </script>
 
 <template>
@@ -408,25 +472,7 @@ function signalTone(row: Record<string, unknown>) {
     </p>
   </section>
 
-  <section
-    v-if="snapshotMeta.generated_at || snapshotMeta.source"
-    class="mt-4 rounded-3xl border p-4 shadow-soft"
-    :class="snapshotIsStale ? 'border-sun/60 bg-sun/20 text-ink' : 'border-moss/20 bg-moss/10 text-ink/70'"
-  >
-    <div class="flex flex-wrap items-center justify-between gap-3">
-      <div>
-        <p class="text-xs font-black uppercase tracking-[0.28em]" :class="snapshotIsStale ? 'text-rust' : 'text-moss'">
-          {{ snapshotIsStale ? 'Stale operator snapshot' : 'Fresh operator snapshot' }}
-        </p>
-        <p class="mt-1 text-sm font-semibold">
-          Created {{ snapshotGeneratedAt }} · {{ snapshotAgeText }} · source {{ snapshotMeta.source || 'unknown' }}
-        </p>
-      </div>
-      <p v-if="snapshotIsStale" class="max-w-2xl text-sm leading-6 text-ink/65">
-        The API is serving the latest cached operator snapshot because a fresh snapshot is missing. Run `python -m advisory.operator_snapshot` or wait for the next advisory/watchers cycle.
-      </p>
-    </div>
-  </section>
+  <SnapshotWarning class="mt-4" :snapshot="snapshotMeta" :warning="snapshotWarning" :generated-at="home?.generated_at" />
 
   <section class="mt-6 grid gap-4 md:grid-cols-4">
     <MetricTile label="Actions" :value="String(summaryValues.action_count || 0)" note="Resolved buy/sell/review queue" />
@@ -461,6 +507,17 @@ function signalTone(row: Record<string, unknown>) {
           </span>
         </div>
         <p class="mt-3 text-sm leading-6 text-ink/70">{{ row.action_reason || 'No reason captured.' }}</p>
+        <div class="mt-3 rounded-2xl bg-paper/80 p-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="rounded-full px-3 py-1 text-xs font-black" :class="effectTone(row)">
+              {{ effectLabel(row) }}
+            </span>
+            <span class="text-xs font-bold text-ink/45">watcher effect</span>
+          </div>
+          <p class="mt-2 text-xs font-semibold leading-5 text-ink/60">
+            {{ row.effect_summary || 'No watcher effect summary captured.' }}
+          </p>
+        </div>
         <div class="mt-3 flex flex-wrap gap-2 text-xs font-bold text-ink/50">
           <span class="rounded-full bg-paper px-3 py-1">status: {{ row.signal_status || '-' }}</span>
           <span class="rounded-full bg-paper px-3 py-1">source: {{ row.signal_source || '-' }}</span>
@@ -595,7 +652,40 @@ function signalTone(row: Record<string, unknown>) {
             <MetaChip v-if="actionSourceAction(row)" label="source action" tone="yellow" :title="sourceActionTitle(row)">{{ actionSourceAction(row) }}</MetaChip>
             <MetaChip v-if="row.setup_id" label="setup" :title="setupTitle(row)">{{ row.setup_id }}</MetaChip>
             <MetaChip v-if="row.reason_contract_status" label="reason" :title="reasonContractTitle(row)" :tone="String(row.reason_contract_status).includes('complete') ? 'green' : 'yellow'">{{ row.reason_contract_status }}</MetaChip>
+            <MetaChip v-if="executionSafetyGate(row).hasData" label="execution gate" :tone="executionSafetyGate(row).liveAllowed ? 'green' : 'yellow'">
+              {{ executionSafetyGate(row).liveAllowed ? 'live allowed' : 'approval/reconcile required' }}
+            </MetaChip>
           </div>
+          <section
+            v-if="executionSafetyGate(row).hasData"
+            class="mt-4 rounded-2xl border border-rust/20 bg-rust/10 p-4"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-black uppercase tracking-[0.22em] text-rust">Execution approval gate</p>
+                <p class="mt-1 text-sm leading-6 text-ink/65">
+                  Dry-run preview only. This panel does not approve, reconcile, or submit broker orders.
+                </p>
+              </div>
+              <StatusPill :tone="executionGateTone(row)">
+                {{ executionSafetyGate(row).liveAllowed ? 'LIVE ALLOWED' : 'LIVE BLOCKED' }}
+              </StatusPill>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+              <p class="rounded-xl bg-white/80 px-3 py-2">
+                <b>Approval:</b> {{ executionSafetyGate(row).approvalStatus }}
+                <span class="text-ink/45">({{ executionSafetyGate(row).approvalRequired ? 'required' : 'not required' }})</span>
+              </p>
+              <p class="rounded-xl bg-white/80 px-3 py-2">
+                <b>Reconciliation:</b> {{ executionSafetyGate(row).reconciliationStatus }}
+                <span class="text-ink/45">({{ executionSafetyGate(row).reconciliationRequired ? 'required' : 'not required' }})</span>
+              </p>
+              <p class="rounded-xl bg-white/80 px-3 py-2"><b>Source:</b> {{ executionSafetyGate(row).source }}</p>
+            </div>
+            <ul v-if="executionSafetyGate(row).issues.length" class="mt-3 space-y-1 text-sm leading-6 text-ink/70">
+              <li v-for="issue in executionSafetyGate(row).issues.slice(0, 3)" :key="issue">{{ issue }}</li>
+            </ul>
+          </section>
           <div class="mt-4 grid gap-2 text-xs font-black sm:grid-cols-2 xl:grid-cols-3">
             <p
               v-for="fact in actionPriceFacts(row)"
@@ -640,6 +730,51 @@ function signalTone(row: Record<string, unknown>) {
             :status="row.reason_contract_status"
             compact
           />
+          <section
+            v-if="actionExplanation(row).hasData"
+            class="mt-4 rounded-2xl border border-sun/40 bg-sun/10 p-4"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-black uppercase tracking-[0.22em] text-rust">{{ actionExplanation(row).title }}</p>
+                <p v-if="actionExplanation(row).summary" class="mt-2 text-sm font-semibold leading-6 text-ink/75">
+                  {{ actionExplanation(row).summary }}
+                </p>
+              </div>
+              <StatusPill v-if="row.manual_revision_status" tone="warning">{{ row.manual_revision_status }}</StatusPill>
+            </div>
+            <div v-if="actionExplanation(row).missingFields.length" class="mt-3 flex flex-wrap gap-2">
+              <MetaChip v-for="field in actionExplanation(row).missingFields" :key="field" label="missing" tone="yellow">
+                {{ field }}
+              </MetaChip>
+            </div>
+            <div class="mt-3 grid gap-3 md:grid-cols-2">
+              <div v-if="actionExplanation(row).keyReasons.length" class="rounded-xl bg-white/80 p-3">
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Reasons</p>
+                <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+                  <li v-for="item in actionExplanation(row).keyReasons.slice(0, 3)" :key="item">{{ item }}</li>
+                </ul>
+              </div>
+              <div v-if="actionExplanation(row).riskFlags.length" class="rounded-xl bg-white/80 p-3">
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Blockers / conflicts</p>
+                <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+                  <li v-for="item in actionExplanation(row).riskFlags.slice(0, 3)" :key="item">{{ item }}</li>
+                </ul>
+              </div>
+              <div v-if="actionExplanation(row).checks.length" class="rounded-xl bg-white/80 p-3">
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Operator checks</p>
+                <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+                  <li v-for="item in actionExplanation(row).checks.slice(0, 3)" :key="item">{{ item }}</li>
+                </ul>
+              </div>
+              <div v-if="actionExplanation(row).questions.length" class="rounded-xl bg-white/80 p-3">
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Questions</p>
+                <ul class="mt-2 space-y-1 text-sm leading-6 text-ink/70">
+                  <li v-for="item in actionExplanation(row).questions.slice(0, 3)" :key="item">{{ item }}</li>
+                </ul>
+              </div>
+            </div>
+          </section>
           <TechnicalDecisionPanel class="mt-4" :record="row" compact />
           <button
             class="mt-4 rounded-full bg-ink px-4 py-2 text-sm font-bold text-paper"

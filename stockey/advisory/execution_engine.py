@@ -24,6 +24,18 @@ FILLS_TABLE = "advisory_execution_fills"
 DEFAULT_MAX_LIVE_ORDERS_PER_RUN = 5
 DEFAULT_MAX_LIVE_ORDER_VALUE_INR = 50_000.0
 DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES = 30
+EXECUTION_APPROVAL_APPROVED_STATUSES = {"approved", "operator_approved"}
+EXECUTION_RECONCILIATION_PASSED_STATUSES = {"passed", "ok", "reconciled"}
+ACTION_ROW_CLOSED_STATUSES = {
+    "closed",
+    "ignored",
+    "manual_closed",
+    "operator_closed",
+    "superseded",
+    "cancelled",
+    "canceled",
+    "rejected",
+}
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -408,6 +420,8 @@ def _payload_rows(payload: list[dict[str, Any]] | dict[str, Any] | None) -> list
             value = payload.get(key)
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
+            if isinstance(value, dict):
+                return _payload_rows(value)
         return [payload]
     return []
 
@@ -627,10 +641,19 @@ def build_execution_orders(
             inventory = inventory_map.get(symbol, {})
             available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
             action_fraction = pd.to_numeric(row.get("action_fraction"), errors="coerce")
+            row_block_reasons = _action_row_block_reasons(row, monitor_date=monitor_date)
+            safety_contract = build_execution_plan_safety_contract(
+                source="action_recommendation",
+                action_status=row.get("action_status") if "action_status" in row.index else row.get("status"),
+                issues=row_block_reasons.copy(),
+            )
 
             if execution_mode not in {"", "broker_order"} or transaction not in {"BUY", "SELL"}:
                 continue
-            if reason_contract_status != "complete":
+            if row_block_reasons:
+                execution_status = "submit_blocked"
+                execution_reason = " ".join(row_block_reasons)
+            elif reason_contract_status != "complete":
                 execution_status = "submit_blocked"
                 execution_reason = f"Reason contract is not complete: {reason_contract_status or 'missing'}."
             else:
@@ -721,7 +744,7 @@ def build_execution_orders(
                     "approved_allocation_inr": pd.to_numeric(row.get("approved_allocation_inr"), errors="coerce"),
                     "invest_score_pct": pd.to_numeric(row.get("invest_score_pct"), errors="coerce"),
                     "estimated_order_value_inr": None if pd.isna(reference_price) or quantity <= 0 else float(reference_price) * int(quantity),
-                    "safety_checks_json": None,
+                    "safety_checks_json": json.dumps(safety_contract, ensure_ascii=False, default=str, sort_keys=True),
                     "broker_order_id": None,
                     "exchange_order_id": None,
                     "execution_status": execution_status,
@@ -741,6 +764,7 @@ def build_execution_orders(
                             "recommended_stop_price": pd.to_numeric(row.get("recommended_stop_price"), errors="coerce"),
                             "reference_price_source": reference_price_source,
                             "reference_price_asof": reference_price_asof,
+                            "execution_safety_contract": safety_contract,
                         },
                         ensure_ascii=False,
                         default=str,
@@ -1052,6 +1076,109 @@ def _append_reason(existing: object, reason: str) -> str:
     return f"{text} {reason}".strip() if text else reason
 
 
+def build_execution_plan_safety_contract(
+    *,
+    source: str,
+    action_status: object = None,
+    approval_status: str = "missing",
+    reconciliation_status: str = "not_run",
+    approval_required: bool = True,
+    reconciliation_required: bool = True,
+    live_submission_allowed: bool = False,
+    issues: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "source": source,
+        "action_status": None if pd.isna(action_status) else action_status,
+        "operator_approval_required": bool(approval_required),
+        "operator_approval_status": approval_status,
+        "broker_reconciliation_required": bool(reconciliation_required),
+        "broker_reconciliation_status": reconciliation_status,
+        "live_submission_allowed": bool(live_submission_allowed),
+        "issues": issues or [],
+    }
+
+
+def _safety_contract_from_row(row: pd.Series) -> dict[str, Any]:
+    parsed = _jsonish(row.get("safety_checks_json"))
+    if parsed:
+        return parsed
+    raw = _jsonish(row.get("raw_broker_json"))
+    return raw.get("execution_safety_contract") if isinstance(raw.get("execution_safety_contract"), dict) else {}
+
+
+def _clean_optional_text(value: object) -> str:
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value or "").strip()
+
+
+def _annotate_reconciliation_contract(row: pd.Series) -> dict[str, Any]:
+    status = _clean_optional_text(row.get("broker_order_status"))
+    broker_order_id = _clean_optional_text(row.get("broker_order_id"))
+    if not status and not broker_order_id:
+        return {}
+    return {
+        "broker_reconciliation_status": "reconciled",
+        "broker_reconciliation_source": "broker_order_state",
+        "broker_reconciliation_broker_order_status": status or None,
+        "broker_reconciliation_broker_order_id": broker_order_id or None,
+    }
+
+
+def annotate_reconciliation_safety_contracts(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    for idx, row in out.iterrows():
+        updates = _annotate_reconciliation_contract(row)
+        if not updates:
+            continue
+        contract = _safety_contract_from_row(row)
+        if not contract:
+            contract = build_execution_plan_safety_contract(
+                source="execution_reconciliation",
+                approval_required=True,
+                reconciliation_status="reconciled",
+                live_submission_allowed=False,
+            )
+        contract = {**contract, **updates, "live_submission_allowed": False}
+        out.at[idx, "safety_checks_json"] = json.dumps(contract, ensure_ascii=False, default=str, sort_keys=True)
+        raw = _jsonish(row.get("raw_broker_json"))
+        if raw:
+            raw["execution_safety_contract"] = contract
+            out.at[idx, "raw_broker_json"] = json.dumps(raw, ensure_ascii=False, default=str, sort_keys=True)
+    return out
+
+
+def _action_row_block_reasons(row: pd.Series, *, monitor_date: pd.Timestamp) -> list[str]:
+    reasons: list[str] = []
+    for column in ["action_status", "status", "source_status", "resolution_status", "operator_status"]:
+        if column not in row.index:
+            continue
+        value = str(row.get(column) or "").strip().lower()
+        if value in ACTION_ROW_CLOSED_STATUSES:
+            reasons.append(f"Action row is {value}.")
+            break
+    for column in ["closed_at", "manual_closed_at", "operator_closed_at", "superseded_at", "cancelled_at", "canceled_at"]:
+        if column in row.index and pd.notna(row.get(column)):
+            reasons.append(f"Action row has {column}.")
+            break
+    published_on = pd.to_datetime(row.get("published_on"), utc=True, errors="coerce")
+    if pd.notna(published_on) and published_on.normalize() > monitor_date:
+        reasons.append("Action row is dated after the execution as-of date.")
+    expiry_value = row.get("expires_at")
+    if pd.isna(expiry_value):
+        expiry_value = row.get("valid_until")
+    expires_at = pd.to_datetime(expiry_value, utc=True, errors="coerce")
+    if pd.notna(expires_at) and expires_at < monitor_date:
+        reasons.append("Action row is expired for the execution as-of date.")
+    return reasons
+
+
 def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
@@ -1065,6 +1192,8 @@ def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
     max_value = _env_float("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", DEFAULT_MAX_LIVE_ORDER_VALUE_INR)
     require_fresh_intraday = _env_bool("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", True)
     max_price_age_minutes = _env_int("STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES", DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES)
+    require_operator_approval = _env_bool("STOCKEY_EXECUTION_REQUIRE_OPERATOR_APPROVAL", True)
+    require_reconciliation = _env_bool("STOCKEY_EXECUTION_REQUIRE_RECONCILIATION", True)
 
     def block(idx: int, reason: str, checks: dict[str, Any]) -> None:
         out.at[idx, "execution_status"] = "submit_blocked"
@@ -1079,6 +1208,8 @@ def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
         "max_order_value_inr": max_value,
         "require_fresh_intraday_price": require_fresh_intraday,
         "max_intraday_price_age_minutes": max_price_age_minutes,
+        "require_operator_approval": require_operator_approval,
+        "require_reconciliation": require_reconciliation,
     }
     if not live_enabled:
         for idx in planned_indexes:
@@ -1104,6 +1235,10 @@ def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
             "reference_price_source": out.at[idx, "reference_price_source"] if "reference_price_source" in out.columns else None,
             "reference_price_asof": out.at[idx, "reference_price_asof"] if "reference_price_asof" in out.columns else None,
         }
+        plan_contract = _safety_contract_from_row(out.loc[idx])
+        approval_status = str(plan_contract.get("operator_approval_status") or "").strip().lower()
+        reconciliation_status = str(plan_contract.get("broker_reconciliation_status") or "").strip().lower()
+        checks["execution_safety_contract"] = plan_contract
         if pd.isna(quantity) or int(quantity) <= 0:
             block(idx, "Quantity is not positive.", checks)
             continue
@@ -1130,6 +1265,12 @@ def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
             if price_age_minutes is None or price_age_minutes > max_price_age_minutes:
                 block(idx, f"Intraday reference price is older than {max_price_age_minutes} minutes.", checks)
                 continue
+        if require_operator_approval and approval_status not in EXECUTION_APPROVAL_APPROVED_STATUSES:
+            block(idx, "Operator approval is required before live submission.", checks)
+            continue
+        if require_reconciliation and reconciliation_status not in EXECUTION_RECONCILIATION_PASSED_STATUSES:
+            block(idx, "Broker account reconciliation is required before live submission.", checks)
+            continue
         out.at[idx, "safety_checks_json"] = json.dumps({**checks, "passed": True}, ensure_ascii=False, default=str, sort_keys=True)
     return out
 
@@ -1278,7 +1419,7 @@ def reconcile_live_orders(
 def persist_reconciliation(order_df: pd.DataFrame, fills_df: pd.DataFrame) -> None:
     ensure_execution_tables()
     if not order_df.empty:
-        order_out = order_df.copy()
+        order_out = annotate_reconciliation_safety_contracts(order_df)
         for col in ["security_id", "quantity", "filled_quantity", "limit_price", "trigger_price", "reference_price", "approved_allocation_inr", "invest_score_pct", "estimated_order_value_inr"]:
             if col in order_out.columns:
                 order_out[col] = pd.to_numeric(order_out[col], errors="coerce")

@@ -8,6 +8,7 @@ import pandas as pd
 
 from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
 from advisory.decision_trace import classify_action_conflict, ensure_trace_tables
+from advisory.decision_trace import load_enabled_dynamic_action_conflict_rules
 from utils.db import db_session, sql_to_df
 from utils.sync import parse_datetime_arg
 
@@ -136,9 +137,10 @@ def resolve_conflicts(
     duplicate_rows = dedupe_conflicts(asof_date=effective_asof, symbol=symbol, dry_run=dry_run) if dedupe else 0
     conflicts = load_conflicts(asof_date=effective_asof, symbol=symbol, unresolved_only=unresolved_only)
     rules = load_enabled_rules()
+    dynamic_rules = load_enabled_dynamic_action_conflict_rules()
     updates: list[dict[str, Any]] = []
     for row in conflicts.to_dict(orient="records"):
-        resolution = classify_action_conflict(row)
+        resolution = classify_action_conflict(row, dynamic_rules=dynamic_rules)
         updates.append(
             {
                 "row_id": row["row_id"],

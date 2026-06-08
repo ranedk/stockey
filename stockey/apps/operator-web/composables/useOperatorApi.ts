@@ -1,4 +1,4 @@
-import type { CronLogsPayload, EventModelArtifactsPayload, EventModelPromotionCheckPayload, EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, ManualReviewDecisionResult, ManualReviewPayload, OperatorActions, OperatorApiErrorsPayload, OperatorCommandRunResult, OperatorCommandsPayload, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorSmokePayload, OperatorSummary, SignalRefreshPayload, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary, WaitSignalsPayload } from '~/types/api'
+import type { ActionConflictRulesPayload, ActionConflictRuleWriteResult, CronLogsPayload, EventDetailPayload, EventModelArtifactsPayload, EventModelPromotionCheckPayload, EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, IdentityIssuesPayload, ManualReviewDecisionResult, ManualReviewPayload, OperatorActions, OperatorApiErrorsPayload, OperatorCommandRunResult, OperatorCommandsPayload, OperatorDetailPayload, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorRuntime, OperatorSmokePayload, OperatorSummary, SignalRefreshPayload, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary, WaitSignalMatchPayload, WaitSignalsPayload } from '~/types/api'
 
 export function useOperatorApi() {
   const config = useRuntimeConfig()
@@ -24,6 +24,7 @@ export function useOperatorApi() {
   return {
     getHome: () => get<OperatorHome>('/api/home'),
     getSummary: () => get<OperatorSummary>('/api/summary'),
+    getRuntime: () => get<OperatorRuntime>('/api/runtime'),
     getHealthDetails: () => get<OperatorHealthDetails>('/api/health/details'),
     runOperationsSmoke: () => get<OperatorSmokePayload>('/api/operations/smoke'),
     getCronLogs: (limit = 20, lines = 80) => get<CronLogsPayload>(`/api/operations/cron-logs?limit=${limit}&lines=${lines}`),
@@ -34,20 +35,23 @@ export function useOperatorApi() {
     getEventModelPromotionCheck: () => get<EventModelPromotionCheckPayload>('/api/research/event-model-promotion-check'),
     getEventModelArtifacts: () => get<EventModelArtifactsPayload>('/api/research/event-model-artifacts'),
     getManualReview: (limit = 100) => get<ManualReviewPayload>(`/api/manual-review?limit=${limit}`),
+    getIdentityIssues: (params: Record<string, unknown> = {}) => get<IdentityIssuesPayload>(`/api/identity-issues${query(params)}`),
     decideManualReview: (body: Record<string, unknown>) => post<ManualReviewDecisionResult>('/api/manual-review/decision', body),
     getActions: (params: Record<string, unknown> = {}) => get<OperatorActions>(`/api/actions${query(params)}`),
-    getActionDetail: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/actions/detail${query(params)}`),
-    getActionConflictRules: () => get<Record<string, unknown>>('/api/action-conflict-rules'),
+    getActionDetail: (params: Record<string, unknown> = {}) => get<OperatorDetailPayload>(`/api/actions/detail${query(params)}`),
+    getActionConflictRules: () => get<ActionConflictRulesPayload>('/api/action-conflict-rules'),
+    promoteActionConflictRule: (body: Record<string, unknown>) => post<ActionConflictRuleWriteResult>('/api/action-conflict-rules/promote', body),
+    updateActionConflictRule: (ruleId: string, body: Record<string, unknown>) => post<ActionConflictRuleWriteResult>(`/api/action-conflict-rules/${encodeURIComponent(ruleId)}`, body),
     getSignalRefresh: (params: Record<string, unknown> = {}) => get<SignalRefreshPayload>(`/api/signal-refresh${query(params)}`),
     getPortfolio: (params: Record<string, unknown> = {}) => get<OperatorPortfolio>(`/api/portfolio${query(params)}`),
-    getPortfolioDetail: (symbol: string, params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/portfolio/${encodeURIComponent(symbol)}/detail${query(params)}`),
+    getPortfolioDetail: (symbol: string, params: Record<string, unknown> = {}) => get<OperatorDetailPayload>(`/api/portfolio/${encodeURIComponent(symbol)}/detail${query(params)}`),
     getMarketContext: (limit = 50) => get<OperatorMarketContext>(`/api/market-context?limit=${limit}`),
     getTechnicalCalibration: (limit = 25) => get<TechnicalCalibrationPayload>(`/api/technical-calibration?limit=${limit}`),
     reviewTechnicalCalibration: (body: Record<string, unknown>) => post<TechnicalPromotionReviewResult>('/api/technical-calibration/promotion-review', body),
     getTechnicalPromotionReviews: (limit = 25) => get<TechnicalPromotionReviewsPayload>(`/api/technical-calibration/promotion-reviews?limit=${limit}`),
     decideTechnicalPromotionReview: (body: Record<string, unknown>) => post<TechnicalPromotionDecisionResult>('/api/technical-calibration/promotion-review/decision', body),
     getEvents: (limit = 50, params: Record<string, unknown> = {}) => get<OperatorEvents>(`/api/events${query({ limit, ...params })}`),
-    getEventDetail: (uniqueId: string, params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/events/${encodeURIComponent(uniqueId)}/detail${query(params)}`),
+    getEventDetail: (uniqueId: string, params: Record<string, unknown> = {}) => get<EventDetailPayload>(`/api/events/${encodeURIComponent(uniqueId)}/detail${query(params)}`),
     getEventPolicy: (limit = 100, actionType = 'ALL') => get<EventPolicyPayload>(`/api/event-policy?limit=${limit}&action_type=${encodeURIComponent(actionType)}`),
     getEventPolicyEvaluation: (limit = 100) => get<EventPolicyEvaluationPayload>(`/api/event-policy/evaluation?limit=${limit}`),
     getEventTrace: (uniqueId: string) => get<EventTrace>(`/api/events/${encodeURIComponent(uniqueId)}/trace`),
@@ -56,6 +60,7 @@ export function useOperatorApi() {
     getSymbolTraceSummary: (symbol: string, limit = 200) => get<TraceSummary>(`/api/symbols/${encodeURIComponent(symbol)}/trace/summary?limit=${limit}`),
     getHypotheses: (limit = 100) => get<HypothesesPayload>(`/api/hypotheses?limit=${limit}`),
     getWaitSignals: (params: Record<string, unknown> = {}) => get<WaitSignalsPayload>(`/api/wait-signals${query(params)}`),
+    runWaitSignalMatch: (body: Record<string, unknown> = {}) => post<WaitSignalMatchPayload>('/api/wait-signals/match', body),
     createHypothesis: (body: Record<string, unknown>) => post<HypothesisCreateResult>('/api/hypotheses', body),
     updateHypothesis: (hypothesisId: string, body: Record<string, unknown>) => post<HypothesisCreateResult>(`/api/hypotheses/${encodeURIComponent(hypothesisId)}`, body),
     previewHypothesis: (body: Record<string, unknown>) => post<HypothesisPreviewResult>('/api/hypotheses/preview', body),

@@ -171,6 +171,8 @@ The same data is exposed at `GET /api/health/details` and rendered in the Nuxt `
 
 The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, Redis reachability, and Postgres connectivity. The Nuxt `Data Health` page shows the hints near the top with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix. The page can filter health rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
 
+The Health page also shows a read-only superseded cleanup preview when recovered event-processing failures or recovered announcement-document errors can be marked superseded. Inspect the sample rows first, then run `python -m advisory.superseded_failures --limit 500` or `./all_superseded_cleanup_audit.sh` for the dry-run JSON. Cron runs `./all_superseded_cleanup_audit.sh` after market close as a preview-only audit, and the Operations page exposes the same dry-run through `superseded_failure_cleanup_dry_run`. Only run `python -m advisory.superseded_failures --apply --limit 500` after explicit operator intent; this marks durable superseded metadata and does not submit broker orders or change portfolio/action/config state.
+
 Useful API/token env knobs:
 
 - `OPERATOR_API_HEALTH_URL`: endpoint checked by operator health, default `http://127.0.0.1:8765/api/health`
@@ -318,6 +320,74 @@ Codex-supervised variant:
 ```
 
 Use this for long unattended runs where Codex CLI should inspect a failure, patch the repo, and rerun with a bounded attempt count. Logs, Codex prompts, and Codex outputs are written to `logs/codex_supervisor/`. Tune it with `CODEX_SUPERVISOR_MAX_ATTEMPTS`, `CODEX_SUPERVISOR_TAIL_LINES`, `CODEX_SUPERVISOR_TIMEOUT_SECONDS`, and `CODEX_SUPERVISOR_MODEL`.
+
+Analysis-development loop:
+
+```sh
+ANALYSIS_AGENT_MAX_CYCLES=1 ./all_analysis_codex.sh
+```
+
+Use this when you want Codex CLI to continue development from `analysis.md`. The loop reads `analysis.md` and `docs/analysis_agent_board.md`, picks the next bounded slice, edits code/docs/tests, runs focused validation, and updates the board. It is manual-only and should not run from cron.
+
+Operational guardrails:
+
+- Default max cycles is `1`; increase deliberately, for example `ANALYSIS_AGENT_MAX_CYCLES=3 ./all_analysis_codex.sh`.
+- Logs, prompts, stdout, and last Codex messages are written to `logs/analysis_agents/`.
+- It fails closed on Codex errors and is prompted to stop instead of editing broker execution, destructive DB/data cleanup, credential-dependent work, or unclear production-safety changes.
+- After each cycle, review `docs/analysis_agent_board.md`, `analysis.md`, `git diff`, and the validation lines before running another cycle.
+- Manual Review follow-up: open `/manual-review` and `/wait-signals` in the operator UI after cycles that touch Manual Review, wait signals, action policy, or health. Confirm new items are understandable and not duplicated before accepting the slice.
+
+## Advisory, Watcher, Wait Signal, And Manual Review Boundaries
+
+Use this table when deciding whether to run a full advisory pass, rely on watcher output, inspect wait signals, or make a Manual Review decision.
+
+| Flow | What starts it | What it reads | What it writes | What it can change | What it cannot do |
+| --- | --- | --- | --- | --- | --- |
+| Full advisory | `./all_advisory.sh` after fresh data, normally post-close | Screener universe, snapshots, event policy, adversarial review, risk, portfolio, lifecycle, action history | Current advisory tables including portfolio/order plans, lifecycle, consolidated action recommendations, execution previews, traces, and operator snapshot | Authoritative daily portfolio/action reconciliation and dry-run execution-plan state | Submit live broker orders without explicit live-execution gates |
+| Watchers | `./all_watchers.sh` cron or loop during market hours | Active watchlist names, open positions, recent OHLCV, news, announcements, wait signals, persisted watcher cursors | Watch alerts, fresh source rows, wait-signal matches, signal-refresh rows, trace summaries, operator snapshot | Fast operator visibility for fresh evidence and per-symbol action/evidence changes | Replace the full cross-sectional advisory, recompute authoritative portfolio allocation, or submit orders |
+| Fast signal refresh | Watcher router or `python -m advisory.signal_refresh ...` | Latest consolidated action, lifecycle/rebalance rows, event-policy rows, matched wait signals for one symbol | `advisory_signal_refresh_actions`, trace rows, materialized trace summaries | Show whether a symbol-level signal changed, created a wait-match action, or only refreshed evidence | Run full allocation/risk sizing across the universe or mutate authoritative portfolio rows |
+| Wait signals | Playbook action plans, Manual Review `watch_for_event`, or `python -m advisory.wait_signals ...` | Typed wait conditions plus price/news/announcement evidence | `advisory_wait_signals` and `advisory_wait_signal_matches` | Record that a future condition is active, matched, expired, or closed | Trade, approve actions, or change portfolio state by itself |
+| Manual Review | Operator decision in `/manual-review` or API decision endpoint | Active manual items, source row context, decision/effect table, optional wait-signal fields | `advisory_manual_review_decisions`; for `watch_for_event`, an active wait signal | Close or annotate a review item; create a watched condition; reopen matched Manual Review wait-signal follow-up work | Submit broker orders, directly mutate portfolio rows, or directly rewrite action recommendations |
+
+Operator rule of thumb:
+
+- Use `./all_advisory.sh` when the question is "what is the authoritative current action/portfolio state?"
+- Use watcher and signal-refresh output when the question is "what changed intraday for a watched symbol?"
+- Use `/wait-signals` when the question is "which future evidence did we decide to wait for, and did it arrive?"
+- Use `/manual-review` when the question is "what explicit operator decision should be recorded for this item?"
+- If a matched wait signal looks actionable, review the evidence first, then run the relevant refresh/advisory flow. A wait match is evidence, not approval.
+
+Watcher trigger boundaries:
+
+| Trigger or observation | Immediate watcher effect | Full advisory required before treating as authoritative? | Notes |
+| --- | --- | --- | --- |
+| Fresh intraday OHLCV for a watched symbol or open position | Writes watcher alerts and can refresh that symbol into `advisory_signal_refresh_actions` | Yes, for portfolio sizing, final allocation, and dry-run execution previews | Intraday refresh is symbol-scoped visibility. It does not rebuild the universe or reconcile the portfolio. |
+| Fresh exchange announcement or news for an active watch/open position | Persists the source evidence, routes material events, and refreshes the affected symbol | Yes, when the evidence changes investability, sizing, or final action state | The watcher can show `action_changed` or `evidence_only`; that is not final approval. |
+| Top market-context news or announcement without deterministic materiality keywords | Persists `context_observed` evidence only | Yes, if the operator wants it considered in cross-sectional advisory state | Context-only observations do not trigger action authority by themselves. |
+| Top market-context news or announcement with deterministic materiality keywords | Marks the item `triggered` and routes it for symbol-level refresh/evaluation | Yes, before using it as authoritative portfolio/action state | Materiality routing improves freshness, but still remains a watcher overlay. |
+| Active wait signal matches price/news/announcement evidence | Writes `advisory_wait_signal_matches`; signal refresh may create a review-only `WATCH`, `MANUAL_REVIEW`, or reduce-review signal | Yes, before any broker-capable action or portfolio mutation | Matched waits are evidence. Manual Review follow-up is expected for operator-created waits. |
+| Watcher tick skipped because the self-lock is held | Publishes skipped watcher events and exits without advancing cursors | No immediate advisory action; inspect only if skips persist | The next successful watcher resumes from persisted source cursors. |
+| Watcher run fails before cursor persistence | Leaves the last successful cursor in place for retry | Usually yes after recovery, especially if the failure spans a trading session | Use `complete_data.sh` for broad repair if intervals were missed beyond bounded watcher catch-up. |
+| Bounded watcher catch-up is truncated by lookback limits | Publishes catch-up metadata with `catchup_truncated` | Yes | Run `complete_data.sh` or the relevant downloader/parser catch-up before trusting daily advisory output. |
+| Scheduled post-close advisory window arrives after data catch-up | `./all_advisory.sh` performs full advisory reconciliation | This is the authoritative path | It recomputes cross-sectional advisory state and dry-run execution-plan state, but still does not submit live broker orders without explicit gates. |
+
+Manual Review decision effects:
+
+| Decision | Runtime state after save | Active queue effect | Side effects | What it never does |
+| --- | --- | --- | --- | --- |
+| `needs_more_data` | `open_needs_more_data` | Keeps the item open | Records the operator rationale | Mutate portfolio rows, action recommendations, config, or broker orders |
+| `watch_for_event` | `waiting_for_event` | Keeps the item open until the wait signal matches or the item is later closed | Records the decision and creates an active typed wait signal from the follow-up text | Approve the future matched evidence, mutate portfolio rows, action recommendations, config, or broker orders |
+| `add_operator_note` | `annotated` | Keeps the item open | Records operator context only | Close the item, mutate portfolio rows, action recommendations, config, or broker orders |
+| `approve_for_manual_config` | `closed_approved_for_manual_config` | Removes the item from the active queue | Records approval for a later manual code/config change | Apply the config change automatically, mutate portfolio rows, action recommendations, or broker orders |
+| `ignore` | `closed_ignored` | Removes the item from the active queue | Records that the item is noise or not worth further review | Mutate source rows, portfolio rows, action recommendations, config, or broker orders |
+| `downgrade_to_no_action` | `closed_no_action` | Removes the item from the active queue | Records an explicit no-action operator decision | Rewrite the stored recommendation, mutate portfolio rows, or broker orders |
+| `mark_fixed` | `closed_fixed` | Removes the item from the active queue | Records that an operational issue was fixed or a rerun succeeded | Clean old DB rows, mutate source rows, portfolio rows, action recommendations, or broker orders |
+
+Matched Manual Review wait-signal behavior:
+
+- If the original item is still in `watch_for_event`, a matched wait signal suppresses the stale waiting item and reopens follow-up work as `reopened_wait_signal_matched`.
+- If the original item was closed later by `ignore`, `mark_fixed`, `downgrade_to_no_action`, or `approve_for_manual_config`, the matched wait signal is suppressed from active Manual Review instead of reopening stale work.
+- A matched wait can create a review-only action candidate linked to the original item and match evidence. It remains evidence for operator review; it is not approval and cannot submit an order.
 
 ### 3. Model prep and training
 
@@ -481,11 +551,15 @@ python -m advisory.wait_signals --match --symbol RELIANCE --format json
 Behavior:
 
 - hypothesis scans generate `advisory_wait_signals` after action plans are persisted
-- price waits are matched against `dhan_ohlcv_daily`
-- news/announcement waits are matched against persisted advisory news and announcement event tables
+- wait conditions are typed in `condition_json.condition_type`
+- supported wait condition types are `price_level`, `event_keywords`, `clarification_filing`, `result_update`, `management_commentary`, `sector_event`, and `expiry_only`
+- price-level waits are matched against `dhan_ohlcv_daily`
+- news/announcement waits are matched against persisted advisory news and announcement event tables with source/evidence assumptions captured in the condition payload
+- invalid or unknown wait condition types are reported as matcher issues instead of crashing the watcher
 - matches are written to `advisory_wait_signal_matches`
 - `./all_watchers.sh` runs a lightweight wait-signal match pass after each watcher cycle
-- the Nuxt Playbooks page shows active, matched, and manually checked waits
+- signal refresh treats matched waits as evidence, not direct execution: negative waits can become `REDUCE_EXPOSURE_REVIEW`, positive waits become `WATCH`, and ambiguous waits become `MANUAL_REVIEW`
+- the Nuxt `/wait-signals` page shows active, matched, expired, and closed waits with source labels and latest evidence
 
 ### 6. Split refreshes
 

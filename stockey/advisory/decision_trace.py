@@ -17,6 +17,9 @@ TRACE_STEPS_TABLE = "advisory_decision_trace_steps"
 EVENT_PROCESSING_TABLE = "advisory_event_processing_runs"
 ACTION_CONFLICTS_TABLE = "advisory_action_conflicts"
 ACTION_CONFLICT_RULES_TABLE = "advisory_action_conflict_rules"
+MANUAL_REVIEW_DECISIONS_TABLE = "advisory_manual_review_decisions"
+WAIT_SIGNALS_TABLE = "advisory_wait_signals"
+WAIT_SIGNAL_MATCHES_TABLE = "advisory_wait_signal_matches"
 
 ACTION_CONFLICT_RULES = [
     {
@@ -34,6 +37,14 @@ ACTION_CONFLICT_RULES = [
         "resolution_status": "resolved",
         "resolution_action": "keep_winner",
         "reason": "When broad market context blocks positive broker actions, MANUAL_REVIEW remains the winner until regime breadth improves.",
+    },
+    {
+        "rule_id": "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH",
+        "rule_name": "Adversarial veto keeps event action manual",
+        "rule_scope": "adversarial_review",
+        "resolution_status": "resolved",
+        "resolution_action": "keep_winner",
+        "reason": "When adversarial review vetoes event evidence, MANUAL_REVIEW beats positive broker and watch candidates until the operator resolves the contradiction.",
     },
     {
         "rule_id": "SAME_ACTION_DUPLICATE_COLLAPSE",
@@ -70,6 +81,23 @@ def safe_trace_call(func, **kwargs):
     except Exception as exc:
         logger.warning("decision trace write failed func=%s error=%s", getattr(func, "__name__", str(func)), exc)
         return None
+
+
+def table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+        return not df.empty
+    except Exception:
+        return False
 
 
 def ensure_trace_tables() -> None:
@@ -176,6 +204,13 @@ def ensure_trace_tables() -> None:
             "requires_manual_resolution": "BOOLEAN",
         }.items():
             cur.execute(f"ALTER TABLE {ACTION_CONFLICTS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+        for column, sql_type in {
+            "condition_json": "TEXT",
+            "promoted_from_conflict_key": "TEXT",
+            "promoted_by": "TEXT",
+            "promotion_note": "TEXT",
+        }.items():
+            cur.execute(f"ALTER TABLE {ACTION_CONFLICT_RULES_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
         now = pd.Timestamp.utcnow()
         for idx, rule in enumerate(ACTION_CONFLICT_RULES):
             cur.execute(
@@ -187,7 +222,7 @@ def ensure_trace_tables() -> None:
                     rule_name = EXCLUDED.rule_name,
                     rule_scope = EXCLUDED.rule_scope,
                     resolution_action = EXCLUDED.resolution_action,
-                    resolution_reason = EXCLUDED.resolution_reason,
+                    resolution_reason = COALESCE({ACTION_CONFLICT_RULES_TABLE}.resolution_reason, EXCLUDED.resolution_reason),
                     updated_at = EXCLUDED.updated_at
                 """,
                 (
@@ -201,6 +236,65 @@ def ensure_trace_tables() -> None:
                     now.to_pydatetime(),
                 ),
             )
+
+
+def _parse_jsonish(value: Any, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, float) and pd.isna(value):
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return default
+    text = value.strip()
+    if not text:
+        return default
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
+
+
+def _norm(value: Any, *, upper: bool = True) -> str:
+    text = "" if value is None else str(value).strip()
+    return text.upper() if upper else text.lower()
+
+
+def _dynamic_rule_matches(row: dict[str, Any], rule: dict[str, Any]) -> bool:
+    condition = _parse_jsonish(rule.get("condition_json"), {})
+    if not isinstance(condition, dict):
+        return False
+    if str(condition.get("condition_type") or "") != "action_pair_exact":
+        return False
+    checks = {
+        "winning_action_code": True,
+        "losing_action_code": True,
+        "winning_source": False,
+        "losing_source": False,
+    }
+    for field, upper in checks.items():
+        expected = condition.get(field)
+        if expected in (None, ""):
+            continue
+        if _norm(row.get(field), upper=upper) != _norm(expected, upper=upper):
+            return False
+    return True
+
+
+def load_enabled_dynamic_action_conflict_rules() -> list[dict[str, Any]]:
+    ensure_trace_tables()
+    df = sql_to_df(
+        f"""
+        SELECT *
+        FROM {ACTION_CONFLICT_RULES_TABLE}
+        WHERE COALESCE(enabled, TRUE)
+          AND condition_json IS NOT NULL
+        ORDER BY priority DESC, rule_id
+        """,
+        retries=2,
+    )
+    return df.to_dict(orient="records") if not df.empty else []
 
 
 def make_trace_id(*, asof_date: Any, symbol: Any, unique_id: Any = None, trigger_type: Any = None) -> str:
@@ -378,7 +472,7 @@ def build_action_conflicts(all_candidates: pd.DataFrame, winners: pd.DataFrame) 
     return pd.DataFrame(rows)
 
 
-def classify_action_conflict(row: dict[str, Any]) -> dict[str, Any]:
+def classify_action_conflict(row: dict[str, Any], dynamic_rules: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     winning = str(row.get("winning_action_code") or "").strip().upper()
     losing = str(row.get("losing_action_code") or "").strip().upper()
     winning_source = str(row.get("winning_source") or "").strip().lower()
@@ -395,6 +489,16 @@ def classify_action_conflict(row: dict[str, Any]) -> dict[str, Any]:
     elif losing == "WATCH" and winning:
         rule = ACTION_CONFLICT_RULES[3]
     else:
+        for rule_row in dynamic_rules or []:
+            if not _dynamic_rule_matches(row, rule_row):
+                continue
+            return {
+                "resolution_status": "resolved",
+                "resolution_rule_id": str(rule_row.get("rule_id")),
+                "resolution_action": str(rule_row.get("resolution_action") or "keep_winner"),
+                "resolution_reason": str(rule_row.get("resolution_reason") or "Matched operator-promoted conflict rule."),
+                "requires_manual_resolution": False,
+            }
         return {
             "resolution_status": "unresolved",
             "resolution_rule_id": None,
@@ -415,7 +519,8 @@ def apply_action_conflict_resolution_rules(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    resolutions = [classify_action_conflict(row) for row in out.to_dict(orient="records")]
+    dynamic_rules = load_enabled_dynamic_action_conflict_rules()
+    resolutions = [classify_action_conflict(row, dynamic_rules=dynamic_rules) for row in out.to_dict(orient="records")]
     for key in ["resolution_status", "resolution_rule_id", "resolution_action", "resolution_reason", "requires_manual_resolution"]:
         out[key] = [item.get(key) for item in resolutions]
     return out
@@ -476,7 +581,103 @@ def load_event_trace(unique_id: str) -> dict[str, Any]:
         "processing": processing.to_dict(orient="records") if not processing.empty else [],
         "traces": traces.to_dict(orient="records") if not traces.empty else [],
         "steps": steps.to_dict(orient="records") if not steps.empty else [],
+        "manual_review_wait_signal_links": load_manual_review_wait_signal_links(unique_id=unique_id, limit=50),
     }
+
+
+def load_manual_review_wait_signal_links(
+    *,
+    symbol: str | None = None,
+    unique_id: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    if not table_exists(MANUAL_REVIEW_DECISIONS_TABLE) or not table_exists(WAIT_SIGNALS_TABLE):
+        return []
+    normalized_symbol = str(symbol or "").strip().upper()
+    normalized_unique_id = str(unique_id or "").strip()
+    if not normalized_symbol and not normalized_unique_id:
+        return []
+    row_limit = max(1, min(int(limit), 1000))
+    has_matches = table_exists(WAIT_SIGNAL_MATCHES_TABLE)
+    match_select = (
+        """
+            m.matched_at,
+            m.match_status,
+            m.match_score,
+            m.source_table AS match_source_table,
+            m.source_key AS match_source_key,
+            m.observed_at,
+            m.match_reason,
+            m.evidence_json
+        """
+        if has_matches
+        else """
+            NULL::timestamptz AS matched_at,
+            NULL::text AS match_status,
+            NULL::double precision AS match_score,
+            NULL::text AS match_source_table,
+            NULL::text AS match_source_key,
+            NULL::timestamptz AS observed_at,
+            NULL::text AS match_reason,
+            NULL::jsonb AS evidence_json
+        """
+    )
+    match_join = (
+        f"""
+        LEFT JOIN {WAIT_SIGNAL_MATCHES_TABLE} m
+          ON m.signal_id = s.signal_id
+        """
+        if has_matches
+        else ""
+    )
+    order_expr = "COALESCE(m.matched_at, s.created_at, d.decided_at)" if has_matches else "COALESCE(s.created_at, d.decided_at)"
+    filters: list[str] = []
+    params: list[Any] = []
+    if normalized_symbol:
+        filters.append("COALESCE(s.symbol, d.symbol, m.symbol) = %s" if has_matches else "COALESCE(s.symbol, d.symbol) = %s")
+        params.append(normalized_symbol)
+    if normalized_unique_id:
+        filters.append("(d.unique_id = %s OR m.source_key = %s)" if has_matches else "d.unique_id = %s")
+        params.extend([normalized_unique_id, normalized_unique_id] if has_matches else [normalized_unique_id])
+    where_clause = " OR ".join(f"({item})" for item in filters)
+    query = f"""
+        SELECT
+            d.decided_at,
+            d.item_id AS manual_review_item_id,
+            d.item_type AS manual_review_item_type,
+            d.source_table AS manual_review_source_table,
+            d.source_key AS manual_review_source_key,
+            d.symbol AS manual_review_symbol,
+            d.unique_id AS manual_review_unique_id,
+            d.setup_id AS manual_review_setup_id,
+            d.decision,
+            d.rationale,
+            d.follow_up_event,
+            d.operator_id,
+            d.note_json,
+            s.created_at AS wait_signal_created_at,
+            s.signal_id,
+            s.status AS wait_signal_status,
+            s.signal_type,
+            s.expected_action,
+            s.operator_summary,
+            s.wait_question,
+            s.condition_json,
+            s.valid_until,
+            s.generated_by,
+            {match_select}
+        FROM {MANUAL_REVIEW_DECISIONS_TABLE} d
+        LEFT JOIN {WAIT_SIGNALS_TABLE} s
+          ON s.source_key = d.item_id
+         AND s.source_table = %s
+         AND s.generated_by = 'manual_review_decision'
+        {match_join}
+        WHERE {where_clause}
+        ORDER BY {order_expr} DESC NULLS LAST
+        LIMIT %s
+    """
+    df = sql_to_df(query, params=tuple([MANUAL_REVIEW_DECISIONS_TABLE, *params, row_limit]))
+    return df.to_dict(orient="records") if not df.empty else []
 
 
 def load_symbol_trace(symbol: str, *, limit: int = 200) -> dict[str, Any]:
@@ -531,6 +732,7 @@ def load_symbol_trace(symbol: str, *, limit: int = 200) -> dict[str, Any]:
         "traces": traces.to_dict(orient="records") if not traces.empty else [],
         "steps": steps.to_dict(orient="records") if not steps.empty else [],
         "action_conflicts": conflicts.to_dict(orient="records") if not conflicts.empty else [],
+        "manual_review_wait_signal_links": load_manual_review_wait_signal_links(symbol=normalized_symbol, limit=row_limit),
     }
 
 

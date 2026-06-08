@@ -24,6 +24,8 @@ STATE_SOURCE_NAME = "advisory:signal_refresh"
 EXIT_ACTIONS = {"SELL", "FULL_EXIT", "EMERGENCY_EXIT", "PARTIAL_SELL", "PARTIAL_EXIT", "REDUCE", "REDUCE_REVIEW", "REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW"}
 BUY_ACTIONS = {"BUY", "BUY_MORE", "ADD_ON_PULLBACK", "BUY_TRIGGERED"}
 WATCH_ACTIONS = {"WATCH", "WATCHLIST", "NEAR_PIVOT", "READY", "MANUAL_REVIEW"}
+WAIT_SIGNAL_NEGATIVE_ACTIONS = {"REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW", "FULL_EXIT", "PARTIAL_EXIT", "SELL", "PARTIAL_SELL", "REDUCE", "REDUCE_REVIEW"}
+WAIT_SIGNAL_POSITIVE_ACTIONS = {"BUY", "BUY_MORE", "BUY_TRIGGERED", "ADD_ON_PULLBACK", "BUY_WATCH", "WATCH_SYMBOLS", "ADD_TO_WATCHLIST", "WATCH"}
 
 
 def json_dumps(value: Any) -> str:
@@ -61,6 +63,18 @@ def _date(value: Any = None) -> pd.Timestamp:
     return out.normalize()
 
 
+def _jsonish(value: Any, default: Any = None) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    text = _text(value)
+    if not text:
+        return {} if default is None else default
+    try:
+        return json.loads(text)
+    except Exception:
+        return {} if default is None else default
+
+
 def table_exists(table_name: str) -> bool:
     try:
         df = sql_to_df(
@@ -94,6 +108,8 @@ def ensure_table() -> None:
                 signal_source TEXT,
                 confidence DOUBLE PRECISION,
                 action_reason TEXT,
+                effect_type TEXT,
+                effect_summary TEXT,
                 action_payload_json TEXT,
                 trace_id TEXT,
                 dry_run BOOLEAN,
@@ -101,6 +117,8 @@ def ensure_table() -> None:
             )
             """
         )
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS effect_type TEXT")
+        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS effect_summary TEXT")
         cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_symbol_refreshed ON {TABLE_NAME} (symbol, refreshed_at DESC)")
         cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_unique_id ON {TABLE_NAME} (unique_id)")
 
@@ -220,6 +238,37 @@ def _extract_action_payload(*, action: dict[str, Any] | None, lifecycle: dict[st
     }
 
 
+def wait_signal_escalation(match: dict[str, Any]) -> dict[str, Any]:
+    expected = _normalized_action(match.get("expected_action")) or "MANUAL_REVIEW"
+    evidence = _jsonish(match.get("evidence_json"), {})
+    wait_context = evidence.get("wait_signal") if isinstance(evidence, dict) else {}
+    if not isinstance(wait_context, dict):
+        wait_context = {}
+    condition_type = _text(wait_context.get("condition_type")) or _text(match.get("signal_type")) or "wait_signal"
+    wait_question = _text(wait_context.get("wait_question"))
+    match_reason = _text(match.get("match_reason")) or "A wait signal matched fresh evidence."
+    if expected in WAIT_SIGNAL_NEGATIVE_ACTIONS or "EXIT" in expected or "SELL" in expected or "REDUCE" in expected:
+        action = "REDUCE_EXPOSURE_REVIEW" if expected not in {"GO_CASH_REVIEW"} else expected
+    elif expected in WAIT_SIGNAL_POSITIVE_ACTIONS or "BUY" in expected or "WATCH" in expected:
+        action = "WATCH"
+    else:
+        action = "MANUAL_REVIEW"
+    reason_bits = [f"Matched {condition_type.replace('_', ' ')} wait signal.", match_reason]
+    if expected != action:
+        reason_bits.append(f"Escalated safely from expected {expected} to review-only {action}.")
+    else:
+        reason_bits.append(f"Expected follow-up action is {expected}.")
+    if wait_question:
+        reason_bits.append(f"Original wait: {wait_question}")
+    return {
+        "action": action,
+        "reason": " ".join(reason_bits),
+        "confidence": _row_confidence(match, "match_score"),
+        "condition_type": condition_type,
+        "expected_action": expected,
+    }
+
+
 def choose_signal(
     *,
     symbol: str,
@@ -242,10 +291,11 @@ def choose_signal(
         confidence = _row_confidence(lifecycle, "target_confidence") or _row_confidence(action, "invest_score_pct")
     elif wait_matches:
         top_wait = wait_matches[0]
+        escalation = wait_signal_escalation(top_wait)
         source = "wait_signal"
-        signal_action = _normalized_action(top_wait.get("expected_action")) or "MANUAL_REVIEW"
-        action_reason = _text(top_wait.get("match_reason")) or "A hypothesis wait signal matched fresh data."
-        confidence = _row_confidence(top_wait, "match_score")
+        signal_action = escalation["action"]
+        action_reason = escalation["reason"]
+        confidence = escalation["confidence"]
     elif events:
         top_event = events[0]
         event_action = _normalized_action(top_event.get("action_type")) or "MANUAL_REVIEW"
@@ -291,6 +341,38 @@ def choose_signal(
     }
 
 
+def classify_signal_effect(
+    *,
+    signal: dict[str, Any],
+    action: dict[str, Any] | None,
+    wait_matches: list[dict[str, Any]] | None = None,
+) -> dict[str, str | None]:
+    wait_matches = wait_matches or []
+    signal_action = _normalized_action(signal.get("signal_action")) or "NO_CHANGE"
+    previous_action = _normalized_action((action or {}).get("action_code"))
+    signal_source = _text(signal.get("signal_source")) or "none"
+
+    if wait_matches:
+        top_match = wait_matches[0]
+        condition_type = _text(top_match.get("signal_type")) or "wait_signal"
+        return {
+            "effect_type": "wait_match_created",
+            "effect_summary": f"Detected a wait-signal match for {condition_type}; fast refresh stayed review-only until operator/advisory reconciliation.",
+            "previous_action": previous_action,
+        }
+    if previous_action and signal_action != previous_action and signal_action != "NO_CHANGE":
+        return {
+            "effect_type": "action_changed",
+            "effect_summary": f"Fast refresh changed the symbol-level action from {previous_action} to {signal_action}; daily advisory remains authoritative.",
+            "previous_action": previous_action,
+        }
+    return {
+        "effect_type": "evidence_only",
+        "effect_summary": f"Watcher refreshed {signal_source} evidence without changing the latest consolidated action.",
+        "previous_action": previous_action,
+    }
+
+
 def make_refresh_id(*, refreshed_at: Any, symbol: str, unique_id: str | None, reason: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, json_dumps({"refreshed_at": str(refreshed_at), "symbol": symbol.upper(), "unique_id": unique_id, "reason": reason})))
 
@@ -331,11 +413,13 @@ def refresh_symbol(
     wait_result = match_wait_signals(symbols=[normalized_symbol], limit=100, persist=not bool(dry_run))
     wait_matches = wait_result.get("matches") or []
     signal = choose_signal(symbol=normalized_symbol, reason=reason, action=action, lifecycle=lifecycle, rebalance=rebalance, events=events, wait_matches=wait_matches)
+    effect = classify_signal_effect(signal=signal, action=action, wait_matches=wait_matches)
     refreshed_at = pd.Timestamp.utcnow()
     refresh_id = make_refresh_id(refreshed_at=refreshed_at, symbol=normalized_symbol, unique_id=unique_id, reason=reason)
     payload = _extract_action_payload(action=action, lifecycle=lifecycle, rebalance=rebalance, events=events)
     payload["wait_signal_matches"] = wait_matches
     payload["wait_signal_match_table"] = WAIT_SIGNAL_MATCHES_TABLE
+    payload["watcher_effect"] = effect
     trace_id = None
     if not dry_run:
         trace_id = safe_trace_call(
@@ -377,6 +461,8 @@ def refresh_symbol(
         "signal_source": signal["signal_source"],
         "confidence": signal["confidence"],
         "action_reason": signal["action_reason"],
+        "effect_type": effect["effect_type"],
+        "effect_summary": effect["effect_summary"],
         "action_payload_json": json_dumps(payload),
         "trace_id": trace_id,
         "dry_run": bool(dry_run),

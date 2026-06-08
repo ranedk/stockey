@@ -1,6 +1,7 @@
 import pandas as pd
 from environs import Env
 
+from advisory.identity_issues import record_dhan_identity_issue
 from utils.db import get_sql, sql_to_df
 from utils.company_master import load_company_master_records
 
@@ -72,6 +73,7 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
 
     if asset_type_lower == "stock":
         company = get_company_master_equity(identifier, exchange_upper)
+        fallback_tried: list[dict[str, object]] = []
         if exchange_upper == "NSE":
             security_id = company.get("dhan_nse_id")
             resolved_ticker = company.get("nse_ticker")
@@ -79,11 +81,25 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
             exchange_segment = "NSE_EQ"
             if pd.isna(security_id):
                 security_id = _resolve_nse_fallback_security_id(company)
+                fallback_tried.append(
+                    {
+                        "exchange": "NSE",
+                        "method": "bse_isin_join",
+                        "result": "found" if not pd.isna(security_id) else "missing",
+                    }
+                )
             if pd.isna(security_id):
                 security_id = company.get("dhan_bse_id")
                 resolved_ticker = company.get("bse_ticker")
                 resolved_exchange = "BSE"
                 exchange_segment = "BSE_EQ"
+                fallback_tried.append(
+                    {
+                        "exchange": "BSE",
+                        "method": "company_master_dhan_bse_id",
+                        "result": "found" if not pd.isna(security_id) else "missing",
+                    }
+                )
         elif exchange_upper == "BSE":
             security_id = company.get("dhan_bse_id")
             resolved_ticker = company.get("bse_ticker")
@@ -94,10 +110,29 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
                 resolved_ticker = company.get("nse_ticker")
                 resolved_exchange = "NSE"
                 exchange_segment = "NSE_EQ"
+                fallback_tried.append(
+                    {
+                        "exchange": "NSE",
+                        "method": "company_master_dhan_nse_id",
+                        "result": "found" if not pd.isna(security_id) else "missing",
+                    }
+                )
         else:
             raise ValueError(f"Unsupported exchange for stock: {exchange}")
         if pd.isna(security_id):
-            raise ValueError(f"No Dhan security id mapped for {exchange_upper}:{identifier}")
+            error_text = f"No Dhan security id mapped for {exchange_upper}:{identifier}"
+            try:
+                record_dhan_identity_issue(
+                    symbol=identifier,
+                    requested_exchange=exchange_upper,
+                    asset_type=asset_type_lower,
+                    company=company,
+                    fallback_tried=fallback_tried,
+                    error_text=error_text,
+                )
+            except Exception as exc:
+                print(f"[dhan.identity] failed to record identity issue for {exchange_upper}:{identifier}: {exc}", flush=True)
+            raise ValueError(error_text)
         return {
             "company_master_id": company["company_master_id"],
             "asset_type": "stock",

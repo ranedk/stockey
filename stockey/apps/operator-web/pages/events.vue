@@ -26,6 +26,8 @@ const { data: policyData, refresh: refreshPolicy } = await useAsyncData('event-p
 const { data: policyEvalData } = await useAsyncData('event-policy-evaluation', () => api.getEventPolicyEvaluation(80))
 const events = computed(() => data.value?.events || [])
 const eventMeta = computed(() => data.value?.meta?.events as Dict || {})
+const snapshotMeta = computed(() => asDict(data.value?.snapshot))
+const snapshotWarning = computed(() => asDict(data.value?.snapshot_warning))
 const policyRows = computed(() => policyData.value?.rows || [])
 const policyEvalRows = computed(() => policyEvalData.value?.summary || [])
 const policySummary = computed(() => policyData.value?.summary || {})
@@ -37,6 +39,10 @@ const actionTypes = ['ALL', 'MANUAL_REVIEW', 'BUY_WATCH', 'REDUCE_EXPOSURE_REVIE
 
 function asList(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
+}
+
+function asDict(value: unknown): Dict {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
 }
 
 function notes(row: Dict): Dict {
@@ -103,6 +109,8 @@ function eventDetailPath(row: Record<string, unknown>) {
       Structured news and announcements are mapped into bounded event-policy actions. Manual review rows include operator notes, wait-for events, and questions; low-value rows are downgraded to no action.
     </p>
   </section>
+
+  <SnapshotWarning class="mt-4" :snapshot="snapshotMeta" :warning="snapshotWarning" :generated-at="data?.generated_at" />
 
   <section class="mt-8 grid gap-4 md:grid-cols-4">
     <MetricTile label="Manual Review" :value="String(actionCounts.MANUAL_REVIEW || 0)" note="Needs operator judgement" />

@@ -48,6 +48,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/exchange_features.py` | `advisory_exchange_features_daily` | Builds daily symbol-level exchange-event features for LLM context, event-model features, review, and risk sizing |
 | `advisory/market_context.py` | `advisory_market_context_universe_daily`, `advisory_market_context_summary_daily` | Builds the top-50% market-context universe from technical/liquidity/market-cap data and summarizes breadth, leadership, sector clusters, events, and regime context |
 | `advisory/operator_health.py` | read-only checks | Operator smoke-test command for DB, Redis, Dhan token, cron logs, key table freshness, frontend dependencies, Poppler, Codex, and TimesFM; also emits `fix_hints` for the Nuxt health page |
+| `advisory/superseded_failures.py` | `advisory_event_processing_runs`, `announcement_pipeline_documents` | Previews recovered failure rows that can be marked superseded; default is dry-run JSON, and `--apply` requires explicit operator intent before writing superseded metadata |
 | `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
 | `advisory/model_training_runner.py` | varies | Gated model-training orchestrator: runs prep, checks label coverage for the requested horizon, then trains and scores only when ready |
 | `advisory/event_model_artifact_store.py` | S3/object store | Uploads trained event-model JSON, metadata JSON, and manifest JSON to versioned and `latest` S3 prefixes |
@@ -59,6 +60,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/wait_signals.py` | `advisory_wait_signals`, `advisory_wait_signal_matches` | Converts hypothesis/playbook action plans into machine-checkable price/news/announcement wait conditions and matches them deterministically |
 | `advisory/decision_trace.py` | `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts`, `advisory_action_conflict_rules` | Durable trace layer that links ingest, event evaluation, review, lifecycle, action consolidation, conflict rows, and seeded conflict-resolution rules |
 | `advisory/action_conflict_resolver.py` | `advisory_action_conflicts`, `advisory_action_conflict_rules` | Re-applies enabled conflict-resolution rules to latest or historical action conflicts after rules are edited; dedupes duplicate conflict rows, keeps resolved conflicts as audit-only trace data, and marks only unresolved/manual-required conflicts for manual handling |
+| `advisory/manual_review_state.py` | `advisory_manual_review_decisions`, `advisory_wait_signals` | Central state/effect contract for operator Manual Review decisions; defines closing versus annotating decisions, no-trade safety flags, and wait-signal side effects |
 | `advisory/trace_summary_store.py` | `advisory_trace_summaries` | Materializes compact symbol/event trace summaries so the operator frontend does not rebuild large traces live on every page load |
 | `advisory/live_dashboard.py` | JSON payload builder | Legacy static dashboard module; API still reuses its payload builder while Nuxt replaces static generation |
 | `advisory/operator_snapshot.py` | `advisory_operator_snapshots` | Builds the compact DB-backed operator dashboard snapshot used by the API to avoid rebuilding the full dashboard payload on every frontend request |
@@ -194,7 +196,7 @@ OSX:
 
 - Event/playbook reason contracts are enriched from latest `advisory_event_evaluations`, `advisory_event_reviews`, and `advisory_playbook_action_plans`. This adds event ids/classes/verdicts/reviewer actions and matched playbook/review-check context before the final action row is accepted.
 
-- `all_watchers.sh` runs `advisory.continuous_watch`, which now augments active watchlist symbols with a lower-priority top-50% market-context queue from `advisory_market_context_universe_daily`. Top-context news and announcements are persisted as `context_observed` unless deterministic materiality keywords mark them `triggered`; only `triggered` rows are routed for advisory refresh/evaluation. Tune breadth with `MARKET_CONTEXT_WATCH_LIMIT` (default `50`). The wrapper self-locks with `/tmp/stockey_watchers.lock`; skipped overlaps exit successfully and the next run resumes from `advisory_sync_state`.
+- `all_watchers.sh` runs `advisory.continuous_watch`, which now augments active watchlist symbols with a lower-priority top-50% market-context queue from `advisory_market_context_universe_daily`. Top-context news and announcements are persisted as `context_observed` unless deterministic materiality keywords mark them `triggered`; only `triggered` rows are routed for advisory refresh/evaluation. Tune breadth with `MARKET_CONTEXT_WATCH_LIMIT` (default `50`). The wrapper self-locks with `/tmp/stockey_watchers.lock`; skipped overlaps exit successfully and the next run resumes from `advisory_sync_state`. Watcher output is an intraday evidence/signal-refresh layer: fresh OHLCV/news/announcement evidence, material context triggers, and matched wait signals can write fast symbol-scoped rows, but final portfolio allocation, cross-sectional action reconciliation, and dry-run execution previews still require the full `all_advisory.sh` path.
 
 - Investor playbooks live in `config/hypotheses.yaml`. Import them with `python -m advisory.hypothesis_engine --import-config config/hypotheses.yaml`; preview with `--dry-run`; run matching/action-plan generation with `python -m advisory.hypothesis_engine --run-scan`. Only `status: trusted_overlay` playbooks can affect consolidated actions, and only as `review_only` overlays.
 
@@ -228,6 +230,7 @@ python -m data.dhanlive.auth_cli clear-cache
 | `all_external_workers.sh` | External queue worker drain | Drains Dhan, Screener, and NSE queues serially under one lock |
 | `complete_data.sh` | Broad ingestion safety net and pre-advisory catch-up | Runs all downloaders and parsers in order; scheduled before market and again before advisory, not in the watcher loop |
 | `all_advisory.sh` | Advisory orchestrator | Runs post-close advisory pipeline and portfolio generation without raw downloads; defaults to bounded local parallel stages and skips hidden rule repair |
+| `all_superseded_cleanup_audit.sh` | Superseded failure cleanup audit | Preview-only wrapper around `advisory.superseded_failures`; emits script markers and never passes `--apply` |
 | `all_ml.sh` | Weekly research training | Long-running event-model research job; scheduled only in a dedicated weekly window if enabled |
 
 Cron also runs selected Python modules directly for operator health, hypothesis scans, TS research refresh/evaluation, event-policy evaluation, technical-threshold calibration, and weekly event-model research training.
@@ -241,6 +244,7 @@ Cron also runs selected Python modules directly for operator health, hypothesis 
 | `complete_data.sh` | Combined ingestion | Full download + parse catch-up/backfill; useful end-of-day, after a missed day, or before a major rerun |
 | `all_ml.sh` | Event-model training orchestrator | Long-running research training; use outputs only after validation/promotion checks |
 | `all_advisory_codex.sh` | Codex-supervised advisory orchestrator | Manual debug/repair wrapper that runs `all_advisory.sh`, captures logs, sends failure lines to Codex CLI, and reruns |
+| `all_analysis_codex.sh` | Codex analysis-development loop | Manual bounded loop that uses `analysis.md` and `docs/analysis_agent_board.md` to pick the next slice, implement it, validate it, and update docs |
 
 The primary operator scripts call `scripts/run_with_markers.sh`, which emits `[stockey.script]` start/end markers to stdout while preserving the wrapped command's exit code. The health parser uses these markers to classify the latest run as `ok`, `failed`, `interrupted_by_operator`, `ok_after_historical_errors`, or `recovered_after_manual_interrupt`.
 
@@ -260,6 +264,7 @@ It schedules:
 - `all_advisory.sh` and `all_watchers.sh` refresh `advisory.operator_snapshot` and `advisory.trace_summary_store` after a successful run so frontend endpoints can serve cached dashboard and trace sections quickly
 - `all_advisory.sh` passes `--intraday-lookback-days ${ADVISORY_INTRADAY_LOOKBACK_DAYS:-30}`; intraday feature reads are session-scoped for the target date so advisory does not scan months of 1-minute candles on every run
 - `advisory.operator_health --skip-dhan` at `08:05`, `12:05`, `17:05`, and `22:05` on weekdays
+- `all_superseded_cleanup_audit.sh` at `17:35` on weekdays as a dry-run-only audit for recovered failure rows; apply mode is intentionally unscheduled
 - `advisory.hypothesis_engine --run-scan` at `10:25`, `13:25`, `16:25`, and `21:25` on weekdays for investor playbook/hypothesis matching over newly collected events
 - `advisory.ts_forecast_workflow` at `11:20`, `14:20`, `17:20`, and `20:20` on weekdays
 

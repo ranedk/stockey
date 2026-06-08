@@ -13,18 +13,28 @@ from typing import Any
 
 import pandas as pd
 from environs import Env
+from pydantic import BaseModel, ConfigDict, Field
 
 from advisory.action_recommender import TABLE_NAME as ACTION_RECOMMENDATIONS_TABLE
-from advisory.decision_trace import load_event_trace, load_symbol_trace
+from advisory.decision_trace import ensure_trace_tables, load_event_trace, load_symbol_trace
 from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
 from advisory.event_model_artifact_store import build_artifact_manifest
 from advisory.event_model_promotion_check import build_promotion_check
 from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audit, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
+from advisory.identity_issues import IDENTITY_ISSUES_TABLE, load_open_identity_issues
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
 from advisory.event_policy_evaluator import SUMMARY_TABLE as EVENT_POLICY_EVAL_SUMMARY_TABLE
 from advisory.execution_engine import EXECUTION_TABLE
 from advisory.live_dashboard import DEFAULT_OUTPUT_DIR, build_live_dashboard_payload
 from advisory.market_context import load_latest_market_context
+from advisory.manual_review_state import (
+    CLOSING_DECISIONS as MANUAL_REVIEW_CLOSING_DECISIONS,
+    MANUAL_REVIEW_DECISIONS_TABLE,
+    apply_decision_side_effects,
+    build_decision_row,
+    runtime_state_for_decision,
+    validate_decision,
+)
 from advisory.operator_health import build_operator_health
 from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
 from advisory.operator_snapshot import load_operator_snapshot
@@ -36,7 +46,7 @@ from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_
 from advisory.technical_threshold_promotion import generate_promotion_review, load_promotion_reviews, record_manual_decision
 from advisory.trace_summary_store import DEFAULT_LIMIT as TRACE_SUMMARY_DEFAULT_LIMIT
 from advisory.trace_summary_store import load_summary as load_materialized_trace_summary
-from advisory.wait_signals import WAIT_SIGNALS_TABLE, make_signal_id, load_wait_signal_matches, load_wait_signals, match_wait_signals, persist_wait_signals
+from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, WAIT_SIGNALS_TABLE, load_wait_signal_matches, load_wait_signals, match_wait_signals
 from utils.db import db_session, sql_to_df, upsert_to_db
 
 
@@ -51,18 +61,415 @@ OPERATOR_API_LARGE_RESPONSE_BYTES = env.int("OPERATOR_API_LARGE_RESPONSE_BYTES",
 OPERATOR_API_TRACE_SUMMARY_CACHE_ENABLED = env.bool("OPERATOR_API_TRACE_SUMMARY_CACHE_ENABLED", True)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CRON_LOG_DIR = env.path("OPERATOR_CRON_LOG_DIR", REPO_ROOT / "logs" / "cron")
-MANUAL_REVIEW_DECISIONS_TABLE = "advisory_manual_review_decisions"
-MANUAL_REVIEW_CLOSING_DECISIONS = {"approve_for_manual_config", "ignore", "downgrade_to_no_action", "mark_fixed"}
-MANUAL_REVIEW_ALLOWED_DECISIONS = MANUAL_REVIEW_CLOSING_DECISIONS | {"needs_more_data", "watch_for_event", "add_operator_note"}
 OPERATOR_COMMAND_RUNS_TABLE = "advisory_operator_command_runs"
 OPERATOR_COMMAND_TIMEOUT_SECONDS = env.int("OPERATOR_COMMAND_TIMEOUT_SECONDS", 180)
 OPERATOR_COMMAND_OUTPUT_TAIL_CHARS = env.int("OPERATOR_COMMAND_OUTPUT_TAIL_CHARS", 12_000)
 OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
 OPERATOR_API_ERROR_TRACE_CHARS = env.int("OPERATOR_API_ERROR_TRACE_CHARS", 4_000)
-MANUAL_REVIEW_WAIT_SIGNAL_DAYS = env.int("MANUAL_REVIEW_WAIT_SIGNAL_DAYS", 30)
 SLOW_ISSUE_ALLOWED_STATUSES = {"open", "triaged", "fixed", "ignored"}
+OPERATOR_API_STALE_CODE_GRACE_SECONDS = env.float("OPERATOR_API_STALE_CODE_GRACE_SECONDS", 2.0)
+PROCESS_STARTED_AT = time.time()
+OPERATOR_API_SCHEMA_VERSION = "2026-06-07.v1"
 
 _PAYLOAD_CACHE: dict[tuple[str, str | None], tuple[float, dict[str, Any]]] = {}
+DISPLAY_REASON_CODE_LABELS = {
+    "blocked_by_adversarial_review": "Blocked by adversarial review",
+    "positive_action_blocked_by_market_context": "Positive action blocked by market context",
+    "risk_off_positive_action_block": "Risk-off market context blocked the positive action",
+    "manual_review": "Manual review",
+    "review_only": "Review only",
+    "incomplete": "Incomplete",
+    "incomplete_downgraded": "Incomplete reason contract; downgraded to manual review",
+    "no_action": "No action",
+    "buy_risk_level": "Buy risk level",
+    "sell_exit_trigger": "Sell exit trigger",
+    "action_reason": "Action reason",
+    "action_source": "Action source",
+    "action_code": "Action code",
+    "evidence_context": "Evidence context",
+    "execution_mode": "Execution mode",
+    "playbook_id": "Playbook id",
+    "playbook_source_key": "Playbook source key",
+    "playbook_review_checks": "Playbook review checks",
+    "event_unique_id": "Event unique id",
+    "event_review_action": "Event review action",
+}
+
+
+class OperatorApiSchemaModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    version: str
+    endpoint: str
+    generated_at: str | None = None
+    read_only: bool
+    broker_execution_enabled: bool
+
+
+class OperatorApiResponseModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class OperatorRuntimeResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    service: str
+    process_started_at: str | None = None
+    uptime_seconds: int | None = None
+    git_rev: str | None = None
+    git_branch: str | None = None
+    git_dirty: bool | None = None
+    latest_source_mtime: str | None = None
+    latest_source_path: str | None = None
+    stale_code: bool | None = None
+    stale_reason: str | None = None
+    operator_action: str | None = None
+    live_trading_enabled: bool | None = None
+    live_trading_disabled: bool | None = None
+    live_trading_env_var: str | None = None
+    live_trading_operator_note: str | None = None
+    read_only: bool
+
+
+class OperatorHealthResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    service: str
+    operator_controlled: bool
+    read_only: bool
+    write_scope: str | None = None
+
+
+class OperatorActionsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    asof_date: str | None = None
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    snapshot_warning: dict[str, Any] | None = None
+    top_action_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    action_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    alerts: list[dict[str, Any]] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorHomeResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    asof_date: str | None = None
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    snapshot_warning: dict[str, Any] | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    runtime_processes: list[dict[str, Any]] = Field(default_factory=list)
+    cron_status: list[dict[str, Any]] = Field(default_factory=list)
+    sync_state: list[dict[str, Any]] = Field(default_factory=list)
+    top_action_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    today_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OperatorSummaryResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    asof_date: str | None = None
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    snapshot_warning: dict[str, Any] | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    runtime_processes: list[dict[str, Any]] = Field(default_factory=list)
+    cron_status: list[dict[str, Any]] = Field(default_factory=list)
+    sync_state: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OperatorPortfolioResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    asof_date: str | None = None
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    snapshot_warning: dict[str, Any] | None = None
+    today_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    current_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    exited_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    portfolio: list[dict[str, Any]] = Field(default_factory=list)
+    lifecycle: list[dict[str, Any]] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorWatchlistResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    asof_date: str | None = None
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    snapshot_warning: dict[str, Any] | None = None
+    watch_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    watchlist: list[dict[str, Any]] = Field(default_factory=list)
+    ts_watch_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    ts_forecast_watch: list[dict[str, Any]] = Field(default_factory=list)
+    ts_forecast_eval_summary: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OperatorMarketContextResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    asof_date: str | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    top_universe: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OperatorEventsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    asof_date: str | None = None
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    snapshot_warning: dict[str, Any] | None = None
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    operator_feed: list[dict[str, Any]] = Field(default_factory=list)
+    alerts: list[dict[str, Any]] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class SignalRefreshResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    signals: list[dict[str, Any]] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorHealthDetailsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    sections: dict[str, Any] = Field(default_factory=dict)
+    fix_hints: list[dict[str, Any]] = Field(default_factory=list)
+    current_blockers: dict[str, Any] | None = None
+
+
+class DataHealthResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    asof_date: str | None = None
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    snapshot_warning: dict[str, Any] | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    sync_state: list[dict[str, Any]] = Field(default_factory=list)
+    runtime_processes: list[dict[str, Any]] = Field(default_factory=list)
+    cron_status: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OperationsSmokeResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str | None = None
+    operator_health: dict[str, Any] = Field(default_factory=dict)
+    fix_hints: list[dict[str, Any]] = Field(default_factory=list)
+    read_only: bool = True
+    note: str | None = None
+
+
+class OperationsCronLogsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    log_dir: str | None = None
+    logs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OperationsCommandsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    commands: list[dict[str, Any]] = Field(default_factory=list)
+    recent_runs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OperationsApiErrorsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    errors: list[dict[str, Any]] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+
+class EventModelPromotionCheckResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    decision: str | None = None
+    ready_for_operator_review: bool | None = None
+    promotion_mode: str | None = None
+    artifact: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] | None = None
+    coverage: dict[str, Any] = Field(default_factory=dict)
+    weekly_runs: dict[str, Any] = Field(default_factory=dict)
+    score_freshness: dict[str, Any] = Field(default_factory=dict)
+    gates: list[dict[str, Any]] = Field(default_factory=list)
+    failed_gates: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
+class EventModelArtifactsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str | None = None
+    artifact: dict[str, Any] = Field(default_factory=dict)
+    latest_s3_heads: list[dict[str, Any]] = Field(default_factory=list)
+    read_only: bool = True
+
+
+class ManualReviewResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    summary: dict[str, Any] = Field(default_factory=dict)
+    items: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class IdentityIssuesResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    summary: dict[str, Any] = Field(default_factory=dict)
+    issues: list[dict[str, Any]] = Field(default_factory=list)
+    skipped: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ManualReviewDecisionResponse(OperatorApiResponseModel):
+    status: str
+    api_schema: OperatorApiSchemaModel
+    decided_at: str | None = None
+    item_id: str
+    decision: str
+    closing_decision: bool
+    next_state: str | None = None
+    creates_wait_signal: bool | None = None
+    wait_signal: dict[str, Any] | None = None
+    note: str | None = None
+
+
+class ActionConflictRulesResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    rules: list[dict[str, Any]] = Field(default_factory=list)
+    unresolved_conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int
+    unresolved_count: int = 0
+
+
+class ActionConflictRuleWriteResponse(OperatorApiResponseModel):
+    status: str
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    rule: dict[str, Any] = Field(default_factory=dict)
+    condition: dict[str, Any] | None = None
+    note: str | None = None
+
+
+class WaitSignalsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    summary: dict[str, Any] = Field(default_factory=dict)
+    sections: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    signals: list[dict[str, Any]] = Field(default_factory=list)
+    matches: list[dict[str, Any]] = Field(default_factory=list)
+    match_result: dict[str, Any] | None = None
+
+
+class WaitSignalMatchResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    match_result: dict[str, Any] = Field(default_factory=dict)
+
+
+class SymbolTraceResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel | None = None
+    symbol: str | None = None
+    processing: list[dict[str, Any]] = Field(default_factory=list)
+    traces: list[dict[str, Any]] = Field(default_factory=list)
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    action_conflicts: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class OperatorDetailResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    kind: str
+    filters: dict[str, Any] = Field(default_factory=dict)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int
+
+
+class EventDetailResponse(OperatorDetailResponse):
+    pass
+
+
+class EventTraceResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel | None = None
+    unique_id: str | None = None
+    processing: list[dict[str, Any]] = Field(default_factory=list)
+    traces: list[dict[str, Any]] = Field(default_factory=list)
+    steps: list[dict[str, Any]] = Field(default_factory=list)
+    action_conflicts: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TraceSummaryResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel | None = None
+    symbol: str | None = None
+    unique_id: str | None = None
+    processing: list[dict[str, Any]] = Field(default_factory=list)
+    decisions: list[dict[str, Any]] = Field(default_factory=list)
+    action_conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    raw_counts: dict[str, Any] = Field(default_factory=dict)
+
+
+class TechnicalCalibrationResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    summary: list[dict[str, Any]] = Field(default_factory=list)
+    top_configs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class TechnicalPromotionReviewsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    reviews: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EventPolicyResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    asof_date: str | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class EventPolicyEvaluationResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    summary: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class HypothesesResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    hypotheses: list[dict[str, Any]] = Field(default_factory=list)
+    matches: list[dict[str, Any]] = Field(default_factory=list)
+    action_plans: list[dict[str, Any]] = Field(default_factory=list)
+    wait_signals: list[dict[str, Any]] = Field(default_factory=list)
+    wait_signal_matches: list[dict[str, Any]] = Field(default_factory=list)
+    promotion_audits: list[dict[str, Any]] = Field(default_factory=list)
+
 
 EVENT_CLASS_LABELS = {
     "REGULATORY_NOTICE": "regulatory or tax notice",
@@ -89,6 +496,24 @@ EVENT_CLASS_LABELS = {
     "CORPORATE_ACTION_NEUTRAL": "routine corporate action",
     "OTHER": "company event",
 }
+
+
+def _operator_api_schema(endpoint: str, *, schema_name: str, version: str = OPERATOR_API_SCHEMA_VERSION) -> dict[str, Any]:
+    return {
+        "name": schema_name,
+        "version": version,
+        "endpoint": endpoint,
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "read_only": True,
+        "broker_execution_enabled": False,
+    }
+
+
+def _with_operator_api_schema(payload: dict[str, Any], *, endpoint: str, schema_name: str) -> dict[str, Any]:
+    enriched = dict(payload or {})
+    enriched.setdefault("generated_at", pd.Timestamp.utcnow().isoformat())
+    enriched.setdefault("api_schema", _operator_api_schema(endpoint, schema_name=schema_name))
+    return enriched
 
 
 def _parse_asof_date(value: str | None) -> pd.Timestamp | None:
@@ -123,6 +548,121 @@ def _snapshot_payload(payload: dict[str, Any]) -> dict[str, Any]:
         out["age_seconds"] = None
     out.setdefault("freshness", "fresh")
     return out
+
+
+def _snapshot_warning_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    snapshot = _snapshot_payload(payload)
+    freshness = str(snapshot.get("freshness") or "").lower()
+    if freshness != "stale":
+        return None
+    reason = str(snapshot.get("reason") or "fresh_snapshot_missing")
+    return {
+        "status": "warn",
+        "title": "Stale operator snapshot",
+        "message": "The API is serving the latest cached operator snapshot because a fresh snapshot is missing.",
+        "source": snapshot.get("source") or "unknown",
+        "generated_at": snapshot.get("generated_at"),
+        "age_seconds": snapshot.get("age_seconds"),
+        "max_age_seconds": snapshot.get("max_age_seconds"),
+        "reason": reason,
+        "operator_action": "run_operator_snapshot_or_wait_for_advisory",
+        "commands": ["python -m advisory.operator_snapshot", "./all_advisory.sh"],
+    }
+
+
+OPERATOR_SOURCE_WARNING_MAX_AGE_SECONDS = int(os.getenv("OPERATOR_SOURCE_WARNING_MAX_AGE_SECONDS", str(36 * 3600)))
+OPERATOR_SOURCE_WARNING_TIMESTAMP_FIELDS = (
+    "updated_at",
+    "last_seen_at",
+    "matched_at",
+    "created_at",
+    "load_ts",
+    "observed_at",
+    "asof_date",
+)
+
+
+def _source_warning_timestamp(row: dict[str, Any], fields: tuple[str, ...] = OPERATOR_SOURCE_WARNING_TIMESTAMP_FIELDS) -> pd.Timestamp | None:
+    latest: pd.Timestamp | None = None
+    for field in fields:
+        ts = pd.to_datetime(row.get(field), utc=True, errors="coerce")
+        if pd.isna(ts):
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _operator_source_warnings(
+    rows: list[dict[str, Any]],
+    *,
+    default_source: str,
+    source_field: str | None = None,
+    skipped: list[dict[str, Any]] | None = None,
+    max_age_seconds: int = OPERATOR_SOURCE_WARNING_MAX_AGE_SECONDS,
+) -> list[dict[str, Any]]:
+    now = pd.Timestamp.utcnow()
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        source = _text(row.get(source_field)) if source_field else ""
+        source = source or default_source
+        group = grouped.setdefault(source, {"source": source, "row_count": 0, "latest_at": None, "timestamped_rows": 0})
+        group["row_count"] += 1
+        ts = _source_warning_timestamp(row)
+        if ts is None:
+            continue
+        group["timestamped_rows"] += 1
+        if group["latest_at"] is None or ts > group["latest_at"]:
+            group["latest_at"] = ts
+
+    warnings: list[dict[str, Any]] = []
+    for source, group in sorted(grouped.items()):
+        latest_at = group.get("latest_at")
+        if latest_at is None:
+            warnings.append(
+                {
+                    "status": "warn",
+                    "title": "Source freshness unknown",
+                    "message": "Rows are visible, but none include a usable source timestamp.",
+                    "source": source,
+                    "reason": "source_timestamp_missing",
+                    "affected_rows": group["row_count"],
+                    "operator_action": "inspect_source_row_or_rerun_source",
+                }
+            )
+            continue
+        age_seconds = max(0, int((now - latest_at).total_seconds()))
+        if age_seconds <= max_age_seconds:
+            continue
+        warnings.append(
+            {
+                "status": "warn",
+                "title": "Stale source rows",
+                "message": "Rows on this page come from source timestamps older than the operator freshness window.",
+                "source": source,
+                "latest_at": latest_at.isoformat(),
+                "age_seconds": age_seconds,
+                "max_age_seconds": max_age_seconds,
+                "affected_rows": group["row_count"],
+                "timestamped_rows": group["timestamped_rows"],
+                "reason": "source_rows_stale",
+                "operator_action": "rerun_source_or_refresh_advisory",
+            }
+        )
+
+    for row in skipped or []:
+        warnings.append(
+            {
+                "status": "warn",
+                "title": "Source unavailable",
+                "message": "A source query failed while building this page, so visible rows may be incomplete.",
+                "source": _text(row.get("source")) or default_source,
+                "error": _text(row.get("error")),
+                "reason": "source_query_skipped",
+                "operator_action": "inspect_source_error_and_rerun_page",
+            }
+        )
+    return warnings
 
 
 def load_operator_payload(*, asof_date: str | pd.Timestamp | None = None) -> dict[str, Any]:
@@ -169,9 +709,101 @@ def build_health_payload() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "stockey-operator-api",
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/health", schema_name="operator_health"),
         "operator_controlled": True,
         "read_only": False,
         "write_scope": "operator_audit_and_research_controls",
+    }
+
+
+def _git_output(args: list[str]) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=REPO_ROOT,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1.5,
+        ).strip()
+    except Exception:
+        return None
+
+
+def _latest_source_mtime(root: Path = REPO_ROOT) -> tuple[float | None, str | None]:
+    ignored_dirs = {
+        ".git",
+        ".mypy_cache",
+        ".nuxt",
+        ".output",
+        ".pytest_cache",
+        "__pycache__",
+        "data",
+        "logs",
+        "node_modules",
+    }
+    source_suffixes = {".css", ".html", ".js", ".json", ".py", ".sh", ".ts", ".vue", ".yaml", ".yml"}
+    latest_mtime: float | None = None
+    latest_path: str | None = None
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in ignored_dirs and not name.startswith(".venv")]
+        for filename in filenames:
+            path = Path(dirpath) / filename
+            if path.suffix not in source_suffixes:
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if latest_mtime is None or mtime > latest_mtime:
+                latest_mtime = mtime
+                try:
+                    latest_path = str(path.relative_to(root))
+                except ValueError:
+                    latest_path = str(path)
+    return latest_mtime, latest_path
+
+
+def _env_bool_runtime(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def build_runtime_payload() -> dict[str, Any]:
+    git_rev = _git_output(["rev-parse", "--short=12", "HEAD"])
+    git_branch = _git_output(["rev-parse", "--abbrev-ref", "HEAD"])
+    dirty_text = _git_output(["status", "--porcelain"])
+    latest_mtime, latest_path = _latest_source_mtime()
+    process_started_at = pd.Timestamp.utcfromtimestamp(PROCESS_STARTED_AT).isoformat()
+    latest_source_mtime = pd.Timestamp.utcfromtimestamp(latest_mtime).isoformat() if latest_mtime else None
+    stale_code = bool(latest_mtime and latest_mtime > PROCESS_STARTED_AT + OPERATOR_API_STALE_CODE_GRACE_SECONDS)
+    live_trading_enabled = _env_bool_runtime("STOCKEY_LIVE_TRADING_ENABLED", False)
+    return {
+        "status": "ok",
+        "service": "stockey-operator-api",
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/runtime", schema_name="operator_runtime"),
+        "process_started_at": process_started_at,
+        "uptime_seconds": max(0, int(time.time() - PROCESS_STARTED_AT)),
+        "git_rev": git_rev,
+        "git_branch": git_branch,
+        "git_dirty": bool(dirty_text),
+        "latest_source_mtime": latest_source_mtime,
+        "latest_source_path": latest_path,
+        "stale_code": stale_code,
+        "stale_reason": "source_newer_than_api_process" if stale_code else None,
+        "operator_action": "restart_operator_api" if stale_code else None,
+        "live_trading_enabled": live_trading_enabled,
+        "live_trading_disabled": not live_trading_enabled,
+        "live_trading_env_var": "STOCKEY_LIVE_TRADING_ENABLED",
+        "live_trading_operator_note": (
+            "Live broker submission is enabled by environment; execution still requires approval, reconciliation, and safety gates."
+            if live_trading_enabled
+            else "Live broker submission is disabled by default; planning and reconciliation stay read-only/dry-run."
+        ),
+        "read_only": True,
     }
 
 
@@ -179,8 +811,10 @@ def build_summary_payload(*, asof_date: str | None = None) -> dict[str, Any]:
     payload = load_operator_payload(asof_date=asof_date)
     return {
         "generated_at": payload.get("generated_at"),
+        "api_schema": _operator_api_schema("/api/summary", schema_name="operator_summary"),
         "asof_date": payload.get("asof_date"),
         "snapshot": _snapshot_payload(payload),
+        "snapshot_warning": _snapshot_warning_payload(payload),
         "summary": payload.get("summary") or {},
         "runtime_processes": payload.get("runtime_processes") or [],
         "cron_status": payload.get("cron_status") or [],
@@ -209,6 +843,7 @@ HOME_CARD_FIELDS = [
     "invest_score_pct",
     "allocation_inr",
     "execution_intent",
+    "execution_safety_contract",
     "exit_strategy",
     "technical_context",
     "announcement_summary",
@@ -239,16 +874,41 @@ def _trim_home_value(value: Any, *, max_text: int = 700, max_list: int = 4, max_
     return value
 
 
+def _display_reason_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    mapped = DISPLAY_REASON_CODE_LABELS.get(text.lower())
+    if mapped:
+        return mapped
+    if "_" in text and "\n" not in text and len(text.split()) <= 3:
+        return text.replace("_", " ").capitalize()
+    return text
+
+
+def _compact_reason_value(key: str, value: Any, *, max_text: int = 320, max_list: int = 4, max_depth: int = 2) -> Any:
+    trimmed = _trim_home_value(value, max_text=max_text, max_list=max_list, max_depth=max_depth)
+    if isinstance(trimmed, str) and any(token in key for token in ("reason", "status", "adjustment")):
+        return _display_reason_text(trimmed) or trimmed
+    if isinstance(trimmed, list) and key in {"missing_fields"}:
+        return [_display_reason_text(item) or item for item in trimmed]
+    return trimmed
+
+
 def _compact_reason_contract(value: Any) -> dict[str, Any] | str | None:
     parsed = _jsonish(value)
     if not isinstance(parsed, dict):
-        return _trim_home_value(value, max_text=500, max_depth=1)
+        trimmed = _trim_home_value(value, max_text=500, max_depth=1)
+        if isinstance(trimmed, str):
+            return _display_reason_text(trimmed) or trimmed
+        return trimmed
     out: dict[str, Any] = {}
     for key in [
         "status",
         "action_code",
         "final_action",
         "new_action",
+        "original_action_code",
         "action_source",
         "execution_action",
         "setup_id",
@@ -258,7 +918,7 @@ def _compact_reason_contract(value: Any) -> dict[str, Any] | str | None:
         "missing_fields",
     ]:
         if parsed.get(key) is not None:
-            out[key] = _trim_home_value(parsed.get(key), max_text=320, max_list=4, max_depth=2)
+            out[key] = _compact_reason_value(key, parsed.get(key), max_text=320, max_list=4, max_depth=2)
     evidence = parsed.get("evidence")
     if isinstance(evidence, dict):
         compact_evidence: dict[str, Any] = {}
@@ -266,8 +926,54 @@ def _compact_reason_contract(value: Any) -> dict[str, Any] | str | None:
             if not isinstance(section_value, dict):
                 continue
             compact_section: dict[str, Any] = {}
-            for item_key, item_value in list(section_value.items())[:5]:
-                trimmed = _trim_home_value(item_value, max_text=160, max_list=3, max_depth=1)
+            if str(section_key) == "conflict_resolution":
+                section_items = [
+                    (key, section_value.get(key))
+                    for key in [
+                        "same_symbol_candidate_count",
+                        "same_symbol_conflict_count",
+                        "winning_action_code",
+                        "winning_action_source",
+                        "source_precedence_reason",
+                        "losing_candidates",
+                    ]
+                    if section_value.get(key) is not None
+                ]
+            elif str(section_key) == "event":
+                section_items = [
+                    (key, section_value.get(key))
+                    for key in [
+                        "event_class",
+                        "verdict",
+                        "review_action",
+                        "veto",
+                        "review_reason",
+                        "action_status",
+                        "state_transition_hint",
+                        "score_impact",
+                    ]
+                    if section_value.get(key) is not None
+                ]
+            elif str(section_key) == "macro_regime":
+                section_items = [
+                    (key, section_value.get(key))
+                    for key in [
+                        "market_context_adjustment",
+                        "market_context_adjustment_reason",
+                        "regime_name",
+                        "macro_risk_state",
+                        "breadth_trend_alignment_pct",
+                        "risk_off_score",
+                        "top_context_rank_pct",
+                        "top_context_sector",
+                    ]
+                    if section_value.get(key) is not None
+                ]
+            else:
+                section_items = list(section_value.items())[:5]
+            for item_key, item_value in section_items:
+                trim_depth = 2 if str(section_key) == "conflict_resolution" and str(item_key) == "losing_candidates" else 1
+                trimmed = _compact_reason_value(str(item_key), item_value, max_text=160, max_list=3, max_depth=trim_depth)
                 if trimmed is not None:
                     compact_section[str(item_key)] = trimmed
             if compact_section:
@@ -282,7 +988,9 @@ def _compact_home_field(key: str, value: Any) -> Any:
         return _compact_reason_contract(value)
     if key == "manual_revision_pointers":
         return _trim_home_value(value, max_text=220, max_list=3, max_depth=2)
-    if key in {"announcement_summary", "news_summary", "reason_detail", "exit_strategy", "manual_revision_summary"}:
+    if key in {"reason", "reason_detail", "action_reason"}:
+        return _compact_reason_value(key, value, max_text=360, max_list=3, max_depth=2)
+    if key in {"announcement_summary", "news_summary", "exit_strategy", "manual_revision_summary"}:
         return _trim_home_value(value, max_text=360, max_list=3, max_depth=2)
     return _trim_home_value(value, max_text=500, max_list=4, max_depth=3)
 
@@ -291,7 +999,7 @@ def _compact_home_rows(rows: Any, *, limit: int) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     if not isinstance(rows, list):
         return out
-    for row in rows[: max(0, int(limit))]:
+    for row in _with_execution_safety_contracts(rows[: max(0, int(limit))]):
         if not isinstance(row, dict):
             continue
         compact = {
@@ -303,12 +1011,50 @@ def _compact_home_rows(rows: Any, *, limit: int) -> list[dict[str, Any]]:
     return out
 
 
+def _execution_safety_contract_from_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    existing = row.get("execution_safety_contract")
+    if isinstance(existing, dict) and existing:
+        return existing
+    safety = _jsonish(row.get("safety_checks_json"))
+    if not isinstance(safety, dict) or not safety:
+        raw_broker = _jsonish(row.get("raw_broker_json"))
+        candidate = raw_broker.get("execution_safety_contract") if isinstance(raw_broker, dict) else None
+        safety = candidate if isinstance(candidate, dict) else {}
+    if not safety:
+        return None
+    issues = safety.get("issues")
+    return {
+        "operator_approval_required": bool(safety.get("operator_approval_required")),
+        "operator_approval_status": str(safety.get("operator_approval_status") or "missing"),
+        "broker_reconciliation_required": bool(safety.get("broker_reconciliation_required")),
+        "broker_reconciliation_status": str(safety.get("broker_reconciliation_status") or "not_run"),
+        "live_submission_allowed": bool(safety.get("live_submission_allowed")),
+        "source": safety.get("source"),
+        "issues": [str(item) for item in issues if str(item or "").strip()] if isinstance(issues, list) else [],
+    }
+
+
+def _with_execution_safety_contracts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        contract = _execution_safety_contract_from_row(item)
+        if contract:
+            item["execution_safety_contract"] = contract
+        out.append(item)
+    return out
+
+
 def build_home_payload(*, asof_date: str | None = None) -> dict[str, Any]:
     payload = load_operator_payload(asof_date=asof_date)
     return {
         "generated_at": payload.get("generated_at"),
+        "api_schema": _operator_api_schema("/api/home", schema_name="operator_home"),
         "asof_date": payload.get("asof_date"),
         "snapshot": _snapshot_payload(payload),
+        "snapshot_warning": _snapshot_warning_payload(payload),
         "summary": payload.get("summary") or {},
         "runtime_processes": payload.get("runtime_processes") or [],
         "cron_status": payload.get("cron_status") or [],
@@ -341,13 +1087,15 @@ def build_actions_payload(
         for row in [*top_action_raw, *action_page, *alert_raw]
         if isinstance(row, dict)
     ])
-    top_action_page = _with_latest_prices(top_action_raw, price_field="current_price", prices=latest_prices)
-    action_page = _with_latest_prices(action_page, price_field="current_price", prices=latest_prices)
+    top_action_page = _with_execution_safety_contracts(_with_latest_prices(top_action_raw, price_field="current_price", prices=latest_prices))
+    action_page = _with_execution_safety_contracts(_with_latest_prices(action_page, price_field="current_price", prices=latest_prices))
     alert_page = _with_latest_prices(alert_raw, price_field="last_price", prices=latest_prices)
     return {
         "generated_at": payload.get("generated_at"),
+        "api_schema": _operator_api_schema("/api/actions", schema_name="operator_actions"),
         "asof_date": payload.get("asof_date"),
         "snapshot": _snapshot_payload(payload),
+        "snapshot_warning": _snapshot_warning_payload(payload),
         "top_action_recommendations": _compact_list_rows(top_action_page, compact=compact),
         "action_recommendations": _compact_list_rows(action_page, compact=compact),
         "alerts": _compact_list_rows(alert_page, compact=compact),
@@ -362,7 +1110,13 @@ def build_actions_payload(
 
 def build_action_conflict_rules_payload() -> dict[str, Any]:
     if not _table_exists(ACTION_CONFLICT_RULES_TABLE):
-        return {"generated_at": pd.Timestamp.utcnow().isoformat(), "rules": [], "row_count": 0}
+        return {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/action-conflict-rules", schema_name="action_conflict_rules"),
+            "rules": [],
+            "unresolved_conflicts": [],
+            "row_count": 0,
+        }
     df = sql_to_df(
         f"""
         SELECT *
@@ -371,10 +1125,215 @@ def build_action_conflict_rules_payload() -> dict[str, Any]:
         """,
         retries=2,
     )
+    unresolved = pd.DataFrame()
+    if _table_exists(ACTION_CONFLICTS_TABLE):
+        unresolved = sql_to_df(
+            f"""
+            SELECT *
+            FROM {ACTION_CONFLICTS_TABLE}
+            WHERE asof_date = (SELECT MAX(asof_date) FROM {ACTION_CONFLICTS_TABLE})
+              AND (
+                COALESCE(requires_manual_resolution, FALSE) = TRUE
+                OR COALESCE(resolution_status, '') IN ('unresolved', 'manual_required')
+              )
+            ORDER BY load_ts DESC NULLS LAST, symbol
+            LIMIT 25
+            """,
+            retries=2,
+        )
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/action-conflict-rules", schema_name="action_conflict_rules"),
         "rules": _json_ready(df.to_dict(orient="records")),
+        "unresolved_conflicts": _json_ready(unresolved.to_dict(orient="records")),
         "row_count": int(len(df)),
+        "unresolved_count": int(len(unresolved)),
+    }
+
+
+def _promoted_conflict_key(conflict: dict[str, Any]) -> str:
+    parts = [
+        conflict.get("asof_date"),
+        conflict.get("symbol"),
+        conflict.get("winning_action_code"),
+        conflict.get("losing_action_code"),
+        conflict.get("winning_source"),
+        conflict.get("losing_source"),
+        conflict.get("losing_setup_id"),
+        conflict.get("losing_unique_id"),
+    ]
+    return ":".join("" if part is None else str(part) for part in parts)
+
+
+def _normalize_action_pair_condition(value: Any) -> dict[str, str]:
+    condition = value
+    if isinstance(value, str):
+        try:
+            condition = json.loads(value)
+        except Exception as exc:
+            raise ValueError("condition_json must be valid JSON") from exc
+    if not isinstance(condition, dict):
+        raise ValueError("condition_json must be an object")
+    condition_type = str(condition.get("condition_type") or "action_pair_exact").strip()
+    if condition_type != "action_pair_exact":
+        raise ValueError("only action_pair_exact conflict rule conditions are supported")
+    out = {
+        "condition_type": "action_pair_exact",
+        "winning_action_code": str(condition.get("winning_action_code") or "").strip().upper(),
+        "losing_action_code": str(condition.get("losing_action_code") or "").strip().upper(),
+        "winning_source": str(condition.get("winning_source") or "").strip().lower(),
+        "losing_source": str(condition.get("losing_source") or "").strip().lower(),
+    }
+    if not out["winning_action_code"] or not out["losing_action_code"]:
+        raise ValueError("condition_json requires winning_action_code and losing_action_code")
+    return out
+
+
+def promote_action_conflict_rule_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    conflict = payload.get("conflict")
+    if not isinstance(conflict, dict):
+        raise ValueError("conflict must be an object")
+    condition = _normalize_action_pair_condition(
+        {
+            "condition_type": "action_pair_exact",
+            "winning_action_code": conflict.get("winning_action_code"),
+            "losing_action_code": conflict.get("losing_action_code"),
+            "winning_source": conflict.get("winning_source"),
+            "losing_source": conflict.get("losing_source"),
+        }
+    )
+    reason = str(payload.get("resolution_reason") or conflict.get("resolution_reason") or conflict.get("lost_reason") or "").strip()
+    if not reason:
+        raise ValueError("resolution_reason is required")
+    if len(reason) > 2_000:
+        raise ValueError("resolution_reason must be 2000 characters or fewer")
+    resolution_action = str(payload.get("resolution_action") or "keep_winner").strip()
+    if resolution_action not in {"keep_winner", "collapse_duplicate", "manual_resolution_required"}:
+        raise ValueError("resolution_action must be keep_winner, collapse_duplicate, or manual_resolution_required")
+    enabled = payload.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+    conflict_key = _promoted_conflict_key(conflict)
+    generated_rule_id = "MANUAL_" + str(uuid.uuid5(uuid.NAMESPACE_URL, json.dumps(condition, sort_keys=True)))[:8].upper()
+    rule_id = str(payload.get("rule_id") or generated_rule_id).strip().upper().replace(" ", "_")
+    if not rule_id:
+        raise ValueError("rule_id is required")
+    rule_name = str(payload.get("rule_name") or f"{condition['winning_action_code']} beats {condition['losing_action_code']}").strip()
+    promotion_note = str(payload.get("promotion_note") or "Promoted from unresolved operator action-conflict review.").strip()
+
+    ensure_trace_tables()
+    now = pd.Timestamp.utcnow()
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            INSERT INTO {ACTION_CONFLICT_RULES_TABLE}
+                (rule_id, rule_name, rule_scope, resolution_action, resolution_reason, enabled, priority,
+                 condition_json, promoted_from_conflict_key, promoted_by, promotion_note, created_at, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (rule_id) DO UPDATE SET
+                rule_name = EXCLUDED.rule_name,
+                rule_scope = EXCLUDED.rule_scope,
+                resolution_action = EXCLUDED.resolution_action,
+                resolution_reason = EXCLUDED.resolution_reason,
+                enabled = EXCLUDED.enabled,
+                priority = EXCLUDED.priority,
+                condition_json = EXCLUDED.condition_json,
+                promoted_from_conflict_key = EXCLUDED.promoted_from_conflict_key,
+                promoted_by = EXCLUDED.promoted_by,
+                promotion_note = EXCLUDED.promotion_note,
+                updated_at = EXCLUDED.updated_at
+            RETURNING *
+            """,
+            (
+                rule_id,
+                rule_name,
+                "manual_resolution",
+                resolution_action,
+                reason,
+                enabled,
+                int(payload.get("priority") or 25),
+                json.dumps(condition, ensure_ascii=False, sort_keys=True),
+                conflict_key,
+                str(payload.get("promoted_by") or "operator"),
+                promotion_note,
+                now,
+                now,
+            ),
+        )
+        row = cur.fetchone()
+        columns = [desc[0] for desc in cur.description]
+    return {
+        "status": "promoted",
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/action-conflict-rules/promote", schema_name="action_conflict_rule_promotion"),
+        "rule": _json_ready(dict(zip(columns, row))),
+        "condition": condition,
+        "note": "Promoted conflict rules are exact action/source matches. They are disabled by default unless enabled is explicitly true; historical action rows are not rewritten.",
+    }
+
+
+def update_action_conflict_rule_payload(rule_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_rule_id = str(rule_id or "").strip()
+    if not normalized_rule_id:
+        raise ValueError("rule_id is required")
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    allowed_fields = {"enabled", "resolution_reason", "reason", "condition", "condition_json"}
+    unknown_fields = sorted(set(payload) - allowed_fields)
+    if unknown_fields:
+        raise ValueError(f"unsupported conflict rule field(s): {', '.join(unknown_fields)}")
+
+    updates: list[str] = []
+    params: list[Any] = []
+    if "enabled" in payload:
+        if not isinstance(payload.get("enabled"), bool):
+            raise ValueError("enabled must be a boolean")
+        updates.append("enabled = %s")
+        params.append(bool(payload["enabled"]))
+    if "resolution_reason" in payload or "reason" in payload:
+        reason_value = payload.get("resolution_reason", payload.get("reason"))
+        reason = str(reason_value or "").strip()
+        if not reason:
+            raise ValueError("resolution_reason is required when editing rule text")
+        if len(reason) > 2_000:
+            raise ValueError("resolution_reason must be 2000 characters or fewer")
+        updates.append("resolution_reason = %s")
+        params.append(reason)
+    if "condition_json" in payload or "condition" in payload:
+        condition_value = payload.get("condition_json", payload.get("condition"))
+        condition = _normalize_action_pair_condition(condition_value)
+        updates.append("condition_json = %s")
+        params.append(json.dumps(condition, ensure_ascii=False, sort_keys=True))
+    if not updates:
+        raise ValueError("at least one editable field is required")
+
+    ensure_trace_tables()
+    now = pd.Timestamp.utcnow()
+    updates.append("updated_at = %s")
+    params.append(now)
+    params.append(normalized_rule_id)
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            UPDATE {ACTION_CONFLICT_RULES_TABLE}
+            SET {", ".join(updates)}
+            WHERE rule_id = %s
+            RETURNING *
+            """,
+            tuple(params),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ValueError(f"Unknown conflict rule: {normalized_rule_id}")
+        columns = [desc[0] for desc in cur.description]
+    return {
+        "status": "updated",
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/action-conflict-rules/{rule_id}", schema_name="action_conflict_rule_update"),
+        "rule": _json_ready(dict(zip(columns, row))),
+        "note": "Rule edits affect future action-candidate ranking/conflict-rule reads where the edited field is consumed; historical action rows are not rewritten.",
     }
 
 
@@ -390,6 +1349,7 @@ def build_signal_refresh_payload(
     if not _table_exists(SIGNAL_REFRESH_TABLE):
         return {
             "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/signal-refresh", schema_name="signal_refresh"),
             "status": "ok",
             "signals": [],
             "meta": {"signals": {"total": 0, "returned": 0}, "filters": {"symbol": symbol, "status": status, "search": search, "compact": compact}},
@@ -411,6 +1371,9 @@ def build_signal_refresh_payload(
     total = int(total_df["total"].iloc[0]) if not total_df.empty else 0
     row_limit = _bounded_limit(limit, default=50)
     row_offset = max(0, int(offset))
+    signal_columns = _table_columns(SIGNAL_REFRESH_TABLE)
+    effect_type_expr = "effect_type" if "effect_type" in signal_columns else "NULL::TEXT AS effect_type"
+    effect_summary_expr = "effect_summary" if "effect_summary" in signal_columns else "NULL::TEXT AS effect_summary"
     rows = sql_to_df(
         f"""
         SELECT
@@ -425,6 +1388,8 @@ def build_signal_refresh_payload(
             signal_source,
             confidence,
             action_reason,
+            {effect_type_expr},
+            {effect_summary_expr},
             trace_id,
             dry_run,
             load_ts
@@ -439,6 +1404,7 @@ def build_signal_refresh_payload(
     next_offset = row_offset + row_limit if row_offset + row_limit < total else None
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/signal-refresh", schema_name="signal_refresh"),
         "status": "ok",
         "signals": _compact_list_rows(page_rows, compact=compact),
         "meta": {
@@ -467,8 +1433,10 @@ def build_portfolio_payload(
     portfolio_page, portfolio_meta = _page_rows(portfolio_rows, limit=limit, offset=offset)
     return {
         "generated_at": payload.get("generated_at"),
+        "api_schema": _operator_api_schema("/api/portfolio", schema_name="operator_portfolio"),
         "asof_date": payload.get("asof_date"),
         "snapshot": _snapshot_payload(payload),
+        "snapshot_warning": _snapshot_warning_payload(payload),
         "today_recommendations": _compact_list_rows(today_rows[: _bounded_limit(limit, default=25)], compact=compact),
         "current_recommendations": _compact_list_rows(current_rows[: _bounded_limit(limit, default=25)], compact=compact),
         "exited_recommendations": _compact_list_rows(exited_rows[: _bounded_limit(limit, default=25)], compact=compact),
@@ -489,7 +1457,10 @@ def build_watchlist_payload(*, asof_date: str | None = None) -> dict[str, Any]:
     payload = load_operator_payload(asof_date=asof_date)
     return {
         "generated_at": payload.get("generated_at"),
+        "api_schema": _operator_api_schema("/api/watchlist", schema_name="operator_watchlist"),
         "asof_date": payload.get("asof_date"),
+        "snapshot": _snapshot_payload(payload),
+        "snapshot_warning": _snapshot_warning_payload(payload),
         "watch_recommendations": payload.get("watch_recommendations") or [],
         "watchlist": payload.get("watchlist") or [],
         "ts_watch_recommendations": payload.get("ts_watch_recommendations") or [],
@@ -503,6 +1474,7 @@ def build_market_context_payload(*, asof_date: str | None = None, limit: int = 5
     payload = load_latest_market_context(parsed_asof, limit=max(0, int(limit)))
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/market-context", schema_name="operator_market_context"),
         "asof_date": asof_date,
         "summary": payload.get("summary") or {},
         "top_universe": payload.get("top_universe") or [],
@@ -522,6 +1494,25 @@ def _table_exists(table_name: str) -> bool:
         retries=2,
     )
     return not df.empty
+
+
+def _table_columns(table_name: str) -> set[str]:
+    try:
+        df = sql_to_df(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            params=(table_name,),
+            retries=2,
+        )
+    except Exception:
+        return set()
+    if df.empty:
+        return set()
+    return {str(value) for value in df["column_name"].dropna().tolist()}
 
 
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
@@ -773,6 +1764,9 @@ COMPACT_LIST_FIELDS = {
     "reason_detail",
     "recommendation_reason",
     "reason_contract_status",
+    "manual_revision_summary",
+    "manual_revision_pointers",
+    "manual_revision_status",
     "portfolio_status",
     "entry_date",
     "entry_price",
@@ -784,6 +1778,8 @@ COMPACT_LIST_FIELDS = {
     "pnl_pct",
     "invest_score_pct",
     "allocation_inr",
+    "execution_intent",
+    "execution_safety_contract",
     "technical_context",
     "technical_state",
     "technical_trigger_type",
@@ -814,6 +1810,15 @@ COMPACT_LIST_FIELDS = {
     "observed_at",
     "load_ts",
     "event_status",
+    "signal_action",
+    "signal_status",
+    "signal_source",
+    "effect_type",
+    "effect_summary",
+    "confidence",
+    "refreshed_at",
+    "dry_run",
+    "trace_id",
     "parse_status",
     "concise_summary_text",
     "summary",
@@ -827,7 +1832,11 @@ def _compact_list_rows(rows: list[dict[str, Any]], *, compact: bool = False) -> 
     for row in rows:
         if not isinstance(row, dict):
             continue
-        compacted.append({key: row.get(key) for key in COMPACT_LIST_FIELDS if row.get(key) not in (None, "", [], {})})
+        compacted.append({
+            key: _compact_home_field(key, row.get(key))
+            for key in COMPACT_LIST_FIELDS
+            if row.get(key) not in (None, "", [], {})
+        })
     return compacted
 
 
@@ -851,8 +1860,15 @@ def _payload_rows_by_kind(payload: dict[str, Any], kind: str) -> list[dict[str, 
 
 
 def _detail_payload(kind: str, rows: list[dict[str, Any]], *, filters: dict[str, Any]) -> dict[str, Any]:
+    schema_by_kind = {
+        "actions": ("/api/actions/detail", "operator_action_detail"),
+        "portfolio": ("/api/portfolio/{symbol}/detail", "operator_portfolio_detail"),
+        "events": ("/api/events/{unique_id}/detail", "operator_event_detail"),
+    }
+    endpoint, schema_name = schema_by_kind.get(kind, (f"/api/{kind}/detail", f"operator_{kind}_detail"))
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema(endpoint, schema_name=schema_name),
         "status": "ok" if rows else "not_found",
         "kind": kind,
         "filters": filters,
@@ -951,6 +1967,7 @@ def build_operator_api_errors_payload(*, limit: int = 50) -> dict[str, Any]:
     if not _table_exists(OPERATOR_API_ERRORS_TABLE):
         return {
             "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/operations/api-errors", schema_name="operations_api_errors"),
             "status": "ok",
             "errors": [],
             "summary": {"total": 0, "error": 0, "warn": 0},
@@ -972,6 +1989,7 @@ def build_operator_api_errors_payload(*, limit: int = 50) -> dict[str, Any]:
     warn_count = len(rows) - error_count
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/operations/api-errors", schema_name="operations_api_errors"),
         "status": "error" if error_count else "warn" if warn_count else "ok",
         "errors": rows,
         "summary": {"total": len(rows), "error": error_count, "warn": warn_count},
@@ -1006,6 +2024,7 @@ def build_technical_calibration_payload(*, limit: int = 25) -> dict[str, Any]:
     if not _table_exists(TECHNICAL_CALIBRATION_SUMMARY_TABLE):
         return {
             "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/technical-calibration", schema_name="technical_calibration"),
             "status": "missing_table",
             "summary": [],
             "top_configs": [],
@@ -1050,6 +2069,7 @@ def build_technical_calibration_payload(*, limit: int = 25) -> dict[str, Any]:
         )
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/technical-calibration", schema_name="technical_calibration"),
         "status": "ok",
         "summary": _records(summary),
         "top_configs": _records(top_configs),
@@ -1075,6 +2095,7 @@ def build_technical_threshold_promotion_review_payload(payload: dict[str, Any]) 
 def build_technical_threshold_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/technical-calibration/promotion-reviews", schema_name="technical_promotion_reviews"),
         "status": "ok",
         "reviews": load_promotion_reviews(limit=limit),
     }
@@ -1120,7 +2141,10 @@ def build_events_payload(
     event_page, event_meta = _page_rows(events, limit=limit, offset=offset)
     return {
         "generated_at": payload.get("generated_at"),
+        "api_schema": _operator_api_schema("/api/events", schema_name="operator_events"),
         "asof_date": payload.get("asof_date"),
+        "snapshot": _snapshot_payload(payload),
+        "snapshot_warning": _snapshot_warning_payload(payload),
         "events": _compact_list_rows(event_page, compact=compact),
         "operator_feed": _compact_list_rows(operator_feed[: _bounded_limit(limit, default=25)], compact=compact),
         "alerts": _compact_list_rows(alerts[: _bounded_limit(limit, default=25)], compact=compact),
@@ -1159,6 +2183,7 @@ def build_event_policy_payload(*, asof_date: str | None = None, action_type: str
     if not _table_exists(EVENT_POLICY_TABLE):
         return {
             "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/event-policy", schema_name="event_policy"),
             "status": "missing_table",
             "summary": {"action_counts": {}, "policy_class_counts": {}},
             "rows": [],
@@ -1220,6 +2245,7 @@ def build_event_policy_payload(*, asof_date: str | None = None, action_type: str
             policy_class_counts[str(item.get("policy_class") or "UNKNOWN")] = policy_class_counts.get(str(item.get("policy_class") or "UNKNOWN"), 0) + count
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/event-policy", schema_name="event_policy"),
         "status": "ok",
         "asof_date": asof_date,
         "summary": {
@@ -1235,6 +2261,7 @@ def build_event_policy_evaluation_payload(*, limit: int = 100) -> dict[str, Any]
     if not _table_exists(EVENT_POLICY_EVAL_SUMMARY_TABLE):
         return {
             "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/event-policy/evaluation", schema_name="event_policy_evaluation"),
             "status": "missing_table",
             "summary": [],
         }
@@ -1263,6 +2290,7 @@ def build_event_policy_evaluation_payload(*, limit: int = 100) -> dict[str, Any]
     )
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/event-policy/evaluation", schema_name="event_policy_evaluation"),
         "status": "ok",
         "summary": _records(df),
     }
@@ -1594,6 +2622,7 @@ def normalize_trace_payload(raw: dict[str, Any]) -> dict[str, Any]:
     trace_rows = list(raw.get("traces") or [])
     step_rows = list(raw.get("steps") or [])
     conflict_rows = list(raw.get("action_conflicts") or [])
+    manual_wait_rows = list(raw.get("manual_review_wait_signal_links") or [])
 
     processing = []
     for row in processing_rows:
@@ -1682,17 +2711,56 @@ def normalize_trace_payload(raw: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
+    manual_wait_links = []
+    for row in manual_wait_rows:
+        manual_wait_links.append(
+            {
+                "decided_at": _ts(row.get("decided_at")),
+                "manual_review_item_id": _text(row.get("manual_review_item_id")),
+                "manual_review_item_type": _text(row.get("manual_review_item_type")),
+                "manual_review_source_table": _text(row.get("manual_review_source_table")),
+                "manual_review_source_key": _text(row.get("manual_review_source_key")),
+                "symbol": _text(row.get("manual_review_symbol")) or _text(row.get("symbol")),
+                "unique_id": _text(row.get("manual_review_unique_id")),
+                "setup_id": _text(row.get("manual_review_setup_id")),
+                "decision": _text(row.get("decision")),
+                "rationale": _text(row.get("rationale")),
+                "follow_up_event": _text(row.get("follow_up_event")),
+                "operator_id": _text(row.get("operator_id")),
+                "wait_signal_created_at": _ts(row.get("wait_signal_created_at")),
+                "signal_id": _text(row.get("signal_id")),
+                "wait_signal_status": _text(row.get("wait_signal_status")),
+                "signal_type": _text(row.get("signal_type")),
+                "expected_action": _text(row.get("expected_action")),
+                "operator_summary": _text(row.get("operator_summary")),
+                "wait_question": _text(row.get("wait_question")),
+                "condition": _jsonish(row.get("condition_json")),
+                "valid_until": _ts(row.get("valid_until")),
+                "generated_by": _text(row.get("generated_by")),
+                "matched_at": _ts(row.get("matched_at")),
+                "match_status": _text(row.get("match_status")),
+                "match_score": row.get("match_score"),
+                "match_source_table": _text(row.get("match_source_table")),
+                "match_source_key": _text(row.get("match_source_key")),
+                "observed_at": _ts(row.get("observed_at")),
+                "match_reason": _text(row.get("match_reason")),
+                "evidence": _jsonish(row.get("evidence_json")),
+            }
+        )
+
     return {
         "symbol": raw.get("symbol"),
         "unique_id": raw.get("unique_id"),
         "processing": processing,
         "decisions": decisions,
         "action_conflicts": conflicts,
+        "manual_review_wait_signal_links": manual_wait_links,
         "raw_counts": {
             "processing": len(processing_rows),
             "traces": len(trace_rows),
             "steps": len(step_rows),
             "action_conflicts": len(conflict_rows),
+            "manual_review_wait_signal_links": len(manual_wait_rows),
         },
     }
 
@@ -1735,7 +2803,10 @@ def build_data_health_payload(*, asof_date: str | None = None) -> dict[str, Any]
     summary = payload.get("summary") or {}
     return {
         "generated_at": payload.get("generated_at"),
+        "api_schema": _operator_api_schema("/api/data-health", schema_name="data_health"),
         "asof_date": payload.get("asof_date"),
+        "snapshot": _snapshot_payload(payload),
+        "snapshot_warning": _snapshot_warning_payload(payload),
         "summary": {
             "alert_count": summary.get("alert_count"),
             "action_count": summary.get("action_count"),
@@ -1748,13 +2819,20 @@ def build_data_health_payload(*, asof_date: str | None = None) -> dict[str, Any]
 
 
 def build_operator_health_payload() -> dict[str, Any]:
-    return build_operator_health()
+    payload = build_operator_health()
+    if isinstance(payload, dict):
+        return {
+            **payload,
+            "api_schema": _operator_api_schema("/api/health/details", schema_name="operator_health_details"),
+        }
+    return payload
 
 
 def build_operations_smoke_payload() -> dict[str, Any]:
     payload = build_operator_health()
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/operations/smoke", schema_name="operations_smoke"),
         "status": payload.get("status"),
         "operator_health": payload,
         "fix_hints": payload.get("fix_hints") or [],
@@ -1797,6 +2875,7 @@ def build_cron_logs_payload(*, limit: int = 20, lines: int = 80) -> dict[str, An
     if not log_dir.exists():
         return {
             "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": _operator_api_schema("/api/operations/cron-logs", schema_name="operations_cron_logs"),
             "status": "missing_log_dir",
             "log_dir": str(log_dir),
             "logs": [],
@@ -1831,6 +2910,7 @@ def build_cron_logs_payload(*, limit: int = 20, lines: int = 80) -> dict[str, An
         )
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/operations/cron-logs", schema_name="operations_cron_logs"),
         "status": "ok",
         "log_dir": str(log_dir),
         "logs": logs,
@@ -1860,6 +2940,10 @@ def build_event_model_promotion_check_payload() -> dict[str, Any]:
     )
     payload = build_promotion_check(args)
     payload["generated_at"] = pd.Timestamp.utcnow().isoformat()
+    payload["api_schema"] = _operator_api_schema(
+        "/api/research/event-model-promotion-check",
+        schema_name="event_model_promotion_check",
+    )
     return payload
 
 
@@ -1906,6 +2990,10 @@ def build_event_model_artifacts_payload() -> dict[str, Any]:
             latest_heads.append({"status": "s3_unavailable", "error": f"{type(exc).__name__}: {exc}"})
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema(
+            "/api/research/event-model-artifacts",
+            schema_name="event_model_artifacts",
+        ),
         "status": manifest.get("status"),
         "artifact": manifest,
         "latest_s3_heads": latest_heads,
@@ -1974,6 +3062,14 @@ OPERATOR_COMMAND_REGISTRY: dict[str, dict[str, Any]] = {
         "dry_run": True,
         "timeout_seconds": 180,
     },
+    "superseded_failure_cleanup_dry_run": {
+        "label": "Superseded Failure Cleanup Dry Run",
+        "description": "Audits recovered event-processing and announcement-document failures that can be marked superseded later. This command is preview-only and never writes cleanup markers.",
+        "args": _python_cmd("-m", "advisory.superseded_failures", "--limit", "500"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 180,
+    },
 }
 
 
@@ -2014,7 +3110,7 @@ def _tail_text(value: str, *, max_chars: int | None = None) -> str:
 def persist_operator_command_run(row: dict[str, Any]) -> None:
     ensure_operator_command_runs_table()
     frame = pd.DataFrame([row])
-    upsert_to_db(frame, OPERATOR_COMMAND_RUNS_TABLE, unique_keys=["run_id"], timescaledb_column="started_at")
+    upsert_to_db(frame, OPERATOR_COMMAND_RUNS_TABLE, unique_keys=["run_id"])
 
 
 def build_operator_commands_payload(*, limit: int = 25) -> dict[str, Any]:
@@ -2034,6 +3130,7 @@ def build_operator_commands_payload(*, limit: int = 25) -> dict[str, Any]:
         row["command_args"] = _jsonish(row.get("command_args_json"))
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/operations/commands", schema_name="operations_commands"),
         "status": "ok",
         "commands": [
             {
@@ -2209,7 +3306,7 @@ def _manual_review_item(
 
 
 def _manual_review_context(*, item_type: str, raw: dict[str, Any], reason: Any = None) -> dict[str, Any]:
-    technical_types = {"event_processing_failure", "announcement_failure", "execution_blocker"}
+    technical_types = {"event_processing_failure", "announcement_failure", "execution_blocker", "identity_issue"}
     research_types = {"threshold_review"}
     is_technical = item_type in technical_types
     if is_technical:
@@ -2259,6 +3356,39 @@ def _manual_review_context(*, item_type: str, raw: dict[str, Any], reason: Any =
             questions = human["operator_questions"]
         if not wait_for:
             wait_for = human["wait_for_events"]
+    elif item_type == "wait_signal_followup":
+        followup = raw.get("wait_signal_followup") if isinstance(raw.get("wait_signal_followup"), dict) else {}
+        matched = _text(followup.get("evidence_summary")) or _text(followup.get("match_reason")) or _text(reason)
+        waited_for = _text(followup.get("wait_question"))
+        summary = f"A previously recorded wait condition has matched. Evidence: {matched}"
+        questions = [
+            "Does this matched evidence answer the original wait condition clearly?",
+            "Does the matched evidence strengthen, weaken, or invalidate the original thesis?",
+            "Should this become a new action candidate, stay on watch, or be closed as noise?",
+        ]
+        if waited_for:
+            questions.insert(0, f"Original wait condition: {waited_for}")
+        wait_for = [
+            "Additional confirmation from price, volume, announcement, or management clarification if the current match is weak",
+            "A fresh advisory or signal-refresh run if the matched evidence is actionable",
+        ]
+        possible_action = "Review the matched evidence and choose whether to close it, keep watching for more evidence, or run the relevant refresh/advisory flow. This item does not mutate portfolio/actions by itself."
+        suggested = "needs_more_data"
+        hint = "A wait signal fired. Decide whether the matched evidence is actionable; no portfolio, action, or broker state has changed."
+    elif item_type == "identity_issue":
+        summary = _text(raw.get("suggested_action")) or _text(reason)
+        questions = [
+            "Is this symbol still tradable and expected in the advisory universe?",
+            "Does company_master contain the right NSE/BSE ticker and Dhan security id?",
+            "After refreshing Dhan and company master data, does the failed downloader/advisory step rerun cleanly?",
+        ]
+        wait_for = [
+            "Fresh Dhan scrip master and company master sync",
+            "Successful rerun of the failed source without the same identity miss",
+        ]
+        possible_action = "Fix the identity mapping, rerun the failed source, then mark fixed only after the row no longer blocks ingestion/advisory."
+        suggested = "mark_fixed"
+        hint = "Identity/data failure. It blocks trusted advisory data for this symbol but does not submit orders or mutate portfolio state."
 
     return {
         "review_lane": lane,
@@ -2430,6 +3560,24 @@ def _safe_manual_query(source_name: str, query: str, *, params: dict[str, Any] |
         return pd.DataFrame()
 
 
+_SUCCESS_PROCESSING_STATUSES = {"ok", "success", "completed", "processed"}
+_RECOVERED_DOCUMENT_STATUSES = {"completed", "success", "ok", "processed", "skipped", "unavailable"}
+
+
+def _processing_failure_is_superseded(row: dict[str, Any]) -> bool:
+    return bool(row.get("superseded_at") or (_text(row.get("superseded_by_status")) or "").lower() in _SUCCESS_PROCESSING_STATUSES)
+
+
+def _announcement_failure_is_active(row: dict[str, Any]) -> bool:
+    ocr_status = (_text(row.get("ocr_status")) or "").lower()
+    parse_status = (_text(row.get("parse_status")) or "").lower()
+    if ocr_status == "failed" or parse_status == "failed":
+        return True
+    if row.get("last_error") is None:
+        return False
+    return not (ocr_status in _RECOVERED_DOCUMENT_STATUSES and parse_status in _RECOVERED_DOCUMENT_STATUSES)
+
+
 def ensure_manual_review_decisions_table() -> None:
     with db_session() as (_, cur):
         cur.execute(
@@ -2477,99 +3625,6 @@ def load_latest_manual_review_decisions(*, limit: int = 1000) -> dict[str, dict[
         row["item_snapshot"] = _jsonish(row.get("item_snapshot_json"))
         decisions[item_id] = row
     return decisions
-
-
-def _manual_wait_signal_keywords(text: str) -> list[str]:
-    stopwords = {
-        "and",
-        "the",
-        "for",
-        "with",
-        "from",
-        "that",
-        "this",
-        "then",
-        "than",
-        "company",
-        "stock",
-        "price",
-        "event",
-        "wait",
-        "follow",
-        "follow-up",
-    }
-    parts = [part.strip().lower() for part in str(text or "").replace("\n", ";").split(";") if part.strip()]
-    words = [
-        "".join(char for char in word.lower() if char.isalnum() or char in {"-", "_"}).strip("-_")
-        for word in str(text or "").replace("/", " ").replace(",", " ").replace(";", " ").split()
-    ]
-    keywords = [part for part in parts if len(part) >= 4]
-    keywords.extend(word for word in words if len(word) >= 5 and word not in stopwords)
-    out: list[str] = []
-    seen: set[str] = set()
-    for keyword in keywords:
-        normalized = " ".join(keyword.split())
-        if normalized and normalized not in seen:
-            out.append(normalized)
-            seen.add(normalized)
-    return out[:16]
-
-
-def persist_manual_review_wait_signal(
-    *,
-    item_id: str,
-    item: dict[str, Any],
-    decision: str,
-    rationale: str | None,
-    follow_up_event: str | None,
-    decided_at: pd.Timestamp,
-    operator_id: str | None,
-) -> dict[str, Any] | None:
-    if decision != "watch_for_event":
-        return None
-    wait_text = _text(follow_up_event) or _text(item.get("possible_action")) or _text(item.get("reason"))
-    if not wait_text:
-        return None
-    symbol = (_text(item.get("symbol")) or "").upper() or None
-    valid_from = decided_at
-    valid_until = decided_at + pd.Timedelta(days=max(1, int(MANUAL_REVIEW_WAIT_SIGNAL_DAYS)))
-    condition = {
-        "keywords": _manual_wait_signal_keywords(wait_text),
-        "sources": ["news", "announcements", "announcement_documents"],
-        "manual_review_item_id": item_id,
-        "operator_id": operator_id,
-        "rationale": rationale,
-        "follow_up_event": wait_text,
-    }
-    row = {
-        "created_at": decided_at,
-        "hypothesis_id": "manual_review",
-        "hypothesis_title": "Operator manual-review follow-up",
-        "source_table": MANUAL_REVIEW_DECISIONS_TABLE,
-        "source_key": item_id,
-        "symbol": symbol,
-        "scope": "symbol" if symbol else "market",
-        "signal_type": "event_keywords",
-        "status": "active",
-        "priority": 75,
-        "expected_action": "MANUAL_REVIEW",
-        "operator_summary": rationale or _text(item.get("operator_summary")) or "Operator asked to watch for follow-up evidence.",
-        "wait_question": wait_text,
-        "condition_json": json.dumps(condition, ensure_ascii=False, sort_keys=True, default=str),
-        "valid_from": valid_from,
-        "valid_until": valid_until,
-        "generated_by": "manual_review_decision",
-        "load_ts": decided_at,
-    }
-    row["signal_id"] = make_signal_id(row)
-    frame = pd.DataFrame([row])
-    persist_wait_signals(frame)
-    return {
-        "signal_id": row["signal_id"],
-        "table": WAIT_SIGNALS_TABLE,
-        "valid_until": valid_until.isoformat(),
-        "keywords": condition["keywords"],
-    }
 
 
 def _append_latest_action_review_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
@@ -2769,17 +3824,26 @@ def _append_processing_failure_items(items: list[dict[str, Any]], skipped: list[
     df = _safe_manual_query(
         table,
         f"""
-        SELECT *
-        FROM {table}
-        WHERE status IN ('failed', 'error')
-           OR error IS NOT NULL
-        ORDER BY COALESCE(completed_at, started_at, load_ts) DESC NULLS LAST
+        SELECT failed.*
+        FROM {table} failed
+        WHERE (failed.status IN ('failed', 'error') OR failed.error IS NOT NULL)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM {table} newer
+              WHERE newer.unique_id = failed.unique_id
+                AND newer.stage = failed.stage
+                AND newer.status IN ('ok', 'success', 'completed', 'processed')
+                AND COALESCE(newer.completed_at, newer.started_at, newer.load_ts) > COALESCE(failed.completed_at, failed.started_at, failed.load_ts)
+          )
+        ORDER BY COALESCE(failed.completed_at, failed.started_at, failed.load_ts) DESC NULLS LAST
         LIMIT %(limit)s
         """,
         params={"limit": max(1, int(limit))},
         skipped=skipped,
     )
     for row in _records(df):
+        if _processing_failure_is_superseded(row):
+            continue
         items.append(
             _manual_review_item(
                 item_type="event_processing_failure",
@@ -2806,7 +3870,13 @@ def _append_announcement_failure_items(items: list[dict[str, Any]], skipped: lis
         FROM {table}
         WHERE ocr_status = 'failed'
            OR parse_status = 'failed'
-           OR last_error IS NOT NULL
+           OR (
+                last_error IS NOT NULL
+                AND NOT (
+                    LOWER(COALESCE(ocr_status, '')) IN ('completed', 'success', 'ok', 'processed', 'skipped', 'unavailable')
+                    AND LOWER(COALESCE(parse_status, '')) IN ('completed', 'success', 'ok', 'processed', 'skipped', 'unavailable')
+                )
+           )
         ORDER BY COALESCE(published_on, created_at, updated_at) DESC NULLS LAST
         LIMIT %(limit)s
         """,
@@ -2814,6 +3884,8 @@ def _append_announcement_failure_items(items: list[dict[str, Any]], skipped: lis
         skipped=skipped,
     )
     for row in _records(df):
+        if not _announcement_failure_is_active(row):
+            continue
         items.append(
             _manual_review_item(
                 item_type="announcement_failure",
@@ -2830,6 +3902,265 @@ def _append_announcement_failure_items(items: list[dict[str, Any]], skipped: lis
         )
 
 
+def _append_identity_issue_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
+    if not _table_exists(IDENTITY_ISSUES_TABLE):
+        skipped.append({"source": IDENTITY_ISSUES_TABLE, "error": "missing_table"})
+        return
+    try:
+        df = load_open_identity_issues(limit=max(1, int(limit)))
+    except Exception as exc:
+        skipped.append({"source": IDENTITY_ISSUES_TABLE, "error": f"{type(exc).__name__}: {exc}"})
+        return
+    for row in _records(df):
+        symbol = row.get("symbol")
+        exchange = row.get("requested_exchange")
+        reason = row.get("error_text") or row.get("suggested_action") or "Unresolved identity issue."
+        items.append(
+            _manual_review_item(
+                item_type="identity_issue",
+                severity="error",
+                status=_text(row.get("status")) or "open",
+                title=f"{exchange or 'Exchange'}:{symbol or 'Symbol'} identity mapping issue",
+                reason=reason,
+                source_table=IDENTITY_ISSUES_TABLE,
+                source_key=row.get("issue_key"),
+                row=row,
+                symbol=symbol,
+                updated_at=row.get("last_seen_at") or row.get("load_ts"),
+            )
+        )
+
+
+def _identity_issue_row(row: dict[str, Any]) -> dict[str, Any]:
+    exchanges_tried = _jsonish(row.get("exchanges_tried_json"))
+    fallback_tried = _jsonish(row.get("fallback_tried_json"))
+    context = _jsonish(row.get("context_json"))
+    if not isinstance(exchanges_tried, list):
+        exchanges_tried = []
+    if not isinstance(fallback_tried, list):
+        fallback_tried = []
+    if not isinstance(context, dict):
+        context = {}
+    symbol = _text(row.get("symbol"))
+    exchange = _text(row.get("requested_exchange"))
+    issue_type = _text(row.get("issue_type")) or "identity_issue"
+    return {
+        "issue_key": _text(row.get("issue_key")),
+        "issue_type": issue_type,
+        "status": _text(row.get("status")) or "open",
+        "symbol": symbol,
+        "requested_exchange": exchange,
+        "asset_type": _text(row.get("asset_type")),
+        "company_master_id": _text(row.get("company_master_id")),
+        "source": _text(row.get("source")),
+        "error_text": _text(row.get("error_text")),
+        "suggested_action": _text(row.get("suggested_action")),
+        "first_seen_at": _ts(row.get("first_seen_at")),
+        "last_seen_at": _ts(row.get("last_seen_at")),
+        "resolved_at": _ts(row.get("resolved_at")),
+        "load_ts": _ts(row.get("load_ts")),
+        "exchanges_tried": exchanges_tried,
+        "fallback_tried": fallback_tried,
+        "context": context,
+        "manual_review_item_id": f"identity_issue:{IDENTITY_ISSUES_TABLE}:{row.get('issue_key')}",
+        "operator_boundary": {
+            "read_only": True,
+            "mutates_identity_mapping": False,
+            "mutates_broker_execution": False,
+            "next_review_surface": "Manual Review",
+        },
+        "repair_hint": (
+            _text(row.get("suggested_action"))
+            or f"Fix the {exchange or 'exchange'}:{symbol or 'symbol'} security mapping, then rerun the failed source."
+        ),
+    }
+
+
+def build_identity_issues_payload(*, limit: int = 100, symbol: str | None = None) -> dict[str, Any]:
+    skipped: list[dict[str, Any]] = []
+    if not _table_exists(IDENTITY_ISSUES_TABLE):
+        skipped.append({"source": IDENTITY_ISSUES_TABLE, "error": "missing_table"})
+        issues: list[dict[str, Any]] = []
+    else:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {IDENTITY_ISSUES_TABLE}
+            WHERE COALESCE(status, 'open') IN ('open', 'active')
+            ORDER BY last_seen_at DESC NULLS LAST, first_seen_at DESC NULLS LAST
+            LIMIT %s
+            """,
+            params=(max(1, int(limit)),),
+            retries=3,
+        )
+        rows = [_identity_issue_row(row) for row in _records(df)]
+        symbol_filter = _text(symbol)
+        if symbol_filter:
+            symbol_filter = symbol_filter.upper()
+            rows = [row for row in rows if str(row.get("symbol") or "").upper() == symbol_filter]
+        issues = rows[: max(1, int(limit))]
+    by_type: dict[str, int] = {}
+    by_exchange: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    for row in issues:
+        by_type[str(row.get("issue_type") or "identity_issue")] = by_type.get(str(row.get("issue_type") or "identity_issue"), 0) + 1
+        by_exchange[str(row.get("requested_exchange") or "unknown")] = by_exchange.get(str(row.get("requested_exchange") or "unknown"), 0) + 1
+        by_source[str(row.get("source") or "unknown")] = by_source.get(str(row.get("source") or "unknown"), 0) + 1
+    source_warnings = _operator_source_warnings(issues, default_source=IDENTITY_ISSUES_TABLE, source_field="source", skipped=skipped)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/identity-issues", schema_name="identity_issues"),
+        "status": "ok",
+        "source_warnings": source_warnings,
+        "summary": {
+            "total_open": len(issues),
+            "by_type": by_type,
+            "by_exchange": by_exchange,
+            "by_source": by_source,
+            "read_only": True,
+            "broker_execution_enabled": False,
+            "source_warnings": source_warnings,
+        },
+        "issues": issues,
+        "skipped": skipped,
+    }
+
+
+def _wait_signal_match_context(row: dict[str, Any]) -> dict[str, Any]:
+    evidence = _jsonish(row.get("evidence_json"))
+    wait_signal = evidence.get("wait_signal") if isinstance(evidence, dict) and isinstance(evidence.get("wait_signal"), dict) else {}
+    condition = _jsonish(row.get("condition_json"))
+    manual_review_item_id = (
+        _text(wait_signal.get("manual_review_item_id")) if isinstance(wait_signal, dict) else None
+    ) or (
+        _text(row.get("signal_source_key")) if _text(row.get("generated_by")) == "manual_review_decision" else None
+    )
+    return {
+        "signal_id": _text(row.get("signal_id")),
+        "manual_review_item_id": manual_review_item_id,
+        "manual_review_source_table": (
+            _text(wait_signal.get("manual_review_source_table")) if isinstance(wait_signal, dict) else None
+        ) or _text(row.get("signal_source_table")),
+        "manual_review_source_key": (
+            _text(wait_signal.get("manual_review_source_key")) if isinstance(wait_signal, dict) else None
+        ) or _text(row.get("signal_source_key")),
+        "wait_question": _text(row.get("wait_question")) or (_text(wait_signal.get("wait_question")) if isinstance(wait_signal, dict) else None),
+        "operator_summary": _text(row.get("operator_summary")) or (_text(wait_signal.get("operator_summary")) if isinstance(wait_signal, dict) else None),
+        "condition_type": (
+            _text(condition.get("condition_type")) if isinstance(condition, dict) else None
+        ) or _text(row.get("signal_type")),
+        "expected_action": _text(row.get("signal_expected_action")) or _text(row.get("expected_action")),
+        "matched_at": _ts(row.get("matched_at")),
+        "match_reason": _text(row.get("match_reason")),
+        "evidence_summary": _wait_signal_evidence_summary(row),
+        "match_source_table": _text(row.get("match_source_table")) or _text(row.get("source_table")),
+        "match_source_key": _text(row.get("match_source_key")) or _text(row.get("source_key")),
+        "observed_at": _ts(row.get("observed_at")),
+        "observed_value": _json_ready(row.get("observed_value")),
+        "threshold_value": _json_ready(row.get("threshold_value")),
+    }
+
+
+def _append_wait_signal_followup_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
+    if not _table_exists(WAIT_SIGNALS_TABLE) or not _table_exists(WAIT_SIGNAL_MATCHES_TABLE):
+        skipped.append({"source": WAIT_SIGNALS_TABLE, "error": "missing_table"})
+        return
+    df = _safe_manual_query(
+        "matched_manual_review_wait_signals",
+        f"""
+        SELECT DISTINCT ON (m.signal_id)
+            m.matched_at,
+            m.signal_id,
+            m.hypothesis_id,
+            m.symbol,
+            m.signal_type,
+            m.expected_action,
+            m.match_status,
+            m.match_score,
+            m.source_table AS match_source_table,
+            m.source_key AS match_source_key,
+            m.observed_at,
+            m.observed_value,
+            m.threshold_value,
+            m.match_reason,
+            m.evidence_json,
+            s.created_at AS signal_created_at,
+            s.hypothesis_title,
+            s.source_table AS signal_source_table,
+            s.source_key AS signal_source_key,
+            s.symbol AS signal_symbol,
+            s.status AS signal_status,
+            s.priority,
+            s.expected_action AS signal_expected_action,
+            s.operator_summary,
+            s.wait_question,
+            s.condition_json,
+            s.valid_until,
+            s.generated_by
+        FROM {WAIT_SIGNAL_MATCHES_TABLE} m
+        JOIN {WAIT_SIGNALS_TABLE} s
+          ON s.signal_id = m.signal_id
+        WHERE s.generated_by = 'manual_review_decision'
+          AND COALESCE(m.match_status, 'matched') = 'matched'
+        ORDER BY m.signal_id, m.matched_at DESC NULLS LAST
+        LIMIT %(limit)s
+        """,
+        params={"limit": max(1, int(limit))},
+        skipped=skipped,
+    )
+    for row in _records(df):
+        context = _wait_signal_match_context(row)
+        manual_review_item_id = _text(context.get("manual_review_item_id"))
+        source_key = f"{row.get('signal_id')}:{row.get('match_source_table')}:{row.get('match_source_key')}"
+        title_symbol = _text(row.get("signal_symbol")) or _text(row.get("symbol")) or "Wait signal"
+        reason_bits = [
+            "A condition you asked the system to watch has matched fresh evidence.",
+            context.get("match_reason") or "",
+        ]
+        if context.get("wait_question"):
+            reason_bits.append(f"Original wait: {context.get('wait_question')}")
+        if manual_review_item_id:
+            reason_bits.append(f"Original Manual Review item: {manual_review_item_id}")
+        raw = dict(row)
+        raw["wait_signal_followup"] = context
+        items.append(
+            _manual_review_item(
+                item_type="wait_signal_followup",
+                severity="review",
+                status="matched_wait_signal",
+                title=f"{title_symbol} wait signal matched",
+                reason=" ".join(str(part).strip() for part in reason_bits if _text(part)),
+                source_table=WAIT_SIGNAL_MATCHES_TABLE,
+                source_key=source_key,
+                row=raw,
+                symbol=row.get("signal_symbol") or row.get("symbol"),
+                unique_id=row.get("match_source_key"),
+                updated_at=row.get("matched_at"),
+            )
+        )
+
+
+def _matched_manual_review_wait_item_ids(items: list[dict[str, Any]]) -> set[str]:
+    out: set[str] = set()
+    for item in items:
+        if item.get("item_type") != "wait_signal_followup":
+            continue
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        followup = raw.get("wait_signal_followup") if isinstance(raw.get("wait_signal_followup"), dict) else {}
+        item_id = _text(followup.get("manual_review_item_id"))
+        if item_id:
+            out.add(item_id)
+    return out
+
+
+def _manual_review_wait_followup_original_item_id(item: dict[str, Any]) -> str | None:
+    if item.get("item_type") != "wait_signal_followup":
+        return None
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    followup = raw.get("wait_signal_followup") if isinstance(raw.get("wait_signal_followup"), dict) else {}
+    return _text(followup.get("manual_review_item_id"))
+
+
 def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
@@ -2839,8 +4170,10 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
     _append_event_policy_review_items(items, skipped, limit=per_source_limit)
     _append_action_conflict_items(items, skipped, limit=per_source_limit)
     _append_threshold_review_items(items, skipped, limit=per_source_limit)
+    _append_wait_signal_followup_items(items, skipped, limit=per_source_limit)
     _append_processing_failure_items(items, skipped, limit=per_source_limit)
     _append_announcement_failure_items(items, skipped, limit=per_source_limit)
+    _append_identity_issue_items(items, skipped, limit=per_source_limit)
     items = _suppress_shadow_manual_review_items(items, skipped)
     deduped: dict[str, dict[str, Any]] = {}
     for item in items:
@@ -2861,14 +4194,58 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
         latest_decisions = load_latest_manual_review_decisions(limit=max(per_source_limit * 5, 1000))
     except Exception as exc:
         skipped.append({"source": MANUAL_REVIEW_DECISIONS_TABLE, "error": f"{type(exc).__name__}: {exc}"})
+    matched_wait_item_ids = _matched_manual_review_wait_item_ids(items)
     active_items: list[dict[str, Any]] = []
     closed_count = 0
     annotated_count = 0
+    reopened_wait_count = 0
+    closed_original_wait_item_ids: set[str] = set()
     for item in items:
-        decision = latest_decisions.get(str(item.get("item_id") or ""))
+        item_id = str(item.get("item_id") or "")
+        original_wait_item_id = _manual_review_wait_followup_original_item_id(item)
+        if original_wait_item_id:
+            original_decision = latest_decisions.get(original_wait_item_id)
+            if original_decision:
+                try:
+                    original_state = runtime_state_for_decision(str(original_decision.get("decision") or ""), has_matched_wait_signal=True)
+                except ValueError:
+                    original_state = None
+                if original_state is not None and original_state.closes_item:
+                    item["latest_operator_decision"] = _json_ready(original_decision)
+                    item["manual_review_state"] = {
+                        "state": original_state.state,
+                        "active": original_state.active,
+                        "closes_item": original_state.closes_item,
+                        "reopened_by_wait_signal": original_state.reopened_by_wait_signal,
+                        "suppression_reason": original_state.suppression_reason,
+                    }
+                    closed_original_wait_item_ids.add(original_wait_item_id)
+                    closed_count += 1
+                    continue
+        decision = latest_decisions.get(item_id)
         if decision:
             item["latest_operator_decision"] = _json_ready(decision)
-            if str(decision.get("decision") or "").strip().lower() in MANUAL_REVIEW_CLOSING_DECISIONS:
+            has_matched_wait_signal = item_id in matched_wait_item_ids
+            try:
+                runtime_state = runtime_state_for_decision(str(decision.get("decision") or ""), has_matched_wait_signal=has_matched_wait_signal)
+            except ValueError:
+                runtime_state = None
+            if runtime_state is not None:
+                item["manual_review_state"] = {
+                    "state": runtime_state.state,
+                    "active": runtime_state.active,
+                    "closes_item": runtime_state.closes_item,
+                    "reopened_by_wait_signal": runtime_state.reopened_by_wait_signal,
+                    "suppression_reason": runtime_state.suppression_reason,
+                }
+                if runtime_state.reopened_by_wait_signal:
+                    reopened_wait_count += 1
+                    continue
+                if not runtime_state.active:
+                    if item_id not in closed_original_wait_item_ids:
+                        closed_count += 1
+                    continue
+            elif str(decision.get("decision") or "").strip().lower() in MANUAL_REVIEW_CLOSING_DECISIONS:
                 closed_count += 1
                 continue
             annotated_count += 1
@@ -2881,17 +4258,22 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
     for row in trimmed:
         by_type[row["item_type"]] = by_type.get(row["item_type"], 0) + 1
         by_severity[row["severity"]] = by_severity.get(row["severity"], 0) + 1
+    source_warnings = _operator_source_warnings(trimmed, default_source="manual_review", source_field="source_table", skipped=skipped)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/manual-review", schema_name="manual_review_queue"),
         "status": "ok",
+        "source_warnings": source_warnings,
         "summary": {
             "total_items": len(trimmed),
             "untrimmed_items": len(items),
             "closed_by_operator": closed_count,
             "annotated_by_operator": annotated_count,
+            "reopened_by_wait_signal": reopened_wait_count,
             "by_type": by_type,
             "by_severity": by_severity,
             "skipped_sources": skipped,
+            "source_warnings": source_warnings,
         },
         "items": trimmed,
     }
@@ -2904,58 +4286,55 @@ def record_manual_review_decision_payload(payload: dict[str, Any]) -> dict[str, 
     item_id = _text(payload.get("item_id")) or _text(item.get("item_id"))
     if not item_id:
         raise ValueError("item_id is required")
-    decision = str(payload.get("decision") or "").strip().lower()
-    if decision not in MANUAL_REVIEW_ALLOWED_DECISIONS:
-        raise ValueError(f"decision must be one of: {', '.join(sorted(MANUAL_REVIEW_ALLOWED_DECISIONS))}")
+    decision = validate_decision(str(payload.get("decision") or ""))
     rationale = _text(payload.get("rationale"))
     if decision != "add_operator_note" and not rationale:
         raise ValueError("rationale is required for this decision")
+    follow_up_event = _text(payload.get("follow_up_event"))
+    if decision == "watch_for_event" and not follow_up_event:
+        raise ValueError("follow_up_event is required when decision is watch_for_event")
     decided_at = pd.Timestamp.utcnow()
     note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
-    if payload.get("follow_up_event") is not None:
-        note["follow_up_event"] = _text(payload.get("follow_up_event"))
-    row = pd.DataFrame(
-        [
-            {
-                "decided_at": decided_at,
-                "item_id": item_id,
-                "item_type": _text(payload.get("item_type")) or _text(item.get("item_type")),
-                "source_table": _text(payload.get("source_table")) or _text(item.get("source_table")),
-                "source_key": _text(payload.get("source_key")) or _text(item.get("source_key")),
-                "symbol": _text(payload.get("symbol")) or _text(item.get("symbol")),
-                "unique_id": _text(payload.get("unique_id")) or _text(item.get("unique_id")),
-                "setup_id": _text(payload.get("setup_id")) or _text(item.get("setup_id")),
-                "decision": decision,
-                "operator_id": _text(payload.get("operator_id")),
-                "rationale": rationale,
-                "follow_up_event": _text(payload.get("follow_up_event")),
-                "note_json": json.dumps(_json_ready(note), ensure_ascii=False, sort_keys=True, default=str),
-                "item_snapshot_json": json.dumps(_json_ready(item), ensure_ascii=False, sort_keys=True, default=str),
-                "load_ts": decided_at,
-            }
-        ]
+    merged_item = {
+        **item,
+        "item_type": _text(payload.get("item_type")) or _text(item.get("item_type")),
+        "source_table": _text(payload.get("source_table")) or _text(item.get("source_table")),
+        "source_key": _text(payload.get("source_key")) or _text(item.get("source_key")),
+        "symbol": _text(payload.get("symbol")) or _text(item.get("symbol")),
+        "unique_id": _text(payload.get("unique_id")) or _text(item.get("unique_id")),
+        "setup_id": _text(payload.get("setup_id")) or _text(item.get("setup_id")),
+    }
+    row = build_decision_row(
+        item_id=item_id,
+        item=merged_item,
+        decision=decision,
+        rationale=rationale,
+        follow_up_event=follow_up_event,
+        operator_id=_text(payload.get("operator_id")),
+        decided_at=decided_at,
+        note=note,
     )
     ensure_manual_review_decisions_table()
     upsert_to_db(row, MANUAL_REVIEW_DECISIONS_TABLE, unique_keys=["item_id", "decided_at"], timescaledb_column="decided_at")
-    wait_signal = persist_manual_review_wait_signal(
+    effects = apply_decision_side_effects(
         item_id=item_id,
-        item=item,
+        item=merged_item,
         decision=decision,
         rationale=rationale,
-        follow_up_event=_text(payload.get("follow_up_event")),
+        follow_up_event=follow_up_event,
         decided_at=decided_at,
         operator_id=_text(payload.get("operator_id")),
     )
     return {
         "status": "ok",
+        "api_schema": _operator_api_schema("/api/manual-review/decision", schema_name="manual_review_decision_result"),
         "decided_at": decided_at.isoformat(),
         "item_id": item_id,
         "decision": decision,
-        "closing_decision": decision in MANUAL_REVIEW_CLOSING_DECISIONS,
-        "wait_signal": wait_signal,
+        **effects,
         "note": (
             "Decision recorded and a wait signal was created. No broker or trading behavior was changed."
-            if wait_signal
+            if effects.get("wait_signal")
             else "Decision recorded only. No config, strategy, broker, or trading behavior was changed."
         ),
     }
@@ -2974,6 +4353,9 @@ def build_hypotheses_payload(*, limit: int = 100) -> dict[str, Any]:
             if audit:
                 promotion_audits.append(audit)
     return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/hypotheses", schema_name="hypotheses"),
+        "status": "ok",
         "hypotheses": hypotheses.to_dict(orient="records") if not hypotheses.empty else [],
         "matches": matches.to_dict(orient="records") if not matches.empty else [],
         "action_plans": action_plans.to_dict(orient="records") if not action_plans.empty else [],
@@ -2983,16 +4365,185 @@ def build_hypotheses_payload(*, limit: int = 100) -> dict[str, Any]:
     }
 
 
-def build_wait_signals_payload(*, limit: int = 100, status: str | None = None, symbol: str | None = None, run_match: bool = False) -> dict[str, Any]:
-    match_result = match_wait_signals(symbols=[symbol] if symbol else None, limit=limit, persist=True) if run_match else None
+def build_wait_signals_payload(*, limit: int = 100, status: str | None = None, symbol: str | None = None) -> dict[str, Any]:
     signals = load_wait_signals(status=status, symbol=symbol, limit=limit)
-    signal_matches = load_wait_signal_matches(limit=limit)
+    signal_rows = [_wait_signal_view(row) for row in (signals.to_dict(orient="records") if not signals.empty else [])]
+    signal_ids = [_text(row.get("signal_id")) for row in signal_rows]
+    signal_matches = load_wait_signal_matches(signal_ids=[item for item in signal_ids if item], symbol=symbol, limit=limit) if signal_ids else pd.DataFrame()
+    match_rows = [_wait_signal_match_view(row) for row in (signal_matches.to_dict(orient="records") if not signal_matches.empty else [])]
+    latest_match_by_signal: dict[str, dict[str, Any]] = {}
+    for match in match_rows:
+        signal_id = _text(match.get("signal_id"))
+        if signal_id and signal_id not in latest_match_by_signal:
+            latest_match_by_signal[signal_id] = match
+    now = pd.Timestamp.utcnow()
+    for row in signal_rows:
+        signal_id = _text(row.get("signal_id"))
+        row["latest_match"] = latest_match_by_signal.get(signal_id) if signal_id else None
+        row["state_bucket"] = _wait_signal_bucket(row, now=now)
+    sections = {
+        "active": [row for row in signal_rows if row.get("state_bucket") == "active"],
+        "matched": [row for row in signal_rows if row.get("state_bucket") == "matched"],
+        "closed": [row for row in signal_rows if row.get("state_bucket") == "closed"],
+        "expired": [row for row in signal_rows if row.get("state_bucket") == "expired"],
+    }
+    source_warnings = _operator_source_warnings(signal_rows + match_rows, default_source=WAIT_SIGNALS_TABLE, source_field="source_table")
+    summary = _wait_signal_summary(signal_rows, match_rows)
+    summary["source_warnings"] = source_warnings
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/wait-signals", schema_name="wait_signals"),
         "status": "ok",
-        "signals": signals.to_dict(orient="records") if not signals.empty else [],
-        "matches": signal_matches.to_dict(orient="records") if not signal_matches.empty else [],
-        "match_result": match_result,
+        "source_warnings": source_warnings,
+        "summary": summary,
+        "sections": sections,
+        "signals": signal_rows,
+        "matches": match_rows,
+        "match_result": None,
+    }
+
+
+def run_wait_signal_match_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = _text(payload.get("symbol"))
+    raw_symbols = payload.get("symbols")
+    symbols = [symbol] if symbol else []
+    if isinstance(raw_symbols, list):
+        symbols.extend(str(item).strip().upper() for item in raw_symbols if str(item or "").strip())
+    symbols = sorted(set(symbols)) or None
+    limit = max(1, min(int(payload.get("limit") or 250), 1000))
+    result = match_wait_signals(symbols=symbols, limit=limit, persist=True)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/wait-signals/match", schema_name="wait_signal_match"),
+        "status": "ok",
+        "match_result": _json_ready(result),
+    }
+
+
+def _wait_signal_bucket(row: dict[str, Any], *, now: pd.Timestamp) -> str:
+    status = str(row.get("status") or "active").strip().lower()
+    if status == "matched":
+        return "matched"
+    if status not in {"active", "open", ""}:
+        return "closed"
+    valid_until = pd.to_datetime(row.get("valid_until"), utc=True, errors="coerce")
+    if not pd.isna(valid_until) and valid_until < now:
+        return "expired"
+    return "active"
+
+
+def _wait_signal_source_label(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text == "manual_review_decision":
+        return "Manual review"
+    if text == "hypothesis_action_plan":
+        return "Playbook action plan"
+    return text.replace("_", " ").title() if text else "System"
+
+
+def _wait_signal_condition_summary(row: dict[str, Any]) -> str:
+    condition = _jsonish(row.get("condition_json"))
+    signal_type = str(row.get("signal_type") or "").strip().lower()
+    condition_type = str(condition.get("condition_type") or signal_type).strip().lower() if isinstance(condition, dict) else signal_type
+    issue_reason = condition.get("issue_reason") if isinstance(condition, dict) else None
+    if issue_reason:
+        return f"Condition issue: {issue_reason}"
+    if condition_type in {"price_close", "price_level"}:
+        operator = str(condition.get("operator") or "").strip().lower()
+        operator_label = {
+            "gte": "above or equal to",
+            "above": "above",
+            "close_above": "above",
+            "lte": "below or equal to",
+            "below": "below",
+            "close_below": "below",
+        }.get(operator, operator.replace("_", " "))
+        threshold = condition.get("threshold")
+        if operator_label and threshold is not None:
+            observed_field = str(condition.get("observed_field") or "close").replace("_", " ")
+            return f"Wait for latest {observed_field} to be {operator_label} {threshold}."
+    keywords = condition.get("keywords") if isinstance(condition, dict) else None
+    if isinstance(keywords, list) and keywords:
+        label = condition_type.replace("_", " ") if condition_type else "evidence"
+        return f"Wait for {label} evidence containing: {', '.join(str(item) for item in keywords[:8])}."
+    question = _text(row.get("wait_question"))
+    if question:
+        return question
+    return _text(row.get("operator_summary")) or "Wait condition was recorded without a readable summary."
+
+
+def _wait_signal_evidence_summary(row: dict[str, Any]) -> str:
+    evidence = _jsonish(row.get("evidence_json"))
+    reason = _text(row.get("match_reason"))
+    if reason:
+        return reason
+    if isinstance(evidence, dict):
+        subject = _text(evidence.get("subject"))
+        summary = _text(evidence.get("concise_summary_text"))
+        if subject and summary:
+            return f"{subject}: {summary}"
+        if subject:
+            return subject
+        if summary:
+            return summary
+    return "Matched evidence is available in raw details."
+
+
+def _wait_signal_view(row: dict[str, Any]) -> dict[str, Any]:
+    out = _json_ready(dict(row))
+    out["source_label"] = _wait_signal_source_label(out.get("generated_by"))
+    out["condition"] = _jsonish(out.get("condition_json"))
+    out["condition_type"] = out["condition"].get("condition_type") if isinstance(out["condition"], dict) else out.get("signal_type")
+    out["condition_issue"] = out["condition"].get("issue_reason") if isinstance(out["condition"], dict) else None
+    out["condition_summary"] = _wait_signal_condition_summary(out)
+    out["is_manual_review_signal"] = str(out.get("generated_by") or "").strip().lower() == "manual_review_decision"
+    out["is_playbook_signal"] = str(out.get("generated_by") or "").strip().lower() == "hypothesis_action_plan"
+    condition = out["condition"] if isinstance(out.get("condition"), dict) else {}
+    out["manual_review_item_id"] = condition.get("manual_review_item_id") or (out.get("source_key") if out["is_manual_review_signal"] else None)
+    out["manual_review_source_table"] = out.get("source_table") if out["is_manual_review_signal"] else None
+    out["manual_review_source_key"] = out.get("source_key") if out["is_manual_review_signal"] else None
+    return out
+
+
+def _wait_signal_match_view(row: dict[str, Any]) -> dict[str, Any]:
+    out = _json_ready(dict(row))
+    out["evidence"] = _jsonish(out.get("evidence_json"))
+    out["evidence_summary"] = _wait_signal_evidence_summary(out)
+    wait_signal = out["evidence"].get("wait_signal") if isinstance(out.get("evidence"), dict) and isinstance(out["evidence"].get("wait_signal"), dict) else {}
+    out["manual_review_item_id"] = wait_signal.get("manual_review_item_id")
+    out["manual_review_source_table"] = wait_signal.get("manual_review_source_table")
+    out["manual_review_source_key"] = wait_signal.get("manual_review_source_key")
+    out["wait_question"] = wait_signal.get("wait_question")
+    out["wait_generated_by"] = wait_signal.get("generated_by")
+    return out
+
+
+def _wait_signal_summary(signals: list[dict[str, Any]], matches: list[dict[str, Any]]) -> dict[str, Any]:
+    by_status: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    by_signal_type: dict[str, int] = {}
+    by_bucket: dict[str, int] = {}
+    for row in signals:
+        status = str(row.get("status") or "active").strip().lower()
+        source = str(row.get("source_label") or "System")
+        signal_type = str(row.get("signal_type") or "unknown")
+        bucket = str(row.get("state_bucket") or "unknown")
+        by_status[status] = by_status.get(status, 0) + 1
+        by_source[source] = by_source.get(source, 0) + 1
+        by_signal_type[signal_type] = by_signal_type.get(signal_type, 0) + 1
+        by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
+    return {
+        "total_signals": len(signals),
+        "total_matches": len(matches),
+        "active": by_bucket.get("active", 0),
+        "matched": by_bucket.get("matched", 0),
+        "expired": by_bucket.get("expired", 0),
+        "closed": by_bucket.get("closed", 0),
+        "manual_review": sum(1 for row in signals if row.get("is_manual_review_signal")),
+        "playbook": sum(1 for row in signals if row.get("is_playbook_signal")),
+        "by_status": by_status,
+        "by_source": by_source,
+        "by_signal_type": by_signal_type,
     }
 
 
@@ -3130,23 +4681,27 @@ def create_app():
                 detail={"message": str(exc), "error_type": type(exc).__name__, "operation": operation, "route": route},
             ) from exc
 
-    @app.get("/api/health")
+    @app.get("/api/health", response_model=OperatorHealthResponse)
     def health():
-        return build_health_payload()
+        return _guard(build_health_payload, route="/api/health")
 
-    @app.get("/api/health/details")
+    @app.get("/api/runtime", response_model=OperatorRuntimeResponse)
+    def runtime():
+        return _guard(build_runtime_payload, route="/api/runtime")
+
+    @app.get("/api/health/details", response_model=OperatorHealthDetailsResponse)
     def health_details():
         return _guard(build_operator_health_payload, route="/api/health/details")
 
-    @app.get("/api/operations/smoke")
+    @app.get("/api/operations/smoke", response_model=OperationsSmokeResponse)
     def operations_smoke():
         return _guard(build_operations_smoke_payload, route="/api/operations/smoke")
 
-    @app.get("/api/operations/cron-logs")
+    @app.get("/api/operations/cron-logs", response_model=OperationsCronLogsResponse)
     def operations_cron_logs(limit: int = Query(default=20, ge=1, le=100), lines: int = Query(default=80, ge=1, le=300)):
         return _guard(build_cron_logs_payload, route="/api/operations/cron-logs", limit=limit, lines=lines)
 
-    @app.get("/api/operations/commands")
+    @app.get("/api/operations/commands", response_model=OperationsCommandsResponse)
     def operations_commands(limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_operator_commands_payload, route="/api/operations/commands", limit=limit)
 
@@ -3154,7 +4709,7 @@ def create_app():
     def operations_command_run(payload: dict[str, Any] = Body(...)):
         return _guard(run_operator_command_payload, route="/api/operations/commands/run", payload=payload)
 
-    @app.get("/api/operations/api-errors")
+    @app.get("/api/operations/api-errors", response_model=OperationsApiErrorsResponse)
     def operations_api_errors(limit: int = Query(default=50, ge=1, le=200)):
         return _guard(build_operator_api_errors_payload, route="/api/operations/api-errors", limit=limit)
 
@@ -3162,31 +4717,35 @@ def create_app():
     def operations_slow_issue_status(payload: dict[str, Any] = Body(...)):
         return _guard(update_slow_issue_payload, route="/api/operations/slow-issues/status", payload=payload)
 
-    @app.get("/api/research/event-model-promotion-check")
+    @app.get("/api/research/event-model-promotion-check", response_model=EventModelPromotionCheckResponse)
     def research_event_model_promotion_check():
         return _guard(build_event_model_promotion_check_payload, route="/api/research/event-model-promotion-check")
 
-    @app.get("/api/research/event-model-artifacts")
+    @app.get("/api/research/event-model-artifacts", response_model=EventModelArtifactsResponse)
     def research_event_model_artifacts():
         return _guard(build_event_model_artifacts_payload, route="/api/research/event-model-artifacts")
 
-    @app.get("/api/manual-review")
+    @app.get("/api/manual-review", response_model=ManualReviewResponse)
     def manual_review(limit: int = Query(default=100, ge=1, le=500)):
         return _guard(build_manual_review_payload, route="/api/manual-review", limit=limit)
 
-    @app.post("/api/manual-review/decision")
+    @app.get("/api/identity-issues", response_model=IdentityIssuesResponse)
+    def identity_issues(limit: int = Query(default=100, ge=1, le=500), symbol: str | None = None):
+        return _guard(build_identity_issues_payload, route="/api/identity-issues", limit=limit, symbol=symbol)
+
+    @app.post("/api/manual-review/decision", response_model=ManualReviewDecisionResponse)
     def manual_review_decision(payload: dict[str, Any] = Body(...)):
         return _guard(record_manual_review_decision_payload, route="/api/manual-review/decision", payload=payload)
 
-    @app.get("/api/summary")
+    @app.get("/api/summary", response_model=OperatorSummaryResponse)
     def summary(asof_date: str | None = None):
         return _guard(build_summary_payload, route="/api/summary", asof_date=asof_date)
 
-    @app.get("/api/home")
+    @app.get("/api/home", response_model=OperatorHomeResponse)
     def home(asof_date: str | None = None):
         return _guard(build_home_payload, route="/api/home", asof_date=asof_date)
 
-    @app.get("/api/actions")
+    @app.get("/api/actions", response_model=OperatorActionsResponse)
     def actions(
         asof_date: str | None = None,
         limit: int = Query(default=50, ge=0, le=500),
@@ -3199,15 +4758,23 @@ def create_app():
     ):
         return _guard(build_actions_payload, route="/api/actions", asof_date=asof_date, limit=limit, offset=offset, symbol=symbol, action=action, status=status, search=search, compact=compact)
 
-    @app.get("/api/actions/detail")
+    @app.get("/api/actions/detail", response_model=OperatorDetailResponse)
     def action_detail(symbol: str | None = None, unique_id: str | None = None, setup_id: str | None = None, asof_date: str | None = None):
         return _guard(build_action_detail_payload, route="/api/actions/detail", symbol=symbol, unique_id=unique_id, setup_id=setup_id, asof_date=asof_date)
 
-    @app.get("/api/action-conflict-rules")
+    @app.get("/api/action-conflict-rules", response_model=ActionConflictRulesResponse)
     def action_conflict_rules():
         return _guard(build_action_conflict_rules_payload, route="/api/action-conflict-rules")
 
-    @app.get("/api/signal-refresh")
+    @app.post("/api/action-conflict-rules/promote", response_model=ActionConflictRuleWriteResponse)
+    def action_conflict_rule_promote(payload: dict[str, Any] = Body(...)):
+        return _guard(promote_action_conflict_rule_payload, route="/api/action-conflict-rules/promote", payload=payload)
+
+    @app.post("/api/action-conflict-rules/{rule_id}", response_model=ActionConflictRuleWriteResponse)
+    def action_conflict_rule_update(rule_id: str, payload: dict[str, Any] = Body(...)):
+        return _guard(update_action_conflict_rule_payload, route="/api/action-conflict-rules/{rule_id}", rule_id=rule_id, payload=payload)
+
+    @app.get("/api/signal-refresh", response_model=SignalRefreshResponse)
     def signal_refresh(
         limit: int = Query(default=50, ge=0, le=500),
         offset: int = Query(default=0, ge=0),
@@ -3218,7 +4785,7 @@ def create_app():
     ):
         return _guard(build_signal_refresh_payload, route="/api/signal-refresh", limit=limit, offset=offset, symbol=symbol, status=status, search=search, compact=compact)
 
-    @app.get("/api/portfolio")
+    @app.get("/api/portfolio", response_model=OperatorPortfolioResponse)
     def portfolio(
         asof_date: str | None = None,
         limit: int = Query(default=50, ge=0, le=500),
@@ -3230,19 +4797,19 @@ def create_app():
     ):
         return _guard(build_portfolio_payload, route="/api/portfolio", asof_date=asof_date, limit=limit, offset=offset, symbol=symbol, status=status, search=search, compact=compact)
 
-    @app.get("/api/portfolio/{symbol}/detail")
+    @app.get("/api/portfolio/{symbol}/detail", response_model=OperatorDetailResponse)
     def portfolio_detail(symbol: str, asof_date: str | None = None):
         return _guard(build_portfolio_detail_payload, route="/api/portfolio/{symbol}/detail", symbol=symbol, asof_date=asof_date)
 
-    @app.get("/api/watchlist")
+    @app.get("/api/watchlist", response_model=OperatorWatchlistResponse)
     def watchlist(asof_date: str | None = None):
         return _guard(build_watchlist_payload, route="/api/watchlist", asof_date=asof_date)
 
-    @app.get("/api/market-context")
+    @app.get("/api/market-context", response_model=OperatorMarketContextResponse)
     def market_context(asof_date: str | None = None, limit: int = Query(default=50, ge=0, le=500)):
         return _guard(build_market_context_payload, route="/api/market-context", asof_date=asof_date, limit=limit)
 
-    @app.get("/api/technical-calibration")
+    @app.get("/api/technical-calibration", response_model=TechnicalCalibrationResponse)
     def technical_calibration(limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_technical_calibration_payload, route="/api/technical-calibration", limit=limit)
 
@@ -3250,7 +4817,7 @@ def create_app():
     def technical_calibration_promotion_review(payload: dict[str, Any]):
         return _guard(build_technical_threshold_promotion_review_payload, route="/api/technical-calibration/promotion-review", payload=payload)
 
-    @app.get("/api/technical-calibration/promotion-reviews")
+    @app.get("/api/technical-calibration/promotion-reviews", response_model=TechnicalPromotionReviewsResponse)
     def technical_calibration_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_technical_threshold_reviews_payload, route="/api/technical-calibration/promotion-reviews", limit=limit)
 
@@ -3258,7 +4825,7 @@ def create_app():
     def technical_calibration_promotion_review_decision(payload: dict[str, Any]):
         return _guard(build_technical_threshold_review_decision_payload, route="/api/technical-calibration/promotion-review/decision", payload=payload)
 
-    @app.get("/api/events")
+    @app.get("/api/events", response_model=OperatorEventsResponse)
     def events(
         asof_date: str | None = None,
         limit: int = Query(default=50, ge=0, le=500),
@@ -3270,45 +4837,74 @@ def create_app():
     ):
         return _guard(build_events_payload, route="/api/events", asof_date=asof_date, limit=limit, offset=offset, symbol=symbol, status=status, search=search, compact=compact)
 
-    @app.get("/api/events/{unique_id}/detail")
+    @app.get("/api/events/{unique_id}/detail", response_model=EventDetailResponse)
     def event_detail(unique_id: str, asof_date: str | None = None):
-        return _guard(build_event_detail_payload, route="/api/events/{unique_id}/detail", unique_id=unique_id, asof_date=asof_date)
+        payload = _guard(build_event_detail_payload, route="/api/events/{unique_id}/detail", unique_id=unique_id, asof_date=asof_date)
+        return _with_operator_api_schema(
+            payload,
+            endpoint="/api/events/{unique_id}/detail",
+            schema_name="operator_event_detail",
+        )
 
-    @app.get("/api/event-policy")
+    @app.get("/api/event-policy", response_model=EventPolicyResponse)
     def event_policy(asof_date: str | None = None, action_type: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
         return _guard(build_event_policy_payload, route="/api/event-policy", asof_date=asof_date, action_type=action_type, limit=limit)
 
-    @app.get("/api/event-policy/evaluation")
+    @app.get("/api/event-policy/evaluation", response_model=EventPolicyEvaluationResponse)
     def event_policy_evaluation(limit: int = Query(default=100, ge=1, le=500)):
         return _guard(build_event_policy_evaluation_payload, route="/api/event-policy/evaluation", limit=limit)
 
-    @app.get("/api/events/{unique_id}/trace")
+    @app.get("/api/events/{unique_id}/trace", response_model=EventTraceResponse)
     def event_trace(unique_id: str):
-        return _guard(build_event_trace_payload, route="/api/events/{unique_id}/trace", unique_id=unique_id)
+        payload = _guard(build_event_trace_payload, route="/api/events/{unique_id}/trace", unique_id=unique_id)
+        return _with_operator_api_schema(
+            payload,
+            endpoint="/api/events/{unique_id}/trace",
+            schema_name="operator_event_trace",
+        )
 
-    @app.get("/api/events/{unique_id}/trace/summary")
+    @app.get("/api/events/{unique_id}/trace/summary", response_model=TraceSummaryResponse)
     def event_trace_summary(unique_id: str):
-        return _guard(build_event_trace_summary_payload, route="/api/events/{unique_id}/trace/summary", unique_id=unique_id)
+        payload = _guard(build_event_trace_summary_payload, route="/api/events/{unique_id}/trace/summary", unique_id=unique_id)
+        return _with_operator_api_schema(
+            payload,
+            endpoint="/api/events/{unique_id}/trace/summary",
+            schema_name="operator_event_trace_summary",
+        )
 
-    @app.get("/api/symbols/{symbol}/trace")
+    @app.get("/api/symbols/{symbol}/trace", response_model=SymbolTraceResponse)
     def symbol_trace(symbol: str, limit: int = Query(default=100, ge=1, le=500)):
-        return _guard(build_symbol_trace_payload, route="/api/symbols/{symbol}/trace", symbol=symbol, limit=limit)
+        payload = _guard(build_symbol_trace_payload, route="/api/symbols/{symbol}/trace", symbol=symbol, limit=limit)
+        return _with_operator_api_schema(
+            payload,
+            endpoint="/api/symbols/{symbol}/trace",
+            schema_name="operator_symbol_trace",
+        )
 
-    @app.get("/api/symbols/{symbol}/trace/summary")
+    @app.get("/api/symbols/{symbol}/trace/summary", response_model=TraceSummaryResponse)
     def symbol_trace_summary(symbol: str, limit: int = Query(default=100, ge=1, le=500)):
-        return _guard(build_symbol_trace_summary_payload, route="/api/symbols/{symbol}/trace/summary", symbol=symbol, limit=limit)
+        payload = _guard(build_symbol_trace_summary_payload, route="/api/symbols/{symbol}/trace/summary", symbol=symbol, limit=limit)
+        return _with_operator_api_schema(
+            payload,
+            endpoint="/api/symbols/{symbol}/trace/summary",
+            schema_name="operator_symbol_trace_summary",
+        )
 
-    @app.get("/api/data-health")
+    @app.get("/api/data-health", response_model=DataHealthResponse)
     def data_health(asof_date: str | None = None):
         return _guard(build_data_health_payload, route="/api/data-health", asof_date=asof_date)
 
-    @app.get("/api/hypotheses")
+    @app.get("/api/hypotheses", response_model=HypothesesResponse)
     def hypotheses(limit: int = Query(default=100, ge=0, le=500)):
         return _guard(build_hypotheses_payload, route="/api/hypotheses", limit=limit)
 
-    @app.get("/api/wait-signals")
-    def wait_signals(limit: int = Query(default=100, ge=1, le=500), status: str | None = None, symbol: str | None = None, run_match: bool = Query(default=False)):
-        return _guard(build_wait_signals_payload, route="/api/wait-signals", limit=limit, status=status, symbol=symbol, run_match=run_match)
+    @app.get("/api/wait-signals", response_model=WaitSignalsResponse)
+    def wait_signals(limit: int = Query(default=100, ge=1, le=500), status: str | None = None, symbol: str | None = None):
+        return _guard(build_wait_signals_payload, route="/api/wait-signals", limit=limit, status=status, symbol=symbol)
+
+    @app.post("/api/wait-signals/match", response_model=WaitSignalMatchResponse)
+    def wait_signal_match(payload: dict[str, Any] = Body(default_factory=dict)):
+        return _guard(run_wait_signal_match_payload, route="/api/wait-signals/match", payload=payload)
 
     @app.post("/api/hypotheses")
     def hypothesis_create(payload: dict[str, Any] = Body(...)):
