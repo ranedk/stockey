@@ -18,13 +18,14 @@ from pydantic import BaseModel, ConfigDict, Field
 from advisory.action_recommender import TABLE_NAME as ACTION_RECOMMENDATIONS_TABLE
 from advisory.company_memory_review import TABLE_NAME as COMPANY_MEMORY_REVIEWS_TABLE
 from advisory.config_change_assistant import build_signal_quality_overlay_preview, build_technical_threshold_preview, load_previews as load_config_change_previews
+from advisory.cron_status import build_cron_status
 from advisory.current_prices import load_current_prices
 from advisory.decision_trace import ensure_trace_tables, load_event_trace, load_symbol_trace
 from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
 from advisory.event_model_artifact_store import build_artifact_manifest
 from advisory.event_model_promotion_check import build_promotion_check
 from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audits, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
-from advisory.identity_issues import IDENTITY_ISSUES_TABLE, load_open_identity_issues
+from advisory.identity_issues import IDENTITY_ISSUES_TABLE, load_open_identity_issues, resolve_open_identity_issues
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
 from advisory.event_policy_evaluator import SUMMARY_TABLE as EVENT_POLICY_EVAL_SUMMARY_TABLE
 from advisory.execution_engine import EXECUTION_TABLE
@@ -290,6 +291,17 @@ class OperationsCronLogsResponse(OperatorApiResponseModel):
     pagination: dict[str, Any] = Field(default_factory=dict)
 
 
+class OperationsCronStatusResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    crontab_path: str | None = None
+    log_dir: str | None = None
+    counts: dict[str, Any] = Field(default_factory=dict)
+    jobs: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
+
+
 class OperationsCommandsResponse(OperatorApiResponseModel):
     generated_at: str | None = None
     api_schema: OperatorApiSchemaModel
@@ -348,6 +360,19 @@ class IdentityIssuesResponse(OperatorApiResponseModel):
     summary: dict[str, Any] = Field(default_factory=dict)
     issues: list[dict[str, Any]] = Field(default_factory=list)
     skipped: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class IdentityIssueResolutionResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    mode: str
+    checked_rows: int = 0
+    counts: dict[str, Any] = Field(default_factory=dict)
+    results: list[dict[str, Any]] = Field(default_factory=list)
+    requested_issue_keys: list[str] = Field(default_factory=list)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
+    note: str | None = None
 
 
 class ManualReviewDecisionResponse(OperatorApiResponseModel):
@@ -3569,6 +3594,26 @@ def build_cron_logs_payload(*, limit: int = 20, lines: int = 80, offset: int = 0
     }
 
 
+def build_cron_status_payload(*, limit: int = 50, lines: int = 12, offset: int = 0) -> dict[str, Any]:
+    payload = build_cron_status(
+        crontab_path=REPO_ROOT / "config" / "stockey.generated.crontab",
+        log_dir=CRON_LOG_DIR,
+        tail_lines=max(0, min(int(lines), 80)),
+    )
+    jobs = payload.get("jobs") if isinstance(payload.get("jobs"), list) else []
+    page, meta = _page_any_rows(jobs, limit=limit, offset=offset, default=50, maximum=200)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/operations/cron-status", schema_name="operations_cron_status"),
+        "status": str(payload.get("status") or "ok"),
+        "crontab_path": payload.get("crontab_path"),
+        "log_dir": payload.get("log_dir"),
+        "counts": payload.get("counts") if isinstance(payload.get("counts"), dict) else {},
+        "jobs": page,
+        "pagination": {"jobs": meta},
+    }
+
+
 def build_event_model_promotion_check_payload() -> dict[str, Any]:
     args = argparse.Namespace(
         artifact_dir=".cache/advisory_event_meta_model",
@@ -4603,12 +4648,15 @@ def _identity_issue_row(row: dict[str, Any]) -> dict[str, Any]:
     exchanges_tried = _jsonish(row.get("exchanges_tried_json"))
     fallback_tried = _jsonish(row.get("fallback_tried_json"))
     context = _jsonish(row.get("context_json"))
+    resolution_context = _jsonish(row.get("resolution_context_json"))
     if not isinstance(exchanges_tried, list):
         exchanges_tried = []
     if not isinstance(fallback_tried, list):
         fallback_tried = []
     if not isinstance(context, dict):
         context = {}
+    if not isinstance(resolution_context, dict):
+        resolution_context = {}
     symbol = _text(row.get("symbol"))
     exchange = _text(row.get("requested_exchange"))
     issue_type = _text(row.get("issue_type")) or "identity_issue"
@@ -4622,7 +4670,9 @@ def _identity_issue_row(row: dict[str, Any]) -> dict[str, Any]:
         "company_master_id": _text(row.get("company_master_id")),
         "source": _text(row.get("source")),
         "error_text": _text(row.get("error_text")),
+        "resolution_error_text": _text(row.get("resolution_error_text")),
         "suggested_action": _text(row.get("suggested_action")),
+        "attempt_count": _count_value(row.get("attempt_count"), fallback=0),
         "first_seen_at": _ts(row.get("first_seen_at")),
         "last_seen_at": _ts(row.get("last_seen_at")),
         "resolved_at": _ts(row.get("resolved_at")),
@@ -4630,6 +4680,7 @@ def _identity_issue_row(row: dict[str, Any]) -> dict[str, Any]:
         "exchanges_tried": exchanges_tried,
         "fallback_tried": fallback_tried,
         "context": context,
+        "resolution_context": resolution_context,
         "manual_review_item_id": f"identity_issue:{IDENTITY_ISSUES_TABLE}:{row.get('issue_key')}",
         "operator_boundary": {
             "read_only": True,
@@ -4691,6 +4742,58 @@ def build_identity_issues_payload(*, limit: int = 100, symbol: str | None = None
         },
         "issues": issues,
         "skipped": skipped,
+    }
+
+
+def resolve_identity_issues_payload(*, payload: dict[str, Any] | None = None, apply: bool = False) -> dict[str, Any]:
+    request = payload if isinstance(payload, dict) else {}
+    limit = _bounded_limit(request.get("limit"), default=100, maximum=500)
+    raw_keys = request.get("issue_keys")
+    issue_keys = [str(key).strip() for key in raw_keys if str(key or "").strip()] if isinstance(raw_keys, list) else []
+    endpoint = "/api/identity-issues/resolve-apply" if apply else "/api/identity-issues/resolve-preview"
+    schema = _operator_api_schema(endpoint, schema_name="identity_issue_resolution")
+    schema["read_only"] = not bool(apply)
+    schema["broker_execution_enabled"] = False
+    if apply and not issue_keys:
+        return {
+            "generated_at": pd.Timestamp.utcnow().isoformat(),
+            "api_schema": schema,
+            "status": "error",
+            "mode": "apply",
+            "checked_rows": 0,
+            "counts": {},
+            "results": [],
+            "requested_issue_keys": [],
+            "operator_boundary": {
+                "mutates_identity_issue_status": True,
+                "mutates_identity_mapping": False,
+                "mutates_broker_execution": False,
+                "requires_preview_issue_keys": True,
+            },
+            "note": "Apply requires explicit issue_keys from a previous preview. No rows were changed.",
+        }
+    summary = resolve_open_identity_issues(limit=limit, apply=bool(apply), issue_keys=issue_keys or None)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": schema,
+        "status": str(summary.get("status") or "ok"),
+        "mode": str(summary.get("mode") or ("apply" if apply else "dry_run")),
+        "checked_rows": int(summary.get("checked_rows") or 0),
+        "counts": summary.get("counts") if isinstance(summary.get("counts"), dict) else {},
+        "results": summary.get("results") if isinstance(summary.get("results"), list) else [],
+        "requested_issue_keys": summary.get("requested_issue_keys") if isinstance(summary.get("requested_issue_keys"), list) else [],
+        "operator_boundary": {
+            "mutates_identity_issue_status": bool(apply),
+            "mutates_identity_mapping": False,
+            "mutates_broker_execution": False,
+            "requires_preview_issue_keys": bool(apply),
+            "safe_to_run_during_market": True,
+        },
+        "note": (
+            "Resolved identity issue rows were closed. Re-run Health and advisory/data source if needed."
+            if apply
+            else "Preview only. Use issue_keys from would_resolve rows if you want to close them."
+        ),
     }
 
 
@@ -5413,6 +5516,10 @@ def create_app():
     def operations_cron_logs(limit: int = Query(default=20, ge=1, le=100), lines: int = Query(default=80, ge=1, le=300), offset: int = Query(default=0, ge=0)):
         return _guard(build_cron_logs_payload, route="/api/operations/cron-logs", limit=limit, lines=lines, offset=offset)
 
+    @app.get("/api/operations/cron-status", response_model=OperationsCronStatusResponse)
+    def operations_cron_status(limit: int = Query(default=50, ge=1, le=200), lines: int = Query(default=12, ge=0, le=80), offset: int = Query(default=0, ge=0)):
+        return _guard(build_cron_status_payload, route="/api/operations/cron-status", limit=limit, lines=lines, offset=offset)
+
     @app.get("/api/operations/commands", response_model=OperationsCommandsResponse)
     def operations_commands(limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_operator_commands_payload, route="/api/operations/commands", limit=limit)
@@ -5448,6 +5555,14 @@ def create_app():
     @app.get("/api/identity-issues", response_model=IdentityIssuesResponse)
     def identity_issues(limit: int = Query(default=100, ge=1, le=500), symbol: str | None = None):
         return _guard(build_identity_issues_payload, route="/api/identity-issues", limit=limit, symbol=symbol)
+
+    @app.post("/api/identity-issues/resolve-preview", response_model=IdentityIssueResolutionResponse)
+    def identity_issues_resolve_preview(payload: dict[str, Any] = Body(default_factory=dict)):
+        return _guard(resolve_identity_issues_payload, route="/api/identity-issues/resolve-preview", payload=payload, apply=False)
+
+    @app.post("/api/identity-issues/resolve-apply", response_model=IdentityIssueResolutionResponse)
+    def identity_issues_resolve_apply(payload: dict[str, Any] = Body(...)):
+        return _guard(resolve_identity_issues_payload, route="/api/identity-issues/resolve-apply", payload=payload, apply=True)
 
     @app.post("/api/manual-review/decision", response_model=ManualReviewDecisionResponse)
     def manual_review_decision(payload: dict[str, Any] = Body(...)):

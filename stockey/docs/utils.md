@@ -93,3 +93,25 @@ python scripts/sql_query_runner.py --read-only "select * from dim_security_revie
 ```
 
 Manual overrides go into `dim_security_overrides`. Use them for mergers, demergers, scheme changes, and any rename the heuristics flag incorrectly.
+
+## Recheck Dhan/security identity issues
+
+Open Dhan security mapping failures are stored in `advisory_identity_issues` and surfaced in Health, Manual Review, and the Identity Issues page.
+
+Preferred operator path: open the Nuxt `Identity Issues` page, click `Recheck mappings`, review the `would_resolve` rows, then click `Close resolved mappings`. This only closes identity issue rows; it does not edit Dhan/company mappings or broker execution.
+
+Use the dry run first:
+
+```sh
+python -m data.dhanlive.scrip_master
+python -m advisory.identity_issues --limit 100
+```
+
+If the dry run shows rows as `would_resolve`, close them:
+
+```sh
+python -m advisory.identity_issues --apply --limit 100
+python -m advisory.operator_health --skip-dhan
+```
+
+Do not manually delete identity rows. The resolver keeps attempt counts and resolution metadata so later Health/UI output can distinguish active issues from fixed mappings.

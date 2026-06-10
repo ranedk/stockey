@@ -1,4 +1,4 @@
-import type { ActionConflictRulesPayload, ActionConflictRuleWriteResult, ConfigChangePreviewResult, ConfigChangePreviewsPayload, CronLogsPayload, EventDetailPayload, EventModelArtifactsPayload, EventModelPromotionCheckPayload, EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, IdentityIssuesPayload, ManualReviewDecisionResult, ManualReviewPayload, OperatorActions, OperatorApiErrorsPayload, OperatorCommandRunResult, OperatorCommandsPayload, OperatorDetailPayload, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorRuntime, OperatorSmokePayload, OperatorSummary, PromptRegistryPayload, SignalQualityPayload, SignalQualityPromotionDecisionResult, SignalQualityPromotionReviewResult, SignalQualityPromotionReviewsPayload, SignalRefreshPayload, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary, WaitSignalMatchPayload, WaitSignalsPayload } from '~/types/api'
+import type { ActionConflictRulesPayload, ActionConflictRuleWriteResult, ConfigChangePreviewResult, ConfigChangePreviewsPayload, CronLogsPayload, CronStatusPayload, EventDetailPayload, EventModelArtifactsPayload, EventModelPromotionCheckPayload, EventPolicyEvaluationPayload, EventPolicyPayload, EventTrace, HypothesesPayload, HypothesisCreateResult, HypothesisPreviewResult, HypothesisPromotionAuditResult, HypothesisRunResult, IdentityIssueResolutionPayload, IdentityIssuesPayload, ManualReviewDecisionResult, ManualReviewPayload, OperatorActions, OperatorApiErrorsPayload, OperatorCommandRunResult, OperatorCommandsPayload, OperatorDetailPayload, OperatorEvents, OperatorHealthDetails, OperatorHome, OperatorMarketContext, OperatorPortfolio, OperatorRuntime, OperatorSmokePayload, OperatorSummary, PromptRegistryPayload, SignalQualityPayload, SignalQualityPromotionDecisionResult, SignalQualityPromotionReviewResult, SignalQualityPromotionReviewsPayload, SignalRefreshPayload, SymbolTrace, TechnicalCalibrationPayload, TechnicalPromotionDecisionResult, TechnicalPromotionReviewResult, TechnicalPromotionReviewsPayload, TraceSummary, WaitSignalMatchPayload, WaitSignalsPayload } from '~/types/api'
 
 export function useOperatorApi() {
   const config = useRuntimeConfig()
@@ -28,6 +28,7 @@ export function useOperatorApi() {
     getHealthDetails: () => get<OperatorHealthDetails>('/api/health/details'),
     runOperationsSmoke: () => get<OperatorSmokePayload>('/api/operations/smoke'),
     getCronLogs: (limit = 20, lines = 80, params: Record<string, unknown> = {}) => get<CronLogsPayload>(`/api/operations/cron-logs${query({ limit, lines, ...params })}`),
+    getCronStatus: (limit = 50, lines = 12, params: Record<string, unknown> = {}) => get<CronStatusPayload>(`/api/operations/cron-status${query({ limit, lines, ...params })}`),
     getOperatorCommands: (limit = 25) => get<OperatorCommandsPayload>(`/api/operations/commands?limit=${limit}`),
     getOperatorApiErrors: (limit = 50) => get<OperatorApiErrorsPayload>(`/api/operations/api-errors?limit=${limit}`),
     runOperatorCommand: (body: Record<string, unknown>) => post<OperatorCommandRunResult>('/api/operations/commands/run', body),
@@ -37,6 +38,8 @@ export function useOperatorApi() {
     getPromptRegistry: (params: Record<string, unknown> = {}) => get<PromptRegistryPayload>(`/api/research/prompt-registry${query(params)}`),
     getManualReview: (limit = 100) => get<ManualReviewPayload>(`/api/manual-review?limit=${limit}`),
     getIdentityIssues: (params: Record<string, unknown> = {}) => get<IdentityIssuesPayload>(`/api/identity-issues${query(params)}`),
+    previewIdentityIssueResolution: (body: Record<string, unknown> = {}) => post<IdentityIssueResolutionPayload>('/api/identity-issues/resolve-preview', body),
+    applyIdentityIssueResolution: (body: Record<string, unknown>) => post<IdentityIssueResolutionPayload>('/api/identity-issues/resolve-apply', body),
     decideManualReview: (body: Record<string, unknown>) => post<ManualReviewDecisionResult>('/api/manual-review/decision', body),
     getActions: (params: Record<string, unknown> = {}) => get<OperatorActions>(`/api/actions${query(params)}`),
     getActionDetail: (params: Record<string, unknown> = {}) => get<OperatorDetailPayload>(`/api/actions/detail${query(params)}`),

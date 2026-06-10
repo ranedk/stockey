@@ -90,6 +90,17 @@ export interface CronLogsPayload {
   pagination?: Dict
 }
 
+export interface CronStatusPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  crontab_path?: string
+  log_dir?: string
+  counts: Dict
+  jobs: Dict[]
+  pagination?: Dict
+}
+
 export interface OperatorCommandsPayload {
   generated_at?: string
   api_schema?: OperatorApiSchema
@@ -104,6 +115,19 @@ export interface OperatorApiErrorsPayload {
   status: string
   summary: Dict
   errors: Dict[]
+}
+
+export interface IdentityIssueResolutionPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  mode: string
+  checked_rows: number
+  counts: Dict
+  results: Dict[]
+  requested_issue_keys?: string[]
+  operator_boundary?: Dict
+  note?: string
 }
 
 export interface OperatorCommandRunResult {

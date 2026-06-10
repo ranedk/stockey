@@ -125,7 +125,7 @@ Required operator UI coverage:
    - do not auto-apply production YAML changes until the review workflow is proven safe over multiple runs
 
 6. Operations dashboard
-   - show the full cron schedule, next/last run, current lock status, and log file links/snippets
+   - done: show the full cron schedule, next-run estimate, latest log marker, current lock status, stale lock flag, and log snippets
    - show safe dry-run buttons for selected jobs: health, hypothesis scan, event-model promotion check, technical calibration review, S3 artifact dry-run
    - block or warn on expensive/long-running jobs from UI unless explicitly confirmed
 
@@ -214,9 +214,11 @@ This is the recommended current implementation order.
    - done: surface operator snapshot freshness, slow-operation issues, and failed watcher/router sync-state rows in operator health and the Nuxt Health page
    - done: add Advisory Trust Gate to Health so the UI says whether today’s recommendations are usable, review-only, or blocked by runtime, freshness, event evidence, identity, signal-quality, or degradation issues
    - done: add persisted fallback telemetry plus Health-page fallback spike cards for Redis fail-soft, Dhan identity fallback, NSE retry/session reset, and LLM/Codex deterministic fallbacks
+   - done: add `python -m advisory.identity_issues` dry-run/apply lifecycle to recheck and close Dhan/security identity issues after master refresh, with attempt counts and resolution metadata
    - done: record dashboard section-loader failures in payloads instead of only printing them
    - done: make watcher cycle failures persist `advisory_sync_state.status=error` and publish error messages before returning
    - done: add a single smoke-test command for API + DB + frontend dependency checks
+   - done: add narrow Identity Issues UI actions to run the dry-run resolver, show rows that would close, and apply only previewed issue keys
    - next: extend fallback telemetry to DB retry/fallback query paths only after avoiding circular DB-telemetry failure modes
    - keep cron/frontend logs visible from the operator app without adding write/trading controls
 

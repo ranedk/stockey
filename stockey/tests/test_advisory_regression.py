@@ -10,8 +10,9 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, fallback_telemetry, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, cron_status, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, fallback_telemetry, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
 from advisory import manual_review_state
+from advisory import identity_issues
 from advisory import superseded_failures
 from advisory.api import app as operator_api
 from data.announcements import pipeline as announcement_pipeline
@@ -1400,6 +1401,81 @@ def test_dhan_identity_records_missing_security_id_issue(monkeypatch):
     assert row["asset_type"] == "stock"
     assert row["company"]["company_master_id"] == "nse:HUIL"
     assert any(item["method"] == "company_master_dhan_bse_id" for item in row["fallback_tried"])
+
+
+def test_identity_issue_resolution_dry_run_does_not_mark_resolved(monkeypatch):
+    rows = pd.DataFrame(
+        [
+            {
+                "issue_key": "dhan_security_id_missing:stock:NSE:HUIL",
+                "issue_type": "dhan_security_id_missing",
+                "symbol": "HUIL",
+                "requested_exchange": "NSE",
+                "asset_type": "stock",
+            }
+        ]
+    )
+    resolved: list[dict[str, object]] = []
+    failed: list[dict[str, object]] = []
+    fallback_events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(identity_issues, "load_open_identity_issues", lambda limit=100: rows.copy())
+    monkeypatch.setattr(identity_issues, "mark_identity_issue_resolved", lambda *args, **kwargs: resolved.append({"args": args, "kwargs": kwargs}))
+    monkeypatch.setattr(identity_issues, "mark_identity_issue_resolution_failed", lambda *args, **kwargs: failed.append({"args": args, "kwargs": kwargs}))
+    monkeypatch.setattr(dhan_db, "record_fallback_event", lambda **kwargs: fallback_events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        dhan_db,
+        "resolve_dhan_identity",
+        lambda symbol, exchange, asset_type="stock": {
+            "security_id": 12345,
+            "exchange": "NSE",
+            "ticker": symbol,
+            "asset_type": asset_type,
+        },
+    )
+
+    summary = identity_issues.resolve_open_identity_issues(limit=10, apply=False)
+
+    assert summary["mode"] == "dry_run"
+    assert summary["counts"]["would_resolve"] == 1
+    assert resolved == []
+    assert failed == []
+    assert fallback_events == []
+
+
+def test_identity_issue_resolution_apply_marks_resolved(monkeypatch):
+    rows = pd.DataFrame(
+        [
+            {
+                "issue_key": "dhan_security_id_missing:stock:NSE:HUIL",
+                "issue_type": "dhan_security_id_missing",
+                "symbol": "HUIL",
+                "requested_exchange": "NSE",
+                "asset_type": "stock",
+            }
+        ]
+    )
+    resolved: list[dict[str, object]] = []
+
+    monkeypatch.setattr(identity_issues, "load_open_identity_issues", lambda limit=100: rows.copy())
+    monkeypatch.setattr(identity_issues, "mark_identity_issue_resolved", lambda issue_key, **kwargs: resolved.append({"issue_key": issue_key, **kwargs}) or {"issue_key": issue_key})
+    monkeypatch.setattr(
+        dhan_db,
+        "resolve_dhan_identity",
+        lambda symbol, exchange, asset_type="stock": {
+            "security_id": 12345,
+            "exchange": "NSE",
+            "ticker": symbol,
+            "asset_type": asset_type,
+        },
+    )
+
+    summary = identity_issues.resolve_open_identity_issues(limit=10, apply=True)
+
+    assert summary["mode"] == "apply"
+    assert summary["counts"]["resolved"] == 1
+    assert resolved[0]["issue_key"] == "dhan_security_id_missing:stock:NSE:HUIL"
+    assert resolved[0]["resolution_context"]["resolved_identity"]["security_id"] == 12345
 
 
 def test_execution_engine_blocks_action_rows_without_complete_reason_contract(monkeypatch):
@@ -3137,6 +3213,61 @@ def test_operator_health_degradation_feed_extracts_dhan_master_miss(monkeypatch,
     assert "Dhan master" in row["title"]
 
 
+def test_cron_status_parses_generated_style_crontab_and_estimates_next_run(tmp_path):
+    crontab = tmp_path / "stockey.generated.crontab"
+    crontab.write_text(
+        "\n".join(
+            [
+                "SHELL=/bin/bash",
+                "# comment",
+                '10 07 * * 1-5 rane cd "$STOCKEY_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1',
+                '*/10 09-15 * * 1-5 rane cd "$STOCKEY_DIR" && ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    rows = cron_status.parse_crontab(crontab)
+
+    assert len(rows) == 2
+    assert rows[0]["job_name"] == "complete_data"
+    assert rows[0]["log_file"] == "complete_data.log"
+    assert rows[0]["lock_file"] == "/tmp/stockey_complete_data.lock"
+    assert rows[1]["job_name"] == "all_watchers"
+    assert cron_status.estimate_next_run(rows[0]["cron_fields"], now=pd.Timestamp("2026-06-08T06:58:00+05:30")) == "2026-06-08T07:10:00+05:30"
+
+
+def test_cron_status_detects_stale_lock_and_log_marker(tmp_path):
+    crontab = tmp_path / "stockey.generated.crontab"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    lock_dir = tmp_path / "stockey_job.lock.d"
+    lock_dir.mkdir()
+    old_time = pd.Timestamp("2026-06-08T00:00:00Z").timestamp()
+    (lock_dir / "pid").write_text("999999", encoding="utf-8")
+    (lock_dir / "command").write_text("./job.sh", encoding="utf-8")
+    os.utime(lock_dir, (old_time, old_time))
+    (log_dir / "job.log").write_text("[stockey.script] name=job status=ok elapsed=12.5\n", encoding="utf-8")
+    crontab.write_text(
+        f'10 07 * * 1-5 rane cd "$STOCKEY_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" {tmp_path}/stockey_job.lock ./job.sh >> "$LOG_DIR/job.log" 2>&1\n',
+        encoding="utf-8",
+    )
+
+    payload = cron_status.build_cron_status(
+        crontab_path=crontab,
+        log_dir=log_dir,
+        now=pd.Timestamp("2026-06-08T08:00:00+05:30"),
+        stale_lock_seconds=60,
+    )
+
+    assert payload["status"] == "error"
+    job = payload["jobs"][0]
+    assert job["latest_marker"]["status"] == "ok"
+    assert job["lock_active"] is True
+    assert job["lock_stale"] is True
+    assert job["status"] == "error"
+
+
 def test_operator_health_degradation_feed_includes_announcement_failures(monkeypatch):
     monkeypatch.setattr(
         operator_health,
@@ -3432,6 +3563,8 @@ def test_operator_api_critical_routes_publish_typed_response_models():
         ("/api/health/details", "get"): "OperatorHealthDetailsResponse",
         ("/api/manual-review", "get"): "ManualReviewResponse",
         ("/api/identity-issues", "get"): "IdentityIssuesResponse",
+        ("/api/identity-issues/resolve-preview", "post"): "IdentityIssueResolutionResponse",
+        ("/api/identity-issues/resolve-apply", "post"): "IdentityIssueResolutionResponse",
         ("/api/manual-review/decision", "post"): "ManualReviewDecisionResponse",
         ("/api/wait-signals", "get"): "WaitSignalsResponse",
         ("/api/wait-signals/match", "post"): "WaitSignalMatchResponse",
@@ -3449,6 +3582,7 @@ def test_operator_api_critical_routes_publish_typed_response_models():
     operations_expected = {
         ("/api/operations/smoke", "get"): "OperationsSmokeResponse",
         ("/api/operations/cron-logs", "get"): "OperationsCronLogsResponse",
+        ("/api/operations/cron-status", "get"): "OperationsCronStatusResponse",
         ("/api/operations/commands", "get"): "OperationsCommandsResponse",
         ("/api/operations/api-errors", "get"): "OperationsApiErrorsResponse",
     }
@@ -3972,6 +4106,33 @@ def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
     )
     monkeypatch.setattr(
         operator_api,
+        "resolve_identity_issues_payload",
+        lambda payload=None, apply=False: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": {
+                **schema(
+                    "/api/identity-issues/resolve-apply" if apply else "/api/identity-issues/resolve-preview",
+                    "identity_issue_resolution",
+                ),
+                "read_only": not apply,
+                "broker_execution_enabled": False,
+            },
+            "status": "ok",
+            "mode": "apply" if apply else "dry_run",
+            "checked_rows": 1,
+            "counts": {"resolved" if apply else "would_resolve": 1},
+            "results": [{"issue_key": "issue:1", "status": "resolved" if apply else "would_resolve"}],
+            "requested_issue_keys": payload.get("issue_keys", []) if isinstance(payload, dict) else [],
+            "operator_boundary": {
+                "mutates_identity_issue_status": apply,
+                "mutates_identity_mapping": False,
+                "mutates_broker_execution": False,
+            },
+            "note": "test",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
         "build_wait_signals_payload",
         lambda **_kwargs: {
             "generated_at": "2026-06-07T00:00:00Z",
@@ -4038,6 +4199,8 @@ def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
         client.get("/api/health/details"),
         client.get("/api/manual-review?limit=1"),
         client.get("/api/identity-issues?limit=1"),
+        client.post("/api/identity-issues/resolve-preview", json={"limit": 1}),
+        client.post("/api/identity-issues/resolve-apply", json={"issue_keys": ["issue:1"], "limit": 1}),
         client.post("/api/manual-review/decision", json={"item_id": "item:1", "decision": "ignore", "rationale": "test"}),
         client.get("/api/wait-signals?limit=1"),
         client.post("/api/wait-signals/match", json={"symbols": ["ABC"], "limit": 1}),
@@ -4091,6 +4254,20 @@ def test_operator_api_operations_read_routes_smoke_with_typed_payloads(monkeypat
     )
     monkeypatch.setattr(
         operator_api,
+        "build_cron_status_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/operations/cron-status", "operations_cron_status"),
+            "status": "ok",
+            "crontab_path": "config/stockey.generated.crontab",
+            "log_dir": "logs/cron",
+            "counts": {"ok": 1},
+            "jobs": [{"job_name": "all_watchers", "status": "ok"}],
+            "pagination": {"jobs": {"total_count": 1}},
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
         "build_operator_commands_payload",
         lambda **_kwargs: {
             "generated_at": "2026-06-07T00:00:00Z",
@@ -4116,6 +4293,7 @@ def test_operator_api_operations_read_routes_smoke_with_typed_payloads(monkeypat
     responses = [
         client.get("/api/operations/smoke"),
         client.get("/api/operations/cron-logs?limit=1&lines=5"),
+        client.get("/api/operations/cron-status?limit=1&lines=5"),
         client.get("/api/operations/commands?limit=1"),
         client.get("/api/operations/api-errors?limit=1"),
     ]
@@ -4127,7 +4305,7 @@ def test_operator_api_operations_read_routes_smoke_with_typed_payloads(monkeypat
         assert body["api_schema"]["read_only"] is True
         assert body["api_schema"]["broker_execution_enabled"] is False
 
-    commands = responses[2].json()["commands"]
+    commands = responses[3].json()["commands"]
     assert commands[0]["key"] == "operator_health_skip_dhan"
     assert commands[0]["dry_run"] is True
 
@@ -13640,6 +13818,46 @@ def test_operator_api_builds_identity_issues_payload(monkeypatch):
     assert issue["manual_review_item_id"] == "identity_issue:advisory_identity_issues:dhan_security_id_missing:stock:NSE:HUIL"
     assert issue["operator_boundary"]["mutates_identity_mapping"] is False
     assert issue["operator_boundary"]["mutates_broker_execution"] is False
+
+
+def test_operator_api_identity_resolution_preview_is_read_only(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def fake_resolve(**kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "ok",
+            "mode": "dry_run",
+            "checked_rows": 1,
+            "counts": {"would_resolve": 1},
+            "results": [{"issue_key": "dhan_security_id_missing:stock:NSE:HUIL", "status": "would_resolve"}],
+            "requested_issue_keys": [],
+        }
+
+    monkeypatch.setattr(operator_api, "resolve_open_identity_issues", fake_resolve)
+
+    payload = operator_api.resolve_identity_issues_payload(payload={"limit": 20}, apply=False)
+
+    assert payload["api_schema"]["endpoint"] == "/api/identity-issues/resolve-preview"
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["api_schema"]["broker_execution_enabled"] is False
+    assert payload["operator_boundary"]["mutates_identity_issue_status"] is False
+    assert payload["counts"]["would_resolve"] == 1
+    assert calls == [{"limit": 20, "apply": False, "issue_keys": None}]
+
+
+def test_operator_api_identity_resolution_apply_requires_issue_keys(monkeypatch):
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(operator_api, "resolve_open_identity_issues", lambda **kwargs: calls.append(kwargs) or {})
+
+    payload = operator_api.resolve_identity_issues_payload(payload={"limit": 20}, apply=True)
+
+    assert payload["status"] == "error"
+    assert payload["api_schema"]["endpoint"] == "/api/identity-issues/resolve-apply"
+    assert payload["api_schema"]["read_only"] is False
+    assert payload["operator_boundary"]["mutates_identity_issue_status"] is True
+    assert payload["operator_boundary"]["requires_preview_issue_keys"] is True
+    assert calls == []
 
 
 def test_manual_review_suppresses_superseded_processing_and_recovered_document_failures(monkeypatch):

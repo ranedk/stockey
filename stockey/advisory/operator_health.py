@@ -1347,7 +1347,12 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             status=str(identity.get("status") or "warn"),
             title="Open Dhan/security identity issues exist",
             reason=str(identity.get("error") or identity.get("message") or "Some active symbols do not resolve cleanly to broker/security identity."),
-            commands=["python -m data.dhanlive.scrip_master", "python -m advisory.operator_health --skip-dhan"],
+            commands=[
+                "python -m data.dhanlive.scrip_master",
+                "python -m advisory.identity_issues --limit 100",
+                "python -m advisory.identity_issues --apply --limit 100",
+                "python -m advisory.operator_health --skip-dhan",
+            ],
             details={"section": "identity_issues", "open_count": identity.get("open_count")},
         )
 

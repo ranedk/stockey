@@ -70,10 +70,11 @@ Done:
 - `scripts/with_lock.sh` and `scripts/wait_for_locks.sh` prevent obvious overlaps.
 - `all_watchers.sh` self-locks.
 - `all_advisory.sh` waits for catch-up/data worker locks before running.
+- Operations UI/API now exposes a scheduled-job status card parsed from `config/stockey.generated.crontab`, including schedule, next-run estimate, latest log marker, bounded tail, lock state, and stale-lock detection.
 
 Gaps:
 
-- `To do`: add a single operator page/card that shows next cron run, last run, duration, status, and latest log tail for every scheduled job.
+- `Done`: add a single operator page/card that shows next cron run estimate, last log marker, status, lock state, and latest log tail for every scheduled job.
 - `To do`: detect stale cron processes and stale lock files.
 - `To do`: move all one-off direct Python cron commands into named shell wrappers or command registry entries so the UI/docs stay consistent.
 - `To do`: add script-level success markers to all wrappers, not just logs.
@@ -138,10 +139,11 @@ Done:
 - Missing Dhan stock security IDs are recorded in `advisory_identity_issues` with symbol, requested exchange, fallback attempts, company-master context, error text, and suggested repair steps.
 - Manual Review surfaces open identity issues as technical items with fix instructions.
 - Operator API/frontend now expose a read-only standalone Identity Issues page with open skipped-symbol rows, repair hints, attempted exchanges/fallbacks, Manual Review item linkage, and explicit no-broker/no-mutation boundaries.
+- `python -m advisory.identity_issues` can dry-run rechecks of open Dhan/security identity issues, and `python -m advisory.identity_issues --apply` closes rows that now resolve after Dhan/company-master refresh.
 
 Gaps:
 
-- `Partial`: unresolved Dhan identity issues now have a durable table, Manual Review queue, and standalone read-only skipped-symbol/identity page; close/reopen lifecycle remains.
+- `Done`: unresolved Dhan identity issues now have a durable table, Manual Review queue, standalone skipped-symbol/identity page, Health fix hints, attempt counts, resolution metadata, CLI close lifecycle, and a guarded operator UI dry-run/apply workflow that only closes previewed rows.
 - `Done`: store every “No Dhan security id mapped” stock case in a durable table with symbol, source, exchange tried, fallback tried, and suggested action.
 - `To do`: add daily auto-repair for NIFTY/index mappings and common symbol aliases.
 - `To do`: assert no active advisory/action row lacks a resolvable company/security identity unless explicitly marked non-tradable.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from typing import Any
 
@@ -45,12 +46,18 @@ def ensure_identity_issues_table() -> None:
                 fallback_tried_json TEXT,
                 suggested_action TEXT,
                 context_json TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                resolution_error_text TEXT,
+                resolution_context_json TEXT,
                 resolved_at TIMESTAMPTZ,
                 load_ts TIMESTAMPTZ NOT NULL DEFAULT now()
             )
             """
         )
         cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS source TEXT")
+        cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 1")
+        cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolution_error_text TEXT")
+        cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolution_context_json TEXT")
         cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ")
         cur.execute(
             f"""
@@ -119,6 +126,9 @@ def record_dhan_identity_issue(
                 fallback_tried_json,
                 suggested_action,
                 context_json,
+                attempt_count,
+                resolution_error_text,
+                resolution_context_json,
                 resolved_at,
                 load_ts
             )
@@ -138,12 +148,16 @@ def record_dhan_identity_issue(
                 %(fallback_tried_json)s,
                 %(suggested_action)s,
                 %(context_json)s,
+                1,
+                NULL,
+                NULL,
                 NULL,
                 now()
             )
             ON CONFLICT (issue_key) DO UPDATE SET
                 last_seen_at = EXCLUDED.last_seen_at,
                 status = 'open',
+                attempt_count = COALESCE({IDENTITY_ISSUES_TABLE}.attempt_count, 0) + 1,
                 symbol = EXCLUDED.symbol,
                 requested_exchange = EXCLUDED.requested_exchange,
                 asset_type = EXCLUDED.asset_type,
@@ -154,12 +168,67 @@ def record_dhan_identity_issue(
                 fallback_tried_json = EXCLUDED.fallback_tried_json,
                 suggested_action = EXCLUDED.suggested_action,
                 context_json = EXCLUDED.context_json,
+                resolution_error_text = NULL,
+                resolution_context_json = NULL,
                 resolved_at = NULL,
                 load_ts = EXCLUDED.load_ts
             """,
             row,
         )
     return row
+
+
+def mark_identity_issue_resolved(
+    issue_key: str,
+    *,
+    resolution_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    key = _text(issue_key)
+    if not key:
+        raise ValueError("issue_key is required")
+    ensure_identity_issues_table()
+    context_json = _json_dumps(resolution_context or {})
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            UPDATE {IDENTITY_ISSUES_TABLE}
+            SET status = 'resolved',
+                resolved_at = now(),
+                resolution_error_text = NULL,
+                resolution_context_json = %s,
+                load_ts = now()
+            WHERE issue_key = %s
+            """,
+            (context_json, key),
+        )
+    return {"issue_key": key, "status": "resolved", "resolution_context": resolution_context or {}}
+
+
+def mark_identity_issue_resolution_failed(
+    issue_key: str,
+    *,
+    error_text: str,
+    resolution_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    key = _text(issue_key)
+    if not key:
+        raise ValueError("issue_key is required")
+    ensure_identity_issues_table()
+    context_json = _json_dumps(resolution_context or {})
+    error = _text(error_text) or "Resolution failed"
+    with db_session() as (_, cur):
+        cur.execute(
+            f"""
+            UPDATE {IDENTITY_ISSUES_TABLE}
+            SET status = 'open',
+                resolution_error_text = %s,
+                resolution_context_json = %s,
+                load_ts = now()
+            WHERE issue_key = %s
+            """,
+            (error, context_json, key),
+        )
+    return {"issue_key": key, "status": "open", "error_text": error, "resolution_context": resolution_context or {}}
 
 
 def load_open_identity_issues(*, limit: int = 100) -> pd.DataFrame:
@@ -175,3 +244,100 @@ def load_open_identity_issues(*, limit: int = 100) -> pd.DataFrame:
         params=(max(1, int(limit)),),
         retries=3,
     )
+
+
+def _resolve_one_issue(row: dict[str, Any], *, apply: bool) -> dict[str, Any]:
+    issue_key = _text(row.get("issue_key")) or ""
+    symbol = (_text(row.get("symbol")) or "").upper()
+    requested_exchange = (_text(row.get("requested_exchange")) or "NSE").upper()
+    asset_type = (_text(row.get("asset_type")) or "stock").lower()
+    if not issue_key or not symbol:
+        return {"issue_key": issue_key, "symbol": symbol, "status": "skipped", "reason": "missing_issue_key_or_symbol"}
+
+    from data.dhanlive import dhan_db
+
+    original_record_issue = getattr(dhan_db, "record_dhan_identity_issue", None)
+    original_record_fallback = getattr(dhan_db, "record_fallback_event", None)
+    if not apply:
+        dhan_db.record_dhan_identity_issue = lambda **kwargs: kwargs
+        dhan_db.record_fallback_event = lambda **kwargs: kwargs
+    try:
+        identity = dhan_db.resolve_dhan_identity(symbol, requested_exchange, asset_type=asset_type)
+    except Exception as exc:
+        error_text = f"{type(exc).__name__}: {exc}"
+        context = {"checked_symbol": symbol, "requested_exchange": requested_exchange, "asset_type": asset_type}
+        if apply:
+            mark_identity_issue_resolution_failed(issue_key, error_text=error_text, resolution_context=context)
+        return {
+            "issue_key": issue_key,
+            "symbol": symbol,
+            "requested_exchange": requested_exchange,
+            "status": "still_open",
+            "error": error_text,
+            "applied": bool(apply),
+        }
+    finally:
+        if not apply:
+            if original_record_issue is not None:
+                dhan_db.record_dhan_identity_issue = original_record_issue
+            if original_record_fallback is not None:
+                dhan_db.record_fallback_event = original_record_fallback
+
+    context = {
+        "checked_symbol": symbol,
+        "requested_exchange": requested_exchange,
+        "asset_type": asset_type,
+        "resolved_identity": identity,
+    }
+    if apply:
+        mark_identity_issue_resolved(issue_key, resolution_context=context)
+    return {
+        "issue_key": issue_key,
+        "symbol": symbol,
+        "requested_exchange": requested_exchange,
+        "status": "resolved" if apply else "would_resolve",
+        "applied": bool(apply),
+        "resolved_identity": identity,
+    }
+
+
+def resolve_open_identity_issues(*, limit: int = 100, apply: bool = False, issue_keys: list[str] | None = None) -> dict[str, Any]:
+    df = load_open_identity_issues(limit=limit)
+    rows = [dict(row) for row in df.to_dict(orient="records")] if not df.empty else []
+    requested_keys = {_text(key) for key in issue_keys or []}
+    requested_keys = {key for key in requested_keys if key}
+    if requested_keys:
+        rows = [row for row in rows if _text(row.get("issue_key")) in requested_keys]
+    results = [_resolve_one_issue(row, apply=apply) for row in rows]
+    counts: dict[str, int] = {}
+    for row in results:
+        status = str(row.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return {
+        "status": "ok",
+        "mode": "apply" if apply else "dry_run",
+        "checked_rows": len(rows),
+        "requested_issue_keys": sorted(requested_keys),
+        "counts": counts,
+        "results": results,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Recheck and optionally close open Dhan/security identity issues.")
+    parser.add_argument("--limit", type=int, default=100, help="Maximum open issues to recheck.")
+    parser.add_argument("--apply", action="store_true", help="Mark issues resolved when the current Dhan/company mapping resolves.")
+    parser.add_argument("--format", choices=["json", "text"], default="json")
+    args = parser.parse_args(argv)
+    summary = resolve_open_identity_issues(limit=max(1, int(args.limit)), apply=bool(args.apply))
+    if args.format == "json":
+        print(_json_dumps(summary))
+    else:
+        print(f"mode={summary['mode']} checked={summary['checked_rows']} counts={summary['counts']}")
+        for row in summary["results"]:
+            print(f"{row.get('symbol')} {row.get('requested_exchange')} {row.get('status')} {row.get('error') or ''}".strip())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

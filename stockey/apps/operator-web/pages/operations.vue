@@ -2,8 +2,9 @@
 import type { Dict } from '~/types/api'
 
 const api = useOperatorApi()
-const [{ data: smoke, refresh: refreshSmoke, pending: smokePending, error: smokeError }, { data: cronLogs, refresh: refreshLogs, error: cronLogsError }, { data: mlGate, refresh: refreshMlGate, error: mlGateError }, { data: artifacts, refresh: refreshArtifacts, error: artifactsError }, { data: commands, refresh: refreshCommands, error: commandsError }, { data: apiErrors, refresh: refreshApiErrors, error: apiErrorsLoadError }] = await Promise.all([
+const [{ data: smoke, refresh: refreshSmoke, pending: smokePending, error: smokeError }, { data: cronStatus, refresh: refreshCronStatus, error: cronStatusError }, { data: cronLogs, refresh: refreshLogs, error: cronLogsError }, { data: mlGate, refresh: refreshMlGate, error: mlGateError }, { data: artifacts, refresh: refreshArtifacts, error: artifactsError }, { data: commands, refresh: refreshCommands, error: commandsError }, { data: apiErrors, refresh: refreshApiErrors, error: apiErrorsLoadError }] = await Promise.all([
   useAsyncData('operations-smoke', () => api.runOperationsSmoke(), { immediate: true }),
+  useAsyncData('operations-cron-status', () => api.getCronStatus(50, 10)),
   useAsyncData('operations-cron-logs', () => api.getCronLogs(12, 60)),
   useAsyncData('operations-event-model-promotion-check', () => api.getEventModelPromotionCheck()),
   useAsyncData('operations-event-model-artifacts', () => api.getEventModelArtifacts()),
@@ -17,6 +18,8 @@ const smokeCommand = computed(() => commandList.value.find((command) => String(c
 const otherCommands = computed(() => commandList.value.filter((command) => String(command.key) !== 'operator_smoke'))
 const smokeCounts = computed(() => asDict(smokeContract.value.counts))
 const smokeNextCommands = computed(() => asStringList(smoke.value?.next_commands || smokeContract.value.next_commands))
+const cronJobs = computed(() => asList(cronStatus.value?.jobs))
+const cronCounts = computed(() => asDict(cronStatus.value?.counts))
 const logs = computed(() => asList(cronLogs.value?.logs))
 const logPageMeta = computed(() => asDict(cronLogs.value?.pagination?.logs))
 const failedGates = computed(() => mlGate.value?.failed_gates || [])
@@ -28,6 +31,7 @@ const recentRuns = computed(() => asList(commands.value?.recent_runs))
 const operatorApiErrors = computed(() => asList(apiErrors.value?.errors))
 const loadErrors = computed(() => [
   { title: 'Operations smoke failed', error: smokeError.value },
+  { title: 'Cron status failed', error: cronStatusError.value },
   { title: 'Cron logs failed', error: cronLogsError.value },
   { title: 'ML gate failed', error: mlGateError.value },
   { title: 'Artifact check failed', error: artifactsError.value },
@@ -76,8 +80,12 @@ function latestMarker(log: Dict): Dict {
   return typeof log.latest_marker === 'object' && log.latest_marker !== null && !Array.isArray(log.latest_marker) ? log.latest_marker as Dict : {}
 }
 
+function tailLines(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((line) => String(line)) : []
+}
+
 async function refreshAll() {
-  await Promise.all([refreshSmoke(), refreshLogs(), refreshMlGate(), refreshArtifacts(), refreshCommands(), refreshApiErrors()])
+  await Promise.all([refreshSmoke(), refreshCronStatus(), refreshLogs(), refreshMlGate(), refreshArtifacts(), refreshCommands(), refreshApiErrors()])
 }
 
 function commandArgs(value: unknown): string {
@@ -103,7 +111,7 @@ async function runCommand(command: Dict) {
       requested_reason: requestedReason.value || 'UI-triggered safe operations check'
     })
     latestRunResult.value = result.run
-    await Promise.all([refreshCommands(), refreshSmoke(), refreshLogs(), refreshApiErrors()])
+    await Promise.all([refreshCommands(), refreshSmoke(), refreshCronStatus(), refreshLogs(), refreshApiErrors()])
   } catch (err) {
     runError.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -328,6 +336,67 @@ async function runSmokeCommand() {
   </section>
 
   <section class="mt-8 grid gap-6 lg:grid-cols-[1fr_1fr]">
+    <div class="glass-panel rounded-3xl p-6 lg:col-span-2">
+      <div class="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <p class="text-xs font-bold uppercase tracking-[0.3em] text-ink/45">Scheduled jobs</p>
+          <h2 class="mt-2 text-2xl font-black">Cron status, locks, and latest run markers</h2>
+          <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/60">
+            Parsed from the generated crontab and joined to lock directories plus bounded log tails. This is read-only and does not start or stop jobs.
+          </p>
+        </div>
+        <button class="rounded-full bg-ink px-4 py-2 text-sm font-black text-paper" type="button" @click="refreshCronStatus()">Refresh schedule</button>
+      </div>
+
+      <div class="mt-5 grid gap-3 md:grid-cols-5">
+        <MetricTile label="Jobs" :value="String(cronJobs.length)" :note="String(cronStatus?.crontab_path || '-')" />
+        <MetricTile label="OK" :value="display(cronCounts.ok || 0)" note="No issue detected" />
+        <MetricTile label="Running" :value="display(cronCounts.running || 0)" note="Active lock present" />
+        <MetricTile label="Warnings" :value="display(cronCounts.warning || 0)" note="Errors in tail or interrupted" />
+        <MetricTile label="Errors" :value="display(cronCounts.error || 0)" note="Traceback, failure, or stale lock" />
+      </div>
+
+      <div class="mt-5 grid gap-4 xl:grid-cols-2">
+        <article v-for="job in cronJobs" :key="`${job.job_name}-${job.line_no}`" class="rounded-3xl bg-white/75 p-5">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p class="text-lg font-black text-ink">{{ job.job_name || 'cron_job' }}</p>
+              <p class="mt-1 text-xs font-semibold uppercase tracking-[0.16em] text-ink/45">{{ job.schedule }}</p>
+            </div>
+            <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(job.status)">{{ String(job.status || 'unknown').toUpperCase() }}</span>
+          </div>
+
+          <div class="mt-4 grid gap-3 md:grid-cols-3">
+            <div class="rounded-2xl bg-paper/80 p-3">
+              <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Next Run</p>
+              <p class="mt-1 text-sm font-bold text-ink/70">{{ display(job.next_run_estimate) }}</p>
+            </div>
+            <div class="rounded-2xl bg-paper/80 p-3">
+              <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Last Log</p>
+              <p class="mt-1 text-sm font-bold text-ink/70">{{ display(job.last_log_at) }}</p>
+            </div>
+            <div class="rounded-2xl bg-paper/80 p-3">
+              <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Lock</p>
+              <p class="mt-1 text-sm font-bold text-ink/70">{{ job.lock_active ? (job.lock_stale ? 'stale' : 'active') : 'clear' }}</p>
+            </div>
+          </div>
+
+          <div class="mt-4 flex flex-wrap gap-2">
+            <MetaChip tone="plain" label="log">{{ display(job.log_file) }}</MetaChip>
+            <MetaChip v-if="job.lock_file" :tone="job.lock_stale ? 'red' : 'blue'" label="lock">{{ display(job.lock_file) }}</MetaChip>
+            <MetaChip v-if="job.latest_run_status" tone="green" label="latest">{{ display(job.latest_run_status) }}</MetaChip>
+          </div>
+
+          <details class="mt-4">
+            <summary class="cursor-pointer text-sm font-black text-ink">Show command and log tail</summary>
+            <code class="mt-3 block max-h-28 overflow-auto rounded-2xl bg-ink px-3 py-2 text-xs text-paper">{{ job.command }}</code>
+            <pre class="mt-3 max-h-56 overflow-auto rounded-2xl bg-ink p-4 text-xs leading-5 text-paper">{{ tailLines(job.tail).join('\n') }}</pre>
+          </details>
+        </article>
+        <p v-if="!cronJobs.length" class="rounded-2xl bg-white/70 p-4 text-sm text-ink/60">No scheduled jobs parsed from generated crontab.</p>
+      </div>
+    </div>
+
     <div class="glass-panel rounded-3xl p-6">
       <div class="flex items-start justify-between gap-4">
         <div>
