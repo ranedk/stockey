@@ -8,6 +8,7 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.fallback_telemetry import record_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.codex_cli import run_codex_structured
@@ -511,6 +512,18 @@ def apply_llm_manual_review(policy_row: dict[str, Any], *, model: str | None = N
             error = f"{type(exc).__name__}: {exc}"
             notes = _deterministic_operator_notes(policy_row, status="fallback_after_error", error=error)
             status = "fallback_after_error"
+            record_fallback_event(
+                module="advisory.event_policy",
+                source="event_policy_manual_review",
+                fallback_type="llm_deterministic_fallback",
+                severity="warn",
+                symbol=policy_row.get("symbol"),
+                unique_id=policy_row.get("unique_id"),
+                reason="Event-policy manual-review LLM failed; deterministic operator notes were used.",
+                deterministic_fallback=True,
+                error=exc,
+                metadata={"model": effective_model, "event_class": policy_row.get("policy_class") or policy_row.get("event_class")},
+            )
 
     out = dict(policy_row)
     final_action = str(notes.get("final_action_type") or out.get("action_type") or "MANUAL_REVIEW").upper()

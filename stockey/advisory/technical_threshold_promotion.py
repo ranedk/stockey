@@ -8,6 +8,7 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.fallback_telemetry import record_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from advisory.setup_registry import load_setup_registry
@@ -309,6 +310,16 @@ def generate_promotion_review(
             review = deterministic_review(payload, status="disabled")
     except Exception as exc:
         review_error = f"{type(exc).__name__}: {exc}"
+        record_fallback_event(
+            module="advisory.technical_threshold_promotion",
+            source="technical_threshold_promotion_review",
+            fallback_type="llm_deterministic_fallback",
+            severity="warn",
+            reason="Technical-threshold promotion LLM review failed; deterministic review was used.",
+            deterministic_fallback=True,
+            error=exc,
+            metadata={"model": effective_model, "setup_id": setup.get("setup_id"), "config_id": calibration.get("config_id")},
+        )
         review = deterministic_review(payload, status="fallback_after_error", error=review_error)
         review_status = "fallback_after_error"
     reviewed_at = pd.Timestamp.utcnow()

@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, fallback_telemetry, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
 from advisory import manual_review_state
 from advisory import superseded_failures
 from advisory.api import app as operator_api
@@ -2281,6 +2281,9 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
     assert summary_payload["snapshot_warning"]["operator_action"] == "run_operator_snapshot_or_wait_for_advisory"
     actions_payload = operator_api.build_actions_payload()
     assert len(actions_payload["action_recommendations"]) == 2
+    assert actions_payload["pagination"]["action_recommendations"]["total_count"] == 2
+    assert actions_payload["pagination"]["action_recommendations"]["returned_count"] == 2
+    assert actions_payload["pagination"]["action_recommendations"]["has_more"] is False
     assert actions_payload["snapshot_warning"]["reason"] == "fresh_snapshot_missing"
     compact_action = operator_api.build_actions_payload(compact=True)["action_recommendations"][0]
     assert compact_action["manual_revision_summary"] == "ABC final action needs operator checks."
@@ -2313,11 +2316,18 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
     assert compact_macro["risk_off_score"] == 0.72
     assert compact_macro["top_context_rank_pct"] == 3.0
     assert operator_api.build_portfolio_payload()["today_recommendations"][0]["symbol"] == "ABC"
+    portfolio_payload = operator_api.build_portfolio_payload()
+    assert portfolio_payload["pagination"]["portfolio"]["total_count"] == 0
+    assert portfolio_payload["pagination"]["today_recommendations"]["total_count"] == 1
     assert operator_api.build_portfolio_payload()["snapshot_warning"]["status"] == "warn"
     assert operator_api.build_watchlist_payload()["watch_recommendations"][0]["symbol"] == "WATCH"
     assert operator_api.build_watchlist_payload()["snapshot_warning"]["status"] == "warn"
     events_payload = operator_api.build_events_payload(limit=1)
     assert events_payload["events"] == [{"unique_id": "event-1"}]
+    assert events_payload["pagination"]["events"]["total_count"] == 2
+    assert events_payload["pagination"]["events"]["returned_count"] == 1
+    assert events_payload["pagination"]["events"]["has_more"] is True
+    assert events_payload["pagination"]["events"]["next_offset"] == 1
     assert events_payload["snapshot_warning"]["status"] == "warn"
     data_health_payload = operator_api.build_data_health_payload()
     assert data_health_payload["summary"]["alert_count"] == 1
@@ -2350,6 +2360,251 @@ def test_operator_api_compact_signal_refresh_keeps_effect_fields():
             "effect_summary": "Created a wait-signal match.",
         }
     ]
+
+
+def test_operator_api_actions_events_compact_pagination_caps_large_payloads(monkeypatch):
+    large_text = "x" * 10_000
+    payload = {
+        "generated_at": "2026-06-07T10:00:00+05:30",
+        "asof_date": "2026-06-07",
+        "top_action_recommendations": [{"symbol": "TOP", "action": "BUY", "raw_json": large_text}],
+        "action_recommendations": [
+            {"symbol": f"SYM{i:03d}", "action": "BUY", "setup_id": "SETUP", "raw_json": large_text}
+            for i in range(60)
+        ],
+        "alerts": [{"symbol": f"ALT{i:03d}", "alert_type": "price", "raw_json": large_text} for i in range(3)],
+        "watch_events": [
+            {"unique_id": f"event-{i:03d}", "symbol": f"SYM{i:03d}", "subject": "Announcement", "raw_json": large_text}
+            for i in range(75)
+        ],
+        "operator_feed": [{"unique_id": f"feed-{i:03d}", "message": "feed", "raw_json": large_text} for i in range(4)],
+    }
+
+    monkeypatch.setattr(operator_api, "load_operator_sections_payload", lambda section_names, **kwargs: None)
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **kwargs: payload)
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda symbols: {})
+
+    actions = operator_api.build_actions_payload(limit=10, offset=20, compact=True)
+    assert [row["symbol"] for row in actions["action_recommendations"][:2]] == ["SYM020", "SYM021"]
+    assert len(actions["action_recommendations"]) == 10
+    assert actions["pagination"]["action_recommendations"] == {
+        "total_count": 60,
+        "returned_count": 10,
+        "limit": 10,
+        "offset": 20,
+        "has_more": True,
+        "next_offset": 30,
+    }
+    assert "raw_json" not in actions["action_recommendations"][0]
+    assert actions["pagination"]["top_action_recommendations"]["total_count"] == 1
+
+    events = operator_api.build_events_payload(limit=15, offset=45, compact=True)
+    assert [row["unique_id"] for row in events["events"][:2]] == ["event-045", "event-046"]
+    assert len(events["events"]) == 15
+    assert events["pagination"]["events"] == {
+        "total_count": 75,
+        "returned_count": 15,
+        "limit": 15,
+        "offset": 45,
+        "has_more": True,
+        "next_offset": 60,
+    }
+    assert "raw_json" not in events["events"][0]
+    assert events["pagination"]["operator_feed"]["returned_count"] == 4
+
+
+def test_operator_api_portfolio_compact_pagination_caps_large_payloads(monkeypatch):
+    large_text = "x" * 10_000
+    payload = {
+        "generated_at": "2026-06-07T10:00:00+05:30",
+        "asof_date": "2026-06-07",
+        "today_recommendations": [{"symbol": "TODAY", "action": "BUY", "raw_json": large_text}],
+        "current_recommendations": [{"symbol": "CURRENT", "action": "HOLD", "raw_json": large_text}],
+        "exited_recommendations": [{"symbol": "EXITED", "action": "SELL", "raw_json": large_text}],
+        "portfolio": [{"symbol": f"PF{i:03d}", "portfolio_status": "active", "raw_json": large_text} for i in range(55)],
+        "lifecycle": [{"symbol": f"LC{i:03d}", "lifecycle_action": "HOLD", "raw_json": large_text} for i in range(8)],
+    }
+
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **kwargs: payload)
+
+    portfolio = operator_api.build_portfolio_payload(limit=12, offset=24, compact=True)
+
+    assert [row["symbol"] for row in portfolio["portfolio"][:2]] == ["PF024", "PF025"]
+    assert len(portfolio["portfolio"]) == 12
+    assert portfolio["pagination"]["portfolio"] == {
+        "total_count": 55,
+        "returned_count": 12,
+        "limit": 12,
+        "offset": 24,
+        "has_more": True,
+        "next_offset": 36,
+    }
+    assert portfolio["pagination"]["today_recommendations"]["total_count"] == 1
+    assert portfolio["pagination"]["lifecycle"]["returned_count"] == 8
+    assert "raw_json" not in portfolio["portfolio"][0]
+
+
+def test_operator_api_logs_and_research_payloads_expose_pagination(monkeypatch, tmp_path):
+    log_dir = tmp_path / "cron"
+    log_dir.mkdir()
+    for idx in range(5):
+        path = log_dir / f"job_{idx}.log"
+        path.write_text(f"[stockey.script] name=job_{idx} status=ok timestamp=2026-06-07T00:00:0{idx}Z\nline {idx}\n", encoding="utf-8")
+    monkeypatch.setattr(operator_api, "CRON_LOG_DIR", log_dir)
+
+    cron_payload = operator_api.build_cron_logs_payload(limit=2, offset=2, lines=1)
+
+    assert len(cron_payload["logs"]) == 2
+    assert cron_payload["pagination"]["logs"] == {
+        "total_count": 5,
+        "returned_count": 2,
+        "limit": 2,
+        "offset": 2,
+        "has_more": True,
+        "next_offset": 4,
+    }
+    assert len(cron_payload["logs"][0]["tail"]) == 1
+
+    prompt_payload = operator_api.build_prompt_registry_api_payload(limit=2, offset=1)
+
+    assert len(prompt_payload["contracts"]) == 2
+    assert prompt_payload["pagination"]["contracts"]["offset"] == 1
+    assert prompt_payload["pagination"]["contracts"]["total_count"] == prompt_payload["summary"]["contract_count"]
+
+    hypotheses_df = pd.DataFrame([{"hypothesis_id": f"H{i}", "title": f"Hypothesis {i}"} for i in range(6)])
+    monkeypatch.setattr(operator_api, "load_hypotheses", lambda: hypotheses_df)
+    monkeypatch.setattr(operator_api, "load_matches", lambda limit=100: pd.DataFrame([{"hypothesis_id": "H2"}]))
+    monkeypatch.setattr(operator_api, "load_action_plans", lambda limit=100: pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_wait_signals", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_wait_signal_matches", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(operator_api, "latest_promotion_audits", lambda hypothesis_ids: [{"hypothesis_id": hypothesis_id, "audit_status": "pending"} for hypothesis_id in hypothesis_ids])
+
+    hypothesis_payload = operator_api.build_hypotheses_payload(limit=2, offset=2)
+
+    assert [row["hypothesis_id"] for row in hypothesis_payload["hypotheses"]] == ["H2", "H3"]
+    assert hypothesis_payload["pagination"]["hypotheses"] == {
+        "total_count": 6,
+        "returned_count": 2,
+        "limit": 2,
+        "offset": 2,
+        "has_more": True,
+        "next_offset": 4,
+    }
+    assert [row["hypothesis_id"] for row in hypothesis_payload["promotion_audits"]] == ["H2", "H3"]
+
+
+def test_operator_api_hypotheses_empty_page_skips_related_loaders(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(operator_api, "load_hypotheses", lambda: pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_matches", lambda limit=100: calls.append("matches") or pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_action_plans", lambda limit=100: calls.append("action_plans") or pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_wait_signals", lambda **kwargs: calls.append("wait_signals") or pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_wait_signal_matches", lambda **kwargs: calls.append("wait_signal_matches") or pd.DataFrame())
+    monkeypatch.setattr(operator_api, "latest_promotion_audits", lambda hypothesis_ids: calls.append("promotion_audits") or [])
+
+    payload = operator_api.build_hypotheses_payload(limit=25)
+
+    assert payload["hypotheses"] == []
+    assert payload["matches"] == []
+    assert payload["pagination"]["hypotheses"]["total_count"] == 0
+    assert calls == []
+
+
+def test_operator_api_latest_prices_prefers_current_price_cache(monkeypatch):
+    operator_api._PAYLOAD_CACHE.clear()
+    sql_calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        operator_api,
+        "load_current_prices",
+        lambda symbols: {
+            "AAA": {
+                "price": 101.0,
+                "price_asof": pd.Timestamp("2026-06-08T00:00:00Z"),
+                "price_source": "advisory_current_prices",
+            }
+        },
+    )
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == "dhan_ohlcv_daily")
+
+    def fake_sql(query, params=None, **kwargs):
+        sql_calls.append({"query": query, "params": params})
+        assert params == {"symbols": ["BBB"]}
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": "BBB",
+                    "price": 202.0,
+                    "price_asof": pd.Timestamp("2026-06-08T00:00:00Z"),
+                }
+            ]
+        )
+
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql)
+
+    prices = operator_api._latest_ohlcv_prices(["AAA", "BBB"])
+
+    assert prices["AAA"]["price"] == 101.0
+    assert prices["AAA"]["price_source"] == "advisory_current_prices"
+    assert prices["BBB"]["price"] == 202.0
+    assert len(sql_calls) == 1
+
+
+def test_operator_api_actions_payload_uses_section_snapshot(monkeypatch):
+    full_payload_calls: list[str] = []
+    section_payload = {
+        "generated_at": "2026-06-09T00:00:00Z",
+        "asof_date": "2026-06-09",
+        "_snapshot": {"source": "db_section_snapshot"},
+        "top_action_recommendations": [{"symbol": "AAA", "action": "BUY"}],
+        "action_recommendations": [{"symbol": "BBB", "action": "BUY"}],
+        "alerts": [],
+    }
+    monkeypatch.setattr(operator_api, "load_operator_sections_payload", lambda section_names, **kwargs: section_payload)
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **kwargs: full_payload_calls.append("full") or {})
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda symbols: {})
+    monkeypatch.setattr(operator_api, "_load_latest_company_memory_reviews", lambda symbols: {})
+
+    payload = operator_api.build_actions_payload(limit=25, compact=True)
+
+    assert payload["snapshot"]["source"] == "db_section_snapshot"
+    assert payload["action_recommendations"][0]["symbol"] == "BBB"
+    assert full_payload_calls == []
+
+
+def test_operator_api_event_model_artifacts_paginates_manifest_files(monkeypatch):
+    files = [
+        {"path": f"model_{idx}.json", "latest_key": f"models/latest/model_{idx}.json"}
+        for idx in range(6)
+    ]
+    monkeypatch.setattr(
+        operator_api,
+        "build_artifact_manifest",
+        lambda **kwargs: {
+            "status": "ok",
+            "model_version": "event_meta_model_h10",
+            "latest_prefix": "models/latest",
+            "files": files,
+        },
+    )
+
+    class FakeS3:
+        def head_object(self, *, Bucket, Key):
+            return {"ContentLength": 123, "LastModified": pd.Timestamp("2026-06-07T00:00:00Z"), "ETag": "etag"}
+
+    monkeypatch.setitem(sys.modules, "utils.store", types.SimpleNamespace(AWS_BUCKET_NAME="bucket", _get_client=lambda: FakeS3()))
+
+    payload = operator_api.build_event_model_artifacts_payload(limit=2, offset=3)
+
+    assert [row["path"] for row in payload["artifact"]["files"]] == ["model_3.json", "model_4.json"]
+    assert [row["key"] for row in payload["latest_s3_heads"]] == ["models/latest/model_3.json", "models/latest/model_4.json"]
+    assert payload["pagination"]["artifact_files"] == {
+        "total_count": 6,
+        "returned_count": 2,
+        "limit": 2,
+        "offset": 3,
+        "has_more": True,
+        "next_offset": 5,
+    }
 
 
 def test_operator_api_builds_signal_quality_payload(monkeypatch):
@@ -2535,18 +2790,22 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     monkeypatch.setattr(operator_health, "build_event_data_quality_report", lambda limit=20: {"status": "ok", "message": "event quality ok", "summary": {}})
     monkeypatch.setattr(operator_health, "check_identity_issues", lambda limit=10: {"status": "ok", "message": "identity ok", "open_count": 0, "rows": []})
     monkeypatch.setattr(operator_health, "check_signal_quality", lambda: {"status": "ok", "message": "signal quality ok", "usable": True})
+    monkeypatch.setattr(operator_health, "summarize_fallback_events", lambda hours=24, limit=25: {"status": "ok", "message": "fallback ok", "active_count": 0, "rows": []})
     monkeypatch.setattr(operator_health, "check_sync_state_failures", lambda: [{"status": "ok", "message": "sync ok"}])
+    monkeypatch.setattr(operator_health, "check_operator_api_errors", lambda: {"status": "ok", "message": "api errors ok", "rows": []})
+    monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
     monkeypatch.setattr(operator_health, "summarize_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
-    monkeypatch.setattr(operator_health, "check_table_freshness", lambda: [{"status": "warn", "message": "stale", "name": "actions"}])
+    monkeypatch.setattr(operator_health, "check_table_freshness", lambda **_kwargs: [{"status": "warn", "message": "stale", "name": "actions"}])
     monkeypatch.setattr(operator_health, "check_redis", lambda: {"status": "ok", "message": "redis ok"})
     monkeypatch.setattr(operator_health, "check_dhan_token", lambda: {"status": "ok", "message": "dhan ok"})
     monkeypatch.setattr(operator_health, "check_dhan_cache", lambda: {"status": "ok", "message": "dhan cache ok"})
     monkeypatch.setattr(operator_health, "check_optional_dependencies", lambda: [{"status": "ok", "message": "deps ok"}])
     monkeypatch.setattr(operator_health, "check_frontend_dependencies", lambda: {"status": "ok", "message": "frontend ok"})
 
-    payload = operator_health.build_operator_health(log_dir=log_dir)
+    payload = operator_health.build_operator_health(log_dir=log_dir, detail_level="full")
 
     assert payload["status"] == "error"
+    assert payload["detail_level"] == "full"
     assert payload["sections"]["table_freshness"][0]["status"] == "warn"
     assert payload["sections"]["cron_logs"][0]["status"] == "error"
     assert any(hint["title"] == "actions data is stale or missing" for hint in payload["fix_hints"])
@@ -2613,6 +2872,7 @@ def test_operator_health_trust_gate_blocks_on_runtime_and_warns_on_signal_qualit
             "event_data_quality": {"status": "ok", "message": "event ok"},
             "identity_issues": {"status": "ok", "open_count": 0},
             "signal_quality": {"status": "ok", "usable": True},
+            "fallback_telemetry": {"status": "ok", "active_count": 0},
             "degradation_feed": {"status": "ok", "active_count": 0},
         }
     )
@@ -2631,6 +2891,7 @@ def test_operator_health_trust_gate_blocks_on_runtime_and_warns_on_signal_qualit
                 "max_matured_rows": 100,
                 "overlay_rows": 0,
             },
+            "fallback_telemetry": {"status": "ok", "active_count": 0},
             "degradation_feed": {"status": "ok", "active_count": 0},
         }
     )
@@ -2640,6 +2901,93 @@ def test_operator_health_trust_gate_blocks_on_runtime_and_warns_on_signal_qualit
     assert review["status"] == "warn"
     assert review["trust_level"] == "review_required"
     assert any(row["key"] == "signal_quality" for row in review["checks"])
+
+
+def test_fallback_telemetry_records_and_summarizes_events(monkeypatch):
+    writes = []
+    monkeypatch.setattr(fallback_telemetry, "ensure_table", lambda: None)
+    monkeypatch.setattr(fallback_telemetry, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+    row = fallback_telemetry.record_fallback_event(
+        module="advisory.test",
+        source="unit",
+        fallback_type="llm_deterministic_fallback",
+        severity="warn",
+        symbol="abc",
+        reason="LLM unavailable in test.",
+        deterministic_fallback=True,
+        error=RuntimeError("boom"),
+        metadata={"model": "codex"},
+    )
+
+    assert row["symbol"] == "ABC"
+    assert row["error_type"] == "RuntimeError"
+    assert writes[0].iloc[0]["fallback_type"] == "llm_deterministic_fallback"
+    assert bool(writes[0].iloc[0]["deterministic_fallback"]) is True
+
+    monkeypatch.setattr(fallback_telemetry, "table_exists", lambda table_name=fallback_telemetry.TABLE_NAME: True)
+
+    def fake_sql(query, params=None, **kwargs):
+        if "COUNT(*) AS active_count" in query:
+            return pd.DataFrame([{"active_count": 2, "error_count": 1, "warn_count": 1}])
+        if "GROUP BY fallback_type" in query:
+            return pd.DataFrame([{"fallback_type": "llm_deterministic_fallback", "count": 2}])
+        if "GROUP BY module" in query:
+            return pd.DataFrame([{"module": "advisory.test", "count": 2}])
+        return pd.DataFrame(
+            [
+                {
+                    "event_id": "evt-1",
+                    "observed_at": pd.Timestamp("2026-06-09T10:00:00Z"),
+                    "module": "advisory.test",
+                    "source": "unit",
+                    "fallback_type": "llm_deterministic_fallback",
+                    "severity": "error",
+                    "status": "active",
+                    "reason": "LLM failed.",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(fallback_telemetry, "sql_to_df", fake_sql)
+
+    summary = fallback_telemetry.summarize_fallback_events(hours=24)
+
+    assert summary["status"] == "error"
+    assert summary["active_count"] == 2
+    assert summary["counts_by_type"]["llm_deterministic_fallback"] == 2
+    assert summary["rows"][0]["event_id"] == "evt-1"
+
+
+def test_operator_health_surfaces_fallback_telemetry_in_trust_and_fix_hints():
+    fallback_section = {
+        "status": "warn",
+        "message": "Recent fallback/degraded-path events found.",
+        "window_hours": 24,
+        "active_count": 3,
+        "error_count": 0,
+        "warn_count": 3,
+        "counts_by_type": {"redis_fail_soft": 2, "llm_deterministic_fallback": 1},
+        "counts_by_module": {"utils.redis": 2, "advisory.event_policy": 1},
+        "rows": [],
+    }
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "fallback_telemetry": fallback_section,
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+    trust = operator_health.build_trust_gate(sections)
+
+    assert any(hint["title"] == "Recent fallback/degraded-path events were recorded" for hint in hints)
+    assert trust["status"] == "warn"
+    assert any(row["key"] == "fallback_telemetry" for row in trust["checks"])
 
 
 def test_operator_health_signal_quality_flags_sparse_overlay_coverage(monkeypatch):
@@ -3007,16 +3355,37 @@ def test_operator_health_dhan_cache_warns_when_expiring(monkeypatch, tmp_path):
 
 
 def test_operator_api_health_details_payload(monkeypatch):
-    monkeypatch.setattr(operator_api, "build_operator_health", lambda: {"status": "ok", "sections": {"database": {"status": "ok"}}})
+    operator_api._PAYLOAD_CACHE.clear()
+    monkeypatch.setattr(operator_api, "build_operator_health", lambda **_kwargs: {"status": "ok", "detail_level": _kwargs.get("detail_level"), "sections": {"database": {"status": "ok"}}})
 
     payload = operator_api.build_operator_health_payload()
 
     assert payload["status"] == "ok"
+    assert payload["detail_level"] == "fast"
     assert payload["sections"]["database"]["status"] == "ok"
 
 
+def test_operator_api_health_details_payload_uses_short_cache(monkeypatch):
+    operator_api._PAYLOAD_CACHE.clear()
+    calls = {"count": 0}
+
+    def fake_health(**kwargs):
+        calls["count"] += 1
+        return {"status": "ok", "detail_level": kwargs.get("detail_level"), "sections": {"database": {"status": "ok"}, "count": calls["count"]}}
+
+    monkeypatch.setattr(operator_api, "build_operator_health", fake_health)
+
+    first = operator_api.build_operator_health_payload(mode="fast")
+    second = operator_api.build_operator_health_payload(mode="fast")
+
+    assert first["sections"]["count"] == 1
+    assert second["sections"]["count"] == 1
+    assert calls["count"] == 1
+
+
 def test_operator_api_critical_payloads_include_schema_metadata(monkeypatch):
-    monkeypatch.setattr(operator_api, "build_operator_health", lambda: {"status": "ok", "sections": {"database": {"status": "ok"}}})
+    operator_api._PAYLOAD_CACHE.clear()
+    monkeypatch.setattr(operator_api, "build_operator_health", lambda **_kwargs: {"status": "ok", "sections": {"database": {"status": "ok"}}})
     monkeypatch.setattr(
         operator_api,
         "load_operator_payload",
@@ -3873,7 +4242,7 @@ def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads
     monkeypatch.setattr(
         operator_api,
         "build_event_model_artifacts_payload",
-        lambda: {
+        lambda **_kwargs: {
             "generated_at": "2026-06-07T00:00:00Z",
             "api_schema": schema("/api/research/event-model-artifacts", "event_model_artifacts"),
             "status": "ok",
@@ -4174,7 +4543,18 @@ def test_operator_api_event_trace_payload(monkeypatch):
 
     payload = operator_api.build_event_trace_payload("event-1")
 
-    assert payload == {"unique_id": "event-1", "steps": [{"stage": "event_evaluation"}]}
+    assert payload == {
+        "unique_id": "event-1",
+        "steps": [{"stage": "event_evaluation"}],
+        "pagination": {
+            "primary": "traces",
+            "processing": {"returned_count": 0, "total_count": 0, "limit": 0, "offset": 0, "has_more": False, "next_offset": None},
+            "traces": {"returned_count": 0, "total_count": 0, "limit": 0, "offset": 0, "has_more": False, "next_offset": None},
+            "steps": {"returned_count": 1, "total_count": 1, "limit": 1, "offset": 0, "has_more": False, "next_offset": None},
+            "action_conflicts": {"returned_count": 0, "total_count": 0, "limit": 0, "offset": 0, "has_more": False, "next_offset": None},
+            "bounded": False,
+        },
+    }
 
 
 def test_operator_api_symbol_trace_payload(monkeypatch):
@@ -4182,7 +4562,19 @@ def test_operator_api_symbol_trace_payload(monkeypatch):
 
     payload = operator_api.build_symbol_trace_payload("abc", limit=10)
 
-    assert payload == {"symbol": "ABC", "traces": [{"final_action": "SELL"}], "limit": 10}
+    assert payload == {
+        "symbol": "ABC",
+        "traces": [{"final_action": "SELL"}],
+        "limit": 10,
+        "pagination": {
+            "primary": "traces",
+            "processing": {"returned_count": 0, "total_count": 0, "limit": 0, "offset": 0, "has_more": False, "next_offset": None},
+            "traces": {"returned_count": 1, "total_count": 1, "limit": 10, "offset": 0, "has_more": False, "next_offset": None},
+            "steps": {"returned_count": 0, "total_count": 0, "limit": 0, "offset": 0, "has_more": False, "next_offset": None},
+            "action_conflicts": {"returned_count": 0, "total_count": 0, "limit": 0, "offset": 0, "has_more": False, "next_offset": None},
+            "bounded": True,
+        },
+    }
 
 
 def test_decision_trace_loads_manual_review_wait_signal_links(monkeypatch):
@@ -4284,6 +4676,8 @@ def test_operator_api_trace_summary_uses_materialized_cache(monkeypatch):
     payload = operator_api.build_symbol_trace_summary_payload("ABC", limit=100)
 
     assert payload["_trace_summary_cache"]["source"] == "materialized"
+    assert payload["pagination"]["decisions"]["returned_count"] == 0
+    assert payload["pagination"]["decisions"]["limit"] == 100
 
 
 def test_operator_api_trace_summary_falls_back_and_marks(monkeypatch):
@@ -4295,12 +4689,17 @@ def test_operator_api_trace_summary_falls_back_and_marks(monkeypatch):
     payload = operator_api.build_event_trace_summary_payload("event-1")
 
     assert payload["_trace_summary_cache"]["source"] == "live_fallback"
+    assert payload["pagination"]["decisions"]["returned_count"] == 0
     assert markers[0]["message"] == "trace_summary_cache_miss:event"
 
 
 def test_operator_api_hypothesis_payloads(monkeypatch):
     monkeypatch.setattr(operator_api, "load_hypotheses", lambda: pd.DataFrame([{"hypothesis_id": "H1", "title": "Austerity"}]))
     monkeypatch.setattr(operator_api, "load_matches", lambda limit=100: pd.DataFrame([{"hypothesis_id": "H1", "suggested_action": "REDUCE_EXPOSURE_REVIEW_TESTING"}]))
+    monkeypatch.setattr(operator_api, "load_action_plans", lambda limit=100: pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_wait_signals", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_wait_signal_matches", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(operator_api, "latest_promotion_audits", lambda hypothesis_ids: [])
     monkeypatch.setattr(operator_api, "create_hypothesis", lambda payload: {"hypothesis_id": "H1", **payload})
     monkeypatch.setattr(operator_api, "run_hypothesis_scan", lambda **kwargs: {"status": "ok", "match_count": 1, **kwargs})
 

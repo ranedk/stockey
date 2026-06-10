@@ -10,6 +10,7 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from advisory.decision_trace import append_trace, append_trace_step, record_event_processing
+from advisory.fallback_telemetry import record_fallback_event
 from advisory.market_context import load_latest_market_context
 from advisory.prompt_registry import response_schema_version
 from advisory.prompts import ADVISORY_EVENT_PROMPT_VERSION, SYSTEM_PROMPT, render_event_prompt
@@ -1152,6 +1153,18 @@ def build_outputs(
             )
         except Exception as exc:
             error_count += 1
+            record_fallback_event(
+                module="advisory.llm_event_evaluator",
+                source="event_evaluation",
+                fallback_type="llm_synthetic_event_fallback",
+                severity="error",
+                symbol=event_row.get("symbol"),
+                unique_id=event_row.get("unique_id"),
+                reason="Event LLM evaluation failed; neutral synthetic event tensor was used.",
+                deterministic_fallback=True,
+                error=exc,
+                metadata={"model": model, "event_source": event_row.get("event_source"), "setup_id": event_row.get("setup_id")},
+            )
             parsed = EventEvaluation(
                 what_happened=fallback_what_happened(event_row),
                 sentiment="neutral",

@@ -8,6 +8,7 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.fallback_telemetry import record_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.codex_cli import run_codex_structured
@@ -565,6 +566,17 @@ def build_review_row(
         fallback_used = True
         error = f"{type(exc).__name__}: {exc}"
         review_status = "fallback_completed"
+        record_fallback_event(
+            module="advisory.company_memory_review",
+            source="company_memory_review",
+            fallback_type="llm_deterministic_fallback",
+            severity="warn",
+            symbol=context.get("symbol"),
+            reason="Company-memory LLM review failed; deterministic review was used.",
+            deterministic_fallback=True,
+            error=exc,
+            metadata={"model": model},
+        )
         review = deterministic_review(context)
 
     return {

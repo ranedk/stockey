@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from advisory.performance_slowlog import summarize_slow_operations
 from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
 from advisory.operator_snapshot import SNAPSHOT_NAME, TABLE_NAME as OPERATOR_SNAPSHOT_TABLE
 from advisory.event_data_quality import build_event_data_quality_report
+from advisory.fallback_telemetry import summarize_fallback_events
 from advisory.identity_issues import IDENTITY_ISSUES_TABLE
 from advisory.signal_quality_evaluator import EVALUATIONS_TABLE as SIGNAL_QUALITY_EVALUATIONS_TABLE
 from advisory.signal_quality_evaluator import SUMMARY_TABLE as SIGNAL_QUALITY_SUMMARY_TABLE
@@ -37,6 +39,7 @@ DEFAULT_OPERATOR_API_URL = "http://127.0.0.1:8765/api/health"
 OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
 TRACE_SUMMARIES_TABLE = "advisory_trace_summaries"
 DHAN_TOKEN_EXPIRY_WARN_SECONDS = 6 * 60 * 60
+OPERATOR_HEALTH_FAST_WORKERS = env.int("OPERATOR_HEALTH_FAST_WORKERS", default=8)
 SIGNAL_QUALITY_MAX_AGE_DAYS = env.float("SIGNAL_QUALITY_MAX_AGE_DAYS", default=14.0)
 SIGNAL_QUALITY_MIN_MATURED_ROWS = env.int("SIGNAL_QUALITY_MIN_MATURED_ROWS", default=30)
 SIGNAL_QUALITY_MIN_OVERLAY_ROWS = env.int("SIGNAL_QUALITY_MIN_OVERLAY_ROWS", default=10)
@@ -238,7 +241,7 @@ def check_operator_api() -> dict[str, Any]:
         return _status("error", "Operator API health endpoint is not reachable.", url=url, latency_ms=latency_ms, error=f"{type(exc).__name__}: {exc}")
 
 
-def check_table_freshness(now: pd.Timestamp | None = None) -> list[dict[str, Any]]:
+def check_table_freshness(now: pd.Timestamp | None = None, *, include_counts: bool = True) -> list[dict[str, Any]]:
     effective_now = pd.to_datetime(now or pd.Timestamp.utcnow(), utc=True, errors="coerce")
     rows: list[dict[str, Any]] = []
     for spec in TABLE_FRESHNESS_CHECKS:
@@ -255,13 +258,14 @@ def check_table_freshness(now: pd.Timestamp | None = None) -> list[dict[str, Any
             if effective_column is None:
                 rows.append(_status("warn", "Freshness column is missing.", name=spec["name"], table=table, column=column))
                 continue
+            count_sql = ', COUNT(*) AS row_count' if include_counts else ''
             df = sql_to_df(
-                f'SELECT MAX("{effective_column}") AS latest_at, COUNT(*) AS row_count FROM "{table}"',
+                f'SELECT MAX("{effective_column}") AS latest_at{count_sql} FROM "{table}"',
                 retries=2,
                 statement_timeout_ms=10000,
             )
             latest_at = pd.to_datetime(df.iloc[0]["latest_at"], utc=True, errors="coerce") if not df.empty else pd.NaT
-            row_count = int(df.iloc[0]["row_count"] or 0) if not df.empty else 0
+            row_count = int(df.iloc[0]["row_count"] or 0) if include_counts and not df.empty else None
             if pd.isna(latest_at):
                 rows.append(_status("warn", "Table has no timestamped rows.", name=spec["name"], table=table, row_count=row_count))
                 continue
@@ -639,7 +643,7 @@ def recover_interrupted_cron_status(path: Path, modified_at: pd.Timestamp, analy
     }
 
 
-def check_cron_logs(log_dir: str | Path = DEFAULT_LOG_DIR, *, tail_lines: int = DEFAULT_LOG_TAIL_LINES) -> list[dict[str, Any]]:
+def check_cron_logs(log_dir: str | Path = DEFAULT_LOG_DIR, *, tail_lines: int = DEFAULT_LOG_TAIL_LINES, analysis_lines: int = DEFAULT_LOG_ANALYSIS_LINES) -> list[dict[str, Any]]:
     root = Path(log_dir)
     if not root.exists():
         return [_status("warn", "Cron log directory does not exist.", log_dir=str(root))]
@@ -647,15 +651,15 @@ def check_cron_logs(log_dir: str | Path = DEFAULT_LOG_DIR, *, tail_lines: int = 
     for path in sorted(root.glob("*.log")):
         stat = path.stat()
         lines = _tail_lines(path, tail_lines)
-        analysis_lines = _tail_lines(path, max(tail_lines, DEFAULT_LOG_ANALYSIS_LINES))
-        analysis = analyze_cron_log_lines(analysis_lines)
+        analyzed_lines = _tail_lines(path, max(tail_lines, int(analysis_lines)))
+        analysis = analyze_cron_log_lines(analyzed_lines)
         modified_at = pd.to_datetime(stat.st_mtime, unit="s", utc=True)
         analysis = recover_interrupted_cron_status(path, modified_at, analysis)
         status = str(analysis.pop("status"))
         message = str(analysis.pop("message"))
         degradation_markers = [
             line
-            for line in analysis_lines
+            for line in analyzed_lines
             if any(spec["pattern"].search(line) for spec in DEGRADATION_PATTERNS)
         ][-12:]
         rows.append(
@@ -666,7 +670,7 @@ def check_cron_logs(log_dir: str | Path = DEFAULT_LOG_DIR, *, tail_lines: int = 
                 size_bytes=stat.st_size,
                 modified_at=_json_ready(modified_at),
                 tail_lines=len(lines),
-                analyzed_lines=len(analysis_lines),
+                analyzed_lines=len(analyzed_lines),
                 recent_tail_errors=[line for line in lines if any(pattern.search(line) for pattern in FAILURE_PATTERNS)][-8:],
                 degradation_markers=degradation_markers,
                 **analysis,
@@ -711,29 +715,36 @@ def _dedupe_degradations(rows: list[dict[str, Any]], *, limit: int = 100) -> lis
     return out[: max(1, int(limit))]
 
 
-def build_degradation_lifecycle_groups(rows: list[dict[str, Any]], *, limit: int = 100) -> dict[str, Any]:
+def build_degradation_lifecycle_groups(rows: list[dict[str, Any]], *, limit: int = 100, include_superseded_preview: bool = True) -> dict[str, Any]:
     active_count = sum(1 for row in rows if not row.get("recovered"))
     recovered_count = sum(1 for row in rows if row.get("recovered"))
     superseded_preview: dict[str, Any] = {"status": "unavailable", "error": None}
     superseded_count = 0
-    try:
-        preview = cleanup_superseded_failures(apply=False, limit=max(1, int(limit)))
-        event_processing = preview.get("event_processing") if isinstance(preview.get("event_processing"), dict) else {}
-        announcement_documents = preview.get("announcement_documents") if isinstance(preview.get("announcement_documents"), dict) else {}
-        superseded_count = int(event_processing.get("candidates") or 0) + int(announcement_documents.get("candidates") or 0)
+    if include_superseded_preview:
+        try:
+            preview = cleanup_superseded_failures(apply=False, limit=max(1, int(limit)))
+            event_processing = preview.get("event_processing") if isinstance(preview.get("event_processing"), dict) else {}
+            announcement_documents = preview.get("announcement_documents") if isinstance(preview.get("announcement_documents"), dict) else {}
+            superseded_count = int(event_processing.get("candidates") or 0) + int(announcement_documents.get("candidates") or 0)
+            superseded_preview = {
+                "status": preview.get("status") or "dry_run",
+                "event_processing_candidates": int(event_processing.get("candidates") or 0),
+                "announcement_document_candidates": int(announcement_documents.get("candidates") or 0),
+                "sample_count": len(event_processing.get("sample") or []) + len(announcement_documents.get("sample") or []),
+                "event_processing_sample": event_processing.get("sample") or [],
+                "announcement_document_sample": announcement_documents.get("sample") or [],
+                "dry_run_command": "python -m advisory.superseded_failures --limit 500",
+                "apply_command": "python -m advisory.superseded_failures --apply --limit 500",
+                "apply_requires_operator_intent": True,
+            }
+        except Exception as exc:
+            superseded_preview = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    else:
         superseded_preview = {
-            "status": preview.get("status") or "dry_run",
-            "event_processing_candidates": int(event_processing.get("candidates") or 0),
-            "announcement_document_candidates": int(announcement_documents.get("candidates") or 0),
-            "sample_count": len(event_processing.get("sample") or []) + len(announcement_documents.get("sample") or []),
-            "event_processing_sample": event_processing.get("sample") or [],
-            "announcement_document_sample": announcement_documents.get("sample") or [],
+            "status": "deferred",
             "dry_run_command": "python -m advisory.superseded_failures --limit 500",
-            "apply_command": "python -m advisory.superseded_failures --apply --limit 500",
             "apply_requires_operator_intent": True,
         }
-    except Exception as exc:
-        superseded_preview = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
 
     groups = [
         {
@@ -855,7 +866,7 @@ def check_announcement_document_failures(limit: int = 25) -> list[dict[str, Any]
         ]
 
 
-def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DEFAULT_LOG_DIR, limit: int = 100) -> dict[str, Any]:
+def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DEFAULT_LOG_DIR, limit: int = 100, include_deep_checks: bool = True) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for row in sections.get("sync_state_failures") or []:
         if not isinstance(row, dict) or row.get("status") == "ok":
@@ -935,7 +946,36 @@ def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DE
             }
         )
 
-    rows.extend(check_announcement_document_failures())
+    fallback_telemetry = sections.get("fallback_telemetry") if isinstance(sections.get("fallback_telemetry"), dict) else {}
+    for row in fallback_telemetry.get("rows") or []:
+        if not isinstance(row, dict):
+            continue
+        rows.append(
+            {
+                "status": row.get("severity") or row.get("status") or "warn",
+                "severity": row.get("severity") or "warn",
+                "kind": row.get("fallback_type") or "fallback_event",
+                "title": "Fallback telemetry event",
+                "message": row.get("reason") or row.get("error_message") or "A fallback/degraded path was used.",
+                "source": row.get("source") or row.get("module") or "fallback_telemetry",
+                "symbol": row.get("symbol"),
+                "unique_id": row.get("unique_id"),
+                "observed_at": row.get("observed_at"),
+                "suggested_fix": "Inspect the source module and rerun the affected pipeline after the fallback cause is fixed.",
+                "recovered": False,
+                "details": {
+                    "event_id": row.get("event_id"),
+                    "module": row.get("module"),
+                    "fallback_type": row.get("fallback_type"),
+                    "error_type": row.get("error_type"),
+                    "error_message": row.get("error_message"),
+                    "metadata_json": row.get("metadata_json"),
+                },
+            }
+        )
+
+    if include_deep_checks:
+        rows.extend(check_announcement_document_failures())
     rows = _dedupe_degradations(rows, limit=limit)
     active = [row for row in rows if not row.get("recovered")]
     recovered = [row for row in rows if row.get("recovered")]
@@ -949,7 +989,7 @@ def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DE
         "active_count": len(active),
         "recovered_count": len(recovered),
         "counts_by_kind": counts,
-        "lifecycle": build_degradation_lifecycle_groups(rows, limit=limit),
+        "lifecycle": build_degradation_lifecycle_groups(rows, limit=limit, include_superseded_preview=include_deep_checks),
         "rows": rows,
     }
 
@@ -1327,6 +1367,23 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             },
         )
 
+    fallback_telemetry = sections.get("fallback_telemetry") if isinstance(sections.get("fallback_telemetry"), dict) else {}
+    if fallback_telemetry.get("status") in {"warn", "error"}:
+        add(
+            status=str(fallback_telemetry.get("status") or "warn"),
+            title="Recent fallback/degraded-path events were recorded",
+            reason=str(fallback_telemetry.get("message") or "Some modules used deterministic fallback, fail-soft, retry, or degraded source handling."),
+            commands=["python -m advisory.operator_health --skip-dhan"],
+            details={
+                "window_hours": fallback_telemetry.get("window_hours"),
+                "active_count": fallback_telemetry.get("active_count"),
+                "error_count": fallback_telemetry.get("error_count"),
+                "warn_count": fallback_telemetry.get("warn_count"),
+                "counts_by_type": fallback_telemetry.get("counts_by_type"),
+                "counts_by_module": fallback_telemetry.get("counts_by_module"),
+            },
+        )
+
     redis = sections.get("redis") if isinstance(sections.get("redis"), dict) else {}
     if redis.get("status") in {"warn", "error"}:
         add(
@@ -1501,6 +1558,7 @@ TRUST_BLOCKER_SECTION_TITLES = {
     "event_data_quality": "Announcement/bhavcopy evidence readiness",
     "identity_issues": "Security identity readiness",
     "signal_quality": "Signal-quality evidence readiness",
+    "fallback_telemetry": "Fallback telemetry",
     "trust_gate": "Advisory trust gate",
     "redis": "Redis runtime state",
     "dhan": "Dhan token validation",
@@ -1667,6 +1725,23 @@ def build_trust_gate(sections: dict[str, Any]) -> dict[str, Any]:
             details={"active_count": active_count, "counts_by_kind": degradation.get("counts_by_kind")},
         )
 
+    fallback_telemetry = section("fallback_telemetry")
+    fallback_count = int(fallback_telemetry.get("active_count") or 0)
+    if fallback_count:
+        add_check(
+            "fallback_telemetry",
+            str(fallback_telemetry.get("status") or "warn"),
+            "Fallback telemetry",
+            f"{fallback_count} fallback/degraded-path event(s) were recorded in the recent window.",
+            impact="Treat affected recommendations as review-only until the fallback source is understood.",
+            details={
+                "window_hours": fallback_telemetry.get("window_hours"),
+                "error_count": fallback_telemetry.get("error_count"),
+                "counts_by_type": fallback_telemetry.get("counts_by_type"),
+                "counts_by_module": fallback_telemetry.get("counts_by_module"),
+            },
+        )
+
     error_count = sum(1 for row in checks if row["status"] == "error")
     warn_count = sum(1 for row in checks if row["status"] == "warn")
     if error_count:
@@ -1777,34 +1852,120 @@ def build_current_blockers(sections: dict[str, Any], fix_hints: list[dict[str, A
     }
 
 
-def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan: bool = True) -> dict[str, Any]:
-    sections: dict[str, Any] = {
-        "database": check_database(),
-        "operator_api": check_operator_api(),
-        "trace_summaries": check_trace_summaries(),
-        "slow_operations": summarize_slow_operations(limit=20),
-        "operator_snapshot": check_operator_snapshot(),
-        "event_data_quality": build_event_data_quality_report(limit=20),
-        "identity_issues": check_identity_issues(limit=10),
-        "signal_quality": check_signal_quality(),
-        "table_freshness": check_table_freshness(),
-        "sync_state_failures": check_sync_state_failures(),
-        "operator_api_errors": check_operator_api_errors(),
-        "redis": check_redis(),
-        "cron_logs": check_cron_logs(log_dir),
-        "optional_dependencies": check_optional_dependencies(),
-        "frontend": check_frontend_dependencies(),
-        "dhan_cache": check_dhan_cache(),
-    }
+def _deferred_section(name: str, *, command: str, reason: str) -> dict[str, Any]:
+    return _status(
+        "ok",
+        f"{name} deferred in fast health mode.",
+        deferred=True,
+        reason=reason,
+        command=command,
+        suggested_fix=f"Run `{command}` when you need the full diagnostic output.",
+    )
+
+
+def _run_health_checks(checks: dict[str, Any], *, workers: int) -> dict[str, Any]:
+    if not checks:
+        return {}
+    max_workers = max(1, min(int(workers), len(checks)))
+    if max_workers <= 1:
+        out: dict[str, Any] = {}
+        for name, func in checks.items():
+            try:
+                out[name] = func()
+            except Exception as exc:
+                out[name] = _status("error", "Health check failed.", error=f"{type(exc).__name__}: {exc}")
+        return out
+    out: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="operator-health") as executor:
+        future_to_name = {executor.submit(func): name for name, func in checks.items()}
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                out[name] = future.result()
+            except Exception as exc:
+                out[name] = _status("error", "Health check failed.", error=f"{type(exc).__name__}: {exc}")
+    return {name: out[name] for name in checks if name in out}
+
+
+def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan: bool = True, detail_level: str = "fast") -> dict[str, Any]:
+    mode = "full" if str(detail_level or "").strip().lower() == "full" else "fast"
+    full_mode = mode == "full"
+    if full_mode:
+        sections: dict[str, Any] = {
+            "database": check_database(),
+            "operator_api": check_operator_api(),
+            "trace_summaries": check_trace_summaries(),
+            "slow_operations": summarize_slow_operations(limit=20),
+            "operator_snapshot": check_operator_snapshot(),
+            "event_data_quality": build_event_data_quality_report(limit=20),
+            "identity_issues": check_identity_issues(limit=10),
+            "signal_quality": check_signal_quality(),
+            "fallback_telemetry": summarize_fallback_events(hours=24, limit=25),
+            "table_freshness": check_table_freshness(include_counts=True),
+            "sync_state_failures": check_sync_state_failures(),
+            "operator_api_errors": check_operator_api_errors(),
+            "redis": check_redis(),
+            "cron_logs": check_cron_logs(log_dir),
+            "optional_dependencies": check_optional_dependencies(),
+            "frontend": check_frontend_dependencies(),
+            "dhan_cache": check_dhan_cache(),
+        }
+    else:
+        fast_checks = {
+            "database": check_database,
+            "operator_api": check_operator_api,
+            "trace_summaries": check_trace_summaries,
+            "slow_operations": lambda: summarize_slow_operations(limit=20),
+            "operator_snapshot": check_operator_snapshot,
+            "identity_issues": lambda: check_identity_issues(limit=10),
+            "signal_quality": check_signal_quality,
+            "sync_state_failures": check_sync_state_failures,
+            "redis": check_redis,
+            "optional_dependencies": check_optional_dependencies,
+            "frontend": check_frontend_dependencies,
+            "dhan_cache": check_dhan_cache,
+        }
+        sections = _run_health_checks(fast_checks, workers=OPERATOR_HEALTH_FAST_WORKERS)
+        sections["event_data_quality"] = _deferred_section(
+            "Announcement/bhavcopy evidence quality",
+            command="python -m advisory.event_data_quality --format json",
+            reason="The full check scans/counts large NSE, announcement, and bhavcopy source tables and can take tens of seconds.",
+        )
+        sections["fallback_telemetry"] = _deferred_section(
+            "Fallback/degraded-path telemetry",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Fallback telemetry is queried from durable event rows and is available from full health or the dedicated diagnostics flow.",
+        )
+        sections["operator_api_errors"] = _deferred_section(
+            "Operator API error history",
+            command="Open Operations API errors or run python -m advisory.operator_health --full --skip-dhan",
+            reason="Recent API-error rows can include tracebacks and are available through the dedicated Operations view.",
+        )
+        sections["table_freshness"] = [
+            _deferred_section(
+                "Table freshness",
+                command="python -m advisory.operator_health --full --skip-dhan",
+                reason="Freshness scans touch many large tables; fast health only checks runtime readiness and cached health indicators.",
+            )
+        ]
+        sections["cron_logs"] = [
+            _deferred_section(
+                "Cron log deep scan",
+                command="python -m advisory.operator_health --full --skip-dhan",
+                reason="Cron log analysis can read thousands of lines from many logs. Use /api/operations/cron-logs for paged log inspection.",
+            )
+        ]
     if include_dhan:
         sections["dhan"] = check_dhan_token()
     else:
         sections["dhan"] = _status("warn", "Dhan token validation skipped by request.")
-    sections["degradation_feed"] = build_degradation_feed(sections, log_dir=log_dir)
+    sections["degradation_feed"] = build_degradation_feed(sections, log_dir=log_dir, include_deep_checks=full_mode)
     sections["trust_gate"] = build_trust_gate(sections)
     fix_hints = build_fix_hints(sections)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "detail_level": mode,
+        "full_diagnostics_command": "python -m advisory.operator_health --full --skip-dhan",
         "status": summarize_status(sections),
         "sections": sections,
         "fix_hints": fix_hints,
@@ -1816,12 +1977,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Read-only Stockey operator health check.")
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     parser.add_argument("--skip-dhan", action="store_true", help="Skip Dhan profile token validation.")
+    parser.add_argument("--full", action="store_true", help="Run expensive deep diagnostics against source data tables and full cron logs.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    payload = build_operator_health(log_dir=args.log_dir, include_dhan=not bool(args.skip_dhan))
+    payload = build_operator_health(log_dir=args.log_dir, include_dhan=not bool(args.skip_dhan), detail_level="full" if bool(args.full) else "fast")
     print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
     return 0 if payload["status"] in {"ok", "warn"} else 1
 

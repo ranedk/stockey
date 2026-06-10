@@ -25,7 +25,7 @@ const { data: policyData, refresh: refreshPolicy } = await useAsyncData('event-p
 })
 const { data: policyEvalData } = await useAsyncData('event-policy-evaluation', () => api.getEventPolicyEvaluation(80))
 const events = computed(() => data.value?.events || [])
-const eventMeta = computed(() => data.value?.meta?.events as Dict || {})
+const eventMeta = computed(() => asDict(data.value?.pagination?.events || data.value?.meta?.events))
 const snapshotMeta = computed(() => asDict(data.value?.snapshot))
 const snapshotWarning = computed(() => asDict(data.value?.snapshot_warning))
 const policyRows = computed(() => policyData.value?.rows || [])
@@ -299,7 +299,7 @@ function eventDetailPath(row: Record<string, unknown>) {
       </button>
     </div>
     <p class="mt-3 text-sm font-semibold text-ink/55">
-      Showing {{ eventMeta.returned || events.length }} of {{ eventMeta.total ?? events.length }} rows. Offset {{ eventMeta.offset || 0 }}.
+      Showing {{ eventMeta.returned_count ?? eventMeta.returned ?? events.length }} of {{ eventMeta.total_count ?? eventMeta.total ?? events.length }} rows. Offset {{ eventMeta.offset || 0 }}.
     </p>
   </section>
 

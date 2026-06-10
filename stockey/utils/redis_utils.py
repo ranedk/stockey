@@ -7,6 +7,8 @@ from typing import Any
 import redis
 from environs import Env
 
+from advisory.fallback_telemetry import record_fallback_event
+
 
 env = Env()
 env.read_env()
@@ -87,6 +89,15 @@ class ResilientRedis:
             _emit(
                 f"[utils.redis] redis unavailable; continuing without redis state command={command_name} "
                 f"error={last_exc.__class__.__name__ if last_exc else 'unknown'}: {last_exc}"
+            )
+            record_fallback_event(
+                module="utils.redis",
+                source="redis",
+                fallback_type="redis_fail_soft",
+                severity="warn",
+                reason=f"Redis command failed; continuing with default value for {command_name}.",
+                error=last_exc,
+                metadata={"command": command_name, "attempts": REDIS_OPERATION_ATTEMPTS},
             )
             return _default_for(command_name)
         if last_exc is not None:

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from advisory.decision_trace import ACTION_CONFLICT_RULES_TABLE
 from advisory.decision_trace import append_trace, append_trace_step, build_action_conflicts, persist_action_conflicts, safe_trace_call
+from advisory.fallback_telemetry import record_fallback_event
 from advisory.hypothesis_engine import ACTION_PLANS_TABLE, HYPOTHESES_TABLE, ensure_tables as ensure_hypothesis_tables
 from advisory.market_context import load_latest_market_context
 from advisory.portfolio_engine import PORTFOLIO_TABLE
@@ -1688,6 +1689,17 @@ def build_manual_revision_pointers(row: pd.Series, candidates: pd.DataFrame, *, 
     except Exception as exc:
         pointers = _deterministic_manual_revision_pointers(row, candidates, status="fallback_after_error")
         pointers["llm_error"] = f"{type(exc).__name__}: {exc}"
+        record_fallback_event(
+            module="advisory.action_recommender",
+            source="manual_revision_pointers",
+            fallback_type="llm_deterministic_fallback",
+            severity="warn",
+            symbol=_text(row.get("symbol")),
+            reason="Manual revision pointer LLM failed; deterministic pointers were used.",
+            deterministic_fallback=True,
+            error=exc,
+            metadata={"model": model, "action_code": row.get("action_code"), "action_source": row.get("action_source")},
+        )
         return pointers, model, "fallback_after_error"
 
 

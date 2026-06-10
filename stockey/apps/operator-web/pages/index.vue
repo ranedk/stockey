@@ -59,16 +59,16 @@ const topActions = computed(() => [
   ...(actionsData.value?.action_recommendations || []),
   ...(actionsData.value?.alerts || [])
 ])
-const actionMeta = computed(() => asDict(actionsData.value?.meta?.action_recommendations))
+const actionMeta = computed(() => asDict(actionsData.value?.pagination?.action_recommendations || actionsData.value?.meta?.action_recommendations))
 const actionQueueMeta = computed(() => {
-  const topMeta = asDict(actionsData.value?.meta?.top_action_recommendations)
-  const rowMeta = asDict(actionsData.value?.meta?.action_recommendations)
-  const alertMeta = asDict(actionsData.value?.meta?.alerts)
-  const returned = Number(topMeta.returned || 0) + Number(rowMeta.returned || 0) + Number(alertMeta.returned || 0)
-  const total = Number(topMeta.total || 0) + Number(rowMeta.total || 0) + Number(alertMeta.total || 0)
+  const topMeta = asDict(actionsData.value?.pagination?.top_action_recommendations || actionsData.value?.meta?.top_action_recommendations)
+  const rowMeta = asDict(actionsData.value?.pagination?.action_recommendations || actionsData.value?.meta?.action_recommendations)
+  const alertMeta = asDict(actionsData.value?.pagination?.alerts || actionsData.value?.meta?.alerts)
+  const returned = Number(topMeta.returned_count ?? topMeta.returned ?? 0) + Number(rowMeta.returned_count ?? rowMeta.returned ?? 0) + Number(alertMeta.returned_count ?? alertMeta.returned ?? 0)
+  const total = Number(topMeta.total_count ?? topMeta.total ?? 0) + Number(rowMeta.total_count ?? rowMeta.total ?? 0) + Number(alertMeta.total_count ?? alertMeta.total ?? 0)
   return { returned, total }
 })
-const portfolioMeta = computed(() => asDict(portfolioData.value?.meta?.portfolio))
+const portfolioMeta = computed(() => asDict(portfolioData.value?.pagination?.portfolio || portfolioData.value?.meta?.portfolio))
 const today = computed(() => portfolioRowsForBucket(portfolioBucket.value))
 const snapshotMeta = computed(() => asDict(home.value?.snapshot || actionsData.value?.snapshot || portfolioData.value?.snapshot))
 const snapshotWarning = computed(() => asDict(home.value?.snapshot_warning || actionsData.value?.snapshot_warning || portfolioData.value?.snapshot_warning))
@@ -215,8 +215,8 @@ function loadNextPortfolio() {
 }
 
 function bucketCount(bucket: string) {
-  const meta = asDict(portfolioData.value?.meta?.[bucket])
-  return Number(meta.total ?? portfolioRowsForBucket(bucket).length)
+  const meta = asDict(portfolioData.value?.pagination?.[bucket] || portfolioData.value?.meta?.[bucket])
+  return Number(meta.total_count ?? meta.total ?? portfolioRowsForBucket(bucket).length)
 }
 
 function actionDetailPath(row: Record<string, unknown>) {

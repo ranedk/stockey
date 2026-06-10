@@ -201,6 +201,8 @@ It writes `advisory_bhavcopy_evidence_daily` and `advisory_announcement_evidence
 
 The Health page also shows a read-only superseded cleanup preview when recovered event-processing failures or recovered announcement-document errors can be marked superseded. Inspect the sample rows first, then run `python -m advisory.superseded_failures --limit 500` or `./all_superseded_cleanup_audit.sh` for the dry-run JSON. Cron runs `./all_superseded_cleanup_audit.sh` after market close as a preview-only audit, and the Operations page exposes the same dry-run through `superseded_failure_cleanup_dry_run`. Only run `python -m advisory.superseded_failures --apply --limit 500` after explicit operator intent; this marks durable superseded metadata and does not submit broker orders or change portfolio/action/config state.
 
+The Health page also reads `advisory_fallback_events` and shows a persisted fallback telemetry card. Treat warning spikes as review-only signals until understood; error-severity fallbacks such as synthetic event-evaluation fallback should block trust in the affected fresh advisory output. The first emitters cover Redis fail-soft, Dhan identity fallback/unresolved identity, NSE retry/session reset, and key LLM/Codex deterministic fallbacks.
+
 Useful API/token env knobs:
 
 - `OPERATOR_API_HEALTH_URL`: endpoint checked by operator health, default `http://127.0.0.1:8765/api/health`

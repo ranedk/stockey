@@ -22,6 +22,7 @@ from .categorize import report_category_map
 from .models import Announcement, CompanyMasterTarget, ParsedReport
 from .prompts import CATEGORY_PROMPTS, REPORT_PROMPTS
 from .schemas import DOCUMENT_PYDANTIC_MAP, MODEL_TYPE_MAP
+from advisory.fallback_telemetry import record_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.http import get_dynamic_headers
@@ -121,6 +122,15 @@ class AnnouncementPipeline:
                 reset_state = headers is None and cookies is None
                 if reset_state:
                     self._reset_nse_http_state(reason=f"{exc.__class__.__name__}: {exc}")
+                record_fallback_event(
+                    module="data.announcements.pipeline",
+                    source="nse_http",
+                    fallback_type="nse_retry",
+                    severity="warn",
+                    reason="NSE request failed; retry loop is waiting and resetting session state when possible.",
+                    error=exc,
+                    metadata={"url": url, "attempt": attempt, "max_attempts": attempt_cap, "status_code": status_code, "sleep_seconds": sleep_for},
+                )
                 self._log_nse_wait(
                     "NSE request failed; retrying url=%s attempt=%s max_attempts=%s sleep=%.1fs error=%s: %s",
                     url,
@@ -620,6 +630,14 @@ class AnnouncementPipeline:
     def _reset_nse_http_state(self, *, reason: str) -> None:
         self._nse_headers = self._build_nse_headers()
         self._nse_cookies = {}
+        record_fallback_event(
+            module="data.announcements.pipeline",
+            source="nse_http",
+            fallback_type="nse_session_reset",
+            severity="warn",
+            reason="NSE HTTP session state was reset and cookies were cleared before retry.",
+            metadata={"reason": reason},
+        )
         self._log_nse_wait("Reset NSE HTTP session state; cleared cookies reason=%s", reason)
         try:
             self._nse_cookies = self._bootstrap_nse_cookies_once(self._nse_headers)

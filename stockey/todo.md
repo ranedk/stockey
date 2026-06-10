@@ -74,12 +74,15 @@ The active stack already has:
 2. Remaining high-risk gaps are observability and correctness gaps, not missing major architecture blocks.
 3. Some manual workflows still require CLI/manual edits: event-model promotion checks, approved technical config diffs, S3 artifact inspection, cron log inspection, and some research-ledger review.
 4. Fast signal refresh is intentionally not the authoritative portfolio allocator. Daily `all_advisory.sh` remains the reconciliation path until enough evidence proves incremental advisory is safe.
-5. Some non-home API endpoints still return large raw rows and need pagination/compaction.
-6. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
-7. The serialized external task queue now has concrete NSE/Dhan/Screener handlers plus a queued downloader/worker cron path; direct `all_downloaders.sh` and `complete_data.sh` remain the catch-up/backfill path when a day is missed.
-8. `all_advisory.sh` now defaults to bounded local-stage parallelism and skips hidden rule repair; next performance work is stage-budget reporting and moving remaining external repair into queue workers where safe.
-9. Continuous watch should add stronger cooldowns, duplicate suppression, and explicit per-source failure counters.
-10. Approved technical threshold reviews still require manual config edits; reviewed-diff generation would reduce operator mistakes.
+5. Done: non-home frontend list endpoints now return compact rows or explicit pagination/bounded-list metadata. Actions, Events, Portfolio, trace summary/list payloads, cron logs, prompt registry, hypotheses, artifact manifests, and research review/previews are covered.
+6. Done: `/api/health/details` now defaults to bounded parallel fast mode, uses short API caching, and defers heavyweight source/table/log/fallback/API-error-history scans to `mode=full` or CLI diagnostics; 2026-06-09 probe measured ~0.64s cold and ~0.002s warm.
+7. Done: Action Queue reads use section snapshots plus `advisory_current_prices`; 2026-06-09 probe improved `/api/actions?...compact=true` to ~0.74s cold and ~0.10s warm, below the generic slowlog threshold.
+8. Done: `/api/hypotheses?limit=25` now skips related empty reads, batches promotion-audit lookups, and uses a short API cache; 2026-06-09 probe improved from ~1.45s to ~0.64s cold and ~0.003s warm.
+9. Decision trace summaries are still built live; old trace/intraday rows need hot/cold retention.
+10. The serialized external task queue now has concrete NSE/Dhan/Screener handlers plus a queued downloader/worker cron path; direct `all_downloaders.sh` and `complete_data.sh` remain the catch-up/backfill path when a day is missed.
+11. `all_advisory.sh` now defaults to bounded local-stage parallelism and skips hidden rule repair; next performance work is stage-budget reporting and moving remaining external repair into queue workers where safe.
+12. Continuous watch should add stronger cooldowns, duplicate suppression, and explicit per-source failure counters.
+13. Approved technical threshold reviews still require manual config edits; reviewed-diff generation would reduce operator mistakes.
 11. Legacy “promotion audit” naming should be migrated to “reliability check” once DB migration is safe.
 
 ## Highest Priority: UI-First Operations
@@ -130,6 +133,7 @@ Required operator UI coverage:
    - paginate and compact events/actions/portfolio/trace APIs so the UI remains fast
    - materialize trace summaries after advisory/watchers instead of rebuilding large traces live
    - show source-to-output lineage: raw event -> OCR/summary -> tensor -> policy/review -> action -> lifecycle/execution plan
+   - done: consolidate `/api/hypotheses` reads so table initialization and empty-list queries do not cost ~1.45s per page load
 
 Next implementation slices:
 
@@ -140,7 +144,8 @@ Next implementation slices:
 5. Add reviewed-diff generation for approved technical threshold decisions.
 6. Add cron/log viewer endpoints with bounded log tails and latest marker parsing.
 7. Add fallback telemetry persistence and Health-page fallback spike cards.
-8. Add pagination/summary-first APIs for events, actions, portfolio, trace, research runs, and logs.
+8. Done: add pagination/summary-first APIs for events, actions, portfolio, trace, research runs, and logs.
+9. Done: split operator Health into fast/default and full/deep diagnostic modes; full mode is intentionally expensive and should be operator-triggered, not used for normal UI refresh.
 
 ## Next development set
 
@@ -208,10 +213,11 @@ This is the recommended current implementation order.
    - done: add API self-check latency and Dhan cached-token age/expiry to the operator health payload and Data Health page
    - done: surface operator snapshot freshness, slow-operation issues, and failed watcher/router sync-state rows in operator health and the Nuxt Health page
    - done: add Advisory Trust Gate to Health so the UI says whether today’s recommendations are usable, review-only, or blocked by runtime, freshness, event evidence, identity, signal-quality, or degradation issues
+   - done: add persisted fallback telemetry plus Health-page fallback spike cards for Redis fail-soft, Dhan identity fallback, NSE retry/session reset, and LLM/Codex deterministic fallbacks
    - done: record dashboard section-loader failures in payloads instead of only printing them
    - done: make watcher cycle failures persist `advisory_sync_state.status=error` and publish error messages before returning
    - done: add a single smoke-test command for API + DB + frontend dependency checks
-   - next: add a health section for recent fallback usage by module/model/source so fallback spikes are visible without grepping logs
+   - next: extend fallback telemetry to DB retry/fallback query paths only after avoiding circular DB-telemetry failure modes
    - keep cron/frontend logs visible from the operator app without adding write/trading controls
 
 ## Next Most Important Tasks
@@ -224,9 +230,9 @@ This is the recommended current implementation order.
    - Target command: `python -m advisory.operator_smoke`.
    - It runs compact API, DB, snapshot, frontend dependency, identity, signal-quality, cron, and trust-gate checks.
 
-3. Add fallback telemetry.
-   - Persist fallback events for LLM disabled/fallback, Codex fallback, Redis fail-soft, live-builder fallback, and Dhan identity fallback.
-   - Surface fallback counts on the Health page and in fix hints when they spike.
+3. Done: add fallback telemetry.
+   - Persist fallback events in `advisory_fallback_events` for Redis fail-soft, Dhan identity fallback/unresolved identity, NSE retry/session reset, and key LLM/Codex deterministic fallbacks.
+   - Surface fallback counts on the Health page, in fix hints, in degradation rows, and in the Advisory Trust Gate when they spike.
 
 4. Build trace summary materialization.
    - Precompute symbol/event trace summaries after advisory/watchers.
@@ -1439,6 +1445,9 @@ Completed performance work:
 - process-local API payload cache avoids repeatedly reparsing the same snapshot
 - compact `/api/home` keeps the Nuxt landing page fast
 - DB duplicate index and heavy-text cleanup scripts exist for periodic maintenance
+- Actions, Events, Portfolio, trace summary/list, cron logs, prompt registry, hypotheses, artifact manifests, and research review/previews expose compact rows or stable pagination/bounded-list metadata: `total_count`, `returned_count`, `limit`, `offset`, `has_more`, and `next_offset`
+- Health details use bounded parallel fast/default mode plus short API caching for UI responsiveness; full mode performs the expensive event-data, freshness, cron-log, API-error-history, and fallback scans on demand. `OPERATOR_HEALTH_FAST_WORKERS` controls the fast-check worker count for small Postgres instances.
+- Latest OHLCV price enrichment uses `advisory_current_prices` plus process-local TTL caching, and `/api/actions` uses section snapshots instead of loading the full operator snapshot. Next measured hotspot should be selected from the slow-operation report after the next normal cron/advisory run.
 
 Next performance backlog:
 

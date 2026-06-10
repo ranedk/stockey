@@ -18,11 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from advisory.action_recommender import TABLE_NAME as ACTION_RECOMMENDATIONS_TABLE
 from advisory.company_memory_review import TABLE_NAME as COMPANY_MEMORY_REVIEWS_TABLE
 from advisory.config_change_assistant import build_signal_quality_overlay_preview, build_technical_threshold_preview, load_previews as load_config_change_previews
+from advisory.current_prices import load_current_prices
 from advisory.decision_trace import ensure_trace_tables, load_event_trace, load_symbol_trace
 from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
 from advisory.event_model_artifact_store import build_artifact_manifest
 from advisory.event_model_promotion_check import build_promotion_check
-from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audit, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
+from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audits, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
 from advisory.identity_issues import IDENTITY_ISSUES_TABLE, load_open_identity_issues
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
 from advisory.event_policy_evaluator import SUMMARY_TABLE as EVENT_POLICY_EVAL_SUMMARY_TABLE
@@ -40,6 +41,7 @@ from advisory.manual_review_state import (
 from advisory.operator_health import build_operator_health
 from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
 from advisory.operator_snapshot import load_operator_snapshot
+from advisory.operator_snapshot import load_operator_snapshot_sections
 from advisory.performance_slowlog import record_slow_operation
 from advisory.performance_slowlog import update_slow_issue_status
 from advisory.prompt_registry import build_prompt_registry_payload
@@ -161,6 +163,7 @@ class OperatorActionsResponse(OperatorApiResponseModel):
     top_action_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     action_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     alerts: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -201,6 +204,7 @@ class OperatorPortfolioResponse(OperatorApiResponseModel):
     exited_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     portfolio: list[dict[str, Any]] = Field(default_factory=list)
     lifecycle: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -234,6 +238,7 @@ class OperatorEventsResponse(OperatorApiResponseModel):
     events: list[dict[str, Any]] = Field(default_factory=list)
     operator_feed: list[dict[str, Any]] = Field(default_factory=list)
     alerts: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -282,6 +287,7 @@ class OperationsCronLogsResponse(OperatorApiResponseModel):
     status: str
     log_dir: str | None = None
     logs: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class OperationsCommandsResponse(OperatorApiResponseModel):
@@ -323,6 +329,7 @@ class EventModelArtifactsResponse(OperatorApiResponseModel):
     status: str | None = None
     artifact: dict[str, Any] = Field(default_factory=dict)
     latest_s3_heads: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
     read_only: bool = True
 
 
@@ -400,6 +407,7 @@ class SymbolTraceResponse(OperatorApiResponseModel):
     traces: list[dict[str, Any]] = Field(default_factory=list)
     steps: list[dict[str, Any]] = Field(default_factory=list)
     action_conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class OperatorDetailResponse(OperatorApiResponseModel):
@@ -424,6 +432,7 @@ class EventTraceResponse(OperatorApiResponseModel):
     traces: list[dict[str, Any]] = Field(default_factory=list)
     steps: list[dict[str, Any]] = Field(default_factory=list)
     action_conflicts: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class TraceSummaryResponse(OperatorApiResponseModel):
@@ -435,6 +444,7 @@ class TraceSummaryResponse(OperatorApiResponseModel):
     decisions: list[dict[str, Any]] = Field(default_factory=list)
     action_conflicts: list[dict[str, Any]] = Field(default_factory=list)
     raw_counts: dict[str, Any] = Field(default_factory=dict)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class TechnicalCalibrationResponse(OperatorApiResponseModel):
@@ -461,6 +471,7 @@ class TechnicalPromotionReviewsResponse(OperatorApiResponseModel):
     api_schema: OperatorApiSchemaModel
     status: str
     reviews: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class SignalQualityPromotionReviewsResponse(OperatorApiResponseModel):
@@ -468,6 +479,7 @@ class SignalQualityPromotionReviewsResponse(OperatorApiResponseModel):
     api_schema: OperatorApiSchemaModel
     status: str
     reviews: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class ConfigChangePreviewsResponse(OperatorApiResponseModel):
@@ -475,6 +487,7 @@ class ConfigChangePreviewsResponse(OperatorApiResponseModel):
     api_schema: OperatorApiSchemaModel
     status: str
     previews: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class PromptRegistryResponse(OperatorApiResponseModel):
@@ -484,6 +497,7 @@ class PromptRegistryResponse(OperatorApiResponseModel):
     contracts: list[dict[str, Any]] = Field(default_factory=list)
     summary: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class EventPolicyResponse(OperatorApiResponseModel):
@@ -512,6 +526,7 @@ class HypothesesResponse(OperatorApiResponseModel):
     wait_signals: list[dict[str, Any]] = Field(default_factory=list)
     wait_signal_matches: list[dict[str, Any]] = Field(default_factory=list)
     promotion_audits: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 EVENT_CLASS_LABELS = {
@@ -745,6 +760,42 @@ def load_operator_payload(*, asof_date: str | pd.Timestamp | None = None) -> dic
         "generated_at": pd.Timestamp.utcnow().isoformat(),
     }
     _PAYLOAD_CACHE[cache_key] = (now, payload)
+    return payload
+
+
+def load_operator_sections_payload(section_names: list[str], *, asof_date: str | pd.Timestamp | None = None) -> dict[str, Any] | None:
+    parsed_asof = _parse_asof_date(asof_date) if isinstance(asof_date, str) else asof_date
+    cache_key = (
+        "operator_sections",
+        ",".join(sorted({str(name) for name in section_names})),
+        None if parsed_asof is None else pd.to_datetime(parsed_asof, utc=True).normalize().strftime("%Y-%m-%d"),
+    )
+    now = time.monotonic()
+    cached = _PAYLOAD_CACHE.get(cache_key)
+    if cached and OPERATOR_API_PAYLOAD_CACHE_SECONDS > 0 and (now - cached[0]) <= OPERATOR_API_PAYLOAD_CACHE_SECONDS:
+        return cached[1]
+    if not OPERATOR_API_USE_SNAPSHOT:
+        return None
+    payload = load_operator_snapshot_sections(
+        section_names,
+        asof_date=parsed_asof,
+        max_age_seconds=OPERATOR_SNAPSHOT_MAX_AGE_SECONDS,
+    )
+    if payload is None and OPERATOR_API_ALLOW_STALE_SNAPSHOT:
+        payload = load_operator_snapshot_sections(
+            section_names,
+            asof_date=parsed_asof,
+            max_age_seconds=0,
+        )
+        if payload is not None:
+            payload["_snapshot"] = {
+                **(payload.get("_snapshot") or {}),
+                "freshness": "stale",
+                "reason": "fresh_section_snapshot_missing",
+                "max_age_seconds": OPERATOR_SNAPSHOT_MAX_AGE_SECONDS,
+            }
+    if payload is not None:
+        _PAYLOAD_CACHE[cache_key] = (now, payload)
     return payload
 
 
@@ -1187,9 +1238,9 @@ def _load_latest_company_memory_reviews(symbols: list[str]) -> dict[str, dict[st
     return out
 
 
-def _with_company_memory_reviews(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _with_company_memory_reviews(rows: list[dict[str, Any]], *, reviews: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     symbols = [str(row.get("symbol") or row.get("ticker") or "") for row in rows if isinstance(row, dict)]
-    reviews = _load_latest_company_memory_reviews(symbols)
+    reviews = reviews if reviews is not None else _load_latest_company_memory_reviews(symbols)
     if not reviews:
         return rows
     out: list[dict[str, Any]] = []
@@ -1238,20 +1289,36 @@ def build_actions_payload(
     search: str | None = None,
     compact: bool = False,
 ) -> dict[str, Any]:
-    payload = load_operator_payload(asof_date=asof_date)
+    payload = load_operator_sections_payload(
+        ["top_action_recommendations", "action_recommendations", "alerts"],
+        asof_date=asof_date,
+    ) or load_operator_payload(asof_date=asof_date)
     top_actions = _filter_rows(payload.get("top_action_recommendations") or [], symbol=symbol, action=action, status=status, search=search)
     action_rows = _filter_rows(payload.get("action_recommendations") or [], symbol=symbol, action=action, status=status, search=search)
     alert_rows = _filter_rows(payload.get("alerts") or [], symbol=symbol, status=status, search=search)
     action_page, action_meta = _page_rows(action_rows, limit=limit, offset=offset)
     top_action_raw = top_actions[: _bounded_limit(limit, default=25)]
     alert_raw = alert_rows[: _bounded_limit(limit, default=25)]
+    top_action_pagination = _limited_pagination_contract(top_actions, limit=limit, default=25)
+    alert_pagination = _limited_pagination_contract(alert_rows, limit=limit, default=25)
     latest_prices = _latest_ohlcv_prices([
         str(row.get("symbol") or row.get("ticker") or "")
         for row in [*top_action_raw, *action_page, *alert_raw]
         if isinstance(row, dict)
     ])
-    top_action_page = _with_company_memory_reviews(_with_execution_safety_contracts(_with_latest_prices(top_action_raw, price_field="current_price", prices=latest_prices)))
-    action_page = _with_company_memory_reviews(_with_execution_safety_contracts(_with_latest_prices(action_page, price_field="current_price", prices=latest_prices)))
+    memory_reviews = _load_latest_company_memory_reviews([
+        str(row.get("symbol") or row.get("ticker") or "")
+        for row in [*top_action_raw, *action_page]
+        if isinstance(row, dict)
+    ])
+    top_action_page = _with_company_memory_reviews(
+        _with_execution_safety_contracts(_with_latest_prices(top_action_raw, price_field="current_price", prices=latest_prices)),
+        reviews=memory_reviews,
+    )
+    action_page = _with_company_memory_reviews(
+        _with_execution_safety_contracts(_with_latest_prices(action_page, price_field="current_price", prices=latest_prices)),
+        reviews=memory_reviews,
+    )
     alert_page = _with_latest_prices(alert_raw, price_field="last_price", prices=latest_prices)
     return {
         "generated_at": payload.get("generated_at"),
@@ -1262,10 +1329,16 @@ def build_actions_payload(
         "top_action_recommendations": _compact_list_rows(top_action_page, compact=compact),
         "action_recommendations": _compact_list_rows(action_page, compact=compact),
         "alerts": _compact_list_rows(alert_page, compact=compact),
+        "pagination": {
+            "primary": "action_recommendations",
+            "top_action_recommendations": top_action_pagination,
+            "action_recommendations": _pagination_contract(action_meta),
+            "alerts": alert_pagination,
+        },
         "meta": {
-            "top_action_recommendations": {"total": len(top_actions), "returned": min(len(top_actions), _bounded_limit(limit, default=25))},
+            "top_action_recommendations": {"total": len(top_actions), "returned": top_action_pagination["returned_count"]},
             "action_recommendations": action_meta,
-            "alerts": {"total": len(alert_rows), "returned": min(len(alert_rows), _bounded_limit(limit, default=25))},
+            "alerts": {"total": len(alert_rows), "returned": alert_pagination["returned_count"]},
             "filters": {"symbol": symbol, "action": action, "status": status, "search": search, "compact": compact},
         },
     }
@@ -1594,6 +1667,10 @@ def build_portfolio_payload(
     portfolio_rows = _filter_rows(payload.get("portfolio") or [], symbol=symbol, status=status, search=search)
     lifecycle_rows = _filter_rows(payload.get("lifecycle") or [], symbol=symbol, status=status, search=search)
     portfolio_page, portfolio_meta = _page_rows(portfolio_rows, limit=limit, offset=offset)
+    today_pagination = _limited_pagination_contract(today_rows, limit=limit, default=25)
+    current_pagination = _limited_pagination_contract(current_rows, limit=limit, default=25)
+    exited_pagination = _limited_pagination_contract(exited_rows, limit=limit, default=25)
+    lifecycle_pagination = _limited_pagination_contract(lifecycle_rows, limit=limit, default=25)
     return {
         "generated_at": payload.get("generated_at"),
         "api_schema": _operator_api_schema("/api/portfolio", schema_name="operator_portfolio"),
@@ -1605,12 +1682,20 @@ def build_portfolio_payload(
         "exited_recommendations": _compact_list_rows(exited_rows[: _bounded_limit(limit, default=25)], compact=compact),
         "portfolio": _compact_list_rows(portfolio_page, compact=compact),
         "lifecycle": _compact_list_rows(lifecycle_rows[: _bounded_limit(limit, default=25)], compact=compact),
+        "pagination": {
+            "primary": "portfolio",
+            "today_recommendations": today_pagination,
+            "current_recommendations": current_pagination,
+            "exited_recommendations": exited_pagination,
+            "portfolio": _pagination_contract(portfolio_meta),
+            "lifecycle": lifecycle_pagination,
+        },
         "meta": {
-            "today_recommendations": {"total": len(today_rows), "returned": min(len(today_rows), _bounded_limit(limit, default=25))},
-            "current_recommendations": {"total": len(current_rows), "returned": min(len(current_rows), _bounded_limit(limit, default=25))},
-            "exited_recommendations": {"total": len(exited_rows), "returned": min(len(exited_rows), _bounded_limit(limit, default=25))},
+            "today_recommendations": {"total": len(today_rows), "returned": today_pagination["returned_count"]},
+            "current_recommendations": {"total": len(current_rows), "returned": current_pagination["returned_count"]},
+            "exited_recommendations": {"total": len(exited_rows), "returned": exited_pagination["returned_count"]},
             "portfolio": portfolio_meta,
-            "lifecycle": {"total": len(lifecycle_rows), "returned": min(len(lifecycle_rows), _bounded_limit(limit, default=25))},
+            "lifecycle": {"total": len(lifecycle_rows), "returned": lifecycle_pagination["returned_count"]},
             "filters": {"symbol": symbol, "status": status, "search": search, "compact": compact},
         },
     }
@@ -1829,11 +1914,82 @@ def _page_rows(rows: list[dict[str, Any]], *, limit: int, offset: int = 0) -> tu
     }
 
 
+def _pagination_contract(meta: dict[str, Any]) -> dict[str, Any]:
+    total = int(meta.get("total") or 0)
+    returned = int(meta.get("returned") or 0)
+    limit = int(meta.get("limit") or returned or 0)
+    offset = int(meta.get("offset") or 0)
+    next_offset = meta.get("next_offset")
+    return {
+        "total_count": total,
+        "returned_count": returned,
+        "limit": limit,
+        "offset": offset,
+        "has_more": bool(meta.get("has_more")),
+        "next_offset": next_offset,
+    }
+
+
+def _limited_pagination_contract(rows: list[dict[str, Any]], *, limit: int, default: int = 25) -> dict[str, Any]:
+    row_limit = _bounded_limit(limit, default=default)
+    total = len(rows)
+    returned = min(total, row_limit)
+    return {
+        "total_count": total,
+        "returned_count": returned,
+        "limit": row_limit,
+        "offset": 0,
+        "has_more": returned < total,
+        "next_offset": returned if returned < total else None,
+    }
+
+
+def _page_any_rows(rows: list[Any], *, limit: int, offset: int = 0, default: int = 50, maximum: int = 500) -> tuple[list[Any], dict[str, Any]]:
+    row_limit = _bounded_limit(limit, default=default, maximum=maximum)
+    row_offset = _bounded_offset(offset)
+    total = len(rows)
+    page = rows[row_offset: row_offset + row_limit]
+    end = row_offset + row_limit
+    return page, {
+        "total_count": total,
+        "returned_count": len(page),
+        "limit": row_limit,
+        "offset": row_offset,
+        "has_more": end < total,
+        "next_offset": end if end < total else None,
+    }
+
+
+def _bounded_list_contract(rows: list[Any], *, limit: int, offset: int = 0, default: int = 25, maximum: int = 500, total_count: int | None = None) -> dict[str, Any]:
+    row_limit = _bounded_limit(limit, default=default, maximum=maximum)
+    row_offset = _bounded_offset(offset)
+    returned = len(rows)
+    total = int(total_count) if total_count is not None else returned
+    next_offset = row_offset + returned if row_offset + returned < total else None
+    return {
+        "total_count": total,
+        "returned_count": returned,
+        "limit": row_limit,
+        "offset": row_offset,
+        "has_more": next_offset is not None,
+        "next_offset": next_offset,
+    }
+
+
 def _latest_ohlcv_prices(symbols: list[str]) -> dict[str, dict[str, Any]]:
     normalized = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
     if not normalized:
         return {}
-    prices: dict[str, dict[str, Any]] = {}
+    cache_key = ("latest_ohlcv_prices", json.dumps(normalized, sort_keys=True))
+    now = time.monotonic()
+    cached = _PAYLOAD_CACHE.get(cache_key)
+    if cached and OPERATOR_API_PAYLOAD_CACHE_SECONDS > 0 and (now - cached[0]) <= OPERATOR_API_PAYLOAD_CACHE_SECONDS:
+        return cached[1]
+    prices: dict[str, dict[str, Any]] = load_current_prices(normalized)
+    missing = [symbol for symbol in normalized if symbol not in prices]
+    if not missing:
+        _PAYLOAD_CACHE[cache_key] = (now, prices)
+        return prices
     if _table_exists("dhan_ohlcv_daily"):
         try:
             daily = sql_to_df(
@@ -1847,7 +2003,7 @@ def _latest_ohlcv_prices(symbols: list[str]) -> dict[str, dict[str, Any]]:
                   AND close IS NOT NULL
                 ORDER BY UPPER(ticker), date DESC, load_ts DESC
                 """,
-                params={"symbols": normalized},
+                params={"symbols": missing},
                 retries=2,
             )
             for row in daily.to_dict(orient="records"):
@@ -1879,6 +2035,7 @@ def _latest_ohlcv_prices(symbols: list[str]) -> dict[str, dict[str, Any]]:
                     prices[symbol] = {"price": row.get("price"), "price_asof": row.get("price_asof"), "price_source": "dhan_ohlcv_intraday"}
         except Exception as exc:
             print(f"[advisory.api] latest intraday price enrichment failed error={type(exc).__name__}: {exc}", flush=True)
+    _PAYLOAD_CACHE[cache_key] = (now, prices)
     return prices
 
 
@@ -2384,11 +2541,13 @@ def build_technical_threshold_promotion_review_payload(payload: dict[str, Any]) 
 
 
 def build_technical_threshold_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
+    reviews = load_promotion_reviews(limit=limit)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/technical-calibration/promotion-reviews", schema_name="technical_promotion_reviews"),
         "status": "ok",
-        "reviews": load_promotion_reviews(limit=limit),
+        "reviews": reviews,
+        "pagination": {"reviews": _bounded_list_contract(reviews, limit=limit, default=25, maximum=100)},
     }
 
 
@@ -2436,11 +2595,13 @@ def build_signal_quality_promotion_review_payload(payload: dict[str, Any]) -> di
 
 
 def build_signal_quality_promotion_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
+    reviews = load_signal_quality_promotion_reviews(limit=limit)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/signal-quality/promotion-reviews", schema_name="signal_quality_promotion_reviews"),
         "status": "ok",
-        "reviews": load_signal_quality_promotion_reviews(limit=limit),
+        "reviews": reviews,
+        "pagination": {"reviews": _bounded_list_contract(reviews, limit=limit, default=25, maximum=100)},
     }
 
 
@@ -2477,11 +2638,13 @@ def build_signal_quality_promotion_review_decision_payload(payload: dict[str, An
 
 
 def build_config_change_previews_payload(*, limit: int = 25) -> dict[str, Any]:
+    previews = load_config_change_previews(limit=limit)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/config-change/previews", schema_name="config_change_previews"),
         "status": "ok",
-        "previews": load_config_change_previews(limit=limit),
+        "previews": previews,
+        "pagination": {"previews": _bounded_list_contract(previews, limit=limit, default=25, maximum=100)},
     }
 
 
@@ -2523,8 +2686,12 @@ def build_signal_quality_config_change_preview_payload(payload: dict[str, Any]) 
     return result
 
 
-def build_prompt_registry_api_payload(*, owner_area: str | None = None, authority_scope: str | None = None) -> dict[str, Any]:
+def build_prompt_registry_api_payload(*, owner_area: str | None = None, authority_scope: str | None = None, limit: int = 100, offset: int = 0) -> dict[str, Any]:
     payload = build_prompt_registry_payload(owner_area=owner_area, authority_scope=authority_scope)
+    contracts = [row for row in payload.get("contracts") or [] if isinstance(row, dict)]
+    contract_page, contract_meta = _page_any_rows(contracts, limit=limit, offset=offset, default=100, maximum=500)
+    payload["contracts"] = contract_page
+    payload["pagination"] = {"contracts": contract_meta}
     payload["api_schema"] = _operator_api_schema("/api/research/prompt-registry", schema_name="prompt_registry")
     return payload
 
@@ -2544,6 +2711,8 @@ def build_events_payload(
     operator_feed = _filter_rows(payload.get("operator_feed") or [], symbol=symbol, status=status, search=search)
     alerts = _filter_rows(payload.get("alerts") or [], symbol=symbol, status=status, search=search)
     event_page, event_meta = _page_rows(events, limit=limit, offset=offset)
+    operator_feed_pagination = _limited_pagination_contract(operator_feed, limit=limit, default=25)
+    alert_pagination = _limited_pagination_contract(alerts, limit=limit, default=25)
     return {
         "generated_at": payload.get("generated_at"),
         "api_schema": _operator_api_schema("/api/events", schema_name="operator_events"),
@@ -2553,10 +2722,16 @@ def build_events_payload(
         "events": _compact_list_rows(event_page, compact=compact),
         "operator_feed": _compact_list_rows(operator_feed[: _bounded_limit(limit, default=25)], compact=compact),
         "alerts": _compact_list_rows(alerts[: _bounded_limit(limit, default=25)], compact=compact),
+        "pagination": {
+            "primary": "events",
+            "events": _pagination_contract(event_meta),
+            "operator_feed": operator_feed_pagination,
+            "alerts": alert_pagination,
+        },
         "meta": {
             "events": event_meta,
-            "operator_feed": {"total": len(operator_feed), "returned": min(len(operator_feed), _bounded_limit(limit, default=25))},
-            "alerts": {"total": len(alerts), "returned": min(len(alerts), _bounded_limit(limit, default=25))},
+            "operator_feed": {"total": len(operator_feed), "returned": operator_feed_pagination["returned_count"]},
+            "alerts": {"total": len(alerts), "returned": alert_pagination["returned_count"]},
             "filters": {"symbol": symbol, "status": status, "search": search, "compact": compact},
         },
     }
@@ -2702,11 +2877,16 @@ def build_event_policy_evaluation_payload(*, limit: int = 100) -> dict[str, Any]
 
 
 def build_event_trace_payload(unique_id: str) -> dict[str, Any]:
-    return load_event_trace(unique_id)
+    payload = load_event_trace(unique_id)
+    payload.setdefault("pagination", _trace_list_pagination(payload))
+    return payload
 
 
 def build_symbol_trace_payload(symbol: str, *, limit: int = 100) -> dict[str, Any]:
-    return load_symbol_trace(symbol, limit=_bounded_limit(limit, default=100, maximum=500))
+    bounded_limit = _bounded_limit(limit, default=100, maximum=500)
+    payload = load_symbol_trace(symbol, limit=bounded_limit)
+    payload.setdefault("pagination", _trace_list_pagination(payload, limit=bounded_limit))
+    return payload
 
 
 def _jsonish(value: Any) -> Any:
@@ -3153,7 +3333,7 @@ def normalize_trace_payload(raw: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    return {
+    out = {
         "symbol": raw.get("symbol"),
         "unique_id": raw.get("unique_id"),
         "processing": processing,
@@ -3168,13 +3348,65 @@ def normalize_trace_payload(raw: dict[str, Any]) -> dict[str, Any]:
             "manual_review_wait_signal_links": len(manual_wait_rows),
         },
     }
+    out["pagination"] = _trace_summary_pagination(out)
+    return out
+
+
+def _trace_list_pagination(payload: dict[str, Any], *, limit: int | None = None) -> dict[str, Any]:
+    processing = list(payload.get("processing") or [])
+    traces = list(payload.get("traces") or [])
+    steps = list(payload.get("steps") or [])
+    conflicts = list(payload.get("action_conflicts") or [])
+    row_limit = _bounded_limit(limit, default=len(traces) or 100, maximum=500) if limit is not None else len(traces)
+    return {
+        "primary": "traces",
+        "processing": {"returned_count": len(processing), "total_count": len(processing), "limit": len(processing), "offset": 0, "has_more": False, "next_offset": None},
+        "traces": {"returned_count": len(traces), "total_count": len(traces), "limit": row_limit, "offset": 0, "has_more": len(traces) >= row_limit if row_limit else False, "next_offset": row_limit if row_limit and len(traces) >= row_limit else None},
+        "steps": {"returned_count": len(steps), "total_count": len(steps), "limit": len(steps), "offset": 0, "has_more": False, "next_offset": None},
+        "action_conflicts": {"returned_count": len(conflicts), "total_count": len(conflicts), "limit": len(conflicts), "offset": 0, "has_more": False, "next_offset": None},
+        "bounded": limit is not None,
+    }
+
+
+def _count_value(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(fallback)
+
+
+def _trace_summary_pagination(payload: dict[str, Any], *, limit: int | None = None) -> dict[str, Any]:
+    raw_counts = payload.get("raw_counts") if isinstance(payload.get("raw_counts"), dict) else {}
+    decisions = list(payload.get("decisions") or [])
+    processing = list(payload.get("processing") or [])
+    conflicts = list(payload.get("action_conflicts") or [])
+    manual_waits = list(payload.get("manual_review_wait_signal_links") or [])
+    decision_limit = _bounded_limit(limit, default=len(decisions) or TRACE_SUMMARY_DEFAULT_LIMIT, maximum=500) if limit is not None else len(decisions)
+    processing_total = _count_value(raw_counts.get("processing"), len(processing))
+    decisions_total = _count_value(raw_counts.get("traces"), len(decisions))
+    conflicts_total = _count_value(raw_counts.get("action_conflicts"), len(conflicts))
+    manual_waits_total = _count_value(raw_counts.get("manual_review_wait_signal_links"), len(manual_waits))
+    return {
+        "primary": "decisions",
+        "processing": {"returned_count": len(processing), "total_count": processing_total, "limit": len(processing), "offset": 0, "has_more": False, "next_offset": None},
+        "decisions": {"returned_count": len(decisions), "total_count": decisions_total, "limit": decision_limit, "offset": 0, "has_more": bool(decision_limit and decisions_total > len(decisions)), "next_offset": len(decisions) if decision_limit and decisions_total > len(decisions) else None},
+        "action_conflicts": {"returned_count": len(conflicts), "total_count": conflicts_total, "limit": len(conflicts), "offset": 0, "has_more": False, "next_offset": None},
+        "manual_review_wait_signal_links": {"returned_count": len(manual_waits), "total_count": manual_waits_total, "limit": len(manual_waits), "offset": 0, "has_more": False, "next_offset": None},
+        "bounded": limit is not None,
+    }
+
+
+def _with_trace_summary_pagination(payload: dict[str, Any], *, limit: int | None = None) -> dict[str, Any]:
+    out = dict(payload)
+    out.setdefault("pagination", _trace_summary_pagination(out, limit=limit))
+    return out
 
 
 def build_event_trace_summary_payload(unique_id: str) -> dict[str, Any]:
     if OPERATOR_API_TRACE_SUMMARY_CACHE_ENABLED:
         cached = load_materialized_trace_summary("event", unique_id, limit=TRACE_SUMMARY_DEFAULT_LIMIT)
         if cached is not None:
-            return cached
+            return _with_trace_summary_pagination(cached, limit=TRACE_SUMMARY_DEFAULT_LIMIT)
         record_operator_api_marker(
             route="/api/events/{unique_id}/trace/summary",
             operation="build_event_trace_summary_payload",
@@ -3183,7 +3415,7 @@ def build_event_trace_summary_payload(unique_id: str) -> dict[str, Any]:
         )
     summary = normalize_trace_payload(load_event_trace(unique_id))
     summary["_trace_summary_cache"] = {"source": "live_fallback", "entity_type": "event", "entity_key": unique_id}
-    return summary
+    return _with_trace_summary_pagination(summary, limit=TRACE_SUMMARY_DEFAULT_LIMIT)
 
 
 def build_symbol_trace_summary_payload(symbol: str, *, limit: int = 100) -> dict[str, Any]:
@@ -3191,7 +3423,7 @@ def build_symbol_trace_summary_payload(symbol: str, *, limit: int = 100) -> dict
     if OPERATOR_API_TRACE_SUMMARY_CACHE_ENABLED:
         cached = load_materialized_trace_summary("symbol", symbol, limit=bounded_limit)
         if cached is not None:
-            return cached
+            return _with_trace_summary_pagination(cached, limit=bounded_limit)
         record_operator_api_marker(
             route="/api/symbols/{symbol}/trace/summary",
             operation="build_symbol_trace_summary_payload",
@@ -3200,7 +3432,7 @@ def build_symbol_trace_summary_payload(symbol: str, *, limit: int = 100) -> dict
         )
     summary = normalize_trace_payload(load_symbol_trace(symbol, limit=bounded_limit))
     summary["_trace_summary_cache"] = {"source": "live_fallback", "entity_type": "symbol", "entity_key": str(symbol).upper(), "limit_rows": bounded_limit}
-    return summary
+    return _with_trace_summary_pagination(summary, limit=bounded_limit)
 
 
 def build_data_health_payload(*, asof_date: str | None = None) -> dict[str, Any]:
@@ -3223,13 +3455,21 @@ def build_data_health_payload(*, asof_date: str | None = None) -> dict[str, Any]
     }
 
 
-def build_operator_health_payload() -> dict[str, Any]:
-    payload = build_operator_health()
+def build_operator_health_payload(*, mode: str = "fast") -> dict[str, Any]:
+    normalized_mode = "full" if str(mode or "").strip().lower() == "full" else "fast"
+    cache_key = ("operator_health_payload", normalized_mode, str(id(build_operator_health)))
+    now = time.monotonic()
+    cached = _PAYLOAD_CACHE.get(cache_key)
+    if cached and OPERATOR_API_PAYLOAD_CACHE_SECONDS > 0 and (now - cached[0]) <= OPERATOR_API_PAYLOAD_CACHE_SECONDS:
+        return cached[1]
+    payload = build_operator_health(detail_level=normalized_mode)
     if isinstance(payload, dict):
-        return {
+        out = {
             **payload,
             "api_schema": _operator_api_schema("/api/health/details", schema_name="operator_health_details"),
         }
+        _PAYLOAD_CACHE[cache_key] = (now, out)
+        return out
     return payload
 
 
@@ -3279,7 +3519,7 @@ def _latest_script_marker(lines: list[str]) -> dict[str, Any]:
     return latest
 
 
-def build_cron_logs_payload(*, limit: int = 20, lines: int = 80) -> dict[str, Any]:
+def build_cron_logs_payload(*, limit: int = 20, lines: int = 80, offset: int = 0) -> dict[str, Any]:
     log_dir = Path(CRON_LOG_DIR)
     if not log_dir.exists():
         return {
@@ -3288,12 +3528,14 @@ def build_cron_logs_payload(*, limit: int = 20, lines: int = 80) -> dict[str, An
             "status": "missing_log_dir",
             "log_dir": str(log_dir),
             "logs": [],
+            "pagination": {"logs": _bounded_list_contract([], limit=limit, offset=offset, default=20, maximum=100, total_count=0)},
         }
-    files = sorted(
+    all_files = sorted(
         [path for path in log_dir.glob("*.log") if path.is_file()],
         key=lambda path: path.stat().st_mtime,
         reverse=True,
-    )[: max(0, int(limit))]
+    )
+    files, file_meta = _page_any_rows(all_files, limit=limit, offset=offset, default=20, maximum=100)
     logs: list[dict[str, Any]] = []
     for path in files:
         stat = path.stat()
@@ -3323,6 +3565,7 @@ def build_cron_logs_payload(*, limit: int = 20, lines: int = 80) -> dict[str, An
         "status": "ok",
         "log_dir": str(log_dir),
         "logs": logs,
+        "pagination": {"logs": file_meta},
     }
 
 
@@ -3356,7 +3599,7 @@ def build_event_model_promotion_check_payload() -> dict[str, Any]:
     return payload
 
 
-def build_event_model_artifacts_payload() -> dict[str, Any]:
+def build_event_model_artifacts_payload(*, limit: int = 50, offset: int = 0) -> dict[str, Any]:
     artifact_dir = Path(".cache/advisory_event_meta_model")
     try:
         manifest = build_artifact_manifest(
@@ -3372,13 +3615,17 @@ def build_event_model_artifacts_payload() -> dict[str, Any]:
             "artifact_dir": str(artifact_dir),
             "files": [],
         }
+    manifest = dict(manifest)
+    files = [item for item in manifest.get("files") or [] if isinstance(item, dict)]
+    file_page, file_meta = _page_any_rows(files, limit=limit, offset=offset, default=50, maximum=200)
+    manifest["files"] = file_page
     latest_heads: list[dict[str, Any]] = []
     if manifest.get("latest_prefix"):
         try:
             from utils.store import AWS_BUCKET_NAME, _get_client
 
             s3 = _get_client()
-            for item in manifest.get("files") or []:
+            for item in file_page:
                 key = item.get("latest_key")
                 if not key:
                     continue
@@ -3406,6 +3653,10 @@ def build_event_model_artifacts_payload() -> dict[str, Any]:
         "status": manifest.get("status"),
         "artifact": manifest,
         "latest_s3_heads": latest_heads,
+        "pagination": {
+            "artifact_files": file_meta,
+            "latest_s3_heads": _bounded_list_contract(latest_heads, limit=limit, offset=offset, default=50, maximum=200, total_count=file_meta["total_count"]),
+        },
         "read_only": True,
     }
 
@@ -4757,29 +5008,73 @@ def record_manual_review_decision_payload(payload: dict[str, Any]) -> dict[str, 
     }
 
 
-def build_hypotheses_payload(*, limit: int = 100) -> dict[str, Any]:
-    hypotheses = load_hypotheses().head(max(0, int(limit)))
-    matches = load_matches(limit=max(0, int(limit)))
-    action_plans = load_action_plans(limit=max(0, int(limit)))
-    wait_signals = load_wait_signals(limit=max(0, int(limit)))
-    wait_signal_matches = load_wait_signal_matches(limit=max(0, int(limit)))
-    promotion_audits = []
-    if not hypotheses.empty:
-        for hypothesis_id in hypotheses["hypothesis_id"].dropna().astype(str).head(max(0, int(limit))).tolist():
-            audit = latest_promotion_audit(hypothesis_id)
-            if audit:
-                promotion_audits.append(audit)
-    return {
+def build_hypotheses_payload(*, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+    row_limit = _bounded_limit(limit, default=100, maximum=500)
+    row_offset = _bounded_offset(offset)
+    cache_key = (
+        "hypotheses_payload",
+        json.dumps(
+            {
+                "limit": row_limit,
+                "offset": row_offset,
+                "load_hypotheses_id": id(load_hypotheses),
+                "load_matches_id": id(load_matches),
+                "load_action_plans_id": id(load_action_plans),
+                "load_wait_signals_id": id(load_wait_signals),
+                "load_wait_signal_matches_id": id(load_wait_signal_matches),
+                "latest_promotion_audits_id": id(latest_promotion_audits),
+            },
+            sort_keys=True,
+        ),
+    )
+    now = time.monotonic()
+    cached = _PAYLOAD_CACHE.get(cache_key)
+    if cached and OPERATOR_API_PAYLOAD_CACHE_SECONDS > 0 and (now - cached[0]) <= OPERATOR_API_PAYLOAD_CACHE_SECONDS:
+        return cached[1]
+    all_hypotheses = load_hypotheses()
+    hypothesis_rows = all_hypotheses.to_dict(orient="records") if not all_hypotheses.empty else []
+    hypothesis_page, hypothesis_meta = _page_any_rows(hypothesis_rows, limit=row_limit, offset=row_offset, default=100, maximum=500)
+    if hypothesis_page:
+        matches = load_matches(limit=row_limit)
+        action_plans = load_action_plans(limit=row_limit)
+        wait_signals = load_wait_signals(limit=row_limit)
+        wait_signal_matches = load_wait_signal_matches(limit=row_limit)
+        promotion_audits = latest_promotion_audits([
+            str(row.get("hypothesis_id") or "")
+            for row in hypothesis_page
+            if str(row.get("hypothesis_id") or "").strip()
+        ])
+    else:
+        matches = pd.DataFrame()
+        action_plans = pd.DataFrame()
+        wait_signals = pd.DataFrame()
+        wait_signal_matches = pd.DataFrame()
+        promotion_audits = []
+    matches_rows = matches.to_dict(orient="records") if not matches.empty else []
+    action_plan_rows = action_plans.to_dict(orient="records") if not action_plans.empty else []
+    wait_signal_rows = wait_signals.to_dict(orient="records") if not wait_signals.empty else []
+    wait_signal_match_rows = wait_signal_matches.to_dict(orient="records") if not wait_signal_matches.empty else []
+    payload = {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/hypotheses", schema_name="hypotheses"),
         "status": "ok",
-        "hypotheses": hypotheses.to_dict(orient="records") if not hypotheses.empty else [],
-        "matches": matches.to_dict(orient="records") if not matches.empty else [],
-        "action_plans": action_plans.to_dict(orient="records") if not action_plans.empty else [],
-        "wait_signals": wait_signals.to_dict(orient="records") if not wait_signals.empty else [],
-        "wait_signal_matches": wait_signal_matches.to_dict(orient="records") if not wait_signal_matches.empty else [],
+        "hypotheses": hypothesis_page,
+        "matches": matches_rows,
+        "action_plans": action_plan_rows,
+        "wait_signals": wait_signal_rows,
+        "wait_signal_matches": wait_signal_match_rows,
         "promotion_audits": promotion_audits,
+        "pagination": {
+            "hypotheses": hypothesis_meta,
+            "matches": _bounded_list_contract(matches_rows, limit=row_limit, default=100, maximum=500),
+            "action_plans": _bounded_list_contract(action_plan_rows, limit=row_limit, default=100, maximum=500),
+            "wait_signals": _bounded_list_contract(wait_signal_rows, limit=row_limit, default=100, maximum=500),
+            "wait_signal_matches": _bounded_list_contract(wait_signal_match_rows, limit=row_limit, default=100, maximum=500),
+            "promotion_audits": _bounded_list_contract(promotion_audits, limit=row_limit, default=100, maximum=500),
+        },
     }
+    _PAYLOAD_CACHE[cache_key] = (now, payload)
+    return payload
 
 
 def build_wait_signals_payload(*, limit: int = 100, status: str | None = None, symbol: str | None = None) -> dict[str, Any]:
@@ -5107,16 +5402,16 @@ def create_app():
         return _guard(build_runtime_payload, route="/api/runtime")
 
     @app.get("/api/health/details", response_model=OperatorHealthDetailsResponse)
-    def health_details():
-        return _guard(build_operator_health_payload, route="/api/health/details")
+    def health_details(mode: str = Query(default="fast", pattern="^(fast|full)$")):
+        return _guard(lambda: build_operator_health_payload(mode=mode), route="/api/health/details")
 
     @app.get("/api/operations/smoke", response_model=OperationsSmokeResponse)
     def operations_smoke():
         return _guard(build_operations_smoke_payload, route="/api/operations/smoke")
 
     @app.get("/api/operations/cron-logs", response_model=OperationsCronLogsResponse)
-    def operations_cron_logs(limit: int = Query(default=20, ge=1, le=100), lines: int = Query(default=80, ge=1, le=300)):
-        return _guard(build_cron_logs_payload, route="/api/operations/cron-logs", limit=limit, lines=lines)
+    def operations_cron_logs(limit: int = Query(default=20, ge=1, le=100), lines: int = Query(default=80, ge=1, le=300), offset: int = Query(default=0, ge=0)):
+        return _guard(build_cron_logs_payload, route="/api/operations/cron-logs", limit=limit, lines=lines, offset=offset)
 
     @app.get("/api/operations/commands", response_model=OperationsCommandsResponse)
     def operations_commands(limit: int = Query(default=25, ge=1, le=100)):
@@ -5139,12 +5434,12 @@ def create_app():
         return _guard(build_event_model_promotion_check_payload, route="/api/research/event-model-promotion-check")
 
     @app.get("/api/research/event-model-artifacts", response_model=EventModelArtifactsResponse)
-    def research_event_model_artifacts():
-        return _guard(build_event_model_artifacts_payload, route="/api/research/event-model-artifacts")
+    def research_event_model_artifacts(limit: int = Query(default=50, ge=0, le=200), offset: int = Query(default=0, ge=0)):
+        return _guard(build_event_model_artifacts_payload, route="/api/research/event-model-artifacts", limit=limit, offset=offset)
 
     @app.get("/api/research/prompt-registry", response_model=PromptRegistryResponse)
-    def research_prompt_registry(owner_area: str | None = None, authority_scope: str | None = None):
-        return _guard(build_prompt_registry_api_payload, route="/api/research/prompt-registry", owner_area=owner_area, authority_scope=authority_scope)
+    def research_prompt_registry(owner_area: str | None = None, authority_scope: str | None = None, limit: int = Query(default=100, ge=0, le=500), offset: int = Query(default=0, ge=0)):
+        return _guard(build_prompt_registry_api_payload, route="/api/research/prompt-registry", owner_area=owner_area, authority_scope=authority_scope, limit=limit, offset=offset)
 
     @app.get("/api/manual-review", response_model=ManualReviewResponse)
     def manual_review(limit: int = Query(default=100, ge=1, le=500)):
@@ -5344,8 +5639,8 @@ def create_app():
         return _guard(build_data_health_payload, route="/api/data-health", asof_date=asof_date)
 
     @app.get("/api/hypotheses", response_model=HypothesesResponse)
-    def hypotheses(limit: int = Query(default=100, ge=0, le=500)):
-        return _guard(build_hypotheses_payload, route="/api/hypotheses", limit=limit)
+    def hypotheses(limit: int = Query(default=100, ge=0, le=500), offset: int = Query(default=0, ge=0)):
+        return _guard(build_hypotheses_payload, route="/api/hypotheses", limit=limit, offset=offset)
 
     @app.get("/api/wait-signals", response_model=WaitSignalsResponse)
     def wait_signals(limit: int = Query(default=100, ge=1, le=500), status: str | None = None, symbol: str | None = None):

@@ -12,8 +12,13 @@ const { data, refresh, pending, error } = await useAsyncData(
 
 const contracts = computed(() => data.value?.contracts || [])
 const summary = computed(() => data.value?.summary || {})
+const contractPageMeta = computed(() => asDict(data.value?.pagination?.contracts))
 const ownerOptions = computed(() => Object.keys((summary.value.by_owner_area || {}) as Dict).sort())
 const scopeOptions = computed(() => Object.keys((summary.value.by_authority_scope || {}) as Dict).sort())
+
+function asDict(value: unknown): Dict {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
+}
 
 function listText(value: unknown) {
   if (!Array.isArray(value)) return '-'
@@ -49,9 +54,9 @@ function scopeClass(scope: unknown) {
 
   <section class="mt-6 grid gap-4 md:grid-cols-4">
     <MetricTile label="Contracts" :value="String(summary.contract_count || contracts.length)" note="Registered prompt contracts" />
+    <MetricTile label="Shown" :value="`${contractPageMeta.returned_count ?? contracts.length}/${contractPageMeta.total_count ?? summary.contract_count ?? contracts.length}`" note="Paged contracts" />
     <MetricTile label="Broker Allowed" :value="String(summary.broker_execution_allowed_count || 0)" note="Should remain zero" />
     <MetricTile label="Owners" :value="String(ownerOptions.length)" note="Functional areas" />
-    <MetricTile label="Scopes" :value="String(scopeOptions.length)" note="Authority classes" />
   </section>
 
   <section class="mt-6 glass-panel rounded-3xl p-6">

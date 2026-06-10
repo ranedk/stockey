@@ -291,6 +291,7 @@ const counters = computed(() => {
   }
 })
 const cacheMeta = computed(() => (props.trace?._trace_summary_cache || {}) as Dict)
+const decisionPageMeta = computed(() => ((props.trace?.pagination as Dict | undefined)?.decisions || {}) as Dict)
 const cacheSource = computed(() => String(cacheMeta.value.source || 'unknown'))
 const isLiveFallback = computed(() => cacheSource.value === 'live_fallback')
 
@@ -342,10 +343,11 @@ function waitLinkStatus(link: ManualReviewWaitSignalLink) {
           <span v-if="trace.unique_id" class="rounded-full bg-white px-3 py-1 text-xs font-bold text-ink/65">{{ trace.unique_id }}</span>
         </div>
       </div>
-      <div class="mt-4 grid gap-2 text-xs md:grid-cols-4">
+      <div class="mt-4 grid gap-2 text-xs md:grid-cols-5">
         <p class="rounded-xl bg-white/70 px-3 py-2"><b>Cache generated:</b> {{ formatWhen(String(cacheMeta.generated_at || '')) }}</p>
         <p class="rounded-xl bg-white/70 px-3 py-2"><b>Source max:</b> {{ formatWhen(String(cacheMeta.source_max_ts || '')) }}</p>
         <p class="rounded-xl bg-white/70 px-3 py-2"><b>Rows limit:</b> {{ textValue(cacheMeta.limit_rows) }}</p>
+        <p class="rounded-xl bg-white/70 px-3 py-2"><b>Shown:</b> {{ textValue(decisionPageMeta.returned_count) }} / {{ textValue(decisionPageMeta.total_count) }}</p>
         <p class="rounded-xl bg-white/70 px-3 py-2"><b>Entity:</b> {{ textValue(cacheMeta.entity_type) }} / {{ textValue(cacheMeta.entity_key) }}</p>
       </div>
       <div v-if="isLiveFallback" class="mt-4 rounded-2xl bg-rust/10 p-4">

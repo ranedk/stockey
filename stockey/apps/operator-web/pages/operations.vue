@@ -18,9 +18,11 @@ const otherCommands = computed(() => commandList.value.filter((command) => Strin
 const smokeCounts = computed(() => asDict(smokeContract.value.counts))
 const smokeNextCommands = computed(() => asStringList(smoke.value?.next_commands || smokeContract.value.next_commands))
 const logs = computed(() => asList(cronLogs.value?.logs))
+const logPageMeta = computed(() => asDict(cronLogs.value?.pagination?.logs))
 const failedGates = computed(() => mlGate.value?.failed_gates || [])
 const gates = computed(() => asList(mlGate.value?.gates))
 const latestHeads = computed(() => asList(artifacts.value?.latest_s3_heads))
+const artifactPageMeta = computed(() => asDict(artifacts.value?.pagination?.artifact_files))
 const commandList = computed(() => asList(commands.value?.commands))
 const recentRuns = computed(() => asList(commands.value?.recent_runs))
 const operatorApiErrors = computed(() => asList(apiErrors.value?.errors))
@@ -339,6 +341,7 @@ async function runSmokeCommand() {
         <p><b>Version:</b> {{ display(artifacts?.artifact?.model_version) }}</p>
         <p><b>Latest prefix:</b> {{ shortPath(artifacts?.artifact?.latest_prefix) }}</p>
         <p><b>Version prefix:</b> {{ shortPath(artifacts?.artifact?.version_prefix) }}</p>
+        <p><b>Files shown:</b> {{ display(artifactPageMeta.returned_count) }} / {{ display(artifactPageMeta.total_count) }}</p>
       </div>
       <div class="mt-4 space-y-3">
         <div v-for="row in latestHeads" :key="String(row.key || row.status)" class="rounded-2xl bg-white/70 p-3 text-sm">
@@ -355,6 +358,7 @@ async function runSmokeCommand() {
       <div>
         <p class="text-xs font-bold uppercase tracking-[0.3em] text-ink/45">Cron and logs</p>
         <h2 class="mt-2 text-2xl font-black">Latest run tails</h2>
+        <p class="mt-2 text-sm font-semibold text-ink/55">Showing {{ display(logPageMeta.returned_count) }} / {{ display(logPageMeta.total_count) }} log files.</p>
       </div>
       <div class="mt-5 space-y-4">
         <details v-for="log in logs" :key="String(log.name)" class="rounded-2xl bg-white/75 p-4">

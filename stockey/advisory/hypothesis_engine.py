@@ -12,6 +12,7 @@ import yaml
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.fallback_telemetry import record_fallback_event
 from advisory.market_context import load_latest_market_context
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
@@ -40,6 +41,7 @@ ACTIVE_SCAN_STATUSES = {"testing", "validated", ACTIVE_REVIEW_STATUS, TRUSTED_OV
 WORD_RE = re.compile(r"[a-z0-9][a-z0-9\-']+", re.IGNORECASE)
 env = Env()
 env.read_env()
+_TABLES_READY = False
 DEFAULT_PLAYBOOK_ACTION_MODEL = env("PLAYBOOK_ACTION_MODEL", default="codex")
 PLAYBOOK_ACTION_PROMPT_ID = "playbook_action_plan"
 PLAYBOOK_ACTION_PROMPT_VERSION = registry_prompt_version(PLAYBOOK_ACTION_PROMPT_ID)
@@ -88,7 +90,10 @@ def table_exists(table_name: str) -> bool:
     return not df.empty
 
 
-def ensure_tables() -> None:
+def ensure_tables(*, force: bool = False) -> None:
+    global _TABLES_READY
+    if _TABLES_READY and not force:
+        return
     with db_session() as (_, cur):
         cur.execute(
             f"""
@@ -196,6 +201,7 @@ def ensure_tables() -> None:
             )
             """
         )
+    _TABLES_READY = True
 
 
 def normalize_text(value: Any) -> str:
@@ -379,6 +385,23 @@ def latest_promotion_audit(hypothesis_id: str) -> dict[str, Any] | None:
     if df.empty:
         return None
     return df.iloc[0].to_dict()
+
+
+def latest_promotion_audits(hypothesis_ids: list[str]) -> list[dict[str, Any]]:
+    ensure_tables()
+    normalized = [str(value).strip() for value in hypothesis_ids if str(value or "").strip()]
+    if not normalized:
+        return []
+    df = sql_to_df(
+        f"""
+        SELECT DISTINCT ON (hypothesis_id) *
+        FROM {PROMOTION_AUDITS_TABLE}
+        WHERE hypothesis_id = ANY(%s)
+        ORDER BY hypothesis_id, audited_at DESC
+        """,
+        params=(normalized,),
+    )
+    return df.to_dict(orient="records") if not df.empty else []
 
 
 def production_gate_passes(hypothesis_id: str, *, allow_override: bool = False) -> bool:
@@ -1264,6 +1287,22 @@ def action_plan_for_match(match: pd.Series, *, model: str | None = None, use_llm
         return plan, "ok", None, adjustment, market_context
     except Exception as exc:
         plan, llm_status, llm_error, adjustment = _fallback_action_plan(match, market_context=market_context, llm_status="fallback_after_error", llm_error=f"{type(exc).__name__}: {exc}")
+        record_fallback_event(
+            module="advisory.hypothesis_engine",
+            source="playbook_action_plan",
+            fallback_type="llm_deterministic_fallback",
+            severity="warn",
+            symbol=match.get("symbol"),
+            unique_id=match.get("source_key"),
+            reason="Playbook action-plan LLM failed; deterministic action plan was used.",
+            deterministic_fallback=True,
+            error=exc,
+            metadata={
+                "model": effective_model,
+                "hypothesis_id": match.get("hypothesis_id"),
+                "source_table": match.get("source_table"),
+            },
+        )
         return plan, llm_status, llm_error, adjustment, market_context
 
 

@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 from environs import Env
 
+from advisory.current_prices import refresh_current_prices
 from advisory.live_dashboard import DEFAULT_OUTPUT_DIR, build_live_dashboard_payload
 from advisory.performance_slowlog import slow_operation
 from utils.db import sql_to_df, upsert_to_db
@@ -19,6 +20,7 @@ env = Env()
 env.read_env()
 
 TABLE_NAME = "advisory_operator_snapshots"
+SECTION_TABLE_NAME = "advisory_operator_snapshot_sections"
 SNAPSHOT_NAME = "operator_dashboard_v1"
 DEFAULT_MAX_AGE_SECONDS = env.int("OPERATOR_SNAPSHOT_MAX_AGE_SECONDS", 86400)
 
@@ -70,6 +72,55 @@ def _payload_to_row(payload: dict[str, Any], *, asof_date: pd.Timestamp | None) 
     }
 
 
+def _payload_to_section_rows(payload: dict[str, Any], *, asof_date: pd.Timestamp | None) -> list[dict[str, Any]]:
+    generated_at = pd.Timestamp.utcnow()
+    key = snapshot_key(asof_date)
+    rows: list[dict[str, Any]] = []
+    for section_name, section_payload in payload.items():
+        if section_name.startswith("_"):
+            continue
+        if not isinstance(section_payload, (list, dict)):
+            continue
+        section_json = json.dumps(section_payload, ensure_ascii=False, default=_json_default, allow_nan=False)
+        rows.append(
+            {
+                "snapshot_name": SNAPSHOT_NAME,
+                "snapshot_key": key,
+                "section_name": section_name,
+                "asof_date": asof_date,
+                "generated_at": generated_at,
+                "payload_json": section_json,
+                "payload_bytes": len(section_json.encode("utf-8")),
+                "payload_sha256": hashlib.sha256(section_json.encode("utf-8")).hexdigest(),
+            }
+        )
+    return rows
+
+
+def _symbols_from_payload(payload: dict[str, Any]) -> list[str]:
+    symbols: set[str] = set()
+    for key in [
+        "top_action_recommendations",
+        "action_recommendations",
+        "alerts",
+        "portfolio",
+        "current_recommendations",
+        "today_recommendations",
+        "watch_recommendations",
+        "watchlist",
+    ]:
+        rows = payload.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
+            if symbol:
+                symbols.add(symbol)
+    return sorted(symbols)
+
+
 def build_operator_snapshot(
     *,
     asof_date: str | pd.Timestamp | None = None,
@@ -84,9 +135,19 @@ def build_operator_snapshot(
         details={"snapshot_name": SNAPSHOT_NAME, "snapshot_key": snapshot_key(parsed_asof)},
     ):
         payload = build_live_dashboard_payload(asof_date=parsed_asof, output_dir=output_dir)
+    price_cache: dict[str, Any] = {"status": "skipped", "reason": "no_payload_symbols"}
+    symbols = _symbols_from_payload(payload)
+    if symbols:
+        try:
+            price_cache = refresh_current_prices(symbols=symbols, persist=persist)
+        except Exception as exc:
+            price_cache = {"status": "error", "error": f"{type(exc).__name__}: {exc}", "requested_symbols": len(symbols)}
     row = _payload_to_row(payload, asof_date=parsed_asof)
     if persist:
         upsert_to_db(pd.DataFrame([row]), TABLE_NAME, unique_keys=["snapshot_name", "snapshot_key"])
+        section_rows = _payload_to_section_rows(payload, asof_date=parsed_asof)
+        if section_rows:
+            upsert_to_db(pd.DataFrame(section_rows), SECTION_TABLE_NAME, unique_keys=["snapshot_name", "snapshot_key", "section_name"])
     return {
         "status": "ok",
         "snapshot_name": row["snapshot_name"],
@@ -96,6 +157,7 @@ def build_operator_snapshot(
         "payload_bytes": row["payload_bytes"],
         "payload_sha256": row["payload_sha256"],
         "section_counts": json.loads(row["section_counts_json"]),
+        "price_cache": price_cache,
         "persisted": bool(persist),
     }
 
@@ -133,6 +195,62 @@ def load_operator_snapshot(
         "generated_at": str(df.iloc[0]["generated_at"]),
         "payload_bytes": int(df.iloc[0]["payload_bytes"] or 0),
         "payload_sha256": str(df.iloc[0]["payload_sha256"] or ""),
+    }
+    return payload
+
+
+def load_operator_snapshot_sections(
+    section_names: list[str],
+    *,
+    asof_date: str | pd.Timestamp | None = None,
+    max_age_seconds: int | None = DEFAULT_MAX_AGE_SECONDS,
+) -> dict[str, Any] | None:
+    names = sorted({str(name or "").strip() for name in section_names if str(name or "").strip()})
+    if not names:
+        return None
+    parsed_asof = _parse_asof_date(asof_date)
+    key = snapshot_key(parsed_asof)
+    clauses = ["snapshot_name = %s", "snapshot_key = %s", "section_name = ANY(%s)"]
+    params: list[Any] = [SNAPSHOT_NAME, key, names]
+    if max_age_seconds is not None and int(max_age_seconds) > 0:
+        clauses.append("generated_at >= NOW() - (%s * INTERVAL '1 second')")
+        params.append(int(max_age_seconds))
+    query = f"""
+        SELECT section_name, payload_json, generated_at, asof_date, payload_bytes, payload_sha256
+        FROM {SECTION_TABLE_NAME}
+        WHERE {' AND '.join(clauses)}
+        ORDER BY generated_at DESC
+    """
+    try:
+        df = sql_to_df(query, params=tuple(params), retries=2)
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    payload: dict[str, Any] = {}
+    latest_generated_at = None
+    total_bytes = 0
+    for row in df.to_dict(orient="records"):
+        section_name = str(row.get("section_name") or "")
+        if section_name in payload:
+            continue
+        payload[section_name] = json.loads(str(row.get("payload_json") or "null"))
+        latest_generated_at = row.get("generated_at") if latest_generated_at is None else latest_generated_at
+        total_bytes += int(row.get("payload_bytes") or 0)
+        if "asof_date" not in payload:
+            asof_value = row.get("asof_date")
+            payload["asof_date"] = None if pd.isna(asof_value) else str(asof_value)
+    missing = [name for name in names if name not in payload]
+    if missing:
+        return None
+    payload["generated_at"] = None if latest_generated_at is None else str(latest_generated_at)
+    payload["_snapshot"] = {
+        "source": "db_section_snapshot",
+        "snapshot_name": SNAPSHOT_NAME,
+        "snapshot_key": key,
+        "generated_at": payload["generated_at"],
+        "payload_bytes": total_bytes,
+        "sections": names,
     }
     return payload
 

@@ -25,6 +25,8 @@ const slowOperations = computed(() => asDict(sections.value.slow_operations))
 const slowIssues = computed(() => asList(slowOperations.value.issues))
 const syncStateFailures = computed(() => asList(sections.value.sync_state_failures))
 const degradationFeed = computed(() => asDict(sections.value.degradation_feed))
+const fallbackTelemetry = computed(() => asDict(sections.value.fallback_telemetry))
+const fallbackRows = computed(() => asList(fallbackTelemetry.value.rows))
 const degradationLifecycle = computed(() => asDict(degradationFeed.value.lifecycle))
 const degradationLifecycleGroups = computed(() => asList(degradationLifecycle.value.groups))
 const supersededPreview = computed(() => asDict(degradationLifecycle.value.superseded_preview))
@@ -410,6 +412,38 @@ async function updateSlowIssue(issue: Dict, status: string) {
       <MetricTile label="Recovered" :value="String(degradationFeed.recovered_count || 0)" note="Historical markers" />
       <MetricTile label="Kinds" :value="String(Object.keys(asDict(degradationFeed.counts_by_kind)).length)" note="Degradation categories" />
       <MetricTile label="Shown" :value="String(filteredDegradations.length)" note="After filters" />
+    </div>
+    <div class="mt-5 rounded-2xl border border-black/10 bg-white/75 p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Persisted Fallback Telemetry</p>
+          <p class="mt-2 text-sm leading-6 text-ink/65">
+            {{ fallbackTelemetry.message || 'No fallback telemetry has been recorded yet.' }}
+          </p>
+        </div>
+        <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(fallbackTelemetry.status)">
+          {{ statusText(fallbackTelemetry.status) }}
+        </span>
+      </div>
+      <div class="mt-4 grid gap-3 md:grid-cols-4">
+        <MetricTile label="Window" :value="`${fallbackTelemetry.window_hours || 24}h`" note="Telemetry lookback" />
+        <MetricTile label="Events" :value="String(fallbackTelemetry.active_count || 0)" note="Recent fallbacks" />
+        <MetricTile label="Errors" :value="String(fallbackTelemetry.error_count || 0)" note="High-impact" />
+        <MetricTile label="Types" :value="String(Object.keys(asDict(fallbackTelemetry.counts_by_type)).length)" note="Fallback classes" />
+      </div>
+      <details v-if="fallbackRows.length" class="mt-4">
+        <summary class="cursor-pointer text-sm font-black text-moss">Show latest fallback events</summary>
+        <div class="mt-3 grid gap-2">
+          <article v-for="row in fallbackRows.slice(0, 6)" :key="String(row.event_id)" class="rounded-xl bg-paper/80 p-3 text-sm">
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <p class="font-black text-ink">{{ titleCase(row.fallback_type) }}</p>
+              <span class="rounded-full px-2 py-1 text-[0.65rem] font-black" :class="statusClass(row.severity)">{{ statusText(row.severity) }}</span>
+            </div>
+            <p class="mt-1 text-ink/65">{{ row.reason || row.error_message || '-' }}</p>
+            <p class="mt-2 text-xs font-semibold text-ink/45">{{ row.module || '-' }} · {{ row.symbol || row.unique_id || '-' }} · {{ row.observed_at || '-' }}</p>
+          </article>
+        </div>
+      </details>
     </div>
     <div v-if="degradationLifecycleGroups.length" class="mt-5 grid gap-3 lg:grid-cols-3">
       <article v-for="group in degradationLifecycleGroups" :key="String(group.key)" class="rounded-2xl bg-white/75 p-4">

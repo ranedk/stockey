@@ -157,13 +157,16 @@ Done:
 - Duplicate index, size, retention, slowlog, archive, and S3 offload scripts exist.
 - Operator snapshot and trace summary materialization exist.
 - API latency probe and slow-operation state exist.
+- Operator health now has explicit fast/full modes. The default API path runs bounded parallel checks, uses short API caching, defers heavyweight event-data/table-freshness/cron/fallback/API-error-history scans, and points to full diagnostic commands, so `/api/health/details` no longer times out on large source tables.
+- Latest OHLCV price enrichment in the operator API now uses a short process-local cache, cutting repeated Action Queue reads from roughly 1.2s to roughly 0.2s in the 2026-06-09 probe.
 
 Gaps:
 
 - `To do`: standardize retry policy for `QueryCanceled`, deadlock, connection closed, and statement timeout across all DB access paths.
 - `To do`: every fallback query path should log “fallback used” into a durable telemetry table or health payload.
 - `To do`: add indexes for current API hot paths after reviewing `api_latency_probe` and Postgres query plans.
-- `To do`: enforce compact API payloads by default for frontend pages.
+- `Done`: enforce compact/paginated API payloads for frontend list pages. Actions, Events, Portfolio, trace summary/list payloads, cron logs, prompt registry, hypotheses, artifact manifests, and research review/previews now expose stable pagination or bounded-list metadata with focused regression coverage.
+- `Partial`: reduce operator API latency. 2026-06-09 probe: `/api/health/details` improved from timeout to ~0.64s cold / ~0.002s warm by using bounded parallel fast checks and short API caching; `/api/hypotheses?limit=25` improved from ~1.45s to ~0.64s cold / ~0.003s warm; `/api/actions?...compact=true` improved to ~0.74s cold / ~0.10s warm by using section snapshots, current-price cache, one company-memory review lookup, and short API caches.
 - `To do`: finalize S3/object storage offload for heavy text and OCR payloads.
 - `To do`: add DB schema migration/version tracking. Current `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE ADD COLUMN` approach is pragmatic but makes compatibility hard to reason about.
 
@@ -288,7 +291,7 @@ Done:
 
 Gaps:
 
-- `To do`: all LLM failures should create a durable, categorized issue with whether deterministic fallback was used.
+- `Partial`: all LLM failures should create a durable, categorized issue with whether deterministic fallback was used. Core Codex/LLM fallback paths now write `advisory_fallback_events` and Health shows counts/samples; old rows still need recovery/supersession handling after successful reruns.
 - `To do`: do not allow old LLM/Codex failures to pollute current Manual Review after a successful rerun exists.
 - `To do`: event-policy class rules need more outcome-driven calibration and operator review.
 - `To do`: add a source-quality model for news versus exchange announcements versus OCR documents.
@@ -533,6 +536,7 @@ Done:
 - Read-only action detail and portfolio detail GET routes now share a permissive FastAPI/Pydantic detail response model, include `api_schema` read-only/broker-disabled metadata, and have mocked route-level smoke coverage that avoids broker, command, and cleanup paths.
 - Read-only runtime GET route now publishes a permissive FastAPI/Pydantic response model, includes `api_schema` read-only/broker-disabled metadata, and has mocked route-level smoke coverage that avoids broker, command, credential, cleanup, and DB paths.
 - Read-only legacy health GET route now publishes a permissive FastAPI/Pydantic response model, includes `api_schema` broker-disabled metadata, and has mocked route-level smoke coverage that avoids broker, command, cleanup, credential, and DB paths.
+- Health details now accept `mode=fast|full`; fast is the default UI/API mode, while full intentionally runs heavyweight source/table/log/fallback diagnostics.
 - Read-only event detail, event trace, event trace summary, symbol trace, and symbol trace summary routes now enrich successful route responses with `api_schema` read-only/broker-disabled metadata even when mocked or alternate builders omit it, with focused route smoke assertions.
 - Frontend TypeScript payload contracts now include `api_schema` metadata for event detail, event trace, symbol trace, and trace summary API responses, so the Nuxt client preserves the read-only/broker-disabled schema contract for trace/detail views.
 - Frontend TypeScript payload contracts now also preserve read-only/broker-disabled `api_schema` metadata for Operations, event-model research, technical calibration, technical promotion-review listing, and event-policy/evaluation payloads.

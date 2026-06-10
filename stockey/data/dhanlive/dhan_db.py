@@ -1,6 +1,7 @@
 import pandas as pd
 from environs import Env
 
+from advisory.fallback_telemetry import record_fallback_event
 from advisory.identity_issues import record_dhan_identity_issue
 from utils.db import get_sql, sql_to_df
 from utils.company_master import load_company_master_records
@@ -122,6 +123,19 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
         if pd.isna(security_id):
             error_text = f"No Dhan security id mapped for {exchange_upper}:{identifier}"
             try:
+                record_fallback_event(
+                    module="data.dhanlive.dhan_db",
+                    source="dhan_identity",
+                    fallback_type="dhan_identity_unresolved",
+                    severity="error",
+                    symbol=identifier,
+                    reason=error_text,
+                    fallback_used=bool(fallback_tried),
+                    metadata={"requested_exchange": exchange_upper, "asset_type": asset_type_lower, "fallback_tried": fallback_tried},
+                )
+            except Exception:
+                pass
+            try:
                 record_dhan_identity_issue(
                     symbol=identifier,
                     requested_exchange=exchange_upper,
@@ -133,6 +147,21 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
             except Exception as exc:
                 print(f"[dhan.identity] failed to record identity issue for {exchange_upper}:{identifier}: {exc}", flush=True)
             raise ValueError(error_text)
+        if fallback_tried:
+            record_fallback_event(
+                module="data.dhanlive.dhan_db",
+                source="dhan_identity",
+                fallback_type="dhan_identity_fallback",
+                severity="warn",
+                symbol=identifier,
+                reason=f"Resolved {exchange_upper}:{identifier} through fallback exchange/method.",
+                metadata={
+                    "requested_exchange": exchange_upper,
+                    "resolved_exchange": resolved_exchange,
+                    "resolved_ticker": resolved_ticker,
+                    "fallback_tried": fallback_tried,
+                },
+            )
         return {
             "company_master_id": company["company_master_id"],
             "asset_type": "stock",

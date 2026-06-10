@@ -87,6 +87,7 @@ export interface CronLogsPayload {
   status: string
   log_dir: string
   logs: Dict[]
+  pagination?: Dict
 }
 
 export interface OperatorCommandsPayload {
@@ -135,6 +136,7 @@ export interface EventModelArtifactsPayload {
   status: string
   artifact: Dict
   latest_s3_heads: Dict[]
+  pagination?: Dict
   read_only: boolean
 }
 
@@ -194,6 +196,7 @@ export interface OperatorActions {
   top_action_recommendations: Dict[]
   action_recommendations: Dict[]
   alerts: Dict[]
+  pagination?: Dict
   meta?: Dict
 }
 
@@ -216,6 +219,7 @@ export interface OperatorPortfolio {
   exited_recommendations: Dict[]
   portfolio: Dict[]
   lifecycle: Dict[]
+  pagination?: Dict
   meta?: Dict
 }
 
@@ -238,6 +242,7 @@ export interface OperatorEvents {
   events: Dict[]
   operator_feed: Dict[]
   alerts: Dict[]
+  pagination?: Dict
   meta?: Dict
 }
 
@@ -305,6 +310,7 @@ export interface SignalQualityPromotionReviewsPayload {
   api_schema?: OperatorApiSchema
   status: string
   reviews: Dict[]
+  pagination?: Dict
 }
 
 export interface SignalQualityPromotionDecisionResult {
@@ -347,6 +353,7 @@ export interface ConfigChangePreviewsPayload {
   api_schema?: OperatorApiSchema
   status: string
   previews: Dict[]
+  pagination?: Dict
 }
 
 export interface PromptRegistryPayload {
@@ -356,6 +363,7 @@ export interface PromptRegistryPayload {
   contracts: Dict[]
   summary: Dict
   notes?: string[]
+  pagination?: Dict
 }
 
 export interface TechnicalPromotionReviewResult {
@@ -380,6 +388,7 @@ export interface TechnicalPromotionReviewsPayload {
   api_schema?: OperatorApiSchema
   status: string
   reviews: Dict[]
+  pagination?: Dict
 }
 
 export interface TechnicalPromotionDecisionResult {
@@ -413,6 +422,8 @@ export interface EventTrace {
   processing: Dict[]
   traces: Dict[]
   steps: Dict[]
+  action_conflicts?: Dict[]
+  pagination?: Dict
 }
 
 export interface SymbolTrace {
@@ -422,6 +433,7 @@ export interface SymbolTrace {
   traces: Dict[]
   steps: Dict[]
   action_conflicts: Dict[]
+  pagination?: Dict
 }
 
 export interface TraceStage {
@@ -519,6 +531,7 @@ export interface TraceSummary {
   action_conflicts: TraceConflict[]
   manual_review_wait_signal_links?: ManualReviewWaitSignalLink[]
   raw_counts: Dict
+  pagination?: Dict
   _trace_summary_cache?: Dict
 }
 
@@ -532,6 +545,7 @@ export interface HypothesesPayload {
   wait_signals?: Dict[]
   wait_signal_matches?: Dict[]
   promotion_audits?: Dict[]
+  pagination?: Dict
 }
 
 export interface WaitSignalsPayload {

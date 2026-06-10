@@ -45,6 +45,7 @@ const checkSettings = reactive({
 })
 
 const hypotheses = computed(() => data.value?.hypotheses || [])
+const hypothesisPageMeta = computed(() => asDict(data.value?.pagination?.hypotheses))
 const matches = computed(() => data.value?.matches || [])
 const actionPlans = computed(() => data.value?.action_plans || [])
 const waitSignals = computed(() => data.value?.wait_signals || [])
@@ -98,6 +99,10 @@ const filteredHypotheses = computed(() => hypotheses.value.filter((row) => {
     && (reliabilityFilter.value === 'all' || reliability === reliabilityFilter.value)
     && (scopeFilter.value === 'all' || scope === scopeFilter.value)
 }))
+
+function asDict(value: unknown): Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
 
 function parseKeywords(value: string) {
   return value
@@ -662,7 +667,9 @@ function conditionSummary(row: Record<string, unknown>) {
             Promotion audit is now operator-facing reliability check. Trusted overlays can influence consolidated actions only as review-only evidence.
           </p>
         </div>
-        <span class="rounded-full bg-ink px-3 py-1 text-xs font-black text-paper">{{ filteredHypotheses.length }} shown</span>
+        <span class="rounded-full bg-ink px-3 py-1 text-xs font-black text-paper">
+          {{ filteredHypotheses.length }} filtered · {{ hypothesisPageMeta.returned_count ?? hypotheses.length }}/{{ hypothesisPageMeta.total_count ?? hypotheses.length }} loaded
+        </span>
       </div>
       <div class="mt-5 flex flex-wrap gap-2">
         <button
