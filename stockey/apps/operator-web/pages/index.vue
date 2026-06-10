@@ -32,7 +32,8 @@ const { data: actionsData, refresh: refreshActions, error: actionsError } = useA
   action: actionType.value,
   status: actionStatus.value,
   search: actionSearch.value.trim(),
-  compact: true
+  compact: true,
+  include_feature_freshness: true
 }), {
   lazy: true,
   server: false,
@@ -353,6 +354,28 @@ function companyMemoryReview(row: Record<string, unknown>) {
     evidenceUsed,
     waitFor
   }
+}
+
+function featureFreshnessSummary(row: Record<string, unknown>) {
+  const summary = asDict(row.feature_freshness_summary)
+  const counts = asDict(summary.counts)
+  const blockers = Array.isArray(summary.blockers) ? summary.blockers.filter((item) => typeof item === 'object' && item !== null) as Record<string, unknown>[] : []
+  const requiredInputs = Array.isArray(summary.required_inputs) ? summary.required_inputs.filter((item) => typeof item === 'object' && item !== null) as Record<string, unknown>[] : []
+  return {
+    hasData: Object.keys(summary).length > 0,
+    status: String(summary.status || 'unknown'),
+    counts,
+    blockers,
+    requiredInputs
+  }
+}
+
+function featureFreshnessTone(row: Record<string, unknown>): 'success' | 'warning' | 'danger' | 'info' | 'dark' | 'neutral' {
+  const status = featureFreshnessSummary(row).status.toLowerCase()
+  if (status === 'ok') return 'success'
+  if (status === 'blocked') return 'danger'
+  if (status === 'warning') return 'warning'
+  return 'neutral'
 }
 
 function actionSourceLabel(row: Record<string, unknown>) {
@@ -705,6 +728,30 @@ function effectLabel(row: Record<string, unknown>) {
             </div>
             <ul v-if="executionSafetyGate(row).issues.length" class="mt-3 space-y-1 text-sm leading-6 text-ink/70">
               <li v-for="issue in executionSafetyGate(row).issues.slice(0, 3)" :key="issue">{{ issue }}</li>
+            </ul>
+          </section>
+          <section
+            v-if="featureFreshnessSummary(row).hasData"
+            class="mt-4 rounded-2xl border border-black/10 bg-white/70 p-4"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-black uppercase tracking-[0.22em] text-ink/45">Data inputs</p>
+                <p class="mt-1 text-sm leading-6 text-ink/65">
+                  Required inputs for this action row: daily OHLCV and technical features.
+                </p>
+              </div>
+              <StatusPill :tone="featureFreshnessTone(row)">
+                {{ featureFreshnessSummary(row).status.toUpperCase() }}
+              </StatusPill>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+              <p class="rounded-xl bg-paper/80 px-3 py-2"><b>Fresh:</b> {{ featureFreshnessSummary(row).counts.fresh || 0 }}</p>
+              <p class="rounded-xl bg-paper/80 px-3 py-2"><b>Stale:</b> {{ featureFreshnessSummary(row).counts.stale || 0 }}</p>
+              <p class="rounded-xl bg-paper/80 px-3 py-2"><b>Missing:</b> {{ featureFreshnessSummary(row).counts.missing || 0 }}</p>
+            </div>
+            <ul v-if="featureFreshnessSummary(row).blockers.length" class="mt-3 space-y-1 text-sm leading-6 text-rust">
+              <li v-for="item in featureFreshnessSummary(row).blockers" :key="String(item.input_key)">{{ item.label || item.input_key }}: {{ item.status }} / {{ item.reason }}</li>
             </ul>
           </section>
           <div class="mt-4 grid gap-2 text-xs font-black sm:grid-cols-2 xl:grid-cols-3">

@@ -66,6 +66,18 @@ export interface OperatorRuntime {
   read_only: boolean
 }
 
+export interface FeatureFreshnessPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  symbol?: string
+  asof_date?: string
+  counts: Dict
+  blockers: Dict[]
+  inputs: Dict[]
+  notes?: string[]
+}
+
 export interface OperatorSmokePayload {
   generated_at?: string
   api_schema?: OperatorApiSchema

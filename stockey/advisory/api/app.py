@@ -24,6 +24,7 @@ from advisory.decision_trace import ensure_trace_tables, load_event_trace, load_
 from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
 from advisory.event_model_artifact_store import build_artifact_manifest
 from advisory.event_model_promotion_check import build_promotion_check
+from advisory.feature_freshness import build_feature_freshness_contract, build_required_feature_freshness_summaries
 from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audits, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
 from advisory.identity_issues import IDENTITY_ISSUES_TABLE, load_open_identity_issues, resolve_open_identity_issues
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
@@ -270,6 +271,18 @@ class DataHealthResponse(OperatorApiResponseModel):
     sync_state: list[dict[str, Any]] = Field(default_factory=list)
     runtime_processes: list[dict[str, Any]] = Field(default_factory=list)
     cron_status: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class FeatureFreshnessResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    symbol: str | None = None
+    asof_date: str | None = None
+    counts: dict[str, Any] = Field(default_factory=dict)
+    blockers: list[dict[str, Any]] = Field(default_factory=list)
+    inputs: list[dict[str, Any]] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class OperationsSmokeResponse(OperatorApiResponseModel):
@@ -1313,6 +1326,7 @@ def build_actions_payload(
     status: str | None = None,
     search: str | None = None,
     compact: bool = False,
+    include_feature_freshness: bool = False,
 ) -> dict[str, Any]:
     payload = load_operator_sections_payload(
         ["top_action_recommendations", "action_recommendations", "alerts"],
@@ -1344,6 +1358,19 @@ def build_actions_payload(
         _with_execution_safety_contracts(_with_latest_prices(action_page, price_field="current_price", prices=latest_prices)),
         reviews=memory_reviews,
     )
+    if include_feature_freshness:
+        feature_summaries = build_required_feature_freshness_summaries(
+            [
+                str(row.get("symbol") or row.get("ticker") or "")
+                for row in [*top_action_page, *action_page]
+                if isinstance(row, dict)
+            ],
+            asof_date=asof_date or payload.get("asof_date"),
+        )
+        for row in [*top_action_page, *action_page]:
+            symbol_key = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
+            if symbol_key and symbol_key in feature_summaries:
+                row["feature_freshness_summary"] = feature_summaries[symbol_key]
     alert_page = _with_latest_prices(alert_raw, price_field="last_price", prices=latest_prices)
     return {
         "generated_at": payload.get("generated_at"),
@@ -1364,7 +1391,7 @@ def build_actions_payload(
             "top_action_recommendations": {"total": len(top_actions), "returned": top_action_pagination["returned_count"]},
             "action_recommendations": action_meta,
             "alerts": {"total": len(alert_rows), "returned": alert_pagination["returned_count"]},
-            "filters": {"symbol": symbol, "action": action, "status": status, "search": search, "compact": compact},
+            "filters": {"symbol": symbol, "action": action, "status": status, "search": search, "compact": compact, "include_feature_freshness": include_feature_freshness},
         },
     }
 
@@ -2223,6 +2250,15 @@ def _detail_payload(kind: str, rows: list[dict[str, Any]], *, filters: dict[str,
     }
 
 
+def build_feature_freshness_payload(*, symbol: str, asof_date: str | None = None) -> dict[str, Any]:
+    payload = build_feature_freshness_contract(symbol, asof_date=asof_date)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/symbols/{symbol}/feature-freshness", schema_name="feature_freshness"),
+        **payload,
+    }
+
+
 def ensure_operator_api_errors_table() -> None:
     with db_session() as (_, cur):
         cur.execute(
@@ -2769,7 +2805,11 @@ def build_action_detail_payload(*, symbol: str | None = None, unique_id: str | N
     normalized_setup = str(setup_id or "").strip().upper()
     if normalized_setup:
         rows = [row for row in rows if str(row.get("setup_id") or "").strip().upper() == normalized_setup]
-    return _detail_payload("actions", rows, filters={"symbol": symbol, "unique_id": unique_id, "setup_id": setup_id, "asof_date": asof_date})
+    out = _detail_payload("actions", rows, filters={"symbol": symbol, "unique_id": unique_id, "setup_id": setup_id, "asof_date": asof_date})
+    normalized_symbol = str(symbol or (rows[0].get("symbol") if rows else "") or "").strip().upper()
+    if normalized_symbol:
+        out["feature_freshness"] = build_feature_freshness_payload(symbol=normalized_symbol, asof_date=asof_date)
+    return out
 
 
 def build_portfolio_detail_payload(*, symbol: str, asof_date: str | None = None) -> dict[str, Any]:
@@ -5586,8 +5626,9 @@ def create_app():
         status: str | None = None,
         search: str | None = None,
         compact: bool = Query(default=False),
+        include_feature_freshness: bool = Query(default=False),
     ):
-        return _guard(build_actions_payload, route="/api/actions", asof_date=asof_date, limit=limit, offset=offset, symbol=symbol, action=action, status=status, search=search, compact=compact)
+        return _guard(build_actions_payload, route="/api/actions", asof_date=asof_date, limit=limit, offset=offset, symbol=symbol, action=action, status=status, search=search, compact=compact, include_feature_freshness=include_feature_freshness)
 
     @app.get("/api/actions/detail", response_model=OperatorDetailResponse)
     def action_detail(symbol: str | None = None, unique_id: str | None = None, setup_id: str | None = None, asof_date: str | None = None):
@@ -5748,6 +5789,10 @@ def create_app():
             endpoint="/api/symbols/{symbol}/trace/summary",
             schema_name="operator_symbol_trace_summary",
         )
+
+    @app.get("/api/symbols/{symbol}/feature-freshness", response_model=FeatureFreshnessResponse)
+    def symbol_feature_freshness(symbol: str, asof_date: str | None = None):
+        return _guard(build_feature_freshness_payload, route="/api/symbols/{symbol}/feature-freshness", symbol=symbol, asof_date=asof_date)
 
     @app.get("/api/data-health", response_model=DataHealthResponse)
     def data_health(asof_date: str | None = None):

@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, cron_status, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, fallback_telemetry, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, cron_status, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, fallback_telemetry, feature_freshness, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
 from advisory import manual_review_state
 from advisory import identity_issues
 from advisory import superseded_failures
@@ -3268,6 +3268,71 @@ def test_cron_status_detects_stale_lock_and_log_marker(tmp_path):
     assert job["status"] == "error"
 
 
+def test_feature_freshness_contract_classifies_required_and_optional_inputs(monkeypatch):
+    required = feature_freshness.FeatureInputSpec(
+        "daily_ohlcv",
+        "Daily OHLCV",
+        "dhan_ohlcv_daily",
+        "date",
+        symbol_column="ticker",
+        max_age_days=5,
+        required=True,
+    )
+    optional = feature_freshness.FeatureInputSpec(
+        "intraday_features",
+        "Intraday Features",
+        "advisory_intraday_features_daily",
+        "asof_date",
+        max_age_days=3,
+        required=False,
+    )
+
+    monkeypatch.setattr(feature_freshness, "table_exists", lambda table: table == "dhan_ohlcv_daily")
+    monkeypatch.setattr(feature_freshness, "table_columns", lambda table: {"date", "ticker"} if table == "dhan_ohlcv_daily" else set())
+    monkeypatch.setattr(
+        feature_freshness,
+        "sql_to_df",
+        lambda *args, **kwargs: pd.DataFrame([{"latest_at": pd.Timestamp("2026-06-09T00:00:00Z"), "row_count": 1}]),
+    )
+
+    fresh = feature_freshness.evaluate_feature_input(required, symbol="ABC", asof_date=pd.Timestamp("2026-06-10T00:00:00Z"))
+    skipped = feature_freshness.evaluate_feature_input(optional, symbol="ABC", asof_date=pd.Timestamp("2026-06-10T00:00:00Z"))
+
+    assert fresh["status"] == "fresh"
+    assert fresh["row_count"] == 1
+    assert skipped["status"] == "intentionally_skipped"
+    assert skipped["reason"] == "optional_table_missing"
+
+
+def test_feature_freshness_contract_flags_stale_and_missing_required(monkeypatch):
+    specs = (
+        feature_freshness.FeatureInputSpec("daily_ohlcv", "Daily OHLCV", "dhan_ohlcv_daily", "date", symbol_column="ticker", max_age_days=2, required=True),
+        feature_freshness.FeatureInputSpec("technical_daily", "Technical Features", "advisory_technical_daily", "asof_date", max_age_days=2, required=True),
+    )
+
+    monkeypatch.setattr(feature_freshness, "FEATURE_INPUT_SPECS", specs)
+    monkeypatch.setattr(feature_freshness, "table_exists", lambda table: table in {"dhan_ohlcv_daily", "advisory_technical_daily"})
+    monkeypatch.setattr(feature_freshness, "table_columns", lambda table: {"date", "ticker"} if table == "dhan_ohlcv_daily" else {"asof_date", "symbol"})
+
+    def fake_sql(query, *args, **kwargs):
+        params = kwargs.get("params") or {}
+        if params.get("symbol") == "MISS":
+            return pd.DataFrame([{"latest_at": None, "row_count": 0}])
+        if '"dhan_ohlcv_daily"' in str(query):
+            return pd.DataFrame([{"latest_at": pd.Timestamp("2026-06-01T00:00:00Z"), "row_count": 1}])
+        return pd.DataFrame([{"latest_at": pd.Timestamp("2026-06-10T00:00:00Z"), "row_count": 1}])
+
+    monkeypatch.setattr(feature_freshness, "sql_to_df", fake_sql)
+
+    stale_contract = feature_freshness.build_feature_freshness_contract("ABC", asof_date=pd.Timestamp("2026-06-10T00:00:00Z"))
+    missing_contract = feature_freshness.build_feature_freshness_contract("MISS", asof_date=pd.Timestamp("2026-06-10T00:00:00Z"))
+
+    assert stale_contract["status"] == "blocked"
+    assert any(row["input_key"] == "daily_ohlcv" and row["status"] == "stale" for row in stale_contract["blockers"])
+    assert missing_contract["status"] == "blocked"
+    assert all(row["status"] == "missing" for row in missing_contract["blockers"])
+
+
 def test_operator_health_degradation_feed_includes_announcement_failures(monkeypatch):
     monkeypatch.setattr(
         operator_health,
@@ -3576,6 +3641,7 @@ def test_operator_api_critical_routes_publish_typed_response_models():
         ("/api/events/{unique_id}/detail", "get"): "EventDetailResponse",
         ("/api/events/{unique_id}/trace", "get"): "EventTraceResponse",
         ("/api/events/{unique_id}/trace/summary", "get"): "TraceSummaryResponse",
+        ("/api/symbols/{symbol}/feature-freshness", "get"): "FeatureFreshnessResponse",
         ("/api/symbols/{symbol}/trace", "get"): "SymbolTraceResponse",
         ("/api/symbols/{symbol}/trace/summary", "get"): "TraceSummaryResponse",
     }
@@ -3755,7 +3821,7 @@ def test_operator_api_home_portfolio_events_read_routes_smoke_with_typed_payload
     ]
 
     for response in responses:
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         body = response.json()
         assert body["api_schema"]["version"] == operator_api.OPERATOR_API_SCHEMA_VERSION
         assert body["api_schema"]["read_only"] is True
@@ -3829,7 +3895,7 @@ def test_operator_api_summary_watchlist_market_context_read_routes_smoke_with_ty
     ]
 
     for response in responses:
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         body = response.json()
         assert body["api_schema"]["version"] == operator_api.OPERATOR_API_SCHEMA_VERSION
         assert body["api_schema"]["read_only"] is True
@@ -4016,7 +4082,7 @@ def test_operator_api_action_portfolio_detail_read_routes_smoke_with_typed_paylo
     ]
 
     for response in responses:
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         body = response.json()
         assert body["api_schema"]["version"] == operator_api.OPERATOR_API_SCHEMA_VERSION
         assert body["api_schema"]["read_only"] is True
@@ -4056,7 +4122,7 @@ def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
     monkeypatch.setattr(
         operator_api,
         "build_operator_health_payload",
-        lambda: {
+        lambda **_kwargs: {
             "generated_at": "2026-06-07T00:00:00Z",
             "api_schema": schema("/api/health/details", "operator_health_details"),
             "status": "ok",
@@ -4210,7 +4276,7 @@ def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
     ]
 
     for response in responses:
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         body = response.json()
         assert body["api_schema"]["version"] == operator_api.OPERATOR_API_SCHEMA_VERSION
         assert body["api_schema"]["broker_execution_enabled"] is False
@@ -4558,6 +4624,7 @@ def test_operator_api_symbol_trace_routes_smoke_and_error_paths(monkeypatch):
     errors = []
     trace_calls = []
     summary_calls = []
+    freshness_calls = []
 
     def fake_trace(symbol, limit=100):
         trace_calls.append({"symbol": symbol, "limit": limit})
@@ -4584,8 +4651,29 @@ def test_operator_api_symbol_trace_routes_smoke_and_error_paths(monkeypatch):
             "_trace_summary_cache": {"source": "test"},
         }
 
+    def fake_feature_freshness(symbol, asof_date=None):
+        freshness_calls.append({"symbol": symbol, "asof_date": asof_date})
+        return {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": {
+                "name": "feature_freshness",
+                "version": operator_api.OPERATOR_API_SCHEMA_VERSION,
+                "endpoint": "/api/symbols/{symbol}/feature-freshness",
+                "read_only": True,
+                "broker_execution_enabled": False,
+            },
+            "symbol": symbol.upper(),
+            "asof_date": asof_date,
+            "status": "ok",
+            "counts": {"fresh": 2},
+            "blockers": [],
+            "inputs": [{"input_key": "daily_ohlcv", "status": "fresh"}],
+            "notes": ["test"],
+        }
+
     monkeypatch.setattr(operator_api, "build_symbol_trace_payload", fake_trace)
     monkeypatch.setattr(operator_api, "build_symbol_trace_summary_payload", fake_summary)
+    monkeypatch.setattr(operator_api, "build_feature_freshness_payload", fake_feature_freshness)
     monkeypatch.setattr(operator_api, "record_operator_api_error", lambda **kwargs: errors.append(kwargs))
 
     client = TestClient(operator_api.create_app())
@@ -4607,6 +4695,16 @@ def test_operator_api_symbol_trace_routes_smoke_and_error_paths(monkeypatch):
     assert summary_body["api_schema"]["read_only"] is True
     assert summary_body["api_schema"]["broker_execution_enabled"] is False
     assert summary_calls[-1] == {"symbol": "abc", "limit": 7}
+
+    freshness_response = client.get("/api/symbols/abc/feature-freshness?asof_date=2026-06-07")
+    assert freshness_response.status_code == 200
+    freshness_body = freshness_response.json()
+    assert freshness_body["symbol"] == "ABC"
+    assert freshness_body["api_schema"]["endpoint"] == "/api/symbols/{symbol}/feature-freshness"
+    assert freshness_body["api_schema"]["read_only"] is True
+    assert freshness_body["api_schema"]["broker_execution_enabled"] is False
+    assert freshness_body["inputs"][0]["input_key"] == "daily_ohlcv"
+    assert freshness_calls[-1] == {"symbol": "abc", "asof_date": "2026-06-07"}
 
     validation_response = client.get("/api/symbols/abc/trace?limit=0")
     assert validation_response.status_code == 422

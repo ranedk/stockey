@@ -188,9 +188,9 @@ Done:
 
 Gaps:
 
-- `To do`: add feature freshness contract per feature table. Advisory should know whether a feature is fresh, stale, missing, or intentionally skipped.
+- `Partial`: add feature freshness contract per feature table. `advisory.feature_freshness` now classifies core symbol inputs as fresh, stale, missing, error, or intentionally skipped, exposes `/api/symbols/{symbol}/feature-freshness`, shows required-input summaries in the Action Queue, and shows the full Data Inputs Used panel on symbol detail pages. Remaining work: persist the decision-time freshness snapshot and make advisory stages enforce the contract instead of only surfacing it read-only.
 - `To do`: add explicit feature dependency graph so a stage cannot silently use stale upstream rows.
-- `To do`: explain in the UI which feature was missing or stale when an action became Manual Review.
+- `Partial`: explain in the UI which feature was missing or stale when an action became Manual Review. Required stale/missing core inputs are now visible beside action rows and on symbol detail pages; remaining work is to link the exact freshness blockers recorded at the time the Manual Review action was created.
 - `To do`: reduce expensive full-table feature queries with materialized/current snapshots.
 - `To do`: add feature-level tests for point-in-time behavior and no lookahead.
 

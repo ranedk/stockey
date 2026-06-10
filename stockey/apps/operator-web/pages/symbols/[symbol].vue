@@ -5,11 +5,12 @@ const api = useOperatorApi()
 const route = useRoute()
 const symbol = computed(() => String(route.params.symbol || '').trim().toUpperCase())
 
-const [{ data: actions, error: actionsError }, { data: portfolio, error: portfolioError }, { data: events, error: eventsError }, { data: traceData, error: traceError }] = await Promise.all([
+const [{ data: actions, error: actionsError }, { data: portfolio, error: portfolioError }, { data: events, error: eventsError }, { data: traceData, error: traceError }, { data: featureFreshness, error: featureFreshnessError }] = await Promise.all([
   useAsyncData(`symbol-actions-${symbol.value}`, () => api.getActions({ symbol: symbol.value, limit: 100 })),
   useAsyncData(`symbol-portfolio-${symbol.value}`, () => api.getPortfolio({ symbol: symbol.value, limit: 100 })),
   useAsyncData(`symbol-events-${symbol.value}`, () => api.getEvents(100, { symbol: symbol.value })),
-  useAsyncData(`symbol-trace-${symbol.value}`, () => api.getSymbolTraceSummary(symbol.value, 250))
+  useAsyncData(`symbol-trace-${symbol.value}`, () => api.getSymbolTraceSummary(symbol.value, 250)),
+  useAsyncData(`symbol-feature-freshness-${symbol.value}`, () => api.getFeatureFreshness(symbol.value))
 ])
 
 const trace = computed<TraceSummary | null>(() => traceData.value || null)
@@ -17,7 +18,8 @@ const loadErrors = computed(() => [
   { title: `${symbol.value} actions failed`, error: actionsError.value },
   { title: `${symbol.value} portfolio failed`, error: portfolioError.value },
   { title: `${symbol.value} events failed`, error: eventsError.value },
-  { title: `${symbol.value} trace failed`, error: traceError.value }
+  { title: `${symbol.value} trace failed`, error: traceError.value },
+  { title: `${symbol.value} data inputs failed`, error: featureFreshnessError.value }
 ].filter((row) => row.error))
 const actionRows = computed(() => filterSymbolRows([...(actions.value?.top_action_recommendations || []), ...(actions.value?.action_recommendations || [])]))
 const alertRows = computed(() => filterSymbolRows(actions.value?.alerts || []))
@@ -39,6 +41,9 @@ const finalAction = computed(() => mergeRows(
 const reasonContract = computed(() => finalAction.value.recommendation_reason || finalAction.value.reason_contract || finalAction.value.recommendation_reason_json)
 const reasonStatus = computed(() => finalAction.value.reason_contract_status || finalAction.value.status)
 const companyMemory = computed(() => companyMemoryReview(finalAction.value))
+const dataInputs = computed(() => Array.isArray(featureFreshness.value?.inputs) ? featureFreshness.value.inputs : [])
+const dataInputCounts = computed(() => asDict(featureFreshness.value?.counts))
+const dataInputBlockers = computed(() => Array.isArray(featureFreshness.value?.blockers) ? featureFreshness.value.blockers : [])
 const explicitTarget = computed(() => numericFirstValue(['target_price', 'recommended_target_price']))
 const derivedTarget = computed(() => computeDerivedTarget())
 const displayTarget = computed(() => explicitTarget.value ?? derivedTarget.value)
@@ -179,6 +184,14 @@ function statusClass(value: unknown) {
   if (status.includes('BUY') || status.includes('HOLD') || status.includes('WATCH')) return 'bg-moss text-paper'
   if (status.includes('MANUAL') || status.includes('REVIEW')) return 'bg-sun text-ink'
   return 'bg-ink text-paper'
+}
+
+function dataInputClass(value: unknown) {
+  const status = String(value || '').toLowerCase()
+  if (status === 'fresh' || status === 'ok') return 'bg-moss text-paper'
+  if (status === 'stale' || status === 'warning') return 'bg-sun text-ink'
+  if (status === 'missing' || status === 'error' || status === 'blocked') return 'bg-rust text-paper'
+  return 'bg-ink/10 text-ink'
 }
 
 function actionLabel(row: Dict) {
@@ -339,6 +352,46 @@ function companyMemoryReview(row: Dict) {
         <p class="rounded-2xl bg-white/75 p-3"><b>Invalidation:</b> {{ display(firstValue(['invalidation_rule', 'invalidation_price', 'support_price'])) }}</p>
         <p class="rounded-2xl bg-white/75 p-3"><b>Horizon:</b> {{ display(firstValue(['expected_horizon_days', 'target_review_date', 'holding_window_days'])) }}</p>
         <p class="rounded-2xl bg-white/75 p-3"><b>Manual review:</b> {{ display(firstValue(['manual_revision_summary', 'manual_revision_pointers', 'review_action'])) }}</p>
+      </div>
+
+      <div class="mt-6 rounded-3xl border border-black/10 bg-white/70 p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Data Inputs Used</p>
+            <h3 class="mt-2 text-xl font-black">Freshness contract</h3>
+            <p class="mt-2 text-sm leading-6 text-ink/60">
+              Required stale/missing inputs can explain why an action is blocked or review-only. Optional missing inputs are shown so you know what evidence was unavailable.
+            </p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="dataInputClass(featureFreshness?.status)">{{ String(featureFreshness?.status || 'unknown').toUpperCase() }}</span>
+        </div>
+        <div class="mt-4 grid gap-2 md:grid-cols-4">
+          <p class="rounded-2xl bg-paper/80 p-3 text-sm"><b>Fresh:</b> {{ display(dataInputCounts.fresh || 0) }}</p>
+          <p class="rounded-2xl bg-paper/80 p-3 text-sm"><b>Stale:</b> {{ display(dataInputCounts.stale || 0) }}</p>
+          <p class="rounded-2xl bg-paper/80 p-3 text-sm"><b>Missing:</b> {{ display(dataInputCounts.missing || 0) }}</p>
+          <p class="rounded-2xl bg-paper/80 p-3 text-sm"><b>Skipped:</b> {{ display(dataInputCounts.intentionally_skipped || 0) }}</p>
+        </div>
+        <div v-if="dataInputBlockers.length" class="mt-4 rounded-2xl bg-rust/10 p-4">
+          <p class="text-sm font-black text-rust">Required input blockers</p>
+          <ul class="mt-2 space-y-1 text-sm font-semibold text-rust">
+            <li v-for="row in dataInputBlockers" :key="String(row.input_key)">{{ row.label || row.input_key }}: {{ row.status }} / {{ row.reason }}</li>
+          </ul>
+        </div>
+        <details class="mt-4">
+          <summary class="cursor-pointer text-sm font-black text-moss">Show all input checks</summary>
+          <div class="mt-3 grid gap-2">
+            <div v-for="row in dataInputs" :key="String(row.input_key)" class="rounded-2xl bg-paper/80 p-3">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <p class="font-black text-ink">{{ row.label || row.input_key }}</p>
+                <span class="rounded-full px-3 py-1 text-xs font-black" :class="dataInputClass(row.status)">{{ String(row.status || 'unknown').toUpperCase() }}</span>
+              </div>
+              <p class="mt-1 text-sm text-ink/60">{{ row.purpose || '-' }}</p>
+              <p class="mt-1 text-xs font-semibold text-ink/45">
+                {{ row.table }} · latest {{ display(row.latest_at) }} · age {{ display(row.age_days) }}d · rows {{ display(row.row_count) }} · {{ row.reason || '-' }}
+              </p>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
   </section>

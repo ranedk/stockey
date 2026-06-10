@@ -100,6 +100,8 @@ Required operator UI coverage:
    - show current status for Postgres, Redis, Dhan token/cache, API, Nuxt, cron jobs, source freshness, slow operations, and fallback spikes
    - done: add a UI action to run the read-only smoke check and display the resulting fix hints
    - expose recent cron logs with latest-run status, recovered/manual-interrupt state, and traceback snippets
+   - partial: show per-symbol feature freshness contracts in Action Queue and Symbol Detail so stale/missing required inputs are visible before trusting a decision
+   - todo: persist decision-time feature freshness and enforce it stage-by-stage instead of only showing the current read-only contract
 
 2. Hypothesis and investor playbook management
    - create, preview, edit, version, activate/deactivate, and mark trusted-overlay playbooks from UI
