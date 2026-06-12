@@ -9,7 +9,8 @@ import pandas as pd
 from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
 from advisory.decision_trace import classify_action_conflict, ensure_trace_tables
 from advisory.decision_trace import load_enabled_dynamic_action_conflict_rules
-from utils.db import db_session, sql_to_df
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import db_session, execute_db_operation, sql_to_df
 from utils.sync import parse_datetime_arg
 
 
@@ -22,8 +23,16 @@ def _json_ready(value: Any) -> Any:
         try:
             if pd.isna(value):
                 return None
-        except Exception:
-            pass
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.action_conflict_resolver",
+                fallback_type="action_conflict_json_ready_missing_check_failed",
+                source="json_ready",
+                severity="warn",
+                reason="Action conflict resolver could not evaluate missingness for a value and kept the original value.",
+                error=exc,
+                metadata={"value_type": type(value).__name__},
+            )
     return value
 
 
@@ -117,9 +126,16 @@ def dedupe_conflicts(*, asof_date: pd.Timestamp | None, symbol: str | None, dry_
     duplicate_count = int(sql_to_df(count_sql, params=params, retries=2)["count"].iloc[0])
     if dry_run or duplicate_count <= 0:
         return duplicate_count
-    with db_session() as (_, cur):
-        cur.execute(delete_sql, params)
-        return int(cur.rowcount or 0)
+
+    def _delete_duplicates() -> int:
+        with db_session() as (_, cur):
+            cur.execute(delete_sql, params)
+            return int(cur.rowcount or 0)
+
+    return execute_db_operation(
+        _delete_duplicates,
+        operation_name="action_conflict_resolver:dedupe_conflicts",
+    )
 
 
 def resolve_conflicts(
@@ -152,27 +168,33 @@ def resolve_conflicts(
         )
 
     if not dry_run and updates:
-        with db_session() as (_, cur):
-            for item in updates:
-                cur.execute(
-                    f"""
-                    UPDATE {ACTION_CONFLICTS_TABLE}
-                    SET resolution_status = %s,
-                        resolution_rule_id = %s,
-                        resolution_action = %s,
-                        resolution_reason = %s,
-                        requires_manual_resolution = %s
-                    WHERE ctid = %s::tid
-                    """,
-                    (
-                        item.get("resolution_status"),
-                        item.get("resolution_rule_id"),
-                        item.get("resolution_action"),
-                        item.get("resolution_reason"),
-                        item.get("requires_manual_resolution"),
-                        item["row_id"],
-                    ),
-                )
+        def _persist_resolutions() -> None:
+            with db_session() as (_, cur):
+                for item in updates:
+                    cur.execute(
+                        f"""
+                        UPDATE {ACTION_CONFLICTS_TABLE}
+                        SET resolution_status = %s,
+                            resolution_rule_id = %s,
+                            resolution_action = %s,
+                            resolution_reason = %s,
+                            requires_manual_resolution = %s
+                        WHERE ctid = %s::tid
+                        """,
+                        (
+                            item.get("resolution_status"),
+                            item.get("resolution_rule_id"),
+                            item.get("resolution_action"),
+                            item.get("resolution_reason"),
+                            item.get("requires_manual_resolution"),
+                            item["row_id"],
+                        ),
+                    )
+
+        execute_db_operation(
+            _persist_resolutions,
+            operation_name="action_conflict_resolver:persist_resolutions",
+        )
 
     status_counts: dict[str, int] = {}
     rule_counts: dict[str, int] = {}

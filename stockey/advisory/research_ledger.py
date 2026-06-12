@@ -10,12 +10,60 @@ from typing import Any
 
 import pandas as pd
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 LEDGER_TABLE = "advisory_research_runs"
+RESEARCH_LEDGER_SCHEMA_MIGRATION_ID = "20260611_advisory_research_runs_base"
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+RESEARCH_LEDGER_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {LEDGER_TABLE} (
+        research_run_id TEXT PRIMARY KEY,
+        parent_run_id TEXT,
+        run_type TEXT NOT NULL,
+        entrypoint TEXT NOT NULL,
+        label TEXT,
+        objective TEXT,
+        asof_date TIMESTAMPTZ,
+        status TEXT NOT NULL,
+        config_hash TEXT NOT NULL,
+        config_json TEXT NOT NULL,
+        validation_protocol_json TEXT,
+        data_snapshot_json TEXT,
+        result_metrics_json TEXT,
+        notes_json TEXT,
+        error_text TEXT,
+        git_rev TEXT,
+        started_ts TIMESTAMPTZ NOT NULL,
+        completed_ts TIMESTAMPTZ,
+        updated_ts TIMESTAMPTZ NOT NULL
+    )
+    """,
+]
+
+
+def _record_research_ledger_fallback(
+    fallback_type: str,
+    *,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.research_ledger",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def _json_default(value: Any) -> Any:
@@ -46,7 +94,14 @@ def _try_git_rev() -> str | None:
             .strip()
             or None
         )
-    except Exception:
+    except Exception as exc:
+        _record_research_ledger_fallback(
+            "research_ledger_git_rev_lookup_failed",
+            source="git",
+            reason="Research ledger could not resolve the current git revision and will store a null git_rev.",
+            error=exc,
+            metadata={"cwd": str(REPO_ROOT), "command": ["git", "rev-parse", "HEAD"]},
+        )
         return None
 
 
@@ -55,32 +110,12 @@ def _config_hash(config: dict[str, Any]) -> str:
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {LEDGER_TABLE} (
-                research_run_id TEXT PRIMARY KEY,
-                parent_run_id TEXT,
-                run_type TEXT NOT NULL,
-                entrypoint TEXT NOT NULL,
-                label TEXT,
-                objective TEXT,
-                asof_date TIMESTAMPTZ,
-                status TEXT NOT NULL,
-                config_hash TEXT NOT NULL,
-                config_json TEXT NOT NULL,
-                validation_protocol_json TEXT,
-                data_snapshot_json TEXT,
-                result_metrics_json TEXT,
-                notes_json TEXT,
-                error_text TEXT,
-                git_rev TEXT,
-                started_ts TIMESTAMPTZ NOT NULL,
-                completed_ts TIMESTAMPTZ,
-                updated_ts TIMESTAMPTZ NOT NULL
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=RESEARCH_LEDGER_SCHEMA_MIGRATION_ID,
+        description="Create advisory research run ledger table.",
+        statements=RESEARCH_LEDGER_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.research_ledger", "tables": [LEDGER_TABLE]},
+    )
 
 
 def start_research_run(
@@ -123,7 +158,17 @@ def start_research_run(
             }
         ]
     )
-    upsert_to_db(row, LEDGER_TABLE, unique_keys=["research_run_id"])
+    try:
+        upsert_to_db(row, LEDGER_TABLE, unique_keys=["research_run_id"])
+    except Exception as exc:
+        _record_research_ledger_fallback(
+            "research_ledger_start_write_failed",
+            source=LEDGER_TABLE,
+            reason="Research ledger could not persist the start of a research run; false-discovery audit trail may be incomplete.",
+            error=exc,
+            metadata={"run_type": run_type, "entrypoint": entrypoint, "label": label, "research_run_id": run_id},
+        )
+        raise
     return run_id
 
 
@@ -152,7 +197,17 @@ def finish_research_run(
             }
         ]
     )
-    upsert_to_db(row, LEDGER_TABLE, unique_keys=["research_run_id"])
+    try:
+        upsert_to_db(row, LEDGER_TABLE, unique_keys=["research_run_id"])
+    except Exception as exc:
+        _record_research_ledger_fallback(
+            "research_ledger_finish_write_failed",
+            source=LEDGER_TABLE,
+            reason="Research ledger could not persist completion metadata for a research run; validation/audit status may be incomplete.",
+            error=exc,
+            metadata={"research_run_id": str(research_run_id), "status": status},
+        )
+        raise
 
 
 def build_data_snapshot(*, asof_date: pd.Timestamp | None, summary: dict[str, Any]) -> dict[str, Any]:
@@ -190,15 +245,25 @@ def parse_validation_protocol(text: str | None) -> dict[str, Any] | None:
 
 def list_runs(limit: int = 50) -> pd.DataFrame:
     ensure_tables()
-    return sql_to_df(
-        f"""
-        SELECT research_run_id, run_type, entrypoint, label, objective, asof_date, status, git_rev, started_ts, completed_ts
-        FROM {LEDGER_TABLE}
-        ORDER BY started_ts DESC
-        LIMIT %s
-        """,
-        params=(int(limit),),
-    )
+    try:
+        return sql_to_df(
+            f"""
+            SELECT research_run_id, run_type, entrypoint, label, objective, asof_date, status, git_rev, started_ts, completed_ts
+            FROM {LEDGER_TABLE}
+            ORDER BY started_ts DESC
+            LIMIT %s
+            """,
+            params=(int(limit),),
+        )
+    except Exception as exc:
+        _record_research_ledger_fallback(
+            "research_ledger_list_runs_failed",
+            source=LEDGER_TABLE,
+            reason="Research ledger runs could not be listed; research evidence visibility may be unavailable.",
+            error=exc,
+            metadata={"limit": int(limit)},
+        )
+        raise
 
 
 def parse_args() -> argparse.Namespace:

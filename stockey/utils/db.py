@@ -2,10 +2,12 @@
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime
+import json
+from pathlib import Path
 import sys
 import tempfile
 import time
-from typing import Callable, List, Sequence, Tuple, TypeVar, Union
+from typing import Any, Callable, List, Sequence, Tuple, TypeVar, Union
 
 import pandas as pd
 import pandas.api.types as pdt
@@ -13,6 +15,8 @@ from environs import Env
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 import sqlalchemy as sa
+
+from utils.redaction import redact_text
 
 env = Env()
 env.read_env()
@@ -29,6 +33,7 @@ SQL_TO_DF_STATEMENT_TIMEOUT_MS = env.int("SQL_TO_DF_STATEMENT_TIMEOUT_MS", 0)
 SQL_TO_DF_CHUNK_SIZE = env.int("SQL_TO_DF_CHUNK_SIZE", 0)
 DB_OPERATION_ATTEMPTS = max(env.int("DB_OPERATION_ATTEMPTS", 3), 3)
 DB_POOL_RECYCLE_SECONDS = env.int("DB_POOL_RECYCLE_SECONDS", 300)
+DB_RETRY_TELEMETRY_FILE = Path(env.str("DB_RETRY_TELEMETRY_FILE", "logs/fallback/db_retry_events.jsonl"))
 
 # Singleton connection engine for sqlalchemy
 _engine = sa.create_engine(
@@ -78,8 +83,99 @@ def _is_transient_db_error(exc: Exception) -> bool:
 def dispose_db_pool() -> None:
     try:
         _engine.dispose()
-    except Exception:
-        pass
+    except Exception as exc:
+        _write_db_retry_telemetry(
+            operation_name="db_pool:dispose",
+            attempt=1,
+            max_attempts=1,
+            exc=exc,
+            event_type="db_pool_dispose_failed",
+        )
+
+
+def _record_db_retry_fallback_write_failure(exc: Exception) -> None:
+    """Log DB telemetry spool failures without recursively writing telemetry."""
+    print(
+        f"[utils.db] db retry telemetry write failed error={exc.__class__.__name__}: {exc}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _write_db_retry_telemetry(
+    *,
+    operation_name: str,
+    attempt: int,
+    max_attempts: int,
+    exc: Exception,
+    event_type: str = "db_retry",
+) -> None:
+    """Write DB retry telemetry without using Postgres, avoiding recursive failure."""
+    try:
+        path = Path(DB_RETRY_TELEMETRY_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        row = {
+            "observed_at": pd.Timestamp.utcnow().isoformat(),
+            "module": "utils.db",
+            "source": "postgres",
+            "fallback_type": event_type,
+            "severity": "warn" if attempt < max_attempts else "error",
+            "status": "active",
+            "operation_name": str(operation_name or "db_operation"),
+            "attempt": int(attempt),
+            "max_attempts": int(max_attempts),
+            "error_type": type(exc).__name__,
+            "error_message": redact_text(str(exc)),
+            "fallback_used": True,
+            "deterministic_fallback": False,
+        }
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) + "\n")
+    except Exception as telemetry_exc:
+        # Telemetry must never break the DB caller, but it should be visible in logs.
+        _record_db_retry_fallback_write_failure(telemetry_exc)
+
+
+def read_db_retry_telemetry_events(*, hours: int = 24, limit: int = 100) -> list[dict[str, Any]]:
+    """Read recent file-spooled DB retry events for Health/fallback summaries."""
+    path = Path(DB_RETRY_TELEMETRY_FILE)
+    if not path.exists():
+        return []
+    cutoff = pd.Timestamp.utcnow() - pd.Timedelta(hours=max(1, int(hours)))
+    rows: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception as exc:
+                    _write_db_retry_telemetry(
+                        operation_name="db_retry_telemetry:line_parse",
+                        attempt=1,
+                        max_attempts=1,
+                        exc=exc,
+                        event_type="db_retry_spool_line_parse_failed",
+                    )
+                    continue
+                observed_at = pd.to_datetime(row.get("observed_at"), utc=True, errors="coerce")
+                if pd.isna(observed_at) or observed_at < cutoff:
+                    continue
+                row["observed_at"] = observed_at.isoformat()
+                rows.append(row)
+    except Exception as exc:
+        _write_db_retry_telemetry(
+            operation_name="db_retry_telemetry:read",
+            attempt=1,
+            max_attempts=1,
+            exc=exc,
+            event_type="db_retry_spool_read_failed",
+        )
+        return []
+    rows.sort(key=lambda item: str(item.get("observed_at") or ""), reverse=True)
+    return rows[: max(1, int(limit))]
 
 
 def with_db_retries(
@@ -98,8 +194,22 @@ def with_db_retries(
         except Exception as exc:
             last_exc = exc
             if not _is_transient_db_error(exc) or attempt >= max_attempts:
+                if _is_transient_db_error(exc):
+                    _write_db_retry_telemetry(
+                        operation_name=operation_name,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        exc=exc,
+                        event_type="db_retry_exhausted",
+                    )
                 raise
             dispose_db_pool()
+            _write_db_retry_telemetry(
+                operation_name=operation_name,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                exc=exc,
+            )
             print(
                 f"[utils.db] transient postgres error in {operation_name}; reconnecting attempt={attempt + 1}/{max_attempts} error={exc.__class__.__name__}: {exc}",
                 file=sys.stderr,
@@ -109,6 +219,28 @@ def with_db_retries(
     if last_exc is not None:
         raise last_exc
     raise RuntimeError(f"{operation_name} failed without exception")
+
+
+def execute_db_operation(
+    operation: Callable[[], T],
+    *,
+    operation_name: str = "db_operation",
+    attempts: int | None = None,
+    retry_sleep_seconds: float | None = None,
+) -> T:
+    """Run a complete DB transaction/read block through transient-error retries.
+
+    Use this for source-specific ``db_session`` blocks so a deadlock, statement
+    timeout, or closed connection retries the whole transaction, not only the
+    initial connection open.
+    """
+    return with_db_retries(
+        operation,
+        attempts=attempts,
+        retry_sleep_seconds=retry_sleep_seconds,
+        operation_name=operation_name,
+    )
+
 
 @contextmanager
 def db_session(dict_factory: bool = False):
@@ -135,8 +267,14 @@ def db_session(dict_factory: bool = False):
                 if opened_conn:
                     try:
                         opened_conn.close()
-                    except Exception:
-                        pass
+                    except Exception as close_exc:
+                        _write_db_retry_telemetry(
+                            operation_name="db_session:failed_connect_close",
+                            attempt=1,
+                            max_attempts=1,
+                            exc=close_exc,
+                            event_type="db_session_cleanup_failed",
+                        )
                 raise
 
         conn, cur = with_db_retries(_open_session, operation_name="db_session:connect")
@@ -149,6 +287,13 @@ def db_session(dict_factory: bool = False):
             try:
                 conn.rollback()
             except Exception as rollback_exc:
+                _write_db_retry_telemetry(
+                    operation_name="db_session:rollback",
+                    attempt=1,
+                    max_attempts=1,
+                    exc=rollback_exc,
+                    event_type="db_session_cleanup_failed",
+                )
                 if _is_transient_db_error(rollback_exc):
                     dispose_db_pool()
         raise e
@@ -156,13 +301,25 @@ def db_session(dict_factory: bool = False):
         if cur:
             try:
                 cur.close()
-            except Exception:
-                pass
+            except Exception as close_exc:
+                _write_db_retry_telemetry(
+                    operation_name="db_session:cursor_close",
+                    attempt=1,
+                    max_attempts=1,
+                    exc=close_exc,
+                    event_type="db_session_cleanup_failed",
+                )
         if conn:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as close_exc:
+                _write_db_retry_telemetry(
+                    operation_name="db_session:connection_close",
+                    attempt=1,
+                    max_attempts=1,
+                    exc=close_exc,
+                    event_type="db_session_cleanup_failed",
+                )
 
 def pandas_to_postgres_type(dtype: str):
     PANDAS_TO_POSTGRES = {
@@ -501,8 +658,14 @@ def _upsert_to_db_once(
             # 5. Drop temp regardless of success
             try:
                 cur.execute(sql.SQL("DROP TABLE IF EXISTS {}").format(temp_table))
-            except Exception:
-                pass
+            except Exception as drop_exc:
+                _write_db_retry_telemetry(
+                    operation_name="upsert_to_db:drop_temp_table",
+                    attempt=1,
+                    max_attempts=1,
+                    exc=drop_exc,
+                    event_type="db_temp_cleanup_failed",
+                )
 
 
 def upsert_to_db(
@@ -574,8 +737,22 @@ def sql_to_df(
         except Exception as exc:
             last_exc = exc
             if attempt >= attempts or not _is_transient_db_error(exc):
+                if _is_transient_db_error(exc):
+                    _write_db_retry_telemetry(
+                        operation_name="sql_to_df",
+                        attempt=attempt,
+                        max_attempts=attempts,
+                        exc=exc,
+                        event_type="db_retry_exhausted",
+                    )
                 raise
             dispose_db_pool()
+            _write_db_retry_telemetry(
+                operation_name="sql_to_df",
+                attempt=attempt,
+                max_attempts=attempts,
+                exc=exc,
+            )
             print(
                 f"[utils.db] transient postgres error in sql_to_df; reconnecting attempt={attempt + 1}/{attempts} error={exc.__class__.__name__}: {exc}",
                 file=sys.stderr,
@@ -700,6 +877,12 @@ def get_max_date(feature_table):
             else:
                 dt = dt.tz_convert("UTC")
             return dt.normalize()
-    except Exception:
-        pass  # table may not exist on first run
+    except Exception as exc:
+        _write_db_retry_telemetry(
+            operation_name=f"get_max_date:{feature_table}",
+            attempt=1,
+            max_attempts=1,
+            exc=exc,
+            event_type="db_lookup_unavailable",
+        )
     return None

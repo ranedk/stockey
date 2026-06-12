@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.client import DhanHistoricalClient, candles_to_df
 from data.dhanlive.dhan_db import (
     get_dhan_ohlcv_daily,
@@ -302,6 +303,26 @@ def main() -> int:
             print(render_text(df, summary, args.limit))
         return 0
     except Exception as exc:
+        record_local_fallback_event(
+            module="data.dhanlive.ohlcv_pull",
+            source=f"dhan_ohlcv_pull:{args.source}:{args.mode}:{args.exchange}:{args.ticker.upper()}",
+            fallback_type="dhan_ohlcv_pull_failed",
+            severity="warn",
+            symbol=args.ticker.upper(),
+            reason=(
+                "Manual Dhan OHLCV pull failed; requested price data may require Dhan token, identity, "
+                "or source-data repair before it can be inspected."
+            ),
+            error=exc,
+            metadata={
+                "ticker": args.ticker.upper(),
+                "exchange": args.exchange,
+                "asset_type": args.asset_type,
+                "mode": args.mode,
+                "source": args.source,
+                "interval_minutes": int(args.interval_minutes),
+            },
+        )
         payload = {
             "status": "error",
             "requested_ticker": args.ticker.upper(),

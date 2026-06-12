@@ -4,6 +4,26 @@ import sys
 
 import redis
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
+
+def _record_redis_local_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | str,
+    metadata: dict | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="utils.redis_bkp_restore",
+        source="redis_backup_restore",
+        fallback_type=fallback_type,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
 
 def redis_backup(
     host="localhost",
@@ -46,6 +66,12 @@ def redis_backup(
                 print(f"Unknown type for key: {key}")
 
         except Exception as e:
+            _record_redis_local_fallback(
+                fallback_type="redis_backup_key_fetch_failed",
+                reason="Redis backup skipped one key because its value could not be fetched.",
+                error=e,
+                metadata={"key": key, "key_type": key_type},
+            )
             print(f"Error fetching key {key}: {e}")
 
     with open(output_file, "w") as f:
@@ -69,6 +95,12 @@ def redis_restore(
         with open(input_file, "r") as f:
             backup = json.load(f)
     except Exception as e:
+        _record_redis_local_fallback(
+            fallback_type="redis_restore_backup_file_read_failed",
+            reason="Redis restore could not read the requested backup file and exited without applying data.",
+            error=e,
+            metadata={"input_file": input_file},
+        )
         print(f"Failed to read backup file: {e}")
         sys.exit(1)
 
@@ -99,6 +131,12 @@ def redis_restore(
             else:
                 print(f"Unknown type for key: {key}")
         except Exception as e:
+            _record_redis_local_fallback(
+                fallback_type="redis_restore_key_failed",
+                reason="Redis restore skipped one key because it could not be written.",
+                error=e,
+                metadata={"key": key, "key_type": key_type},
+            )
             print(f"Error restoring key {key}: {e}")
 
     print(f"Restore completed from {input_file}")

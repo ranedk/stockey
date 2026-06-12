@@ -13,14 +13,41 @@ import pandas as pd
 from advisory.announcement_watch import persist_watch_outputs, run_announcement_watch
 from advisory.announcement_watch import DEFAULT_MARKET_CONTEXT_WATCH_LIMIT
 from advisory.event_router import route_live_updates
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.news_watch import persist_news_events, run_news_watch
 from advisory.sync_state import ensure_sync_state_table, load_sync_state, persist_sync_state, publish_bus_message
 from data.dhanlive.ohlcv import sync_many_intraday
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 WATCHLIST_TABLE = "advisory_watchlist"
 ALERTS_TABLE = "advisory_live_watch_alerts"
+ALERTS_SCHEMA_MIGRATION_ID = "20260611_advisory_live_watch_alerts_base"
+
+ALERTS_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {ALERTS_TABLE} (
+        observed_at TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        alert_type TEXT NOT NULL,
+        alert_reason TEXT,
+        monitor_source TEXT,
+        last_price DOUBLE PRECISION,
+        attractive_price_low DOUBLE PRECISION,
+        attractive_price_high DOUBLE PRECISION,
+        stop_price DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        current_state TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (observed_at, setup_id, symbol, alert_type)
+    )
+    """,
+    f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT",
+    f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS stop_price DOUBLE PRECISION",
+]
 
 
 def _emit(message: str) -> None:
@@ -28,30 +55,12 @@ def _emit(message: str) -> None:
 
 
 def ensure_alerts_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {ALERTS_TABLE} (
-                observed_at TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                alert_type TEXT NOT NULL,
-                alert_reason TEXT,
-                monitor_source TEXT,
-                last_price DOUBLE PRECISION,
-                attractive_price_low DOUBLE PRECISION,
-                attractive_price_high DOUBLE PRECISION,
-                stop_price DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                current_state TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (observed_at, setup_id, symbol, alert_type)
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT")
-        cur.execute(f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS stop_price DOUBLE PRECISION")
+    apply_schema_migration(
+        migration_id=ALERTS_SCHEMA_MIGRATION_ID,
+        description="Create and normalize continuous-watch live alert table.",
+        statements=ALERTS_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.continuous_watch", "tables": [ALERTS_TABLE]},
+    )
 
 
 def load_active_watchlist(asof_date: pd.Timestamp | None = None) -> pd.DataFrame:
@@ -134,10 +143,22 @@ def load_open_positions(asof_date: pd.Timestamp | None = None) -> pd.DataFrame:
           AND portfolio_status IN ('approved', 'trimmed')
         """,
     ]
-    for query in queries:
+    for query_index, query in enumerate(queries, start=1):
         try:
             df = sql_to_df(query, params=(asof_date,))
-        except Exception:
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.continuous_watch",
+                source="open_positions",
+                fallback_type="continuous_watch_open_positions_load_failed",
+                severity="error",
+                reason="Continuous watcher could not load open positions from one source query and tried the next source.",
+                error=exc,
+                metadata={
+                    "query_index": query_index,
+                    "asof_date": None if asof_date is None else str(asof_date),
+                },
+            )
             continue
         if df.empty:
             continue
@@ -653,6 +674,15 @@ def run_once(
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             _emit(f"[advisory.continuous_watch] {cycle_name} failed error={error}")
+            record_local_fallback_event(
+                module="advisory.continuous_watch",
+                source=source_name,
+                fallback_type="continuous_watch_cycle_failed",
+                severity="error",
+                reason="Continuous watcher cycle failed; status was persisted as error and later cycles may continue.",
+                error=exc,
+                metadata={"cycle": cycle_name},
+            )
             persist_sync_state(
                 source_name=source_name,
                 status="error",

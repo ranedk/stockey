@@ -9,14 +9,17 @@ import pandas as pd
 from sqlalchemy.exc import SQLAlchemyError
 
 from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.setup_registry import load_setup_registry
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.display_time import to_display_value
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 ALLOCATIONS_TABLE = "advisory_allocations"
 PORTFOLIO_TABLE = "advisory_portfolio_orders"
+PORTFOLIO_SCHEMA_MIGRATION_ID = "20260611_advisory_portfolio_orders_base"
 
 DEFAULT_PORTFOLIO_CAPITAL_INR = 300_000.0
 DEFAULT_MAX_POSITIONS = 5
@@ -35,6 +38,82 @@ RISK_PENALTY = {
     "medium_high": 0.5,
     "high": 1.0,
 }
+
+PORTFOLIO_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {PORTFOLIO_TABLE} (
+        published_on TIMESTAMPTZ NOT NULL,
+        source_published_on TIMESTAMPTZ,
+        asof_date TIMESTAMPTZ,
+        planned_at TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        unique_id TEXT NOT NULL,
+        portfolio_capital_inr DOUBLE PRECISION,
+        max_positions BIGINT,
+        plan_rank BIGINT,
+        portfolio_status TEXT,
+        portfolio_reason TEXT,
+        priority_score DOUBLE PRECISION,
+        overlap_group TEXT,
+        overlap_reason TEXT,
+        event_class TEXT,
+        state_transition_hint TEXT,
+        score_impact DOUBLE PRECISION,
+        requested_allocation_inr DOUBLE PRECISION,
+        approved_allocation_inr DOUBLE PRECISION,
+        remaining_capital_after_inr DOUBLE PRECISION,
+        stop_price DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        invalidation_rule TEXT,
+        execution_notes TEXT,
+        context_snapshot_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS source_published_on TIMESTAMPTZ",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS setup_name TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS company_master_id TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS portfolio_capital_inr DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS max_positions BIGINT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS plan_rank BIGINT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS portfolio_status TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS portfolio_reason TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS priority_score DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS overlap_group TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS overlap_reason TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS event_class TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS state_transition_hint TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS score_impact DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS requested_allocation_inr DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS approved_allocation_inr DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS remaining_capital_after_inr DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS stop_price DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS invalidation_price DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS invalidation_rule TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS execution_notes TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS context_snapshot_json TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS load_ts TIMESTAMPTZ",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS thesis_bucket TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS bucket_reason TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS target_price DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS target_basis TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS target_confidence DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS target_review_date TIMESTAMPTZ",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS expected_horizon_days BIGINT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS horizon_type TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS horizon_end_date TIMESTAMPTZ",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS horizon_basis TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS data_dependency_reason TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS continue_while TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS key_monitor_fields_json TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS recheck_frequency TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS exit_event_rules_json TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS invest_score_pct DOUBLE PRECISION",
+]
 
 
 @dataclass(frozen=True)
@@ -70,101 +149,56 @@ def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
 
 
-def table_exists(table_name: str) -> bool:
-    df = sql_to_df(
-        """
-        SELECT 1 AS exists_flag
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        LIMIT 1
-        """,
-        params=(table_name,),
+def _record_portfolio_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.portfolio_engine",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
     )
+
+
+def table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        _record_portfolio_fallback(
+            fallback_type="portfolio_engine_table_lookup_failed",
+            source=table_name,
+            reason="Portfolio engine could not inspect whether a source/output table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        return False
     return not df.empty
 
 
 def ensure_portfolio_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {PORTFOLIO_TABLE} (
-                published_on TIMESTAMPTZ NOT NULL,
-                source_published_on TIMESTAMPTZ,
-                asof_date TIMESTAMPTZ,
-                planned_at TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                unique_id TEXT NOT NULL,
-                portfolio_capital_inr DOUBLE PRECISION,
-                max_positions BIGINT,
-                plan_rank BIGINT,
-                portfolio_status TEXT,
-                portfolio_reason TEXT,
-                priority_score DOUBLE PRECISION,
-                overlap_group TEXT,
-                overlap_reason TEXT,
-                event_class TEXT,
-                state_transition_hint TEXT,
-                score_impact DOUBLE PRECISION,
-                requested_allocation_inr DOUBLE PRECISION,
-                approved_allocation_inr DOUBLE PRECISION,
-                remaining_capital_after_inr DOUBLE PRECISION,
-                stop_price DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                invalidation_rule TEXT,
-                execution_notes TEXT,
-                context_snapshot_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        column_defs = {
-            "source_published_on": "TIMESTAMPTZ",
-            "setup_name": "TEXT",
-            "company_master_id": "TEXT",
-            "portfolio_capital_inr": "DOUBLE PRECISION",
-            "max_positions": "BIGINT",
-            "plan_rank": "BIGINT",
-            "portfolio_status": "TEXT",
-            "portfolio_reason": "TEXT",
-            "priority_score": "DOUBLE PRECISION",
-            "overlap_group": "TEXT",
-            "overlap_reason": "TEXT",
-            "event_class": "TEXT",
-            "state_transition_hint": "TEXT",
-            "score_impact": "DOUBLE PRECISION",
-            "requested_allocation_inr": "DOUBLE PRECISION",
-            "approved_allocation_inr": "DOUBLE PRECISION",
-            "remaining_capital_after_inr": "DOUBLE PRECISION",
-            "stop_price": "DOUBLE PRECISION",
-            "invalidation_price": "DOUBLE PRECISION",
-            "invalidation_rule": "TEXT",
-            "execution_notes": "TEXT",
-            "context_snapshot_json": "TEXT",
-            "load_ts": "TIMESTAMPTZ",
-            "thesis_bucket": "TEXT",
-            "bucket_reason": "TEXT",
-            "target_price": "DOUBLE PRECISION",
-            "target_basis": "TEXT",
-            "target_confidence": "DOUBLE PRECISION",
-            "target_review_date": "TIMESTAMPTZ",
-            "expected_horizon_days": "BIGINT",
-            "horizon_type": "TEXT",
-            "horizon_end_date": "TIMESTAMPTZ",
-            "horizon_basis": "TEXT",
-            "data_dependency_reason": "TEXT",
-            "continue_while": "TEXT",
-            "key_monitor_fields_json": "TEXT",
-            "recheck_frequency": "TEXT",
-            "exit_event_rules_json": "TEXT",
-            "invest_score_pct": "DOUBLE PRECISION",
-        }
-        for column, sql_type in column_defs.items():
-            cur.execute(f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    apply_schema_migration(
+        migration_id=PORTFOLIO_SCHEMA_MIGRATION_ID,
+        description="Create and normalize advisory portfolio order table.",
+        statements=PORTFOLIO_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.portfolio_engine", "tables": [PORTFOLIO_TABLE]},
+    )
 
 
 def load_allocations(
@@ -205,18 +239,33 @@ def load_allocations(
         if not include_planned:
             clauses.append("p.unique_id IS NULL")
 
-    df = sql_to_df(
-        f"""
-        SELECT
-            a.*
-            {select_sql}
-        FROM {ALLOCATIONS_TABLE} a
-        {join_sql}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY a.published_on, a.setup_id, a.symbol
-        """,
-        params=tuple(params) if params else None,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                a.*
+                {select_sql}
+            FROM {ALLOCATIONS_TABLE} a
+            {join_sql}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY a.published_on, a.setup_id, a.symbol
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception as exc:
+        _record_portfolio_fallback(
+            fallback_type="portfolio_engine_allocations_load_failed",
+            source=ALLOCATIONS_TABLE,
+            reason="Portfolio engine could not load allocated risk rows for portfolio planning.",
+            error=exc,
+            metadata={
+                "asof_date": str(asof_date) if asof_date is not None else None,
+                "symbol_count": 0 if symbols is None else len(symbols),
+                "setup_id_count": 0 if setup_ids is None else len(setup_ids),
+                "include_planned": bool(include_planned),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["asof_date"] = normalize_timestamp(df["asof_date"])
@@ -228,32 +277,42 @@ def load_allocations(
 def load_symbol_metadata(symbols: list[str]) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame(columns=["symbol", "sector_code"])
-    meta = sql_to_df(
-        """
-        WITH sector_counts AS (
-            SELECT
-                UPPER(TRIM(symbol)) AS symbol,
-                TRIM(sector_code) AS sector_code,
-                COUNT(*) AS row_count
-            FROM master_sharpely_equity
-            WHERE NULLIF(TRIM(symbol), '') IS NOT NULL
-              AND NULLIF(TRIM(sector_code), '') IS NOT NULL
-              AND UPPER(TRIM(symbol)) = ANY(%s)
-            GROUP BY UPPER(TRIM(symbol)), TRIM(sector_code)
-        ),
-        ranked AS (
-            SELECT
-                symbol,
-                sector_code,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY row_count DESC, sector_code) AS rn
-            FROM sector_counts
+    try:
+        meta = sql_to_df(
+            """
+            WITH sector_counts AS (
+                SELECT
+                    UPPER(TRIM(symbol)) AS symbol,
+                    TRIM(sector_code) AS sector_code,
+                    COUNT(*) AS row_count
+                FROM master_sharpely_equity
+                WHERE NULLIF(TRIM(symbol), '') IS NOT NULL
+                  AND NULLIF(TRIM(sector_code), '') IS NOT NULL
+                  AND UPPER(TRIM(symbol)) = ANY(%s)
+                GROUP BY UPPER(TRIM(symbol)), TRIM(sector_code)
+            ),
+            ranked AS (
+                SELECT
+                    symbol,
+                    sector_code,
+                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY row_count DESC, sector_code) AS rn
+                FROM sector_counts
+            )
+            SELECT symbol, sector_code
+            FROM ranked
+            WHERE rn = 1
+            """,
+            params=(symbols,),
         )
-        SELECT symbol, sector_code
-        FROM ranked
-        WHERE rn = 1
-        """,
-        params=(symbols,),
-    )
+    except Exception as exc:
+        _record_portfolio_fallback(
+            fallback_type="portfolio_engine_symbol_metadata_load_failed",
+            source="master_sharpely_equity",
+            reason="Portfolio engine could not load sector metadata for overlap grouping.",
+            error=exc,
+            metadata={"symbol_count": len(symbols)},
+        )
+        raise
     if meta.empty:
         return pd.DataFrame(columns=["symbol", "sector_code"])
     meta["symbol"] = meta["symbol"].astype("string").str.upper()
@@ -672,21 +731,28 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
     for column in ["published_on", "source_published_on", "asof_date", "planned_at", "load_ts", "target_review_date", "horizon_end_date"]:
         if column in out.columns:
             out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
-    with db_session() as (_, cur):
-        pairs = (
-            out[["asof_date", "symbol"]]
-            .dropna()
-            .drop_duplicates()
-            .to_dict(orient="records")
-        )
-        for item in pairs:
-            cur.execute(
-                f"DELETE FROM {PORTFOLIO_TABLE} WHERE asof_date = %s AND symbol = %s",
-                (
-                    pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
-                    str(item["symbol"]).upper(),
-                ),
-            )
+    pairs = (
+        out[["asof_date", "symbol"]]
+        .dropna()
+        .drop_duplicates()
+        .to_dict(orient="records")
+    )
+
+    def _delete_existing_portfolio_orders() -> None:
+        with db_session() as (_, cur):
+            for item in pairs:
+                cur.execute(
+                    f"DELETE FROM {PORTFOLIO_TABLE} WHERE asof_date = %s AND symbol = %s",
+                    (
+                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                        str(item["symbol"]).upper(),
+                    ),
+                )
+
+    execute_db_operation(
+        _delete_existing_portfolio_orders,
+        operation_name="portfolio_engine:delete_existing_orders",
+    )
     upsert_to_db(
         out,
         PORTFOLIO_TABLE,
@@ -891,6 +957,17 @@ def main() -> int:
             print(json.dumps(to_display_value(result), indent=2, ensure_ascii=False, default=str))
         return 0
     except SQLAlchemyError as exc:
+        _record_portfolio_fallback(
+            fallback_type="portfolio_engine_cli_database_failed",
+            source=PORTFOLIO_TABLE,
+            reason="Portfolio CLI failed because the database layer raised an error.",
+            error=exc,
+            metadata={
+                "format": str(args.format),
+                "dry_run": bool(args.dry_run),
+                "include_planned": bool(include_planned),
+            },
+        )
         emit_error(
             message="database connection failed",
             detail=f"{exc.__class__.__name__}: {exc}",
@@ -900,12 +977,35 @@ def main() -> int:
     except Exception as exc:
         error_name = exc.__class__.__name__
         if error_name in {"OperationalError", "InterfaceError"}:
+            _record_portfolio_fallback(
+                fallback_type="portfolio_engine_cli_database_failed",
+                source=PORTFOLIO_TABLE,
+                reason="Portfolio CLI failed because the database connection became unavailable.",
+                error=exc,
+                metadata={
+                    "format": str(args.format),
+                    "dry_run": bool(args.dry_run),
+                    "include_planned": bool(include_planned),
+                },
+            )
             emit_error(
                 message="database connection failed",
                 detail=f"{error_name}: {exc}",
                 as_json=args.format == "json",
             )
             return 1
+        _record_portfolio_fallback(
+            fallback_type="portfolio_engine_cli_build_failed",
+            source=PORTFOLIO_TABLE,
+            reason="Portfolio CLI failed while building or persisting portfolio orders.",
+            error=exc,
+            metadata={
+                "format": str(args.format),
+                "dry_run": bool(args.dry_run),
+                "include_planned": bool(include_planned),
+                "error_type": error_name,
+            },
+        )
         emit_error(
             message="portfolio build failed",
             detail=f"{error_name}: {exc}",

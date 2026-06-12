@@ -7,7 +7,8 @@ from typing import Any
 
 import pandas as pd
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
 
@@ -50,7 +51,16 @@ def table_exists(table_name: str) -> bool:
             """,
             params=(table_name,),
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.exchange_events",
+            source=table_name,
+            fallback_type="exchange_events_table_lookup_failed",
+            severity="warn",
+            reason="Exchange event table existence check failed; exchange-event feature availability may be incomplete.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return False
     return not df.empty
 
@@ -407,50 +417,57 @@ def repair_missing_event_types(*, dry_run: bool = True) -> dict[str, object]:
             "repair_source": "nse_legacy_deal",
             "repair_type": "LEGACY_DEAL",
         }
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            UPDATE {TABLE_NAME}
-            SET
-                event_source = COALESCE(event_source, 'nse_legacy_deal'),
-                event_type = COALESCE(event_type, 'LEGACY_DEAL'),
-                event_summary = CASE
-                    WHEN event_summary IS NULL OR event_summary LIKE 'nan %%'
-                    THEN CONCAT('Legacy NSE deal ', side, ' by ', participant)
-                    ELSE event_summary
-                END
-            WHERE (event_source IS NULL OR event_type IS NULL)
-              AND side IN ('BUY', 'SELL')
-              AND participant IS NOT NULL
-              AND quantity IS NOT NULL
-              AND price IS NOT NULL
-            """
-        )
-        updated_deals = int(cur.rowcount or 0)
-        cur.execute(
-            f"""
-            UPDATE {TABLE_NAME}
-            SET
-                event_source = COALESCE(event_source, 'nse_short_selling'),
-                event_type = COALESCE(event_type, 'SHORT_SELLING')
-            WHERE (event_source IS NULL OR event_type IS NULL)
-              AND event_summary LIKE 'Short selling quantity%%'
-              AND quantity IS NOT NULL
-            """
-        )
-        updated_shorts = int(cur.rowcount or 0)
-        cur.execute(
-            f"""
-            UPDATE {TABLE_NAME}
-            SET
-                event_source = COALESCE(event_source, 'nse_unclassified_event'),
-                event_type = COALESCE(event_type, 'UNCLASSIFIED_EVENT'),
-                event_summary = COALESCE(event_summary, 'Unclassified legacy NSE event')
-            WHERE event_source IS NULL OR event_type IS NULL
-            """
-        )
-        updated_unclassified = int(cur.rowcount or 0)
-        updated_rows = updated_deals + updated_shorts + updated_unclassified
+    def _apply_missing_event_type_repair() -> tuple[int, int, int]:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                UPDATE {TABLE_NAME}
+                SET
+                    event_source = COALESCE(event_source, 'nse_legacy_deal'),
+                    event_type = COALESCE(event_type, 'LEGACY_DEAL'),
+                    event_summary = CASE
+                        WHEN event_summary IS NULL OR event_summary LIKE 'nan %%'
+                        THEN CONCAT('Legacy NSE deal ', side, ' by ', participant)
+                        ELSE event_summary
+                    END
+                WHERE (event_source IS NULL OR event_type IS NULL)
+                  AND side IN ('BUY', 'SELL')
+                  AND participant IS NOT NULL
+                  AND quantity IS NOT NULL
+                  AND price IS NOT NULL
+                """
+            )
+            updated_deals = int(cur.rowcount or 0)
+            cur.execute(
+                f"""
+                UPDATE {TABLE_NAME}
+                SET
+                    event_source = COALESCE(event_source, 'nse_short_selling'),
+                    event_type = COALESCE(event_type, 'SHORT_SELLING')
+                WHERE (event_source IS NULL OR event_type IS NULL)
+                  AND event_summary LIKE 'Short selling quantity%%'
+                  AND quantity IS NOT NULL
+                """
+            )
+            updated_shorts = int(cur.rowcount or 0)
+            cur.execute(
+                f"""
+                UPDATE {TABLE_NAME}
+                SET
+                    event_source = COALESCE(event_source, 'nse_unclassified_event'),
+                    event_type = COALESCE(event_type, 'UNCLASSIFIED_EVENT'),
+                    event_summary = COALESCE(event_summary, 'Unclassified legacy NSE event')
+                WHERE event_source IS NULL OR event_type IS NULL
+                """
+            )
+            updated_unclassified = int(cur.rowcount or 0)
+        return updated_deals, updated_shorts, updated_unclassified
+
+    updated_deals, updated_shorts, updated_unclassified = execute_db_operation(
+        _apply_missing_event_type_repair,
+        operation_name="exchange_events:repair_missing_event_types",
+    )
+    updated_rows = updated_deals + updated_shorts + updated_unclassified
     return {
         "status": "applied",
         "table": TABLE_NAME,

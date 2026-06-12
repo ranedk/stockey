@@ -144,8 +144,18 @@ POPPLER_PATH=/opt/homebrew/bin
 Existing rows that still have large inline OCR/transcript/report JSON can be migrated incrementally:
 
 ```sh
-python scripts/offload_announcement_text_to_s3.py --dry-run --limit 100
-python scripts/offload_announcement_text_to_s3.py --limit 500
+python scripts/offload_announcement_text_to_s3.py --dry-run --limit 100 --manifest-path logs/performance/announcement_text_offload_dry_run.json
+python scripts/offload_announcement_text_to_s3.py --limit 500 --manifest-path logs/performance/announcement_text_offload_apply.json
 ```
 
-Use `--keep-inline` if you want to upload and add metadata first without nulling the heavy inline columns.
+Use `--keep-inline` if you want to upload and add metadata first without nulling the heavy inline columns. The manifest records planned/uploaded S3 keys, hashes, byte counts, excerpts, and whether each text column will be nulled, so review the dry-run manifest before applying.
+
+Validate offloaded pointers after migration:
+
+```sh
+python scripts/validate_announcement_s3_pointers.py --dry-run --limit 100
+python scripts/validate_announcement_s3_pointers.py --limit 100
+python scripts/validate_announcement_s3_pointers.py --limit 25 --verify-hash
+```
+
+The default validation uses S3 `HEAD` and compares stored byte counts when available. `--verify-hash` downloads each object and compares SHA-256, so run it on a small sample first.

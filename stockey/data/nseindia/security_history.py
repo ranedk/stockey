@@ -2,8 +2,10 @@ import hashlib
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.company_master import map_company_master_ids
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 MERGER_KEYWORDS = (
@@ -15,6 +17,65 @@ MERGER_KEYWORDS = (
     "SPIN OFF",
     "SPINOFF",
 )
+SECURITY_HISTORY_SCHEMA_MIGRATION_ID = "20260611_nse_security_history_base"
+SYNC_SOURCE_NAME = "data.nseindia.security_history"
+SECURITY_HISTORY_SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS dim_security_history (
+        symbol TEXT,
+        series TEXT,
+        isin TEXT,
+        effective_from TIMESTAMPTZ,
+        effective_to TIMESTAMPTZ,
+        price_row_count BIGINT,
+        raw_security_key TEXT,
+        security_id TEXT NOT NULL,
+        predecessor_security_id TEXT,
+        successor_security_id TEXT,
+        relation_type TEXT,
+        mapping_source TEXT,
+        confidence DOUBLE PRECISION,
+        company_master_id TEXT,
+        UNIQUE (security_id, symbol, series, isin, effective_from)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS dim_security_overrides (
+        override_key TEXT PRIMARY KEY,
+        symbol TEXT,
+        series TEXT,
+        isin TEXT,
+        effective_from TIMESTAMPTZ,
+        effective_to TIMESTAMPTZ,
+        security_id TEXT NOT NULL,
+        predecessor_security_id TEXT,
+        successor_security_id TEXT,
+        relation_type TEXT,
+        confidence DOUBLE PRECISION,
+        notes TEXT,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS dim_security_review_events (
+        event_key TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        symbol TEXT,
+        series TEXT,
+        isin TEXT,
+        related_symbol TEXT,
+        related_series TEXT,
+        related_isin TEXT,
+        first_seen TIMESTAMPTZ,
+        last_seen TIMESTAMPTZ,
+        security_id TEXT,
+        related_security_id TEXT,
+        confidence DOUBLE PRECISION,
+        reason TEXT,
+        needs_review BOOLEAN NOT NULL DEFAULT TRUE
+    )
+    """,
+]
 
 
 def values_equal(left: object, right: object) -> bool:
@@ -26,47 +87,16 @@ def values_equal(left: object, right: object) -> bool:
 
 
 def ensure_identity_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dim_security_overrides (
-                override_key TEXT PRIMARY KEY,
-                symbol TEXT,
-                series TEXT,
-                isin TEXT,
-                effective_from TIMESTAMPTZ,
-                effective_to TIMESTAMPTZ,
-                security_id TEXT NOT NULL,
-                predecessor_security_id TEXT,
-                successor_security_id TEXT,
-                relation_type TEXT,
-                confidence DOUBLE PRECISION,
-                notes TEXT,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS dim_security_review_events (
-                event_key TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                symbol TEXT,
-                series TEXT,
-                isin TEXT,
-                related_symbol TEXT,
-                related_series TEXT,
-                related_isin TEXT,
-                first_seen TIMESTAMPTZ,
-                last_seen TIMESTAMPTZ,
-                security_id TEXT,
-                related_security_id TEXT,
-                confidence DOUBLE PRECISION,
-                reason TEXT,
-                needs_review BOOLEAN NOT NULL DEFAULT TRUE
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=SECURITY_HISTORY_SCHEMA_MIGRATION_ID,
+        statements=SECURITY_HISTORY_SCHEMA_STATEMENTS,
+        owner="data.nseindia.security_history",
+        description="Create NSE security identity history, override, and review tables.",
+        metadata={
+            "tables": ["dim_security_history", "dim_security_overrides", "dim_security_review_events"],
+            "workflow": "nse_security_identity_history",
+        },
+    )
 
 
 def load_price_identity_observations() -> pd.DataFrame:
@@ -273,7 +303,16 @@ def build_review_events(history: pd.DataFrame) -> pd.DataFrame:
             FROM nseindia_corporate_actions_normalized
             """
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source="nseindia_corporate_actions_normalized",
+            fallback_type="nse_security_history_corporate_action_context_failed",
+            severity="warn",
+            reason="Could not load corporate-action context while building security identity review events; rename/identity-break candidates still use price identity history.",
+            error=exc,
+            metadata={"table": "nseindia_corporate_actions_normalized"},
+        )
         actions = pd.DataFrame()
     if not actions.empty:
         actions["date"] = pd.to_datetime(actions["date"], utc=True)
@@ -342,7 +381,16 @@ def load_security_history() -> pd.DataFrame:
             FROM dim_security_history
             """
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source="dim_security_history",
+            fallback_type="nse_security_history_load_failed",
+            severity="warn",
+            reason="Could not load persisted security identity history; downstream attachment will fall back to raw symbol/series/ISIN identity.",
+            error=exc,
+            metadata={"table": "dim_security_history"},
+        )
         return pd.DataFrame()
 
     if history.empty:

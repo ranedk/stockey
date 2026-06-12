@@ -5,6 +5,7 @@ from datetime import date, datetime
 import pandas as pd
 from psycopg2 import sql
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import get_sql
 
 MONTH_PAT = re.compile(r"^Total for ([A-Za-z]+)$")
@@ -37,8 +38,16 @@ def _infer_year(df: pd.DataFrame, idx: int, month: int) -> int:
             d = pd.to_datetime(df.at[j, "date"], format="%d-%b-%Y")
             if d.month == month:
                 return d.year
-        except ValueError:
-            pass
+        except ValueError as exc:
+            record_local_fallback_event(
+                module="data.nsdl.fpi_utils",
+                source="nsdl_fpi_month_year_inference",
+                fallback_type="nsdl_fpi_year_infer_date_parse_failed",
+                severity="warn",
+                reason="NSDL FPI monthly-total year inference skipped a malformed prior date and continued searching.",
+                error=exc,
+                metadata={"direction": "backward", "row_index": int(j), "target_index": int(idx), "raw_date": str(df.at[j, "date"])},
+            )
 
     # → look forward (rarely needed)
     for j in range(idx + 1, len(df)):
@@ -46,8 +55,16 @@ def _infer_year(df: pd.DataFrame, idx: int, month: int) -> int:
             d = pd.to_datetime(df.at[j, "date"], format="%d-%b-%Y")
             if d.month == month:
                 return d.year
-        except ValueError:
-            pass
+        except ValueError as exc:
+            record_local_fallback_event(
+                module="data.nsdl.fpi_utils",
+                source="nsdl_fpi_month_year_inference",
+                fallback_type="nsdl_fpi_year_infer_date_parse_failed",
+                severity="warn",
+                reason="NSDL FPI monthly-total year inference skipped a malformed following date and continued searching.",
+                error=exc,
+                metadata={"direction": "forward", "row_index": int(j), "target_index": int(idx), "raw_date": str(df.at[j, "date"])},
+            )
 
     raise ValueError(f"Couldn’t infer year for monthly total at row {idx}")
 

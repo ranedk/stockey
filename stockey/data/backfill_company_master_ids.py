@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from utils.db import db_session
+from utils.db import db_session, execute_db_operation
+from utils.schema_migrations import apply_schema_migration
 
 
 @dataclass(frozen=True)
@@ -48,30 +50,60 @@ SPECS: tuple[BackfillSpec, ...] = (
 )
 
 
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _schema_migration_id_for_table(table_name: str) -> str:
+    safe_name = re.sub(r"[^a-z0-9_]+", "_", table_name.lower()).strip("_")
+    return f"20260611_company_master_id_backfill_{safe_name}"
+
+
+def ensure_company_master_id_column(spec: BackfillSpec) -> None:
+    apply_schema_migration(
+        migration_id=_schema_migration_id_for_table(spec.table_name),
+        description=f"Add company_master_id to {spec.table_name} for cross-source company joins.",
+        owner="data.backfill_company_master_ids",
+        metadata={
+            "tables": [spec.table_name],
+            "source": "company_master_id_backfill",
+            "ticker_column": spec.ticker_column,
+            "exchange": spec.exchange,
+            "exchange_column": spec.exchange_column,
+        },
+        statements=[
+            f'ALTER TABLE public.{_quote_identifier(spec.table_name)} ADD COLUMN IF NOT EXISTS company_master_id TEXT'
+        ],
+    )
+
+
 def backfill_company_master_ids(specs: Iterable[BackfillSpec] = SPECS) -> list[dict[str, int | str]]:
     results: list[dict[str, int | str]] = []
     for spec in specs:
-        with db_session() as (_, cur):
-            cur.execute("SET LOCAL statement_timeout = 0")
-            if not _table_exists(cur, spec.table_name):
-                results.append({"table": spec.table_name, "status": "missing"})
-                continue
-            if not _column_exists(cur, spec.table_name, spec.ticker_column):
-                results.append({"table": spec.table_name, "status": "missing_ticker_column"})
-                continue
-            if spec.exchange_column and not _column_exists(cur, spec.table_name, spec.exchange_column):
-                results.append({"table": spec.table_name, "status": "missing_exchange_column"})
-                continue
+        def _backfill_table() -> dict[str, int | str]:
+            with db_session() as (_, cur):
+                cur.execute("SET LOCAL statement_timeout = 0")
+                if not _table_exists(cur, spec.table_name):
+                    return {"table": spec.table_name, "status": "missing"}
+                if not _column_exists(cur, spec.table_name, spec.ticker_column):
+                    return {"table": spec.table_name, "status": "missing_ticker_column"}
+                if spec.exchange_column and not _column_exists(cur, spec.table_name, spec.exchange_column):
+                    return {"table": spec.table_name, "status": "missing_exchange_column"}
 
-            cur.execute(f'ALTER TABLE public."{spec.table_name}" ADD COLUMN IF NOT EXISTS company_master_id TEXT')
-            updated = _run_update(cur, spec)
-            results.append(
-                {
+                ensure_company_master_id_column(spec)
+                updated = _run_update(cur, spec)
+                return {
                     "table": spec.table_name,
                     "status": "ok",
                     "updated": updated,
                 }
+
+        results.append(
+            execute_db_operation(
+                _backfill_table,
+                operation_name=f"backfill_company_master_ids:{spec.table_name}",
             )
+        )
     return results
 
 

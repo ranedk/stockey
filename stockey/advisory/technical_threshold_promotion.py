@@ -8,13 +8,14 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
-from advisory.fallback_telemetry import record_fallback_event
+from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from advisory.setup_registry import load_setup_registry
 from advisory.technical_threshold_calibration import EVALUATIONS_TABLE, SUMMARY_TABLE
 from utils.codex_cli import run_codex_structured
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 env = Env()
@@ -22,10 +23,55 @@ env.read_env()
 
 REVIEWS_TABLE = "advisory_technical_threshold_promotion_reviews"
 DECISIONS_TABLE = "advisory_technical_threshold_promotion_decisions"
+TECHNICAL_THRESHOLD_PROMOTION_SCHEMA_MIGRATION_ID = "20260611_advisory_technical_threshold_promotion_base"
 DEFAULT_PROMOTION_REVIEW_MODEL = env("TECHNICAL_THRESHOLD_PROMOTION_REVIEW_MODEL", default="codex")
 PROMPT_ID = "technical_threshold_promotion_review"
 PROMPT_VERSION = registry_prompt_version(PROMPT_ID)
 PROMPT_SCHEMA_VERSION = response_schema_version(PROMPT_ID)
+TECHNICAL_THRESHOLD_PROMOTION_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {REVIEWS_TABLE} (
+        reviewed_at TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        config_id TEXT NOT NULL,
+        horizon_days BIGINT,
+        evaluated_at TIMESTAMPTZ,
+        current_thresholds_json TEXT,
+        candidate_thresholds_json TEXT,
+        calibration_evidence_json TEXT,
+        llm_review_json TEXT,
+        recommendation TEXT,
+        confidence DOUBLE PRECISION,
+        patch_json TEXT,
+        prompt_id TEXT,
+        prompt_version TEXT,
+        prompt_schema_version TEXT,
+        review_model TEXT,
+        review_status TEXT,
+        review_error TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (setup_id, config_id, reviewed_at)
+    )
+    """,
+    f"ALTER TABLE {REVIEWS_TABLE} ADD COLUMN IF NOT EXISTS prompt_id TEXT",
+    f"ALTER TABLE {REVIEWS_TABLE} ADD COLUMN IF NOT EXISTS prompt_version TEXT",
+    f"ALTER TABLE {REVIEWS_TABLE} ADD COLUMN IF NOT EXISTS prompt_schema_version TEXT",
+    f"""
+    CREATE TABLE IF NOT EXISTS {DECISIONS_TABLE} (
+        decided_at TIMESTAMPTZ NOT NULL,
+        reviewed_at TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        config_id TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        operator_id TEXT,
+        decision_reason TEXT,
+        final_patch_json TEXT,
+        review_snapshot_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (reviewed_at, setup_id, config_id, decided_at)
+    )
+    """,
+]
 
 
 class TechnicalThresholdPromotionReview(BaseModel):
@@ -47,59 +93,34 @@ def json_dumps(value: Any) -> str:
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {REVIEWS_TABLE} (
-                reviewed_at TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                config_id TEXT NOT NULL,
-                horizon_days BIGINT,
-                evaluated_at TIMESTAMPTZ,
-                current_thresholds_json TEXT,
-                candidate_thresholds_json TEXT,
-                calibration_evidence_json TEXT,
-                llm_review_json TEXT,
-                recommendation TEXT,
-                confidence DOUBLE PRECISION,
-                patch_json TEXT,
-                prompt_id TEXT,
-                prompt_version TEXT,
-                prompt_schema_version TEXT,
-                review_model TEXT,
-                review_status TEXT,
-                review_error TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (setup_id, config_id, reviewed_at)
-            )
-            """
-        )
-        for column, sql_type in {
-            "prompt_id": "TEXT",
-            "prompt_version": "TEXT",
-            "prompt_schema_version": "TEXT",
-        }.items():
-            cur.execute(f"ALTER TABLE {REVIEWS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {DECISIONS_TABLE} (
-                decided_at TIMESTAMPTZ NOT NULL,
-                reviewed_at TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                config_id TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                operator_id TEXT,
-                decision_reason TEXT,
-                final_patch_json TEXT,
-                review_snapshot_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (reviewed_at, setup_id, config_id, decided_at)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=TECHNICAL_THRESHOLD_PROMOTION_SCHEMA_MIGRATION_ID,
+        description="Create advisory technical-threshold promotion review and decision tables.",
+        statements=TECHNICAL_THRESHOLD_PROMOTION_SCHEMA_STATEMENTS,
+        metadata={"tables": [REVIEWS_TABLE, DECISIONS_TABLE], "authority_scope": "manual_config_review_only"},
+    )
 
 
-def parse_jsonish(value: Any, default: Any) -> Any:
+def _record_promotion_source_failure(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.technical_threshold_promotion",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
+def parse_jsonish(value: Any, default: Any, *, source: str = "technical_threshold_promotion_json") -> Any:
     if value is None:
         return default
     if isinstance(value, (dict, list)):
@@ -107,11 +128,28 @@ def parse_jsonish(value: Any, default: Any) -> Any:
     try:
         if pd.isna(value):
             return default
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.technical_threshold_promotion",
+            fallback_type="technical_threshold_promotion_json_missing_check_failed",
+            source=source,
+            severity="warn",
+            reason="Technical-threshold promotion could not evaluate missingness for stored JSON and continued parsing.",
+            error=exc,
+            metadata={"source": source, "value_type": type(value).__name__, "default_type": type(default).__name__},
+        )
     try:
         return json.loads(str(value))
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.technical_threshold_promotion",
+            fallback_type="technical_threshold_promotion_json_parse_failed",
+            source=source,
+            severity="warn",
+            reason="Technical-threshold promotion could not parse stored JSON; using the existing default fallback.",
+            error=exc,
+            metadata={"source": source, "payload_length": len(str(value))},
+        )
         return default
 
 
@@ -124,34 +162,54 @@ def load_setup(setup_id: str) -> dict[str, Any]:
 
 
 def load_calibration_config(config_id: str) -> dict[str, Any]:
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {EVALUATIONS_TABLE}
-        WHERE config_id = %s
-        ORDER BY evaluated_at DESC
-        LIMIT 1
-        """,
-        params=(str(config_id),),
-        retries=3,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {EVALUATIONS_TABLE}
+            WHERE config_id = %s
+            ORDER BY evaluated_at DESC
+            LIMIT 1
+            """,
+            params=(str(config_id),),
+            retries=3,
+        )
+    except Exception as exc:
+        _record_promotion_source_failure(
+            fallback_type="technical_threshold_promotion_calibration_load_failed",
+            source=EVALUATIONS_TABLE,
+            reason="Technical-threshold promotion could not load calibration evidence for review.",
+            error=exc,
+            metadata={"config_id": str(config_id)},
+        )
+        raise
     if df.empty:
         raise ValueError(f"Unknown calibration config_id: {config_id}")
     return df.iloc[0].to_dict()
 
 
 def load_horizon_summary(horizon_days: int, evaluated_at: Any) -> dict[str, Any]:
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {SUMMARY_TABLE}
-        WHERE horizon_days = %s
-          AND evaluated_at = %s
-        LIMIT 1
-        """,
-        params=(int(horizon_days), evaluated_at),
-        retries=3,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {SUMMARY_TABLE}
+            WHERE horizon_days = %s
+              AND evaluated_at = %s
+            LIMIT 1
+            """,
+            params=(int(horizon_days), evaluated_at),
+            retries=3,
+        )
+    except Exception as exc:
+        _record_promotion_source_failure(
+            fallback_type="technical_threshold_promotion_summary_load_failed",
+            source=SUMMARY_TABLE,
+            reason="Technical-threshold promotion could not load horizon summary context for review.",
+            error=exc,
+            metadata={"horizon_days": int(horizon_days), "evaluated_at": str(evaluated_at)},
+        )
+        raise
     return df.iloc[0].to_dict() if not df.empty else {}
 
 

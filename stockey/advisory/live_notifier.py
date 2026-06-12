@@ -9,6 +9,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.sync_state import DEFAULT_REDIS_HOST, DEFAULT_REDIS_PORT
 from utils.redis_utils import get_redis_client
 
@@ -89,7 +90,20 @@ def append_operator_event(
             existing = json.loads(feed_json.read_text(encoding="utf-8"))
             if not isinstance(existing, list):
                 existing = []
-        except Exception:
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.live_notifier",
+                source=str(feed_json),
+                fallback_type="live_notifier_feed_read_failed",
+                severity="warn",
+                reason="Existing operator feed could not be read; live notifier will rebuild the bounded feed from the current event.",
+                error=exc,
+                metadata={
+                    "output_dir": str(output_path),
+                    "feed_json": str(feed_json),
+                    "channel": str(channel),
+                },
+            )
             existing = []
     existing.append(entry)
     existing = existing[-int(max_items) :]
@@ -127,7 +141,20 @@ def subscribe_and_run(
             raw = message.get("data")
             try:
                 payload = json.loads(raw) if isinstance(raw, str) else {}
-            except Exception:
+            except Exception as exc:
+                record_local_fallback_event(
+                    module="advisory.live_notifier",
+                    source=str(channel),
+                    fallback_type="live_notifier_payload_parse_failed",
+                    severity="warn",
+                    reason="Redis operator-feed payload was not valid JSON; live notifier will preserve the raw payload.",
+                    error=exc,
+                    metadata={
+                        "channel": str(channel),
+                        "payload_type": type(raw).__name__,
+                        "payload_preview": str(raw)[:500],
+                    },
+                )
                 payload = {"raw": raw}
             last_entry = append_operator_event(
                 output_dir=output_dir,

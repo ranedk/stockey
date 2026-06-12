@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 
 from advisory import event_meta_model
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df
 
 
@@ -44,6 +45,25 @@ def _int_or_zero(value: Any) -> int:
     if pd.isna(numeric):
         return 0
     return int(numeric)
+
+
+def _record_event_model_promotion_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.event_model_promotion_check",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def _check_gte(name: str, value: float | int | None, threshold: float | int, details: list[dict[str, Any]]) -> bool:
@@ -114,10 +134,20 @@ def summarize_successful_runs(log_path: Path, *, since_days: int) -> dict[str, A
 
 
 def summarize_label_coverage(*, horizon_days: int, return_threshold: float) -> dict[str, Any]:
-    dataset = event_meta_model.build_labeled_event_dataset(
-        horizon_days=int(horizon_days),
-        return_threshold=float(return_threshold),
-    )
+    try:
+        dataset = event_meta_model.build_labeled_event_dataset(
+            horizon_days=int(horizon_days),
+            return_threshold=float(return_threshold),
+        )
+    except Exception as exc:
+        _record_event_model_promotion_fallback(
+            fallback_type="event_model_promotion_label_coverage_load_failed",
+            source="event_meta_model_labeled_dataset",
+            reason="Event-model promotion check could not build labeled event coverage evidence.",
+            error=exc,
+            metadata={"horizon_days": int(horizon_days), "return_threshold": float(return_threshold)},
+        )
+        raise
     if dataset.empty or "target_label" not in dataset.columns:
         return {
             "horizon_days": int(horizon_days),
@@ -164,6 +194,17 @@ def summarize_score_freshness(*, model_name: str | None, model_version: str | No
             params=tuple(params) if params else None,
         )
     except Exception as exc:
+        _record_event_model_promotion_fallback(
+            fallback_type="event_model_promotion_score_freshness_load_failed",
+            source=event_meta_model.SCORES_TABLE,
+            reason="Event-model promotion check could not load latest model score freshness evidence.",
+            error=exc,
+            metadata={
+                "model_name": model_name,
+                "model_version": model_version,
+                "max_score_age_days": int(max_score_age_days),
+            },
+        )
         return {
             "table_exists": None,
             "score_rows": 0,
@@ -185,6 +226,57 @@ def summarize_score_freshness(*, model_name: str | None, model_version: str | No
         "latest_scored_at": latest.isoformat(),
         "age_days": round(float(age_days), 3),
         "fresh": bool(age_days <= float(max_score_age_days)),
+    }
+
+
+def build_research_scorecard(
+    *,
+    decision: str,
+    gates: list[dict[str, Any]],
+    metrics: dict[str, Any],
+    coverage: dict[str, Any],
+    weekly_runs: dict[str, Any],
+    score_freshness: dict[str, Any],
+) -> dict[str, Any]:
+    failed_gates = [str(gate.get("gate")) for gate in gates if not gate.get("passed")]
+    ready = decision == "review_candidate" and not failed_gates
+    precision = _metric_number(metrics, "precision")
+    positive_rate_test = _metric_number(metrics, "positive_rate_test")
+    precision_lift = None
+    if precision is not None and positive_rate_test is not None:
+        precision_lift = round(float(precision - positive_rate_test), 6)
+    usability_status = "usable_for_manual_review" if ready else "not_usable"
+    if ready:
+        operator_action = "Review manually as a low-weight research input; do not auto-promote."
+        headline = "Model evidence passed the configured research gates."
+    else:
+        operator_action = "Keep model research-only; improve labels, scores, weekly runs, or validation evidence before review."
+        headline = "Model evidence is not usable for operator review yet."
+    return {
+        "status": usability_status,
+        "usable": bool(ready),
+        "headline": headline,
+        "operator_action": operator_action,
+        "authority": "research_only_manual_review",
+        "broker_execution_allowed": False,
+        "policy_auto_promotion_allowed": False,
+        "failed_gate_count": len(failed_gates),
+        "failed_gates": failed_gates,
+        "key_metrics": {
+            "train_rows": _metric_number(metrics, "train_rows"),
+            "test_rows": _metric_number(metrics, "test_rows"),
+            "precision": precision,
+            "positive_rate_test": positive_rate_test,
+            "precision_lift_vs_positive_rate_test": precision_lift,
+            "roc_auc": _metric_number(metrics, "roc_auc"),
+            "labeled_rows": coverage.get("labeled_rows"),
+            "date_count": coverage.get("date_count"),
+            "symbol_count": coverage.get("symbol_count"),
+            "event_class_count": coverage.get("event_class_count"),
+            "successful_runs": weekly_runs.get("successful_runs"),
+            "score_rows": score_freshness.get("score_rows"),
+            "score_age_days": score_freshness.get("age_days"),
+        },
     }
 
 
@@ -245,10 +337,19 @@ def build_promotion_check(args: argparse.Namespace) -> dict[str, Any]:
 
     failed = [gate for gate in gates if not gate.get("passed")]
     decision = "review_candidate" if not failed else "hold_research_only"
+    scorecard = build_research_scorecard(
+        decision=decision,
+        gates=gates,
+        metrics=metrics,
+        coverage=coverage,
+        weekly_runs=run_summary,
+        score_freshness=score_summary,
+    )
     return {
         "status": "ok",
         "decision": decision,
         "ready_for_operator_review": decision == "review_candidate",
+        "scorecard": scorecard,
         "promotion_mode": "manual_low_weight_input_only",
         "artifact": artifact_info,
         "metadata": metadata,

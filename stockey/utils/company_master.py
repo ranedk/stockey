@@ -4,23 +4,42 @@ from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 from .db import sql_to_df, upsert_to_db
 
 
 COMPANY_MASTER_TABLE = "company_master"
 
 
+def _company_master_sql_to_df(query: str, *, params: object | None = None, operation: str) -> pd.DataFrame:
+    try:
+        return sql_to_df(query, params=params)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="utils.company_master",
+            source=COMPANY_MASTER_TABLE,
+            fallback_type="company_master_query_failed",
+            severity="error",
+            reason=f"company master query failed during {operation}",
+            error=exc,
+            metadata={"operation": operation},
+        )
+        raise
+
+
 def sync_company_master() -> pd.DataFrame:
-    sharpely_columns = sql_to_df(
+    sharpely_columns = _company_master_sql_to_df(
         """
         SELECT column_name
         FROM information_schema.columns
         WHERE table_schema = 'public'
           AND table_name = 'master_sharpely_equity'
-        """
+        """,
+        operation="sync_sharpely_columns",
     )
     has_sharpely_id = not sharpely_columns.empty and "sharpely_id" in set(sharpely_columns["column_name"])
-    sharpely = sql_to_df(
+    sharpely = _company_master_sql_to_df(
         f"""
         SELECT
             symbol AS nse_ticker,
@@ -28,7 +47,8 @@ def sync_company_master() -> pd.DataFrame:
             proper_name AS company_name,
             {"sharpely_id" if has_sharpely_id else "NULL::text AS sharpely_id"}
         FROM master_sharpely_equity
-        """
+        """,
+        operation="sync_sharpely_equity",
     )
     if sharpely.empty:
         return sharpely
@@ -42,7 +62,7 @@ def sync_company_master() -> pd.DataFrame:
     sharpely = sharpely.sort_values(["nse_ticker", "bse_ticker"], na_position="last")
     sharpely = sharpely.drop_duplicates(subset=["nse_ticker", "bse_ticker"], keep="last")
 
-    dhan_bse = sql_to_df(
+    dhan_bse = _company_master_sql_to_df(
         """
         SELECT DISTINCT ON (security_id::text)
             security_id::text AS bse_ticker,
@@ -53,12 +73,13 @@ def sync_company_master() -> pd.DataFrame:
           AND instrument = 'EQUITY'
           AND instrument_type = 'ES'
         ORDER BY security_id::text, load_ts DESC, valid_from DESC
-        """
+        """,
+        operation="sync_dhan_bse",
     )
     if not dhan_bse.empty:
         dhan_bse["bse_ticker"] = _clean_text_series(dhan_bse["bse_ticker"])
 
-    dhan_nse = sql_to_df(
+    dhan_nse = _company_master_sql_to_df(
         """
         SELECT DISTINCT ON (underlying_symbol)
             underlying_symbol AS nse_ticker,
@@ -70,7 +91,8 @@ def sync_company_master() -> pd.DataFrame:
           AND instrument_type = 'ES'
           AND underlying_symbol IS NOT NULL
         ORDER BY underlying_symbol, load_ts DESC, valid_from DESC
-        """
+        """,
+        operation="sync_dhan_nse",
     )
     if not dhan_nse.empty:
         dhan_nse["nse_ticker"] = _clean_text_series(dhan_nse["nse_ticker"])
@@ -147,13 +169,14 @@ def map_company_master_ids(tickers: Iterable[object], *, exchange: str) -> pd.Se
     else:
         raise ValueError(f"Unsupported exchange: {exchange}")
 
-    lookup = sql_to_df(
+    lookup = _company_master_sql_to_df(
         f"""
         SELECT {column} AS ticker, company_master_id
         FROM {COMPANY_MASTER_TABLE}
         WHERE {column} = ANY(%s)
         """,
         params=(cleaned.dropna().unique().tolist(),),
+        operation=f"map_{exchange_upper.lower()}_ids",
     )
     if lookup.empty:
         return pd.Series(pd.NA, index=ticker_series.index, dtype="string")
@@ -175,21 +198,23 @@ def load_company_master_records(ticker: str, exchanges: Optional[Sequence[str]] 
             WHERE nse_ticker = %s OR bse_ticker = %s
             ORDER BY company_master_id
         """
-        return sql_to_df(query, params=(clean_ticker, clean_ticker))
+        return _company_master_sql_to_df(query, params=(clean_ticker, clean_ticker), operation="load_any_exchange_records")
 
     frames: list[pd.DataFrame] = []
     if "NSE" in exchanges_upper:
         frames.append(
-            sql_to_df(
+            _company_master_sql_to_df(
                 f"SELECT * FROM {COMPANY_MASTER_TABLE} WHERE nse_ticker = %s ORDER BY company_master_id",
                 params=(clean_ticker,),
+                operation="load_nse_records",
             )
         )
     if "BSE" in exchanges_upper:
         frames.append(
-            sql_to_df(
+            _company_master_sql_to_df(
                 f"SELECT * FROM {COMPANY_MASTER_TABLE} WHERE bse_ticker = %s ORDER BY company_master_id",
                 params=(clean_ticker,),
+                operation="load_bse_records",
             )
         )
     if not frames:

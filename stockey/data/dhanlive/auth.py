@@ -10,6 +10,8 @@ from urllib.parse import parse_qs, urlparse
 import requests
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 env = Env()
 env.read_env()
@@ -23,12 +25,36 @@ class DhanAuthError(RuntimeError):
     pass
 
 
+def _record_dhan_auth_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | str,
+    metadata: dict | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="data.dhanlive.auth",
+        source="dhan_auth",
+        fallback_type=fallback_type,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 def load_cached_access_token_payload(cache_path: Path = DEFAULT_TOKEN_CACHE) -> dict | None:
     if not cache_path.exists():
         return None
     try:
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        _record_dhan_auth_fallback(
+            fallback_type="dhan_cached_access_token_read_failed",
+            reason="Dhan cached access-token payload could not be read or parsed; cached broker auth was ignored.",
+            error=exc,
+            metadata={"cache_path": str(cache_path)},
+        )
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -59,7 +85,13 @@ def clear_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> bool:
     try:
         cache_path.unlink()
         return True
-    except FileNotFoundError:
+    except FileNotFoundError as exc:
+        _record_dhan_auth_fallback(
+            fallback_type="dhan_cached_access_token_clear_missing",
+            reason="Requested Dhan cached access-token clear, but no cache file was present.",
+            error=exc,
+            metadata={"cache_path": str(cache_path)},
+        )
         return False
 
 
@@ -249,7 +281,13 @@ def open_browser_url(url: str) -> None:
                 stderr=subprocess.DEVNULL,
             )
             return
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
+            _record_dhan_auth_fallback(
+                fallback_type="dhan_browser_launcher_missing",
+                reason="Configured Dhan browser launcher command was not found; trying the next launcher.",
+                error=exc,
+                metadata={"command": command[0], "url_host": urlparse(str(url)).netloc},
+            )
             continue
         except OSError as exc:
             raise DhanAuthError(f"Failed to open browser for Dhan consent URL: {exc}") from exc
@@ -271,7 +309,13 @@ def _parse_expiry(raw_expiry: str) -> datetime | None:
         text = text[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(text)
-    except ValueError:
+    except ValueError as exc:
+        _record_dhan_auth_fallback(
+            fallback_type="dhan_cached_access_token_expiry_invalid",
+            reason="Dhan cached access-token expiry could not be parsed; cached broker auth was ignored.",
+            error=exc,
+            metadata={"raw_expiry": raw_expiry},
+        )
         return None
     if parsed.tzinfo is not None:
         return parsed.astimezone().astimezone(tz=None).replace(tzinfo=None)

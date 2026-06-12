@@ -8,18 +8,122 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.client import DhanAPIError
 from data.dhanlive.ohlcv import sync_intraday_ohlcv
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import load_tracked_symbols, parse_datetime_arg
 
 
 TABLE_NAME = "advisory_intraday_features_daily"
+INTRADAY_FEATURES_SCHEMA_MIGRATION_ID = "20260611_advisory_intraday_features_base"
 DEFAULT_LOOKBACK_DAYS = int(os.getenv("ADVISORY_INTRADAY_LOOKBACK_DAYS", "30"))
 DEFAULT_INTERVAL_MINUTES = 1
 INTRADAY_READ_SYMBOL_CHUNK_SIZE = 40
 SUPPORTED_INTERVAL_MINUTES = (1, 5, 15, 25, 60)
 LOCAL_TIMEZONE = "Asia/Kolkata"
+INTRADAY_FEATURE_COLUMNS = {
+    "company_master_id": "TEXT",
+    "bar_count": "INTEGER",
+    "session_open": "DOUBLE PRECISION",
+    "session_high": "DOUBLE PRECISION",
+    "session_low": "DOUBLE PRECISION",
+    "session_close": "DOUBLE PRECISION",
+    "session_volume": "DOUBLE PRECISION",
+    "intraday_vwap": "DOUBLE PRECISION",
+    "intraday_range_pct": "DOUBLE PRECISION",
+    "intraday_open_to_close_pct": "DOUBLE PRECISION",
+    "intraday_close_vs_vwap_pct": "DOUBLE PRECISION",
+    "intraday_pct_bars_above_vwap": "DOUBLE PRECISION",
+    "intraday_close_location_pct": "DOUBLE PRECISION",
+    "intraday_opening_range_high": "DOUBLE PRECISION",
+    "intraday_opening_range_low": "DOUBLE PRECISION",
+    "intraday_opening_range_breakout_up": "BOOLEAN",
+    "intraday_opening_range_breakout_down": "BOOLEAN",
+    "intraday_prev_day_high": "DOUBLE PRECISION",
+    "intraday_prev_day_low": "DOUBLE PRECISION",
+    "intraday_prev_day_breakout_up": "BOOLEAN",
+    "intraday_failed_prev_day_breakout": "BOOLEAN",
+    "intraday_first_30m_return_pct": "DOUBLE PRECISION",
+    "intraday_last_60m_return_pct": "DOUBLE PRECISION",
+    "intraday_volume_vs_20d": "DOUBLE PRECISION",
+    "intraday_breakout_score": "DOUBLE PRECISION",
+    "intraday_pattern_label": "TEXT",
+    "model_name": "TEXT",
+    "model_score": "DOUBLE PRECISION",
+    "load_ts": "TIMESTAMPTZ",
+}
+INTRADAY_FEATURES_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        interval_minutes INTEGER NOT NULL,
+        bar_count INTEGER,
+        session_open DOUBLE PRECISION,
+        session_high DOUBLE PRECISION,
+        session_low DOUBLE PRECISION,
+        session_close DOUBLE PRECISION,
+        session_volume DOUBLE PRECISION,
+        intraday_vwap DOUBLE PRECISION,
+        intraday_range_pct DOUBLE PRECISION,
+        intraday_open_to_close_pct DOUBLE PRECISION,
+        intraday_close_vs_vwap_pct DOUBLE PRECISION,
+        intraday_pct_bars_above_vwap DOUBLE PRECISION,
+        intraday_close_location_pct DOUBLE PRECISION,
+        intraday_opening_range_high DOUBLE PRECISION,
+        intraday_opening_range_low DOUBLE PRECISION,
+        intraday_opening_range_breakout_up BOOLEAN,
+        intraday_opening_range_breakout_down BOOLEAN,
+        intraday_prev_day_high DOUBLE PRECISION,
+        intraday_prev_day_low DOUBLE PRECISION,
+        intraday_prev_day_breakout_up BOOLEAN,
+        intraday_failed_prev_day_breakout BOOLEAN,
+        intraday_first_30m_return_pct DOUBLE PRECISION,
+        intraday_last_60m_return_pct DOUBLE PRECISION,
+        intraday_volume_vs_20d DOUBLE PRECISION,
+        intraday_breakout_score DOUBLE PRECISION,
+        intraday_pattern_label TEXT,
+        model_name TEXT,
+        model_score DOUBLE PRECISION,
+        load_ts TIMESTAMPTZ NOT NULL,
+        UNIQUE (asof_date, symbol, interval_minutes)
+    )
+    """,
+    *[
+        f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+        for column, sql_type in INTRADAY_FEATURE_COLUMNS.items()
+    ],
+    """
+    CREATE INDEX IF NOT EXISTS idx_dhan_ohlcv_intraday_ticker_window
+    ON dhan_ohlcv_intraday (exchange, asset_type, interval_minutes, ticker, "timestamp")
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_dhan_ohlcv_daily_ticker_window
+    ON dhan_ohlcv_daily (exchange, asset_type, ticker, date)
+    """,
+]
+
+
+def _record_intraday_features_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.intraday_features",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -27,105 +131,36 @@ def normalize_timestamp(series: pd.Series) -> pd.Series:
 
 
 def table_exists(table_name: str) -> bool:
-    df = sql_to_df(
-        """
-        SELECT 1 AS exists_flag
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        LIMIT 1
-        """,
-        params=(table_name,),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        _record_intraday_features_fallback(
+            fallback_type="intraday_features_table_lookup_failed",
+            source=table_name,
+            reason="Intraday feature builder could not inspect whether a source/output table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        return False
     return not df.empty
 
 
 def ensure_intraday_features_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                interval_minutes INTEGER NOT NULL,
-                bar_count INTEGER,
-                session_open DOUBLE PRECISION,
-                session_high DOUBLE PRECISION,
-                session_low DOUBLE PRECISION,
-                session_close DOUBLE PRECISION,
-                session_volume DOUBLE PRECISION,
-                intraday_vwap DOUBLE PRECISION,
-                intraday_range_pct DOUBLE PRECISION,
-                intraday_open_to_close_pct DOUBLE PRECISION,
-                intraday_close_vs_vwap_pct DOUBLE PRECISION,
-                intraday_pct_bars_above_vwap DOUBLE PRECISION,
-                intraday_close_location_pct DOUBLE PRECISION,
-                intraday_opening_range_high DOUBLE PRECISION,
-                intraday_opening_range_low DOUBLE PRECISION,
-                intraday_opening_range_breakout_up BOOLEAN,
-                intraday_opening_range_breakout_down BOOLEAN,
-                intraday_prev_day_high DOUBLE PRECISION,
-                intraday_prev_day_low DOUBLE PRECISION,
-                intraday_prev_day_breakout_up BOOLEAN,
-                intraday_failed_prev_day_breakout BOOLEAN,
-                intraday_first_30m_return_pct DOUBLE PRECISION,
-                intraday_last_60m_return_pct DOUBLE PRECISION,
-                intraday_volume_vs_20d DOUBLE PRECISION,
-                intraday_breakout_score DOUBLE PRECISION,
-                intraday_pattern_label TEXT,
-                model_name TEXT,
-                model_score DOUBLE PRECISION,
-                load_ts TIMESTAMPTZ NOT NULL,
-                UNIQUE (asof_date, symbol, interval_minutes)
-            )
-            """
-        )
-        column_defs = {
-            "company_master_id": "TEXT",
-            "bar_count": "INTEGER",
-            "session_open": "DOUBLE PRECISION",
-            "session_high": "DOUBLE PRECISION",
-            "session_low": "DOUBLE PRECISION",
-            "session_close": "DOUBLE PRECISION",
-            "session_volume": "DOUBLE PRECISION",
-            "intraday_vwap": "DOUBLE PRECISION",
-            "intraday_range_pct": "DOUBLE PRECISION",
-            "intraday_open_to_close_pct": "DOUBLE PRECISION",
-            "intraday_close_vs_vwap_pct": "DOUBLE PRECISION",
-            "intraday_pct_bars_above_vwap": "DOUBLE PRECISION",
-            "intraday_close_location_pct": "DOUBLE PRECISION",
-            "intraday_opening_range_high": "DOUBLE PRECISION",
-            "intraday_opening_range_low": "DOUBLE PRECISION",
-            "intraday_opening_range_breakout_up": "BOOLEAN",
-            "intraday_opening_range_breakout_down": "BOOLEAN",
-            "intraday_prev_day_high": "DOUBLE PRECISION",
-            "intraday_prev_day_low": "DOUBLE PRECISION",
-            "intraday_prev_day_breakout_up": "BOOLEAN",
-            "intraday_failed_prev_day_breakout": "BOOLEAN",
-            "intraday_first_30m_return_pct": "DOUBLE PRECISION",
-            "intraday_last_60m_return_pct": "DOUBLE PRECISION",
-            "intraday_volume_vs_20d": "DOUBLE PRECISION",
-            "intraday_breakout_score": "DOUBLE PRECISION",
-            "intraday_pattern_label": "TEXT",
-            "model_name": "TEXT",
-            "model_score": "DOUBLE PRECISION",
-            "load_ts": "TIMESTAMPTZ",
-        }
-        for column, sql_type in column_defs.items():
-            cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_dhan_ohlcv_intraday_ticker_window
-            ON dhan_ohlcv_intraday (exchange, asset_type, interval_minutes, ticker, "timestamp")
-            """
-        )
-        cur.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_dhan_ohlcv_daily_ticker_window
-            ON dhan_ohlcv_daily (exchange, asset_type, ticker, date)
-            """
-        )
+    apply_schema_migration(
+        migration_id=INTRADAY_FEATURES_SCHEMA_MIGRATION_ID,
+        description="Create advisory intraday feature cache and supporting Dhan OHLCV indexes.",
+        statements=INTRADAY_FEATURES_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME], "indexes": ["idx_dhan_ohlcv_intraday_ticker_window", "idx_dhan_ohlcv_daily_ticker_window"]},
+    )
 
 
 def resolve_symbol_universe(
@@ -144,15 +179,28 @@ def resolve_symbol_universe(
         params.append(asof_date)
     else:
         clauses.append("date = (SELECT MAX(date) FROM advisory_screener_constituents)")
-    df = sql_to_df(
-        f"""
-        SELECT DISTINCT symbol
-        FROM advisory_screener_constituents
-        WHERE {' AND '.join(clauses)}
-        ORDER BY symbol
-        """,
-        params=tuple(params) if params else None,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT DISTINCT symbol
+            FROM advisory_screener_constituents
+            WHERE {' AND '.join(clauses)}
+            ORDER BY symbol
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception as exc:
+        _record_intraday_features_fallback(
+            fallback_type="intraday_features_universe_load_failed",
+            source="advisory_screener_constituents",
+            reason="Intraday feature builder could not load the screener-derived symbol universe.",
+            error=exc,
+            metadata={
+                "asof_date": str(asof_date) if asof_date is not None else None,
+                "provided_symbol_count": 0 if symbols is None else len(symbols),
+            },
+        )
+        raise
     if df.empty:
         return []
     return df["symbol"].astype("string").dropna().str.strip().str.upper().drop_duplicates().tolist()
@@ -165,21 +213,31 @@ def load_intraday_coverage(
 ) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame(columns=["symbol", "min_timestamp", "max_timestamp"])
-    return sql_to_df(
-        """
-        SELECT
-            ticker AS symbol,
-            MIN("timestamp") AS min_timestamp,
-            MAX("timestamp") AS max_timestamp
-        FROM dhan_ohlcv_intraday
-        WHERE exchange = 'NSE'
-          AND asset_type = 'stock'
-          AND interval_minutes = %s
-          AND ticker = ANY(%s)
-        GROUP BY ticker
-        """,
-        params=(interval_minutes, symbols),
-    )
+    try:
+        return sql_to_df(
+            """
+            SELECT
+                ticker AS symbol,
+                MIN("timestamp") AS min_timestamp,
+                MAX("timestamp") AS max_timestamp
+            FROM dhan_ohlcv_intraday
+            WHERE exchange = 'NSE'
+              AND asset_type = 'stock'
+              AND interval_minutes = %s
+              AND ticker = ANY(%s)
+            GROUP BY ticker
+            """,
+            params=(interval_minutes, symbols),
+        )
+    except Exception as exc:
+        _record_intraday_features_fallback(
+            fallback_type="intraday_features_coverage_load_failed",
+            source="dhan_ohlcv_intraday",
+            reason="Intraday feature builder could not inspect existing intraday OHLCV coverage.",
+            error=exc,
+            metadata={"symbol_count": len(symbols), "interval_minutes": interval_minutes},
+        )
+        raise
 
 
 def ensure_intraday_history(
@@ -234,6 +292,18 @@ def ensure_intraday_history(
                     to_date=target_end,
                 )
             except (DhanAPIError, ValueError) as exc:
+                _record_intraday_features_fallback(
+                    fallback_type="intraday_features_dhan_sync_failed",
+                    source="data.dhanlive.ohlcv",
+                    reason="Intraday feature builder could not refresh missing Dhan intraday OHLCV for a symbol.",
+                    error=exc,
+                    metadata={
+                        "symbol": symbol,
+                        "interval_minutes": current_interval,
+                        "from_timestamp": str(target_start),
+                        "to_timestamp": str(target_end),
+                    },
+                )
                 results.append(
                     {
                         "symbol": symbol,
@@ -271,30 +341,45 @@ def load_intraday_history(
     frames: list[pd.DataFrame] = []
     for offset in range(0, len(unique_symbols), INTRADAY_READ_SYMBOL_CHUNK_SIZE):
         symbol_chunk = unique_symbols[offset : offset + INTRADAY_READ_SYMBOL_CHUNK_SIZE]
-        frame = sql_to_df(
-            """
-            SELECT
-                company_master_id,
-                ticker AS symbol,
-                interval_minutes,
-                "timestamp",
-                open,
-                high,
-                low,
-                close,
-                volume
-            FROM dhan_ohlcv_intraday
-            WHERE exchange = 'NSE'
-              AND asset_type = 'stock'
-              AND interval_minutes = %s
-              AND ticker = ANY(%s)
-              AND "timestamp" >= %s
-              AND "timestamp" <= %s
-            ORDER BY ticker, "timestamp"
-            """,
-            params=(interval_minutes, symbol_chunk, start_timestamp, end_timestamp),
-            chunksize=25_000,
-        )
+        try:
+            frame = sql_to_df(
+                """
+                SELECT
+                    company_master_id,
+                    ticker AS symbol,
+                    interval_minutes,
+                    "timestamp",
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume
+                FROM dhan_ohlcv_intraday
+                WHERE exchange = 'NSE'
+                  AND asset_type = 'stock'
+                  AND interval_minutes = %s
+                  AND ticker = ANY(%s)
+                  AND "timestamp" >= %s
+                  AND "timestamp" <= %s
+                ORDER BY ticker, "timestamp"
+                """,
+                params=(interval_minutes, symbol_chunk, start_timestamp, end_timestamp),
+                chunksize=25_000,
+            )
+        except Exception as exc:
+            _record_intraday_features_fallback(
+                fallback_type="intraday_features_history_load_failed",
+                source="dhan_ohlcv_intraday",
+                reason="Intraday feature builder could not load stored intraday OHLCV history.",
+                error=exc,
+                metadata={
+                    "symbol_count": len(symbol_chunk),
+                    "interval_minutes": interval_minutes,
+                    "start_timestamp": str(start_timestamp),
+                    "end_timestamp": str(end_timestamp),
+                },
+            )
+            raise
         if not frame.empty:
             frames.append(frame)
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
@@ -321,25 +406,39 @@ def load_daily_reference(
 ) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
-    df = sql_to_df(
-        """
-        SELECT
-            ticker AS symbol,
-            date,
-            high,
-            low,
-            close,
-            volume
-        FROM dhan_ohlcv_daily
-        WHERE exchange = 'NSE'
-          AND asset_type = 'stock'
-          AND ticker = ANY(%s)
-          AND date >= %s
-          AND date <= %s
-        ORDER BY ticker, date
-        """,
-        params=(symbols, start_date, end_date),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT
+                ticker AS symbol,
+                date,
+                high,
+                low,
+                close,
+                volume
+            FROM dhan_ohlcv_daily
+            WHERE exchange = 'NSE'
+              AND asset_type = 'stock'
+              AND ticker = ANY(%s)
+              AND date >= %s
+              AND date <= %s
+            ORDER BY ticker, date
+            """,
+            params=(symbols, start_date, end_date),
+        )
+    except Exception as exc:
+        _record_intraday_features_fallback(
+            fallback_type="intraday_features_daily_reference_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Intraday feature builder could not load daily OHLCV reference rows.",
+            error=exc,
+            metadata={
+                "symbol_count": len(symbols),
+                "start_date": str(start_date),
+                "end_date": str(end_date),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.upper()
@@ -593,14 +692,20 @@ def persist_intraday_features(
             df[column] = pd.to_numeric(df[column], errors="coerce")
     effective_asof = asof_date or pd.to_datetime(df["asof_date"].max(), utc=True, errors="coerce")
     if rebuild and pd.notna(effective_asof):
-        with db_session() as (_, cur):
-            if intervals:
-                cur.execute(
-                    f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s AND interval_minutes = ANY(%s)",
-                    (effective_asof, list(intervals)),
-                )
-            else:
-                cur.execute(f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s", (effective_asof,))
+        def _delete_existing_intraday_features() -> None:
+            with db_session() as (_, cur):
+                if intervals:
+                    cur.execute(
+                        f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s AND interval_minutes = ANY(%s)",
+                        (effective_asof, list(intervals)),
+                    )
+                else:
+                    cur.execute(f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s", (effective_asof,))
+
+        execute_db_operation(
+            _delete_existing_intraday_features,
+            operation_name="intraday_features:delete_rebuild_features",
+        )
     upsert_to_db(df, TABLE_NAME, unique_keys=["asof_date", "symbol", "interval_minutes"], timescaledb_column="asof_date")
 
 

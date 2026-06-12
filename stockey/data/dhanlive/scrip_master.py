@@ -19,7 +19,9 @@ import pandas as pd
 import requests
 from environs import Env
 
-from utils.db import db_session
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import db_session, execute_db_operation
+from utils.schema_migrations import apply_schema_migration
 
 env = Env()
 env.read_env()
@@ -34,67 +36,88 @@ TRACKED_COLS = [
     "instrument",
     "expiry_flag",
 ]
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
-DDL = """
-CREATE TABLE IF NOT EXISTS master_dhan_instruments (
-    exch_id                 VARCHAR,
-    segment                 VARCHAR,
-    security_id             BIGINT,
-    isin                    VARCHAR,
-    instrument              VARCHAR,
-    underlying_security_id  BIGINT,
-    underlying_symbol       VARCHAR,
-    symbol_name             VARCHAR,
-    display_name            VARCHAR,
-    instrument_type         VARCHAR,
-    series                  VARCHAR,
-    lot_size                DOUBLE PRECISION,
-    sm_expiry_date          DATE,
-    strike_price            DOUBLE PRECISION,
-    option_type             VARCHAR,
-    tick_size               DOUBLE PRECISION,
-    expiry_flag             VARCHAR,
-    bracket_flag            VARCHAR,
-    cover_flag              VARCHAR,
-    asm_gsm_flag            VARCHAR,
-    asm_gsm_category        VARCHAR,
-    buy_sell_indicator      VARCHAR,
-    buy_co_min_margin_per   DOUBLE PRECISION,
-    sell_co_min_margin_per  DOUBLE PRECISION,
-    buy_co_sl_range_max_perc DOUBLE PRECISION,
-    sell_co_sl_range_max_perc DOUBLE PRECISION,
-    buy_co_sl_range_min_perc DOUBLE PRECISION,
-    sell_co_sl_range_min_perc DOUBLE PRECISION,
-    buy_bo_min_margin_per   DOUBLE PRECISION,
-    sell_bo_min_margin_per  DOUBLE PRECISION,
-    buy_bo_sl_range_max_perc DOUBLE PRECISION,
-    sell_bo_sl_range_max_perc DOUBLE PRECISION,
-    buy_bo_sl_range_min_perc DOUBLE PRECISION,
-    sell_bo_sl_min_range    DOUBLE PRECISION,
-    buy_bo_profit_range_max_perc DOUBLE PRECISION,
-    sell_bo_profit_range_max_perc DOUBLE PRECISION,
-    buy_bo_profit_range_min_perc DOUBLE PRECISION,
-    sell_bo_profit_range_min_perc DOUBLE PRECISION,
-    mtf_leverage            DOUBLE PRECISION,
-    sm_upper_limit          DOUBLE PRECISION,
-    sm_lower_limit          DOUBLE PRECISION,
-    sm_freeze_qty           DOUBLE PRECISION,
 
-    valid_from              TIMESTAMP NOT NULL,
-    valid_to                TIMESTAMP,
-    load_ts                 TIMESTAMP NOT NULL,
+def _record_scrip_master_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | str,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="data.dhanlive.scrip_master",
+        source="dhan_scrip_master",
+        fallback_type=fallback_type,
+        severity="error",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
-    PRIMARY KEY (security_id, segment, valid_from)
-);
-CREATE INDEX IF NOT EXISTS idx_master_dhan_active
-    ON master_dhan_instruments (security_id, segment, valid_to);
-ALTER TABLE master_dhan_instruments
-    ADD COLUMN IF NOT EXISTS sm_upper_limit DOUBLE PRECISION;
-ALTER TABLE master_dhan_instruments
-    ADD COLUMN IF NOT EXISTS sm_lower_limit DOUBLE PRECISION;
-ALTER TABLE master_dhan_instruments
-    ADD COLUMN IF NOT EXISTS sm_freeze_qty DOUBLE PRECISION;
-"""
+DHAN_MASTER_SCHEMA_MIGRATION_ID = "20260611_dhan_scrip_master_base"
+DHAN_MASTER_SCHEMA_STATEMENTS = [
+    """
+    CREATE TABLE IF NOT EXISTS master_dhan_instruments (
+        exch_id                 VARCHAR,
+        segment                 VARCHAR,
+        security_id             BIGINT,
+        isin                    VARCHAR,
+        instrument              VARCHAR,
+        underlying_security_id  BIGINT,
+        underlying_symbol       VARCHAR,
+        symbol_name             VARCHAR,
+        display_name            VARCHAR,
+        instrument_type         VARCHAR,
+        series                  VARCHAR,
+        lot_size                DOUBLE PRECISION,
+        sm_expiry_date          DATE,
+        strike_price            DOUBLE PRECISION,
+        option_type             VARCHAR,
+        tick_size               DOUBLE PRECISION,
+        expiry_flag             VARCHAR,
+        bracket_flag            VARCHAR,
+        cover_flag              VARCHAR,
+        asm_gsm_flag            VARCHAR,
+        asm_gsm_category        VARCHAR,
+        buy_sell_indicator      VARCHAR,
+        buy_co_min_margin_per   DOUBLE PRECISION,
+        sell_co_min_margin_per  DOUBLE PRECISION,
+        buy_co_sl_range_max_perc DOUBLE PRECISION,
+        sell_co_sl_range_max_perc DOUBLE PRECISION,
+        buy_co_sl_range_min_perc DOUBLE PRECISION,
+        sell_co_sl_range_min_perc DOUBLE PRECISION,
+        buy_bo_min_margin_per   DOUBLE PRECISION,
+        sell_bo_min_margin_per  DOUBLE PRECISION,
+        buy_bo_sl_range_max_perc DOUBLE PRECISION,
+        sell_bo_sl_range_max_perc DOUBLE PRECISION,
+        buy_bo_sl_range_min_perc DOUBLE PRECISION,
+        sell_bo_sl_min_range    DOUBLE PRECISION,
+        buy_bo_profit_range_max_perc DOUBLE PRECISION,
+        sell_bo_profit_range_max_perc DOUBLE PRECISION,
+        buy_bo_profit_range_min_perc DOUBLE PRECISION,
+        sell_bo_profit_range_min_perc DOUBLE PRECISION,
+        mtf_leverage            DOUBLE PRECISION,
+        sm_upper_limit          DOUBLE PRECISION,
+        sm_lower_limit          DOUBLE PRECISION,
+        sm_freeze_qty           DOUBLE PRECISION,
+
+        valid_from              TIMESTAMP NOT NULL,
+        valid_to                TIMESTAMP,
+        load_ts                 TIMESTAMP NOT NULL,
+
+        PRIMARY KEY (security_id, segment, valid_from)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_master_dhan_active
+        ON master_dhan_instruments (security_id, segment, valid_to)
+    """,
+    "ALTER TABLE master_dhan_instruments ADD COLUMN IF NOT EXISTS sm_upper_limit DOUBLE PRECISION",
+    "ALTER TABLE master_dhan_instruments ADD COLUMN IF NOT EXISTS sm_lower_limit DOUBLE PRECISION",
+    "ALTER TABLE master_dhan_instruments ADD COLUMN IF NOT EXISTS sm_freeze_qty DOUBLE PRECISION",
+]
 
 
 def download_master_csv(timeout: int = 30) -> Path:
@@ -104,9 +127,21 @@ def download_master_csv(timeout: int = 30) -> Path:
         r = requests.get(url, timeout=timeout)
         r.raise_for_status()
     except Exception as exc:
+        _record_scrip_master_fallback(
+            fallback_type="dhan_scrip_master_download_failed",
+            reason="Dhan scrip master download failed; security-id mapping may be stale until the master is refreshed.",
+            error=exc,
+            metadata={"url": url, "timeout": timeout},
+        )
         sys.exit(f"[ERROR] download failed: {exc}")
 
     if len(r.content) < 10_000:  # sanity check
+        _record_scrip_master_fallback(
+            fallback_type="dhan_scrip_master_response_too_small",
+            reason="Dhan scrip master response was too small and was rejected before updating security-id mappings.",
+            error=f"response too small: {len(r.content)} bytes",
+            metadata={"url": url, "response_bytes": len(r.content)},
+        )
         sys.exit("[ERROR] response too small, aborting")
 
     tmp.write(r.content)
@@ -191,6 +226,16 @@ def quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def ensure_master_table() -> None:
+    apply_schema_migration(
+        migration_id=DHAN_MASTER_SCHEMA_MIGRATION_ID,
+        statements=DHAN_MASTER_SCHEMA_STATEMENTS,
+        owner="data.dhanlive.scrip_master",
+        description="Create versioned Dhan instrument master table.",
+        metadata={"tables": ["master_dhan_instruments"], "source": "dhan_scrip_master"},
+    )
+
+
 def make_insert_sql(columns: list[str]) -> str:
     target_columns = [*columns, "valid_from", "valid_to", "load_ts"]
     quoted_targets = ", ".join(quote_identifier(column) for column in target_columns)
@@ -229,61 +274,85 @@ def sync_master_schema(cur: Any, df: pd.DataFrame) -> None:
         existing_cols.add(column)
 
 
-def update_database(df: pd.DataFrame) -> None:
+def update_database(df: pd.DataFrame) -> datetime:
     load_ts = datetime.now(timezone.utc)
 
-    with db_session() as (conn, cur):
-        # schema
-        cur.execute(DDL)
-        sync_master_schema(cur, df)
-        conn.commit()
+    ensure_master_table()
 
-        # temp staging table (structure cloned, dropped on COMMIT)
-        cur.execute(
+    def _update_database() -> None:
+        with db_session() as (conn, cur):
+            sync_master_schema(cur, df)
+            conn.commit()
+
+            # temp staging table (structure cloned, dropped on COMMIT)
+            cur.execute(
+                """
+                CREATE TEMP TABLE _stage
+                ON COMMIT DROP
+                AS SELECT * FROM master_dhan_instruments WHERE false;
+
+                /* remove the audit/version columns */
+                ALTER TABLE _stage
+                    DROP COLUMN valid_from,
+                    DROP COLUMN valid_to,
+                    DROP COLUMN load_ts;
             """
-            CREATE TEMP TABLE _stage
-            ON COMMIT DROP
-            AS SELECT * FROM master_dhan_instruments WHERE false;
+            )
 
-            /* remove the audit/version columns */
-            ALTER TABLE _stage
-                DROP COLUMN valid_from,
-                DROP COLUMN valid_to,
-                DROP COLUMN load_ts;
-        """
-        )
+            buf = io.StringIO()
+            df.to_csv(
+                buf,
+                sep="\t",
+                header=False,
+                index=False,
+                na_rep="\\N",  # <- NULL _must_ be \N for COPY text mode
+                quoting=csv.QUOTE_NONE,
+            )
+            buf.seek(0)
+            cur.copy_from(
+                buf,
+                "_stage",
+                sep="\t",
+                null="\\N",
+                columns=df.columns.to_list(),
+            )
 
-        buf = io.StringIO()
-        df.to_csv(
-            buf,
-            sep="\t",
-            header=False,
-            index=False,
-            na_rep="\\N",  # <- NULL _must_ be \N for COPY text mode
-            quoting=csv.QUOTE_NONE,
-        )
-        buf.seek(0)
-        cur.copy_from(
-            buf,
-            "_stage",
-            sep="\t",
-            null="\\N",
-            columns=df.columns.to_list(),
-        )
+            # versioning
+            cur.execute("BEGIN;")
+            cur.execute(make_update_sql(TRACKED_COLS), {"load_ts": load_ts})
+            cur.execute(make_insert_sql(df.columns.to_list()), {"load_ts": load_ts})
+            cur.execute("COMMIT;")
 
-        # versioning
-        cur.execute("BEGIN;")
-        cur.execute(make_update_sql(TRACKED_COLS), {"load_ts": load_ts})
-        cur.execute(make_insert_sql(df.columns.to_list()), {"load_ts": load_ts})
-        cur.execute("COMMIT;")
+    execute_db_operation(
+        _update_database,
+        operation_name="dhan_scrip_master:update_database",
+    )
 
     print(
         f"{len(df):,} rows processed  |  load_ts = {load_ts.isoformat(timespec='seconds')}"
     )
+    return load_ts
 
 
-if __name__ == "__main__":
+def main() -> int:
+    global STOCKEY_RUN_STATE
     csv_path = download_master_csv()
     print(f"downloaded → {csv_path}")
     df_master = load_csv(csv_path)
-    update_database(df_master)
+    load_ts = update_database(df_master)
+    STOCKEY_RUN_STATE = {
+        "rows": int(len(df_master)),
+        "rows_read": int(len(df_master)),
+        "rows_written": int(len(df_master)),
+        "column_count": int(len(df_master.columns)),
+        "source_file": str(csv_path),
+        "load_ts": load_ts.isoformat(),
+        "fallback_used": False,
+    }
+    return 0
+
+
+if __name__ == "__main__":
+    _exit_code = main()
+    if _exit_code:
+        raise SystemExit(_exit_code)

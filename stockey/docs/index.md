@@ -156,12 +156,19 @@ Use:
 - `./all_ml.sh` for optional research prep, readiness checks, model train, and score
 - `python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS` for experimental OHLCV forecast features
 - `python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30` for matured TS forecast evaluation
+- `python -m advisory.ts_forecast_paper_portfolio --dry-run --from-date 2026-04-01 --to-date 2026-04-30` for research-only forecast paper-portfolio validation
+- `python -m advisory.ts_forecast_promotion_check --format json` for the read-only TS forecast promotion gate
+- `python -m advisory.ts_forecast_promotion --model-name timesfm_2p5_200m --horizon-days 10 --dry-run` for manual-only TS forecast promotion review guidance after the gate passes
+- `python -m advisory.config_change_assistant --source-type ts_forecast_review_rule --model-name timesfm_2p5_200m --horizon-days 10 --dry-run` for the preview-only disabled TS forecast config diff after operator approval
+- `/api/research/ts-forecast-review-rules` to verify any manually applied disabled TS forecast review rules remain review-only and broker-disabled
 - `python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m` for the optional Screener/Dhan/TimesFM/TS-watchlist workflow
 - `python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m --max-symbols 80` for the default TS screener workflow
 - `python -m advisory.event_policy_evaluator --dry-run --horizons 5 10 20` for event-policy realized-return evidence
 - `python -m advisory.technical_threshold_calibration --dry-run --horizons 5 10 20` for weekly technical threshold evidence
 - `python -m advisory.operator_health --skip-dhan` for a read-only local smoke test
 - `./all_advisory.sh` for the advisory and portfolio run
+
+The Operator home page and generated legacy dashboard show compact TS forecast paper-portfolio summaries. Treat those as validation evidence only; they do not approve action queue rows, portfolio rows, or Dhan execution.
 - `./all_advisory.sh --fast` for a quicker lifecycle/action refresh when data is already current
 - `./all_watchers.sh --loop` for the lightweight live monitoring loop
 - `./all_frontend.sh` for the operator API + Nuxt frontend
@@ -357,6 +364,8 @@ The runner uses the invoking interpreter for downstream Python commands, so star
 ## Advisory roadmap
 
 Use [`todo.md`](../todo.md) as the maintained roadmap for current priorities, bottlenecks, and next implementation steps.
+
+Use [`analysis.md`](../analysis.md) as the detailed audit for implemented, partial, and open engineering gaps.
 
 Use [`docs/implementation.md`](implementation.md) as the current architecture summary for the live advisory stack.
 

@@ -3,17 +3,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import types
 from datetime import date
 from datetime import datetime
+from datetime import timezone
+from pathlib import Path
 
 import pandas as pd
+import pytest
+import requests
 
-from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, cron_status, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, fallback_telemetry, feature_freshness, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_workflow, wait_signals, watchlist_builder
+from advisory import action_recommender, adversarial_review, announcement_watch, company_memory_review, config_change_assistant, continuous_watch, cron_status, current_prices, dashboard, decision_trace, event_data_quality, event_evidence_store, event_meta_model, event_model_artifact_store, event_model_data_prep, event_model_promotion_check, event_policy, event_policy_evaluator, event_policy_promotion, event_router, execution_engine, exchange_events, exchange_features, external_task_queue, fallback_telemetry, feature_freshness, hypothesis_engine, intraday_features, live_dashboard, llm_event_evaluator, macro_features, market_context, master_pipeline, model_training_runner, news_overlay_engine, news_theme_engine, news_watch, operator_health, operator_smoke, performance_slowlog, pipeline, portfolio_engine, position_lifecycle, prompt_registry, regime_engine, research_ledger, risk_engine, rule_engine, setup_registry, setup_trace, signal_quality_evaluator, signal_quality_promotion, signal_refresh, sync_state, symbol_trace, technical_engine, technical_features, technical_threshold_calibration, technical_threshold_promotion, trace_summary_store, training_universe, ts_forecast_evaluator, ts_forecast_features, ts_forecast_paper_portfolio, ts_forecast_promotion, ts_forecast_promotion_check, ts_forecast_workflow, wait_signals, watchlist_builder
+from advisory import fundamental_snapshot
+from advisory import operator_snapshot
+from advisory import screener_coverage
 from advisory import manual_review_state
 from advisory import identity_issues
 from advisory import superseded_failures
+from advisory import peer_sync
 from advisory.api import app as operator_api
 from data.announcements import pipeline as announcement_pipeline
 from data.announcements import managed_pipeline as announcement_managed_pipeline
@@ -25,16 +34,738 @@ from data.dhanlive import auth_cli as dhan_auth_cli
 from data.dhanlive import client as dhan_client
 from data.dhanlive import web_login as dhan_web_login
 from data.dhanlive import dhan_db, ohlcv as dhan_ohlcv, scrip_master as dhan_scrip_master
-from data.nseindia import bhavcopy_downloader, bhavcopy_parser, indices_downloader, indices_parser, offmarket, recent_events
+from data.nseindia import bhavcopy_downloader, bhavcopy_parser, corporate_actions, earnings_events, indices_downloader, indices_parser, insider_deals, offmarket, recent_events, security_history
+from data.screenerin import ad_hoc_query as screener_ad_hoc_query
 from data.screenerin import auth as screener_auth
+from data.screenerin import failure_log as screener_failure_log
+from data.screenerin import query_validation as screener_query_validation
+from data.screenerin import screener_parser as screener_parser_module
+from data.sharpelydata import sharpely_data
+from data.sharpelydata import scrip_master as sharpely_scrip_master
 from data.mospi import cpi
 from data.nsdl import fpi
 from data import benchmark_sync, download_runner, download_queue
 from utils import codex_cli
 from utils import db as db_utils
+from utils import http as http_utils
+from utils import company_master as company_master_utils
+from utils import ingestion_state
+from utils import redaction
+from utils import redis_bkp_restore
 from utils.ocr import llm_ocr
 from utils import poppler as poppler_utils
 from utils import redis_utils
+from utils import sync as sync_utils
+
+
+def test_ingestion_state_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(ingestion_state, "apply_schema_migration", lambda **kwargs: calls.append(kwargs))
+
+    ingestion_state.ensure_ingestion_state_table()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == ingestion_state.INGESTION_STATE_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "utils.ingestion_state"
+    assert call["metadata"]["tables"] == [ingestion_state.TABLE_NAME]
+    ddl = "\n".join(call["statements"])
+    assert f"CREATE TABLE IF NOT EXISTS {ingestion_state.TABLE_NAME}" in ddl
+    assert "PRIMARY KEY (source_prefix, object_key)" in ddl
+    assert "ADD COLUMN IF NOT EXISTS error_message" in ddl
+
+
+def test_ingestion_state_db_paths_use_retryable_operations(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[object, object]] = []
+
+    class FakeCursor:
+        def __init__(self, *, dict_rows: bool = False):
+            self.dict_rows = dict_rows
+
+        def execute(self, query, params=None):
+            executed.append((query, params))
+
+        def fetchall(self):
+            if not self.dict_rows:
+                return [("file-1",)]
+            return [{"object_key": "file-1", "status": "failed", "error_message": "classification=parser_bug; x"}]
+
+    class FakeSession:
+        def __init__(self, *, dict_factory: bool = False):
+            self.dict_factory = dict_factory
+
+        def __enter__(self):
+            return None, FakeCursor(dict_rows=self.dict_factory)
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(ingestion_state, "ensure_ingestion_state_table", lambda: None)
+    monkeypatch.setattr(ingestion_state, "db_session", lambda **kwargs: FakeSession(dict_factory=bool(kwargs.get("dict_factory"))))
+    monkeypatch.setattr(ingestion_state, "execute_db_operation", fake_execute_db_operation)
+
+    assert ingestion_state.get_processed_keys("bhavcopy") == {"file-1"}
+    ingestion_state.mark_state("bhavcopy", "file-2", status="empty_valid_source")
+    assert ingestion_state.get_failed_entries("bhavcopy")[0]["object_key"] == "file-1"
+    assert ingestion_state.get_state_entries("bhavcopy", status="failed", limit=5)[0]["status"] == "failed"
+    ingestion_state.clear_state("bhavcopy", "file-2")
+
+    assert operation_names == [
+        "ingestion_state:get_processed_keys",
+        "ingestion_state:mark_state",
+        "ingestion_state:get_failed_entries",
+        "ingestion_state:get_state_entries",
+        "ingestion_state:clear_state",
+    ]
+    assert len(executed) == 5
+
+
+def test_ingestion_state_runner_summarizes_statuses_and_classifications():
+    rows = [
+        {
+            "source_prefix": "bhavcopy",
+            "object_key": "bhavcopy/bhavcopy_2026-01-01.zip",
+            "status": "failed",
+            "error_message": "classification=bad_file_retryable; bad zip",
+        },
+        {
+            "source_prefix": "indices",
+            "object_key": "indices/indices_2026-01-01.zip",
+            "status": "empty_valid_source",
+            "error_message": None,
+        },
+        {
+            "source_prefix": "bhavcopy",
+            "object_key": "bhavcopy/bhavcopy_2026-01-02.zip",
+            "status": "failed",
+            "error_message": "classification=schema_changed; missing columns",
+        },
+    ]
+
+    summary = ingestion_state.summarize_state_entries(rows, sample_limit=1)
+
+    assert summary["count"] == 3
+    assert summary["status_counts"] == {"empty_valid_source": 1, "failed": 2}
+    assert summary["source_counts"] == {"bhavcopy": 2, "indices": 1}
+    assert summary["classification_counts"] == {"bad_file_retryable": 1, "schema_changed": 1}
+    assert summary["sample_rows"] == rows[:1]
+
+
+def test_ingestion_state_extract_failure_classification_handles_missing_values():
+    assert ingestion_state.extract_failure_classification("classification=parser_bug; parse failed") == "parser_bug"
+    assert ingestion_state.extract_failure_classification("prefix; classification=schema_changed; missing column") == "schema_changed"
+    assert ingestion_state.extract_failure_classification("plain error without class") is None
+    assert ingestion_state.extract_failure_classification(None) is None
+
+
+def test_file_state_parser_failure_classifiers_follow_shared_contract():
+    from data.nseindia import offmarket_parser
+
+    parser_contracts = [
+        (
+            "bhavcopy",
+            bhavcopy_parser.classify_bhavcopy_parse_failure,
+            {
+                RuntimeError("bad_bhavcopy_zip:bad.zip"): "bad_file_retryable",
+                KeyError("TradDt"): "schema_changed",
+                RuntimeError("unexpected parser branch"): "parser_bug",
+            },
+            {"bad_file_retryable", "schema_changed", "parser_bug"},
+        ),
+        (
+            "indices",
+            indices_parser.classify_indices_parse_failure,
+            {
+                RuntimeError("bad_indices_zip:bad.zip"): "bad_file_retryable",
+                KeyError("Index Name"): "schema_changed",
+                RuntimeError("unexpected parser branch"): "parser_bug",
+            },
+            {"bad_file_retryable", "schema_changed", "parser_bug"},
+        ),
+        (
+            "offmarket",
+            offmarket_parser.classify_offmarket_parse_failure,
+            {
+                pd.errors.EmptyDataError("empty"): "empty_valid_source",
+                KeyError("client_name"): "schema_changed",
+                RuntimeError("unexpected parser branch"): "parser_bug",
+            },
+            {"empty_valid_source", "schema_changed", "parser_bug"},
+        ),
+    ]
+
+    for parser_name, classifier, examples, allowed in parser_contracts:
+        for exc, expected in examples.items():
+            classification = classifier(exc)
+            assert classification == expected, parser_name
+            assert classification in allowed, parser_name
+            message = f"classification={classification}; {type(exc).__name__}: {exc}"
+            assert ingestion_state.extract_failure_classification(message) == classification
+
+
+def test_ingestion_state_runner_summary_cli_uses_filters(monkeypatch, capsys):
+    from scripts import ingestion_state_runner
+
+    calls = []
+    rows = [
+        {
+            "source_prefix": "offmarket",
+            "object_key": "offmarket/file.csv",
+            "status": "failed",
+            "error_message": "classification=parser_bug; parse failed",
+        }
+    ]
+
+    def fake_get_state_entries(*, source_prefix=None, status=None, limit=None):
+        calls.append({"source_prefix": source_prefix, "status": status, "limit": limit})
+        return rows
+
+    monkeypatch.setattr(ingestion_state_runner, "get_state_entries", fake_get_state_entries)
+
+    ingestion_state_runner.main(["summary", "--source", "offmarket", "--status", "failed", "--limit", "10", "--sample-limit", "2"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == [{"source_prefix": "offmarket", "status": "failed", "limit": 10}]
+    assert payload["status"] == "ok"
+    assert payload["count"] == 1
+    assert payload["classification_counts"] == {"parser_bug": 1}
+    assert payload["sample_rows"][0]["object_key"] == "offmarket/file.csv"
+
+
+def test_operator_api_ingestion_state_payload_summarizes_rows(monkeypatch):
+    calls = []
+    rows = [
+        {
+            "source_prefix": "bhavcopy",
+            "object_key": "bhavcopy/bhavcopy_2026-01-01.zip",
+            "status": "failed",
+            "error_message": "classification=bad_file_retryable; bad zip",
+        },
+        {
+            "source_prefix": "bhavcopy",
+            "object_key": "bhavcopy/bhavcopy_2026-01-02.zip",
+            "status": "empty_valid_source",
+            "error_message": None,
+        },
+    ]
+
+    def fake_get_entries(*, source_prefix=None, status=None, limit=None):
+        calls.append({"source_prefix": source_prefix, "status": status, "limit": limit})
+        return rows
+
+    monkeypatch.setattr(operator_api, "get_ingestion_state_entries", fake_get_entries)
+
+    payload = operator_api.build_ingestion_state_payload(source="bhavcopy", status="failed", limit=10, sample_limit=1)
+
+    assert calls == [{"source_prefix": "bhavcopy", "status": "failed", "limit": 10}]
+    assert payload["api_schema"]["endpoint"] == "/api/operations/ingestion-state"
+    assert payload["status"] == "ok"
+    assert payload["filters"]["source"] == "bhavcopy"
+    assert payload["summary"]["status_counts"] == {"empty_valid_source": 1, "failed": 1}
+    assert payload["summary"]["classification_counts"] == {"bad_file_retryable": 1}
+    assert len(payload["summary"]["sample_rows"]) == 1
+    assert payload["operator_boundary"]["read_only"] is True
+    assert payload["operator_boundary"]["mutates_state"] is False
+
+
+def test_security_history_ensure_identity_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(security_history, "apply_schema_migration", lambda **kwargs: calls.append(kwargs))
+
+    security_history.ensure_identity_tables()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == security_history.SECURITY_HISTORY_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "data.nseindia.security_history"
+    assert call["metadata"]["tables"] == [
+        "dim_security_history",
+        "dim_security_overrides",
+        "dim_security_review_events",
+    ]
+    ddl = "\n".join(call["statements"])
+    assert "CREATE TABLE IF NOT EXISTS dim_security_history" in ddl
+    assert "CREATE TABLE IF NOT EXISTS dim_security_overrides" in ddl
+    assert "CREATE TABLE IF NOT EXISTS dim_security_review_events" in ddl
+    assert "UNIQUE (security_id, symbol, series, isin, effective_from)" in ddl
+
+
+def test_security_history_records_corporate_action_context_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    history = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "series": "EQ",
+                "isin": "INE001",
+                "effective_from": pd.Timestamp("2026-01-01", tz="UTC"),
+                "effective_to": pd.Timestamp("2026-01-02", tz="UTC"),
+                "security_id": "isin:INE001",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        security_history,
+        "sql_to_df",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("corporate action table unavailable")),
+    )
+    monkeypatch.setattr(security_history, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    review = security_history.build_review_events(history)
+
+    assert review.empty
+    assert events[0]["module"] == "data.nseindia.security_history"
+    assert events[0]["source"] == "nseindia_corporate_actions_normalized"
+    assert events[0]["fallback_type"] == "nse_security_history_corporate_action_context_failed"
+    assert isinstance(events[0]["error"], RuntimeError)
+
+
+def test_security_history_records_load_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        security_history,
+        "sql_to_df",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("history table unavailable")),
+    )
+    monkeypatch.setattr(security_history, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    history = security_history.load_security_history()
+
+    assert history.empty
+    assert events[0]["module"] == "data.nseindia.security_history"
+    assert events[0]["source"] == "dim_security_history"
+    assert events[0]["fallback_type"] == "nse_security_history_load_failed"
+    assert isinstance(events[0]["error"], RuntimeError)
+
+
+def test_regime_engine_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(regime_engine, "apply_schema_migration", lambda **kwargs: calls.append(kwargs))
+
+    regime_engine.ensure_regime_table()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == regime_engine.REGIME_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "advisory.regime_engine"
+    assert call["metadata"]["tables"] == [regime_engine.TABLE_NAME]
+    ddl = "\n".join(call["statements"])
+    assert f"CREATE TABLE IF NOT EXISTS {regime_engine.TABLE_NAME}" in ddl
+    assert "benchmark_ret_20d DOUBLE PRECISION" in ddl
+    assert "new_macro_source_required BOOLEAN" in ddl
+    assert "UNIQUE (asof_date)" in ddl
+
+
+def test_regime_engine_rebuild_ensures_schema_before_delete(monkeypatch):
+    events = []
+    operation_names = []
+
+    class Cursor:
+        def execute(self, query, params=None):
+            events.append(str(query))
+
+    class Session:
+        def __enter__(self):
+            return object(), Cursor()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    frame = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "regime_name": "STABLE",
+            }
+        ]
+    )
+    monkeypatch.setattr(regime_engine, "ensure_regime_table", lambda: events.append("ensure"))
+    monkeypatch.setattr(regime_engine, "db_session", lambda: Session())
+    monkeypatch.setattr(
+        regime_engine,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
+    monkeypatch.setattr(regime_engine, "upsert_to_db", lambda df, *args, **kwargs: events.append(f"upsert:{len(df)}"))
+
+    regime_engine.persist_regime_snapshot(frame, rebuild=True)
+
+    assert events[0] == "ensure"
+    assert operation_names == ["regime_engine:delete_rebuild_snapshot"]
+    assert any(f"DELETE FROM {regime_engine.TABLE_NAME}" in event for event in events)
+    assert events[-1] == "upsert:1"
+
+
+def test_regime_engine_records_table_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(regime_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("lookup failed")))
+    monkeypatch.setattr(regime_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert regime_engine.table_exists("advisory_macro_features_daily") is False
+    assert events[0]["fallback_type"] == "regime_engine_table_lookup_failed"
+    assert events[0]["source"] == "advisory_macro_features_daily"
+
+
+def test_regime_engine_records_nse_benchmark_fallback_and_uses_dhan(monkeypatch):
+    events = []
+    calls = []
+
+    def fake_sql_to_df(query, params=None):
+        calls.append(str(query))
+        if "FROM nseindia_indices" in str(query):
+            raise RuntimeError("nse timeout")
+        return pd.DataFrame(
+            [
+                {"date": pd.Timestamp("2026-01-01T00:00:00Z"), "close": 100.0},
+                {"date": pd.Timestamp("2026-01-02T00:00:00Z"), "close": 101.0},
+            ]
+        )
+
+    monkeypatch.setattr(regime_engine, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(regime_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = regime_engine.load_benchmark_history(benchmark_name="NIFTY")
+
+    assert not out.empty
+    assert any("FROM dhan_ohlcv_daily" in query for query in calls)
+    assert events[0]["fallback_type"] == "regime_engine_nse_benchmark_load_failed"
+    assert events[0]["source"] == "nseindia_indices"
+
+
+def test_regime_engine_records_macro_feature_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(regime_engine, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(regime_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("macro failed")))
+    monkeypatch.setattr(regime_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="macro failed"):
+        regime_engine.load_macro_history(to_date=pd.Timestamp("2026-06-01T00:00:00Z"))
+
+    assert events[0]["fallback_type"] == "regime_engine_macro_features_load_failed"
+    assert events[0]["source"] == regime_engine.MACRO_FEATURES_TABLE
+
+
+def test_rule_engine_ensure_output_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(rule_engine, "apply_schema_migration", lambda **kwargs: calls.append(kwargs))
+
+    rule_engine.ensure_rule_output_tables()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "advisory.rule_engine"
+    assert call["metadata"]["tables"] == [rule_engine.CANDIDATES_TABLE, rule_engine.REJECTIONS_TABLE]
+    ddl = "\n".join(call["statements"])
+    assert f"CREATE TABLE IF NOT EXISTS {rule_engine.CANDIDATES_TABLE}" in ddl
+    assert f"CREATE TABLE IF NOT EXISTS {rule_engine.REJECTIONS_TABLE}" in ddl
+    assert "intraday_volume_vs_20d DOUBLE PRECISION" in ddl
+    assert "delta_to_pass DOUBLE PRECISION" in ddl
+    assert "UNIQUE (asof_date, setup_id, symbol)" in ddl
+    assert "UNIQUE (asof_date, setup_id, symbol, reason_code)" in ddl
+
+
+def test_rule_engine_rebuild_cleanup_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+    upserts: list[tuple[str, int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    candidates = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "screener_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "setup_id": "SETUP_A",
+                "symbol": "ABC",
+            }
+        ]
+    )
+    monkeypatch.setattr(rule_engine, "ensure_rule_output_tables", lambda: None)
+    monkeypatch.setattr(rule_engine, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(rule_engine, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(rule_engine, "upsert_to_db", lambda frame, table, **_kwargs: upserts.append((table, len(frame))))
+
+    rule_engine.persist_rule_outputs(
+        candidates,
+        pd.DataFrame(),
+        asof_date=pd.Timestamp("2026-06-10T00:00:00Z"),
+        rebuild=True,
+    )
+
+    assert operation_names == ["rule_engine:delete_rebuild_outputs"]
+    assert [rule_engine.CANDIDATES_TABLE in query for query, _params in executed] == [True, False]
+    assert [rule_engine.REJECTIONS_TABLE in query for query, _params in executed] == [False, True]
+    assert upserts == [(rule_engine.CANDIDATES_TABLE, 1)]
+
+
+def test_rule_engine_records_table_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(rule_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table lookup failed")))
+    monkeypatch.setattr(rule_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert rule_engine.table_exists("advisory_intraday_features_daily") is False
+    assert events[0]["fallback_type"] == "rule_engine_table_lookup_failed"
+    assert events[0]["source"] == "advisory_intraday_features_daily"
+
+
+def test_rule_engine_records_screener_universe_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(rule_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("screener failed")))
+    monkeypatch.setattr(rule_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="screener failed"):
+        rule_engine.load_screener_universe(pd.Timestamp("2026-06-01T00:00:00Z"), ["growth"])
+
+    assert events[0]["fallback_type"] == "rule_engine_screener_universe_load_failed"
+    assert events[0]["source"] == "advisory_screener_constituents"
+
+
+def test_rule_engine_records_technical_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(rule_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("technical failed")))
+    monkeypatch.setattr(rule_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="technical failed"):
+        rule_engine.load_technical(pd.Timestamp("2026-06-01T00:00:00Z"))
+
+    assert events[0]["fallback_type"] == "rule_engine_technical_load_failed"
+    assert events[0]["source"] == "advisory_technical_daily"
+
+
+def test_portfolio_engine_ensure_portfolio_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(portfolio_engine, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    portfolio_engine.ensure_portfolio_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == portfolio_engine.PORTFOLIO_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [portfolio_engine.PORTFOLIO_TABLE]
+    assert any(portfolio_engine.PORTFOLIO_TABLE in statement for statement in calls[0]["statements"])
+    assert any("approved_allocation_inr" in statement for statement in calls[0]["statements"])
+    assert any("exit_event_rules_json" in statement for statement in calls[0]["statements"])
+
+
+def test_portfolio_engine_persist_cleanup_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+    upserts: list[tuple[str, int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    frame = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-06-10T10:00:00Z"),
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "planned_at": pd.Timestamp("2026-06-10T10:05:00Z"),
+                "load_ts": pd.Timestamp("2026-06-10T10:06:00Z"),
+                "setup_id": "TEST",
+                "symbol": "abc",
+                "unique_id": "u1",
+                "portfolio_status": "approved",
+                "approved_allocation_inr": "1000.25",
+                "plan_rank": "1",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(portfolio_engine, "ensure_portfolio_table", lambda: None)
+    monkeypatch.setattr(portfolio_engine, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(portfolio_engine, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(
+        portfolio_engine,
+        "upsert_to_db",
+        lambda frame, table, **_kwargs: upserts.append((table, len(frame))),
+    )
+    monkeypatch.setattr(portfolio_engine, "_trace_portfolio_rows", lambda _frame: None)
+
+    portfolio_engine.persist_portfolio_orders(frame)
+
+    assert operation_names == ["portfolio_engine:delete_existing_orders"]
+    assert len(executed) == 1
+    assert f"DELETE FROM {portfolio_engine.PORTFOLIO_TABLE}" in executed[0][0]
+    assert executed[0][1][1] == "ABC"
+    assert upserts == [(portfolio_engine.PORTFOLIO_TABLE, 1)]
+
+
+def test_portfolio_engine_records_table_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(portfolio_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table failed")))
+    monkeypatch.setattr(portfolio_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert portfolio_engine.table_exists("advisory_allocations") is False
+    assert events[0]["fallback_type"] == "portfolio_engine_table_lookup_failed"
+    assert events[0]["source"] == "advisory_allocations"
+
+
+def test_portfolio_engine_records_allocations_load_failure(monkeypatch):
+    events = []
+    calls = {"count": 0}
+
+    def fake_sql_to_df(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] <= 2:
+            return pd.DataFrame([{"exists_flag": 1}])
+        raise RuntimeError("allocations failed")
+
+    monkeypatch.setattr(portfolio_engine, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(portfolio_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="allocations failed"):
+        portfolio_engine.load_allocations(asof_date=pd.Timestamp("2026-06-01T00:00:00Z"))
+
+    assert events[0]["fallback_type"] == "portfolio_engine_allocations_load_failed"
+    assert events[0]["source"] == portfolio_engine.ALLOCATIONS_TABLE
+
+
+def test_portfolio_engine_records_symbol_metadata_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(portfolio_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("metadata failed")))
+    monkeypatch.setattr(portfolio_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="metadata failed"):
+        portfolio_engine.load_symbol_metadata(["ABC"])
+
+    assert events[0]["fallback_type"] == "portfolio_engine_symbol_metadata_load_failed"
+    assert events[0]["source"] == "master_sharpely_equity"
+
+
+def test_portfolio_engine_main_records_database_failure(monkeypatch, capsys):
+    events = []
+    args = argparse.Namespace(
+        date=None,
+        capital_inr=300000,
+        max_positions=5,
+        single_position_cap_pct=0.35,
+        per_setup_cap_pct=0.5,
+        max_positions_per_overlap_group=1,
+        include_planned=False,
+        dry_run=True,
+        symbols=None,
+        setup_ids=None,
+        format="json",
+    )
+
+    monkeypatch.setattr(portfolio_engine, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        portfolio_engine,
+        "build_portfolio_orders",
+        lambda **kwargs: (_ for _ in ()).throw(portfolio_engine.SQLAlchemyError("db down")),
+    )
+    monkeypatch.setattr(portfolio_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert portfolio_engine.main() == 1
+    body = json.loads(capsys.readouterr().out)
+    assert body["status"] == "error"
+    assert body["message"] == "database connection failed"
+    assert events[0]["fallback_type"] == "portfolio_engine_cli_database_failed"
+    assert events[0]["source"] == portfolio_engine.PORTFOLIO_TABLE
+    assert events[0]["metadata"]["dry_run"] is True
+
+
+def test_portfolio_engine_main_records_build_failure(monkeypatch, capsys):
+    events = []
+    args = argparse.Namespace(
+        date=None,
+        capital_inr=300000,
+        max_positions=5,
+        single_position_cap_pct=0.35,
+        per_setup_cap_pct=0.5,
+        max_positions_per_overlap_group=1,
+        include_planned=False,
+        dry_run=True,
+        symbols=None,
+        setup_ids=None,
+        format="json",
+    )
+
+    monkeypatch.setattr(portfolio_engine, "parse_args", lambda: args)
+    monkeypatch.setattr(portfolio_engine, "build_portfolio_orders", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("bad portfolio")))
+    monkeypatch.setattr(portfolio_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert portfolio_engine.main() == 1
+    body = json.loads(capsys.readouterr().out)
+    assert body["status"] == "error"
+    assert body["message"] == "portfolio build failed"
+    assert events[0]["fallback_type"] == "portfolio_engine_cli_build_failed"
+    assert events[0]["metadata"]["error_type"] == "RuntimeError"
+
+
+def test_risk_engine_parse_context_snapshot_records_malformed_json(monkeypatch):
+    events = []
+    monkeypatch.setattr(risk_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    parsed = risk_engine._parse_context_snapshot("{bad-json")
+
+    assert parsed == {}
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.risk_engine"
+    assert events[0]["source"] == risk_engine.ALLOCATIONS_TABLE
+    assert events[0]["fallback_type"] == "risk_context_snapshot_parse_failed"
+    assert events[0]["metadata"]["value_length"] == len("{bad-json")
+    assert events[0]["metadata"]["value_excerpt"] == "{bad-json"
+
+
+def test_risk_engine_parse_context_snapshot_records_missing_check_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(risk_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(risk_engine.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    parsed = risk_engine._parse_context_snapshot('{"risk": "ok"}')
+
+    assert parsed == {"risk": "ok"}
+    assert events[0]["module"] == "advisory.risk_engine"
+    assert events[0]["source"] == risk_engine.ALLOCATIONS_TABLE
+    assert events[0]["fallback_type"] == "risk_context_snapshot_missing_check_failed"
+    assert events[0]["metadata"]["value_type"] == "str"
 
 
 def test_portfolio_engine_overlap_cap(monkeypatch):
@@ -143,6 +874,7 @@ def test_db_retry_wrapper_reconnects_on_transient_error(monkeypatch):
 
     monkeypatch.setattr(db_utils, "dispose_db_pool", lambda: calls.__setitem__("dispose", calls["dispose"] + 1))
     monkeypatch.setattr(db_utils.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(db_utils, "_write_db_retry_telemetry", lambda **_kwargs: None)
 
     assert db_utils.with_db_retries(operation, attempts=3, operation_name="test") == "ok"
     assert calls == {"operation": 3, "dispose": 2}
@@ -162,9 +894,358 @@ def test_db_retry_wrapper_retries_deadlock(monkeypatch):
 
     monkeypatch.setattr(db_utils, "dispose_db_pool", lambda: calls.__setitem__("dispose", calls["dispose"] + 1))
     monkeypatch.setattr(db_utils.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(db_utils, "_write_db_retry_telemetry", lambda **_kwargs: None)
 
     assert db_utils.with_db_retries(operation, attempts=3, operation_name="deadlock_test") == "ok"
     assert calls == {"operation": 3, "dispose": 2}
+
+
+def test_execute_db_operation_retries_complete_transaction(monkeypatch):
+    calls = {"operation": 0}
+    operation_names: list[str] = []
+
+    def fake_with_db_retries(operation, **kwargs):
+        operation_names.append(kwargs["operation_name"])
+        return operation()
+
+    def operation():
+        calls["operation"] += 1
+        return "done"
+
+    monkeypatch.setattr(db_utils, "with_db_retries", fake_with_db_retries)
+
+    assert db_utils.execute_db_operation(operation, operation_name="unit:transaction") == "done"
+    assert calls["operation"] == 1
+    assert operation_names == ["unit:transaction"]
+
+
+def test_db_schema_dump_collects_metadata_with_retryable_operation(monkeypatch):
+    from utils import db_schema_dump
+
+    operation_names = []
+    executed = []
+
+    class FakeCursor:
+        def __init__(self):
+            self.rows = []
+
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+            query_text = str(query)
+            if "FROM pg_class c" in query_text:
+                self.rows = [("public", "example_table")]
+            elif "FROM pg_attribute" in query_text:
+                self.rows = [("public", "example_table", "id", "integer", False, None)]
+            elif "FROM pg_constraint" in query_text:
+                self.rows = [("public", "example_table", "id")]
+            elif "FROM pg_class t" in query_text:
+                self.rows = [("public", "example_table", "idx_example_id", True, ["id"])]
+            elif "timescaledb_information.hypertables" in query_text:
+                self.rows = [("public", "example_table")]
+            else:
+                self.rows = []
+
+        def fetchall(self):
+            return list(self.rows)
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(db_schema_dump, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(db_schema_dump, "execute_db_operation", fake_execute_db_operation)
+
+    tables, colmap, pkmap, idxmap, hypertables = db_schema_dump.collect_schema_metadata("public")
+
+    assert operation_names == ["db_schema_dump:collect_schema_metadata"]
+    assert tables == [("public", "example_table")]
+    assert colmap[("public", "example_table")][0]["name"] == "id"
+    assert pkmap[("public", "example_table")] == {"id"}
+    assert idxmap[("public", "example_table")][0]["name"] == "idx_example_id"
+    assert hypertables == {("public", "example_table")}
+    assert all(params == (["public"],) for _query, params in executed)
+
+
+def test_db_retry_coverage_report_classifies_wrapped_and_direct_sessions(tmp_path):
+    from scripts import db_retry_coverage_report
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "sample.py").write_text(
+        """
+from utils.db import db_session, execute_db_operation
+
+def direct():
+    with db_session() as (_, cur):
+        cur.execute("SELECT 1")
+
+def wrapped():
+    with db_session() as (_, cur):
+        cur.execute("SELECT 2")
+
+def outer():
+    execute_db_operation(wrapped, operation_name="unit")
+""",
+        encoding="utf-8",
+    )
+
+    report = db_retry_coverage_report.build_report(root=tmp_path, roots=["pkg"])
+    rows = {(row["function"], row["status"]) for row in report["rows"]}
+
+    assert report["counts"] == {"direct": 1, "wrapped": 1}
+    assert ("direct", "direct") in rows
+    assert ("wrapped", "wrapped") in rows
+
+
+def test_db_retry_coverage_report_records_parse_fallback(monkeypatch, tmp_path):
+    from scripts import db_retry_coverage_report
+
+    events = []
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    report = db_retry_coverage_report.build_report(root=tmp_path, roots=["pkg"])
+
+    assert report["counts"] == {"parse_error": 1}
+    assert len(events) == 1
+    assert events[0]["module"] == "scripts.db_retry_coverage_report"
+    assert events[0]["source"] == "pkg/broken.py"
+    assert events[0]["fallback_type"] == "db_retry_coverage_parse_failed"
+
+
+def test_fallback_telemetry_coverage_report_classifies_exception_handlers(tmp_path):
+    from scripts import fallback_telemetry_coverage_report
+
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "sample.py").write_text(
+        """
+from advisory.fallback_telemetry import record_local_fallback_event
+
+def telemetry():
+    try:
+        raise RuntimeError("x")
+    except RuntimeError as exc:
+        record_local_fallback_event(source="unit", fallback_type="unit_failed", error=exc)
+        return []
+
+def reraises():
+    try:
+        raise RuntimeError("x")
+    except RuntimeError:
+        raise
+
+def logs_only(logger):
+    try:
+        raise RuntimeError("x")
+    except RuntimeError:
+        logger.warning("fallback")
+        return []
+
+def silent():
+    try:
+        raise RuntimeError("x")
+    except RuntimeError:
+        return []
+""",
+        encoding="utf-8",
+    )
+
+    report = fallback_telemetry_coverage_report.build_report(root=tmp_path, roots=["pkg"])
+    rows = {(row["function"], row["status"]) for row in report["rows"]}
+
+    assert report["counts"] == {
+        "logs_only": 1,
+        "records_fallback": 1,
+        "reraises": 1,
+        "silent_fallback": 1,
+    }
+    assert ("telemetry", "records_fallback") in rows
+    assert ("reraises", "reraises") in rows
+    assert ("logs_only", "logs_only") in rows
+    assert ("silent", "silent_fallback") in rows
+
+
+def test_fallback_telemetry_coverage_report_records_parse_fallback(monkeypatch, tmp_path):
+    from scripts import fallback_telemetry_coverage_report
+
+    events = []
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    report = fallback_telemetry_coverage_report.build_report(root=tmp_path, roots=["pkg"])
+
+    assert report["counts"] == {"parse_error": 1}
+    assert len(events) == 1
+    assert events[0]["module"] == "scripts.fallback_telemetry_coverage_report"
+    assert events[0]["source"] == "pkg/broken.py"
+    assert events[0]["fallback_type"] == "fallback_coverage_parse_failed"
+
+
+def test_agent_tool_runner_records_local_fallback_on_failure(monkeypatch):
+    from scripts import agent_tool_runner
+
+    events = []
+    monkeypatch.setattr(sys, "argv", ["agent_tool_runner.py", "list"])
+    monkeypatch.setattr(agent_tool_runner, "list_tools", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("registry unavailable")))
+    monkeypatch.setattr(agent_tool_runner, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(SystemExit) as raised:
+        agent_tool_runner.main()
+
+    assert raised.value.code == 1
+    assert len(events) == 1
+    assert events[0]["module"] == "scripts.agent_tool_runner"
+    assert events[0]["fallback_type"] == "agent_tool_runner_failed"
+    assert events[0]["metadata"]["action"] == "list"
+
+
+def test_drop_duplicate_indexes_records_local_fallback_on_drop_failure(monkeypatch):
+    from scripts import drop_duplicate_indexes
+
+    events = []
+    report = {
+        "duplicate_groups": [
+            {
+                "schema_name": "public",
+                "table_name": "example",
+                "columns": ["symbol"],
+                "indexes": [
+                    {
+                        "index_name": "idx_example_duplicate",
+                        "index_bytes": 1024,
+                        "index_size": "1024 bytes",
+                        "safe_drop_candidate": True,
+                    }
+                ],
+            }
+        ]
+    }
+
+    class FakeCursor:
+        def execute(self, *_args, **_kwargs):
+            raise RuntimeError("drop failed")
+
+        def close(self):
+            pass
+
+    class FakeConnection:
+        autocommit = False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(drop_duplicate_indexes, "build_duplicate_index_report", lambda **_kwargs: report)
+    monkeypatch.setattr(drop_duplicate_indexes.psycopg2, "connect", lambda **_kwargs: FakeConnection())
+    monkeypatch.setattr(drop_duplicate_indexes, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    output = drop_duplicate_indexes.drop_duplicate_indexes(execute=True)
+
+    assert output["dropped"] == []
+    assert len(output["skipped"]) == 1
+    assert len(events) == 1
+    assert events[0]["module"] == "scripts.drop_duplicate_indexes"
+    assert events[0]["fallback_type"] == "drop_duplicate_index_failed"
+    assert events[0]["metadata"]["index_name"] == "idx_example_duplicate"
+
+
+def test_sql_query_runner_records_local_fallback_on_failure(monkeypatch):
+    from scripts import sql_query_runner
+
+    events = []
+    monkeypatch.setattr(sys, "argv", ["sql_query_runner.py", "SELECT 1", "--read-only"])
+    monkeypatch.setattr(sql_query_runner, "get_connection", lambda: (_ for _ in ()).throw(RuntimeError("db unavailable")))
+    monkeypatch.setattr(sql_query_runner, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(SystemExit) as raised:
+        sql_query_runner.main()
+
+    assert raised.value.code == 1
+    assert len(events) == 1
+    assert events[0]["module"] == "scripts.sql_query_runner"
+    assert events[0]["fallback_type"] == "sql_query_runner_failed"
+    assert events[0]["metadata"]["read_only"] is True
+
+
+def test_redis_backup_records_local_fallback_for_key_fetch_failure(monkeypatch, tmp_path):
+    events = []
+
+    class FakeRedis:
+        def keys(self, pattern):
+            assert pattern == "*"
+            return ["bad-key"]
+
+        def type(self, key):
+            assert key == "bad-key"
+            return "string"
+
+        def get(self, key):
+            assert key == "bad-key"
+            raise RuntimeError("redis read failed")
+
+    monkeypatch.setattr(redis_bkp_restore.redis, "Redis", lambda **_kwargs: FakeRedis())
+    monkeypatch.setattr(redis_bkp_restore, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    output_file = tmp_path / "redis_backup.json"
+
+    redis_bkp_restore.redis_backup(output_file=str(output_file))
+
+    assert json.loads(output_file.read_text(encoding="utf-8")) == {}
+    assert len(events) == 1
+    assert events[0]["module"] == "utils.redis_bkp_restore"
+    assert events[0]["fallback_type"] == "redis_backup_key_fetch_failed"
+    assert events[0]["metadata"]["key"] == "bad-key"
+    assert events[0]["metadata"]["key_type"] == "string"
+
+
+def test_redis_restore_records_local_fallback_for_unreadable_backup(monkeypatch, tmp_path):
+    events = []
+    monkeypatch.setattr(redis_bkp_restore.redis, "Redis", lambda **_kwargs: object())
+    monkeypatch.setattr(redis_bkp_restore, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    missing_file = tmp_path / "missing.json"
+
+    with pytest.raises(SystemExit) as raised:
+        redis_bkp_restore.redis_restore(input_file=str(missing_file))
+
+    assert raised.value.code == 1
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "redis_restore_backup_file_read_failed"
+    assert events[0]["metadata"]["input_file"] == str(missing_file)
+
+
+def test_redis_restore_records_local_fallback_for_key_write_failure(monkeypatch, tmp_path):
+    events = []
+
+    class FakeRedis:
+        def set(self, key, value):
+            assert key == "bad-key"
+            assert value == "value"
+            raise RuntimeError("redis write failed")
+
+    monkeypatch.setattr(redis_bkp_restore.redis, "Redis", lambda **_kwargs: FakeRedis())
+    monkeypatch.setattr(redis_bkp_restore, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    input_file = tmp_path / "redis_backup.json"
+    input_file.write_text(json.dumps({"bad-key": {"type": "string", "value": "value"}}), encoding="utf-8")
+
+    redis_bkp_restore.redis_restore(input_file=str(input_file))
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "redis_restore_key_failed"
+    assert events[0]["metadata"]["key"] == "bad-key"
+    assert events[0]["metadata"]["key_type"] == "string"
 
 
 def test_sql_to_df_retries_query_canceled(monkeypatch):
@@ -181,14 +1262,306 @@ def test_sql_to_df_retries_query_canceled(monkeypatch):
 
     monkeypatch.setattr(db_utils, "_fetch_sql_to_df_once", fake_fetch)
     monkeypatch.setattr(db_utils.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(db_utils, "_write_db_retry_telemetry", lambda **_kwargs: None)
 
     out = db_utils.sql_to_df("select 1", retries=2)
     assert out.to_dict(orient="records") == [{"ok": 1}]
     assert calls["count"] == 3
 
 
+def test_db_retry_telemetry_spools_without_postgres(monkeypatch, tmp_path):
+    calls = {"operation": 0, "dispose": 0}
+
+    class OperationalError(Exception):
+        pass
+
+    def operation():
+        calls["operation"] += 1
+        if calls["operation"] < 2:
+            raise OperationalError("server closed the connection unexpectedly tokenId=SECRET123")
+        return "ok"
+
+    telemetry_file = tmp_path / "db_retry_events.jsonl"
+    monkeypatch.setattr(db_utils, "DB_RETRY_TELEMETRY_FILE", telemetry_file)
+    monkeypatch.setattr(db_utils, "dispose_db_pool", lambda: calls.__setitem__("dispose", calls["dispose"] + 1))
+    monkeypatch.setattr(db_utils.time, "sleep", lambda *_args, **_kwargs: None)
+
+    assert db_utils.with_db_retries(operation, attempts=3, operation_name="unit_db_retry") == "ok"
+
+    rows = db_utils.read_db_retry_telemetry_events(hours=24, limit=10)
+    assert len(rows) == 1
+    assert rows[0]["operation_name"] == "unit_db_retry"
+    assert rows[0]["fallback_type"] == "db_retry"
+    assert rows[0]["severity"] == "warn"
+    assert "SECRET123" not in rows[0]["error_message"]
+
+
+def test_db_retry_telemetry_records_corrupt_spool_line(monkeypatch, tmp_path):
+    events = []
+    telemetry_file = tmp_path / "db_retry_events.jsonl"
+    telemetry_file.write_text("{bad-json\n", encoding="utf-8")
+    monkeypatch.setattr(db_utils, "DB_RETRY_TELEMETRY_FILE", telemetry_file)
+    monkeypatch.setattr(db_utils, "_write_db_retry_telemetry", lambda **kwargs: events.append(kwargs))
+
+    rows = db_utils.read_db_retry_telemetry_events(hours=24, limit=10)
+
+    assert rows == []
+    assert len(events) == 1
+    assert events[0]["operation_name"] == "db_retry_telemetry:line_parse"
+    assert events[0]["event_type"] == "db_retry_spool_line_parse_failed"
+
+
+def test_db_pool_dispose_failure_records_retry_telemetry(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    class BrokenEngine:
+        def dispose(self):
+            raise RuntimeError("dispose failed")
+
+    monkeypatch.setattr(db_utils, "_engine", BrokenEngine())
+    monkeypatch.setattr(db_utils, "_write_db_retry_telemetry", lambda **kwargs: events.append(kwargs))
+
+    db_utils.dispose_db_pool()
+
+    assert len(events) == 1
+    assert events[0]["operation_name"] == "db_pool:dispose"
+    assert events[0]["event_type"] == "db_pool_dispose_failed"
+
+
+def test_db_session_cleanup_failures_record_retry_telemetry(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    class FakeCursor:
+        def close(self):
+            raise RuntimeError("cursor close failed")
+
+    class FakeConnection:
+        def commit(self):
+            return None
+
+        def close(self):
+            raise RuntimeError("connection close failed")
+
+    def fake_with_db_retries(operation, **_kwargs):
+        return FakeConnection(), FakeCursor()
+
+    monkeypatch.setattr(db_utils, "with_db_retries", fake_with_db_retries)
+    monkeypatch.setattr(db_utils, "_write_db_retry_telemetry", lambda **kwargs: events.append(kwargs))
+
+    with db_utils.db_session():
+        pass
+
+    assert [event["operation_name"] for event in events] == [
+        "db_session:cursor_close",
+        "db_session:connection_close",
+    ]
+    assert {event["event_type"] for event in events} == {"db_session_cleanup_failed"}
+
+
+def test_get_max_date_failure_records_retry_telemetry(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(db_utils, "sql_to_df", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("missing table")))
+    monkeypatch.setattr(db_utils, "_write_db_retry_telemetry", lambda **kwargs: events.append(kwargs))
+
+    assert db_utils.get_max_date("missing_feature_table") is None
+    assert len(events) == 1
+    assert events[0]["operation_name"] == "get_max_date:missing_feature_table"
+    assert events[0]["event_type"] == "db_lookup_unavailable"
+
+
+def test_company_master_lookup_failure_records_local_fallback_and_reraises(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def fake_sql_to_df(*_args, **_kwargs):
+        raise RuntimeError("company master unavailable")
+
+    monkeypatch.setattr(company_master_utils, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(company_master_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="company master unavailable"):
+        company_master_utils.map_company_master_ids(["ABC"], exchange="NSE")
+
+    assert len(events) == 1
+    assert events[0]["module"] == "utils.company_master"
+    assert events[0]["source"] == company_master_utils.COMPANY_MASTER_TABLE
+    assert events[0]["fallback_type"] == "company_master_query_failed"
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"] == {"operation": "map_nse_ids"}
+
+
+def test_company_master_success_path_does_not_record_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def fake_sql_to_df(*_args, **_kwargs):
+        return pd.DataFrame([{"ticker": "ABC", "company_master_id": "nse:ABC"}])
+
+    monkeypatch.setattr(company_master_utils, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(company_master_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = company_master_utils.map_company_master_ids(["ABC"], exchange="NSE")
+
+    assert out.astype("string").tolist() == ["nse:ABC"]
+    assert events == []
+
+
+def test_action_conflict_dedupe_uses_retryable_db_operation(monkeypatch):
+    from advisory import action_conflict_resolver
+
+    executed: list[tuple[str, object]] = []
+    operation_names: list[str] = []
+
+    class FakeCursor:
+        rowcount = 2
+
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(action_conflict_resolver, "sql_to_df", lambda *_args, **_kwargs: pd.DataFrame({"count": [2]}))
+    monkeypatch.setattr(action_conflict_resolver, "db_session", lambda: FakeSession())
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(action_conflict_resolver, "execute_db_operation", fake_execute_db_operation)
+
+    deleted = action_conflict_resolver.dedupe_conflicts(
+        asof_date=pd.Timestamp("2026-06-10T00:00:00Z"),
+        symbol="ABC",
+        dry_run=False,
+    )
+
+    assert deleted == 2
+    assert operation_names == ["action_conflict_resolver:dedupe_conflicts"]
+    assert executed and "DELETE FROM" in executed[0][0]
+    assert executed[0][1]["symbol"] == "ABC"
+
+
+def test_action_conflict_resolution_updates_use_retryable_db_operation(monkeypatch):
+    from advisory import action_conflict_resolver
+
+    executed: list[tuple[str, object]] = []
+    operation_names: list[str] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    conflicts = pd.DataFrame(
+        [
+            {
+                "row_id": "(0,1)",
+                "symbol": "ABC",
+                "winning_action_code": "BUY",
+                "losing_action_code": "SELL",
+            }
+        ]
+    )
+    monkeypatch.setattr(action_conflict_resolver, "ensure_trace_tables", lambda: None)
+    monkeypatch.setattr(action_conflict_resolver, "load_conflicts", lambda **_kwargs: conflicts)
+    monkeypatch.setattr(action_conflict_resolver, "load_enabled_rules", lambda: [])
+    monkeypatch.setattr(action_conflict_resolver, "load_enabled_dynamic_action_conflict_rules", lambda: [])
+    monkeypatch.setattr(
+        action_conflict_resolver,
+        "classify_action_conflict",
+        lambda _row, dynamic_rules=None: {
+            "resolution_status": "resolved",
+            "resolution_rule_id": "BUY_OVER_SELL",
+            "resolution_action": "keep_winner",
+            "resolution_reason": "BUY signal wins in test.",
+            "requires_manual_resolution": False,
+        },
+    )
+    monkeypatch.setattr(action_conflict_resolver, "db_session", lambda: FakeSession())
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(action_conflict_resolver, "execute_db_operation", fake_execute_db_operation)
+
+    result = action_conflict_resolver.resolve_conflicts(
+        asof_date=pd.Timestamp("2026-06-10T00:00:00Z"),
+        dedupe=False,
+        dry_run=False,
+    )
+
+    assert result["updated_rows"] == 1
+    assert result["status_counts"] == {"resolved": 1}
+    assert operation_names == ["action_conflict_resolver:persist_resolutions"]
+    assert executed and "UPDATE" in executed[0][0]
+    assert executed[0][1][1] == "BUY_OVER_SELL"
+
+
+def test_action_conflict_classifies_same_action_duplicate_with_dedupe_rule():
+    resolution = decision_trace.classify_action_conflict(
+        {
+            "winning_action_code": "BUY",
+            "losing_action_code": "BUY",
+            "winning_source": "portfolio",
+            "losing_source": "screener",
+        }
+    )
+
+    assert resolution["resolution_status"] == "resolved"
+    assert resolution["resolution_rule_id"] == "SAME_ACTION_DUPLICATE_COLLAPSE"
+    assert resolution["resolution_action"] == "collapse_duplicate"
+    assert resolution["requires_manual_resolution"] is False
+    assert "Same final action" in resolution["resolution_reason"]
+
+
+def test_action_conflict_classifies_watch_loser_with_watch_rule():
+    resolution = decision_trace.classify_action_conflict(
+        {
+            "winning_action_code": "BUY",
+            "losing_action_code": "WATCH",
+            "winning_source": "portfolio",
+            "losing_source": "watchlist",
+        }
+    )
+
+    assert resolution["resolution_status"] == "resolved"
+    assert resolution["resolution_rule_id"] == "WATCH_LOSES_TO_HIGHER_PRIORITY"
+    assert resolution["resolution_action"] == "keep_winner"
+    assert resolution["requires_manual_resolution"] is False
+    assert "WATCH is informational" in resolution["resolution_reason"]
+
+
+def test_action_conflict_resolver_json_ready_missing_check_records_fallback(monkeypatch):
+    from advisory import action_conflict_resolver
+
+    events: list[dict[str, object]] = []
+    sentinel = object()
+    monkeypatch.setattr(action_conflict_resolver, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(action_conflict_resolver.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = action_conflict_resolver._json_ready(sentinel)
+
+    assert result is sentinel
+    assert events[0]["module"] == "advisory.action_conflict_resolver"
+    assert events[0]["fallback_type"] == "action_conflict_json_ready_missing_check_failed"
+    assert events[0]["source"] == "json_ready"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
 def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
     calls = {"attempts": 0}
+    events: list[dict[str, object]] = []
 
     class FailingRedis:
         def __init__(self, *args, **kwargs):
@@ -201,14 +1574,18 @@ def test_resilient_redis_retries_then_returns_safe_default(monkeypatch):
     monkeypatch.setattr(redis_utils, "_ORIGINAL_REDIS_CLASS", FailingRedis)
     monkeypatch.setattr(redis_utils, "REDIS_OPERATION_ATTEMPTS", 3)
     monkeypatch.setattr(redis_utils.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(redis_utils, "record_fallback_event", lambda **kwargs: events.append(kwargs))
     client = redis_utils.ResilientRedis(host="127.0.0.1", port=6379, decode_responses=True, fail_soft=True)
 
     assert client.get("missing") is None
     assert calls["attempts"] == 3
+    assert [event["fallback_type"] for event in events] == ["redis_retry", "redis_retry", "redis_fail_soft"]
+    assert events[-1]["metadata"] == {"command": "get", "attempts": 3}
 
 
 def test_resilient_redis_enters_cooldown_after_failure(monkeypatch):
     calls = {"attempts": 0}
+    events: list[dict[str, object]] = []
 
     class FailingRedis:
         def __init__(self, *args, **kwargs):
@@ -225,6 +1602,7 @@ def test_resilient_redis_enters_cooldown_after_failure(monkeypatch):
     monkeypatch.setattr(redis_utils, "REDIS_RECONNECT_COOLDOWN_SECONDS", 30.0)
     monkeypatch.setattr(redis_utils.time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(redis_utils.time, "time", lambda: now["value"])
+    monkeypatch.setattr(redis_utils, "record_fallback_event", lambda **kwargs: events.append(kwargs))
 
     client = redis_utils.ResilientRedis(host="127.0.0.1", port=6379, decode_responses=True, fail_soft=True)
 
@@ -233,6 +1611,87 @@ def test_resilient_redis_enters_cooldown_after_failure(monkeypatch):
 
     assert client.sadd("test", "value2") == 0
     assert calls["attempts"] == 3
+    assert [event["fallback_type"] for event in events] == [
+        "redis_retry",
+        "redis_retry",
+        "redis_fail_soft",
+        "redis_reconnect_cooldown",
+    ]
+    assert events[-1]["metadata"]["command"] == "sadd"
+    assert events[-1]["metadata"]["cooldown_remaining_seconds"] == 30.0
+
+
+def test_resilient_redis_close_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    class ClosingRedis:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    client = redis_utils.ResilientRedis(host="127.0.0.1", port=6379, decode_responses=True, fail_soft=True)
+    client._client = ClosingRedis()  # type: ignore[assignment]
+    monkeypatch.setattr(redis_utils, "record_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    client.close()
+
+    assert client._client is None
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "redis_close_failed"
+    assert events[0]["metadata"] == {"command": "close"}
+
+
+def test_http_cache_bad_date_records_fallback_and_uses_mtime(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    cache_file = tmp_path / "endpoint__bad_date.json"
+    cache_file.write_text('{"ok": true}', encoding="utf-8")
+
+    monkeypatch.setattr(http_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    assert http_utils._load_from_cache(str(tmp_path / "endpoint__*.json"), max_age_days=10) == '{"ok": true}'
+    assert len(events) == 1
+    assert events[0]["module"] == "utils.http"
+    assert events[0]["source"] == "http_cache"
+    assert events[0]["fallback_type"] == "http_cache_date_parse_failed"
+    assert events[0]["metadata"]["cache_file"] == "endpoint__bad_date.json"
+    assert events[0]["metadata"]["date_part"] == "bad_date"
+
+
+def test_http_cache_read_failure_records_fallback(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    cache_file = tmp_path / f"endpoint__{datetime.now().strftime('%Y_%d_%m')}.json"
+    cache_file.write_text("cached", encoding="utf-8")
+
+    def fake_read_text(self, *args, **kwargs):
+        raise OSError("cache unreadable")
+
+    monkeypatch.setattr(http_utils.Path, "read_text", fake_read_text)
+    monkeypatch.setattr(http_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    assert http_utils._load_from_cache(str(tmp_path / "endpoint__*.json"), max_age_days=10) is None
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "http_cache_read_failed"
+    assert events[0]["metadata"]["cache_file"] == cache_file.name
+    assert isinstance(events[0]["error"], OSError)
+
+
+def test_sync_redis_set_members_records_local_fallback(monkeypatch):
+    events = []
+
+    class FailingRedis:
+        def smembers(self, key):
+            raise RuntimeError(f"redis down for {key}")
+
+    monkeypatch.setattr(sync_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    assert sync_utils.get_redis_set_members(FailingRedis(), "bhavcopy:parsed") == set()
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "utils.sync"
+    assert event["source"] == "redis:bhavcopy:parsed"
+    assert event["fallback_type"] == "redis_set_members_unavailable"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"] == {"key": "bhavcopy:parsed", "command": "smembers"}
 
 
 def test_screener_auth_auto_login_fills_credentials_and_reaches_dash():
@@ -280,6 +1739,95 @@ def test_screener_auth_is_logged_in_uses_login_redirect_to_dash():
             pass
 
     assert screener_auth.is_logged_in(FakePage()) is True
+
+
+def test_screener_auth_records_cleanup_failures(monkeypatch):
+    events = []
+
+    class FailingClose:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    class FailingPlaywright:
+        def stop(self):
+            raise RuntimeError("stop failed")
+
+    session = screener_auth.ScreenerBrowserSession(
+        playwright=FailingPlaywright(),
+        browser=object(),
+        context=FailingClose(),
+        page=FailingClose(),
+        owns_context=True,
+    )
+    monkeypatch.setattr(screener_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    session.close()
+
+    assert {event["fallback_type"] for event in events} == {
+        "screener_auth_page_close_failed",
+        "screener_auth_context_close_failed",
+        "screener_auth_playwright_stop_failed",
+    }
+    assert all(event["module"] == "data.screenerin.auth" for event in events)
+    assert all(event["source"] == "screener_in_auth" for event in events)
+
+
+def test_screener_auth_records_login_status_timeout(monkeypatch):
+    events = []
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://www.screener.in/login/"
+
+        def goto(self, url, wait_until=None):
+            raise screener_auth.PlaywrightTimeoutError("login status timeout")
+
+        def wait_for_timeout(self, value):
+            pass
+
+    monkeypatch.setattr(screener_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert screener_auth.is_logged_in(FakePage()) is False
+    assert events[0]["fallback_type"] == "screener_auth_login_status_timeout"
+    assert events[0]["metadata"]["current_url"] == "https://www.screener.in/login/"
+
+
+def test_screener_auth_records_dashboard_wait_timeout(monkeypatch):
+    events = []
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://www.screener.in/login/"
+            self.actions = []
+
+        def goto(self, url, wait_until=None):
+            self.actions.append(("goto", url, wait_until))
+            self.url = url
+
+        def wait_for_timeout(self, value):
+            self.actions.append(("wait", value))
+            if value == 3000:
+                self.url = "https://www.screener.in/dash/"
+
+        def fill(self, selector, value):
+            self.actions.append(("fill", selector, value))
+
+        def click(self, selector):
+            self.actions.append(("click", selector))
+
+        def wait_for_url(self, pattern, timeout=None):
+            self.actions.append(("wait_for_url", pattern, timeout))
+            raise screener_auth.PlaywrightTimeoutError("dashboard wait timeout")
+
+    monkeypatch.setattr(screener_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    page = FakePage()
+
+    screener_auth.auto_login(page, username="user@example.com", password="secret", wait_ms=5000)
+
+    assert page.url == "https://www.screener.in/dash/"
+    assert events[0]["fallback_type"] == "screener_auth_dashboard_wait_timeout"
+    assert events[0]["metadata"]["wait_ms"] == 5000
+    assert events[0]["metadata"]["current_url"] == "https://www.screener.in/login/"
 
 
 def test_dhan_web_login_fills_mobile_totp_pin_and_extracts_token(monkeypatch):
@@ -372,6 +1920,144 @@ def test_dhan_web_login_generates_totp(monkeypatch):
     assert dhan_web_login.generate_totp("abc") == "111222"
 
 
+def test_dhan_web_login_records_cleanup_failures(monkeypatch):
+    events = []
+
+    class FailingClose:
+        def close(self):
+            raise RuntimeError("close failed")
+
+    class FailingPlaywright:
+        def stop(self):
+            raise RuntimeError("stop failed")
+
+    session = dhan_web_login.DhanBrowserSession(
+        playwright=FailingPlaywright(),
+        browser=object(),
+        context=FailingClose(),
+        page=FailingClose(),
+        owns_context=True,
+    )
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    session.close()
+
+    assert {event["fallback_type"] for event in events} == {
+        "dhan_web_login_page_close_failed",
+        "dhan_web_login_context_close_failed",
+        "dhan_web_login_playwright_stop_failed",
+    }
+    assert all(event["module"] == "data.dhanlive.web_login" for event in events)
+    assert all(event["source"] == "dhan_web_login" for event in events)
+
+
+def test_dhan_web_login_records_proceed_force_click_fallback(monkeypatch):
+    events = []
+    actions = []
+
+    class FakeButton:
+        def wait_for(self, **kwargs):
+            actions.append(("wait_for", kwargs))
+
+        def click(self, **kwargs):
+            actions.append(("click", kwargs))
+            if not kwargs.get("force"):
+                raise RuntimeError("normal click failed")
+
+    class FakeLocator:
+        @property
+        def last(self):
+            return FakeButton()
+
+    class FakePage:
+        def locator(self, selector):
+            return FakeLocator()
+
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    dhan_web_login._click_enabled_proceed(FakePage(), timeout_ms=123)
+
+    assert ("click", {"force": True, "timeout": 123}) in actions
+    assert events[0]["fallback_type"] == "dhan_web_login_proceed_click_fallback"
+    assert events[0]["metadata"]["timeout_ms"] == 123
+
+
+def test_dhan_web_login_records_missing_token_after_timeout(monkeypatch):
+    events = []
+
+    class FakeLocator:
+        def __init__(self, count=1):
+            self._count = count
+
+        @property
+        def first(self):
+            return self
+
+        @property
+        def last(self):
+            return self
+
+        def nth(self, index):
+            return self
+
+        def count(self):
+            return self._count
+
+        def wait_for(self, **kwargs):
+            pass
+
+        def fill(self, value, **kwargs):
+            pass
+
+        def click(self, **kwargs):
+            pass
+
+        def dispatch_event(self, event):
+            pass
+
+    class FakePage:
+        def __init__(self):
+            self.url = "https://login.dhan.co/auth"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def wait_for_timeout(self, value):
+            pass
+
+        def locator(self, selector):
+            if selector in {dhan_web_login.CODE_INPUT_SELECTOR, dhan_web_login.PIN_INPUT_SELECTOR}:
+                return FakeLocator(count=6)
+            return FakeLocator(count=1)
+
+        def on(self, event, callback):
+            pass
+
+        def wait_for_function(self, expression, **kwargs):
+            raise dhan_web_login.PlaywrightTimeoutError("token timeout")
+
+    monkeypatch.setattr(dhan_web_login, "generate_totp", lambda _secret=None: "654321")
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(dhan_web_login.DhanAuthError):
+        dhan_web_login.run_dhan_consent_login(
+            FakePage(),
+            consent_url="https://auth.dhan.co/login/consentApp-login?consentAppId=abc",
+            mobile="9999999999",
+            pin="123456",
+            totp_secret="secret",
+            timeout_ms=77,
+        )
+
+    assert [event["fallback_type"] for event in events] == [
+        "dhan_web_login_token_wait_timeout",
+        "dhan_web_login_token_missing",
+    ]
+    assert events[0]["metadata"]["timeout_ms"] == 77
+    assert events[0]["metadata"]["current_url_host"] == "auth.dhan.co"
+    assert events[1]["severity"] == "error"
+
+
 def test_dhan_access_token_uses_auto_login_when_configured(monkeypatch):
     class FakeEnv:
         def __call__(self, name, default=None):
@@ -401,6 +2087,103 @@ def test_dhan_auth_cli_refresh_auto_login_without_manual_browser(monkeypatch):
     assert result["status"] == "ok"
     assert result["token_id_used"] == "TOKEN123"
     assert result["validation"] == {"status": "ok", "access_token": "access:TOKEN123"}
+
+
+def test_dhan_auth_cli_parse_expiry_records_local_fallback_on_malformed_value(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(dhan_auth_cli, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert dhan_auth_cli.parse_expiry("not-a-date") is None
+    assert events[0]["module"] == "data.dhanlive.auth_cli"
+    assert events[0]["source"] == "dhan_auth_cache"
+    assert events[0]["fallback_type"] == "dhan_auth_cli_cached_expiry_parse_failed"
+    assert events[0]["metadata"]["raw_expiry"] == "not-a-date"
+
+
+def test_dhan_auth_cli_validate_token_records_local_fallback_on_failure(monkeypatch):
+    events = []
+
+    class FakeClient:
+        def __init__(self, access_token):
+            self.access_token = access_token
+
+        def validate_access_token(self):
+            raise dhan_client.DhanAPIError("Client ID or user generated access token is invalid or expired.")
+
+    monkeypatch.setattr(dhan_auth_cli, "DhanHistoricalClient", FakeClient)
+    monkeypatch.setattr(dhan_auth_cli, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = dhan_auth_cli.validate_token("TOKEN")
+
+    assert result["status"] == "error"
+    assert "invalid or expired" in result["error"]
+    assert len(events) == 1
+    assert events[0]["module"] == "data.dhanlive.auth_cli"
+    assert events[0]["source"] == "dhan_auth"
+    assert events[0]["fallback_type"] == "dhan_token_validation_failed"
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"]["access_token_present"] is True
+
+
+def test_dhan_auth_records_local_fallback_for_corrupt_cached_token(monkeypatch, tmp_path):
+    events = []
+    cache_path = tmp_path / "dhan_access_token.json"
+    cache_path.write_text("{not-json", encoding="utf-8")
+    monkeypatch.setattr(dhan_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = dhan_auth.load_cached_access_token_payload(cache_path)
+
+    assert payload is None
+    assert len(events) == 1
+    assert events[0]["module"] == "data.dhanlive.auth"
+    assert events[0]["source"] == "dhan_auth"
+    assert events[0]["fallback_type"] == "dhan_cached_access_token_read_failed"
+    assert events[0]["metadata"]["cache_path"] == str(cache_path)
+
+
+def test_dhan_auth_records_local_fallback_for_invalid_cached_expiry(monkeypatch, tmp_path):
+    events = []
+    cache_path = tmp_path / "dhan_access_token.json"
+    cache_path.write_text(json.dumps({"accessToken": "TOKEN", "expiryTime": "not-a-date"}), encoding="utf-8")
+    monkeypatch.setattr(dhan_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    token = dhan_auth.load_cached_access_token(cache_path)
+
+    assert token is None
+    assert len(events) == 1
+    assert events[0]["module"] == "data.dhanlive.auth"
+    assert events[0]["fallback_type"] == "dhan_cached_access_token_expiry_invalid"
+    assert events[0]["metadata"]["raw_expiry"] == "not-a-date"
+
+
+def test_dhan_auth_records_fallback_when_clear_cache_missing(monkeypatch, tmp_path):
+    events = []
+    cache_path = tmp_path / "missing_token.json"
+    monkeypatch.setattr(dhan_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert dhan_auth.clear_cached_access_token(cache_path) is False
+    assert events[0]["module"] == "data.dhanlive.auth"
+    assert events[0]["fallback_type"] == "dhan_cached_access_token_clear_missing"
+    assert events[0]["metadata"]["cache_path"] == str(cache_path)
+
+
+def test_dhan_auth_records_missing_browser_launchers(monkeypatch):
+    events = []
+
+    def missing_launcher(*args, **kwargs):
+        raise FileNotFoundError("missing")
+
+    monkeypatch.delenv("CHROME_BINARY", raising=False)
+    monkeypatch.setattr(dhan_auth.subprocess, "Popen", missing_launcher)
+    monkeypatch.setattr(dhan_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(dhan_auth.DhanAuthError):
+        dhan_auth.open_browser_url("https://auth.dhan.co/consent")
+
+    assert {event["fallback_type"] for event in events} == {"dhan_browser_launcher_missing"}
+    assert {event["metadata"]["command"] for event in events} == {"google-chrome", "xdg-open", "open"}
+    assert all(event["metadata"]["url_host"] == "auth.dhan.co" for event in events)
 
 
 def test_dhan_client_refreshes_token_after_401(monkeypatch):
@@ -476,6 +2259,58 @@ def test_dhan_client_gives_up_after_auth_refresh_attempts(monkeypatch):
     assert len(refresh_calls) == 2
 
 
+def test_dhan_client_records_malformed_json_success_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status_code = 200
+        ok = True
+        text = "not-json"
+        url = "https://api.dhan.co/v2/charts/historical"
+
+        def json(self):
+            raise ValueError("bad json")
+
+    monkeypatch.setattr(dhan_client, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    payload = dhan_client.DhanHistoricalClient._parse_response(dhan_client.DhanHistoricalClient.__new__(dhan_client.DhanHistoricalClient), FakeResponse())
+
+    assert payload == {"raw_text": "not-json"}
+    assert len(events) == 1
+    assert events[0]["module"] == "data.dhanlive.client"
+    assert events[0]["source"] == "dhan_api"
+    assert events[0]["fallback_type"] == "dhan_response_json_parse_failed"
+    assert events[0]["metadata"]["status_code"] == 200
+    assert events[0]["metadata"]["url_host"] == "api.dhan.co"
+    assert events[0]["metadata"]["url_path"] == "/v2/charts/historical"
+    assert events[0]["metadata"]["response_ok"] is True
+
+
+def test_dhan_client_records_malformed_json_error_before_raising(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    class FakeResponse:
+        status_code = 502
+        ok = False
+        text = "<html>bad gateway</html>"
+        url = "https://api.dhan.co/v2/charts/intraday"
+
+        def json(self):
+            raise ValueError("bad json")
+
+    monkeypatch.setattr(dhan_client, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    client = dhan_client.DhanHistoricalClient.__new__(dhan_client.DhanHistoricalClient)
+    with pytest.raises(dhan_client.DhanAPIError, match="status 502"):
+        dhan_client.DhanHistoricalClient._parse_response(client, FakeResponse())
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "dhan_response_json_parse_failed"
+    assert events[0]["metadata"]["status_code"] == 502
+    assert events[0]["metadata"]["url_path"] == "/v2/charts/intraday"
+    assert events[0]["metadata"]["response_ok"] is False
+
+
 def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):
     processed: list[str] = []
 
@@ -493,7 +2328,7 @@ def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):
         lambda *_args, **_kwargs: pd.DataFrame({"parsed_date": [pd.Timestamp("2015-01-16")]}),
     )
     monkeypatch.setattr(bhavcopy_parser.store, "get_as_temp_file", lambda key: f"/tmp/{key.split('/')[-1]}")
-    monkeypatch.setattr(bhavcopy_parser, "unzip_and_process", lambda file_path: processed.append(file_path))
+    monkeypatch.setattr(bhavcopy_parser, "unzip_and_process", lambda file_path: processed.append(file_path) or True)
     monkeypatch.setattr(bhavcopy_parser, "mark_processed", lambda *_args, **_kwargs: None)
 
     class DummyRedis:
@@ -505,9 +2340,14 @@ def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):
 
     monkeypatch.setattr(bhavcopy_parser, "rop", DummyRedis())
 
-    bhavcopy_parser.run_parser()
+    result = bhavcopy_parser.run_parser()
 
     assert processed == ["/tmp/bhavcopy_2015-01-17.zip"]
+    assert result["files_considered"] == 2
+    assert result["already_parsed_db_count"] == 1
+    assert result["parsed_count"] == 1
+    assert result["rows_written"] == 2
+    assert result["state_advanced"] is True
 
 
 def test_bhavcopy_parser_cat_turnover_raises_visible_error(monkeypatch):
@@ -528,6 +2368,7 @@ def test_bhavcopy_parser_cat_turnover_raises_visible_error(monkeypatch):
 
 def test_bhavcopy_parser_records_failed_key(monkeypatch):
     failed: list[tuple[str, str, str]] = []
+    events: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         bhavcopy_parser.store,
@@ -549,6 +2390,7 @@ def test_bhavcopy_parser_records_failed_key(monkeypatch):
         "mark_failed",
         lambda source_prefix, object_key, error_message: failed.append((source_prefix, object_key, error_message)),
     )
+    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
 
     class DummyRedis:
         def sadd(self, *_args, **_kwargs):
@@ -559,13 +2401,19 @@ def test_bhavcopy_parser_records_failed_key(monkeypatch):
 
     monkeypatch.setattr(bhavcopy_parser, "rop", DummyRedis())
 
-    bhavcopy_parser.run_parser()
+    result = bhavcopy_parser.run_parser()
 
-    assert failed == [("bhavcopy", "bhavcopy/bhavcopy_2015-01-16.zip", "RuntimeError: broken nested zip")]
+    assert failed == [("bhavcopy", "bhavcopy/bhavcopy_2015-01-16.zip", "classification=parser_bug; RuntimeError: broken nested zip")]
+    assert result["failed_count"] == 1
+    assert result["failed_classifications"] == {"parser_bug": 1}
+    assert result["failed_keys"] == ["bhavcopy/bhavcopy_2015-01-16.zip"]
+    assert result["state_advanced"] is False
+    assert events[0]["fallback_type"] == "nse_bhavcopy_parse_failed"
+    assert events[0]["metadata"]["classification"] == "parser_bug"
 
 
 def test_bhavcopy_parser_marks_empty_like_key_processed(monkeypatch):
-    processed: list[tuple[str, str]] = []
+    processed: list[tuple[str, str, str]] = []
 
     monkeypatch.setattr(
         bhavcopy_parser.store,
@@ -581,7 +2429,7 @@ def test_bhavcopy_parser_marks_empty_like_key_processed(monkeypatch):
     monkeypatch.setattr(
         bhavcopy_parser,
         "mark_processed",
-        lambda source_prefix, object_key, **_kwargs: processed.append((source_prefix, object_key)),
+        lambda source_prefix, object_key, status="processed", **_kwargs: processed.append((source_prefix, object_key, status)),
     )
 
     class DummyRedis:
@@ -593,9 +2441,52 @@ def test_bhavcopy_parser_marks_empty_like_key_processed(monkeypatch):
 
     monkeypatch.setattr(bhavcopy_parser, "rop", DummyRedis())
 
-    bhavcopy_parser.run_parser()
+    result = bhavcopy_parser.run_parser()
 
-    assert processed == [("bhavcopy", "bhavcopy/bhavcopy_2015-10-18.zip")]
+    assert processed == [("bhavcopy", "bhavcopy/bhavcopy_2015-10-18.zip", bhavcopy_parser.EMPTY_VALID_STATUS)]
+    assert result["empty_processed_count"] == 1
+    assert result["empty_keys"] == ["bhavcopy/bhavcopy_2015-10-18.zip"]
+    assert result["rows_written"] == 1
+    assert result["state_advanced"] is True
+
+
+def test_bhavcopy_parser_treats_empty_valid_source_as_completed(monkeypatch):
+    processed_statuses: list[str] = []
+
+    monkeypatch.setattr(
+        bhavcopy_parser.store,
+        "list_files",
+        lambda prefix: iter(["bhavcopy/bhavcopy_2015-10-18.zip"]),
+    )
+    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "get_processed_keys",
+        lambda _source_prefix, status="processed": {"bhavcopy/bhavcopy_2015-10-18.zip"} if status == bhavcopy_parser.EMPTY_VALID_STATUS else set(),
+    )
+    monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(bhavcopy_parser, "load_existing_ohlcv_dates", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(bhavcopy_parser.store, "get_as_temp_file", lambda key: (_ for _ in ()).throw(AssertionError("completed empty key should not be fetched")))
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "mark_processed",
+        lambda source_prefix, object_key, status="processed", **_kwargs: processed_statuses.append(status),
+    )
+
+    class DummyRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("completed empty key should not hit redis")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(bhavcopy_parser, "rop", DummyRedis())
+
+    result = bhavcopy_parser.run_parser()
+
+    assert processed_statuses == []
+    assert result["already_processed_count"] == 1
+    assert result["empty_processed_count"] == 0
 
 
 def test_bhavcopy_parser_raises_on_bad_zip(monkeypatch, tmp_path):
@@ -608,6 +2499,90 @@ def test_bhavcopy_parser_raises_on_bad_zip(monkeypatch, tmp_path):
         assert "bad_bhavcopy_zip" in str(exc)
     else:
         raise AssertionError("expected bad zip to raise RuntimeError")
+
+
+def test_bhavcopy_parser_failure_classifier_distinguishes_retryable_and_schema_errors():
+    assert bhavcopy_parser.classify_bhavcopy_parse_failure(RuntimeError("bad_bhavcopy_zip:bad.zip")) == "bad_file_retryable"
+    assert bhavcopy_parser.classify_bhavcopy_parse_failure(KeyError("TradDt")) == "schema_changed"
+    assert bhavcopy_parser.classify_bhavcopy_parse_failure(ValueError("Length mismatch: Expected axis has 4 elements")) == "schema_changed"
+    assert bhavcopy_parser.classify_bhavcopy_parse_failure(RuntimeError("unexpected parser branch")) == "parser_bug"
+
+
+def test_bhavcopy_parser_records_invalid_key_date(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert bhavcopy_parser.extract_bhavcopy_date_from_key("bhavcopy/not-a-date.zip") is None
+
+    assert events[0]["fallback_type"] == "nse_bhavcopy_key_date_parse_failed"
+    assert events[0]["source"] == "bhavcopy/not-a-date.zip"
+
+
+def test_bhavcopy_parser_records_empty_zip_stat_failure(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        bhavcopy_parser.os.path,
+        "getsize",
+        lambda path: (_ for _ in ()).throw(OSError("stat failed")),
+    )
+
+    assert bhavcopy_parser.is_empty_zip("/tmp/missing.zip") is False
+
+    assert events[0]["fallback_type"] == "nse_bhavcopy_zip_stat_failed"
+    assert events[0]["source"] == "/tmp/missing.zip"
+
+
+def test_bhavcopy_parser_records_circuit_hit_date_fallback(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    path = tmp_path / "bh01012026.csv"
+    path.write_text("SYMBOL,SERIES,IGNORED,CIRCUIT\nABC,EQ,x,UPPER\n", encoding="utf-8")
+    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda *_args, **_kwargs: None)
+
+    frame = bhavcopy_parser.parse_circuit_hit(str(path))
+
+    assert frame["date"].iloc[0] == pd.Timestamp("2026-01-01")
+    assert events[0]["fallback_type"] == "nse_bhavcopy_circuit_hit_date_fallback"
+    assert events[0]["metadata"]["fallback_format"] == "bh%d%m%Y.csv"
+
+
+def test_bhavcopy_parser_records_inner_file_parse_failure(monkeypatch, tmp_path):
+    import zipfile
+
+    events: list[dict[str, object]] = []
+    zip_path = tmp_path / "bhavcopy_2026-01-01.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("C_CATG_BAD.TXT", "bad")
+    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "parse_catg",
+        lambda path: (_ for _ in ()).throw(ValueError("bad catg schema")),
+    )
+
+    with pytest.raises(RuntimeError, match="catg:C_CATG_BAD.TXT"):
+        bhavcopy_parser.unzip_and_process(str(zip_path))
+
+    assert events[0]["fallback_type"] == "nse_bhavcopy_file_parse_failed"
+    assert events[0]["metadata"]["label"] == "catg"
+
+
+def test_bhavcopy_parser_records_nested_bad_zip(monkeypatch, tmp_path):
+    import zipfile
+
+    events: list[dict[str, object]] = []
+    zip_path = tmp_path / "bhavcopy_2026-01-01.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("cm_bad.zip", "not a zip")
+    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="nested_cm_zip:cm_bad.zip"):
+        bhavcopy_parser.unzip_and_process(str(zip_path))
+
+    assert events[0]["fallback_type"] == "nse_bhavcopy_nested_zip_failed"
+    assert events[0]["metadata"]["nested_type"] == "cm"
 
 
 def test_bhavcopy_downloader_uses_s3_keys_as_source_of_truth(monkeypatch):
@@ -636,6 +2611,16 @@ def test_bhavcopy_downloader_excludes_failed_keys_from_downloaded_set(monkeypatc
     assert bhavcopy_downloader.load_downloaded_dates_from_store() == {"2015-01-17"}
 
 
+def test_bhavcopy_downloader_records_malformed_store_key(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(bhavcopy_downloader, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert bhavcopy_downloader.extract_downloaded_date_from_key("bhavcopy/bhavcopy_bad.zip") is None
+
+    assert events[0]["fallback_type"] == "nse_bhavcopy_download_key_date_parse_failed"
+    assert events[0]["source"] == "bhavcopy/bhavcopy_bad.zip"
+
+
 def test_bhavcopy_parser_only_considers_last_year_keys():
     today = datetime(2026, 4, 13)
 
@@ -655,6 +2640,27 @@ def test_indices_downloader_uses_s3_keys_as_source_of_truth(monkeypatch):
     assert indices_downloader.load_downloaded_dates_from_store() == {"2015-01-16"}
 
 
+def test_indices_downloader_records_malformed_store_key(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(indices_downloader, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert indices_downloader.extract_downloaded_date_from_key("indices/indices_bad.zip") is None
+
+    assert events[0]["fallback_type"] == "nse_indices_download_key_date_parse_failed"
+    assert events[0]["source"] == "indices/indices_bad.zip"
+
+
+def test_indices_downloader_records_malformed_downloaded_member(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(indices_downloader, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    latest = indices_downloader.latest_downloaded_date({"2026-06-10", "bad-date"})
+
+    assert latest == datetime(2026, 6, 10)
+    assert events[0]["fallback_type"] == "nse_indices_downloaded_member_parse_failed"
+    assert events[0]["source"] == "bad-date"
+
+
 def test_indices_parser_only_considers_last_year_keys():
     today = datetime(2026, 4, 13)
 
@@ -666,6 +2672,7 @@ def test_indices_parser_only_considers_last_year_keys():
 
 def test_indices_parser_records_failed_key(monkeypatch):
     failed: list[tuple[str, str, str]] = []
+    events: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         indices_downloader.store,
@@ -680,6 +2687,7 @@ def test_indices_parser_records_failed_key(monkeypatch):
     monkeypatch.setattr(indices_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(indices_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(indices_parser.store, "get_as_temp_file", lambda key: "/tmp/failing_indices.zip")
+    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key: True)
     monkeypatch.setattr(
         indices_parser,
         "unzip_and_process",
@@ -690,6 +2698,7 @@ def test_indices_parser_records_failed_key(monkeypatch):
         "mark_failed",
         lambda source_prefix, object_key, error_message: failed.append((source_prefix, object_key, error_message)),
     )
+    monkeypatch.setattr(indices_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
 
     class DummyRedis:
         def sadd(self, *_args, **_kwargs):
@@ -700,21 +2709,160 @@ def test_indices_parser_records_failed_key(monkeypatch):
 
     monkeypatch.setattr(indices_parser, "rop", DummyRedis())
 
-    # mirror module __main__ flow
-    parsed_files = indices_parser.get_processed_keys(indices_parser.SOURCE_PREFIX)
-    for f in indices_parser.store.list_files("indices"):
-        if f in parsed_files:
-            continue
-        file_path = indices_parser.store.get_as_temp_file(f)
-        try:
-            parsed = indices_parser.unzip_and_process(file_path)
-        except Exception as exc:
-            indices_parser.mark_failed(indices_parser.SOURCE_PREFIX, f, f"{exc.__class__.__name__}: {exc}")
-            continue
-        if parsed:
-            raise AssertionError("unexpected parsed success")
+    result = indices_parser.run_parser()
 
-    assert failed == [("indices", "indices/indices_2015-01-16.zip", "RuntimeError: bad indices zip contents")]
+    assert failed == [("indices", "indices/indices_2015-01-16.zip", "classification=parser_bug; RuntimeError: bad indices zip contents")]
+    assert result["files_considered"] == 1
+    assert result["failed_count"] == 1
+    assert result["failed_classifications"] == {"parser_bug": 1}
+    assert result["failed_keys"] == ["indices/indices_2015-01-16.zip"]
+    assert result["state_advanced"] is False
+    assert events[0]["fallback_type"] == "nse_indices_parse_failed"
+    assert events[0]["metadata"]["classification"] == "parser_bug"
+
+
+def test_indices_parser_marks_empty_valid_source_processed(monkeypatch):
+    processed: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(indices_parser.store, "list_files", lambda prefix: iter(["indices/indices_2015-01-16.zip"]))
+    monkeypatch.setattr(indices_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
+    monkeypatch.setattr(indices_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(indices_parser.store, "get_as_temp_file", lambda key: "/tmp/empty_indices.zip")
+    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(indices_parser, "unzip_and_process", lambda path: {"status": indices_parser.EMPTY_VALID_STATUS, "rows": 0})
+    monkeypatch.setattr(
+        indices_parser,
+        "mark_processed",
+        lambda source_prefix, object_key, status="processed", **_kwargs: processed.append((source_prefix, object_key, status)),
+    )
+
+    class DummyRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("empty valid indices key should not mark redis success")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(indices_parser, "rop", DummyRedis())
+
+    result = indices_parser.run_parser()
+
+    assert processed == [("indices", "indices/indices_2015-01-16.zip", indices_parser.EMPTY_VALID_STATUS)]
+    assert result["empty_or_incomplete_count"] == 1
+    assert result["empty_valid_count"] == 1
+    assert result["failed_count"] == 0
+    assert result["rows_written"] == 1
+    assert result["state_advanced"] is True
+
+
+def test_indices_parser_treats_empty_valid_source_as_completed(monkeypatch):
+    monkeypatch.setattr(indices_parser.store, "list_files", lambda prefix: iter(["indices/indices_2015-01-16.zip"]))
+    monkeypatch.setattr(
+        indices_parser,
+        "get_processed_keys",
+        lambda _source_prefix, status="processed": {"indices/indices_2015-01-16.zip"} if status == indices_parser.EMPTY_VALID_STATUS else set(),
+    )
+    monkeypatch.setattr(indices_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(indices_parser.store, "get_as_temp_file", lambda key: (_ for _ in ()).throw(AssertionError("completed empty key should not be fetched")))
+    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key: True)
+
+    class DummyRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("completed empty key should not mark redis")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(indices_parser, "rop", DummyRedis())
+
+    result = indices_parser.run_parser()
+
+    assert result["already_processed_count"] == 1
+    assert result["empty_or_incomplete_count"] == 0
+    assert result["state_advanced"] is False
+
+
+def test_indices_parser_failure_classifier_distinguishes_retryable_and_schema_errors():
+    assert indices_parser.classify_indices_parse_failure(RuntimeError("bad_indices_zip:bad.zip")) == "bad_file_retryable"
+    assert indices_parser.classify_indices_parse_failure(KeyError("Index Name")) == "schema_changed"
+    assert indices_parser.classify_indices_parse_failure(ValueError("Length mismatch: Expected axis has 4 elements")) == "schema_changed"
+    assert indices_parser.classify_indices_parse_failure(RuntimeError("unexpected parser branch")) == "parser_bug"
+
+
+def test_indices_parser_raises_on_bad_zip(tmp_path):
+    bad_zip = tmp_path / "indices_bad.zip"
+    bad_zip.write_text("not a zip", encoding="utf-8")
+
+    try:
+        indices_parser.unzip_and_process(str(bad_zip))
+    except RuntimeError as exc:
+        assert "bad_indices_zip" in str(exc)
+    else:
+        raise AssertionError("expected bad indices zip to raise RuntimeError")
+
+
+def test_indices_parser_records_invalid_key_date(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(indices_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert indices_parser.extract_indices_date_from_key("indices/not-a-date.zip") is None
+
+    assert events[0]["fallback_type"] == "nse_indices_key_date_parse_failed"
+    assert events[0]["source"] == "indices/not-a-date.zip"
+
+
+def test_indices_parser_records_empty_file_stat_failure(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(indices_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        indices_parser.os.path,
+        "getsize",
+        lambda path: (_ for _ in ()).throw(OSError("stat failed")),
+    )
+
+    assert indices_parser.is_empty_file("/tmp/missing_indices.zip") is False
+
+    assert events[0]["fallback_type"] == "nse_indices_zip_stat_failed"
+    assert events[0]["source"] == "/tmp/missing_indices.zip"
+
+
+def test_indices_parser_records_date_fallback(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    csv_path = tmp_path / "ind_close_01012026.csv"
+    csv_path.write_text(
+        "index,date,open,high,low,close,points,percent,volume,turnover,pe,pb,div\n"
+        "Nifty 50,01/01/2026,1,2,1,2,0.1,1,100,10,20,3,1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(indices_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(indices_parser, "upsert_to_db", lambda *_args, **_kwargs: None)
+
+    frame = indices_parser.parse_indices_close(str(csv_path))
+
+    assert frame["date"].iloc[0] == pd.Timestamp("2026-01-01")
+    assert events[0]["fallback_type"] == "nse_indices_date_fallback"
+    assert events[0]["metadata"]["fallback_format"] == "%d/%m/%Y"
+
+
+def test_indices_parser_records_inner_file_parse_failure(monkeypatch, tmp_path):
+    import zipfile
+
+    events: list[dict[str, object]] = []
+    zip_path = tmp_path / "indices_2026-01-01.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("ind_close_bad.csv", "bad")
+    monkeypatch.setattr(indices_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        indices_parser,
+        "parse_indices_close",
+        lambda path: (_ for _ in ()).throw(ValueError("bad indices schema")),
+    )
+
+    with pytest.raises(ValueError, match="bad indices schema"):
+        indices_parser.unzip_and_process(str(zip_path))
+
+    assert events[0]["fallback_type"] == "nse_indices_file_parse_failed"
+    assert events[0]["metadata"]["filename"] == "ind_close_bad.csv"
 
 
 def test_offmarket_downloader_uses_s3_ranges_as_source_of_truth(monkeypatch):
@@ -738,6 +2886,18 @@ def test_offmarket_downloader_uses_s3_ranges_as_source_of_truth(monkeypatch):
     assert offmarket.load_downloaded_dates_from_store("bulk_deals") == {"2015-01-05"}
 
 
+def test_offmarket_downloader_records_malformed_download_key(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(offmarket, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    dates = offmarket.extract_downloaded_dates_from_key("nsedeals/block_deals_bad.csv", "block_deals")
+
+    assert dates == set()
+    assert events[0]["fallback_type"] == "nse_offmarket_download_key_date_parse_failed"
+    assert events[0]["source"] == "nsedeals/block_deals_bad.csv"
+    assert events[0]["metadata"]["dtype"] == "block_deals"
+
+
 def test_recent_events_always_refreshes_today(monkeypatch):
     calls: list[str] = []
 
@@ -757,8 +2917,10 @@ def test_recent_events_always_refreshes_today(monkeypatch):
     monkeypatch.setattr(
         recent_events,
         "dowload_events",
-        lambda playwright, formatted_date, rop: calls.append(formatted_date),
+        lambda playwright, formatted_date, rop: calls.append(formatted_date) or {"rows": 1},
     )
+    monkeypatch.setattr(recent_events, "persist_sync_state", lambda **_kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["data.nseindia.recent_events"])
 
     recent_events.main()
 
@@ -769,6 +2931,25 @@ def test_recent_events_date_parser_falls_back_to_abbreviated_month():
     dates = recent_events.parse_event_dates(pd.Series(["01-June-2026", "01-Jun-2026"]))
 
     assert dates.tolist() == [pd.Timestamp("2026-06-01"), pd.Timestamp("2026-06-01")]
+
+
+def test_recent_events_records_mixed_parser_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    original_to_datetime = recent_events.pd.to_datetime
+
+    def fake_to_datetime(values, *args, **kwargs):
+        if kwargs.get("format") == "mixed":
+            raise ValueError("mixed parser unavailable")
+        return original_to_datetime(values, *args, **kwargs)
+
+    monkeypatch.setattr(recent_events, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(recent_events.pd, "to_datetime", fake_to_datetime)
+
+    dates = recent_events.parse_event_dates(pd.Series(["13/06/2026"]))
+
+    assert dates.tolist() == [pd.Timestamp("2026-06-13")]
+    assert events[0]["fallback_type"] == "nse_recent_events_mixed_date_parser_failed"
+    assert events[0]["metadata"]["fallback_parser"] == "pd.to_datetime(dayfirst=True)"
 
 
 def test_cpi_sync_uses_db_months_only(monkeypatch):
@@ -787,6 +2968,70 @@ def test_fpi_latest_downloaded_date_uses_db_anchor_only(monkeypatch):
     monkeypatch.setattr(fpi.futils, "downloaded_for", lambda today: (False, date(2026, 4, 10)))
 
     assert fpi.latest_downloaded_date(date(2026, 4, 11)) == date(2026, 4, 10)
+
+
+def test_fpi_update_exports_monthly_run_state(monkeypatch):
+    monkeypatch.setattr(fpi, "latest_downloaded_date", lambda today: date(2026, 1, 31))
+
+    def fake_downloaded_for(target_date):
+        return target_date == date(2026, 2, 28), None
+
+    monkeypatch.setattr(fpi.futils, "downloaded_for", fake_downloaded_for)
+    monkeypatch.setattr(fpi, "get_fpi_data", lambda rdate: {"date": rdate.isoformat(), "rows": 5})
+
+    state = fpi.update_fpi_data(today=date(2026, 3, 15))
+
+    assert state["source"] == "data.nsdl.fpi"
+    assert state["month_count"] == 3
+    assert state["skipped_month_count"] == 1
+    assert state["downloaded_month_count"] == 2
+    assert state["rows_written"] == 10
+    assert state["attempt_count"] == 2
+    assert state["state_advanced"] is True
+
+
+def test_fpi_update_records_local_fallback_for_failed_month(monkeypatch):
+    events = []
+    monkeypatch.setattr(fpi, "latest_downloaded_date", lambda today: date(2026, 1, 31))
+    monkeypatch.setattr(fpi.futils, "downloaded_for", lambda target_date: (False, None))
+    monkeypatch.setattr(fpi, "get_fpi_data", lambda rdate: (_ for _ in ()).throw(RuntimeError("nsdl down")))
+    monkeypatch.setattr(fpi, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    state = fpi.update_fpi_data(today=date(2026, 2, 28))
+
+    assert state["source"] == "data.nsdl.fpi"
+    assert state["failed_month_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["source_unavailable_count"] == 1
+    assert state["failed_months"][0]["date"] == "2026-01-31"
+    assert len(events) == 1
+    assert events[0]["module"] == "data.nsdl.fpi"
+    assert events[0]["source"] == "nsdl_fpi"
+    assert events[0]["fallback_type"] == "nsdl_fpi_month_download_failed"
+    assert events[0]["metadata"] == {"target_date": "2026-01-31", "year": 2026, "month": 1}
+
+
+def test_fpi_utils_infer_year_records_skipped_bad_date_fallback(monkeypatch):
+    from data.nsdl import fpi_utils
+
+    events = []
+    frame = pd.DataFrame(
+        {
+            "date": ["01-Apr-2026", "bad-date", "Total for April"],
+            "instrument": ["Equity", "Equity", "Equity"],
+        }
+    )
+    monkeypatch.setattr(fpi_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    year = fpi_utils._infer_year(frame, 2, 4)
+
+    assert year == 2026
+    assert len(events) == 1
+    assert events[0]["module"] == "data.nsdl.fpi_utils"
+    assert events[0]["source"] == "nsdl_fpi_month_year_inference"
+    assert events[0]["fallback_type"] == "nsdl_fpi_year_infer_date_parse_failed"
+    assert events[0]["metadata"]["direction"] == "backward"
+    assert events[0]["metadata"]["raw_date"] == "bad-date"
 
 
 def test_exchange_events_normalize_corporate_actions_handles_missing_side():
@@ -829,6 +3074,19 @@ def test_exchange_events_normalize_corporate_actions_uses_action_type():
     assert "source=bc" in out.iloc[0]["event_summary"]
 
 
+def test_exchange_events_table_exists_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(exchange_events, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("catalog timeout")))
+    monkeypatch.setattr(exchange_events, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert exchange_events.table_exists(exchange_events.TABLE_NAME) is False
+
+    assert events[0]["module"] == "advisory.exchange_events"
+    assert events[0]["source"] == exchange_events.TABLE_NAME
+    assert events[0]["fallback_type"] == "exchange_events_table_lookup_failed"
+    assert events[0]["metadata"] == {"table_name": exchange_events.TABLE_NAME}
+
+
 def test_exchange_events_repair_missing_event_types_dry_run(monkeypatch):
     queries: list[str] = []
 
@@ -854,6 +3112,7 @@ def test_exchange_events_repair_missing_event_types_dry_run(monkeypatch):
 
 def test_exchange_events_repair_missing_event_types_apply(monkeypatch):
     executed: list[str] = []
+    operation_names: list[str] = []
 
     class FakeCursor:
         rowcount = 2
@@ -872,6 +3131,11 @@ def test_exchange_events_repair_missing_event_types_apply(monkeypatch):
     query_counts = iter([pd.DataFrame([{"matched_rows": 2}]), pd.DataFrame([{"matched_rows": 4}]), pd.DataFrame([{"matched_rows": 10}])])
     monkeypatch.setattr(exchange_events, "sql_to_df", lambda *args, **kwargs: next(query_counts))
     monkeypatch.setattr(exchange_events, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(
+        exchange_events,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
 
     result = exchange_events.repair_missing_event_types(dry_run=False)
 
@@ -880,6 +3144,7 @@ def test_exchange_events_repair_missing_event_types_apply(monkeypatch):
     assert result["short_selling_rows"] == 4
     assert result["unclassified_rows"] == 4
     assert result["updated_rows"] == 6
+    assert operation_names == ["exchange_events:repair_missing_event_types"]
     assert "nse_legacy_deal" in executed[0]
     assert "LEGACY_DEAL" in executed[0]
     assert "nse_short_selling" in executed[1]
@@ -1011,6 +3276,172 @@ def test_wpi_sync_uses_db_completion(monkeypatch):
     assert downloaded == ["B1"]
     assert summary["skipped_count"] == 1
     assert summary["downloaded_count"] == 1
+
+
+def test_wpi_sync_exports_retry_counters(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        wpi,
+        "fetch_wpi_catalog",
+        lambda year: (
+            "session",
+            {},
+            [["A1", "(A). FOOD ARTICLES", "(A). FOOD ARTICLES"]],
+        ),
+    )
+    completed_sets = [set(), {"A1"}]
+    monkeypatch.setattr(wpi, "load_completed_items", lambda year, *, expected_months: completed_sets.pop(0) if completed_sets else {"A1"})
+    calls = {"download": 0}
+
+    def fake_download(**kwargs):
+        calls["download"] += 1
+        if calls["download"] == 1:
+            raise ValueError("temporary WPI table miss")
+        return pd.DataFrame(
+            [{"date": pd.Timestamp("2026-02-28"), "value": 1.0, "cname": kwargs["item"][0], "name": kwargs["item"][1]}]
+        )
+
+    monkeypatch.setattr(wpi, "download_wpi_item", fake_download)
+    monkeypatch.setattr(wpi, "persist_wpi_item", lambda df, **kwargs: None)
+    monkeypatch.setattr(wpi, "bootstrap_wpi_session", lambda: ("fresh-session", {}))
+    monkeypatch.setattr(wpi, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(wpi.time, "sleep", lambda *_args, **_kwargs: None)
+
+    summary = wpi.sync_wpi_for_year(2026, today=date(2026, 3, 25))
+
+    assert summary["downloaded_count"] == 1
+    assert summary["attempt_count"] == 2
+    assert summary["retry_count"] == 1
+    assert summary["failed_attempt_count"] == 1
+    assert summary["source_unavailable_count"] == 0
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.eaindustry.wpi"
+    assert event["fallback_type"] == "wpi_item_download_attempt_failed"
+    assert event["source"] == "eaindustry_wpi"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], ValueError)
+    assert event["metadata"]["year"] == 2026
+    assert event["metadata"]["cname"] == "A1"
+    assert event["metadata"]["attempt"] == 1
+    assert event["metadata"]["max_attempts"] == wpi.MAX_ITEM_ATTEMPTS
+
+
+def test_wpi_run_exports_runner_state(monkeypatch, capsys):
+    monkeypatch.setattr(
+        wpi,
+        "sync_wpi",
+        lambda: [
+            {
+                "year": 2026,
+                "status": "partial",
+                "item_count": 2,
+                "downloaded_count": 1,
+                "skipped_count": 0,
+                "failed_count": 1,
+                "attempt_count": 6,
+                "retry_count": 4,
+                "failed_attempt_count": 5,
+                "failed_items": [{"cname": "B1", "name": "(B). NON-FOOD ARTICLES", "error": "timeout"}],
+            }
+        ],
+    )
+
+    assert wpi.run() == 0
+    capsys.readouterr()
+
+    state = wpi.STOCKEY_RUN_STATE
+    assert state["source"] == "data.eaindustry.wpi"
+    assert state["rows"] == 1
+    assert state["rows_read"] == 2
+    assert state["retry_count"] == 4
+    assert state["failed_attempt_count"] == 5
+    assert state["source_unavailable_count"] == 1
+    assert state["failed_items"][0]["year"] == 2026
+    assert state["state_advanced"] is True
+
+
+def test_cpi_sync_returns_noop_run_state(monkeypatch):
+    monkeypatch.setattr(cpi, "load_existing_cpi_months", lambda: {date(2026, 1, 1), date(2026, 2, 1)})
+    monkeypatch.setattr(cpi, "get_db_max_date", lambda *args, **kwargs: pd.Timestamp("2026-02-01"))
+
+    state = cpi.sync_cpi_data(from_date=date(2026, 1, 1), to_date=date(2026, 2, 1))
+
+    assert state["source"] == "data.mospi.cpi"
+    assert state["pending_month_count"] == 0
+    assert state["attempt_count"] == 0
+    assert state["state_advanced"] is False
+
+
+def test_cpi_sync_exports_retry_success_run_state(monkeypatch):
+    monkeypatch.setattr(cpi, "load_existing_cpi_months", lambda: set())
+    monkeypatch.setattr(cpi, "get_db_max_date", lambda *args, **kwargs: pd.Timestamp("2025-12-01"))
+    monkeypatch.setattr(cpi.time, "sleep", lambda *_args, **_kwargs: None)
+    calls = {"download": 0}
+
+    def fake_download(month_start):
+        calls["download"] += 1
+        if calls["download"] == 1:
+            raise ValueError("temporary CPI timeout")
+        return pd.DataFrame([{"cpi_for_month": pd.Timestamp(month_start), "state": "ALL India"}])
+
+    monkeypatch.setattr(cpi, "download_cpi_month", fake_download)
+
+    state = cpi.sync_cpi_data(from_date=date(2026, 1, 1), to_date=date(2026, 1, 1))
+
+    assert state["pending_month_count"] == 1
+    assert state["completed_month_count"] == 1
+    assert state["attempt_count"] == 2
+    assert state["retry_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["rows_written"] == 1
+    assert state["state_advanced"] is True
+
+
+def test_cpi_main_exports_failed_month_run_state(monkeypatch, capsys):
+    events = []
+    monkeypatch.setattr(cpi, "parse_args", lambda: argparse.Namespace(from_date=date(2026, 1, 1), to_date=date(2026, 1, 1), force=False))
+    monkeypatch.setattr(cpi, "load_existing_cpi_months", lambda: set())
+    monkeypatch.setattr(cpi, "get_db_max_date", lambda *args, **kwargs: pd.Timestamp("2025-12-01"))
+    monkeypatch.setattr(cpi.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cpi, "download_cpi_month", lambda month_start: (_ for _ in ()).throw(ValueError("api down")))
+    monkeypatch.setattr(cpi, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    assert cpi.main() == 0
+    capsys.readouterr()
+
+    state = cpi.STOCKEY_RUN_STATE
+    assert state["source"] == "data.mospi.cpi"
+    assert state["failed_month_count"] == 1
+    assert state["attempt_count"] == cpi.MONTH_RETRY_ATTEMPTS
+    assert state["retry_count"] == cpi.MONTH_RETRY_ATTEMPTS - 1
+    assert state["failed_attempt_count"] == cpi.MONTH_RETRY_ATTEMPTS
+    assert state["source_unavailable_count"] == 1
+    assert state["failed_months"][0]["month"] == "2026-01"
+    assert state["state_advanced"] is False
+    assert len(events) == cpi.MONTH_RETRY_ATTEMPTS
+    assert {event["fallback_type"] for event in events} == {"mospi_cpi_month_download_failed"}
+    assert {event["source"] for event in events} == {"mospi_cpi:2026-01"}
+    assert [event["metadata"]["attempt"] for event in events] == list(range(1, cpi.MONTH_RETRY_ATTEMPTS + 1))
+    assert events[-1]["metadata"] == {
+        "month": "2026-01",
+        "attempt": cpi.MONTH_RETRY_ATTEMPTS,
+        "max_attempts": cpi.MONTH_RETRY_ATTEMPTS,
+        "is_final_attempt": True,
+    }
+    assert all(isinstance(event["error"], ValueError) for event in events)
+
+
+def test_cpi_derive_group_code_records_parse_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(cpi, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert cpi.derive_group_code("Food and beverages") == 0.0
+    assert events[0]["module"] == "data.mospi.cpi"
+    assert events[0]["source"] == "cpi_group_code"
+    assert events[0]["fallback_type"] == "cpi_group_code_parse_failed"
+    assert events[0]["metadata"]["value_excerpt"] == "Food and beverages"
 
 
 def test_portfolio_engine_keeps_only_highest_priority_symbol_owner(monkeypatch):
@@ -1147,6 +3578,384 @@ def test_portfolio_engine_overlap_limit_for_reason():
     assert portfolio_engine.overlap_limit_for_reason("symbol_only", config) == 1
 
 
+def test_position_lifecycle_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(position_lifecycle, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    position_lifecycle.ensure_lifecycle_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == position_lifecycle.LIFECYCLE_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [
+        position_lifecycle.LIFECYCLE_TABLE,
+        position_lifecycle.REBALANCE_TABLE,
+        position_lifecycle.POLICY_CHANGES_TABLE,
+    ]
+    assert any(position_lifecycle.LIFECYCLE_TABLE in statement for statement in calls[0]["statements"])
+    assert any(position_lifecycle.REBALANCE_TABLE in statement for statement in calls[0]["statements"])
+    assert any(position_lifecycle.POLICY_CHANGES_TABLE in statement for statement in calls[0]["statements"])
+    assert any("exit_event_rules_json" in statement for statement in calls[0]["statements"])
+    assert any("recommended_target_price" in statement for statement in calls[0]["statements"])
+
+
+def test_position_lifecycle_persist_outputs_cleanup_uses_retryable_operations(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+    upserts: list[tuple[str, int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    lifecycle_df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-01T10:00:00Z"),
+                "entry_date": pd.Timestamp("2026-06-01T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-06-10T10:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "abc",
+                "unique_id": "u1",
+                "entry_price": "100.5",
+                "current_price": "105.5",
+                "days_held": "9",
+                "next_action": "hold",
+            }
+        ]
+    )
+    actions_df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-01T10:00:00Z"),
+                "load_ts": pd.Timestamp("2026-06-10T10:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "abc",
+                "unique_id": "u1",
+                "suggested_action": "tighten_stop",
+                "reference_price": "105.5",
+                "recommended_stop_price": "101.0",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(position_lifecycle, "ensure_lifecycle_tables", lambda: None)
+    monkeypatch.setattr(position_lifecycle, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(position_lifecycle, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(
+        position_lifecycle,
+        "upsert_to_db",
+        lambda frame, table, **_kwargs: upserts.append((table, len(frame))),
+    )
+    monkeypatch.setattr(position_lifecycle, "_trace_lifecycle_rows", lambda _frame: None)
+    monkeypatch.setattr(position_lifecycle, "_trace_rebalance_rows", lambda _frame: None)
+    monkeypatch.setattr(position_lifecycle, "apply_missing_target_baselines", lambda _frame: 0)
+    monkeypatch.setattr(position_lifecycle, "apply_tightened_stop_baseline", lambda _frame: 0)
+
+    position_lifecycle.persist_outputs(lifecycle_df, actions_df)
+
+    assert operation_names == [
+        "position_lifecycle:delete_existing_lifecycle_rows",
+        "position_lifecycle:delete_existing_rebalance_rows",
+    ]
+    assert any(f"DELETE FROM {position_lifecycle.LIFECYCLE_TABLE}" in query for query, _params in executed)
+    assert any(f"DELETE FROM {position_lifecycle.REBALANCE_TABLE}" in query for query, _params in executed)
+    assert {params[1] for _query, params in executed} == {"ABC"}
+    assert upserts == [
+        (position_lifecycle.LIFECYCLE_TABLE, 1),
+        (position_lifecycle.REBALANCE_TABLE, 1),
+    ]
+
+
+def test_position_lifecycle_persist_outputs_applies_missing_target_baselines(monkeypatch):
+    target_calls: list[pd.DataFrame] = []
+    stop_calls: list[pd.DataFrame] = []
+
+    class FakeCursor:
+        def execute(self, *_args, **_kwargs):
+            return None
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    lifecycle_df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-01T10:00:00Z"),
+                "entry_date": pd.Timestamp("2026-06-01T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-06-10T10:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "abc",
+                "unique_id": "u1",
+                "entry_price": "100.5",
+                "current_price": "105.5",
+                "target_price": "125.0",
+                "next_action": "hold",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(position_lifecycle, "ensure_lifecycle_tables", lambda: None)
+    monkeypatch.setattr(position_lifecycle, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(position_lifecycle, "execute_db_operation", lambda operation, **_kwargs: operation())
+    monkeypatch.setattr(position_lifecycle, "upsert_to_db", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(position_lifecycle, "_trace_lifecycle_rows", lambda _frame: None)
+    monkeypatch.setattr(position_lifecycle, "_trace_rebalance_rows", lambda _frame: None)
+    monkeypatch.setattr(position_lifecycle, "apply_missing_target_baselines", lambda frame: target_calls.append(frame.copy()) or 1)
+    monkeypatch.setattr(position_lifecycle, "apply_tightened_stop_baseline", lambda frame: stop_calls.append(frame.copy()) or 0)
+
+    position_lifecycle.persist_outputs(lifecycle_df, pd.DataFrame())
+
+    assert len(target_calls) == 1
+    assert target_calls[0].iloc[0]["symbol"] == "abc"
+    assert float(target_calls[0].iloc[0]["target_price"]) == 125.0
+    assert stop_calls == []
+
+
+def test_position_lifecycle_tightened_stop_baseline_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+
+    class FakeCursor:
+        rowcount = 1
+
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(position_lifecycle, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(position_lifecycle, "execute_db_operation", fake_execute_db_operation)
+
+    actions_df = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-06-01T10:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "abc",
+                "unique_id": "u1",
+                "suggested_action": "tighten_stop",
+                "action_reason": "Trail stop after profit.",
+                "reference_price": "110.0",
+                "recommended_stop_price": "101.0",
+                "recommended_target_price": "125.0",
+                "expected_horizon_days": "42",
+                "stop_price": "99.0",
+                "context_snapshot_json": json.dumps({"pnl_pct": 12.0}),
+            }
+        ]
+    )
+
+    updated = position_lifecycle.apply_tightened_stop_baseline(actions_df)
+
+    assert updated == 1
+    assert operation_names == ["position_lifecycle:apply_tightened_stop_baseline"]
+    assert len(executed) == 2
+    assert f"UPDATE {position_lifecycle.PORTFOLIO_TABLE}" in executed[0][0]
+    assert executed[0][1][3] == "ABC"
+    assert f"INSERT INTO {position_lifecycle.POLICY_CHANGES_TABLE}" in executed[1][0]
+    assert executed[1][1][6] == "stop_tightened"
+    assert executed[1][1][7] == 99.0
+    assert executed[1][1][8] == 101.0
+    assert executed[1][1][10] == "Trail stop after profit."
+    context = json.loads(executed[1][1][11])
+    assert context["previous_stop_price"] == 99.0
+    assert context["recommended_stop_price"] == 101.0
+    assert context["reference_price"] == 110.0
+    assert context["recommended_target_price"] == 125.0
+    assert context["expected_horizon_days"] == 42
+
+
+def test_position_lifecycle_tightened_stop_baseline_skips_non_improving_stop(monkeypatch):
+    operation_names: list[str] = []
+    monkeypatch.setattr(
+        position_lifecycle,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
+
+    actions_df = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-06-01T10:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "suggested_action": "tighten_stop",
+                "recommended_stop_price": "98.0",
+                "stop_price": "99.0",
+            }
+        ]
+    )
+
+    updated = position_lifecycle.apply_tightened_stop_baseline(actions_df)
+
+    assert updated == 0
+    assert operation_names == []
+
+
+def test_position_lifecycle_missing_target_baseline_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+
+    class FakeCursor:
+        rowcount = 1
+
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(position_lifecycle, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(position_lifecycle, "execute_db_operation", fake_execute_db_operation)
+
+    lifecycle_df = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-06-01T10:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "abc",
+                "unique_id": "u1",
+                "target_price": "125.0",
+                "target_basis": "2.50R target from entry risk.",
+                "target_confidence": "0.82",
+                "target_review_date": pd.Timestamp("2026-06-21T00:00:00Z"),
+                "expected_horizon_days": "30",
+                "horizon_end_date": pd.Timestamp("2026-07-01T00:00:00Z"),
+                "next_action": "hold",
+                "next_action_reason": "Thesis intact.",
+                "context_snapshot_json": json.dumps({"entry_price": 100.0}),
+            }
+        ]
+    )
+
+    updated = position_lifecycle.apply_missing_target_baselines(lifecycle_df)
+
+    assert updated == 1
+    assert operation_names == ["position_lifecycle:apply_missing_target_baselines"]
+    assert len(executed) == 2
+    assert f"UPDATE {position_lifecycle.PORTFOLIO_TABLE}" in executed[0][0]
+    assert "target_price IS NULL" in executed[0][0]
+    assert executed[0][1][0] == 125.0
+    assert executed[0][1][7] == "ABC"
+    assert f"INSERT INTO {position_lifecycle.POLICY_CHANGES_TABLE}" in executed[1][0]
+    assert executed[1][1][6] == "target_initialized"
+    assert executed[1][1][7] is None
+    assert executed[1][1][8] == 125.0
+    assert executed[1][1][9] == "hold"
+    context = json.loads(executed[1][1][11])
+    assert context["target_price"] == 125.0
+    assert context["target_basis"] == "2.50R target from entry risk."
+    assert context["expected_horizon_days"] == 30
+    assert context["source_next_action"] == "hold"
+
+
+def test_position_lifecycle_missing_target_baseline_skips_invalid_target(monkeypatch):
+    operation_names: list[str] = []
+    monkeypatch.setattr(
+        position_lifecycle,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
+
+    lifecycle_df = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-06-01T10:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "target_price": None,
+            }
+        ]
+    )
+
+    updated = position_lifecycle.apply_missing_target_baselines(lifecycle_df)
+
+    assert updated == 0
+    assert operation_names == []
+
+
+def test_position_lifecycle_records_table_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(position_lifecycle, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table failed")))
+    monkeypatch.setattr(position_lifecycle, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert position_lifecycle.table_exists(position_lifecycle.PORTFOLIO_TABLE) is False
+    assert events[0]["fallback_type"] == "position_lifecycle_table_lookup_failed"
+    assert events[0]["source"] == position_lifecycle.PORTFOLIO_TABLE
+
+
+def test_position_lifecycle_records_open_orders_load_failure(monkeypatch):
+    events = []
+    calls = {"count": 0}
+
+    def fake_sql_to_df(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pd.DataFrame([{"exists_flag": 1}])
+        raise RuntimeError("orders failed")
+
+    monkeypatch.setattr(position_lifecycle, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(position_lifecycle, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="orders failed"):
+        position_lifecycle.load_open_orders(asof_date=pd.Timestamp("2026-06-01T00:00:00Z"))
+
+    assert events[0]["fallback_type"] == "position_lifecycle_open_orders_load_failed"
+    assert events[0]["source"] == position_lifecycle.PORTFOLIO_TABLE
+
+
+def test_position_lifecycle_records_price_identity_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(position_lifecycle, "resolve_dhan_identity", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("no id")))
+    monkeypatch.setattr(position_lifecycle, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = position_lifecycle.resolve_price_identities(["ABC"])
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "position_lifecycle_price_identity_failed"
+    assert events[0]["source"] == "dhan_scrip_master"
+
+
 def test_position_lifecycle_classification_paths():
     hold_row = pd.Series(
         {
@@ -1240,6 +4049,124 @@ def test_position_lifecycle_time_stop_exits_loser_after_horizon():
     assert "no positive follow-through" in action_reason
 
 
+def test_position_lifecycle_maps_post_entry_technical_states_to_actions():
+    base = {
+        "entry_price": 100.0,
+        "current_price": 112.0,
+        "stop_price": 94.0,
+        "invalidation_price": 90.0,
+        "pnl_pct": 12.0,
+        "days_held": 10,
+        "pass_above_dma_20": True,
+        "pass_above_dma_50": True,
+        "pass_trend_alignment": True,
+        "distribution_days_20d": 1.0,
+        "rs_vs_sector": 0.02,
+        "breakout_extension_pct": 0.0,
+        "support_distance_20d_pct": 3.0,
+        "pullback_volume_dryup_ratio_20d": 1.0,
+        "gap_pct": 0.0,
+    }
+    cases = [
+        (
+            {"pass_above_dma_50": False, "distribution_days_20d": 6.0, "rs_vs_sector": -0.05},
+            "exit_review",
+            "exit_technical_failure",
+            "FULL_EXIT",
+        ),
+        (
+            {"breakout_extension_pct": 16.0},
+            "open",
+            "trim_winner",
+            "PARTIAL_EXIT",
+        ),
+        (
+            {"support_distance_20d_pct": 1.0, "pullback_volume_dryup_ratio_20d": 0.7},
+            "open",
+            "add_on_pullback",
+            "ADD_ON_PULLBACK",
+        ),
+        (
+            {"gap_pct": 9.0, "pass_above_dma_20": False},
+            "exit_review",
+            "exit_emergency",
+            "EMERGENCY_EXIT",
+        ),
+    ]
+
+    for updates, expected_status, expected_action, expected_reason_fragment in cases:
+        status, _, action, action_reason = position_lifecycle.classify_position(
+            pd.Series({**base, **updates}),
+            review_stale_days=20,
+            tighten_stop_gain_pct=20.0,
+            trim_winner_gain_pct=25.0,
+        )
+        assert status == expected_status
+        assert action == expected_action
+        assert expected_reason_fragment in action_reason
+
+
+def test_position_lifecycle_build_outputs_labels_technical_full_exit_condition(monkeypatch):
+    orders = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-04-17T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-04-17T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "ABC",
+                "unique_id": "uid-abc",
+                "portfolio_status": "approved",
+                "approved_allocation_inr": 25000.0,
+                "priority_score": 3.0,
+                "stop_price": 95.0,
+                "invalidation_price": 90.0,
+                "thesis_bucket": "TARGET",
+                "expected_horizon_days": 30,
+            }
+        ]
+    )
+    prices = pd.DataFrame(
+        [
+            {"symbol": "ABC", "date": pd.Timestamp("2026-04-18T00:00:00Z"), "close": 101.0},
+            {"symbol": "ABC", "date": pd.Timestamp("2026-04-20T00:00:00Z"), "close": 104.0},
+        ]
+    )
+    technical = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "pass_above_dma_20": True,
+                "pass_above_dma_50": False,
+                "pass_trend_alignment": False,
+                "distribution_days_20d": 6.0,
+                "rs_vs_sector": -0.05,
+                "breakout_extension_pct": 0.0,
+                "support_distance_20d_pct": 8.0,
+                "pullback_volume_dryup_ratio_20d": 1.2,
+                "gap_pct": 0.0,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(position_lifecycle, "load_open_orders", lambda **_kwargs: orders.copy())
+    monkeypatch.setattr(position_lifecycle, "load_price_points", lambda *_args, **_kwargs: prices.copy())
+    monkeypatch.setattr(position_lifecycle, "load_latest_technical_context", lambda *_args, **_kwargs: technical.copy())
+
+    lifecycle_df, actions_df = position_lifecycle.build_lifecycle_outputs(asof_date=pd.Timestamp("2026-04-20T00:00:00Z"))
+
+    lifecycle_row = lifecycle_df.iloc[0]
+    action_row = actions_df.iloc[0]
+    assert lifecycle_row["position_status"] == "exit_review"
+    assert lifecycle_row["next_action"] == "exit_technical_failure"
+    assert lifecycle_row["active_exit_condition"] == "TECHNICAL_FULL_EXIT"
+    assert lifecycle_row["exit_condition_status"] == "triggered"
+    assert lifecycle_row["bucket_status_note"] == "Exit event overrides target and horizon policy."
+    assert action_row["suggested_action"] == "exit_technical_failure"
+    assert action_row["execution_mode"] == "broker_order"
+    assert action_row["action_fraction"] == 1.0
+    assert "FULL_EXIT" in action_row["action_reason"]
+
+
 def test_position_lifecycle_does_not_backdate_paper_entry(monkeypatch):
     orders = pd.DataFrame(
         [
@@ -1328,6 +4255,144 @@ def test_position_lifecycle_missing_post_approval_price_creates_manual_review_co
     assert context["operator_question"] == "Missing entry/current price prevents automated lifecycle management."
 
 
+def test_execution_engine_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(execution_engine, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    execution_engine.ensure_execution_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == execution_engine.EXECUTION_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [execution_engine.EXECUTION_TABLE, execution_engine.FILLS_TABLE]
+    assert any(execution_engine.EXECUTION_TABLE in statement for statement in calls[0]["statements"])
+    assert any(execution_engine.FILLS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("safety_checks_json" in statement for statement in calls[0]["statements"])
+    assert any("reference_price_asof" in statement for statement in calls[0]["statements"])
+
+
+def test_execution_engine_records_broker_account_fallbacks(monkeypatch):
+    events = []
+
+    class BrokenBrokerClient:
+        def get_fund_limits(self):
+            raise RuntimeError("funds unavailable")
+
+        def get_holdings(self):
+            raise RuntimeError("holdings unavailable")
+
+        def get_positions(self):
+            return []
+
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    cash, inventory = execution_engine.load_live_account_budget(BrokenBrokerClient())
+
+    assert cash is None
+    assert inventory.empty
+    assert {event["fallback_type"] for event in events} == {
+        "execution_broker_fund_limits_failed",
+        "execution_broker_inventory_failed",
+    }
+    assert events[0]["module"] == "advisory.execution_engine"
+    assert "account-aware sizing" in events[0]["reason"]
+
+
+def test_execution_engine_records_recon_target_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(execution_engine, "table_exists", lambda table: True)
+    monkeypatch.setattr(execution_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable")))
+
+    df = execution_engine.load_recon_targets(symbols=["TCS"], setup_ids=["SETUP"])
+
+    assert df.empty
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "execution_recon_targets_load_failed"
+    assert events[0]["source"] == execution_engine.EXECUTION_TABLE
+    assert events[0]["metadata"]["symbols"] == ["TCS"]
+
+
+def test_execution_engine_env_int_parse_failure_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setenv("STOCKEY_TEST_EXECUTION_INT", "not-an-int")
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = execution_engine._env_int("STOCKEY_TEST_EXECUTION_INT", 7)
+
+    assert result == 7
+    assert events[0]["module"] == "advisory.execution_engine"
+    assert events[0]["fallback_type"] == "execution_env_int_parse_failed"
+    assert events[0]["source"] == "STOCKEY_TEST_EXECUTION_INT"
+    assert events[0]["metadata"]["default"] == 7
+
+
+def test_execution_engine_env_float_parse_failure_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setenv("STOCKEY_TEST_EXECUTION_FLOAT", "not-a-float")
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = execution_engine._env_float("STOCKEY_TEST_EXECUTION_FLOAT", 12.5)
+
+    assert result == 12.5
+    assert events[0]["module"] == "advisory.execution_engine"
+    assert events[0]["fallback_type"] == "execution_env_float_parse_failed"
+    assert events[0]["source"] == "STOCKEY_TEST_EXECUTION_FLOAT"
+    assert events[0]["metadata"]["default"] == 12.5
+
+
+def test_execution_engine_jsonish_records_malformed_context_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    parsed = execution_engine._jsonish("{bad broker json", source="raw_broker_json", symbol="ABC")
+
+    assert parsed == {}
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.execution_engine"
+    assert event["fallback_type"] == "execution_json_parse_failed"
+    assert event["source"] == "raw_broker_json"
+    assert event["symbol"] == "ABC"
+    assert event["metadata"]["value_length"] == len("{bad broker json")
+    assert event["metadata"]["value_excerpt"] == "{bad broker json"
+
+
+def test_execution_engine_jsonish_missing_check_records_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(execution_engine.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    parsed = execution_engine._jsonish('{"ok": true}', source="raw_broker_json", symbol="ABC")
+
+    assert parsed == {"ok": True}
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.execution_engine"
+    assert events[0]["fallback_type"] == "execution_json_missing_check_failed"
+    assert events[0]["source"] == "raw_broker_json"
+    assert events[0]["symbol"] == "ABC"
+    assert events[0]["metadata"]["value_type"] == "str"
+
+
+def test_execution_engine_clean_optional_text_missing_check_records_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(execution_engine.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    text = execution_engine._clean_optional_text(sentinel)
+
+    assert text.startswith("<object object at ")
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.execution_engine"
+    assert events[0]["fallback_type"] == "execution_text_missing_check_failed"
+    assert events[0]["source"] == "clean_optional_text"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
 def test_execution_engine_builds_planned_orders(monkeypatch):
     monkeypatch.setattr(execution_engine, "DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK", True)
     portfolio_orders = pd.DataFrame(
@@ -1372,6 +4437,87 @@ def test_execution_engine_builds_planned_orders(monkeypatch):
     assert len(row["correlation_id"]) <= 30
 
 
+def test_execution_engine_records_portfolio_identity_resolution_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monitor_date = pd.Timestamp("2026-03-23T00:00:00Z")
+    portfolio_orders = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-03-23T09:00:00Z"),
+                "asof_date": monitor_date,
+                "setup_id": "TEST",
+                "symbol": "HUIL",
+                "unique_id": "uid-identity",
+                "company_master_id": "nse:HUIL",
+                "approved_allocation_inr": 40000.0,
+            }
+        ]
+    )
+    latest_prices = pd.DataFrame(
+        [{"symbol": "HUIL", "price_asof": pd.Timestamp("2026-03-23T09:15:00Z"), "price": 800.0, "price_source": "intraday"}]
+    )
+
+    monkeypatch.setattr(execution_engine, "DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK", True)
+    monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: portfolio_orders.copy())
+    monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "build_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_latest_execution_prices", lambda symbols, asof_date: latest_prices.copy())
+    monkeypatch.setattr(execution_engine, "resolve_dhan_identity", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("No Dhan security id mapped")))
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    df = execution_engine.build_execution_orders(asof_date=monitor_date)
+
+    assert df.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Identity resolution failed" in df.iloc[0]["execution_reason"]
+    assert events[0]["fallback_type"] == "execution_portfolio_identity_resolution_failed"
+    assert events[0]["source"] == "dhan_identity"
+    assert events[0]["symbol"] == "HUIL"
+    assert events[0]["metadata"]["action_path"] == "portfolio_order"
+    assert events[0]["metadata"]["unique_id"] == "uid-identity"
+
+
+def test_execution_engine_records_exit_identity_resolution_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monitor_date = pd.Timestamp("2026-03-23T00:00:00Z")
+    exit_actions = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-03-23T09:00:00Z"),
+                "asof_date": monitor_date,
+                "setup_id": "TEST",
+                "symbol": "HUIL",
+                "unique_id": "exit-identity",
+                "suggested_action": "exit_stop",
+                "execution_mode": "broker_order",
+                "action_fraction": 1.0,
+            }
+        ]
+    )
+    latest_prices = pd.DataFrame(
+        [{"symbol": "HUIL", "price_asof": pd.Timestamp("2026-03-23T09:15:00Z"), "price": 800.0, "price_source": "intraday"}]
+    )
+
+    monkeypatch.setattr(execution_engine, "DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK", True)
+    monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: exit_actions.copy())
+    monkeypatch.setattr(execution_engine, "load_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "build_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_latest_execution_prices", lambda symbols, asof_date: latest_prices.copy())
+    monkeypatch.setattr(execution_engine, "resolve_dhan_identity", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("No Dhan security id mapped")))
+    monkeypatch.setattr(execution_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    df = execution_engine.build_execution_orders(asof_date=monitor_date)
+
+    assert df.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Identity resolution failed" in df.iloc[0]["execution_reason"]
+    assert events[0]["fallback_type"] == "execution_exit_identity_resolution_failed"
+    assert events[0]["source"] == "dhan_identity"
+    assert events[0]["symbol"] == "HUIL"
+    assert events[0]["metadata"]["action_path"] == "exit_action"
+    assert events[0]["metadata"]["suggested_action"] == "exit_stop"
+
+
 def test_dhan_identity_records_missing_security_id_issue(monkeypatch):
     company = pd.Series(
         {
@@ -1401,6 +4547,112 @@ def test_dhan_identity_records_missing_security_id_issue(monkeypatch):
     assert row["asset_type"] == "stock"
     assert row["company"]["company_master_id"] == "nse:HUIL"
     assert any(item["method"] == "company_master_dhan_bse_id" for item in row["fallback_tried"])
+
+
+def test_dhan_identity_records_local_fallback_when_issue_telemetry_fails(monkeypatch):
+    company = pd.Series(
+        {
+            "company_master_id": "nse:HUIL",
+            "nse_ticker": "HUIL",
+            "bse_ticker": None,
+            "dhan_nse_id": pd.NA,
+            "dhan_bse_id": pd.NA,
+        }
+    )
+    local_events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(dhan_db, "get_company_master_equity", lambda ticker, exchange: company.copy())
+    monkeypatch.setattr(dhan_db, "record_fallback_event", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("fallback table down")))
+    monkeypatch.setattr(dhan_db, "record_dhan_identity_issue", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("identity table down")))
+    monkeypatch.setattr(dhan_db, "record_local_fallback_event", lambda **kwargs: local_events.append(kwargs) or kwargs)
+
+    with pytest.raises(ValueError, match="No Dhan security id mapped for NSE:HUIL"):
+        dhan_db.resolve_dhan_identity("HUIL", "NSE")
+
+    assert [event["fallback_type"] for event in local_events] == [
+        "dhan_identity_telemetry_failed",
+        "dhan_identity_issue_record_failed",
+    ]
+    assert all(event["module"] == "data.dhanlive.dhan_db" for event in local_events)
+    assert all(event["source"] == "dhan_identity" for event in local_events)
+    assert all(event["metadata"]["symbol"] == "HUIL" for event in local_events)
+    assert all(event["metadata"]["requested_exchange"] == "NSE" for event in local_events)
+    assert all(event["metadata"]["asset_type"] == "stock" for event in local_events)
+
+
+def test_dhan_index_search_terms_include_common_nifty_aliases():
+    terms = dhan_db.index_search_terms("NIFTY50")
+
+    assert terms[0] == "NIFTY50"
+    assert "NIFTY" in terms
+    assert "NIFTY 50" in terms
+
+
+def test_dhan_benchmark_identity_resolves_common_index_alias(monkeypatch):
+    def fake_get_index_instrument(symbol, exchange):
+        assert symbol == "NIFTY50"
+        assert exchange == "NSE"
+        return pd.Series(
+            {
+                "underlying_symbol": "NIFTY",
+                "security_id": 13,
+            }
+        )
+
+    monkeypatch.setattr(dhan_db, "get_index_instrument", fake_get_index_instrument)
+
+    identity = dhan_db.resolve_dhan_identity("NIFTY50", "NSE", asset_type="benchmark")
+
+    assert identity["asset_type"] == "benchmark"
+    assert identity["ticker"] == "NIFTY"
+    assert identity["security_id"] == 13
+    assert identity["exchange_segment"] == "IDX_I"
+
+
+def test_dhan_index_identity_records_missing_alias_issue(monkeypatch):
+    recorded: list[dict[str, object]] = []
+    fallback_events: list[dict[str, object]] = []
+
+    def fail_index_lookup(symbol, exchange):
+        raise ValueError("Query returned no rows.")
+
+    monkeypatch.setattr(dhan_db, "get_index_instrument", fail_index_lookup)
+    monkeypatch.setattr(dhan_db, "record_dhan_identity_issue", lambda **kwargs: recorded.append(kwargs) or kwargs)
+    monkeypatch.setattr(dhan_db, "record_fallback_event", lambda **kwargs: fallback_events.append(kwargs) or kwargs)
+
+    with pytest.raises(ValueError, match="No Dhan index security id mapped for NSE:NIFTY50"):
+        dhan_db.resolve_dhan_identity("NIFTY50", "NSE", asset_type="benchmark")
+
+    assert recorded[0]["symbol"] == "NIFTY50"
+    assert recorded[0]["asset_type"] == "benchmark"
+    assert recorded[0]["fallback_tried"][0]["method"] == "index_alias_lookup"
+    assert "NIFTY 50" in recorded[0]["fallback_tried"][0]["aliases"]
+    assert fallback_events[0]["fallback_type"] == "dhan_index_identity_unresolved"
+
+
+def test_dhan_index_identity_records_local_fallback_when_issue_telemetry_fails(monkeypatch):
+    local_events: list[dict[str, object]] = []
+
+    def fail_index_lookup(symbol, exchange):
+        raise ValueError("Query returned no rows.")
+
+    monkeypatch.setattr(dhan_db, "get_index_instrument", fail_index_lookup)
+    monkeypatch.setattr(dhan_db, "record_fallback_event", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("fallback table down")))
+    monkeypatch.setattr(dhan_db, "record_dhan_identity_issue", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("identity table down")))
+    monkeypatch.setattr(dhan_db, "record_local_fallback_event", lambda **kwargs: local_events.append(kwargs) or kwargs)
+
+    with pytest.raises(ValueError, match="No Dhan index security id mapped for NSE:NIFTY50"):
+        dhan_db.resolve_dhan_identity("NIFTY50", "NSE", asset_type="benchmark")
+
+    assert [event["fallback_type"] for event in local_events] == [
+        "dhan_index_identity_telemetry_failed",
+        "dhan_index_identity_issue_record_failed",
+    ]
+    assert all(event["module"] == "data.dhanlive.dhan_db" for event in local_events)
+    assert all(event["source"] == "dhan_identity" for event in local_events)
+    assert all(event["metadata"]["symbol"] == "NIFTY50" for event in local_events)
+    assert all(event["metadata"]["requested_exchange"] == "NSE" for event in local_events)
+    assert all(event["metadata"]["asset_type"] == "benchmark" for event in local_events)
 
 
 def test_identity_issue_resolution_dry_run_does_not_mark_resolved(monkeypatch):
@@ -1478,6 +4730,264 @@ def test_identity_issue_resolution_apply_marks_resolved(monkeypatch):
     assert resolved[0]["resolution_context"]["resolved_identity"]["security_id"] == 12345
 
 
+def test_identity_issue_resolution_handles_index_alias(monkeypatch):
+    rows = pd.DataFrame(
+        [
+            {
+                "issue_key": "dhan_security_id_missing:benchmark:NSE:NIFTY50",
+                "issue_type": "dhan_security_id_missing",
+                "symbol": "NIFTY50",
+                "requested_exchange": "NSE",
+                "asset_type": "benchmark",
+            }
+        ]
+    )
+    resolved: list[dict[str, object]] = []
+
+    monkeypatch.setattr(identity_issues, "load_open_identity_issues", lambda limit=100: rows.copy())
+    monkeypatch.setattr(identity_issues, "mark_identity_issue_resolved", lambda issue_key, **kwargs: resolved.append({"issue_key": issue_key, **kwargs}) or {"issue_key": issue_key})
+    monkeypatch.setattr(
+        dhan_db,
+        "resolve_dhan_identity",
+        lambda symbol, exchange, asset_type="stock": {
+            "security_id": 13,
+            "exchange": "NSE",
+            "ticker": "NIFTY",
+            "asset_type": asset_type,
+        },
+    )
+
+    summary = identity_issues.resolve_open_identity_issues(limit=10, apply=True)
+
+    assert summary["counts"]["resolved"] == 1
+    assert resolved[0]["issue_key"] == "dhan_security_id_missing:benchmark:NSE:NIFTY50"
+    assert resolved[0]["resolution_context"]["resolved_identity"]["ticker"] == "NIFTY"
+
+
+def test_identity_issue_resolution_failure_records_fallback(monkeypatch):
+    rows = pd.DataFrame(
+        [
+            {
+                "issue_key": "dhan_security_id_missing:stock:NSE:HUIL",
+                "issue_type": "dhan_security_id_missing",
+                "symbol": "HUIL",
+                "requested_exchange": "NSE",
+                "asset_type": "stock",
+            }
+        ]
+    )
+    failed: list[dict[str, object]] = []
+    fallback_events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(identity_issues, "load_open_identity_issues", lambda limit=100: rows.copy())
+    monkeypatch.setattr(
+        identity_issues,
+        "mark_identity_issue_resolution_failed",
+        lambda issue_key, **kwargs: failed.append({"issue_key": issue_key, **kwargs}) or {"issue_key": issue_key},
+    )
+    monkeypatch.setattr(
+        identity_issues,
+        "record_local_fallback_event",
+        lambda **kwargs: fallback_events.append(kwargs) or kwargs,
+    )
+
+    def fail_resolve(symbol, exchange, asset_type="stock"):
+        raise ValueError(f"No Dhan security id mapped for {exchange}:{symbol}")
+
+    monkeypatch.setattr(dhan_db, "resolve_dhan_identity", fail_resolve)
+
+    summary = identity_issues.resolve_open_identity_issues(limit=10, apply=True)
+
+    assert summary["counts"]["still_open"] == 1
+    assert failed[0]["issue_key"] == "dhan_security_id_missing:stock:NSE:HUIL"
+    assert fallback_events[0]["fallback_type"] == "identity_issue_resolution_failed"
+    assert fallback_events[0]["symbol"] == "HUIL"
+    assert fallback_events[0]["metadata"]["issue_key"] == "dhan_security_id_missing:stock:NSE:HUIL"
+    assert fallback_events[0]["metadata"]["apply"] is True
+
+
+def test_identity_issues_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(identity_issues, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    identity_issues.ensure_identity_issues_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == identity_issues.IDENTITY_ISSUES_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [identity_issues.IDENTITY_ISSUES_TABLE]
+    assert any(identity_issues.IDENTITY_ISSUES_TABLE in statement for statement in calls[0]["statements"])
+    assert any("issue_key TEXT PRIMARY KEY" in statement for statement in calls[0]["statements"])
+    assert any("CREATE INDEX IF NOT EXISTS" in statement for statement in calls[0]["statements"])
+
+
+def test_identity_issues_text_records_missing_check_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(identity_issues, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(identity_issues.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = identity_issues._text(sentinel)
+
+    assert result.startswith("<object object at ")
+    assert events[0]["module"] == "advisory.identity_issues"
+    assert events[0]["fallback_type"] == "identity_issue_text_missing_check_failed"
+    assert events[0]["source"] == "text"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
+def test_identity_issues_writes_use_retryable_operations(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(identity_issues, "ensure_identity_issues_table", lambda: None)
+    monkeypatch.setattr(identity_issues, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(identity_issues, "execute_db_operation", fake_execute_db_operation)
+
+    row = identity_issues.record_dhan_identity_issue(
+        symbol="HUIL",
+        requested_exchange="NSE",
+        asset_type="stock",
+        company={"company_master_id": "nse:HUIL"},
+        fallback_tried=[{"exchange": "BSE", "method": "company_master_dhan_bse_id"}],
+    )
+    resolved = identity_issues.mark_identity_issue_resolved(
+        row["issue_key"],
+        resolution_context={"security_id": 123},
+    )
+    failed = identity_issues.mark_identity_issue_resolution_failed(
+        row["issue_key"],
+        error_text="still missing",
+        resolution_context={"checked": True},
+    )
+
+    assert row["issue_key"] == "dhan_security_id_missing:stock:NSE:HUIL"
+    assert resolved["status"] == "resolved"
+    assert failed["status"] == "open"
+    assert operation_names == [
+        "identity_issues:record_dhan_identity_issue",
+        "identity_issues:mark_resolved",
+        "identity_issues:mark_resolution_failed",
+    ]
+    assert "INSERT INTO" in executed[0][0]
+    assert "status = 'resolved'" in executed[1][0]
+    assert "resolution_error_text = %s" in executed[2][0]
+
+
+def test_operator_health_active_action_identity_coverage_warns_on_missing_company_master(monkeypatch):
+    calls = []
+
+    def fake_sql_to_df(query, params=None, **kwargs):
+        calls.append((query, params, kwargs))
+        if "COUNT(*) AS missing_count" in query:
+            return pd.DataFrame([{"missing_count": 1}])
+        return pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-06-11T00:00:00Z"),
+                    "symbol": "MISS",
+                    "action_code": "BUY",
+                    "action_source": "portfolio",
+                    "execution_mode": "broker",
+                    "reason_contract_status": "complete",
+                    "action_reason": "test",
+                    "company_master_id": None,
+                    "nse_ticker": None,
+                    "bse_ticker": None,
+                    "dhan_nse_id": None,
+                    "dhan_bse_id": None,
+                    "identity_gap": "missing_company_master",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", fake_sql_to_df)
+
+    payload = operator_health.check_active_action_identity_coverage(limit=5)
+
+    assert payload["status"] == "warn"
+    assert payload["missing_count"] == 1
+    assert payload["rows"][0]["symbol"] == "MISS"
+    assert payload["rows"][0]["identity_gap"] == "missing_company_master"
+    assert calls[0][1]["action_codes"] == list(operator_health.BROKER_CAPABLE_ACTION_CODES)
+
+
+def test_operator_health_identity_issues_warns_on_active_action_identity_gap(monkeypatch):
+    identity_queries = []
+
+    def fake_sql_to_df(query, params=None, **kwargs):
+        identity_queries.append(query)
+        if "SELECT *" in query:
+            return pd.DataFrame()
+        return pd.DataFrame([{"open_count": 0}])
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(
+        operator_health,
+        "check_active_action_identity_coverage",
+        lambda limit=10: {
+            "status": "warn",
+            "message": "Active broker-capable actions have missing company/security identity.",
+            "missing_count": 2,
+            "rows": [{"symbol": "MISS", "identity_gap": "missing_dhan_security_id"}],
+        },
+    )
+
+    payload = operator_health.check_identity_issues(limit=10)
+
+    assert payload["status"] == "warn"
+    assert payload["open_count"] == 0
+    assert payload["active_action_identity_coverage"]["missing_count"] == 2
+    assert "Active broker-capable actions" in payload["message"]
+
+
+def test_operator_health_identity_issues_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "check_active_action_identity_coverage", lambda limit=10: {"status": "ok", "missing_count": 0, "rows": []})
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: (_ for _ in ()).throw(RuntimeError("identity table lookup failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_identity_issues(limit=8)
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_identity_issues_check_failed"
+    assert events[0]["source"] == operator_health.IDENTITY_ISSUES_TABLE
+    assert events[0]["metadata"] == {"limit": 8}
+
+
+def test_operator_health_active_action_identity_coverage_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("identity coverage query failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_active_action_identity_coverage(limit=6)
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_active_action_identity_coverage_failed"
+    assert events[0]["source"] == operator_health.ACTION_RECOMMENDATIONS_TABLE
+    assert events[0]["metadata"]["limit"] == 6
+
+
 def test_execution_engine_blocks_action_rows_without_complete_reason_contract(monkeypatch):
     action_rows = pd.DataFrame(
         [
@@ -1492,6 +5002,7 @@ def test_execution_engine_blocks_action_rows_without_complete_reason_contract(mo
                 "execution_mode": "broker_order",
                 "approved_allocation_inr": 40000.0,
                 "reason_contract_status": "incomplete_downgraded",
+                "recommendation_reason_json": json.dumps({"status": "incomplete", "action": "BUY", "missing_fields": ["buy_risk_level"]}),
             }
         ]
     )
@@ -1514,6 +5025,11 @@ def test_execution_engine_blocks_action_rows_without_complete_reason_contract(mo
     assert "Reason contract is not complete" in row["execution_reason"]
     assert row["quantity"] == 0
     assert identity_calls == []
+    safety = json.loads(row["safety_checks_json"])
+    lineage = safety["order_intent_lineage"]
+    assert lineage["reason_contract_status"] == "incomplete_downgraded"
+    assert lineage["reason_contract"]["missing_fields"] == ["buy_risk_level"]
+    assert lineage["approval"]["operator_approval_required"] is True
 
 
 def test_execution_engine_marks_action_order_preview_as_approval_gated(monkeypatch):
@@ -1529,7 +5045,19 @@ def test_execution_engine_marks_action_order_preview_as_approval_gated(monkeypat
                 "transaction_type": "BUY",
                 "execution_mode": "broker_order",
                 "approved_allocation_inr": 40000.0,
+                "invest_score_pct": 82.0,
+                "stop_price": 760.0,
+                "recommended_stop_price": 765.0,
+                "recommended_target_price": 900.0,
                 "reason_contract_status": "complete",
+                "recommendation_reason_json": json.dumps(
+                    {
+                        "status": "complete",
+                        "action": "BUY",
+                        "summary": "Technical breakout with complete risk controls.",
+                        "risk": {"stop_price": 760.0, "recommended_target_price": 900.0},
+                    }
+                ),
                 "action_status": "approved",
             }
         ]
@@ -1557,7 +5085,75 @@ def test_execution_engine_marks_action_order_preview_as_approval_gated(monkeypat
     assert safety["broker_reconciliation_required"] is True
     assert safety["broker_reconciliation_status"] == "not_run"
     assert safety["live_submission_allowed"] is False
+    lineage = safety["order_intent_lineage"]
+    assert lineage["source"] == "advisory_action_recommendations"
+    assert lineage["action_code"] == "BUY"
+    assert lineage["unique_id"] == "action-1"
+    assert lineage["reason_contract_status"] == "complete"
+    assert lineage["reason_contract"]["summary"] == "Technical breakout with complete risk controls."
+    assert lineage["risk_sizing"]["approved_allocation_inr"] == 40000.0
+    assert lineage["risk_sizing"]["invest_score_pct"] == 82.0
+    assert lineage["risk_levels"]["reference_price"] == 800.0
+    assert lineage["risk_levels"]["recommended_stop_price"] == 765.0
+    assert lineage["risk_levels"]["recommended_target_price"] == 900.0
+    assert lineage["approval"]["operator_approval_status"] == "missing"
     assert raw["execution_safety_contract"] == safety
+    assert raw["order_intent_lineage"] == lineage
+
+
+def test_execution_engine_identity_failure_is_structured_safety_block(monkeypatch):
+    action_rows = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "MISS",
+                "unique_id": "action-identity-miss",
+                "action_code": "BUY",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "approved_allocation_inr": 40000.0,
+                "reason_contract_status": "complete",
+                "action_status": "approved",
+            }
+        ]
+    )
+    latest_prices = pd.DataFrame(
+        [{"symbol": "MISS", "price_asof": pd.Timestamp("2026-05-01T09:15:00Z"), "price": 800.0, "price_source": "intraday"}]
+    )
+    fallback_events = []
+
+    monkeypatch.setattr(execution_engine, "load_action_recommendations", lambda **kwargs: action_rows.copy())
+    monkeypatch.setattr(execution_engine, "build_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_latest_execution_prices", lambda symbols, asof_date: latest_prices.copy())
+    monkeypatch.setattr(
+        execution_engine,
+        "resolve_dhan_identity",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("No Dhan security id mapped for NSE:MISS")),
+    )
+    monkeypatch.setattr(execution_engine, "_record_execution_fallback", lambda *args, **kwargs: fallback_events.append((args, kwargs)))
+
+    df = execution_engine.build_execution_orders(asof_date=pd.Timestamp("2026-05-01T00:00:00Z"))
+    row = df.iloc[0]
+    safety = json.loads(row["safety_checks_json"])
+    raw = json.loads(row["raw_broker_json"])
+
+    assert row["execution_status"] == "submit_blocked"
+    assert row["quantity"] == 0
+    assert row["security_id"] is None
+    assert "Identity resolution failed" in row["execution_reason"]
+    assert safety["broker_identity_required"] is True
+    assert safety["broker_identity_status"] == "failed"
+    assert safety["broker_identity_resolved"] is False
+    assert "No Dhan security id mapped for NSE:MISS" in safety["broker_identity_error"]
+    assert any("Identity resolution failed" in issue for issue in safety["issues"])
+    assert raw["execution_safety_contract"] == safety
+    assert fallback_events[0][0] == ("execution_identity_resolution_failed",)
+    assert fallback_events[0][1]["source"] == "dhan_identity"
+    assert fallback_events[0][1]["symbol"] == "MISS"
 
 
 def test_execution_engine_blocks_closed_or_expired_action_rows(monkeypatch):
@@ -1610,6 +5206,7 @@ def test_submit_live_orders_requires_operator_approval_and_reconciliation(monkey
     monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
     monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "50000")
     monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "false")
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
 
     class DummyClient:
         def __init__(self):
@@ -1619,6 +5216,7 @@ def test_submit_live_orders_requires_operator_approval_and_reconciliation(monkey
     df = pd.DataFrame(
         [
             {
+                "asof_date": pd.Timestamp("2026-03-23T00:00:00Z"),
                 "execution_status": "planned",
                 "execution_reason": None,
                 "transaction_type": "BUY",
@@ -1643,7 +5241,127 @@ def test_submit_live_orders_requires_operator_approval_and_reconciliation(monkey
     out = execution_engine.submit_live_orders(df)
 
     assert out.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Live run confirmation is required" in out.iloc[0]["execution_reason"]
+    safety = json.loads(out.iloc[0]["safety_checks_json"])
+    assert safety["live_run_confirmation_required"] is True
+    assert safety["live_run_confirmation_expected"].startswith("STOCKEY-LIVE-")
+
+
+def test_submit_live_orders_requires_operator_approval_after_live_confirmation(monkeypatch):
+    monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "50000")
+    monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "false")
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
+
+    class DummyClient:
+        def __init__(self):
+            raise AssertionError("unapproved order should not create broker client")
+
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "execution_status": "planned",
+                "execution_reason": None,
+                "transaction_type": "BUY",
+                "security_id": 1333,
+                "quantity": 10,
+                "reference_price": 100.0,
+                "reference_price_source": "intraday",
+                "reference_price_asof": pd.Timestamp.utcnow(),
+                "estimated_order_value_inr": 1000.0,
+                "live_mode": False,
+                "safety_checks_json": json.dumps(
+                    execution_engine.build_execution_plan_safety_contract(
+                        source="action_recommendation",
+                        approval_status="missing",
+                        reconciliation_status="not_run",
+                    )
+                ),
+            }
+        ]
+    )
+    token = execution_engine.build_live_execution_confirmation_token(df)
+
+    out = execution_engine.submit_live_orders(df, live_confirmation=token)
+
+    assert out.iloc[0]["execution_status"] == "submit_blocked"
     assert "Operator approval is required" in out.iloc[0]["execution_reason"]
+
+
+def test_submit_live_orders_submits_only_with_live_confirmation_and_safety_gates(monkeypatch):
+    monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "50000")
+    monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "false")
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
+
+    submitted: list[dict[str, object]] = []
+
+    class DummyClient:
+        def place_order(self, **kwargs):
+            submitted.append(kwargs)
+            return {"orderId": "broker-1", "exchangeOrderId": "exchange-1", "orderStatus": "TRANSIT"}
+
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "HDFCBANK",
+                "unique_id": "u1",
+                "correlation_id": "BUY-HDFCBANK-u1",
+                "execution_status": "planned",
+                "execution_reason": None,
+                "transaction_type": "BUY",
+                "exchange_segment": "NSE_EQ",
+                "product_type": "CNC",
+                "order_type": "MARKET",
+                "validity": "DAY",
+                "security_id": 1333,
+                "quantity": 10,
+                "limit_price": 0.0,
+                "trigger_price": 0.0,
+                "reference_price": 100.0,
+                "reference_price_source": "intraday",
+                "reference_price_asof": pd.Timestamp.utcnow(),
+                "estimated_order_value_inr": 1000.0,
+                "live_mode": False,
+                "safety_checks_json": json.dumps(
+                    execution_engine.build_execution_plan_safety_contract(
+                        source="action_recommendation",
+                        approval_status="approved",
+                        reconciliation_status="reconciled",
+                    )
+                ),
+            }
+        ]
+    )
+    token = execution_engine.build_live_execution_confirmation_token(df)
+
+    out = execution_engine.submit_live_orders(df, live_confirmation=token)
+
+    assert submitted == [
+        {
+            "correlation_id": "BUY-HDFCBANK-u1",
+            "transaction_type": "BUY",
+            "exchange_segment": "NSE_EQ",
+            "product_type": "CNC",
+            "order_type": "MARKET",
+            "validity": "DAY",
+            "security_id": 1333,
+            "quantity": 10,
+            "price": 0.0,
+            "trigger_price": 0.0,
+        }
+    ]
+    assert out.iloc[0]["execution_status"] == "submitted"
+    assert out.iloc[0]["broker_order_id"] == "broker-1"
+    assert bool(out.iloc[0]["live_mode"]) is True
 
 
 def test_execution_engine_uses_broker_cash_cap_and_exit_holdings(monkeypatch):
@@ -1898,10 +5616,12 @@ def test_submit_live_orders_is_fail_closed_without_env(monkeypatch):
             called["client"] = True
 
     monkeypatch.delenv("STOCKEY_LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
     df = pd.DataFrame(
         [
             {
+                "asof_date": pd.Timestamp("2026-03-23T00:00:00Z"),
                 "execution_status": "planned",
                 "execution_reason": None,
                 "transaction_type": "BUY",
@@ -1915,8 +5635,9 @@ def test_submit_live_orders_is_fail_closed_without_env(monkeypatch):
             }
         ]
     )
+    token = execution_engine.build_live_execution_confirmation_token(df)
 
-    out = execution_engine.submit_live_orders(df)
+    out = execution_engine.submit_live_orders(df, live_confirmation=token)
 
     assert out.iloc[0]["execution_status"] == "submit_blocked"
     assert "Live trading disabled" in out.iloc[0]["execution_reason"]
@@ -1929,6 +5650,7 @@ def test_submit_live_orders_enforces_caps_and_fresh_price(monkeypatch):
     monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "500")
     monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "true")
     monkeypatch.setenv("STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES", "30")
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
 
     class DummyClient:
         def place_order(self, **kwargs):
@@ -1938,6 +5660,7 @@ def test_submit_live_orders_enforces_caps_and_fresh_price(monkeypatch):
     df = pd.DataFrame(
         [
             {
+                "asof_date": pd.Timestamp("2026-03-23T00:00:00Z"),
                 "execution_status": "planned",
                 "execution_reason": None,
                 "transaction_type": "BUY",
@@ -1951,8 +5674,9 @@ def test_submit_live_orders_enforces_caps_and_fresh_price(monkeypatch):
             }
         ]
     )
+    token = execution_engine.build_live_execution_confirmation_token(df)
 
-    out = execution_engine.submit_live_orders(df)
+    out = execution_engine.submit_live_orders(df, live_confirmation=token)
 
     assert out.iloc[0]["execution_status"] == "submit_blocked"
     assert "Estimated order value exceeds live cap" in out.iloc[0]["execution_reason"]
@@ -2110,6 +5834,39 @@ def test_news_watch_marks_non_material_top_context_news_observed(monkeypatch):
     assert df["monitor_source"].tolist() == ["market_context", "market_context"]
 
 
+def test_market_context_materiality_keywords_cover_operational_and_regulatory_events():
+    assert announcement_watch.is_material_context_event(
+        pd.Series(
+            {
+                "subject": "Company receives tax demand notice",
+                "filed_under_category": "Regulatory",
+                "concise_summary_text": "",
+                "categories_json": "[]",
+            }
+        )
+    )
+    assert announcement_watch.is_material_context_event(
+        pd.Series(
+            {
+                "subject": "Commercial production starts at new facility",
+                "filed_under_category": "Operations",
+                "concise_summary_text": "",
+                "categories_json": "[]",
+            }
+        )
+    )
+    assert not announcement_watch.is_material_context_event(
+        pd.Series(
+            {
+                "subject": "Shares trade flat in muted session",
+                "filed_under_category": "Market movement",
+                "concise_summary_text": "Routine price movement without company disclosure.",
+                "categories_json": "[]",
+            }
+        )
+    )
+
+
 def test_announcement_watch_merges_market_context_as_lower_priority():
     primary = pd.DataFrame(
         [
@@ -2190,6 +5947,7 @@ def test_announcement_pipeline_retries_nse_timeout(monkeypatch, capsys):
     )
     monkeypatch.setattr(announcement_pipeline.requests, "get", fake_get)
     monkeypatch.setattr(announcement_pipeline.time, "sleep", lambda seconds: calls["sleeps"].append(seconds))
+    monkeypatch.setattr(announcement_pipeline, "record_fallback_event", lambda **kwargs: kwargs)
 
     response = pipeline_obj._nse_get_with_retry("https://www.nseindia.com/api/test")
     captured = capsys.readouterr()
@@ -2207,12 +5965,16 @@ def test_announcement_pipeline_reset_clears_nse_cookies(monkeypatch, capsys):
     pipeline_obj.request_timeout = 60
     pipeline_obj._nse_headers = {"accept": "*/*", "user-agent": "stale"}
     pipeline_obj._nse_cookies = {"stale": "cookie"}
+    fallback_events = []
+    local_events = []
 
     def fake_get(*args, **kwargs):
         raise announcement_pipeline.requests.ReadTimeout("bootstrap timeout")
 
     monkeypatch.setattr(announcement_pipeline, "get_dynamic_headers", lambda: {"user-agent": "fresh"})
     monkeypatch.setattr(announcement_pipeline.requests, "get", fake_get)
+    monkeypatch.setattr(announcement_pipeline, "record_fallback_event", lambda **kwargs: fallback_events.append(kwargs) or kwargs)
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: local_events.append(kwargs) or kwargs)
 
     pipeline_obj._reset_nse_http_state(reason="test")
     captured = capsys.readouterr()
@@ -2220,6 +5982,71 @@ def test_announcement_pipeline_reset_clears_nse_cookies(monkeypatch, capsys):
     assert pipeline_obj._nse_headers["user-agent"] == "fresh"
     assert pipeline_obj._nse_cookies == {}
     assert "Reset NSE HTTP session state; cleared cookies reason=test" in captured.err
+    assert fallback_events[0]["fallback_type"] == "nse_session_reset"
+    assert fallback_events[0]["source"] == "nse_http"
+    assert fallback_events[0]["metadata"] == {"reason": "test"}
+    assert len(local_events) == 3
+    assert local_events[0]["fallback_type"] == "nse_cookie_bootstrap_failed"
+    assert local_events[1]["fallback_type"] == "nse_cookie_bootstrap_failed"
+    assert local_events[2]["fallback_type"] == "nse_cookie_bootstrap_after_reset_failed"
+    assert local_events[2]["source"] == "nse_http"
+    assert local_events[2]["metadata"] == {"reason": "test"}
+
+
+def test_announcement_pipeline_build_nse_session_records_bootstrap_retry_fallback(monkeypatch):
+    pipeline_obj = object.__new__(announcement_pipeline.AnnouncementPipeline)
+    pipeline_obj.request_timeout = 60
+    events = []
+
+    monkeypatch.setattr(announcement_pipeline, "NSE_HTTP_MAX_ATTEMPTS", 1)
+    monkeypatch.setattr(announcement_pipeline, "get_dynamic_headers", lambda: {"user-agent": "fresh"})
+    monkeypatch.setattr(
+        pipeline_obj,
+        "_bootstrap_nse_cookies_once",
+        lambda headers: (_ for _ in ()).throw(announcement_pipeline.requests.ReadTimeout("bootstrap timeout")),
+    )
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    headers, cookies = pipeline_obj._build_nse_session()
+
+    assert headers["user-agent"] == "fresh"
+    assert headers["accept"] == "*/*"
+    assert cookies == {}
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "nse_session_bootstrap_retry_failed"
+    assert events[0]["source"] == "nse_http"
+    assert events[0]["metadata"] == {"attempt": 1, "max_attempts": 1}
+
+
+def test_announcement_pipeline_datetime_parse_failures_record_local_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(ValueError):
+        announcement_pipeline.AnnouncementPipeline._parse_bse_datetime("bad-bse-date")
+    with pytest.raises(ValueError):
+        announcement_pipeline.AnnouncementPipeline._parse_nse_datetime("bad-nse-date")
+
+    assert [event["fallback_type"] for event in events] == [
+        "bse_announcement_datetime_parse_failed",
+        "nse_announcement_datetime_parse_failed",
+    ]
+    assert events[0]["source"] == "bse_announcements"
+    assert events[0]["metadata"]["value"] == "bad-bse-date"
+    assert events[1]["source"] == "nse_announcements"
+    assert events[1]["metadata"]["value"] == "bad-nse-date"
+
+
+def test_announcement_pipeline_datetime_second_format_does_not_record_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    bse_dt = announcement_pipeline.AnnouncementPipeline._parse_bse_datetime("2026-06-12T09:30:00")
+    nse_dt = announcement_pipeline.AnnouncementPipeline._parse_nse_datetime("2026-06-12 09:30:00")
+
+    assert bse_dt.tzinfo is not None
+    assert nse_dt.tzinfo is not None
+    assert events == []
 
 
 def test_poppler_resolver_prefers_explicit_directory(monkeypatch, tmp_path):
@@ -2238,6 +6065,14 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
         "generated_at": "2026-05-14 10:00:00 IST",
         "asof_date": "2026-05-14",
         "summary": {"action_count": 2, "alert_count": 1, "ts_eval_summary_count": 3},
+        "ts_forecast_paper_summary": [
+            {
+                "paper_decision": "PAPER_BUY",
+                "model_name": "timesfm_2p5_200m",
+                "horizon_days": 10,
+                "evaluated_trades": 7,
+            }
+        ],
         "top_action_recommendations": [{"symbol": "ABC", "action": "BUY"}],
         "action_recommendations": [
             {
@@ -2328,6 +6163,7 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
     }
 
     monkeypatch.setattr(operator_api, "load_operator_payload", lambda **kwargs: payload)
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda symbols: {})
     monkeypatch.setattr(
         operator_api,
         "_load_latest_company_memory_reviews",
@@ -2398,6 +6234,8 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
     assert operator_api.build_portfolio_payload()["snapshot_warning"]["status"] == "warn"
     assert operator_api.build_watchlist_payload()["watch_recommendations"][0]["symbol"] == "WATCH"
     assert operator_api.build_watchlist_payload()["snapshot_warning"]["status"] == "warn"
+    assert operator_api.build_home_payload()["ts_forecast_paper_summary"][0]["paper_decision"] == "PAPER_BUY"
+    assert operator_api.build_watchlist_payload()["ts_forecast_paper_summary"][0]["model_name"] == "timesfm_2p5_200m"
     events_payload = operator_api.build_events_payload(limit=1)
     assert events_payload["events"] == [{"unique_id": "event-1"}]
     assert events_payload["pagination"]["events"]["total_count"] == 2
@@ -2438,6 +6276,169 @@ def test_operator_api_compact_signal_refresh_keeps_effect_fields():
     ]
 
 
+def test_operator_api_operator_journey_stitches_read_only_pipeline_sources(monkeypatch):
+    def fake_sql_to_df(query, params=None, **kwargs):
+        sql = str(query)
+        if operator_api.MANUAL_REVIEW_DECISIONS_TABLE in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "decided_at": pd.Timestamp("2026-06-10T09:00:00Z"),
+                        "item_id": "manual-1",
+                        "item_type": "action_manual_review",
+                        "symbol": "ABC",
+                        "unique_id": "u1",
+                        "setup_id": "SETUP",
+                        "decision": "watch_for_event",
+                        "rationale": "Wait for management clarification.",
+                        "follow_up_event": "Watch for order update.",
+                        "load_ts": pd.Timestamp("2026-06-10T09:00:00Z"),
+                    }
+                ]
+            )
+        if operator_api.WAIT_SIGNALS_TABLE in sql and operator_api.WAIT_SIGNAL_MATCHES_TABLE not in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "created_at": pd.Timestamp("2026-06-10T09:01:00Z"),
+                        "signal_id": "signal-1",
+                        "source_key": "manual-1",
+                        "symbol": "ABC",
+                        "status": "matched",
+                        "expected_action": "MANUAL_REVIEW",
+                        "wait_question": "Watch for order update.",
+                        "load_ts": pd.Timestamp("2026-06-10T09:01:00Z"),
+                    }
+                ]
+            )
+        if operator_api.WAIT_SIGNAL_MATCHES_TABLE in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "matched_at": pd.Timestamp("2026-06-11T09:05:00Z"),
+                        "signal_id": "signal-1",
+                        "symbol": "ABC",
+                        "match_status": "matched",
+                        "match_reason": "Order update was announced.",
+                        "source_table": "announcements",
+                        "source_key": "ann-1",
+                        "load_ts": pd.Timestamp("2026-06-11T09:05:00Z"),
+                    }
+                ]
+            )
+        if operator_api.SIGNAL_REFRESH_TABLE in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "refreshed_at": pd.Timestamp("2026-06-11T09:06:00Z"),
+                        "refresh_id": "refresh-1",
+                        "symbol": "ABC",
+                        "unique_id": "u1",
+                        "signal_action": "MANUAL_REVIEW",
+                        "signal_status": "review_only",
+                        "action_reason": "Matched wait signal requires review.",
+                        "effect_type": "wait_match_created",
+                        "load_ts": pd.Timestamp("2026-06-11T09:06:00Z"),
+                    }
+                ]
+            )
+        if operator_api.ACTION_RECOMMENDATIONS_TABLE in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "published_on": pd.Timestamp("2026-06-11T09:07:00Z"),
+                        "asof_date": pd.Timestamp("2026-06-11T00:00:00Z"),
+                        "symbol": "ABC",
+                        "unique_id": "u1",
+                        "setup_id": "SETUP",
+                        "action_code": "MANUAL_REVIEW",
+                        "action_reason": "Matched Manual Review wait signal.",
+                        "load_ts": pd.Timestamp("2026-06-11T09:07:00Z"),
+                    }
+                ]
+            )
+        if operator_api.PORTFOLIO_TABLE in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "published_on": pd.Timestamp("2026-06-11T09:08:00Z"),
+                        "asof_date": pd.Timestamp("2026-06-11T00:00:00Z"),
+                        "symbol": "ABC",
+                        "unique_id": "u1",
+                        "setup_id": "SETUP",
+                        "portfolio_status": "review_manual",
+                        "portfolio_reason": "Manual review required.",
+                        "load_ts": pd.Timestamp("2026-06-11T09:08:00Z"),
+                    }
+                ]
+            )
+        if operator_api.EXECUTION_TABLE in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "published_on": pd.Timestamp("2026-06-11T09:09:00Z"),
+                        "asof_date": pd.Timestamp("2026-06-11T00:00:00Z"),
+                        "symbol": "ABC",
+                        "unique_id": "u1",
+                        "setup_id": "SETUP",
+                        "execution_status": "submit_blocked",
+                        "execution_reason": "Review-only action is not broker-submittable.",
+                        "load_ts": pd.Timestamp("2026-06-11T09:09:00Z"),
+                    }
+                ]
+            )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+
+    payload = operator_api.build_operator_journey_payload(symbol="ABC", item_id="manual-1", unique_id="u1", limit=10)
+
+    assert payload["status"] == "ok"
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["api_schema"]["broker_execution_enabled"] is False
+    assert payload["summary"]["stage_counts"]["manual_decisions"] == 1
+    assert payload["summary"]["has_wait_match"] is True
+    assert payload["summary"]["has_portfolio_or_execution_implication"] is True
+    assert payload["summary"]["operator_boundary"]["submits_order"] is False
+    assert [event["stage"] for event in payload["timeline"][:3]] == ["execution", "portfolio", "actions"]
+    assert payload["timeline"][0]["reason"] == "Review-only action is not broker-submittable."
+    assert payload["skipped_sources"] == []
+
+
+def test_operator_api_operator_journey_route_is_read_only(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(
+        operator_api,
+        "build_operator_journey_payload",
+        lambda **kwargs: {
+            "generated_at": "2026-06-11T00:00:00Z",
+            "api_schema": {
+                "name": "operator_journey",
+                "version": operator_api.OPERATOR_API_SCHEMA_VERSION,
+                "endpoint": "/api/operator-journey",
+                "read_only": True,
+                "broker_execution_enabled": False,
+            },
+            "status": "ok",
+            "filters": kwargs,
+            "summary": {"operator_boundary": {"read_only": True, "submits_order": False}},
+            "stages": {"manual_decisions": []},
+            "timeline": [],
+            "skipped_sources": [],
+        },
+    )
+
+    response = TestClient(operator_api.create_app()).get("/api/operator-journey?symbol=ABC&limit=5")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["api_schema"]["read_only"] is True
+    assert body["api_schema"]["broker_execution_enabled"] is False
+    assert body["summary"]["operator_boundary"]["submits_order"] is False
+
+
 def test_operator_api_actions_events_compact_pagination_caps_large_payloads(monkeypatch):
     large_text = "x" * 10_000
     payload = {
@@ -2473,6 +6474,9 @@ def test_operator_api_actions_events_compact_pagination_caps_large_payloads(monk
     }
     assert "raw_json" not in actions["action_recommendations"][0]
     assert actions["pagination"]["top_action_recommendations"]["total_count"] == 1
+    assert actions["meta"]["action_recommendations"]["payload_bytes"] > 0
+    assert actions["meta"]["action_recommendations"]["max_row_bytes"] > 0
+    assert actions["meta"]["alerts"]["payload_bytes"] > 0
 
     events = operator_api.build_events_payload(limit=15, offset=45, compact=True)
     assert [row["unique_id"] for row in events["events"][:2]] == ["event-045", "event-046"]
@@ -2518,6 +6522,9 @@ def test_operator_api_portfolio_compact_pagination_caps_large_payloads(monkeypat
     assert portfolio["pagination"]["today_recommendations"]["total_count"] == 1
     assert portfolio["pagination"]["lifecycle"]["returned_count"] == 8
     assert "raw_json" not in portfolio["portfolio"][0]
+    assert portfolio["meta"]["portfolio"]["payload_bytes"] > 0
+    assert portfolio["meta"]["portfolio"]["max_row_bytes"] > 0
+    assert portfolio["meta"]["today_recommendations"]["payload_bytes"] > 0
 
 
 def test_operator_api_logs_and_research_payloads_expose_pagination(monkeypatch, tmp_path):
@@ -2625,6 +6632,91 @@ def test_operator_api_latest_prices_prefers_current_price_cache(monkeypatch):
     assert len(sql_calls) == 1
 
 
+def test_operator_api_latest_prices_records_daily_fallback_telemetry(monkeypatch):
+    operator_api._PAYLOAD_CACHE.clear()
+    events = []
+    monkeypatch.setattr(operator_api, "load_current_prices", lambda symbols: {})
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == "dhan_ohlcv_daily")
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("daily unavailable")))
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    prices = operator_api._latest_ohlcv_prices(["AAA", "BBB"])
+
+    assert prices == {}
+    assert len(events) == 1
+    assert events[0]["source"] == "dhan_ohlcv_daily"
+    assert events[0]["fallback_type"] == "operator_api_latest_daily_ohlcv_prices_load_failed"
+    assert events[0]["metadata"]["symbol_count"] == 2
+    assert events[0]["metadata"]["symbols"] == ["AAA", "BBB"]
+
+
+def test_operator_api_latest_prices_records_intraday_fallback_telemetry(monkeypatch):
+    operator_api._PAYLOAD_CACHE.clear()
+    events = []
+    monkeypatch.setattr(operator_api, "load_current_prices", lambda symbols: {})
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == "dhan_ohlcv_intraday")
+    monkeypatch.setattr(operator_api.env, "bool", lambda key, default=False: True if key == "OPERATOR_API_INTRADAY_PRICE_FALLBACK" else default)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("intraday unavailable")))
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    prices = operator_api._latest_ohlcv_prices(["AAA"])
+
+    assert prices == {}
+    assert len(events) == 1
+    assert events[0]["source"] == "dhan_ohlcv_intraday"
+    assert events[0]["fallback_type"] == "operator_api_latest_intraday_ohlcv_prices_load_failed"
+    assert events[0]["metadata"]["symbol_count"] == 1
+    assert events[0]["metadata"]["symbols"] == ["AAA"]
+
+
+def test_current_prices_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+    monkeypatch.setattr(current_prices, "_TABLE_READY", False)
+    monkeypatch.setattr(current_prices, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    current_prices.ensure_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == current_prices.CURRENT_PRICES_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [current_prices.TABLE_NAME]
+    assert any(current_prices.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("symbol TEXT PRIMARY KEY" in statement for statement in calls[0]["statements"])
+    assert any("CREATE INDEX IF NOT EXISTS" in statement for statement in calls[0]["statements"])
+
+
+def test_current_prices_ensure_table_respects_ready_cache_and_force(monkeypatch):
+    calls = []
+    monkeypatch.setattr(current_prices, "_TABLE_READY", False)
+    monkeypatch.setattr(current_prices, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    current_prices.ensure_table()
+    current_prices.ensure_table()
+    current_prices.ensure_table(force=True)
+
+    assert [call["migration_id"] for call in calls] == [
+        current_prices.CURRENT_PRICES_SCHEMA_MIGRATION_ID,
+        current_prices.CURRENT_PRICES_SCHEMA_MIGRATION_ID,
+    ]
+
+
+def test_current_prices_cache_failure_records_local_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def fail_sql(*_args, **_kwargs):
+        raise RuntimeError("statement timeout")
+
+    monkeypatch.setattr(current_prices, "sql_to_df", fail_sql)
+    monkeypatch.setattr(current_prices, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    prices = current_prices.load_current_prices(["AAA", "BBB"], max_age_seconds=60)
+
+    assert prices == {}
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "current_price_cache_unavailable"
+    assert events[0]["source"] == current_prices.TABLE_NAME
+    assert events[0]["metadata"] == {"symbol_count": 2, "max_age_seconds": 60}
+
+
 def test_operator_api_actions_payload_uses_section_snapshot(monkeypatch):
     full_payload_calls: list[str] = []
     section_payload = {
@@ -2645,6 +6737,140 @@ def test_operator_api_actions_payload_uses_section_snapshot(monkeypatch):
     assert payload["snapshot"]["source"] == "db_section_snapshot"
     assert payload["action_recommendations"][0]["symbol"] == "BBB"
     assert full_payload_calls == []
+
+
+def test_operator_api_company_memory_review_load_failures_record_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: (_ for _ in ()).throw(RuntimeError("table lookup failed")))
+
+    assert operator_api._load_latest_company_memory_reviews(["ABC"]) == {}
+    assert events[0]["fallback_type"] == "operator_api_company_memory_table_lookup_failed"
+    assert events[0]["source"] == operator_api.COMPANY_MEMORY_REVIEWS_TABLE
+    assert events[0]["metadata"] == {"symbol_count": 1}
+
+    events.clear()
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("review load failed")))
+
+    assert operator_api._load_latest_company_memory_reviews(["ABC", "ABC", "XYZ"]) == {}
+    assert events[0]["fallback_type"] == "operator_api_company_memory_reviews_load_failed"
+    assert events[0]["source"] == operator_api.COMPANY_MEMORY_REVIEWS_TABLE
+    assert events[0]["metadata"] == {"symbol_count": 2}
+
+
+def test_operator_api_table_columns_lookup_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("columns unavailable")))
+
+    columns = operator_api._table_columns(operator_api.SIGNAL_REFRESH_TABLE)
+
+    assert columns == set()
+    assert events[0]["fallback_type"] == "operator_api_table_columns_lookup_failed"
+    assert events[0]["source"] == operator_api.SIGNAL_REFRESH_TABLE
+    assert events[0]["metadata"] == {"table_name": operator_api.SIGNAL_REFRESH_TABLE}
+
+
+def test_operator_api_safe_manual_query_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    skipped: list[dict[str, str]] = []
+
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("manual source failed")))
+
+    out = operator_api._safe_manual_query("manual_source", "SELECT 1", params={"limit": 5}, skipped=skipped)
+
+    assert out.empty
+    assert skipped == [{"source": "manual_source", "error": "RuntimeError: manual source failed"}]
+    assert events[0]["fallback_type"] == "operator_api_manual_review_source_query_failed"
+    assert events[0]["source"] == "manual_source"
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"] == {"params_keys": ["limit"]}
+
+
+def test_operator_api_threshold_and_identity_appenders_record_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    items: list[dict[str, object]] = []
+    skipped: list[dict[str, str]] = []
+
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("threshold failed")))
+
+    operator_api._append_threshold_review_items(items, skipped, limit=7)
+
+    assert items == []
+    assert skipped == [{"source": "technical_threshold_promotion_reviews", "error": "RuntimeError: threshold failed"}]
+    assert events[0]["fallback_type"] == "operator_api_threshold_review_load_failed"
+    assert events[0]["metadata"] == {"limit": 7}
+
+    events.clear()
+    skipped.clear()
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_api, "load_open_identity_issues", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("identity failed")))
+
+    operator_api._append_identity_issue_items(items, skipped, limit=3)
+
+    assert skipped == [{"source": operator_api.IDENTITY_ISSUES_TABLE, "error": "RuntimeError: identity failed"}]
+    assert events[0]["fallback_type"] == "operator_api_identity_issues_load_failed"
+    assert events[0]["source"] == operator_api.IDENTITY_ISSUES_TABLE
+    assert events[0]["metadata"] == {"limit": 3}
+
+
+def test_operator_snapshot_records_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(operator_snapshot, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("snapshot db down")))
+    monkeypatch.setattr(operator_snapshot, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = operator_snapshot.load_operator_snapshot()
+
+    assert payload is None
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "operator_snapshot_load_failed"
+    assert events[0]["source"] == operator_snapshot.TABLE_NAME
+    assert events[0]["metadata"]["snapshot_key"] == "latest"
+
+
+def test_operator_snapshot_records_section_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(operator_snapshot, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("section db down")))
+    monkeypatch.setattr(operator_snapshot, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = operator_snapshot.load_operator_snapshot_sections(["top_action_recommendations", "alerts"])
+
+    assert payload is None
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "operator_snapshot_section_load_failed"
+    assert events[0]["source"] == operator_snapshot.SECTION_TABLE_NAME
+    assert events[0]["metadata"]["section_names"] == ["alerts", "top_action_recommendations"]
+
+
+def test_operator_snapshot_records_price_cache_refresh_failure(monkeypatch):
+    events = []
+    payload = {
+        "top_action_recommendations": [{"symbol": "TCS"}],
+        "action_recommendations": [],
+    }
+    persisted_rows: list[pd.DataFrame] = []
+
+    monkeypatch.setattr(operator_snapshot, "build_live_dashboard_payload", lambda **kwargs: payload)
+    monkeypatch.setattr(operator_snapshot, "refresh_current_prices", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("price cache failed")))
+    monkeypatch.setattr(operator_snapshot, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(operator_snapshot, "upsert_to_db", lambda df, *args, **kwargs: persisted_rows.append(df.copy()))
+
+    result = operator_snapshot.build_operator_snapshot(persist=True)
+
+    assert result["status"] == "ok"
+    assert result["price_cache"]["status"] == "error"
+    assert persisted_rows
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "operator_snapshot_price_cache_refresh_failed"
+    assert events[0]["source"] == "advisory_current_prices"
+    assert events[0]["metadata"]["symbol_count"] == 1
 
 
 def test_operator_api_event_model_artifacts_paginates_manifest_files(monkeypatch):
@@ -2681,6 +6907,72 @@ def test_operator_api_event_model_artifacts_paginates_manifest_files(monkeypatch
         "has_more": True,
         "next_offset": 5,
     }
+
+
+def test_operator_api_event_model_artifact_manifest_missing_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(
+        operator_api,
+        "build_artifact_manifest",
+        lambda **kwargs: (_ for _ in ()).throw(FileNotFoundError("artifact missing")),
+    )
+
+    payload = operator_api.build_event_model_artifacts_payload(limit=5)
+
+    assert payload["status"] == "missing_artifact"
+    assert payload["artifact"]["files"] == []
+    assert events[0]["fallback_type"] == "operator_api_event_model_artifact_manifest_missing"
+    assert events[0]["source"] == "event_model_artifacts"
+    assert events[0]["metadata"] == {
+        "artifact_dir": ".cache/advisory_event_meta_model",
+        "model_basename": "event_meta_model",
+    }
+
+
+def test_operator_api_event_model_artifact_s3_failures_record_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    files = [
+        {"path": "model.json", "latest_key": "models/latest/model.json"},
+    ]
+
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(
+        operator_api,
+        "build_artifact_manifest",
+        lambda **kwargs: {
+            "status": "ok",
+            "model_version": "event_meta_model_h10",
+            "latest_prefix": "models/latest",
+            "files": files,
+        },
+    )
+
+    class BrokenHeadS3:
+        def head_object(self, *, Bucket, Key):
+            raise RuntimeError("head failed")
+
+    monkeypatch.setitem(sys.modules, "utils.store", types.SimpleNamespace(AWS_BUCKET_NAME="bucket", _get_client=lambda: BrokenHeadS3()))
+
+    payload = operator_api.build_event_model_artifacts_payload(limit=5)
+
+    assert payload["latest_s3_heads"][0]["status"] == "missing_or_error"
+    assert events[0]["fallback_type"] == "operator_api_event_model_artifact_head_failed"
+    assert events[0]["metadata"] == {"bucket": "bucket", "key": "models/latest/model.json"}
+
+    events.clear()
+    monkeypatch.setitem(
+        sys.modules,
+        "utils.store",
+        types.SimpleNamespace(AWS_BUCKET_NAME="bucket", _get_client=lambda: (_ for _ in ()).throw(RuntimeError("s3 unavailable"))),
+    )
+
+    payload = operator_api.build_event_model_artifacts_payload(limit=5)
+
+    assert payload["latest_s3_heads"][0]["status"] == "s3_unavailable"
+    assert events[0]["fallback_type"] == "operator_api_event_model_artifact_s3_unavailable"
+    assert events[0]["metadata"] == {"latest_prefix": "models/latest"}
 
 
 def test_operator_api_builds_signal_quality_payload(monkeypatch):
@@ -2854,6 +7146,174 @@ def test_operator_api_runtime_payload_surfaces_live_trading_env(monkeypatch):
     assert "requires approval, reconciliation, and safety gates" in payload["live_trading_operator_note"]
 
 
+def test_operator_api_create_module_app_records_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(operator_api, "create_app", lambda: (_ for _ in ()).throw(RuntimeError("config missing")))
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert operator_api._create_module_app() is None
+    assert events[0]["module"] == "advisory.api.app"
+    assert events[0]["source"] == "operator_api_create_app"
+    assert events[0]["fallback_type"] == "operator_api_create_app_failed"
+    assert events[0]["severity"] == "error"
+
+
+def test_operator_api_git_output_records_runtime_metadata_failure(monkeypatch):
+    events = []
+
+    def fake_check_output(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=1.5)
+
+    monkeypatch.setattr(operator_api.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert operator_api._git_output(["status", "--porcelain"]) is None
+    assert events[0]["module"] == "advisory.api.app"
+    assert events[0]["source"] == "operator_runtime"
+    assert events[0]["fallback_type"] == "operator_api_runtime_git_metadata_unavailable"
+    assert events[0]["metadata"]["git_args"] == ["status", "--porcelain"]
+
+
+def test_operator_api_latest_source_mtime_records_stat_failure(monkeypatch, tmp_path):
+    events = []
+    source_path = tmp_path / "api.py"
+    source_path.write_text("print('x')\n", encoding="utf-8")
+    original_stat = operator_api.Path.stat
+
+    def fake_stat(path, *args, **kwargs):
+        if path == source_path:
+            raise OSError("stat failed")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(operator_api.Path, "stat", fake_stat)
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    latest_mtime, latest_path = operator_api._latest_source_mtime(root=tmp_path)
+
+    assert latest_mtime is None
+    assert latest_path is None
+    assert events[0]["module"] == "advisory.api.app"
+    assert events[0]["source"] == "operator_runtime"
+    assert events[0]["fallback_type"] == "operator_api_runtime_source_mtime_unavailable"
+    assert events[0]["metadata"]["path"] == str(source_path)
+
+
+def test_operator_api_json_byte_size_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(operator_api.json, "dumps", lambda *args, **kwargs: (_ for _ in ()).throw(TypeError("json failed")))
+
+    assert operator_api._json_byte_size({"symbol": "ABC"}) == len(str({"symbol": "ABC"}).encode("utf-8"))
+    assert events[0]["module"] == "advisory.api.app"
+    assert events[0]["source"] == "operator_api_payload_size"
+    assert events[0]["fallback_type"] == "operator_api_json_byte_size_failed"
+
+
+def test_operator_api_safe_json_dumps_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(operator_api, "_json_ready", lambda value: (_ for _ in ()).throw(TypeError("not ready")))
+
+    payload = json.loads(operator_api._safe_json_dumps({"symbol": "ABC"}))
+
+    assert payload["serialization_error"] is True
+    assert events[0]["module"] == "advisory.api.app"
+    assert events[0]["source"] == "operator_api_safe_json_dumps"
+    assert events[0]["fallback_type"] == "operator_api_safe_json_dumps_failed"
+
+
+def test_operator_api_jsonish_records_missing_check_and_parse_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(operator_api.pd, "isna", lambda value: (_ for _ in ()).throw(TypeError("missing check failed")))
+
+    parsed = operator_api._jsonish("{bad json", source="manual_review_context_json")
+
+    assert parsed == {}
+    assert [event["fallback_type"] for event in events] == [
+        "operator_api_jsonish_missing_check_failed",
+        "operator_api_jsonish_parse_failed",
+    ]
+    assert events[0]["source"] == "manual_review_context_json"
+    assert events[1]["source"] == "manual_review_context_json"
+
+
+def test_operator_api_bounded_pagination_records_parse_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert operator_api._bounded_limit("bad-limit", default=25, maximum=100) == 25
+    assert operator_api._bounded_offset("bad-offset") == 0
+
+    assert [event["fallback_type"] for event in events] == [
+        "operator_api_bounded_limit_parse_failed",
+        "operator_api_bounded_offset_parse_failed",
+    ]
+    assert all(event["source"] == "operator_api_pagination" for event in events)
+
+
+def test_operator_api_scalar_normalizers_record_missing_check_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(operator_api.pd, "isna", lambda value: (_ for _ in ()).throw(TypeError("missing check failed")))
+
+    text = operator_api._text(sentinel)
+    boolish = operator_api._boolish(sentinel)
+
+    assert text.startswith("<object object at ")
+    assert boolish is True
+    assert [event["fallback_type"] for event in events] == [
+        "operator_api_text_missing_check_failed",
+        "operator_api_boolish_missing_check_failed",
+    ]
+
+
+def test_operator_api_json_ready_records_conversion_fallbacks(monkeypatch):
+    events = []
+
+    class BadItem:
+        def item(self):
+            raise TypeError("bad item")
+
+    class BadIsoformat:
+        def isoformat(self):
+            raise TypeError("bad isoformat")
+
+    sentinel = object()
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    bad_item = BadItem()
+    bad_isoformat = BadIsoformat()
+    assert operator_api._json_ready(bad_item) is bad_item
+    assert operator_api._json_ready(bad_isoformat) is bad_isoformat
+
+    monkeypatch.setattr(operator_api.pd, "isna", lambda value: (_ for _ in ()).throw(TypeError("missing check failed")))
+    assert operator_api._json_ready(sentinel) is sentinel
+
+    assert [event["fallback_type"] for event in events] == [
+        "operator_api_json_ready_item_failed",
+        "operator_api_json_ready_isoformat_failed",
+        "operator_api_json_ready_missing_check_failed",
+    ]
+    assert all(event["source"] == "operator_api_json_ready" for event in events)
+
+
+def test_operator_api_count_value_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert operator_api._count_value("not-a-count", fallback=7, source="trace_summary.raw_counts") == 7
+    assert events[0]["module"] == "advisory.api.app"
+    assert events[0]["source"] == "trace_summary.raw_counts"
+    assert events[0]["fallback_type"] == "operator_api_count_value_parse_failed"
+    assert events[0]["metadata"]["fallback"] == 7
+
+
 def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
@@ -2866,9 +7326,14 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     monkeypatch.setattr(operator_health, "build_event_data_quality_report", lambda limit=20: {"status": "ok", "message": "event quality ok", "summary": {}})
     monkeypatch.setattr(operator_health, "check_identity_issues", lambda limit=10: {"status": "ok", "message": "identity ok", "open_count": 0, "rows": []})
     monkeypatch.setattr(operator_health, "check_signal_quality", lambda: {"status": "ok", "message": "signal quality ok", "usable": True})
+    monkeypatch.setattr(operator_health, "check_feature_stage_gates", lambda: {"status": "ok", "message": "stage gates ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []})
+    monkeypatch.setattr(operator_health, "check_lifecycle_policy_change_audit", lambda: {"status": "ok", "message": "lifecycle audit ok", "missing_audit_count": 0})
     monkeypatch.setattr(operator_health, "summarize_fallback_events", lambda hours=24, limit=25: {"status": "ok", "message": "fallback ok", "active_count": 0, "rows": []})
     monkeypatch.setattr(operator_health, "check_sync_state_failures", lambda: [{"status": "ok", "message": "sync ok"}])
+    monkeypatch.setattr(operator_health, "check_downloader_run_state", lambda: {"status": "ok", "message": "downloaders ok", "rows": []})
+    monkeypatch.setattr(operator_health, "check_schema_migrations", lambda: {"status": "ok", "message": "schema ok", "rows": []})
     monkeypatch.setattr(operator_health, "check_operator_api_errors", lambda: {"status": "ok", "message": "api errors ok", "rows": []})
+    monkeypatch.setattr(operator_health, "check_screener_failures", lambda limit=10: {"status": "ok", "message": "screener ok", "active_count": 0, "rows": []})
     monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
     monkeypatch.setattr(operator_health, "summarize_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
     monkeypatch.setattr(operator_health, "check_table_freshness", lambda **_kwargs: [{"status": "warn", "message": "stale", "name": "actions"}])
@@ -2891,6 +7356,90 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     assert any(row["category"] == "pipeline" for row in payload["current_blockers"]["rows"])
     assert payload["sections"]["trust_gate"]["status"] == "warn"
     assert payload["sections"]["trust_gate"]["trust_level"] == "review_required"
+
+
+def test_operator_health_schema_migrations_warns_when_registry_missing(monkeypatch):
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: False)
+
+    payload = operator_health.check_schema_migrations()
+
+    assert payload["status"] == "warn"
+    assert payload["table"] == "stockey_schema_migrations"
+    assert payload["returned_count"] == 0
+    assert "utils.schema_migrations --ensure-table" in payload["command"]
+
+
+def test_operator_health_schema_migrations_errors_on_failed_rows(monkeypatch):
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: table_name == "stockey_schema_migrations")
+    monkeypatch.setattr(
+        operator_health,
+        "sql_to_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "migration_id": "20260611_failed",
+                    "status": "failed",
+                    "checksum": "abc",
+                    "description": "failed migration",
+                    "started_at": pd.Timestamp("2026-06-11T01:00:00Z"),
+                    "applied_at": pd.NaT,
+                    "finished_at": pd.Timestamp("2026-06-11T01:01:00Z"),
+                    "error_text": "boom",
+                    "metadata_json": "{}",
+                },
+                {
+                    "migration_id": "20260611_running",
+                    "status": "running",
+                    "checksum": "def",
+                    "description": "running migration",
+                    "started_at": pd.Timestamp("2026-06-11T02:00:00Z"),
+                    "applied_at": pd.NaT,
+                    "finished_at": pd.NaT,
+                    "error_text": None,
+                    "metadata_json": "{}",
+                },
+            ]
+        ),
+    )
+
+    payload = operator_health.check_schema_migrations(limit=5)
+
+    assert payload["status"] == "error"
+    assert payload["failed_count"] == 1
+    assert payload["running_count"] == 1
+    assert payload["rows"][0]["migration_id"] == "20260611_failed"
+
+
+def test_operator_health_schema_migrations_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: (_ for _ in ()).throw(RuntimeError("schema registry lookup failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_schema_migrations(limit=5)
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_schema_migrations_check_failed"
+    assert events[0]["source"] == operator_health.SCHEMA_MIGRATIONS_TABLE
+
+
+def test_operator_health_schema_migrations_surface_fix_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "schema_migrations": {
+                "status": "error",
+                "message": "Schema migration registry has failed migration rows.",
+                "table": "stockey_schema_migrations",
+                "failed_count": 1,
+                "running_count": 0,
+                "returned_count": 3,
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Schema migration registry needs attention" for hint in hints)
+    commands = " ".join(command for hint in hints for command in hint["commands"])
+    assert "utils.schema_migrations --list" in commands
 
 
 def test_operator_health_current_blockers_prioritize_active_trust_issues():
@@ -2948,6 +7497,7 @@ def test_operator_health_trust_gate_blocks_on_runtime_and_warns_on_signal_qualit
             "event_data_quality": {"status": "ok", "message": "event ok"},
             "identity_issues": {"status": "ok", "open_count": 0},
             "signal_quality": {"status": "ok", "usable": True},
+            "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
             "fallback_telemetry": {"status": "ok", "active_count": 0},
             "degradation_feed": {"status": "ok", "active_count": 0},
         }
@@ -2967,6 +7517,7 @@ def test_operator_health_trust_gate_blocks_on_runtime_and_warns_on_signal_qualit
                 "max_matured_rows": 100,
                 "overlay_rows": 0,
             },
+            "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
             "fallback_telemetry": {"status": "ok", "active_count": 0},
             "degradation_feed": {"status": "ok", "active_count": 0},
         }
@@ -2983,6 +7534,8 @@ def test_fallback_telemetry_records_and_summarizes_events(monkeypatch):
     writes = []
     monkeypatch.setattr(fallback_telemetry, "ensure_table", lambda: None)
     monkeypatch.setattr(fallback_telemetry, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+    monkeypatch.setattr(fallback_telemetry, "read_db_retry_telemetry_events", lambda **_kwargs: [])
+    monkeypatch.setattr(fallback_telemetry, "read_local_fallback_events", lambda **_kwargs: [])
     row = fallback_telemetry.record_fallback_event(
         module="advisory.test",
         source="unit",
@@ -3006,7 +7559,13 @@ def test_fallback_telemetry_records_and_summarizes_events(monkeypatch):
         if "COUNT(*) AS active_count" in query:
             return pd.DataFrame([{"active_count": 2, "error_count": 1, "warn_count": 1}])
         if "GROUP BY fallback_type" in query:
-            return pd.DataFrame([{"fallback_type": "llm_deterministic_fallback", "count": 2}])
+            return pd.DataFrame(
+                [
+                    {"fallback_type": "llm_deterministic_fallback", "count": 2},
+                    {"fallback_type": "nse_session_reset", "count": 3},
+                    {"fallback_type": "nse_retry", "count": 4},
+                ]
+            )
         if "GROUP BY module" in query:
             return pd.DataFrame([{"module": "advisory.test", "count": 2}])
         return pd.DataFrame(
@@ -3031,7 +7590,272 @@ def test_fallback_telemetry_records_and_summarizes_events(monkeypatch):
     assert summary["status"] == "error"
     assert summary["active_count"] == 2
     assert summary["counts_by_type"]["llm_deterministic_fallback"] == 2
+    assert summary["nse_session_reset_count"] == 3
+    assert summary["nse_retry_count"] == 4
+    assert summary["nse_http_count"] == 7
     assert summary["rows"][0]["event_id"] == "evt-1"
+
+
+def test_fallback_telemetry_db_write_failure_spools_local_event(monkeypatch):
+    events = []
+    monkeypatch.setattr(fallback_telemetry, "ensure_table", lambda: None)
+    monkeypatch.setattr(fallback_telemetry, "upsert_to_db", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("postgres down")))
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    row = fallback_telemetry.record_fallback_event(
+        module="advisory.unit",
+        source="unit_source",
+        fallback_type="unit_fallback",
+        error=RuntimeError("original"),
+    )
+
+    assert row["fallback_type"] == "unit_fallback"
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.fallback_telemetry"
+    assert events[0]["source"] == fallback_telemetry.TABLE_NAME
+    assert events[0]["fallback_type"] == "fallback_telemetry_db_write_failed"
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"]["original_event_id"] == row["event_id"]
+    assert events[0]["metadata"]["original_module"] == "advisory.unit"
+    assert events[0]["metadata"]["original_source"] == "unit_source"
+    assert events[0]["metadata"]["original_fallback_type"] == "unit_fallback"
+
+
+def test_fallback_telemetry_includes_file_spooled_db_retry_events(monkeypatch):
+    monkeypatch.setattr(fallback_telemetry, "table_exists", lambda table_name=fallback_telemetry.TABLE_NAME: False)
+    monkeypatch.setattr(fallback_telemetry, "read_local_fallback_events", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        fallback_telemetry,
+        "read_db_retry_telemetry_events",
+        lambda **_kwargs: [
+            {
+                "observed_at": "2026-06-11T10:00:00+00:00",
+                "module": "utils.db",
+                "source": "postgres",
+                "fallback_type": "db_retry",
+                "severity": "warn",
+                "status": "active",
+                "operation_name": "sql_to_df",
+                "attempt": 1,
+                "max_attempts": 3,
+                "error_type": "QueryCanceled",
+                "error_message": "statement timeout",
+            }
+        ],
+    )
+
+    summary = fallback_telemetry.summarize_fallback_events(hours=24, limit=10)
+
+    assert summary["status"] == "warn"
+    assert summary["active_count"] == 1
+    assert summary["db_retry_count"] == 1
+    assert summary["counts_by_type"]["db_retry"] == 1
+    assert summary["rows"][0]["operation_name"] == "sql_to_df"
+
+
+def test_fallback_telemetry_summary_records_table_check_failure(monkeypatch):
+    events = []
+    monkeypatch.setattr(fallback_telemetry, "read_db_retry_telemetry_events", lambda **_kwargs: [])
+    monkeypatch.setattr(fallback_telemetry, "read_local_fallback_events", lambda **_kwargs: [])
+    monkeypatch.setattr(fallback_telemetry, "table_exists", lambda table_name=fallback_telemetry.TABLE_NAME: (_ for _ in ()).throw(RuntimeError("table check failed")))
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    summary = fallback_telemetry.summarize_fallback_events(hours=24, limit=7)
+
+    assert summary["status"] == "error"
+    assert summary["error"] == "RuntimeError: table check failed"
+    assert events[0]["source"] == fallback_telemetry.TABLE_NAME
+    assert events[0]["fallback_type"] == "fallback_telemetry_table_check_failed"
+    assert events[0]["metadata"] == {"hours": 24, "limit": 7}
+
+
+def test_fallback_telemetry_summary_records_table_query_failure(monkeypatch):
+    events = []
+    monkeypatch.setattr(fallback_telemetry, "read_db_retry_telemetry_events", lambda **_kwargs: [])
+    monkeypatch.setattr(fallback_telemetry, "read_local_fallback_events", lambda **_kwargs: [])
+    monkeypatch.setattr(fallback_telemetry, "table_exists", lambda table_name=fallback_telemetry.TABLE_NAME: True)
+    monkeypatch.setattr(fallback_telemetry, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("query failed")))
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    summary = fallback_telemetry.summarize_fallback_events(hours=12, limit=9)
+
+    assert summary["status"] == "error"
+    assert summary["error"] == "RuntimeError: query failed"
+    assert events[0]["source"] == fallback_telemetry.TABLE_NAME
+    assert events[0]["fallback_type"] == "fallback_telemetry_table_query_failed"
+    assert events[0]["metadata"] == {"hours": 12, "limit": 9}
+
+
+def test_fallback_telemetry_records_local_fallback_events(monkeypatch, tmp_path):
+    telemetry_file = tmp_path / "local_fallback_events.jsonl"
+    monkeypatch.setattr(fallback_telemetry, "LOCAL_FALLBACK_TELEMETRY_FILE", telemetry_file)
+    monkeypatch.setattr(fallback_telemetry, "read_db_retry_telemetry_events", lambda **_kwargs: [])
+    monkeypatch.setattr(fallback_telemetry, "table_exists", lambda table_name=fallback_telemetry.TABLE_NAME: False)
+
+    row = fallback_telemetry.record_local_fallback_event(
+        module="advisory.test",
+        source="unit",
+        fallback_type="current_price_cache_unavailable",
+        reason="tokenId=SECRET123 should be hidden",
+        error=RuntimeError("Authorization: Bearer abc.def"),
+        metadata={"access_token": "SECRET123"},
+    )
+
+    rows = fallback_telemetry.read_local_fallback_events(hours=24, limit=10)
+    summary = fallback_telemetry.summarize_fallback_events(hours=24, limit=10)
+
+    assert row["fallback_type"] == "current_price_cache_unavailable"
+    assert len(rows) == 1
+    assert "SECRET123" not in json.dumps(rows, default=str)
+    assert "abc.def" not in json.dumps(rows, default=str)
+    assert summary["local_fallback_count"] == 1
+    assert summary["counts_by_type"]["current_price_cache_unavailable"] == 1
+
+
+def test_fallback_telemetry_records_bad_local_jsonl_line(monkeypatch, tmp_path):
+    events = []
+    telemetry_file = tmp_path / "local_fallback_events.jsonl"
+    observed_at = pd.Timestamp.utcnow().isoformat()
+    telemetry_file.write_text(
+        "{bad-json\n"
+        + json.dumps(
+            {
+                "observed_at": observed_at,
+                "module": "advisory.test",
+                "source": "unit",
+                "fallback_type": "unit_fallback",
+                "severity": "warn",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(fallback_telemetry, "LOCAL_FALLBACK_TELEMETRY_FILE", telemetry_file)
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = fallback_telemetry.read_local_fallback_events(hours=24, limit=10)
+
+    assert len(rows) == 1
+    assert rows[0]["fallback_type"] == "unit_fallback"
+    assert events[0]["module"] == "advisory.fallback_telemetry"
+    assert events[0]["source"] == str(telemetry_file)
+    assert events[0]["fallback_type"] == "local_fallback_telemetry_line_parse_failed"
+    assert events[0]["metadata"]["line_number"] == 1
+    assert events[0]["metadata"]["line_excerpt"] == "{bad-json"
+
+
+def test_fallback_telemetry_records_local_spool_read_failure(monkeypatch, tmp_path):
+    events = []
+    telemetry_file = tmp_path / "local_fallback_events.jsonl"
+    telemetry_file.write_text("{}\n", encoding="utf-8")
+    original_open = fallback_telemetry.Path.open
+
+    def fake_open(path, *args, **kwargs):
+        if path == telemetry_file:
+            raise OSError("cannot read")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(fallback_telemetry, "LOCAL_FALLBACK_TELEMETRY_FILE", telemetry_file)
+    monkeypatch.setattr(fallback_telemetry.Path, "open", fake_open)
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = fallback_telemetry.read_local_fallback_events(hours=24, limit=10)
+
+    assert rows == []
+    assert events[0]["module"] == "advisory.fallback_telemetry"
+    assert events[0]["source"] == str(telemetry_file)
+    assert events[0]["fallback_type"] == "local_fallback_telemetry_read_failed"
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"]["path"] == str(telemetry_file)
+
+
+def test_redaction_masks_secrets_mobile_and_auth_urls():
+    text = (
+        "DHAN_LOGIN_MOBILE=9876543210 tokenId=SECRET123 "
+        "Authorization: Bearer abc.def "
+        "https://broker.example/callback?tokenId=SECRET123&symbol=ABC"
+    )
+    redacted = redaction.redact_text(text)
+
+    assert "9876543210" not in redacted
+    assert "SECRET123" not in redacted
+    assert "abc.def" not in redacted
+    assert "symbol=ABC" in redacted
+    assert redaction.REDACTED in redacted
+
+
+def test_redaction_url_parse_failure_records_fallback(monkeypatch):
+    events = []
+
+    def fail_urlsplit(_value):
+        raise ValueError("bad url")
+
+    monkeypatch.setattr(redaction, "urlsplit", fail_urlsplit)
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    redacted = redaction.redact_text("see https://broker.example/callback?tokenId=SECRET123")
+
+    assert redacted == f"see {redaction.REDACTED}"
+    assert len(events) == 1
+    assert events[0]["module"] == "utils.redaction"
+    assert events[0]["source"] == "url_redaction"
+    assert events[0]["fallback_type"] == "redaction_url_parse_failed"
+    assert events[0]["severity"] == "warn"
+
+
+def test_redaction_json_parse_failure_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    redacted = redaction.redact_json_text("password=SECRET123")
+
+    assert redacted == f"password={redaction.REDACTED}"
+    assert len(events) == 1
+    assert events[0]["module"] == "utils.redaction"
+    assert events[0]["source"] == "json_redaction"
+    assert events[0]["fallback_type"] == "redaction_json_parse_failed"
+    assert events[0]["severity"] == "warn"
+
+
+def test_fallback_telemetry_redacts_sensitive_error_and_metadata(monkeypatch):
+    writes = []
+    monkeypatch.setattr(fallback_telemetry, "ensure_table", lambda: None)
+    monkeypatch.setattr(fallback_telemetry, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+    monkeypatch.setattr(fallback_telemetry, "read_db_retry_telemetry_events", lambda **_kwargs: [])
+    monkeypatch.setattr(fallback_telemetry, "read_local_fallback_events", lambda **_kwargs: [])
+
+    row = fallback_telemetry.record_fallback_event(
+        module="advisory.test",
+        fallback_type="dhan_refresh",
+        reason="Retry with tokenId=SECRET123 for mobile 9876543210",
+        error="Authorization: Bearer abc.def",
+        metadata={"access_token": "SECRET123", "auth_url": "https://x.test/cb?tokenId=SECRET123&symbol=ABC"},
+    )
+
+    dumped = json.dumps(row, default=str)
+    persisted = writes[0].to_json()
+    assert "SECRET123" not in dumped
+    assert "9876543210" not in dumped
+    assert "abc.def" not in dumped
+    assert "SECRET123" not in persisted
+    assert "symbol=ABC" in row["metadata_json"]
+
+
+def test_fallback_telemetry_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(fallback_telemetry, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    fallback_telemetry.ensure_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == fallback_telemetry.FALLBACK_TELEMETRY_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [fallback_telemetry.TABLE_NAME]
+    assert any(fallback_telemetry.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("fallback_type TEXT NOT NULL" in statement for statement in calls[0]["statements"])
+    assert any("deterministic_fallback BOOLEAN" in statement for statement in calls[0]["statements"])
 
 
 def test_operator_health_surfaces_fallback_telemetry_in_trust_and_fix_hints():
@@ -3042,8 +7866,11 @@ def test_operator_health_surfaces_fallback_telemetry_in_trust_and_fix_hints():
         "active_count": 3,
         "error_count": 0,
         "warn_count": 3,
-        "counts_by_type": {"redis_fail_soft": 2, "llm_deterministic_fallback": 1},
+        "counts_by_type": {"redis_fail_soft": 2, "llm_deterministic_fallback": 1, "nse_session_reset": 1},
         "counts_by_module": {"utils.redis": 2, "advisory.event_policy": 1},
+        "nse_session_reset_count": 1,
+        "nse_retry_count": 0,
+        "nse_http_count": 1,
         "rows": [],
     }
     sections = {
@@ -3054,6 +7881,7 @@ def test_operator_health_surfaces_fallback_telemetry_in_trust_and_fix_hints():
         "event_data_quality": {"status": "ok", "message": "event ok"},
         "identity_issues": {"status": "ok", "open_count": 0},
         "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
         "fallback_telemetry": fallback_section,
         "degradation_feed": {"status": "ok", "active_count": 0},
     }
@@ -3062,8 +7890,919 @@ def test_operator_health_surfaces_fallback_telemetry_in_trust_and_fix_hints():
     trust = operator_health.build_trust_gate(sections)
 
     assert any(hint["title"] == "Recent fallback/degraded-path events were recorded" for hint in hints)
+    assert any(hint["title"] == "NSE HTTP session retries or cookie resets were recorded" for hint in hints)
     assert trust["status"] == "warn"
     assert any(row["key"] == "fallback_telemetry" for row in trust["checks"])
+    fallback_check = next(row for row in trust["checks"] if row["key"] == "fallback_telemetry")
+    assert fallback_check["details"]["nse_session_reset_count"] == 1
+
+
+def test_operator_health_surfaces_db_retry_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent DB retry fallback events found.",
+            "window_hours": 24,
+            "active_count": 2,
+            "error_count": 0,
+            "warn_count": 2,
+            "db_retry_count": 2,
+            "db_retry_error_count": 0,
+            "counts_by_type": {"db_retry": 2},
+            "counts_by_module": {"utils.db": 2},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Postgres retry or reconnect telemetry was recorded" for hint in hints)
+
+
+def test_operator_health_surfaces_current_price_cache_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 1,
+            "error_count": 0,
+            "warn_count": 1,
+            "local_fallback_count": 1,
+            "counts_by_type": {"current_price_cache_unavailable": 1},
+            "counts_by_module": {"advisory.current_prices": 1},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Operator current-price cache fallback was used" for hint in hints)
+
+
+def test_operator_health_surfaces_risk_liquidity_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 1,
+            "error_count": 0,
+            "warn_count": 1,
+            "local_fallback_count": 1,
+            "counts_by_type": {"risk_liquidity_cap_adv20_missing": 1},
+            "counts_by_module": {"advisory.risk_engine": 1},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Risk sizing used liquidity fallback because ADV20 was missing" for hint in hints)
+
+
+def test_operator_health_surfaces_risk_context_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 2,
+            "error_count": 0,
+            "warn_count": 2,
+            "local_fallback_count": 2,
+            "counts_by_type": {"risk_macro_context_unavailable": 1, "risk_exchange_context_unavailable": 1},
+            "counts_by_module": {"advisory.risk_engine": 2},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Risk sizing continued with missing context fallback" for hint in hints)
+
+
+def test_operator_health_surfaces_signal_refresh_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 3,
+            "error_count": 0,
+            "warn_count": 3,
+            "local_fallback_count": 3,
+            "counts_by_type": {
+                "signal_refresh_latest_row_unavailable": 1,
+                "signal_refresh_event_policy_unavailable": 1,
+                "signal_refresh_router_actions_unavailable": 1,
+            },
+            "counts_by_module": {"advisory.signal_refresh": 3},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Signal refresh continued with missing source context" for hint in hints)
+
+
+def test_operator_health_surfaces_action_conflict_rule_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 2,
+            "error_count": 0,
+            "warn_count": 2,
+            "local_fallback_count": 2,
+            "counts_by_type": {
+                "action_conflict_rule_load_failed_default_rules": 1,
+                "action_dynamic_conflict_rule_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.action_recommender": 2},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Action consolidation used fallback conflict-rule behavior" for hint in hints)
+
+
+def test_operator_health_surfaces_wait_signal_source_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 2,
+            "error_count": 0,
+            "warn_count": 2,
+            "local_fallback_count": 2,
+            "counts_by_type": {
+                "wait_signal_source_table_missing_columns": 1,
+                "wait_signal_source_event_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.wait_signals": 2},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Wait-signal matching skipped source evidence" for hint in hints)
+
+
+def test_operator_health_surfaces_feature_freshness_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 1,
+            "error_count": 0,
+            "warn_count": 1,
+            "local_fallback_count": 1,
+            "counts_by_type": {"feature_freshness_input_lookup_failed": 1},
+            "counts_by_module": {"advisory.feature_freshness": 1},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Feature freshness lookup fallback was used" for hint in hints)
+
+
+def test_operator_health_surfaces_company_memory_source_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 3,
+            "error_count": 0,
+            "warn_count": 3,
+            "local_fallback_count": 3,
+            "counts_by_type": {
+                "company_memory_source_table_lookup_failed": 1,
+                "company_memory_source_rows_load_failed": 1,
+                "company_memory_wait_signals_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.company_memory_review": 3},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Company-memory review skipped source context" for hint in hints)
+
+
+def test_operator_health_surfaces_news_theme_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 2,
+            "error_count": 0,
+            "warn_count": 2,
+            "local_fallback_count": 2,
+            "counts_by_type": {
+                "news_theme_asof_resolve_failed": 1,
+                "news_theme_market_news_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.news_theme_engine": 2},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "News-theme recommendations returned empty fallback output" for hint in hints)
+
+
+def test_operator_health_surfaces_event_policy_evaluator_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 3,
+            "error_count": 0,
+            "warn_count": 3,
+            "local_fallback_count": 3,
+            "counts_by_type": {
+                "event_policy_evaluator_schema_lookup_failed": 1,
+                "event_policy_evaluator_required_columns_missing": 1,
+                "event_policy_evaluator_policy_rows_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.event_policy_evaluator": 3},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Event-policy evaluator returned empty fallback output" for hint in hints)
+
+
+def test_operator_health_surfaces_event_data_quality_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 3,
+            "error_count": 0,
+            "warn_count": 3,
+            "local_fallback_count": 3,
+            "counts_by_type": {
+                "event_data_quality_table_lookup_failed": 1,
+                "event_data_quality_source_freshness_query_failed": 1,
+                "event_data_quality_announcement_readiness_query_failed": 1,
+            },
+            "counts_by_module": {"advisory.event_data_quality": 3},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Event data-quality checks used fallback source handling" for hint in hints)
+
+
+def test_operator_health_surfaces_trace_summary_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 3,
+            "error_count": 0,
+            "warn_count": 3,
+            "local_fallback_count": 3,
+            "counts_by_type": {
+                "trace_summary_cache_load_failed": 1,
+                "trace_summary_recent_symbols_load_failed": 1,
+                "trace_summary_symbol_build_failed": 1,
+            },
+            "counts_by_module": {"advisory.trace_summary_store": 3},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Trace summary cache used fallback behavior" for hint in hints)
+
+
+def test_operator_health_surfaces_event_evidence_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 3,
+            "error_count": 0,
+            "warn_count": 3,
+            "local_fallback_count": 3,
+            "counts_by_type": {
+                "event_evidence_table_lookup_failed": 1,
+                "event_evidence_bhavcopy_source_load_failed": 1,
+                "event_evidence_announcement_source_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.event_evidence_store": 3},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Compact event evidence refresh used fallback behavior" for hint in hints)
+
+
+def test_operator_health_surfaces_event_meta_model_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 3,
+            "error_count": 0,
+            "warn_count": 3,
+            "local_fallback_count": 3,
+            "counts_by_type": {
+                "event_meta_model_price_history_load_failed": 1,
+                "event_meta_model_macro_context_load_failed": 1,
+                "event_meta_model_exchange_context_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.event_meta_model": 3},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Event meta-model used degraded source context" for hint in hints)
+
+
+def test_operator_health_surfaces_exchange_features_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 2,
+            "error_count": 0,
+            "warn_count": 2,
+            "local_fallback_count": 2,
+            "counts_by_type": {
+                "exchange_features_table_lookup_failed": 1,
+                "exchange_features_events_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.exchange_features": 2},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Exchange-event feature build used fallback behavior" for hint in hints)
+
+
+def test_operator_health_surfaces_market_context_fallback_hint():
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {
+            "status": "warn",
+            "message": "Recent fallback/degraded-path events found.",
+            "window_hours": 24,
+            "active_count": 3,
+            "error_count": 0,
+            "warn_count": 3,
+            "local_fallback_count": 3,
+            "counts_by_type": {
+                "market_context_technical_load_failed": 1,
+                "market_context_event_count_load_failed": 1,
+                "market_context_summary_cache_load_failed": 1,
+            },
+            "counts_by_module": {"advisory.market_context": 3},
+            "rows": [],
+        },
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+
+    assert any(hint["title"] == "Market context used partial or fallback source data" for hint in hints)
+
+
+def test_operator_health_feature_stage_gates_warns_on_blocked_inputs(monkeypatch):
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: table_name == "advisory_action_recommendations")
+    monkeypatch.setattr(
+        operator_health,
+        "sql_to_df",
+        lambda *args, **kwargs: pd.DataFrame([{"symbol": "ABC"}, {"symbol": "XYZ"}]),
+    )
+
+    def fake_gate(stage, symbols, asof_date=None):
+        if stage == "risk":
+            return {
+                "stage": stage,
+                "status": "blocked",
+                "symbols_checked": len(symbols),
+                "blocked_count": 1,
+                "blocked_symbols": ["ABC"],
+                "required_input_keys": ["technical_features"],
+                "gate_effect": "review_only",
+            }
+        return {
+            "stage": stage,
+            "status": "ok",
+            "symbols_checked": len(symbols),
+            "blocked_count": 0,
+            "blocked_symbols": [],
+            "required_input_keys": ["technical_features"],
+            "gate_effect": "none",
+        }
+
+    monkeypatch.setattr(operator_health, "evaluate_stage_feature_gate", fake_gate)
+
+    payload = operator_health.check_feature_stage_gates(limit=10)
+
+    assert payload["status"] == "warn"
+    assert payload["blocked_stage_count"] == 1
+    assert payload["blocked_symbol_count"] == 1
+    assert any(row["stage"] == "risk" and row["status"] == "blocked" for row in payload["rows"])
+
+
+def test_operator_health_feature_stage_gate_symbol_load_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "load_feature_stage_gate_symbols", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("symbol load failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_feature_stage_gates(limit=9)
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_feature_stage_gate_symbols_load_failed"
+    assert events[0]["source"] == operator_health.ACTION_RECOMMENDATIONS_TABLE
+    assert events[0]["metadata"] == {"limit": 9}
+
+
+def test_operator_health_feature_stage_gate_eval_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "load_feature_stage_gate_symbols", lambda **kwargs: ["ABC", "XYZ"])
+
+    def fail_gate(stage, symbols, asof_date=None):
+        if stage == "risk":
+            raise RuntimeError("gate failed")
+        return {"stage": stage, "status": "ok", "symbols_checked": len(symbols), "blocked_count": 0, "blocked_symbols": []}
+
+    monkeypatch.setattr(operator_health, "evaluate_stage_feature_gate", fail_gate)
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_feature_stage_gates(limit=10)
+
+    assert payload["status"] == "warn"
+    assert any(row["stage"] == "risk" and row["status"] == "error" for row in payload["rows"])
+    assert events[0]["fallback_type"] == "operator_health_feature_stage_gate_eval_failed"
+    assert events[0]["source"] == "advisory.feature_freshness"
+    assert events[0]["metadata"]["stage"] == "risk"
+
+
+def test_operator_health_surfaces_feature_stage_gates_in_fix_hints_and_trust_gate():
+    stage_gate_section = {
+        "status": "warn",
+        "message": "One or more advisory stages have blocked required feature inputs.",
+        "blocked_stage_count": 1,
+        "blocked_symbol_count": 1,
+        "rows": [
+            {
+                "stage": "portfolio",
+                "status": "blocked",
+                "blocked_symbols": ["ABC"],
+                "gate_effect": "defer_positive_rows",
+            }
+        ],
+        "command": "./complete_data.sh && ./all_advisory.sh",
+    }
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": stage_gate_section,
+        "fallback_telemetry": {"status": "ok", "active_count": 0},
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+    trust = operator_health.build_trust_gate(sections)
+
+    assert any(hint["title"] == "Feature freshness gates are blocking advisory stages" for hint in hints)
+    assert trust["status"] == "warn"
+    assert any(row["key"] == "feature_stage_gates" for row in trust["checks"])
+
+
+def test_operator_health_lifecycle_policy_audit_warns_on_missing_stop_change(monkeypatch):
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: table_name in {operator_health.REBALANCE_TABLE, operator_health.LIFECYCLE_POLICY_CHANGES_TABLE})
+    monkeypatch.setattr(
+        operator_health,
+        "sql_to_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-06-10"),
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "action_load_ts": pd.Timestamp("2026-06-10 10:00:00"),
+                    "recommended_stop_price": 101.0,
+                    "stop_price": 99.0,
+                    "action_reason": "trail improved",
+                    "change_id": None,
+                    "changed_at": None,
+                    "old_value": None,
+                    "new_value": None,
+                },
+                {
+                    "published_on": pd.Timestamp("2026-06-10"),
+                    "setup_id": "SETUP",
+                    "symbol": "XYZ",
+                    "unique_id": "u2",
+                    "action_load_ts": pd.Timestamp("2026-06-10 11:00:00"),
+                    "recommended_stop_price": 88.0,
+                    "stop_price": 90.0,
+                    "action_reason": "non-improving row",
+                    "change_id": None,
+                    "changed_at": None,
+                    "old_value": None,
+                    "new_value": None,
+                },
+            ]
+        ),
+    )
+
+    payload = operator_health.check_lifecycle_policy_change_audit(limit=5)
+
+    assert payload["status"] == "warn"
+    assert payload["tighten_stop_rows"] == 2
+    assert payload["auditable_rows"] == 1
+    assert payload["missing_audit_count"] == 1
+    assert payload["sample_missing"][0]["symbol"] == "ABC"
+
+
+def test_operator_health_lifecycle_policy_audit_ok_when_policy_change_exists(monkeypatch):
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: table_name in {operator_health.REBALANCE_TABLE, operator_health.LIFECYCLE_POLICY_CHANGES_TABLE})
+    monkeypatch.setattr(
+        operator_health,
+        "sql_to_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-06-10"),
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "action_load_ts": pd.Timestamp("2026-06-10 10:00:00"),
+                    "recommended_stop_price": 101.0,
+                    "stop_price": 99.0,
+                    "action_reason": "trail improved",
+                    "change_id": "change-1",
+                    "changed_at": pd.Timestamp("2026-06-10 10:01:00"),
+                    "old_value": 99.0,
+                    "new_value": 101.0,
+                }
+            ]
+        ),
+    )
+
+    payload = operator_health.check_lifecycle_policy_change_audit(limit=5)
+
+    assert payload["status"] == "ok"
+    assert payload["auditable_rows"] == 1
+    assert payload["missing_audit_count"] == 0
+
+
+def test_operator_health_lifecycle_policy_audit_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("audit query failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_lifecycle_policy_change_audit(limit=7)
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_lifecycle_policy_audit_check_failed"
+    assert events[0]["source"] == operator_health.LIFECYCLE_POLICY_CHANGES_TABLE
+    assert events[0]["metadata"] == {"limit": 7}
+
+
+def test_operator_health_surfaces_lifecycle_policy_audit_fix_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "lifecycle_policy_audit": {
+                "status": "warn",
+                "message": "Some recent tighten-stop actions are missing lifecycle policy-change audit rows.",
+                "tighten_stop_rows": 2,
+                "auditable_rows": 1,
+                "missing_audit_count": 1,
+                "sample_missing": [{"symbol": "ABC"}],
+                "command": "./all_advisory.sh && python -m advisory.operator_health --skip-dhan",
+            }
+        }
+    )
+
+    hint = next(row for row in hints if row["title"] == "Lifecycle stop-policy audit rows are missing")
+    assert hint["status"] == "warn"
+    assert hint["details"]["missing_audit_count"] == 1
+    assert any("./all_advisory.sh" in command for command in hint["commands"])
+
+
+def test_operator_health_summarizes_screener_failures(monkeypatch):
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: table_name == operator_health.SCREENER_FAILURES_TABLE)
+
+    def fake_sql(query, params=None, **kwargs):
+        if "COUNT(*) AS active_count" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "active_count": 2,
+                        "validation_count": 1,
+                        "fetch_count": 0,
+                        "parse_count": 1,
+                    }
+                ]
+            )
+        if "GROUP BY failure_stage" in query:
+            return pd.DataFrame(
+                [
+                    {"failure_stage": "ad_hoc_validation", "count": 1},
+                    {"failure_stage": "registered_parse", "count": 1},
+                ]
+            )
+        return pd.DataFrame(
+            [
+                {
+                    "failure_id": "sf-1",
+                    "observed_at": pd.Timestamp("2026-06-11T10:00:00Z"),
+                    "failure_stage": "ad_hoc_validation",
+                    "query_name": "Bad DMA",
+                    "error_type": "ScreenerQueryValidationError",
+                    "error_message": "Use `DMA 50`.",
+                },
+                {
+                    "failure_id": "sf-2",
+                    "observed_at": pd.Timestamp("2026-06-11T09:00:00Z"),
+                    "failure_stage": "registered_parse",
+                    "query_name": "Registered screen",
+                    "error_type": "ValueError",
+                    "error_message": "Could not find Screener.in results table.",
+                },
+            ]
+        )
+
+    monkeypatch.setattr(operator_health, "sql_to_df", fake_sql)
+
+    payload = operator_health.check_screener_failures(hours=24, limit=10)
+
+    assert payload["status"] == "warn"
+    assert payload["active_count"] == 2
+    assert payload["validation_count"] == 1
+    assert payload["fetch_count"] == 0
+    assert payload["parse_count"] == 1
+    assert payload["counts_by_stage"] == {"ad_hoc_validation": 1, "registered_parse": 1}
+    assert payload["rows"][0]["failure_stage"] == "ad_hoc_validation"
+
+
+def test_operator_health_screener_failures_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("screener failures query failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_screener_failures(hours=12, limit=4)
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_screener_failures_check_failed"
+    assert events[0]["source"] == operator_health.SCREENER_FAILURES_TABLE
+    assert events[0]["metadata"] == {"hours": 12, "limit": 4}
+
+
+def test_operator_health_surfaces_screener_failures_in_fix_hints_trust_and_degradation(monkeypatch):
+    monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
+    screener_section = {
+        "status": "warn",
+        "message": "Recent Screener.in query/fetch/parse failures found.",
+        "active_count": 1,
+        "validation_count": 1,
+        "fetch_count": 0,
+        "parse_count": 0,
+        "counts_by_stage": {"ad_hoc_validation": 1},
+        "rows": [
+            {
+                "failure_id": "sf-1",
+                "observed_at": "2026-06-11T10:00:00+00:00",
+                "failure_stage": "ad_hoc_validation",
+                "query_name": "Bad DMA",
+                "query_hash": "abc123",
+                "screener_url": "https://www.screener.in/screen/raw/?query=x",
+                "error_type": "ScreenerQueryValidationError",
+                "error_message": "Use `DMA 50`.",
+                "has_login_form": False,
+                "has_page_results_container": False,
+            }
+        ],
+    }
+    sections = {
+        "database": {"status": "ok", "message": "db ok"},
+        "operator_api": {"status": "ok", "message": "api ok"},
+        "dhan": {"status": "ok", "message": "dhan ok"},
+        "table_freshness": [],
+        "event_data_quality": {"status": "ok", "message": "event ok"},
+        "identity_issues": {"status": "ok", "open_count": 0, "rows": []},
+        "signal_quality": {"status": "ok", "usable": True},
+        "feature_stage_gates": {"status": "ok", "blocked_stage_count": 0, "blocked_symbol_count": 0, "rows": []},
+        "fallback_telemetry": {"status": "ok", "active_count": 0, "rows": []},
+        "screener_failures": screener_section,
+        "degradation_feed": {"status": "ok", "active_count": 0},
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+    trust = operator_health.build_trust_gate(sections)
+    degradation = operator_health.build_degradation_feed(
+        {**sections, "cron_logs": [], "sync_state_failures": [], "slow_operations": {"issues": []}},
+        include_deep_checks=False,
+    )
+
+    assert any(hint["details"].get("section") == "screener_failures" for hint in hints)
+    assert trust["status"] == "warn"
+    assert any(row["key"] == "screener_failures" for row in trust["checks"])
+    assert degradation["status"] == "warn"
+    assert degradation["counts_by_kind"]["screener_ad_hoc_validation"] == 1
+    assert degradation["rows"][0]["details"]["failure_id"] == "sf-1"
 
 
 def test_operator_health_signal_quality_flags_sparse_overlay_coverage(monkeypatch):
@@ -3108,6 +8847,85 @@ def test_operator_health_signal_quality_flags_sparse_overlay_coverage(monkeypatc
     assert "insufficient_overlay_coverage" in payload["reasons"]
 
 
+def test_operator_health_signal_quality_summary_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("summary check failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_signal_quality()
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_signal_quality_summary_check_failed"
+    assert events[0]["source"] == operator_health.SIGNAL_QUALITY_SUMMARY_TABLE
+
+
+def test_operator_health_signal_quality_rows_load_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    latest = pd.Timestamp("2026-06-11T00:00:00Z")
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+
+    def fake_sql(query, params=None, **kwargs):
+        if "MAX(evaluated_at)" in query:
+            return pd.DataFrame([{"latest_evaluated_at": latest}])
+        raise RuntimeError("summary rows failed")
+
+    monkeypatch.setattr(operator_health, "sql_to_df", fake_sql)
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_signal_quality()
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_signal_quality_rows_load_failed"
+    assert events[0]["source"] == operator_health.SIGNAL_QUALITY_SUMMARY_TABLE
+    assert events[0]["metadata"]["latest_evaluated_at"] == latest.isoformat()
+
+
+def test_operator_health_signal_quality_coverage_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    latest = pd.Timestamp("2026-06-11T00:00:00Z")
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+
+    def fake_sql(query, params=None, **kwargs):
+        if "MAX(evaluated_at)" in query:
+            return pd.DataFrame([{"latest_evaluated_at": latest}])
+        if "advisory_signal_quality_eval_summary" in query:
+            return pd.DataFrame([{"evaluated_at": latest, "horizon_days": 5, "variant": "technical_only", "matured_count": 80}])
+        if "advisory_signal_quality_evaluations" in query:
+            raise RuntimeError("coverage failed")
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_health, "sql_to_df", fake_sql)
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_signal_quality()
+
+    assert payload["status"] == "warn"
+    assert events[0]["fallback_type"] == "operator_health_signal_quality_coverage_load_failed"
+    assert events[0]["source"] == operator_health.SIGNAL_QUALITY_EVALUATIONS_TABLE
+    assert payload["overlay_rows"] == 0
+
+
+def test_operator_health_frontend_dependency_failure_records_fallback(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    web_dir = tmp_path / "apps" / "operator-web"
+    web_dir.mkdir(parents=True)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(operator_health.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("node failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_frontend_dependencies()
+
+    assert payload["status"] == "warn"
+    assert events[0]["fallback_type"] == "operator_health_frontend_dependencies_check_failed"
+    assert events[0]["source"] == "apps/operator-web"
+    assert events[0]["metadata"] == {"web_dir": "apps/operator-web"}
+
+
 def test_operator_smoke_builds_compact_trust_contract(monkeypatch):
     monkeypatch.setattr(
         operator_smoke,
@@ -3132,9 +8950,9 @@ def test_operator_smoke_builds_compact_trust_contract(monkeypatch):
                     "warn_count": 2,
                 },
             },
-            "current_blockers": {"count": 2, "rows": [{"title": "Snapshot stale"}]},
+            "current_blockers": {"count": 2, "rows": [{"title": "Snapshot stale", "details": {"traceback": "x" * 3000}}, {"title": "Signal sparse"}]},
             "fix_hints": [
-                {"status": "warn", "title": "Snapshot stale", "commands": ["python -m advisory.operator_snapshot"]},
+                {"status": "warn", "title": "Snapshot stale", "commands": ["python -m advisory.operator_snapshot"], "details": {"traceback": "y" * 3000}},
                 {"status": "warn", "title": "Signal quality sparse", "commands": ["python -m advisory.signal_quality_evaluator --dry-run"]},
             ],
         },
@@ -3148,6 +8966,10 @@ def test_operator_smoke_builds_compact_trust_contract(monkeypatch):
     assert payload["broker_execution_enabled"] is False
     assert payload["counts"]["current_blockers"] == 2
     assert payload["next_commands"] == ["python -m advisory.operator_snapshot"]
+    assert payload["compact"] is True
+    assert payload["compact_meta"]["current_blockers"]["omitted_list_items"] == 1
+    assert payload["current_blockers"][0]["details"]["traceback"].endswith("...[truncated]")
+    assert payload["fix_hints"][0]["details"]["traceback"].endswith("...[truncated]")
 
 
 def test_operator_health_flags_snapshot_and_sync_failures(monkeypatch):
@@ -3191,6 +9013,168 @@ def test_operator_health_flags_snapshot_and_sync_failures(monkeypatch):
     assert "stale" in snapshot["message"].lower()
     assert sync_rows[0]["status"] == "error"
     assert sync_rows[0]["source_name"] == "continuous_watch:ohlcv"
+
+
+def test_operator_health_snapshot_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: (_ for _ in ()).throw(RuntimeError("snapshot lookup failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_operator_snapshot()
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_snapshot_check_failed"
+    assert events[0]["source"] == operator_health.OPERATOR_SNAPSHOT_TABLE
+    assert events[0]["metadata"] == {"snapshot_name": operator_health.SNAPSHOT_NAME}
+
+
+def test_operator_health_database_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_database()
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_database_check_failed"
+    assert events[0]["source"] == "postgres"
+
+
+def test_operator_health_sync_state_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: (_ for _ in ()).throw(RuntimeError("sync-state lookup failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    rows = operator_health.check_sync_state_failures(limit=7)
+
+    assert rows[0]["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_sync_state_check_failed"
+    assert events[0]["source"] == "advisory_sync_state"
+    assert events[0]["metadata"] == {"limit": 7}
+
+
+def test_operator_health_downloader_run_state_summarizes_latest_rows(monkeypatch):
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: table_name == "advisory_sync_state")
+
+    def fake_sql(query, params=None, **kwargs):
+        assert "download_runner:%" in query
+        return pd.DataFrame(
+            [
+                {
+                    "source_name": "download_runner:data.dhanlive.ohlcv",
+                    "scope_key": "dhan_ohlcv_precheck",
+                    "status": "ok",
+                    "error_text": None,
+                    "updated_at": pd.Timestamp("2026-06-10T10:00:00Z"),
+                    "last_success_at": pd.Timestamp("2026-06-10T10:00:00Z"),
+                    "state_json": json.dumps(
+                        {
+                            "module": "data.dhanlive.ohlcv",
+                            "purpose": "dhan_ohlcv_precheck",
+                            "phase": "downloader",
+                            "classification": "ok",
+                            "status": "ok",
+                            "rows_written": 12,
+                            "attempt_count": 2,
+                            "retry_count": 1,
+                            "fallback_count": 0,
+                            "state_advanced": True,
+                            "fallback_used": False,
+                        }
+                    ),
+                },
+                {
+                    "source_name": "download_runner:data.nseindia.bhavcopy_parser",
+                    "scope_key": "market_wide",
+                    "status": "error",
+                    "error_text": "ValueError: schema changed",
+                    "updated_at": pd.Timestamp("2026-06-10T09:00:00Z"),
+                    "last_success_at": pd.Timestamp("2026-06-09T09:00:00Z"),
+                    "state_json": {
+                        "module": "data.nseindia.bhavcopy_parser",
+                        "purpose": "market_wide",
+                        "phase": "parser",
+                        "classification": "parse_failed",
+                        "status": "failed",
+                        "rows": 0,
+                        "attempt_count": 3,
+                        "retry_count": 2,
+                        "fallback_count": 1,
+                        "state_advanced": False,
+                    },
+                },
+            ]
+        )
+
+    monkeypatch.setattr(operator_health, "sql_to_df", fake_sql)
+
+    payload = operator_health.check_downloader_run_state()
+
+    assert payload["status"] == "error"
+    assert payload["returned_count"] == 2
+    assert payload["ok_count"] == 1
+    assert payload["error_count"] == 1
+    assert payload["advanced_count"] == 1
+    assert payload["retry_count"] == 3
+    assert payload["fallback_count"] == 1
+    assert payload["counts_by_classification"]["parse_failed"] == 1
+    assert payload["rows"][1]["module"] == "data.nseindia.bhavcopy_parser"
+    assert payload["rows"][1]["status"] == "error"
+    assert payload["rows"][1]["attempt_count"] == 3
+
+
+def test_operator_health_downloader_run_state_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("sync state failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_downloader_run_state(limit=9)
+
+    assert payload["status"] == "error"
+    assert payload["returned_count"] == 0
+    assert events[0]["fallback_type"] == "operator_health_downloader_run_state_check_failed"
+    assert events[0]["source"] == "advisory_sync_state"
+    assert events[0]["metadata"] == {"limit": 9}
+
+
+def test_operator_health_degradation_feed_includes_downloader_run_state(monkeypatch):
+    monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
+    feed = operator_health.build_degradation_feed(
+        {
+            "cron_logs": [],
+            "sync_state_failures": [],
+            "slow_operations": {"issues": []},
+            "downloader_run_state": {
+                "status": "error",
+                "rows": [
+                    {
+                        "status": "error",
+                        "source_name": "download_runner:data.nseindia.bhavcopy_parser",
+                        "module": "data.nseindia.bhavcopy_parser",
+                        "purpose": "market_wide",
+                        "phase": "parser",
+                        "classification": "parse_failed",
+                        "rows": 0,
+                        "rows_written": 0,
+                        "state_advanced": False,
+                        "fallback_used": False,
+                        "error": "ValueError: schema changed",
+                        "updated_at": "2026-06-10T09:00:00+00:00",
+                    }
+                ],
+            },
+        },
+        include_deep_checks=False,
+    )
+
+    assert feed["status"] == "error"
+    assert feed["rows"][0]["kind"] == "download_runner_state"
+    assert "bhavcopy_parser" in feed["rows"][0]["title"]
 
 
 def test_operator_health_degradation_feed_extracts_dhan_master_miss(monkeypatch, tmp_path):
@@ -3268,6 +9252,207 @@ def test_cron_status_detects_stale_lock_and_log_marker(tmp_path):
     assert job["status"] == "error"
 
 
+def test_cron_status_invalid_pid_records_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(cron_status, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert cron_status._pid_running("not-a-pid") is False
+
+    assert events[0]["module"] == "advisory.cron_status"
+    assert events[0]["fallback_type"] == "cron_status_invalid_pid_file"
+    assert events[0]["source"] == "cron_lock_pid"
+
+
+def test_cron_status_pid_os_error_records_fallback(monkeypatch):
+    events = []
+
+    def fail_kill(pid, signal):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(cron_status.os, "kill", fail_kill)
+    monkeypatch.setattr(cron_status, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert cron_status._pid_running("123") is False
+
+    assert events[0]["fallback_type"] == "cron_status_pid_check_failed"
+    assert events[0]["metadata"]["pid"] == 123
+
+
+def test_cron_status_missing_pid_remains_normal_false(monkeypatch):
+    events = []
+
+    def missing_process(pid, signal):
+        raise ProcessLookupError("missing")
+
+    monkeypatch.setattr(cron_status.os, "kill", missing_process)
+    monkeypatch.setattr(cron_status, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert cron_status._pid_running("123") is False
+    assert events == []
+
+
+def test_operator_health_tail_lines_records_read_failure(monkeypatch, tmp_path):
+    events = []
+    log_path = tmp_path / "broken.log"
+    log_path.write_text("hello\n", encoding="utf-8")
+
+    def fail_read_text(self, *args, **kwargs):
+        raise PermissionError("no access")
+
+    monkeypatch.setattr(Path, "read_text", fail_read_text)
+    monkeypatch.setattr(operator_health, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert operator_health._tail_lines(log_path, 10) == []
+    assert events[0]["module"] == "advisory.operator_health"
+    assert events[0]["fallback_type"] == "operator_health_log_tail_failed"
+    assert events[0]["source"] == str(log_path)
+    assert events[0]["metadata"]["limit"] == 10
+
+
+def test_cron_preflight_validates_generated_crontab(tmp_path, monkeypatch):
+    from scripts import cron_preflight
+
+    repo = tmp_path / "repo"
+    scripts_dir = repo / "scripts"
+    logs_dir = repo / "logs" / "cron"
+    scripts_dir.mkdir(parents=True)
+    logs_dir.mkdir(parents=True)
+    script = repo / "complete_data.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    script.chmod(0o755)
+    with_lock = scripts_dir / "with_lock.sh"
+    with_lock.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    with_lock.chmod(0o755)
+    crontab = tmp_path / "stockey.generated.crontab"
+    crontab.write_text(
+        "\n".join(
+            [
+                "SHELL=/bin/bash",
+                "PATH=/usr/bin:/bin",
+                "STOCKEY_DIR=" + str(repo),
+                "LOG_DIR=" + str(logs_dir),
+                '10 07 * * 1-5 rane cd "$STOCKEY_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cron_preflight, "_resolve_python", lambda repo_root: {"status": "ok", "check": "python", "message": "python ok", "python": str(sys.executable)})
+    monkeypatch.setattr(cron_preflight, "_check_port", lambda host, port, timeout=0.25: {"host": host, "port": port, "state": "available"})
+
+    payload = cron_preflight.build_cron_preflight(crontab_path=crontab)
+
+    assert payload["status"] == "ok"
+    assert payload["job_count"] == 1
+    assert any(row["check"] == "scripts" and row["status"] == "ok" for row in payload["checks"])
+    assert payload["next_command"].startswith("./go-crond")
+
+
+def test_cron_preflight_flags_missing_scripts_and_stale_locks(tmp_path, monkeypatch):
+    from scripts import cron_preflight
+
+    repo = tmp_path / "repo"
+    logs_dir = repo / "logs" / "cron"
+    repo.mkdir()
+    logs_dir.mkdir(parents=True)
+    lock_file = tmp_path / "stockey_job.lock"
+    lock_dir = tmp_path / "stockey_job.lock.d"
+    lock_dir.mkdir()
+    (lock_dir / "pid").write_text("999999", encoding="utf-8")
+    old_time = pd.Timestamp("2026-01-01T00:00:00Z").timestamp()
+    os.utime(lock_dir, (old_time, old_time))
+    crontab = tmp_path / "stockey.generated.crontab"
+    crontab.write_text(
+        "\n".join(
+            [
+                "SHELL=/bin/bash",
+                "PATH=/usr/bin:/bin",
+                "STOCKEY_DIR=" + str(repo),
+                "LOG_DIR=" + str(logs_dir),
+                f'10 07 * * 1-5 rane cd "$STOCKEY_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" {lock_file} ./missing.sh >> "$LOG_DIR/job.log" 2>&1',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cron_preflight, "_resolve_python", lambda repo_root: {"status": "ok", "check": "python", "message": "python ok", "python": str(sys.executable)})
+    monkeypatch.setattr(cron_preflight, "_check_port", lambda host, port, timeout=0.25: {"host": host, "port": port, "state": "available"})
+
+    payload = cron_preflight.build_cron_preflight(
+        crontab_path=crontab,
+        now=pd.Timestamp("2026-06-08T08:00:00Z"),
+        stale_lock_seconds=60,
+    )
+
+    assert payload["status"] == "error"
+    script_check = next(row for row in payload["checks"] if row["check"] == "scripts")
+    assert script_check["status"] == "error"
+    assert any("missing.sh" in item for item in script_check["missing"])
+    lock_check = next(row for row in payload["checks"] if row["check"] == "locks")
+    assert lock_check["status"] == "warn"
+    assert lock_check["stale_count"] == 1
+    assert payload["next_command"] == "fix preflight errors before starting go-crond"
+
+
+def test_cron_preflight_resolve_python_failure_records_fallback(tmp_path, monkeypatch):
+    from scripts import cron_preflight
+
+    events = []
+    repo = tmp_path / "repo"
+    script = repo / "scripts" / "resolve_python.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    monkeypatch.setattr(
+        cron_preflight.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.TimeoutExpired(cmd=args[0], timeout=3)),
+    )
+    monkeypatch.setattr(cron_preflight, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = cron_preflight._resolve_python(repo, timeout_seconds=3)
+
+    assert out["status"] == "error"
+    assert out["check"] == "python"
+    assert events[0]["module"] == "scripts.cron_preflight"
+    assert events[0]["source"] == "resolve_python"
+    assert events[0]["fallback_type"] == "cron_preflight_resolve_python_failed"
+    assert events[0]["metadata"]["timeout_seconds"] == 3
+
+
+def test_analysis_agent_loop_post_check_timeout_records_fallback(tmp_path, monkeypatch):
+    from scripts import analysis_agent_loop
+
+    events = []
+    log_path = tmp_path / "post_checks.log"
+
+    monkeypatch.setattr(analysis_agent_loop, "changed_files", lambda: ["scripts/analysis_agent_loop.py"])
+    monkeypatch.setattr(analysis_agent_loop, "untracked_root_artifacts", lambda: [])
+
+    def fake_run_local_command(command, *, timeout_seconds):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=timeout_seconds, output="partial output")
+
+    monkeypatch.setattr(analysis_agent_loop, "run_local_command", fake_run_local_command)
+    monkeypatch.setattr(analysis_agent_loop, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    ok = analysis_agent_loop.post_cycle_checks(
+        cycle=2,
+        log_path=log_path,
+        timeout_seconds=5,
+        cycle_files=["scripts/analysis_agent_loop.py"],
+        max_files_per_cycle=20,
+        allow_lockfile_drift=False,
+    )
+
+    assert ok is False
+    assert "timed out after 5s" in log_path.read_text(encoding="utf-8")
+    assert events[0]["module"] == "scripts.analysis_agent_loop"
+    assert events[0]["fallback_type"] == "analysis_agent_post_check_timeout"
+    assert events[0]["metadata"]["cycle"] == 2
+    assert events[0]["metadata"]["timeout_seconds"] == 5
+
+
 def test_feature_freshness_contract_classifies_required_and_optional_inputs(monkeypatch):
     required = feature_freshness.FeatureInputSpec(
         "daily_ohlcv",
@@ -3331,6 +9516,716 @@ def test_feature_freshness_contract_flags_stale_and_missing_required(monkeypatch
     assert any(row["input_key"] == "daily_ohlcv" and row["status"] == "stale" for row in stale_contract["blockers"])
     assert missing_contract["status"] == "blocked"
     assert all(row["status"] == "missing" for row in missing_contract["blockers"])
+
+
+def test_feature_freshness_records_lookup_fallback_on_error(monkeypatch):
+    events = []
+    spec = feature_freshness.FeatureInputSpec(
+        "daily_ohlcv",
+        "Daily OHLCV",
+        "dhan_ohlcv_daily",
+        "date",
+        symbol_column="ticker",
+        max_age_days=5,
+        required=True,
+    )
+    monkeypatch.setattr(feature_freshness, "table_exists", lambda table: (_ for _ in ()).throw(RuntimeError("db timeout")))
+    monkeypatch.setattr(feature_freshness, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = feature_freshness.evaluate_feature_input(spec, symbol="ABC", asof_date=pd.Timestamp("2026-06-10T00:00:00Z"))
+
+    assert out["status"] == "error"
+    assert out["reason"].startswith("RuntimeError: db timeout")
+    assert events[0]["fallback_type"] == "feature_freshness_input_lookup_failed"
+    assert events[0]["source"] == "dhan_ohlcv_daily"
+    assert events[0]["metadata"]["input_key"] == "daily_ohlcv"
+    assert events[0]["metadata"]["symbol"] == "ABC"
+
+
+def test_action_recommender_adds_decision_time_feature_freshness(monkeypatch):
+    captured = []
+
+    def fake_contract(symbol, asof_date=None):
+        captured.append({"symbol": symbol, "asof_date": asof_date})
+        return {
+            "symbol": symbol,
+            "asof_date": pd.to_datetime(asof_date, utc=True).isoformat(),
+            "status": "blocked",
+            "counts": {"fresh": 1, "stale": 1},
+            "blockers": [{"input_key": "technical_daily", "status": "stale", "required": True}],
+            "inputs": [
+                {"input_key": "daily_ohlcv", "status": "fresh", "required": True},
+                {"input_key": "technical_daily", "status": "stale", "required": True},
+            ],
+        }
+
+    monkeypatch.setattr(action_recommender, "build_feature_freshness_contract", fake_contract)
+    asof_date = pd.Timestamp("2026-06-10T00:00:00Z")
+    out = action_recommender.add_feature_freshness_contracts(
+        pd.DataFrame([{"asof_date": asof_date, "symbol": "abc", "action_code": "MANUAL_REVIEW"}])
+    )
+
+    assert captured == [{"symbol": "ABC", "asof_date": asof_date}]
+    payload = json.loads(out.iloc[0]["feature_freshness_json"])
+    assert payload["symbol"] == "ABC"
+    assert payload["status"] == "blocked"
+    assert payload["captured_for"] == "advisory_action_recommendation"
+    assert payload["blockers"][0]["input_key"] == "technical_daily"
+    assert payload["captured_at"]
+
+
+def test_action_recommender_feature_freshness_blocks_positive_broker_action(monkeypatch):
+    def fake_contract(symbol, asof_date=None):
+        return {
+            "symbol": str(symbol).upper(),
+            "asof_date": pd.to_datetime(asof_date, utc=True).isoformat(),
+            "status": "blocked",
+            "counts": {"fresh": 1, "stale": 1},
+            "blockers": [
+                {
+                    "input_key": "technical_daily",
+                    "label": "Technical Features",
+                    "status": "stale",
+                    "required": True,
+                    "reason": "older_than_freshness_window",
+                }
+            ],
+            "inputs": [],
+        }
+
+    monkeypatch.setattr(action_recommender, "build_feature_freshness_contract", fake_contract)
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "symbol": "ABC",
+                "setup_id": "TECH",
+                "unique_id": "abc-buy",
+                "action_code": "BUY",
+                "action_priority": 50,
+                "action_source": "portfolio",
+                "source_action": "approved",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "stop_price": 95.0,
+                "reference_price": 100.0,
+                "action_reason": "Breakout is valid.",
+                "action_detail": "Technical trigger confirmed.",
+                "raw_context_json": json.dumps({"technical_state": "BUY_TRIGGERED", "technical_score": 82}),
+                "load_ts": pd.Timestamp("2026-06-10T09:30:00Z"),
+            }
+        ]
+    )
+
+    out = action_recommender.apply_feature_freshness_gates(rows)
+    row = out.iloc[0]
+    context = json.loads(row["raw_context_json"])
+    contract = json.loads(row["feature_freshness_json"])
+
+    assert row["action_code"] == "MANUAL_REVIEW"
+    assert row["execution_mode"] == "review_only"
+    assert pd.isna(row["transaction_type"])
+    assert context["manual_review_boundary"] == "feature_freshness_required_input_blocked"
+    assert context["blocked_original_action_code"] == "BUY"
+    assert context["broker_execution_allowed"] is False
+    assert context["feature_freshness_blockers"][0]["input_key"] == "technical_daily"
+    assert contract["status"] == "blocked"
+    assert out.attrs["feature_freshness_gate_changed_count"] == 1
+
+
+def test_action_recommender_feature_freshness_does_not_hide_exit(monkeypatch):
+    monkeypatch.setattr(
+        action_recommender,
+        "build_feature_freshness_contract",
+        lambda symbol, asof_date=None: {
+            "symbol": str(symbol).upper(),
+            "asof_date": pd.to_datetime(asof_date, utc=True).isoformat(),
+            "status": "blocked",
+            "counts": {"error": 1},
+            "blockers": [{"input_key": "daily_ohlcv", "label": "Daily OHLCV", "status": "error", "required": True}],
+            "inputs": [],
+        },
+    )
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "symbol": "ABC",
+                "setup_id": "LIFE",
+                "unique_id": "abc-sell",
+                "action_code": "SELL",
+                "action_priority": 100,
+                "action_source": "rebalance",
+                "source_action": "exit_stop",
+                "transaction_type": "SELL",
+                "execution_mode": "broker_order",
+                "action_reason": "Stop hit.",
+                "action_detail": "Exit on stop.",
+                "raw_context_json": json.dumps({"suggested_action": "exit_stop", "lifecycle_reason": "Stop hit."}),
+                "load_ts": pd.Timestamp("2026-06-10T09:30:00Z"),
+            }
+        ]
+    )
+
+    out = action_recommender.apply_feature_freshness_gates(rows)
+
+    assert out.iloc[0]["action_code"] == "SELL"
+    assert out.iloc[0]["execution_mode"] == "broker_order"
+    assert json.loads(out.iloc[0]["feature_freshness_json"])["status"] == "blocked"
+    assert out.attrs["feature_freshness_gate_changed_count"] == 0
+
+
+def test_action_recommender_identity_gate_downgrades_broker_buy(monkeypatch):
+    monkeypatch.setattr(
+        action_recommender,
+        "load_action_identity_gaps",
+        lambda symbols: pd.DataFrame(
+            [
+                {
+                    "symbol": "MISS",
+                    "identity_gap": "missing_company_master",
+                    "company_master_id": None,
+                    "nse_ticker": None,
+                    "bse_ticker": None,
+                    "dhan_nse_id": None,
+                    "dhan_bse_id": None,
+                }
+            ]
+        ),
+    )
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "symbol": "MISS",
+                "setup_id": "TECH",
+                "unique_id": "miss-buy",
+                "action_code": "BUY",
+                "action_priority": 50,
+                "action_source": "portfolio",
+                "source_action": "approved",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "stop_price": 95.0,
+                "reference_price": 100.0,
+                "action_reason": "Breakout is valid.",
+                "action_detail": "Technical trigger confirmed.",
+                "raw_context_json": json.dumps({"technical_state": "BUY_TRIGGERED", "technical_score": 82}),
+                "load_ts": pd.Timestamp("2026-06-10T09:30:00Z"),
+            }
+        ]
+    )
+
+    out = action_recommender.apply_identity_resolution_gates(rows)
+    row = out.iloc[0]
+    context = json.loads(row["raw_context_json"])
+
+    assert row["action_code"] == "MANUAL_REVIEW"
+    assert row["execution_mode"] == "review_only"
+    assert pd.isna(row["transaction_type"])
+    assert context["manual_review_boundary"] == "broker_identity_unresolved"
+    assert context["manual_review_effect"] == "review_only_no_broker_execution"
+    assert context["blocked_original_action_code"] == "BUY"
+    assert context["identity_gap"] == "missing_company_master"
+    assert context["broker_execution_allowed"] is False
+    assert "broker identity unresolved" in row["action_reason"]
+    assert out.attrs["identity_gate_changed_count"] == 1
+
+
+def test_action_recommender_identity_gate_leaves_review_only_rows_untouched(monkeypatch):
+    calls = []
+    monkeypatch.setattr(action_recommender, "load_action_identity_gaps", lambda symbols: calls.append(symbols) or pd.DataFrame())
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "symbol": "MISS",
+                "setup_id": "EVENT",
+                "unique_id": "miss-review",
+                "action_code": "MANUAL_REVIEW",
+                "action_priority": 80,
+                "action_source": "event_policy",
+                "source_action": "MANUAL_REVIEW",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Needs operator interpretation.",
+                "action_detail": "Review the event.",
+                "raw_context_json": "{}",
+                "load_ts": pd.Timestamp("2026-06-10T09:30:00Z"),
+            }
+        ]
+    )
+
+    out = action_recommender.apply_identity_resolution_gates(rows)
+
+    assert calls == []
+    assert out.iloc[0]["action_code"] == "MANUAL_REVIEW"
+    assert out.iloc[0]["execution_mode"] == "review_only"
+    assert out.iloc[0]["action_reason"] == "Needs operator interpretation."
+    assert out.attrs["identity_gate_changed_count"] == 0
+
+
+def test_feature_freshness_stage_gate_reports_blocked_action_inputs(monkeypatch):
+    statuses = {
+        ("ABC", "daily_ohlcv"): ("fresh", "within_freshness_window"),
+        ("ABC", "technical_daily"): ("stale", "older_than_freshness_window"),
+        ("XYZ", "daily_ohlcv"): ("fresh", "within_freshness_window"),
+        ("XYZ", "technical_daily"): ("fresh", "within_freshness_window"),
+    }
+
+    def fake_evaluate(spec, *, symbol, asof_date):
+        status, reason = statuses[(symbol, spec.key)]
+        return {
+            "input_key": spec.key,
+            "label": spec.label,
+            "status": status,
+            "reason": reason,
+            "latest_at": "2026-06-09T00:00:00+00:00",
+            "age_days": 1.0,
+            "required": True,
+        }
+
+    monkeypatch.setattr(feature_freshness, "evaluate_feature_input", fake_evaluate)
+
+    gate = feature_freshness.evaluate_stage_feature_gate(
+        "actions",
+        ["abc", "xyz"],
+        asof_date=pd.Timestamp("2026-06-10T00:00:00Z"),
+    )
+
+    assert gate["status"] == "blocked"
+    assert gate["blocked_symbols"] == ["ABC"]
+    assert gate["block_positive_actions"] is True
+    assert gate["required_input_keys"] == ["daily_ohlcv", "technical_daily"]
+    assert gate["symbols"]["ABC"]["blockers"][0]["input_key"] == "technical_daily"
+    assert gate["symbols"]["XYZ"]["status"] == "ok"
+
+
+def test_feature_freshness_stage_dependencies_cover_upstream_decision_stages():
+    configured = feature_freshness.STAGE_FEATURE_DEPENDENCIES_BY_STAGE
+
+    assert configured["rules"].input_keys == ("daily_ohlcv", "technical_daily")
+    assert configured["risk"].input_keys == ("daily_ohlcv", "technical_daily")
+    assert configured["portfolio"].input_keys == ("daily_ohlcv", "technical_daily")
+    assert configured["lifecycle"].input_keys == ("daily_ohlcv",)
+    assert configured["actions"].block_positive_actions is True
+
+
+def test_pipeline_actions_stage_includes_feature_gate(monkeypatch):
+    asof_date = pd.Timestamp("2026-06-10T00:00:00Z")
+    captured = {}
+
+    def fake_gate(stage, symbols, *, asof_date=None):
+        captured["stage"] = stage
+        captured["symbols"] = symbols
+        captured["asof_date"] = asof_date
+        return {
+            "stage": stage,
+            "status": "blocked",
+            "symbols_checked": 1,
+            "blocked_symbols": ["ABC"],
+            "blocked_count": 1,
+            "required_input_keys": ["daily_ohlcv", "technical_daily"],
+            "gate_effect": "Positive broker-capable actions become MANUAL_REVIEW.",
+            "block_positive_actions": True,
+        }
+
+    actions = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": asof_date,
+                "symbol": "ABC",
+                "action_code": "MANUAL_REVIEW",
+                "action_reason": "Required inputs blocked.",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(pipeline, "evaluate_stage_feature_gate", fake_gate)
+    monkeypatch.setattr(pipeline, "build_action_recommendations", lambda **kwargs: actions.copy())
+    monkeypatch.setattr(pipeline, "persist_action_recommendations", lambda df: None)
+
+    args = argparse.Namespace(
+        date=asof_date,
+        symbols=["ABC"],
+        setup_ids=None,
+        start_at="actions",
+        stop_at="actions",
+        rebuild=False,
+        skip_peer_sync=True,
+        include_watch=False,
+        include_news=False,
+        include_lifecycle=False,
+        include_execution=False,
+        live_execution=False,
+        execution_reconcile=False,
+        eval_include_evaluated=False,
+        portfolio_capital_inr=300000.0,
+        portfolio_max_positions=5,
+        portfolio_single_position_cap_pct=0.35,
+        portfolio_per_setup_cap_pct=0.50,
+        portfolio_max_positions_per_overlap_group=1,
+        event_model=None,
+        dry_run=True,
+    )
+
+    summary = pipeline.run_pipeline(args)
+
+    assert captured == {"stage": "actions", "symbols": ["ABC"], "asof_date": asof_date}
+    assert summary["stages"]["actions"]["feature_gate"]["status"] == "blocked"
+    assert summary["stages"]["actions"]["feature_gate"]["blocked_symbols"] == ["ABC"]
+    assert summary["stages"]["actions"]["actions"]["row_count"] == 1
+
+
+def test_pipeline_portfolio_stage_preserves_rows_and_adds_feature_gate(monkeypatch):
+    asof_date = pd.Timestamp("2026-06-10T00:00:00Z")
+    portfolio_df = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": asof_date,
+                "symbol": "ABC",
+                "approved_allocation_inr": 10000.0,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "evaluate_stage_feature_gate",
+        lambda stage, symbols, *, asof_date=None: {
+            "stage": stage,
+            "status": "ok",
+            "symbols_checked": len(symbols or []),
+            "blocked_symbols": [],
+            "blocked_count": 0,
+            "required_input_keys": ["daily_ohlcv", "technical_daily"],
+            "gate_effect": "test",
+        },
+    )
+    monkeypatch.setattr(pipeline, "build_portfolio_orders", lambda **kwargs: portfolio_df.copy())
+    monkeypatch.setattr(pipeline, "persist_portfolio_orders", lambda df: None)
+
+    args = argparse.Namespace(
+        date=asof_date,
+        symbols=["ABC"],
+        setup_ids=None,
+        start_at="portfolio",
+        stop_at="portfolio",
+        rebuild=False,
+        skip_peer_sync=True,
+        include_watch=False,
+        include_news=False,
+        include_lifecycle=False,
+        include_execution=False,
+        live_execution=False,
+        execution_reconcile=False,
+        eval_include_evaluated=False,
+        portfolio_capital_inr=300000.0,
+        portfolio_max_positions=5,
+        portfolio_single_position_cap_pct=0.35,
+        portfolio_per_setup_cap_pct=0.50,
+        portfolio_max_positions_per_overlap_group=1,
+        event_model=None,
+        dry_run=True,
+    )
+
+    summary = pipeline.run_pipeline(args)
+
+    assert summary["stages"]["portfolio"]["row_count"] == 1
+    assert summary["stages"]["portfolio"]["feature_gate"]["stage"] == "portfolio"
+    assert summary["stages"]["portfolio"]["feature_gate"]["status"] == "ok"
+
+
+def test_pipeline_feature_gate_policy_moves_allocations_to_manual_review():
+    gate = {
+        "stage": "risk",
+        "status": "blocked",
+        "blocked_symbols": ["ABC"],
+        "required_input_keys": ["daily_ohlcv", "technical_daily"],
+        "gate_effect": "Risk sizing remains visible for audit.",
+    }
+    rows = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "allocation_status": "allocated",
+                "suggested_allocation_inr": 25000.0,
+                "allocation_pct_of_adv20d": 0.01,
+                "notes": "Initial allocation.",
+                "context_snapshot_json": json.dumps({"source": "test"}),
+            },
+            {
+                "symbol": "XYZ",
+                "allocation_status": "allocated",
+                "suggested_allocation_inr": 15000.0,
+                "allocation_pct_of_adv20d": 0.02,
+                "notes": "",
+                "context_snapshot_json": "{}",
+            },
+        ]
+    )
+
+    out = pipeline.apply_stage_feature_gate_policy("risk", rows, gate)
+    abc = out[out["symbol"] == "ABC"].iloc[0]
+    xyz = out[out["symbol"] == "XYZ"].iloc[0]
+    context = json.loads(abc["context_snapshot_json"])
+
+    assert abc["allocation_status"] == "review_manual"
+    assert abc["suggested_allocation_inr"] == 0.0
+    assert pd.isna(abc["allocation_pct_of_adv20d"])
+    assert "Feature freshness gate blocked automatic allocation" in abc["notes"]
+    assert context["feature_freshness_gate"] == "blocked_stage_output"
+    assert context["feature_freshness_stage"] == "risk"
+    assert context["broker_execution_allowed"] is False
+    assert xyz["allocation_status"] == "allocated"
+    assert xyz["suggested_allocation_inr"] == 15000.0
+    assert out.attrs["feature_gate_changed_count"] == 1
+
+
+def test_pipeline_feature_gate_policy_defers_portfolio_positive_rows():
+    gate = {
+        "stage": "portfolio",
+        "status": "blocked",
+        "blocked_symbols": ["ABC"],
+        "required_input_keys": ["daily_ohlcv", "technical_daily"],
+        "gate_effect": "Portfolio planning remains visible for audit.",
+    }
+    rows = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "portfolio_status": "approved",
+                "portfolio_reason": "within_limits",
+                "approved_allocation_inr": 20000.0,
+                "remaining_capital_after_inr": 80000.0,
+                "execution_notes": "Approve up to INR 20,000.",
+                "context_snapshot_json": "{}",
+            },
+            {
+                "symbol": "XYZ",
+                "portfolio_status": "deferred",
+                "portfolio_reason": "max_positions",
+                "approved_allocation_inr": 0.0,
+                "remaining_capital_after_inr": 80000.0,
+                "execution_notes": "Deferred.",
+                "context_snapshot_json": "{}",
+            },
+        ]
+    )
+
+    out = pipeline.apply_stage_feature_gate_policy("portfolio", rows, gate)
+    abc = out[out["symbol"] == "ABC"].iloc[0]
+    xyz = out[out["symbol"] == "XYZ"].iloc[0]
+    context = json.loads(abc["context_snapshot_json"])
+
+    assert abc["portfolio_status"] == "deferred"
+    assert abc["portfolio_reason"] == "feature_freshness_blocked"
+    assert abc["approved_allocation_inr"] == 0.0
+    assert pd.isna(abc["remaining_capital_after_inr"])
+    assert "required OHLCV/technical inputs" in abc["execution_notes"]
+    assert context["feature_freshness_stage"] == "portfolio"
+    assert context["broker_execution_allowed"] is False
+    assert xyz["portfolio_status"] == "deferred"
+    assert xyz["portfolio_reason"] == "max_positions"
+    assert out.attrs["feature_gate_changed_count"] == 1
+
+
+def test_pipeline_feature_gate_policy_downgrades_rules_pass_now_to_watch():
+    gate = {
+        "stage": "rules",
+        "status": "blocked",
+        "blocked_symbols": ["ABC"],
+        "required_input_keys": ["daily_ohlcv", "technical_daily"],
+        "gate_effect": "Rule output remains visible.",
+    }
+    rows = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "candidate_state": "PASS_NOW",
+                "rule_pass": True,
+                "watch_reason_detail": "Breakout confirmed.",
+            },
+            {
+                "symbol": "XYZ",
+                "candidate_state": "PASS_NOW",
+                "rule_pass": True,
+                "watch_reason_detail": "Breakout confirmed.",
+            },
+        ]
+    )
+
+    out = pipeline.apply_stage_feature_gate_policy("rules", rows, gate)
+    abc = out[out["symbol"] == "ABC"].iloc[0]
+    xyz = out[out["symbol"] == "XYZ"].iloc[0]
+
+    assert abc["candidate_state"] == "WATCH_EVENT"
+    assert bool(abc["rule_pass"]) is False
+    assert "Feature freshness gate blocked PASS_NOW" in abc["watch_reason_detail"]
+    assert xyz["candidate_state"] == "PASS_NOW"
+    assert bool(xyz["rule_pass"]) is True
+    assert out.attrs["feature_gate_changed_count"] == 1
+
+
+def test_pipeline_feature_gate_policy_annotates_lifecycle_without_hiding_exit():
+    gate = {
+        "stage": "lifecycle",
+        "status": "blocked",
+        "blocked_symbols": ["ABC"],
+        "required_input_keys": ["daily_ohlcv"],
+        "gate_effect": "Lifecycle rows remain visible.",
+    }
+    rows = pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "next_action": "full_exit",
+                "lifecycle_reason": "Stop failed.",
+                "next_action_reason": "Exit remaining position.",
+                "context_snapshot_json": "{}",
+            },
+            {
+                "symbol": "XYZ",
+                "next_action": "hold",
+                "lifecycle_reason": "Still valid.",
+                "next_action_reason": "Hold.",
+                "context_snapshot_json": "{}",
+            },
+        ]
+    )
+
+    out = pipeline.apply_stage_feature_gate_policy("lifecycle", rows, gate)
+    abc = out[out["symbol"] == "ABC"].iloc[0]
+    xyz = out[out["symbol"] == "XYZ"].iloc[0]
+    context = json.loads(abc["context_snapshot_json"])
+
+    assert abc["next_action"] == "full_exit"
+    assert "verify latest OHLCV" in abc["next_action_reason"]
+    assert "verify latest OHLCV" in abc["lifecycle_reason"]
+    assert context["feature_freshness_stage"] == "lifecycle"
+    assert context["broker_execution_allowed"] is False
+    assert xyz["next_action_reason"] == "Hold."
+    assert out.attrs["feature_gate_changed_count"] == 1
+
+
+def test_operator_api_prefers_persisted_feature_freshness_snapshot(monkeypatch):
+    persisted = {
+        "symbol": "ABC",
+        "asof_date": "2026-06-10T00:00:00+00:00",
+        "captured_at": "2026-06-10T08:00:00+00:00",
+        "status": "blocked",
+        "counts": {"fresh": 1, "stale": 1},
+        "blockers": [{"input_key": "technical_daily", "label": "Technical Features", "status": "stale", "required": True}],
+        "inputs": [
+            {"input_key": "daily_ohlcv", "label": "Daily OHLCV", "status": "fresh", "required": True},
+            {"input_key": "technical_daily", "label": "Technical Features", "status": "stale", "required": True},
+        ],
+    }
+    monkeypatch.setattr(
+        operator_api,
+        "load_operator_sections_payload",
+        lambda *_args, **_kwargs: {
+            "generated_at": "2026-06-10T08:30:00Z",
+            "asof_date": "2026-06-10",
+            "top_action_recommendations": [
+                {
+                    "symbol": "ABC",
+                    "action_code": "MANUAL_REVIEW",
+                    "status": "manual_review",
+                    "feature_freshness": persisted,
+                }
+            ],
+            "action_recommendations": [],
+            "alerts": [],
+        },
+    )
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(operator_api, "_load_latest_company_memory_reviews", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        operator_api,
+        "build_required_feature_freshness_summaries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live freshness should not run for persisted snapshots")),
+    )
+
+    payload = operator_api.build_actions_payload(include_feature_freshness=True, compact=True)
+    row = payload["top_action_recommendations"][0]
+    summary = row["feature_freshness_summary"]
+    effects = row["feature_gate_effects"]
+
+    assert summary["source"] == "decision_time_snapshot"
+    assert summary["status"] == "blocked"
+    assert summary["counts"] == {"fresh": 1, "stale": 1}
+    assert summary["required_inputs"][1]["input_key"] == "technical_daily"
+    assert row["feature_freshness"]["captured_at"] == "2026-06-10T08:00:00+00:00"
+    assert effects[0]["stage"] == "actions"
+    assert effects[0]["broker_execution_allowed"] is False
+    assert effects[0]["blocked_inputs"][0]["input_key"] == "technical_daily"
+
+
+def test_operator_api_feature_gate_effects_prefer_decision_context(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "load_operator_sections_payload",
+        lambda *_args, **_kwargs: {
+            "generated_at": "2026-06-10T08:30:00Z",
+            "asof_date": "2026-06-10",
+            "top_action_recommendations": [
+                {
+                    "symbol": "ABC",
+                    "action_code": "MANUAL_REVIEW",
+                    "raw_context_json": json.dumps(
+                        {
+                            "feature_freshness_gate": "blocked_stage_output",
+                            "feature_freshness_stage": "portfolio",
+                            "feature_freshness_status": "blocked",
+                            "feature_freshness_gate_effect": "defer_positive_rows",
+                            "feature_freshness_blocked_inputs": ["daily_ohlcv", "technical_daily"],
+                            "broker_execution_allowed": False,
+                        }
+                    ),
+                }
+            ],
+            "action_recommendations": [],
+            "alerts": [],
+        },
+    )
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(operator_api, "_load_latest_company_memory_reviews", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(operator_api, "build_required_feature_freshness_summaries", lambda *_args, **_kwargs: {})
+
+    payload = operator_api.build_actions_payload(include_feature_freshness=True, compact=True)
+    row = payload["top_action_recommendations"][0]
+
+    assert row["feature_gate_effects"][0]["stage"] == "portfolio"
+    assert row["feature_gate_effects"][0]["gate_effect"] == "defer_positive_rows"
+    assert row["feature_gate_effects"][0]["blocked_inputs"][0]["input_key"] == "daily_ohlcv"
+    assert row["feature_gate_effects"][0]["summary"].startswith("Approved or trimmed capital was deferred")
+
+
+def test_live_dashboard_action_loader_tolerates_legacy_feature_freshness_column(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        live_dashboard,
+        "_table_columns",
+        lambda table_name: {"asof_date", "symbol", "recommendation_reason_json", "reason_contract_status"},
+    )
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        captured["query"] = str(query)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(live_dashboard, "sql_to_df", fake_sql_to_df)
+
+    out = live_dashboard.load_action_rows(asof_date=pd.Timestamp("2026-06-10T00:00:00Z"), limit=5)
+
+    assert out.empty
+    assert "NULL AS feature_freshness_json" in captured["query"]
 
 
 def test_operator_health_degradation_feed_includes_announcement_failures(monkeypatch):
@@ -3401,6 +10296,84 @@ def test_operator_health_degradation_feed_groups_active_recovered_superseded(mon
     assert "explicit operator intent" in lifecycle["groups"][2]["next_action"]
 
 
+def test_superseded_failures_marking_uses_retryable_operations(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+
+    class FakeCursor:
+        rowcount = 1
+
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(superseded_failures, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(superseded_failures, "execute_db_operation", fake_execute_db_operation)
+
+    event_count = superseded_failures.mark_superseded_event_processing_failures(
+        [
+            {
+                "unique_id": "EVT-1",
+                "stage": "parse",
+                "started_at": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "superseded_by_status": "ok",
+                "superseded_by_completed_at": pd.Timestamp("2026-06-10T00:05:00Z"),
+            }
+        ]
+    )
+    doc_count = superseded_failures.mark_recovered_announcement_document_errors([{"unique_id": "DOC-1"}])
+
+    assert event_count == 1
+    assert doc_count == 1
+    assert operation_names == [
+        "superseded_failures:mark_event_processing",
+        "superseded_failures:mark_announcement_documents",
+    ]
+    assert any(superseded_failures.EVENT_PROCESSING_TABLE in query for query, _params in executed)
+    assert any(superseded_failures.ANNOUNCEMENT_DOCUMENTS_TABLE in query for query, _params in executed)
+
+
+def test_superseded_failures_ensure_columns_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[str] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append(str(query))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(superseded_failures, "_table_exists", lambda _table_name: True)
+    monkeypatch.setattr(superseded_failures, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(superseded_failures, "execute_db_operation", fake_execute_db_operation)
+
+    superseded_failures.ensure_superseded_columns()
+
+    assert operation_names == ["superseded_failures:ensure_columns"]
+    assert len(executed) == 2
+    assert any("superseded_at" in query for query in executed)
+    assert any("last_error_superseded_at" in query for query in executed)
+
+
 def test_operator_health_suppresses_recovered_announcement_last_error(monkeypatch):
     monkeypatch.setattr(operator_health, "table_exists", lambda _table_name: True)
     monkeypatch.setattr(
@@ -3426,6 +10399,22 @@ def test_operator_health_suppresses_recovered_announcement_last_error(monkeypatc
     )
 
     assert operator_health.check_announcement_document_failures() == []
+
+
+def test_operator_health_announcement_document_failure_check_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "table_columns", lambda table_name: {"unique_id", "ticker", "ocr_status", "parse_status", "last_error"})
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("announcement query failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    rows = operator_health.check_announcement_document_failures(limit=3)
+
+    assert rows[0]["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_announcement_document_failures_check_failed"
+    assert events[0]["source"] == "announcement_pipeline_documents"
+    assert events[0]["metadata"] == {"limit": 3}
 
 
 def test_operator_health_downgrades_recovered_cron_log_error(tmp_path):
@@ -3525,6 +10514,196 @@ def test_operator_health_api_check_reports_latency(monkeypatch):
     assert payload["latency_ms"] >= 0
 
 
+def test_operator_health_api_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health.requests, "get", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("api down")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_operator_api()
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_api_check_failed"
+    assert events[0]["source"] == operator_health.DEFAULT_OPERATOR_API_URL
+    assert events[0]["metadata"]["url"] == operator_health.DEFAULT_OPERATOR_API_URL
+
+
+def test_operator_health_operator_api_errors_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("api errors query failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_operator_api_errors(limit=11)
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_api_errors_check_failed"
+    assert events[0]["source"] == operator_health.OPERATOR_API_ERRORS_TABLE
+    assert events[0]["metadata"] == {"limit": 11}
+
+
+def test_operator_health_json_dict_records_parse_failure(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    parsed = operator_health._json_dict("{bad-json", source="unit_source", fallback_type="unit_json_parse_failed", metadata={"row": 1})
+
+    assert parsed == {}
+    assert events[0]["source"] == "unit_source"
+    assert events[0]["fallback_type"] == "unit_json_parse_failed"
+    assert events[0]["severity"] == "warn"
+    assert events[0]["metadata"]["row"] == 1
+    assert events[0]["metadata"]["value_excerpt"] == "{bad-json"
+
+
+def test_operator_health_operator_api_errors_records_bad_context_json(monkeypatch):
+    events: list[dict[str, object]] = []
+    df = pd.DataFrame(
+        [
+            {
+                "occurred_at": pd.Timestamp("2026-06-12T09:00:00Z"),
+                "route": "/api/actions",
+                "status_code": 500,
+                "error_message": "boom",
+                "traceback_tail": "trace",
+                "request_context_json": "{bad-json",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: df)
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_operator_api_errors(limit=5)
+
+    assert payload["status"] == "error"
+    assert payload["rows"][0]["request_context"] == {}
+    assert events[0]["source"] == operator_health.OPERATOR_API_ERRORS_TABLE
+    assert events[0]["fallback_type"] == "operator_health_api_error_context_parse_failed"
+    assert events[0]["metadata"]["route"] == "/api/actions"
+    assert events[0]["metadata"]["value_excerpt"] == "{bad-json"
+
+
+def test_operator_health_table_freshness_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        operator_health,
+        "TABLE_FRESHNESS_CHECKS",
+        [{"name": "actions", "table": "advisory_action_recommendations", "column": "asof_date", "max_age_days": 3}],
+    )
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "table_columns", lambda table_name: {"asof_date"})
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("freshness query failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    rows = operator_health.check_table_freshness(include_counts=True)
+
+    assert rows[0]["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_table_freshness_check_failed"
+    assert events[0]["source"] == "advisory_action_recommendations"
+    assert events[0]["metadata"] == {
+        "name": "actions",
+        "table": "advisory_action_recommendations",
+        "column": "asof_date",
+        "fallback_column": "asof_date",
+        "include_counts": True,
+    }
+
+
+def test_operator_health_cron_recovery_failure_records_fallback(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    log_path = tmp_path / "all_advisory.log"
+    modified_at = pd.Timestamp("2026-05-01T10:00:00Z")
+    analysis = {"latest_error_line": "KeyboardInterrupt", "recent_errors": []}
+
+    monkeypatch.setattr(operator_health, "get_table_latest_timestamp", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("recovery query failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.recover_interrupted_cron_status(log_path, modified_at, analysis)
+
+    assert payload["recovery_outputs"][0]["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_cron_recovery_check_failed"
+    assert events[0]["metadata"]["log_file"] == "all_advisory.log"
+    assert events[0]["metadata"]["output_name"] == "actions"
+
+
+def test_operator_health_superseded_preview_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(operator_health, "cleanup_superseded_failures", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("cleanup preview failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.build_degradation_lifecycle_groups([], limit=7, include_superseded_preview=True)
+
+    assert payload["superseded_preview"]["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_superseded_preview_failed"
+    assert events[0]["source"] == "advisory.superseded_failures"
+    assert events[0]["metadata"] == {"limit": 7}
+
+
+def test_operator_health_run_health_checks_records_serial_failure(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health._run_health_checks({"broken": lambda: (_ for _ in ()).throw(RuntimeError("serial health failed"))}, workers=1)
+
+    assert payload["broken"]["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_check_failed"
+    assert events[0]["source"] == "broken"
+    assert events[0]["metadata"] == {"check_name": "broken", "workers": 1}
+
+
+def test_operator_health_run_health_checks_records_parallel_failure(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health._run_health_checks(
+        {
+            "ok": lambda: {"status": "ok"},
+            "broken": lambda: (_ for _ in ()).throw(RuntimeError("parallel health failed")),
+        },
+        workers=2,
+    )
+
+    assert payload["ok"]["status"] == "ok"
+    assert payload["broken"]["status"] == "error"
+    broken_event = [event for event in events if event["source"] == "broken"][0]
+    assert broken_event["fallback_type"] == "operator_health_check_failed"
+    assert broken_event["metadata"] == {"check_name": "broken", "workers": 2}
+
+
+def test_operator_health_trace_summaries_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("trace summary query failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_trace_summaries()
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_trace_summaries_check_failed"
+    assert events[0]["source"] == operator_health.TRACE_SUMMARIES_TABLE
+
+
+def test_operator_health_redis_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setenv("REDIS_HOST", "127.0.0.1")
+    monkeypatch.setenv("REDIS_PORT", "6379")
+    monkeypatch.setattr(operator_health, "get_redis_client", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("redis down")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_redis()
+
+    assert payload["status"] == "warn"
+    assert events[0]["fallback_type"] == "operator_health_redis_check_failed"
+    assert events[0]["source"] == "redis"
+    assert events[0]["metadata"] == {"host": "127.0.0.1", "port": "6379"}
+
+
 def test_operator_health_dhan_cache_warns_when_expiring(monkeypatch, tmp_path):
     cache_path = tmp_path / "dhan.json"
     cache_path.write_text("{}", encoding="utf-8")
@@ -3550,15 +10729,86 @@ def test_operator_health_dhan_cache_warns_when_expiring(monkeypatch, tmp_path):
     assert payload["has_cached_access_token"] is True
 
 
+def test_operator_health_dhan_cached_token_inspect_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
+    import data.dhanlive.auth as dhan_auth_module
+
+    monkeypatch.setattr(dhan_auth_module, "load_cached_access_token", lambda: (_ for _ in ()).throw(RuntimeError("cache read failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_dhan_token()
+
+    assert payload["status"] == "warn"
+    assert events[0]["fallback_type"] == "operator_health_dhan_cached_token_inspect_failed"
+    assert events[0]["source"] == "data.dhanlive.auth"
+
+
+def test_operator_health_dhan_token_validation_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setenv("DHAN_ACCESS_TOKEN", "bad-token")
+    import data.dhanlive.client as dhan_client_module
+
+    class FailingClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def validate_access_token(self):
+            raise RuntimeError("token rejected")
+
+    monkeypatch.setattr(dhan_client_module, "DhanHistoricalClient", FailingClient)
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_dhan_token()
+
+    assert payload["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_dhan_token_validation_failed"
+    assert events[0]["source"] == "data.dhanlive.client"
+
+
+def test_operator_health_dhan_cache_check_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    import data.dhanlive.auth as dhan_auth_module
+
+    monkeypatch.setattr(dhan_auth_module, "load_cached_access_token_payload", lambda: (_ for _ in ()).throw(RuntimeError("cache parse failed")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_dhan_cache()
+
+    assert payload["status"] == "warn"
+    assert events[0]["fallback_type"] == "operator_health_dhan_cache_check_failed"
+    assert events[0]["source"] == "data.dhanlive.auth"
+
+
 def test_operator_api_health_details_payload(monkeypatch):
     operator_api._PAYLOAD_CACHE.clear()
-    monkeypatch.setattr(operator_api, "build_operator_health", lambda **_kwargs: {"status": "ok", "detail_level": _kwargs.get("detail_level"), "sections": {"database": {"status": "ok"}}})
+    monkeypatch.setattr(operator_api, "build_operator_health", lambda **_kwargs: {"status": "ok", "detail_level": _kwargs.get("detail_level"), "sections": {"database": {"status": "ok"}, "rows": [{"idx": idx} for idx in range(40)], "trace": "x" * 3000}})
 
     payload = operator_api.build_operator_health_payload()
 
     assert payload["status"] == "ok"
     assert payload["detail_level"] == "fast"
     assert payload["sections"]["database"]["status"] == "ok"
+    assert payload["compact"] is True
+    assert len(payload["sections"]["rows"]) == operator_api.OPERATOR_HEALTH_COMPACT_LIST_LIMIT
+    assert payload["compact_meta"]["omitted_list_items"] == 15
+    assert payload["sections"]["trace"].endswith("...[truncated]")
+
+
+def test_operator_api_health_details_full_raw_payload(monkeypatch):
+    operator_api._PAYLOAD_CACHE.clear()
+    monkeypatch.setattr(operator_api, "build_operator_health", lambda **_kwargs: {"status": "ok", "detail_level": _kwargs.get("detail_level"), "sections": {"rows": [{"idx": idx} for idx in range(40)], "trace": "x" * 3000}})
+
+    compact_payload = operator_api.build_operator_health_payload(mode="full", compact=True)
+    full_payload = operator_api.build_operator_health_payload(mode="full", compact=False)
+
+    assert compact_payload["compact"] is True
+    assert full_payload["compact"] is False
+    assert len(full_payload["sections"]["rows"]) == 40
+    assert full_payload["sections"]["trace"] == "x" * 3000
 
 
 def test_operator_api_health_details_payload_uses_short_cache(monkeypatch):
@@ -3651,17 +10901,37 @@ def test_operator_api_critical_routes_publish_typed_response_models():
         ("/api/operations/cron-status", "get"): "OperationsCronStatusResponse",
         ("/api/operations/commands", "get"): "OperationsCommandsResponse",
         ("/api/operations/api-errors", "get"): "OperationsApiErrorsResponse",
+        ("/api/operations/superseded-cleanup", "get"): "OperationsSupersededCleanupResponse",
+        ("/api/operations/superseded-cleanup/apply", "post"): "OperationsSupersededCleanupResponse",
     }
     research_expected = {
         ("/api/research/event-model-promotion-check", "get"): "EventModelPromotionCheckResponse",
+        ("/api/research/ts-forecast-promotion-check", "get"): "TsForecastPromotionCheckResponse",
+        ("/api/research/ts-forecast-promotion-review", "post"): "PromotionReviewResponse",
+        ("/api/research/ts-forecast-promotion-reviews", "get"): "TsForecastPromotionReviewsResponse",
+        ("/api/research/ts-forecast-promotion-review/decision", "post"): "PromotionDecisionResponse",
+        ("/api/research/ts-forecast-review-rules", "get"): "TsForecastReviewRulesResponse",
         ("/api/research/event-model-artifacts", "get"): "EventModelArtifactsResponse",
         ("/api/research/prompt-registry", "get"): "PromptRegistryResponse",
     }
     calibration_expected = {
         ("/api/technical-calibration", "get"): "TechnicalCalibrationResponse",
+        ("/api/technical-calibration/promotion-review", "post"): "PromotionReviewResponse",
         ("/api/technical-calibration/promotion-reviews", "get"): "TechnicalPromotionReviewsResponse",
+        ("/api/technical-calibration/promotion-review/decision", "post"): "PromotionDecisionResponse",
+        ("/api/signal-quality/promotion-review", "post"): "PromotionReviewResponse",
         ("/api/signal-quality/promotion-reviews", "get"): "SignalQualityPromotionReviewsResponse",
+        ("/api/signal-quality/promotion-review/decision", "post"): "PromotionDecisionResponse",
+        ("/api/event-policy/promotion-review", "post"): "PromotionReviewResponse",
+        ("/api/event-policy/promotion-reviews", "get"): "EventPolicyPromotionReviewsResponse",
+        ("/api/event-policy/promotion-review/decision", "post"): "PromotionDecisionResponse",
         ("/api/config-change/previews", "get"): "ConfigChangePreviewsResponse",
+        ("/api/config-change/applications", "get"): "ConfigChangeApplicationsResponse",
+        ("/api/config-change/application-decision", "post"): "ConfigChangeApplicationResponse",
+        ("/api/config-change/technical-threshold-preview", "post"): "ConfigChangePreviewResponse",
+        ("/api/config-change/signal-quality-preview", "post"): "ConfigChangePreviewResponse",
+        ("/api/config-change/event-policy-preview", "post"): "ConfigChangePreviewResponse",
+        ("/api/config-change/ts-forecast-preview", "post"): "ConfigChangePreviewResponse",
     }
     event_policy_expected = {
         ("/api/event-policy", "get"): "EventPolicyResponse",
@@ -3749,6 +11019,66 @@ def test_operator_api_health_read_route_smoke_with_typed_payload(monkeypatch):
     assert body["api_schema"]["broker_execution_enabled"] is False
     assert body["status"] == "ok"
     assert body["read_only"] is False
+
+
+def test_operator_api_slow_request_logger_records_slowlog_failure(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    events = []
+
+    def schema(endpoint: str, name: str) -> dict[str, object]:
+        return {
+            "name": name,
+            "version": operator_api.OPERATOR_API_SCHEMA_VERSION,
+            "endpoint": endpoint,
+            "read_only": True,
+            "broker_execution_enabled": False,
+        }
+
+    monkeypatch.setattr(
+        operator_api,
+        "build_health_payload",
+        lambda: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/health", "operator_health"),
+            "status": "ok",
+            "service": "stockey-operator-api",
+            "operator_controlled": True,
+            "read_only": False,
+            "write_scope": "operator_audit_and_research_controls",
+        },
+    )
+    monkeypatch.setattr(operator_api, "record_slow_operation", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("slowlog down")))
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    response = TestClient(operator_api.create_app()).get("/api/health")
+
+    assert response.status_code == 200
+    assert events[0]["fallback_type"] == "operator_api_slow_request_logging_failed"
+    assert events[0]["source"] == "slow_request_logger"
+    assert events[0]["metadata"]["route"] == "/api/health"
+
+
+def test_operator_api_slow_request_logger_records_content_length_parse_failure(monkeypatch):
+    from fastapi import Response
+    from fastapi.testclient import TestClient
+
+    events = []
+    monkeypatch.setattr(operator_api, "record_slow_operation", lambda **kwargs: None)
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    app = operator_api.create_app()
+
+    @app.get("/unit/bad-content-length")
+    def bad_content_length():
+        return Response(content="ok", headers={"content-length": "not-a-number"})
+
+    response = TestClient(app).get("/unit/bad-content-length")
+
+    assert response.status_code == 200
+    assert response.text == "ok"
+    assert events[0]["fallback_type"] == "operator_api_response_size_parse_failed"
+    assert events[0]["source"] == "slow_request_logger"
+    assert events[0]["metadata"]["route"] == "/unit/bad-content-length"
 
 
 def test_operator_api_home_portfolio_events_read_routes_smoke_with_typed_payloads(monkeypatch):
@@ -4093,6 +11423,61 @@ def test_operator_api_action_portfolio_detail_read_routes_smoke_with_typed_paylo
     assert responses[1].json()["rows"][0]["portfolio_status"] == "active"
 
 
+def test_operator_api_portfolio_detail_includes_lifecycle_policy_changes(monkeypatch):
+    portfolio_payload = {
+        "generated_at": "2026-06-07T00:00:00Z",
+        "asof_date": "2026-06-07",
+        "portfolio": [{"symbol": "ABC", "portfolio_status": "approved"}],
+        "lifecycle": [{"symbol": "ABC", "next_action": "tighten_stop"}],
+        "today_recommendations": [],
+        "current_recommendations": [],
+        "exited_recommendations": [],
+    }
+
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **_kwargs: portfolio_payload)
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.LIFECYCLE_POLICY_CHANGES_TABLE)
+    monkeypatch.setattr(
+        operator_api,
+        "sql_to_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            [
+                {
+                    "change_id": "chg-1",
+                    "changed_at": pd.Timestamp("2026-06-07T10:00:00Z"),
+                    "symbol": "ABC",
+                    "change_type": "stop_tightened",
+                    "old_value": 99.0,
+                    "new_value": 101.0,
+                    "source_action": "tighten_stop",
+                    "reason": "Trail stop after profit.",
+                }
+            ]
+        ),
+    )
+
+    payload = operator_api.build_portfolio_detail_payload(symbol="abc")
+
+    assert payload["status"] == "ok"
+    assert payload["row_count"] == 2
+    assert payload["policy_change_count"] == 1
+    assert payload["policy_changes"][0]["change_type"] == "stop_tightened"
+    assert payload["policy_changes"][0]["new_value"] == 101.0
+
+
+def test_operator_api_portfolio_detail_policy_change_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("policy table down")))
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = operator_api.load_lifecycle_policy_changes_for_symbol("abc")
+
+    assert rows == []
+    assert events[0]["fallback_type"] == "operator_portfolio_detail_policy_changes_load_failed"
+    assert events[0]["source"] == operator_api.LIFECYCLE_POLICY_CHANGES_TABLE
+    assert events[0]["metadata"]["symbol"] == "ABC"
+
+
 def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -4242,7 +11627,7 @@ def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
             "api_schema": schema("/api/action-conflict-rules/promote", "action_conflict_rule_promotion"),
             "rule": {"rule_id": payload["rule_id"], "enabled": False},
             "condition": {"condition_type": "action_pair_exact"},
-            "note": "Promoted conflict rules are disabled by default unless enabled is explicitly true.",
+            "note": "Promoted conflict rules support exact action/source matches or broader action-only pairs. They are disabled by default unless enabled is explicitly true.",
         },
     )
     monkeypatch.setattr(
@@ -4284,6 +11669,8 @@ def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
 
 def test_operator_api_operations_read_routes_smoke_with_typed_payloads(monkeypatch):
     from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(operator_api, "record_operator_api_error", lambda **_kwargs: {})
 
     def schema(endpoint: str, name: str) -> dict[str, object]:
         return {
@@ -4354,6 +11741,36 @@ def test_operator_api_operations_read_routes_smoke_with_typed_payloads(monkeypat
             "summary": {"total": 0, "error": 0, "warn": 0},
         },
     )
+    monkeypatch.setattr(
+        operator_api,
+        "build_superseded_cleanup_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/operations/superseded-cleanup", "operations_superseded_cleanup"),
+            "status": "ok",
+            "mode": "preview",
+            "dry_run": True,
+            "result": {"status": "dry_run"},
+            "counts": {"total_candidates": 1, "total_updated": 0},
+            "operator_boundary": {"mutates_portfolio": False, "submits_order": False},
+            "audit_run": None,
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "apply_superseded_cleanup_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/operations/superseded-cleanup/apply", "operations_superseded_cleanup_apply"),
+            "status": "ok",
+            "mode": "apply",
+            "dry_run": False,
+            "result": {"status": "applied"},
+            "counts": {"total_candidates": 1, "total_updated": 1},
+            "operator_boundary": {"mutates_portfolio": False, "submits_order": False},
+            "audit_run": {"run_id": "run-1"},
+        },
+    )
 
     client = TestClient(operator_api.create_app())
     responses = [
@@ -4362,10 +11779,12 @@ def test_operator_api_operations_read_routes_smoke_with_typed_payloads(monkeypat
         client.get("/api/operations/cron-status?limit=1&lines=5"),
         client.get("/api/operations/commands?limit=1"),
         client.get("/api/operations/api-errors?limit=1"),
+        client.get("/api/operations/superseded-cleanup?limit=1"),
+        client.post("/api/operations/superseded-cleanup/apply", json={"confirm": True, "requested_reason": "reviewed"}),
     ]
 
     for response in responses:
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         body = response.json()
         assert body["api_schema"]["version"] == operator_api.OPERATOR_API_SCHEMA_VERSION
         assert body["api_schema"]["read_only"] is True
@@ -4421,6 +11840,46 @@ def test_operator_api_technical_calibration_read_routes_smoke_with_typed_payload
     )
     monkeypatch.setattr(
         operator_api,
+        "build_event_policy_promotion_reviews_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/event-policy/promotion-reviews", "event_policy_promotion_reviews"),
+            "status": "ok",
+            "reviews": [{"group_type": "source_quality", "group_value": "high", "review_status": "ok"}],
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "build_event_policy_promotion_review_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/event-policy/promotion-review", "event_policy_promotion_review"),
+            "status": "ok",
+            "reviewed_at": "2026-06-08T00:00:00Z",
+            "review_status": "ok",
+            "pending_patch": {"mode": "manual_review_only"},
+            "llm_review": {"recommendation": "promote_review_rule"},
+            "applied": False,
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "build_event_policy_promotion_review_decision_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/event-policy/promotion-review/decision", "event_policy_promotion_decision"),
+            "status": "ok",
+            "decided_at": "2026-06-09T00:00:00Z",
+            "reviewed_at": payload.get("reviewed_at"),
+            "decision": payload.get("decision"),
+            "final_patch": {"mode": "manual_apply_required"},
+            "review": {"recommendation": "promote_review_rule"},
+            "applied": False,
+            "note": "Decision recorded only.",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
         "build_config_change_previews_payload",
         lambda **_kwargs: {
             "generated_at": "2026-06-07T00:00:00Z",
@@ -4429,13 +11888,65 @@ def test_operator_api_technical_calibration_read_routes_smoke_with_typed_payload
             "previews": [{"preview_id": "p1", "applied": False}],
         },
     )
+    monkeypatch.setattr(
+        operator_api,
+        "build_event_policy_config_change_preview_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/config-change/event-policy-preview", "event_policy_config_change_preview"),
+            "status": "ok",
+            "preview_id": "event-policy-preview-1",
+            "source_type": "event_policy_review_rule",
+            "source_key": "review-1",
+            "config_path": "config/advisory_setups.yaml",
+            "review_status": "manual_review_required",
+            "decision_status": "preview_only_not_applied",
+            "patch_payload": {"rule_suggestion": {"event_policy_group_type": "source_quality"}},
+            "unified_diff": "---\n+++",
+            "rollback_note": "Do not apply.",
+            "safety_checks": ["Preview only; no file write was performed."],
+            "decision": {"decision": "approved"},
+            "applied": False,
+        },
+    )
 
     client = TestClient(operator_api.create_app())
     responses = [
         client.get("/api/technical-calibration?limit=1"),
         client.get("/api/technical-calibration/promotion-reviews?limit=1"),
         client.get("/api/signal-quality/promotion-reviews?limit=1"),
+        client.get("/api/event-policy/promotion-reviews?limit=1"),
+        client.post(
+            "/api/event-policy/promotion-review",
+            json={
+                "evaluated_at": "2026-05-01T00:00:00Z",
+                "horizon_days": 5,
+                "group_type": "source_quality",
+                "group_value": "high",
+            },
+        ),
+        client.post(
+            "/api/event-policy/promotion-review/decision",
+            json={
+                "reviewed_at": "2026-06-08T00:00:00Z",
+                "evaluated_at": "2026-05-01T00:00:00Z",
+                "horizon_days": 5,
+                "group_type": "source_quality",
+                "group_value": "high",
+                "decision": "approved",
+            },
+        ),
         client.get("/api/config-change/previews?limit=1"),
+        client.post(
+            "/api/config-change/event-policy-preview",
+            json={
+                "reviewed_at": "2026-05-30T00:00:00Z",
+                "evaluated_at": "2026-05-01T00:00:00Z",
+                "horizon_days": 5,
+                "group_type": "source_quality",
+                "group_value": "high",
+            },
+        ),
     ]
 
     for response in responses:
@@ -4448,7 +11959,12 @@ def test_operator_api_technical_calibration_read_routes_smoke_with_typed_payload
     assert responses[0].json()["summary"][0]["best_config_id"] == "cfg-1"
     assert responses[1].json()["reviews"][0]["review_status"] == "pending_operator_decision"
     assert responses[2].json()["reviews"][0]["variant"] == "technical_plus_all"
-    assert responses[3].json()["previews"][0]["applied"] is False
+    assert responses[3].json()["reviews"][0]["group_type"] == "source_quality"
+    assert responses[4].json()["review_status"] == "ok"
+    assert responses[5].json()["decision"] == "approved"
+    assert responses[6].json()["previews"][0]["applied"] is False
+    assert responses[7].json()["source_type"] == "event_policy_review_rule"
+    assert responses[7].json()["applied"] is False
 
 
 def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads(monkeypatch):
@@ -4472,6 +11988,12 @@ def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads
             "status": "ok",
             "decision": "hold_research_only",
             "ready_for_operator_review": False,
+            "scorecard": {
+                "status": "not_usable",
+                "usable": False,
+                "broker_execution_allowed": False,
+                "policy_auto_promotion_allowed": False,
+            },
             "promotion_mode": "manual_low_weight_review",
             "artifact": {"status": "ok", "model_version": "event_meta_model_h10"},
             "metadata": {"model_name": "xgboost_event_meta_model"},
@@ -4523,6 +12045,8 @@ def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads
         assert body["api_schema"]["broker_execution_enabled"] is False
 
     assert responses[0].json()["decision"] == "hold_research_only"
+    assert responses[0].json()["scorecard"]["broker_execution_allowed"] is False
+    assert responses[0].json()["scorecard"]["policy_auto_promotion_allowed"] is False
     assert responses[1].json()["read_only"] is True
     assert responses[2].json()["summary"]["broker_execution_allowed_count"] == 0
 
@@ -4908,6 +12432,18 @@ def test_decision_trace_loads_manual_review_wait_signal_links(monkeypatch):
     assert any("LEFT JOIN advisory_wait_signal_matches" in query for query in queries)
 
 
+def test_decision_trace_table_exists_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(decision_trace, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table lookup timeout")))
+    monkeypatch.setattr(decision_trace, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert decision_trace.table_exists(decision_trace.TRACES_TABLE) is False
+    assert events[0]["fallback_type"] == "decision_trace_table_lookup_failed"
+    assert events[0]["source"] == decision_trace.TRACES_TABLE
+    assert events[0]["metadata"] == {"table_name": decision_trace.TRACES_TABLE}
+
+
 def test_operator_api_trace_summary_normalizes_manual_review_wait_signal_links():
     payload = operator_api.normalize_trace_payload(
         {
@@ -4967,6 +12503,139 @@ def test_operator_api_trace_summary_falls_back_and_marks(monkeypatch):
     assert payload["_trace_summary_cache"]["source"] == "live_fallback"
     assert payload["pagination"]["decisions"]["returned_count"] == 0
     assert markers[0]["message"] == "trace_summary_cache_miss:event"
+
+
+def test_trace_summary_store_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(trace_summary_store, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    trace_summary_store.ensure_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == trace_summary_store.TRACE_SUMMARY_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [trace_summary_store.TABLE_NAME]
+    assert any(trace_summary_store.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("summary_json" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (entity_type, entity_key, limit_rows)" in statement for statement in calls[0]["statements"])
+
+
+def test_trace_summary_store_records_cache_load_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(trace_summary_store, "ensure_table", lambda: None)
+    monkeypatch.setattr(trace_summary_store, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("cache query failed")))
+    monkeypatch.setattr(trace_summary_store, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    summary = trace_summary_store.load_summary("symbol", "abc", limit=25)
+
+    assert summary is None
+    assert events[0]["fallback_type"] == "trace_summary_cache_load_failed"
+    assert events[0]["source"] == trace_summary_store.TABLE_NAME
+    assert events[0]["metadata"]["entity_key"] == "ABC"
+    assert events[0]["metadata"]["limit_rows"] == 25
+
+
+def test_trace_summary_store_json_loads_records_malformed_cache_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(trace_summary_store, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    parsed = trace_summary_store.json_loads("{bad trace summary", source="summary_json")
+
+    assert parsed is None
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.trace_summary_store"
+    assert event["fallback_type"] == "trace_summary_json_parse_failed"
+    assert event["source"] == "summary_json"
+    assert event["severity"] == "warn"
+    assert event["metadata"]["value_length"] == len("{bad trace summary")
+    assert event["metadata"]["value_excerpt"] == "{bad trace summary"
+
+
+def test_trace_summary_store_records_recent_entity_load_fallbacks(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(trace_summary_store, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("trace query failed")))
+    monkeypatch.setattr(trace_summary_store, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    symbols, unique_ids = trace_summary_store.recent_entities(symbol_limit=2, event_limit=3)
+
+    assert symbols == []
+    assert unique_ids == []
+    assert [row["fallback_type"] for row in events] == [
+        "trace_summary_recent_symbols_load_failed",
+        "trace_summary_recent_events_load_failed",
+    ]
+
+
+def test_trace_summary_store_cleanup_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+
+    class FakeCursor:
+        rowcount = 7
+
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_sql_to_df(query, params=None, **_kwargs):
+        assert "row_number()" in str(query)
+        return pd.DataFrame(
+            [
+                {
+                    "entity_type": "symbol",
+                    "entity_key": "ABC",
+                    "limit_rows": 100,
+                    "generated_at": pd.Timestamp("2026-06-01T00:00:00Z"),
+                    "rn": 2,
+                }
+            ]
+        )
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(trace_summary_store, "ensure_table", lambda: None)
+    monkeypatch.setattr(trace_summary_store, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(trace_summary_store, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(trace_summary_store, "execute_db_operation", fake_execute_db_operation)
+
+    result = trace_summary_store.cleanup_summaries(keep_latest_per_entity=1, older_than_days=30, dry_run=False)
+
+    assert result["candidate_rows"] == 1
+    assert result["deleted_rows"] == 7
+    assert operation_names == ["trace_summary_store:cleanup_old_summaries"]
+    assert len(executed) == 1
+    assert f"DELETE FROM {trace_summary_store.TABLE_NAME}" in executed[0][0]
+    assert executed[0][1]["older_than_days"] == 30
+
+
+def test_trace_summary_store_records_rebuild_entity_failures(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(trace_summary_store, "ensure_table", lambda: None)
+    monkeypatch.setattr(trace_summary_store, "recent_entities", lambda **kwargs: (["ABC"], ["EVT1"]))
+    monkeypatch.setattr(trace_summary_store, "build_symbol_summary", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("symbol build failed")))
+    monkeypatch.setattr(trace_summary_store, "build_event_summary", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("event build failed")))
+    monkeypatch.setattr(trace_summary_store, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    summary = trace_summary_store.rebuild_summaries(symbol_limit=1, event_limit=1, dry_run=False)
+
+    assert summary["status"] == "partial"
+    assert len(summary["errors"]) == 2
+    assert [row["fallback_type"] for row in events] == [
+        "trace_summary_symbol_build_failed",
+        "trace_summary_event_build_failed",
+    ]
 
 
 def test_operator_api_hypothesis_payloads(monkeypatch):
@@ -5057,6 +12726,40 @@ def test_decision_trace_promoted_conflict_rule_matches_exact_pair():
     assert miss["resolution_status"] == "unresolved"
 
 
+def test_decision_trace_promoted_conflict_rule_matches_action_pair_without_source():
+    row = {
+        "winning_action_code": "HOLD",
+        "losing_action_code": "BUY",
+        "winning_source": "lifecycle",
+        "losing_source": "portfolio",
+        "lost_reason": "No deterministic rule matched.",
+    }
+    dynamic_rules = [
+        {
+            "rule_id": "MANUAL_HOLD_BEATS_BUY",
+            "resolution_action": "keep_winner",
+            "resolution_reason": "Operator confirmed hold beats buy across sources.",
+            "condition_json": json.dumps(
+                {
+                    "condition_type": "action_pair",
+                    "winning_action_code": "HOLD",
+                    "losing_action_code": "BUY",
+                    "winning_source": "manual_review",
+                    "losing_source": "screener",
+                }
+            ),
+        }
+    ]
+
+    resolution = decision_trace.classify_action_conflict(row, dynamic_rules=dynamic_rules)
+    miss = decision_trace.classify_action_conflict({**row, "losing_action_code": "SELL"}, dynamic_rules=dynamic_rules)
+
+    assert resolution["resolution_status"] == "resolved"
+    assert resolution["resolution_rule_id"] == "MANUAL_HOLD_BEATS_BUY"
+    assert resolution["requires_manual_resolution"] is False
+    assert miss["resolution_status"] == "unresolved"
+
+
 def test_action_recommender_enabled_conflict_rule_changes_candidate_ranking(monkeypatch):
     asof_date = pd.Timestamp("2026-05-14T00:00:00Z")
     candidates = pd.DataFrame(
@@ -5106,6 +12809,104 @@ def test_action_recommender_enabled_conflict_rule_changes_candidate_ranking(monk
     assert enabled_winner.iloc[0]["action_code"] == "SELL"
     assert enabled_context["conflict_precedence_rule_id"] == "EXIT_BEATS_ENTRY_OR_WATCH"
     assert disabled_winner.iloc[0]["action_code"] == "BUY"
+
+
+def test_action_recommender_records_conflict_rule_default_fallback_on_lookup_error(monkeypatch):
+    events = []
+    monkeypatch.setattr(action_recommender, "table_exists", lambda table_name: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rule_ids = action_recommender.load_enabled_conflict_rule_ids()
+
+    assert rule_ids == set(action_recommender.DEFAULT_CONFLICT_RULE_IDS)
+    assert events[0]["fallback_type"] == "action_conflict_rule_lookup_failed_default_rules"
+    assert events[0]["source"] == action_recommender.ACTION_CONFLICT_RULES_TABLE
+
+
+def test_action_recommender_records_conflict_rule_default_fallback_on_load_error(monkeypatch):
+    events = []
+    monkeypatch.setattr(action_recommender, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(action_recommender, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("query failed")))
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rule_ids = action_recommender.load_enabled_conflict_rule_ids()
+
+    assert rule_ids == set(action_recommender.DEFAULT_CONFLICT_RULE_IDS)
+    assert events[0]["fallback_type"] == "action_conflict_rule_load_failed_default_rules"
+    assert events[0]["metadata"]["fallback_rule_count"] == len(action_recommender.DEFAULT_CONFLICT_RULE_IDS)
+
+
+def test_action_recommender_records_dynamic_conflict_rule_fallback_on_load_error(monkeypatch):
+    events = []
+    monkeypatch.setattr(action_recommender, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(action_recommender, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("query failed")))
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rules = action_recommender.load_enabled_dynamic_conflict_rules_for_ranking()
+
+    assert rules == []
+    assert events[0]["fallback_type"] == "action_dynamic_conflict_rule_load_failed"
+    assert events[0]["source"] == action_recommender.ACTION_CONFLICT_RULES_TABLE
+
+
+def test_action_recommender_parse_jsonish_records_malformed_context_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = action_recommender._parse_jsonish("{bad-json", {"fallback": True})
+
+    assert result == {"fallback": True}
+    assert events[0]["module"] == "advisory.action_recommender"
+    assert events[0]["fallback_type"] == "action_recommender_json_parse_failed"
+    assert events[0]["source"] == "json_context"
+    assert events[0]["metadata"]["default_type"] == "dict"
+    assert events[0]["metadata"]["value_length"] == len("{bad-json")
+    assert events[0]["metadata"]["value_excerpt"] == "{bad-json"
+
+
+def test_action_recommender_parse_jsonish_missing_check_records_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(action_recommender.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = action_recommender._parse_jsonish('{"ok": true}', {})
+
+    assert result == {"ok": True}
+    assert events[0]["module"] == "advisory.action_recommender"
+    assert events[0]["fallback_type"] == "action_recommender_missing_check_failed"
+    assert events[0]["source"] == "parse_jsonish"
+    assert events[0]["metadata"]["value_type"] == "str"
+
+
+def test_action_recommender_json_context_value_missing_check_records_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(action_recommender.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = action_recommender._json_context_value(sentinel)
+
+    assert result is sentinel
+    assert events[0]["module"] == "advisory.action_recommender"
+    assert events[0]["fallback_type"] == "action_recommender_context_missing_check_failed"
+    assert events[0]["source"] == "json_context_value"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
+def test_action_recommender_json_ready_record_missing_check_records_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(action_recommender.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = action_recommender._json_ready_record({"raw_value": sentinel})
+
+    assert result["raw_value"] is sentinel
+    assert events[0]["module"] == "advisory.action_recommender"
+    assert events[0]["fallback_type"] == "action_recommender_record_missing_check_failed"
+    assert events[0]["source"] == "json_ready_record"
+    assert events[0]["metadata"]["key"] == "raw_value"
+    assert events[0]["metadata"]["value_type"] == "object"
 
 
 def test_action_recommender_promoted_conflict_rule_changes_candidate_ranking(monkeypatch):
@@ -5199,8 +13000,74 @@ def test_action_recommender_promoted_conflict_rule_changes_candidate_ranking(mon
     assert fallback_winner.iloc[0]["action_code"] == "BUY"
 
 
+def test_action_recommender_promoted_action_pair_rule_changes_ranking_across_sources(monkeypatch):
+    asof_date = pd.Timestamp("2026-05-14T00:00:00Z")
+    candidates = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-14T09:45:00Z"),
+                "symbol": "ABC",
+                "setup_id": "LIFE",
+                "unique_id": "hold-1",
+                "action_code": "HOLD",
+                "action_priority": 20,
+                "action_source": "lifecycle",
+                "source_action": "hold_existing",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "action_reason": "Lifecycle says existing position is still valid.",
+                "raw_context_json": "{}",
+                "load_ts": asof_date,
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-14T10:00:00Z"),
+                "symbol": "ABC",
+                "setup_id": "PORT",
+                "unique_id": "buy-1",
+                "action_code": "BUY",
+                "action_priority": 50,
+                "action_source": "portfolio",
+                "source_action": "approved",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "action_reason": "Fresh buy candidate.",
+                "raw_context_json": "{}",
+                "load_ts": asof_date,
+            },
+        ]
+    )
+    promoted_rule = {
+        "rule_id": "MANUAL_HOLD_BEATS_BUY",
+        "resolution_action": "keep_winner",
+        "resolution_reason": "Operator confirmed HOLD beats BUY across sources.",
+        "priority": 30,
+        "condition_json": json.dumps(
+            {
+                "condition_type": "action_pair",
+                "winning_action_code": "HOLD",
+                "losing_action_code": "BUY",
+                "winning_source": "manual_review",
+                "losing_source": "screener",
+            }
+        ),
+    }
+
+    monkeypatch.setattr(action_recommender, "load_enabled_conflict_rule_ids", lambda: set())
+    monkeypatch.setattr(action_recommender, "load_enabled_dynamic_conflict_rules_for_ranking", lambda: [promoted_rule])
+
+    promoted_winner = action_recommender.rank_action_candidates(candidates)
+    promoted_context = json.loads(promoted_winner.iloc[0]["raw_context_json"])
+
+    assert promoted_winner.iloc[0]["action_code"] == "HOLD"
+    assert promoted_context["conflict_precedence_rule_id"] == "MANUAL_HOLD_BEATS_BUY"
+    assert promoted_context["conflict_precedence_score"] == 230
+
+
 def test_operator_api_updates_action_conflict_rule_enablement(monkeypatch):
     calls = []
+    operation_names = []
 
     class Cursor:
         description = [
@@ -5225,9 +13092,15 @@ def test_operator_api_updates_action_conflict_rule_enablement(monkeypatch):
 
     monkeypatch.setattr(operator_api, "ensure_trace_tables", lambda: None)
     monkeypatch.setattr(operator_api, "db_session", lambda: Session())
+    monkeypatch.setattr(
+        operator_api,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
 
     payload = operator_api.update_action_conflict_rule_payload("EXIT_BEATS_ENTRY_OR_WATCH", {"enabled": False})
 
+    assert operation_names == ["operator_api:update_action_conflict_rule"]
     assert payload["status"] == "updated"
     assert payload["rule"]["rule_id"] == "EXIT_BEATS_ENTRY_OR_WATCH"
     assert payload["rule"]["enabled"] is False
@@ -5235,6 +13108,129 @@ def test_operator_api_updates_action_conflict_rule_enablement(monkeypatch):
     assert "historical action rows are not rewritten" in payload["note"]
     assert calls[0][1][0] is False
     assert calls[0][1][2] == "EXIT_BEATS_ENTRY_OR_WATCH"
+
+
+def test_operator_api_audit_tables_use_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(operator_api, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    operator_api.ensure_operator_api_audit_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == operator_api.OPERATOR_API_AUDIT_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [
+        operator_api.OPERATOR_API_ERRORS_TABLE,
+        operator_api.OPERATOR_COMMAND_RUNS_TABLE,
+        operator_api.MANUAL_REVIEW_DECISIONS_TABLE,
+    ]
+    assert any(operator_api.OPERATOR_API_ERRORS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(operator_api.OPERATOR_COMMAND_RUNS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(operator_api.MANUAL_REVIEW_DECISIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("request_context_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("stdout_tail TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (item_id, decided_at)" in statement for statement in calls[0]["statements"])
+
+
+def test_operator_api_legacy_ensure_helpers_share_audit_migration(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(operator_api, "ensure_operator_api_audit_tables", lambda: calls.append("audit"))
+
+    operator_api.ensure_operator_api_errors_table()
+    operator_api.ensure_operator_command_runs_table()
+    operator_api.ensure_manual_review_decisions_table()
+
+    assert calls == ["audit", "audit", "audit"]
+
+
+def test_operator_api_errors_and_cron_logs_are_redacted(monkeypatch, tmp_path):
+    writes = []
+    monkeypatch.setattr(operator_api, "ensure_operator_api_errors_table", lambda: None)
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+
+    row = operator_api.record_operator_api_error(
+        exc=RuntimeError("tokenId=SECRET123 failed for mobile 9876543210"),
+        operation="unit",
+        route="/api/test",
+        request_context={"access_token": "SECRET123", "auth_url": "https://x.test/cb?tokenId=SECRET123"},
+    )
+
+    dumped = json.dumps(row, default=str)
+    persisted = writes[0].to_json()
+    assert "SECRET123" not in dumped
+    assert "9876543210" not in dumped
+    assert "SECRET123" not in persisted
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory.log").write_text(
+        "Traceback tokenId=SECRET123 DHAN_LOGIN_MOBILE=9876543210\n"
+        "[stockey.script] name=all_advisory status=failed exit_code=1 timestamp=2026-06-11T10:00:00+00:00\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(operator_api, "CRON_LOG_DIR", log_dir)
+
+    payload = operator_api.build_cron_logs_payload(limit=1, lines=10)
+    tail = "\n".join(payload["logs"][0]["tail"])
+    assert "SECRET123" not in tail
+    assert "9876543210" not in tail
+    assert redaction.REDACTED in tail
+
+
+def test_operator_api_error_audit_write_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_api, "ensure_operator_api_errors_table", lambda: None)
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("audit db down")))
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    row = operator_api.record_operator_api_error(
+        exc=RuntimeError("route failed"),
+        operation="unit_error",
+        route="/api/test",
+        status_code=503,
+        request_context={"symbol": "ABC"},
+    )
+
+    assert row["operation"] == "unit_error"
+    assert events[0]["module"] == "advisory.api.app"
+    assert events[0]["source"] == operator_api.OPERATOR_API_ERRORS_TABLE
+    assert events[0]["fallback_type"] == "operator_api_error_audit_write_failed"
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"] == {
+        "error_id": row["error_id"],
+        "operation": "unit_error",
+        "route": "/api/test",
+        "status_code": 503,
+        "error_type": "RuntimeError",
+    }
+
+
+def test_operator_api_marker_audit_write_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_api, "ensure_operator_api_errors_table", lambda: None)
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("marker audit db down")))
+    monkeypatch.setattr(operator_api, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    operator_api.record_operator_api_marker(
+        route="/api/test",
+        operation="unit_marker",
+        message="Fallback used",
+        status_code=299,
+        context={"symbol": "ABC"},
+    )
+
+    assert events[0]["module"] == "advisory.api.app"
+    assert events[0]["source"] == operator_api.OPERATOR_API_ERRORS_TABLE
+    assert events[0]["fallback_type"] == "operator_api_marker_audit_write_failed"
+    assert events[0]["severity"] == "warn"
+    assert events[0]["metadata"]["operation"] == "unit_marker"
+    assert events[0]["metadata"]["route"] == "/api/test"
+    assert events[0]["metadata"]["status_code"] == 299
+    assert events[0]["metadata"]["error_type"] == "FallbackUsed"
+    assert str(events[0]["metadata"]["error_id"]).startswith("api-marker:")
 
 
 def test_operator_api_updates_action_conflict_rule_reason(monkeypatch):
@@ -5339,13 +13335,32 @@ def test_operator_api_updates_action_conflict_rule_condition(monkeypatch):
             {"condition": {"condition_type": "unsupported"}},
         )
     except ValueError as exc:
-        assert "only action_pair_exact" in str(exc)
+        assert "only action_pair and action_pair_exact" in str(exc)
     else:
         raise AssertionError("unsupported conflict-rule condition should fail validation")
 
 
+def test_operator_api_normalizes_action_pair_conflict_rule_condition():
+    condition = operator_api._normalize_action_pair_condition(
+        {
+            "condition_type": " ACTION_PAIR ",
+            "winning_action_code": " hold ",
+            "losing_action_code": " buy ",
+            "winning_source": "ignored_for_action_pair",
+            "losing_source": "ignored_for_action_pair",
+        }
+    )
+
+    assert condition == {
+        "condition_type": "action_pair",
+        "winning_action_code": "HOLD",
+        "losing_action_code": "BUY",
+    }
+
+
 def test_operator_api_promotes_action_conflict_rule_disabled_by_default(monkeypatch):
     calls = []
+    operation_names = []
 
     class Cursor:
         description = [
@@ -5378,6 +13393,11 @@ def test_operator_api_promotes_action_conflict_rule_disabled_by_default(monkeypa
 
     monkeypatch.setattr(operator_api, "ensure_trace_tables", lambda: None)
     monkeypatch.setattr(operator_api, "db_session", lambda: Session())
+    monkeypatch.setattr(
+        operator_api,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
 
     payload = operator_api.promote_action_conflict_rule_payload(
         {
@@ -5395,6 +13415,7 @@ def test_operator_api_promotes_action_conflict_rule_disabled_by_default(monkeypa
     )
 
     condition = json.loads(payload["rule"]["condition_json"])
+    assert operation_names == ["operator_api:promote_action_conflict_rule"]
     assert payload["status"] == "promoted"
     assert payload["rule"]["enabled"] is False
     assert payload["rule"]["rule_id"].startswith("MANUAL_")
@@ -5402,6 +13423,71 @@ def test_operator_api_promotes_action_conflict_rule_disabled_by_default(monkeypa
     assert condition["winning_action_code"] == "MANUAL_REVIEW"
     assert condition["losing_source"] == "portfolio"
     assert "disabled by default" in payload["note"]
+
+
+def test_operator_api_promotes_action_pair_conflict_rule_when_condition_is_supplied(monkeypatch):
+    calls = []
+
+    class Cursor:
+        description = [
+            ("rule_id",),
+            ("enabled",),
+            ("resolution_reason",),
+            ("condition_json",),
+            ("promoted_from_conflict_key",),
+        ]
+
+        def execute(self, query, params):
+            calls.append((query, params))
+
+        def fetchone(self):
+            return (
+                calls[0][1][0],
+                calls[0][1][5],
+                calls[0][1][4],
+                calls[0][1][7],
+                calls[0][1][8],
+            )
+
+    class Session:
+        def __enter__(self):
+            return (None, Cursor())
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(operator_api, "ensure_trace_tables", lambda: None)
+    monkeypatch.setattr(operator_api, "db_session", lambda: Session())
+    monkeypatch.setattr(operator_api, "execute_db_operation", lambda operation, **_kwargs: operation())
+
+    payload = operator_api.promote_action_conflict_rule_payload(
+        {
+            "conflict": {
+                "asof_date": "2026-05-14T00:00:00Z",
+                "symbol": "ABC",
+                "winning_action_code": "HOLD",
+                "losing_action_code": "BUY",
+                "winning_source": "lifecycle",
+                "losing_source": "portfolio",
+                "lost_reason": "Hold should win.",
+            },
+            "condition": {
+                "condition_type": "action_pair",
+                "winning_action_code": "HOLD",
+                "losing_action_code": "BUY",
+            },
+            "resolution_reason": "Operator confirmed HOLD beats BUY across sources.",
+        }
+    )
+
+    condition = json.loads(payload["rule"]["condition_json"])
+    assert payload["condition"] == condition
+    assert condition == {
+        "condition_type": "action_pair",
+        "winning_action_code": "HOLD",
+        "losing_action_code": "BUY",
+    }
+    assert "broader action-only pairs" in payload["note"]
 
 
 def test_decision_trace_append_trace_casts_action_changed_boolean(monkeypatch):
@@ -5428,6 +13514,110 @@ def test_decision_trace_append_trace_casts_action_changed_boolean(monkeypatch):
     out = captured[0][1]
     assert str(out["action_changed"].dtype) == "boolean"
     assert bool(out.iloc[0]["action_changed"]) is True
+
+
+def test_decision_trace_safe_call_records_trace_write_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def broken_trace_writer(**_kwargs):
+        raise RuntimeError("trace table unavailable")
+
+    monkeypatch.setattr(decision_trace, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = decision_trace.safe_trace_call(
+        broken_trace_writer,
+        symbol="abc",
+        unique_id="EVT-1",
+        setup_id="SETUP-1",
+        trigger_type="event_policy",
+        payload={"x": 1},
+    )
+
+    assert result is None
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.decision_trace"
+    assert event["source"] == "decision_trace"
+    assert event["fallback_type"] == "decision_trace_write_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert str(event["error"]) == "trace table unavailable"
+    assert event["metadata"] == {
+        "function": "broken_trace_writer",
+        "kwargs_keys": ["payload", "setup_id", "symbol", "trigger_type", "unique_id"],
+        "symbol": "ABC",
+        "unique_id": "EVT-1",
+        "setup_id": "SETUP-1",
+        "trigger_type": "event_policy",
+    }
+
+
+def test_decision_trace_parse_jsonish_records_malformed_context_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(decision_trace, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = decision_trace._parse_jsonish("{bad-json", {"fallback": True}, source="conflict_rule_condition_json")
+
+    assert result == {"fallback": True}
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.decision_trace"
+    assert event["fallback_type"] == "decision_trace_json_parse_failed"
+    assert event["source"] == "conflict_rule_condition_json"
+    assert event["severity"] == "warn"
+    assert event["metadata"]["default_type"] == "dict"
+    assert event["metadata"]["value_length"] == len("{bad-json")
+    assert event["metadata"]["value_excerpt"] == "{bad-json"
+
+
+def test_decision_trace_ensure_tables_uses_schema_registry_and_seeds_rules(monkeypatch):
+    migrations = []
+    executes = []
+    operation_names = []
+
+    class Cursor:
+        def execute(self, query, params=None):
+            executes.append((str(query), params))
+
+    class Session:
+        def __enter__(self):
+            return None, Cursor()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(decision_trace, "apply_schema_migration", lambda **kwargs: migrations.append(kwargs) or {"status": "applied"})
+    monkeypatch.setattr(decision_trace, "db_session", lambda: Session())
+    monkeypatch.setattr(
+        decision_trace,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
+
+    decision_trace.ensure_trace_tables()
+
+    assert len(migrations) == 1
+    assert migrations[0]["migration_id"] == decision_trace.TRACE_SCHEMA_MIGRATION_ID
+    assert decision_trace.TRACES_TABLE in migrations[0]["metadata"]["tables"]
+    assert decision_trace.ACTION_CONFLICT_RULES_TABLE in migrations[0]["metadata"]["tables"]
+    assert any(decision_trace.EVENT_PROCESSING_TABLE in statement for statement in migrations[0]["statements"])
+    assert operation_names == ["decision_trace:seed_action_conflict_rules"]
+    assert len(executes) == len(decision_trace.ACTION_CONFLICT_RULES)
+    assert all("INSERT INTO" in query and decision_trace.ACTION_CONFLICT_RULES_TABLE in query for query, _ in executes)
+
+
+def test_action_recommender_ensure_actions_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(action_recommender, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    action_recommender.ensure_actions_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == action_recommender.ACTIONS_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [action_recommender.TABLE_NAME]
+    assert any(action_recommender.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("recommendation_reason_json" in statement for statement in calls[0]["statements"])
 
 
 def test_adversarial_review_emits_trace(monkeypatch):
@@ -5465,6 +13655,8 @@ def test_adversarial_review_emits_trace(monkeypatch):
 
 def test_action_recommender_persist_traces_consolidation(monkeypatch):
     calls = []
+    operation_names = []
+    executed = []
 
     def fake_trace(func, **kwargs):
         calls.append((getattr(func, "__name__", str(func)), kwargs))
@@ -5477,9 +13669,30 @@ def test_action_recommender_persist_traces_consolidation(monkeypatch):
     monkeypatch.setattr(action_recommender, "safe_trace_call", fake_trace)
     monkeypatch.setattr(action_recommender, "upsert_to_db", lambda *args, **kwargs: None)
     monkeypatch.setattr(action_recommender, "enrich_action_candidate_context", lambda df, asof_date: df)
+    monkeypatch.setattr(action_recommender, "apply_conflict_rule_precedence", lambda df: df)
+    monkeypatch.setattr(action_recommender, "load_enabled_conflict_rule_ids", lambda: set())
+    monkeypatch.setattr(action_recommender, "load_enabled_dynamic_conflict_rules_for_ranking", lambda: [])
+    monkeypatch.setattr(
+        action_recommender,
+        "build_action_conflicts",
+        lambda _candidates, _winners: pd.DataFrame(
+            [{"asof_date": pd.Timestamp("2026-05-14T00:00:00Z"), "symbol": "ABC", "losing_action": "BUY"}]
+        ),
+    )
+    monkeypatch.setattr(action_recommender, "add_recommendation_reason_contracts", lambda winners, _candidates: winners)
+    monkeypatch.setattr(action_recommender, "add_manual_revision_pointers", lambda winners, _candidates: winners)
+    monkeypatch.setattr(action_recommender, "add_feature_freshness_contracts", lambda winners: winners)
+    monkeypatch.setattr(action_recommender, "apply_feature_freshness_gates", lambda winners: winners)
+    monkeypatch.setattr(action_recommender, "apply_identity_resolution_gates", lambda winners: winners)
+    monkeypatch.setattr(
+        action_recommender,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
 
     class DummyCursor:
-        def execute(self, *args, **kwargs):
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
             return None
 
     class DummySession:
@@ -5524,12 +13737,22 @@ def test_action_recommender_persist_traces_consolidation(monkeypatch):
             },
         ]
     )
-    winners = action_recommender.rank_action_candidates(candidates)
+    candidates["reason_contract_status"] = "complete"
+    candidates["recommendation_reason_json"] = json.dumps({"summary": "Stop hit."})
+    candidates["manual_revision_pointers_json"] = json.dumps({"summary": "No manual revision needed."})
+    candidates["manual_revision_summary"] = "No manual revision needed."
+    candidates["manual_revision_status"] = "not_required"
+    candidates["feature_freshness_json"] = json.dumps({"status": "fresh"})
+    winners = candidates.iloc[[0]].copy()
     winners.attrs["all_action_candidates"] = candidates
 
     action_recommender.persist_action_recommendations(winners)
 
     assert [name for name, _ in calls] == ["append_trace", "append_trace_step"]
+    assert operation_names == ["action_recommender:delete_existing_recommendations"]
+    assert len(executed) == 1
+    assert f"DELETE FROM {action_recommender.TABLE_NAME}" in executed[0][0]
+    assert executed[0][1][1] == "ABC"
     assert calls[0][1]["final_action"] == "SELL"
     assert calls[1][1]["payload"]["conflict_count"] == 1
     assert calls[1][1]["payload"]["reason_contract_status"] == "complete"
@@ -8446,6 +16669,225 @@ def test_event_policy_maps_regulatory_notice_to_reduce_exposure_review():
     assert policy["policy_class"] == "REGULATORY_NOTICE"
     assert policy["action_type"] == "REDUCE_EXPOSURE_REVIEW"
     assert policy["policy_score"] < 0
+    actionability = json.loads(policy["actionability_json"])
+    assert actionability["materiality"] == "high"
+    assert actionability["review_priority"] == "high"
+    assert actionability["freshness"]["bucket"] == "fresh"
+    assert actionability["source_quality"]["quality"] in {"medium", "high", "unknown"}
+    assert actionability["current_exposure"]["bucket"] == "unknown"
+    assert actionability["deterministic_boundary"]["broker_executable"] is False
+    assert "Current stop/invalidation level" in " ".join(actionability["suggested_next_evidence"])
+
+
+def test_event_policy_actionability_uses_optional_state_and_price_reaction():
+    row = pd.Series(
+        {
+            "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+            "asof_date": pd.Timestamp("2026-05-12T00:00:00Z"),
+            "setup_id": "EVENT_OPPORTUNITY_V1",
+            "symbol": "ABC",
+            "unique_id": "ABC-2B",
+            "event_source": "exchange_announcement",
+            "source_reliability": "high",
+            "event_class": "ORDER_WIN",
+            "affected_sectors_json": json.dumps(["capital goods", "industrial machinery"]),
+            "affected_peers_json": json.dumps(["PEER1", "PEER2"]),
+            "verdict": "continue",
+            "setup_effect": "strengthens",
+            "materiality": "medium",
+            "expected_decay_days": 20,
+            "price_reaction_pct": 0.061,
+            "current_position_state": "holding",
+            "governance_risk": "none",
+            "balance_sheet_risk": "none",
+            "execution_risk": "low",
+            "score_impact": 0.2,
+            "confidence": 0.7,
+            "what_happened": "Company announced a large order win.",
+            "rationale": "Order improves revenue visibility.",
+        }
+    )
+
+    policy = event_policy.build_policy_for_event(row)
+    actionability = json.loads(policy["actionability_json"])
+    raw_context = json.loads(policy["raw_context_json"])
+
+    assert actionability["freshness"]["bucket"] == "within_expected_decay"
+    assert actionability["price_reaction"]["bucket"] == "strong_positive"
+    assert actionability["current_exposure"]["bucket"] == "open_position"
+    assert actionability["source_quality"]["quality"] == "high"
+    assert actionability["market_scope"]["scope_type"] == "sector_and_peer_group"
+    assert actionability["market_scope"]["affected_sectors"] == ["capital goods", "industrial machinery"]
+    assert actionability["market_scope"]["affected_peers"] == ["PEER1", "PEER2"]
+    assert "affected peers/sectors" in " ".join(actionability["suggested_next_evidence"])
+    assert raw_context["actionability"] == actionability
+    assert raw_context["affected_sectors"] == ["capital goods", "industrial machinery"]
+    assert raw_context["affected_peers"] == ["PEER1", "PEER2"]
+
+
+def test_event_policy_jsonish_records_malformed_context_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(event_policy, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = event_policy._jsonish("{bad policy json", source="event_tensor_json")
+
+    assert result is None
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.event_policy"
+    assert event["fallback_type"] == "event_policy_json_parse_failed"
+    assert event["source"] == "event_tensor_json"
+    assert event["severity"] == "warn"
+    assert event["metadata"]["value_length"] == len("{bad policy json")
+    assert event["metadata"]["value_excerpt"] == "{bad policy json"
+
+
+def test_event_policy_text_records_missing_check_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(event_policy, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(event_policy.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = event_policy._text(sentinel)
+
+    assert result.startswith("<object object at ")
+    assert events[0]["module"] == "advisory.event_policy"
+    assert events[0]["fallback_type"] == "event_policy_text_missing_check_failed"
+    assert events[0]["source"] == "text"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
+@pytest.mark.parametrize(
+    ("event_source", "parse_status", "source_reliability", "source_trace_json", "expected_family", "expected_quality", "confirmation_required"),
+    [
+        ("exchange_announcement", "completed", "medium", json.dumps(["stock exchange filing"]), "exchange_filing", "high", False),
+        ("economic_times_rss", "rss", "high", json.dumps(["news article"]), "market_news", "medium", True),
+        ("announcement", "ocr_failed", "high", json.dumps(["raw_announcement_document_fallback", "ocr"]), "derived_document", "low", True),
+        ("document_ocr", "completed", "high", json.dumps(["pdf", "ocr"]), "derived_document", "medium", True),
+    ],
+)
+def test_event_policy_source_quality_calibrates_source_authority(
+    event_source,
+    parse_status,
+    source_reliability,
+    source_trace_json,
+    expected_family,
+    expected_quality,
+    confirmation_required,
+):
+    row = pd.Series(
+        {
+            "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+            "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+            "setup_id": "EVENT_OPPORTUNITY_V1",
+            "symbol": "ABC",
+            "unique_id": f"ABC-source-{event_source}",
+            "event_source": event_source,
+            "parse_status": parse_status,
+            "source_reliability": source_reliability,
+            "source_trace_json": source_trace_json,
+            "event_class": "ORDER_WIN",
+            "verdict": "continue",
+            "setup_effect": "strengthens",
+            "materiality": "medium",
+            "score_impact": 0.2,
+            "confidence": 0.7,
+            "what_happened": "Company announced a large order win.",
+            "rationale": "Order improves revenue visibility.",
+        }
+    )
+
+    policy = event_policy.build_policy_for_event(row)
+    actionability = json.loads(policy["actionability_json"])
+    raw_context = json.loads(policy["raw_context_json"])
+    source_quality = actionability["source_quality"]
+
+    assert source_quality["source_family"] == expected_family
+    assert source_quality["quality"] == expected_quality
+    assert source_quality["confirmation_required"] is confirmation_required
+    assert source_quality["source_reliability"] == source_reliability
+    assert raw_context["parse_status"] == parse_status
+    assert raw_context["source_trace"] == json.loads(source_trace_json)
+
+
+def test_event_policy_load_inputs_adds_point_in_time_price_and_exposure_context(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_table_exists(table_name: str) -> bool:
+        return table_name in {event_policy.EVALUATIONS_TABLE, event_policy.DHAN_DAILY_TABLE, event_policy.PORTFOLIO_TABLE}
+
+    def fake_table_columns(table_name: str) -> set[str]:
+        if table_name == event_policy.DHAN_DAILY_TABLE:
+            return {"ticker", "date", "close", "load_ts"}
+        if table_name == event_policy.PORTFOLIO_TABLE:
+            return {"symbol", "asof_date", "portfolio_status", "approved_allocation_inr", "portfolio_reason", "load_ts"}
+        return set()
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        captured["query"] = str(query)
+        captured["params"] = kwargs.get("params")
+        return pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                    "asof_date": pd.Timestamp("2026-05-12T00:00:00Z"),
+                    "setup_id": "EVENT_OPPORTUNITY_V1",
+                    "setup_name": "Event Opportunity",
+                    "symbol": "ABC",
+                    "company_master_id": "nse:ABC",
+                    "unique_id": "ABC-ctx",
+                    "event_source": "announcement",
+                    "subject": "Large order win",
+                    "materiality": "high",
+                    "setup_effect": "strengthens",
+                    "direction": "positive",
+                    "surprise": "positive",
+                    "novelty": "new",
+                    "contradiction": "none",
+                    "expected_decay_days": 20,
+                    "source_reliability": "high",
+                    "affected_sectors_json": json.dumps(["capital goods"]),
+                    "affected_peers_json": json.dumps(["PEER1"]),
+                    "governance_risk": "none",
+                    "balance_sheet_risk": "none",
+                    "execution_risk": "low",
+                    "investable_now": True,
+                    "verdict": "continue",
+                    "event_class": "ORDER_WIN",
+                    "state_transition_hint": "watch",
+                    "score_impact": 0.2,
+                    "confidence": 0.75,
+                    "what_happened": "Large order improves revenue visibility.",
+                    "rationale": "Order is material.",
+                    "event_tensor_json": "{}",
+                    "current_reference_price": 112.0,
+                    "event_reference_price": 100.0,
+                    "price_reaction_pct": 0.12,
+                    "current_position_state": "approved",
+                    "approved_allocation_inr": 25000.0,
+                    "current_position_reason": "within_limits",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(event_policy, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(event_policy, "_table_columns", fake_table_columns)
+    monkeypatch.setattr(event_policy, "sql_to_df", fake_sql_to_df)
+
+    rows = event_policy.load_policy_inputs(asof_date=pd.Timestamp("2026-05-12T00:00:00Z"), symbols=["ABC"])
+    policy = event_policy.build_policy_for_event(rows.iloc[0])
+    actionability = json.loads(policy["actionability_json"])
+
+    assert "LEFT JOIN LATERAL" in str(captured["query"])
+    assert event_policy.DHAN_DAILY_TABLE in str(captured["query"])
+    assert event_policy.PORTFOLIO_TABLE in str(captured["query"])
+    assert "e.affected_sectors_json" in str(captured["query"])
+    assert "e.affected_peers_json" in str(captured["query"])
+    assert actionability["price_reaction"]["bucket"] == "strong_positive"
+    assert actionability["current_exposure"]["bucket"] == "open_position"
+    assert actionability["freshness"]["bucket"] == "within_expected_decay"
+    assert actionability["market_scope"]["affected_sectors"] == ["capital goods"]
+    assert actionability["market_scope"]["affected_peers"] == ["PEER1"]
 
 
 def test_event_policy_llm_downgrades_non_actionable_manual_review(monkeypatch):
@@ -8540,6 +16982,26 @@ def test_event_policy_llm_adds_questions_to_manual_review(monkeypatch):
     assert meta["llm_manual_review_rows"] == 1
 
 
+def test_event_policy_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(event_policy, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    event_policy.ensure_tables()
+
+    assert len(calls) == 2
+    base_call, actionability_call = calls
+    assert base_call["migration_id"] == event_policy.EVENT_POLICY_SCHEMA_MIGRATION_ID
+    assert base_call["metadata"] == {"tables": [event_policy.TABLE_NAME], "authority_scope": "review_overlay_only"}
+    assert any(event_policy.TABLE_NAME in statement for statement in base_call["statements"])
+    assert any("llm_prompt_schema_version" in statement for statement in base_call["statements"])
+    assert not any("actionability_json" in statement for statement in base_call["statements"])
+    assert any("UNIQUE (published_on, setup_id, symbol, unique_id)" in statement for statement in base_call["statements"])
+    assert actionability_call["migration_id"] == event_policy.EVENT_POLICY_ACTIONABILITY_SCHEMA_MIGRATION_ID
+    assert actionability_call["metadata"] == {"tables": [event_policy.TABLE_NAME], "authority_scope": "review_overlay_only", "additive": True}
+    assert actionability_call["statements"] == event_policy.EVENT_POLICY_ACTIONABILITY_SCHEMA_STATEMENTS
+
+
 def test_event_policy_evaluator_builds_rows_and_summary():
     evaluated_at = pd.Timestamp("2026-05-30T00:00:00Z")
     dataset = pd.DataFrame(
@@ -8564,7 +17026,19 @@ def test_event_policy_evaluator_builds_rows_and_summary():
                 "entry_close_h5": 100.0,
                 "exit_close_h5": 106.0,
                 "forward_return_h5": 0.06,
-                "raw_context_json": "{}",
+                "raw_context_json": json.dumps(
+                    {
+                        "actionability": {
+                            "source_quality": {
+                                "quality": "high",
+                                "source_family": "exchange_filing",
+                                "authority": "primary",
+                                "confirmation_required": False,
+                            },
+                            "market_scope": {"scope_type": "sector_and_peer_group"},
+                        }
+                    }
+                ),
             },
             {
                 "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
@@ -8586,7 +17060,19 @@ def test_event_policy_evaluator_builds_rows_and_summary():
                 "entry_close_h5": 100.0,
                 "exit_close_h5": 98.0,
                 "forward_return_h5": -0.02,
-                "raw_context_json": "{}",
+                "raw_context_json": json.dumps(
+                    {
+                        "actionability": {
+                            "source_quality": {
+                                "quality": "medium",
+                                "source_family": "market_news",
+                                "authority": "secondary",
+                                "confirmation_required": True,
+                            },
+                            "market_scope": {"scope_type": "single_company_or_unknown"},
+                        }
+                    }
+                ),
             },
         ]
     )
@@ -8608,6 +17094,20 @@ def test_event_policy_evaluator_builds_rows_and_summary():
     assert round(float(policy_summary["avg_forward_return_after_cost"]), 4) == 0.0175
     assert float(policy_summary["hit_rate_after_cost"]) == 0.5
     assert policy_summary["recommendation"] == "candidate_policy_strengthen"
+    source_quality_summary = summary[(summary["group_type"] == "source_quality") & (summary["group_value"] == "high")].iloc[0]
+    assert source_quality_summary["matured_count"] == 1
+    assert source_quality_summary["recommendation"] == "candidate_policy_strengthen"
+    source_family_summary = summary[(summary["group_type"] == "source_family") & (summary["group_value"] == "market_news")].iloc[0]
+    assert source_family_summary["matured_count"] == 1
+    assert source_family_summary["recommendation"] == "candidate_policy_tighten_or_downgrade"
+    source_authority_summary = summary[(summary["group_type"] == "source_authority") & (summary["group_value"] == "primary")].iloc[0]
+    assert source_authority_summary["matured_count"] == 1
+    confirmation_summary = summary[
+        (summary["group_type"] == "source_confirmation_required") & (summary["group_value"] == "True")
+    ].iloc[0]
+    assert confirmation_summary["matured_count"] == 1
+    market_scope_summary = summary[(summary["group_type"] == "market_scope") & (summary["group_value"] == "sector_and_peer_group")].iloc[0]
+    assert market_scope_summary["matured_count"] == 1
 
 
 def test_event_policy_evaluator_normalizes_persist_dtypes():
@@ -8640,6 +17140,93 @@ def test_event_policy_evaluator_normalizes_persist_dtypes():
     assert pd.api.types.is_integer_dtype(out["horizon_days"])
     assert str(out["hit_after_cost"].dtype) == "boolean"
     assert str(out["entry_date"].dtype) == "datetime64[ns, UTC]"
+
+
+def test_event_policy_evaluator_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(event_policy_evaluator, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    event_policy_evaluator.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == event_policy_evaluator.EVENT_POLICY_EVAL_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [event_policy_evaluator.EVALUATIONS_TABLE, event_policy_evaluator.SUMMARY_TABLE]
+    assert any(event_policy_evaluator.EVALUATIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(event_policy_evaluator.SUMMARY_TABLE in statement for statement in calls[0]["statements"])
+    assert any("entry_close DOUBLE PRECISION" in statement for statement in calls[0]["statements"])
+    assert any("hit_after_cost BOOLEAN" in statement for statement in calls[0]["statements"])
+
+
+def test_event_policy_evaluator_records_schema_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_policy_evaluator, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("schema timeout")))
+    monkeypatch.setattr(event_policy_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    columns = event_policy_evaluator.table_columns(event_policy_evaluator.EVENT_POLICY_TABLE)
+
+    assert columns == set()
+    assert events[0]["fallback_type"] == "event_policy_evaluator_schema_lookup_failed"
+    assert events[0]["source"] == event_policy_evaluator.EVENT_POLICY_TABLE
+
+
+def test_event_policy_evaluator_records_missing_required_columns_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_policy_evaluator, "table_columns", lambda table: {"symbol", "published_on"})
+    monkeypatch.setattr(event_policy_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = event_policy_evaluator.load_event_policy_rows()
+
+    assert rows.empty
+    assert events[0]["fallback_type"] == "event_policy_evaluator_required_columns_missing"
+    assert events[0]["source"] == event_policy_evaluator.EVENT_POLICY_TABLE
+    assert set(events[0]["metadata"]["missing_columns"]) == {"action_type", "policy_class"}
+
+
+def test_event_policy_evaluator_records_policy_row_load_fallback(monkeypatch):
+    events = []
+    required_columns = {"symbol", "published_on", "action_type", "policy_class", "asof_date", "setup_id", "unique_id"}
+
+    monkeypatch.setattr(event_policy_evaluator, "table_columns", lambda table: required_columns)
+    monkeypatch.setattr(event_policy_evaluator, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("query timeout")))
+    monkeypatch.setattr(event_policy_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = event_policy_evaluator.load_event_policy_rows(symbols=["ABC"])
+
+    assert rows.empty
+    assert events[0]["fallback_type"] == "event_policy_evaluator_policy_rows_load_failed"
+    assert events[0]["source"] == event_policy_evaluator.EVENT_POLICY_TABLE
+    assert events[0]["metadata"]["symbol_count"] == 1
+
+
+def test_event_policy_evaluator_records_raw_context_parse_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(event_policy_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    parsed = event_policy_evaluator._parse_raw_context("{bad raw context")
+
+    assert parsed == {}
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.event_policy_evaluator"
+    assert events[0]["fallback_type"] == "event_policy_evaluator_raw_context_parse_failed"
+    assert events[0]["source"] == event_policy_evaluator.EVENT_POLICY_TABLE
+    assert events[0]["metadata"] == {"payload_length": len("{bad raw context")}
+
+
+def test_event_policy_evaluator_raw_context_missing_check_records_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(event_policy_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(event_policy_evaluator.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    parsed = event_policy_evaluator._parse_raw_context('{"event_class": "ORDER_WIN"}')
+
+    assert parsed == {"event_class": "ORDER_WIN"}
+    assert events[0]["module"] == "advisory.event_policy_evaluator"
+    assert events[0]["fallback_type"] == "event_policy_evaluator_raw_context_missing_check_failed"
+    assert events[0]["source"] == event_policy_evaluator.EVENT_POLICY_TABLE
+    assert events[0]["metadata"]["value_type"] == "str"
 
 
 def test_event_policy_evaluator_loads_policy_rows_and_attaches_returns(monkeypatch):
@@ -8752,6 +17339,137 @@ def test_hypothesis_engine_builds_matches_and_decision():
     assert row["suggested_action"] == "REDUCE_EXPOSURE_REVIEW_TESTING"
     assert row["match_score"] > 0
     assert "austerity" in row["matched_terms_json"]
+
+
+def test_hypothesis_engine_records_market_context_load_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        hypothesis_engine,
+        "load_latest_market_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("market context unavailable")),
+    )
+    monkeypatch.setattr(hypothesis_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = hypothesis_engine.load_playbook_market_context(
+        pd.Series(
+            {
+                "published_on": pd.Timestamp("2026-05-14T10:00:00Z"),
+                "symbol": "NIFTY",
+                "unique_id": "NEWS-1",
+                "hypothesis_id": "H1",
+            }
+        )
+    )
+
+    assert payload["summary"] == {}
+    assert payload["symbol_context"] == {}
+    assert payload["error"] == "RuntimeError: market context unavailable"
+    assert events[0]["fallback_type"] == "hypothesis_market_context_load_failed"
+    assert events[0]["source"] == "advisory.market_context"
+    assert events[0]["symbol"] == "NIFTY"
+    assert events[0]["metadata"]["hypothesis_id"] == "H1"
+
+
+def test_hypothesis_engine_parse_jsonish_records_malformed_context_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(hypothesis_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = hypothesis_engine.parse_jsonish("{bad hypothesis json", {"fallback": True}, source="decision_policy_json")
+
+    assert result == {"fallback": True}
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.hypothesis_engine"
+    assert event["fallback_type"] == "hypothesis_json_parse_failed"
+    assert event["source"] == "decision_policy_json"
+    assert event["severity"] == "warn"
+    assert event["metadata"]["default_type"] == "dict"
+    assert event["metadata"]["value_length"] == len("{bad hypothesis json")
+    assert event["metadata"]["value_excerpt"] == "{bad hypothesis json"
+
+
+def test_hypothesis_engine_audit_horizon_load_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        hypothesis_engine,
+        "load_hypotheses",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("hypothesis table unavailable")),
+    )
+    monkeypatch.setattr(hypothesis_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    horizons = hypothesis_engine._audit_horizons_for_hypothesis("H1")
+
+    assert horizons == hypothesis_engine.DEFAULT_PROMOTION_HORIZONS
+    assert events[0]["module"] == "advisory.hypothesis_engine"
+    assert events[0]["source"] == hypothesis_engine.HYPOTHESES_TABLE
+    assert events[0]["fallback_type"] == "hypothesis_audit_horizon_load_failed"
+    assert events[0]["metadata"] == {
+        "hypothesis_id": "H1",
+        "default_horizons": hypothesis_engine.DEFAULT_PROMOTION_HORIZONS,
+    }
+
+
+def test_hypothesis_engine_wait_signal_generation_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    action_plans = pd.DataFrame(
+        [
+            {
+                "hypothesis_id": "H1",
+                "source_table": "advisory_news_events",
+                "source_key": "N1",
+                "symbol": "NIFTY",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(hypothesis_engine, "ensure_tables", lambda: None)
+    monkeypatch.setattr(hypothesis_engine, "load_hypotheses", lambda include_inactive=False: pd.DataFrame([{"hypothesis_id": "H1"}]))
+    monkeypatch.setattr(hypothesis_engine, "load_source_events", lambda **kwargs: pd.DataFrame([{"source_key": "N1"}]))
+    monkeypatch.setattr(hypothesis_engine, "build_matches", lambda hypotheses, events_df: pd.DataFrame([{"hypothesis_id": "H1"}]))
+    monkeypatch.setattr(hypothesis_engine, "persist_matches", lambda matches: None)
+    monkeypatch.setattr(hypothesis_engine, "build_action_plans", lambda matches, model=None, use_llm=True: action_plans.copy())
+    monkeypatch.setattr(hypothesis_engine, "persist_action_plans", lambda plans: None)
+    monkeypatch.setattr(wait_signals, "generate_wait_signals", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("wait signal failure")))
+    monkeypatch.setattr(hypothesis_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = hypothesis_engine.run_hypothesis_scan(hypothesis_id="H1", persist=True, build_actions=True, use_llm=False)
+
+    assert result["status"] == "ok"
+    assert result["action_plan_count"] == 1
+    assert events[0]["module"] == "advisory.hypothesis_engine"
+    assert events[0]["source"] == "advisory.wait_signals"
+    assert events[0]["fallback_type"] == "hypothesis_wait_signal_generation_failed"
+    assert events[0]["metadata"] == {"hypothesis_id": "H1", "action_plan_count": 1}
+
+
+def test_hypothesis_engine_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(hypothesis_engine, "_TABLES_READY", False)
+    monkeypatch.setattr(hypothesis_engine, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    hypothesis_engine.ensure_tables(force=True)
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == hypothesis_engine.HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [
+            hypothesis_engine.HYPOTHESES_TABLE,
+            hypothesis_engine.MATCHES_TABLE,
+            hypothesis_engine.ACTION_PLANS_TABLE,
+            hypothesis_engine.PROMOTION_AUDITS_TABLE,
+        ],
+        "authority_scope": "review_only_playbook_overlay",
+    }
+    assert any(hypothesis_engine.HYPOTHESES_TABLE in statement for statement in calls[0]["statements"])
+    assert any(hypothesis_engine.MATCHES_TABLE in statement for statement in calls[0]["statements"])
+    assert any(hypothesis_engine.ACTION_PLANS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(hypothesis_engine.PROMOTION_AUDITS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("hypothesis_id TEXT PRIMARY KEY" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (hypothesis_id, source_table, source_key)" in statement for statement in calls[0]["statements"])
+    assert any("prompt_schema_version TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (hypothesis_id, audited_at)" in statement for statement in calls[0]["statements"])
+    assert hypothesis_engine._TABLES_READY is True
 
 
 def test_hypothesis_engine_action_plans_persist_prompt_metadata(monkeypatch):
@@ -9114,6 +17832,48 @@ def test_codex_cli_structured_validates_json(monkeypatch):
     assert "JSON must validate against this schema" in calls[0]
 
 
+def test_codex_cli_structured_validation_retry_records_fallback(monkeypatch):
+    events = []
+    calls = []
+
+    class TinyModel(codex_cli.BaseModel):
+        name: str
+        score: float
+
+    responses = iter(['{"name":"ABC"}', '{"name":"ABC","score":0.7}'])
+
+    def fake_run_codex_cli(prompt, model=None, timeout_seconds=None):
+        calls.append(prompt)
+        return next(responses)
+
+    monkeypatch.setattr(codex_cli, "run_codex_cli", fake_run_codex_cli)
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = codex_cli.run_codex_structured("Extract", response_model=TinyModel, model="gpt-test", max_attempts=2)
+
+    assert result.name == "ABC"
+    assert result.score == 0.7
+    assert len(calls) == 2
+    assert len(events) == 1
+    assert events[0]["module"] == "utils.codex_cli"
+    assert events[0]["source"] == "TinyModel"
+    assert events[0]["fallback_type"] == "codex_structured_validation_retry"
+    assert events[0]["metadata"]["attempt"] == 1
+
+
+def test_codex_cli_extract_json_object_records_direct_parse_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = codex_cli.extract_json_object('Here is the JSON:\n{"name":"ABC"}')
+
+    assert payload == {"name": "ABC"}
+    assert len(events) == 1
+    assert events[0]["module"] == "utils.codex_cli"
+    assert events[0]["source"] == "extract_json_object"
+    assert events[0]["fallback_type"] == "codex_json_direct_parse_failed"
+
+
 def test_ocr_pdf_with_codex_routes_rendered_images(monkeypatch):
     calls = []
 
@@ -9272,6 +18032,104 @@ def test_ts_forecast_features_builds_experimental_horizon_rows():
     assert df["feature_context_json"].str.contains("Experimental forecast feature only").all()
 
 
+def test_ts_forecast_features_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(ts_forecast_features, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    ts_forecast_features.ensure_ts_forecast_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == ts_forecast_features.TS_FORECAST_FEATURES_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [ts_forecast_features.TABLE_NAME],
+        "workflow": "ts_forecast_features",
+    }
+    assert any(ts_forecast_features.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("forecast_price DOUBLE PRECISION" in statement for statement in calls[0]["statements"])
+    assert any("feature_context_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)" in statement for statement in calls[0]["statements"])
+
+
+def test_ts_forecast_features_records_ohlcv_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(ts_forecast_features, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ohlcv failed")))
+    monkeypatch.setattr(ts_forecast_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="ohlcv failed"):
+        ts_forecast_features.load_ohlcv_history(
+            symbols=["ABC", "XYZ"],
+            asof_date=pd.Timestamp("2026-06-01", tz="UTC"),
+            lookback_days=120,
+        )
+
+    assert events[0]["fallback_type"] == "ts_forecast_features_ohlcv_load_failed"
+    assert events[0]["source"] == "dhan_ohlcv_daily"
+    assert events[0]["metadata"]["symbol_count"] == 2
+    assert events[0]["metadata"]["lookback_days"] == 120
+
+
+def test_ts_forecast_evaluator_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(ts_forecast_evaluator, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    ts_forecast_evaluator.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == ts_forecast_evaluator.TS_FORECAST_EVAL_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [ts_forecast_evaluator.EVALUATIONS_TABLE, ts_forecast_evaluator.SUMMARY_TABLE]
+    assert any(ts_forecast_evaluator.EVALUATIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(ts_forecast_evaluator.SUMMARY_TABLE in statement for statement in calls[0]["statements"])
+    assert any("direction_hit BOOLEAN" in statement for statement in calls[0]["statements"])
+
+
+def test_ts_forecast_evaluator_records_forecast_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(ts_forecast_evaluator, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("forecast failed")))
+    monkeypatch.setattr(ts_forecast_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="forecast failed"):
+        ts_forecast_evaluator.load_forecasts(
+            from_date=pd.Timestamp("2026-04-01", tz="UTC"),
+            to_date=pd.Timestamp("2026-04-30", tz="UTC"),
+            symbols=["ABC"],
+            model_names=["naive_momentum_v1"],
+        )
+
+    assert events[0]["fallback_type"] == "ts_forecast_evaluator_forecast_load_failed"
+    assert events[0]["source"] == ts_forecast_features.TABLE_NAME
+    assert events[0]["metadata"]["symbol_count"] == 1
+    assert events[0]["metadata"]["model_count"] == 1
+
+
+def test_operator_health_surfaces_ts_forecast_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "ts_forecast_features_ohlcv_load_failed": 1,
+                    "ts_forecast_evaluator_price_window_load_failed": 2,
+                },
+                "counts_by_module": {
+                    "advisory.ts_forecast_features": 1,
+                    "advisory.ts_forecast_evaluator": 2,
+                },
+            }
+        }
+    )
+
+    assert any(hint["title"] == "TS forecast research pipeline source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "TS forecast research pipeline source data failed")
+    assert hint["details"]["ts_forecast_features_ohlcv_load_failed"] == 1
+    assert hint["details"]["ts_forecast_evaluator_price_window_load_failed"] == 2
+    assert "./all_ts_forecast_workflow.sh" in hint["commands"]
+
+
 def test_ts_forecast_evaluator_scores_matured_rows_after_costs():
     forecasts = pd.DataFrame(
         [
@@ -9389,6 +18247,529 @@ def test_ts_forecast_evaluator_persist_casts_boolean_columns(monkeypatch):
     assert str(persisted["realized_direction"].dtype) == "Int64"
 
 
+def test_ts_forecast_paper_portfolio_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(ts_forecast_paper_portfolio, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    ts_forecast_paper_portfolio.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == ts_forecast_paper_portfolio.TS_FORECAST_PAPER_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "module": "advisory.ts_forecast_paper_portfolio",
+        "tables": [ts_forecast_paper_portfolio.PAPER_TABLE],
+    }
+    assert any(ts_forecast_paper_portfolio.PAPER_TABLE in statement for statement in calls[0]["statements"])
+    assert any("paper_decision TEXT NOT NULL" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)" in statement for statement in calls[0]["statements"])
+
+
+def test_ts_forecast_paper_portfolio_scores_forecast_only_against_baselines():
+    forecasts = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 5,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "forecast_return": 0.06,
+                "probability_positive": 0.70,
+                "signal_quality": 0.55,
+                "momentum_return_20d": 0.08,
+                "momentum_return_60d": 0.12,
+            },
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "XYZ",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 5,
+                "action_hint": "EXPERIMENTAL_NEUTRAL",
+                "forecast_return": 0.02,
+                "probability_positive": 0.54,
+                "signal_quality": 0.50,
+                "momentum_return_20d": -0.01,
+                "momentum_return_60d": 0.04,
+            },
+        ]
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["ABC"] * 6 + ["XYZ"] * 6,
+            "date": list(pd.date_range("2026-01-01", periods=6, freq="D", tz="UTC")) * 2,
+            "close": [100, 101, 102, 103, 104, 112, 100, 99, 98, 97, 96, 95],
+        }
+    )
+    advisory_actions = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "ABC",
+                "action_code": "BUY",
+                "execution_mode": "paper",
+            }
+        ]
+    )
+
+    rows = ts_forecast_paper_portfolio.build_paper_portfolio(
+        forecasts=forecasts,
+        prices=prices,
+        advisory_actions=advisory_actions,
+        cost_bps=25,
+    )
+    summary = ts_forecast_paper_portfolio.build_summary(rows, cost_bps=25)
+
+    assert len(rows) == 2
+    abc = rows[rows["symbol"].eq("ABC")].iloc[0]
+    xyz = rows[rows["symbol"].eq("XYZ")].iloc[0]
+    assert abc["paper_decision"] == "PAPER_BUY"
+    assert abc["momentum_baseline_decision"] == "MOMENTUM_BUY"
+    assert abc["advisory_alignment"] == "ALIGNED_POSITIVE"
+    assert round(float(abc["cost_adjusted_return"]), 4) == 0.1175
+    assert round(float(abc["baseline_cost_adjusted_return"]), 4) == 0.1175
+    assert xyz["paper_decision"] == "PAPER_SKIP"
+    assert pd.isna(xyz["cost_adjusted_return"])
+    assert "not EXPERIMENTAL_POSITIVE" in xyz["decision_reason"]
+    assert len(summary) == 2
+    buy_summary = summary[summary["paper_decision"].eq("PAPER_BUY")].iloc[0]
+    assert int(buy_summary["evaluated_trades"]) == 1
+    assert round(float(buy_summary["win_rate"]), 4) == 1.0
+
+
+def test_ts_forecast_paper_portfolio_persist_casts_numeric_columns(monkeypatch):
+    captured: list[tuple[str, pd.DataFrame, dict]] = []
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 5,
+                "paper_decision": "PAPER_BUY",
+                "paper_policy_version": "ts_forecast_paper_v1",
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "forecast_return": "0.06",
+                "probability_positive": "0.70",
+                "signal_quality": "0.55",
+                "momentum_return_20d": "0.08",
+                "momentum_return_60d": "0.12",
+                "momentum_baseline_decision": "MOMENTUM_BUY",
+                "advisory_action_code": "BUY",
+                "advisory_execution_mode": "paper",
+                "advisory_alignment": "ALIGNED_POSITIVE",
+                "entry_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "exit_date": pd.Timestamp("2026-01-06T00:00:00Z"),
+                "entry_price": "100",
+                "exit_price": "112",
+                "realized_return": "0.12",
+                "cost_adjusted_return": "0.1175",
+                "baseline_cost_adjusted_return": "0.1175",
+                "evaluation_status": "evaluated",
+                "decision_reason": "research only",
+                "config_json": "{}",
+                "load_ts": pd.Timestamp("2026-01-07T00:00:00Z"),
+            }
+        ]
+    )
+
+    monkeypatch.setattr(ts_forecast_paper_portfolio, "ensure_tables", lambda: None)
+    monkeypatch.setattr(
+        ts_forecast_paper_portfolio,
+        "upsert_to_db",
+        lambda df, table_name, **kwargs: captured.append((table_name, df.copy(), kwargs)),
+    )
+
+    ts_forecast_paper_portfolio.persist_paper_portfolio(rows)
+
+    assert captured[0][0] == ts_forecast_paper_portfolio.PAPER_TABLE
+    persisted = captured[0][1]
+    assert str(persisted["forecast_horizon_days"].dtype) == "Int64"
+    assert str(persisted["forecast_return"].dtype) == "float64"
+    assert str(persisted["entry_price"].dtype) == "int64" or str(persisted["entry_price"].dtype) == "float64"
+    assert captured[0][2]["unique_keys"] == ["asof_date", "symbol", "model_name", "forecast_horizon_days"]
+    assert captured[0][2]["timescaledb_column"] == "asof_date"
+
+
+def test_ts_forecast_paper_portfolio_main_logs_research_ledger(monkeypatch, capsys):
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 5,
+                "paper_decision": "PAPER_BUY",
+                "paper_policy_version": "ts_forecast_paper_v1",
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "forecast_return": 0.06,
+                "probability_positive": 0.70,
+                "signal_quality": 0.55,
+                "momentum_baseline_decision": "MOMENTUM_BUY",
+                "advisory_alignment": "NO_ADVISORY_ACTION",
+                "entry_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "exit_date": pd.Timestamp("2026-01-06T00:00:00Z"),
+                "entry_price": 100,
+                "exit_price": 112,
+                "realized_return": 0.12,
+                "cost_adjusted_return": 0.1175,
+                "baseline_cost_adjusted_return": 0.1175,
+                "evaluation_status": "evaluated",
+                "decision_reason": "research only",
+                "config_json": "{}",
+                "load_ts": pd.Timestamp("2026-01-07T00:00:00Z"),
+            }
+        ]
+    )
+    starts = []
+    finishes = []
+    persisted = []
+
+    monkeypatch.setattr(
+        ts_forecast_paper_portfolio,
+        "parse_args",
+        lambda: argparse.Namespace(
+            from_date=pd.Timestamp("2026-01-01T00:00:00Z"),
+            to_date=pd.Timestamp("2026-01-31T00:00:00Z"),
+            symbols=[],
+            model_names=["timesfm_2p5_200m"],
+            cost_bps=25.0,
+            min_probability_positive=0.58,
+            min_signal_quality=0.35,
+            min_forecast_return=0.0,
+            log_research_ledger=True,
+            dry_run=False,
+        ),
+    )
+    monkeypatch.setattr(ts_forecast_paper_portfolio, "build_paper_portfolio", lambda **_kwargs: rows.copy())
+    monkeypatch.setattr(ts_forecast_paper_portfolio, "persist_paper_portfolio", lambda df: persisted.append(df.copy()))
+    monkeypatch.setattr(ts_forecast_paper_portfolio, "start_research_run", lambda **kwargs: starts.append(kwargs) or "run-1")
+    monkeypatch.setattr(ts_forecast_paper_portfolio, "finish_research_run", lambda *args, **kwargs: finishes.append((args, kwargs)))
+
+    assert ts_forecast_paper_portfolio.main() == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["research_run_id"] == "run-1"
+    assert output["paper_buy_rows"] == 1
+    assert persisted
+    assert starts[0]["run_type"] == "ts_forecast_paper_portfolio"
+    assert starts[0]["validation_protocol"]["no_broker_execution"] is True
+    assert finishes[0][1]["status"] == "completed"
+    assert finishes[0][1]["notes"]["authority"] == "research_only"
+
+
+def test_ts_forecast_promotion_check_scores_groups_against_gates():
+    dates = pd.date_range("2026-01-01", periods=60, freq="D", tz="UTC")
+    evidence = pd.DataFrame(
+        [
+            {
+                "asof_date": dates[idx],
+                "symbol": f"SYM{idx:03d}",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 10,
+                "paper_decision": "PAPER_BUY",
+                "cost_adjusted_return": 0.02 if idx < 40 else -0.01,
+                "baseline_cost_adjusted_return": 0.005,
+                "realized_return": 0.022 if idx < 40 else -0.008,
+                "advisory_alignment": "ALIGNED_POSITIVE",
+                "load_ts": pd.Timestamp("2026-03-31T00:00:00Z"),
+            }
+            for idx in range(60)
+        ]
+        + [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "WEAK",
+                "model_name": "naive_momentum_v1",
+                "forecast_horizon_days": 10,
+                "paper_decision": "PAPER_BUY",
+                "cost_adjusted_return": -0.02,
+                "baseline_cost_adjusted_return": 0.01,
+                "realized_return": -0.018,
+                "advisory_alignment": "CONFLICT_EXIT",
+                "load_ts": pd.Timestamp("2026-03-31T00:00:00Z"),
+            }
+        ]
+    )
+    args = argparse.Namespace(
+        min_evaluated_trades=50,
+        min_win_rate=0.52,
+        min_avg_cost_adjusted_return=0.005,
+        min_lift_vs_momentum=0.002,
+        max_exit_conflict_rate=0.05,
+        min_distinct_dates=10,
+        min_symbols=20,
+    )
+
+    groups = ts_forecast_promotion_check.summarize_groups(evidence)
+    scorecard = ts_forecast_promotion_check.build_scorecard(groups=groups, args=args)
+
+    assert scorecard["decision"] == "review_candidate"
+    assert scorecard["ready_group_count"] == 1
+    best = scorecard["best_group"]
+    assert best["model_name"] == "timesfm_2p5_200m"
+    assert best["ready_for_operator_review"] is True
+    assert best["failed_gates"] == []
+    weak = next(row for row in scorecard["groups"] if row["model_name"] == "naive_momentum_v1")
+    assert weak["decision"] == "hold_research_only"
+    assert "evaluated_trades" in weak["failed_gates"]
+    assert weak["broker_execution_allowed"] is False
+
+
+def test_ts_forecast_promotion_check_load_failure_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(ts_forecast_promotion_check, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("paper down")))
+    monkeypatch.setattr(ts_forecast_promotion_check, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="paper down"):
+        ts_forecast_promotion_check.load_paper_evidence(model_name="timesfm_2p5_200m")
+
+    assert events[0]["module"] == "advisory.ts_forecast_promotion_check"
+    assert events[0]["fallback_type"] == "ts_forecast_promotion_paper_evidence_load_failed"
+    assert events[0]["source"] == ts_forecast_paper_portfolio.PAPER_TABLE
+
+
+def test_operator_api_builds_ts_forecast_promotion_payload(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "build_ts_forecast_promotion_check",
+        lambda args: {
+            "status": "ok",
+            "decision": "hold_research_only",
+            "ready_for_operator_review": False,
+            "promotion_mode": "manual_low_weight_input_only",
+            "scorecard": {"status": "not_usable", "configured_gates": {"min_evaluated_trades": args.min_evaluated_trades}},
+            "evidence": {"row_count": 0},
+            "notes": ["research only"],
+        },
+    )
+
+    payload = operator_api.build_ts_forecast_promotion_check_payload(model_name="timesfm_2p5_200m", horizon_days=10)
+
+    assert payload["api_schema"]["endpoint"] == "/api/research/ts-forecast-promotion-check"
+    assert payload["decision"] == "hold_research_only"
+    assert payload["scorecard"]["configured_gates"]["min_evaluated_trades"] == ts_forecast_promotion_check.DEFAULT_MIN_EVALUATED_TRADES
+    assert payload["api_schema"]["broker_execution_enabled"] is False
+
+
+def test_ts_forecast_promotion_review_is_manual_only(monkeypatch):
+    persisted = []
+    group = {
+        "model_name": "timesfm_2p5_200m",
+        "horizon_days": 10,
+        "evaluated_trades": 80,
+        "win_rate": 0.61,
+        "avg_cost_adjusted_return": 0.028,
+        "lift_vs_momentum": 0.015,
+        "exit_conflict_rate": 0.0,
+        "from_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+        "to_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+        "ready_for_operator_review": True,
+        "failed_gates": [],
+    }
+    monkeypatch.setattr(
+        ts_forecast_promotion,
+        "build_promotion_check",
+        lambda args: {
+            "status": "ok",
+            "decision": "review_candidate",
+            "ready_for_operator_review": True,
+            "promotion_mode": "manual_low_weight_input_only",
+            "scorecard": {"best_group": group, "ready_group_count": 1},
+            "evidence": {"row_count": 80},
+        },
+    )
+    monkeypatch.setattr(ts_forecast_promotion, "persist_review", lambda result: persisted.append(result))
+
+    result = ts_forecast_promotion.generate_promotion_review(
+        model_name="timesfm_2p5_200m",
+        horizon_days=10,
+        persist=True,
+    )
+
+    assert persisted == [result]
+    assert result["review_model"] == "deterministic_ts_forecast_v1"
+    assert result["llm_review"]["recommendation"] == "promote_low_weight_review"
+    assert result["pending_patch"]["mode"] == "manual_review_only"
+    assert result["pending_patch"]["rule_suggestion"]["authority"] == "review_input_only"
+    assert result["pending_patch"]["rule_suggestion"]["broker_execution_allowed"] is False
+    assert result["applied"] is False
+    assert "ts_forecast_review_rules:" in ts_forecast_promotion.build_manual_patch_text(result["pending_patch"])
+
+
+def test_ts_forecast_promotion_review_fails_closed_when_gate_not_ready(monkeypatch):
+    monkeypatch.setattr(
+        ts_forecast_promotion,
+        "build_promotion_check",
+        lambda args: {
+            "status": "ok",
+            "decision": "hold_research_only",
+            "ready_for_operator_review": False,
+            "scorecard": {
+                "best_group": {
+                    "model_name": "timesfm_2p5_200m",
+                    "horizon_days": 10,
+                    "ready_for_operator_review": False,
+                    "failed_gates": ["evaluated_trades"],
+                }
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="has not passed promotion gates"):
+        ts_forecast_promotion.generate_promotion_review(model_name="timesfm_2p5_200m", horizon_days=10)
+
+
+def test_ts_forecast_promotion_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+    monkeypatch.setattr(ts_forecast_promotion, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    ts_forecast_promotion.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == ts_forecast_promotion.TS_FORECAST_PROMOTION_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [ts_forecast_promotion.REVIEWS_TABLE, ts_forecast_promotion.DECISIONS_TABLE],
+        "authority_scope": "manual_config_review_only",
+    }
+    assert any(ts_forecast_promotion.REVIEWS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(ts_forecast_promotion.DECISIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("promotion_check_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (reviewed_at, model_name, horizon_days)" in statement for statement in calls[0]["statements"])
+
+
+def test_ts_forecast_promotion_records_json_parse_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(ts_forecast_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = ts_forecast_promotion.parse_jsonish("{bad ts json", {"fallback": True}, source="promotion_check_json")
+
+    assert result == {"fallback": True}
+    assert events[0]["module"] == "advisory.ts_forecast_promotion"
+    assert events[0]["fallback_type"] == "ts_forecast_promotion_json_parse_failed"
+    assert events[0]["source"] == "promotion_check_json"
+
+
+def test_ts_forecast_promotion_manual_decision_does_not_apply_patch(monkeypatch):
+    writes = []
+    monkeypatch.setattr(ts_forecast_promotion, "ensure_tables", lambda: None)
+    monkeypatch.setattr(
+        ts_forecast_promotion,
+        "find_review",
+        lambda **_kwargs: {
+            "reviewed_at": pd.Timestamp("2026-05-30T00:00:00Z"),
+            "model_name": "timesfm_2p5_200m",
+            "horizon_days": 10,
+            "recommendation": "promote_low_weight_review",
+            "confidence": 0.6,
+            "llm_review": {"recommendation": "promote_low_weight_review"},
+            "group_evidence": {"evaluated_trades": 80},
+            "patch": {
+                "path": "config/advisory_setups.yaml",
+                "mode": "manual_review_only",
+                "rule_suggestion": {"ts_forecast_model_name": "timesfm_2p5_200m", "ts_forecast_horizon_days": 10},
+            },
+        },
+    )
+    monkeypatch.setattr(ts_forecast_promotion, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+
+    result = ts_forecast_promotion.record_manual_decision(
+        reviewed_at="2026-05-30T00:00:00Z",
+        model_name="timesfm_2p5_200m",
+        horizon_days=10,
+        decision="approved",
+        operator_id="tester",
+        decision_reason="stable after paper review",
+    )
+
+    assert result["applied"] is False
+    assert "No config file, action rule, portfolio row, or broker behavior was changed" in result["note"]
+    assert result["final_patch"]["mode"] == "manual_apply_required"
+    assert "ts_forecast_review_rules:" in result["final_patch"]["manual_patch_text"]
+    assert writes[0].iloc[0]["decision"] == "approved"
+
+
+def test_operator_api_builds_ts_forecast_promotion_review_payload(monkeypatch):
+    called = {}
+
+    def fake_review(**kwargs):
+        called.update(kwargs)
+        return {
+            "status": "ok",
+            "reviewed_at": pd.Timestamp("2026-06-12T00:00:00Z"),
+            "model_name": kwargs["model_name"],
+            "horizon_days": kwargs["horizon_days"],
+            "pending_patch": {"mode": "manual_review_only"},
+            "llm_review": {"recommendation": "promote_low_weight_review"},
+            "applied": False,
+        }
+
+    monkeypatch.setattr(operator_api, "generate_ts_forecast_promotion_review", fake_review)
+
+    payload = operator_api.build_ts_forecast_promotion_review_payload({"model_name": "timesfm_2p5_200m", "horizon_days": 10})
+
+    assert payload["api_schema"]["endpoint"] == "/api/research/ts-forecast-promotion-review"
+    assert payload["pending_patch"]["mode"] == "manual_review_only"
+    assert called["persist"] is True
+    assert called["allow_not_ready"] is False
+    assert called["model_name"] == "timesfm_2p5_200m"
+
+
+def test_operator_api_records_ts_forecast_promotion_manual_decision(monkeypatch):
+    called = {}
+
+    def fake_decision(**kwargs):
+        called.update(kwargs)
+        return {
+            "status": "ok",
+            "decision": kwargs["decision"],
+            "model_name": kwargs["model_name"],
+            "horizon_days": kwargs["horizon_days"],
+            "final_patch": {"mode": "manual_apply_required"},
+            "applied": False,
+        }
+
+    monkeypatch.setattr(operator_api, "record_ts_forecast_manual_decision", fake_decision)
+
+    payload = operator_api.build_ts_forecast_promotion_review_decision_payload(
+        {
+            "reviewed_at": "2026-05-30T00:00:00Z",
+            "model_name": "timesfm_2p5_200m",
+            "horizon_days": 10,
+            "decision": "approved",
+            "operator_id": "tester",
+        }
+    )
+
+    assert payload["applied"] is False
+    assert payload["api_schema"]["endpoint"] == "/api/research/ts-forecast-promotion-review/decision"
+    assert called["decision"] == "approved"
+    assert called["operator_id"] == "tester"
+
+
+def test_operator_api_builds_ts_forecast_review_rules_payload(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "load_ts_forecast_review_rules",
+        lambda: {
+            "status": "ok",
+            "config_path": "config/advisory_setups.yaml",
+            "rules": [{"model_name": "timesfm_2p5_200m", "horizon_days": 10, "usable_for_live_policy": False}],
+            "issues": [],
+            "summary": {"row_count": 1, "broker_execution_allowed": False},
+            "operator_boundary": {"broker_execution_enabled": False, "policy_auto_promotion_allowed": False},
+        },
+    )
+
+    payload = operator_api.build_ts_forecast_review_rules_payload()
+
+    assert payload["api_schema"]["endpoint"] == "/api/research/ts-forecast-review-rules"
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["api_schema"]["broker_execution_enabled"] is False
+    assert payload["rules"][0]["usable_for_live_policy"] is False
+
+
 def test_ts_forecast_workflow_builds_watchlist_from_positive_forecasts():
     forecasts = pd.DataFrame(
         [
@@ -9430,7 +18811,28 @@ def test_ts_forecast_workflow_builds_watchlist_from_positive_forecasts():
     assert "Experimental TS forecast positive" in watchlist.iloc[0]["watch_reason"]
 
 
+def test_ts_forecast_workflow_ensure_watchlist_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(ts_forecast_workflow, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    ts_forecast_workflow.ensure_watchlist_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == ts_forecast_workflow.TS_FORECAST_WORKFLOW_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [ts_forecast_workflow.WATCHLIST_TABLE],
+        "workflow": "ts_forecast_watchlist",
+    }
+    assert any(ts_forecast_workflow.WATCHLIST_TABLE in statement for statement in calls[0]["statements"])
+    assert any("watch_status TEXT" in statement for statement in calls[0]["statements"])
+    assert any("raw_context_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)" in statement for statement in calls[0]["statements"])
+
+
 def test_ts_forecast_workflow_falls_back_when_screener_fails(monkeypatch):
+    events = []
+
     def fail_screener(**_kwargs):
         raise ValueError("Could not find Screener.in results table")
 
@@ -9453,6 +18855,7 @@ def test_ts_forecast_workflow_falls_back_when_screener_fails(monkeypatch):
     monkeypatch.setattr(ts_forecast_workflow, "symbols_from_screener", fail_screener)
     monkeypatch.setattr(ts_forecast_workflow, "resolve_symbol_universe", lambda symbols: ["ABC", "XYZ"] if symbols is None else symbols)
     monkeypatch.setattr(ts_forecast_workflow, "build_ts_forecasts", lambda **_kwargs: forecasts.copy())
+    monkeypatch.setattr(ts_forecast_workflow, "_record_ts_workflow_fallback", lambda **kwargs: events.append(kwargs))
 
     result = ts_forecast_workflow.run_workflow(
         query_text="Market capitalization > 1000",
@@ -9472,6 +18875,11 @@ def test_ts_forecast_workflow_falls_back_when_screener_fails(monkeypatch):
     assert "screener_url='https://www.screener.in/screen/raw/" in result["warnings"][0]
     assert result["screener"]["error"].startswith("screener_failed:ValueError")
     assert result["screener"]["screener_url"].startswith("https://www.screener.in/screen/raw/")
+    assert len(events) == 1
+    assert events[0]["source"] == "screenerin_ad_hoc"
+    assert events[0]["fallback_type"] == "ts_forecast_workflow_screener_failed"
+    assert events[0]["metadata"]["query_name"] == "Unit TS Screener"
+    assert events[0]["metadata"]["screener_url"].startswith("https://www.screener.in/screen/raw/")
 
 
 def test_live_dashboard_builds_experimental_ts_forecast_views():
@@ -9513,11 +18921,34 @@ def test_live_dashboard_builds_experimental_ts_forecast_views():
             }
         ]
     )
+    paper_df = pd.DataFrame(
+        [
+            {
+                "evaluated_at": pd.Timestamp("2026-05-05T00:00:00Z"),
+                "from_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "to_date": pd.Timestamp("2026-04-30T00:00:00Z"),
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 10,
+                "paper_decision": "PAPER_BUY",
+                "row_count": 12,
+                "evaluated_trades": 7,
+                "win_rate": 0.5714,
+                "avg_cost_adjusted_return": 0.024,
+                "median_cost_adjusted_return": 0.019,
+                "avg_realized_return_all_rows": 0.026,
+                "baseline_trade_count": 5,
+                "baseline_avg_cost_adjusted_return": 0.008,
+                "aligned_positive_count": 3,
+                "conflict_exit_count": 1,
+            }
+        ]
+    )
 
     views = live_dashboard.build_ts_forecast_views(
         watch_df=watch_df,
         forecast_df=pd.DataFrame(),
         eval_summary_df=eval_df,
+        paper_summary_df=paper_df,
     )
 
     assert len(views["watch"]) == 1
@@ -9532,6 +18963,16 @@ def test_live_dashboard_builds_experimental_ts_forecast_views():
     assert len(views["evaluation_summary"]) == 1
     assert views["evaluation_summary"][0]["row_count"] == 12
     assert views["evaluation_summary"][0]["hit_rate_pct"] == 62.5
+    assert len(views["paper_summary"]) == 1
+    paper_row = views["paper_summary"][0]
+    assert paper_row["paper_decision"] == "PAPER_BUY"
+    assert paper_row["evaluated_trades"] == 7
+    assert paper_row["win_rate_pct"] == 57.1
+    assert paper_row["avg_cost_adjusted_return_pct"] == 2.4
+    assert paper_row["baseline_avg_cost_adjusted_return_pct"] == 0.8
+    assert paper_row["aligned_positive_count"] == 3
+    assert paper_row["conflict_exit_count"] == 1
+    assert "evidence only" in paper_row["operator_note"]
 
 
 def test_live_dashboard_collapses_ts_horizons_into_windows():
@@ -9598,17 +19039,28 @@ def test_live_dashboard_parses_ps_elapsed_formats():
     assert live_dashboard._parse_ps_elapsed_seconds("2-01:02:03") == 176523
 
 
-def test_live_dashboard_safe_loader_records_section_failures():
+def test_live_dashboard_safe_loader_records_section_failures(monkeypatch):
     live_dashboard.SECTION_FAILURES.clear()
+    events: list[dict[str, object]] = []
 
     def broken_loader():
         raise ValueError("broken section")
 
-    out = live_dashboard._safe_frame_loader(broken_loader)
+    monkeypatch.setattr(live_dashboard, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
 
-    assert out.empty
-    assert live_dashboard.SECTION_FAILURES[-1]["section"] == "broken_loader"
-    assert "ValueError" in live_dashboard.SECTION_FAILURES[-1]["error"]
+    frame_out = live_dashboard._safe_frame_loader(broken_loader)
+    list_out = live_dashboard._safe_list_loader(broken_loader)
+
+    assert frame_out.empty
+    assert list_out == []
+    assert [row["section"] for row in live_dashboard.SECTION_FAILURES[-2:]] == ["broken_loader", "broken_loader"]
+    assert all("ValueError" in row["error"] for row in live_dashboard.SECTION_FAILURES[-2:])
+    assert [event["fallback_type"] for event in events] == [
+        "live_dashboard_section_frame_load_failed",
+        "live_dashboard_section_list_load_failed",
+    ]
+    assert events[0]["source"] == "broken_loader"
+    assert events[1]["source"] == "broken_loader"
 
 
 def test_announcement_watch_deduplicates_ingest_by_symbol(monkeypatch):
@@ -9749,6 +19201,39 @@ def test_announcement_watch_caps_initial_ingest_lookback(monkeypatch):
     assert calls[0][0] == pd.Timestamp("2026-03-29T00:00:00Z").date()
     assert meta["capped_watch_rows"] == 1
     assert meta["initial_lookback_days"] == 3
+
+
+def test_announcement_watch_records_watchlist_load_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def fake_sql(*_args, **_kwargs):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(announcement_watch, "sql_to_df", fake_sql)
+    monkeypatch.setattr(announcement_watch, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = announcement_watch.load_watchlist(symbols=["ABC"], setup_ids=["SETUP_A"])
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "announcement_watchlist_load_failed"
+    assert events[0]["source"] == announcement_watch.WATCHLIST_TABLE
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"] == {"asof_date": None, "symbols_count": 1, "setup_ids_count": 1}
+
+
+def test_announcement_watch_records_table_lookup_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def fake_sql(*_args, **_kwargs):
+        raise RuntimeError("information schema unavailable")
+
+    monkeypatch.setattr(announcement_watch, "sql_to_df", fake_sql)
+    monkeypatch.setattr(announcement_watch, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert announcement_watch._table_exists("missing_table") is False
+    assert events[0]["fallback_type"] == "announcement_watch_table_lookup_failed"
+    assert events[0]["source"] == "missing_table"
+    assert events[0]["metadata"] == {"table_name": "missing_table"}
 
 
 def test_event_normalization_produces_taxonomy_and_transition():
@@ -10077,6 +19562,204 @@ def test_event_tensor_builds_richer_fields_into_evaluation_output(monkeypatch):
     assert tensor["state_transition_hint"] == "UPGRADE_TO_PASS_NOW"
 
 
+def test_llm_event_evaluator_ensure_output_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(llm_event_evaluator, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    llm_event_evaluator.ensure_output_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == llm_event_evaluator.EVENT_EVALUATION_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [llm_event_evaluator.EVALUATIONS_TABLE, llm_event_evaluator.RISKS_TABLE]
+    assert any(llm_event_evaluator.EVALUATIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(llm_event_evaluator.RISKS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("event_tensor_json" in statement for statement in calls[0]["statements"])
+
+
+def test_llm_event_evaluator_delete_existing_risks_ensures_schema_before_delete(monkeypatch):
+    ensures = []
+    deletes = []
+    operation_names = []
+
+    class Cursor:
+        def execute(self, query, params=None):
+            deletes.append((str(query), params))
+
+    class Session:
+        def __enter__(self):
+            return None, Cursor()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(llm_event_evaluator, "ensure_output_tables", lambda: ensures.append(True))
+    monkeypatch.setattr(llm_event_evaluator, "db_session", lambda: Session())
+    monkeypatch.setattr(
+        llm_event_evaluator,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
+
+    llm_event_evaluator.delete_existing_risks(
+        pd.DataFrame(
+            [
+                {"setup_id": "S1", "symbol": "ABC", "unique_id": "evt-1"},
+                {"setup_id": "S1", "symbol": "ABC", "unique_id": "evt-1"},
+                {"setup_id": "S2", "symbol": "XYZ", "unique_id": "evt-2"},
+            ]
+        )
+    )
+
+    assert ensures == [True]
+    assert operation_names == ["llm_event_evaluator:delete_existing_risks"]
+    assert len(deletes) == 2
+    assert all(llm_event_evaluator.RISKS_TABLE in query for query, _ in deletes)
+
+
+def test_llm_event_evaluator_table_exists_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(llm_event_evaluator, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("catalog unavailable")))
+    monkeypatch.setattr(llm_event_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert llm_event_evaluator._table_exists("advisory_watch_events") is False
+
+    assert events[0]["module"] == "advisory.llm_event_evaluator"
+    assert events[0]["source"] == "advisory_watch_events"
+    assert events[0]["fallback_type"] == "llm_event_table_lookup_failed"
+    assert events[0]["metadata"] == {"table_name": "advisory_watch_events"}
+
+
+def test_llm_event_evaluator_missing_scalar_check_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(llm_event_evaluator.pd, "isna", lambda value: (_ for _ in ()).throw(TypeError("isna failed")))
+    monkeypatch.setattr(llm_event_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert llm_event_evaluator._is_missing_scalar(object()) is False
+    assert events[0]["module"] == "advisory.llm_event_evaluator"
+    assert events[0]["source"] == "missing_scalar_check"
+    assert events[0]["fallback_type"] == "llm_event_missing_scalar_check_failed"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
+def test_llm_event_evaluator_safe_trace_call_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def broken_trace(**kwargs):
+        raise RuntimeError("trace write unavailable")
+
+    monkeypatch.setattr(llm_event_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert (
+        llm_event_evaluator._safe_trace_call(
+            broken_trace,
+            symbol="abc",
+            unique_id="UID-1",
+            setup_id="SETUP_A",
+            stage="evaluate",
+            payload={"x": 1},
+        )
+        is None
+    )
+
+    assert events[0]["module"] == "advisory.llm_event_evaluator"
+    assert events[0]["source"] == "decision_trace"
+    assert events[0]["fallback_type"] == "llm_event_trace_call_failed"
+    assert events[0]["metadata"] == {
+        "function": "broken_trace",
+        "kwargs_keys": ["payload", "setup_id", "stage", "symbol", "unique_id"],
+        "symbol": "ABC",
+        "unique_id": "UID-1",
+        "setup_id": "SETUP_A",
+        "stage": "evaluate",
+    }
+
+
+def test_llm_event_evaluator_normalize_jsonish_records_malformed_context_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(llm_event_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = llm_event_evaluator.normalize_jsonish("{bad event json", source="event_categories_json")
+
+    assert result == "{bad event json"
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.llm_event_evaluator"
+    assert event["fallback_type"] == "llm_event_json_parse_failed"
+    assert event["source"] == "event_categories_json"
+    assert event["severity"] == "warn"
+    assert event["metadata"]["value_length"] == len("{bad event json")
+    assert event["metadata"]["value_excerpt"] == "{bad event json"
+
+
+def test_llm_event_evaluator_records_existing_evaluation_lookup_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(llm_event_evaluator, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(llm_event_evaluator, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable")))
+    monkeypatch.setattr(llm_event_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = llm_event_evaluator.load_watch_events(
+        asof_date=pd.Timestamp("2026-04-17T00:00:00Z"),
+        symbols=["ABC"],
+        setup_ids=["SETUP_A"],
+        include_evaluated=False,
+    )
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "llm_event_existing_evaluation_lookup_failed"
+    assert events[0]["source"] == llm_event_evaluator.EVALUATIONS_TABLE
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"] == {
+        "asof_date": "2026-04-17 00:00:00+00:00",
+        "symbols_count": 1,
+        "setup_ids_count": 1,
+        "include_evaluated": False,
+    }
+
+
+def test_llm_event_evaluator_records_exchange_context_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(llm_event_evaluator, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(llm_event_evaluator, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("context unavailable")))
+    monkeypatch.setattr(llm_event_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = llm_event_evaluator.load_exchange_context(
+        "ABC",
+        pd.Timestamp("2026-04-17T10:00:00Z"),
+        lookback_days=7,
+        max_events=3,
+    )
+
+    assert out["error"] == "context unavailable"
+    assert events[0]["fallback_type"] == "llm_event_exchange_context_load_failed"
+    assert events[0]["source"] == "exchange_context"
+    assert events[0]["symbol"] == "ABC"
+    assert events[0]["metadata"] == {
+        "published_on": "2026-04-17 10:00:00+00:00",
+        "lookback_days": 7,
+        "max_events": 3,
+    }
+
+
+def test_llm_event_evaluator_records_broad_market_context_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(llm_event_evaluator, "load_latest_market_context", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("market unavailable")))
+    monkeypatch.setattr(llm_event_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = llm_event_evaluator.load_broad_market_context("ABC", pd.Timestamp("2026-04-17T10:00:00Z"))
+
+    assert out["error"] == "RuntimeError: market unavailable"
+    assert events[0]["fallback_type"] == "llm_event_broad_market_context_load_failed"
+    assert events[0]["source"] == "market_context"
+    assert events[0]["symbol"] == "ABC"
+    assert events[0]["metadata"] == {"daily_cutoff": "2026-04-17 00:00:00+00:00"}
+
+
 def test_llm_event_evaluator_prefers_compact_evidence_and_marks_raw_fallback(monkeypatch):
     events = pd.DataFrame(
         [
@@ -10320,6 +20003,57 @@ themes:
     assert theme["suggested_screeners"][0]["screener_query"] == "Market Capitalization > 1000"
 
 
+def test_news_theme_engine_ensure_theme_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    def fake_apply_schema_migration(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(news_theme_engine, "apply_schema_migration", fake_apply_schema_migration)
+
+    news_theme_engine.ensure_theme_table()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == news_theme_engine.NEWS_THEME_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "advisory.news_theme_engine"
+    assert call["metadata"]["tables"] == [news_theme_engine.THEME_SCREENERS_TABLE]
+    ddl = "\n".join(call["statements"])
+    assert f"CREATE TABLE IF NOT EXISTS {news_theme_engine.THEME_SCREENERS_TABLE}" in ddl
+    assert "screener_url TEXT NOT NULL" in ddl
+    assert "UNIQUE (theme_id, screener_slug)" in ddl
+
+
+def test_news_theme_engine_records_asof_resolve_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(news_theme_engine, "resolve_asof_date", lambda asof_date=None: (_ for _ in ()).throw(RuntimeError("date lookup failed")))
+    monkeypatch.setattr(news_theme_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = news_theme_engine.build_theme_recommendations(asof_date=pd.Timestamp("2026-04-01T00:00:00Z"))
+
+    assert payload["recommendations"] == []
+    assert payload["error"] == "failed_to_resolve_asof_date: RuntimeError"
+    assert events[0]["fallback_type"] == "news_theme_asof_resolve_failed"
+    assert events[0]["source"] == "advisory_market_overlay_daily"
+
+
+def test_news_theme_engine_records_market_news_load_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(news_theme_engine, "resolve_asof_date", lambda asof_date=None: pd.Timestamp("2026-04-01T00:00:00Z"))
+    monkeypatch.setattr(news_theme_engine, "load_recent_market_news", lambda asof_date: (_ for _ in ()).throw(RuntimeError("news query failed")))
+    monkeypatch.setattr(news_theme_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = news_theme_engine.build_theme_recommendations(asof_date=pd.Timestamp("2026-04-01T00:00:00Z"))
+
+    assert payload["recommendations"] == []
+    assert payload["error"] == "failed_to_load_recent_market_news: RuntimeError"
+    assert events[0]["fallback_type"] == "news_theme_market_news_load_failed"
+    assert events[0]["source"] == "advisory_market_overlay_daily"
+    assert events[0]["metadata"]["asof_date"] == "2026-04-01 00:00:00+00:00"
+
+
 def test_news_theme_engine_active_mapping_returns_theme_ids_and_slugs(monkeypatch):
     monkeypatch.setattr(
         news_theme_engine,
@@ -10349,6 +20083,39 @@ def test_news_theme_engine_active_mapping_returns_theme_ids_and_slugs(monkeypatc
     assert mapping["screener_slugs"] == ["defense-indigenisation-v1", "power-grid-storage-v1"]
 
 
+def test_news_theme_engine_records_active_mapping_load_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        news_theme_engine,
+        "build_theme_recommendations",
+        lambda **kwargs: {
+            "asof_date": pd.Timestamp("2026-03-31T00:00:00Z"),
+            "recommendations": [{"theme_id": "DEFENSE_INDIGENISATION"}],
+            "error": None,
+        },
+    )
+    monkeypatch.setattr(
+        news_theme_engine,
+        "list_theme_screeners",
+        lambda theme_id=None: (_ for _ in ()).throw(RuntimeError("theme mapping failed")),
+    )
+    monkeypatch.setattr(
+        news_theme_engine,
+        "record_local_fallback_event",
+        lambda **kwargs: events.append(kwargs) or kwargs,
+    )
+
+    mapping = news_theme_engine.load_active_theme_screener_mapping(asof_date=pd.Timestamp("2026-03-31T00:00:00Z"))
+
+    assert mapping["theme_ids"] == ["DEFENSE_INDIGENISATION"]
+    assert mapping["screener_slugs"] == []
+    assert mapping["error"] == "failed_to_list_theme_screeners: RuntimeError"
+    assert events[0]["fallback_type"] == "news_theme_screener_mapping_load_failed"
+    assert events[0]["source"] == news_theme_engine.THEME_SCREENERS_TABLE
+    assert events[0]["metadata"]["theme_ids"] == ["DEFENSE_INDIGENISATION"]
+
+
 def test_download_runner_stops_on_failure_when_continue_disabled(monkeypatch):
     monkeypatch.setattr(
         download_runner,
@@ -10372,6 +20139,1158 @@ def test_download_runner_stops_on_failure_when_continue_disabled(monkeypatch):
     assert [row["module"] for row in payload["results"]] == ["mod.ok", "mod.fail"]
 
 
+def test_download_runner_classifies_standard_run_statuses():
+    assert download_runner.classify_run_status(status="ok", module_name="data.fred.us_macro", returncode=0) == "ok"
+    assert download_runner.classify_run_status(status="failed", module_name="data.dhanlive.ohlcv", error="DhanAPIError: status 401 token expired") == "auth_unavailable"
+    assert download_runner.classify_run_status(status="failed", module_name="data.nseindia.recent_events", error="ReadTimeout: nseindia timed out") == "source_unavailable"
+    assert download_runner.classify_run_status(status="failed", module_name="data.nseindia.bhavcopy_parser", error="ValueError: schema changed") == "parse_failed"
+    assert download_runner.classify_run_status(status="failed", module_name="data.nsdl.fpi", error="No data for date") == "no_data"
+
+
+def test_download_runner_persists_standard_run_state_on_success(monkeypatch):
+    persisted: list[dict[str, object]] = []
+    monkeypatch.setattr(download_runner, "_execute_module_entrypoint", lambda _module_name: (0, {}))
+    monkeypatch.setattr(download_runner, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+
+    result = download_runner.run_download_module({"module": "data.fred.us_macro", "args": ["--recent"], "purpose": "macro"})
+
+    assert result["status"] == "ok"
+    assert result["run_state"]["classification"] == "ok"
+    assert result["run_state"]["phase"] == "downloader"
+    assert result["sync_state_persist"]["status"] == "ok"
+    assert persisted[0]["source_name"] == "download_runner:data.fred.us_macro"
+    assert persisted[0]["scope_key"] == "macro"
+    assert persisted[0]["status"] == "ok"
+    assert persisted[0]["state"]["state_advanced"] is True
+
+
+def test_download_runner_merges_exported_module_run_state(monkeypatch):
+    persisted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        download_runner,
+        "_execute_module_entrypoint",
+        lambda _module_name: (
+            0,
+            {
+                "from_date": "2026-06-01",
+                "to_date": "2026-06-10",
+                "rows": 12,
+                "rows_written": 10,
+                "rows_read": 12,
+                "retries": 2,
+                "attempt_count": 4,
+                "failed_attempt_count": 2,
+                "fallback_count": 1,
+                "source_unavailable_count": 1,
+                "fallback_used": True,
+                "state_advanced": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(download_runner, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+
+    result = download_runner.run_download_module({"module": "advisory.event_evidence_store", "args": [], "purpose": "compact_event_evidence"})
+
+    assert result["run_state"]["from"] == "2026-06-01"
+    assert result["run_state"]["to"] == "2026-06-10"
+    assert result["run_state"]["rows"] == 12
+    assert result["run_state"]["rows_written"] == 10
+    assert result["run_state"]["rows_read"] == 12
+    assert result["run_state"]["retries"] == 2
+    assert result["run_state"]["retry_count"] == 2
+    assert result["run_state"]["attempt_count"] == 4
+    assert result["run_state"]["failed_attempt_count"] == 2
+    assert result["run_state"]["fallback_count"] == 1
+    assert result["run_state"]["source_unavailable_count"] == 1
+    assert result["run_state"]["fallback_used"] is True
+    assert result["run_state"]["state_advanced"] is False
+    assert persisted[0]["state"]["rows"] == 12
+
+
+def test_download_runner_merges_exported_module_run_state_on_nonzero_exit(monkeypatch):
+    persisted: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        download_runner,
+        "_execute_module_entrypoint",
+        lambda _module_name: (
+            2,
+            {
+                "rows": 0,
+                "attempt_count": 3,
+                "failed_attempt_count": 3,
+                "source_unavailable_count": 1,
+                "no_data_count": 0,
+                "state_advanced": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(download_runner, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+
+    result = download_runner.run_download_module({"module": "data.company_master", "args": [], "purpose": "identity_build"})
+
+    assert result["status"] == "failed"
+    assert result["returncode"] == 2
+    assert result["run_state"]["classification"] == "failed"
+    assert result["run_state"]["attempt_count"] == 3
+    assert result["run_state"]["failed_attempt_count"] == 3
+    assert result["run_state"]["source_unavailable_count"] == 1
+    assert result["run_state"]["state_advanced"] is False
+    assert persisted[0]["status"] == "error"
+    assert persisted[0]["state"]["attempt_count"] == 3
+
+
+def test_download_runner_entrypoint_preserves_state_after_system_exit(monkeypatch):
+    module = types.ModuleType("fake_download_module")
+    module.STOCKEY_RUN_STATE = {}
+
+    def fake_main():
+        module.STOCKEY_RUN_STATE = {
+            "rows": 4,
+            "attempt_count": 1,
+            "state_advanced": True,
+        }
+        raise SystemExit(0)
+
+    module.main = fake_main
+    monkeypatch.setattr(download_runner.importlib, "import_module", lambda _module_name: module)
+    monkeypatch.setitem(sys.modules, "fake_download_module", module)
+
+    code, state = download_runner._execute_module_entrypoint("fake_download_module")
+
+    assert code == 0
+    assert state["rows"] == 4
+    assert state["attempt_count"] == 1
+    assert state["state_advanced"] is True
+
+
+def test_download_runner_entrypoint_records_nonzero_system_exit(monkeypatch):
+    events: list[dict[str, object]] = []
+    module = types.ModuleType("fake_download_module_nonzero")
+    module.STOCKEY_RUN_STATE = {}
+
+    def fake_main():
+        module.STOCKEY_RUN_STATE = {"rows": 0, "state_advanced": False}
+        raise SystemExit(3)
+
+    module.main = fake_main
+    monkeypatch.setattr(download_runner.importlib, "import_module", lambda _module_name: module)
+    monkeypatch.setattr(download_runner, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setitem(sys.modules, "fake_download_module_nonzero", module)
+
+    code, state = download_runner._execute_module_entrypoint("fake_download_module_nonzero")
+
+    assert code == 3
+    assert state["rows"] == 0
+    assert events[0]["module"] == "data.download_runner"
+    assert events[0]["fallback_type"] == "download_runner_entrypoint_system_exit_nonzero"
+    assert events[0]["source"] == "fake_download_module_nonzero"
+    assert events[0]["metadata"]["returncode"] == 3
+
+
+def test_download_runner_entrypoint_falls_back_to_runpy_without_main(monkeypatch):
+    module = types.ModuleType("fake_legacy_download_module")
+    calls: list[str] = []
+
+    monkeypatch.setattr(download_runner.importlib, "import_module", lambda _module_name: module)
+    monkeypatch.setattr(
+        download_runner.runpy,
+        "run_module",
+        lambda module_name, run_name: calls.append(f"{module_name}:{run_name}") or {"STOCKEY_RUN_STATE": {"rows": 7}},
+    )
+    monkeypatch.setitem(sys.modules, "fake_legacy_download_module", module)
+
+    code, state = download_runner._execute_module_entrypoint("fake_legacy_download_module")
+
+    assert code == 0
+    assert state["rows"] == 7
+    assert calls == ["fake_legacy_download_module:__main__"]
+    assert "fake_legacy_download_module" not in sys.modules
+
+
+def test_download_runner_persists_standard_run_state_on_parser_failure(monkeypatch):
+    persisted: list[dict[str, object]] = []
+    events: list[dict[str, object]] = []
+
+    def fail_module(*args, **kwargs):
+        raise ValueError("schema changed")
+
+    monkeypatch.setattr(download_runner, "_execute_module_entrypoint", fail_module)
+    monkeypatch.setattr(download_runner, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+    monkeypatch.setattr(download_runner, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = download_runner.run_download_module({"module": "data.nseindia.bhavcopy_parser", "args": [], "purpose": "market_wide"})
+
+    assert result["status"] == "failed"
+    assert result["run_state"]["classification"] == "parse_failed"
+    assert result["run_state"]["phase"] == "parser"
+    assert result["run_state"]["state_advanced"] is False
+    assert persisted[0]["status"] == "error"
+    assert persisted[0]["error_text"].startswith("ValueError: schema changed")
+    assert events[0]["fallback_type"] == "download_runner_module_exception"
+    assert events[0]["source"] == "data.nseindia.bhavcopy_parser"
+    assert events[0]["metadata"] == {"module": "data.nseindia.bhavcopy_parser", "purpose": "market_wide"}
+
+
+def test_download_runner_marks_sync_state_persist_failure_without_hiding_result(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(download_runner, "_execute_module_entrypoint", lambda _module_name: (0, {}))
+
+    def fail_persist(**kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(download_runner, "persist_sync_state", fail_persist)
+    monkeypatch.setattr(download_runner, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = download_runner.run_download_module({"module": "data.fred.us_macro", "args": [], "purpose": "macro"})
+
+    assert result["status"] == "ok"
+    assert result["sync_state_persist"]["status"] == "error"
+    assert "RuntimeError: db down" in result["sync_state_persist"]["error"]
+    assert events[0]["fallback_type"] == "download_runner_sync_state_persist_failed"
+    assert events[0]["source"] == "download_runner:data.fred.us_macro"
+    assert events[0]["metadata"] == {
+        "module": "data.fred.us_macro",
+        "purpose": "macro",
+        "classification": "ok",
+        "sync_status": "ok",
+    }
+
+
+def test_download_runner_records_nonzero_exit_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    persisted: list[dict[str, object]] = []
+
+    monkeypatch.setattr(download_runner, "_execute_module_entrypoint", lambda _module_name: (2, {"rows": 0}))
+    monkeypatch.setattr(download_runner, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+    monkeypatch.setattr(download_runner, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = download_runner.run_download_module({"module": "data.company_master", "args": [], "purpose": "identity_build"})
+
+    assert result["status"] == "failed"
+    assert result["returncode"] == 2
+    assert persisted[0]["status"] == "error"
+    assert events[0]["fallback_type"] == "download_runner_module_nonzero_exit"
+    assert events[0]["source"] == "data.company_master"
+    assert events[0]["metadata"] == {"module": "data.company_master", "purpose": "identity_build", "returncode": 2}
+
+
+def test_schema_migration_dry_run_and_checksum_skip(monkeypatch):
+    from utils import schema_migrations
+
+    statements = ["CREATE TABLE test_schema_migration (id INT)"]
+    checksum = schema_migrations.checksum_statements(statements)
+    monkeypatch.setattr(schema_migrations, "ensure_schema_migrations_table", lambda: None)
+    monkeypatch.setattr(schema_migrations, "load_schema_migration", lambda _migration_id: None)
+
+    dry_run = schema_migrations.apply_schema_migration(
+        migration_id="20260611_test",
+        description="test migration",
+        statements=statements,
+        dry_run=True,
+    )
+    assert dry_run["status"] == "dry_run"
+    assert dry_run["checksum"] == checksum
+    assert dry_run["statement_count"] == 1
+
+    monkeypatch.setattr(
+        schema_migrations,
+        "load_schema_migration",
+        lambda _migration_id: {"status": "applied", "checksum": checksum},
+    )
+    skipped = schema_migrations.apply_schema_migration(
+        migration_id="20260611_test",
+        description="test migration",
+        statements=statements,
+    )
+    assert skipped["status"] == "skipped_already_applied"
+
+
+def test_schema_migration_records_owner_in_metadata(monkeypatch):
+    from utils import schema_migrations
+
+    monkeypatch.setattr(schema_migrations, "ensure_schema_migrations_table", lambda: None)
+    monkeypatch.setattr(schema_migrations, "load_schema_migration", lambda _migration_id: None)
+
+    result = schema_migrations.apply_schema_migration(
+        migration_id="20260611_owner",
+        description="owner metadata",
+        owner="advisory.test_owner",
+        metadata={"tables": ["example_table"]},
+        statements=["CREATE TABLE example_table (id INT)"],
+        dry_run=True,
+    )
+
+    metadata = json.loads(result["metadata_json"])
+    assert metadata == {"owner": "advisory.test_owner", "tables": ["example_table"]}
+
+
+def test_schema_migration_rejects_checksum_mismatch(monkeypatch):
+    from utils import schema_migrations
+
+    monkeypatch.setattr(schema_migrations, "ensure_schema_migrations_table", lambda: None)
+    monkeypatch.setattr(
+        schema_migrations,
+        "load_schema_migration",
+        lambda _migration_id: {"status": "applied", "checksum": "old"},
+    )
+
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        schema_migrations.apply_schema_migration(
+            migration_id="20260611_test",
+            description="test migration",
+            statements=["CREATE TABLE new_shape (id INT)"],
+        )
+
+
+def test_schema_migration_ensure_table_uses_retryable_operation(monkeypatch):
+    from utils import schema_migrations
+
+    operation_names = []
+    executed = []
+
+    class Cursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class Session:
+        def __enter__(self):
+            return None, Cursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(schema_migrations, "db_session", lambda: Session())
+    monkeypatch.setattr(schema_migrations, "execute_db_operation", fake_execute_db_operation)
+
+    schema_migrations.ensure_schema_migrations_table()
+
+    assert operation_names == ["schema_migrations:ensure_table"]
+    assert any("CREATE TABLE IF NOT EXISTS stockey_schema_migrations" in query for query, _ in executed)
+    assert any("ADD COLUMN IF NOT EXISTS metadata_json" in query for query, _ in executed)
+
+
+def test_schema_migration_applies_statements(monkeypatch):
+    from utils import schema_migrations
+    operation_names = []
+
+    class FakeCursor:
+        def __init__(self):
+            self.calls = []
+
+        def execute(self, query, params=None):
+            self.calls.append((str(query), params))
+
+    class FakeSession:
+        def __init__(self, cur):
+            self.cur = cur
+
+        def __enter__(self):
+            return None, self.cur
+
+        def __exit__(self, *_args):
+            return False
+
+    cur = FakeCursor()
+    monkeypatch.setattr(schema_migrations, "ensure_schema_migrations_table", lambda: None)
+    monkeypatch.setattr(schema_migrations, "load_schema_migration", lambda _migration_id: None)
+    monkeypatch.setattr(schema_migrations, "db_session", lambda *args, **kwargs: FakeSession(cur))
+    monkeypatch.setattr(
+        schema_migrations,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
+
+    result = schema_migrations.apply_schema_migration(
+        migration_id="20260611_apply",
+        description="apply migration",
+        statements=["CREATE TABLE schema_test (id INT)", "ALTER TABLE schema_test ADD COLUMN name TEXT"],
+    )
+
+    assert result["status"] == "applied"
+    assert operation_names == ["schema_migrations:apply:20260611_apply"]
+    assert any("CREATE TABLE schema_test" in query for query, _params in cur.calls)
+    assert any("ALTER TABLE schema_test" in query for query, _params in cur.calls)
+    assert any("SET status = 'applied'" in query for query, _params in cur.calls)
+
+
+def test_schema_migration_records_failure_after_statement_error(monkeypatch):
+    from utils import schema_migrations
+    operation_names = []
+
+    class FakeCursor:
+        def __init__(self, fail_on_bad: bool):
+            self.fail_on_bad = fail_on_bad
+            self.calls = []
+
+        def execute(self, query, params=None):
+            self.calls.append((str(query), params))
+            if self.fail_on_bad and str(query) == "BAD SQL":
+                raise RuntimeError("boom")
+
+    class FakeSession:
+        def __init__(self, cur):
+            self.cur = cur
+
+        def __enter__(self):
+            return None, self.cur
+
+        def __exit__(self, *_args):
+            return False
+
+    apply_cur = FakeCursor(fail_on_bad=True)
+    failure_cur = FakeCursor(fail_on_bad=False)
+    sessions = [FakeSession(apply_cur), FakeSession(failure_cur)]
+
+    monkeypatch.setattr(schema_migrations, "ensure_schema_migrations_table", lambda: None)
+    monkeypatch.setattr(schema_migrations, "load_schema_migration", lambda _migration_id: None)
+    monkeypatch.setattr(schema_migrations, "db_session", lambda *args, **kwargs: sessions.pop(0))
+    monkeypatch.setattr(
+        schema_migrations,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
+
+    with pytest.raises(RuntimeError, match="boom"):
+        schema_migrations.apply_schema_migration(
+            migration_id="20260611_fail",
+            description="failing migration",
+            statements=["BAD SQL"],
+        )
+
+    assert operation_names == [
+        "schema_migrations:apply:20260611_fail",
+        "schema_migrations:record_failure:20260611_fail",
+    ]
+    assert any("status = 'failed'" in query or "'failed'" in query for query, _params in failure_cur.calls)
+    assert any(params and "RuntimeError: boom" in params.get("error_text", "") for _query, params in failure_cur.calls)
+
+
+def test_company_master_backfill_column_uses_schema_registry(monkeypatch):
+    from data import backfill_company_master_ids as backfill
+
+    calls = []
+    spec = backfill.BackfillSpec("nseindia_events", "symbol", exchange="NSE")
+
+    monkeypatch.setattr(backfill, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    backfill.ensure_company_master_id_column(spec)
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == "20260611_company_master_id_backfill_nseindia_events"
+    assert call["owner"] == "data.backfill_company_master_ids"
+    assert call["metadata"]["tables"] == ["nseindia_events"]
+    assert call["metadata"]["ticker_column"] == "symbol"
+    assert call["metadata"]["exchange"] == "NSE"
+    ddl = "\n".join(call["statements"])
+    assert 'ALTER TABLE public."nseindia_events" ADD COLUMN IF NOT EXISTS company_master_id TEXT' in ddl
+
+
+def test_company_master_backfill_uses_retryable_operations(monkeypatch):
+    from data import backfill_company_master_ids as backfill
+
+    operation_names = []
+    executed = []
+    ensured = []
+
+    class Cursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class Session:
+        def __enter__(self):
+            return None, Cursor()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(backfill, "db_session", lambda: Session())
+    monkeypatch.setattr(backfill, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(backfill, "_table_exists", lambda _cur, table_name: table_name != "missing_table")
+    monkeypatch.setattr(backfill, "_column_exists", lambda _cur, _table_name, _column_name: True)
+    monkeypatch.setattr(backfill, "ensure_company_master_id_column", lambda spec: ensured.append(spec.table_name))
+    monkeypatch.setattr(backfill, "_run_update", lambda _cur, spec: 7 if spec.table_name == "ok_table" else 0)
+
+    results = backfill.backfill_company_master_ids(
+        [
+            backfill.BackfillSpec("ok_table", "symbol", exchange="NSE"),
+            backfill.BackfillSpec("missing_table", "symbol", exchange="NSE"),
+        ]
+    )
+
+    assert operation_names == [
+        "backfill_company_master_ids:ok_table",
+        "backfill_company_master_ids:missing_table",
+    ]
+    assert ensured == ["ok_table"]
+    assert results == [
+        {"table": "ok_table", "status": "ok", "updated": 7},
+        {"table": "missing_table", "status": "missing"},
+    ]
+    assert len([query for query, _ in executed if "SET LOCAL statement_timeout = 0" in query]) == 2
+
+
+def test_nse_offmarket_exports_retry_run_state(monkeypatch):
+    class FakeRedis:
+        def close(self):
+            return None
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    calls = {"get_next": 0, "download": 0}
+
+    def fake_get_next(rop, dtype, g_start, g_end, skipped_dates=None):
+        if dtype == "block_deals" and calls["get_next"] == 0:
+            calls["get_next"] += 1
+            return offmarket.datetime(2026, 6, 9), offmarket.datetime(2026, 6, 10)
+        calls["get_next"] += 1
+        return None
+
+    def fake_download_data(playwright, dtype, from_date, to_date, rop):
+        calls["download"] += 1
+        return calls["download"] == 2
+
+    monkeypatch.setattr(offmarket, "get_redis_client", lambda *args, **kwargs: FakeRedis())
+    monkeypatch.setattr(offmarket, "sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(offmarket, "latest_completed_day", lambda: offmarket.datetime(2026, 6, 10))
+    monkeypatch.setattr(offmarket, "NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS", 1)
+    monkeypatch.setattr(offmarket, "get_next_download_block", fake_get_next)
+    monkeypatch.setattr(offmarket, "download_data", fake_download_data)
+
+    assert offmarket.main() == 0
+
+    state = offmarket.STOCKEY_RUN_STATE
+    assert state["source"] == "data.nseindia.offmarket"
+    assert state["blocks_attempted"] == 1
+    assert state["download_attempts"] == 2
+    assert state["attempt_count"] == 2
+    assert state["retry_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["downloaded_blocks"] == 1
+    assert state["dates_downloaded"] == 2
+    assert state["rows_written"] == 2
+    assert state["state_advanced"] is True
+
+
+def test_nse_offmarket_records_download_failure_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    class FakePage:
+        def goto(self, *_args, **_kwargs):
+            raise RuntimeError("offmarket timeout")
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = []
+
+        def new_context(self):
+            return FakeContext()
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("download failure must not mark redis downloaded")
+
+    monkeypatch.setattr(offmarket, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    ok = offmarket.download_data(
+        FakePlaywright(),
+        "block_deals",
+        offmarket.datetime(2026, 6, 9),
+        offmarket.datetime(2026, 6, 10),
+        FakeRedis(),
+    )
+
+    assert ok is False
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.nseindia.offmarket"
+    assert event["source"] == "nsedeals:block_deals:2026-06-09:2026-06-10"
+    assert event["fallback_type"] == "nse_offmarket_download_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert str(event["error"]) == "offmarket timeout"
+    assert event["metadata"] == {
+        "dtype": "block_deals",
+        "from_date": "2026-06-09",
+        "to_date": "2026-06-10",
+        "from_date_display": "09-06-2026",
+        "to_date_display": "10-06-2026",
+    }
+
+
+def test_nse_offmarket_parser_exports_file_run_state(monkeypatch):
+    from data.nseindia import offmarket_parser
+
+    failed_states = []
+    monkeypatch.setattr(
+        offmarket_parser,
+        "get_processed_keys",
+        lambda _source, status="processed": {"nsedeals/already.csv"} if status == "processed" else set(),
+    )
+    monkeypatch.setattr(
+        offmarket_parser,
+        "mark_failed",
+        lambda source_prefix, object_key, error_message: failed_states.append((source_prefix, object_key, error_message)),
+    )
+    monkeypatch.setattr(
+        offmarket_parser.store,
+        "list_files",
+        lambda _prefix: ["nsedeals/already.csv", "nsedeals/block_deals.csv", "nsedeals/bad.csv"],
+    )
+    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: f"/tmp/{key.rsplit('/', 1)[-1]}")
+
+    def fake_process(file_name, _csv_path):
+        if file_name == "nsedeals/bad.csv":
+            raise ValueError("bad schema")
+        return {"file_name": file_name, "dtype": "block_deals", "rows": 4, "from_date": "2026-06-01", "to_date": "2026-06-02"}
+
+    monkeypatch.setattr(offmarket_parser, "process_csv", fake_process)
+
+    state = offmarket_parser.run_parser()
+
+    assert state["source"] == "data.nseindia.offmarket_parser"
+    assert state["files_seen"] == 3
+    assert state["already_processed_count"] == 1
+    assert state["files_considered"] == 2
+    assert state["parsed_count"] == 1
+    assert state["failed_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["parse_failed_count"] == 1
+    assert state["failed_classifications"] == {"parser_bug": 1}
+    assert state["rows_written"] == 4
+    assert state["from_date"] == "2026-06-01"
+    assert state["to_date"] == "2026-06-02"
+    assert state["failed_files"][0]["file_name"] == "nsedeals/bad.csv"
+    assert state["failed_files"][0]["classification"] == "parser_bug"
+    assert failed_states == [("nsedeals", "nsedeals/bad.csv", "classification=parser_bug; ValueError: bad schema")]
+    assert state["state_advanced"] is True
+
+
+def test_nse_offmarket_parser_records_parse_failure_fallback(monkeypatch):
+    from data.nseindia import offmarket_parser
+
+    failed_states = []
+    events = []
+    monkeypatch.setattr(offmarket_parser, "get_processed_keys", lambda _source, status="processed": set())
+    monkeypatch.setattr(
+        offmarket_parser,
+        "mark_failed",
+        lambda source_prefix, object_key, error_message: failed_states.append((source_prefix, object_key, error_message)),
+    )
+    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/bulk_deals_bad.csv"])
+    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: "/tmp/bulk_deals_bad.csv")
+    monkeypatch.setattr(
+        offmarket_parser,
+        "process_csv",
+        lambda _file_name, _csv_path: (_ for _ in ()).throw(KeyError("client_name")),
+    )
+    monkeypatch.setattr(
+        offmarket_parser,
+        "record_local_fallback_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    state = offmarket_parser.run_parser()
+
+    assert state["failed_count"] == 1
+    assert state["failed_classifications"] == {"schema_changed": 1}
+    assert failed_states == [
+        ("nsedeals", "nsedeals/bulk_deals_bad.csv", "classification=schema_changed; KeyError: 'client_name'")
+    ]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.nseindia.offmarket_parser"
+    assert event["source"] == "nsedeals/bulk_deals_bad.csv"
+    assert event["fallback_type"] == "nse_offmarket_parse_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], KeyError)
+    assert event["metadata"] == {
+        "file_name": "nsedeals/bulk_deals_bad.csv",
+        "classification": "schema_changed",
+        "error_message": "classification=schema_changed; KeyError: 'client_name'",
+    }
+
+
+def test_nse_offmarket_parser_marks_empty_valid_source(monkeypatch):
+    from data.nseindia import offmarket_parser
+
+    monkeypatch.setattr(offmarket_parser, "get_processed_keys", lambda _source, status="processed": set())
+    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/empty.csv"])
+    monkeypatch.setattr(offmarket_parser.store, "get_as_temp_file", lambda key: "/tmp/empty.csv")
+    monkeypatch.setattr(
+        offmarket_parser,
+        "process_csv",
+        lambda file_name, _csv_path: {
+            "file_name": file_name,
+            "dtype": "bulk_deals",
+            "status": offmarket_parser.EMPTY_VALID_STATUS,
+            "rows": 0,
+        },
+    )
+
+    state = offmarket_parser.run_parser()
+
+    assert state["files_considered"] == 1
+    assert state["parsed_count"] == 0
+    assert state["empty_valid_count"] == 1
+    assert state["failed_count"] == 0
+    assert state["rows_written"] == 1
+    assert state["state_advanced"] is True
+
+
+def test_nse_offmarket_parser_treats_empty_valid_source_as_completed(monkeypatch):
+    from data.nseindia import offmarket_parser
+
+    monkeypatch.setattr(
+        offmarket_parser,
+        "get_processed_keys",
+        lambda _source, status="processed": {"nsedeals/empty.csv"} if status == offmarket_parser.EMPTY_VALID_STATUS else set(),
+    )
+    monkeypatch.setattr(offmarket_parser.store, "list_files", lambda _prefix: ["nsedeals/empty.csv"])
+    monkeypatch.setattr(
+        offmarket_parser.store,
+        "get_as_temp_file",
+        lambda key: (_ for _ in ()).throw(AssertionError("completed empty key should not be fetched")),
+    )
+
+    state = offmarket_parser.run_parser()
+
+    assert state["already_processed_count"] == 1
+    assert state["files_considered"] == 0
+    assert state["empty_valid_count"] == 0
+    assert state["state_advanced"] is False
+
+
+def test_nse_offmarket_parser_schema_helpers_use_retryable_operations(monkeypatch):
+    from data.nseindia import offmarket_parser
+
+    operation_names = []
+    executed = []
+    fetch_rows = iter(
+        [
+            ("public.nseindia_offmarket_block_deals",),
+            None,
+            ("public.nseindia_offmarket_block_deals",),
+            ("integer",),
+        ]
+    )
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+        def fetchone(self):
+            return next(fetch_rows)
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(offmarket_parser, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(offmarket_parser, "execute_db_operation", fake_execute_db_operation)
+
+    offmarket_parser.ensure_unique_constraint(
+        "nseindia_offmarket_block_deals",
+        "uniq_test",
+        ["date", "symbol"],
+        drop_constraints=["old_constraint"],
+        drop_indexes=["old_index"],
+    )
+    offmarket_parser.ensure_text_columns("nseindia_offmarket_block_deals", ["symbol"])
+
+    assert operation_names == [
+        "offmarket_parser:ensure_unique_constraint:nseindia_offmarket_block_deals",
+        "offmarket_parser:ensure_text_columns:nseindia_offmarket_block_deals",
+    ]
+    assert any("DROP CONSTRAINT IF EXISTS old_constraint" in query for query, _ in executed)
+    assert any("DROP INDEX IF EXISTS old_index" in query for query, _ in executed)
+    assert any("ADD CONSTRAINT uniq_test UNIQUE (date, symbol)" in query for query, _ in executed)
+    assert any(
+        "ALTER TABLE nseindia_offmarket_block_deals ALTER COLUMN symbol TYPE TEXT" in query
+        for query, _ in executed
+    )
+
+
+def test_nse_offmarket_parser_failure_classifier_distinguishes_schema_and_parser_errors():
+    from data.nseindia import offmarket_parser
+
+    assert offmarket_parser.classify_offmarket_parse_failure(pd.errors.EmptyDataError("empty")) == "empty_valid_source"
+    assert offmarket_parser.classify_offmarket_parse_failure(KeyError("client_name")) == "schema_changed"
+    assert offmarket_parser.classify_offmarket_parse_failure(ValueError("Length mismatch: Expected axis has 4 elements")) == "schema_changed"
+    assert offmarket_parser.classify_offmarket_parse_failure(RuntimeError("unexpected parser branch")) == "parser_bug"
+
+
+def test_nse_offmarket_parser_main_exports_run_state(monkeypatch, capsys):
+    from data.nseindia import offmarket_parser
+
+    payload = {
+        "source": "data.nseindia.offmarket_parser",
+        "rows": 0,
+        "rows_read": 0,
+        "rows_written": 0,
+        "files_seen": 1,
+        "failed_count": 1,
+        "failed_attempt_count": 1,
+        "parse_failed_count": 1,
+        "state_advanced": False,
+    }
+
+    class FakeRedis:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(offmarket_parser, "run_parser", lambda: payload)
+    monkeypatch.setattr(offmarket_parser, "rop", FakeRedis())
+
+    assert offmarket_parser.main() == 0
+    capsys.readouterr()
+
+    assert offmarket_parser.STOCKEY_RUN_STATE["source"] == "data.nseindia.offmarket_parser"
+    assert offmarket_parser.STOCKEY_RUN_STATE["failed_count"] == 1
+    assert offmarket_parser.STOCKEY_RUN_STATE["state_advanced"] is False
+
+
+def test_bhavcopy_downloader_exports_retry_run_state(monkeypatch):
+    class FakeRedis:
+        def close(self):
+            return None
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    dates = [
+        bhavcopy_downloader.datetime(2026, 6, 10),
+        bhavcopy_downloader.datetime(2026, 6, 9),
+        bhavcopy_downloader.datetime(2026, 6, 8),
+    ]
+    calls = {"download": 0}
+
+    def fake_download(playwright, formatted_date, display_date, rop):
+        calls["download"] += 1
+        return calls["download"] != 2
+
+    monkeypatch.setattr(bhavcopy_downloader, "get_redis_client", lambda *args, **kwargs: FakeRedis())
+    monkeypatch.setattr(bhavcopy_downloader, "sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(bhavcopy_downloader, "load_downloaded_dates_from_store", lambda: set())
+    monkeypatch.setattr(bhavcopy_downloader, "reverse_daterange", lambda start, end: dates)
+    monkeypatch.setattr(bhavcopy_downloader, "filter_missing_date_members", lambda all_dates, existing: list(all_dates))
+    monkeypatch.setattr(bhavcopy_downloader, "download_bhavcopy_for_date", fake_download)
+
+    assert bhavcopy_downloader.main() == 0
+
+    state = bhavcopy_downloader.STOCKEY_RUN_STATE
+    assert state["source"] == "data.nseindia.bhavcopy_downloader"
+    assert state["candidate_dates"] == 3
+    assert state["missing_dates"] == 3
+    assert state["download_attempts"] == 3
+    assert state["failed_attempt_count"] == 1
+    assert state["source_unavailable_count"] == 1
+    assert state["downloaded_dates"] == 2
+    assert state["rows_written"] == 2
+    assert state["stopped_after_consecutive_failures"] is False
+    assert state["state_advanced"] is True
+
+
+def test_bhavcopy_downloader_records_download_failure_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    class FakePage:
+        def wait_for_timeout(self, *_args, **_kwargs):
+            raise RuntimeError("nse timeout")
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = []
+
+        def new_context(self):
+            return FakeContext()
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("download failure must not mark redis downloaded")
+
+    monkeypatch.setattr(bhavcopy_downloader, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    ok = bhavcopy_downloader.download_bhavcopy_for_date(
+        FakePlaywright(),
+        "2026-06-10",
+        "10-Jun-2026",
+        FakeRedis(),
+    )
+
+    assert ok is False
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.nseindia.bhavcopy_downloader"
+    assert event["source"] == "bhavcopy:2026-06-10"
+    assert event["fallback_type"] == "nse_bhavcopy_download_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert str(event["error"]) == "nse timeout"
+    assert event["metadata"] == {
+        "formatted_date": "2026-06-10",
+        "display_date": "10-Jun-2026",
+        "weekday": "Wednesday",
+        "source_prefix": "bhavcopy",
+    }
+
+
+def test_indices_downloader_exports_failure_stop_run_state(monkeypatch):
+    class FakeRedis:
+        def close(self):
+            return None
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    dates = [indices_downloader.datetime(2026, 6, day) for day in range(10, 2, -1)]
+    monkeypatch.setattr(indices_downloader, "get_redis_client", lambda *args, **kwargs: FakeRedis())
+    monkeypatch.setattr(indices_downloader, "sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(indices_downloader, "load_downloaded_dates_from_store", lambda: set())
+    monkeypatch.setattr(indices_downloader, "latest_downloaded_date", lambda existing: None)
+    monkeypatch.setattr(indices_downloader, "reverse_daterange", lambda start, end: dates)
+    monkeypatch.setattr(indices_downloader, "download_indices_for_date", lambda *args, **kwargs: False)
+    monkeypatch.setattr(indices_downloader, "parse_datetime_arg", lambda value: indices_downloader.datetime.strptime(value, "%Y-%m-%d") if value else None)
+    monkeypatch.setattr(sys, "argv", ["data.nseindia.indices_downloader", "--backfill", "--from-date", "2026-06-03", "--to-date", "2026-06-10"])
+
+    with pytest.raises(SystemExit):
+        indices_downloader.main()
+
+    state = indices_downloader.STOCKEY_RUN_STATE
+    assert state["source"] == "data.nseindia.indices_downloader"
+    assert state["mode"] == "backfill"
+    assert state["candidate_dates"] == 8
+    assert state["download_attempts"] == 7
+    assert state["failed_attempt_count"] == 7
+    assert state["source_unavailable_count"] == 7
+    assert state["skipped_after_failure_stop"] == 1
+    assert state["stopped_after_consecutive_failures"] is True
+    assert state["state_advanced"] is False
+
+
+def test_indices_downloader_records_download_failure_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    class FakePage:
+        def wait_for_timeout(self, *_args, **_kwargs):
+            raise RuntimeError("indices timeout")
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = []
+
+        def new_context(self):
+            return FakeContext()
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeRedis:
+        def sadd(self, *_args, **_kwargs):
+            raise AssertionError("download failure must not mark redis downloaded")
+
+    monkeypatch.setattr(indices_downloader, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    ok = indices_downloader.download_indices_for_date(
+        FakePlaywright(),
+        "2026-06-10",
+        "10-Jun-2026",
+        FakeRedis(),
+    )
+
+    assert ok is False
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.nseindia.indices_downloader"
+    assert event["source"] == "indices:2026-06-10"
+    assert event["fallback_type"] == "nse_indices_download_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert str(event["error"]) == "indices timeout"
+    assert event["metadata"] == {
+        "formatted_date": "2026-06-10",
+        "display_date": "10-Jun-2026",
+        "weekday": "Wednesday",
+        "source_prefix": "indices",
+    }
+
+
+def test_event_evidence_store_exports_runner_state(monkeypatch, capsys):
+    monkeypatch.setattr(
+        event_evidence_store,
+        "parse_args",
+        lambda: argparse.Namespace(
+            from_date=None,
+            to_date=None,
+            rebuild=False,
+            lookback_days=365,
+            skip_bhavcopy=False,
+            skip_announcements=False,
+            dry_run=False,
+        ),
+    )
+    monkeypatch.setattr(
+        event_evidence_store,
+        "build_event_evidence_store",
+        lambda **kwargs: {
+            "status": "ok",
+            "dry_run": False,
+            "bhavcopy": {"rows": 7, "date_min": "2026-06-01T00:00:00+00:00", "date_max": "2026-06-10T00:00:00+00:00"},
+            "announcements": {"rows": 3, "date_min": "2026-06-03T00:00:00+00:00", "date_max": "2026-06-11T00:00:00+00:00"},
+        },
+    )
+
+    assert event_evidence_store.main() == 0
+    capsys.readouterr()
+
+    assert event_evidence_store.STOCKEY_RUN_STATE["rows"] == 10
+    assert event_evidence_store.STOCKEY_RUN_STATE["rows_written"] == 10
+    assert event_evidence_store.STOCKEY_RUN_STATE["from_date"] == "2026-06-01T00:00:00+00:00"
+    assert event_evidence_store.STOCKEY_RUN_STATE["to_date"] == "2026-06-11T00:00:00+00:00"
+    assert event_evidence_store.STOCKEY_RUN_STATE["bhavcopy_rows"] == 7
+    assert event_evidence_store.STOCKEY_RUN_STATE["announcement_rows"] == 3
+
+
+def test_bhavcopy_parser_main_exports_runner_state(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bhavcopy_parser,
+        "run_parser",
+        lambda: {
+            "source": "bhavcopy",
+            "rows": 2,
+            "rows_read": 3,
+            "rows_written": 2,
+            "files_seen": 4,
+            "files_considered": 3,
+            "parsed_count": 1,
+            "empty_processed_count": 1,
+            "failed_count": 1,
+            "from_date": "2026-06-01",
+            "to_date": "2026-06-03",
+            "fallback_used": False,
+            "state_advanced": True,
+        },
+    )
+
+    assert bhavcopy_parser.main() == 0
+    capsys.readouterr()
+
+    assert bhavcopy_parser.STOCKEY_RUN_STATE["source"] == "bhavcopy"
+    assert bhavcopy_parser.STOCKEY_RUN_STATE["rows"] == 2
+    assert bhavcopy_parser.STOCKEY_RUN_STATE["rows_read"] == 3
+    assert bhavcopy_parser.STOCKEY_RUN_STATE["rows_written"] == 2
+    assert bhavcopy_parser.STOCKEY_RUN_STATE["parsed_count"] == 1
+    assert bhavcopy_parser.STOCKEY_RUN_STATE["empty_processed_count"] == 1
+    assert bhavcopy_parser.STOCKEY_RUN_STATE["failed_count"] == 1
+    assert bhavcopy_parser.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_indices_parser_main_exports_runner_state(monkeypatch, capsys):
+    monkeypatch.setattr(
+        indices_parser,
+        "run_parser",
+        lambda: {
+            "source": "indices",
+            "rows": 1,
+            "rows_read": 2,
+            "rows_written": 1,
+            "files_seen": 2,
+            "files_considered": 2,
+            "parsed_count": 1,
+            "empty_or_incomplete_count": 1,
+            "failed_count": 0,
+            "from_date": "2026-06-01",
+            "to_date": "2026-06-02",
+            "fallback_used": False,
+            "state_advanced": True,
+        },
+    )
+
+    assert indices_parser.main() == 0
+    capsys.readouterr()
+
+    assert indices_parser.STOCKEY_RUN_STATE["source"] == "indices"
+    assert indices_parser.STOCKEY_RUN_STATE["rows"] == 1
+    assert indices_parser.STOCKEY_RUN_STATE["rows_read"] == 2
+    assert indices_parser.STOCKEY_RUN_STATE["rows_written"] == 1
+    assert indices_parser.STOCKEY_RUN_STATE["parsed_count"] == 1
+    assert indices_parser.STOCKEY_RUN_STATE["empty_or_incomplete_count"] == 1
+    assert indices_parser.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
 def test_download_runner_prioritizes_dhan_and_registered_screener_sync():
     steps = download_runner.DOWNLOAD_STEPS
     modules = [step["module"] for step in steps[:6]]
@@ -10386,7 +21305,61 @@ def test_download_runner_prioritizes_dhan_and_registered_screener_sync():
     assert steps[5]["args"] == []
     assert steps[5]["purpose"] == "screener_sync_registered"
     parser_modules = [step["module"] for step in download_runner.PARSER_STEPS]
-    assert parser_modules[-2:] == ["data.nseindia.indices_parser", "data.benchmark_sync"]
+    assert parser_modules[-3:] == ["data.nseindia.indices_parser", "data.benchmark_sync", "advisory.event_evidence_store"]
+
+
+def test_company_master_main_exports_identifier_run_state(monkeypatch, capsys):
+    from data import company_master as company_master_module
+
+    df = pd.DataFrame(
+        [
+            {
+                "company_master_id": "nse:AAA",
+                "nse_ticker": "AAA",
+                "bse_ticker": "500001",
+                "sharpely_id": "s1",
+                "dhan_nse_id": 1,
+                "dhan_bse_id": 2,
+            },
+            {
+                "company_master_id": "nse:BBB",
+                "nse_ticker": "BBB",
+                "bse_ticker": pd.NA,
+                "sharpely_id": pd.NA,
+                "dhan_nse_id": 3,
+                "dhan_bse_id": pd.NA,
+            },
+        ]
+    )
+    monkeypatch.setattr(company_master_module, "sync_company_master", lambda: df)
+
+    assert company_master_module.main() == 0
+    capsys.readouterr()
+
+    state = company_master_module.STOCKEY_RUN_STATE
+    assert state["source"] == "data.company_master"
+    assert state["rows_written"] == 2
+    assert state["nse_ticker_count"] == 2
+    assert state["bse_ticker_count"] == 1
+    assert state["sharpely_id_count"] == 1
+    assert state["dhan_nse_id_count"] == 2
+    assert state["dhan_bse_id_count"] == 1
+    assert state["state_advanced"] is True
+
+
+def test_company_master_main_exports_no_data_state(monkeypatch, capsys):
+    from data import company_master as company_master_module
+
+    monkeypatch.setattr(company_master_module, "sync_company_master", lambda: pd.DataFrame())
+
+    assert company_master_module.main() == 0
+    capsys.readouterr()
+
+    state = company_master_module.STOCKEY_RUN_STATE
+    assert state["source"] == "data.company_master"
+    assert state["rows_written"] == 0
+    assert state["no_data_count"] == 1
+    assert state["state_advanced"] is False
 
 
 def test_benchmark_sync_normalizes_nifty_from_nse_indices(monkeypatch):
@@ -10429,6 +21402,60 @@ def test_benchmark_sync_normalizes_nifty_from_nse_indices(monkeypatch):
     assert float(row["close"]) == 25050.0
 
 
+def test_benchmark_sync_main_exports_partial_run_state(monkeypatch, capsys):
+    events = []
+
+    def fake_sync(symbol, **kwargs):
+        assert kwargs["dry_run"] is False
+        if symbol == "BAD":
+            raise ValueError("Unsupported benchmark: BAD")
+        return {"status": "ok", "ticker": symbol, "rows_loaded": 3}
+
+    monkeypatch.setattr(benchmark_sync, "sync_benchmark", fake_sync)
+    monkeypatch.setattr(benchmark_sync, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(sys, "argv", ["benchmark_sync.py", "--symbols", "NIFTY", "BAD"])
+
+    assert benchmark_sync.main() == 0
+    capsys.readouterr()
+
+    state = benchmark_sync.STOCKEY_RUN_STATE
+    assert state["source"] == "data.benchmark_sync"
+    assert state["rows_written"] == 3
+    assert state["symbol_count"] == 2
+    assert state["succeeded_symbol_count"] == 1
+    assert state["failed_symbol_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["failed_symbols"][0]["symbol"] == "BAD"
+    assert state["state_advanced"] is True
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.benchmark_sync"
+    assert event["fallback_type"] == "benchmark_sync_symbol_failed"
+    assert event["source"] == "benchmark_sync"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], ValueError)
+    assert event["metadata"]["symbol"] == "BAD"
+    assert event["metadata"]["dry_run"] is False
+
+
+def test_benchmark_sync_main_marks_dry_run_not_advanced(monkeypatch, capsys):
+    monkeypatch.setattr(
+        benchmark_sync,
+        "sync_benchmark",
+        lambda symbol, **kwargs: {"status": "ok", "ticker": symbol, "rows_loaded": 2},
+    )
+    monkeypatch.setattr(sys, "argv", ["benchmark_sync.py", "--symbols", "NIFTY", "--dry-run"])
+
+    assert benchmark_sync.main() == 0
+    capsys.readouterr()
+
+    state = benchmark_sync.STOCKEY_RUN_STATE
+    assert state["rows"] == 2
+    assert state["rows_written"] == 0
+    assert state["dry_run"] is True
+    assert state["state_advanced"] is False
+
+
 def test_technical_and_regime_benchmark_loaders_prefer_nse_indices(monkeypatch):
     nse = pd.DataFrame(
         [
@@ -10460,6 +21487,92 @@ def test_technical_and_regime_benchmark_loaders_prefer_nse_indices(monkeypatch):
     assert regime["benchmark_close"].tolist() == [100.0, 101.0]
 
 
+def test_technical_features_records_nse_benchmark_fallback_and_uses_dhan(monkeypatch):
+    events = []
+    calls = []
+
+    def fake_sql_to_df(query, params=None):
+        calls.append(str(query))
+        if "FROM nseindia_indices" in str(query):
+            raise RuntimeError("nse timeout")
+        return pd.DataFrame(
+            [
+                {"ticker": "NIFTY", "date": pd.Timestamp("2026-01-01T00:00:00Z"), "close": 100.0},
+                {"ticker": "NIFTY", "date": pd.Timestamp("2026-01-02T00:00:00Z"), "close": 101.0},
+            ]
+        )
+
+    monkeypatch.setattr(technical_features, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(technical_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = technical_features.load_benchmark_series(benchmark_name="NIFTY")
+
+    assert not out.empty
+    assert any("FROM dhan_ohlcv_daily" in query for query in calls)
+    assert events[0]["fallback_type"] == "technical_features_nse_benchmark_load_failed"
+    assert events[0]["source"] == "nseindia_indices"
+
+
+def test_technical_features_records_price_history_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(technical_features, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("price failed")))
+    monkeypatch.setattr(technical_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="price failed"):
+        technical_features.load_price_history(symbols=["ABC"], to_date=pd.Timestamp("2026-06-01T00:00:00Z"))
+
+    assert events[0]["fallback_type"] == "technical_features_price_history_load_failed"
+    assert events[0]["source"] == "dhan_ohlcv_daily"
+
+
+def test_technical_features_rebuild_cleanup_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+    upserts: list[tuple[str, int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    frame = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "symbol": "ABC",
+                "series": "EQ",
+                "close": 100.0,
+            }
+        ]
+    )
+    monkeypatch.setattr(technical_features, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(technical_features, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(
+        technical_features,
+        "upsert_to_db",
+        lambda frame, table, **_kwargs: upserts.append((table, len(frame))),
+    )
+
+    technical_features.persist_technical_features(frame, rebuild=True, symbols=["ABC"])
+
+    assert operation_names == ["technical_features:delete_rebuild_features"]
+    assert len(executed) == 1
+    assert f"DELETE FROM {technical_features.TABLE_NAME}" in executed[0][0]
+    assert executed[0][1] == (["ABC"],)
+    assert upserts == [(technical_features.TABLE_NAME, 1)]
+
+
 def test_dhan_scrip_master_loads_new_freeze_quantity_column(tmp_path):
     csv_path = tmp_path / "dhan_master.csv"
     csv_path.write_text(
@@ -10487,6 +21600,65 @@ def test_dhan_scrip_master_dynamic_insert_uses_explicit_columns():
     assert "SELECT st.*" not in sql
 
 
+def test_dhan_scrip_master_ensure_master_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(dhan_scrip_master, "apply_schema_migration", lambda **kwargs: calls.append(kwargs))
+
+    dhan_scrip_master.ensure_master_table()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == dhan_scrip_master.DHAN_MASTER_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "data.dhanlive.scrip_master"
+    assert call["metadata"] == {"tables": ["master_dhan_instruments"], "source": "dhan_scrip_master"}
+    ddl = "\n".join(call["statements"])
+    assert "CREATE TABLE IF NOT EXISTS master_dhan_instruments" in ddl
+    assert "sm_freeze_qty           DOUBLE PRECISION" in ddl
+    assert "CREATE INDEX IF NOT EXISTS idx_master_dhan_active" in ddl
+
+
+def test_dhan_scrip_master_download_failure_records_local_fallback(monkeypatch):
+    events = []
+
+    def fail_get(*_args, **_kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(dhan_scrip_master.requests, "get", fail_get)
+    monkeypatch.setattr(dhan_scrip_master, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(SystemExit) as raised:
+        dhan_scrip_master.download_master_csv(timeout=7)
+
+    assert "[ERROR] download failed" in str(raised.value)
+    assert len(events) == 1
+    assert events[0]["module"] == "data.dhanlive.scrip_master"
+    assert events[0]["source"] == "dhan_scrip_master"
+    assert events[0]["fallback_type"] == "dhan_scrip_master_download_failed"
+    assert events[0]["metadata"]["timeout"] == 7
+
+
+def test_dhan_scrip_master_short_response_records_local_fallback(monkeypatch):
+    events = []
+
+    class FakeResponse:
+        content = b"too-small"
+
+        def raise_for_status(self):
+            return None
+
+    monkeypatch.setattr(dhan_scrip_master.requests, "get", lambda *_args, **_kwargs: FakeResponse())
+    monkeypatch.setattr(dhan_scrip_master, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(SystemExit) as raised:
+        dhan_scrip_master.download_master_csv()
+
+    assert "response too small" in str(raised.value)
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "dhan_scrip_master_response_too_small"
+    assert events[0]["metadata"]["response_bytes"] == len(FakeResponse.content)
+
+
 def test_dhan_scrip_master_sync_schema_adds_missing_columns():
     class FakeCursor:
         def __init__(self):
@@ -10504,6 +21676,1060 @@ def test_dhan_scrip_master_sync_schema_adds_missing_columns():
     dhan_scrip_master.sync_master_schema(cur, df)
 
     assert any('ADD COLUMN "sm_freeze_qty" DOUBLE PRECISION' in query for query in cur.queries)
+
+
+def test_dhan_scrip_master_update_database_uses_retryable_operation(monkeypatch):
+    operation_names = []
+    queries = []
+    copied = []
+    commits = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            queries.append((str(query), params))
+
+        def copy_from(self, buf, table, sep, null, columns):
+            copied.append((buf.getvalue(), table, sep, null, columns))
+
+    class FakeConnection:
+        def commit(self):
+            commits.append(True)
+
+    class FakeSession:
+        def __enter__(self):
+            return FakeConnection(), FakeCursor()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    frame = pd.DataFrame({"exch_id": ["NSE"], "segment": ["E"], "security_id": [123], "sm_freeze_qty": [5000.0]})
+    fixed_now = datetime(2026, 6, 12, 9, 30, tzinfo=timezone.utc)
+
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now if tz else fixed_now.replace(tzinfo=None)
+
+    monkeypatch.setattr(dhan_scrip_master, "datetime", FixedDateTime)
+    monkeypatch.setattr(dhan_scrip_master, "ensure_master_table", lambda: None)
+    monkeypatch.setattr(dhan_scrip_master, "sync_master_schema", lambda cur, df: queries.append(("SYNC_SCHEMA", list(df.columns))))
+    monkeypatch.setattr(dhan_scrip_master, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(dhan_scrip_master, "execute_db_operation", fake_execute_db_operation)
+
+    load_ts = dhan_scrip_master.update_database(frame)
+
+    assert load_ts == fixed_now
+    assert operation_names == ["dhan_scrip_master:update_database"]
+    assert commits == [True]
+    assert copied and copied[0][1] == "_stage"
+    assert copied[0][4] == ["exch_id", "segment", "security_id", "sm_freeze_qty"]
+    assert any("CREATE TEMP TABLE _stage" in query for query, _ in queries)
+    assert any(query == "BEGIN;" for query, _ in queries)
+    assert any(query == "COMMIT;" for query, _ in queries)
+
+
+def test_dhan_scrip_master_main_exports_runner_state(monkeypatch, tmp_path):
+    csv_path = tmp_path / "dhan_master.csv"
+    df = pd.DataFrame(
+        {
+            "exch_id": ["NSE", "NSE"],
+            "segment": ["E", "E"],
+            "security_id": [1, 2],
+            "sm_freeze_qty": [100.0, 200.0],
+        }
+    )
+    load_ts = datetime(2026, 6, 11, 9, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(dhan_scrip_master, "download_master_csv", lambda: csv_path)
+    monkeypatch.setattr(dhan_scrip_master, "load_csv", lambda path: df.copy())
+    monkeypatch.setattr(dhan_scrip_master, "update_database", lambda frame: load_ts)
+
+    assert dhan_scrip_master.main() == 0
+
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["rows"] == 2
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["rows_read"] == 2
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["rows_written"] == 2
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["column_count"] == 4
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["source_file"] == str(csv_path)
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["load_ts"] == load_ts.isoformat()
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["fallback_used"] is False
+
+
+def test_screener_parser_main_exports_runner_state(monkeypatch, capsys):
+    monkeypatch.setattr(screener_parser_module, "load_registered_urls", lambda: ["https://www.screener.in/screens/1/demo/"])
+    monkeypatch.setattr(
+        screener_parser_module,
+        "sync_screener",
+        lambda url: {
+            "source_name": "screener.in",
+            "screener_slug": "demo",
+            "screener_name": "Demo",
+            "screen_id": 1,
+            "date": "2026-06-11",
+            "row_count": 3,
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["data.screenerin.screener_parser"])
+
+    assert screener_parser_module.main() == 0
+    capsys.readouterr()
+
+    assert screener_parser_module.STOCKEY_RUN_STATE["source"] == "screener.in"
+    assert screener_parser_module.STOCKEY_RUN_STATE["rows"] == 3
+    assert screener_parser_module.STOCKEY_RUN_STATE["rows_read"] == 3
+    assert screener_parser_module.STOCKEY_RUN_STATE["rows_written"] == 3
+    assert screener_parser_module.STOCKEY_RUN_STATE["screener_count"] == 1
+    assert screener_parser_module.STOCKEY_RUN_STATE["screeners_synced"] == 1
+    assert screener_parser_module.STOCKEY_RUN_STATE["from_date"] == "2026-06-11"
+    assert screener_parser_module.STOCKEY_RUN_STATE["to_date"] == "2026-06-11"
+    assert screener_parser_module.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_screener_parser_main_exports_no_data_state(monkeypatch, capsys):
+    monkeypatch.setattr(screener_parser_module, "load_registered_urls", lambda: [])
+    monkeypatch.setattr(sys, "argv", ["data.screenerin.screener_parser"])
+
+    assert screener_parser_module.main() == 0
+    captured = capsys.readouterr()
+
+    assert "no_registered_screener_urls" in captured.out
+    assert screener_parser_module.STOCKEY_RUN_STATE["rows"] == 0
+    assert screener_parser_module.STOCKEY_RUN_STATE["screener_count"] == 0
+    assert screener_parser_module.STOCKEY_RUN_STATE["state_advanced"] is False
+
+
+def test_screener_parser_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(screener_parser_module, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    screener_parser_module.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == screener_parser_module.SCREENER_PARSER_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [screener_parser_module.SNAPSHOT_TABLE, screener_parser_module.REGISTRY_TABLE],
+        "source": screener_parser_module.SOURCE_NAME,
+    }
+    assert any(screener_parser_module.SNAPSHOT_TABLE in statement for statement in calls[0]["statements"])
+    assert any(screener_parser_module.REGISTRY_TABLE in statement for statement in calls[0]["statements"])
+    assert any("raw_json JSONB NOT NULL" in statement for statement in calls[0]["statements"])
+    assert any("screener_slug TEXT PRIMARY KEY" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (date, screener_slug)" in statement for statement in calls[0]["statements"])
+
+
+def test_screener_parser_to_number_records_numeric_parse_fallbacks(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(screener_parser_module, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(screener_parser_module, "int", lambda value: (_ for _ in ()).throw(ValueError("int failed")), raising=False)
+    monkeypatch.setattr(screener_parser_module, "float", lambda value: (_ for _ in ()).throw(ValueError("float failed")), raising=False)
+
+    assert screener_parser_module.to_number("123") == "123"
+    assert screener_parser_module.to_number("12.3") == "12.3"
+    assert [event["fallback_type"] for event in events] == [
+        "screener_integer_parse_failed",
+        "screener_float_parse_failed",
+    ]
+    assert all(event["module"] == "data.screenerin.screener_parser" for event in events)
+    assert all(event["source"] == "screener_numeric_parse" for event in events)
+
+
+def test_screener_parser_mutations_use_retryable_operations(monkeypatch):
+    operation_names = []
+    executed = []
+
+    class FakeCursor:
+        rowcount = 2
+
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(screener_parser_module, "ensure_tables", lambda: None)
+    monkeypatch.setattr(screener_parser_module, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(screener_parser_module, "execute_db_operation", fake_execute_db_operation)
+
+    registered = screener_parser_module.upsert_registered_screener(
+        screener_url="https://www.screener.in/screens/123/demo-screen/",
+        screener_name="Demo Screen",
+        is_active=True,
+    )
+    removed = screener_parser_module.remove_registered_screener("demo-screen")
+    screener_parser_module.upsert_snapshot(
+        screener_slug="demo-screen",
+        screener_name="Demo Screen",
+        screener_url="https://www.screener.in/screens/123/demo-screen/",
+        snapshot_date=datetime(2026, 6, 11, tzinfo=timezone.utc),
+        payload={"screen_id": 123, "companies": [{"ticker": "ABC"}]},
+    )
+
+    assert registered["screener_slug"] == "demo-screen"
+    assert removed == {"identifier": "demo-screen", "removed": 2}
+    assert operation_names == [
+        "screener_parser:upsert_registered_screener:demo-screen",
+        "screener_parser:remove_registered_screener",
+        "screener_parser:upsert_snapshot:demo-screen",
+    ]
+    assert any("INSERT INTO public.screenerin_screeners" in query for query, _ in executed)
+    assert any("DELETE FROM public.screenerin_screeners" in query for query, _ in executed)
+    assert any("INSERT INTO public.screenerin_screener_snapshots" in query for query, _ in executed)
+
+
+def test_advisory_screener_parser_persist_constituents_uses_retryable_delete(monkeypatch):
+    from advisory import screener_parser as advisory_screener_parser
+
+    operation_names = []
+    deletes = []
+    upserts = []
+
+    class Cursor:
+        def execute(self, query, params=None):
+            deletes.append((str(query), params))
+
+    class Session:
+        def __enter__(self):
+            return None, Cursor()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(advisory_screener_parser, "db_session", lambda: Session())
+    monkeypatch.setattr(advisory_screener_parser, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(
+        advisory_screener_parser,
+        "upsert_to_db",
+        lambda df, table_name, unique_keys, timescaledb_column=None: upserts.append(
+            (df.copy(), table_name, unique_keys, timescaledb_column)
+        ),
+    )
+
+    frame = pd.DataFrame(
+        [
+            {"date": date(2026, 6, 11), "screener_slug": "growth", "ticker": "ABC", "exchange": "NSE"},
+            {"date": date(2026, 6, 11), "screener_slug": "growth", "ticker": "XYZ", "exchange": "NSE"},
+            {"date": date(2026, 6, 12), "screener_slug": "value", "ticker": "DEF", "exchange": "NSE"},
+        ]
+    )
+
+    advisory_screener_parser.persist_constituents(frame)
+
+    assert operation_names == ["screener_parser:persist_constituents:delete_existing"]
+    assert len(deletes) == 2
+    assert all(advisory_screener_parser.CONSTITUENTS_TABLE in query for query, _ in deletes)
+    assert upserts
+    assert upserts[0][1] == advisory_screener_parser.CONSTITUENTS_TABLE
+    assert upserts[0][2] == ["date", "screener_slug", "ticker", "exchange"]
+    assert upserts[0][3] == "date"
+
+
+def test_screener_ad_hoc_query_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(screener_ad_hoc_query, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    screener_ad_hoc_query.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == screener_ad_hoc_query.AD_HOC_QUERY_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [screener_ad_hoc_query.RUNS_TABLE, screener_ad_hoc_query.RESULTS_TABLE],
+        "source": "screener.in",
+    }
+    assert any(screener_ad_hoc_query.RUNS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(screener_ad_hoc_query.RESULTS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("query_run_id TEXT PRIMARY KEY" in statement for statement in calls[0]["statements"])
+    assert any("ticker TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (query_run_id, company_id, company_name)" in statement for statement in calls[0]["statements"])
+
+
+def test_screener_ad_hoc_query_persist_uses_retryable_delete(monkeypatch):
+    executed: list[tuple[str, object]] = []
+    operation_names: list[str] = []
+    upserts: list[tuple[str, list[str], int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    run_df = pd.DataFrame(
+        [
+            {
+                "query_run_id": "run-1",
+                "query_name": "Quality",
+                "query_slug": "quality",
+                "query_text": "Market capitalization > 1000",
+                "query_hash": "hash",
+                "screener_url": "https://www.screener.in/screen/raw/?query=x",
+                "row_count": 1,
+                "raw_json": "{}",
+                "run_ts": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-06-10T00:00:00Z"),
+            }
+        ]
+    )
+    results_df = pd.DataFrame(
+        [
+            {
+                "query_run_id": "run-1",
+                "query_slug": "quality",
+                "query_name": "Quality",
+                "run_ts": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "company_id": 1,
+                "company_name": "ABC Ltd",
+                "ticker": "ABC",
+                "company_url": "/company/ABC/",
+                "page_slug": "ABC",
+                "rank": 1,
+                "metrics_json": "{}",
+                "load_ts": pd.Timestamp("2026-06-10T00:00:00Z"),
+            }
+        ]
+    )
+    monkeypatch.setattr(screener_ad_hoc_query, "ensure_tables", lambda: None)
+    monkeypatch.setattr(screener_ad_hoc_query, "db_session", lambda: FakeSession())
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    def fake_upsert(df, table, unique_keys, **_kwargs):
+        upserts.append((table, list(unique_keys), int(len(df))))
+
+    monkeypatch.setattr(screener_ad_hoc_query, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(screener_ad_hoc_query, "upsert_to_db", fake_upsert)
+
+    screener_ad_hoc_query.persist_query(run_df, results_df)
+
+    assert operation_names == ["screener_ad_hoc_query:delete_existing_results"]
+    assert executed and f"DELETE FROM {screener_ad_hoc_query.RESULTS_TABLE}" in executed[0][0]
+    assert executed[0][1] == ("run-1",)
+    assert upserts == [
+        (screener_ad_hoc_query.RUNS_TABLE, ["query_run_id"], 1),
+        (screener_ad_hoc_query.RESULTS_TABLE, ["query_run_id", "company_id", "company_name"], 1),
+    ]
+
+
+def test_screener_ad_hoc_query_main_exports_runner_state(monkeypatch, capsys):
+    result = {
+        "status": "ok",
+        "query_run_id": "run-1",
+        "query_name": "Quality Query",
+        "query_slug": "quality-query",
+        "row_count": 4,
+        "screener_url": "https://www.screener.in/screen/raw/?query=Market+capitalization",
+        "headers": [],
+        "companies": [],
+    }
+    monkeypatch.setattr(screener_ad_hoc_query, "run_ad_hoc_query", lambda **kwargs: result.copy())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "data.screenerin.ad_hoc_query",
+            "--query",
+            "Market capitalization > 1000",
+            "--name",
+            "Quality Query",
+        ],
+    )
+
+    assert screener_ad_hoc_query.main() == 0
+    capsys.readouterr()
+
+    assert screener_ad_hoc_query.STOCKEY_RUN_STATE["source"] == "screener.in"
+    assert screener_ad_hoc_query.STOCKEY_RUN_STATE["query_run_id"] == "run-1"
+    assert screener_ad_hoc_query.STOCKEY_RUN_STATE["query_slug"] == "quality-query"
+    assert screener_ad_hoc_query.STOCKEY_RUN_STATE["rows"] == 4
+    assert screener_ad_hoc_query.STOCKEY_RUN_STATE["rows_read"] == 4
+    assert screener_ad_hoc_query.STOCKEY_RUN_STATE["rows_written"] == 4
+    assert screener_ad_hoc_query.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_screener_query_validation_accepts_dma_syntax():
+    issues = screener_query_validation.validate_screener_query(
+        "Market capitalization > 1000 AND Current price > DMA 50 AND Current price > DMA 200"
+    )
+
+    assert issues == []
+
+
+def test_screener_query_validation_rejects_moving_average_aliases():
+    with pytest.raises(screener_query_validation.ScreenerQueryValidationError) as excinfo:
+        screener_query_validation.assert_valid_screener_query(
+            "Current price > 50 Day Moving Average AND Current price > DMA200"
+        )
+
+    message = str(excinfo.value)
+    assert "Use `DMA 50`" in message
+    assert "Use `DMA 200` with a space" in message
+
+
+def test_screener_ad_hoc_validation_failure_is_recorded_before_browser(monkeypatch):
+    failures = []
+    opened = []
+    monkeypatch.setattr(screener_ad_hoc_query, "open_screener_browser_session", lambda: opened.append(True))
+    monkeypatch.setattr(screener_ad_hoc_query, "record_screener_failure", lambda **kwargs: failures.append(kwargs) or kwargs)
+
+    with pytest.raises(screener_query_validation.ScreenerQueryValidationError):
+        screener_ad_hoc_query.fetch_ad_hoc_payload(
+            query_text="Current price > 50 Day Moving Average",
+            query_name="Bad DMA Alias",
+            persist=False,
+        )
+
+    assert opened == []
+    assert failures
+    assert failures[0]["failure_stage"] == "ad_hoc_validation"
+    assert failures[0]["query_text"] == "Current price > 50 Day Moving Average"
+    assert failures[0]["query_name"] == "Bad DMA Alias"
+
+
+def test_operator_api_screener_preview_validates_without_fetch(monkeypatch):
+    fetched = []
+    monkeypatch.setattr(operator_api, "fetch_ad_hoc_payload", lambda **kwargs: fetched.append(kwargs) or {})
+
+    payload = operator_api.build_screener_preview_payload(
+        {
+            "query_name": "DMA typo",
+            "query_text": "Current price > 50 Day Moving Average AND Current price > DMA200",
+            "fetch_rows": True,
+        }
+    )
+
+    assert payload["status"] == "invalid"
+    assert fetched == []
+    assert len(payload["validation_issues"]) == 2
+    assert payload["operator_boundary"]["investment_state_read_only"] is True
+    assert payload["operator_boundary"]["failure_audit_write_possible"] is True
+    assert payload["operator_boundary"]["registers_production_screener"] is False
+
+
+def test_operator_api_screener_preview_fetches_without_persisting(monkeypatch):
+    calls = []
+
+    def fake_fetch(**kwargs):
+        calls.append(kwargs)
+        return {
+            "query_run_id": "run-1",
+            "screener_url": "https://www.screener.in/screen/raw/?query=x",
+            "headers": ["S.No.", "Name", "Current Price"],
+            "companies": [
+                {"name": "Alpha Ltd", "ticker": "ALPHA", "url": "/company/ALPHA/", "s_no": 1, "metrics": {"Current Price": 100}},
+                {"name": "Beta Ltd", "ticker": "BETA", "url": "/company/BETA/", "s_no": 2, "metrics": {"Current Price": 200}},
+            ],
+        }
+
+    monkeypatch.setattr(operator_api, "fetch_ad_hoc_payload", fake_fetch)
+
+    payload = operator_api.build_screener_preview_payload(
+        {
+            "query_name": "Valid DMA",
+            "query_text": "Current price > DMA 50 AND Current price > DMA 200",
+            "fetch_rows": True,
+            "row_limit": 1,
+        }
+    )
+
+    assert payload["status"] == "ok"
+    assert calls == [{"query_text": "Current price > DMA 50 AND Current price > DMA 200", "query_name": "Valid DMA", "persist": False}]
+    assert payload["row_count"] == 2
+    assert len(payload["rows"]) == 1
+    assert payload["meta"]["persisted"] is False
+    assert payload["meta"]["omitted_rows"] == 1
+    assert payload["operator_boundary"]["broker_execution_enabled"] is False
+    assert payload["api_schema"]["write_scope"] == "failure_audit_only_when_authenticated_fetch_fails"
+
+
+def test_screener_coverage_extracts_screener_slugs_from_contexts():
+    row = {
+        "source_screener_slug": "primary",
+        "source_screener_list": json.dumps(["primary", "secondary"]),
+        "raw_context_json": json.dumps({"source_screener_slug": "raw-context"}),
+        "recommendation_reason_json": json.dumps(
+            {
+                "evidence": {
+                    "screener": {
+                        "source_screener_slug": "reason-context",
+                        "source_screener_list": json.dumps(["secondary", "third"]),
+                    }
+                }
+            }
+        ),
+    }
+
+    assert screener_coverage.extract_screener_slugs(row) == ["primary", "raw-context", "reason-context", "secondary", "third"]
+
+
+def test_screener_coverage_records_corrupt_json_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(screener_coverage, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    row = {
+        "source_screener_slug": "primary",
+        "source_screener_list": "[bad list",
+        "raw_context_json": "{bad dict",
+        "recommendation_reason_json": "{bad reason",
+    }
+
+    assert screener_coverage.extract_screener_slugs(row) == ["primary"]
+    assert [event["fallback_type"] for event in events] == [
+        "screener_coverage_json_list_parse_failed",
+        "screener_coverage_json_dict_parse_failed",
+        "screener_coverage_json_dict_parse_failed",
+    ]
+    assert {event["module"] for event in events} == {"advisory.screener_coverage"}
+    assert {event["severity"] for event in events} == {"warn"}
+    assert {event["metadata"]["source"] for event in events} == {"json_dict", "json_list"}
+
+
+def test_screener_coverage_builds_read_only_metrics(monkeypatch):
+    monkeypatch.setattr(screener_coverage, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(
+        screener_coverage,
+        "_load_constituents",
+        lambda start_date, end_date: pd.DataFrame(
+            [
+                {
+                    "screener_date": pd.Timestamp("2026-06-10").date(),
+                    "screener_slug": "breakouts",
+                    "screener_name": "Breakouts",
+                    "constituent_rows": 10,
+                    "constituent_symbols": 10,
+                    "latest_load_ts": pd.Timestamp("2026-06-10T10:00:00Z"),
+                },
+                {
+                    "screener_date": pd.Timestamp("2026-06-10").date(),
+                    "screener_slug": "momentum",
+                    "screener_name": "Momentum",
+                    "constituent_rows": 20,
+                    "constituent_symbols": 20,
+                    "latest_load_ts": pd.Timestamp("2026-06-10T10:00:00Z"),
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        screener_coverage,
+        "_load_candidates",
+        lambda start_date, end_date: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                    "symbol": "AAA",
+                    "candidate_state": "PASS_NOW",
+                    "rule_pass": True,
+                    "source_screener_slug": "breakouts",
+                    "source_screener_list": json.dumps(["breakouts", "momentum"]),
+                    "setup_score": 82,
+                },
+                {
+                    "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                    "symbol": "BBB",
+                    "candidate_state": "WATCH_EVENT",
+                    "rule_pass": False,
+                    "source_screener_slug": "momentum",
+                    "source_screener_list": json.dumps(["momentum"]),
+                    "setup_score": 65,
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        screener_coverage,
+        "_load_actions",
+        lambda start_date, end_date: pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                    "symbol": "AAA",
+                    "action_code": "BUY",
+                    "raw_context_json": json.dumps({"source_screener_slug": "breakouts", "source_screener_list": json.dumps(["breakouts", "momentum"])}),
+                    "recommendation_reason_json": "{}",
+                },
+                {
+                    "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                    "symbol": "BBB",
+                    "action_code": "MANUAL_REVIEW",
+                    "raw_context_json": json.dumps({"source_screener_slug": "momentum"}),
+                    "recommendation_reason_json": "{}",
+                },
+            ]
+        ),
+    )
+
+    payload = screener_coverage.build_screener_coverage_payload(asof_date="2026-06-10", lookback_days=7, limit=10)
+    rows = {row["screener_slug"]: row for row in payload["screeners"]}
+
+    assert payload["status"] == "ok"
+    assert payload["summary"]["screener_count"] == 2
+    assert rows["breakouts"]["candidate_symbols"] == 1
+    assert rows["breakouts"]["action_symbols"] == 1
+    assert rows["breakouts"]["positive_action_rows"] == 1
+    assert rows["breakouts"]["action_symbol_coverage_pct"] == 10.0
+    assert rows["momentum"]["candidate_symbols"] == 2
+    assert rows["momentum"]["manual_review_rows"] == 1
+    assert rows["momentum"]["positive_action_rate_pct"] == 50.0
+
+
+def test_screener_failure_log_redacts_and_persists_context(monkeypatch):
+    writes = []
+    monkeypatch.setattr(screener_failure_log, "ensure_tables", lambda: None)
+    monkeypatch.setattr(screener_failure_log, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+
+    row = screener_failure_log.record_screener_failure(
+        failure_stage="ad_hoc_parse",
+        error=ValueError("Could not find Screener.in results table tokenId=SECRET123"),
+        screener_url="https://www.screener.in/screen/raw/?query=Current+price+%3E+DMA+50&tokenId=SECRET123",
+        final_url="https://www.screener.in/screen/raw/?tokenId=SECRET123",
+        query_text="Market capitalization > 1000 AND Current price > DMA 50",
+        query_name="Test query",
+        html="<html><body><form action='/login/'><input name='username'/></form>Bad field tokenId=SECRET123</body></html>",
+        http_status=200,
+        context={"access_token": "SECRET123"},
+    )
+
+    dumped = json.dumps(row, default=str)
+    assert "SECRET123" not in dumped
+    assert row["failure_stage"] == "ad_hoc_parse"
+    assert row["query_hash"]
+    assert row["has_login_form"] is True
+    assert "Bad field" in row["body_excerpt"]
+    assert len(writes) == 1
+    assert writes[0].iloc[0]["failure_stage"] == "ad_hoc_parse"
+
+
+def test_screener_ad_hoc_parse_failure_is_recorded(monkeypatch):
+    failures = []
+
+    class BrowserSession:
+        context = object()
+        page = object()
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(screener_ad_hoc_query, "open_screener_browser_session", lambda: BrowserSession())
+    monkeypatch.setattr(screener_ad_hoc_query, "ensure_screener_logged_in", lambda *args, **kwargs: None)
+    monkeypatch.setattr(screener_ad_hoc_query, "build_authenticated_requests_session", lambda context: object())
+    monkeypatch.setattr(screener_ad_hoc_query, "execute_query", lambda session, query_text: ("https://www.screener.in/screen/raw/?query=x", "<html>No results</html>"))
+    monkeypatch.setattr(screener_ad_hoc_query, "parse_screener_html", lambda html, url=None: (_ for _ in ()).throw(ValueError("Could not find Screener.in results table")))
+    monkeypatch.setattr(screener_ad_hoc_query, "record_screener_failure", lambda **kwargs: failures.append(kwargs) or kwargs)
+
+    with pytest.raises(ValueError, match="Could not find Screener"):
+        screener_ad_hoc_query.fetch_ad_hoc_payload(query_text="Current price > 50", query_name="Bad DMA", persist=False)
+
+    assert failures
+    assert failures[0]["failure_stage"] == "ad_hoc_parse"
+    assert failures[0]["query_text"] == "Current price > 50"
+    assert failures[0]["query_name"] == "Bad DMA"
+    assert "No results" in failures[0]["html"]
+
+
+def test_registered_screener_parse_failure_is_recorded(monkeypatch):
+    failures = []
+    monkeypatch.setattr(screener_parser_module, "ensure_tables", lambda: None)
+    monkeypatch.setattr(screener_parser_module, "get_screener_html", lambda url: "<html>No table</html>")
+    monkeypatch.setattr(screener_parser_module, "parse_screener_html", lambda html, url=None: (_ for _ in ()).throw(ValueError("Could not find Screener.in results table")))
+    monkeypatch.setattr(screener_parser_module, "record_screener_failure", lambda **kwargs: failures.append(kwargs) or kwargs)
+
+    with pytest.raises(ValueError, match="Could not find Screener"):
+        screener_parser_module.sync_screener("https://www.screener.in/screens/1/demo/")
+
+    assert failures
+    assert failures[0]["failure_stage"] == "registered_parse"
+    assert failures[0]["screener_url"] == "https://www.screener.in/screens/1/demo/"
+    assert "No table" in failures[0]["html"]
+
+
+def test_sharpely_scrip_master_main_exports_runner_state(monkeypatch, capsys):
+    writes: list[tuple[str, int, list[str]]] = []
+    fund_a = pd.DataFrame(
+        [
+            {"amfi_code": "1001", "plan_name": "Fund A"},
+            {"amfi_code": None, "plan_name": "Fund Missing"},
+        ]
+    )
+    fund_b = pd.DataFrame([{"amfi_code": "2001", "plan_name": "Fund B"}])
+    equity = pd.DataFrame(
+        [
+            {"symbol": "AAA", "bse_ticker": None, "proper_name": "AAA Ltd"},
+            {"symbol": None, "bse_ticker": "500001", "proper_name": "BSE Only Ltd"},
+            {"symbol": None, "bse_ticker": None, "proper_name": "Invalid Ltd"},
+        ]
+    )
+
+    monkeypatch.setattr(sharpely_scrip_master, "get_sharpely_headers", lambda: {"Authorization": "Bearer test"})
+    monkeypatch.setattr(sharpely_scrip_master, "get_latest_from_sharpely", lambda headers: [fund_a.copy(), fund_b.copy(), equity.copy()])
+    monkeypatch.setattr(
+        sharpely_scrip_master,
+        "upsert_to_db",
+        lambda df, table_name, unique_keys: writes.append((table_name, len(df), list(unique_keys))),
+    )
+
+    assert sharpely_scrip_master.main() == 0
+    capsys.readouterr()
+
+    assert writes == [
+        ("master_sharpely_funds", 2, ["amfi_code"]),
+        ("master_sharpely_equity", 2, ["symbol", "bse_ticker"]),
+    ]
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["source"] == "sharpely"
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows"] == 4
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows_read"] == 6
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["rows_written"] == 4
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["fund_rows"] == 2
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["equity_rows"] == 2
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["raw_fund_rows"] == 3
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["raw_equity_rows"] == 3
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["instrument_type_count"] == 3
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["fallback_used"] is False
+    assert sharpely_scrip_master.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_sharpely_load_latest_stock_meta_records_corrupt_json_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        sharpely_data,
+        "sql_to_df",
+        lambda *_args, **_kwargs: pd.DataFrame(
+            [
+                {
+                    "symbol": "ABC",
+                    "as_on_date": pd.Timestamp("2026-06-11"),
+                    "raw_json": "{bad-json",
+                    "sector_code": "FIN",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(sharpely_data, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    row = sharpely_data.load_latest_stock_meta("abc")
+
+    assert row is not None
+    assert row["symbol"] == "ABC"
+    assert row["sector_code"] == "FIN"
+    assert len(events) == 1
+    assert events[0]["module"] == "data.sharpelydata.sharpely_data"
+    assert events[0]["source"] == "sharpely"
+    assert events[0]["fallback_type"] == "sharpely_cached_meta_json_parse_failed"
+    assert events[0]["symbol"] == "ABC"
+    assert events[0]["metadata"] == {"table": sharpely_data.SHARPELY_STOCK_META_TABLE}
+
+
+def test_sharpely_data_sync_exports_fundamental_run_state(monkeypatch):
+    max_dates = {
+        sharpely_data.SHARPELY_STOCK_META_TABLE: None,
+        sharpely_data.SHARPELY_STOCK_PEERS_TABLE: None,
+        "stmt_income": pd.Timestamp("2026-05-30"),
+        "stmt_balancesheet": pd.Timestamp("2026-05-30"),
+        "stmt_cashflow": pd.Timestamp("2026-05-30"),
+        "shareholding_category": pd.Timestamp("2026-05-30"),
+        "shareholding_top_holders": pd.Timestamp("2026-05-30"),
+        "historical_mcap": pd.Timestamp("2026-05-30"),
+    }
+
+    def fake_get_db_max_date(table_name, **_kwargs):
+        return max_dates.get(table_name)
+
+    monkeypatch.setattr(
+        sharpely_data,
+        "normalize_date_window",
+        lambda from_date, to_date: (pd.Timestamp("2026-06-01").to_pydatetime(), pd.Timestamp("2026-06-11").to_pydatetime()),
+    )
+    monkeypatch.setattr(sharpely_data, "get_db_max_date", fake_get_db_max_date)
+    monkeypatch.setattr(sharpely_data, "choose_from_date", lambda explicit, candidates: pd.Timestamp("2026-06-01").to_pydatetime())
+    monkeypatch.setattr(
+        sharpely_data,
+        "get_stock_meta",
+        lambda symbol: [{"symbol": symbol, "as_on_date": "2026-06-11", "nse_basic_ind_code": "IND"}],
+    )
+    monkeypatch.setattr(
+        sharpely_data,
+        "save_stock_meta",
+        lambda symbol, payload: pd.DataFrame([{"raw_json": json.dumps(payload[0])}]),
+    )
+    monkeypatch.setattr(sharpely_data, "get_stock_peers", lambda symbol, meta=None: [{"symbol": f"{symbol}P"}])
+    monkeypatch.setattr(sharpely_data, "save_stock_peers", lambda symbol, meta, peers: pd.DataFrame([{"peer_symbol": peers[0]["symbol"]}]))
+    monkeypatch.setattr(sharpely_data, "get_financial_statement", lambda symbol, from_date, to_date: {"symbol": symbol, "rows": 3})
+    monkeypatch.setattr(sharpely_data, "get_shareholding", lambda symbol, from_date, to_date: {"symbol": symbol, "rows": 2})
+    monkeypatch.setattr(sharpely_data, "get_historical_mcap", lambda symbol, from_date, to_date: {"symbol": symbol, "rows": 4})
+
+    result = sharpely_data.sync_sharpely_data(["aaa", "BBB"], from_date=None, to_date=None)
+
+    assert result["source"] == "sharpely_fundamentals"
+    assert result["symbols"] == ["AAA", "BBB"]
+    assert result["symbol_count"] == 2
+    assert result["from_date"] == "2026-06-01"
+    assert result["to_date"] == "2026-06-11"
+    assert result["meta_rows"] == 2
+    assert result["peer_rows"] == 2
+    assert result["statement_rows"] == 6
+    assert result["shareholding_rows"] == 4
+    assert result["historical_mcap_rows"] == 8
+    assert result["rows_written"] == 22
+    assert result["rows"] == 22
+    assert result["meta_refreshed_count"] == 2
+    assert result["peer_refreshed_count"] == 2
+    assert result["statement_refreshed_count"] == 2
+    assert result["shareholding_refreshed_count"] == 2
+    assert result["mcap_refreshed_count"] == 2
+    assert result["symbols_skipped_no_work"] == []
+    assert result["state_advanced"] is True
+
+
+def test_sharpely_data_main_exports_runner_state(monkeypatch, capsys):
+    monkeypatch.setattr(sharpely_data, "load_tracked_symbols", lambda symbols: ["AAA", "BBB"])
+    monkeypatch.setattr(sharpely_data, "parse_datetime_arg", lambda value: pd.Timestamp(value).to_pydatetime() if value else None)
+    monkeypatch.setattr(
+        sharpely_data,
+        "sync_sharpely_data",
+        lambda **kwargs: {
+            "source": "sharpely_fundamentals",
+            "symbol_count": len(kwargs["symbols"]),
+            "rows": 5,
+            "rows_read": len(kwargs["symbols"]),
+            "rows_written": 5,
+            "from_date": "2026-06-01",
+            "to_date": "2026-06-11",
+            "fallback_used": False,
+            "state_advanced": True,
+        },
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["data.sharpelydata.sharpely_data", "--symbols", "AAA", "BBB", "--from-date", "2026-06-01", "--to-date", "2026-06-11"],
+    )
+
+    assert sharpely_data.main() == 0
+    capsys.readouterr()
+
+    assert sharpely_data.STOCKEY_RUN_STATE["source"] == "sharpely_fundamentals"
+    assert sharpely_data.STOCKEY_RUN_STATE["symbol_count"] == 2
+    assert sharpely_data.STOCKEY_RUN_STATE["rows"] == 5
+    assert sharpely_data.STOCKEY_RUN_STATE["rows_read"] == 2
+    assert sharpely_data.STOCKEY_RUN_STATE["rows_written"] == 5
+    assert sharpely_data.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_nse_corporate_actions_sync_returns_standard_run_state(monkeypatch):
+    persisted: list[dict[str, object]] = []
+    upserts: list[pd.DataFrame] = []
+    cursors: list[tuple[str, object]] = []
+
+    class FakeRedis:
+        def close(self):
+            return None
+
+    class FakeEquity:
+        def __init__(self, symbol: str):
+            self.display_name = f"{symbol} LTD"
+
+    class FakePage:
+        def goto(self, *_args, **_kwargs):
+            return None
+
+        def wait_for_timeout(self, *_args, **_kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def connect_over_cdp(self, *_args, **_kwargs):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_fetch(_page, symbol, _issuer, _from_date, _to_date):
+        return pd.DataFrame(
+            [
+                {
+                    "date": pd.Timestamp("2026-06-10"),
+                    "symbol": symbol,
+                    "series": "EQ",
+                    "subject": "Bonus issue",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(corporate_actions, "normalize_date_window", lambda from_date, to_date: (pd.Timestamp("2026-06-01").to_pydatetime(), pd.Timestamp("2026-06-11").to_pydatetime()))
+    monkeypatch.setattr(corporate_actions, "get_redis_client", lambda *_args, **_kwargs: FakeRedis())
+    monkeypatch.setattr(corporate_actions, "sync_playwright", lambda: FakePlaywright())
+    monkeypatch.setattr(corporate_actions, "get_nse_equity", lambda symbol: FakeEquity(symbol))
+    monkeypatch.setattr(corporate_actions, "choose_from_date", lambda explicit, candidates: pd.Timestamp("2026-06-01").to_pydatetime())
+    monkeypatch.setattr(corporate_actions, "get_redis_cursor", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(corporate_actions, "get_db_max_date", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(corporate_actions, "fetch_corporate_actions", fake_fetch)
+    monkeypatch.setattr(corporate_actions, "attach_company_master_id", lambda df, **_kwargs: df.copy())
+    monkeypatch.setattr(corporate_actions, "upsert_to_db", lambda df, *_args, **_kwargs: upserts.append(df.copy()))
+    monkeypatch.setattr(corporate_actions, "set_redis_cursor", lambda redis_client, key, value: cursors.append((key, value)))
+    monkeypatch.setattr(corporate_actions, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+
+    result = corporate_actions.sync_corporate_actions(["aaa", "BBB"], from_date=None, to_date=None)
+
+    assert result["source"] == corporate_actions.SYNC_SOURCE_NAME
+    assert result["rows"] == 2
+    assert result["rows_read"] == 2
+    assert result["rows_written"] == 2
+    assert result["symbol_count"] == 2
+    assert result["symbols_queried"] == 2
+    assert result["symbols_skipped"] == 0
+    assert result["from_date"] == "2026-06-01"
+    assert result["to_date"] == "2026-06-11"
+    assert result["latest_item_ts"].startswith("2026-06-10")
+    assert result["state_advanced"] is True
+    assert len(upserts) == 2
+    assert len(cursors) == 2
+    assert persisted[-1]["source_name"] == corporate_actions.SYNC_SOURCE_NAME
+    assert persisted[-1]["status"] == "ok"
+    assert persisted[-1]["state"]["rows_written"] == 2
+
+
+def test_nse_sparse_event_mains_export_runner_state(monkeypatch, capsys):
+    module_cases = [
+        (
+            corporate_actions,
+            "sync_corporate_actions",
+            "data.nseindia.corporate_actions",
+            ["data.nseindia.corporate_actions", "--symbols", "AAA", "--from-date", "2026-06-01", "--to-date", "2026-06-11"],
+        ),
+        (
+            earnings_events,
+            "sync_earnings_events",
+            "data.nseindia.earnings_events",
+            ["data.nseindia.earnings_events", "--symbols", "AAA", "--from-date", "2026-06-01", "--to-date", "2026-06-11"],
+        ),
+        (
+            insider_deals,
+            "sync_insider_deals",
+            "data.nseindia.insider_deals",
+            ["data.nseindia.insider_deals", "--symbols", "AAA", "--from-date", "2026-06-01", "--to-date", "2026-06-11"],
+        ),
+    ]
+
+    for module, sync_name, source_name, argv in module_cases:
+        monkeypatch.setattr(module, "load_tracked_symbols", lambda symbols: ["AAA"])
+        monkeypatch.setattr(module, "parse_datetime_arg", lambda value: pd.Timestamp(value).to_pydatetime() if value else None)
+        monkeypatch.setattr(
+            module,
+            sync_name,
+            lambda **kwargs: {
+                "source": source_name,
+                "rows": 3,
+                "rows_read": 1,
+                "rows_written": 3,
+                "symbol_count": len(kwargs["symbols"]),
+                "from_date": "2026-06-01",
+                "to_date": "2026-06-11",
+                "fallback_used": False,
+                "state_advanced": True,
+            },
+        )
+        monkeypatch.setattr(sys, "argv", argv)
+        assert module.main() == 0
+        capsys.readouterr()
+        assert module.STOCKEY_RUN_STATE["source"] == source_name
+        assert module.STOCKEY_RUN_STATE["rows"] == 3
+        assert module.STOCKEY_RUN_STATE["rows_read"] == 1
+        assert module.STOCKEY_RUN_STATE["rows_written"] == 3
+        assert module.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_recent_events_main_exports_runner_state(monkeypatch, capsys):
+    persisted: list[dict[str, object]] = []
+
+    class FakeRedis:
+        def close(self):
+            return None
+
+    class FakePlaywright:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(recent_events, "get_redis_client", lambda *_args, **_kwargs: FakeRedis())
+    monkeypatch.setattr(recent_events, "sync_playwright", lambda: FakePlaywright())
+    monkeypatch.setattr(
+        recent_events,
+        "dowload_events",
+        lambda playwright, formatted_date, rop: {"formatted_date": formatted_date, "rows": 7, "file_path": f"calendar_{formatted_date}.csv"},
+    )
+    monkeypatch.setattr(recent_events, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+    monkeypatch.setattr(sys, "argv", ["data.nseindia.recent_events", "--date", "2026-06-11"])
+
+    assert recent_events.main() == 0
+    capsys.readouterr()
+
+    assert recent_events.STOCKEY_RUN_STATE["source"] == recent_events.SYNC_SOURCE_NAME
+    assert recent_events.STOCKEY_RUN_STATE["rows"] == 7
+    assert recent_events.STOCKEY_RUN_STATE["rows_read"] == 1
+    assert recent_events.STOCKEY_RUN_STATE["rows_written"] == 7
+    assert recent_events.STOCKEY_RUN_STATE["from_date"] == "2026-06-11"
+    assert recent_events.STOCKEY_RUN_STATE["to_date"] == "2026-06-11"
+    assert recent_events.STOCKEY_RUN_STATE["state_advanced"] is True
+    assert persisted[-1]["source_name"] == recent_events.SYNC_SOURCE_NAME
+    assert persisted[-1]["status"] == "ok"
+
+
+def test_research_ledger_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(research_ledger, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    research_ledger.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == research_ledger.RESEARCH_LEDGER_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [research_ledger.LEDGER_TABLE]
+    assert any(research_ledger.LEDGER_TABLE in statement for statement in calls[0]["statements"])
+    assert any("config_hash" in statement and "validation_protocol_json" in statement for statement in calls[0]["statements"])
 
 
 def test_research_ledger_start_and_finish(monkeypatch):
@@ -10541,6 +22767,61 @@ def test_research_ledger_start_and_finish(monkeypatch):
     assert writes[1][0] == research_ledger.LEDGER_TABLE
     assert writes[1][1].iloc[0]["research_run_id"] == run_id
     assert writes[1][1].iloc[0]["status"] == "completed"
+
+
+def test_research_ledger_git_rev_lookup_failure_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        research_ledger.subprocess,
+        "check_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(subprocess.CalledProcessError(128, args[0])),
+    )
+    monkeypatch.setattr(research_ledger, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert research_ledger._try_git_rev() is None
+    assert events[0]["module"] == "advisory.research_ledger"
+    assert events[0]["source"] == "git"
+    assert events[0]["fallback_type"] == "research_ledger_git_rev_lookup_failed"
+    assert events[0]["metadata"]["command"] == ["git", "rev-parse", "HEAD"]
+
+
+def test_research_ledger_records_start_write_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(research_ledger, "ensure_tables", lambda: None)
+    monkeypatch.setattr(research_ledger, "_try_git_rev", lambda: "deadbeef")
+    monkeypatch.setattr(research_ledger, "upsert_to_db", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ledger write down")))
+    monkeypatch.setattr(research_ledger, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError):
+        research_ledger.start_research_run(
+            run_type="advisory_pipeline",
+            entrypoint="advisory.pipeline",
+            config={"alpha": 1},
+            label="baseline",
+        )
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "research_ledger_start_write_failed"
+    assert events[0]["source"] == research_ledger.LEDGER_TABLE
+    assert events[0]["metadata"]["run_type"] == "advisory_pipeline"
+
+
+def test_research_ledger_records_list_runs_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(research_ledger, "ensure_tables", lambda: None)
+    monkeypatch.setattr(research_ledger, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ledger read down")))
+    monkeypatch.setattr(research_ledger, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError):
+        research_ledger.list_runs(limit=7)
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "research_ledger_list_runs_failed"
+    assert events[0]["source"] == research_ledger.LEDGER_TABLE
+    assert events[0]["metadata"] == {"limit": 7}
 
 
 def test_research_ledger_summary_helpers():
@@ -10597,6 +22878,65 @@ def test_portfolio_priority_rewards_positive_event_transition():
     upgraded["state_transition_hint"] = "UPGRADE_TO_PASS_NOW"
 
     assert portfolio_engine.compute_priority_score(upgraded) > portfolio_engine.compute_priority_score(base)
+
+
+def test_watchlist_builder_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(watchlist_builder, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    watchlist_builder.ensure_watchlist_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == watchlist_builder.WATCHLIST_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [watchlist_builder.TABLE_NAME]
+    assert any(watchlist_builder.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("base_regime TEXT" in statement for statement in calls[0]["statements"])
+    assert any("source_screener_list TEXT" in statement for statement in calls[0]["statements"])
+    assert any("watch_enabled BOOLEAN" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (asof_date, setup_id, symbol)" in statement for statement in calls[0]["statements"])
+
+
+def test_watchlist_builder_rebuild_cleanup_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+    upserts: list[tuple[str, int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "setup_id": "SETUP_A",
+                "symbol": "ABC",
+            }
+        ]
+    )
+    monkeypatch.setattr(watchlist_builder, "ensure_watchlist_table", lambda: None)
+    monkeypatch.setattr(watchlist_builder, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(watchlist_builder, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(watchlist_builder, "upsert_to_db", lambda frame, table, **_kwargs: upserts.append((table, len(frame))))
+
+    watchlist_builder.persist_watchlist(df, rebuild=True, asof_date=pd.Timestamp("2026-06-10T00:00:00Z"))
+
+    assert operation_names == ["watchlist_builder:delete_rebuild_rows"]
+    assert executed and f"DELETE FROM {watchlist_builder.TABLE_NAME}" in executed[0][0]
+    assert executed[0][1][1] == "SETUP_A"
+    assert upserts == [(watchlist_builder.TABLE_NAME, 1)]
 
 
 def test_watchlist_builder_applies_event_state_transition(monkeypatch):
@@ -10713,6 +23053,89 @@ def test_watchlist_builder_promotes_raise_score_only_when_adjusted_score_crosses
     assert row["last_state_transition_hint"] == "RAISE_SCORE_ONLY"
 
 
+def test_watchlist_builder_records_event_transition_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(watchlist_builder, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(watchlist_builder, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("events failed")))
+
+    out = watchlist_builder.load_latest_event_transitions(
+        asof_date=pd.Timestamp("2026-06-01", tz="UTC"),
+        setup_ids=["TEST"],
+        symbols=["ABC", "XYZ"],
+    )
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "watchlist_builder_event_transition_load_failed"
+    assert events[0]["source"] == "advisory_event_evaluations"
+    assert events[0]["metadata"]["setup_count"] == 1
+    assert events[0]["metadata"]["symbol_count"] == 2
+
+
+def test_watchlist_builder_records_existing_state_load_failure(monkeypatch):
+    events = []
+    candidates = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-03-24T00:00:00Z"),
+                "setup_id": "TEST",
+                "setup_name": "Test",
+                "regime_name": "STABLE",
+                "symbol": "ABC",
+                "company_master_id": "nse:ABC",
+                "screener_slug": "demo",
+                "rank": 1,
+                "candidate_state": "WATCH_EVENT",
+                "setup_score": 0.55,
+                "watch_reason_detail": "waiting",
+                "entry_style": "RETEST",
+                "attractive_price_low": 100.0,
+                "attractive_price_high": 105.0,
+                "invalidation_price": 95.0,
+                "entry_note": "wait",
+                "near_miss_flag": False,
+                "watch_enabled": True,
+                "watch_reasons": "[]",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(watchlist_builder, "load_candidate_rows", lambda **kwargs: candidates.copy())
+    monkeypatch.setattr(watchlist_builder, "load_setup_thresholds", lambda: {"TEST": watchlist_builder.DEFAULT_SCORE_THRESHOLDS})
+    monkeypatch.setattr(watchlist_builder, "load_latest_event_transitions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(watchlist_builder, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(watchlist_builder, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("state failed")))
+
+    out = watchlist_builder.build_watchlist()
+
+    assert len(out) == 1
+    assert events[0]["fallback_type"] == "watchlist_builder_existing_state_load_failed"
+    assert events[0]["source"] == watchlist_builder.TABLE_NAME
+    assert events[0]["metadata"]["candidate_count"] == 1
+
+
+def test_operator_health_surfaces_watchlist_builder_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "watchlist_builder_event_transition_load_failed": 2,
+                    "watchlist_builder_existing_state_load_failed": 1,
+                },
+                "counts_by_module": {"advisory.watchlist_builder": 3},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Watchlist builder used degraded source context" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Watchlist builder used degraded source context")
+    assert hint["details"]["watchlist_builder_event_transition_load_failed"] == 2
+    assert hint["details"]["watchlist_builder_existing_state_load_failed"] == 1
+    assert "./all_advisory.sh" in hint["commands"]
+
+
 def test_setup_registry_normalizes_multi_screener_overlay_config(tmp_path):
     config_path = tmp_path / "advisory_setups.yaml"
     config_path.write_text(
@@ -10743,6 +23166,65 @@ setups:
     assert row["overlay_screeners"]["TARIFF_PRESSURE"]["remove"] == ["screen-a"]
 
 
+def test_setup_registry_loads_ts_forecast_review_rules_as_review_only(tmp_path):
+    config_path = tmp_path / "advisory_setups.yaml"
+    config_path.write_text(
+        """
+setups: []
+ts_forecast_review_rules:
+  - model_name: timesfm_2p5_200m
+    horizon_days: 10
+    minimum_evaluated_trades: 80
+    minimum_win_rate: 0.61
+    minimum_avg_cost_adjusted_return: 0.028
+    minimum_lift_vs_momentum: 0.015
+    maximum_exit_conflict_rate: 0.0
+    authority: review_input_only
+    broker_execution_allowed: false
+    status: active_review
+""",
+        encoding="utf-8",
+    )
+
+    payload = setup_registry.load_ts_forecast_review_rules(str(config_path))
+
+    assert payload["status"] == "ok"
+    assert payload["summary"]["row_count"] == 1
+    assert payload["summary"]["active_review_count"] == 1
+    rule = payload["rules"][0]
+    assert rule["model_name"] == "timesfm_2p5_200m"
+    assert rule["horizon_days"] == 10
+    assert rule["valid"] is True
+    assert rule["readable_as_review_input"] is True
+    assert rule["usable_for_live_policy"] is False
+    assert rule["broker_execution_allowed"] is False
+    assert payload["operator_boundary"]["broker_execution_enabled"] is False
+
+
+def test_setup_registry_flags_unsafe_ts_forecast_review_rules(tmp_path):
+    config_path = tmp_path / "advisory_setups.yaml"
+    config_path.write_text(
+        """
+setups: []
+ts_forecast_review_rules:
+  - model_name: timesfm_2p5_200m
+    horizon_days: 10
+    authority: live_policy
+    broker_execution_allowed: true
+    status: active_review
+""",
+        encoding="utf-8",
+    )
+
+    payload = setup_registry.load_ts_forecast_review_rules(str(config_path))
+
+    assert payload["status"] == "issues_found"
+    assert payload["summary"]["issue_count"] == 2
+    assert payload["rules"][0]["valid"] is False
+    assert payload["rules"][0]["broker_execution_allowed"] is False
+    assert {issue["code"] for issue in payload["issues"]} == {"unsafe_authority", "unsafe_broker_execution"}
+
+
 def test_news_overlay_engine_classifies_tariff_overlay():
     regime_row = {"regime_name": "STABLE_BUT_TARIFF_RISING", "tariff_pressure_flag": True}
     news_rows = pd.DataFrame(
@@ -10756,6 +23238,79 @@ def test_news_overlay_engine_classifies_tariff_overlay():
     assert intensity > 0
     assert source_count == 2
     assert "tariff" in reason.lower()
+
+
+def test_news_overlay_engine_ensure_output_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(news_overlay_engine, "apply_schema_migration", lambda **kwargs: calls.append(kwargs))
+
+    news_overlay_engine.ensure_output_table()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == news_overlay_engine.NEWS_OVERLAY_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "advisory.news_overlay_engine"
+    assert call["metadata"]["tables"] == [news_overlay_engine.TABLE_NAME]
+    ddl = "\n".join(call["statements"])
+    assert f"CREATE TABLE IF NOT EXISTS {news_overlay_engine.TABLE_NAME}" in ddl
+    assert "overlay_intensity DOUBLE PRECISION" in ddl
+    assert "ADD COLUMN IF NOT EXISTS overlay_name" in ddl
+    assert "UNIQUE (asof_date)" in ddl
+
+
+def test_news_overlay_engine_rebuild_cleanup_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+    upserts: list[tuple[str, int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    frame = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "base_regime": "STABLE",
+                "overlay_name": "NONE",
+                "overlay_intensity": 0.0,
+                "overlay_reason": "no dominant overlay signals",
+                "source_count": 0,
+                "load_ts": pd.Timestamp("2026-06-10T10:00:00Z"),
+            }
+        ]
+    )
+    monkeypatch.setattr(news_overlay_engine, "ensure_output_table", lambda: None)
+    monkeypatch.setattr(news_overlay_engine, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(news_overlay_engine, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(
+        news_overlay_engine,
+        "upsert_to_db",
+        lambda frame, table, **_kwargs: upserts.append((table, len(frame))),
+    )
+
+    news_overlay_engine.persist_overlay_state(
+        frame,
+        rebuild=True,
+        asof_date=pd.Timestamp("2026-06-10T00:00:00Z"),
+    )
+
+    assert operation_names == ["news_overlay_engine:delete_rebuild_overlay"]
+    assert len(executed) == 1
+    assert f"DELETE FROM {news_overlay_engine.TABLE_NAME}" in executed[0][0]
+    assert upserts == [(news_overlay_engine.TABLE_NAME, 1)]
 
 
 def test_rule_engine_resolves_overlay_screeners_and_blocks_disallowed_overlay():
@@ -10854,6 +23409,37 @@ def test_pipeline_stage_order_includes_macro_features_before_regime():
     assert pipeline.PIPELINE_STAGES.index("macro_features") < pipeline.PIPELINE_STAGES.index("regime")
     assert pipeline.PIPELINE_STAGES.index("exchange_events") < pipeline.PIPELINE_STAGES.index("exchange_features")
     assert pipeline.PIPELINE_STAGES.index("exchange_features") < pipeline.PIPELINE_STAGES.index("evaluate")
+
+
+def test_pipeline_parse_json_object_records_malformed_context_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    parsed = pipeline._parse_json_object("{bad pipeline json", source="portfolio_context_json")
+
+    assert parsed == {}
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.pipeline"
+    assert event["fallback_type"] == "pipeline_json_parse_failed"
+    assert event["source"] == "portfolio_context_json"
+    assert event["severity"] == "warn"
+    assert event["metadata"]["value_length"] == len("{bad pipeline json")
+    assert event["metadata"]["value_excerpt"] == "{bad pipeline json"
+
+
+def test_pipeline_parse_json_object_records_missing_check_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(pipeline.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    parsed = pipeline._parse_json_object('{"stage": "portfolio"}', source="portfolio_context_json")
+
+    assert parsed == {"stage": "portfolio"}
+    assert events[0]["module"] == "advisory.pipeline"
+    assert events[0]["fallback_type"] == "pipeline_json_missing_check_failed"
+    assert events[0]["source"] == "portfolio_context_json"
+    assert events[0]["metadata"]["value_type"] == "str"
 
 
 def test_exchange_events_normalize_block_and_insider_rows():
@@ -10983,6 +23569,52 @@ def test_exchange_features_compute_distribution_and_upcoming_earnings():
     assert latest["exchange_distribution_score"] > 0
 
 
+def test_exchange_features_records_table_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(exchange_features, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("catalog failed")))
+    monkeypatch.setattr(exchange_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    exists = exchange_features.table_exists(exchange_features.EVENTS_TABLE)
+
+    assert exists is False
+    assert events[0]["fallback_type"] == "exchange_features_table_lookup_failed"
+    assert events[0]["source"] == exchange_features.EVENTS_TABLE
+
+
+def test_exchange_features_records_trading_days_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(exchange_features, "table_exists", lambda table_name: False)
+    monkeypatch.setattr(exchange_features, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("trading days failed")))
+    monkeypatch.setattr(exchange_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="trading days failed"):
+        exchange_features.load_target_dates(from_date=pd.Timestamp("2026-06-01", tz="UTC"), to_date=pd.Timestamp("2026-06-10", tz="UTC"))
+
+    assert events[0]["fallback_type"] == "exchange_features_trading_days_load_failed"
+    assert events[0]["source"] == "dim_trading_days"
+
+
+def test_exchange_features_records_events_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(exchange_features, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(exchange_features, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("events failed")))
+    monkeypatch.setattr(exchange_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="events failed"):
+        exchange_features.load_exchange_events(
+            start_date=pd.Timestamp("2026-06-01", tz="UTC"),
+            end_date=pd.Timestamp("2026-06-10", tz="UTC"),
+            symbols=["ABC"],
+        )
+
+    assert events[0]["fallback_type"] == "exchange_features_events_load_failed"
+    assert events[0]["source"] == exchange_features.EVENTS_TABLE
+    assert events[0]["metadata"]["symbol_count"] == 1
+
+
 def test_macro_features_are_point_in_time_and_null_tolerant():
     dates = pd.date_range("2026-01-01", periods=100, freq="D", tz="UTC")
     source = pd.DataFrame(
@@ -11037,6 +23669,45 @@ def test_macro_feature_builder_uses_history_but_returns_target_window(monkeypatc
     assert len(out) == 1
     assert out.iloc[0]["asof_date"] == dates[-1].normalize()
     assert round(float(out.iloc[0]["gsec_10y_change_20d_bps"]), 2) == 40.0
+
+
+def test_macro_features_records_table_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(macro_features, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table lookup failed")))
+    monkeypatch.setattr(macro_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert macro_features.table_exists(macro_features.SOURCE_TABLE) is False
+
+    assert events[0]["fallback_type"] == "macro_features_table_lookup_failed"
+    assert events[0]["source"] == macro_features.SOURCE_TABLE
+    assert events[0]["metadata"]["table_name"] == macro_features.SOURCE_TABLE
+
+
+def test_macro_features_records_source_load_fallback(monkeypatch):
+    events = []
+    calls = {"count": 0}
+
+    def fake_sql(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pd.DataFrame([{"exists_flag": 1}])
+        raise RuntimeError("source failed")
+
+    monkeypatch.setattr(macro_features, "sql_to_df", fake_sql)
+    monkeypatch.setattr(macro_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="source failed"):
+        macro_features.load_macro_daily(
+            from_date=pd.Timestamp("2026-04-01", tz="UTC"),
+            to_date=pd.Timestamp("2026-04-30", tz="UTC"),
+            rebuild=True,
+        )
+
+    assert events[0]["fallback_type"] == "macro_features_source_load_failed"
+    assert events[0]["source"] == macro_features.SOURCE_TABLE
+    assert events[0]["metadata"]["rebuild"] is True
+    assert events[0]["metadata"]["lookback_days"] == 140
 
 
 def test_event_model_dataset_joins_macro_features_by_anchor_date(monkeypatch):
@@ -11391,6 +24062,75 @@ def test_risk_engine_macro_multiplier_reduces_allocated_size(monkeypatch):
     assert "Macro sizing multiplier applied" in out.iloc[0]["notes"]
 
 
+def test_risk_engine_records_liquidity_cap_fallback_when_adv20_missing(monkeypatch):
+    events: list[dict[str, object]] = []
+    evaluations = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-04-01T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+                "setup_id": "LARGECAP_BREAKOUT_V1",
+                "setup_name": "Largecap",
+                "symbol": "HDFCBANK",
+                "company_master_id": "nse:HDFCBANK",
+                "unique_id": "u1",
+                "evaluation_status": "completed",
+                "verdict": "continue",
+                "investable_now": True,
+                "materiality": "high",
+                "setup_effect": "strengthens",
+                "sentiment": "positive",
+                "event_class": "ORDER_WIN",
+                "state_transition_hint": "",
+                "score_impact": 0.0,
+                "confidence": 0.9,
+                "governance_risk": "none",
+                "balance_sheet_risk": "none",
+                "execution_risk": "none",
+                "review_action": "",
+                "review_veto": False,
+            }
+        ]
+    )
+    monkeypatch.setattr(risk_engine, "load_event_evaluations", lambda **kwargs: evaluations)
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(risk_engine, "load_watch_states", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(risk_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        risk_engine,
+        "load_point_in_time_context",
+        lambda *args, **kwargs: {
+            "adj_close": 100.0,
+            "dma_20": 95.0,
+            "dma_50": 90.0,
+            "dma_200": 80.0,
+            "atr_20": 3.0,
+        },
+    )
+
+    out = risk_engine.build_allocations(include_allocated=True)
+
+    assert "Liquidity cap fallback used because ADV20 was missing." in out.iloc[0]["notes"]
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "risk_liquidity_cap_adv20_missing"
+    assert events[0]["source"] == risk_engine.ALLOCATIONS_TABLE
+    assert events[0]["metadata"]["affected_rows"] == 1
+    assert events[0]["metadata"]["symbols_sample"] == ["HDFCBANK"]
+
+
+def test_risk_engine_missing_value_check_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(risk_engine.pd, "isna", lambda value: (_ for _ in ()).throw(TypeError("isna failed")))
+    monkeypatch.setattr(risk_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert risk_engine._is_missing_value(object()) is False
+    assert events[0]["module"] == "advisory.risk_engine"
+    assert events[0]["source"] == "missing_value_check"
+    assert events[0]["fallback_type"] == "risk_missing_value_check_failed"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
 def test_risk_engine_exchange_distribution_reduces_allocated_size(monkeypatch):
     evaluations = pd.DataFrame(
         [
@@ -11483,6 +24223,35 @@ def test_risk_engine_point_in_time_context_excludes_same_day_daily_rows(monkeypa
     assert calls[0]["params"]["daily_cutoff"] == pd.Timestamp("2026-04-15T00:00:00Z")
 
 
+def test_risk_engine_records_macro_context_fallback_on_lookup_error(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(risk_engine, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(risk_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("macro timeout")))
+    monkeypatch.setattr(risk_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = risk_engine.load_macro_context(pd.Timestamp("2026-04-01T00:00:00Z"))
+
+    assert out == {}
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "risk_macro_context_unavailable"
+    assert events[0]["source"] == risk_engine.MACRO_FEATURES_TABLE
+
+
+def test_risk_engine_records_exchange_context_fallback_on_lookup_error(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(risk_engine, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(risk_engine, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("exchange timeout")))
+    monkeypatch.setattr(risk_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = risk_engine.load_exchange_feature_context("ABC", pd.Timestamp("2026-04-01T00:00:00Z"))
+
+    assert out == {}
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "risk_exchange_context_unavailable"
+    assert events[0]["source"] == risk_engine.EXCHANGE_FEATURES_TABLE
+    assert events[0]["symbol"] == "ABC"
+
+
 def test_adversarial_review_penalizes_exchange_distribution_against_positive_event():
     row = pd.Series(
         {
@@ -11572,6 +24341,215 @@ def test_adversarial_review_penalizes_low_model_edge():
     review = adversarial_review.review_event_row(row)
     assert review["review_action"] in {"penalize", "review_manual", "veto"}
     assert "low_model_edge" in json.loads(review["review_flags_json"])
+
+
+def test_adversarial_review_ignores_event_model_scores_by_default(monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(adversarial_review, "table_exists", lambda table_name: True)
+
+    def fake_sql_to_df(query, params=None, **kwargs):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-04-01T00:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-04-02T00:00:00Z"),
+                    "setup_id": "S1",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "event_source": "announcement",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(adversarial_review, "sql_to_df", fake_sql_to_df)
+
+    events = adversarial_review.load_event_evaluations(event_model_score_policy_mode="research_only")
+
+    assert adversarial_review.SCORES_TABLE not in str(captured["query"])
+    assert "event_meta_score" not in events.columns
+    assert events.attrs["event_model_score_policy"]["allowed"] is False
+    assert events.attrs["event_model_score_policy"]["reason"] == "research_only_default"
+
+
+def test_adversarial_review_loads_event_model_scores_only_when_promoted(monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(adversarial_review, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(
+        adversarial_review,
+        "evaluate_event_model_score_policy",
+        lambda policy_mode=None: {
+            "allowed": True,
+            "mode": "promoted",
+            "reason": "promotion_gate_passed",
+            "scorecard_status": "usable_for_manual_review",
+        },
+    )
+
+    def fake_sql_to_df(query, params=None, **kwargs):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-04-01T00:00:00Z"),
+                    "asof_date": pd.Timestamp("2026-04-02T00:00:00Z"),
+                    "setup_id": "S1",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "event_source": "announcement",
+                    "event_meta_score": 0.18,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(adversarial_review, "sql_to_df", fake_sql_to_df)
+
+    events = adversarial_review.load_event_evaluations(event_model_score_policy_mode="promoted")
+
+    assert adversarial_review.SCORES_TABLE in str(captured["query"])
+    assert events.iloc[0]["event_meta_score"] == 0.18
+    assert events.attrs["event_model_score_policy"]["allowed"] is True
+    assert events.attrs["event_model_score_policy"]["reason"] == "promotion_gate_passed"
+
+
+def test_adversarial_review_event_model_policy_gate_fails_closed(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "build_promotion_check",
+        lambda args: (_ for _ in ()).throw(RuntimeError("gate failed")),
+    )
+    monkeypatch.setattr(adversarial_review, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    policy = adversarial_review.evaluate_event_model_score_policy("promoted")
+
+    assert policy["allowed"] is False
+    assert policy["reason"] == "promotion_check_failed"
+    assert events[0]["fallback_type"] == "adversarial_event_model_score_policy_check_failed"
+    assert events[0]["source"] == adversarial_review.SCORES_TABLE
+
+
+def test_event_meta_model_ensure_scores_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    def fake_apply_schema_migration(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(event_meta_model, "apply_schema_migration", fake_apply_schema_migration)
+
+    event_meta_model.ensure_scores_table()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == event_meta_model.EVENT_META_MODEL_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "advisory.event_meta_model"
+    assert call["metadata"]["tables"] == [event_meta_model.SCORES_TABLE]
+    ddl = "\n".join(call["statements"])
+    assert f"CREATE TABLE IF NOT EXISTS {event_meta_model.SCORES_TABLE}" in ddl
+    assert "event_meta_score DOUBLE PRECISION" in ddl
+    assert "UNIQUE (published_on, setup_id, symbol, unique_id, model_name, model_version, horizon_days)" in ddl
+
+
+def test_event_meta_model_records_event_rows_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_meta_model, "ensure_event_evaluation_tables", lambda: None)
+    monkeypatch.setattr(event_meta_model, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(event_meta_model, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("event rows failed")))
+    monkeypatch.setattr(event_meta_model, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="event rows failed"):
+        event_meta_model.load_event_rows(symbols=["abc"], setup_ids=["setup1"])
+
+    assert events[0]["fallback_type"] == "event_meta_model_event_rows_load_failed"
+    assert events[0]["source"] == event_meta_model.EVENTS_TABLE
+    assert events[0]["metadata"]["symbols"] == ["abc"]
+
+
+def test_event_meta_model_records_price_history_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_meta_model, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("price load failed")))
+    monkeypatch.setattr(event_meta_model, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="price load failed"):
+        event_meta_model.load_price_history(["ABC"], pd.Timestamp("2026-06-01", tz="UTC"), pd.Timestamp("2026-06-10", tz="UTC"))
+
+    assert events[0]["fallback_type"] == "event_meta_model_price_history_load_failed"
+    assert events[0]["source"] == "dhan_ohlcv_daily"
+    assert events[0]["metadata"]["symbol_count"] == 1
+
+
+def test_event_meta_model_records_optional_context_fallbacks(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_meta_model, "table_exists", lambda table_name: (_ for _ in ()).throw(RuntimeError(f"{table_name} unavailable")))
+    monkeypatch.setattr(event_meta_model, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    intraday = event_meta_model.load_intraday_event_features(["ABC"], pd.Timestamp("2026-06-01", tz="UTC"), pd.Timestamp("2026-06-10", tz="UTC"))
+    macro = event_meta_model.load_macro_event_features(pd.Timestamp("2026-06-01", tz="UTC"), pd.Timestamp("2026-06-10", tz="UTC"))
+    exchange = event_meta_model.load_exchange_event_features(["ABC"], pd.Timestamp("2026-06-01", tz="UTC"), pd.Timestamp("2026-06-10", tz="UTC"))
+
+    assert intraday.empty
+    assert macro.empty
+    assert exchange.empty
+    assert [row["fallback_type"] for row in events] == [
+        "event_meta_model_intraday_context_load_failed",
+        "event_meta_model_macro_context_load_failed",
+        "event_meta_model_exchange_context_load_failed",
+    ]
+
+
+def test_event_meta_model_main_records_command_failure(monkeypatch, capsys):
+    events = []
+    args = argparse.Namespace(
+        command="score",
+        date=None,
+        symbols=["ABC"],
+        setup_ids=["EVENT_OPPORTUNITY_V1"],
+        artifact_dir=".cache/test-event-model",
+        model_basename="event_meta_model",
+        dry_run=True,
+    )
+
+    monkeypatch.setattr(event_meta_model, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        event_meta_model,
+        "build_live_event_dataset",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("score data unavailable")),
+    )
+    monkeypatch.setattr(event_meta_model, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert event_meta_model.main() == 1
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload == {
+        "status": "error",
+        "command": "score",
+        "error": "score data unavailable",
+    }
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.event_meta_model"
+    assert event["source"] == "event_meta_model:score"
+    assert event["fallback_type"] == "event_meta_model_main_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"] == {
+        "command": "score",
+        "artifact_dir": ".cache/test-event-model",
+        "model_basename": "event_meta_model",
+        "horizon_days": None,
+        "return_threshold": None,
+        "dry_run": True,
+        "symbols": ["ABC"],
+        "setup_ids": ["EVENT_OPPORTUNITY_V1"],
+    }
 
 
 def test_event_meta_model_builds_directional_label_from_future_returns(monkeypatch):
@@ -11931,6 +24909,11 @@ def test_event_model_promotion_check_passes_for_strong_evidence(monkeypatch):
     assert payload["decision"] == "review_candidate"
     assert payload["ready_for_operator_review"] is True
     assert payload["failed_gates"] == []
+    assert payload["scorecard"]["status"] == "usable_for_manual_review"
+    assert payload["scorecard"]["usable"] is True
+    assert payload["scorecard"]["broker_execution_allowed"] is False
+    assert payload["scorecard"]["policy_auto_promotion_allowed"] is False
+    assert payload["scorecard"]["key_metrics"]["precision_lift_vs_positive_rate_test"] == 0.27
 
 
 def test_event_model_promotion_check_holds_when_gates_fail(monkeypatch):
@@ -12003,6 +24986,50 @@ def test_event_model_promotion_check_holds_when_gates_fail(monkeypatch):
     assert payload["ready_for_operator_review"] is False
     assert "precision_lift_vs_positive_rate_test" in payload["failed_gates"]
     assert "latest_ml_run_not_failed" in payload["failed_gates"]
+    assert payload["scorecard"]["status"] == "not_usable"
+    assert payload["scorecard"]["usable"] is False
+    assert payload["scorecard"]["failed_gate_count"] == len(payload["failed_gates"])
+    assert "research-only" in payload["scorecard"]["operator_action"]
+
+
+def test_event_model_promotion_check_records_label_coverage_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        event_model_promotion_check.event_meta_model,
+        "build_labeled_event_dataset",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("labels failed")),
+    )
+    monkeypatch.setattr(event_model_promotion_check, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="labels failed"):
+        event_model_promotion_check.summarize_label_coverage(horizon_days=5, return_threshold=0.03)
+
+    assert events[0]["fallback_type"] == "event_model_promotion_label_coverage_load_failed"
+    assert events[0]["source"] == "event_meta_model_labeled_dataset"
+    assert events[0]["metadata"]["horizon_days"] == 5
+    assert events[0]["metadata"]["return_threshold"] == 0.03
+
+
+def test_event_model_promotion_check_records_score_freshness_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_model_promotion_check.event_meta_model, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(event_model_promotion_check, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("scores failed")))
+    monkeypatch.setattr(event_model_promotion_check, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    summary = event_model_promotion_check.summarize_score_freshness(
+        model_name="xgboost_event_meta_model",
+        model_version="event_meta_model_h1",
+        max_score_age_days=14,
+    )
+
+    assert summary["fresh"] is False
+    assert summary["score_rows"] == 0
+    assert "scores failed" in summary["error"]
+    assert events[0]["fallback_type"] == "event_model_promotion_score_freshness_load_failed"
+    assert events[0]["source"] == event_model_promotion_check.event_meta_model.SCORES_TABLE
+    assert events[0]["metadata"]["model_version"] == "event_meta_model_h1"
 
 
 def test_event_model_artifact_store_builds_manifest(tmp_path):
@@ -12123,11 +25150,13 @@ def test_get_dhan_ohlcv_daily_uses_resolved_exchange(monkeypatch):
 
 def test_risk_engine_persist_allocations_normalizes_review_veto(monkeypatch):
     captured: dict[str, pd.DataFrame] = {}
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
     monkeypatch.setattr(risk_engine, "ensure_allocations_table", lambda: None)
 
     class DummyCursor:
-        def execute(self, *args, **kwargs):
-            return None
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
 
     class DummySession:
         def __enter__(self):
@@ -12137,11 +25166,17 @@ def test_risk_engine_persist_allocations_normalizes_review_veto(monkeypatch):
             return False
 
     monkeypatch.setattr(risk_engine, "db_session", lambda *args, **kwargs: DummySession())
+    monkeypatch.setattr(
+        risk_engine,
+        "execute_db_operation",
+        lambda operation, *, operation_name, **_kwargs: operation_names.append(operation_name) or operation(),
+    )
 
     def fake_upsert(df, table_name, unique_keys=None, timescaledb_column=None):
         captured["df"] = df.copy()
 
     monkeypatch.setattr(risk_engine, "upsert_to_db", fake_upsert)
+    monkeypatch.setattr(risk_engine, "_trace_allocation_rows", lambda _frame: None)
     risk_engine.persist_allocations(
         pd.DataFrame(
             [
@@ -12162,6 +25197,104 @@ def test_risk_engine_persist_allocations_normalizes_review_veto(monkeypatch):
     assert out["review_veto"].dtype == bool
     assert out["investable_now"].dtype == bool
     assert pd.api.types.is_float_dtype(out["review_score"])
+    assert operation_names == ["risk_engine:delete_existing_allocations"]
+    assert len(executed) == 1
+    assert f"DELETE FROM {risk_engine.ALLOCATIONS_TABLE}" in executed[0][0]
+    assert executed[0][1][1] == "TEST"
+
+
+def test_risk_engine_ensure_allocations_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(risk_engine, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    risk_engine.ensure_allocations_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == risk_engine.ALLOCATIONS_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [risk_engine.ALLOCATIONS_TABLE]
+    assert any(risk_engine.ALLOCATIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("review_veto BOOLEAN" in statement for statement in calls[0]["statements"])
+    assert any("suggested_allocation_inr DOUBLE PRECISION" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (published_on, setup_id, symbol, unique_id)" in statement for statement in calls[0]["statements"])
+
+
+def test_adversarial_review_ensure_output_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(adversarial_review, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    adversarial_review.ensure_output_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == adversarial_review.REVIEWS_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [adversarial_review.REVIEWS_TABLE]
+    assert any(adversarial_review.REVIEWS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("review_score DOUBLE PRECISION" in statement for statement in calls[0]["statements"])
+    assert any("veto BOOLEAN" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (published_on, setup_id, symbol, unique_id)" in statement for statement in calls[0]["statements"])
+
+
+def test_announcement_watch_ensure_outputs_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(announcement_watch, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    announcement_watch.ensure_watch_outputs_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == announcement_watch.WATCH_OUTPUTS_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [announcement_watch.WATCHLIST_TABLE, announcement_watch.EVENTS_TABLE]
+    assert any(announcement_watch.WATCHLIST_TABLE in statement for statement in calls[0]["statements"])
+    assert any(announcement_watch.EVENTS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("watch_enabled BOOLEAN" in statement for statement in calls[0]["statements"])
+    assert any("monitor_source TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (asof_date, setup_id, symbol)" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (published_on, setup_id, symbol, unique_id)" in statement for statement in calls[0]["statements"])
+
+
+def test_news_watch_ensure_output_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(news_watch, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    news_watch.ensure_output_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == news_watch.EVENTS_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [news_watch.EVENTS_TABLE]
+    assert any(news_watch.EVENTS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("source_url TEXT" in statement for statement in calls[0]["statements"])
+    assert any("match_score DOUBLE PRECISION" in statement for statement in calls[0]["statements"])
+    assert any("monitor_source TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (published_on, setup_id, symbol, unique_id)" in statement for statement in calls[0]["statements"])
+
+
+def test_news_watch_records_recent_news_load_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        news_watch,
+        "sql_to_df",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("news table unavailable")),
+    )
+    monkeypatch.setattr(
+        news_watch,
+        "record_local_fallback_event",
+        lambda **kwargs: events.append(kwargs) or kwargs,
+    )
+
+    df = news_watch.load_recent_news(
+        published_from=pd.Timestamp("2026-04-01T00:00:00Z"),
+        published_to=pd.Timestamp("2026-04-02T00:00:00Z"),
+        feed_names=["markets"],
+    )
+
+    assert df.empty
+    assert events[0]["fallback_type"] == "news_watch_recent_news_load_failed"
+    assert events[0]["source"] == news_watch.NEWS_TABLE
+    assert events[0]["metadata"]["feed_names"] == ["markets"]
+    assert "2026-04-01" in events[0]["metadata"]["published_from"]
 
 
 def test_position_lifecycle_uses_published_day_for_entry_price(monkeypatch):
@@ -12689,6 +25822,71 @@ def test_symbol_trace_surfaces_aggregated_event_decision(monkeypatch):
     assert trace["decision_summary"]["effective_raw_event_count"] == 2
 
 
+def test_symbol_trace_records_table_lookup_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(symbol_trace, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table failed")))
+    monkeypatch.setattr(symbol_trace, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="table failed"):
+        symbol_trace.table_exists("advisory_candidates")
+
+    assert events[0]["fallback_type"] == "symbol_trace_table_lookup_failed"
+    assert events[0]["source"] == "advisory_candidates"
+    assert events[0]["metadata"]["table_name"] == "advisory_candidates"
+
+
+def test_symbol_trace_records_stage_rows_load_failure(monkeypatch):
+    events = []
+    calls = {"count": 0}
+
+    def fake_sql(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pd.DataFrame([{"exists_flag": 1}])
+        raise RuntimeError("stage failed")
+
+    monkeypatch.setattr(symbol_trace, "sql_to_df", fake_sql)
+    monkeypatch.setattr(symbol_trace, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="stage failed"):
+        symbol_trace.latest_rows(
+            "advisory_candidates",
+            symbol="ABC",
+            setup_id="TEST",
+            date_column="asof_date",
+            limit=5,
+        )
+
+    assert events[0]["fallback_type"] == "symbol_trace_stage_rows_load_failed"
+    assert events[0]["source"] == "advisory_candidates"
+    assert events[0]["metadata"]["symbol"] == "ABC"
+    assert events[0]["metadata"]["setup_id"] == "TEST"
+    assert events[0]["metadata"]["limit"] == 5
+
+
+def test_operator_health_surfaces_symbol_trace_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "symbol_trace_table_lookup_failed": 1,
+                    "symbol_trace_stage_rows_load_failed": 2,
+                },
+                "counts_by_module": {"advisory.symbol_trace": 3},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Symbol trace detail pages hit source read failures" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Symbol trace detail pages hit source read failures")
+    assert hint["details"]["symbol_trace_table_lookup_failed"] == 1
+    assert hint["details"]["symbol_trace_stage_rows_load_failed"] == 2
+    assert "python -m advisory.symbol_trace RELIANCE --format text" in hint["commands"]
+
+
 def test_setup_trace_builds_funnel_summary(monkeypatch):
     monkeypatch.setattr(setup_trace, "resolve_asof_date", lambda setup_id, requested_date=None: pd.Timestamp("2026-03-24T00:00:00Z"))
     monkeypatch.setattr(setup_trace, "load_setup_regime", lambda asof_date: {"regime_name": "RISK_OFF"})
@@ -12742,6 +25940,487 @@ def test_setup_trace_builds_funnel_summary(monkeypatch):
     assert trace["stage_summary"]["near_miss_count"] == 1
     assert trace["funnel_summary"]["screener_to_candidate"] == round(1 / 3, 4)
     assert trace["decision_summary"]["latest_event_source"] == "economic_times_rss"
+
+
+def test_setup_trace_records_table_lookup_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(setup_trace, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table failed")))
+    monkeypatch.setattr(setup_trace, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="table failed"):
+        setup_trace.table_exists("advisory_candidates")
+
+    assert events[0]["fallback_type"] == "setup_trace_table_lookup_failed"
+    assert events[0]["source"] == "advisory_candidates"
+    assert events[0]["metadata"]["table_name"] == "advisory_candidates"
+
+
+def test_setup_trace_records_stage_rows_load_failure(monkeypatch):
+    events = []
+    calls = {"count": 0}
+
+    def fake_sql(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return pd.DataFrame([{"exists_flag": 1}])
+        if calls["count"] == 2:
+            return pd.DataFrame([{"column_name": "asof_date"}])
+        raise RuntimeError("rows failed")
+
+    monkeypatch.setattr(setup_trace, "sql_to_df", fake_sql)
+    monkeypatch.setattr(setup_trace, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="rows failed"):
+        setup_trace.load_setup_rows(
+            "advisory_candidates",
+            "TEST",
+            pd.Timestamp("2026-06-01", tz="UTC"),
+            limit=7,
+        )
+
+    assert events[0]["fallback_type"] == "setup_trace_stage_rows_load_failed"
+    assert events[0]["source"] == "advisory_candidates"
+    assert events[0]["metadata"]["setup_id"] == "TEST"
+    assert events[0]["metadata"]["limit"] == 7
+
+
+def test_operator_health_surfaces_setup_trace_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "setup_trace_table_lookup_failed": 1,
+                    "setup_trace_stage_rows_load_failed": 2,
+                },
+                "counts_by_module": {"advisory.setup_trace": 3},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Setup trace funnel pages hit source read failures" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Setup trace funnel pages hit source read failures")
+    assert hint["details"]["setup_trace_table_lookup_failed"] == 1
+    assert hint["details"]["setup_trace_stage_rows_load_failed"] == 2
+    assert "python -m advisory.setup_trace LARGECAP_BREAKOUT_POSITION_V1 --format text" in hint["commands"]
+
+
+def test_operator_health_surfaces_technical_threshold_calibration_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "technical_threshold_calibration_schema_lookup_failed": 1,
+                    "technical_threshold_calibration_signal_rows_load_failed": 2,
+                },
+                "counts_by_module": {"advisory.technical_threshold_calibration": 3},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Technical-threshold calibration source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Technical-threshold calibration source data failed")
+    assert hint["details"]["technical_threshold_calibration_schema_lookup_failed"] == 1
+    assert hint["details"]["technical_threshold_calibration_signal_rows_load_failed"] == 2
+    assert "./all_technical_threshold_calibration.sh" in hint["commands"]
+
+
+def test_operator_health_surfaces_signal_quality_evaluator_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "signal_quality_evaluator_schema_lookup_failed": 1,
+                    "signal_quality_evaluator_event_policy_load_failed": 2,
+                    "signal_quality_evaluator_bhavcopy_load_failed": 3,
+                },
+                "counts_by_module": {"advisory.signal_quality_evaluator": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Signal-quality evaluator source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Signal-quality evaluator source data failed")
+    assert hint["details"]["signal_quality_evaluator_schema_lookup_failed"] == 1
+    assert hint["details"]["signal_quality_evaluator_event_policy_load_failed"] == 2
+    assert hint["details"]["signal_quality_evaluator_bhavcopy_load_failed"] == 3
+    assert "python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20" in hint["commands"]
+
+
+def test_operator_health_surfaces_promotion_review_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "technical_threshold_promotion_calibration_load_failed": 1,
+                    "signal_quality_promotion_summary_load_failed": 2,
+                    "event_policy_promotion_summary_load_failed": 3,
+                },
+                "counts_by_module": {
+                    "advisory.technical_threshold_promotion": 1,
+                    "advisory.signal_quality_promotion": 2,
+                    "advisory.event_policy_promotion": 3,
+                },
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Promotion-review evidence source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Promotion-review evidence source data failed")
+    assert hint["details"]["technical_threshold_promotion_calibration_load_failed"] == 1
+    assert hint["details"]["signal_quality_promotion_summary_load_failed"] == 2
+    assert hint["details"]["event_policy_promotion_summary_load_failed"] == 3
+    assert "./all_technical_threshold_calibration.sh" in hint["commands"]
+    assert "python -m advisory.event_policy_evaluator --horizons 5 10 20" in hint["commands"]
+
+
+def test_operator_health_surfaces_event_model_promotion_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "event_model_promotion_label_coverage_load_failed": 1,
+                    "event_model_promotion_score_freshness_load_failed": 2,
+                },
+                "counts_by_module": {"advisory.event_model_promotion_check": 3},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Event-model promotion check source evidence failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Event-model promotion check source evidence failed")
+    assert hint["details"]["event_model_promotion_label_coverage_load_failed"] == 1
+    assert hint["details"]["event_model_promotion_score_freshness_load_failed"] == 2
+    assert "./all_ml.sh" in hint["commands"]
+    assert "python -m advisory.event_model_promotion_check --format text" in hint["commands"]
+
+
+def test_operator_health_surfaces_macro_features_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "macro_features_table_lookup_failed": 1,
+                    "macro_features_source_load_failed": 2,
+                },
+                "counts_by_module": {"advisory.macro_features": 3},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Macro feature source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Macro feature source data failed")
+    assert hint["details"]["macro_features_table_lookup_failed"] == 1
+    assert hint["details"]["macro_features_source_load_failed"] == 2
+    assert "./complete_data.sh" in hint["commands"]
+    assert "./all_advisory.sh" in hint["commands"]
+
+
+def test_operator_health_surfaces_regime_engine_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "regime_engine_table_lookup_failed": 1,
+                    "regime_engine_nse_benchmark_load_failed": 2,
+                    "regime_engine_macro_features_load_failed": 3,
+                },
+                "counts_by_module": {"advisory.regime_engine": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Regime snapshot source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Regime snapshot source data failed")
+    assert hint["details"]["regime_engine_table_lookup_failed"] == 1
+    assert hint["details"]["regime_engine_nse_benchmark_load_failed"] == 2
+    assert hint["details"]["regime_engine_macro_features_load_failed"] == 3
+    assert "./complete_data.sh" in hint["commands"]
+    assert "python -m advisory.regime_engine --dry-run" in hint["commands"]
+
+
+def test_operator_health_surfaces_technical_features_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "technical_features_price_history_load_failed": 1,
+                    "technical_features_nse_benchmark_load_failed": 2,
+                    "technical_features_peer_ohlcv_load_failed": 3,
+                },
+                "counts_by_module": {"advisory.technical_features": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Technical feature source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Technical feature source data failed")
+    assert hint["details"]["technical_features_price_history_load_failed"] == 1
+    assert hint["details"]["technical_features_nse_benchmark_load_failed"] == 2
+    assert hint["details"]["technical_features_peer_ohlcv_load_failed"] == 3
+    assert "./complete_data.sh" in hint["commands"]
+    assert "python -m advisory.technical_features --dry-run --skip-peer-sync" in hint["commands"]
+
+
+def test_operator_health_surfaces_intraday_features_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "intraday_features_dhan_sync_failed": 1,
+                    "intraday_features_history_load_failed": 2,
+                    "intraday_features_daily_reference_load_failed": 3,
+                },
+                "counts_by_module": {"advisory.intraday_features": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Intraday feature source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Intraday feature source data failed")
+    assert hint["details"]["intraday_features_dhan_sync_failed"] == 1
+    assert hint["details"]["intraday_features_history_load_failed"] == 2
+    assert hint["details"]["intraday_features_daily_reference_load_failed"] == 3
+    assert "./complete_data.sh" in hint["commands"]
+    assert "python -m advisory.intraday_features --skip-sync" in hint["commands"]
+
+
+def test_operator_health_surfaces_rule_engine_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "rule_engine_screener_universe_load_failed": 1,
+                    "rule_engine_technical_load_failed": 2,
+                    "rule_engine_fundamentals_load_failed": 3,
+                },
+                "counts_by_module": {"advisory.rule_engine": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Rule engine source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Rule engine source data failed")
+    assert hint["details"]["rule_engine_screener_universe_load_failed"] == 1
+    assert hint["details"]["rule_engine_technical_load_failed"] == 2
+    assert hint["details"]["rule_engine_fundamentals_load_failed"] == 3
+    assert "./complete_data.sh" in hint["commands"]
+    assert "./all_advisory.sh" in hint["commands"]
+
+
+def test_operator_health_surfaces_portfolio_engine_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "portfolio_engine_allocations_load_failed": 1,
+                    "portfolio_engine_symbol_metadata_load_failed": 2,
+                },
+                "counts_by_module": {"advisory.portfolio_engine": 3},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Portfolio engine source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Portfolio engine source data failed")
+    assert hint["details"]["portfolio_engine_allocations_load_failed"] == 1
+    assert hint["details"]["portfolio_engine_symbol_metadata_load_failed"] == 2
+    assert "./all_advisory.sh" in hint["commands"]
+    assert "python -m advisory.portfolio_engine --format json" in hint["commands"]
+
+
+def test_operator_health_surfaces_position_lifecycle_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "position_lifecycle_open_orders_load_failed": 1,
+                    "position_lifecycle_price_identity_failed": 2,
+                    "position_lifecycle_technical_context_load_failed": 3,
+                },
+                "counts_by_module": {"advisory.position_lifecycle": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Position lifecycle source data failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Position lifecycle source data failed")
+    assert hint["details"]["position_lifecycle_open_orders_load_failed"] == 1
+    assert hint["details"]["position_lifecycle_price_identity_failed"] == 2
+    assert hint["details"]["position_lifecycle_technical_context_load_failed"] == 3
+    assert "./all_advisory.sh" in hint["commands"]
+    assert "python -m advisory.position_lifecycle --format json" in hint["commands"]
+
+
+def test_operator_health_surfaces_execution_engine_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "error",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "execution_broker_fund_limits_failed": 1,
+                    "execution_recon_targets_load_failed": 2,
+                    "execution_broker_reconcile_failed": 1,
+                },
+                "counts_by_module": {"advisory.execution_engine": 4},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Execution engine broker/reconciliation path failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Execution engine broker/reconciliation path failed")
+    assert hint["status"] == "error"
+    assert hint["details"]["execution_broker_fund_limits_failed"] == 1
+    assert hint["details"]["execution_recon_targets_load_failed"] == 2
+    assert hint["details"]["execution_broker_reconcile_failed"] == 1
+    assert "python -m advisory.execution_engine --reconcile-only --dry-run" in hint["commands"]
+
+
+def test_operator_health_surfaces_operator_snapshot_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "operator_snapshot_price_cache_refresh_failed": 1,
+                    "operator_snapshot_load_failed": 2,
+                    "operator_snapshot_section_load_failed": 3,
+                },
+                "counts_by_module": {"advisory.operator_snapshot": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Operator snapshot fallback used" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Operator snapshot fallback used")
+    assert hint["details"]["operator_snapshot_price_cache_refresh_failed"] == 1
+    assert hint["details"]["operator_snapshot_load_failed"] == 2
+    assert hint["details"]["operator_snapshot_section_load_failed"] == 3
+    assert "python -m advisory.operator_snapshot" in hint["commands"]
+
+
+def test_operator_health_surfaces_event_router_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "error",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "event_router_source_rows_load_failed": 1,
+                    "event_router_watchlist_priority_load_failed": 2,
+                    "event_router_symbol_refresh_failed": 3,
+                },
+                "counts_by_module": {"advisory.event_router": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Event router source or refresh path failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Event router source or refresh path failed")
+    assert hint["status"] == "error"
+    assert hint["details"]["event_router_source_rows_load_failed"] == 1
+    assert hint["details"]["event_router_watchlist_priority_load_failed"] == 2
+    assert hint["details"]["event_router_symbol_refresh_failed"] == 3
+    assert "python -m advisory.event_router --dry-run" in hint["commands"]
+
+
+def test_operator_health_surfaces_external_task_queue_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "error",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "external_task_queue_status_load_failed": 1,
+                    "external_task_queue_task_failed": 2,
+                },
+                "counts_by_module": {"advisory.external_task_queue": 3},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "External task queue degraded" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "External task queue degraded")
+    assert hint["status"] == "error"
+    assert hint["details"]["external_task_queue_status_load_failed"] == 1
+    assert hint["details"]["external_task_queue_task_failed"] == 2
+    assert "python -m advisory.external_task_queue --status" in hint["commands"]
+
+
+def test_operator_health_surfaces_config_change_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "config_change_technical_decision_load_failed": 1,
+                    "config_change_signal_quality_decision_load_failed": 2,
+                    "config_change_event_policy_decision_load_failed": 3,
+                    "config_change_previews_load_failed": 4,
+                },
+                "counts_by_module": {"advisory.config_change_assistant": 10},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Config-change preview source failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Config-change preview source failed")
+    assert hint["details"]["config_change_technical_decision_load_failed"] == 1
+    assert hint["details"]["config_change_signal_quality_decision_load_failed"] == 2
+    assert hint["details"]["config_change_event_policy_decision_load_failed"] == 3
+    assert hint["details"]["config_change_previews_load_failed"] == 4
+    assert "python -m advisory.config_change_assistant --help" in hint["commands"]
+
+
+def test_operator_health_surfaces_research_ledger_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {
+                    "research_ledger_start_write_failed": 1,
+                    "research_ledger_finish_write_failed": 2,
+                    "research_ledger_list_runs_failed": 3,
+                },
+                "counts_by_module": {"advisory.research_ledger": 6},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Research ledger degraded" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Research ledger degraded")
+    assert hint["details"]["research_ledger_start_write_failed"] == 1
+    assert hint["details"]["research_ledger_finish_write_failed"] == 2
+    assert hint["details"]["research_ledger_list_runs_failed"] == 3
+    assert "python -m advisory.research_ledger --limit 20" in hint["commands"]
 
 
 def test_dashboard_aggregates_setup_traces(monkeypatch):
@@ -12881,6 +26560,115 @@ def test_intraday_feature_builder_detects_breakout_context():
     assert bool(row["intraday_failed_prev_day_breakout"]) is False
     assert float(row["intraday_close_vs_vwap_pct"]) > 0
     assert float(row["intraday_volume_vs_20d"]) > 1
+
+
+def test_intraday_features_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(intraday_features, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    intraday_features.ensure_intraday_features_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == intraday_features.INTRADAY_FEATURES_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [intraday_features.TABLE_NAME]
+    assert "idx_dhan_ohlcv_intraday_ticker_window" in calls[0]["metadata"]["indexes"]
+    assert any(intraday_features.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("intraday_volume_vs_20d DOUBLE PRECISION" in statement for statement in calls[0]["statements"])
+    assert any("intraday_opening_range_breakout_up BOOLEAN" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (asof_date, symbol, interval_minutes)" in statement for statement in calls[0]["statements"])
+    assert any("idx_dhan_ohlcv_intraday_ticker_window" in statement for statement in calls[0]["statements"])
+
+
+def test_intraday_features_records_history_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(intraday_features, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("intraday failed")))
+    monkeypatch.setattr(intraday_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="intraday failed"):
+        intraday_features.load_intraday_history(
+            ["ABC"],
+            start_timestamp=pd.Timestamp("2026-06-01T00:00:00Z"),
+            end_timestamp=pd.Timestamp("2026-06-02T00:00:00Z"),
+            interval_minutes=5,
+        )
+
+    assert events[0]["fallback_type"] == "intraday_features_history_load_failed"
+    assert events[0]["source"] == "dhan_ohlcv_intraday"
+
+
+def test_intraday_features_rebuild_cleanup_uses_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+    upserts: list[tuple[str, int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    frame = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "symbol": "ABC",
+                "interval_minutes": 5,
+                "session_close": "100.0",
+            }
+        ]
+    )
+    monkeypatch.setattr(intraday_features, "ensure_intraday_features_table", lambda: None)
+    monkeypatch.setattr(intraday_features, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(intraday_features, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(
+        intraday_features,
+        "upsert_to_db",
+        lambda frame, table, **_kwargs: upserts.append((table, len(frame))),
+    )
+
+    intraday_features.persist_intraday_features(
+        frame,
+        rebuild=True,
+        asof_date=pd.Timestamp("2026-06-10T00:00:00Z"),
+        intervals=(5, 15),
+    )
+
+    assert operation_names == ["intraday_features:delete_rebuild_features"]
+    assert len(executed) == 1
+    assert f"DELETE FROM {intraday_features.TABLE_NAME}" in executed[0][0]
+    assert executed[0][1][1] == [5, 15]
+    assert upserts == [(intraday_features.TABLE_NAME, 1)]
+
+
+def test_intraday_features_records_dhan_sync_issue(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(intraday_features, "load_intraday_coverage", lambda symbols, interval_minutes: pd.DataFrame())
+    monkeypatch.setattr(intraday_features, "sync_intraday_ohlcv", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("no dhan id")))
+    monkeypatch.setattr(intraday_features, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    results = intraday_features.ensure_intraday_history(
+        ["ABC"],
+        asof_date=pd.Timestamp("2026-06-01T00:00:00Z"),
+        lookback_days=1,
+        intervals=(5,),
+    )
+
+    assert results[0]["action"] == "issue"
+    assert results[0]["reason"] == "dhan_intraday_sync_failed"
+    assert events[0]["fallback_type"] == "intraday_features_dhan_sync_failed"
+    assert events[0]["source"] == "data.dhanlive.ohlcv"
 
 
 def test_intraday_features_dedupes_daily_reference_lookup():
@@ -13063,7 +26851,9 @@ def test_intraday_history_records_dhan_mapping_issue(monkeypatch):
 def test_daily_ohlcv_repair_records_dhan_mapping_issue(monkeypatch):
     from advisory import data_sync
 
+    events: list[dict[str, object]] = []
     monkeypatch.setattr(data_sync, "get_db_max_date", lambda *args, **kwargs: None)
+    monkeypatch.setattr(data_sync, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
 
     def fake_sync_daily_ohlcv(*args, **kwargs):
         raise ValueError("No Dhan security id mapped for NSE:HUIL")
@@ -13084,6 +26874,22 @@ def test_daily_ohlcv_repair_records_dhan_mapping_issue(monkeypatch):
             "error": "No Dhan security id mapped for NSE:HUIL",
         }
     ]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.data_sync"
+    assert event["source"] == "dhan_ohlcv_daily"
+    assert event["fallback_type"] == "advisory_daily_ohlcv_sync_failed"
+    assert event["severity"] == "error"
+    assert event["symbol"] == "HUIL"
+    assert event["metadata"] == {
+        "symbol": "HUIL",
+        "exchange": "NSE",
+        "asset_type": "stock",
+        "from_date": None,
+        "to_date": "2026-05-25T00:00:00",
+    }
+    assert isinstance(event["error"], ValueError)
+    assert str(event["error"]) == "No Dhan security id mapped for NSE:HUIL"
 
 
 def test_rule_engine_intraday_confirmation_lifts_default_technical_score():
@@ -13399,6 +27205,81 @@ def test_technical_threshold_calibration_attaches_point_in_time_forward_returns(
     assert out.iloc[1]["entry_date_h2"] == pd.Timestamp("2026-05-04T00:00:00Z")
 
 
+def test_technical_threshold_calibration_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(technical_threshold_calibration, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    technical_threshold_calibration.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == technical_threshold_calibration.TECHNICAL_THRESHOLD_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [
+        technical_threshold_calibration.EVALUATIONS_TABLE,
+        technical_threshold_calibration.SUMMARY_TABLE,
+    ]
+    assert any(technical_threshold_calibration.EVALUATIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(technical_threshold_calibration.SUMMARY_TABLE in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (evaluated_at, config_id, horizon_days)" in statement for statement in calls[0]["statements"])
+    assert any("DROP CONSTRAINT" in statement for statement in calls[0]["statements"])
+
+
+def test_technical_threshold_calibration_records_schema_lookup_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(technical_threshold_calibration, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("schema failed")))
+    monkeypatch.setattr(technical_threshold_calibration, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert technical_threshold_calibration.table_columns("advisory_candidates") == set()
+
+    assert events[0]["fallback_type"] == "technical_threshold_calibration_schema_lookup_failed"
+    assert events[0]["source"] == "advisory_candidates"
+    assert events[0]["metadata"]["table_name"] == "advisory_candidates"
+
+
+def test_technical_threshold_calibration_records_signal_rows_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        technical_threshold_calibration,
+        "table_columns",
+        lambda table_name: {"asof_date", "setup_id", "symbol", "technical_total_score"},
+    )
+    monkeypatch.setattr(technical_threshold_calibration, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("signals failed")))
+    monkeypatch.setattr(technical_threshold_calibration, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="signals failed"):
+        technical_threshold_calibration.load_technical_signal_rows(
+            from_date=pd.Timestamp("2026-04-01", tz="UTC"),
+            to_date=pd.Timestamp("2026-04-30", tz="UTC"),
+            symbols=["ABC"],
+        )
+
+    assert events[0]["fallback_type"] == "technical_threshold_calibration_signal_rows_load_failed"
+    assert events[0]["source"] == "advisory_candidates"
+    assert events[0]["metadata"]["symbol_count"] == 1
+    assert events[0]["metadata"]["from_date"] == "2026-04-01 00:00:00+00:00"
+
+
+def test_technical_threshold_calibration_records_price_history_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(technical_threshold_calibration, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("prices failed")))
+    monkeypatch.setattr(technical_threshold_calibration, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="prices failed"):
+        technical_threshold_calibration.load_price_history_for_returns(
+            symbols=["abc", "XYZ"],
+            from_date=pd.Timestamp("2026-04-01", tz="UTC"),
+            to_date=pd.Timestamp("2026-04-30", tz="UTC"),
+        )
+
+    assert events[0]["fallback_type"] == "technical_threshold_calibration_price_history_load_failed"
+    assert events[0]["source"] == "dhan_ohlcv_daily"
+    assert events[0]["metadata"]["symbol_count"] == 2
+    assert events[0]["metadata"]["from_date"] == "2026-04-01 00:00:00+00:00"
+
+
 def test_technical_threshold_calibration_selects_profitable_threshold_config():
     dataset = pd.DataFrame(
         [
@@ -13551,6 +27432,79 @@ def test_signal_quality_evaluator_compares_overlay_variants():
     assert bool(risk_event["selected"]) is False
 
 
+def test_signal_quality_evaluator_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(signal_quality_evaluator, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    signal_quality_evaluator.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == signal_quality_evaluator.SIGNAL_QUALITY_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [
+        signal_quality_evaluator.EVALUATIONS_TABLE,
+        signal_quality_evaluator.SUMMARY_TABLE,
+    ]
+    assert any(signal_quality_evaluator.EVALUATIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(signal_quality_evaluator.SUMMARY_TABLE in statement for statement in calls[0]["statements"])
+    assert any("variant TEXT NOT NULL" in statement for statement in calls[0]["statements"])
+    assert any("lift_vs_technical_only DOUBLE PRECISION" in statement for statement in calls[0]["statements"])
+
+
+def test_signal_quality_evaluator_records_schema_lookup_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(signal_quality_evaluator, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("schema failed")))
+    monkeypatch.setattr(signal_quality_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert signal_quality_evaluator.table_columns(signal_quality_evaluator.EVENT_POLICY_TABLE) == set()
+
+    assert events[0]["fallback_type"] == "signal_quality_evaluator_schema_lookup_failed"
+    assert events[0]["source"] == signal_quality_evaluator.EVENT_POLICY_TABLE
+    assert events[0]["metadata"]["table_name"] == signal_quality_evaluator.EVENT_POLICY_TABLE
+
+
+def test_signal_quality_evaluator_records_event_policy_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        signal_quality_evaluator,
+        "table_columns",
+        lambda table_name: {"symbol", "asof_date", "action_type", "policy_class", "policy_score", "confidence", "event_class"},
+    )
+    monkeypatch.setattr(signal_quality_evaluator, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("event policy failed")))
+    monkeypatch.setattr(signal_quality_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="event policy failed"):
+        signal_quality_evaluator._load_latest_event_policy(
+            from_date=pd.Timestamp("2026-04-01", tz="UTC"),
+            to_date=pd.Timestamp("2026-04-30", tz="UTC"),
+            symbols=["ABC"],
+            lookback_days=30,
+        )
+
+    assert events[0]["fallback_type"] == "signal_quality_evaluator_event_policy_load_failed"
+    assert events[0]["source"] == signal_quality_evaluator.EVENT_POLICY_TABLE
+    assert events[0]["metadata"]["symbol_count"] == 1
+    assert events[0]["metadata"]["lookback_days"] == 30
+
+
+def test_signal_quality_evaluator_normalizers_record_missing_check_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(signal_quality_evaluator, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(signal_quality_evaluator.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    assert signal_quality_evaluator._json_ready(sentinel) is sentinel
+    assert signal_quality_evaluator._clean_text(sentinel).startswith("<OBJECT OBJECT AT ")
+
+    assert [event["fallback_type"] for event in events] == [
+        "signal_quality_json_ready_missing_check_failed",
+        "signal_quality_clean_text_missing_check_failed",
+    ]
+    assert all(event["module"] == "advisory.signal_quality_evaluator" for event in events)
+
+
 def test_signal_quality_evaluator_summary_reports_lift_vs_technical_only():
     evaluations = signal_quality_evaluator.build_evaluation_rows(
         pd.DataFrame(
@@ -13673,7 +27627,17 @@ def test_operator_api_builds_event_policy_payload(monkeypatch):
                     }
                 ),
                 "llm_review_json": json.dumps({"recommended_action": "MANUAL_REVIEW"}),
-                "raw_context_json": json.dumps({"source_type": "announcement"}),
+                "actionability_json": json.dumps(
+                    {
+                        "materiality": "high",
+                        "review_priority": "high",
+                        "freshness": {"bucket": "fresh", "age_days": 0},
+                        "source_quality": {"quality": "high", "source_type": "announcement"},
+                        "current_exposure": {"bucket": "unknown"},
+                        "price_reaction": {"bucket": "unknown", "value": None},
+                    }
+                ),
+                "raw_context_json": json.dumps({"source_type": "announcement", "large": "x" * 5000}),
                 "published_on": pd.Timestamp("2026-05-30T09:00:00Z"),
             }
         ]
@@ -13703,9 +27667,20 @@ def test_operator_api_builds_event_policy_payload(monkeypatch):
     assert payload["summary"]["action_counts"]["MANUAL_REVIEW"] == 1
     assert payload["summary"]["action_counts"]["NO_ACTION"] == 2
     assert payload["summary"]["policy_class_counts"]["ORDER_WIN"] == 1
+    assert payload["summary"]["compact"] is True
     assert payload["rows"][0]["checks"][0]["check"] == "materiality"
     assert payload["rows"][0]["operator_notes"]["operator_questions"] == ["Is this already priced in?"]
     assert payload["rows"][0]["llm_review"]["recommended_action"] == "MANUAL_REVIEW"
+    assert payload["rows"][0]["actionability"]["review_priority"] == "high"
+    assert payload["rows"][0]["raw_compacted"] is True
+    assert "raw_context_json" not in payload["rows"][0]
+    assert "raw_context_json" in payload["rows"][0]["raw_omitted_keys_sample"]
+    assert "actionability_json" in payload["rows"][0]["raw_omitted_keys_sample"]
+
+    full_payload = operator_api.build_event_policy_payload(limit=10, action_type="ALL", include_raw=True)
+    assert full_payload["summary"]["raw_included"] is True
+    assert full_payload["rows"][0]["raw_context_json"] == json.dumps({"source_type": "announcement", "large": "x" * 5000})
+    assert full_payload["rows"][0]["raw_included"] is True
 
 
 def test_operator_api_builds_manual_review_payload(monkeypatch):
@@ -13719,6 +27694,7 @@ def test_operator_api_builds_manual_review_payload(monkeypatch):
                 "action_code": "MANUAL_REVIEW",
                 "action_reason": "conflicting evidence",
                 "reason_contract_status": "needs_review",
+                "raw_context_json": json.dumps({"large": "x" * 5000}),
             }
         ]
     )
@@ -13854,6 +27830,148 @@ def test_operator_api_builds_manual_review_payload(monkeypatch):
     assert "Dhan security id" in payload["items"][0]["reason"]
     execution_item = next(item for item in payload["items"] if item["item_type"] == "execution_blocker")
     assert execution_item["raw"]["updated_at"] == "2026-05-30T10:00:00+00:00"
+    action_item = next(item for item in payload["items"] if item["item_type"] == "action_manual_review")
+    assert action_item["raw_compacted"] is True
+    assert action_item["raw"]["action_code"] == "MANUAL_REVIEW"
+    assert "raw_context_json" not in action_item["raw"]
+    assert "raw_context_json" in action_item["raw_omitted_keys_sample"]
+
+    full_payload = operator_api.build_manual_review_payload(limit=20, include_raw=True)
+    full_action_item = next(item for item in full_payload["items"] if item["item_type"] == "action_manual_review")
+    assert full_payload["summary"]["raw_included"] is True
+    assert full_action_item["raw"]["raw_context_json"] == json.dumps({"large": "x" * 5000})
+    assert "raw_compacted" not in full_action_item
+
+
+def test_operator_api_manual_review_decision_load_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def noop_append(_items, _skipped, *, limit):
+        return None
+
+    def append_item(items, _skipped, *, limit):
+        items.append(
+            {
+                "item_id": "manual:ABC",
+                "item_type": "action_manual_review",
+                "severity": "warning",
+                "source_table": operator_api.ACTION_RECOMMENDATIONS_TABLE,
+                "updated_at": "2026-05-30T09:00:00+00:00",
+                "raw": {"symbol": "ABC"},
+            }
+        )
+
+    for name in [
+        "_append_execution_blocker_items",
+        "_append_event_policy_review_items",
+        "_append_action_conflict_items",
+        "_append_threshold_review_items",
+        "_append_wait_signal_followup_items",
+        "_append_processing_failure_items",
+        "_append_announcement_failure_items",
+        "_append_identity_issue_items",
+    ]:
+        monkeypatch.setattr(operator_api, name, noop_append)
+    monkeypatch.setattr(operator_api, "_append_latest_action_review_items", append_item)
+    monkeypatch.setattr(operator_api, "_suppress_shadow_manual_review_items", lambda items, skipped: items)
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("decisions table down")))
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_api.build_manual_review_payload(limit=5)
+
+    assert payload["summary"]["total_items"] == 1
+    assert payload["summary"]["skipped_sources"][0]["source"] == operator_api.MANUAL_REVIEW_DECISIONS_TABLE
+    assert events[0]["fallback_type"] == "operator_api_manual_review_decisions_load_failed"
+    assert events[0]["source"] == operator_api.MANUAL_REVIEW_DECISIONS_TABLE
+    assert events[0]["metadata"] == {"limit": 1000}
+
+
+def test_operator_api_manual_review_invalid_decision_state_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def noop_append(_items, _skipped, *, limit):
+        return None
+
+    def append_item(items, _skipped, *, limit):
+        items.append(
+            {
+                "item_id": "manual:ABC",
+                "item_type": "action_manual_review",
+                "severity": "warning",
+                "source_table": operator_api.ACTION_RECOMMENDATIONS_TABLE,
+                "updated_at": "2026-05-30T09:00:00+00:00",
+                "raw": {"symbol": "ABC"},
+            }
+        )
+
+    for name in [
+        "_append_execution_blocker_items",
+        "_append_event_policy_review_items",
+        "_append_action_conflict_items",
+        "_append_threshold_review_items",
+        "_append_wait_signal_followup_items",
+        "_append_processing_failure_items",
+        "_append_announcement_failure_items",
+        "_append_identity_issue_items",
+    ]:
+        monkeypatch.setattr(operator_api, name, noop_append)
+    monkeypatch.setattr(operator_api, "_append_latest_action_review_items", append_item)
+    monkeypatch.setattr(operator_api, "_suppress_shadow_manual_review_items", lambda items, skipped: items)
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: {"manual:ABC": {"decision": "legacy_bad_decision"}})
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_api.build_manual_review_payload(limit=5)
+
+    assert payload["summary"]["total_items"] == 1
+    assert payload["summary"]["annotated_by_operator"] == 1
+    assert events[0]["fallback_type"] == "operator_api_manual_review_invalid_decision_state"
+    assert events[0]["metadata"]["item_id"] == "manual:ABC"
+    assert events[0]["metadata"]["decision"] == "legacy_bad_decision"
+    assert events[0]["metadata"]["has_matched_wait_signal"] is False
+
+
+def test_operator_api_manual_review_invalid_original_wait_decision_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def noop_append(_items, _skipped, *, limit):
+        return None
+
+    def append_wait_item(items, _skipped, *, limit):
+        items.append(
+            {
+                "item_id": "wait:ABC",
+                "item_type": "wait_signal_followup",
+                "severity": "warning",
+                "source_table": operator_api.WAIT_SIGNAL_MATCHES_TABLE,
+                "updated_at": "2026-05-30T09:00:00+00:00",
+                "raw": {"wait_signal_followup": {"manual_review_item_id": "manual:ABC"}},
+            }
+        )
+
+    for name in [
+        "_append_execution_blocker_items",
+        "_append_latest_action_review_items",
+        "_append_event_policy_review_items",
+        "_append_action_conflict_items",
+        "_append_threshold_review_items",
+        "_append_processing_failure_items",
+        "_append_announcement_failure_items",
+        "_append_identity_issue_items",
+    ]:
+        monkeypatch.setattr(operator_api, name, noop_append)
+    monkeypatch.setattr(operator_api, "_append_wait_signal_followup_items", append_wait_item)
+    monkeypatch.setattr(operator_api, "_suppress_shadow_manual_review_items", lambda items, skipped: items)
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: {"manual:ABC": {"decision": "legacy_bad_decision"}})
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_api.build_manual_review_payload(limit=5)
+
+    assert payload["summary"]["total_items"] == 1
+    assert events[0]["fallback_type"] == "operator_api_manual_review_invalid_decision_state"
+    assert events[0]["metadata"]["item_id"] == "wait:ABC"
+    assert events[0]["metadata"]["original_item_id"] == "manual:ABC"
+    assert events[0]["metadata"]["decision"] == "legacy_bad_decision"
+    assert events[0]["metadata"]["has_matched_wait_signal"] is True
 
 
 def test_operator_api_builds_identity_issues_payload(monkeypatch):
@@ -14139,6 +28257,78 @@ def test_superseded_failure_cleanup_apply_marks_candidates(monkeypatch):
     assert executed[1][1][2] == "doc-old"
 
 
+def test_operator_api_superseded_cleanup_preview_is_metadata_only(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "cleanup_superseded_failures",
+        lambda apply=False, limit=500: {
+            "status": "dry_run" if not apply else "applied",
+            "event_processing": {"candidates": 2, "updated": 0, "sample": []},
+            "announcement_documents": {"candidates": 1, "updated": 0, "sample": []},
+        },
+    )
+
+    payload = operator_api.build_superseded_cleanup_payload(limit=10)
+
+    assert payload["status"] == "ok"
+    assert payload["mode"] == "preview"
+    assert payload["dry_run"] is True
+    assert payload["counts"]["total_candidates"] == 3
+    assert payload["counts"]["total_updated"] == 0
+    assert payload["operator_boundary"]["writes_superseded_metadata"] is False
+    assert payload["operator_boundary"]["mutates_portfolio"] is False
+    assert payload["operator_boundary"]["mutates_action_recommendation"] is False
+    assert payload["operator_boundary"]["submits_order"] is False
+
+
+def test_operator_api_superseded_cleanup_apply_requires_confirmation_and_reason():
+    with pytest.raises(ValueError, match="confirm=true"):
+        operator_api.apply_superseded_cleanup_payload({"requested_reason": "reviewed"})
+
+    with pytest.raises(ValueError, match="requested_reason"):
+        operator_api.apply_superseded_cleanup_payload({"confirm": True, "requested_reason": "  "})
+
+
+def test_operator_api_superseded_cleanup_apply_audits_metadata_cleanup(monkeypatch):
+    writes: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        operator_api,
+        "cleanup_superseded_failures",
+        lambda apply=False, limit=500: {
+            "status": "applied" if apply else "dry_run",
+            "event_processing": {"candidates": 2, "updated": 2, "sample": [{"unique_id": "event-1"}]},
+            "announcement_documents": {"candidates": 1, "updated": 1, "sample": [{"unique_id": "doc-1"}]},
+        },
+    )
+    monkeypatch.setattr(operator_api, "persist_operator_command_run", lambda row: writes.append(row))
+
+    payload = operator_api.apply_superseded_cleanup_payload(
+        {
+            "confirm": True,
+            "operator_id": "rane",
+            "requested_reason": "reviewed recovered rows from Health preview",
+            "limit": 10,
+        }
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["mode"] == "apply"
+    assert payload["dry_run"] is False
+    assert payload["api_schema"]["read_only"] is False
+    assert payload["api_schema"]["broker_execution_enabled"] is False
+    assert payload["counts"]["total_updated"] == 3
+    assert payload["operator_boundary"]["writes_superseded_metadata"] is True
+    assert payload["operator_boundary"]["mutates_portfolio"] is False
+    assert payload["operator_boundary"]["mutates_action_recommendation"] is False
+    assert payload["operator_boundary"]["mutates_config"] is False
+    assert payload["operator_boundary"]["submits_order"] is False
+    assert payload["audit_run"]["command_key"] == "superseded_failure_cleanup_apply"
+    assert payload["audit_run"]["risk"] == "metadata_cleanup"
+    assert writes[0]["operator_id"] == "rane"
+    assert writes[0]["requested_reason"] == "reviewed recovered rows from Health preview"
+
+
 def test_event_data_quality_reports_schema_tolerant_issues(monkeypatch):
     table_columns = {
         "nseindia_ohlcv": {"date", "symbol"},
@@ -14253,6 +28443,61 @@ def test_event_data_quality_reports_schema_tolerant_issues(monkeypatch):
     assert feature_section["corporate_action_feature_rows"] == 0
 
 
+def test_event_data_quality_records_table_and_schema_lookup_fallbacks(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_data_quality, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("lookup failed")))
+    monkeypatch.setattr(event_data_quality, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    exists = event_data_quality.table_exists("nseindia_ohlcv")
+    columns = event_data_quality.table_columns("nseindia_ohlcv")
+
+    assert exists is False
+    assert columns == set()
+    assert [row["fallback_type"] for row in events] == [
+        "event_data_quality_table_lookup_failed",
+        "event_data_quality_schema_lookup_failed",
+    ]
+    assert all(row["source"] == "nseindia_ohlcv" for row in events)
+
+
+def test_event_data_quality_records_source_freshness_query_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        event_data_quality,
+        "SOURCE_FRESHNESS_CHECKS",
+        [{"name": "test_source", "table": "test_source_table", "date_columns": ["asof_date"], "max_age_days": 5, "required": True}],
+    )
+    monkeypatch.setattr(event_data_quality, "table_exists", lambda table: True)
+    monkeypatch.setattr(event_data_quality, "table_columns", lambda table: {"asof_date", "symbol"})
+    monkeypatch.setattr(event_data_quality, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("freshness query failed")))
+    monkeypatch.setattr(event_data_quality, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = event_data_quality.check_source_freshness(now=pd.Timestamp("2026-06-08T00:00:00Z"))
+
+    assert rows[0]["status"] == "error"
+    assert rows[0]["message"] == "Freshness query failed."
+    assert events[0]["fallback_type"] == "event_data_quality_source_freshness_query_failed"
+    assert events[0]["source"] == "test_source_table"
+    assert events[0]["metadata"]["name"] == "test_source"
+
+
+def test_event_data_quality_records_announcement_readiness_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_data_quality, "table_exists", lambda table: True)
+    monkeypatch.setattr(event_data_quality, "table_columns", lambda table: {"published_on", "symbol", "parse_status", "ocr_status"})
+    monkeypatch.setattr(event_data_quality, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("announcement query failed")))
+    monkeypatch.setattr(event_data_quality, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    row = event_data_quality.check_announcement_readiness()
+
+    assert row["status"] == "error"
+    assert row["message"] == "Announcement readiness query failed."
+    assert events[0]["fallback_type"] == "event_data_quality_announcement_readiness_query_failed"
+    assert events[0]["source"] == event_data_quality.ANNOUNCEMENT_DOCUMENTS_TABLE
+
+
 def test_event_evidence_store_orchestrates_compact_tables(monkeypatch):
     writes: list[tuple[str, pd.DataFrame, list[str], str | None]] = []
     bhavcopy = pd.DataFrame(
@@ -14316,6 +28561,59 @@ def test_event_evidence_store_dry_run_does_not_persist(monkeypatch):
     assert payload["announcements"]["rows"] == 1
 
 
+def test_event_evidence_store_records_table_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_evidence_store, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("catalog down")))
+    monkeypatch.setattr(event_evidence_store, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    exists = event_evidence_store.table_exists("nseindia_ohlcv")
+
+    assert exists is False
+    assert events[0]["fallback_type"] == "event_evidence_table_lookup_failed"
+    assert events[0]["source"] == "nseindia_ohlcv"
+    assert events[0]["metadata"]["table_name"] == "nseindia_ohlcv"
+
+
+def test_event_evidence_store_records_bhavcopy_source_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        event_evidence_store,
+        "resolve_date_range",
+        lambda **_kwargs: (pd.Timestamp("2026-06-01", tz="UTC"), pd.Timestamp("2026-06-01", tz="UTC")),
+    )
+    monkeypatch.setattr(event_evidence_store, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("bhavcopy source failed")))
+    monkeypatch.setattr(event_evidence_store, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="bhavcopy source failed"):
+        event_evidence_store.build_bhavcopy_evidence(from_date="2026-06-01", to_date="2026-06-01")
+
+    assert events[0]["fallback_type"] == "event_evidence_bhavcopy_source_load_failed"
+    assert "nseindia_ohlcv" in events[0]["source"]
+    assert events[0]["metadata"]["start_date"] == "2026-06-01"
+
+
+def test_event_evidence_store_records_announcement_source_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        event_evidence_store,
+        "resolve_date_range",
+        lambda **_kwargs: (pd.Timestamp("2026-06-01", tz="UTC"), pd.Timestamp("2026-06-01", tz="UTC")),
+    )
+    monkeypatch.setattr(event_evidence_store, "table_exists", lambda table_name: False)
+    monkeypatch.setattr(event_evidence_store, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("announcement source failed")))
+    monkeypatch.setattr(event_evidence_store, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="announcement source failed"):
+        event_evidence_store.build_announcement_evidence(from_date="2026-06-01", to_date="2026-06-01")
+
+    assert events[0]["fallback_type"] == "event_evidence_announcement_source_load_failed"
+    assert "announcement_pipeline_documents" in events[0]["source"]
+    assert events[0]["metadata"]["has_evaluations"] is False
+
+
 def test_company_memory_deterministic_review_is_review_input_only():
     context = {
         "symbol": "LUPIN",
@@ -14353,6 +28651,112 @@ def test_company_memory_deterministic_review_downgrades_buy_on_distribution_pres
 
     assert review.recommended_signal == "WATCH"
     assert any("distribution" in item for item in review.risk_flags)
+
+
+def test_company_memory_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(company_memory_review, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    company_memory_review.ensure_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == company_memory_review.COMPANY_MEMORY_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {"tables": [company_memory_review.TABLE_NAME], "authority_scope": "review_input_only"}
+    assert any(company_memory_review.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("prompt_schema_version" in statement for statement in calls[0]["statements"])
+    assert any("authority_scope" in statement for statement in calls[0]["statements"])
+
+
+def test_company_memory_normalizers_record_missing_check_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(company_memory_review, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(company_memory_review.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    assert company_memory_review._json_ready(sentinel) is sentinel
+    assert company_memory_review._text(sentinel).startswith("<object object at ")
+
+    assert [event["fallback_type"] for event in events] == [
+        "company_memory_json_ready_missing_check_failed",
+        "company_memory_text_missing_check_failed",
+    ]
+    assert all(event["module"] == "advisory.company_memory_review" for event in events)
+
+
+def test_company_memory_records_table_lookup_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(company_memory_review, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(company_memory_review, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    exists = company_memory_review.table_exists(company_memory_review.ACTIONS_TABLE)
+
+    assert exists is False
+    assert events[0]["fallback_type"] == "company_memory_source_table_lookup_failed"
+    assert events[0]["source"] == company_memory_review.ACTIONS_TABLE
+
+
+def test_company_memory_records_source_rows_load_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(company_memory_review, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(company_memory_review, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("query timeout")))
+    monkeypatch.setattr(company_memory_review, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = company_memory_review._load_table_rows(
+        company_memory_review.ACTIONS_TABLE,
+        symbol="ABC",
+        asof_date=pd.Timestamp("2026-06-01T00:00:00Z"),
+        date_column="asof_date",
+        columns=["asof_date", "symbol"],
+        lookback_days=30,
+        limit=5,
+    )
+
+    assert rows.empty
+    assert events[0]["fallback_type"] == "company_memory_source_rows_load_failed"
+    assert events[0]["source"] == company_memory_review.ACTIONS_TABLE
+    assert events[0]["symbol"] == "ABC"
+    assert events[0]["metadata"]["date_column"] == "asof_date"
+
+
+def test_company_memory_records_review_symbol_load_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(company_memory_review, "table_exists", lambda table_name: table_name == company_memory_review.ACTIONS_TABLE)
+    monkeypatch.setattr(company_memory_review, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("symbol query timeout")))
+    monkeypatch.setattr(company_memory_review, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    symbols = company_memory_review.load_review_symbols(
+        asof_date=pd.Timestamp("2026-06-01T00:00:00Z"),
+        limit=3,
+    )
+
+    assert symbols == []
+    assert events[0]["fallback_type"] == "company_memory_review_symbols_load_failed"
+    assert events[0]["source"] == company_memory_review.ACTIONS_TABLE
+    assert events[0]["metadata"]["date_column"] == "asof_date"
+
+
+def test_company_memory_records_wait_signal_load_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(company_memory_review, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(company_memory_review, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("query timeout")))
+    monkeypatch.setattr(company_memory_review, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = company_memory_review._load_wait_signal_rows(
+        symbol="ABC",
+        asof_date=pd.Timestamp("2026-06-01T00:00:00Z"),
+        lookback_days=30,
+        limit=5,
+    )
+
+    assert rows.empty
+    assert events[0]["fallback_type"] == "company_memory_wait_signals_load_failed"
+    assert events[0]["source"] == company_memory_review.WAIT_SIGNALS_TABLE
+    assert events[0]["symbol"] == "ABC"
 
 
 def test_company_memory_build_reviews_uses_bounded_symbols_and_persists_contract(monkeypatch):
@@ -14446,6 +28850,15 @@ def test_operator_api_records_manual_review_decision(monkeypatch):
     assert payload["creates_wait_signal"] is True
     assert payload["mutates_portfolio"] is False
     assert payload["submits_order"] is False
+    assert payload["manual_review_state"] == {
+        "state": "waiting_for_event",
+        "active": True,
+        "closes_item": False,
+        "reopened_by_wait_signal": False,
+        "suppression_reason": None,
+    }
+    assert payload["decision_effect"]["decision"] == "watch_for_event"
+    assert payload["decision_effect"]["description"].startswith("Annotates the item")
     assert payload["wait_signal"]["table"] == manual_review_state.WAIT_SIGNALS_TABLE
     assert writes
     row = writes[0].iloc[0].to_dict()
@@ -14498,6 +28911,14 @@ def test_operator_api_records_closing_manual_review_decision_without_side_effect
     assert payload["mutates_action_recommendation"] is False
     assert payload["submits_order"] is False
     assert payload["wait_signal"] is None
+    assert payload["manual_review_state"] == {
+        "state": "closed_no_action",
+        "active": False,
+        "closes_item": True,
+        "reopened_by_wait_signal": False,
+        "suppression_reason": "closed_by_operator",
+    }
+    assert payload["decision_effect"]["decision"] == "downgrade_to_no_action"
     assert writes
     assert not wait_signal_writes
 
@@ -14573,6 +28994,10 @@ def test_operator_api_records_every_manual_review_decision_effect(monkeypatch):
         assert result["mutates_portfolio"] is False
         assert result["mutates_action_recommendation"] is False
         assert result["submits_order"] is False
+        assert result["manual_review_state"]["state"] == effect.next_state
+        assert result["manual_review_state"]["active"] is (not effect.closes_item)
+        assert result["decision_effect"]["decision"] == decision
+        assert result["decision_effect"]["description"] == effect.description
 
     assert len(writes) == len(manual_review_state.ALLOWED_DECISIONS)
     assert len(wait_signal_writes) == 1
@@ -14618,6 +29043,22 @@ def test_manual_review_state_reopens_waiting_item_after_wait_signal_match():
     assert closed.active is False
     assert closed.reopened_by_wait_signal is False
     assert closed.suppression_reason == "closed_by_operator"
+
+
+def test_manual_review_state_normalizers_record_missing_check_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(manual_review_state, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(manual_review_state.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    assert manual_review_state.json_ready(sentinel) is sentinel
+    assert manual_review_state.text(sentinel).startswith("<object object at ")
+
+    assert [event["fallback_type"] for event in events] == [
+        "manual_review_json_ready_missing_check_failed",
+        "manual_review_text_missing_check_failed",
+    ]
+    assert all(event["module"] == "advisory.manual_review_state" for event in events)
 
 
 def test_operator_api_builds_wait_signal_sections(monkeypatch):
@@ -15164,6 +29605,10 @@ def test_operator_api_lists_operator_commands(monkeypatch):
     assert payload["commands"][0]["key"] == "operator_smoke"
     assert payload["commands"][0]["risk"] == "safe_read_only"
     assert any(row["key"] == "operator_health_skip_dhan" for row in payload["commands"])
+    cron_command = next(row for row in payload["commands"] if row["key"] == "cron_preflight")
+    assert cron_command["dry_run"] is True
+    assert cron_command["risk"] == "safe_read_only"
+    assert any("cron_preflight.py" in str(arg) for arg in cron_command["args"])
     superseded_command = next(row for row in payload["commands"] if row["key"] == "superseded_failure_cleanup_dry_run")
     assert superseded_command["dry_run"] is True
     assert superseded_command["risk"] == "safe_read_only"
@@ -15205,6 +29650,41 @@ def test_operator_api_runs_whitelisted_command_with_audit(monkeypatch):
     assert writes[1].iloc[0]["operator_id"] == "rane"
     assert {call["timescaledb_column"] for call in upsert_calls} == {None}
     assert {tuple(call["unique_keys"]) for call in upsert_calls} == {("run_id",)}
+
+
+def test_operator_api_operator_command_timeout_records_fallback(monkeypatch):
+    writes: list[pd.DataFrame] = []
+    events: list[dict[str, object]] = []
+
+    def fake_run(*_args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=kwargs.get("args") or ["python"], timeout=3, output="partial out", stderr="partial err")
+
+    monkeypatch.setattr(operator_api, "ensure_operator_command_runs_table", lambda: None)
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+    monkeypatch.setattr(operator_api.subprocess, "run", fake_run)
+    monkeypatch.setattr(operator_api, "_record_operator_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_api.run_operator_command_payload(
+        {
+            "command_key": "operator_health_skip_dhan",
+            "confirm": True,
+            "operator_id": "rane",
+            "requested_reason": "timeout test",
+        }
+    )
+
+    assert payload["status"] == "timeout"
+    assert len(writes) == 2
+    assert writes[0].iloc[0]["status"] == "running"
+    assert writes[1].iloc[0]["status"] == "timeout"
+    assert writes[1].iloc[0]["error"].startswith("timeout after")
+    assert payload["run"]["stdout_tail"] == "partial out"
+    assert payload["run"]["stderr_tail"] == "partial err"
+    assert events[0]["fallback_type"] == "operator_command_timeout"
+    assert events[0]["source"] == "operator_command"
+    assert events[0]["metadata"]["command_key"] == "operator_health_skip_dhan"
+    assert events[0]["metadata"]["risk"] == "safe_read_only"
+    assert events[0]["metadata"]["dry_run"] is True
 
 
 def test_operator_api_blocks_unknown_or_unconfirmed_operator_command():
@@ -15294,6 +29774,70 @@ def test_technical_threshold_promotion_review_is_manual_only(monkeypatch):
     assert result["prompt_schema_version"] == technical_threshold_promotion.PROMPT_SCHEMA_VERSION
     assert result["llm_review"]["recommendation"] == "needs_more_data"
     assert len(persisted) == 1
+
+
+def test_technical_threshold_promotion_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(technical_threshold_promotion, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    technical_threshold_promotion.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == technical_threshold_promotion.TECHNICAL_THRESHOLD_PROMOTION_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [technical_threshold_promotion.REVIEWS_TABLE, technical_threshold_promotion.DECISIONS_TABLE],
+        "authority_scope": "manual_config_review_only",
+    }
+    assert any(technical_threshold_promotion.REVIEWS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(technical_threshold_promotion.DECISIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("prompt_schema_version TEXT" in statement for statement in calls[0]["statements"])
+    assert any("final_patch_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (setup_id, config_id, reviewed_at)" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (reviewed_at, setup_id, config_id, decided_at)" in statement for statement in calls[0]["statements"])
+
+
+def test_technical_threshold_promotion_records_calibration_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(technical_threshold_promotion, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("calibration failed")))
+    monkeypatch.setattr(technical_threshold_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="calibration failed"):
+        technical_threshold_promotion.load_calibration_config("cfg-1")
+
+    assert events[0]["fallback_type"] == "technical_threshold_promotion_calibration_load_failed"
+    assert events[0]["source"] == technical_threshold_promotion.EVALUATIONS_TABLE
+    assert events[0]["metadata"]["config_id"] == "cfg-1"
+
+
+def test_technical_threshold_promotion_records_json_parse_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(technical_threshold_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = technical_threshold_promotion.parse_jsonish("{bad threshold json", {"fallback": True}, source="patch_json")
+
+    assert result == {"fallback": True}
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.technical_threshold_promotion"
+    assert events[0]["fallback_type"] == "technical_threshold_promotion_json_parse_failed"
+    assert events[0]["source"] == "patch_json"
+    assert events[0]["metadata"] == {"source": "patch_json", "payload_length": len("{bad threshold json")}
+
+
+def test_technical_threshold_promotion_records_json_missing_check_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(technical_threshold_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(technical_threshold_promotion.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = technical_threshold_promotion.parse_jsonish('{"ok": true}', {"fallback": True}, source="patch_json")
+
+    assert result == {"ok": True}
+    assert events[0]["module"] == "advisory.technical_threshold_promotion"
+    assert events[0]["fallback_type"] == "technical_threshold_promotion_json_missing_check_failed"
+    assert events[0]["source"] == "patch_json"
+    assert events[0]["metadata"]["value_type"] == "str"
+    assert events[0]["metadata"]["default_type"] == "dict"
 
 
 def test_operator_api_builds_technical_promotion_review_payload(monkeypatch):
@@ -15423,6 +29967,76 @@ def test_signal_quality_promotion_review_is_manual_only(monkeypatch):
     assert len(persisted) == 1
 
 
+def test_signal_quality_promotion_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(signal_quality_promotion, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    signal_quality_promotion.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == signal_quality_promotion.SIGNAL_QUALITY_PROMOTION_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [signal_quality_promotion.REVIEWS_TABLE, signal_quality_promotion.DECISIONS_TABLE],
+        "authority_scope": "manual_config_review_only",
+    }
+    assert any(signal_quality_promotion.REVIEWS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(signal_quality_promotion.DECISIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("signal_quality_evidence_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("final_patch_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (reviewed_at, evaluated_at, horizon_days, variant)" in statement for statement in calls[0]["statements"])
+    assert any(
+        "UNIQUE (reviewed_at, evaluated_at, horizon_days, variant, decided_at)" in statement for statement in calls[0]["statements"]
+    )
+
+
+def test_signal_quality_promotion_records_summary_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(signal_quality_promotion, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("signal quality failed")))
+    monkeypatch.setattr(signal_quality_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="signal quality failed"):
+        signal_quality_promotion.load_signal_quality_summary(
+            evaluated_at="2026-05-01T00:00:00Z",
+            horizon_days=5,
+            variant="technical_plus_all",
+        )
+
+    assert events[0]["fallback_type"] == "signal_quality_promotion_summary_load_failed"
+    assert events[0]["source"] == signal_quality_promotion.SUMMARY_TABLE
+    assert events[0]["metadata"]["variant"] == "technical_plus_all"
+
+
+def test_signal_quality_promotion_records_json_parse_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(signal_quality_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = signal_quality_promotion.parse_jsonish("{bad signal json", {"fallback": True}, source="coverage_json")
+
+    assert result == {"fallback": True}
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.signal_quality_promotion"
+    assert events[0]["fallback_type"] == "signal_quality_promotion_json_parse_failed"
+    assert events[0]["source"] == "coverage_json"
+    assert events[0]["metadata"] == {"source": "coverage_json", "payload_length": len("{bad signal json")}
+
+
+def test_signal_quality_promotion_json_missing_check_records_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(signal_quality_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(signal_quality_promotion.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = signal_quality_promotion.parse_jsonish('{"ok": true}', {"fallback": True}, source="coverage_json")
+
+    assert result == {"ok": True}
+    assert events[0]["module"] == "advisory.signal_quality_promotion"
+    assert events[0]["fallback_type"] == "signal_quality_promotion_json_missing_check_failed"
+    assert events[0]["source"] == "coverage_json"
+    assert events[0]["metadata"]["value_type"] == "str"
+    assert events[0]["metadata"]["default_type"] == "dict"
+
+
 def test_signal_quality_promotion_manual_decision_does_not_apply_patch(monkeypatch):
     writes = []
     monkeypatch.setattr(signal_quality_promotion, "ensure_tables", lambda: None)
@@ -15461,6 +30075,172 @@ def test_signal_quality_promotion_manual_decision_does_not_apply_patch(monkeypat
     assert result["applied"] is False
     assert result["final_patch"]["mode"] == "manual_apply_required"
     assert "signal_quality_overlay_rules:" in result["final_patch"]["manual_patch_text"]
+    assert writes[0].iloc[0]["decision"] == "approved"
+
+
+def test_event_policy_promotion_review_is_manual_only(monkeypatch):
+    evaluated_at = pd.Timestamp("2026-05-01T00:00:00Z")
+    evidence = {
+        "evaluated_at": evaluated_at,
+        "horizon_days": 5,
+        "group_type": "source_quality",
+        "group_value": "high",
+        "sample_count": 50,
+        "matured_count": 40,
+        "avg_forward_return_after_cost": 0.035,
+        "hit_rate_after_cost": 0.58,
+        "recommendation": "candidate_policy_strengthen",
+    }
+    persisted = []
+
+    monkeypatch.setattr(event_policy_promotion, "load_event_policy_summary", lambda **kwargs: evidence.copy())
+    monkeypatch.setattr(event_policy_promotion, "persist_review", lambda result: persisted.append(result))
+
+    result = event_policy_promotion.generate_promotion_review(
+        evaluated_at=evaluated_at,
+        horizon_days=5,
+        group_type="source_quality",
+        group_value="high",
+        persist=True,
+    )
+
+    assert persisted == [result]
+    assert result["review_model"] == "deterministic_event_policy_v1"
+    assert result["llm_review"]["recommendation"] == "promote_review_rule"
+    assert result["pending_patch"]["mode"] == "manual_review_only"
+    assert result["pending_patch"]["rule_suggestion"]["authority"] == "review_input_only"
+    assert result["pending_patch"]["rule_suggestion"]["broker_execution_allowed"] is False
+    assert "event_policy_review_rules:" in event_policy_promotion.build_manual_patch_text(result["pending_patch"])
+
+
+def test_event_policy_promotion_tightens_weak_group():
+    evidence = {
+        "evaluated_at": pd.Timestamp("2026-05-01T00:00:00Z"),
+        "horizon_days": 10,
+        "group_type": "source_family",
+        "group_value": "market_news",
+        "matured_count": 45,
+        "avg_forward_return_after_cost": -0.02,
+        "hit_rate_after_cost": 0.33,
+    }
+
+    review = event_policy_promotion.deterministic_review(evidence)
+
+    assert review.recommendation == "tighten_or_downgrade"
+    assert any("negative average" in reason.lower() for reason in review.reasons)
+    assert review.proposed_patch["mode"] == "manual_review_only"
+
+
+def test_event_policy_promotion_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+    monkeypatch.setattr(event_policy_promotion, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    event_policy_promotion.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == event_policy_promotion.EVENT_POLICY_PROMOTION_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {
+        "tables": [event_policy_promotion.REVIEWS_TABLE, event_policy_promotion.DECISIONS_TABLE],
+        "authority_scope": "manual_config_review_only",
+    }
+    assert any(event_policy_promotion.REVIEWS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(event_policy_promotion.DECISIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("event_policy_evidence_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (reviewed_at, evaluated_at, horizon_days, group_type, group_value)" in statement for statement in calls[0]["statements"])
+
+
+def test_event_policy_promotion_records_summary_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_policy_promotion, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("event policy failed")))
+    monkeypatch.setattr(event_policy_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="event policy failed"):
+        event_policy_promotion.load_event_policy_summary(
+            evaluated_at="2026-05-01T00:00:00Z",
+            horizon_days=5,
+            group_type="source_quality",
+            group_value="high",
+        )
+
+    assert events[0]["fallback_type"] == "event_policy_promotion_summary_load_failed"
+    assert events[0]["source"] == event_policy_promotion.SUMMARY_TABLE
+    assert events[0]["metadata"]["group_type"] == "source_quality"
+    assert events[0]["metadata"]["group_value"] == "high"
+
+
+def test_event_policy_promotion_records_json_parse_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(event_policy_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = event_policy_promotion.parse_jsonish("{bad promotion json", {"fallback": True}, source="llm_review_json")
+
+    assert result == {"fallback": True}
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.event_policy_promotion"
+    assert events[0]["fallback_type"] == "event_policy_promotion_json_parse_failed"
+    assert events[0]["source"] == "llm_review_json"
+    assert events[0]["metadata"] == {"source": "llm_review_json", "payload_length": len("{bad promotion json")}
+
+
+def test_event_policy_promotion_json_missing_check_records_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(event_policy_promotion, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(event_policy_promotion.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = event_policy_promotion.parse_jsonish('{"ok": true}', {"fallback": True}, source="llm_review_json")
+
+    assert result == {"ok": True}
+    assert events[0]["module"] == "advisory.event_policy_promotion"
+    assert events[0]["fallback_type"] == "event_policy_promotion_json_missing_check_failed"
+    assert events[0]["source"] == "llm_review_json"
+    assert events[0]["metadata"]["value_type"] == "str"
+    assert events[0]["metadata"]["default_type"] == "dict"
+
+
+def test_event_policy_promotion_manual_decision_does_not_apply_patch(monkeypatch):
+    writes = []
+    monkeypatch.setattr(event_policy_promotion, "ensure_tables", lambda: None)
+    monkeypatch.setattr(
+        event_policy_promotion,
+        "find_review",
+        lambda **_kwargs: {
+            "reviewed_at": pd.Timestamp("2026-05-30T00:00:00Z"),
+            "evaluated_at": pd.Timestamp("2026-05-01T00:00:00Z"),
+            "horizon_days": 5,
+            "group_type": "source_quality",
+            "group_value": "high",
+            "recommendation": "promote_review_rule",
+            "confidence": 0.6,
+            "llm_review": {"recommendation": "promote_review_rule"},
+            "event_policy_evidence": {"matured_count": 40},
+            "patch": {
+                "path": "config/advisory_setups.yaml",
+                "mode": "manual_review_only",
+                "rule_suggestion": {
+                    "event_policy_group_type": "source_quality",
+                    "event_policy_group_value": "high",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(event_policy_promotion, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+
+    result = event_policy_promotion.record_manual_decision(
+        reviewed_at="2026-05-30T00:00:00Z",
+        evaluated_at="2026-05-01T00:00:00Z",
+        horizon_days=5,
+        group_type="source_quality",
+        group_value="high",
+        decision="approved",
+        operator_id="tester",
+        decision_reason="stable across manual checks",
+    )
+
+    assert result["applied"] is False
+    assert "No config file, action rule, portfolio row, or trading behavior was changed" in result["note"]
+    assert result["final_patch"]["mode"] == "manual_apply_required"
+    assert "event_policy_review_rules:" in result["final_patch"]["manual_patch_text"]
     assert writes[0].iloc[0]["decision"] == "approved"
 
 
@@ -15524,6 +30304,90 @@ def test_operator_api_records_signal_quality_promotion_manual_decision(monkeypat
     assert called["operator_id"] == "tester"
 
 
+def test_operator_api_builds_event_policy_promotion_review_payload(monkeypatch):
+    called = {}
+
+    def fake_review(**kwargs):
+        called.update(kwargs)
+        return {
+            "status": "ok",
+            "evaluated_at": kwargs["evaluated_at"],
+            "horizon_days": kwargs["horizon_days"],
+            "group_type": kwargs["group_type"],
+            "group_value": kwargs["group_value"],
+            "pending_patch": {"mode": "manual_review_only"},
+            "llm_review": {"recommendation": "promote_review_rule"},
+        }
+
+    monkeypatch.setattr(operator_api, "generate_event_policy_promotion_review", fake_review)
+
+    payload = operator_api.build_event_policy_promotion_review_payload(
+        {
+            "evaluated_at": "2026-05-01T00:00:00Z",
+            "horizon_days": 5,
+            "group_type": "source_quality",
+            "group_value": "high",
+        }
+    )
+
+    assert payload["api_schema"]["endpoint"] == "/api/event-policy/promotion-review"
+    assert payload["pending_patch"]["mode"] == "manual_review_only"
+    assert called["persist"] is True
+    assert called["group_type"] == "source_quality"
+    assert called["group_value"] == "high"
+
+
+def test_operator_api_lists_event_policy_promotion_reviews(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "load_event_policy_promotion_reviews",
+        lambda **_kwargs: [{"group_type": "source_quality", "group_value": "high", "review_status": "ok"}],
+    )
+
+    payload = operator_api.build_event_policy_promotion_reviews_payload(limit=5)
+
+    assert payload["api_schema"]["endpoint"] == "/api/event-policy/promotion-reviews"
+    assert payload["reviews"][0]["group_value"] == "high"
+    assert payload["pagination"]["reviews"]["limit"] == 5
+
+
+def test_operator_api_records_event_policy_promotion_manual_decision(monkeypatch):
+    called = {}
+
+    def fake_decision(**kwargs):
+        called.update(kwargs)
+        return {
+            "status": "ok",
+            "decision": kwargs["decision"],
+            "evaluated_at": kwargs["evaluated_at"],
+            "horizon_days": kwargs["horizon_days"],
+            "group_type": kwargs["group_type"],
+            "group_value": kwargs["group_value"],
+            "final_patch": {"mode": "manual_apply_required"},
+            "applied": False,
+        }
+
+    monkeypatch.setattr(operator_api, "record_event_policy_manual_decision", fake_decision)
+
+    payload = operator_api.build_event_policy_promotion_review_decision_payload(
+        {
+            "reviewed_at": "2026-05-30T00:00:00Z",
+            "evaluated_at": "2026-05-01T00:00:00Z",
+            "horizon_days": 5,
+            "group_type": "source_quality",
+            "group_value": "high",
+            "decision": "approved",
+            "operator_id": "tester",
+        }
+    )
+
+    assert payload["applied"] is False
+    assert payload["api_schema"]["endpoint"] == "/api/event-policy/promotion-review/decision"
+    assert called["decision"] == "approved"
+    assert called["operator_id"] == "tester"
+    assert called["group_value"] == "high"
+
+
 def test_config_change_assistant_renders_technical_threshold_diff(tmp_path):
     config_path = tmp_path / "advisory_setups.yaml"
     config_path.write_text(
@@ -15558,6 +30422,90 @@ def test_config_change_assistant_renders_technical_threshold_diff(tmp_path):
     assert "Preview only" in result["safety_checks"][0]
 
 
+def test_config_change_assistant_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(config_change_assistant, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    config_change_assistant.ensure_tables()
+
+    assert len(calls) == 2
+    preview_call = calls[0]
+    application_call = calls[1]
+    assert preview_call["migration_id"] == config_change_assistant.PREVIEWS_SCHEMA_MIGRATION_ID
+    assert preview_call["metadata"]["tables"] == [config_change_assistant.PREVIEWS_TABLE]
+    assert any(config_change_assistant.PREVIEWS_TABLE in statement for statement in preview_call["statements"])
+    assert any("patch_payload_json TEXT" in statement for statement in preview_call["statements"])
+    assert any("unified_diff TEXT" in statement for statement in preview_call["statements"])
+    assert any("UNIQUE (preview_id)" in statement for statement in preview_call["statements"])
+    assert application_call["migration_id"] == config_change_assistant.APPLICATIONS_SCHEMA_MIGRATION_ID
+    assert application_call["metadata"]["tables"] == [config_change_assistant.APPLICATIONS_TABLE]
+    assert application_call["metadata"]["authority_scope"] == "manual_application_audit_only"
+    assert any(config_change_assistant.APPLICATIONS_TABLE in statement for statement in application_call["statements"])
+    assert any("applied_by_system BOOLEAN" in statement for statement in application_call["statements"])
+    assert any("UNIQUE (application_id)" in statement for statement in application_call["statements"])
+
+
+def test_config_change_assistant_records_technical_decision_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(config_change_assistant, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("decision db down")))
+    monkeypatch.setattr(config_change_assistant, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError):
+        config_change_assistant.load_latest_approved_technical_decision(setup_id="SETUP", config_id="cfg")
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "config_change_technical_decision_load_failed"
+    assert events[0]["source"] == config_change_assistant.TECHNICAL_DECISIONS_TABLE
+    assert events[0]["metadata"]["setup_id"] == "SETUP"
+
+
+def test_config_change_assistant_records_preview_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(config_change_assistant, "ensure_tables", lambda: None)
+    monkeypatch.setattr(config_change_assistant, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("preview db down")))
+    monkeypatch.setattr(config_change_assistant, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError):
+        config_change_assistant.load_previews(limit=5)
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "config_change_previews_load_failed"
+    assert events[0]["source"] == config_change_assistant.PREVIEWS_TABLE
+    assert events[0]["metadata"] == {"limit": 5}
+
+
+def test_config_change_assistant_records_json_parse_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(config_change_assistant, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = config_change_assistant.parse_jsonish("{bad config json", {"fallback": True}, source="patch_payload_json")
+
+    assert result == {"fallback": True}
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.config_change_assistant"
+    assert events[0]["fallback_type"] == "config_change_json_parse_failed"
+    assert events[0]["source"] == "patch_payload_json"
+    assert events[0]["metadata"] == {"source": "patch_payload_json", "payload_length": len("{bad config json")}
+
+
+def test_config_change_assistant_records_json_missing_check_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(config_change_assistant, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(config_change_assistant.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = config_change_assistant.parse_jsonish('{"ok": true}', {"fallback": True}, source="patch_payload_json")
+
+    assert result == {"ok": True}
+    assert events[0]["module"] == "advisory.config_change_assistant"
+    assert events[0]["fallback_type"] == "config_change_json_missing_check_failed"
+    assert events[0]["source"] == "patch_payload_json"
+    assert events[0]["metadata"]["value_type"] == "str"
+    assert events[0]["metadata"]["default_type"] == "dict"
+
+
 def test_config_change_assistant_renders_signal_quality_overlay_diff(tmp_path):
     config_path = tmp_path / "advisory_setups.yaml"
     config_path.write_text("setups:\n  - setup_id: TEST\n    setup_name: Test\n", encoding="utf-8")
@@ -15583,9 +30531,171 @@ def test_config_change_assistant_renders_signal_quality_overlay_diff(tmp_path):
     assert "+    broker_execution_allowed: false" in result["unified_diff"]
 
 
+def test_config_change_assistant_renders_event_policy_review_rule_diff(tmp_path):
+    config_path = tmp_path / "advisory_setups.yaml"
+    config_path.write_text("setups:\n  - setup_id: TEST\n    setup_name: Test\n", encoding="utf-8")
+
+    result = config_change_assistant.build_preview_from_patch(
+        source_type="event_policy_review_rule",
+        source_key="review-3",
+        config_path=config_path,
+        patch_payload={
+            "rule_suggestion": {
+                "event_policy_group_type": "source_quality",
+                "event_policy_group_value": "high",
+                "minimum_horizon_days": 5,
+                "minimum_matured_rows": 40,
+                "minimum_avg_forward_return_after_cost": 0.03,
+                "minimum_hit_rate_after_cost": 0.55,
+            }
+        },
+        persist=False,
+    )
+
+    assert result["applied"] is False
+    assert result["source_type"] == "event_policy_review_rule"
+    assert "event_policy_review_rules:" in result["unified_diff"]
+    assert "+  - authority: review_input_only" in result["unified_diff"]
+    assert "+    broker_execution_allowed: false" in result["unified_diff"]
+    assert "+    group_type: source_quality" in result["unified_diff"]
+    assert "+    group_value: high" in result["unified_diff"]
+
+
+def test_config_change_assistant_renders_ts_forecast_review_rule_diff(tmp_path):
+    config_path = tmp_path / "advisory_setups.yaml"
+    config_path.write_text("setups:\n  - setup_id: TEST\n    setup_name: Test\n", encoding="utf-8")
+
+    result = config_change_assistant.build_preview_from_patch(
+        source_type="ts_forecast_review_rule",
+        source_key="review-4",
+        config_path=config_path,
+        patch_payload={
+            "rule_suggestion": {
+                "ts_forecast_model_name": "timesfm_2p5_200m",
+                "ts_forecast_horizon_days": 10,
+                "minimum_evaluated_trades": 80,
+                "minimum_win_rate": 0.61,
+                "minimum_avg_cost_adjusted_return": 0.028,
+                "minimum_lift_vs_momentum": 0.015,
+                "maximum_exit_conflict_rate": 0.0,
+            }
+        },
+        persist=False,
+    )
+
+    assert result["applied"] is False
+    assert result["source_type"] == "ts_forecast_review_rule"
+    assert "ts_forecast_review_rules:" in result["unified_diff"]
+    assert "+  - authority: review_input_only" in result["unified_diff"]
+    assert "+    broker_execution_allowed: false" in result["unified_diff"]
+    assert "+    model_name: timesfm_2p5_200m" in result["unified_diff"]
+    assert "+    horizon_days: 10" in result["unified_diff"]
+    assert "+    status: disabled_review_candidate" in result["unified_diff"]
+
+
+def test_config_change_assistant_records_ts_forecast_decision_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(config_change_assistant, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ts decision db down")))
+    monkeypatch.setattr(config_change_assistant, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError):
+        config_change_assistant.load_latest_approved_ts_forecast_decision(model_name="timesfm_2p5_200m", horizon_days=10)
+
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "config_change_ts_forecast_decision_load_failed"
+    assert events[0]["source"] == config_change_assistant.TS_FORECAST_DECISIONS_TABLE
+    assert events[0]["metadata"]["model_name"] == "timesfm_2p5_200m"
+
+
+def test_config_change_assistant_verifies_ts_forecast_review_rule_config(tmp_path):
+    config_path = tmp_path / "advisory_setups.yaml"
+    config_path.write_text(
+        """ts_forecast_review_rules:
+  - authority: review_input_only
+    broker_execution_allowed: false
+    horizon_days: 10
+    model_name: timesfm_2p5_200m
+    status: disabled_review_candidate
+""",
+        encoding="utf-8",
+    )
+    preview = {
+        "source_type": "ts_forecast_review_rule",
+        "patch_payload": {
+            "rule_suggestion": {
+                "ts_forecast_model_name": "timesfm_2p5_200m",
+                "ts_forecast_horizon_days": 10,
+            }
+        },
+    }
+
+    result = config_change_assistant.verify_preview_against_config(preview, config_path=config_path)
+
+    assert result["status"] == "verified"
+    assert result["verified"] is True
+    assert result["model_name"] == "timesfm_2p5_200m"
+    assert result["horizon_days"] == 10
+    assert result["valid_matched_count"] == 1
+    assert result["config_summary"]["valid_rules"] == 1
+
+
+def test_config_change_assistant_records_application_decision_as_audit_only(monkeypatch):
+    captured = {}
+
+    monkeypatch.setattr(config_change_assistant, "ensure_tables", lambda: None)
+    monkeypatch.setattr(
+        config_change_assistant,
+        "load_preview",
+        lambda preview_id: {
+            "preview_id": preview_id,
+            "source_type": "ts_forecast_review_rule",
+            "source_key": "timesfm_2p5_200m:10",
+            "config_path": "config/advisory_setups.yaml",
+            "decision_status": "preview_only_not_applied",
+            "patch_payload": {"rule_suggestion": {"model_name": "timesfm_2p5_200m", "horizon_days": 10}},
+        },
+    )
+    monkeypatch.setattr(
+        config_change_assistant,
+        "verify_preview_against_config",
+        lambda preview, **_kwargs: {"status": "verified", "verified": True, "model_name": "timesfm_2p5_200m", "horizon_days": 10},
+    )
+
+    def fake_upsert(df, table, unique_keys, timescaledb_column=None):
+        captured["df"] = df.copy()
+        captured["table"] = table
+        captured["unique_keys"] = list(unique_keys)
+
+    monkeypatch.setattr(config_change_assistant, "upsert_to_db", fake_upsert)
+
+    result = config_change_assistant.record_application_decision(
+        preview_id="preview-1",
+        application_decision="marked_applied",
+        operator_id="tester",
+        operator_note="Applied disabled review rule manually.",
+    )
+
+    assert result["status"] == "ok"
+    assert result["application_decision"] == "marked_applied"
+    assert result["verification_status"] == "verified"
+    assert result["applied_by_system"] is False
+    assert result["applied"] is False
+    assert "did not modify config files" in result["note"]
+    assert captured["table"] == config_change_assistant.APPLICATIONS_TABLE
+    assert captured["unique_keys"] == ["application_id"]
+    row = captured["df"].iloc[0].to_dict()
+    assert row["preview_id"] == "preview-1"
+    assert row["application_decision"] == "marked_applied"
+    assert row["applied_by_system"] is False
+    assert "verified" in row["verification_json"]
+
+
 def test_operator_api_builds_config_change_previews(monkeypatch):
     technical_called = {}
     signal_called = {}
+    event_policy_called = {}
+    ts_called = {}
 
     def fake_technical(**kwargs):
         technical_called.update(kwargs)
@@ -15607,8 +30717,30 @@ def test_operator_api_builds_config_change_previews(monkeypatch):
             "applied": False,
         }
 
+    def fake_event_policy(**kwargs):
+        event_policy_called.update(kwargs)
+        return {
+            "status": "ok",
+            "source_type": "event_policy_review_rule",
+            "config_path": "config/advisory_setups.yaml",
+            "unified_diff": "---\n+++",
+            "applied": False,
+        }
+
+    def fake_ts(**kwargs):
+        ts_called.update(kwargs)
+        return {
+            "status": "ok",
+            "source_type": "ts_forecast_review_rule",
+            "config_path": "config/advisory_setups.yaml",
+            "unified_diff": "---\n+++",
+            "applied": False,
+        }
+
     monkeypatch.setattr(operator_api, "build_technical_threshold_preview", fake_technical)
     monkeypatch.setattr(operator_api, "build_signal_quality_overlay_preview", fake_signal)
+    monkeypatch.setattr(operator_api, "build_event_policy_review_rule_preview", fake_event_policy)
+    monkeypatch.setattr(operator_api, "build_ts_forecast_review_rule_preview", fake_ts)
 
     technical_payload = operator_api.build_technical_config_change_preview_payload(
         {"reviewed_at": "2026-05-30T00:00:00Z", "setup_id": "EVENT_OPPORTUNITY_V1", "config_id": "cfg-1"}
@@ -15621,6 +30753,22 @@ def test_operator_api_builds_config_change_previews(monkeypatch):
             "variant": "technical_plus_all",
         }
     )
+    event_policy_payload = operator_api.build_event_policy_config_change_preview_payload(
+        {
+            "reviewed_at": "2026-05-30T00:00:00Z",
+            "evaluated_at": "2026-05-01T00:00:00Z",
+            "horizon_days": 5,
+            "group_type": "source_quality",
+            "group_value": "high",
+        }
+    )
+    ts_payload = operator_api.build_ts_forecast_config_change_preview_payload(
+        {
+            "reviewed_at": "2026-05-30T00:00:00Z",
+            "model_name": "timesfm_2p5_200m",
+            "horizon_days": 10,
+        }
+    )
 
     assert technical_payload["applied"] is False
     assert technical_payload["api_schema"]["endpoint"] == "/api/config-change/technical-threshold-preview"
@@ -15628,6 +30776,69 @@ def test_operator_api_builds_config_change_previews(monkeypatch):
     assert signal_payload["applied"] is False
     assert signal_payload["api_schema"]["endpoint"] == "/api/config-change/signal-quality-preview"
     assert signal_called["variant"] == "technical_plus_all"
+    assert event_policy_payload["applied"] is False
+    assert event_policy_payload["api_schema"]["endpoint"] == "/api/config-change/event-policy-preview"
+    assert event_policy_called["group_type"] == "source_quality"
+    assert event_policy_called["group_value"] == "high"
+    assert ts_payload["applied"] is False
+    assert ts_payload["api_schema"]["endpoint"] == "/api/config-change/ts-forecast-preview"
+    assert ts_called["model_name"] == "timesfm_2p5_200m"
+    assert ts_called["horizon_days"] == 10
+
+
+def test_operator_api_builds_config_change_application_payloads(monkeypatch):
+    decision_called = {}
+
+    monkeypatch.setattr(
+        operator_api,
+        "load_application_decisions",
+        lambda **_kwargs: [
+            {
+                "application_id": "app-1",
+                "preview_id": "preview-1",
+                "application_decision": "marked_applied",
+                "verification_status": "verified",
+                "applied_by_system": False,
+            }
+        ],
+    )
+
+    def fake_decision(**kwargs):
+        decision_called.update(kwargs)
+        return {
+            "status": "ok",
+            "application_id": "app-2",
+            "preview_id": kwargs["preview_id"],
+            "application_decision": kwargs["application_decision"],
+            "verification_status": "verified",
+            "verification": {"status": "verified"},
+            "safety_checks": ["audit only"],
+            "applied_by_system": False,
+            "applied": False,
+            "note": "Decision recorded only.",
+        }
+
+    monkeypatch.setattr(operator_api, "record_application_decision", fake_decision)
+
+    applications = operator_api.build_config_change_applications_payload(limit=5)
+    decision = operator_api.build_config_change_application_decision_payload(
+        {
+            "preview_id": "preview-1",
+            "application_decision": "marked_applied",
+            "operator_id": "tester",
+            "operator_note": "I applied the disabled rule manually.",
+        }
+    )
+
+    assert applications["api_schema"]["endpoint"] == "/api/config-change/applications"
+    assert applications["applications"][0]["application_id"] == "app-1"
+    assert applications["pagination"]["applications"]["limit"] == 5
+    assert decision["api_schema"]["endpoint"] == "/api/config-change/application-decision"
+    assert decision["applied_by_system"] is False
+    assert decision["applied"] is False
+    assert decision_called["preview_id"] == "preview-1"
+    assert decision_called["application_decision"] == "marked_applied"
+    assert decision_called["operator_id"] == "tester"
 
 
 def test_prompt_registry_lists_prompt_contracts_with_no_broker_authority():
@@ -15952,6 +31163,48 @@ def test_performance_slowlog_deduplicates_state(tmp_path):
     assert len(log_file.read_text(encoding="utf-8").splitlines()) == 2
 
 
+def test_performance_slowlog_corrupt_state_records_fallback(tmp_path, monkeypatch):
+    events = []
+    state_file = tmp_path / "state.json"
+    state_file.write_text("{bad-json", encoding="utf-8")
+    monkeypatch.setattr(performance_slowlog, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    state = performance_slowlog.load_slow_state(state_file)
+
+    assert state == {"version": 1, "issues": {}}
+    assert events[0]["module"] == "advisory.performance_slowlog"
+    assert events[0]["fallback_type"] == "performance_slowlog_state_parse_failed"
+    assert events[0]["source"] == str(state_file)
+
+
+def test_performance_slowlog_non_json_details_records_fallback(monkeypatch):
+    events = []
+    monkeypatch.setattr(performance_slowlog, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    value: dict[str, object] = {}
+    value["self"] = value
+    result = performance_slowlog._safe_json(value)
+
+    assert isinstance(result, str)
+    assert events[0]["fallback_type"] == "performance_slowlog_json_safety_failed"
+    assert events[0]["source"] == "slow_operation_details"
+    assert events[0]["metadata"]["value_type"] == "dict"
+
+
+def test_performance_slowlog_context_record_failure_records_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(performance_slowlog, "record_slow_operation", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("slowlog write failed")))
+    monkeypatch.setattr(performance_slowlog, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with performance_slowlog.slow_operation("unit", "slow-step", threshold_ms=0.0):
+        pass
+
+    assert events[0]["fallback_type"] == "performance_slowlog_context_record_failed"
+    assert events[0]["source"] == "slow-step"
+    assert events[0]["metadata"]["kind"] == "unit"
+
+
 def test_operator_api_updates_slow_issue_status(monkeypatch):
     calls = []
 
@@ -16003,6 +31256,21 @@ def test_rule_engine_refresh_missing_snapshots_can_skip_intraday(monkeypatch):
     assert called["intraday"] is False
     assert result["intraday_rows"] == 0
     assert result["intraday_meta"]["reason"] == "intraday_refresh_disabled"
+
+
+def test_continuous_watch_ensure_alerts_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(continuous_watch, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    continuous_watch.ensure_alerts_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == continuous_watch.ALERTS_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [continuous_watch.ALERTS_TABLE]
+    assert any(continuous_watch.ALERTS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("monitor_source" in statement for statement in calls[0]["statements"])
+    assert any("stop_price" in statement for statement in calls[0]["statements"])
 
 
 def test_continuous_watch_build_price_alerts_entry_and_invalidation():
@@ -16162,6 +31430,59 @@ def test_continuous_watch_load_monitored_universe_dedupes_same_symbol(monkeypatc
     ]
 
 
+def test_continuous_watch_records_open_position_load_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def fake_sql(*_args, **_kwargs):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(continuous_watch, "sql_to_df", fake_sql)
+    monkeypatch.setattr(continuous_watch, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = continuous_watch.load_open_positions(asof_date=pd.Timestamp("2026-04-17T00:00:00Z"))
+
+    assert out.empty
+    assert [event["fallback_type"] for event in events] == [
+        "continuous_watch_open_positions_load_failed",
+        "continuous_watch_open_positions_load_failed",
+    ]
+    assert events[0]["metadata"] == {"query_index": 1, "asof_date": "2026-04-17 00:00:00+00:00"}
+    assert events[1]["metadata"] == {"query_index": 2, "asof_date": "2026-04-17 00:00:00+00:00"}
+
+
+def test_continuous_watch_records_cycle_failure_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    sync_states: list[dict[str, object]] = []
+    bus_messages: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr(continuous_watch, "ensure_sync_state_table", lambda: None)
+    monkeypatch.setattr(continuous_watch, "ensure_alerts_table", lambda: None)
+    monkeypatch.setattr(continuous_watch, "_is_due", lambda source_name, interval_seconds: source_name == "continuous_watch:ohlcv")
+    monkeypatch.setattr(continuous_watch, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(continuous_watch, "persist_sync_state", lambda **kwargs: sync_states.append(kwargs))
+    monkeypatch.setattr(continuous_watch, "publish_bus_message", lambda channel, payload: bus_messages.append((channel, payload)))
+    monkeypatch.setattr(continuous_watch, "run_ohlcv_cycle", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("ohlcv failed")))
+    monkeypatch.setattr(continuous_watch, "route_live_updates", lambda: {"status": "ok"})
+    monkeypatch.setattr(continuous_watch, "run_operator_frontend_cycle", lambda: {"status": "ok"})
+
+    summary = continuous_watch.run_once(
+        ohlcv_interval_seconds=1,
+        news_interval_seconds=1,
+        announcement_interval_seconds=1,
+        intraday_interval_minutes=1,
+        ohlcv_max_lookback_minutes=60,
+    )
+
+    assert summary["status"] == "error"
+    assert summary["cycles"]["ohlcv"]["status"] == "error"
+    assert events[0]["fallback_type"] == "continuous_watch_cycle_failed"
+    assert events[0]["source"] == "continuous_watch:ohlcv"
+    assert events[0]["metadata"] == {"cycle": "ohlcv"}
+    assert sync_states[0]["source_name"] == "continuous_watch:ohlcv"
+    assert sync_states[0]["status"] == "error"
+    assert any(channel == "stockey:continuous_watch:ohlcv" for channel, _payload in bus_messages)
+
+
 def test_continuous_watch_ohlcv_cursor_does_not_advance_on_empty_pull():
     previous = pd.Timestamp("2026-04-08T09:20:00Z")
     requested_from = pd.Timestamp("2026-04-08T09:15:00Z")
@@ -16222,6 +31543,50 @@ def test_continuous_watch_event_cursor_uses_initial_window_without_state():
 
     assert truncated is False
     assert from_cursor == pd.Timestamp("2026-04-08T08:30:00Z")
+
+
+def test_event_router_ensure_actions_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(event_router, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    event_router.ensure_actions_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == event_router.EVENT_ROUTER_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [event_router.ACTIONS_TABLE]
+    assert any(event_router.ACTIONS_TABLE in statement for statement in calls[0]["statements"])
+    assert any("source_type TEXT NOT NULL" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (routed_at, symbol, source_type, action_type)" in statement for statement in calls[0]["statements"])
+
+
+def test_event_router_records_source_row_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_router, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("source timeout")))
+    monkeypatch.setattr(event_router, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    df = event_router.load_recent_source_rows(event_router.ALERTS_TABLE, load_from=pd.Timestamp("2026-04-08T09:00:00Z"))
+
+    assert df.empty
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "event_router_source_rows_load_failed"
+    assert events[0]["source"] == event_router.ALERTS_TABLE
+    assert events[0]["metadata"]["load_from"] == "2026-04-08T09:00:00+00:00"
+
+
+def test_event_router_records_watchlist_priority_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(event_router, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("watchlist timeout")))
+    monkeypatch.setattr(event_router, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    df = event_router.load_watchlist_priority()
+
+    assert df.empty
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "event_router_watchlist_priority_load_failed"
+    assert events[0]["source"] == "advisory_watchlist"
 
 
 def test_event_router_build_routing_plan_merges_price_and_event_sources():
@@ -16376,6 +31741,188 @@ def test_signal_refresh_maps_event_buy_watch_to_watch():
     assert signal["signal_source"] == "event_policy"
 
 
+def test_signal_refresh_jsonish_records_malformed_context_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    parsed = signal_refresh._jsonish("{bad wait evidence", {"fallback": True}, source="wait_signal_evidence_json")
+
+    assert parsed == {"fallback": True}
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "advisory.signal_refresh"
+    assert event["fallback_type"] == "signal_refresh_json_parse_failed"
+    assert event["source"] == "wait_signal_evidence_json"
+    assert event["severity"] == "warn"
+    assert event["metadata"]["default_type"] == "dict"
+    assert event["metadata"]["value_length"] == len("{bad wait evidence")
+    assert event["metadata"]["value_excerpt"] == "{bad wait evidence"
+
+
+def test_signal_refresh_text_records_missing_check_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    sentinel = object()
+    monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(signal_refresh.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = signal_refresh._text(sentinel)
+
+    assert result.startswith("<object object at ")
+    assert events[0]["module"] == "advisory.signal_refresh"
+    assert events[0]["fallback_type"] == "signal_refresh_text_missing_check_failed"
+    assert events[0]["source"] == "text"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
+def test_signal_refresh_records_latest_row_lookup_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(signal_refresh, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(signal_refresh, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("action lookup timeout")))
+    monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    row = signal_refresh.load_latest_action("ABC", asof_date=pd.Timestamp("2026-04-01T00:00:00Z"))
+
+    assert row is None
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "signal_refresh_latest_row_unavailable"
+    assert events[0]["source"] == signal_refresh.ACTIONS_TABLE
+    assert events[0]["symbol"] == "ABC"
+
+
+def test_signal_refresh_records_table_exists_check_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        signal_refresh,
+        "sql_to_df",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table lookup timeout")),
+    )
+    monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    exists = signal_refresh.table_exists(signal_refresh.ACTIONS_TABLE)
+
+    assert exists is False
+    assert events[0]["fallback_type"] == "signal_refresh_table_exists_check_failed"
+    assert events[0]["source"] == signal_refresh.ACTIONS_TABLE
+    assert events[0]["metadata"]["table_name"] == signal_refresh.ACTIONS_TABLE
+
+
+def test_signal_refresh_records_event_policy_lookup_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(signal_refresh, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(signal_refresh, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("event policy timeout")))
+    monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = signal_refresh.load_event_policy("ABC", unique_id="evt-1", asof_date=pd.Timestamp("2026-04-01T00:00:00Z"))
+
+    assert rows == []
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "signal_refresh_event_policy_unavailable"
+    assert events[0]["source"] == signal_refresh.EVENT_POLICY_TABLE
+    assert events[0]["symbol"] == "ABC"
+    assert events[0]["unique_id"] == "evt-1"
+
+
+def test_signal_refresh_records_router_action_lookup_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(signal_refresh, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(signal_refresh, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("router timeout")))
+    monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    rows = signal_refresh.load_recent_router_actions(limit=10)
+
+    assert rows == []
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "signal_refresh_router_actions_unavailable"
+    assert events[0]["source"] == signal_refresh.ROUTER_ACTIONS_TABLE
+
+
+def test_signal_refresh_records_trace_summary_refresh_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(signal_refresh, "ensure_table", lambda: None)
+    monkeypatch.setattr(signal_refresh, "load_latest_action", lambda *args, **kwargs: None)
+    monkeypatch.setattr(signal_refresh, "load_latest_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(signal_refresh, "load_latest_rebalance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(signal_refresh, "load_event_policy", lambda *args, **kwargs: [])
+    monkeypatch.setattr(signal_refresh, "match_wait_signals", lambda **kwargs: {"matches": []})
+    monkeypatch.setattr(signal_refresh, "safe_trace_call", lambda *args, **kwargs: None)
+    monkeypatch.setattr(signal_refresh, "persist_signal_rows", lambda rows: None)
+    monkeypatch.setattr(
+        signal_refresh,
+        "build_symbol_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("trace summary failed")),
+    )
+    monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    row = signal_refresh.refresh_symbol(symbol="ABC", reason="news", asof_date=pd.Timestamp("2026-04-01T00:00:00Z"), dry_run=False)
+
+    assert row["symbol"] == "ABC"
+    assert events[0]["fallback_type"] == "signal_refresh_trace_summary_refresh_failed"
+    assert events[0]["source"] == "advisory.trace_summary_store"
+    assert events[0]["symbol"] == "ABC"
+    assert events[0]["metadata"]["reason"] == "news"
+
+
+def test_signal_refresh_records_router_item_failure_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    router_rows = [
+        {
+            "symbol": "ABC",
+            "source_type": "news_event",
+            "action_type": "refresh_symbol_full",
+            "unique_id": "evt-1",
+            "asof_date": pd.Timestamp("2026-04-01T00:00:00Z"),
+        }
+    ]
+
+    monkeypatch.setattr(signal_refresh, "load_recent_router_actions", lambda limit=25: router_rows)
+    monkeypatch.setattr(signal_refresh, "refresh_symbol", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("refresh failed")))
+    monkeypatch.setattr(signal_refresh, "persist_sync_state", lambda **kwargs: None)
+    monkeypatch.setattr(signal_refresh, "publish_bus_message", lambda *args, **kwargs: True)
+    monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    summary = signal_refresh.refresh_from_router(limit=10, dry_run=False)
+
+    assert summary["status"] == "partial"
+    assert summary["errors"][0]["symbol"] == "ABC"
+    assert events[0]["fallback_type"] == "signal_refresh_router_item_failed"
+    assert events[0]["source"] == signal_refresh.ROUTER_ACTIONS_TABLE
+    assert events[0]["symbol"] == "ABC"
+    assert events[0]["metadata"]["unique_id"] == "evt-1"
+
+
+def test_wait_signals_ensure_tables_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(wait_signals, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    wait_signals.ensure_tables()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == wait_signals.WAIT_SIGNALS_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [wait_signals.WAIT_SIGNALS_TABLE, wait_signals.WAIT_SIGNAL_MATCHES_TABLE]
+    assert any(wait_signals.WAIT_SIGNALS_TABLE in statement for statement in calls[0]["statements"])
+    assert any(wait_signals.WAIT_SIGNAL_MATCHES_TABLE in statement for statement in calls[0]["statements"])
+    assert any("signal_id TEXT PRIMARY KEY" in statement for statement in calls[0]["statements"])
+    assert any("CREATE INDEX IF NOT EXISTS" in statement for statement in calls[0]["statements"])
+
+
+def test_wait_signals_text_records_missing_check_fallback(monkeypatch):
+    events = []
+    sentinel = object()
+    monkeypatch.setattr(wait_signals, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(wait_signals.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
+
+    result = wait_signals._text(sentinel)
+
+    assert result.startswith("<object object at ")
+    assert events[0]["module"] == "advisory.wait_signals"
+    assert events[0]["fallback_type"] == "wait_signals_text_missing_check_failed"
+    assert events[0]["source"] == "text"
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
 def test_wait_signals_generate_price_and_event_waits(monkeypatch):
     monkeypatch.setattr(
         wait_signals,
@@ -16485,6 +32032,67 @@ def test_wait_signal_matcher_routes_price_conditions(monkeypatch):
     assert evidence["wait_signal"]["wait_question"] == "Has ABC closed above 100?"
 
 
+def test_wait_signal_matcher_persist_marks_signals_with_retryable_operation(monkeypatch):
+    operation_names: list[str] = []
+    executed: list[tuple[str, object]] = []
+    upserts: list[tuple[str, int]] = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(wait_signals, "ensure_tables", lambda: None)
+    monkeypatch.setattr(
+        wait_signals,
+        "load_active_wait_signals",
+        lambda **_kwargs: pd.DataFrame(
+            [
+                {
+                    "signal_id": "sig-price",
+                    "hypothesis_id": "manual_review",
+                    "symbol": "ABC",
+                    "signal_type": "price_level",
+                    "expected_action": "MANUAL_REVIEW",
+                    "condition_json": json.dumps(
+                        wait_signals.build_price_level_condition(
+                            operator="close_above",
+                            threshold=100.0,
+                        )
+                    ),
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(wait_signals, "load_recent_price", lambda symbol: {"date": pd.Timestamp("2026-04-10T00:00:00Z"), "close": 101.5})
+    monkeypatch.setattr(wait_signals, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(wait_signals, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(
+        wait_signals,
+        "upsert_to_db",
+        lambda frame, table, **_kwargs: upserts.append((table, len(frame))),
+    )
+
+    result = wait_signals.match_wait_signals(persist=True)
+
+    assert result["matched_rows"] == 1
+    assert upserts == [(wait_signals.WAIT_SIGNAL_MATCHES_TABLE, 1)]
+    assert operation_names == ["wait_signals:mark_matched"]
+    assert len(executed) == 1
+    assert f"UPDATE {wait_signals.WAIT_SIGNALS_TABLE}" in executed[0][0]
+    assert executed[0][1][1] == ["sig-price"]
+
+
 def test_wait_signal_matcher_routes_typed_event_conditions(monkeypatch):
     monkeypatch.setattr(wait_signals, "ensure_tables", lambda: None)
     monkeypatch.setattr(
@@ -16589,6 +32197,45 @@ def test_wait_signal_matcher_requires_operator_keywords_for_typed_events(monkeyp
     assert result["matched_rows"] == 0
 
 
+def test_wait_signals_records_missing_source_columns_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(wait_signals, "_table_exists", lambda table_name: table_name == "advisory_news_events")
+    monkeypatch.setattr(wait_signals, "_table_columns", lambda table_name: {"symbol", "unique_id", "published_on"})
+    monkeypatch.setattr(wait_signals, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = wait_signals._load_source_events_for_match(
+        from_ts=pd.Timestamp("2026-04-01T00:00:00Z"),
+        to_ts=pd.Timestamp("2026-04-30T00:00:00Z"),
+        symbol="ABC",
+    )
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "wait_signal_source_table_missing_columns"
+    assert events[0]["source"] == "advisory_news_events"
+    assert "subject" in events[0]["metadata"]["missing_columns"]
+
+
+def test_wait_signals_records_source_event_load_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(wait_signals, "_table_exists", lambda table_name: table_name == "advisory_news_events")
+    monkeypatch.setattr(wait_signals, "_table_columns", lambda table_name: {"symbol", "unique_id", "published_on", "subject", "concise_summary_text"})
+    monkeypatch.setattr(wait_signals, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("query failed")))
+    monkeypatch.setattr(wait_signals, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = wait_signals._load_source_events_for_match(
+        from_ts=pd.Timestamp("2026-04-01T00:00:00Z"),
+        to_ts=pd.Timestamp("2026-04-30T00:00:00Z"),
+        symbol="ABC",
+    )
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "wait_signal_source_event_load_failed"
+    assert events[0]["source"] == "advisory_news_events"
+    assert events[0]["metadata"]["symbol"] == "ABC"
+
+
 def test_wait_signal_symbol_refresh_excludes_market_wide_waits(monkeypatch):
     captured: dict[str, object] = {}
     monkeypatch.setattr(wait_signals, "ensure_tables", lambda: None)
@@ -16647,6 +32294,21 @@ def test_external_task_queue_stable_task_id():
     assert "ABC" in row_a
 
 
+def test_external_task_queue_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(external_task_queue, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    external_task_queue.ensure_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == external_task_queue.EXTERNAL_TASK_QUEUE_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [external_task_queue.TABLE_NAME]
+    assert any(external_task_queue.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("task_id TEXT PRIMARY KEY" in statement for statement in calls[0]["statements"])
+    assert any("CREATE INDEX IF NOT EXISTS" in statement for statement in calls[0]["statements"])
+
+
 def test_external_task_queue_executes_registered_handler(monkeypatch):
     calls: list[dict[str, object]] = []
 
@@ -16694,6 +32356,99 @@ def test_external_task_queue_enqueue_uses_timestamp_dtypes(monkeypatch):
     assert str(captured["df"]["completed_at"].dtype).startswith("datetime64")
 
 
+def test_external_task_queue_state_transitions_use_retryable_operations(monkeypatch):
+    executed: list[tuple[str, object]] = []
+    operation_names: list[str] = []
+
+    class FakeCursor:
+        def __init__(self, *, dict_rows: bool = False):
+            self.dict_rows = dict_rows
+
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+        def fetchone(self):
+            return {"task_id": "task-1", "status": "claimed"} if self.dict_rows else ("task-1",)
+
+    class FakeSession:
+        def __init__(self, *, dict_factory: bool = False):
+            self.dict_factory = dict_factory
+
+        def __enter__(self):
+            return None, FakeCursor(dict_rows=self.dict_factory)
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(external_task_queue, "ensure_table", lambda: None)
+    monkeypatch.setattr(external_task_queue, "db_session", lambda **kwargs: FakeSession(dict_factory=bool(kwargs.get("dict_factory"))))
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(external_task_queue, "execute_db_operation", fake_execute_db_operation)
+
+    claimed = external_task_queue.claim_task(queue_name="nse", worker_id="worker-1")
+    external_task_queue.complete_task(task_id="task-1", result={"status": "ok"})
+    external_task_queue.fail_task(task_id="task-2", error="boom", retry_delay_seconds=30)
+
+    assert claimed == {"task_id": "task-1", "status": "claimed"}
+    assert operation_names == [
+        "external_task_queue:claim_task",
+        "external_task_queue:complete_task",
+        "external_task_queue:fail_task",
+    ]
+    assert "RETURNING q.*" in executed[0][0]
+    assert "status = 'completed'" in executed[1][0]
+    assert "last_error = %s" in executed[2][0]
+
+
+def test_external_task_queue_records_status_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(external_task_queue, "ensure_table", lambda: None)
+    monkeypatch.setattr(external_task_queue, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("queue db down")))
+    monkeypatch.setattr(external_task_queue, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    df = external_task_queue.load_queue_status(queue_name="nse", limit=25)
+
+    assert df.empty
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "external_task_queue_status_load_failed"
+    assert events[0]["source"] == external_task_queue.TABLE_NAME
+    assert events[0]["metadata"] == {"queue_name": "nse", "limit": 25}
+
+
+def test_external_task_queue_records_worker_task_failure(monkeypatch):
+    events = []
+    failed_tasks = []
+    task = {
+        "task_id": "task-1",
+        "queue_name": "nse",
+        "task_type": "fake_fail",
+        "task_args_json": "{}",
+        "attempt_count": 1,
+        "max_attempts": 3,
+    }
+
+    monkeypatch.setattr(external_task_queue, "ensure_table", lambda: None)
+    monkeypatch.setattr(external_task_queue, "claim_task", lambda **kwargs: task)
+    monkeypatch.setattr(external_task_queue, "execute_task", lambda task: (_ for _ in ()).throw(RuntimeError("worker boom")))
+    monkeypatch.setattr(external_task_queue, "fail_task", lambda **kwargs: failed_tasks.append(kwargs))
+    monkeypatch.setattr(external_task_queue, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = external_task_queue.run_worker(queue_name="nse", worker_id="worker-test", once=True)
+
+    assert result["failed"] == 1
+    assert failed_tasks[0]["task_id"] == "task-1"
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "external_task_queue_task_failed"
+    assert events[0]["severity"] == "error"
+    assert events[0]["metadata"]["task_id"] == "task-1"
+    assert events[0]["metadata"]["worker_id"] == "worker-test"
+
+
 def test_download_queue_classifies_single_client_modules():
     dhan_daily = download_queue.classify_step({"module": "data.dhanlive.ohlcv", "purpose": "ohlcv", "args": ["--daily"]})
     dhan_master = download_queue.classify_step({"module": "data.dhanlive.scrip_master", "purpose": "master", "args": []})
@@ -16724,28 +32479,19 @@ def test_download_queue_dry_run_no_inline():
 
 
 def test_dhan_ohlcv_table_setup_runs_once_per_process(monkeypatch):
-    calls = {"execute": 0}
-
-    class FakeCursor:
-        def execute(self, *_args, **_kwargs):
-            calls["execute"] += 1
-
-    class FakeSession:
-        def __enter__(self):
-            return None, FakeCursor()
-
-        def __exit__(self, *_args):
-            return False
+    calls = []
 
     monkeypatch.setattr(dhan_ohlcv, "_OHLCV_TABLES_ENSURED", False)
-    monkeypatch.setattr(dhan_ohlcv, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(dhan_ohlcv, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
 
     dhan_ohlcv.ensure_ohlcv_tables()
-    first_call_count = calls["execute"]
     dhan_ohlcv.ensure_ohlcv_tables()
 
-    assert first_call_count > 0
-    assert calls["execute"] == first_call_count
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == dhan_ohlcv.OHLCV_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [dhan_ohlcv.DAILY_TABLE, dhan_ohlcv.INTRADAY_TABLE]
+    assert any(dhan_ohlcv.DAILY_TABLE in statement for statement in calls[0]["statements"])
+    assert any(dhan_ohlcv.INTRADAY_TABLE in statement for statement in calls[0]["statements"])
 
 
 def test_announcement_pipeline_skips_malformed_nse_rows(monkeypatch):
@@ -16778,6 +32524,215 @@ def test_announcement_pipeline_skips_malformed_nse_rows(monkeypatch):
     assert len(rows) == 1
     assert rows[0].ticker == "ABC"
     assert rows[0].subject == "Board Meeting"
+
+
+def _sample_announcement(**overrides):
+    payload = {
+        "company_master_id": "cm1",
+        "exchange": "NSE",
+        "ticker": "ABC",
+        "company_name": "ABC Ltd",
+        "unique_id": "ABC-20260408100000",
+        "subject": "Board Meeting",
+        "text": "Board meeting update",
+        "filed_under_category": "Board Meeting",
+        "exchange_category_id": "Board Meeting",
+        "raw": {},
+        "published_on": datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc),
+        "exchange_published_on": datetime(2026, 4, 8, 10, 0, tzinfo=timezone.utc),
+        "attachment_url": "https://example.com/abc.pdf",
+        "attachment_name": "abc.pdf",
+        "attachment_content_type": "application/pdf",
+        "attachment_bytes": b"%PDF-bad-test",
+    }
+    payload.update(overrides)
+    return Announcement(**payload)
+
+
+def test_announcement_first_page_ocr_failure_records_local_fallback(monkeypatch):
+    events = []
+    pipe = object.__new__(announcement_pipeline.AnnouncementPipeline)
+    announcement = _sample_announcement()
+
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(announcement_pipeline, "resolve_poppler_path", lambda: None)
+    monkeypatch.setattr(
+        announcement_pipeline,
+        "pdfinfo_from_bytes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("poppler missing")),
+    )
+
+    result = pipe.ocr_first_pages([announcement], max_pages=2)
+
+    assert result == [announcement]
+    assert announcement.ocr_error.startswith("poppler missing")
+    assert "Poppler is required" in announcement.ocr_error
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.announcements.pipeline"
+    assert event["fallback_type"] == "announcement_ocr_first_pages_failed"
+    assert event["source"] == "announcement_ocr_first_pages"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"]["unique_id"] == "ABC-20260408100000"
+    assert event["metadata"]["ticker"] == "ABC"
+    assert event["metadata"]["max_pages"] == 2
+    assert event["metadata"]["is_pdf"] is True
+
+
+def test_announcement_full_ocr_failure_records_local_fallback(monkeypatch):
+    events = []
+    pipe = object.__new__(announcement_pipeline.AnnouncementPipeline)
+    announcement = _sample_announcement()
+
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        pipe,
+        "_ocr_pdf_bytes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("ocr provider unavailable")),
+    )
+
+    result = pipe.ocr_full_documents([announcement])
+
+    assert result == [announcement]
+    assert announcement.ocr_error == "ocr provider unavailable"
+    assert len(events) == 1
+    event = events[0]
+    assert event["fallback_type"] == "announcement_full_ocr_failed"
+    assert event["source"] == "announcement_full_ocr"
+    assert event["metadata"]["unique_id"] == "ABC-20260408100000"
+    assert event["metadata"]["attachment_name"] == "abc.pdf"
+
+
+def test_announcement_audio_transcription_failure_records_local_fallback(monkeypatch):
+    events = []
+    pipe = object.__new__(announcement_pipeline.AnnouncementPipeline)
+    announcement = _sample_announcement(
+        text="Earnings call recording https://example.com/abc-call.mp3",
+        categories=["EARNINGS_CALL"],
+        attachment_url=None,
+        attachment_name=None,
+        attachment_content_type=None,
+        attachment_bytes=None,
+    )
+
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(pipe, "_headers_for_download", lambda _exchange: {})
+    monkeypatch.setattr(pipe, "_cookies_for_download", lambda _exchange: None)
+    pipe.request_timeout = 1
+    monkeypatch.setattr(
+        announcement_pipeline.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("audio host timeout")),
+    )
+
+    result = pipe.transcribe_earnings_call_audio([announcement])
+
+    assert result == [announcement]
+    assert announcement.audio_transcript_text == ""
+    assert len(events) == 1
+    event = events[0]
+    assert event["fallback_type"] == "announcement_audio_transcription_failed"
+    assert event["source"] == "announcement_earnings_audio_transcription"
+    assert event["metadata"]["unique_id"] == "ABC-20260408100000"
+    assert event["metadata"]["audio_url_present"] is True
+    assert event["metadata"]["audio_attachment_name"] == "abc-call.mp3"
+
+
+def test_announcement_nse_cookie_bootstrap_failure_records_local_fallback(monkeypatch):
+    events = []
+    pipe = object.__new__(announcement_pipeline.AnnouncementPipeline)
+    pipe.request_timeout = 1
+
+    def raise_timeout(*_args, **_kwargs):
+        raise requests.Timeout("nse timeout")
+
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(announcement_pipeline.requests, "get", raise_timeout)
+
+    with pytest.raises(requests.Timeout):
+        pipe._bootstrap_nse_cookies_once({"User-Agent": "pytest"})
+
+    assert len(events) == 2
+    assert [event["fallback_type"] for event in events] == [
+        "nse_cookie_bootstrap_failed",
+        "nse_cookie_bootstrap_failed",
+    ]
+    assert all(event["module"] == "data.announcements.pipeline" for event in events)
+    assert all(event["source"] == "nse_http" for event in events)
+    assert all(event["severity"] == "warn" for event in events)
+    assert all(isinstance(event["error"], requests.Timeout) for event in events)
+    assert [event["metadata"]["url"] for event in events] == [
+        "https://www.nseindia.com",
+        "https://www.nseindia.com/companies-listing/corporate-filings-announcements",
+    ]
+
+
+def test_managed_announcement_ingest_failure_records_local_fallback(monkeypatch):
+    events = []
+    stages = []
+    persisted = []
+    announcement = _sample_announcement(attachment_url=None, attachment_bytes=None)
+
+    class FakePipeline:
+        def fetch_announcements(self, *_args, **_kwargs):
+            return [announcement]
+
+    manager = announcement_managed_pipeline.ManagedAnnouncementPipeline(pipeline=FakePipeline())
+
+    monkeypatch.setattr(
+        announcement_managed_pipeline,
+        "load_company_master_targets",
+        lambda **_kwargs: [
+            CompanyMasterTarget(
+                company_master_id="cm1",
+                ticker="ABC",
+                exchange="NSE",
+                company_name="ABC Ltd",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        announcement_managed_pipeline,
+        "get_existing_documents",
+        lambda _unique_ids: {
+            announcement.unique_id: {
+                "pdf_status": "completed",
+                "ocr_status": "pending",
+                "parse_status": "pending",
+            }
+        },
+    )
+    monkeypatch.setattr(announcement_managed_pipeline, "get_existing_reports", lambda _unique_ids: {})
+    monkeypatch.setattr(announcement_managed_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(manager, "_save_raw_metadata", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("metadata write failed")))
+    monkeypatch.setattr(manager, "_record_stage", lambda *args, **kwargs: stages.append({"args": args, "kwargs": kwargs}))
+    monkeypatch.setattr(manager, "_persist_document", lambda *args, **kwargs: persisted.append({"args": args, "kwargs": kwargs}))
+
+    summary = manager.ingest_date_range(
+        "ABC",
+        date(2026, 4, 8),
+        date(2026, 4, 8),
+        exchanges=["NSE"],
+    )
+
+    assert summary.discovered == 1
+    assert summary.failed == 1
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.announcements.managed_pipeline"
+    assert event["fallback_type"] == "announcement_managed_ingest_failed"
+    assert event["source"] == "announcement_managed_pipeline"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"]["unique_id"] == announcement.unique_id
+    assert event["metadata"]["ticker"] == "ABC"
+    assert event["metadata"]["existing_document"] is True
+    assert event["metadata"]["existing_ocr_status"] == "pending"
+    assert stages[-1]["args"][1:3] == ("managed_ingest", "error")
+    assert stages[-1]["kwargs"]["error"] == "metadata write failed"
+    assert persisted[-1]["kwargs"]["parse_status"] == "failed"
+    assert persisted[-1]["kwargs"]["error"] == "metadata write failed"
 
 
 def test_signal_refresh_prioritizes_wait_signal_match():
@@ -16897,6 +32852,21 @@ def test_signal_refresh_classifies_watcher_output_effects():
     assert evidence_effect["effect_type"] == "evidence_only"
 
 
+def test_signal_refresh_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(signal_refresh, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    signal_refresh.ensure_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == signal_refresh.SIGNAL_REFRESH_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [signal_refresh.TABLE_NAME]
+    assert any(signal_refresh.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("effect_summary" in statement for statement in calls[0]["statements"])
+    assert any("CREATE INDEX IF NOT EXISTS" in statement for statement in calls[0]["statements"])
+
+
 def test_event_router_execute_uses_signal_refresh(monkeypatch):
     calls: list[dict[str, object]] = []
 
@@ -16921,6 +32891,36 @@ def test_event_router_execute_uses_signal_refresh(monkeypatch):
     assert calls[0]["symbol"] == "ABC"
     assert str(calls[0]["reason"]).startswith("router:price_alert")
     assert actions.iloc[0]["action_status"] == "ok"
+
+
+def test_event_router_records_symbol_refresh_failure(monkeypatch):
+    events = []
+
+    def fail_refresh_symbol(**kwargs):
+        raise RuntimeError("refresh failed")
+
+    monkeypatch.setattr(signal_refresh, "refresh_symbol", fail_refresh_symbol)
+    monkeypatch.setattr(event_router, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    actions = event_router.execute_routing_plan(
+        [
+            {
+                "symbol": "ABC",
+                "setup_ids": ["SETUP_A"],
+                "source_types": ["price_alert"],
+                "action_type": "refresh_symbol_price",
+                "asof_date": "2026-04-08T00:00:00Z",
+                "reasons": ["ENTRY_ZONE_HIT"],
+            }
+        ]
+    )
+
+    assert actions.iloc[0]["action_status"] == "error"
+    assert actions.iloc[0]["action_reason"] == "router_error:RuntimeError"
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "event_router_symbol_refresh_failed"
+    assert events[0]["severity"] == "error"
+    assert events[0]["symbol"] == "ABC"
 
 
 def test_live_notifier_formats_operator_messages():
@@ -16964,6 +32964,151 @@ def test_live_notifier_appends_operator_feed(tmp_path):
     assert "alerts count=1" in feed[0]["message"]
     assert (tmp_path / "operator_feed.jsonl").exists()
     assert (tmp_path / "operator_feed.txt").exists()
+
+
+def test_live_notifier_records_fallback_for_corrupt_feed(tmp_path, monkeypatch):
+    from advisory import live_notifier
+
+    events: list[dict[str, object]] = []
+    (tmp_path / "operator_feed.json").write_text("{bad json", encoding="utf-8")
+    monkeypatch.setattr(live_notifier, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    live_notifier.append_operator_event(
+        output_dir=tmp_path,
+        channel="stockey:continuous_watch:alerts",
+        payload={"alert_count": 1},
+        max_items=10,
+    )
+
+    assert events[0]["module"] == "advisory.live_notifier"
+    assert events[0]["fallback_type"] == "live_notifier_feed_read_failed"
+    assert events[0]["metadata"]["channel"] == "stockey:continuous_watch:alerts"
+    feed = json.loads((tmp_path / "operator_feed.json").read_text(encoding="utf-8"))
+    assert len(feed) == 1
+
+
+def test_live_notifier_records_fallback_for_bad_redis_payload(tmp_path, monkeypatch):
+    from advisory import live_notifier
+
+    events: list[dict[str, object]] = []
+    monotonic_values = iter([0.0, 0.0, 2.0])
+
+    class FakePubSub:
+        def __init__(self):
+            self.closed = False
+            self.subscribed_pattern = None
+            self.calls = 0
+
+        def psubscribe(self, pattern):
+            self.subscribed_pattern = pattern
+
+        def get_message(self, timeout=1.0):
+            self.calls += 1
+            if self.calls == 1:
+                return {"channel": "stockey:continuous_watch:alerts", "data": "{bad json"}
+            return None
+
+        def close(self):
+            self.closed = True
+
+    class FakeClient:
+        def __init__(self):
+            self.pubsub_obj = FakePubSub()
+            self.closed = False
+
+        def pubsub(self, ignore_subscribe_messages=True):
+            return self.pubsub_obj
+
+        def close(self):
+            self.closed = True
+
+    client = FakeClient()
+    monkeypatch.setattr(live_notifier, "get_redis_client", lambda **kwargs: client)
+    monkeypatch.setattr(live_notifier.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(live_notifier, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = live_notifier.subscribe_and_run(output_dir=tmp_path, duration_seconds=1)
+
+    assert result["status"] == "ok"
+    assert result["event_count"] == 1
+    assert result["last_entry"]["payload"] == {"raw": "{bad json"}
+    assert events[0]["module"] == "advisory.live_notifier"
+    assert events[0]["fallback_type"] == "live_notifier_payload_parse_failed"
+    assert events[0]["source"] == "stockey:continuous_watch:alerts"
+    assert client.pubsub_obj.closed is True
+    assert client.closed is True
+
+
+def test_sync_state_ensure_table_uses_schema_registry(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(sync_state, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    sync_state.ensure_sync_state_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == sync_state.SYNC_STATE_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"]["tables"] == [sync_state.TABLE_NAME]
+    assert any(sync_state.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("source_name" in statement and "scope_key" in statement for statement in calls[0]["statements"])
+
+
+def test_sync_state_load_records_state_json_parse_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(
+        sync_state,
+        "load_sync_states",
+        lambda source_name=None: pd.DataFrame(
+            [
+                {
+                    "source_name": source_name,
+                    "scope_key": "default",
+                    "state_json": "{bad json",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(sync_state, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    row = sync_state.load_sync_state("download_runner:nse", "default")
+
+    assert row is not None
+    assert row["state"] == {}
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.sync_state"
+    assert events[0]["fallback_type"] == "sync_state_state_json_parse_failed"
+    assert events[0]["source"] == "download_runner:nse"
+    assert events[0]["metadata"] == {
+        "source_name": "download_runner:nse",
+        "scope_key": "default",
+        "state_json_length": len("{bad json"),
+    }
+
+
+def test_sync_state_publish_bus_message_records_fallback(monkeypatch):
+    events = []
+
+    class FakeRedis:
+        def publish(self, channel, payload):
+            raise RuntimeError("redis unavailable")
+
+        def close(self):
+            raise AssertionError("close should not be called after publish failure")
+
+    monkeypatch.setattr(sync_state, "get_redis_client", lambda **kwargs: FakeRedis())
+    monkeypatch.setattr(sync_state, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = sync_state.publish_bus_message("stockey:test", {"symbol": "ABC", "status": "ok"})
+
+    assert result is False
+    assert events[0]["module"] == "advisory.sync_state"
+    assert events[0]["fallback_type"] == "sync_state_bus_publish_failed"
+    assert events[0]["source"] == "stockey:test"
+    assert events[0]["error"].args == ("redis unavailable",)
+    assert events[0]["metadata"]["channel"] == "stockey:test"
+    assert set(events[0]["metadata"]["payload_keys"]) == {"status", "symbol"}
+    assert events[0]["metadata"]["payload_type"] == "dict"
 
 
 def test_continuous_watch_records_failed_cycle_in_sync_state(monkeypatch):
@@ -17145,8 +33290,202 @@ def test_live_dashboard_loads_operator_feed(tmp_path):
     assert "alerts count=1" in loaded[0]["message"]
 
 
+def test_live_dashboard_table_columns_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("schema unavailable")))
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    assert live_dashboard._table_columns("missing_table") == set()
+    assert events[0]["fallback_type"] == "live_dashboard_table_columns_lookup_failed"
+    assert events[0]["source"] == "missing_table"
+    assert events[0]["metadata"] == {"table_name": "missing_table"}
+
+
+def test_live_dashboard_parse_json_blob_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    assert live_dashboard._parse_json_blob("{bad json", source="recommendation_reason_json") == {}
+    assert events[0]["fallback_type"] == "live_dashboard_json_blob_parse_failed"
+    assert events[0]["source"] == "recommendation_reason_json"
+    assert events[0]["metadata"] == {"value_excerpt": "{bad json"}
+
+
+def test_live_dashboard_summarize_exit_rules_records_raw_text_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    assert live_dashboard._summarize_exit_rules("{bad rules", source="exit_event_rules_json") == "{bad rules"
+    assert events[0]["fallback_type"] == "live_dashboard_exit_rules_parse_failed"
+    assert events[0]["source"] == "exit_event_rules_json"
+    assert events[0]["metadata"] == {"value_excerpt": "{bad rules"}
+
+
+def test_live_dashboard_action_loader_build_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "_table_columns", lambda table_name: set())
+    monkeypatch.setattr(
+        live_dashboard,
+        "build_action_recommendations",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("action build failed")),
+    )
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_action_rows(asof_date=pd.Timestamp("2026-06-10T00:00:00Z"), limit=3)
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "live_dashboard_action_rows_build_failed"
+    assert events[0]["source"] == live_dashboard.ACTIONS_TABLE
+    assert events[0]["metadata"] == {"asof_date": "2026-06-10T00:00:00+00:00", "limit": 3}
+
+
+def test_live_dashboard_ts_watch_loader_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "_table_columns", lambda table_name: {"asof_date", "symbol"})
+    monkeypatch.setattr(live_dashboard, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ts watch query failed")))
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_ts_forecast_watch_rows(asof_date=pd.Timestamp("2026-06-10T00:00:00Z"), limit=4)
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "live_dashboard_ts_watch_rows_load_failed"
+    assert events[0]["source"] == live_dashboard.TS_WATCHLIST_TABLE
+    assert events[0]["metadata"] == {"asof_date": "2026-06-10T00:00:00+00:00", "limit": 4}
+
+
+def test_live_dashboard_latest_ts_forecasts_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "_table_columns", lambda table_name: {"asof_date", "symbol"})
+    monkeypatch.setattr(live_dashboard, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("latest ts query failed")))
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_latest_ts_forecasts(asof_date=pd.Timestamp("2026-06-10T00:00:00Z"), limit=8)
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "live_dashboard_latest_ts_forecasts_load_failed"
+    assert events[0]["source"] == live_dashboard.TS_FORECAST_TABLE
+    assert events[0]["metadata"] == {"asof_date": "2026-06-10T00:00:00+00:00", "limit": 8}
+
+
+def test_live_dashboard_ts_forecast_history_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "_table_columns", lambda table_name: {"asof_date", "symbol"})
+    monkeypatch.setattr(live_dashboard, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ts history query failed")))
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_ts_forecast_history_rows(
+        asof_date=pd.Timestamp("2026-06-10T00:00:00Z"),
+        lookback_days=30,
+        limit=9,
+    )
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "live_dashboard_ts_forecast_history_load_failed"
+    assert events[0]["source"] == live_dashboard.TS_FORECAST_TABLE
+    assert events[0]["metadata"] == {
+        "asof_date": "2026-06-10T00:00:00+00:00",
+        "lookback_days": 30,
+        "limit": 9,
+    }
+
+
+def test_live_dashboard_ts_eval_summary_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "_table_columns", lambda table_name: {"evaluated_at"})
+    monkeypatch.setattr(live_dashboard, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ts eval query failed")))
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_ts_eval_summary_rows(limit=10)
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "live_dashboard_ts_eval_summary_load_failed"
+    assert events[0]["source"] == live_dashboard.TS_EVAL_SUMMARY_TABLE
+    assert events[0]["metadata"] == {"limit": 10}
+
+
+def test_live_dashboard_alert_loader_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(live_dashboard, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("alert query failed")))
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_alert_rows(limit=5)
+
+    assert out.empty
+    assert events[0]["fallback_type"] == "live_dashboard_alert_rows_load_failed"
+    assert events[0]["source"] == live_dashboard.ALERTS_TABLE
+    assert events[0]["metadata"] == {"limit": 5}
+
+
+def test_live_dashboard_operator_feed_failure_records_fallback(tmp_path, monkeypatch):
+    events: list[dict[str, object]] = []
+    (tmp_path / "operator_feed.json").write_text("{bad json", encoding="utf-8")
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_operator_feed(output_dir=tmp_path, limit=6)
+
+    assert out == []
+    assert events[0]["fallback_type"] == "live_dashboard_operator_feed_read_failed"
+    assert events[0]["metadata"]["limit"] == 6
+    assert events[0]["metadata"]["feed_path"].endswith("operator_feed.json")
+
+
+def test_live_dashboard_runtime_process_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        live_dashboard.subprocess,
+        "check_output",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("ps unavailable")),
+    )
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_runtime_processes(limit=7)
+
+    assert out == []
+    assert [event["fallback_type"] for event in events] == [
+        "live_dashboard_runtime_processes_load_failed",
+        "live_dashboard_runtime_processes_load_failed",
+    ]
+    assert [event["metadata"]["elapsed_field"] for event in events] == ["etimes", "etime"]
+    assert all(event["metadata"]["limit"] == 7 for event in events)
+
+
+def test_live_dashboard_cron_log_read_failure_records_fallback(tmp_path, monkeypatch):
+    events: list[dict[str, object]] = []
+    log_file = tmp_path / "all_watchers.log"
+    log_file.write_text("ok\n", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def fake_read_text(path, *args, **kwargs):
+        if Path(path).name == "all_watchers.log":
+            raise RuntimeError("log unreadable")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    monkeypatch.setattr(live_dashboard, "_record_dashboard_loader_fallback", lambda **kwargs: events.append(kwargs))
+
+    out = live_dashboard.load_cron_status(log_dir=tmp_path, tail_lines=9)
+
+    assert len(out) == 1
+    assert out[0]["tail"] == ""
+    assert events[0]["fallback_type"] == "live_dashboard_cron_log_read_failed"
+    assert events[0]["metadata"]["log_file"] == "all_watchers.log"
+    assert events[0]["metadata"]["tail_lines"] == 9
+
+
 def test_sync_many_daily_continues_after_symbol_error(monkeypatch):
+    events = []
     monkeypatch.setattr(dhan_ohlcv, "DhanHistoricalClient", lambda: object())
+    monkeypatch.setattr(dhan_ohlcv, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
 
     def fake_sync_daily_ohlcv(ticker, **kwargs):
         if ticker == "BAD":
@@ -17169,6 +33508,72 @@ def test_sync_many_daily_continues_after_symbol_error(monkeypatch):
     assert results[1]["ticker"] == "BAD"
     assert results[1]["rows"] == 0
     assert "DhanAPIError" in results[1]["error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.dhanlive.ohlcv"
+    assert event["fallback_type"] == "dhan_ohlcv_daily_symbol_sync_failed"
+    assert event["source"] == dhan_ohlcv.DAILY_TABLE
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], dhan_client.DhanAPIError)
+    assert event["metadata"]["ticker"] == "BAD"
+    assert event["metadata"]["exchange"] == "NSE"
+    assert event["metadata"]["asset_type"] == "stock"
+
+
+def test_peer_sync_ohlcv_records_local_fallback_for_dhan_failures(monkeypatch):
+    events = []
+    monkeypatch.setattr(peer_sync, "get_db_max_date", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(peer_sync, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    def fake_sync_daily_ohlcv(symbol, **_kwargs):
+        if symbol == "NODATA":
+            raise dhan_client.DhanAPIError("No data present for this request")
+        if symbol == "BAD":
+            raise dhan_client.DhanAPIError("bad values for parameters")
+        return pd.DataFrame([{"date": pd.Timestamp("2026-04-09T00:00:00Z")}])
+
+    monkeypatch.setattr(peer_sync, "sync_daily_ohlcv", fake_sync_daily_ohlcv)
+
+    results = peer_sync.sync_peer_ohlcv(["GOOD", "NODATA", "BAD"], pd.Timestamp("2026-04-10T00:00:00Z").to_pydatetime())
+
+    assert [row["symbol"] for row in results] == ["GOOD", "NODATA", "BAD"]
+    assert results[0]["action"] == "sync"
+    assert results[1]["action"] == "skip"
+    assert results[1]["reason"] == "ohlcv_no_new_data"
+    assert results[2]["action"] == "error"
+    assert len(events) == 2
+    assert events[0]["module"] == "advisory.peer_sync"
+    assert events[0]["fallback_type"] == "peer_ohlcv_no_new_data"
+    assert events[0]["severity"] == "info"
+    assert events[0]["symbol"] == "NODATA"
+    assert events[1]["module"] == "advisory.peer_sync"
+    assert events[1]["fallback_type"] == "peer_ohlcv_sync_failed"
+    assert events[1]["source"] == "dhan_ohlcv_daily"
+    assert events[1]["symbol"] == "BAD"
+    assert events[1]["metadata"]["target_day"] == "2026-04-10"
+
+
+def test_peer_sync_data_records_local_fallback_for_peer_fundamental_failure(monkeypatch):
+    events = []
+    monkeypatch.setattr(peer_sync, "load_tracked_symbols", lambda symbols: ["ANCHOR"])
+    monkeypatch.setattr(peer_sync, "normalize_date_window", lambda from_date, to_date: (from_date, pd.Timestamp("2026-04-10T00:00:00Z").to_pydatetime()))
+    monkeypatch.setattr(peer_sync, "ensure_peer_membership", lambda anchor_symbols, to_date: None)
+    monkeypatch.setattr(peer_sync, "load_latest_peer_symbols", lambda anchor_symbols: {"ANCHOR": ["PEER1"]})
+    monkeypatch.setattr(peer_sync, "sync_sharpely_data", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("sharpely down")))
+    monkeypatch.setattr(peer_sync, "sync_peer_ohlcv", lambda peer_symbols, to_date: [])
+    monkeypatch.setattr(peer_sync, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = peer_sync.sync_peer_data(symbols=["ANCHOR"], to_date=pd.Timestamp("2026-04-10T00:00:00Z").to_pydatetime())
+
+    assert result["status"] == "ok"
+    assert result["peer_symbols"] == ["PEER1"]
+    assert result["fundamentals_results"][0]["action"] == "error"
+    assert result["fundamentals_results"][0]["symbol"] == "PEER1"
+    assert len(events) == 1
+    assert events[0]["module"] == "advisory.peer_sync"
+    assert events[0]["fallback_type"] == "peer_fundamentals_sync_failed"
+    assert events[0]["symbol"] == "PEER1"
+    assert events[0]["metadata"]["effective_to_date"] == "2026-04-10"
 
 
 def test_sync_daily_ohlcv_normalizes_mixed_timezone_dates(monkeypatch):
@@ -17231,7 +33636,9 @@ def test_sync_daily_ohlcv_normalizes_mixed_timezone_dates(monkeypatch):
 
 
 def test_sync_many_intraday_continues_after_symbol_error(monkeypatch):
+    events = []
     monkeypatch.setattr(dhan_ohlcv, "DhanHistoricalClient", lambda: object())
+    monkeypatch.setattr(dhan_ohlcv, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
 
     def fake_sync_intraday_ohlcv(ticker, **kwargs):
         if ticker == "BAD":
@@ -17254,6 +33661,141 @@ def test_sync_many_intraday_continues_after_symbol_error(monkeypatch):
     assert results[1]["ticker"] == "BAD"
     assert results[1]["rows"] == 0
     assert "ValueError" in results[1]["error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.dhanlive.ohlcv"
+    assert event["fallback_type"] == "dhan_ohlcv_intraday_symbol_sync_failed"
+    assert event["source"] == dhan_ohlcv.INTRADAY_TABLE
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], ValueError)
+    assert event["metadata"]["ticker"] == "BAD"
+    assert event["metadata"]["exchange"] == "NSE"
+    assert event["metadata"]["asset_type"] == "stock"
+    assert event["metadata"]["interval_minutes"] == 1
+
+
+def test_dhan_ohlcv_build_run_state_aggregates_windows_and_errors():
+    state = dhan_ohlcv.build_run_state(
+        daily_results=[
+            {"ticker": "AAA", "rows": 2, "from_date": "2026-06-01", "to_date": "2026-06-02"},
+            {"ticker": "BAD", "rows": 0, "from_date": None, "to_date": None, "error": "ValueError: no identity"},
+        ],
+        intraday_results=[
+            {"ticker": "AAA", "rows": 3, "from_timestamp": "2026-06-02 09:15:00", "to_timestamp": "2026-06-02 09:25:00"},
+        ],
+        only="both",
+        symbols=["AAA", "BAD"],
+        exchange="nse",
+        asset_type="stock",
+        interval_minutes=5,
+    )
+
+    assert state["rows"] == 5
+    assert state["rows_written"] == 5
+    assert state["daily_rows"] == 2
+    assert state["intraday_rows"] == 3
+    assert state["from_date"] == "2026-06-01"
+    assert state["to_date"] == "2026-06-02"
+    assert state["from_datetime"] == "2026-06-02 09:15:00"
+    assert state["to_datetime"] == "2026-06-02 09:25:00"
+    assert state["error_count"] == 1
+    assert state["failed_symbols"] == ["BAD"]
+    assert state["fallback_used"] is False
+
+
+def test_dhan_ohlcv_main_exports_runner_state(monkeypatch):
+    monkeypatch.setattr(
+        dhan_ohlcv,
+        "load_tracked_symbols",
+        lambda symbols: ["AAA", "BBB"],
+    )
+    monkeypatch.setattr(dhan_ohlcv, "ensure_ohlcv_tables", lambda: None)
+    monkeypatch.setattr(dhan_ohlcv, "parse_datetime_arg", lambda value: datetime(2026, 6, 1) if value else None)
+    monkeypatch.setattr(
+        dhan_ohlcv,
+        "sync_many_daily",
+        lambda *args, **kwargs: [
+            {"ticker": "AAA", "rows": 2, "from_date": "2026-06-01", "to_date": "2026-06-02"},
+            {"ticker": "BBB", "rows": 1, "from_date": "2026-06-01", "to_date": "2026-06-01"},
+        ],
+    )
+    monkeypatch.setattr(
+        dhan_ohlcv,
+        "sync_many_intraday",
+        lambda *args, **kwargs: [
+            {"ticker": "AAA", "rows": 4, "from_timestamp": "2026-06-02 09:15:00", "to_timestamp": "2026-06-02 09:30:00"},
+            {"ticker": "BBB", "rows": 0, "from_timestamp": None, "to_timestamp": None, "error": "DhanAPIError: no data"},
+        ],
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["data.dhanlive.ohlcv", "--symbols", "AAA,BBB", "--only", "both", "--intraday-interval", "5", "--from-date", "2026-06-01"],
+    )
+
+    dhan_ohlcv.main()
+
+    assert dhan_ohlcv.STOCKEY_RUN_STATE["rows"] == 7
+    assert dhan_ohlcv.STOCKEY_RUN_STATE["daily_rows"] == 3
+    assert dhan_ohlcv.STOCKEY_RUN_STATE["intraday_rows"] == 4
+    assert dhan_ohlcv.STOCKEY_RUN_STATE["symbol_count"] == 2
+    assert dhan_ohlcv.STOCKEY_RUN_STATE["error_count"] == 1
+    assert dhan_ohlcv.STOCKEY_RUN_STATE["failed_symbols"] == ["BBB"]
+    assert dhan_ohlcv.STOCKEY_RUN_STATE["only"] == "both"
+    assert dhan_ohlcv.STOCKEY_RUN_STATE["interval_minutes"] == 5
+
+
+def test_dhan_ohlcv_pull_records_failure_fallback(monkeypatch, capsys):
+    from data.dhanlive import ohlcv_pull
+
+    events = []
+    args = argparse.Namespace(
+        ticker="reliance",
+        exchange="NSE",
+        asset_type="stock",
+        mode="intraday",
+        source="api",
+        interval_minutes=5,
+        last_minutes=60,
+        last_days=30,
+        from_datetime=None,
+        to_datetime=None,
+        from_date=None,
+        to_date=None,
+        format="json",
+        limit=20,
+    )
+
+    monkeypatch.setattr(ohlcv_pull, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        ohlcv_pull,
+        "load_api_intraday",
+        lambda _args: (_ for _ in ()).throw(RuntimeError("token expired")),
+    )
+    monkeypatch.setattr(ohlcv_pull, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    assert ohlcv_pull.main() == 1
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["status"] == "error"
+    assert output["requested_ticker"] == "RELIANCE"
+    assert "token expired" in output["error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.dhanlive.ohlcv_pull"
+    assert event["source"] == "dhan_ohlcv_pull:api:intraday:NSE:RELIANCE"
+    assert event["fallback_type"] == "dhan_ohlcv_pull_failed"
+    assert event["severity"] == "warn"
+    assert event["symbol"] == "RELIANCE"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"] == {
+        "ticker": "RELIANCE",
+        "exchange": "NSE",
+        "asset_type": "stock",
+        "mode": "intraday",
+        "source": "api",
+        "interval_minutes": 5,
+    }
 
 
 def test_wpi_sync_uses_env_backed_lookback_days(monkeypatch):
@@ -17304,11 +33846,139 @@ def test_fred_fallback_start_uses_env_backed_lookback_days(monkeypatch):
     monkeypatch.setattr(us_macro, "table_has_date", fake_table_has_date)
     monkeypatch.setattr(us_macro, "_fetch_single_fred_series", fake_fetch)
     monkeypatch.setattr(us_macro, "upsert_to_db", lambda *_args, **_kwargs: None)
+    events = []
+    monkeypatch.setattr(us_macro, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
 
     us_macro.fetch_fred_series(series={"DGS10": "ust10y_yield"}, resample=None)
 
     expected_latest = date.today() - pd.Timedelta(days=365)
     assert captured["start"] == expected_latest - pd.Timedelta(days=15)
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.fred.us_macro"
+    assert event["source"] == "macro_usa:date"
+    assert event["fallback_type"] == "fred_macro_table_date_fallback"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"]["table"] == "macro_usa"
+    assert event["metadata"]["date_column"] == "date"
+    assert event["metadata"]["fallback_latest_date"] == expected_latest.isoformat()
+    assert event["metadata"]["lookback_days"] == 365
+
+
+def test_fred_series_exports_partial_run_state(monkeypatch):
+    from data.fred import us_macro
+
+    monkeypatch.setattr(us_macro, "FRED_MACRO_LOOKBACK_DAYS", 365)
+    monkeypatch.setattr(us_macro, "table_has_date", lambda *_args, **_kwargs: (False, date.today() - pd.Timedelta(days=5)))
+
+    def fake_fetch(series_id, *, start, end):
+        if series_id == "VIXCLS":
+            return None
+        series = pd.Series([1.0], index=pd.to_datetime([start]), name=series_id)
+        series.index.name = "date"
+        return series
+
+    monkeypatch.setattr(us_macro, "_fetch_single_fred_series", fake_fetch)
+    monkeypatch.setattr(us_macro, "upsert_to_db", lambda *_args, **_kwargs: None)
+
+    df = us_macro.fetch_fred_series(series={"DGS10": "ust10y_yield", "VIXCLS": "vix_close"}, resample=None)
+
+    state = us_macro.LAST_FRED_SERIES_STATE
+    assert len(df) == 1
+    assert state["source"] == "data.fred.us_macro:fred"
+    assert state["status"] == "partial"
+    assert state["series_count"] == 2
+    assert state["succeeded_series_count"] == 1
+    assert state["failed_series_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["source_unavailable_count"] == 1
+    assert state["rows_written"] == 1
+    assert state["failed_series"] == ["VIXCLS"]
+    assert state["state_advanced"] is True
+
+
+def test_fred_series_fetch_failure_records_local_fallback(monkeypatch):
+    from data.fred import us_macro
+
+    events = []
+    latest_date = date.today() - pd.Timedelta(days=5)
+    monkeypatch.setattr(us_macro, "table_has_date", lambda *_args, **_kwargs: (False, latest_date))
+
+    def fake_fetch(series_id, *, start, end):
+        if series_id == "VIXCLS":
+            raise RuntimeError("fred timeout")
+        series = pd.Series([1.0], index=pd.to_datetime([start]), name=series_id)
+        series.index.name = "date"
+        return series
+
+    monkeypatch.setattr(us_macro, "_fetch_single_fred_series", fake_fetch)
+    monkeypatch.setattr(us_macro, "upsert_to_db", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(us_macro, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    df = us_macro.fetch_fred_series(series={"DGS10": "ust10y_yield", "VIXCLS": "vix_close"}, resample=None)
+
+    assert len(df) == 1
+    assert us_macro.LAST_FRED_SERIES_STATE["status"] == "partial"
+    assert us_macro.LAST_FRED_SERIES_STATE["failed_series"] == ["VIXCLS"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.fred.us_macro"
+    assert event["source"] == "fred:VIXCLS"
+    assert event["fallback_type"] == "fred_series_fetch_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"] == {
+        "series_id": "VIXCLS",
+        "friendly_name": "vix_close",
+        "from_date": (latest_date - pd.Timedelta(days=15)).isoformat(),
+        "to_date": date.today().isoformat(),
+    }
+
+
+def test_fred_main_exports_leg_failure_run_state(monkeypatch, capsys):
+    from data.fred import us_macro
+    events = []
+
+    def fake_fetch_fred_series():
+        us_macro.LAST_FRED_SERIES_STATE = {
+            "status": "ok",
+            "fallback_count": 1,
+            "fallback_used": True,
+            "source_unavailable_count": 0,
+        }
+        return pd.DataFrame([{"date": pd.Timestamp("2026-06-10"), "ust10y_yield": 4.0}])
+
+    def fake_fetch_ism():
+        raise RuntimeError("fxstreet down")
+
+    monkeypatch.setattr(us_macro, "fetch_fred_series", fake_fetch_fred_series)
+    monkeypatch.setattr(us_macro, "fetch_ism_manufacturing", fake_fetch_ism)
+    monkeypatch.setattr(us_macro, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    assert us_macro.main() == 0
+    capsys.readouterr()
+
+    state = us_macro.STOCKEY_RUN_STATE
+    assert state["source"] == "data.fred.us_macro"
+    assert state["status"] == "partial"
+    assert state["succeeded_leg_count"] == 1
+    assert state["failed_leg_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["fallback_count"] == 1
+    assert state["fallback_used"] is True
+    assert state["fred_rows"] == 1
+    assert state["ism_rows"] == 0
+    assert state["failed_legs"][0]["leg"] == "ism"
+    assert state["state_advanced"] is True
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.fred.us_macro"
+    assert event["fallback_type"] == "fred_macro_leg_failed"
+    assert event["source"] == "data.fred.us_macro:ism"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"]["leg"] == "ism"
 
 
 def test_market_context_builds_top_fraction_and_summary(monkeypatch):
@@ -17422,7 +34092,11 @@ def test_market_context_builds_top_fraction_and_summary(monkeypatch):
             {
                 "symbol": "AAA",
                 "announcement_event_count_7d": 1,
+                "triggered_announcement_event_count_7d": 1,
+                "context_observed_announcement_event_count_7d": 0,
                 "news_event_count_7d": 2,
+                "triggered_news_event_count_7d": 1,
+                "context_observed_news_event_count_7d": 1,
                 "evaluated_event_count_20d": 3,
                 "positive_event_count_20d": 2,
                 "negative_event_count_20d": 0,
@@ -17430,7 +34104,11 @@ def test_market_context_builds_top_fraction_and_summary(monkeypatch):
             {
                 "symbol": "BBB",
                 "announcement_event_count_7d": 0,
+                "triggered_announcement_event_count_7d": 0,
+                "context_observed_announcement_event_count_7d": 0,
                 "news_event_count_7d": 1,
+                "triggered_news_event_count_7d": 0,
+                "context_observed_news_event_count_7d": 1,
                 "evaluated_event_count_20d": 1,
                 "positive_event_count_20d": 0,
                 "negative_event_count_20d": 1,
@@ -17466,7 +34144,147 @@ def test_market_context_builds_top_fraction_and_summary(monkeypatch):
     assert summary.iloc[0]["universe_count"] == 4
     assert summary.iloc[0]["top_context_count"] == 2
     assert summary.iloc[0]["positive_event_count_20d"] == 2
+    assert summary.iloc[0]["triggered_event_count_7d"] == 2
+    assert summary.iloc[0]["context_observed_event_count_7d"] == 2
+    assert summary.iloc[0]["triggered_announcement_event_count_7d"] == 1
+    assert summary.iloc[0]["context_observed_news_event_count_7d"] == 2
     assert "Top-context universe has 2 symbols" in summary.iloc[0]["summary_text"]
+
+
+def test_market_context_records_technical_load_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(market_context, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(market_context, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("technical failed")))
+    monkeypatch.setattr(market_context, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="technical failed"):
+        market_context.load_latest_technical(pd.Timestamp("2026-06-01", tz="UTC"))
+
+    assert events[0]["fallback_type"] == "market_context_technical_load_failed"
+    assert events[0]["source"] == "advisory_technical_daily"
+
+
+def test_market_context_records_optional_event_count_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(market_context, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(market_context, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("event count failed")))
+    monkeypatch.setattr(market_context, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = market_context._count_events(
+        table_name="advisory_news_events",
+        date_col="published_on",
+        asof_date=pd.Timestamp("2026-06-01", tz="UTC"),
+        symbols=["ABC"],
+        lookback_days=7,
+    )
+
+    assert out.empty
+    assert list(out.columns) == ["symbol"]
+    assert events[0]["fallback_type"] == "market_context_event_count_load_failed"
+    assert events[0]["source"] == "advisory_news_events"
+    assert events[0]["metadata"]["symbol_count"] == 1
+
+
+def test_market_context_safe_float_records_parse_fallback(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(market_context, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = market_context._safe_float(object(), default=3.5, source="market_breadth")
+
+    assert out == 3.5
+    assert events[0]["module"] == "advisory.market_context"
+    assert events[0]["fallback_type"] == "market_context_numeric_parse_failed"
+    assert events[0]["source"] == "market_breadth"
+    assert events[0]["metadata"]["default"] == 3.5
+    assert events[0]["metadata"]["value_type"] == "object"
+
+
+def test_market_context_records_cache_load_fallbacks(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(market_context, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(market_context, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("cache failed")))
+    monkeypatch.setattr(market_context, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = market_context.load_latest_market_context(asof_date=pd.Timestamp("2026-06-01", tz="UTC"), limit=3)
+
+    assert payload == {"summary": {}, "top_universe": []}
+    assert [row["fallback_type"] for row in events] == [
+        "market_context_summary_cache_load_failed",
+        "market_context_universe_cache_load_failed",
+    ]
+    assert events[1]["metadata"]["limit"] == 3
+
+
+def test_fundamental_snapshot_records_peer_membership_source_failure(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(fundamental_snapshot, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("peer failed")))
+    monkeypatch.setattr(fundamental_snapshot, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="peer failed"):
+        fundamental_snapshot.load_latest_peer_memberships(["ABC", "XYZ"])
+
+    assert events[0]["fallback_type"] == "fundamental_snapshot_peer_membership_load_failed"
+    assert events[0]["source"] == "sharpely_stock_peers"
+    assert events[0]["metadata"]["symbol_count"] == 2
+
+
+def test_fundamental_snapshot_records_statement_source_failure(monkeypatch):
+    events = []
+    universe = pd.DataFrame([{"company_master_id": "cm-1", "symbol": "ABC"}])
+
+    def fake_sql(query, params=None):
+        if "FROM stmt_income" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "company_master_id": "cm-1",
+                        "symbol": "ABC",
+                        "date": pd.Timestamp("2026-03-31", tz="UTC"),
+                        "period_length": "3 Months",
+                        "total_revenue": 100.0,
+                        "ebitda": 10.0,
+                        "profit_after_tax": 5.0,
+                        "operating_profit": 9.0,
+                        "eps_diluted": 1.0,
+                    }
+                ]
+            )
+        if "FROM stmt_balancesheet" in query:
+            raise RuntimeError("balance failed")
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fundamental_snapshot, "sql_to_df", fake_sql)
+    monkeypatch.setattr(fundamental_snapshot, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="balance failed"):
+        fundamental_snapshot.load_statement_snapshot(universe)
+
+    assert events[0]["fallback_type"] == "fundamental_snapshot_balance_load_failed"
+    assert events[0]["source"] == "stmt_balancesheet"
+    assert events[0]["metadata"]["company_count"] == 1
+
+
+def test_operator_health_surfaces_fundamental_snapshot_fallback_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "fallback_telemetry": {
+                "status": "warn",
+                "window_hours": 24,
+                "counts_by_type": {"fundamental_snapshot_peer_membership_load_failed": 2},
+                "counts_by_module": {"advisory.fundamental_snapshot": 2},
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Fundamental snapshot source context failed" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Fundamental snapshot source context failed")
+    assert hint["details"]["fundamental_snapshot_peer_membership_load_failed"] == 2
+    assert "python -m advisory.fundamental_snapshot --dry-run" in hint["commands"]
 
 
 def test_playbook_action_plan_downgrades_positive_action_in_weak_market(monkeypatch):
@@ -17544,6 +34362,38 @@ def test_fpi_update_uses_env_backed_lookback_days(monkeypatch):
     )
 
 
+def test_fpi_main_exports_failed_month_run_state(monkeypatch, capsys):
+    payload = {
+        "source": "data.nsdl.fpi",
+        "rows": 0,
+        "rows_read": 1,
+        "rows_written": 0,
+        "month_count": 1,
+        "downloaded_month_count": 0,
+        "failed_month_count": 1,
+        "attempt_count": 1,
+        "failed_attempt_count": 1,
+        "source_unavailable_count": 1,
+        "failed_months": [{"date": "2026-01-31", "error": "RuntimeError: nsdl down"}],
+        "state_advanced": False,
+    }
+    monkeypatch.setattr(fpi, "update_fpi_data", lambda: payload)
+
+    assert fpi.main() == 0
+    capsys.readouterr()
+
+    state = fpi.STOCKEY_RUN_STATE
+    assert state["source"] == "data.nsdl.fpi"
+    assert state["month_count"] == 1
+    assert state["downloaded_month_count"] == 0
+    assert state["failed_month_count"] == 1
+    assert state["attempt_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["source_unavailable_count"] == 1
+    assert state["failed_months"][0]["date"] == "2026-01-31"
+    assert state["state_advanced"] is False
+
+
 def test_fbil_gsec_uses_env_backed_lookback_days(monkeypatch):
     from data.rbi import download_fbil_gsec as fbil_gsec
 
@@ -17563,3 +34413,1700 @@ def test_fbil_gsec_uses_env_backed_lookback_days(monkeypatch):
 
     expected_start = datetime.combine(date.today(), datetime.min.time()) - pd.Timedelta(days=365)
     assert captured["start"] == expected_start
+
+
+def test_fbil_gsec_download_all_exports_run_state(monkeypatch):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    dates = [date(2026, 6, 5), date(2026, 6, 6), date(2026, 6, 8)]
+    monkeypatch.setattr(fbil_gsec, "get_cookies", lambda: {"session": "ok"})
+    monkeypatch.setattr(fbil_gsec.rop, "get", lambda _key: None)
+    monkeypatch.setattr(fbil_gsec, "daterange", lambda _start, _stop: dates)
+
+    def fake_download_gsec(fdate, cookies):
+        assert cookies == {"session": "ok"}
+        if fdate == dates[0]:
+            return {"date": "2026-06-05", "status": "downloaded", "rows": 7}
+        if fdate == dates[1]:
+            return {"date": "2026-06-06", "status": "skipped_weekend", "rows": 0}
+        return {"date": "2026-06-08", "status": "source_unavailable", "rows": 0}
+
+    monkeypatch.setattr(fbil_gsec, "download_gsec", fake_download_gsec)
+
+    state = fbil_gsec.download_all_gsec_data()
+
+    assert state["source"] == "data.rbi.download_fbil_gsec"
+    assert state["date_count"] == 3
+    assert state["downloaded_date_count"] == 1
+    assert state["skipped_weekend_count"] == 1
+    assert state["failed_date_count"] == 1
+    assert state["attempt_count"] == 2
+    assert state["failed_attempt_count"] == 1
+    assert state["source_unavailable_count"] == 1
+    assert state["rows_written"] == 7
+    assert state["state_advanced"] is True
+
+
+def test_fbil_gsec_download_failure_records_local_fallback(monkeypatch):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    events: list[dict[str, object]] = []
+    target_date = date(2026, 6, 8)
+    monkeypatch.setattr(fbil_gsec, "get_cookies", lambda: {"session": "ok"})
+    monkeypatch.setattr(fbil_gsec.rop, "get", lambda _key: None)
+    monkeypatch.setattr(fbil_gsec, "daterange", lambda _start, _stop: [target_date])
+    monkeypatch.setattr(fbil_gsec, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+    monkeypatch.setattr(
+        fbil_gsec,
+        "download_gsec",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fbil down")),
+    )
+
+    state = fbil_gsec.download_all_gsec_data()
+
+    assert state["failed_date_count"] == 1
+    assert len(events) == 1
+    assert events[0]["module"] == "data.rbi.download_fbil_gsec"
+    assert events[0]["source"] == "rbi_fbil_gsec"
+    assert events[0]["fallback_type"] == "fbil_gsec_download_failed"
+    assert events[0]["metadata"]["date"] == "2026-06-08"
+
+
+def test_fbil_gsec_try_parsing_date_records_format_fallback(monkeypatch):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(fbil_gsec, "_record_fbil_gsec_fallback", lambda **kwargs: events.append(kwargs))
+
+    parsed = fbil_gsec.try_parsing_date("08 Jun, 2026")
+
+    assert parsed == datetime(2026, 6, 8)
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "fbil_gsec_date_format_parse_failed"
+    assert events[0]["source"] == "rbi_fbil_gsec"
+    assert events[0]["metadata"]["format"] == "%d-%b-%Y"
+    assert events[0]["metadata"]["raw_date"] == "08 Jun, 2026"
+
+
+def test_fbil_gsec_parse_xls_records_trade_date_and_sheet_fallbacks(monkeypatch):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    events: list[dict[str, object]] = []
+    calls: list[tuple[str, object]] = []
+
+    def fake_read_excel(_path, sheet_name=None, skiprows=None):
+        calls.append((str(sheet_name), skiprows))
+        if sheet_name == "G-Sec" and skiprows is None:
+            return pd.DataFrame([[None, None, None], [None, None, "bad-date"]])
+        if sheet_name == "G-Sec" and skiprows == 5:
+            return pd.DataFrame(
+                [
+                    [
+                        "IN000000001",
+                        "7.1",
+                        "31-Dec-2030",
+                        "100.2",
+                        "7.0",
+                        None,
+                        None,
+                        "liquid",
+                    ]
+                ]
+            )
+        if sheet_name == "Par Yield":
+            raise ValueError("missing Par Yield")
+        if sheet_name == "Par-Yield":
+            return pd.DataFrame([[10, 7.2, 7.45]])
+        raise AssertionError(f"unexpected read_excel call {sheet_name=} {skiprows=}")
+
+    monkeypatch.setattr(fbil_gsec.pd, "read_excel", fake_read_excel)
+    monkeypatch.setattr(fbil_gsec, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    quote, par = fbil_gsec.parse_xls("dummy.xls", date(2026, 6, 8))
+
+    assert quote["trade_date"].iloc[0] == date(2026, 6, 8)
+    assert float(par["par_yield_sa"].iloc[0]) == 7.2
+    assert [event["fallback_type"] for event in events] == [
+        "fbil_gsec_trade_date_parse_failed",
+        "fbil_gsec_par_yield_sheet_fallback",
+    ]
+    assert events[0]["metadata"]["raw_trade_date"] == "bad-date"
+    assert all(event["metadata"]["date"] == "2026-06-08" for event in events)
+    assert ("Par-Yield", 5) in calls
+
+
+def test_fbil_gsec_main_exports_failed_run_state(monkeypatch, capsys):
+    from data.rbi import download_fbil_gsec as fbil_gsec
+
+    payload = {
+        "source": "data.rbi.download_fbil_gsec",
+        "rows": 0,
+        "rows_read": 1,
+        "rows_written": 0,
+        "date_count": 1,
+        "downloaded_date_count": 0,
+        "failed_date_count": 1,
+        "attempt_count": 1,
+        "failed_attempt_count": 1,
+        "source_unavailable_count": 1,
+        "failed_dates": [{"date": "2026-06-08", "error": "RuntimeError: fbil down"}],
+        "state_advanced": False,
+    }
+    monkeypatch.setattr(fbil_gsec, "download_all_gsec_data", lambda: payload)
+
+    assert fbil_gsec.main() == 0
+    capsys.readouterr()
+
+    state = fbil_gsec.STOCKEY_RUN_STATE
+    assert state["source"] == "data.rbi.download_fbil_gsec"
+    assert state["date_count"] == 1
+    assert state["failed_date_count"] == 1
+    assert state["failed_dates"][0]["date"] == "2026-06-08"
+    assert state["state_advanced"] is False
+
+
+def test_rbi_bank_rates_exports_source_unavailable_state(monkeypatch):
+    from data.rbi import download_bank_rates as bank_rates
+
+    events = []
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            raise bank_rates.PlaywrightTimeoutError("cdp timeout")
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    monkeypatch.setattr(bank_rates, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    state = bank_rates.download_latest_rates(FakePlaywright())
+
+    assert state["source"] == "data.rbi.download_bank_rates"
+    assert state["status"] == "source_unavailable"
+    assert state["attempt_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["source_unavailable_count"] == 1
+    assert state["state_advanced"] is False
+    assert "cdp timeout" in state["error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.rbi.download_bank_rates"
+    assert event["source"] == "rbi_bank_rates:browser"
+    assert event["fallback_type"] == "rbi_bank_rates_source_unavailable"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], bank_rates.PlaywrightTimeoutError)
+    assert event["metadata"] == {
+        "cdp_endpoint": bank_rates.CDP_ENDPOINT,
+        "status": "source_unavailable",
+    }
+
+
+def test_rbi_bank_rates_records_generic_download_failure(monkeypatch):
+    from data.rbi import download_bank_rates as bank_rates
+
+    events = []
+
+    class FakePage:
+        def close(self):
+            pass
+
+        def goto(self, _url):
+            raise RuntimeError("rbi layout changed")
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = [FakeContext()]
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    monkeypatch.setattr(bank_rates, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    state = bank_rates.download_latest_rates(FakePlaywright())
+
+    assert state["status"] == "failed"
+    assert state["failed_attempt_count"] == 1
+    assert state["source_unavailable_count"] == 0
+    assert state["state_advanced"] is False
+    assert "rbi layout changed" in state["error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.rbi.download_bank_rates"
+    assert event["source"] == "rbi_bank_rates:download"
+    assert event["fallback_type"] == "rbi_bank_rates_download_failed"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"] == {
+        "cdp_endpoint": bank_rates.CDP_ENDPOINT,
+        "status": "failed",
+    }
+
+
+def test_rbi_bank_rates_main_exports_run_state(monkeypatch, capsys):
+    from data.rbi import download_bank_rates as bank_rates
+
+    payload = {
+        "source": "data.rbi.download_bank_rates",
+        "status": "ok",
+        "rows": 5,
+        "rows_read": 5,
+        "rows_written": 5,
+        "attempt_count": 1,
+        "failed_attempt_count": 0,
+        "source_unavailable_count": 0,
+        "state_advanced": True,
+    }
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(bank_rates, "sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(bank_rates, "download_latest_rates", lambda _playwright: payload)
+
+    assert bank_rates.main() == 0
+    capsys.readouterr()
+
+    assert bank_rates.STOCKEY_RUN_STATE["source"] == "data.rbi.download_bank_rates"
+    assert bank_rates.STOCKEY_RUN_STATE["rows_written"] == 5
+    assert bank_rates.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_nse_holidays_exports_source_unavailable_state(monkeypatch):
+    from data.nseindia import holidays as nse_holidays
+
+    events: list[dict[str, object]] = []
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            raise nse_holidays.PlaywrightTimeoutError("cdp timeout")
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    monkeypatch.setattr(nse_holidays, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    state = nse_holidays.download_holidays(FakePlaywright())
+
+    assert state["source"] == "data.nseindia.holidays"
+    assert state["status"] == "source_unavailable"
+    assert state["attempt_count"] == 1
+    assert state["failed_attempt_count"] == 1
+    assert state["source_unavailable_count"] == 1
+    assert state["state_advanced"] is False
+    assert "cdp timeout" in state["error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["module"] == "data.nseindia.holidays"
+    assert event["source"] == "data.nseindia.holidays"
+    assert event["fallback_type"] == "nse_holidays_source_unavailable"
+    assert event["severity"] == "warn"
+    assert isinstance(event["error"], nse_holidays.PlaywrightTimeoutError)
+    assert event["metadata"] == {"classification": "source_unavailable", "attempt_count": 1}
+
+
+def test_nse_holidays_records_generic_download_failure(monkeypatch):
+    from data.nseindia import holidays as nse_holidays
+
+    events: list[dict[str, object]] = []
+
+    class FakePage:
+        def goto(self, *_args, **_kwargs):
+            raise RuntimeError("holiday parse failed")
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts = []
+
+        def new_context(self):
+            return FakeContext()
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    monkeypatch.setattr(nse_holidays, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    state = nse_holidays.download_holidays(FakePlaywright())
+
+    assert state["source"] == "data.nseindia.holidays"
+    assert state["status"] == "failed"
+    assert state["failed_attempt_count"] == 1
+    assert state["state_advanced"] is False
+    assert "holiday parse failed" in state["error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["fallback_type"] == "nse_holidays_download_failed"
+    assert event["severity"] == "error"
+    assert isinstance(event["error"], RuntimeError)
+    assert event["metadata"] == {"classification": "failed", "attempt_count": 1}
+
+
+def test_nse_holidays_main_exports_run_state(monkeypatch, capsys):
+    from data.nseindia import holidays as nse_holidays
+
+    payload = {
+        "source": "data.nseindia.holidays",
+        "status": "ok",
+        "rows": 4,
+        "rows_read": 4,
+        "rows_written": 4,
+        "attempt_count": 1,
+        "failed_attempt_count": 0,
+        "source_unavailable_count": 0,
+        "state_advanced": True,
+    }
+
+    class FakeRedis:
+        def get(self, _key):
+            return None
+
+        def close(self):
+            pass
+
+    class FakePlaywrightContext:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(nse_holidays, "rop", FakeRedis())
+    monkeypatch.setattr(nse_holidays, "sync_playwright", lambda: FakePlaywrightContext())
+    monkeypatch.setattr(nse_holidays, "download_holidays", lambda _playwright: payload)
+
+    assert nse_holidays.main() == 0
+    capsys.readouterr()
+
+    assert nse_holidays.STOCKEY_RUN_STATE["source"] == "data.nseindia.holidays"
+    assert nse_holidays.STOCKEY_RUN_STATE["rows_written"] == 4
+    assert nse_holidays.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_economictimes_rss_exports_partial_feed_run_state(monkeypatch):
+    from data.economictimes import rss as et_rss
+
+    events: list[dict[str, object]] = []
+
+    def fake_fetch_feed(feed_name, _feed_url):
+        if feed_name == "stocks":
+            raise et_rss.requests.Timeout("timed out")
+        if feed_name == "investment_ideas":
+            raise ValueError("bad xml")
+        if feed_name == "expert_views":
+            return pd.DataFrame()
+        return pd.DataFrame(
+            [
+                {
+                    "feed_name": feed_name,
+                    "guid": f"{feed_name}-1",
+                    "published_on": pd.Timestamp("2026-06-10T09:00:00Z"),
+                }
+            ]
+        )
+
+    monkeypatch.setattr(et_rss, "fetch_feed", fake_fetch_feed)
+    monkeypatch.setattr(et_rss, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    df, state = et_rss.build_feed_rows_with_state(feed_names=["markets", "stocks", "expert_views", "investment_ideas"])
+
+    assert len(df) == 1
+    assert state["source"] == "data.economictimes.rss"
+    assert state["feed_count"] == 4
+    assert state["succeeded_feed_count"] == 1
+    assert state["empty_feed_count"] == 1
+    assert state["failed_feed_count"] == 2
+    assert state["attempt_count"] == 4
+    assert state["failed_attempt_count"] == 2
+    assert state["source_unavailable_count"] == 1
+    assert state["parse_failed_count"] == 1
+    assert state["no_data_count"] == 1
+    assert state["rows"] == 1
+    assert state["failed_feeds"][0]["feed_name"] == "stocks"
+    assert state["state_advanced"] is False
+    assert [event["fallback_type"] for event in events] == [
+        "economictimes_rss_feed_source_unavailable",
+        "economictimes_rss_feed_parse_failed",
+    ]
+    assert events[0]["source"] == "data.economictimes.rss:stocks"
+    assert events[0]["metadata"]["classification"] == "source_unavailable"
+    assert isinstance(events[0]["error"], et_rss.requests.Timeout)
+    assert events[1]["source"] == "data.economictimes.rss:investment_ideas"
+    assert events[1]["metadata"]["classification"] == "parse_failed"
+    assert isinstance(events[1]["error"], ValueError)
+
+
+def test_economictimes_rss_parse_datetime_records_email_parse_fallback(monkeypatch):
+    from data.economictimes import rss as et_rss
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(et_rss, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    out = et_rss.parse_datetime("2026-06-11 09:15:00+05:30")
+
+    assert out == pd.Timestamp("2026-06-11T03:45:00Z")
+    assert events[0]["module"] == "data.economictimes.rss"
+    assert events[0]["source"] == "rss_pubdate"
+    assert events[0]["fallback_type"] == "economictimes_rss_pubdate_email_parse_failed"
+    assert events[0]["metadata"]["value_excerpt"] == "2026-06-11 09:15:00+05:30"
+
+
+def test_economictimes_rss_ensure_table_uses_schema_registry(monkeypatch):
+    from data.economictimes import rss as et_rss
+
+    calls = []
+
+    monkeypatch.setattr(et_rss, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    et_rss.ensure_table()
+
+    assert len(calls) == 1
+    assert calls[0]["migration_id"] == et_rss.ECONOMICTIMES_RSS_SCHEMA_MIGRATION_ID
+    assert calls[0]["metadata"] == {"tables": [et_rss.TABLE_NAME], "source": et_rss.SYNC_SOURCE_NAME}
+    assert any(et_rss.TABLE_NAME in statement for statement in calls[0]["statements"])
+    assert any("published_on TIMESTAMPTZ" in statement for statement in calls[0]["statements"])
+    assert any("categories_json TEXT" in statement for statement in calls[0]["statements"])
+    assert any("UNIQUE (feed_name, guid)" in statement for statement in calls[0]["statements"])
+
+
+def test_economictimes_rss_main_exports_persisted_run_state(monkeypatch, capsys):
+    from data.economictimes import rss as et_rss
+
+    df = pd.DataFrame(
+        [
+            {
+                "feed_name": "markets",
+                "guid": "m1",
+                "published_on": pd.Timestamp("2026-06-10T09:00:00Z"),
+            },
+            {
+                "feed_name": "stocks",
+                "guid": "s1",
+                "published_on": pd.Timestamp("2026-06-10T10:00:00Z"),
+            },
+        ]
+    )
+    state = {
+        "source": "data.economictimes.rss",
+        "rows": 2,
+        "rows_read": 2,
+        "rows_written": 0,
+        "feed_count": 2,
+        "failed_feed_count": 0,
+        "attempt_count": 2,
+        "failed_attempt_count": 0,
+        "source_unavailable_count": 0,
+        "state_advanced": False,
+        "feed_names": ["markets", "stocks"],
+    }
+    persisted = []
+    monkeypatch.setattr(et_rss, "build_feed_rows_with_state", lambda feed_names=None: (df, state.copy()))
+    monkeypatch.setattr(et_rss, "persist_feed_rows", lambda frame: persisted.append(frame.copy()))
+    monkeypatch.setattr(sys, "argv", ["rss.py"])
+
+    assert et_rss.main() == 0
+    capsys.readouterr()
+
+    assert len(persisted) == 1
+    assert len(persisted[0]) == 2
+    assert et_rss.STOCKEY_RUN_STATE["source"] == "data.economictimes.rss"
+    assert et_rss.STOCKEY_RUN_STATE["rows_written"] == 2
+    assert et_rss.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_env_example_audit_extracts_python_and_shell_vars():
+    from scripts import env_example_audit
+
+    text = """
+api_key = env.str("OPENAI_API_KEY", "")
+workers = int(os.getenv("OPERATOR_HEALTH_FAST_WORKERS", "4"))
+token = os.environ.get("DHAN_ACCESS_TOKEN")
+echo "${STOCKEY_DIR:-/tmp/stockey}" "$LOG_DIR" "$PWD"
+"""
+
+    usages = env_example_audit.extract_env_usages_from_text(text, "sample.sh")
+    names = {usage.name for usage in usages}
+
+    assert names == {
+        "OPENAI_API_KEY",
+        "OPERATOR_HEALTH_FAST_WORKERS",
+        "DHAN_ACCESS_TOKEN",
+        "STOCKEY_DIR",
+        "LOG_DIR",
+    }
+
+
+def test_env_example_audit_parse_env_example_names():
+    from scripts import env_example_audit
+
+    names = env_example_audit.parse_env_example_names(
+        """
+# comment
+OPENAI_API_KEY=
+BAD-name=value
+LOG_DIR=logs/cron
+  STOCKEY_DIR=/tmp/stockey
+"""
+    )
+
+    assert names == {"OPENAI_API_KEY", "LOG_DIR", "STOCKEY_DIR"}
+
+
+def test_env_example_audit_build_report_flags_missing_vars(tmp_path):
+    from scripts import env_example_audit
+
+    (tmp_path / ".env.example").write_text("OPENAI_API_KEY=\n", encoding="utf-8")
+    (tmp_path / "runner.py").write_text(
+        'env.str("OPENAI_API_KEY")\nos.getenv("MISSING_RUNTIME_VAR")\n',
+        encoding="utf-8",
+    )
+
+    report = env_example_audit.build_report(repo_root=tmp_path)
+
+    assert report["status"] == "missing_env_example_entries"
+    assert report["missing"] == ["MISSING_RUNTIME_VAR"]
+    assert report["documented_count"] == 1
+    assert report["used_count"] == 2
+
+
+def test_env_example_audit_records_decode_fallback(monkeypatch, tmp_path):
+    from scripts import env_example_audit
+
+    events = []
+    (tmp_path / ".env.example").write_text("OPENAI_API_KEY=\n", encoding="utf-8")
+    (tmp_path / "broken.py").write_bytes(b"\xff\xfe\xff")
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    usages = env_example_audit.collect_env_usages(repo_root=tmp_path)
+
+    assert usages == []
+    assert len(events) == 1
+    assert events[0]["module"] == "scripts.env_example_audit"
+    assert events[0]["source"] == "broken.py"
+    assert events[0]["fallback_type"] == "env_example_audit_decode_failed"
+
+
+def test_all_frontend_script_exposes_component_modes():
+    script = Path("all_frontend.sh").read_text(encoding="utf-8")
+
+    assert "--api-only" in script
+    assert "--web-only" in script
+    assert "OPERATOR_FRONTEND_COMPONENT=both|api|web" in script
+    assert 'COMPONENT="${OPERATOR_FRONTEND_COMPONENT:-both}"' in script
+    assert 'if [[ "${COMPONENT}" == "both" || "${COMPONENT}" == "api" ]]; then' in script
+    assert 'if [[ "${COMPONENT}" == "both" || "${COMPONENT}" == "web" ]]; then' in script
+    assert "emit_script_marker \"start\"" in script
+    assert "name=all_frontend" in script
+    assert "script_status_for_exit_code" in script
+
+
+def test_codex_wrappers_emit_script_markers():
+    advisory = Path("all_advisory_codex.sh").read_text(encoding="utf-8")
+    analysis = Path("all_analysis_codex.sh").read_text(encoding="utf-8")
+
+    assert 'scripts/run_with_markers.sh" "all_advisory_codex"' in advisory
+    assert "scripts/codex_supervised_runner.py" in advisory
+    assert 'scripts/run_with_markers.sh" "all_analysis_codex"' in analysis
+    assert "scripts/analysis_agent_loop.py" in analysis
+
+
+def test_cron_python_jobs_use_named_marker_wrappers():
+    wrapper_names = [
+        "all_api_latency_probe.sh",
+        "all_operator_health.sh",
+        "all_hypothesis_scan.sh",
+        "all_ts_forecast_workflow.sh",
+        "all_ts_forecast_evaluator.sh",
+        "all_event_policy_evaluator.sh",
+        "all_technical_threshold_calibration.sh",
+    ]
+    for wrapper_name in wrapper_names:
+        script = Path(wrapper_name).read_text(encoding="utf-8")
+        assert "scripts/resolve_python.sh" in script
+        assert "scripts/run_with_markers.sh" in script
+
+    for crontab_path in [Path("config/stockey.crontab.template"), Path("config/stockey.generated.crontab")]:
+        active_lines = [
+            line
+            for line in crontab_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        cron_text = "\n".join(active_lines)
+        for wrapper_name in wrapper_names:
+            assert f"./{wrapper_name}" in cron_text
+        assert "scripts/resolve_python.sh" not in cron_text
+        assert " -m advisory." not in cron_text
+        assert " scripts/api_latency_probe.py" not in cron_text
+
+
+def test_run_with_markers_emits_start_and_failed_status():
+    proc = subprocess.run(
+        ["bash", "scripts/run_with_markers.sh", "marker_test", "bash", "-c", "exit 7"],
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 7
+    assert "[stockey.script] name=marker_test status=start" in proc.stdout
+    assert "[stockey.script] name=marker_test status=failed exit_code=7" in proc.stdout
+
+
+def test_cleanup_deprecated_tables_uses_retryable_drop(monkeypatch):
+    from scripts import cleanup_deprecated_tables
+
+    operation_names = []
+    executed = []
+
+    class FakeCursor:
+        def execute(self, query, params=None):
+            executed.append((str(query), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(cleanup_deprecated_tables, "list_existing_deprecated_tables", lambda: ["dhan_screeners"])
+    monkeypatch.setattr(cleanup_deprecated_tables, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(cleanup_deprecated_tables, "execute_db_operation", fake_execute_db_operation)
+
+    dropped = cleanup_deprecated_tables.drop_deprecated_tables()
+
+    assert dropped == ["dhan_screeners"]
+    assert operation_names == ["cleanup_deprecated_tables:drop"]
+    assert executed == [("DROP TABLE IF EXISTS dhan_screeners", None)]
+
+
+def test_hot_table_retention_selects_trace_and_intraday_groups():
+    from scripts import hot_table_retention
+
+    trace_specs = hot_table_retention.selected_specs(group="trace")
+    intraday_specs = hot_table_retention.selected_specs(group="intraday")
+
+    assert trace_specs
+    assert intraday_specs
+    assert {spec.group for spec in trace_specs} == {"trace"}
+    assert {spec.group for spec in intraday_specs} == {"intraday"}
+    assert "advisory_decision_traces" in {spec.table_name for spec in trace_specs}
+    assert "dhan_ohlcv_intraday" in {spec.table_name for spec in intraday_specs}
+
+
+def test_hot_table_retention_parse_cutoff_normalizes_explicit_date():
+    from scripts import hot_table_retention
+
+    cutoff = hot_table_retention.parse_cutoff("2026-06-11 15:45:00+05:30", 45)
+
+    assert str(cutoff.tz) == "UTC"
+    assert cutoff.hour == 0
+    assert cutoff.minute == 0
+
+
+def test_hot_table_retention_blocks_delete_without_archive(monkeypatch):
+    from scripts import hot_table_retention
+
+    spec = hot_table_retention.RETENTION_TABLES["dhan_ohlcv_intraday"]
+    monkeypatch.setattr(hot_table_retention, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(hot_table_retention, "column_exists", lambda table_name, column_name: True)
+    monkeypatch.setattr(
+        hot_table_retention,
+        "month_chunks",
+        lambda *args, **kwargs: [{"chunk_start": pd.Timestamp("2026-01-01T00:00:00Z"), "chunk_end": pd.Timestamp("2026-02-01T00:00:00Z"), "row_count": 10}],
+    )
+
+    result = hot_table_retention.archive_or_delete_table(
+        spec,
+        cutoff=pd.Timestamp("2026-03-01T00:00:00Z"),
+        archive_s3=False,
+        delete=True,
+        execute=False,
+        allow_delete_without_archive=False,
+        archive_prefix="archives/hot_tables",
+        max_chunks=None,
+        exact_counts=True,
+    )
+
+    assert result["status"] == "blocked_delete_without_archive"
+    assert result["candidate_rows"] == 10
+    assert "archive" in result["message"].lower()
+
+
+def test_hot_table_retention_execute_uses_retryable_operation(monkeypatch):
+    from scripts import hot_table_retention
+
+    spec = hot_table_retention.RETENTION_TABLES["dhan_ohlcv_intraday"]
+    operation_names = []
+
+    class FakeSession:
+        def __enter__(self):
+            return None, object()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(hot_table_retention, "table_exists", lambda table_name: True)
+    monkeypatch.setattr(hot_table_retention, "column_exists", lambda table_name, column_name: True)
+    monkeypatch.setattr(
+        hot_table_retention,
+        "month_chunks",
+        lambda *args, **kwargs: [
+            {
+                "chunk_start": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "chunk_end": pd.Timestamp("2026-02-01T00:00:00Z"),
+                "row_count": 10,
+            }
+        ],
+    )
+    monkeypatch.setattr(hot_table_retention, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(hot_table_retention, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(hot_table_retention, "delete_chunk", lambda **_kwargs: 7)
+
+    result = hot_table_retention.archive_or_delete_table(
+        spec,
+        cutoff=pd.Timestamp("2026-03-01T00:00:00Z"),
+        archive_s3=False,
+        delete=True,
+        execute=True,
+        allow_delete_without_archive=True,
+        archive_prefix="archives/hot_tables",
+        max_chunks=None,
+        exact_counts=True,
+    )
+
+    assert operation_names == ["hot_table_retention:archive_or_delete:dhan_ohlcv_intraday"]
+    assert result["status"] == "ok"
+    assert result["deleted_rows"] == 7
+    assert result["chunks"][0]["deleted_rows"] == 7
+
+
+def test_offload_announcement_manifest_sample_is_bounded():
+    from scripts import offload_announcement_text_to_s3 as offload
+    from utils.blob_store import text_blob_metadata
+
+    summary = offload._new_offload_summary(sample_limit=1)
+    first = text_blob_metadata("first payload", key="announcements/a.txt")
+    second = text_blob_metadata("second payload", key="announcements/b.txt")
+
+    offload._append_manifest_sample(
+        summary,
+        table_name="announcement_pipeline_documents",
+        unique_id="ABC-1",
+        text_column="full_ocr_text",
+        key_column="full_ocr_s3_key",
+        key=first.key,
+        metadata=first,
+        null_after_upload=True,
+    )
+    offload._append_manifest_sample(
+        summary,
+        table_name="announcement_pipeline_documents",
+        unique_id="ABC-2",
+        text_column="three_page_ocr_text",
+        key_column="ocr_s3_key",
+        key=second.key,
+        metadata=second,
+        null_after_upload=False,
+    )
+
+    assert len(summary["sample_items"]) == 1
+    sample = summary["sample_items"][0]
+    assert sample["unique_id"] == "ABC-1"
+    assert sample["s3_key"] == "announcements/a.txt"
+    assert sample["bytes"] == len("first payload".encode("utf-8"))
+    assert sample["text_column_will_be_nulled"] is True
+
+
+def test_offload_announcement_manifest_write_roundtrip(tmp_path):
+    from scripts import offload_announcement_text_to_s3 as offload
+
+    payload = {"status": "ok", "dry_run": True, "documents": {"uploaded": 0}}
+    path = tmp_path / "offload" / "manifest.json"
+
+    written = offload.write_manifest(path, payload)
+
+    assert written == str(path)
+    assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_offload_announcement_schema_columns_use_migration_registry(monkeypatch):
+    from scripts import offload_announcement_text_to_s3 as offload
+
+    calls = []
+
+    monkeypatch.setattr(offload, "_table_exists", lambda _cur, _table_name: True)
+    monkeypatch.setattr(offload, "apply_schema_migration", lambda **kwargs: calls.append(kwargs) or {"status": "applied"})
+
+    offload.ensure_migration_columns(object())
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["migration_id"] == offload.ANNOUNCEMENT_TEXT_OFFLOAD_SCHEMA_MIGRATION_ID
+    assert call["owner"] == "scripts.offload_announcement_text_to_s3"
+    assert call["metadata"]["tables"] == [offload.DOCUMENT_TABLE, offload.REPORT_TABLE]
+    ddl = "\n".join(call["statements"])
+    assert f"ALTER TABLE \"{offload.DOCUMENT_TABLE}\"" in ddl
+    assert f"ALTER TABLE \"{offload.REPORT_TABLE}\"" in ddl
+    assert "ADD COLUMN IF NOT EXISTS \"ocr_s3_key\" TEXT" in ddl
+    assert "ADD COLUMN IF NOT EXISTS report_s3_key TEXT" in ddl
+
+
+def test_offload_announcement_schema_columns_skip_when_tables_missing(monkeypatch):
+    from scripts import offload_announcement_text_to_s3 as offload
+
+    calls = []
+
+    monkeypatch.setattr(offload, "_table_exists", lambda _cur, _table_name: False)
+    monkeypatch.setattr(offload, "apply_schema_migration", lambda **kwargs: calls.append(kwargs))
+
+    offload.ensure_migration_columns(object())
+
+    assert calls == []
+
+
+def test_offload_announcement_paths_use_retryable_operations(monkeypatch):
+    from scripts import offload_announcement_text_to_s3 as offload
+
+    operation_names = []
+
+    class FakeConnection:
+        def rollback(self):
+            pass
+
+    class FakeSession:
+        def __enter__(self):
+            return FakeConnection(), object()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(offload, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(offload, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(offload, "_table_exists", lambda _cur, _table_name: False)
+
+    documents = offload.offload_documents(limit=10, dry_run=True, null_after_upload=True)
+    reports = offload.offload_reports(limit=10, dry_run=True, null_after_upload=True)
+
+    assert operation_names == [
+        "offload_announcement_text_to_s3:documents",
+        "offload_announcement_text_to_s3:reports",
+    ]
+    assert documents["status"] == "missing_table"
+    assert reports["status"] == "missing_table"
+
+
+def test_validate_announcement_s3_pointer_items_from_row():
+    from scripts import validate_announcement_s3_pointers as validator
+
+    row = {
+        "unique_id": "ABC-1",
+        "ticker": "ABC",
+        "ocr_s3_key": "announcement/abc/ocr.txt",
+        "ocr_sha256": "hash-1",
+        "ocr_bytes": 12,
+        "three_page_ocr_text": None,
+        "full_ocr_s3_key": "",
+        "audio_transcript_s3_key": None,
+    }
+
+    items = validator.pointer_items_from_row(
+        row,
+        table_name=validator.DOCUMENT_TABLE,
+        pointer_fields=validator.DOCUMENT_POINTER_FIELDS,
+    )
+
+    assert len(items) == 1
+    assert items[0]["unique_id"] == "ABC-1"
+    assert items[0]["kind"] == "ocr"
+    assert items[0]["s3_key"] == "announcement/abc/ocr.txt"
+    assert items[0]["expected_bytes"] == 12
+    assert items[0]["inline_text_present"] is False
+
+
+def test_validate_announcement_s3_pointer_fetch_uses_retryable_operation(monkeypatch):
+    from scripts import validate_announcement_s3_pointers as validator
+
+    operation_names = []
+
+    class FakeSession:
+        def __enter__(self):
+            return None, object()
+
+        def __exit__(self, *_args):
+            return False
+
+    def fake_execute_db_operation(operation, *, operation_name, **_kwargs):
+        operation_names.append(operation_name)
+        return operation()
+
+    monkeypatch.setattr(validator, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(validator, "execute_db_operation", fake_execute_db_operation)
+    monkeypatch.setattr(
+        validator,
+        "fetch_document_rows",
+        lambda _cur, *, limit: [
+            {
+                "unique_id": "DOC-1",
+                "ticker": "ABC",
+                "ocr_s3_key": "announcements/doc-1/ocr.txt",
+                "ocr_sha256": "hash",
+                "ocr_bytes": 10,
+                "three_page_ocr_text": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        validator,
+        "fetch_report_rows",
+        lambda _cur, *, limit: [
+            {
+                "unique_id": "REP-1",
+                "ticker": "XYZ",
+                "report_name": "summary",
+                "report_s3_key": "announcements/rep-1/report.json",
+                "report_sha256": "hash",
+                "report_bytes": 20,
+                "report_json": None,
+            }
+        ],
+    )
+
+    items = validator.fetch_pointer_items(limit=1)
+
+    assert operation_names == ["validate_announcement_s3_pointers:fetch_pointer_items"]
+    assert len(items) == 1
+    assert items[0]["unique_id"] == "DOC-1"
+    assert items[0]["kind"] == "ocr"
+
+
+def test_validate_announcement_s3_pointer_ok_and_hash_match():
+    from io import BytesIO
+    from scripts import validate_announcement_s3_pointers as validator
+
+    payload = b"hello announcement"
+    expected_sha = __import__("hashlib").sha256(payload).hexdigest()
+
+    class FakeS3:
+        def head_object(self, *, Bucket, Key):
+            return {"ContentLength": len(payload), "ETag": '"etag"'}
+
+        def get_object(self, *, Bucket, Key):
+            return {"Body": BytesIO(payload)}
+
+    result = validator.validate_pointer_item(
+        {
+            "s3_key": "announcement/abc/ocr.txt",
+            "expected_bytes": len(payload),
+            "expected_sha256": expected_sha,
+        },
+        s3_client=FakeS3(),
+        bucket="stockeydata",
+        verify_hash=True,
+    )
+
+    assert result["status"] == "ok"
+    assert result["bytes_match"] is True
+    assert result["sha256_match"] is True
+
+
+def test_validate_announcement_s3_pointer_detects_mismatch():
+    from io import BytesIO
+    from scripts import validate_announcement_s3_pointers as validator
+
+    class FakeS3:
+        def head_object(self, *, Bucket, Key):
+            return {"ContentLength": 5}
+
+        def get_object(self, *, Bucket, Key):
+            return {"Body": BytesIO(b"actual")}
+
+    result = validator.validate_pointer_item(
+        {
+            "s3_key": "announcement/abc/report.json",
+            "expected_bytes": 99,
+            "expected_sha256": "not-the-real-hash",
+        },
+        s3_client=FakeS3(),
+        bucket="stockeydata",
+        verify_hash=True,
+    )
+
+    assert result["status"] == "mismatch"
+    assert result["bytes_match"] is False
+    assert result["sha256_match"] is False
+
+
+def test_validate_announcement_s3_summary_marks_issues():
+    from scripts import validate_announcement_s3_pointers as validator
+
+    summary = validator.build_validation_summary(
+        [{"status": "ok"}, {"status": "missing_or_unreadable"}],
+        verify_hash=False,
+        dry_run=False,
+    )
+
+    assert summary["status"] == "issues_found"
+    assert summary["status_counts"] == {"ok": 1, "missing_or_unreadable": 1}
+
+
+def test_heavy_payload_inventory_classifies_control_payload():
+    from scripts import heavy_payload_inventory
+
+    row = heavy_payload_inventory.classify_column(
+        {
+            "schema_name": "public",
+            "table_name": "advisory_decision_traces",
+            "column_name": "payload_json",
+            "data_type": "text",
+            "estimated_rows": 250_000,
+            "total_bytes": 250 * 1024 * 1024,
+            "toast_bytes": 50 * 1024 * 1024,
+        }
+    )
+
+    assert row["risk_score"] >= 6
+    assert row["recommended_action"] == "compact_or_retention"
+
+
+def test_heavy_payload_inventory_marks_announcement_as_handled():
+    from scripts import heavy_payload_inventory
+
+    row = heavy_payload_inventory.classify_column(
+        {
+            "schema_name": "public",
+            "table_name": "announcement_pipeline_documents",
+            "column_name": "full_ocr_text",
+            "data_type": "text",
+            "estimated_rows": 1000,
+            "total_bytes": 500 * 1024 * 1024,
+            "toast_bytes": 450 * 1024 * 1024,
+        }
+    )
+
+    assert row["announcement_table"] is True
+    assert row["recommended_action"] == "handled_by_announcement_offload"
+
+
+def test_heavy_payload_inventory_recommends_source_snapshot_retention():
+    from scripts import heavy_payload_inventory
+
+    row = heavy_payload_inventory.classify_column(
+        {
+            "schema_name": "public",
+            "table_name": "screenerin_ad_hoc_query_runs",
+            "column_name": "raw_json",
+            "data_type": "text",
+            "estimated_rows": 5000,
+            "total_bytes": 50 * 1024 * 1024,
+            "toast_bytes": 20 * 1024 * 1024,
+        }
+    )
+
+    assert row["recommended_action"] == "retain_raw_source_snapshot"
+
+
+def test_heavy_payload_inventory_build_report_sorts_by_risk(monkeypatch):
+    from scripts import heavy_payload_inventory
+
+    monkeypatch.setattr(
+        heavy_payload_inventory,
+        "fetch_payload_columns",
+        lambda schema, include_announcement: [
+            {
+                "schema_name": "public",
+                "table_name": "small_table",
+                "column_name": "name",
+                "data_type": "text",
+                "estimated_rows": 10,
+                "total_bytes": 100,
+                "toast_bytes": 0,
+            },
+            {
+                "schema_name": "public",
+                "table_name": "advisory_event_processing_runs",
+                "column_name": "payload_json",
+                "data_type": "text",
+                "estimated_rows": 500_000,
+                "total_bytes": 600 * 1024 * 1024,
+                "toast_bytes": 200 * 1024 * 1024,
+            },
+        ],
+    )
+
+    report = heavy_payload_inventory.build_inventory(min_risk_score=1)
+
+    assert report["status"] == "ok"
+    assert report["returned_count"] == 1
+    assert report["rows"][0]["table_name"] == "advisory_event_processing_runs"
+    assert report["recommended_action_counts"] == {"compact_or_retention": 1}
+
+
+def test_api_latency_probe_writes_latest_summary(tmp_path):
+    from scripts import api_latency_probe
+
+    payload = {
+        "status": "ok",
+        "generated_at": "2026-06-11T00:00:00Z",
+        "slow_count": 0,
+        "error_count": 0,
+        "rows": [],
+    }
+    path = tmp_path / "performance" / "latest_api_latency_probe.json"
+
+    written = api_latency_probe.write_probe_summary(path, payload)
+
+    assert written == str(path)
+    assert json.loads(path.read_text(encoding="utf-8")) == payload
+
+
+def test_api_latency_probe_http_error_records_fallback(monkeypatch):
+    import io
+    from scripts import api_latency_probe
+
+    events: list[dict[str, object]] = []
+
+    def fake_urlopen(url, timeout=None):
+        raise api_latency_probe.urllib.error.HTTPError(
+            url=url,
+            code=503,
+            msg="Service Unavailable",
+            hdrs=None,
+            fp=io.BytesIO(b"down"),
+        )
+
+    monkeypatch.setattr(api_latency_probe.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(api_latency_probe, "record_slow_operation", lambda **_kwargs: None)
+    monkeypatch.setattr(api_latency_probe, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    row = api_latency_probe.probe_endpoint(
+        "http://127.0.0.1:8765",
+        "/api/health/details?mode=fast",
+        timeout_seconds=1,
+        threshold_ms=1,
+    )
+
+    assert row["status_code"] == 503
+    assert row["body_bytes"] == 4
+    assert "HTTPError" in row["error"]
+    assert len(events) == 1
+    assert events[0]["module"] == "scripts.api_latency_probe"
+    assert events[0]["fallback_type"] == "api_latency_probe_http_error"
+    assert events[0]["metadata"] == {
+        "endpoint": "/api/health/details?mode=fast",
+        "route": "/api/health/details",
+        "status_code": 503,
+    }
+
+
+def test_api_latency_probe_request_failure_records_fallback(monkeypatch):
+    from scripts import api_latency_probe
+
+    events: list[dict[str, object]] = []
+
+    def fake_urlopen(_url, timeout=None):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(api_latency_probe.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(api_latency_probe, "record_slow_operation", lambda **_kwargs: None)
+    monkeypatch.setattr(api_latency_probe, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    row = api_latency_probe.probe_endpoint(
+        "http://127.0.0.1:8765",
+        "/api/actions",
+        timeout_seconds=1,
+        threshold_ms=1,
+    )
+
+    assert row["status_code"] is None
+    assert row["body_bytes"] == 0
+    assert row["error"] == "TimeoutError: timed out"
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "api_latency_probe_request_failed"
+    assert events[0]["metadata"] == {
+        "endpoint": "/api/actions",
+        "route": "/api/actions",
+        "status_code": None,
+    }
+
+
+def test_operator_health_api_latency_probe_ok(tmp_path):
+    path = tmp_path / "latest_api_latency_probe.json"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "generated_at": pd.Timestamp.utcnow().isoformat(),
+                "slow_count": 0,
+                "error_count": 0,
+                "endpoint_count": 2,
+                "rows": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = operator_health.check_api_latency_probe(path, max_age_seconds=3600)
+
+    assert result["status"] == "ok"
+    assert result["slow_count"] == 0
+    assert result["error_count"] == 0
+
+
+def test_operator_health_api_latency_probe_warns_on_slow(tmp_path):
+    path = tmp_path / "latest_api_latency_probe.json"
+    path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "generated_at": pd.Timestamp.utcnow().isoformat(),
+                "slow_count": 1,
+                "error_count": 0,
+                "endpoint_count": 1,
+                "rows": [{"endpoint": "/api/actions", "elapsed_ms": 1200}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = operator_health.check_api_latency_probe(path, max_age_seconds=3600)
+
+    assert result["status"] == "warn"
+    assert result["slow_count"] == 1
+    assert "api_latency_probe.py" in result["command"]
+
+
+def test_operator_health_api_latency_probe_warns_when_missing(tmp_path):
+    result = operator_health.check_api_latency_probe(tmp_path / "missing.json", max_age_seconds=3600)
+
+    assert result["status"] == "warn"
+    assert "not produced" in result["message"]
+
+
+def test_operator_health_api_latency_probe_unreadable_records_fallback(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    path = tmp_path / "latest_api_latency_probe.json"
+    path.write_text("{bad json", encoding="utf-8")
+
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    result = operator_health.check_api_latency_probe(path, max_age_seconds=3600)
+
+    assert result["status"] == "error"
+    assert events[0]["fallback_type"] == "operator_health_api_latency_probe_unreadable"
+    assert events[0]["source"] == str(path)
+    assert events[0]["metadata"] == {"path": str(path)}
+
+
+def test_api_performance_report_ranks_probe_and_slowlog_rows(tmp_path):
+    from scripts import api_performance_report
+
+    probe_path = tmp_path / "latest_api_latency_probe.json"
+    state_file = tmp_path / "slow_operation_state.json"
+    probe_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-11T00:00:00+00:00",
+                "rows": [
+                    {"endpoint": "/api/actions?limit=25", "elapsed_ms": 1200, "body_bytes": 80000, "status_code": 200},
+                    {"endpoint": "/api/health/details", "elapsed_ms": 6000, "body_bytes": 224, "status_code": 500, "error": "HTTPError"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-06-11T00:05:00+00:00",
+                "issues": {
+                    "health": {
+                        "fingerprint": "health",
+                        "kind": "operator_api_request",
+                        "operation": "GET /api/health/details",
+                        "status": "open",
+                        "count": 3,
+                        "max_elapsed_ms": 6200,
+                        "last_elapsed_ms": 6100,
+                        "last_seen_at": "2026-06-11T00:04:00+00:00",
+                        "last_details": {"route": "/api/health/details", "response_bytes": 224, "status_code": 500},
+                    },
+                    "actions": {
+                        "fingerprint": "actions",
+                        "kind": "operator_api_request",
+                        "operation": "GET /api/actions",
+                        "status": "open",
+                        "count": 10,
+                        "max_elapsed_ms": 1500,
+                        "last_elapsed_ms": 1200,
+                        "last_seen_at": "2026-06-11T00:03:00+00:00",
+                        "last_details": {"route": "/api/actions", "response_bytes": 80000, "status_code": 200},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = api_performance_report.build_api_performance_report(probe_path=probe_path, state_file=state_file, limit=5)
+
+    assert report["status"] == "warn"
+    assert report["rows"][0]["route"] == "/api/health/details"
+    assert report["rows"][0]["error_count"] >= 1
+    assert "Fix endpoint errors first" in report["rows"][0]["recommendation"]
+    assert any(row["route"] == "/api/actions" for row in report["rows"])
+
+
+def test_api_performance_report_flags_large_payloads(tmp_path):
+    from scripts import api_performance_report
+
+    state_file = tmp_path / "slow_operation_state.json"
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "issues": {
+                    "manual": {
+                        "fingerprint": "manual",
+                        "kind": "operator_api_large_response",
+                        "operation": "GET /api/manual-review",
+                        "status": "open",
+                        "count": 2,
+                        "max_elapsed_ms": 2_000_000,
+                        "last_elapsed_ms": 1_500_000,
+                        "last_details": {"route": "/api/manual-review", "response_bytes": 1_500_000, "status_code": 200},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = api_performance_report.build_api_performance_report(probe_path=tmp_path / "missing.json", state_file=state_file)
+
+    assert report["rows"][0]["route"] == "/api/manual-review"
+    assert "Split or compact" in report["rows"][0]["recommendation"]
+
+
+def test_api_performance_report_records_bad_probe_json_fallback(monkeypatch, tmp_path):
+    from scripts import api_performance_report
+
+    events = []
+    probe_path = tmp_path / "latest_api_latency_probe.json"
+    probe_path.write_text("{bad json", encoding="utf-8")
+    state_file = tmp_path / "slow_operation_state.json"
+    state_file.write_text(
+        json.dumps({"version": 1, "updated_at": "2026-06-11T00:00:00+00:00", "issues": {}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_performance_report, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    report = api_performance_report.build_api_performance_report(probe_path=probe_path, state_file=state_file)
+
+    assert report["status"] == "ok"
+    assert len(events) == 1
+    assert events[0]["module"] == "scripts.api_performance_report"
+    assert events[0]["fallback_type"] == "api_performance_probe_json_parse_failed"
+    assert events[0]["metadata"] == {"path": str(probe_path)}
+
+
+def test_api_performance_report_records_numeric_parse_fallbacks(monkeypatch, tmp_path):
+    from scripts import api_performance_report
+
+    events = []
+    probe_path = tmp_path / "latest_api_latency_probe.json"
+    state_file = tmp_path / "slow_operation_state.json"
+    probe_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-11T00:00:00+00:00",
+                "rows": [
+                    {
+                        "endpoint": "/api/actions",
+                        "elapsed_ms": 100,
+                        "body_bytes": "large",
+                        "status_code": "bad-status",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-06-11T00:00:00+00:00",
+                "issues": {
+                    "actions": {
+                        "fingerprint": "actions",
+                        "kind": "operator_api_request",
+                        "operation": "GET /api/actions",
+                        "status": "open",
+                        "count": 1,
+                        "max_elapsed_ms": 150,
+                        "last_elapsed_ms": 100,
+                        "last_seen_at": "2026-06-11T00:00:00+00:00",
+                        "last_details": {
+                            "route": "/api/actions",
+                            "response_bytes": "many",
+                            "status_code": "oops",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(api_performance_report, "record_local_fallback_event", lambda **kwargs: events.append(kwargs))
+
+    report = api_performance_report.build_api_performance_report(probe_path=probe_path, state_file=state_file)
+
+    assert report["returned_count"] == 1
+    assert report["rows"][0]["route"] == "/api/actions"
+    assert report["rows"][0]["max_response_bytes"] == 0
+    assert [event["fallback_type"] for event in events] == ["api_performance_numeric_parse_failed"] * 4
+    assert {event["metadata"]["field"] for event in events} == {"response_bytes", "status_code", "body_bytes"}
+    assert {event["metadata"]["source"] for event in events} == {"/api/actions"}
+
+
+class _BadPandasMissingCheck:
+    def __array__(self, dtype=None):
+        raise RuntimeError("missing check failed")
+
+
+def test_cron_status_invalid_step_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(cron_status, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = cron_status._expand_field("*/bad", 0, 5)
+
+    assert result == set(range(0, 6))
+    assert events[0]["fallback_type"] == "cron_status_invalid_step_fallback"
+    assert events[0]["metadata"]["step_text"] == "bad"
+
+
+def test_event_data_quality_json_ready_records_missing_check_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    sentinel = _BadPandasMissingCheck()
+    monkeypatch.setattr(event_data_quality, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = event_data_quality._json_ready(sentinel)
+
+    assert result is sentinel
+    assert events[0]["fallback_type"] == "event_data_quality_json_ready_missing_check_failed"
+    assert events[0]["metadata"] == {"value_type": "_BadPandasMissingCheck"}
+
+
+def test_event_evidence_json_ready_records_missing_check_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    sentinel = _BadPandasMissingCheck()
+    monkeypatch.setattr(event_evidence_store, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = event_evidence_store._json_ready(sentinel)
+
+    assert result is sentinel
+    assert events[0]["fallback_type"] == "event_evidence_json_ready_missing_check_failed"
+    assert events[0]["metadata"] == {"value_type": "_BadPandasMissingCheck"}
+
+
+def test_hypothesis_clean_json_record_records_missing_check_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    sentinel = _BadPandasMissingCheck()
+    monkeypatch.setattr(hypothesis_engine, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = hypothesis_engine._clean_json_record({"field": sentinel})
+
+    assert result == {"field": sentinel}
+    assert events[0]["fallback_type"] == "hypothesis_clean_json_missing_check_failed"
+    assert events[0]["metadata"] == {"field": "field", "value_type": "_BadPandasMissingCheck"}
+
+
+def test_operator_health_json_ready_records_missing_check_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    sentinel = _BadPandasMissingCheck()
+    monkeypatch.setattr(operator_health, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = operator_health._json_ready(sentinel)
+
+    assert result is sentinel
+    assert events[0]["fallback_type"] == "operator_health_json_ready_missing_check_failed"
+    assert events[0]["metadata"] == {"value_type": "_BadPandasMissingCheck"}
+
+
+def test_operator_smoke_json_ready_records_missing_check_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+    sentinel = _BadPandasMissingCheck()
+    monkeypatch.setattr(operator_smoke, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = operator_smoke._json_ready(sentinel)
+
+    assert result is sentinel
+    assert events[0]["fallback_type"] == "operator_smoke_json_ready_missing_check_failed"
+    assert events[0]["metadata"] == {"value_type": "_BadPandasMissingCheck"}
+
+
+def test_validate_announcement_s3_pointer_records_unreadable_fallback(monkeypatch):
+    from scripts import validate_announcement_s3_pointers
+
+    events: list[dict[str, object]] = []
+
+    class FakeS3:
+        def head_object(self, *, Bucket, Key):
+            raise KeyError("missing")
+
+    monkeypatch.setattr(validate_announcement_s3_pointers, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = validate_announcement_s3_pointers.validate_pointer_item(
+        {"s3_key": "announcements/doc.txt", "kind": "summary", "table_name": "docs", "column_name": "summary_s3_key"},
+        s3_client=FakeS3(),
+        bucket="bucket",
+        verify_hash=False,
+    )
+
+    assert result["status"] == "missing_or_unreadable"
+    assert "KeyError" in result["error"]
+    assert events[0]["fallback_type"] == "announcement_s3_pointer_validation_failed"
+    assert events[0]["metadata"]["s3_key"] == "announcements/doc.txt"
+
+
+def test_utils_date_pd_to_datetime_records_format_fallback(monkeypatch):
+    from utils import date as date_utils
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(date_utils, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    frame = pd.DataFrame({"published_on": ["2026/06/12"]})
+    result = date_utils.pd_to_datetime(frame, "published_on", ["%d-%m-%Y", "%Y/%m/%d"])
+
+    assert result["published_on"].iloc[0] == pd.Timestamp("2026-06-12")
+    assert events[0]["fallback_type"] == "date_format_parse_failed"
+    assert events[0]["metadata"] == {"column": "published_on", "format": "%d-%m-%Y"}
+
+
+def test_display_time_records_json_parse_fallback(monkeypatch):
+    from utils import display_time
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(display_time, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = display_time.to_display_value("{bad json")
+
+    assert result == "{bad json"
+    assert events[0]["fallback_type"] == "display_time_json_parse_failed"
+    assert events[0]["metadata"]["value_excerpt"] == "{bad json"
+
+
+def test_agent_tool_runner_records_stdout_json_parse_fallback(monkeypatch):
+    import subprocess
+    from scripts import agent_tool_runner
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        agent_tool_runner,
+        "registry_by_name",
+        lambda: {"unit": {"name": "unit", "category": "qa", "read_only": True, "command": ["python", "-m", "unit"]}},
+    )
+    monkeypatch.setattr(
+        agent_tool_runner.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args=args[0], returncode=0, stdout="{bad json", stderr=""),
+    )
+    monkeypatch.setattr(agent_tool_runner, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = agent_tool_runner.run_tool("unit", [], allow_writes=False)
+
+    assert result["stdout"] == "{bad json"
+    assert events[0]["fallback_type"] == "agent_tool_runner_stdout_json_parse_failed"
+    assert events[0]["source"] == "unit"
+
+
+def test_duplicate_index_report_records_indexes_json_parse_fallback(monkeypatch):
+    from scripts import db_duplicate_index_report
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        db_duplicate_index_report,
+        "sql_to_df",
+        lambda *args, **kwargs: pd.DataFrame(
+            [{"schema_name": "public", "table_name": "t", "indexes": "{bad json", "total_index_bytes": 1}]
+        ),
+    )
+    monkeypatch.setattr(db_duplicate_index_report, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = db_duplicate_index_report.build_duplicate_index_report()
+
+    assert result["duplicate_groups"][0]["indexes"] == "{bad json"
+    assert result["suggested_drop_candidates"] == []
+    assert events[0]["fallback_type"] == "duplicate_index_report_indexes_json_parse_failed"
+
+
+def test_docs_and_env_audit_record_relative_path_fallback(monkeypatch, tmp_path):
+    from scripts import docs_state_audit, env_example_audit
+
+    docs_events: list[dict[str, object]] = []
+    env_events: list[dict[str, object]] = []
+    outside = tmp_path / "outside.md"
+    outside.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(docs_state_audit, "record_local_fallback_event", lambda **kwargs: docs_events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        "advisory.fallback_telemetry.record_local_fallback_event",
+        lambda **kwargs: env_events.append(kwargs) or kwargs,
+    )
+
+    assert docs_state_audit.should_scan_path(outside, repo_root=tmp_path / "repo") is True
+    assert env_example_audit.should_scan_path(outside, repo_root=tmp_path / "repo") is True
+    assert docs_events[0]["fallback_type"] == "docs_state_audit_relative_path_failed"
+    assert env_events[0]["fallback_type"] == "env_example_audit_relative_path_failed"
+
+
+def test_transcribe_cleanup_missing_temp_file_records_fallback(monkeypatch, tmp_path):
+    from utils.transcribe import llm_transcribe
+
+    events: list[dict[str, object]] = []
+    missing = tmp_path / "missing.mp3"
+    monkeypatch.setattr(llm_transcribe, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    llm_transcribe.cleanup_temp_file(str(missing))
+
+    assert events[0]["fallback_type"] == "transcribe_temp_file_cleanup_missing"
+    assert events[0]["metadata"] == {"path": str(missing)}

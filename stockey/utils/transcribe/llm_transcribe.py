@@ -12,6 +12,8 @@ import requests
 from environs import Env
 from openai import OpenAI
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 env = Env()
 env.read_env()
@@ -46,8 +48,16 @@ def download_audio_file(audio_url: str) -> tuple[str, str]:
 def cleanup_temp_file(path: str) -> None:
     try:
         os.unlink(path)
-    except FileNotFoundError:
-        pass
+    except FileNotFoundError as exc:
+        record_local_fallback_event(
+            module="utils.transcribe.llm_transcribe",
+            fallback_type="transcribe_temp_file_cleanup_missing",
+            source="cleanup_temp_file",
+            severity="warn",
+            reason="Transcription cleanup could not remove a temporary file because it was already missing.",
+            error=exc,
+            metadata={"path": str(path)},
+        )
 
 
 def persist_bytes_to_temp_file(data: bytes, suffix: str) -> str:

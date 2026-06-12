@@ -15,9 +15,11 @@ const portfolioStatus = ref('all')
 const portfolioSearch = ref('')
 const portfolioBucket = ref('today_recommendations')
 
-const [{ data: marketContext }, { data: technicalCalibration }, { data: signalRefresh, error: signalRefreshError }] = await Promise.all([
+const [{ data: marketContext }, { data: technicalCalibration }, { data: tsPromotionCheck }, { data: tsReviewRules }, { data: signalRefresh, error: signalRefreshError }] = await Promise.all([
   useAsyncData('market-context', () => api.getMarketContext(20)),
   useAsyncData('technical-calibration-home', () => api.getTechnicalCalibration(3)),
+  useAsyncData('ts-forecast-promotion-check-home', () => api.getTsForecastPromotionCheck()),
+  useAsyncData('ts-forecast-review-rules-home', () => api.getTsForecastReviewRules()),
   useAsyncData('signal-refresh-home', () => api.getSignalRefresh({ limit: 12, compact: true }))
 ])
 
@@ -76,6 +78,12 @@ const snapshotWarning = computed(() => asDict(home.value?.snapshot_warning || ac
 const marketSummary = computed(() => marketContext.value?.summary || {})
 const marketLeaders = computed(() => marketContext.value?.top_universe || [])
 const calibrationSummary = computed(() => technicalCalibration.value?.summary || [])
+const tsPaperSummary = computed(() => Array.isArray(home.value?.ts_forecast_paper_summary) ? home.value.ts_forecast_paper_summary : [])
+const tsPromotionScorecard = computed(() => asDict(tsPromotionCheck.value?.scorecard))
+const tsPromotionBestGroup = computed(() => asDict(tsPromotionScorecard.value.best_group))
+const tsReviewRuleSummary = computed(() => asDict(tsReviewRules.value?.summary))
+const tsReviewRuleIssues = computed(() => Array.isArray(tsReviewRules.value?.issues) ? tsReviewRules.value.issues : [])
+const tsReviewRuleRows = computed(() => Array.isArray(tsReviewRules.value?.rules) ? tsReviewRules.value.rules : [])
 const symbolTraces = reactive<Record<string, TraceSummary>>({})
 const loadingSymbolTrace = reactive<Record<string, boolean>>({})
 const portfolioBuckets = [
@@ -587,12 +595,13 @@ function effectLabel(row: Record<string, unknown>) {
         {{ marketSummary.regime_name || 'UNKNOWN' }}
       </span>
     </div>
-    <div class="mt-5 grid gap-3 md:grid-cols-5">
+    <div class="mt-5 grid gap-3 md:grid-cols-6">
       <MetricTile label="Top Names" :value="String(marketSummary.top_context_count || 0)" note="Tracked context universe" />
       <MetricTile label="Above 50DMA" :value="pct(marketSummary.breadth_above_dma50_pct)" note="Breadth inside top context" />
       <MetricTile label="Trend Aligned" :value="pct(marketSummary.breadth_trend_alignment_pct)" note="Healthy leadership share" />
       <MetricTile label="RS Positive" :value="pct(marketSummary.breadth_rs_positive_pct)" note="Outperforming benchmark" />
-      <MetricTile label="Events" :value="String((Number(marketSummary.news_event_count_7d || 0) + Number(marketSummary.announcement_event_count_7d || 0)) || 0)" note="News + announcements, 7d" />
+      <MetricTile label="Triggered" :value="String(Number(marketSummary.triggered_event_count_7d || 0))" note="Material top-context events, 7d" />
+      <MetricTile label="Observed" :value="String(Number(marketSummary.context_observed_event_count_7d || 0))" note="Context-only top events, 7d" />
     </div>
     <details class="mt-5">
       <summary class="cursor-pointer text-sm font-black text-moss">Show top market-context leaders</summary>
@@ -1040,6 +1049,101 @@ function effectLabel(row: Record<string, unknown>) {
       </article>
       <p v-if="!calibrationSummary.length" class="rounded-2xl bg-white/70 p-4 text-sm text-ink/60">
         No calibration rows yet. Run the technical threshold calibration script.
+      </p>
+    </div>
+  </section>
+
+  <section class="mt-8 glass-panel rounded-3xl p-6">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-bold uppercase tracking-[0.3em] text-ink/45">TS Forecast Paper Portfolio</p>
+        <h2 class="mt-2 text-2xl font-black">Forecast evidence must beat paper baselines first</h2>
+        <p class="mt-2 max-w-3xl text-sm leading-6 text-ink/60">
+          Research-only forecast decisions compared with naive momentum and current advisory alignment. These rows do not create action queue, portfolio, or Dhan execution authority.
+        </p>
+      </div>
+      <LinkButton variant="ghost" to="/operations">
+        Check research runs
+      </LinkButton>
+    </div>
+    <div class="mt-5 grid gap-3 lg:grid-cols-2">
+      <article class="rounded-3xl border border-black/10 bg-ink p-5 text-paper lg:col-span-2">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.22em] text-paper/45">Promotion gate</p>
+            <h3 class="mt-2 text-xl font-black">{{ tsPromotionScorecard.headline || 'TS forecast paper evidence has not passed promotion gates.' }}</h3>
+            <p class="mt-2 max-w-3xl text-sm leading-6 text-paper/65">
+              {{ tsPromotionScorecard.operator_action || 'Keep TS forecasts research-only until paper evidence beats momentum with enough breadth.' }}
+            </p>
+          </div>
+          <StatusPill :tone="tsPromotionCheck?.ready_for_operator_review ? 'success' : 'warning'" title="Read-only gate. Passing this only allows manual review, not automatic policy changes.">
+            {{ tsPromotionCheck?.decision || 'hold_research_only' }}
+          </StatusPill>
+        </div>
+        <div class="mt-4 grid gap-2 text-sm md:grid-cols-4">
+          <p class="rounded-2xl bg-paper/10 px-3 py-2"><b>Ready groups:</b> {{ numberText(tsPromotionScorecard.ready_group_count) }}/{{ numberText(tsPromotionScorecard.group_count) }}</p>
+          <p class="rounded-2xl bg-paper/10 px-3 py-2"><b>Best trades:</b> {{ numberText(tsPromotionBestGroup.evaluated_trades) }}</p>
+          <p class="rounded-2xl bg-paper/10 px-3 py-2"><b>Best avg:</b> {{ pct(Number(tsPromotionBestGroup.avg_cost_adjusted_return || 0) * 100) }}</p>
+          <p class="rounded-2xl bg-paper/10 px-3 py-2"><b>Lift vs momentum:</b> {{ pct(Number(tsPromotionBestGroup.lift_vs_momentum || 0) * 100) }}</p>
+        </div>
+        <p v-if="Array.isArray(tsPromotionBestGroup.failed_gates) && tsPromotionBestGroup.failed_gates.length" class="mt-3 rounded-2xl bg-rust/20 px-3 py-2 text-xs font-bold text-paper">
+          Failed gates: {{ tsPromotionBestGroup.failed_gates.join(', ') }}
+        </p>
+      </article>
+      <article class="rounded-3xl border border-black/10 bg-white/75 p-5 lg:col-span-2">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.22em] text-ink/45">Configured review rules</p>
+            <h3 class="mt-2 text-lg font-black text-ink">Manual TS rules are visible, not live authority</h3>
+            <p class="mt-2 max-w-3xl text-sm leading-6 text-ink/60">
+              These are disabled/review-only config entries generated from approved promotion reviews. They do not create actions, portfolio rows, or broker orders.
+            </p>
+          </div>
+          <StatusPill :tone="tsReviewRuleIssues.length ? 'warning' : 'neutral'" title="Config validation status for ts_forecast_review_rules.">
+            {{ tsReviewRules?.status || 'not_loaded' }}
+          </StatusPill>
+        </div>
+        <div class="mt-4 grid gap-2 text-sm md:grid-cols-4">
+          <p class="rounded-2xl bg-paper/70 px-3 py-2"><b>Rules:</b> {{ numberText(tsReviewRuleSummary.row_count) }}</p>
+          <p class="rounded-2xl bg-paper/70 px-3 py-2"><b>Active review:</b> {{ numberText(tsReviewRuleSummary.active_review_count) }}</p>
+          <p class="rounded-2xl bg-paper/70 px-3 py-2"><b>Trusted overlay:</b> {{ numberText(tsReviewRuleSummary.trusted_overlay_count) }}</p>
+          <p class="rounded-2xl bg-paper/70 px-3 py-2"><b>Issues:</b> {{ numberText(tsReviewRuleSummary.issue_count) }}</p>
+        </div>
+        <div v-if="tsReviewRuleRows.length" class="mt-4 grid gap-2 md:grid-cols-2">
+          <p v-for="rule in tsReviewRuleRows.slice(0, 4)" :key="String(rule.rule_id || `${rule.model_name}-${rule.horizon_days}`)" class="rounded-2xl bg-moss/10 px-3 py-2 text-xs font-bold text-moss">
+            {{ rule.model_name || '-' }} · {{ rule.horizon_days || '-' }}d · {{ rule.status || '-' }} · live policy: {{ rule.usable_for_live_policy ? 'allowed' : 'blocked' }}
+          </p>
+        </div>
+        <p v-if="tsReviewRuleIssues.length" class="mt-3 rounded-2xl bg-rust/10 px-3 py-2 text-xs font-bold text-rust">
+          Rule issues: {{ tsReviewRuleIssues.slice(0, 3).map((issue) => issue.code || issue.message || 'issue').join(', ') }}
+        </p>
+      </article>
+      <article v-for="row in tsPaperSummary.slice(0, 4)" :key="`${row.model_name || '-'}-${row.horizon_days || '-'}-${row.paper_decision || '-'}`" class="rounded-3xl border border-black/10 bg-white/75 p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.22em] text-ink/45">{{ row.paper_decision || 'PAPER' }}</p>
+            <h3 class="mt-2 text-lg font-black text-ink">{{ row.model_name || '-' }} · {{ row.horizon_days || '-' }}d</h3>
+            <p class="mt-1 text-xs font-bold text-ink/45">{{ row.from_date || '-' }} to {{ row.to_date || '-' }}</p>
+          </div>
+          <StatusPill tone="neutral" title="Research-only paper trades. No broker authority.">
+            {{ numberText(row.evaluated_trades) }}/{{ numberText(row.row_count) }} trades
+          </StatusPill>
+        </div>
+        <div class="mt-4 grid gap-2 text-sm sm:grid-cols-3">
+          <p class="rounded-2xl bg-paper/70 px-3 py-2"><b>Win:</b> {{ pct(row.win_rate_pct) }}</p>
+          <p class="rounded-2xl bg-paper/70 px-3 py-2"><b>Avg:</b> {{ pct(row.avg_cost_adjusted_return_pct) }}</p>
+          <p class="rounded-2xl bg-paper/70 px-3 py-2"><b>Momentum:</b> {{ pct(row.baseline_avg_cost_adjusted_return_pct) }}</p>
+        </div>
+        <div class="mt-3 grid gap-2 text-xs font-bold text-ink/55 sm:grid-cols-2">
+          <p class="rounded-2xl bg-moss/10 px-3 py-2 text-moss">Aligned advisory: {{ numberText(row.aligned_positive_count) }}</p>
+          <p class="rounded-2xl bg-rust/10 px-3 py-2 text-rust">Exit conflicts: {{ numberText(row.conflict_exit_count) }}</p>
+        </div>
+        <p class="mt-3 text-xs font-semibold leading-5 text-ink/55">
+          {{ row.operator_note || 'Evidence only. Promotion requires enough matured rows and manual approval.' }}
+        </p>
+      </article>
+      <p v-if="!tsPaperSummary.length" class="rounded-2xl bg-white/70 p-4 text-sm text-ink/60">
+        No TS paper-portfolio summary yet. Run `./all_ts_forecast_paper_portfolio.sh` after forecast/evaluator rows exist.
       </p>
     </div>
   </section>

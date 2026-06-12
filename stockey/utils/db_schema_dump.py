@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 from collections import defaultdict
-from utils.db import db_session
+from utils.db import db_session, execute_db_operation
 
 EXCLUDE_SCHEMAS = {"pg_catalog", "information_schema"}
 
@@ -61,44 +61,57 @@ FROM   timescaledb_information.hypertables
 WHERE  hypertable_schema = ANY(%s);
 """
 
+
+def collect_schema_metadata(schemas_arg: str = ""):
+    def _collect_schema_metadata():
+        with db_session() as (_conn, cur):
+            # figure schemas
+            if schemas_arg:
+                schemas = [s.strip() for s in schemas_arg.split(",") if s.strip()]
+            else:
+                cur.execute("SELECT nspname FROM pg_namespace;")
+                schemas = [s for (s,) in cur.fetchall() if s not in EXCLUDE_SCHEMAS]
+
+            # collect
+            cur.execute(SQL_TABLES, (schemas,))
+            tables = [(s, t) for s, t in cur.fetchall()]
+
+            cur.execute(SQL_COLUMNS, (schemas,))
+            colmap = defaultdict(list)
+            for s, t, col, typ, nullable, default in cur.fetchall():
+                colmap[(s, t)].append({"name": col, "type": typ,
+                                       "nullable": nullable, "default": default})
+
+            cur.execute(SQL_PKS, (schemas,))
+            pkmap = defaultdict(set)
+            for s, t, col in cur.fetchall():
+                pkmap[(s, t)].add(col)
+
+            cur.execute(SQL_INDEXES, (schemas,))
+            idxmap = defaultdict(list)
+            col_to_idx = defaultdict(lambda: defaultdict(list))
+            for s, t, idx, uniq, cols in cur.fetchall():
+                idxmap[(s, t)].append({"name": idx, "unique": uniq, "cols": cols})
+                for c in cols:
+                    col_to_idx[(s, t)][c].append(idx)
+
+            cur.execute(SQL_TS_HYPERTABLES, (schemas,))
+            hypertables = {(s, t) for s, t in cur.fetchall()}
+
+        return tables, colmap, pkmap, idxmap, hypertables
+
+    return execute_db_operation(
+        _collect_schema_metadata,
+        operation_name="db_schema_dump:collect_schema_metadata",
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--schemas", default="", help="Comma-separated schema list (default: all except system)")
     args = ap.parse_args()
 
-    with db_session() as (conn, cur):
-        # figure schemas
-        if args.schemas:
-            schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
-        else:
-            cur.execute("SELECT nspname FROM pg_namespace;")
-            schemas = [s for (s,) in cur.fetchall() if s not in EXCLUDE_SCHEMAS]
-
-        # collect
-        cur.execute(SQL_TABLES, (schemas,))
-        tables = [(s, t) for s, t in cur.fetchall()]
-
-        cur.execute(SQL_COLUMNS, (schemas,))
-        colmap = defaultdict(list)
-        for s, t, col, typ, nullable, default in cur.fetchall():
-            colmap[(s, t)].append({"name": col, "type": typ,
-                                   "nullable": nullable, "default": default})
-
-        cur.execute(SQL_PKS, (schemas,))
-        pkmap = defaultdict(set)
-        for s, t, col in cur.fetchall():
-            pkmap[(s, t)].add(col)
-
-        cur.execute(SQL_INDEXES, (schemas,))
-        idxmap = defaultdict(list)
-        col_to_idx = defaultdict(lambda: defaultdict(list))
-        for s, t, idx, uniq, cols in cur.fetchall():
-            idxmap[(s, t)].append({"name": idx, "unique": uniq, "cols": cols})
-            for c in cols:
-                col_to_idx[(s, t)][c].append(idx)
-
-        cur.execute(SQL_TS_HYPERTABLES, (schemas,))
-        hypertables = {(s, t) for s, t in cur.fetchall()}
+    tables, colmap, pkmap, idxmap, hypertables = collect_schema_metadata(args.schemas)
 
     # print
     for schema, table in tables:

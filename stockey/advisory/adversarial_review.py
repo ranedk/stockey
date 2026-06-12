@@ -2,18 +2,47 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from typing import Any
 
 import pandas as pd
 
 from advisory.decision_trace import append_trace_step, make_trace_id, record_event_processing, safe_trace_call
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 REVIEWS_TABLE = "advisory_event_reviews"
+REVIEWS_SCHEMA_MIGRATION_ID = "20260611_advisory_event_reviews_base"
 SCORES_TABLE = "advisory_event_model_scores"
 EXCHANGE_FEATURES_TABLE = "advisory_exchange_features_daily"
+EVENT_MODEL_SCORE_POLICY_MODE_ENV = "STOCKEY_EVENT_MODEL_SCORE_POLICY_MODE"
+DEFAULT_EVENT_MODEL_SCORE_POLICY_MODE = "research_only"
+EVENT_MODEL_SCORE_POLICY_MODES = {"research_only", "promoted"}
+REVIEWS_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {REVIEWS_TABLE} (
+        published_on TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        reviewed_at TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        unique_id TEXT NOT NULL,
+        event_source TEXT,
+        review_status TEXT,
+        review_action TEXT,
+        review_score DOUBLE PRECISION,
+        veto BOOLEAN,
+        review_reason TEXT,
+        review_flags_json TEXT,
+        feature_snapshot_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id)
+    )
+    """,
+]
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -39,29 +68,87 @@ def table_exists(table_name: str) -> bool:
 
 
 def ensure_output_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {REVIEWS_TABLE} (
-                published_on TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                reviewed_at TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                unique_id TEXT NOT NULL,
-                event_source TEXT,
-                review_status TEXT,
-                review_action TEXT,
-                review_score DOUBLE PRECISION,
-                veto BOOLEAN,
-                review_reason TEXT,
-                review_flags_json TEXT,
-                feature_snapshot_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id)
-            )
-            """
+    apply_schema_migration(
+        migration_id=REVIEWS_SCHEMA_MIGRATION_ID,
+        description="Create advisory adversarial event review table.",
+        statements=REVIEWS_SCHEMA_STATEMENTS,
+        metadata={"tables": [REVIEWS_TABLE]},
+    )
+
+
+def _event_model_promotion_args() -> argparse.Namespace:
+    from advisory import event_meta_model
+    from advisory.event_model_promotion_check import DEFAULT_LOG_PATH
+
+    return argparse.Namespace(
+        artifact_dir=str(event_meta_model.DEFAULT_ARTIFACT_DIR),
+        model_basename=event_meta_model.DEFAULT_MODEL_BASENAME,
+        horizon_days=event_meta_model.DEFAULT_HORIZON_DAYS,
+        return_threshold=event_meta_model.DEFAULT_RETURN_THRESHOLD,
+        log_path=str(DEFAULT_LOG_PATH),
+        run_window_days=35,
+        max_score_age_days=14,
+        min_successful_runs=3,
+        min_train_rows=80,
+        min_test_rows=20,
+        min_labeled_rows=100,
+        min_dates=20,
+        min_symbols=25,
+        min_event_classes=4,
+        min_score_rows=10,
+        min_precision=0.55,
+        min_precision_lift=0.10,
+        min_roc_auc=0.55,
+    )
+
+
+def evaluate_event_model_score_policy(policy_mode: str | None = None) -> dict[str, Any]:
+    mode = str(policy_mode or os.getenv(EVENT_MODEL_SCORE_POLICY_MODE_ENV, DEFAULT_EVENT_MODEL_SCORE_POLICY_MODE)).strip().lower()
+    if mode not in EVENT_MODEL_SCORE_POLICY_MODES:
+        return {
+            "allowed": False,
+            "mode": mode,
+            "reason": "invalid_policy_mode",
+            "valid_modes": sorted(EVENT_MODEL_SCORE_POLICY_MODES),
+        }
+    if mode == "research_only":
+        return {
+            "allowed": False,
+            "mode": mode,
+            "reason": "research_only_default",
+        }
+
+    try:
+        from advisory.event_model_promotion_check import build_promotion_check
+
+        payload = build_promotion_check(_event_model_promotion_args())
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.adversarial_review",
+            fallback_type="adversarial_event_model_score_policy_check_failed",
+            source=SCORES_TABLE,
+            severity="warn",
+            reason="Event-model score policy gate failed closed before adversarial review could use model scores.",
+            error=exc,
+            metadata={"policy_mode": mode},
         )
+        return {
+            "allowed": False,
+            "mode": mode,
+            "reason": "promotion_check_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    scorecard = payload.get("scorecard") if isinstance(payload, dict) else {}
+    usable = isinstance(scorecard, dict) and bool(scorecard.get("usable"))
+    return {
+        "allowed": bool(usable),
+        "mode": mode,
+        "reason": "promotion_gate_passed" if usable else "promotion_gate_failed",
+        "decision": payload.get("decision") if isinstance(payload, dict) else None,
+        "scorecard_status": scorecard.get("status") if isinstance(scorecard, dict) else None,
+        "failed_gates": payload.get("failed_gates", []) if isinstance(payload, dict) else [],
+    }
 
 
 def load_event_evaluations(
@@ -70,6 +157,7 @@ def load_event_evaluations(
     symbols: list[str] | None = None,
     setup_ids: list[str] | None = None,
     include_reviewed: bool = False,
+    event_model_score_policy_mode: str | None = None,
 ) -> pd.DataFrame:
     if not table_exists("advisory_event_evaluations"):
         return pd.DataFrame()
@@ -102,9 +190,10 @@ def load_event_evaluations(
         if not include_reviewed:
             clauses.append("r.unique_id IS NULL")
 
+    score_policy = evaluate_event_model_score_policy(event_model_score_policy_mode)
     score_join = ""
     score_select = ""
-    if table_exists(SCORES_TABLE):
+    if score_policy.get("allowed") and table_exists(SCORES_TABLE):
         score_join = f"""
         LEFT JOIN LATERAL (
             SELECT
@@ -169,10 +258,12 @@ def load_event_evaluations(
         params=tuple(params) if params else None,
     )
     if df.empty:
+        df.attrs["event_model_score_policy"] = score_policy
         return df
     df["asof_date"] = normalize_timestamp(df["asof_date"])
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
     df["symbol"] = df["symbol"].astype("string").str.upper()
+    df.attrs["event_model_score_policy"] = score_policy
     return df
 
 
@@ -311,7 +402,13 @@ def review_event_row(row: pd.Series) -> dict[str, Any]:
 
 def build_reviews(events: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
     if events.empty:
-        return pd.DataFrame(), {"input_event_count": 0, "reviewed_count": 0, "veto_count": 0, "manual_count": 0}
+        return pd.DataFrame(), {
+            "input_event_count": 0,
+            "reviewed_count": 0,
+            "veto_count": 0,
+            "manual_count": 0,
+            "event_model_score_policy": events.attrs.get("event_model_score_policy", {}),
+        }
     rows: list[dict[str, Any]] = []
     for _, row in events.iterrows():
         review = review_event_row(row)
@@ -336,6 +433,7 @@ def build_reviews(events: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
         "veto_count": int((out["review_action"] == "veto").sum()) if not out.empty else 0,
         "manual_count": int((out["review_action"] == "review_manual").sum()) if not out.empty else 0,
         "penalize_count": int((out["review_action"] == "penalize").sum()) if not out.empty else 0,
+        "event_model_score_policy": events.attrs.get("event_model_score_policy", {}),
     }
     return out, meta
 
@@ -422,6 +520,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", nargs="*", help="Optional symbols")
     parser.add_argument("--setup", dest="setup_ids", nargs="*", help="Optional setup ids")
     parser.add_argument("--include-reviewed", action="store_true", help="Re-review rows already present in advisory_event_reviews")
+    parser.add_argument(
+        "--event-model-score-policy-mode",
+        choices=sorted(EVENT_MODEL_SCORE_POLICY_MODES),
+        default=os.getenv(EVENT_MODEL_SCORE_POLICY_MODE_ENV, DEFAULT_EVENT_MODEL_SCORE_POLICY_MODE),
+        help="Controls whether event meta-model scores can influence adversarial review. Default research_only ignores persisted scores.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -434,6 +538,7 @@ def main() -> int:
         symbols=args.symbols,
         setup_ids=args.setup_ids,
         include_reviewed=bool(args.include_reviewed),
+        event_model_score_policy_mode=args.event_model_score_policy_mode,
     )
     reviews, meta = build_reviews(events)
     if not args.dry_run:

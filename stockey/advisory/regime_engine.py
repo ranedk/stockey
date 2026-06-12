@@ -2,17 +2,77 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 TABLE_NAME = "advisory_market_regime"
 DEFAULT_BENCHMARK_NAME = "NIFTY"
 MACRO_FEATURES_TABLE = "advisory_macro_features_daily"
+REGIME_SCHEMA_MIGRATION_ID = "20260611_advisory_market_regime_base"
+REGIME_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        benchmark_name TEXT,
+        benchmark_close DOUBLE PRECISION,
+        benchmark_ret_20d DOUBLE PRECISION,
+        benchmark_ret_60d DOUBLE PRECISION,
+        benchmark_dma_50 DOUBLE PRECISION,
+        benchmark_dma_200 DOUBLE PRECISION,
+        benchmark_realized_vol_20d DOUBLE PRECISION,
+        benchmark_drawdown_60d DOUBLE PRECISION,
+        vix_close DOUBLE PRECISION,
+        broad_usd_index_ret_20d DOUBLE PRECISION,
+        wti_crude_spot_ret_20d DOUBLE PRECISION,
+        inr_usd_spot_ret_20d DOUBLE PRECISION,
+        gsec_10y_change_20d_bps DOUBLE PRECISION,
+        macro_stress_score DOUBLE PRECISION,
+        macro_risk_state TEXT,
+        macro_sizing_multiplier DOUBLE PRECISION,
+        repo_rate DOUBLE PRECISION,
+        macro_usa_freshness_status TEXT,
+        bank_rates_freshness_status TEXT,
+        cpi_freshness_status TEXT,
+        wpi_freshness_status TEXT,
+        gsec_curve_freshness_status TEXT,
+        new_macro_source_required BOOLEAN,
+        tariff_pressure_flag BOOLEAN,
+        shock_flag BOOLEAN,
+        risk_off_flag BOOLEAN,
+        regime_name TEXT,
+        regime_notes TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date)
+    )
+    """,
+]
+
+
+def _record_regime_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.regime_engine",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -23,19 +83,39 @@ def table_exists(table_name: str) -> bool:
     schema_name, base_table_name = (
         table_name.split(".", 1) if "." in table_name else ("public", table_name)
     )
-    df = sql_to_df(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = %s AND table_name = %s
-        ) AS exists
-        """,
-        params=(schema_name, base_table_name),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = %s AND table_name = %s
+            ) AS exists
+            """,
+            params=(schema_name, base_table_name),
+        )
+    except Exception as exc:
+        _record_regime_fallback(
+            fallback_type="regime_engine_table_lookup_failed",
+            source=table_name,
+            reason="Regime engine could not inspect whether a source table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        return False
     if df.empty:
         return False
     return bool(df.iloc[0]["exists"])
+
+
+def ensure_regime_table() -> None:
+    apply_schema_migration(
+        migration_id=REGIME_SCHEMA_MIGRATION_ID,
+        statements=REGIME_SCHEMA_STATEMENTS,
+        owner="advisory.regime_engine",
+        description="Create advisory market regime snapshot table.",
+        metadata={"tables": [TABLE_NAME], "workflow": "market_regime"},
+    )
 
 
 def load_benchmark_history(
@@ -53,15 +133,29 @@ def load_benchmark_history(
         if to_date is not None:
             clauses.append("date <= %(to_date)s")
             params["to_date"] = to_date
-        nse_df = sql_to_df(
-            f"""
-            SELECT date, close
-            FROM nseindia_indices
-            WHERE {' AND '.join(clauses)}
-            ORDER BY date
-            """,
-            params=params,
-        )
+        try:
+            nse_df = sql_to_df(
+                f"""
+                SELECT date, close
+                FROM nseindia_indices
+                WHERE {' AND '.join(clauses)}
+                ORDER BY date
+                """,
+                params=params,
+            )
+        except Exception as exc:
+            _record_regime_fallback(
+                fallback_type="regime_engine_nse_benchmark_load_failed",
+                source="nseindia_indices",
+                reason="Regime engine could not load the preferred NSE NIFTY benchmark history and will try the Dhan benchmark table.",
+                error=exc,
+                metadata={
+                    "benchmark_name": benchmark_name,
+                    "start_date": str(start_date) if start_date is not None else None,
+                    "to_date": str(to_date) if to_date is not None else None,
+                },
+            )
+            nse_df = pd.DataFrame()
         if not nse_df.empty:
             df = nse_df
             df["date"] = normalize_timestamp(df["date"])
@@ -86,15 +180,29 @@ def load_benchmark_history(
     if to_date is not None:
         clauses.append("date <= %(to_date)s")
         params["to_date"] = to_date
-    df = sql_to_df(
-        f"""
-        SELECT date, close
-        FROM dhan_ohlcv_daily
-        WHERE {' AND '.join(clauses)}
-        ORDER BY date
-        """,
-        params=params,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT date, close
+            FROM dhan_ohlcv_daily
+            WHERE {' AND '.join(clauses)}
+            ORDER BY date
+            """,
+            params=params,
+        )
+    except Exception as exc:
+        _record_regime_fallback(
+            fallback_type="regime_engine_dhan_benchmark_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Regime engine could not load benchmark history from Dhan OHLCV.",
+            error=exc,
+            metadata={
+                "benchmark_name": benchmark_name,
+                "start_date": str(start_date) if start_date is not None else None,
+                "to_date": str(to_date) if to_date is not None else None,
+            },
+        )
+        raise
     if df.empty:
         return df
     df["date"] = normalize_timestamp(df["date"])
@@ -127,58 +235,84 @@ def load_macro_history(
         params["to_date"] = to_date
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     if table_exists(MACRO_FEATURES_TABLE):
-        df = sql_to_df(
-            f"""
-            SELECT
-                asof_date,
-                vix_close,
-                broad_usd_index,
-                wti_crude_spot,
-                inr_usd_spot,
-                gsec_10y_yield,
-                repo_rate,
-                macro_usa_freshness_status,
-                bank_rates_freshness_status,
-                cpi_freshness_status,
-                wpi_freshness_status,
-                gsec_curve_freshness_status,
-                new_macro_source_required,
-                broad_usd_ret_20d,
-                wti_ret_20d,
-                inr_usd_ret_20d,
-                gsec_10y_change_20d_bps,
-                macro_stress_score,
-                macro_risk_state,
-                macro_sizing_multiplier
-            FROM {MACRO_FEATURES_TABLE}
-            {where_sql}
-            ORDER BY asof_date
-            """,
-            params=params or None,
-        )
+        try:
+            df = sql_to_df(
+                f"""
+                SELECT
+                    asof_date,
+                    vix_close,
+                    broad_usd_index,
+                    wti_crude_spot,
+                    inr_usd_spot,
+                    gsec_10y_yield,
+                    repo_rate,
+                    macro_usa_freshness_status,
+                    bank_rates_freshness_status,
+                    cpi_freshness_status,
+                    wpi_freshness_status,
+                    gsec_curve_freshness_status,
+                    new_macro_source_required,
+                    broad_usd_ret_20d,
+                    wti_ret_20d,
+                    inr_usd_ret_20d,
+                    gsec_10y_change_20d_bps,
+                    macro_stress_score,
+                    macro_risk_state,
+                    macro_sizing_multiplier
+                FROM {MACRO_FEATURES_TABLE}
+                {where_sql}
+                ORDER BY asof_date
+                """,
+                params=params or None,
+            )
+        except Exception as exc:
+            _record_regime_fallback(
+                fallback_type="regime_engine_macro_features_load_failed",
+                source=MACRO_FEATURES_TABLE,
+                reason="Regime engine could not load macro feature rows for regime classification.",
+                error=exc,
+                metadata={
+                    "start_date": str(start_date) if start_date is not None else None,
+                    "to_date": str(to_date) if to_date is not None else None,
+                },
+            )
+            raise
     else:
-        df = sql_to_df(
-            f"""
-            SELECT
-                asof_date,
-                vix_close,
-                broad_usd_index,
-                wti_crude_spot,
-                inr_usd_spot,
-                gsec_10y_yield,
-                repo_rate,
-                macro_usa_freshness_status,
-                bank_rates_freshness_status,
-                cpi_freshness_status,
-                wpi_freshness_status,
-                gsec_curve_freshness_status,
-                new_macro_source_required
-            FROM advisory_macro_daily
-            {where_sql}
-            ORDER BY asof_date
-            """,
-            params=params or None,
-        )
+        try:
+            df = sql_to_df(
+                f"""
+                SELECT
+                    asof_date,
+                    vix_close,
+                    broad_usd_index,
+                    wti_crude_spot,
+                    inr_usd_spot,
+                    gsec_10y_yield,
+                    repo_rate,
+                    macro_usa_freshness_status,
+                    bank_rates_freshness_status,
+                    cpi_freshness_status,
+                    wpi_freshness_status,
+                    gsec_curve_freshness_status,
+                    new_macro_source_required
+                FROM advisory_macro_daily
+                {where_sql}
+                ORDER BY asof_date
+                """,
+                params=params or None,
+            )
+        except Exception as exc:
+            _record_regime_fallback(
+                fallback_type="regime_engine_macro_daily_load_failed",
+                source="advisory_macro_daily",
+                reason="Regime engine could not load raw macro rows for regime classification.",
+                error=exc,
+                metadata={
+                    "start_date": str(start_date) if start_date is not None else None,
+                    "to_date": str(to_date) if to_date is not None else None,
+                },
+            )
+            raise
     if df.empty:
         return df
     df["asof_date"] = normalize_timestamp(df["asof_date"])
@@ -374,10 +508,16 @@ def build_regime_snapshot(
 def persist_regime_snapshot(df: pd.DataFrame, *, rebuild: bool = False) -> None:
     if df.empty:
         return
+    ensure_regime_table()
     if rebuild:
-        with db_session() as (_, cur):
-            cur.execute(f"CREATE TABLE IF NOT EXISTS {TABLE_NAME} (asof_date TIMESTAMPTZ UNIQUE)")
-            cur.execute(f"DELETE FROM {TABLE_NAME}")
+        def _delete_existing_regime_rows() -> None:
+            with db_session() as (_, cur):
+                cur.execute(f"DELETE FROM {TABLE_NAME}")
+
+        execute_db_operation(
+            _delete_existing_regime_rows,
+            operation_name="regime_engine:delete_rebuild_snapshot",
+        )
     upsert_to_db(
         df,
         TABLE_NAME,

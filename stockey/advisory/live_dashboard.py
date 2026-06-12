@@ -12,6 +12,7 @@ from advisory.action_recommender import build_action_recommendations
 from advisory.action_recommender import TABLE_NAME as ACTIONS_TABLE
 from advisory.dashboard import build_dashboard
 from advisory.execution_engine import EXECUTION_TABLE
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.portfolio_engine import PORTFOLIO_TABLE, derive_thesis_policy
 from advisory.position_lifecycle import LIFECYCLE_TABLE, REBALANCE_TABLE
 from advisory.setup_registry import load_setup_registry
@@ -26,6 +27,7 @@ SECTION_FAILURES: list[dict[str, Any]] = []
 TS_FORECAST_TABLE = "advisory_ts_forecasts_daily"
 TS_WATCHLIST_TABLE = "advisory_ts_forecast_watchlist"
 TS_EVAL_SUMMARY_TABLE = "advisory_ts_forecast_eval_summary"
+TS_PAPER_PORTFOLIO_TABLE = "advisory_ts_forecast_paper_portfolio"
 DEFAULT_OUTPUT_DIR = Path("live_dashboard")
 DEFAULT_OPERATOR_FEED_PATH = DEFAULT_OUTPUT_DIR / "operator_feed.json"
 DEFAULT_CRON_LOG_DIR = Path("logs/cron")
@@ -57,7 +59,14 @@ def _table_columns(table_name: str) -> set[str]:
             """,
             params=(table_name,),
         )
-    except Exception:
+    except Exception as exc:
+        _record_dashboard_loader_fallback(
+            source=table_name,
+            fallback_type="live_dashboard_table_columns_lookup_failed",
+            reason="Live dashboard could not inspect a table schema and used an empty column set.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return set()
     if df.empty or "column_name" not in df.columns:
         return set()
@@ -102,7 +111,7 @@ def _as_float(value: Any) -> float | None:
     return float(out)
 
 
-def _parse_json_blob(value: Any) -> dict[str, Any]:
+def _parse_json_blob(value: Any, *, source: str = "live_dashboard_json_blob") -> dict[str, Any]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return {}
     if isinstance(value, dict):
@@ -110,7 +119,14 @@ def _parse_json_blob(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-        except Exception:
+        except Exception as exc:
+            _record_dashboard_loader_fallback(
+                source=source,
+                fallback_type="live_dashboard_json_blob_parse_failed",
+                reason="Live dashboard could not parse a stored JSON blob and used the empty-object fallback.",
+                error=exc,
+                metadata={"value_excerpt": value[:240]},
+            )
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
@@ -211,14 +227,21 @@ def _setup_context_text(setup_snapshot: dict[str, Any], setup_meta: dict[str, An
     return " ".join(pieces) if pieces else None
 
 
-def _summarize_exit_rules(raw_value: Any) -> str | None:
+def _summarize_exit_rules(raw_value: Any, *, source: str = "exit_event_rules_json") -> str | None:
     if raw_value is None or (isinstance(raw_value, float) and pd.isna(raw_value)):
         return None
     parsed = raw_value
     if isinstance(raw_value, str):
         try:
             parsed = json.loads(raw_value)
-        except Exception:
+        except Exception as exc:
+            _record_dashboard_loader_fallback(
+                source=source,
+                fallback_type="live_dashboard_exit_rules_parse_failed",
+                reason="Live dashboard could not parse exit-rule JSON and used the raw text fallback.",
+                error=exc,
+                metadata={"value_excerpt": raw_value[:240]},
+            )
             return raw_value
     if not isinstance(parsed, list):
         return str(parsed)
@@ -694,8 +717,37 @@ def _safe_frame_loader(loader, *args, **kwargs) -> pd.DataFrame:
         name = getattr(loader, "__name__", str(loader))
         error = f"{type(exc).__name__}: {exc}"
         SECTION_FAILURES.append({"section": name, "status": "error", "error": error})
+        record_local_fallback_event(
+            module="advisory.live_dashboard",
+            source=name,
+            fallback_type="live_dashboard_section_frame_load_failed",
+            severity="error",
+            reason="Live dashboard frame section failed and was replaced with an empty frame.",
+            error=exc,
+            metadata={"section": name},
+        )
         print(f"[advisory.live_dashboard] section loader failed {name}: {error}", flush=True)
         return pd.DataFrame()
+
+
+def _record_dashboard_loader_fallback(
+    *,
+    source: str,
+    fallback_type: str,
+    reason: str,
+    error: Exception,
+    severity: str = "warn",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.live_dashboard",
+        source=source,
+        fallback_type=fallback_type,
+        severity=severity,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def _safe_list_loader(loader, *args, **kwargs) -> list[dict[str, Any]]:
@@ -705,6 +757,15 @@ def _safe_list_loader(loader, *args, **kwargs) -> list[dict[str, Any]]:
         name = getattr(loader, "__name__", str(loader))
         error = f"{type(exc).__name__}: {exc}"
         SECTION_FAILURES.append({"section": name, "status": "error", "error": error})
+        record_local_fallback_event(
+            module="advisory.live_dashboard",
+            source=name,
+            fallback_type="live_dashboard_section_list_load_failed",
+            severity="error",
+            reason="Live dashboard list section failed and was replaced with an empty list.",
+            error=exc,
+            metadata={"section": name},
+        )
         print(f"[advisory.live_dashboard] section loader failed {name}: {error}", flush=True)
         return []
 
@@ -963,10 +1024,21 @@ def load_execution_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 1
 
 
 def load_action_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 100) -> pd.DataFrame:
-    if not _table_columns(ACTIONS_TABLE):
+    action_columns = _table_columns(ACTIONS_TABLE)
+    if not action_columns:
         try:
             df = build_action_recommendations(asof_date=asof_date)
-        except Exception:
+        except Exception as exc:
+            _record_dashboard_loader_fallback(
+                source=ACTIONS_TABLE,
+                fallback_type="live_dashboard_action_rows_build_failed",
+                reason="Live dashboard could not build action recommendations after action table lookup returned no columns.",
+                error=exc,
+                metadata={
+                    "asof_date": None if asof_date is None else pd.Timestamp(asof_date).isoformat(),
+                    "limit": int(limit),
+                },
+            )
             return pd.DataFrame()
         if df.empty:
             return df
@@ -1003,6 +1075,7 @@ def load_action_rows(*, asof_date: pd.Timestamp | None = None, limit: int = 100)
             action_detail,
             recommendation_reason_json,
             reason_contract_status,
+            {"feature_freshness_json" if "feature_freshness_json" in action_columns else "NULL AS feature_freshness_json"},
             manual_revision_summary,
             manual_revision_pointers_json,
             manual_revision_model,
@@ -1069,7 +1142,17 @@ def load_ts_forecast_watch_rows(*, asof_date: pd.Timestamp | None = None, limit:
             """,
             params=tuple(params) if params else None,
         )
-    except Exception:
+    except Exception as exc:
+        _record_dashboard_loader_fallback(
+            source=TS_WATCHLIST_TABLE,
+            fallback_type="live_dashboard_ts_watch_rows_load_failed",
+            reason="Live dashboard could not load TS forecast watch rows.",
+            error=exc,
+            metadata={
+                "asof_date": None if asof_date is None else pd.Timestamp(asof_date).isoformat(),
+                "limit": int(limit),
+            },
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -1121,7 +1204,17 @@ def load_latest_ts_forecasts(*, asof_date: pd.Timestamp | None = None, limit: in
             """,
             params=tuple(params) if params else None,
         )
-    except Exception:
+    except Exception as exc:
+        _record_dashboard_loader_fallback(
+            source=TS_FORECAST_TABLE,
+            fallback_type="live_dashboard_latest_ts_forecasts_load_failed",
+            reason="Live dashboard could not load latest TS forecast rows.",
+            error=exc,
+            metadata={
+                "asof_date": None if asof_date is None else pd.Timestamp(asof_date).isoformat(),
+                "limit": int(limit),
+            },
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -1175,7 +1268,18 @@ def load_ts_forecast_history_rows(*, asof_date: pd.Timestamp | None = None, look
             """,
             params=tuple(params) if params else None,
         )
-    except Exception:
+    except Exception as exc:
+        _record_dashboard_loader_fallback(
+            source=TS_FORECAST_TABLE,
+            fallback_type="live_dashboard_ts_forecast_history_load_failed",
+            reason="Live dashboard could not load TS forecast history rows.",
+            error=exc,
+            metadata={
+                "asof_date": None if asof_date is None else pd.Timestamp(asof_date).isoformat(),
+                "lookback_days": int(lookback_days),
+                "limit": int(limit),
+            },
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -1224,7 +1328,14 @@ def load_ts_eval_summary_rows(*, limit: int = 20) -> pd.DataFrame:
             LIMIT {int(limit)}
             """
         )
-    except Exception:
+    except Exception as exc:
+        _record_dashboard_loader_fallback(
+            source=TS_EVAL_SUMMARY_TABLE,
+            fallback_type="live_dashboard_ts_eval_summary_load_failed",
+            reason="Live dashboard could not load TS forecast evaluation summary rows.",
+            error=exc,
+            metadata={"limit": int(limit)},
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -1243,6 +1354,81 @@ def load_ts_eval_summary_rows(*, limit: int = 20) -> pd.DataFrame:
         "rmse",
         "sharpe_like",
         "max_drawdown_proxy",
+    ]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df.reset_index(drop=True)
+
+
+def load_ts_paper_summary_rows(*, limit: int = 20) -> pd.DataFrame:
+    if not _table_columns(TS_PAPER_PORTFOLIO_TABLE):
+        return pd.DataFrame()
+    try:
+        df = sql_to_df(
+            f"""
+            WITH latest AS (
+                SELECT MAX(load_ts) AS load_ts
+                FROM {TS_PAPER_PORTFOLIO_TABLE}
+            ),
+            rows AS (
+                SELECT p.*
+                FROM {TS_PAPER_PORTFOLIO_TABLE} p
+                JOIN latest l ON p.load_ts = l.load_ts
+            )
+            SELECT
+                MAX(load_ts) AS evaluated_at,
+                MIN(asof_date) AS from_date,
+                MAX(asof_date) AS to_date,
+                model_name,
+                forecast_horizon_days,
+                paper_decision,
+                COUNT(*) AS row_count,
+                COUNT(cost_adjusted_return) AS evaluated_trades,
+                AVG(CASE WHEN cost_adjusted_return > 0 THEN 1.0 WHEN cost_adjusted_return <= 0 THEN 0.0 END) AS win_rate,
+                AVG(cost_adjusted_return) AS avg_cost_adjusted_return,
+                PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY cost_adjusted_return) AS median_cost_adjusted_return,
+                AVG(realized_return) AS avg_realized_return_all_rows,
+                COUNT(baseline_cost_adjusted_return) AS baseline_trade_count,
+                AVG(baseline_cost_adjusted_return) AS baseline_avg_cost_adjusted_return,
+                SUM(CASE WHEN advisory_alignment = 'ALIGNED_POSITIVE' THEN 1 ELSE 0 END) AS aligned_positive_count,
+                SUM(CASE WHEN advisory_alignment = 'CONFLICT_EXIT' THEN 1 ELSE 0 END) AS conflict_exit_count
+            FROM rows
+            GROUP BY model_name, forecast_horizon_days, paper_decision
+            ORDER BY
+                CASE WHEN paper_decision = 'PAPER_BUY' THEN 0 ELSE 1 END,
+                avg_cost_adjusted_return DESC NULLS LAST,
+                evaluated_trades DESC,
+                model_name,
+                forecast_horizon_days
+            LIMIT {int(limit)}
+            """
+        )
+    except Exception as exc:
+        _record_dashboard_loader_fallback(
+            source=TS_PAPER_PORTFOLIO_TABLE,
+            fallback_type="live_dashboard_ts_paper_summary_load_failed",
+            reason="Live dashboard could not load TS forecast paper-portfolio summary rows.",
+            error=exc,
+            metadata={"limit": int(limit)},
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["evaluated_at", "from_date", "to_date"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    for column in [
+        "forecast_horizon_days",
+        "row_count",
+        "evaluated_trades",
+        "win_rate",
+        "avg_cost_adjusted_return",
+        "median_cost_adjusted_return",
+        "avg_realized_return_all_rows",
+        "baseline_trade_count",
+        "baseline_avg_cost_adjusted_return",
+        "aligned_positive_count",
+        "conflict_exit_count",
     ]:
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
@@ -1498,6 +1684,7 @@ def build_ts_forecast_views(
     watch_df: pd.DataFrame,
     forecast_df: pd.DataFrame,
     eval_summary_df: pd.DataFrame,
+    paper_summary_df: pd.DataFrame | None = None,
     history_df: pd.DataFrame | None = None,
     limit: int = 25,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1538,8 +1725,38 @@ def build_ts_forecast_views(
                     "research_only": True,
                 }
             )
+    paper_rows: list[dict[str, Any]] = []
+    if paper_summary_df is not None and not paper_summary_df.empty:
+        for _, row in paper_summary_df.iterrows():
+            win_rate = _as_float(row.get("win_rate"))
+            avg_cost = _as_float(row.get("avg_cost_adjusted_return"))
+            median_cost = _as_float(row.get("median_cost_adjusted_return"))
+            avg_realized = _as_float(row.get("avg_realized_return_all_rows"))
+            baseline_avg = _as_float(row.get("baseline_avg_cost_adjusted_return"))
+            paper_rows.append(
+                {
+                    "evaluated_at": _display_dashboard_timestamp(row.get("evaluated_at")),
+                    "from_date": _display_dashboard_timestamp(row.get("from_date"), prefer_date_for_midnight_utc=True),
+                    "to_date": _display_dashboard_timestamp(row.get("to_date"), prefer_date_for_midnight_utc=True),
+                    "model_name": _as_text(row.get("model_name")),
+                    "horizon_days": int(_as_float(row.get("forecast_horizon_days")) or 0) or None,
+                    "paper_decision": _as_text(row.get("paper_decision")),
+                    "row_count": int(_as_float(row.get("row_count")) or 0),
+                    "evaluated_trades": int(_as_float(row.get("evaluated_trades")) or 0),
+                    "win_rate_pct": None if win_rate is None else round(win_rate * 100.0, 1),
+                    "avg_cost_adjusted_return_pct": None if avg_cost is None else round(avg_cost * 100.0, 2),
+                    "median_cost_adjusted_return_pct": None if median_cost is None else round(median_cost * 100.0, 2),
+                    "avg_realized_return_all_rows_pct": None if avg_realized is None else round(avg_realized * 100.0, 2),
+                    "baseline_trade_count": int(_as_float(row.get("baseline_trade_count")) or 0),
+                    "baseline_avg_cost_adjusted_return_pct": None if baseline_avg is None else round(baseline_avg * 100.0, 2),
+                    "aligned_positive_count": int(_as_float(row.get("aligned_positive_count")) or 0),
+                    "conflict_exit_count": int(_as_float(row.get("conflict_exit_count")) or 0),
+                    "research_only": True,
+                    "operator_note": "Forecast paper results are evidence only. They do not approve actions, portfolio rows, or Dhan orders.",
+                }
+            )
     recommendation_rows = [ts_view_to_recommendation_row(row) for row in rows]
-    return {"watch": rows, "recommendations": recommendation_rows, "evaluation_summary": eval_rows}
+    return {"watch": rows, "recommendations": recommendation_rows, "evaluation_summary": eval_rows, "paper_summary": paper_rows}
 
 
 def load_alert_rows(limit: int = 100) -> pd.DataFrame:
@@ -1552,7 +1769,14 @@ def load_alert_rows(limit: int = 100) -> pd.DataFrame:
             LIMIT {int(limit)}
             """
         )
-    except Exception:
+    except Exception as exc:
+        _record_dashboard_loader_fallback(
+            source=ALERTS_TABLE,
+            fallback_type="live_dashboard_alert_rows_load_failed",
+            reason="Live dashboard could not load live alert rows.",
+            error=exc,
+            metadata={"limit": int(limit)},
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -1760,7 +1984,18 @@ def load_operator_feed(*, output_dir: str | Path = DEFAULT_OUTPUT_DIR, limit: in
         return []
     try:
         payload = json.loads(feed_path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        _record_dashboard_loader_fallback(
+            source=str(feed_path),
+            fallback_type="live_dashboard_operator_feed_read_failed",
+            reason="Live dashboard could not read operator feed JSON and will show an empty feed.",
+            error=exc,
+            metadata={
+                "output_dir": str(output_dir),
+                "feed_path": str(feed_path),
+                "limit": int(limit),
+            },
+        )
         return []
     if not isinstance(payload, list):
         return []
@@ -1806,7 +2041,14 @@ def load_runtime_processes(limit: int = 30) -> list[dict[str, Any]]:
             )
             elapsed_is_seconds = elapsed_field == "etimes"
             break
-        except Exception:
+        except Exception as exc:
+            _record_dashboard_loader_fallback(
+                source="ps",
+                fallback_type="live_dashboard_runtime_processes_load_failed",
+                reason="Live dashboard could not inspect runtime processes with ps.",
+                error=exc,
+                metadata={"elapsed_field": elapsed_field, "limit": int(limit)},
+            )
             continue
     if output is None:
         return []
@@ -1838,7 +2080,18 @@ def load_cron_status(*, log_dir: str | Path = DEFAULT_CRON_LOG_DIR, tail_lines: 
     for file_path in sorted(log_path.glob("*.log")):
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except Exception:
+        except Exception as exc:
+            _record_dashboard_loader_fallback(
+                source=str(file_path),
+                fallback_type="live_dashboard_cron_log_read_failed",
+                reason="Live dashboard could not read a cron log file and will show an empty tail for it.",
+                error=exc,
+                metadata={
+                    "log_file": file_path.name,
+                    "log_dir": str(log_path),
+                    "tail_lines": int(tail_lines),
+                },
+            )
             content = []
         stat = file_path.stat()
         rows.append(
@@ -1943,6 +2196,7 @@ def _base_recommendation_record(
     manual_revision_pointers: Any = None,
     recommendation_reason: Any = None,
     reason_contract_status: Any = None,
+    feature_freshness: Any = None,
     sort_ts: Any = None,
 ) -> dict[str, Any]:
     return {
@@ -1975,6 +2229,7 @@ def _base_recommendation_record(
         "manual_revision_pointers": manual_revision_pointers,
         "recommendation_reason": recommendation_reason,
         "reason_contract_status": _as_text(reason_contract_status),
+        "feature_freshness": feature_freshness,
         "sort_ts": None if pd.isna(pd.to_datetime(sort_ts, utc=True, errors="coerce")) else pd.to_datetime(sort_ts, utc=True, errors="coerce").isoformat(),
     }
 
@@ -2151,6 +2406,7 @@ def build_recommendation_views(
                     manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
                     recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
                     reason_contract_status=action_row.get("reason_contract_status") if action_row else None,
+                    feature_freshness=_parse_json_blob(action_row.get("feature_freshness_json")) if action_row else None,
                     sort_ts=row.get("published_on"),
                 )
             )
@@ -2240,6 +2496,7 @@ def build_recommendation_views(
                     manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
                     recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
                     reason_contract_status=action_row.get("reason_contract_status") if action_row else None,
+                    feature_freshness=_parse_json_blob(action_row.get("feature_freshness_json")) if action_row else None,
                     sort_ts=row.get("published_on"),
                 )
             )
@@ -2328,6 +2585,7 @@ def build_recommendation_views(
                     manual_revision_pointers=_manual_revision_pointers(action_row) if action_row else None,
                     recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")) if action_row else None,
                     reason_contract_status=action_row.get("reason_contract_status") if action_row else None,
+                    feature_freshness=_parse_json_blob(action_row.get("feature_freshness_json")) if action_row else None,
                     sort_ts=row.get("state_updated_at"),
                 )
             )
@@ -2389,6 +2647,7 @@ def build_recommendation_views(
                     manual_revision_pointers=_manual_revision_pointers(action_row),
                     recommendation_reason=_parse_json_blob(action_row.get("recommendation_reason_json")),
                     reason_contract_status=action_row.get("reason_contract_status"),
+                    feature_freshness=_parse_json_blob(action_row.get("feature_freshness_json")),
                     sort_ts=action_row.get("published_on"),
                 )
             )
@@ -2535,6 +2794,7 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
     ts_forecast_df = _safe_frame_loader(load_latest_ts_forecasts, asof_date=asof_date)
     ts_history_df = _safe_frame_loader(load_ts_forecast_history_rows, asof_date=asof_date)
     ts_eval_df = _safe_frame_loader(load_ts_eval_summary_rows)
+    ts_paper_df = _safe_frame_loader(load_ts_paper_summary_rows)
     sync_state_df = _safe_frame_loader(load_sync_states)
     operator_feed = _safe_list_loader(load_operator_feed, output_dir=output_dir)
     runtime_processes = _safe_list_loader(load_runtime_processes)
@@ -2543,6 +2803,7 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
         watch_df=ts_watch_df,
         forecast_df=ts_forecast_df,
         eval_summary_df=ts_eval_df,
+        paper_summary_df=ts_paper_df,
         history_df=ts_history_df,
     )
     recommendation_views = build_recommendation_views(
@@ -2567,6 +2828,7 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
     summary["ts_watch_count"] = len(ts_forecast_views["watch"])
     summary["ts_recommendation_count"] = len(ts_forecast_views["recommendations"])
     summary["ts_eval_summary_count"] = len(ts_forecast_views["evaluation_summary"])
+    summary["ts_paper_summary_count"] = len(ts_forecast_views["paper_summary"])
     return {
         "generated_at": to_display_timestamp(pd.Timestamp.utcnow()),
         "asof_date": None if asof_date is None else _display_dashboard_timestamp(asof_date, prefer_date_for_midnight_utc=True),
@@ -2580,6 +2842,7 @@ def build_live_dashboard_payload(*, asof_date: pd.Timestamp | None = None, outpu
         "ts_forecast_watch": _json_ready(ts_forecast_views["watch"]),
         "ts_watch_recommendations": _json_ready(ts_forecast_views["recommendations"]),
         "ts_forecast_eval_summary": _json_ready(ts_forecast_views["evaluation_summary"]),
+        "ts_forecast_paper_summary": _json_ready(ts_forecast_views["paper_summary"]),
         "dashboard": _json_ready(dashboard_df),
         "portfolio": _json_ready(portfolio_df),
         "watchlist": _json_ready(watchlist_df),
@@ -3097,6 +3360,16 @@ def render_html(payload: dict[str, Any]) -> str:
         </div>
         <div class="ops-list" id="ts_forecast_eval_summary"></div>
       </div>
+      <div style="margin-top:18px;">
+        <div class="section-head" style="margin-bottom:12px;">
+          <div class="section-title-wrap">
+            <h3 class="section-title" style="font-size:18px;">Forecast Paper Portfolio</h3>
+            <div class="section-note">Latest research-only paper decisions compared with naive momentum and current advisory alignment. This is evidence, not execution approval.</div>
+          </div>
+          <div class="section-count" id="ts-paper-count"></div>
+        </div>
+        <div class="ops-list" id="ts_forecast_paper_summary"></div>
+      </div>
     </section>
 
     <section class="section">
@@ -3206,6 +3479,10 @@ def render_html(payload: dict[str, Any]) -> str:
       const tsEval = Array.isArray(data.ts_forecast_eval_summary) ? data.ts_forecast_eval_summary : [];
       document.getElementById("ts-eval-count").textContent = `${tsEval.length} rows`;
       document.getElementById("ts_forecast_eval_summary").innerHTML = renderTsEvalRows(tsEval);
+
+      const tsPaper = Array.isArray(data.ts_forecast_paper_summary) ? data.ts_forecast_paper_summary : [];
+      document.getElementById("ts-paper-count").textContent = `${tsPaper.length} rows`;
+      document.getElementById("ts_forecast_paper_summary").innerHTML = renderTsPaperRows(tsPaper);
 
       const exited = Array.isArray(data.exited_recommendations) ? data.exited_recommendations : [];
       document.getElementById("exited-count").textContent = `${exited.length} rows`;
@@ -3407,6 +3684,31 @@ def render_html(payload: dict[str, Any]) -> str:
             <div class="metric"><div class="metric-label">Median Cost Adj</div><div class="metric-value">${formatPct(row.median_cost_adjusted_return_pct)}</div></div>
             <div class="metric"><div class="metric-label">Sharpe-like</div><div class="metric-value">${escapeHtml(row.sharpe_like === null || row.sharpe_like === undefined ? '-' : Number(row.sharpe_like).toFixed(2))}</div></div>
           </div>
+        </div>
+      `).join('');
+    }
+
+    function renderTsPaperRows(rows) {
+      if (!rows.length) {
+        return '<div class="empty">No forecast paper-portfolio summary yet.</div>';
+      }
+      return rows.map(row => `
+        <div class="ops-item">
+          <div class="recommendation-top" style="margin-bottom:8px;">
+            <div>
+              <div style="font-size:18px; margin-bottom:6px;">${escapeHtml(row.paper_decision || '-')} | ${escapeHtml(row.model_name || '-')} | ${escapeHtml(row.horizon_days ? `${row.horizon_days}d` : '-')}</div>
+              <div class="recommendation-setup">${escapeHtml(row.from_date || '-')} to ${escapeHtml(row.to_date || '-')} | evaluated ${escapeHtml(row.evaluated_at || '-')}</div>
+            </div>
+            <div class="status-pill status-ts_watch">${escapeHtml(String(row.evaluated_trades || 0))}/${escapeHtml(String(row.row_count || 0))} trades</div>
+          </div>
+          <div class="metrics">
+            <div class="metric"><div class="metric-label">Win Rate</div><div class="metric-value">${formatPct(row.win_rate_pct)}</div></div>
+            <div class="metric"><div class="metric-label">Avg Cost Adj</div><div class="metric-value">${formatPct(row.avg_cost_adjusted_return_pct)}</div></div>
+            <div class="metric"><div class="metric-label">Momentum Avg</div><div class="metric-value">${formatPct(row.baseline_avg_cost_adjusted_return_pct)}</div></div>
+            <div class="metric"><div class="metric-label">Aligned Advisory</div><div class="metric-value">${escapeHtml(String(row.aligned_positive_count || 0))}</div></div>
+            <div class="metric"><div class="metric-label">Exit Conflicts</div><div class="metric-value">${escapeHtml(String(row.conflict_exit_count || 0))}</div></div>
+          </div>
+          <div class="detail-text" style="margin-top:10px;">${escapeHtml(row.operator_note || 'Research only.')}</div>
         </div>
       `).join('');
     }

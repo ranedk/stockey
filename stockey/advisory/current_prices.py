@@ -7,13 +7,28 @@ from typing import Any
 import pandas as pd
 from environs import Env
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 env = Env()
 env.read_env()
 
 TABLE_NAME = "advisory_current_prices"
+CURRENT_PRICES_SCHEMA_MIGRATION_ID = "20260611_advisory_current_prices_base"
+CURRENT_PRICES_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        symbol TEXT PRIMARY KEY,
+        price DOUBLE PRECISION,
+        price_asof TIMESTAMPTZ,
+        price_source TEXT,
+        refreshed_at TIMESTAMPTZ
+    )
+    """,
+    f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_refreshed ON {TABLE_NAME} (refreshed_at DESC)",
+]
 DEFAULT_MAX_AGE_SECONDS = env.int("OPERATOR_CURRENT_PRICE_MAX_AGE_SECONDS", 7 * 24 * 60 * 60)
 _TABLE_READY = False
 
@@ -22,19 +37,12 @@ def ensure_table(*, force: bool = False) -> None:
     global _TABLE_READY
     if _TABLE_READY and not force:
         return
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                symbol TEXT PRIMARY KEY,
-                price DOUBLE PRECISION,
-                price_asof TIMESTAMPTZ,
-                price_source TEXT,
-                refreshed_at TIMESTAMPTZ
-            )
-            """
-        )
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_refreshed ON {TABLE_NAME} (refreshed_at DESC)")
+    apply_schema_migration(
+        migration_id=CURRENT_PRICES_SCHEMA_MIGRATION_ID,
+        description="Create compact operator current-price cache table.",
+        statements=CURRENT_PRICES_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME]},
+    )
     _TABLE_READY = True
 
 
@@ -62,7 +70,16 @@ def load_current_prices(symbols: list[str], *, max_age_seconds: int | None = DEF
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.current_prices",
+            source=TABLE_NAME,
+            fallback_type="current_price_cache_unavailable",
+            severity="warn",
+            reason="Operator current-price cache query failed; caller may fall back to OHLCV history.",
+            error=exc,
+            metadata={"symbol_count": len(normalized), "max_age_seconds": max_age_seconds},
+        )
         return {}
     out: dict[str, dict[str, Any]] = {}
     for row in df.to_dict(orient="records"):

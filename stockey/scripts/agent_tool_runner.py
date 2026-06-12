@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REGISTRY_PATH = REPO_ROOT / "docs" / "tool_registry.json"
@@ -64,7 +66,16 @@ def run_tool(tool_name: str, tool_args: list[str], allow_writes: bool) -> dict:
     if stdout:
         try:
             parsed_stdout = json.loads(stdout)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            record_local_fallback_event(
+                module="scripts.agent_tool_runner",
+                fallback_type="agent_tool_runner_stdout_json_parse_failed",
+                source=tool_name,
+                severity="warn",
+                reason="Agent tool runner could not parse command stdout as JSON and kept raw stdout.",
+                error=exc,
+                metadata={"stdout_length": len(stdout), "stdout_excerpt": stdout[:240]},
+            )
             parsed_stdout = None
 
     return {
@@ -125,6 +136,15 @@ def main():
         print(json.dumps(result, indent=2, ensure_ascii=False))
         sys.exit(0 if result["status"] == "ok" else 1)
     except Exception as exc:
+        record_local_fallback_event(
+            module="scripts.agent_tool_runner",
+            source="agent_tool_runner",
+            fallback_type="agent_tool_runner_failed",
+            severity="error",
+            reason="Agent tool runner failed before returning a normal tool result.",
+            error=exc,
+            metadata={"action": getattr(args, "action", None)},
+        )
         print(
             json.dumps(
                 {

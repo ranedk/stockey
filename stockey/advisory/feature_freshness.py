@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df
 
 
@@ -25,6 +26,14 @@ class FeatureInputSpec:
     purpose: str = ""
 
 
+@dataclass(frozen=True)
+class StageFeatureDependency:
+    stage: str
+    input_keys: tuple[str, ...]
+    gate_effect: str
+    block_positive_actions: bool = False
+
+
 FEATURE_INPUT_SPECS: tuple[FeatureInputSpec, ...] = (
     FeatureInputSpec("daily_ohlcv", "Daily OHLCV", "dhan_ohlcv_daily", "date", symbol_column="ticker", max_age_days=5, required=True, purpose="Price, trend, stop/target, P&L, and liquidity context."),
     FeatureInputSpec("technical_daily", "Technical Features", "advisory_technical_daily", "asof_date", max_age_days=5, required=True, purpose="Swing state, trigger, trend, participation, and risk scoring."),
@@ -36,6 +45,67 @@ FEATURE_INPUT_SPECS: tuple[FeatureInputSpec, ...] = (
     FeatureInputSpec("announcement_evidence", "Announcement Evidence", "advisory_announcement_evidence", "published_on", max_age_days=30, purpose="Compact corporate announcement evidence available to LLM/event policy."),
     FeatureInputSpec("company_memory", "Company Memory Review", "advisory_company_memory_reviews", "review_date", max_age_days=14, purpose="LLM/deterministic company-memory review input; never final execution authority."),
 )
+FEATURE_INPUT_SPECS_BY_KEY = {spec.key: spec for spec in FEATURE_INPUT_SPECS}
+STAGE_FEATURE_DEPENDENCIES: tuple[StageFeatureDependency, ...] = (
+    StageFeatureDependency(
+        stage="rules",
+        input_keys=("daily_ohlcv", "technical_daily"),
+        gate_effect="Rule output remains visible, but blocked required inputs should be treated as stale candidate evidence and downstream positive actions stay review-only.",
+    ),
+    StageFeatureDependency(
+        stage="risk",
+        input_keys=("daily_ohlcv", "technical_daily"),
+        gate_effect="Risk sizing remains visible for audit, but blocked required inputs mean positive allocation evidence is stale and must not become broker-executable without review.",
+    ),
+    StageFeatureDependency(
+        stage="portfolio",
+        input_keys=("daily_ohlcv", "technical_daily"),
+        gate_effect="Portfolio planning remains visible for audit, but blocked required inputs mean positive portfolio rows require manual review before broker execution.",
+    ),
+    StageFeatureDependency(
+        stage="lifecycle",
+        input_keys=("daily_ohlcv",),
+        gate_effect="Lifecycle rows remain visible because exits and risk reductions must not be hidden; blocked price inputs require operator verification.",
+    ),
+    StageFeatureDependency(
+        stage="actions",
+        input_keys=("daily_ohlcv", "technical_daily"),
+        gate_effect="Positive broker-capable actions become MANUAL_REVIEW when required inputs are blocked; exits and risk-reduction rows remain visible.",
+        block_positive_actions=True,
+    ),
+)
+STAGE_FEATURE_DEPENDENCIES_BY_STAGE = {item.stage: item for item in STAGE_FEATURE_DEPENDENCIES}
+
+
+def _record_feature_freshness_fallback(
+    *,
+    fallback_type: str,
+    spec: FeatureInputSpec,
+    reason: str,
+    error: Exception,
+    symbol: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "input_key": spec.key,
+        "label": spec.label,
+        "date_column": spec.date_column,
+        "symbol_column": spec.symbol_column,
+        "required": bool(spec.required),
+        "scope": spec.scope,
+        **(metadata or {}),
+    }
+    if symbol:
+        payload["symbol"] = symbol
+    record_local_fallback_event(
+        module="advisory.feature_freshness",
+        fallback_type=fallback_type,
+        source=spec.table,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=payload,
+    )
 
 
 def _safe_identifier(value: str) -> str:
@@ -159,6 +229,14 @@ def evaluate_feature_input(spec: FeatureInputSpec, *, symbol: str, asof_date: An
             }
         latest = _latest_row_for_spec(spec, symbol=normalized_symbol, asof=asof)
     except Exception as exc:
+        _record_feature_freshness_fallback(
+            fallback_type="feature_freshness_input_lookup_failed",
+            spec=spec,
+            symbol=normalized_symbol,
+            reason="Feature freshness marked an input as error because table/schema/latest-row lookup failed.",
+            error=exc,
+            metadata={"asof_date": asof.isoformat()},
+        )
         return {**base, "status": "error", "reason": f"{type(exc).__name__}: {exc}", "latest_at": None, "row_count": 0}
     if latest.get("status") in {"missing", "error"}:
         return {**base, **latest, "required": bool(spec.required)}
@@ -199,7 +277,7 @@ def build_feature_freshness_contract(symbol: str, *, asof_date: Any = None) -> d
         "inputs": inputs,
         "notes": [
             "Required inputs currently gate confidence; optional missing inputs are shown as intentionally_skipped.",
-            "This contract is read-only and explains data availability. It does not change action authority by itself.",
+            "Action consolidation uses blocked required inputs to make positive broker-capable actions review-only.",
         ],
     }
 
@@ -237,3 +315,75 @@ def build_required_feature_freshness_summaries(symbols: list[str], *, asof_date:
         summary["status"] = "blocked" if summary["blockers"] else "ok"
         summary["symbol"] = symbol
     return summaries
+
+
+def evaluate_stage_feature_gate(stage: str, symbols: list[str] | None, *, asof_date: Any = None) -> dict[str, Any]:
+    dependency = STAGE_FEATURE_DEPENDENCIES_BY_STAGE.get(str(stage or "").strip().lower())
+    normalized_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols or [] if str(symbol or "").strip()})
+    if dependency is None:
+        return {
+            "stage": str(stage or "").strip().lower(),
+            "status": "not_configured",
+            "symbols_checked": 0,
+            "blocked_symbols": [],
+            "required_input_keys": [],
+            "gate_effect": "No explicit feature dependency contract is configured for this stage.",
+        }
+    if not normalized_symbols:
+        return {
+            "stage": dependency.stage,
+            "status": "skipped",
+            "reason": "no_symbols_available",
+            "symbols_checked": 0,
+            "blocked_symbols": [],
+            "required_input_keys": list(dependency.input_keys),
+            "gate_effect": dependency.gate_effect,
+            "block_positive_actions": dependency.block_positive_actions,
+        }
+    summaries: dict[str, dict[str, Any]] = {}
+    blocked_symbols: list[str] = []
+    for symbol in normalized_symbols:
+        symbol_summary = {"status": "ok", "counts": {}, "blockers": [], "required_inputs": []}
+        for input_key in dependency.input_keys:
+            spec = FEATURE_INPUT_SPECS_BY_KEY.get(input_key)
+            if spec is None:
+                compact = {
+                    "input_key": input_key,
+                    "label": input_key,
+                    "status": "error",
+                    "reason": "feature_input_spec_missing",
+                    "required": True,
+                }
+            else:
+                row = evaluate_feature_input(spec, symbol=symbol, asof_date=asof_date)
+                compact = {
+                    "input_key": row.get("input_key"),
+                    "label": row.get("label"),
+                    "status": row.get("status"),
+                    "reason": row.get("reason"),
+                    "latest_at": row.get("latest_at"),
+                    "age_days": row.get("age_days"),
+                    "required": True,
+                }
+            status = str(compact.get("status") or "unknown")
+            counts = symbol_summary["counts"]
+            counts[status] = counts.get(status, 0) + 1
+            symbol_summary["required_inputs"].append(compact)
+            if status in {"missing", "stale", "error"}:
+                symbol_summary["blockers"].append(compact)
+        if symbol_summary["blockers"]:
+            symbol_summary["status"] = "blocked"
+            blocked_symbols.append(symbol)
+        symbol_summary["symbol"] = symbol
+        summaries[symbol] = symbol_summary
+    return {
+        "stage": dependency.stage,
+        "status": "blocked" if blocked_symbols else "ok",
+        "symbols_checked": len(normalized_symbols),
+        "blocked_symbols": blocked_symbols,
+        "blocked_count": len(blocked_symbols),
+        "required_input_keys": list(dependency.input_keys),
+        "gate_effect": dependency.gate_effect,
+        "block_positive_actions": dependency.block_positive_actions,
+        "symbols": summaries,
+    }

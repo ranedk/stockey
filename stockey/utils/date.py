@@ -3,6 +3,8 @@ import calendar
 from typing import List
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 def last_of_month(date: datetime) -> datetime:
     """Return the last day of the month for the given date."""
@@ -97,8 +99,16 @@ def pd_to_datetime(df: pd.DataFrame, col: str, formats: List[str], errors: str="
             df[col] = pd.to_datetime(df[col], format=fmt, errors=errors)
             fixed = True
             break
-        except ValueError:
-            pass
+        except ValueError as exc:
+            record_local_fallback_event(
+                module="utils.date",
+                fallback_type="date_format_parse_failed",
+                source="pd_to_datetime",
+                severity="warn",
+                reason="Date parser could not parse a column with one configured format and will try the next format.",
+                error=exc,
+                metadata={"column": col, "format": fmt},
+            )
     if not fixed:
         raise ValueError("No valid date format found")
     return df

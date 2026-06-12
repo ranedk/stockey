@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from features.tutils import get_max_date
 from utils.db import sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
@@ -13,6 +14,25 @@ from utils.sync import parse_datetime_arg
 
 TABLE_NAME = "advisory_macro_features_daily"
 SOURCE_TABLE = "advisory_macro_daily"
+
+
+def _record_macro_features_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.macro_features",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -34,7 +54,14 @@ def table_exists(table_name: str) -> bool:
             """,
             params=(schema_name, base_table_name),
         )
-    except Exception:
+    except Exception as exc:
+        _record_macro_features_fallback(
+            fallback_type="macro_features_table_lookup_failed",
+            source=table_name,
+            reason="Macro feature builder could not inspect whether a source/output table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return False
     return not df.empty
 
@@ -115,15 +142,32 @@ def load_macro_daily(
         clauses.append("asof_date <= %(to_date)s")
         params["to_date"] = effective_to
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {SOURCE_TABLE}
-        {where_sql}
-        ORDER BY asof_date
-        """,
-        params=params or None,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {SOURCE_TABLE}
+            {where_sql}
+            ORDER BY asof_date
+            """,
+            params=params or None,
+        )
+    except Exception as exc:
+        _record_macro_features_fallback(
+            fallback_type="macro_features_source_load_failed",
+            source=SOURCE_TABLE,
+            reason="Macro feature builder could not load point-in-time macro source rows.",
+            error=exc,
+            metadata={
+                "from_date": str(source_from) if source_from is not None else None,
+                "to_date": str(effective_to) if effective_to is not None else None,
+                "target_from": str(effective_from) if effective_from is not None else None,
+                "target_to": str(effective_to) if effective_to is not None else None,
+                "rebuild": bool(rebuild),
+                "lookback_days": int(lookback_days),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["asof_date"] = normalize_timestamp(df["asof_date"])

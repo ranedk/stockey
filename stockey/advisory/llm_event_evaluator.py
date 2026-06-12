@@ -10,12 +10,13 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from advisory.decision_trace import append_trace, append_trace_step, record_event_processing
-from advisory.fallback_telemetry import record_fallback_event
+from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
 from advisory.market_context import load_latest_market_context
 from advisory.prompt_registry import response_schema_version
 from advisory.prompts import ADVISORY_EVENT_PROMPT_VERSION, SYSTEM_PROMPT, render_event_prompt
 from utils.codex_cli import run_codex_structured
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
@@ -24,6 +25,7 @@ env.read_env()
 
 EVALUATIONS_TABLE = "advisory_event_evaluations"
 RISKS_TABLE = "advisory_event_risks"
+EVENT_EVALUATION_SCHEMA_MIGRATION_ID = "20260611_advisory_event_evaluation_outputs_base"
 NEWS_EVENTS_TABLE = "advisory_news_events"
 ANNOUNCEMENT_EVIDENCE_TABLE = "advisory_announcement_evidence"
 BHAVCOPY_EVIDENCE_TABLE = "advisory_bhavcopy_evidence_daily"
@@ -33,6 +35,91 @@ PROMPT_ID = "advisory_event_evaluation"
 PROMPT_SCHEMA_VERSION = response_schema_version(PROMPT_ID)
 _MAX_DOC_TEXT_CHARS = 12000
 _MAX_JSON_TEXT_CHARS = 6000
+
+EVENT_EVALUATION_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
+        published_on TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        evaluated_at TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        unique_id TEXT NOT NULL,
+        event_source TEXT,
+        subject TEXT,
+        filed_under_category TEXT,
+        parse_status TEXT,
+        evaluation_status TEXT,
+        sentiment TEXT,
+        materiality TEXT,
+        setup_effect TEXT,
+        direction TEXT,
+        surprise DOUBLE PRECISION,
+        novelty DOUBLE PRECISION,
+        contradiction DOUBLE PRECISION,
+        expected_decay_days INTEGER,
+        source_reliability TEXT,
+        affected_sectors_json TEXT,
+        affected_peers_json TEXT,
+        governance_risk TEXT,
+        balance_sheet_risk TEXT,
+        execution_risk TEXT,
+        investable_now BOOLEAN,
+        verdict TEXT,
+        event_class TEXT,
+        state_transition_hint TEXT,
+        score_impact DOUBLE PRECISION,
+        confidence DOUBLE PRECISION,
+        what_happened TEXT,
+        rationale TEXT,
+        event_tensor_json TEXT,
+        source_trace_json TEXT,
+        context_snapshot_json TEXT,
+        model_name TEXT,
+        prompt_id TEXT,
+        prompt_version TEXT,
+        prompt_schema_version TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS prompt_id TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS prompt_schema_version TEXT",
+    f"""
+    CREATE TABLE IF NOT EXISTS {RISKS_TABLE} (
+        published_on TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        unique_id TEXT NOT NULL,
+        event_source TEXT,
+        risk_idx BIGINT NOT NULL,
+        risk_type TEXT,
+        severity TEXT,
+        title TEXT,
+        detail TEXT,
+        evidence_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id, risk_idx)
+    )
+    """,
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_class TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS state_transition_hint TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS score_impact DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS direction TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS surprise DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS novelty DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS contradiction DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS expected_decay_days INTEGER",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS source_reliability TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_sectors_json TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_peers_json TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_tensor_json TEXT",
+    f"ALTER TABLE {RISKS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT",
+]
 
 
 class EventRisk(BaseModel):
@@ -121,7 +208,16 @@ def _table_exists(table_name: str) -> bool:
             """,
             params=(table_name,),
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            source=table_name,
+            fallback_type="llm_event_table_lookup_failed",
+            severity="warn",
+            reason="Event evaluator table existence check failed and will treat the table as unavailable.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return False
     return not df.empty
 
@@ -133,7 +229,16 @@ def _is_missing_scalar(value: Any) -> bool:
         return False
     try:
         return bool(pd.isna(value))
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            source="missing_scalar_check",
+            fallback_type="llm_event_missing_scalar_check_failed",
+            severity="warn",
+            reason="Event evaluator could not determine whether a scalar value is missing and treated it as present.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": str(value)[:240]},
+        )
         return False
 
 
@@ -169,7 +274,7 @@ def fallback_what_happened(event_row: pd.Series) -> str:
     return "Event could not be evaluated automatically."
 
 
-def normalize_jsonish(value: Any) -> Any:
+def normalize_jsonish(value: Any, *, source: str = "llm_event_json_context") -> Any:
     if value is None:
         return None
     if isinstance(value, (dict, list)):
@@ -179,14 +284,40 @@ def normalize_jsonish(value: Any) -> Any:
         return None
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            fallback_type="llm_event_json_parse_failed",
+            source=source,
+            severity="warn",
+            reason="LLM event evaluator could not parse JSON context and will use the original text fallback.",
+            error=exc,
+            metadata={"value_length": len(text), "value_excerpt": text[:240]},
+        )
         return text
 
 
 def _safe_trace_call(func, **kwargs) -> Any | None:
     try:
         return func(**kwargs)
-    except Exception:
+    except Exception as exc:
+        func_name = getattr(func, "__name__", str(func))
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            source="decision_trace",
+            fallback_type="llm_event_trace_call_failed",
+            severity="warn",
+            reason="Event evaluator decision trace write failed; evaluation continues but trace evidence may be incomplete.",
+            error=exc,
+            metadata={
+                "function": func_name,
+                "kwargs_keys": sorted(str(key) for key in kwargs.keys()),
+                "symbol": str(kwargs.get("symbol") or "").upper() or None,
+                "unique_id": kwargs.get("unique_id"),
+                "setup_id": kwargs.get("setup_id"),
+                "stage": kwargs.get("stage"),
+            },
+        )
         return None
 
 
@@ -204,8 +335,8 @@ def normalize_int(value: Any, *, minimum: int, maximum: int, default: int) -> in
     return int(max(minimum, min(maximum, int(numeric))))
 
 
-def normalize_string_list(value: Any, *, limit: int, item_limit: int = 80) -> list[str]:
-    normalized = normalize_jsonish(value)
+def normalize_string_list(value: Any, *, limit: int, item_limit: int = 80, source: str = "llm_event_string_list") -> list[str]:
+    normalized = normalize_jsonish(value, source=source)
     if normalized is None:
         return []
     if isinstance(normalized, list):
@@ -230,8 +361,8 @@ def normalize_string_list(value: Any, *, limit: int, item_limit: int = 80) -> li
     return out
 
 
-def _flatten_jsonish_text(value: Any) -> str:
-    normalized = normalize_jsonish(value)
+def _flatten_jsonish_text(value: Any, *, source: str = "llm_event_flatten_jsonish_text") -> str:
+    normalized = normalize_jsonish(value, source=source)
     if normalized is None:
         return ""
     if isinstance(normalized, list):
@@ -324,7 +455,7 @@ def classify_event_type(event_row: pd.Series, parsed: EventEvaluation) -> str:
     subject_text = trim_text(event_row.get("subject"), 500) or ""
     category_text = trim_text(event_row.get("filed_under_category"), 500) or ""
     summary_text = trim_text(event_row.get("concise_summary_text"), 3000) or ""
-    categories_text = _flatten_jsonish_text(event_row.get("categories_json"))
+    categories_text = _flatten_jsonish_text(event_row.get("categories_json"), source="event_categories_json")
     strong_haystack = " ".join([subject_text, category_text, categories_text]).lower()
     full_haystack = " ".join([subject_text, category_text, summary_text, categories_text]).lower()
 
@@ -596,7 +727,21 @@ def load_watch_events(
             """,
             params=(EVALUATIONS_TABLE,),
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            source=EVALUATIONS_TABLE,
+            fallback_type="llm_event_existing_evaluation_lookup_failed",
+            severity="error",
+            reason="Event evaluator could not check existing evaluation rows and continued with an empty event set to avoid duplicate or unsafe evaluation.",
+            error=exc,
+            metadata={
+                "asof_date": None if asof_date is None else str(asof_date),
+                "symbols_count": len(symbols or []),
+                "setup_ids_count": len(setup_ids or []),
+                "include_evaluated": bool(include_evaluated),
+            },
+        )
         return pd.DataFrame()
     if evaluation_table_exists.empty:
         join_sql = ""
@@ -956,6 +1101,20 @@ def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_d
                     for row in events.to_dict(orient="records")
                 ]
     except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            source="exchange_context",
+            fallback_type="llm_event_exchange_context_load_failed",
+            severity="warn",
+            symbol=symbol,
+            reason="Event evaluator could not load point-in-time exchange/bhavcopy context and continued with an error marker in the event payload.",
+            error=exc,
+            metadata={
+                "published_on": None if pd.isna(published_on) else str(published_on),
+                "lookback_days": int(lookback_days),
+                "max_events": int(max_events),
+            },
+        )
         out["error"] = str(exc)
     return out
 
@@ -967,6 +1126,16 @@ def load_broad_market_context(symbol: str, published_on: pd.Timestamp) -> dict[s
     try:
         payload = load_latest_market_context(daily_cutoff, limit=250)
     except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            source="market_context",
+            fallback_type="llm_event_broad_market_context_load_failed",
+            severity="warn",
+            symbol=symbol,
+            reason="Event evaluator could not load broad market context and continued with an error marker in the event payload.",
+            error=exc,
+            metadata={"daily_cutoff": None if pd.isna(daily_cutoff) else str(daily_cutoff)},
+        )
         return {"error": f"{type(exc).__name__}: {exc}"}
     summary = payload.get("summary") if isinstance(payload, dict) else {}
     top_universe = payload.get("top_universe") if isinstance(payload, dict) else []
@@ -1001,8 +1170,8 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
         "published_on": published_on.isoformat() if not pd.isna(published_on) else None,
         "parse_status": event_row.get("parse_status"),
         "concise_summary_text": trim_text(event_row.get("concise_summary_text"), 2000),
-        "categories_json": normalize_jsonish(event_row.get("categories_json")),
-        "watch_reasons_json": normalize_jsonish(event_row.get("watch_reasons_json")),
+        "categories_json": normalize_jsonish(event_row.get("categories_json"), source="event_categories_json"),
+        "watch_reasons_json": normalize_jsonish(event_row.get("watch_reasons_json"), source="event_watch_reasons_json"),
         "context_source": "event_row",
     }
 
@@ -1028,7 +1197,8 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
                     "latest_event_verdict": document_row.get("verdict"),
                     "latest_event_confidence": document_row.get("confidence"),
                     "latest_event_tensor_json": normalize_jsonish(
-                        trim_text(document_row.get("event_tensor_json"), _MAX_JSON_TEXT_CHARS)
+                        trim_text(document_row.get("event_tensor_json"), _MAX_JSON_TEXT_CHARS),
+                        source="announcement_evidence_event_tensor_json",
                     ),
                     "latest_event_prompt_version": document_row.get("prompt_version"),
                     "fallback_used": False,
@@ -1043,9 +1213,10 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
                     "document_parse_status": document_row.get("parse_status"),
                     "document_summary_text": trim_text(document_row.get("concise_summary_text"), 2000),
                     "document_text_excerpt": trim_text(document_row.get("text"), _MAX_DOC_TEXT_CHARS),
-                    "document_categories_json": normalize_jsonish(document_row.get("categories_json")),
+                    "document_categories_json": normalize_jsonish(document_row.get("categories_json"), source="document_categories_json"),
                     "parsed_reports_json": normalize_jsonish(
-                        trim_text(document_row.get("parsed_reports_json"), _MAX_JSON_TEXT_CHARS)
+                        trim_text(document_row.get("parsed_reports_json"), _MAX_JSON_TEXT_CHARS),
+                        source="document_parsed_reports_json",
                     ),
                     "fallback_used": True,
                 }
@@ -1057,7 +1228,7 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
             "asof_date": event_row["asof_date"].isoformat() if not pd.isna(event_row["asof_date"]) else None,
             "setup_id": event_row.get("setup_id"),
             "setup_name": event_row.get("setup_name"),
-            "watch_reasons_json": normalize_jsonish(event_row.get("watch_reasons_json")),
+            "watch_reasons_json": normalize_jsonish(event_row.get("watch_reasons_json"), source="event_watch_reasons_json"),
         },
         "market_context": stock_context,
         "broad_market_context": broad_market_context,
@@ -1336,117 +1507,29 @@ def delete_existing_risks(evaluations: pd.DataFrame) -> None:
     if evaluations.empty:
         return
     keys = evaluations[["setup_id", "symbol", "unique_id"]].drop_duplicates().itertuples(index=False, name=None)
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {RISKS_TABLE} (
-                published_on TIMESTAMPTZ,
-                asof_date TIMESTAMPTZ,
-                setup_id TEXT,
-                symbol TEXT,
-                unique_id TEXT,
-                risk_idx BIGINT
-            )
-            """
-        )
-        for setup_id, symbol, unique_id in keys:
-            cur.execute(
-                f"DELETE FROM {RISKS_TABLE} WHERE setup_id = %s AND symbol = %s AND unique_id = %s",
-                (setup_id, symbol, unique_id),
-            )
+    ensure_output_tables()
+
+    def _delete_existing_risks() -> None:
+        with db_session() as (_, cur):
+            for setup_id, symbol, unique_id in keys:
+                cur.execute(
+                    f"DELETE FROM {RISKS_TABLE} WHERE setup_id = %s AND symbol = %s AND unique_id = %s",
+                    (setup_id, symbol, unique_id),
+                )
+
+    execute_db_operation(
+        _delete_existing_risks,
+        operation_name="llm_event_evaluator:delete_existing_risks",
+    )
 
 
 def ensure_output_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
-                published_on TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                evaluated_at TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                unique_id TEXT NOT NULL,
-                event_source TEXT,
-                subject TEXT,
-                filed_under_category TEXT,
-                parse_status TEXT,
-                evaluation_status TEXT,
-                sentiment TEXT,
-                materiality TEXT,
-                setup_effect TEXT,
-                direction TEXT,
-                surprise DOUBLE PRECISION,
-                novelty DOUBLE PRECISION,
-                contradiction DOUBLE PRECISION,
-                expected_decay_days INTEGER,
-                source_reliability TEXT,
-                affected_sectors_json TEXT,
-                affected_peers_json TEXT,
-                governance_risk TEXT,
-                balance_sheet_risk TEXT,
-                execution_risk TEXT,
-                investable_now BOOLEAN,
-                verdict TEXT,
-                event_class TEXT,
-                state_transition_hint TEXT,
-                score_impact DOUBLE PRECISION,
-                confidence DOUBLE PRECISION,
-                what_happened TEXT,
-                rationale TEXT,
-                event_tensor_json TEXT,
-                source_trace_json TEXT,
-                context_snapshot_json TEXT,
-                model_name TEXT,
-                prompt_id TEXT,
-                prompt_version TEXT,
-                prompt_schema_version TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        for column, sql_type in {
-            "prompt_id": "TEXT",
-            "prompt_schema_version": "TEXT",
-        }.items():
-            cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {RISKS_TABLE} (
-                published_on TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                unique_id TEXT NOT NULL,
-                event_source TEXT,
-                risk_idx BIGINT NOT NULL,
-                risk_type TEXT,
-                severity TEXT,
-                title TEXT,
-                detail TEXT,
-                evidence_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id, risk_idx)
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_class TEXT")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS state_transition_hint TEXT")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS score_impact DOUBLE PRECISION")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS direction TEXT")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS surprise DOUBLE PRECISION")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS novelty DOUBLE PRECISION")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS contradiction DOUBLE PRECISION")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS expected_decay_days INTEGER")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS source_reliability TEXT")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_sectors_json TEXT")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_peers_json TEXT")
-        cur.execute(f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_tensor_json TEXT")
-        cur.execute(f"ALTER TABLE {RISKS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT")
+    apply_schema_migration(
+        migration_id=EVENT_EVALUATION_SCHEMA_MIGRATION_ID,
+        description="Create and normalize event evaluation and event risk output tables.",
+        statements=EVENT_EVALUATION_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.llm_event_evaluator", "tables": [EVALUATIONS_TABLE, RISKS_TABLE]},
+    )
 
 
 def persist_outputs(evaluations: pd.DataFrame, risks: pd.DataFrame) -> None:

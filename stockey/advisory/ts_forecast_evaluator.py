@@ -7,14 +7,88 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.ts_forecast_features import TABLE_NAME as FORECAST_TABLE
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 EVALUATIONS_TABLE = "advisory_ts_forecast_evaluations"
 SUMMARY_TABLE = "advisory_ts_forecast_eval_summary"
+TS_FORECAST_EVAL_SCHEMA_MIGRATION_ID = "20260611_advisory_ts_forecast_evaluator_base"
 DEFAULT_COST_BPS = 25.0
+
+
+def _record_ts_forecast_evaluator_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.ts_forecast_evaluator",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
+TS_FORECAST_EVAL_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        symbol TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        forecast_horizon_days BIGINT NOT NULL,
+        action_hint TEXT,
+        forecast_return DOUBLE PRECISION,
+        realized_return DOUBLE PRECISION,
+        cost_adjusted_return DOUBLE PRECISION,
+        forecast_direction BIGINT,
+        realized_direction BIGINT,
+        direction_hit BOOLEAN,
+        positive_realized BOOLEAN,
+        absolute_error DOUBLE PRECISION,
+        squared_error DOUBLE PRECISION,
+        future_date TIMESTAMPTZ,
+        entry_price DOUBLE PRECISION,
+        exit_price DOUBLE PRECISION,
+        evaluation_status TEXT,
+        evaluation_detail TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        from_date TIMESTAMPTZ,
+        to_date TIMESTAMPTZ,
+        model_name TEXT NOT NULL,
+        forecast_horizon_days BIGINT NOT NULL,
+        action_hint TEXT NOT NULL,
+        row_count BIGINT,
+        hit_rate DOUBLE PRECISION,
+        positive_rate DOUBLE PRECISION,
+        avg_realized_return DOUBLE PRECISION,
+        avg_cost_adjusted_return DOUBLE PRECISION,
+        median_cost_adjusted_return DOUBLE PRECISION,
+        avg_absolute_error DOUBLE PRECISION,
+        rmse DOUBLE PRECISION,
+        sharpe_like DOUBLE PRECISION,
+        max_drawdown_proxy DOUBLE PRECISION,
+        config_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (evaluated_at, model_name, forecast_horizon_days, action_hint)
+    )
+    """,
+]
 
 
 def _normalize_timestamp(value: Any | None) -> pd.Timestamp | None:
@@ -52,59 +126,12 @@ def _annualized_sharpe(returns: pd.Series, horizon_days: int) -> float | None:
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                symbol TEXT NOT NULL,
-                model_name TEXT NOT NULL,
-                forecast_horizon_days BIGINT NOT NULL,
-                action_hint TEXT,
-                forecast_return DOUBLE PRECISION,
-                realized_return DOUBLE PRECISION,
-                cost_adjusted_return DOUBLE PRECISION,
-                forecast_direction BIGINT,
-                realized_direction BIGINT,
-                direction_hit BOOLEAN,
-                positive_realized BOOLEAN,
-                absolute_error DOUBLE PRECISION,
-                squared_error DOUBLE PRECISION,
-                future_date TIMESTAMPTZ,
-                entry_price DOUBLE PRECISION,
-                exit_price DOUBLE PRECISION,
-                evaluation_status TEXT,
-                evaluation_detail TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                from_date TIMESTAMPTZ,
-                to_date TIMESTAMPTZ,
-                model_name TEXT NOT NULL,
-                forecast_horizon_days BIGINT NOT NULL,
-                action_hint TEXT NOT NULL,
-                row_count BIGINT,
-                hit_rate DOUBLE PRECISION,
-                positive_rate DOUBLE PRECISION,
-                avg_realized_return DOUBLE PRECISION,
-                avg_cost_adjusted_return DOUBLE PRECISION,
-                median_cost_adjusted_return DOUBLE PRECISION,
-                avg_absolute_error DOUBLE PRECISION,
-                rmse DOUBLE PRECISION,
-                sharpe_like DOUBLE PRECISION,
-                max_drawdown_proxy DOUBLE PRECISION,
-                config_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (evaluated_at, model_name, forecast_horizon_days, action_hint)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=TS_FORECAST_EVAL_SCHEMA_MIGRATION_ID,
+        description="Create TS forecast evaluation and summary tables.",
+        statements=TS_FORECAST_EVAL_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.ts_forecast_evaluator", "tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
+    )
 
 
 def load_forecasts(
@@ -128,24 +155,39 @@ def load_forecasts(
     if model_names:
         clauses.append("model_name = ANY(%s)")
         params.append([str(value).strip().lower() for value in model_names if str(value).strip()])
-    df = sql_to_df(
-        f"""
-        SELECT
-            asof_date,
-            symbol,
-            model_name,
-            forecast_horizon_days,
-            action_hint,
-            forecast_return,
-            forecast_price,
-            probability_positive,
-            signal_quality
-        FROM {FORECAST_TABLE}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY asof_date, model_name, forecast_horizon_days, symbol
-        """,
-        params=tuple(params) if params else None,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date,
+                symbol,
+                model_name,
+                forecast_horizon_days,
+                action_hint,
+                forecast_return,
+                forecast_price,
+                probability_positive,
+                signal_quality
+            FROM {FORECAST_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY asof_date, model_name, forecast_horizon_days, symbol
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception as exc:
+        _record_ts_forecast_evaluator_fallback(
+            fallback_type="ts_forecast_evaluator_forecast_load_failed",
+            source=FORECAST_TABLE,
+            reason="TS forecast evaluator could not load forecast rows for evaluation.",
+            error=exc,
+            metadata={
+                "from_date": str(from_date) if from_date is not None else None,
+                "to_date": str(to_date) if to_date is not None else None,
+                "symbol_count": len(symbols or []),
+                "model_count": len(model_names or []),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["asof_date"] = pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dt.normalize()
@@ -164,19 +206,34 @@ def load_price_window(
 ) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
-    df = sql_to_df(
-        """
-        SELECT ticker AS symbol, date, close
-        FROM dhan_ohlcv_daily
-        WHERE ticker = ANY(%s)
-          AND asset_type = 'stock'
-          AND exchange = 'NSE'
-          AND date >= %s
-          AND date <= %s
-        ORDER BY ticker, date
-        """,
-        params=(_as_symbol_list(symbols), start_date, end_date),
-    )
+    normalized_symbols = _as_symbol_list(symbols)
+    try:
+        df = sql_to_df(
+            """
+            SELECT ticker AS symbol, date, close
+            FROM dhan_ohlcv_daily
+            WHERE ticker = ANY(%s)
+              AND asset_type = 'stock'
+              AND exchange = 'NSE'
+              AND date >= %s
+              AND date <= %s
+            ORDER BY ticker, date
+            """,
+            params=(normalized_symbols, start_date, end_date),
+        )
+    except Exception as exc:
+        _record_ts_forecast_evaluator_fallback(
+            fallback_type="ts_forecast_evaluator_price_window_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="TS forecast evaluator could not load future Dhan OHLCV prices.",
+            error=exc,
+            metadata={
+                "symbol_count": len(normalized_symbols),
+                "from_date": str(start_date),
+                "to_date": str(end_date),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()

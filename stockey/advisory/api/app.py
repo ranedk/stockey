@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -17,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from advisory.action_recommender import TABLE_NAME as ACTION_RECOMMENDATIONS_TABLE
 from advisory.company_memory_review import TABLE_NAME as COMPANY_MEMORY_REVIEWS_TABLE
-from advisory.config_change_assistant import build_signal_quality_overlay_preview, build_technical_threshold_preview, load_previews as load_config_change_previews
+from advisory.config_change_assistant import build_event_policy_review_rule_preview, build_signal_quality_overlay_preview, build_technical_threshold_preview, build_ts_forecast_review_rule_preview, load_application_decisions, load_previews as load_config_change_previews, record_application_decision
 from advisory.cron_status import build_cron_status
 from advisory.current_prices import load_current_prices
 from advisory.decision_trace import ensure_trace_tables, load_event_trace, load_symbol_trace
@@ -29,7 +30,11 @@ from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audit
 from advisory.identity_issues import IDENTITY_ISSUES_TABLE, load_open_identity_issues, resolve_open_identity_issues
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
 from advisory.event_policy_evaluator import SUMMARY_TABLE as EVENT_POLICY_EVAL_SUMMARY_TABLE
+from advisory.event_policy_promotion import generate_promotion_review as generate_event_policy_promotion_review
+from advisory.event_policy_promotion import load_promotion_reviews as load_event_policy_promotion_reviews
+from advisory.event_policy_promotion import record_manual_decision as record_event_policy_manual_decision
 from advisory.execution_engine import EXECUTION_TABLE
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.live_dashboard import DEFAULT_OUTPUT_DIR, build_live_dashboard_payload
 from advisory.market_context import load_latest_market_context
 from advisory.manual_review_state import (
@@ -37,7 +42,9 @@ from advisory.manual_review_state import (
     MANUAL_REVIEW_DECISIONS_TABLE,
     apply_decision_side_effects,
     build_decision_row,
+    decision_effect_payload,
     runtime_state_for_decision,
+    runtime_state_payload,
     validate_decision,
 )
 from advisory.operator_health import build_operator_health
@@ -47,6 +54,8 @@ from advisory.operator_snapshot import load_operator_snapshot_sections
 from advisory.performance_slowlog import record_slow_operation
 from advisory.performance_slowlog import update_slow_issue_status
 from advisory.prompt_registry import build_prompt_registry_payload
+from advisory.portfolio_engine import PORTFOLIO_TABLE
+from advisory.screener_coverage import build_screener_coverage_payload
 from advisory.signal_refresh import TABLE_NAME as SIGNAL_REFRESH_TABLE
 from advisory.signal_quality_evaluator import EVALUATIONS_TABLE as SIGNAL_QUALITY_EVALUATIONS_TABLE
 from advisory.signal_quality_evaluator import SUMMARY_TABLE as SIGNAL_QUALITY_SUMMARY_TABLE
@@ -54,13 +63,33 @@ from advisory.signal_quality_promotion import generate_promotion_review as gener
 from advisory.signal_quality_promotion import load_promotion_reviews as load_signal_quality_promotion_reviews
 from advisory.signal_quality_promotion import record_manual_decision as record_signal_quality_manual_decision
 from advisory.operator_smoke import build_operator_smoke
+from advisory.position_lifecycle import POLICY_CHANGES_TABLE as LIFECYCLE_POLICY_CHANGES_TABLE
+from advisory.setup_registry import load_ts_forecast_review_rules
+from advisory.superseded_failures import cleanup_superseded_failures
 from advisory.technical_threshold_calibration import EVALUATIONS_TABLE as TECHNICAL_CALIBRATION_EVALUATIONS_TABLE
 from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_CALIBRATION_SUMMARY_TABLE
 from advisory.technical_threshold_promotion import generate_promotion_review, load_promotion_reviews, record_manual_decision
 from advisory.trace_summary_store import DEFAULT_LIMIT as TRACE_SUMMARY_DEFAULT_LIMIT
 from advisory.trace_summary_store import load_summary as load_materialized_trace_summary
+from advisory.ts_forecast_promotion_check import build_promotion_check as build_ts_forecast_promotion_check
+from advisory.ts_forecast_promotion_check import DEFAULT_MAX_EXIT_CONFLICT_RATE as TS_PROMOTION_DEFAULT_MAX_EXIT_CONFLICT_RATE
+from advisory.ts_forecast_promotion_check import DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN as TS_PROMOTION_DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN
+from advisory.ts_forecast_promotion_check import DEFAULT_MIN_DISTINCT_DATES as TS_PROMOTION_DEFAULT_MIN_DISTINCT_DATES
+from advisory.ts_forecast_promotion_check import DEFAULT_MIN_EVALUATED_TRADES as TS_PROMOTION_DEFAULT_MIN_EVALUATED_TRADES
+from advisory.ts_forecast_promotion_check import DEFAULT_MIN_LIFT_VS_MOMENTUM as TS_PROMOTION_DEFAULT_MIN_LIFT_VS_MOMENTUM
+from advisory.ts_forecast_promotion_check import DEFAULT_MIN_SYMBOLS as TS_PROMOTION_DEFAULT_MIN_SYMBOLS
+from advisory.ts_forecast_promotion_check import DEFAULT_MIN_WIN_RATE as TS_PROMOTION_DEFAULT_MIN_WIN_RATE
+from advisory.ts_forecast_promotion import generate_promotion_review as generate_ts_forecast_promotion_review
+from advisory.ts_forecast_promotion import load_promotion_reviews as load_ts_forecast_promotion_reviews
+from advisory.ts_forecast_promotion import record_manual_decision as record_ts_forecast_manual_decision
 from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, WAIT_SIGNALS_TABLE, load_wait_signal_matches, load_wait_signals, match_wait_signals
-from utils.db import db_session, sql_to_df, upsert_to_db
+from data.screenerin.ad_hoc_query import build_raw_screen_url, companies_preview, fetch_ad_hoc_payload, slugify as screener_slugify
+from data.screenerin.query_validation import validate_screener_query
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.ingestion_state import get_state_entries as get_ingestion_state_entries
+from utils.ingestion_state import summarize_state_entries as summarize_ingestion_state_entries
+from utils.redaction import redact_mapping, redact_text
+from utils.schema_migrations import apply_schema_migration
 
 
 env = Env()
@@ -72,19 +101,103 @@ OPERATOR_API_SLOW_REQUEST_MS = env.float("OPERATOR_API_SLOW_REQUEST_MS", 750.0)
 OPERATOR_API_PAYLOAD_CACHE_SECONDS = env.float("OPERATOR_API_PAYLOAD_CACHE_SECONDS", 15.0)
 OPERATOR_API_LARGE_RESPONSE_BYTES = env.int("OPERATOR_API_LARGE_RESPONSE_BYTES", 250_000)
 OPERATOR_API_TRACE_SUMMARY_CACHE_ENABLED = env.bool("OPERATOR_API_TRACE_SUMMARY_CACHE_ENABLED", True)
+OPERATOR_HEALTH_COMPACT_LIST_LIMIT = env.int("OPERATOR_HEALTH_COMPACT_LIST_LIMIT", 25)
+OPERATOR_HEALTH_COMPACT_STRING_CHARS = env.int("OPERATOR_HEALTH_COMPACT_STRING_CHARS", 2_000)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CRON_LOG_DIR = env.path("OPERATOR_CRON_LOG_DIR", REPO_ROOT / "logs" / "cron")
 OPERATOR_COMMAND_RUNS_TABLE = "advisory_operator_command_runs"
 OPERATOR_COMMAND_TIMEOUT_SECONDS = env.int("OPERATOR_COMMAND_TIMEOUT_SECONDS", 180)
 OPERATOR_COMMAND_OUTPUT_TAIL_CHARS = env.int("OPERATOR_COMMAND_OUTPUT_TAIL_CHARS", 12_000)
 OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
+OPERATOR_API_AUDIT_SCHEMA_MIGRATION_ID = "20260611_advisory_operator_api_audit_base"
 OPERATOR_API_ERROR_TRACE_CHARS = env.int("OPERATOR_API_ERROR_TRACE_CHARS", 4_000)
 SLOW_ISSUE_ALLOWED_STATUSES = {"open", "triaged", "fixed", "ignored"}
 OPERATOR_API_STALE_CODE_GRACE_SECONDS = env.float("OPERATOR_API_STALE_CODE_GRACE_SECONDS", 2.0)
 PROCESS_STARTED_AT = time.time()
 OPERATOR_API_SCHEMA_VERSION = "2026-06-07.v1"
+OPERATOR_API_AUDIT_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {OPERATOR_API_ERRORS_TABLE} (
+        error_id TEXT NOT NULL,
+        occurred_at TIMESTAMPTZ NOT NULL,
+        route TEXT,
+        operation TEXT,
+        status_code BIGINT,
+        error_type TEXT,
+        error_message TEXT,
+        traceback_tail TEXT,
+        request_context_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (error_id)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {OPERATOR_COMMAND_RUNS_TABLE} (
+        run_id TEXT NOT NULL,
+        command_key TEXT NOT NULL,
+        command_label TEXT,
+        command_args_json TEXT,
+        risk TEXT,
+        dry_run BOOLEAN,
+        status TEXT NOT NULL,
+        returncode BIGINT,
+        operator_id TEXT,
+        requested_reason TEXT,
+        started_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ,
+        elapsed_ms DOUBLE PRECISION,
+        stdout_tail TEXT,
+        stderr_tail TEXT,
+        error TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (run_id)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {MANUAL_REVIEW_DECISIONS_TABLE} (
+        decided_at TIMESTAMPTZ NOT NULL,
+        item_id TEXT NOT NULL,
+        item_type TEXT,
+        source_table TEXT,
+        source_key TEXT,
+        symbol TEXT,
+        unique_id TEXT,
+        setup_id TEXT,
+        decision TEXT NOT NULL,
+        operator_id TEXT,
+        rationale TEXT,
+        follow_up_event TEXT,
+        note_json TEXT,
+        item_snapshot_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (item_id, decided_at)
+    )
+    """,
+]
 
 _PAYLOAD_CACHE: dict[tuple[str, str | None], tuple[float, dict[str, Any]]] = {}
+
+
+def _record_operator_local_fallback(
+    *,
+    source: str,
+    fallback_type: str,
+    reason: str,
+    error: Exception | str,
+    severity: str = "warn",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.api.app",
+        source=source,
+        fallback_type=fallback_type,
+        severity=severity,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 DISPLAY_REASON_CODE_LABELS = {
     "blocked_by_adversarial_review": "Blocked by adversarial review",
     "positive_action_blocked_by_market_context": "Positive action blocked by market context",
@@ -181,6 +294,7 @@ class OperatorHomeResponse(OperatorApiResponseModel):
     sync_state: list[dict[str, Any]] = Field(default_factory=list)
     top_action_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     today_recommendations: list[dict[str, Any]] = Field(default_factory=list)
+    ts_forecast_paper_summary: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class OperatorSummaryResponse(OperatorApiResponseModel):
@@ -221,6 +335,7 @@ class OperatorWatchlistResponse(OperatorApiResponseModel):
     ts_watch_recommendations: list[dict[str, Any]] = Field(default_factory=list)
     ts_forecast_watch: list[dict[str, Any]] = Field(default_factory=list)
     ts_forecast_eval_summary: list[dict[str, Any]] = Field(default_factory=list)
+    ts_forecast_paper_summary: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class OperatorMarketContextResponse(OperatorApiResponseModel):
@@ -250,6 +365,17 @@ class SignalRefreshResponse(OperatorApiResponseModel):
     status: str
     signals: list[dict[str, Any]] = Field(default_factory=list)
     meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperatorJourneyResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    filters: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    stages: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
+    timeline: list[dict[str, Any]] = Field(default_factory=list)
+    skipped_sources: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class OperatorHealthDetailsResponse(OperatorApiResponseModel):
@@ -331,12 +457,35 @@ class OperationsApiErrorsResponse(OperatorApiResponseModel):
     summary: dict[str, Any] = Field(default_factory=dict)
 
 
+class OperationsIngestionStateResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    filters: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperationsSupersededCleanupResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    mode: str
+    dry_run: bool = True
+    result: dict[str, Any] = Field(default_factory=dict)
+    counts: dict[str, Any] = Field(default_factory=dict)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
+    audit_run: dict[str, Any] | None = None
+    note: str | None = None
+
+
 class EventModelPromotionCheckResponse(OperatorApiResponseModel):
     generated_at: str | None = None
     api_schema: OperatorApiSchemaModel
     status: str
     decision: str | None = None
     ready_for_operator_review: bool | None = None
+    scorecard: dict[str, Any] = Field(default_factory=dict)
     promotion_mode: str | None = None
     artifact: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] | None = None
@@ -346,6 +495,29 @@ class EventModelPromotionCheckResponse(OperatorApiResponseModel):
     gates: list[dict[str, Any]] = Field(default_factory=list)
     failed_gates: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+class TsForecastPromotionCheckResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    decision: str | None = None
+    ready_for_operator_review: bool | None = None
+    promotion_mode: str | None = None
+    scorecard: dict[str, Any] = Field(default_factory=dict)
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    notes: list[str] = Field(default_factory=list)
+
+
+class TsForecastReviewRulesResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    config_path: str | None = None
+    rules: list[dict[str, Any]] = Field(default_factory=list)
+    issues: list[dict[str, Any]] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
 
 
 class EventModelArtifactsResponse(OperatorApiResponseModel):
@@ -398,6 +570,8 @@ class ManualReviewDecisionResponse(OperatorApiResponseModel):
     next_state: str | None = None
     creates_wait_signal: bool | None = None
     wait_signal: dict[str, Any] | None = None
+    manual_review_state: dict[str, Any] | None = None
+    decision_effect: dict[str, Any] | None = None
     note: str | None = None
 
 
@@ -456,6 +630,8 @@ class OperatorDetailResponse(OperatorApiResponseModel):
     filters: dict[str, Any] = Field(default_factory=dict)
     rows: list[dict[str, Any]] = Field(default_factory=list)
     row_count: int
+    policy_changes: list[dict[str, Any]] = Field(default_factory=list)
+    policy_change_count: int = 0
 
 
 class EventDetailResponse(OperatorDetailResponse):
@@ -520,12 +696,96 @@ class SignalQualityPromotionReviewsResponse(OperatorApiResponseModel):
     pagination: dict[str, Any] = Field(default_factory=dict)
 
 
+class EventPolicyPromotionReviewsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    reviews: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
+
+
+class TsForecastPromotionReviewsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    reviews: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
+
+
+class PromotionReviewResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel | None = None
+    status: str
+    reviewed_at: str | None = None
+    review_status: str | None = None
+    review_error: str | None = None
+    recommendation: str | None = None
+    confidence: float | None = None
+    pending_patch: dict[str, Any] = Field(default_factory=dict)
+    llm_review: dict[str, Any] = Field(default_factory=dict)
+    applied: bool = False
+
+
+class PromotionDecisionResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel | None = None
+    status: str
+    decided_at: str | None = None
+    reviewed_at: str | None = None
+    decision: str | None = None
+    final_patch: dict[str, Any] = Field(default_factory=dict)
+    review: dict[str, Any] = Field(default_factory=dict)
+    applied: bool = False
+    note: str | None = None
+
+
 class ConfigChangePreviewsResponse(OperatorApiResponseModel):
     generated_at: str | None = None
     api_schema: OperatorApiSchemaModel
     status: str
     previews: list[dict[str, Any]] = Field(default_factory=list)
     pagination: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConfigChangePreviewResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    preview_id: str | None = None
+    source_type: str | None = None
+    source_key: str | None = None
+    config_path: str | None = None
+    review_status: str | None = None
+    decision_status: str | None = None
+    patch_payload: dict[str, Any] = Field(default_factory=dict)
+    unified_diff: str | None = None
+    rollback_note: str | None = None
+    safety_checks: list[Any] = Field(default_factory=list)
+    decision: dict[str, Any] = Field(default_factory=dict)
+    applied: bool = False
+
+
+class ConfigChangeApplicationsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    applications: list[dict[str, Any]] = Field(default_factory=list)
+    pagination: dict[str, Any] = Field(default_factory=dict)
+
+
+class ConfigChangeApplicationResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    application_id: str | None = None
+    preview_id: str | None = None
+    application_decision: str | None = None
+    verification_status: str | None = None
+    verification: dict[str, Any] = Field(default_factory=dict)
+    safety_checks: list[Any] = Field(default_factory=list)
+    applied_by_system: bool = False
+    applied: bool = False
+    note: str | None = None
 
 
 class PromptRegistryResponse(OperatorApiResponseModel):
@@ -536,6 +796,34 @@ class PromptRegistryResponse(OperatorApiResponseModel):
     summary: dict[str, Any] = Field(default_factory=dict)
     notes: list[str] = Field(default_factory=list)
     pagination: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScreenerPreviewResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    query_name: str | None = None
+    query_slug: str | None = None
+    query_hash: str | None = None
+    screener_url: str | None = None
+    validation_issues: list[dict[str, Any]] = Field(default_factory=list)
+    row_count: int = 0
+    rows: list[dict[str, Any]] = Field(default_factory=list)
+    headers: list[Any] = Field(default_factory=list)
+    meta: dict[str, Any] = Field(default_factory=dict)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScreenerCoverageResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    asof_date: str | None = None
+    lookback_days: int | None = None
+    window: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    screeners: list[dict[str, Any]] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
 
 
 class EventPolicyResponse(OperatorApiResponseModel):
@@ -594,13 +882,13 @@ EVENT_CLASS_LABELS = {
 }
 
 
-def _operator_api_schema(endpoint: str, *, schema_name: str, version: str = OPERATOR_API_SCHEMA_VERSION) -> dict[str, Any]:
+def _operator_api_schema(endpoint: str, *, schema_name: str, version: str = OPERATOR_API_SCHEMA_VERSION, read_only: bool = True) -> dict[str, Any]:
     return {
         "name": schema_name,
         "version": version,
         "endpoint": endpoint,
         "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "read_only": True,
+        "read_only": bool(read_only),
         "broker_execution_enabled": False,
     }
 
@@ -858,7 +1146,16 @@ def _git_output(args: list[str]) -> str | None:
             text=True,
             timeout=1.5,
         ).strip()
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.api.app",
+            fallback_type="operator_api_runtime_git_metadata_unavailable",
+            source="operator_runtime",
+            severity="warn",
+            reason="Operator API runtime metadata could not read git state; stale-code and version display may be incomplete.",
+            error=exc,
+            metadata={"git_args": list(args)},
+        )
         return None
 
 
@@ -885,13 +1182,31 @@ def _latest_source_mtime(root: Path = REPO_ROOT) -> tuple[float | None, str | No
                 continue
             try:
                 mtime = path.stat().st_mtime
-            except OSError:
+            except OSError as exc:
+                record_local_fallback_event(
+                    module="advisory.api.app",
+                    fallback_type="operator_api_runtime_source_mtime_unavailable",
+                    source="operator_runtime",
+                    severity="warn",
+                    reason="Operator API runtime metadata could not stat a source file; stale-code detection may be incomplete.",
+                    error=exc,
+                    metadata={"path": str(path)},
+                )
                 continue
             if latest_mtime is None or mtime > latest_mtime:
                 latest_mtime = mtime
                 try:
                     latest_path = str(path.relative_to(root))
-                except ValueError:
+                except ValueError as exc:
+                    record_local_fallback_event(
+                        module="advisory.api.app",
+                        fallback_type="operator_api_runtime_source_path_relative_failed",
+                        source="operator_runtime",
+                        severity="warn",
+                        reason="Operator API runtime metadata could not compute a repository-relative source path.",
+                        error=exc,
+                        metadata={"path": str(path), "root": str(root)},
+                    )
                     latest_path = str(path)
     return latest_mtime, latest_path
 
@@ -1148,6 +1463,8 @@ def _compact_home_field(key: str, value: Any) -> Any:
         return _compact_company_memory_review(value)
     if key == "manual_revision_pointers":
         return _trim_home_value(value, max_text=220, max_list=3, max_depth=2)
+    if key == "feature_gate_effects":
+        return _trim_home_value(value, max_text=360, max_list=5, max_depth=5)
     if key in {"reason", "reason_detail", "action_reason"}:
         return _compact_reason_value(key, value, max_text=360, max_list=3, max_depth=2)
     if key in {"announcement_summary", "news_summary", "exit_strategy", "manual_revision_summary"}:
@@ -1214,7 +1531,15 @@ def _load_latest_company_memory_reviews(symbols: list[str]) -> dict[str, dict[st
     try:
         if not _table_exists(COMPANY_MEMORY_REVIEWS_TABLE):
             return {}
-    except Exception:
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source=COMPANY_MEMORY_REVIEWS_TABLE,
+            fallback_type="operator_api_company_memory_table_lookup_failed",
+            severity="warn",
+            reason="Operator API could not check company-memory review table availability and skipped memory-review enrichment.",
+            error=exc,
+            metadata={"symbol_count": len(normalized)},
+        )
         return {}
     try:
         df = sql_to_df(
@@ -1245,7 +1570,15 @@ def _load_latest_company_memory_reviews(symbols: list[str]) -> dict[str, dict[st
             retries=2,
             statement_timeout_ms=10000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source=COMPANY_MEMORY_REVIEWS_TABLE,
+            fallback_type="operator_api_company_memory_reviews_load_failed",
+            severity="warn",
+            reason="Operator API could not load latest company-memory reviews and returned rows without memory-review enrichment.",
+            error=exc,
+            metadata={"symbol_count": len(normalized)},
+        )
         return {}
     out: dict[str, dict[str, Any]] = {}
     if df.empty:
@@ -1299,6 +1632,163 @@ def _with_company_memory_reviews(rows: list[dict[str, Any]], *, reviews: dict[st
     return out
 
 
+def _feature_freshness_summary_from_contract(contract: Any) -> dict[str, Any] | None:
+    payload = _jsonish(contract)
+    if not isinstance(payload, dict) or not payload:
+        return None
+    blockers = payload.get("blockers") if isinstance(payload.get("blockers"), list) else []
+    inputs = payload.get("inputs") if isinstance(payload.get("inputs"), list) else []
+    required_inputs = [
+        {
+            "input_key": row.get("input_key"),
+            "label": row.get("label"),
+            "status": row.get("status"),
+            "reason": row.get("reason"),
+            "latest_at": row.get("latest_at"),
+            "age_days": row.get("age_days"),
+            "required": True,
+        }
+        for row in inputs
+        if isinstance(row, dict) and row.get("required")
+    ]
+    return {
+        "symbol": payload.get("symbol"),
+        "status": payload.get("status") or ("blocked" if blockers else "unknown"),
+        "counts": payload.get("counts") if isinstance(payload.get("counts"), dict) else {},
+        "blockers": blockers,
+        "required_inputs": required_inputs,
+        "asof_date": payload.get("asof_date"),
+        "captured_at": payload.get("captured_at"),
+        "source": "decision_time_snapshot",
+    }
+
+
+def _attach_feature_freshness_summaries(rows: list[dict[str, Any]], *, live_summaries: dict[str, dict[str, Any]] | None = None) -> None:
+    live_summaries = live_summaries or {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        persisted = _feature_freshness_summary_from_contract(row.get("feature_freshness"))
+        if persisted:
+            row["feature_freshness_summary"] = persisted
+            continue
+        symbol_key = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
+        if symbol_key and symbol_key in live_summaries:
+            row["feature_freshness_summary"] = {**live_summaries[symbol_key], "source": "current_live_check"}
+
+
+FEATURE_GATE_EFFECT_LABELS = {
+    "rules": "Rules gate",
+    "risk": "Risk gate",
+    "portfolio": "Portfolio gate",
+    "lifecycle": "Lifecycle gate",
+    "actions": "Final action gate",
+}
+
+
+FEATURE_GATE_EFFECT_SUMMARIES = {
+    "rules": "Immediate PASS_NOW candidate was kept on watch until required inputs refresh.",
+    "risk": "Automatic allocation was moved to manual review and suggested allocation was zeroed.",
+    "portfolio": "Approved or trimmed capital was deferred until required inputs refresh.",
+    "lifecycle": "Lifecycle output was preserved, but price confidence warning was attached.",
+    "actions": "Positive broker-capable action was downgraded to Manual Review with no broker execution.",
+}
+
+
+def _normalise_blocked_feature_inputs(value: Any) -> list[dict[str, Any]]:
+    rows = value if isinstance(value, list) else []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            input_key = _text(row.get("input_key")) or _text(row.get("key")) or _text(row.get("name"))
+            label = _text(row.get("label")) or input_key
+            status = _text(row.get("status"))
+            reason = _text(row.get("reason"))
+            if input_key or label:
+                out.append({key: item for key, item in {"input_key": input_key, "label": label, "status": status, "reason": reason}.items() if item not in (None, "")})
+        else:
+            text = _text(row)
+            if text:
+                out.append({"input_key": text, "label": text})
+    return out
+
+
+def _feature_gate_contexts_from_row(row: dict[str, Any]) -> list[dict[str, Any]]:
+    contexts: list[dict[str, Any]] = []
+    for key in ["raw_context_json", "raw_context", "context_snapshot_json", "context_snapshot"]:
+        value = _jsonish(row.get(key))
+        if isinstance(value, dict) and value:
+            contexts.append(value)
+    reason = _jsonish(row.get("recommendation_reason"))
+    if isinstance(reason, dict):
+        evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
+        freshness = evidence.get("feature_freshness") if isinstance(evidence.get("feature_freshness"), dict) else {}
+        if freshness:
+            contexts.append(freshness)
+    return contexts
+
+
+def _build_feature_gate_effects(row: dict[str, Any]) -> list[dict[str, Any]]:
+    effects: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    contexts = _feature_gate_contexts_from_row(row)
+    for context in contexts:
+        gate = _text(context.get("feature_freshness_gate"))
+        if not gate:
+            continue
+        stage = (_text(context.get("feature_freshness_stage")) or ("actions" if gate == "blocked_positive_broker_action" else "")).lower()
+        stage = stage if stage in FEATURE_GATE_EFFECT_LABELS else "actions"
+        blockers = _normalise_blocked_feature_inputs(context.get("feature_freshness_blockers") or context.get("feature_freshness_blocked_inputs"))
+        key = (stage, gate, _text(context.get("blocked_original_action_code")) or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        effects.append(
+            {
+                "stage": stage,
+                "label": FEATURE_GATE_EFFECT_LABELS.get(stage, "Feature gate"),
+                "gate": gate,
+                "status": _text(context.get("feature_freshness_status")) or "blocked",
+                "gate_effect": _text(context.get("feature_freshness_gate_effect")) or None,
+                "summary": FEATURE_GATE_EFFECT_SUMMARIES.get(stage, "Required feature inputs were blocked for this stage."),
+                "blocked_inputs": blockers,
+                "original_action": _text(context.get("blocked_original_action_code") or context.get("blocked_original_action")),
+                "broker_execution_allowed": _boolish(context.get("broker_execution_allowed")),
+                "source": "decision_context",
+            }
+        )
+    if effects:
+        return effects
+    freshness_summary = _feature_freshness_summary_from_contract(row.get("feature_freshness")) or _jsonish(row.get("feature_freshness_summary"))
+    action = _text(row.get("action_code") or row.get("action") or row.get("next_action")).upper()
+    if isinstance(freshness_summary, dict) and str(freshness_summary.get("status") or "").lower() == "blocked" and action in {"MANUAL_REVIEW", "REVIEW"}:
+        blockers = _normalise_blocked_feature_inputs(freshness_summary.get("blockers"))
+        if blockers:
+            effects.append(
+                {
+                    "stage": "actions",
+                    "label": FEATURE_GATE_EFFECT_LABELS["actions"],
+                    "gate": "blocked_positive_broker_action",
+                    "status": "blocked",
+                    "summary": FEATURE_GATE_EFFECT_SUMMARIES["actions"],
+                    "blocked_inputs": blockers,
+                    "original_action": None,
+                    "broker_execution_allowed": False,
+                    "source": freshness_summary.get("source") or "feature_freshness_summary",
+                }
+            )
+    return effects
+
+
+def _attach_feature_gate_effects(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        effects = _build_feature_gate_effects(row)
+        if effects:
+            row["feature_gate_effects"] = effects
+
+
 def build_home_payload(*, asof_date: str | None = None) -> dict[str, Any]:
     payload = load_operator_payload(asof_date=asof_date)
     return {
@@ -1313,6 +1803,7 @@ def build_home_payload(*, asof_date: str | None = None) -> dict[str, Any]:
         "sync_state": payload.get("sync_state") or [],
         "top_action_recommendations": _compact_home_rows(payload.get("top_action_recommendations"), limit=25),
         "today_recommendations": _compact_home_rows(payload.get("today_recommendations"), limit=25),
+        "ts_forecast_paper_summary": (payload.get("ts_forecast_paper_summary") or [])[:10],
     }
 
 
@@ -1359,28 +1850,35 @@ def build_actions_payload(
         reviews=memory_reviews,
     )
     if include_feature_freshness:
-        feature_summaries = build_required_feature_freshness_summaries(
-            [
-                str(row.get("symbol") or row.get("ticker") or "")
-                for row in [*top_action_page, *action_page]
-                if isinstance(row, dict)
-            ],
-            asof_date=asof_date or payload.get("asof_date"),
+        rows_for_freshness = [*top_action_page, *action_page]
+        needs_live = [
+            str(row.get("symbol") or row.get("ticker") or "")
+            for row in rows_for_freshness
+            if isinstance(row, dict) and not _feature_freshness_summary_from_contract(row.get("feature_freshness"))
+        ]
+        live_summaries = (
+            build_required_feature_freshness_summaries(
+                needs_live,
+                asof_date=asof_date or payload.get("asof_date"),
+            )
+            if needs_live
+            else {}
         )
-        for row in [*top_action_page, *action_page]:
-            symbol_key = str(row.get("symbol") or row.get("ticker") or "").strip().upper()
-            if symbol_key and symbol_key in feature_summaries:
-                row["feature_freshness_summary"] = feature_summaries[symbol_key]
+        _attach_feature_freshness_summaries(rows_for_freshness, live_summaries=live_summaries)
+        _attach_feature_gate_effects(rows_for_freshness)
     alert_page = _with_latest_prices(alert_raw, price_field="last_price", prices=latest_prices)
+    top_action_response = _compact_list_rows(top_action_page, compact=compact)
+    action_response = _compact_list_rows(action_page, compact=compact)
+    alert_response = _compact_list_rows(alert_page, compact=compact)
     return {
         "generated_at": payload.get("generated_at"),
         "api_schema": _operator_api_schema("/api/actions", schema_name="operator_actions"),
         "asof_date": payload.get("asof_date"),
         "snapshot": _snapshot_payload(payload),
         "snapshot_warning": _snapshot_warning_payload(payload),
-        "top_action_recommendations": _compact_list_rows(top_action_page, compact=compact),
-        "action_recommendations": _compact_list_rows(action_page, compact=compact),
-        "alerts": _compact_list_rows(alert_page, compact=compact),
+        "top_action_recommendations": top_action_response,
+        "action_recommendations": action_response,
+        "alerts": alert_response,
         "pagination": {
             "primary": "action_recommendations",
             "top_action_recommendations": top_action_pagination,
@@ -1388,9 +1886,9 @@ def build_actions_payload(
             "alerts": alert_pagination,
         },
         "meta": {
-            "top_action_recommendations": {"total": len(top_actions), "returned": top_action_pagination["returned_count"]},
-            "action_recommendations": action_meta,
-            "alerts": {"total": len(alert_rows), "returned": alert_pagination["returned_count"]},
+            "top_action_recommendations": {"total": len(top_actions), "returned": top_action_pagination["returned_count"], **_payload_size_meta(top_action_response)},
+            "action_recommendations": {**action_meta, **_payload_size_meta(action_response)},
+            "alerts": {"total": len(alert_rows), "returned": alert_pagination["returned_count"], **_payload_size_meta(alert_response)},
             "filters": {"symbol": symbol, "action": action, "status": status, "search": search, "compact": compact, "include_feature_freshness": include_feature_freshness},
         },
     }
@@ -1462,16 +1960,17 @@ def _normalize_action_pair_condition(value: Any) -> dict[str, str]:
             raise ValueError("condition_json must be valid JSON") from exc
     if not isinstance(condition, dict):
         raise ValueError("condition_json must be an object")
-    condition_type = str(condition.get("condition_type") or "action_pair_exact").strip()
-    if condition_type != "action_pair_exact":
-        raise ValueError("only action_pair_exact conflict rule conditions are supported")
+    condition_type = str(condition.get("condition_type") or "action_pair_exact").strip().lower()
+    if condition_type not in {"action_pair", "action_pair_exact"}:
+        raise ValueError("only action_pair and action_pair_exact conflict rule conditions are supported")
     out = {
-        "condition_type": "action_pair_exact",
+        "condition_type": condition_type,
         "winning_action_code": str(condition.get("winning_action_code") or "").strip().upper(),
         "losing_action_code": str(condition.get("losing_action_code") or "").strip().upper(),
-        "winning_source": str(condition.get("winning_source") or "").strip().lower(),
-        "losing_source": str(condition.get("losing_source") or "").strip().lower(),
     }
+    if condition_type == "action_pair_exact":
+        out["winning_source"] = str(condition.get("winning_source") or "").strip().lower()
+        out["losing_source"] = str(condition.get("losing_source") or "").strip().lower()
     if not out["winning_action_code"] or not out["losing_action_code"]:
         raise ValueError("condition_json requires winning_action_code and losing_action_code")
     return out
@@ -1483,15 +1982,16 @@ def promote_action_conflict_rule_payload(payload: dict[str, Any]) -> dict[str, A
     conflict = payload.get("conflict")
     if not isinstance(conflict, dict):
         raise ValueError("conflict must be an object")
-    condition = _normalize_action_pair_condition(
-        {
+    condition_payload = payload.get("condition_json", payload.get("condition"))
+    if condition_payload is None:
+        condition_payload = {
             "condition_type": "action_pair_exact",
             "winning_action_code": conflict.get("winning_action_code"),
             "losing_action_code": conflict.get("losing_action_code"),
             "winning_source": conflict.get("winning_source"),
             "losing_source": conflict.get("losing_source"),
         }
-    )
+    condition = _normalize_action_pair_condition(condition_payload)
     reason = str(payload.get("resolution_reason") or conflict.get("resolution_reason") or conflict.get("lost_reason") or "").strip()
     if not reason:
         raise ValueError("resolution_reason is required")
@@ -1513,52 +2013,64 @@ def promote_action_conflict_rule_payload(payload: dict[str, Any]) -> dict[str, A
 
     ensure_trace_tables()
     now = pd.Timestamp.utcnow()
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            INSERT INTO {ACTION_CONFLICT_RULES_TABLE}
-                (rule_id, rule_name, rule_scope, resolution_action, resolution_reason, enabled, priority,
-                 condition_json, promoted_from_conflict_key, promoted_by, promotion_note, created_at, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (rule_id) DO UPDATE SET
-                rule_name = EXCLUDED.rule_name,
-                rule_scope = EXCLUDED.rule_scope,
-                resolution_action = EXCLUDED.resolution_action,
-                resolution_reason = EXCLUDED.resolution_reason,
-                enabled = EXCLUDED.enabled,
-                priority = EXCLUDED.priority,
-                condition_json = EXCLUDED.condition_json,
-                promoted_from_conflict_key = EXCLUDED.promoted_from_conflict_key,
-                promoted_by = EXCLUDED.promoted_by,
-                promotion_note = EXCLUDED.promotion_note,
-                updated_at = EXCLUDED.updated_at
-            RETURNING *
-            """,
-            (
-                rule_id,
-                rule_name,
-                "manual_resolution",
-                resolution_action,
-                reason,
-                enabled,
-                int(payload.get("priority") or 25),
-                json.dumps(condition, ensure_ascii=False, sort_keys=True),
-                conflict_key,
-                str(payload.get("promoted_by") or "operator"),
-                promotion_note,
-                now,
-                now,
-            ),
-        )
-        row = cur.fetchone()
-        columns = [desc[0] for desc in cur.description]
+    row: tuple[Any, ...] | None = None
+    columns: list[str] = []
+
+    def _promote_conflict_rule() -> None:
+        nonlocal row, columns
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                INSERT INTO {ACTION_CONFLICT_RULES_TABLE}
+                    (rule_id, rule_name, rule_scope, resolution_action, resolution_reason, enabled, priority,
+                     condition_json, promoted_from_conflict_key, promoted_by, promotion_note, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (rule_id) DO UPDATE SET
+                    rule_name = EXCLUDED.rule_name,
+                    rule_scope = EXCLUDED.rule_scope,
+                    resolution_action = EXCLUDED.resolution_action,
+                    resolution_reason = EXCLUDED.resolution_reason,
+                    enabled = EXCLUDED.enabled,
+                    priority = EXCLUDED.priority,
+                    condition_json = EXCLUDED.condition_json,
+                    promoted_from_conflict_key = EXCLUDED.promoted_from_conflict_key,
+                    promoted_by = EXCLUDED.promoted_by,
+                    promotion_note = EXCLUDED.promotion_note,
+                    updated_at = EXCLUDED.updated_at
+                RETURNING *
+                """,
+                (
+                    rule_id,
+                    rule_name,
+                    "manual_resolution",
+                    resolution_action,
+                    reason,
+                    enabled,
+                    int(payload.get("priority") or 25),
+                    json.dumps(condition, ensure_ascii=False, sort_keys=True),
+                    conflict_key,
+                    str(payload.get("promoted_by") or "operator"),
+                    promotion_note,
+                    now,
+                    now,
+                ),
+            )
+            row = cur.fetchone()
+            columns = [desc[0] for desc in cur.description]
+
+    execute_db_operation(
+        _promote_conflict_rule,
+        operation_name="operator_api:promote_action_conflict_rule",
+    )
+    if row is None:
+        raise RuntimeError("conflict rule promotion did not return a row")
     return {
         "status": "promoted",
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/action-conflict-rules/promote", schema_name="action_conflict_rule_promotion"),
         "rule": _json_ready(dict(zip(columns, row))),
         "condition": condition,
-        "note": "Promoted conflict rules are exact action/source matches. They are disabled by default unless enabled is explicitly true; historical action rows are not rewritten.",
+        "note": "Promoted conflict rules support exact action/source matches or broader action-only pairs. They are disabled by default unless enabled is explicitly true; historical action rows are not rewritten.",
     }
 
 
@@ -1602,20 +2114,30 @@ def update_action_conflict_rule_payload(rule_id: str, payload: dict[str, Any]) -
     updates.append("updated_at = %s")
     params.append(now)
     params.append(normalized_rule_id)
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            UPDATE {ACTION_CONFLICT_RULES_TABLE}
-            SET {", ".join(updates)}
-            WHERE rule_id = %s
-            RETURNING *
-            """,
-            tuple(params),
-        )
-        row = cur.fetchone()
-        if row is None:
-            raise ValueError(f"Unknown conflict rule: {normalized_rule_id}")
-        columns = [desc[0] for desc in cur.description]
+    row: tuple[Any, ...] | None = None
+    columns: list[str] = []
+
+    def _update_conflict_rule() -> None:
+        nonlocal row, columns
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                UPDATE {ACTION_CONFLICT_RULES_TABLE}
+                SET {", ".join(updates)}
+                WHERE rule_id = %s
+                RETURNING *
+                """,
+                tuple(params),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise ValueError(f"Unknown conflict rule: {normalized_rule_id}")
+            columns = [desc[0] for desc in cur.description]
+
+    execute_db_operation(
+        _update_conflict_rule,
+        operation_name="operator_api:update_action_conflict_rule",
+    )
     return {
         "status": "updated",
         "generated_at": pd.Timestamp.utcnow().isoformat(),
@@ -1702,6 +2224,212 @@ def build_signal_refresh_payload(
     }
 
 
+def _journey_filter_values(*, symbol: str | None, item_id: str | None, unique_id: str | None) -> dict[str, str]:
+    return {
+        "symbol": str(symbol or "").strip().upper(),
+        "item_id": str(item_id or "").strip(),
+        "unique_id": str(unique_id or "").strip(),
+    }
+
+
+def _journey_table_rows(
+    *,
+    table_name: str,
+    stage: str,
+    filters: dict[str, str],
+    limit: int,
+    timestamp_column: str,
+    supported_filters: dict[str, str],
+    order_by: str,
+    skipped_sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not _table_exists(table_name):
+        skipped_sources.append({"stage": stage, "source": table_name, "reason": "missing_table"})
+        return []
+    clauses = ["1 = 1"]
+    params: list[Any] = []
+    for filter_key, column_name in supported_filters.items():
+        value = filters.get(filter_key)
+        if not value:
+            continue
+        if filter_key == "symbol":
+            clauses.append(f"UPPER(TRIM({column_name})) = %s")
+            params.append(value)
+        else:
+            clauses.append(f"{column_name} = %s")
+            params.append(value)
+    try:
+        rows = sql_to_df(
+            f"""
+            SELECT *
+            FROM {table_name}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY {order_by}
+            LIMIT %s
+            """,
+            params=tuple([*params, limit]),
+            retries=2,
+        )
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source=table_name,
+            fallback_type="operator_journey_source_load_failed",
+            reason="Operator journey could not load a source table and will show the remaining stages.",
+            error=exc,
+            metadata={"stage": stage, "filters": filters},
+        )
+        skipped_sources.append({"stage": stage, "source": table_name, "reason": f"{type(exc).__name__}: {exc}"})
+        return []
+    out = _records(rows)
+    for row in out:
+        row["_journey_stage"] = stage
+        row["_journey_timestamp"] = _ts(row.get(timestamp_column) or row.get("load_ts"))
+        row["_journey_source_table"] = table_name
+    return [_json_ready(row) for row in out]
+
+
+def _journey_timeline_event(stage: str, row: dict[str, Any]) -> dict[str, Any]:
+    title_by_stage = {
+        "manual_decisions": "Manual-review decision",
+        "wait_signals": "Wait signal created",
+        "wait_signal_matches": "Wait signal matched",
+        "signal_refresh": "Signal refresh result",
+        "actions": "Action recommendation",
+        "portfolio": "Portfolio plan",
+        "execution": "Execution preview",
+    }
+    reason = (
+        row.get("rationale")
+        or row.get("wait_question")
+        or row.get("match_reason")
+        or row.get("action_reason")
+        or row.get("portfolio_reason")
+        or row.get("execution_reason")
+        or row.get("reason")
+    )
+    action = row.get("decision") or row.get("expected_action") or row.get("signal_action") or row.get("action_code") or row.get("portfolio_status") or row.get("execution_status")
+    return {
+        "stage": stage,
+        "title": title_by_stage.get(stage, stage.replace("_", " ").title()),
+        "timestamp": row.get("_journey_timestamp"),
+        "symbol": row.get("symbol"),
+        "unique_id": row.get("unique_id"),
+        "setup_id": row.get("setup_id"),
+        "action": action,
+        "reason": reason,
+        "source_table": row.get("_journey_source_table"),
+        "source_key": row.get("item_id") or row.get("signal_id") or row.get("refresh_id") or row.get("unique_id") or row.get("correlation_id"),
+    }
+
+
+def build_operator_journey_payload(
+    *,
+    symbol: str | None = None,
+    item_id: str | None = None,
+    unique_id: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    row_limit = _bounded_limit(limit, default=25, maximum=100)
+    filters = _journey_filter_values(symbol=symbol, item_id=item_id, unique_id=unique_id)
+    skipped_sources: list[dict[str, Any]] = []
+    stage_specs = [
+        {
+            "stage": "manual_decisions",
+            "table": MANUAL_REVIEW_DECISIONS_TABLE,
+            "timestamp": "decided_at",
+            "filters": {"symbol": "symbol", "item_id": "item_id", "unique_id": "unique_id"},
+            "order_by": "decided_at DESC NULLS LAST, load_ts DESC NULLS LAST",
+        },
+        {
+            "stage": "wait_signals",
+            "table": WAIT_SIGNALS_TABLE,
+            "timestamp": "created_at",
+            "filters": {"symbol": "symbol", "item_id": "source_key"},
+            "order_by": "created_at DESC NULLS LAST, load_ts DESC NULLS LAST",
+        },
+        {
+            "stage": "wait_signal_matches",
+            "table": WAIT_SIGNAL_MATCHES_TABLE,
+            "timestamp": "matched_at",
+            "filters": {"symbol": "symbol"},
+            "order_by": "matched_at DESC NULLS LAST, load_ts DESC NULLS LAST",
+        },
+        {
+            "stage": "signal_refresh",
+            "table": SIGNAL_REFRESH_TABLE,
+            "timestamp": "refreshed_at",
+            "filters": {"symbol": "symbol", "unique_id": "unique_id"},
+            "order_by": "refreshed_at DESC NULLS LAST, load_ts DESC NULLS LAST",
+        },
+        {
+            "stage": "actions",
+            "table": ACTION_RECOMMENDATIONS_TABLE,
+            "timestamp": "published_on",
+            "filters": {"symbol": "symbol", "unique_id": "unique_id"},
+            "order_by": "published_on DESC NULLS LAST, load_ts DESC NULLS LAST",
+        },
+        {
+            "stage": "portfolio",
+            "table": PORTFOLIO_TABLE,
+            "timestamp": "published_on",
+            "filters": {"symbol": "symbol", "unique_id": "unique_id"},
+            "order_by": "published_on DESC NULLS LAST, load_ts DESC NULLS LAST",
+        },
+        {
+            "stage": "execution",
+            "table": EXECUTION_TABLE,
+            "timestamp": "published_on",
+            "filters": {"symbol": "symbol", "unique_id": "unique_id"},
+            "order_by": "published_on DESC NULLS LAST, load_ts DESC NULLS LAST",
+        },
+    ]
+    stages: dict[str, list[dict[str, Any]]] = {}
+    for spec in stage_specs:
+        stages[spec["stage"]] = _journey_table_rows(
+            table_name=spec["table"],
+            stage=spec["stage"],
+            filters=filters,
+            limit=row_limit,
+            timestamp_column=spec["timestamp"],
+            supported_filters=spec["filters"],
+            order_by=spec["order_by"],
+            skipped_sources=skipped_sources,
+        )
+    timeline = [
+        _journey_timeline_event(stage, row)
+        for stage, rows in stages.items()
+        for row in rows
+    ]
+    timeline.sort(key=lambda row: str(row.get("timestamp") or ""), reverse=True)
+    summary = {
+        "stage_counts": {stage: len(rows) for stage, rows in stages.items()},
+        "timeline_count": len(timeline),
+        "skipped_source_count": len(skipped_sources),
+        "has_manual_decision": bool(stages.get("manual_decisions")),
+        "has_wait_signal": bool(stages.get("wait_signals")),
+        "has_wait_match": bool(stages.get("wait_signal_matches")),
+        "has_refreshed_action": bool(stages.get("signal_refresh") or stages.get("actions")),
+        "has_portfolio_or_execution_implication": bool(stages.get("portfolio") or stages.get("execution")),
+        "operator_boundary": {
+            "read_only": True,
+            "broker_execution_enabled": False,
+            "mutates_portfolio": False,
+            "mutates_action_recommendation": False,
+            "submits_order": False,
+        },
+    }
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/operator-journey", schema_name="operator_journey"),
+        "status": "ok",
+        "filters": {key: value for key, value in filters.items() if value},
+        "summary": summary,
+        "stages": stages,
+        "timeline": timeline[:row_limit],
+        "skipped_sources": skipped_sources,
+    }
+
+
 def build_portfolio_payload(
     *,
     asof_date: str | None = None,
@@ -1723,17 +2451,22 @@ def build_portfolio_payload(
     current_pagination = _limited_pagination_contract(current_rows, limit=limit, default=25)
     exited_pagination = _limited_pagination_contract(exited_rows, limit=limit, default=25)
     lifecycle_pagination = _limited_pagination_contract(lifecycle_rows, limit=limit, default=25)
+    today_response = _compact_list_rows(today_rows[: _bounded_limit(limit, default=25)], compact=compact)
+    current_response = _compact_list_rows(current_rows[: _bounded_limit(limit, default=25)], compact=compact)
+    exited_response = _compact_list_rows(exited_rows[: _bounded_limit(limit, default=25)], compact=compact)
+    portfolio_response = _compact_list_rows(portfolio_page, compact=compact)
+    lifecycle_response = _compact_list_rows(lifecycle_rows[: _bounded_limit(limit, default=25)], compact=compact)
     return {
         "generated_at": payload.get("generated_at"),
         "api_schema": _operator_api_schema("/api/portfolio", schema_name="operator_portfolio"),
         "asof_date": payload.get("asof_date"),
         "snapshot": _snapshot_payload(payload),
         "snapshot_warning": _snapshot_warning_payload(payload),
-        "today_recommendations": _compact_list_rows(today_rows[: _bounded_limit(limit, default=25)], compact=compact),
-        "current_recommendations": _compact_list_rows(current_rows[: _bounded_limit(limit, default=25)], compact=compact),
-        "exited_recommendations": _compact_list_rows(exited_rows[: _bounded_limit(limit, default=25)], compact=compact),
-        "portfolio": _compact_list_rows(portfolio_page, compact=compact),
-        "lifecycle": _compact_list_rows(lifecycle_rows[: _bounded_limit(limit, default=25)], compact=compact),
+        "today_recommendations": today_response,
+        "current_recommendations": current_response,
+        "exited_recommendations": exited_response,
+        "portfolio": portfolio_response,
+        "lifecycle": lifecycle_response,
         "pagination": {
             "primary": "portfolio",
             "today_recommendations": today_pagination,
@@ -1743,11 +2476,11 @@ def build_portfolio_payload(
             "lifecycle": lifecycle_pagination,
         },
         "meta": {
-            "today_recommendations": {"total": len(today_rows), "returned": today_pagination["returned_count"]},
-            "current_recommendations": {"total": len(current_rows), "returned": current_pagination["returned_count"]},
-            "exited_recommendations": {"total": len(exited_rows), "returned": exited_pagination["returned_count"]},
-            "portfolio": portfolio_meta,
-            "lifecycle": {"total": len(lifecycle_rows), "returned": lifecycle_pagination["returned_count"]},
+            "today_recommendations": {"total": len(today_rows), "returned": today_pagination["returned_count"], **_payload_size_meta(today_response)},
+            "current_recommendations": {"total": len(current_rows), "returned": current_pagination["returned_count"], **_payload_size_meta(current_response)},
+            "exited_recommendations": {"total": len(exited_rows), "returned": exited_pagination["returned_count"], **_payload_size_meta(exited_response)},
+            "portfolio": {**portfolio_meta, **_payload_size_meta(portfolio_response)},
+            "lifecycle": {"total": len(lifecycle_rows), "returned": lifecycle_pagination["returned_count"], **_payload_size_meta(lifecycle_response)},
             "filters": {"symbol": symbol, "status": status, "search": search, "compact": compact},
         },
     }
@@ -1766,6 +2499,7 @@ def build_watchlist_payload(*, asof_date: str | None = None) -> dict[str, Any]:
         "ts_watch_recommendations": payload.get("ts_watch_recommendations") or [],
         "ts_forecast_watch": payload.get("ts_forecast_watch") or [],
         "ts_forecast_eval_summary": payload.get("ts_forecast_eval_summary") or [],
+        "ts_forecast_paper_summary": payload.get("ts_forecast_paper_summary") or [],
     }
 
 
@@ -1808,7 +2542,14 @@ def _table_columns(table_name: str) -> set[str]:
             params=(table_name,),
             retries=2,
         )
-    except Exception:
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source=table_name,
+            fallback_type="operator_api_table_columns_lookup_failed",
+            reason="Operator API could not inspect table columns and will continue with an empty column set.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return set()
     if df.empty:
         return set()
@@ -1826,7 +2567,14 @@ def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
 def _bounded_limit(value: int | None, *, default: int = 50, maximum: int = 500) -> int:
     try:
         parsed = int(value if value is not None else default)
-    except Exception:
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source="operator_api_pagination",
+            fallback_type="operator_api_bounded_limit_parse_failed",
+            reason="Operator API could not parse a limit value and used the configured default.",
+            error=exc,
+            metadata={"value": str(value), "default": int(default), "maximum": int(maximum)},
+        )
         parsed = default
     return max(0, min(parsed, maximum))
 
@@ -1834,7 +2582,14 @@ def _bounded_limit(value: int | None, *, default: int = 50, maximum: int = 500) 
 def _bounded_offset(value: int | None) -> int:
     try:
         parsed = int(value if value is not None else 0)
-    except Exception:
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source="operator_api_pagination",
+            fallback_type="operator_api_bounded_offset_parse_failed",
+            reason="Operator API could not parse an offset value and used zero.",
+            error=exc,
+            metadata={"value": str(value), "default": 0},
+        )
         parsed = 0
     return max(0, parsed)
 
@@ -2063,6 +2818,14 @@ def _latest_ohlcv_prices(symbols: list[str]) -> dict[str, dict[str, Any]]:
                 if symbol:
                     prices[symbol] = {"price": row.get("price"), "price_asof": row.get("price_asof"), "price_source": "dhan_ohlcv_daily"}
         except Exception as exc:
+            _record_operator_local_fallback(
+                source="dhan_ohlcv_daily",
+                fallback_type="operator_api_latest_daily_ohlcv_prices_load_failed",
+                severity="warn",
+                reason="Operator API could not load latest daily OHLCV prices and returned rows with partial or missing latest-price enrichment.",
+                error=exc,
+                metadata={"symbol_count": len(missing), "symbols": missing[:50]},
+            )
             print(f"[advisory.api] latest daily price enrichment failed error={type(exc).__name__}: {exc}", flush=True)
     use_intraday = env.bool("OPERATOR_API_INTRADAY_PRICE_FALLBACK", False)
     if use_intraday and _table_exists("dhan_ohlcv_intraday"):
@@ -2086,6 +2849,14 @@ def _latest_ohlcv_prices(symbols: list[str]) -> dict[str, dict[str, Any]]:
                 if symbol:
                     prices[symbol] = {"price": row.get("price"), "price_asof": row.get("price_asof"), "price_source": "dhan_ohlcv_intraday"}
         except Exception as exc:
+            _record_operator_local_fallback(
+                source="dhan_ohlcv_intraday",
+                fallback_type="operator_api_latest_intraday_ohlcv_prices_load_failed",
+                severity="warn",
+                reason="Operator API could not load latest intraday OHLCV prices and returned rows with partial or missing latest-price enrichment.",
+                error=exc,
+                metadata={"symbol_count": len(normalized), "symbols": normalized[:50]},
+            )
             print(f"[advisory.api] latest intraday price enrichment failed error={type(exc).__name__}: {exc}", flush=True)
     _PAYLOAD_CACHE[cache_key] = (now, prices)
     return prices
@@ -2136,6 +2907,9 @@ COMPACT_LIST_FIELDS = {
     "reason_detail",
     "recommendation_reason",
     "reason_contract_status",
+    "feature_freshness",
+    "feature_freshness_summary",
+    "feature_gate_effects",
     "manual_revision_summary",
     "manual_revision_pointers",
     "manual_revision_status",
@@ -2213,6 +2987,30 @@ def _compact_list_rows(rows: list[dict[str, Any]], *, compact: bool = False) -> 
     return compacted
 
 
+def _json_byte_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source="operator_api_payload_size",
+            fallback_type="operator_api_json_byte_size_failed",
+            reason="Operator API could not JSON-serialize a payload row for byte-size telemetry and used repr/string byte length.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": redact_text(str(value)[:240])},
+        )
+        return len(str(value).encode("utf-8"))
+
+
+def _payload_size_meta(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    row_sizes = [_json_byte_size(row) for row in rows if isinstance(row, dict)]
+    total = sum(row_sizes)
+    return {
+        "payload_bytes": total,
+        "avg_row_bytes": round(total / len(row_sizes), 2) if row_sizes else 0,
+        "max_row_bytes": max(row_sizes) if row_sizes else 0,
+    }
+
+
 def _payload_rows_by_kind(payload: dict[str, Any], kind: str) -> list[dict[str, Any]]:
     if kind == "actions":
         keys = ["top_action_recommendations", "action_recommendations", "alerts"]
@@ -2260,31 +3058,30 @@ def build_feature_freshness_payload(*, symbol: str, asof_date: str | None = None
 
 
 def ensure_operator_api_errors_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {OPERATOR_API_ERRORS_TABLE} (
-                error_id TEXT NOT NULL,
-                occurred_at TIMESTAMPTZ NOT NULL,
-                route TEXT,
-                operation TEXT,
-                status_code BIGINT,
-                error_type TEXT,
-                error_message TEXT,
-                traceback_tail TEXT,
-                request_context_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (error_id)
-            )
-            """
-        )
+    ensure_operator_api_audit_tables()
+
+
+def ensure_operator_api_audit_tables() -> None:
+    apply_schema_migration(
+        migration_id=OPERATOR_API_AUDIT_SCHEMA_MIGRATION_ID,
+        description="Create operator API audit, command-run, and manual-review decision tables.",
+        statements=OPERATOR_API_AUDIT_SCHEMA_STATEMENTS,
+        metadata={"tables": [OPERATOR_API_ERRORS_TABLE, OPERATOR_COMMAND_RUNS_TABLE, MANUAL_REVIEW_DECISIONS_TABLE]},
+    )
 
 
 def _safe_json_dumps(value: Any) -> str:
     try:
-        return json.dumps(_json_ready(value), ensure_ascii=False, default=str)
-    except Exception:
-        return json.dumps({"serialization_error": True, "repr": repr(value)}, ensure_ascii=False)
+        return json.dumps(_json_ready(redact_mapping(value) if isinstance(value, dict) else value), ensure_ascii=False, default=str)
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source="operator_api_safe_json_dumps",
+            fallback_type="operator_api_safe_json_dumps_failed",
+            reason="Operator API could not serialize an audit/request context payload and used the serialization-error fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": redact_text(repr(value)[:240])},
+        )
+        return json.dumps({"serialization_error": True, "repr": redact_text(repr(value))}, ensure_ascii=False)
 
 
 def record_operator_api_error(
@@ -2303,17 +3100,31 @@ def record_operator_api_error(
         "operation": _text(operation),
         "status_code": int(status_code),
         "error_type": type(exc).__name__,
-        "error_message": str(exc),
-        "traceback_tail": _tail_text("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), max_chars=OPERATOR_API_ERROR_TRACE_CHARS),
+        "error_message": redact_text(str(exc)),
+        "traceback_tail": redact_text(_tail_text("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), max_chars=OPERATOR_API_ERROR_TRACE_CHARS)),
         "request_context_json": _safe_json_dumps(request_context or {}),
         "load_ts": occurred_at,
     }
     try:
         ensure_operator_api_errors_table()
         upsert_to_db(pd.DataFrame([row]), OPERATOR_API_ERRORS_TABLE, unique_keys=["error_id"])
-    except Exception:
+    except Exception as audit_exc:
         # Error auditing must not mask the API error being reported to the frontend.
-        pass
+        record_local_fallback_event(
+            module="advisory.api.app",
+            source=OPERATOR_API_ERRORS_TABLE,
+            fallback_type="operator_api_error_audit_write_failed",
+            severity="error",
+            reason="Operator API could not persist an API error audit row; the original API response continues.",
+            error=audit_exc,
+            metadata={
+                "error_id": row["error_id"],
+                "operation": row["operation"],
+                "route": row["route"],
+                "status_code": row["status_code"],
+                "error_type": row["error_type"],
+            },
+        )
     return row
 
 
@@ -2333,7 +3144,7 @@ def record_operator_api_marker(
         "operation": _text(operation),
         "status_code": int(status_code),
         "error_type": "FallbackUsed",
-        "error_message": message,
+        "error_message": redact_text(message),
         "traceback_tail": None,
         "request_context_json": _safe_json_dumps(context or {}),
         "load_ts": occurred_at,
@@ -2341,8 +3152,22 @@ def record_operator_api_marker(
     try:
         ensure_operator_api_errors_table()
         upsert_to_db(pd.DataFrame([row]), OPERATOR_API_ERRORS_TABLE, unique_keys=["error_id"])
-    except Exception:
-        pass
+    except Exception as audit_exc:
+        record_local_fallback_event(
+            module="advisory.api.app",
+            source=OPERATOR_API_ERRORS_TABLE,
+            fallback_type="operator_api_marker_audit_write_failed",
+            severity="warn",
+            reason="Operator API could not persist a marker audit row; the original API flow continues.",
+            error=audit_exc,
+            metadata={
+                "error_id": row["error_id"],
+                "operation": row["operation"],
+                "route": row["route"],
+                "status_code": row["status_code"],
+                "error_type": row["error_type"],
+            },
+        )
 
 
 def build_operator_api_errors_payload(*, limit: int = 50) -> dict[str, Any]:
@@ -2366,7 +3191,11 @@ def build_operator_api_errors_payload(*, limit: int = 50) -> dict[str, Any]:
     )
     rows = _records(df)
     for row in rows:
+        row["error_message"] = redact_text(row.get("error_message"))
+        row["traceback_tail"] = redact_text(row.get("traceback_tail"))
         row["request_context"] = _jsonish(row.pop("request_context_json", None))
+        if isinstance(row["request_context"], dict):
+            row["request_context"] = redact_mapping(row["request_context"])
     error_count = sum(1 for row in rows if int(row.get("status_code") or 500) >= 500)
     warn_count = len(rows) - error_count
     return {
@@ -2592,13 +3421,15 @@ def build_technical_threshold_promotion_review_payload(payload: dict[str, Any]) 
         raise ValueError("setup_id is required")
     if not config_id:
         raise ValueError("config_id is required")
-    return generate_promotion_review(
+    result = generate_promotion_review(
         setup_id=setup_id,
         config_id=config_id,
         model=str(payload.get("model") or "") or None,
         use_llm=bool(payload.get("use_llm", True)),
         persist=True,
     )
+    result["api_schema"] = _operator_api_schema("/api/technical-calibration/promotion-review", schema_name="technical_promotion_review")
+    return result
 
 
 def build_technical_threshold_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
@@ -2625,7 +3456,7 @@ def build_technical_threshold_review_decision_payload(payload: dict[str, Any]) -
         raise ValueError("config_id is required")
     if decision not in {"approved", "rejected", "needs_more_data"}:
         raise ValueError("decision must be approved, rejected, or needs_more_data")
-    return record_manual_decision(
+    result = record_manual_decision(
         reviewed_at=reviewed_at,
         setup_id=setup_id,
         config_id=config_id,
@@ -2633,6 +3464,11 @@ def build_technical_threshold_review_decision_payload(payload: dict[str, Any]) -
         operator_id=str(payload.get("operator_id") or "") or None,
         decision_reason=str(payload.get("decision_reason") or "") or None,
     )
+    result["api_schema"] = _operator_api_schema(
+        "/api/technical-calibration/promotion-review/decision",
+        schema_name="technical_promotion_decision",
+    )
+    return result
 
 
 def build_signal_quality_promotion_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2698,6 +3534,141 @@ def build_signal_quality_promotion_review_decision_payload(payload: dict[str, An
     return result
 
 
+def build_event_policy_promotion_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    evaluated_at = payload.get("evaluated_at")
+    horizon_days = payload.get("horizon_days")
+    group_type = str(payload.get("group_type") or "").strip()
+    group_value = str(payload.get("group_value") or "").strip()
+    if not evaluated_at:
+        raise ValueError("evaluated_at is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    if not group_type:
+        raise ValueError("group_type is required")
+    if not group_value:
+        raise ValueError("group_value is required")
+    result = generate_event_policy_promotion_review(
+        evaluated_at=evaluated_at,
+        horizon_days=int(horizon_days),
+        group_type=group_type,
+        group_value=group_value,
+        persist=True,
+    )
+    result["api_schema"] = _operator_api_schema("/api/event-policy/promotion-review", schema_name="event_policy_promotion_review")
+    return result
+
+
+def build_event_policy_promotion_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
+    reviews = load_event_policy_promotion_reviews(limit=limit)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/event-policy/promotion-reviews", schema_name="event_policy_promotion_reviews"),
+        "status": "ok",
+        "reviews": reviews,
+        "pagination": {"reviews": _bounded_list_contract(reviews, limit=limit, default=25, maximum=100)},
+    }
+
+
+def build_event_policy_promotion_review_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    reviewed_at = payload.get("reviewed_at")
+    evaluated_at = payload.get("evaluated_at")
+    horizon_days = payload.get("horizon_days")
+    group_type = str(payload.get("group_type") or "").strip()
+    group_value = str(payload.get("group_value") or "").strip()
+    decision = str(payload.get("decision") or "").strip().lower()
+    if not reviewed_at:
+        raise ValueError("reviewed_at is required")
+    if not evaluated_at:
+        raise ValueError("evaluated_at is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    if not group_type:
+        raise ValueError("group_type is required")
+    if not group_value:
+        raise ValueError("group_value is required")
+    if decision not in {"approved", "rejected", "needs_more_data"}:
+        raise ValueError("decision must be approved, rejected, or needs_more_data")
+    result = record_event_policy_manual_decision(
+        reviewed_at=reviewed_at,
+        evaluated_at=evaluated_at,
+        horizon_days=int(horizon_days),
+        group_type=group_type,
+        group_value=group_value,
+        decision=decision,  # type: ignore[arg-type]
+        operator_id=str(payload.get("operator_id") or "") or None,
+        decision_reason=str(payload.get("decision_reason") or "") or None,
+    )
+    result["api_schema"] = _operator_api_schema(
+        "/api/event-policy/promotion-review/decision",
+        schema_name="event_policy_promotion_decision",
+    )
+    return result
+
+
+def build_ts_forecast_promotion_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    model_name = str(payload.get("model_name") or "").strip()
+    horizon_days = payload.get("horizon_days")
+    if not model_name:
+        raise ValueError("model_name is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    result = generate_ts_forecast_promotion_review(
+        model_name=model_name,
+        horizon_days=int(horizon_days),
+        from_date=payload.get("from_date"),
+        to_date=payload.get("to_date"),
+        persist=True,
+        allow_not_ready=bool(payload.get("allow_not_ready", False)),
+    )
+    result["api_schema"] = _operator_api_schema(
+        "/api/research/ts-forecast-promotion-review",
+        schema_name="ts_forecast_promotion_review",
+    )
+    return result
+
+
+def build_ts_forecast_promotion_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
+    reviews = load_ts_forecast_promotion_reviews(limit=limit)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema(
+            "/api/research/ts-forecast-promotion-reviews",
+            schema_name="ts_forecast_promotion_reviews",
+        ),
+        "status": "ok",
+        "reviews": reviews,
+        "pagination": {"reviews": _bounded_list_contract(reviews, limit=limit, default=25, maximum=100)},
+    }
+
+
+def build_ts_forecast_promotion_review_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    reviewed_at = payload.get("reviewed_at")
+    model_name = str(payload.get("model_name") or "").strip()
+    horizon_days = payload.get("horizon_days")
+    decision = str(payload.get("decision") or "").strip().lower()
+    if not reviewed_at:
+        raise ValueError("reviewed_at is required")
+    if not model_name:
+        raise ValueError("model_name is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    if decision not in {"approved", "rejected", "needs_more_data"}:
+        raise ValueError("decision must be approved, rejected, or needs_more_data")
+    result = record_ts_forecast_manual_decision(
+        reviewed_at=reviewed_at,
+        model_name=model_name,
+        horizon_days=int(horizon_days),
+        decision=decision,  # type: ignore[arg-type]
+        operator_id=str(payload.get("operator_id") or "") or None,
+        decision_reason=str(payload.get("decision_reason") or "") or None,
+    )
+    result["api_schema"] = _operator_api_schema(
+        "/api/research/ts-forecast-promotion-review/decision",
+        schema_name="ts_forecast_promotion_decision",
+    )
+    return result
+
+
 def build_config_change_previews_payload(*, limit: int = 25) -> dict[str, Any]:
     previews = load_config_change_previews(limit=limit)
     return {
@@ -2707,6 +3678,36 @@ def build_config_change_previews_payload(*, limit: int = 25) -> dict[str, Any]:
         "previews": previews,
         "pagination": {"previews": _bounded_list_contract(previews, limit=limit, default=25, maximum=100)},
     }
+
+
+def build_config_change_applications_payload(*, limit: int = 25) -> dict[str, Any]:
+    applications = load_application_decisions(limit=limit)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/config-change/applications", schema_name="config_change_applications"),
+        "status": "ok",
+        "applications": applications,
+        "pagination": {"applications": _bounded_list_contract(applications, limit=limit, default=25, maximum=100)},
+    }
+
+
+def build_config_change_application_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    preview_id = str(payload.get("preview_id") or "").strip()
+    application_decision = str(payload.get("application_decision") or payload.get("decision") or "").strip().lower()
+    if not preview_id:
+        raise ValueError("preview_id is required")
+    if application_decision not in {"approved_to_apply", "marked_applied", "rejected", "needs_more_data"}:
+        raise ValueError("application_decision must be approved_to_apply, marked_applied, rejected, or needs_more_data")
+    result = record_application_decision(
+        preview_id=preview_id,
+        application_decision=application_decision,  # type: ignore[arg-type]
+        operator_id=str(payload.get("operator_id") or "") or None,
+        operator_note=str(payload.get("operator_note") or payload.get("note") or "") or None,
+        verify_config=bool(payload.get("verify_config", True)),
+    )
+    result["generated_at"] = pd.Timestamp.utcnow().isoformat()
+    result["api_schema"] = _operator_api_schema("/api/config-change/application-decision", schema_name="config_change_application_decision")
+    return result
 
 
 def build_technical_config_change_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2747,6 +3748,48 @@ def build_signal_quality_config_change_preview_payload(payload: dict[str, Any]) 
     return result
 
 
+def build_event_policy_config_change_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    evaluated_at = payload.get("evaluated_at")
+    horizon_days = payload.get("horizon_days")
+    group_type = str(payload.get("group_type") or "").strip()
+    group_value = str(payload.get("group_value") or "").strip()
+    if not evaluated_at:
+        raise ValueError("evaluated_at is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    if not group_type:
+        raise ValueError("group_type is required")
+    if not group_value:
+        raise ValueError("group_value is required")
+    result = build_event_policy_review_rule_preview(
+        evaluated_at=evaluated_at,
+        horizon_days=int(horizon_days),
+        group_type=group_type,
+        group_value=group_value,
+        reviewed_at=payload.get("reviewed_at"),
+        persist=bool(payload.get("persist", True)),
+    )
+    result["api_schema"] = _operator_api_schema("/api/config-change/event-policy-preview", schema_name="event_policy_config_change_preview")
+    return result
+
+
+def build_ts_forecast_config_change_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    model_name = str(payload.get("model_name") or "").strip()
+    horizon_days = payload.get("horizon_days")
+    if not model_name:
+        raise ValueError("model_name is required")
+    if horizon_days is None or str(horizon_days).strip() == "":
+        raise ValueError("horizon_days is required")
+    result = build_ts_forecast_review_rule_preview(
+        model_name=model_name,
+        horizon_days=int(horizon_days),
+        reviewed_at=payload.get("reviewed_at"),
+        persist=bool(payload.get("persist", True)),
+    )
+    result["api_schema"] = _operator_api_schema("/api/config-change/ts-forecast-preview", schema_name="ts_forecast_config_change_preview")
+    return result
+
+
 def build_prompt_registry_api_payload(*, owner_area: str | None = None, authority_scope: str | None = None, limit: int = 100, offset: int = 0) -> dict[str, Any]:
     payload = build_prompt_registry_payload(owner_area=owner_area, authority_scope=authority_scope)
     contracts = [row for row in payload.get("contracts") or [] if isinstance(row, dict)]
@@ -2754,6 +3797,90 @@ def build_prompt_registry_api_payload(*, owner_area: str | None = None, authorit
     payload["contracts"] = contract_page
     payload["pagination"] = {"contracts": contract_meta}
     payload["api_schema"] = _operator_api_schema("/api/research/prompt-registry", schema_name="prompt_registry")
+    return payload
+
+
+def build_screener_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    query_text = str(payload.get("query_text") or payload.get("query") or "").strip()
+    if not query_text:
+        raise ValueError("query_text is required")
+    query_name = str(payload.get("query_name") or payload.get("name") or "Operator Screener Preview").strip() or "Operator Screener Preview"
+    fetch_rows = bool(payload.get("fetch_rows") or payload.get("run_query"))
+    row_limit = min(max(int(payload.get("row_limit") or 25), 1), 100)
+    query_hash = hashlib.sha256(query_text.encode("utf-8")).hexdigest()
+    validation_issues = [
+        {"code": issue.code, "text": issue.text, "suggestion": issue.suggestion}
+        for issue in validate_screener_query(query_text)
+    ]
+    api_schema = _operator_api_schema("/api/screeners/preview", schema_name="screener_preview")
+    api_schema["read_only"] = False
+    api_schema["write_scope"] = "failure_audit_only_when_authenticated_fetch_fails"
+    api_schema["investment_state_mutation_enabled"] = False
+    base = {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": api_schema,
+        "query_name": query_name,
+        "query_slug": screener_slugify(query_name),
+        "query_hash": query_hash,
+        "screener_url": build_raw_screen_url(query_text),
+        "validation_issues": validation_issues,
+        "row_count": 0,
+        "rows": [],
+        "headers": [],
+        "meta": {
+            "fetch_rows_requested": fetch_rows,
+            "persisted": False,
+            "row_limit": row_limit,
+            "query_length": len(query_text),
+        },
+        "operator_boundary": {
+            "read_only": False,
+            "investment_state_read_only": True,
+            "failure_audit_write_possible": fetch_rows,
+            "write_scope": "failure_audit_only_when_authenticated_fetch_fails",
+            "broker_execution_enabled": False,
+            "persists_query_results": False,
+            "registers_production_screener": False,
+            "side_effects": "Validation is local. Fetch preview may access Screener.in and records failure audit rows if the authenticated fetch/parse fails, but it does not persist query results or register a screener.",
+            "next_step_if_good": "Register the query explicitly through the screener registry only after reviewing preview rows and validation outcome.",
+        },
+    }
+    if validation_issues:
+        return {
+            **base,
+            "status": "invalid",
+            "meta": {**base["meta"], "can_fetch": False},
+        }
+    if not fetch_rows:
+        return {
+            **base,
+            "status": "valid",
+            "meta": {**base["meta"], "can_fetch": True, "validation_only": True},
+        }
+
+    result = fetch_ad_hoc_payload(query_text=query_text, query_name=query_name, persist=False)
+    companies = result.get("companies") or []
+    return {
+        **base,
+        "status": "ok",
+        "screener_url": result.get("screener_url") or base["screener_url"],
+        "row_count": int(len(companies)),
+        "rows": companies_preview(companies, limit=row_limit),
+        "headers": result.get("headers") or [],
+        "meta": {
+            **base["meta"],
+            "can_fetch": True,
+            "validation_only": False,
+            "query_run_id": result.get("query_run_id"),
+            "returned_rows": min(len(companies), row_limit),
+            "omitted_rows": max(0, len(companies) - row_limit),
+        },
+    }
+
+
+def build_screener_coverage_api_payload(*, asof_date: str | None = None, lookback_days: int = 30, limit: int = 50) -> dict[str, Any]:
+    payload = build_screener_coverage_payload(asof_date=asof_date, lookback_days=lookback_days, limit=limit)
+    payload["api_schema"] = _operator_api_schema("/api/screeners/coverage", schema_name="screener_coverage")
     return payload
 
 
@@ -2812,10 +3939,45 @@ def build_action_detail_payload(*, symbol: str | None = None, unique_id: str | N
     return out
 
 
+def load_lifecycle_policy_changes_for_symbol(symbol: str, *, limit: int = 25) -> list[dict[str, Any]]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        return []
+    if not _table_exists(LIFECYCLE_POLICY_CHANGES_TABLE):
+        return []
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {LIFECYCLE_POLICY_CHANGES_TABLE}
+            WHERE UPPER(symbol) = %(symbol)s
+            ORDER BY changed_at DESC NULLS LAST, load_ts DESC NULLS LAST
+            LIMIT %(limit)s
+            """,
+            params={"symbol": normalized_symbol, "limit": max(1, int(limit))},
+            retries=2,
+        )
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source=LIFECYCLE_POLICY_CHANGES_TABLE,
+            fallback_type="operator_portfolio_detail_policy_changes_load_failed",
+            reason="Operator portfolio detail could not load lifecycle policy-change audit rows.",
+            error=exc,
+            metadata={"symbol": normalized_symbol, "limit": int(limit)},
+        )
+        return []
+    return _json_ready(df.to_dict(orient="records")) if not df.empty else []
+
+
 def build_portfolio_detail_payload(*, symbol: str, asof_date: str | None = None) -> dict[str, Any]:
     payload = load_operator_payload(asof_date=asof_date)
     rows = _filter_rows(_payload_rows_by_kind(payload, "portfolio"), symbol=symbol)
-    return _detail_payload("portfolio", rows, filters={"symbol": symbol, "asof_date": asof_date})
+    out = _detail_payload("portfolio", rows, filters={"symbol": symbol, "asof_date": asof_date})
+    policy_changes = load_lifecycle_policy_changes_for_symbol(symbol)
+    out["policy_changes"] = policy_changes
+    out["policy_change_count"] = len(policy_changes)
+    return out
+
 
 
 def build_event_detail_payload(*, unique_id: str, asof_date: str | None = None) -> dict[str, Any]:
@@ -2824,7 +3986,30 @@ def build_event_detail_payload(*, unique_id: str, asof_date: str | None = None) 
     return _detail_payload("events", rows, filters={"unique_id": unique_id, "asof_date": asof_date})
 
 
-def build_event_policy_payload(*, asof_date: str | None = None, action_type: str | None = None, limit: int = 100) -> dict[str, Any]:
+_EVENT_POLICY_COMPACT_OMIT_KEYS = {
+    "checks_json",
+    "operator_notes_json",
+    "llm_review_json",
+    "actionability_json",
+    "raw_context_json",
+    "recommendation_reason_json",
+}
+
+
+def _compact_event_policy_row(row: dict[str, Any], *, include_raw: bool) -> dict[str, Any]:
+    if include_raw:
+        out = dict(row)
+        out["raw_included"] = True
+        return out
+    omitted = sorted(key for key in _EVENT_POLICY_COMPACT_OMIT_KEYS if key in row)
+    out = {key: value for key, value in row.items() if key not in _EVENT_POLICY_COMPACT_OMIT_KEYS}
+    out["raw_compacted"] = True
+    out["raw_omitted_keys_sample"] = omitted[:25]
+    out["raw_omitted_key_count"] = len(omitted)
+    return out
+
+
+def build_event_policy_payload(*, asof_date: str | None = None, action_type: str | None = None, limit: int = 100, include_raw: bool = False) -> dict[str, Any]:
     if not _table_exists(EVENT_POLICY_TABLE):
         return {
             "generated_at": pd.Timestamp.utcnow().isoformat(),
@@ -2880,7 +4065,9 @@ def build_event_policy_payload(*, asof_date: str | None = None, action_type: str
         row["checks"] = _jsonish(row.get("checks_json"))
         row["operator_notes"] = _jsonish(row.get("operator_notes_json"))
         row["llm_review"] = _jsonish(row.get("llm_review_json"))
+        row["actionability"] = _jsonish(row.get("actionability_json"))
         row["raw_context"] = _jsonish(row.get("raw_context_json"))
+    response_rows = [_compact_event_policy_row(row, include_raw=bool(include_raw)) for row in records]
     action_counts: dict[str, int] = {}
     policy_class_counts: dict[str, int] = {}
     if not summary_df.empty:
@@ -2897,8 +4084,10 @@ def build_event_policy_payload(*, asof_date: str | None = None, action_type: str
             "action_counts": action_counts,
             "policy_class_counts": policy_class_counts,
             "row_count": int(sum(action_counts.values())),
+            "compact": not bool(include_raw),
+            "raw_included": bool(include_raw),
         },
-        "rows": records,
+        "rows": response_rows,
     }
 
 
@@ -2954,7 +4143,7 @@ def build_symbol_trace_payload(symbol: str, *, limit: int = 100) -> dict[str, An
     return payload
 
 
-def _jsonish(value: Any) -> Any:
+def _jsonish(value: Any, *, source: str = "operator_api_jsonish") -> Any:
     if value is None:
         return {}
     if isinstance(value, (dict, list)):
@@ -2962,11 +4151,24 @@ def _jsonish(value: Any) -> Any:
     try:
         if pd.isna(value):
             return {}
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source=source,
+            fallback_type="operator_api_jsonish_missing_check_failed",
+            reason="Operator API could not evaluate whether a JSON-like value is missing; it will attempt JSON parsing next.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": redact_text(str(value)[:240])},
+        )
     try:
         return json.loads(str(value))
-    except Exception:
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source=source,
+            fallback_type="operator_api_jsonish_parse_failed",
+            reason="Operator API could not parse a stored JSON-like value and used the empty-object fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": redact_text(str(value)[:240])},
+        )
         return {}
 
 
@@ -2976,8 +4178,14 @@ def _text(value: Any) -> str | None:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source="operator_api_text",
+            fallback_type="operator_api_text_missing_check_failed",
+            reason="Operator API could not evaluate missingness while normalizing text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     text = str(value).strip()
     return text or None
 
@@ -2995,8 +4203,14 @@ def _boolish(value: Any) -> bool | None:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source="operator_api_boolish",
+            fallback_type="operator_api_boolish_missing_check_failed",
+            reason="Operator API could not evaluate missingness while normalizing a boolean value and kept boolean conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     if isinstance(value, str):
         normalized = value.strip().lower()
         if normalized in {"true", "t", "1", "yes"}:
@@ -3433,10 +4647,17 @@ def _trace_list_pagination(payload: dict[str, Any], *, limit: int | None = None)
     }
 
 
-def _count_value(value: Any, fallback: int = 0) -> int:
+def _count_value(value: Any, fallback: int = 0, *, source: str = "operator_api_count") -> int:
     try:
         return int(value)
-    except Exception:
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source=source,
+            fallback_type="operator_api_count_value_parse_failed",
+            reason="Operator API could not parse a count value and used the supplied fallback count.",
+            error=exc,
+            metadata={"fallback": int(fallback), "value_type": type(value).__name__, "value_excerpt": redact_text(str(value)[:240])},
+        )
         return int(fallback)
 
 
@@ -3520,9 +4741,51 @@ def build_data_health_payload(*, asof_date: str | None = None) -> dict[str, Any]
     }
 
 
-def build_operator_health_payload(*, mode: str = "fast") -> dict[str, Any]:
+def _compact_health_value(value: Any, *, list_limit: int, string_chars: int, stats: dict[str, int]) -> Any:
+    if isinstance(value, str):
+        if len(value) > string_chars:
+            stats["truncated_strings"] = int(stats.get("truncated_strings") or 0) + 1
+            return value[:string_chars] + "...[truncated]"
+        return value
+    if isinstance(value, list):
+        compacted = [_compact_health_value(item, list_limit=list_limit, string_chars=string_chars, stats=stats) for item in value[:list_limit]]
+        omitted = max(0, len(value) - list_limit)
+        if omitted:
+            stats["truncated_lists"] = int(stats.get("truncated_lists") or 0) + 1
+            stats["omitted_list_items"] = int(stats.get("omitted_list_items") or 0) + omitted
+        return compacted
+    if isinstance(value, dict):
+        return {str(key): _compact_health_value(val, list_limit=list_limit, string_chars=string_chars, stats=stats) for key, val in value.items()}
+    return value
+
+
+def _compact_operator_health_payload(payload: dict[str, Any], *, compact: bool) -> dict[str, Any]:
+    if not compact:
+        out = dict(payload)
+        out["compact"] = False
+        return out
+    stats = {"truncated_lists": 0, "omitted_list_items": 0, "truncated_strings": 0}
+    out = _compact_health_value(
+        payload,
+        list_limit=max(1, int(OPERATOR_HEALTH_COMPACT_LIST_LIMIT)),
+        string_chars=max(200, int(OPERATOR_HEALTH_COMPACT_STRING_CHARS)),
+        stats=stats,
+    )
+    if not isinstance(out, dict):
+        return payload
+    out["compact"] = True
+    out["compact_meta"] = {
+        "list_limit": max(1, int(OPERATOR_HEALTH_COMPACT_LIST_LIMIT)),
+        "string_chars": max(200, int(OPERATOR_HEALTH_COMPACT_STRING_CHARS)),
+        **stats,
+        "full_payload_hint": "/api/health/details?mode=full&compact=false",
+    }
+    return out
+
+
+def build_operator_health_payload(*, mode: str = "fast", compact: bool = True) -> dict[str, Any]:
     normalized_mode = "full" if str(mode or "").strip().lower() == "full" else "fast"
-    cache_key = ("operator_health_payload", normalized_mode, str(id(build_operator_health)))
+    cache_key = ("operator_health_payload", normalized_mode, bool(compact), str(id(build_operator_health)))
     now = time.monotonic()
     cached = _PAYLOAD_CACHE.get(cache_key)
     if cached and OPERATOR_API_PAYLOAD_CACHE_SECONDS > 0 and (now - cached[0]) <= OPERATOR_API_PAYLOAD_CACHE_SECONDS:
@@ -3533,6 +4796,7 @@ def build_operator_health_payload(*, mode: str = "fast") -> dict[str, Any]:
             **payload,
             "api_schema": _operator_api_schema("/api/health/details", schema_name="operator_health_details"),
         }
+        out = _compact_operator_health_payload(out, compact=bool(compact))
         _PAYLOAD_CACHE[cache_key] = (now, out)
         return out
     return payload
@@ -3552,6 +4816,43 @@ def build_operations_smoke_payload() -> dict[str, Any]:
         "next_commands": payload.get("next_commands") or [],
         "read_only": True,
         "note": "This endpoint runs the compact read-only operator smoke checks. It does not start ingestion, advisory, broker, or trading jobs.",
+    }
+
+
+def build_ingestion_state_payload(
+    *,
+    source: str | None = None,
+    status: str | None = None,
+    limit: int = 1000,
+    sample_limit: int = 20,
+) -> dict[str, Any]:
+    normalized_source = str(source).strip() if source else None
+    normalized_status = str(status).strip() if status else None
+    bounded_limit = max(1, min(int(limit), 5000))
+    bounded_sample_limit = max(0, min(int(sample_limit), 100))
+    rows = get_ingestion_state_entries(
+        source_prefix=normalized_source or None,
+        status=normalized_status or None,
+        limit=bounded_limit,
+    )
+    summary = summarize_ingestion_state_entries(rows, sample_limit=bounded_sample_limit)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/operations/ingestion-state", schema_name="operations_ingestion_state"),
+        "status": "ok",
+        "filters": {
+            "source": normalized_source,
+            "status": normalized_status,
+            "limit": bounded_limit,
+            "sample_limit": bounded_sample_limit,
+        },
+        "summary": summary,
+        "operator_boundary": {
+            "read_only": True,
+            "mutates_state": False,
+            "clear_command": "python scripts/ingestion_state_runner.py clear --source <source> --key <object_key>",
+            "note": "This endpoint summarizes file-level ingestion state only. It does not clear failed rows or retry ingestion.",
+        },
     }
 
 
@@ -3604,7 +4905,7 @@ def build_cron_logs_payload(*, limit: int = 20, lines: int = 80, offset: int = 0
     logs: list[dict[str, Any]] = []
     for path in files:
         stat = path.stat()
-        tail = _tail_file(path, line_count=int(lines))
+        tail = [redact_text(line) or "" for line in _tail_file(path, line_count=int(lines))]
         lower_tail = "\n".join(tail).lower()
         latest_marker = _latest_script_marker(tail)
         if latest_marker.get("status") == "failed" or "traceback" in lower_tail or "error" in lower_tail:
@@ -3684,6 +4985,47 @@ def build_event_model_promotion_check_payload() -> dict[str, Any]:
     return payload
 
 
+def build_ts_forecast_promotion_check_payload(
+    *,
+    model_name: str | None = None,
+    horizon_days: int | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict[str, Any]:
+    args = argparse.Namespace(
+        from_date=pd.to_datetime(from_date, utc=True, errors="coerce") if from_date else None,
+        to_date=pd.to_datetime(to_date, utc=True, errors="coerce") if to_date else None,
+        model_name=model_name,
+        horizon_days=horizon_days,
+        min_evaluated_trades=TS_PROMOTION_DEFAULT_MIN_EVALUATED_TRADES,
+        min_win_rate=TS_PROMOTION_DEFAULT_MIN_WIN_RATE,
+        min_avg_cost_adjusted_return=TS_PROMOTION_DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN,
+        min_lift_vs_momentum=TS_PROMOTION_DEFAULT_MIN_LIFT_VS_MOMENTUM,
+        max_exit_conflict_rate=TS_PROMOTION_DEFAULT_MAX_EXIT_CONFLICT_RATE,
+        min_distinct_dates=TS_PROMOTION_DEFAULT_MIN_DISTINCT_DATES,
+        min_symbols=TS_PROMOTION_DEFAULT_MIN_SYMBOLS,
+    )
+    payload = build_ts_forecast_promotion_check(args)
+    payload["generated_at"] = pd.Timestamp.utcnow().isoformat()
+    payload["api_schema"] = _operator_api_schema(
+        "/api/research/ts-forecast-promotion-check",
+        schema_name="ts_forecast_promotion_check",
+    )
+    return payload
+
+
+def build_ts_forecast_review_rules_payload() -> dict[str, Any]:
+    payload = load_ts_forecast_review_rules()
+    payload["generated_at"] = pd.Timestamp.utcnow().isoformat()
+    payload["api_schema"] = _operator_api_schema(
+        "/api/research/ts-forecast-review-rules",
+        schema_name="ts_forecast_review_rules",
+    )
+    payload["api_schema"]["read_only"] = True
+    payload["api_schema"]["broker_execution_enabled"] = False
+    return payload
+
+
 def build_event_model_artifacts_payload(*, limit: int = 50, offset: int = 0) -> dict[str, Any]:
     artifact_dir = Path(".cache/advisory_event_meta_model")
     try:
@@ -3694,6 +5036,14 @@ def build_event_model_artifacts_payload(*, limit: int = 50, offset: int = 0) -> 
         )
         manifest["status"] = "ok"
     except FileNotFoundError as exc:
+        _record_operator_local_fallback(
+            source="event_model_artifacts",
+            fallback_type="operator_api_event_model_artifact_manifest_missing",
+            reason="event model artifact manifest is not available",
+            error=exc,
+            severity="warn",
+            metadata={"artifact_dir": str(artifact_dir), "model_basename": "event_meta_model"},
+        )
         manifest = {
             "status": "missing_artifact",
             "error": str(exc),
@@ -3726,8 +5076,24 @@ def build_event_model_artifacts_payload(*, limit: int = 50, offset: int = 0) -> 
                         }
                     )
                 except Exception as exc:
+                    _record_operator_local_fallback(
+                        source="event_model_artifacts",
+                        fallback_type="operator_api_event_model_artifact_head_failed",
+                        reason="event model artifact latest S3 object could not be inspected",
+                        error=exc,
+                        severity="warn",
+                        metadata={"bucket": AWS_BUCKET_NAME, "key": str(key)},
+                    )
                     latest_heads.append({"key": key, "status": "missing_or_error", "error": f"{type(exc).__name__}: {exc}"})
         except Exception as exc:
+            _record_operator_local_fallback(
+                source="event_model_artifacts",
+                fallback_type="operator_api_event_model_artifact_s3_unavailable",
+                reason="event model artifact S3 client or store configuration is unavailable",
+                error=exc,
+                severity="warn",
+                metadata={"latest_prefix": str(manifest.get("latest_prefix") or "")},
+            )
             latest_heads.append({"status": "s3_unavailable", "error": f"{type(exc).__name__}: {exc}"})
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
@@ -3766,6 +5132,14 @@ OPERATOR_COMMAND_REGISTRY: dict[str, dict[str, Any]] = {
         "risk": "safe_read_only",
         "dry_run": True,
         "timeout_seconds": 180,
+    },
+    "cron_preflight": {
+        "label": "Cron Preflight",
+        "description": "Read-only go-crond setup check for generated crontab, environment, referenced scripts, stale locks, Python resolution, and operator ports.",
+        "args": _python_cmd("scripts/cron_preflight.py", "--format", "json"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 60,
     },
     "event_model_promotion_check": {
         "label": "Event Model Promotion Check",
@@ -3827,31 +5201,7 @@ OPERATOR_COMMAND_REGISTRY: dict[str, dict[str, Any]] = {
 
 
 def ensure_operator_command_runs_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {OPERATOR_COMMAND_RUNS_TABLE} (
-                run_id TEXT NOT NULL,
-                command_key TEXT NOT NULL,
-                command_label TEXT,
-                command_args_json TEXT,
-                risk TEXT,
-                dry_run BOOLEAN,
-                status TEXT NOT NULL,
-                returncode BIGINT,
-                operator_id TEXT,
-                requested_reason TEXT,
-                started_at TIMESTAMPTZ,
-                completed_at TIMESTAMPTZ,
-                elapsed_ms DOUBLE PRECISION,
-                stdout_tail TEXT,
-                stderr_tail TEXT,
-                error TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (run_id)
-            )
-            """
-        )
+    ensure_operator_api_audit_tables()
 
 
 def _tail_text(value: str, *, max_chars: int | None = None) -> str:
@@ -3960,6 +5310,19 @@ def run_operator_command_payload(payload: dict[str, Any]) -> dict[str, Any]:
     except subprocess.TimeoutExpired as exc:
         completed_at = pd.Timestamp.utcnow()
         elapsed_ms = (completed_at - started_at).total_seconds() * 1000.0
+        _record_operator_local_fallback(
+            source="operator_command",
+            fallback_type="operator_command_timeout",
+            reason="whitelisted operator command timed out before completion",
+            error=exc,
+            severity="warn",
+            metadata={
+                "command_key": command_key,
+                "timeout_seconds": timeout_seconds,
+                "risk": str(command.get("risk") or ""),
+                "dry_run": bool(command.get("dry_run")),
+            },
+        )
         final_row = {
             **base_row,
             "status": "timeout",
@@ -3983,6 +5346,145 @@ def run_operator_command_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _superseded_cleanup_counts(result: dict[str, Any]) -> dict[str, Any]:
+    event_processing = result.get("event_processing") if isinstance(result.get("event_processing"), dict) else {}
+    announcement_documents = result.get("announcement_documents") if isinstance(result.get("announcement_documents"), dict) else {}
+    return {
+        "event_processing_candidates": int(event_processing.get("candidates") or 0),
+        "event_processing_updated": int(event_processing.get("updated") or 0),
+        "announcement_document_candidates": int(announcement_documents.get("candidates") or 0),
+        "announcement_document_updated": int(announcement_documents.get("updated") or 0),
+        "total_candidates": int(event_processing.get("candidates") or 0) + int(announcement_documents.get("candidates") or 0),
+        "total_updated": int(event_processing.get("updated") or 0) + int(announcement_documents.get("updated") or 0),
+    }
+
+
+def _superseded_cleanup_boundary(*, apply: bool) -> dict[str, Any]:
+    return {
+        "mode": "apply" if apply else "preview",
+        "writes_superseded_metadata": bool(apply),
+        "mutates_portfolio": False,
+        "mutates_action_recommendation": False,
+        "mutates_config": False,
+        "submits_order": False,
+        "broker_execution_enabled": False,
+        "requires_confirm": bool(apply),
+        "requires_requested_reason": bool(apply),
+        "description": (
+            "Marks recovered event-processing/document failure rows as superseded so they stop polluting operator review."
+            if apply
+            else "Previews recovered event-processing/document failure rows that are safe candidates for superseded metadata."
+        ),
+    }
+
+
+def _persist_superseded_cleanup_audit(
+    *,
+    run_id: str,
+    status: str,
+    started_at: pd.Timestamp,
+    completed_at: pd.Timestamp,
+    operator_id: str,
+    requested_reason: str,
+    limit: int,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    elapsed_ms = (completed_at - started_at).total_seconds() * 1000.0
+    row = {
+        "run_id": run_id,
+        "command_key": "superseded_failure_cleanup_apply",
+        "command_label": "Apply Superseded Failure Cleanup",
+        "command_args_json": json.dumps(["internal", "advisory.superseded_failures", "--apply", "--limit", str(limit)], ensure_ascii=False),
+        "risk": "metadata_cleanup",
+        "dry_run": False,
+        "status": status,
+        "returncode": 0 if status == "ok" else 1,
+        "operator_id": operator_id,
+        "requested_reason": requested_reason,
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "elapsed_ms": elapsed_ms,
+        "stdout_tail": _tail_text(json.dumps(_json_ready(result or {}), ensure_ascii=False, default=str)),
+        "stderr_tail": None,
+        "error": error,
+        "load_ts": completed_at,
+    }
+    persist_operator_command_run(row)
+    output = dict(row)
+    output["command_args"] = _jsonish(output.pop("command_args_json", None))
+    return output
+
+
+def build_superseded_cleanup_payload(*, limit: int = 500) -> dict[str, Any]:
+    bounded_limit = max(1, min(int(limit), 1000))
+    result = cleanup_superseded_failures(apply=False, limit=bounded_limit)
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/operations/superseded-cleanup", schema_name="operations_superseded_cleanup"),
+        "status": "ok",
+        "mode": "preview",
+        "dry_run": True,
+        "result": _json_ready(result),
+        "counts": _superseded_cleanup_counts(result),
+        "operator_boundary": _superseded_cleanup_boundary(apply=False),
+        "audit_run": None,
+        "note": "Preview only. Use apply with confirm=true and a requested_reason to mark recovered failures superseded.",
+    }
+
+
+def apply_superseded_cleanup_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not bool(payload.get("confirm")):
+        raise ValueError("confirm=true is required before applying superseded cleanup")
+    requested_reason = (_text(payload.get("requested_reason")) or "").strip()
+    if not requested_reason:
+        raise ValueError("requested_reason is required before applying superseded cleanup")
+    operator_id = (_text(payload.get("operator_id")) or "").strip() or "operator"
+    limit = max(1, min(int(payload.get("limit") or 500), 1000))
+    started_at = pd.Timestamp.utcnow()
+    run_id = f"superseded_failure_cleanup_apply:{started_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+    try:
+        result = cleanup_superseded_failures(apply=True, limit=limit)
+    except Exception as exc:
+        completed_at = pd.Timestamp.utcnow()
+        audit_run = _persist_superseded_cleanup_audit(
+            run_id=run_id,
+            status="failed",
+            started_at=started_at,
+            completed_at=completed_at,
+            operator_id=operator_id,
+            requested_reason=requested_reason,
+            limit=limit,
+            result=None,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        # Surface the original error through the API guard while keeping the audit row.
+        raise RuntimeError(f"superseded cleanup failed; audit_run={audit_run.get('run_id')}: {type(exc).__name__}: {exc}") from exc
+    completed_at = pd.Timestamp.utcnow()
+    audit_run = _persist_superseded_cleanup_audit(
+        run_id=run_id,
+        status="ok",
+        started_at=started_at,
+        completed_at=completed_at,
+        operator_id=operator_id,
+        requested_reason=requested_reason,
+        limit=limit,
+        result=result,
+    )
+    return {
+        "generated_at": completed_at.isoformat(),
+        "api_schema": _operator_api_schema("/api/operations/superseded-cleanup/apply", schema_name="operations_superseded_cleanup_apply", read_only=False),
+        "status": "ok",
+        "mode": "apply",
+        "dry_run": False,
+        "result": _json_ready(result),
+        "counts": _superseded_cleanup_counts(result),
+        "operator_boundary": _superseded_cleanup_boundary(apply=True),
+        "audit_run": _json_ready(audit_run),
+        "note": "Applied only superseded metadata markers for recovered failures. Portfolio, actions, config, and broker state were not changed.",
+    }
+
+
 def _json_ready(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): _json_ready(item) for key, item in value.items()}
@@ -3995,18 +5497,36 @@ def _json_ready(value: Any) -> Any:
     if hasattr(value, "item") and not isinstance(value, (str, bytes, bytearray)):
         try:
             return _json_ready(value.item())
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_operator_local_fallback(
+                source="operator_api_json_ready",
+                fallback_type="operator_api_json_ready_item_failed",
+                reason="Operator API could not unwrap a scalar value with item() and kept the original value for later serialization.",
+                error=exc,
+                metadata={"value_type": type(value).__name__},
+            )
     if hasattr(value, "isoformat") and not isinstance(value, str):
         try:
             return value.isoformat()
-        except Exception:
-            pass
+        except Exception as exc:
+            _record_operator_local_fallback(
+                source="operator_api_json_ready",
+                fallback_type="operator_api_json_ready_isoformat_failed",
+                reason="Operator API could not serialize an object with isoformat() and kept the original value for later serialization.",
+                error=exc,
+                metadata={"value_type": type(value).__name__},
+            )
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_operator_local_fallback(
+            source="operator_api_json_ready",
+            fallback_type="operator_api_json_ready_missing_check_failed",
+            reason="Operator API could not evaluate missingness while preparing JSON and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
 
 
@@ -4310,6 +5830,14 @@ def _safe_manual_query(source_name: str, query: str, *, params: dict[str, Any] |
         return sql_to_df(query, params=params or {}, retries=3)
     except Exception as exc:
         skipped.append({"source": source_name, "error": f"{type(exc).__name__}: {exc}"})
+        _record_operator_local_fallback(
+            source=source_name,
+            fallback_type="operator_api_manual_review_source_query_failed",
+            severity="error",
+            reason="Operator API could not load a Manual Review source table and omitted that source from the response.",
+            error=exc,
+            metadata={"params_keys": sorted((params or {}).keys())},
+        )
         return pd.DataFrame()
 
 
@@ -4332,29 +5860,7 @@ def _announcement_failure_is_active(row: dict[str, Any]) -> bool:
 
 
 def ensure_manual_review_decisions_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {MANUAL_REVIEW_DECISIONS_TABLE} (
-                decided_at TIMESTAMPTZ NOT NULL,
-                item_id TEXT NOT NULL,
-                item_type TEXT,
-                source_table TEXT,
-                source_key TEXT,
-                symbol TEXT,
-                unique_id TEXT,
-                setup_id TEXT,
-                decision TEXT NOT NULL,
-                operator_id TEXT,
-                rationale TEXT,
-                follow_up_event TEXT,
-                note_json TEXT,
-                item_snapshot_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (item_id, decided_at)
-            )
-            """
-        )
+    ensure_operator_api_audit_tables()
 
 
 def load_latest_manual_review_decisions(*, limit: int = 1000) -> dict[str, dict[str, Any]]:
@@ -4516,6 +6022,14 @@ def _append_threshold_review_items(items: list[dict[str, Any]], skipped: list[di
         reviews = load_promotion_reviews(limit=max(1, int(limit)))
     except Exception as exc:
         skipped.append({"source": "technical_threshold_promotion_reviews", "error": f"{type(exc).__name__}: {exc}"})
+        _record_operator_local_fallback(
+            source="technical_threshold_promotion_reviews",
+            fallback_type="operator_api_threshold_review_load_failed",
+            severity="error",
+            reason="Operator API could not load technical-threshold promotion reviews and omitted them from Manual Review.",
+            error=exc,
+            metadata={"limit": max(1, int(limit))},
+        )
         return
     for row in reviews:
         if _text(row.get("manual_decision")):
@@ -4663,6 +6177,14 @@ def _append_identity_issue_items(items: list[dict[str, Any]], skipped: list[dict
         df = load_open_identity_issues(limit=max(1, int(limit)))
     except Exception as exc:
         skipped.append({"source": IDENTITY_ISSUES_TABLE, "error": f"{type(exc).__name__}: {exc}"})
+        _record_operator_local_fallback(
+            source=IDENTITY_ISSUES_TABLE,
+            fallback_type="operator_api_identity_issues_load_failed",
+            severity="error",
+            reason="Operator API could not load identity issues and omitted them from Manual Review.",
+            error=exc,
+            metadata={"limit": max(1, int(limit))},
+        )
         return
     for row in _records(df):
         symbol = row.get("symbol")
@@ -4972,7 +6494,101 @@ def _manual_review_wait_followup_original_item_id(item: dict[str, Any]) -> str |
     return _text(followup.get("manual_review_item_id"))
 
 
-def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
+_MANUAL_REVIEW_COMPACT_RAW_KEYS = {
+    "action_code",
+    "action_reason",
+    "action_source",
+    "action_status",
+    "action_type",
+    "asof_date",
+    "asset_type",
+    "company_master_id",
+    "completed_at",
+    "confidence",
+    "created_at",
+    "error",
+    "error_text",
+    "event_class",
+    "event_id",
+    "execution_id",
+    "execution_reason",
+    "execution_status",
+    "issue_key",
+    "issue_type",
+    "last_error",
+    "last_seen_at",
+    "load_ts",
+    "losing_action_code",
+    "match_reason",
+    "match_score",
+    "match_status",
+    "materiality",
+    "observed_at",
+    "observed_value",
+    "ocr_status",
+    "parse_status",
+    "policy_class",
+    "policy_score",
+    "published_on",
+    "reason",
+    "reason_contract_status",
+    "reason_detail",
+    "requested_exchange",
+    "resolution_status",
+    "review_status",
+    "reviewed_at",
+    "run_id",
+    "setup_id",
+    "signal_id",
+    "signal_type",
+    "source_action",
+    "source_key",
+    "source_table",
+    "stage",
+    "status",
+    "suggested_action",
+    "symbol",
+    "threshold_value",
+    "ticker",
+    "unique_id",
+    "updated_at",
+    "wait_question",
+    "wait_signal_followup",
+    "winning_action_code",
+}
+
+
+def _compact_manual_review_raw_value(value: Any) -> Any:
+    ready = _json_ready(value)
+    if isinstance(ready, str) and len(ready) > 1000:
+        return ready[:1000] + "...[truncated]"
+    if isinstance(ready, list):
+        return ready[:20]
+    if isinstance(ready, dict):
+        return {str(key): _compact_manual_review_raw_value(val) for key, val in list(ready.items())[:50]}
+    return ready
+
+
+def _compact_manual_review_item(item: dict[str, Any], *, include_raw: bool) -> dict[str, Any]:
+    if include_raw:
+        return item
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    compact_raw: dict[str, Any] = {}
+    omitted_keys: list[str] = []
+    for key, value in raw.items():
+        if key in _MANUAL_REVIEW_COMPACT_RAW_KEYS:
+            compact_raw[key] = _compact_manual_review_raw_value(value)
+        else:
+            omitted_keys.append(str(key))
+    out = dict(item)
+    out["raw"] = compact_raw
+    out["raw_compacted"] = True
+    out["raw_omitted_key_count"] = len(omitted_keys)
+    out["raw_omitted_keys_sample"] = sorted(omitted_keys)[:25]
+    return out
+
+
+def build_manual_review_payload(*, limit: int = 100, include_raw: bool = False) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
     per_source_limit = max(1, int(limit))
@@ -5004,6 +6620,14 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
     try:
         latest_decisions = load_latest_manual_review_decisions(limit=max(per_source_limit * 5, 1000))
     except Exception as exc:
+        _record_operator_local_fallback(
+            source=MANUAL_REVIEW_DECISIONS_TABLE,
+            fallback_type="operator_api_manual_review_decisions_load_failed",
+            reason="manual review queue could not load latest operator decisions",
+            error=exc,
+            severity="warn",
+            metadata={"limit": max(per_source_limit * 5, 1000)},
+        )
         skipped.append({"source": MANUAL_REVIEW_DECISIONS_TABLE, "error": f"{type(exc).__name__}: {exc}"})
     matched_wait_item_ids = _matched_manual_review_wait_item_ids(items)
     active_items: list[dict[str, Any]] = []
@@ -5019,7 +6643,20 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
             if original_decision:
                 try:
                     original_state = runtime_state_for_decision(str(original_decision.get("decision") or ""), has_matched_wait_signal=True)
-                except ValueError:
+                except ValueError as exc:
+                    _record_operator_local_fallback(
+                        source=MANUAL_REVIEW_DECISIONS_TABLE,
+                        fallback_type="operator_api_manual_review_invalid_decision_state",
+                        reason="manual review queue ignored an invalid original wait-signal decision state",
+                        error=exc,
+                        severity="warn",
+                        metadata={
+                            "item_id": item_id,
+                            "original_item_id": original_wait_item_id,
+                            "decision": str(original_decision.get("decision") or ""),
+                            "has_matched_wait_signal": True,
+                        },
+                    )
                     original_state = None
                 if original_state is not None and original_state.closes_item:
                     item["latest_operator_decision"] = _json_ready(original_decision)
@@ -5039,7 +6676,19 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
             has_matched_wait_signal = item_id in matched_wait_item_ids
             try:
                 runtime_state = runtime_state_for_decision(str(decision.get("decision") or ""), has_matched_wait_signal=has_matched_wait_signal)
-            except ValueError:
+            except ValueError as exc:
+                _record_operator_local_fallback(
+                    source=MANUAL_REVIEW_DECISIONS_TABLE,
+                    fallback_type="operator_api_manual_review_invalid_decision_state",
+                    reason="manual review queue ignored an invalid operator decision state",
+                    error=exc,
+                    severity="warn",
+                    metadata={
+                        "item_id": item_id,
+                        "decision": str(decision.get("decision") or ""),
+                        "has_matched_wait_signal": bool(has_matched_wait_signal),
+                    },
+                )
                 runtime_state = None
             if runtime_state is not None:
                 item["manual_review_state"] = {
@@ -5070,6 +6719,7 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
         by_type[row["item_type"]] = by_type.get(row["item_type"], 0) + 1
         by_severity[row["severity"]] = by_severity.get(row["severity"], 0) + 1
     source_warnings = _operator_source_warnings(trimmed, default_source="manual_review", source_field="source_table", skipped=skipped)
+    response_items = [_compact_manual_review_item(row, include_raw=bool(include_raw)) for row in trimmed]
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/manual-review", schema_name="manual_review_queue"),
@@ -5081,12 +6731,14 @@ def build_manual_review_payload(*, limit: int = 100) -> dict[str, Any]:
             "closed_by_operator": closed_count,
             "annotated_by_operator": annotated_count,
             "reopened_by_wait_signal": reopened_wait_count,
+            "compact": not bool(include_raw),
+            "raw_included": bool(include_raw),
             "by_type": by_type,
             "by_severity": by_severity,
             "skipped_sources": skipped,
             "source_warnings": source_warnings,
         },
-        "items": trimmed,
+        "items": response_items,
     }
 
 
@@ -5136,6 +6788,8 @@ def record_manual_review_decision_payload(payload: dict[str, Any]) -> dict[str, 
         decided_at=decided_at,
         operator_id=_text(payload.get("operator_id")),
     )
+    state_payload = runtime_state_payload(decision, has_matched_wait_signal=False)
+    effect_payload = decision_effect_payload(decision)
     return {
         "status": "ok",
         "api_schema": _operator_api_schema("/api/manual-review/decision", schema_name="manual_review_decision_result"),
@@ -5143,6 +6797,8 @@ def record_manual_review_decision_payload(payload: dict[str, Any]) -> dict[str, 
         "item_id": item_id,
         "decision": decision,
         **effects,
+        "manual_review_state": state_payload,
+        "decision_effect": effect_payload,
         "note": (
             "Decision recorded and a wait signal was created. No broker or trading behavior was changed."
             if effects.get("wait_signal")
@@ -5473,7 +7129,21 @@ def create_app():
                 if content_length:
                     try:
                         response_bytes = int(content_length)
-                    except ValueError:
+                    except ValueError as exc:
+                        record_local_fallback_event(
+                            module="advisory.api.app",
+                            fallback_type="operator_api_response_size_parse_failed",
+                            source="slow_request_logger",
+                            severity="warn",
+                            reason="Operator API middleware could not parse response content-length for slow/large response telemetry.",
+                            error=exc,
+                            metadata={
+                                "method": str(request.method),
+                                "route": str(request.url.path),
+                                "content_length": str(content_length),
+                                "status_code": int(status_code),
+                            },
+                        )
                         response_bytes = None
             try:
                 record_slow_operation(
@@ -5503,9 +7173,24 @@ def create_app():
                             "response_bytes": response_bytes,
                         },
                     )
-            except Exception:
+            except Exception as exc:
                 # Slow logging must never turn a successful operator API response into a failure.
-                pass
+                record_local_fallback_event(
+                    module="advisory.api.app",
+                    fallback_type="operator_api_slow_request_logging_failed",
+                    source="slow_request_logger",
+                    severity="warn",
+                    reason="Operator API slow-request telemetry failed; the API response was still returned.",
+                    error=exc,
+                    metadata={
+                        "method": str(request.method),
+                        "route": str(request.url.path),
+                        "query": str(request.url.query or ""),
+                        "status_code": int(status_code),
+                        "elapsed_ms": float(elapsed_ms),
+                        "response_bytes": response_bytes,
+                    },
+                )
 
     def _guard(callable_obj, *, route: str | None = None, **kwargs):
         operation = getattr(callable_obj, "__name__", str(callable_obj))
@@ -5545,8 +7230,8 @@ def create_app():
         return _guard(build_runtime_payload, route="/api/runtime")
 
     @app.get("/api/health/details", response_model=OperatorHealthDetailsResponse)
-    def health_details(mode: str = Query(default="fast", pattern="^(fast|full)$")):
-        return _guard(lambda: build_operator_health_payload(mode=mode), route="/api/health/details")
+    def health_details(mode: str = Query(default="fast", pattern="^(fast|full)$"), compact: bool = Query(default=True)):
+        return _guard(lambda: build_operator_health_payload(mode=mode, compact=compact), route="/api/health/details")
 
     @app.get("/api/operations/smoke", response_model=OperationsSmokeResponse)
     def operations_smoke():
@@ -5572,6 +7257,23 @@ def create_app():
     def operations_api_errors(limit: int = Query(default=50, ge=1, le=200)):
         return _guard(build_operator_api_errors_payload, route="/api/operations/api-errors", limit=limit)
 
+    @app.get("/api/operations/ingestion-state", response_model=OperationsIngestionStateResponse)
+    def operations_ingestion_state(
+        source: str | None = None,
+        status: str | None = None,
+        limit: int = Query(default=1000, ge=1, le=5000),
+        sample_limit: int = Query(default=20, ge=0, le=100),
+    ):
+        return _guard(build_ingestion_state_payload, route="/api/operations/ingestion-state", source=source, status=status, limit=limit, sample_limit=sample_limit)
+
+    @app.get("/api/operations/superseded-cleanup", response_model=OperationsSupersededCleanupResponse)
+    def operations_superseded_cleanup(limit: int = Query(default=500, ge=1, le=1000)):
+        return _guard(build_superseded_cleanup_payload, route="/api/operations/superseded-cleanup", limit=limit)
+
+    @app.post("/api/operations/superseded-cleanup/apply", response_model=OperationsSupersededCleanupResponse)
+    def operations_superseded_cleanup_apply(payload: dict[str, Any] = Body(...)):
+        return _guard(apply_superseded_cleanup_payload, route="/api/operations/superseded-cleanup/apply", payload=payload)
+
     @app.post("/api/operations/slow-issues/status")
     def operations_slow_issue_status(payload: dict[str, Any] = Body(...)):
         return _guard(update_slow_issue_payload, route="/api/operations/slow-issues/status", payload=payload)
@@ -5579,6 +7281,42 @@ def create_app():
     @app.get("/api/research/event-model-promotion-check", response_model=EventModelPromotionCheckResponse)
     def research_event_model_promotion_check():
         return _guard(build_event_model_promotion_check_payload, route="/api/research/event-model-promotion-check")
+
+    @app.get("/api/research/ts-forecast-promotion-check", response_model=TsForecastPromotionCheckResponse)
+    def research_ts_forecast_promotion_check(
+        model_name: str | None = None,
+        horizon_days: int | None = Query(default=None, ge=1, le=252),
+        from_date: str | None = None,
+        to_date: str | None = None,
+    ):
+        return _guard(
+            build_ts_forecast_promotion_check_payload,
+            route="/api/research/ts-forecast-promotion-check",
+            model_name=model_name,
+            horizon_days=horizon_days,
+            from_date=from_date,
+            to_date=to_date,
+        )
+
+    @app.post("/api/research/ts-forecast-promotion-review", response_model=PromotionReviewResponse)
+    def research_ts_forecast_promotion_review(payload: dict[str, Any]):
+        return _guard(build_ts_forecast_promotion_review_payload, route="/api/research/ts-forecast-promotion-review", payload=payload)
+
+    @app.get("/api/research/ts-forecast-promotion-reviews", response_model=TsForecastPromotionReviewsResponse)
+    def research_ts_forecast_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
+        return _guard(build_ts_forecast_promotion_reviews_payload, route="/api/research/ts-forecast-promotion-reviews", limit=limit)
+
+    @app.post("/api/research/ts-forecast-promotion-review/decision", response_model=PromotionDecisionResponse)
+    def research_ts_forecast_promotion_review_decision(payload: dict[str, Any]):
+        return _guard(
+            build_ts_forecast_promotion_review_decision_payload,
+            route="/api/research/ts-forecast-promotion-review/decision",
+            payload=payload,
+        )
+
+    @app.get("/api/research/ts-forecast-review-rules", response_model=TsForecastReviewRulesResponse)
+    def research_ts_forecast_review_rules():
+        return _guard(build_ts_forecast_review_rules_payload, route="/api/research/ts-forecast-review-rules")
 
     @app.get("/api/research/event-model-artifacts", response_model=EventModelArtifactsResponse)
     def research_event_model_artifacts(limit: int = Query(default=50, ge=0, le=200), offset: int = Query(default=0, ge=0)):
@@ -5588,9 +7326,17 @@ def create_app():
     def research_prompt_registry(owner_area: str | None = None, authority_scope: str | None = None, limit: int = Query(default=100, ge=0, le=500), offset: int = Query(default=0, ge=0)):
         return _guard(build_prompt_registry_api_payload, route="/api/research/prompt-registry", owner_area=owner_area, authority_scope=authority_scope, limit=limit, offset=offset)
 
+    @app.post("/api/screeners/preview", response_model=ScreenerPreviewResponse)
+    def screener_preview(payload: dict[str, Any] = Body(...)):
+        return _guard(build_screener_preview_payload, route="/api/screeners/preview", payload=payload)
+
+    @app.get("/api/screeners/coverage", response_model=ScreenerCoverageResponse)
+    def screener_coverage(asof_date: str | None = None, lookback_days: int = Query(default=30, ge=0, le=365), limit: int = Query(default=50, ge=1, le=200)):
+        return _guard(build_screener_coverage_api_payload, route="/api/screeners/coverage", asof_date=asof_date, lookback_days=lookback_days, limit=limit)
+
     @app.get("/api/manual-review", response_model=ManualReviewResponse)
-    def manual_review(limit: int = Query(default=100, ge=1, le=500)):
-        return _guard(build_manual_review_payload, route="/api/manual-review", limit=limit)
+    def manual_review(limit: int = Query(default=100, ge=1, le=500), include_raw: bool = Query(default=False)):
+        return _guard(build_manual_review_payload, route="/api/manual-review", limit=limit, include_raw=include_raw)
 
     @app.get("/api/identity-issues", response_model=IdentityIssuesResponse)
     def identity_issues(limit: int = Query(default=100, ge=1, le=500), symbol: str | None = None):
@@ -5657,6 +7403,15 @@ def create_app():
     ):
         return _guard(build_signal_refresh_payload, route="/api/signal-refresh", limit=limit, offset=offset, symbol=symbol, status=status, search=search, compact=compact)
 
+    @app.get("/api/operator-journey", response_model=OperatorJourneyResponse)
+    def operator_journey(
+        symbol: str | None = None,
+        item_id: str | None = None,
+        unique_id: str | None = None,
+        limit: int = Query(default=25, ge=1, le=100),
+    ):
+        return _guard(build_operator_journey_payload, route="/api/operator-journey", symbol=symbol, item_id=item_id, unique_id=unique_id, limit=limit)
+
     @app.get("/api/portfolio", response_model=OperatorPortfolioResponse)
     def portfolio(
         asof_date: str | None = None,
@@ -5689,7 +7444,7 @@ def create_app():
     def signal_quality(limit: int = Query(default=10, ge=1, le=100)):
         return _guard(build_signal_quality_payload, route="/api/signal-quality", limit=limit)
 
-    @app.post("/api/signal-quality/promotion-review")
+    @app.post("/api/signal-quality/promotion-review", response_model=PromotionReviewResponse)
     def signal_quality_promotion_review(payload: dict[str, Any]):
         return _guard(build_signal_quality_promotion_review_payload, route="/api/signal-quality/promotion-review", payload=payload)
 
@@ -5697,23 +7452,51 @@ def create_app():
     def signal_quality_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_signal_quality_promotion_reviews_payload, route="/api/signal-quality/promotion-reviews", limit=limit)
 
-    @app.post("/api/signal-quality/promotion-review/decision")
+    @app.post("/api/signal-quality/promotion-review/decision", response_model=PromotionDecisionResponse)
     def signal_quality_promotion_review_decision(payload: dict[str, Any]):
         return _guard(build_signal_quality_promotion_review_decision_payload, route="/api/signal-quality/promotion-review/decision", payload=payload)
+
+    @app.post("/api/event-policy/promotion-review", response_model=PromotionReviewResponse)
+    def event_policy_promotion_review(payload: dict[str, Any]):
+        return _guard(build_event_policy_promotion_review_payload, route="/api/event-policy/promotion-review", payload=payload)
+
+    @app.get("/api/event-policy/promotion-reviews", response_model=EventPolicyPromotionReviewsResponse)
+    def event_policy_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
+        return _guard(build_event_policy_promotion_reviews_payload, route="/api/event-policy/promotion-reviews", limit=limit)
+
+    @app.post("/api/event-policy/promotion-review/decision", response_model=PromotionDecisionResponse)
+    def event_policy_promotion_review_decision(payload: dict[str, Any]):
+        return _guard(build_event_policy_promotion_review_decision_payload, route="/api/event-policy/promotion-review/decision", payload=payload)
 
     @app.get("/api/config-change/previews", response_model=ConfigChangePreviewsResponse)
     def config_change_previews(limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_config_change_previews_payload, route="/api/config-change/previews", limit=limit)
 
-    @app.post("/api/config-change/technical-threshold-preview")
+    @app.get("/api/config-change/applications", response_model=ConfigChangeApplicationsResponse)
+    def config_change_applications(limit: int = Query(default=25, ge=1, le=100)):
+        return _guard(build_config_change_applications_payload, route="/api/config-change/applications", limit=limit)
+
+    @app.post("/api/config-change/application-decision", response_model=ConfigChangeApplicationResponse)
+    def config_change_application_decision(payload: dict[str, Any]):
+        return _guard(build_config_change_application_decision_payload, route="/api/config-change/application-decision", payload=payload)
+
+    @app.post("/api/config-change/technical-threshold-preview", response_model=ConfigChangePreviewResponse)
     def technical_threshold_config_change_preview(payload: dict[str, Any]):
         return _guard(build_technical_config_change_preview_payload, route="/api/config-change/technical-threshold-preview", payload=payload)
 
-    @app.post("/api/config-change/signal-quality-preview")
+    @app.post("/api/config-change/signal-quality-preview", response_model=ConfigChangePreviewResponse)
     def signal_quality_config_change_preview(payload: dict[str, Any]):
         return _guard(build_signal_quality_config_change_preview_payload, route="/api/config-change/signal-quality-preview", payload=payload)
 
-    @app.post("/api/technical-calibration/promotion-review")
+    @app.post("/api/config-change/event-policy-preview", response_model=ConfigChangePreviewResponse)
+    def event_policy_config_change_preview(payload: dict[str, Any]):
+        return _guard(build_event_policy_config_change_preview_payload, route="/api/config-change/event-policy-preview", payload=payload)
+
+    @app.post("/api/config-change/ts-forecast-preview", response_model=ConfigChangePreviewResponse)
+    def ts_forecast_config_change_preview(payload: dict[str, Any]):
+        return _guard(build_ts_forecast_config_change_preview_payload, route="/api/config-change/ts-forecast-preview", payload=payload)
+
+    @app.post("/api/technical-calibration/promotion-review", response_model=PromotionReviewResponse)
     def technical_calibration_promotion_review(payload: dict[str, Any]):
         return _guard(build_technical_threshold_promotion_review_payload, route="/api/technical-calibration/promotion-review", payload=payload)
 
@@ -5721,7 +7504,7 @@ def create_app():
     def technical_calibration_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_technical_threshold_reviews_payload, route="/api/technical-calibration/promotion-reviews", limit=limit)
 
-    @app.post("/api/technical-calibration/promotion-review/decision")
+    @app.post("/api/technical-calibration/promotion-review/decision", response_model=PromotionDecisionResponse)
     def technical_calibration_promotion_review_decision(payload: dict[str, Any]):
         return _guard(build_technical_threshold_review_decision_payload, route="/api/technical-calibration/promotion-review/decision", payload=payload)
 
@@ -5747,8 +7530,8 @@ def create_app():
         )
 
     @app.get("/api/event-policy", response_model=EventPolicyResponse)
-    def event_policy(asof_date: str | None = None, action_type: str | None = None, limit: int = Query(default=100, ge=1, le=500)):
-        return _guard(build_event_policy_payload, route="/api/event-policy", asof_date=asof_date, action_type=action_type, limit=limit)
+    def event_policy(asof_date: str | None = None, action_type: str | None = None, limit: int = Query(default=100, ge=1, le=500), include_raw: bool = Query(default=False)):
+        return _guard(build_event_policy_payload, route="/api/event-policy", asof_date=asof_date, action_type=action_type, limit=limit, include_raw=include_raw)
 
     @app.get("/api/event-policy/evaluation", response_model=EventPolicyEvaluationResponse)
     def event_policy_evaluation(limit: int = Query(default=100, ge=1, le=500)):
@@ -5833,10 +7616,23 @@ def create_app():
     return app
 
 
-try:
-    app = create_app()
-except RuntimeError:
-    app = None
+def _create_module_app():
+    try:
+        return create_app()
+    except RuntimeError as exc:
+        record_local_fallback_event(
+            module="advisory.api.app",
+            source="operator_api_create_app",
+            fallback_type="operator_api_create_app_failed",
+            severity="error",
+            reason="Operator API app initialization failed; module-level app is unavailable until the configuration/runtime issue is fixed.",
+            error=exc,
+            metadata={},
+        )
+        return None
+
+
+app = _create_module_app()
 
 
 def main() -> int:

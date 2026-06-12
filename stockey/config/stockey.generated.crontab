@@ -44,9 +44,12 @@ LOG_DIR=/Users/rane/code/stockey/logs/cron
 # Static live_dashboard generation is disabled.
 */5 * * * * rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_frontend.lock ./all_frontend.sh >> "$LOG_DIR/operator_frontend.log" 2>&1
 
+# Operator API latency probe. Writes latest latency summary under logs/performance and records slow endpoints.
+55 07,11,16,21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" logs/performance && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_api_latency_probe.lock ./all_api_latency_probe.sh >> "$LOG_DIR/api_latency_probe.log" 2>&1
+
 # Operator health snapshot. This writes current failures/fix hints into logs and exercises DB/API/snapshot/cron visibility.
 # Dhan validation is skipped here to avoid triggering broker auth from cron; cached-token freshness is still checked.
-05 08,12,17,22 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_operator_health.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.operator_health --skip-dhan >> "$LOG_DIR/operator_health.log" 2>&1
+05 08,12,17,22 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_operator_health.lock ./all_operator_health.sh >> "$LOG_DIR/operator_health.log" 2>&1
 
 # Superseded failure cleanup audit. Preview-only; apply mode is intentionally not scheduled.
 35 17 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_superseded_cleanup_audit.lock ./all_superseded_cleanup_audit.sh >> "$LOG_DIR/superseded_cleanup_audit.log" 2>&1
@@ -56,23 +59,26 @@ LOG_DIR=/Users/rane/code/stockey/logs/cron
 
 # Investor hypothesis/playbook scan over newly collected news and announcements.
 # Set HYPOTHESIS_CRON_ARGS="--no-llm" if you want deterministic scans only.
-25 10,13,16,21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_hypothesis_scan.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.hypothesis_engine --run-scan --model "${HYPOTHESIS_ACTION_MODEL:-codex}" ${HYPOTHESIS_CRON_ARGS:-} >> "$LOG_DIR/hypothesis_scan.log" 2>&1
+25 10,13,16,21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_hypothesis_scan.lock ./all_hypothesis_scan.sh >> "$LOG_DIR/hypothesis_scan.log" 2>&1
 
 # Experimental TS forecast workflow. This uses config/ts_forecast_screeners.yaml
 # to select a liquid technical universe, refreshes Dhan daily OHLCV, and writes research-only TS watch rows.
 # Daily OHLCV changes slowly, so this runs a few times a day instead of every watcher tick.
-20 11,14,17,20 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.ts_forecast_workflow --model-name "${TS_FORECAST_MODEL_NAME:-timesfm_2p5_200m}" --max-symbols "${TS_FORECAST_MAX_SYMBOLS:-80}" >> "$LOG_DIR/ts_forecast_workflow.log" 2>&1
+20 11,14,17,20 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast.lock ./all_ts_forecast_workflow.sh >> "$LOG_DIR/ts_forecast_workflow.log" 2>&1
 
 # Matured TS forecast evaluation. This validates prior forecast rows after costs; it does not create actions.
-20 18,21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_eval.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.ts_forecast_evaluator --model-name "${TS_FORECAST_MODEL_NAME:-timesfm_2p5_200m}" --cost-bps "${TS_FORECAST_COST_BPS:-25}" >> "$LOG_DIR/ts_forecast_evaluator.log" 2>&1
+20 18,21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_eval.lock ./all_ts_forecast_evaluator.sh >> "$LOG_DIR/ts_forecast_evaluator.log" 2>&1
+
+# Research-only TS forecast paper portfolio. Compares forecast-only decisions with naive momentum and advisory alignment.
+35 21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_paper.lock ./all_ts_forecast_paper_portfolio.sh >> "$LOG_DIR/ts_forecast_paper_portfolio.log" 2>&1
 
 # Research-only event-policy realized-return evaluation. Runs after the post-close advisory window.
 # It writes policy/action/class quality summaries only; it does not change thresholds or actions.
-10 23 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_event_policy_eval.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.event_policy_evaluator --horizons ${EVENT_POLICY_EVAL_HORIZONS:-5 10 20} --cost-bps "${EVENT_POLICY_EVAL_COST_BPS:-25}" --min-matured-rows "${EVENT_POLICY_EVAL_MIN_MATURED_ROWS:-10}" >> "$LOG_DIR/event_policy_evaluator.log" 2>&1
+10 23 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_event_policy_eval.lock ./all_event_policy_evaluator.sh >> "$LOG_DIR/event_policy_evaluator.log" 2>&1
 
 # Weekly research-only technical threshold calibration. This is deliberately not tied to live promotion.
 # Review the operator UI before manually changing config/advisory_setups.yaml.
-20 04 * * 6 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_technical_calibration.lock "$("$STOCKEY_DIR/scripts/resolve_python.sh")" -m advisory.technical_threshold_calibration --horizons ${TECHNICAL_CALIBRATION_HORIZONS:-5 10 20} --cost-bps "${TECHNICAL_CALIBRATION_COST_BPS:-25}" --min-signals "${TECHNICAL_CALIBRATION_MIN_SIGNALS:-10}" >> "$LOG_DIR/technical_threshold_calibration.log" 2>&1
+20 04 * * 6 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_technical_calibration.lock ./all_technical_threshold_calibration.sh >> "$LOG_DIR/technical_threshold_calibration.log" 2>&1
 
 # Weekly long-running research-only event-model prep/training.
 # It refreshes event-model evidence but does not change live policy automatically.

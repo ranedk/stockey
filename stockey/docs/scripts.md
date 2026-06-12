@@ -25,7 +25,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/sharpelydata/scrip_master.py` | `master_sharpely_funds`, `master_sharpely_equity` | Security masters |
 | `data/company_master.py` | `company_master` | Unified company identity built from Sharpely + Dhan masters |
 | `data/sharpelydata/sharpely_data.py` | `stmt_income`, `stmt_balancesheet`, `stmt_cashflow`, `shareholding_category`, `shareholding_top_holders`, `historical_mcap`, `sharpely_stock_meta`, `sharpely_stock_peers` | Fundamental data plus current stock metadata and peer snapshots |
-| `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master |
+| `data/dhanlive/scrip_master.py` | `master_dhan_instruments` | Versioned Dhan instrument master; base table/index schema is registry-managed by `20260611_dhan_scrip_master_base`, while new broker columns are still added dynamically after CSV inspection |
 | `data/dhanlive/auth_cli.py` | none | Dhan token status, refresh, validate, and cache-clear helper |
 | `data/dhanlive/ohlcv.py` | `dhan_ohlcv_daily`, `dhan_ohlcv_intraday` | Dhan OHLCV for `stock`, `index`, and `benchmark`; default sync resumes from the latest stored candle with overlap, and backfills only when no local data exists |
 | `data/dhanlive/ohlcv_pull.py` | none | Quick operator OHLCV pull utility; defaults to NSE equity, 5-minute candles, and the last 60 minutes |
@@ -34,19 +34,27 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `data/screenerin/screener_parser.py` | `screenerin_screener_snapshots` | Stores parsed Screener.in screener snapshots by screener slug and date |
 | `data/screenerin/screener_registry.py` | `screenerin_screeners` | Registry utility to add/list/remove Screener.in screeners and inspect latest stored snapshots |
 | `data/screenerin/ad_hoc_query.py` | `screenerin_ad_hoc_query_runs`, `screenerin_ad_hoc_query_results` | Authenticated ad hoc Screener.in raw query runner; auto-logins through CDP when needed and stores parsed company rows plus queried metrics |
+| `data/screenerin/query_validation.py` | none | Local Screener.in query validator for known bad syntax before browser/network execution |
 | `advisory/research_ledger.py` | `advisory_research_runs` | Research ledger for recording experiment configs, point-in-time context, validation protocol, and run outcomes |
 | `advisory/training_universe.py` | `advisory_screener_constituents` | Sync broad ad hoc Screener.in training universes directly into normalized advisory screener rows for research-only event-model coverage |
-| `advisory/event_meta_model.py` | `advisory_event_model_scores` | Train/score scaffold for XGBoost event meta-models using structured event tensors, anchor-day intraday response features, and future daily returns |
+| `advisory/event_meta_model.py` | `advisory_event_model_scores` | Train/score scaffold for XGBoost event meta-models using structured event tensors, anchor-day intraday response features, and future daily returns; score schema setup is registry-managed by `20260611_advisory_event_meta_model_scores_base` |
+| `advisory/regime_engine.py` | `advisory_market_regime` | Builds base market regime snapshots from benchmark, volatility, macro stress, and freshness inputs; schema setup is registry-managed by `20260611_advisory_market_regime_base` |
+| `advisory/news_overlay_engine.py` | `advisory_market_overlay_daily` | Builds a lightweight market news overlay over base regime state; overlay schema is registry-managed by `20260611_advisory_market_overlay_daily_base` |
+| `advisory/news_theme_engine.py` | `advisory_news_theme_screeners` | Classifies market news into configured investment themes and maps active themes to Screener.in screeners; mapping schema is registry-managed by `20260611_advisory_news_theme_screeners_base` |
+| `advisory/rule_engine.py` | `advisory_candidates`, `advisory_candidate_rejections` | Scores setup candidates into pass/watch/reject states with technical, fundamental, intraday, regime, and screener context; output schemas are registry-managed by `20260611_advisory_rule_outputs_base` |
 | `advisory/ts_forecast_features.py` | `advisory_ts_forecasts_daily` | Experimental OHLCV time-series forecast features; starts with `naive_momentum_v1` and is designed to host TimesFM / Chronos / Moirai adapters later |
 | `advisory/ts_forecast_evaluator.py` | `advisory_ts_forecast_evaluations`, `advisory_ts_forecast_eval_summary` | Evaluates matured TS forecast rows against future Dhan OHLCV returns after costs |
+| `advisory/ts_forecast_paper_portfolio.py` | `advisory_ts_forecast_paper_portfolio` | Builds research-only forecast paper decisions and compares them with naive momentum and current advisory alignment |
+| `advisory/ts_forecast_promotion_check.py` | read-only checks | Conservative promotion gate for deciding whether TS forecast paper evidence is ready for manual operator review as a low-weight input |
 | `advisory/ts_forecast_workflow.py` | `advisory_ts_forecasts_daily`, `advisory_ts_forecast_watchlist` | Optional Screener.in -> Dhan OHLCV refresh -> TimesFM forecast -> experimental TS watchlist workflow |
 | `advisory/technical_threshold_calibration.py` | `advisory_technical_threshold_evaluations`, `advisory_technical_threshold_eval_summary` | Research-only calibration of technical-engine thresholds against realized forward Dhan OHLCV returns after costs |
 | `advisory/technical_threshold_promotion.py` | `advisory_technical_threshold_promotion_reviews`, `advisory_technical_threshold_promotion_decisions` | LLM-assisted manual review of calibrated technical thresholds plus operator approval/rejection audit rows; produces patch guidance without applying config changes |
 | `advisory/config_change_assistant.py` | `advisory_config_change_previews` | Generates reviewed unified diffs from approved technical-threshold or signal-quality promotion decisions; preview/audit only, never applies config changes |
 | `advisory/prompt_registry.py` | read-only metadata | Central inventory of LLM/Codex prompt contracts, schemas, model env vars, source files, authority scope, fallbacks, and migration status |
-| `advisory/event_policy.py` | `advisory_event_policy_actions` | Deterministic and bounded Codex-assisted mapping from structured event evaluations to buy-watch, manual review, reduce-exposure review, or no action, including operator notes for actionable manual reviews |
-| `advisory/event_policy_evaluator.py` | `advisory_event_policy_evaluations`, `advisory_event_policy_eval_summary` | Research-only evaluation of event-policy action/classes against realized forward Dhan OHLCV returns after costs |
-| `advisory/company_memory_review.py` | `advisory_company_memory_reviews` | Review-only company-memory signal summaries from compact announcement evidence, bhavcopy evidence, technical state, event policy, wait signals, and latest action rows; deterministic by default, optional Codex |
+| `advisory/event_policy.py` | `advisory_event_policy_actions` | Deterministic and bounded Codex-assisted mapping from structured event evaluations to buy-watch, manual review, reduce-exposure review, or no action, including actionability context, calibrated source quality for filings/news/OCR evidence, affected sectors/peers, point-in-time Dhan daily price reaction/latest portfolio exposure when available, and operator notes for actionable manual reviews; base schema is registry-managed by `20260611_advisory_event_policy_actions_base`, and actionability is added by `20260611_advisory_event_policy_actionability` |
+| `advisory/event_policy_evaluator.py` | `advisory_event_policy_evaluations`, `advisory_event_policy_eval_summary` | Research-only evaluation of event-policy actions/classes, source-quality buckets, and market-scope buckets against realized forward Dhan OHLCV returns after costs |
+| `advisory/event_policy_promotion.py` | `advisory_event_policy_promotion_reviews`, `advisory_event_policy_promotion_decisions` | Manual review of event-policy evaluation groups plus operator approval/rejection audit rows; produces review-only event-policy rule guidance without changing live policy |
+| `advisory/company_memory_review.py` | `advisory_company_memory_reviews` | Review-only company-memory signal summaries from compact announcement evidence, bhavcopy evidence, technical state, event policy, wait signals, and latest action rows; deterministic by default, optional Codex; schema setup is registry-managed by `20260611_advisory_company_memory_reviews_base` |
 | `advisory/signal_quality_evaluator.py` | `advisory_signal_quality_evaluations`, `advisory_signal_quality_eval_summary` | Research-only comparison of technical-only signals versus technical signals enriched with event-policy, bhavcopy, and company-memory overlays after costs |
 | `advisory/signal_quality_promotion.py` | `advisory_signal_quality_promotion_reviews`, `advisory_signal_quality_promotion_decisions` | Manual review of signal-quality overlay lift plus operator approval/rejection audit rows; produces review-only overlay rule guidance without changing live policy |
 | `advisory/exchange_events.py` | `advisory_exchange_events` | Normalizes NSE block/bulk/short-selling/insider/corporate-action/earnings rows into point-in-time exchange events |
@@ -59,7 +67,10 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/identity_issues.py` | read-only by default; optional repair apply | Rechecks open Dhan/security identity issues after scrip/company master refresh; use `--apply` only after dry-run rows show `would_resolve` |
 | `advisory/cron_status.py` | read-only checks | Parses `config/stockey.generated.crontab`, joins scheduled jobs to lock directories and cron log tails, and powers the Operations scheduled-jobs card |
 | `advisory/operator_smoke.py` | read-only checks | Compact one-command operator preflight over Health that returns status, trust level, fix hints, current blockers, and next commands; also available as an audited Operations UI command |
-| `advisory/superseded_failures.py` | `advisory_event_processing_runs`, `announcement_pipeline_documents` | Previews recovered failure rows that can be marked superseded; default is dry-run JSON, and `--apply` requires explicit operator intent before writing superseded metadata |
+| `scripts/cron_preflight.py` | read-only checks | Validates generated go-crond setup before startup: required env, referenced scripts, stale locks, Python resolution, and operator API/web port availability; also available as the audited `cron_preflight` Operations command |
+| `scripts/docs_state_audit.py` | read-only docs checks | Audits README, roadmap, analysis, and docs for stale operator terminology plus required current-state coverage |
+| `utils/schema_migrations.py` | `stockey_schema_migrations` | Schema migration registry with checksum-protected apply, durable failure recording, dry-run, list, and ensure-table modes |
+| `advisory/superseded_failures.py` | `advisory_event_processing_runs`, `announcement_pipeline_documents` | Previews recovered failure rows that can be marked superseded; default is dry-run JSON, the Health UI has a guarded audited apply path, and CLI `--apply` is the manual fallback requiring explicit operator intent before writing superseded metadata |
 | `advisory/event_model_data_prep.py` | varies | One-shot prep flow for event-model training: normalizes missing screener constituents, backfills historical event evaluations, refreshes price history, and reports label coverage |
 | `advisory/model_training_runner.py` | varies | Gated model-training orchestrator: runs prep, checks label coverage for the requested horizon, then trains and scores only when ready |
 | `advisory/event_model_artifact_store.py` | S3/object store | Uploads trained event-model JSON, metadata JSON, and manifest JSON to versioned and `latest` S3 prefixes |
@@ -72,39 +83,43 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/decision_trace.py` | `advisory_decision_traces`, `advisory_decision_trace_steps`, `advisory_event_processing_runs`, `advisory_action_conflicts`, `advisory_action_conflict_rules` | Durable trace layer that links ingest, event evaluation, review, lifecycle, action consolidation, conflict rows, and seeded conflict-resolution rules |
 | `advisory/action_conflict_resolver.py` | `advisory_action_conflicts`, `advisory_action_conflict_rules` | Re-applies enabled conflict-resolution rules to latest or historical action conflicts after rules are edited; dedupes duplicate conflict rows, keeps resolved conflicts as audit-only trace data, and marks only unresolved/manual-required conflicts for manual handling |
 | `advisory/manual_review_state.py` | `advisory_manual_review_decisions`, `advisory_wait_signals` | Central state/effect contract for operator Manual Review decisions; defines closing versus annotating decisions, no-trade safety flags, and wait-signal side effects |
-| `advisory/trace_summary_store.py` | `advisory_trace_summaries` | Materializes compact symbol/event trace summaries so the operator frontend does not rebuild large traces live on every page load |
+| `advisory/trace_summary_store.py` | `advisory_trace_summaries` | Materializes compact symbol/event trace summaries so the operator frontend does not rebuild large traces live on every page load; schema setup is registry-managed by `20260611_advisory_trace_summaries_base` |
 | `advisory/live_dashboard.py` | JSON payload builder | Legacy static dashboard module; API still reuses its payload builder while Nuxt replaces static generation |
 | `advisory/operator_snapshot.py` | `advisory_operator_snapshots` | Builds the compact DB-backed operator dashboard snapshot used by the API to avoid rebuilding the full dashboard payload on every frontend request |
 | `advisory/performance_slowlog.py` | files under `logs/performance/` | Deduped slow-operation logger and state manager for API latency, snapshot builds, and future slow pipeline sections |
 | `advisory/api/app.py` | operator HTTP API | Serves operator-facing JSON endpoints, normalized trace summaries, hypothesis write/audit endpoints, and technical-calibration review endpoints for the Nuxt app |
 | `advisory/external_task_queue.py` | `advisory_external_task_queue` | Serialized queue foundation for single-client NSE/Dhan/Screener work so browser/API-heavy jobs do not run concurrently inside advisory |
 | `scripts/wait_for_locks.sh` | none | Shell guard used by cron so advisory waits for data catch-up and external queue locks before reconciling actions |
-| `advisory/live_notifier.py` | files in `live_dashboard/` | Subscribes to Redis pub-sub from the continuous-watch stack and writes a human-readable operator feed |
+| `advisory/live_notifier.py` | legacy files in `live_dashboard/` | Subscribes to Redis pub-sub from the continuous-watch stack and writes a legacy human-readable operator feed if run directly |
 | `advisory/adversarial_review.py` | `advisory_event_reviews` | Deterministic reviewer over structured event tensors; can clear, penalize, force manual review, or veto event-driven allocations |
 | `utils/ocr` | none | Provider-agnostic PDF OCR utility using Gemini 3 Flash preview and OpenAI GPT-5 nano |
 | `utils/transcribe` | none | Audio transcription utility for remote mp3/wav/mp4 links using Gemini 3 Flash preview and OpenAI transcription APIs |
-| `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives for the legacy/reference NSE pipeline |
+| `data/nseindia/bhavcopy_parser.py` | `nseindia_*` daily tables | Parses downloaded NSE archives for the legacy/reference NSE pipeline; empty valid archives are marked `empty_valid_source`, and failed rows classify as `bad_file_retryable`, `schema_changed`, or `parser_bug` in runner state |
 | `data/nseindia/adjusted_prices.py` | `nseindia_corporate_actions_normalized`, `nseindia_ohlcv_adjusted` | Builds split/bonus-adjusted OHLCV for the legacy/reference NSE pipeline |
-| `data/nseindia/security_history.py` | `dim_security_history`, `dim_security_review_events`, `dim_security_overrides` | Builds canonical security identity history and review queue for renames / identity breaks |
+| `data/nseindia/security_history.py` | `dim_security_history`, `dim_security_review_events`, `dim_security_overrides` | Builds canonical security identity history and review queue for renames / identity breaks; schema setup is registry-managed by `20260611_nse_security_history_base` |
 | `data/nseindia/security_dimension.py` | `dim_security` | Current canonical security dimension keyed by `security_id` |
-| `data/nseindia/indices_parser.py` | `nseindia_indices` | Index history |
+| `data/nseindia/indices_parser.py` | `nseindia_indices` | Index history; empty/no-row archives are marked `empty_valid_source`, and failed rows classify as `bad_file_retryable`, `schema_changed`, or `parser_bug` in runner state |
 | `data/benchmark_sync.py` | `dhan_ohlcv_daily` | Syncs canonical advisory benchmark rows such as `NIFTY` from parsed NSE index history so benchmark features do not depend on stale Dhan index candles |
 | `data/nseindia/corporate_actions.py` | `nseindia_corporate_actions` | Corporate actions |
 | `data/nseindia/earnings_events.py` | `nseindia_earnings_events` | Earnings calendar |
 | `data/nseindia/insider_deals.py` | `nseindia_insider_deals` | Insider deals |
-| `data/nseindia/offmarket_parser.py` | `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_short_selling` | Off-market parsers |
+| `data/nseindia/offmarket_parser.py` | `nseindia_block_deals`, `nseindia_bulk_deals`, `nseindia_short_selling` | Off-market parsers; valid zero-row files are marked `empty_valid_source`, and failed rows classify as `schema_changed` or `parser_bug` in runner state |
 | `data/nseindia/recent_events.py` | `nseindia_events` | NSE event feed |
 | `data/nseindia/holidays.py` | `nseindia_holidays` | Trading holidays |
 | `data/announcements/cli.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Exchange announcement ingest keyed by `company_master_id` |
 | `data/backfill_company_master_ids.py` | many existing symbol-based tables | Adds and backfills `company_master_id` on historical rows |
 | `scripts/cleanup_deprecated_tables.py` | none | Drops deprecated tables that are no longer used by the active advisory stack |
-| `scripts/ingestion_state_runner.py` | `ingestion_file_state` | Inspect failed/processed ingestion file state and clear specific failed keys before retry |
+| `scripts/ingestion_state_runner.py` | `ingestion_file_state` | Inspect and summarize failed/processed/empty-valid ingestion file state, including parser failure classifications, and clear specific failed keys before retry; schema setup is registry-managed by `20260611_ingestion_file_state_base` |
 | `scripts/db_size_report.py` | read-only Postgres stats | Reports largest tables, largest indexes, and text/json columns so performance work can be measured before and after changes |
+| `scripts/heavy_payload_inventory.py` | read-only Postgres catalog stats | Classifies non-announcement text/json/blob-like columns by risk and recommended action so offload/retention work can be targeted |
 | `scripts/db_table_retention_report.py` | read-only Postgres stats | Fast retention report for legacy NSE tables using indexed date bounds by default; exact counts are opt-in |
+| `scripts/hot_table_retention.py` | hot trace/intraday tables | Report-first hot/cold retention utility for raw decision traces, trace steps, event-processing runs, action conflicts, trace-summary cache, Dhan intraday candles, and daily intraday feature rows; dry-run by default, S3 archive/delete are explicit |
 | `scripts/db_duplicate_index_report.py` | read-only Postgres stats | Finds exact duplicate indexes and emits reviewable `DROP INDEX CONCURRENTLY` candidates; does not drop anything |
 | `scripts/drop_duplicate_indexes.py` | duplicate Postgres indexes | Guarded duplicate-index cleanup utility; dry-run by default and requires `--execute` to drop non-constraint duplicate indexes |
-| `scripts/offload_announcement_text_to_s3.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Migrates heavy announcement OCR/transcript/report text to object storage while keeping S3 keys, hashes, counts, and excerpts in Postgres |
-| `scripts/api_latency_probe.py` | operator API | Probes operator API endpoint latency and records slow endpoints through the deduped slow-operation log |
+| `scripts/offload_announcement_text_to_s3.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Migrates heavy announcement OCR/transcript/report text to object storage while keeping S3 keys, hashes, counts, excerpts, and optional JSON manifests in Postgres/operator logs |
+| `scripts/validate_announcement_s3_pointers.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Read-only validator for offloaded announcement S3 pointers; supports dry-run, HEAD/size checks, and optional SHA-256 verification |
+| `scripts/api_latency_probe.py` | operator API and `logs/performance/latest_api_latency_probe.json` | Probes operator API endpoint latency, writes the latest summary for Operator Health, and records slow endpoints through the deduped slow-operation log |
+| `scripts/api_performance_report.py` | `logs/performance/latest_api_latency_probe.json`, `logs/performance/slow_operation_state.json` | Ranks slow/error/large operator API routes and emits endpoint-specific optimization guidance before adding indexes or changing payloads |
 | `scripts/archive_legacy_nse_tables.py` | legacy NSE tables | Dry-run, S3 archive, and optional delete utility for old legacy NSE rows, chunked by month |
 
 ## Management scripts
@@ -121,23 +136,53 @@ python scripts/cleanup_deprecated_tables.py --dry-run
 Ingestion state inspection:
 
 ```sh
+python scripts/ingestion_state_runner.py summary --status failed --limit 1000
+python scripts/ingestion_state_runner.py summary --source bhavcopy --status empty_valid_source
 python scripts/ingestion_state_runner.py list --status failed --limit 50
 python scripts/ingestion_state_runner.py list --source bhavcopy --status failed
 python scripts/ingestion_state_runner.py clear --source bhavcopy --key bhavcopy/bhavcopy_2015-01-16.zip
 ```
 
+The same summary is exposed read-only in the operator API at `/api/operations/ingestion-state` and on the Nuxt Health page under File-Level Ingestion State.
+
 Performance inspection and text offload:
 
 ```sh
 python scripts/db_size_report.py --limit 30
+python scripts/heavy_payload_inventory.py --min-risk-score 1 --format json
 python scripts/db_table_retention_report.py --retention-days 365
+python scripts/hot_table_retention.py --format json
+python scripts/hot_table_retention.py --group intraday --exact-counts --format json
 python scripts/db_duplicate_index_report.py --limit 20
 python scripts/drop_duplicate_indexes.py --limit 20 --min-mb 1
-python scripts/api_latency_probe.py
+python scripts/api_latency_probe.py --output-path logs/performance/latest_api_latency_probe.json
+python scripts/api_performance_report.py --limit 20
+python scripts/docs_state_audit.py --strict
 python -m advisory.performance_slowlog report --limit 20
-python scripts/offload_announcement_text_to_s3.py --dry-run --limit 100
-python scripts/offload_announcement_text_to_s3.py --limit 500
+python -m utils.schema_migrations --ensure-table
+python -m utils.schema_migrations --list --limit 20
+python scripts/offload_announcement_text_to_s3.py --dry-run --limit 100 --manifest-path logs/performance/announcement_text_offload_dry_run.json
+python scripts/offload_announcement_text_to_s3.py --limit 500 --manifest-path logs/performance/announcement_text_offload_apply.json
+python scripts/validate_announcement_s3_pointers.py --dry-run --limit 100
+python scripts/validate_announcement_s3_pointers.py --limit 100
+python scripts/validate_announcement_s3_pointers.py --limit 25 --verify-hash
 ```
+
+Use `python -m utils.schema_migrations --migration-id <id> --description "..." --sql-file path/to/file.sql --dry-run` before applying any future schema SQL file. The helper records checksum, status, statements, metadata, and failures in `stockey_schema_migrations`. Missing, running, or failed registry rows are also surfaced by `python -m advisory.operator_health --skip-dhan` and the existing Data Health/fix-hints UI.
+
+The announcement text offload script also uses this registry for its S3 key/hash/count/excerpt columns, so if the offload fails before uploading text, inspect `python -m utils.schema_migrations --list --limit 20` before rerunning.
+
+Hot trace/intraday retention is also dry-run first. Use the report command before any archive/delete:
+
+```sh
+python scripts/hot_table_retention.py --format json
+python scripts/hot_table_retention.py --archive-s3 --max-chunks 1 --format json
+python scripts/hot_table_retention.py --archive-s3 --delete --max-chunks 1 --execute --format json
+```
+
+`--delete` is blocked unless `--archive-s3` is present or `--allow-delete-without-archive` is explicitly supplied. Archive/delete operations are chunked by month.
+
+The first registry-managed runtime schemas are Dhan OHLCV via migration id `20260611_dhan_ohlcv_base_asset_type`, used by `data/dhanlive/ohlcv.py`; Dhan scrip master via migration id `20260611_dhan_scrip_master_base`, used by `data/dhanlive/scrip_master.py`; file-level ingestion state via migration id `20260611_ingestion_file_state_base`, used by `utils/ingestion_state.py`; NSE security identity history/review output via migration id `20260611_nse_security_history_base`, used by `data/nseindia/security_history.py`; Screener.in registered screener outputs via migration id `20260611_screenerin_registered_screeners_base`, used by `data/screenerin/screener_parser.py`; Screener.in ad hoc query outputs via migration id `20260611_screenerin_ad_hoc_query_base`, used by `data/screenerin/ad_hoc_query.py`; Screener.in parse/fetch failures via migration id `20260611_screenerin_parse_failures_base`, used by `data/screenerin/failure_log.py`; Economic Times RSS items via migration id `20260611_economictimes_rss_items_base`, used by `data/economictimes/rss.py`; market regime snapshot output via migration id `20260611_advisory_market_regime_base`, used by `advisory/regime_engine.py`; market news overlay output via migration id `20260611_advisory_market_overlay_daily_base`, used by `advisory/news_overlay_engine.py`; hypothesis/playbook outputs via migration id `20260611_advisory_hypothesis_engine_base`, used by `advisory/hypothesis_engine.py`; external task queue via migration id `20260611_advisory_external_task_queue_base`, used by `advisory/external_task_queue.py`; identity issue tracking via migration id `20260611_advisory_identity_issues_base`, used by `advisory/identity_issues.py`; fallback telemetry via migration id `20260611_advisory_fallback_telemetry_base`, used by `advisory/fallback_telemetry.py`; current-price cache via migration id `20260611_advisory_current_prices_base`, used by `advisory/current_prices.py`; wait-signal outputs via migration id `20260611_advisory_wait_signals_base`, used by `advisory/wait_signals.py`; live event-router actions via migration id `20260611_advisory_event_router_actions_base`, used by `advisory/event_router.py`; trace-summary cache via migration id `20260611_advisory_trace_summaries_base`, used by `advisory/trace_summary_store.py`; execution order/fill handoff via migration id `20260611_advisory_execution_orders_base`, used by `advisory/execution_engine.py`; company-memory review output via migration id `20260611_advisory_company_memory_reviews_base`, used by `advisory/company_memory_review.py`; rule-engine candidates/rejections via migration id `20260611_advisory_rule_outputs_base`, used by `advisory/rule_engine.py`; event-policy action overlay via migration id `20260611_advisory_event_policy_actions_base`, used by `advisory/event_policy.py`; adversarial event reviews via migration id `20260611_advisory_event_reviews_base`, used by `advisory/adversarial_review.py`; announcement watch outputs via migration id `20260611_advisory_announcement_watch_outputs_base`, used by `advisory/announcement_watch.py`; news watch outputs via migration id `20260611_advisory_news_events_base`, used by `advisory/news_watch.py`; news theme screener mappings via migration id `20260611_advisory_news_theme_screeners_base`, used by `advisory/news_theme_engine.py`; config-change previews via migration id `20260611_advisory_config_change_previews_base`, used by `advisory/config_change_assistant.py`; intraday feature cache via migration id `20260611_advisory_intraday_features_base`, used by `advisory/intraday_features.py`; watchlist builder output via migration id `20260611_advisory_watchlist_base`, used by `advisory/watchlist_builder.py`; operator API write-audit tables via migration id `20260611_advisory_operator_api_audit_base`, used by `advisory/api/app.py`; technical-threshold promotion review output via migration id `20260611_advisory_technical_threshold_promotion_base`, used by `advisory/technical_threshold_promotion.py`; signal-quality promotion review output via migration id `20260611_advisory_signal_quality_promotion_base`, used by `advisory/signal_quality_promotion.py`; event-policy promotion review output via migration id `20260611_advisory_event_policy_promotion_base`, used by `advisory/event_policy_promotion.py`; consolidated action recommendations via migration id `20260611_advisory_action_recommendations_base`, used by `advisory/action_recommender.py`; decision trace/action-conflict audit tables via migration id `20260611_advisory_decision_trace_base`, used by `advisory/decision_trace.py`; event-evaluation/risk outputs via migration id `20260611_advisory_event_evaluation_outputs_base`, used by `advisory/llm_event_evaluator.py`; event meta-model score outputs via migration id `20260611_advisory_event_meta_model_scores_base`, used by `advisory/event_meta_model.py`; event-policy evaluator outputs via migration id `20260611_advisory_event_policy_evaluator_base`, used by `advisory/event_policy_evaluator.py`; technical-threshold calibration outputs via migration id `20260611_advisory_technical_threshold_calibration_base`, used by `advisory/technical_threshold_calibration.py`; signal-quality evaluator outputs via migration id `20260611_advisory_signal_quality_evaluator_base`, used by `advisory/signal_quality_evaluator.py`; risk allocations via migration id `20260611_advisory_allocations_base`, used by `advisory/risk_engine.py`; portfolio orders via migration id `20260611_advisory_portfolio_orders_base`, used by `advisory/portfolio_engine.py`; lifecycle/rebalance actions via migration id `20260611_advisory_position_lifecycle_base`, used by `advisory/position_lifecycle.py`; signal-refresh actions via migration id `20260611_advisory_signal_refresh_actions_base`, used by `advisory/signal_refresh.py`; shared sync-state via migration id `20260611_advisory_sync_state_base`, used by `advisory/sync_state.py`; continuous-watch alerts via migration id `20260611_advisory_live_watch_alerts_base`, used by `advisory/continuous_watch.py`; the research ledger via migration id `20260611_advisory_research_runs_base`, used by `advisory/research_ledger.py`; TS forecast feature output via migration id `20260611_advisory_ts_forecast_features_base`, used by `advisory/ts_forecast_features.py`; TS forecast workflow watchlist output via migration id `20260611_advisory_ts_forecast_workflow_base`, used by `advisory/ts_forecast_workflow.py`; TS forecast evaluator outputs via migration id `20260611_advisory_ts_forecast_evaluator_base`, used by `advisory/ts_forecast_evaluator.py`; announcement text offload columns via migration id `20260611_announcement_text_offload_storage_columns`, used by `scripts/offload_announcement_text_to_s3.py`; and dynamic company-master-id backfill columns via per-table `20260611_company_master_id_backfill_*` migrations, used by `data/backfill_company_master_ids.py`. Remaining direct DDL is limited to generic `utils.db` table/upsert helpers and source-specific temporary/staging tables.
 
 Only run the duplicate-index cleanup with `--execute` after reviewing the dry-run output:
 
@@ -152,6 +197,8 @@ Slow-operation tracking writes:
 
 Use `python -m advisory.performance_slowlog mark <fingerprint> triaged --note "..."` after adding a TODO or fix plan, so recurring slow events are counted but not treated as new work.
 
+For `/api/actions?compact=true` and `/api/portfolio?compact=true`, inspect `meta.<section>.payload_bytes`, `avg_row_bytes`, and `max_row_bytes` alongside the probe latency. This tells you whether the next fix should target query/index work or response compaction/detail endpoints.
+
 Legacy NSE retention workflow:
 
 ```sh
@@ -165,6 +212,8 @@ Only add `--delete` after validating the S3 archive. Deleting old rows does not 
 ## General usage guidelines
 
 - Prefer `python -m ...` from the repo root so relative config and `.env` loading behave consistently.
+- Keep `.env.example` in sync with runtime settings by running `python scripts/env_example_audit.py --strict` after adding new `env(...)`, `os.getenv(...)`, shell, cron, or frontend public env usage.
+- Keep docs aligned with the current operator flow by running `python scripts/docs_state_audit.py --strict` after changing top-level scripts, cron, UI paths, or roadmap status.
 - DB reads, selected metadata calls, DB connects, and DB upserts retry transient statement-timeout and connection errors by default. Tune with `SQL_TO_DF_RETRIES`, `SQL_TO_DF_RETRY_SLEEP_SECONDS`, `SQL_TO_DF_STATEMENT_TIMEOUT_MS`, `SQL_TO_DF_CHUNK_SIZE`, `DB_OPERATION_ATTEMPTS`, and `DB_POOL_RECYCLE_SECONDS` if remote PostgreSQL is unstable.
 - Ingestion Redis cursor/cache operations retry by default and fail soft after retries. Tune with `REDIS_OPERATION_ATTEMPTS`, `REDIS_RETRY_SLEEP_SECONDS`, `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS`, `REDIS_SOCKET_TIMEOUT_SECONDS`, and `REDIS_FAIL_SOFT`.
 - DB upserts use local temporary files for the `COPY` payload, which avoids holding very large CSV buffers fully in memory.
@@ -202,7 +251,7 @@ OSX:
 
 - Core LLM/Codex output rows persist prompt-contract metadata so later audits can tell which prompt and response schema produced a row. Current coverage includes `advisory_event_evaluations.prompt_id/prompt_version/prompt_schema_version`, `advisory_event_policy_actions.llm_prompt_*`, `advisory_playbook_action_plans.prompt_*`, `advisory_company_memory_reviews.prompt_*`, `advisory_action_recommendations.manual_revision_prompt_*`, `advisory_technical_threshold_promotion_reviews.prompt_*`, `announcement_pipeline_documents` summary/OCR prompt metadata, and `announcement_pipeline_reports.prompt_*`.
 
-- Runtime fallback/degraded-path events are persisted in `advisory_fallback_events`. Current emitters cover Redis fail-soft, Dhan identity fallback/unresolved identity, NSE retry/session reset, event-evaluation synthetic fallback, event-policy/manual-revision/playbook/company-memory deterministic fallbacks, and technical-threshold promotion fallback. Operator Health reads this table as `fallback_telemetry`, adds it to fix hints and the trust gate, and also mirrors recent rows into the Fallbacks & Degradation section.
+- Runtime fallback/degraded-path events are persisted in `advisory_fallback_events` or, when Postgres itself may be unavailable, in the local fallback JSONL spool read by Operator Health. Current emitters cover source retries/session resets, broker identity/auth failures, DB retry exhaustion, ingestion/parser degradation, event/policy/playbook/company-memory fallbacks, feature/risk/portfolio/action/execution context degradation, operator API payload fallbacks, date/display formatting fallbacks, and maintenance-tool failures. Operator Health reads this as `fallback_telemetry`, adds it to fix hints and the trust gate, and mirrors recent rows into the Fallbacks & Degradation section. Use `python scripts/fallback_telemetry_coverage_report.py --format json` to audit remaining source/API handlers; the 2026-06-12 baseline is `records_fallback=468`, `reraises=52`, `silent_handler=2`, with zero `silent_fallback` and zero `logs_then_falls_through`. The remaining scanner-visible silent handlers are fallback-telemetry self-protection paths where emitting telemetry would risk recursion.
 
 - Consolidated action decisions can also get Codex-generated manual revision pointers. Set `ACTION_MANUAL_REVISION_POINTERS_ENABLED=true` and `ACTION_MANUAL_REVISION_POINTERS_MODEL=codex` or `codex:<model>`. The output is persisted on `advisory_action_recommendations` as `manual_revision_summary` and `manual_revision_pointers_json`; if Codex fails, deterministic fallback pointers are written instead.
 
@@ -213,9 +262,9 @@ OSX:
 
 - Event/playbook reason contracts are enriched from latest `advisory_event_evaluations`, `advisory_event_reviews`, and `advisory_playbook_action_plans`. This adds event ids/classes/verdicts/reviewer actions and matched playbook/review-check context before the final action row is accepted.
 
-- `all_watchers.sh` runs `advisory.continuous_watch`, which now augments active watchlist symbols with a lower-priority top-50% market-context queue from `advisory_market_context_universe_daily`. Top-context news and announcements are persisted as `context_observed` unless deterministic materiality keywords mark them `triggered`; only `triggered` rows are routed for advisory refresh/evaluation. Tune breadth with `MARKET_CONTEXT_WATCH_LIMIT` (default `50`). The wrapper self-locks with `/tmp/stockey_watchers.lock`; skipped overlaps exit successfully and the next run resumes from `advisory_sync_state`. Watcher output is an intraday evidence/signal-refresh layer: fresh OHLCV/news/announcement evidence, material context triggers, and matched wait signals can write fast symbol-scoped rows, but final portfolio allocation, cross-sectional action reconciliation, and dry-run execution previews still require the full `all_advisory.sh` path.
+- `all_watchers.sh` runs `advisory.continuous_watch`, which now augments active watchlist symbols with a lower-priority top-50% market-context queue from `advisory_market_context_universe_daily`. Top-context news and announcements are persisted as `context_observed` unless deterministic materiality keywords mark them `triggered`; only `triggered` rows are routed for advisory refresh/evaluation. Market-context summaries and the operator home page show `Triggered` versus `Observed` counts so broad evidence noise is visible. Tune breadth with `MARKET_CONTEXT_WATCH_LIMIT` (default `50`). The wrapper self-locks with `/tmp/stockey_watchers.lock`; skipped overlaps exit successfully and the next run resumes from `advisory_sync_state`. Watcher output is an intraday evidence/signal-refresh layer: fresh OHLCV/news/announcement evidence, material context triggers, and matched wait signals can write fast symbol-scoped rows, but final portfolio allocation, cross-sectional action reconciliation, and dry-run execution previews still require the full `all_advisory.sh` path.
 
-- Investor playbooks live in `config/hypotheses.yaml`. Import them with `python -m advisory.hypothesis_engine --import-config config/hypotheses.yaml`; preview with `--dry-run`; run matching/action-plan generation with `python -m advisory.hypothesis_engine --run-scan`. Only `status: trusted_overlay` playbooks can affect consolidated actions, and only as `review_only` overlays.
+- Investor playbooks live in `config/hypotheses.yaml`. Import them with `python -m advisory.hypothesis_engine --import-config config/hypotheses.yaml`; preview with `--dry-run`; run matching/action-plan generation with `python -m advisory.hypothesis_engine --run-scan`. Hypothesis/playbook tables are registry-managed by `20260611_advisory_hypothesis_engine_base`. Only `status: trusted_overlay` playbooks can affect consolidated actions, and only as `review_only` overlays.
 
 - Dhan OHLCV auth falls back in this order:
   1. `DHAN_ACCESS_TOKEN`
@@ -241,7 +290,7 @@ python -m data.dhanlive.auth_cli clear-cache
 
 | Script | Purpose | Scope |
 | --- | --- | --- |
-| `all_frontend.sh` | Operator frontend supervisor | Regular cron restarts/supervises `advisory.api.app` and the Nuxt operator app under a lock |
+| `all_frontend.sh` | Operator frontend supervisor | Regular cron restarts/supervises `advisory.api.app` and the Nuxt operator app under a lock; supports `--api-only`, `--web-only`, and `--both` for targeted restarts |
 | `all_watchers.sh` | Continuous monitoring wrapper | Self-locking one-shot/loop wrapper that polls active watchlist OHLCV, announcements, and ET/news incrementally from persisted cursors |
 | `all_downloaders_queue.sh` | Queued download ingestion | Enqueues single-client NSE/Dhan/Screener downloader work and runs safe non-queued downloader modules inline |
 | `all_external_workers.sh` | External queue worker drain | Drains Dhan, Screener, and NSE queues serially under one lock |
@@ -249,8 +298,20 @@ python -m data.dhanlive.auth_cli clear-cache
 | `all_advisory.sh` | Advisory orchestrator | Runs post-close advisory pipeline and portfolio generation without raw downloads; defaults to bounded local parallel stages and skips hidden rule repair |
 | `all_superseded_cleanup_audit.sh` | Superseded failure cleanup audit | Preview-only wrapper around `advisory.superseded_failures`; emits script markers and never passes `--apply` |
 | `all_ml.sh` | Weekly research training | Long-running event-model research job; scheduled only in a dedicated weekly window if enabled |
+| `all_api_latency_probe.sh` | Operator API latency probe | Runs `scripts/api_latency_probe.py` with lifecycle markers and writes latency/slowlog evidence |
+| `all_operator_health.sh` | Operator health check | Runs `advisory.operator_health --skip-dhan` by default with lifecycle markers |
+| `all_hypothesis_scan.sh` | Hypothesis/playbook scan | Runs `advisory.hypothesis_engine --run-scan` with configured model/args and lifecycle markers |
+| `all_ts_forecast_workflow.sh` | TS forecast workflow | Runs the research-only TS forecast watchlist refresh with configured model/max symbols and lifecycle markers |
+| `all_ts_forecast_evaluator.sh` | TS forecast evaluator | Evaluates matured TS forecast rows after costs with lifecycle markers |
+| `all_ts_forecast_paper_portfolio.sh` | TS forecast paper portfolio | Builds research-only forecast paper decisions with lifecycle markers |
+| `all_event_policy_evaluator.sh` | Event-policy evaluator | Evaluates event-policy outcomes after costs with lifecycle markers |
+| `all_technical_threshold_calibration.sh` | Technical threshold calibration | Runs weekly research-only technical threshold calibration with lifecycle markers |
 
-Cron also runs selected Python modules directly for operator health, hypothesis scans, TS research refresh/evaluation, event-policy evaluation, technical-threshold calibration, and weekly event-model research training.
+`/api/manual-review` is intentionally compact by default. Use `include_raw=true` only for bounded debugging, for example `curl 'http://127.0.0.1:8765/api/manual-review?limit=5&include_raw=true'`, because full raw source rows can be much larger than the operator list needs.
+
+`/api/health/details` is also compact by default. Use `compact=false` only for bounded debugging, for example `curl 'http://127.0.0.1:8765/api/health/details?mode=full&compact=false'`, because full health can include long tracebacks, log excerpts, and source-table diagnostic rows.
+
+`/api/event-policy` omits bulky raw JSON source columns by default while preserving parsed checks, operator notes, LLM review, and compact raw context. Use `include_raw=true` only for short debugging, for example `curl 'http://127.0.0.1:8765/api/event-policy?limit=5&include_raw=true'`.
 
 ### Manual / catch-up / long-running scripts
 
@@ -263,7 +324,11 @@ Cron also runs selected Python modules directly for operator health, hypothesis 
 | `all_advisory_codex.sh` | Codex-supervised advisory orchestrator | Manual debug/repair wrapper that runs `all_advisory.sh`, captures logs, sends failure lines to Codex CLI, and reruns |
 | `all_analysis_codex.sh` | Codex analysis-development loop | Manual bounded loop that uses `analysis.md` and `docs/analysis_agent_board.md` to pick the next slice, implement it, validate it, and update docs |
 
-The primary operator scripts call `scripts/run_with_markers.sh`, which emits `[stockey.script]` start/end markers to stdout while preserving the wrapped command's exit code. The health parser uses these markers to classify the latest run as `ok`, `failed`, `interrupted_by_operator`, `ok_after_historical_errors`, or `recovered_after_manual_interrupt`.
+Top-level operator scripts emit `[stockey.script]` start/end markers to stdout while preserving the wrapped command's exit code. Most call `scripts/run_with_markers.sh`; `all_frontend.sh` emits markers internally so it can supervise and clean up API/Nuxt child processes. The health parser uses these markers to classify the latest run as `ok`, `failed`, `interrupted_by_operator`, `ok_after_historical_errors`, or `recovered_after_manual_interrupt`.
+
+Fallback telemetry also carries source-specific NSE counters. Announcement NSE HTTP retries record `nse_retry`, cookie/session resets record `nse_session_reset`, `summarize_fallback_events` exposes `nse_retry_count`, `nse_session_reset_count`, and `nse_http_count`, and Operator Health emits a specific NSE session fix hint when these counters are nonzero.
+
+`data.download_runner` also writes the latest standardized module run state to `advisory_sync_state` as `download_runner:<module>`. The runner records module, args, purpose, phase, elapsed time, return code, source/error classification, and whether state advanced. Every module configured in `DOWNLOAD_STEPS` and `PARSER_STEPS` exports or emits runner state. Modules can additionally export `STOCKEY_RUN_STATE`, `RUN_STATE`, or `RUN_RESULT` as a dictionary; the runner merges supported fields such as `from_date`, `to_date`, `rows`, `rows_read`, `rows_written`, `retries`, `retry_count`, `attempt_count`, `failed_attempt_count`, `fallback_count`, `source_unavailable_count`, `no_data_count`, `fallback_used`, and explicit `state_advanced` into the durable state. `advisory.event_evidence_store` uses this convention for compact bhavcopy/announcement evidence row counts and date windows. `data.company_master` uses it for identity row and identifier coverage counts. `data.dhanlive.ohlcv` uses it for daily/intraday OHLCV row counts, price windows, failed symbols, interval, exchange, and asset type. `data.dhanlive.scrip_master` uses it for master rows, column count, source file, and load timestamp. `data.sharpelydata.scrip_master` uses it for filtered fund/equity master counts versus raw Sharpely rows. `data.sharpelydata.sharpely_data` uses it for symbol/date-window counts plus meta, peer, statement, shareholding, and historical market-cap row counts. Screener registered/ad-hoc query CLIs use it for synced screener counts, query ids, row counts, and explicit no-data states. NSE holiday-calendar downloads use it for browser/CDP source-unavailable state plus row/product counts. NSE bhavcopy and indices parsers use it for file-level parser state: files seen/considered, date windows, lookback skips, already-processed keys, valid empty/incomplete files, failed keys, and whether parser state advanced. NSE off-market parser uses it for file-level skipped/parsed/failed counts and failure samples. NSE sparse event crawlers for corporate actions, earnings events, insider deals, and the recent event calendar use it for symbol/date-window rows plus queried/skipped counts. NSE off-market downloads use it for block/date attempts, retries, failed attempts, skipped blocks, downloaded blocks, and source-unavailable counts. NSE bhavcopy and indices archive downloaders use it for candidate/missing/downloaded date counts, failed attempts, source-unavailable counts, and consecutive-failure stop flags. Canonical benchmark sync uses it for symbol-level row, no-data, dry-run, and failure counters. WPI uses it for year/item counts, retries, failed attempts, failed item samples, and source-unavailable counts. CPI uses it for month counts, retries, failed attempts, failed month samples, and source-unavailable counts. NSDL FPI uses it for monthly catch-up counts, downloaded/skipped/failed month counts, failed month samples, and source-unavailable counts. RBI FBIL G-sec uses it for date counts, downloaded/skipped-weekend/failed dates, failed date samples, and source-unavailable counts. RBI bank rates uses it for browser/CDP source-unavailable state plus read/write row counts. Economic Times RSS uses it for feed-level success, empty-feed, failed-feed, and source-unavailable counters. FRED/ISM macro uses it for series/leg-level row counts, fallback counts, failed series/legs, and source-unavailable counters. Operator Health/Data Health reads the latest `download_runner:*` rows, summarizes run classifications and counters, and mirrors degraded rows into fix hints and Fallbacks & Degradation.
 
 Recommended scheduler file:
 
@@ -306,6 +371,7 @@ Not scheduled by default:
 Operator health and logs:
 
 - `python -m advisory.operator_smoke` is the compact read-only preflight for DB/API/frontend/freshness/identity/signal-quality/cron trust. Use `python -m advisory.operator_health --skip-dhan` when you need the full detailed diagnostic payload.
+- Smoke output truncates long nested details and bounds visible fix hints/current blockers by default. Tune `OPERATOR_SMOKE_COMPACT_LIST_LIMIT` and `OPERATOR_SMOKE_COMPACT_STRING_CHARS` only if the Operations page needs more context.
 - It also checks local operator API latency and Dhan cached-token expiry metadata without initiating broker login.
 - `fix_hints` are emitted in the health payload and rendered at the top of the Nuxt Data Health page.
 - The Data Health page has filters for `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
@@ -363,11 +429,13 @@ python -m advisory.ts_forecast_workflow --dry-run --symbols RELIANCE TCS --model
 python -m features.price_daily
 ```
 
+Dhan benchmark/index identity resolution accepts common aliases such as `NIFTY50`, `NIFTY 50`, `BANKNIFTY`, `NIFTY BANK`, `INDIAVIX`, and `INDIA VIX`. If one of these still lands in Identity Issues, refresh the Dhan master and run `python -m advisory.identity_issues --limit 100` before applying closure.
+
 ## Experimental time-series forecasts
 
 Module: `advisory.ts_forecast_features`
 
-This is a research-only forecast feature path over `dhan_ohlcv_daily`. It writes to `advisory_ts_forecasts_daily` and currently uses a dependency-free `naive_momentum_v1` baseline. The table schema is intentionally compatible with later TimesFM, Chronos, or Moirai adapters.
+This is a research-only forecast feature path over `dhan_ohlcv_daily`. It writes to `advisory_ts_forecasts_daily` and currently uses a dependency-free `naive_momentum_v1` baseline. The table schema is registry-managed by `20260611_advisory_ts_forecast_features_base` and is intentionally compatible with later TimesFM, Chronos, or Moirai adapters.
 
 The output is not a live action source. It should be evaluated through a paper portfolio and research-ledger comparison before being allowed to affect `advisory_action_recommendations` or Dhan execution.
 
@@ -389,6 +457,8 @@ Current outputs include expected return, forecast price, upside/downside quantil
 Evaluation writes row-level realized-return checks to `advisory_ts_forecast_evaluations` and grouped model/horizon/action-hint metrics to `advisory_ts_forecast_eval_summary`.
 
 The workflow command uses `config/ts_forecast_screeners.yaml` when no symbols or query are supplied. It runs an ad hoc Screener.in query to find liquid/technical candidates, refreshes their Dhan daily OHLCV, runs the selected forecast model, and writes positive experimental names to `advisory_ts_forecast_watchlist`. For TimesFM, install the optional package first; otherwise use `--model-name naive_momentum_v1` for a dependency-free baseline.
+
+The experimental TS watchlist schema is registry-managed by `20260611_advisory_ts_forecast_workflow_base`.
 
 The default cron run uses `--max-symbols "${TS_FORECAST_MAX_SYMBOLS:-80}"` and runs a few times per weekday, not every watcher tick, because the current TS workflow consumes daily OHLCV. If Screener.in returns no parseable results or is temporarily unavailable, the workflow logs the failure and falls back to a capped Dhan/tracked symbol universe so the research job still emits an auditable result.
 
@@ -521,10 +591,19 @@ Operational notes:
 - If login is required, `data.screenerin.auth` fills the username/password form from env and verifies that `/dash/` is reached.
 - The Screener.in password is never printed.
 - `data.screenerin.ad_hoc_query` and `data.screenerin.screener_parser` ensure logged-in mode before fetching Screener.in data.
+- Ad hoc queries validate known local syntax pitfalls before opening Chrome or hitting Screener.in. Use `DMA 50` / `DMA 200`, not `50 Day Moving Average`, `200 Day Moving Average`, or compact `DMA200`.
+- Operator UI Screener preview lives at `/screeners` and calls `POST /api/screeners/preview`. Validation-only mode is local and does not open Chrome; fetch-preview mode uses the authenticated Screener.in session with `persist=false`, returns bounded preview rows, and does not register a production screener.
+- Screener contribution metrics live in `advisory.screener_coverage`, `GET /api/screeners/coverage`, and the same `/screeners` page. They read `advisory_screener_constituents`, `advisory_candidates`, and `advisory_action_recommendations` to attribute constituent, candidate, final-action, positive-action, manual-review, and exit rows by screener over a bounded lookback window.
+- registered screener registry/snapshot schemas are registry-managed by `20260611_screenerin_registered_screeners_base`.
 - ad hoc runs are stored in `screenerin_ad_hoc_query_runs`.
 - normalized company rows for ad hoc runs are stored in `screenerin_ad_hoc_query_results`.
+- ad hoc query run/result schemas are registry-managed by `20260611_screenerin_ad_hoc_query_base`.
+- Screener fetch/parse failures are stored in `screenerin_parse_failures` before the original exception is re-raised. Rows include sanitized URL/query context, body excerpt, login/results-container flags, and error class/message for debugging bad syntax such as unsupported Screener.in field names.
+- Screener failure schema is registry-managed by `20260611_screenerin_parse_failures_base`.
+- `python -m advisory.operator_health --full --skip-dhan` summarizes recent Screener failure rows in Health fix hints, the Advisory Trust Gate, and Fallbacks & Degradation; default fast Health defers this history scan.
 - parsed ad hoc output includes `company_name`, `ticker`, `company_url`, `rank`, and `metrics`.
 - theme-to-screener discovery now uses only `config/investment_themes.yaml`; the older fallback theme config was removed.
+- theme-to-screener mapping schema is registry-managed by `20260611_advisory_news_theme_screeners_base`.
 
 ## Research Priorities
 
@@ -587,7 +666,8 @@ Behavior:
 - trains `advisory.event_meta_model` only when the readiness gate passes
 - uploads trained model artifacts to S3 after successful training unless `--skip-s3-upload` or `EVENT_MODEL_ARTIFACT_UPLOAD_ENABLED=false` is set
 - scores current events after training unless `--skip-score` is used
-- use `python -m advisory.event_model_promotion_check --format json` after weekly runs to see whether the evidence is ready for manual review
+- use `python -m advisory.event_model_promotion_check --format json` after weekly runs to see whether the evidence is ready for manual review; the JSON includes a research-only `scorecard` with usable/not-usable status, key metrics, failed gates, and explicit no-broker/no-auto-promotion boundaries
+- normal advisory/adversarial-review runs ignore persisted event-model scores by default via `STOCKEY_EVENT_MODEL_SCORE_POLICY_MODE=research_only`; set `STOCKEY_EVENT_MODEL_SCORE_POLICY_MODE=promoted` or pass `--event-model-score-policy-mode promoted` only after the promotion check is usable, and the code still fails closed if the gate does not pass
 
 Event-model artifact upload:
 
@@ -944,7 +1024,7 @@ python -m advisory.pipeline --include-watch --include-lifecycle --dry-run
 
 For the advisory stack, `dhan_ohlcv_daily` is the canonical OHLCV source. The NSE bhavcopy plus adjusted-price pipeline remains available for reference and reconciliation, but advisory technicals and rule evaluation no longer depend on `nseindia_ohlcv_adjusted`.
 
-`data.economictimes.rss` stores raw ET RSS items in `economictimes_rss_items`.
+`data.economictimes.rss` stores raw ET RSS items in `economictimes_rss_items`. Its item schema is registry-managed by `20260611_economictimes_rss_items_base`.
 
 `advisory.news_watch` matches ET RSS items onto the active watchlist and writes `advisory_news_events`.
 
@@ -956,7 +1036,7 @@ For the advisory stack, `dhan_ohlcv_daily` is the canonical OHLCV source. The NS
 
 `advisory.llm_event_evaluator` reads both `advisory_watch_events` and `advisory_news_events`, joins `advisory_announcement_evidence` when official filings exist, and explicitly falls back to `announcement_pipeline_documents` only when compact evidence has not been built for that `unique_id`. It adds point-in-time regime, technical, fundamentals, exchange-feature, and compact bhavcopy evidence context before writing `advisory_event_evaluations` and `advisory_event_risks`.
 
-`advisory.company_memory_review` writes `advisory_company_memory_reviews` as a review-only company-memory input. It reads compact evidence plus latest technical, event-policy, wait-signal, and action rows for a bounded symbol set. It defaults to deterministic V1 and only uses Codex when `--llm` or `COMPANY_MEMORY_REVIEW_LLM_ENABLED=true` is set. These rows do not grant execution authority.
+`advisory.company_memory_review` writes `advisory_company_memory_reviews` as a review-only company-memory input. Its schema is registry-managed by `20260611_advisory_company_memory_reviews_base`. It reads compact evidence plus latest technical, event-policy, wait-signal, and action rows for a bounded symbol set. It defaults to deterministic V1 and only uses Codex when `--llm` or `COMPANY_MEMORY_REVIEW_LLM_ENABLED=true` is set. These rows do not grant execution authority.
 
 ```sh
 python -m advisory.company_memory_review --dry-run --symbols RELIANCE --limit 1
@@ -983,31 +1063,83 @@ python -m advisory.signal_quality_promotion --evaluated-at 2026-05-01T00:00:00Z 
 
 The operator API exposes this workflow at `/api/signal-quality/promotion-review`, `/api/signal-quality/promotion-reviews`, and `/api/signal-quality/promotion-review/decision`. The Nuxt `/signal-quality` page can create a review, show the Advisory Trust Gate context, record an approve/reject/needs-more-data decision, and copy patch guidance for a separate reviewed code/config change.
 
+Use `advisory.ts_forecast_promotion_check` after `advisory.ts_forecast_paper_portfolio` has enough matured rows. It is read-only and never writes action recommendations, portfolio rows, config changes, or broker orders.
+
+```sh
+python -m advisory.ts_forecast_promotion_check --format json
+python -m advisory.ts_forecast_promotion_check --model-name timesfm_2p5_200m --horizon-days 10
+```
+
+Default gates require enough evaluated paper trades, positive win rate, positive average after-cost return, lift versus the simple momentum baseline, low advisory exit-conflict rate, enough distinct forecast dates, and enough symbols. A passing result means eligible for manual review only, not automatic policy integration.
+
+Use `advisory.ts_forecast_promotion` only after the read-only TS promotion gate returns `review_candidate`. It writes manual review/decision audit rows and copyable TS forecast review-rule guidance; it does not edit config, action rules, portfolio rows, or broker behavior.
+
+```sh
+python -m advisory.ts_forecast_promotion --model-name timesfm_2p5_200m --horizon-days 10 --dry-run
+```
+
+The operator API exposes this workflow at `/api/research/ts-forecast-promotion-review`, `/api/research/ts-forecast-promotion-reviews`, and `/api/research/ts-forecast-promotion-review/decision`.
+
+Use `advisory.event_policy_promotion` only after `advisory.event_policy_evaluator` has enough matured rows for a specific `group_type/group_value`. It writes manual review/decision audit rows and copyable event-policy review-rule guidance; it does not edit config, action rules, portfolio rows, or broker behavior.
+
+```sh
+python -m advisory.event_policy_promotion --evaluated-at 2026-05-01T00:00:00Z --horizon-days 5 --group-type source_quality --group-value high --dry-run
+```
+
+The operator API exposes this workflow at `/api/event-policy/promotion-review`, `/api/event-policy/promotion-reviews`, and `/api/event-policy/promotion-review/decision`. The Nuxt Event Inbox can create a manual-only review from an actionability calibration group, list pending reviews, and record approve/reject/needs-more-data decisions. These flows record review/decision evidence only; they do not apply config, action rules, portfolio rows, or broker behavior.
+
 `advisory.config_change_assistant` turns approved review decisions into reviewed unified diffs. It is intentionally one step short of applying the change: the generated diff is an audit artifact and copyable operator aid only.
 
 ```sh
 python -m advisory.config_change_assistant --source-type technical_threshold --setup-id EVENT_OPPORTUNITY_V1 --config-id CONFIG_ID --dry-run
 python -m advisory.config_change_assistant --source-type signal_quality_overlay --evaluated-at 2026-05-01T00:00:00Z --horizon-days 5 --variant technical_plus_all --dry-run
+python -m advisory.config_change_assistant --source-type event_policy_review_rule --evaluated-at 2026-05-01T00:00:00Z --horizon-days 5 --group-type source_quality --group-value high --dry-run
+python -m advisory.config_change_assistant --source-type ts_forecast_review_rule --model-name timesfm_2p5_200m --horizon-days 10 --dry-run
 ```
 
-The operator API exposes recent previews at `/api/config-change/previews` and diff generation at `/api/config-change/technical-threshold-preview` and `/api/config-change/signal-quality-preview`. The Nuxt Technical Calibration and Signal Quality pages show `Reviewed Diff` actions for approved decisions.
+The operator API exposes recent previews at `/api/config-change/previews` and diff generation at `/api/config-change/technical-threshold-preview`, `/api/config-change/signal-quality-preview`, `/api/config-change/event-policy-preview`, and `/api/config-change/ts-forecast-preview`. The Event Inbox shows a `Reviewed Diff` action for approved event-policy promotion reviews. Generated event-policy and TS forecast diffs add disabled review-rule entries only; they do not change live policy unless an operator manually applies a reviewed diff later.
 
-`advisory.risk_engine` reads `advisory_event_evaluations`, joins the latest point-in-time technical and fundamental context, and writes `advisory_allocations` with risk bucket, conviction bucket, suggested INR allocation, and invalidation guidance.
+After manually applying a disabled TS forecast review-rule diff, inspect `/api/research/ts-forecast-review-rules` to confirm the rule parses and remains `review_input_only`, broker-disabled, and excluded from automatic policy promotion.
+
+`advisory.risk_engine` reads `advisory_event_evaluations`, joins the latest point-in-time technical and fundamental context, and writes `advisory_allocations` with risk bucket, conviction bucket, suggested INR allocation, and invalidation guidance. Its allocation schema is registry-managed by `20260611_advisory_allocations_base`.
+
+`advisory.adversarial_review` writes deterministic review/veto rows to `advisory_event_reviews` before risk sizing. Its review schema is registry-managed by `20260611_advisory_event_reviews_base`.
+
+`advisory.announcement_watch` writes active announcement-watch state to `advisory_watchlist` and matched announcement events to `advisory_watch_events`. Its watch output schemas are registry-managed by `20260611_advisory_announcement_watch_outputs_base`.
+
+`advisory.news_watch` writes matched RSS/news rows to `advisory_news_events`. Its news event schema is registry-managed by `20260611_advisory_news_events_base`.
+
+`advisory.config_change_assistant` writes reviewed config preview diffs to `advisory_config_change_previews`. Its preview schema is registry-managed by `20260611_advisory_config_change_previews_base`.
+
+`advisory.intraday_features` writes intraday confirmation features to `advisory_intraday_features_daily` and ensures supporting Dhan OHLCV read indexes. Its feature-cache schema is registry-managed by `20260611_advisory_intraday_features_base`.
+
+`advisory.watchlist_builder` writes the full advisory watchlist to `advisory_watchlist`. Its builder-owned watchlist schema is registry-managed by `20260611_advisory_watchlist_base`.
+
+`advisory.api.app` writes operator API errors, operator command runs, and manual-review decisions to API audit tables. These schemas are registry-managed together by `20260611_advisory_operator_api_audit_base`. Operator API error messages, traceback tails, request context, and cron-log tails returned by Operations routes are redacted for common broker/API secrets before reaching the frontend.
+
+`advisory.technical_threshold_promotion` writes manual technical-threshold promotion reviews and operator decisions. Its review/decision schemas are registry-managed by `20260611_advisory_technical_threshold_promotion_base`.
+
+`advisory.signal_quality_promotion` writes manual signal-quality overlay promotion reviews and operator decisions. Its review/decision schemas are registry-managed by `20260611_advisory_signal_quality_promotion_base`.
+
+`advisory.ts_forecast_promotion` writes manual TS forecast promotion reviews and operator decisions. Its review/decision schemas are registry-managed by `20260612_advisory_ts_forecast_promotion_base`.
 
 `advisory.portfolio_engine` reads `advisory_allocations`, ranks approved allocations by conviction/risk/liquidity-aware priority, applies portfolio-level capital and setup caps, and writes `advisory_portfolio_orders`.
 
 `advisory.position_lifecycle` reads approved `advisory_portfolio_orders`, marks paper entry/current prices from `dhan_ohlcv_daily`, and writes `advisory_position_lifecycle` plus `advisory_rebalance_actions` with hold/trim/exit/review suggestions.
 
-`advisory.execution_engine` reads consolidated `advisory_action_recommendations`, builds broker handoff orders in `advisory_execution_orders`, and can reconcile order/trade state from Dhan into `advisory_execution_orders` plus `advisory_execution_fills`. Staged order sizing prefers fresh `dhan_ohlcv_intraday` prices and falls back to `dhan_ohlcv_daily` close when intraday is unavailable.
+`advisory.execution_engine` reads consolidated `advisory_action_recommendations`, builds broker handoff orders in `advisory_execution_orders`, and can reconcile order/trade state from Dhan into `advisory_execution_orders` plus `advisory_execution_fills`. Its order/fill schema is registry-managed by `20260611_advisory_execution_orders_base`. Staged order sizing prefers fresh `dhan_ohlcv_intraday` prices and falls back to `dhan_ohlcv_daily` close when intraday is unavailable. Dhan identity failures are fail-closed in dry-run previews: the row becomes `submit_blocked`, the safety contract records `broker_identity_status=failed`, and execution fallback telemetry records the blocker. Action-table order previews also write `order_intent_lineage` into `safety_checks_json` and raw broker context, linking the order back to the action recommendation, reason-contract summary/status, risk sizing, stop/target levels, and approval/reconciliation gate status.
 
 Use `--use-broker-account` on a dry run when you want staged quantities capped by live Dhan cash and holdings without submitting orders. `--live` enables the same broker-account sizing automatically before safety checks and submission.
 
-Live Dhan submission is fail-closed. `--live` is not enough by itself; set `STOCKEY_LIVE_TRADING_ENABLED=true` only when you intentionally want broker submission. Keep these caps configured before live use:
+Live Dhan submission is fail-closed. `--live` is not enough by itself; set `STOCKEY_LIVE_TRADING_ENABLED=true` only when you intentionally want broker submission. Each live run also requires a per-run confirmation token. Run once without the token to see the expected token in `safety_checks_json.live_run_confirmation_expected`, then pass `--live-confirmation <token>` or set `STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION=<token>` for that specific run.
+
+Keep these caps configured before live use:
 
 - `STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN`, default `5`
 - `STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR`, default `50000`
 - `STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE`, default `true`
 - `STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES`, default `30`
+- `STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION`, default blank and must match the current run token
 
 Live Dhan order placement also requires the API static IP to be whitelisted.
 

@@ -33,6 +33,7 @@ export interface OperatorHome {
   sync_state: Dict[]
   top_action_recommendations: Dict[]
   today_recommendations: Dict[]
+  ts_forecast_paper_summary?: Dict[]
 }
 
 export interface OperatorHealthDetails {
@@ -42,6 +43,8 @@ export interface OperatorHealthDetails {
   sections: Dict
   fix_hints?: Dict[]
   current_blockers?: Dict
+  compact?: boolean
+  compact_meta?: Dict
 }
 
 export interface OperatorRuntime {
@@ -129,6 +132,28 @@ export interface OperatorApiErrorsPayload {
   errors: Dict[]
 }
 
+export interface IngestionStatePayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  filters: Dict
+  summary: Dict
+  operator_boundary: Dict
+}
+
+export interface SupersededCleanupPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  mode: string
+  dry_run: boolean
+  result: Dict
+  counts: Dict
+  operator_boundary: Dict
+  audit_run?: Dict | null
+  note?: string
+}
+
 export interface IdentityIssueResolutionPayload {
   generated_at?: string
   api_schema?: OperatorApiSchema
@@ -155,6 +180,7 @@ export interface EventModelPromotionCheckPayload {
   status: string
   decision: string
   ready_for_operator_review: boolean
+  scorecard?: Dict
   promotion_mode: string
   artifact: Dict
   metadata?: Dict
@@ -164,6 +190,71 @@ export interface EventModelPromotionCheckPayload {
   gates: Dict[]
   failed_gates: string[]
   notes: string[]
+}
+
+export interface TsForecastPromotionCheckPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  decision?: string
+  ready_for_operator_review?: boolean
+  promotion_mode?: string
+  scorecard: Dict
+  evidence: Dict
+  notes?: string[]
+}
+
+export interface TsForecastReviewRulesPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  config_path?: string
+  rules: Dict[]
+  issues: Dict[]
+  summary: Dict
+  operator_boundary?: Dict
+}
+
+export interface TsForecastPromotionReviewResult {
+  status: string
+  api_schema?: OperatorApiSchema
+  reviewed_at?: string
+  model_name: string
+  horizon_days: number
+  evidence_from_date?: string
+  evidence_to_date?: string
+  promotion_check: Dict
+  group_evidence: Dict
+  pending_patch: Dict
+  llm_review: Dict
+  review_model?: string
+  review_status?: string
+  review_error?: string
+  applied?: boolean
+}
+
+export interface TsForecastPromotionReviewsPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  reviews: Dict[]
+  pagination?: Dict
+}
+
+export interface TsForecastPromotionDecisionResult {
+  status: string
+  api_schema?: OperatorApiSchema
+  decided_at?: string
+  reviewed_at?: string
+  model_name: string
+  horizon_days: number
+  decision: string
+  operator_id?: string
+  decision_reason?: string
+  final_patch: Dict
+  review?: Dict
+  applied: boolean
+  note?: string
 }
 
 export interface EventModelArtifactsPayload {
@@ -202,6 +293,11 @@ export interface ManualReviewDecisionResult {
   item_id: string
   decision: string
   closing_decision: boolean
+  next_state?: string
+  creates_wait_signal?: boolean
+  wait_signal?: Dict | null
+  manual_review_state?: Dict | null
+  decision_effect?: Dict | null
   note?: string
 }
 
@@ -244,6 +340,17 @@ export interface SignalRefreshPayload {
   meta?: Dict
 }
 
+export interface OperatorJourneyPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  filters: Dict
+  summary: Dict
+  stages: Record<string, Dict[]>
+  timeline: Dict[]
+  skipped_sources: Dict[]
+}
+
 export interface OperatorPortfolio {
   generated_at?: string
   api_schema?: OperatorApiSchema
@@ -267,6 +374,8 @@ export interface OperatorDetailPayload {
   filters: Dict
   rows: Dict[]
   row_count: number
+  policy_changes?: Dict[]
+  policy_change_count?: number
 }
 
 export interface OperatorEvents {
@@ -366,6 +475,48 @@ export interface SignalQualityPromotionDecisionResult {
   note?: string
 }
 
+export interface EventPolicyPromotionReviewResult {
+  status: string
+  api_schema?: OperatorApiSchema
+  reviewed_at?: string
+  evaluated_at?: string
+  horizon_days?: number
+  group_type: string
+  group_value: string
+  event_policy_evidence: Dict
+  pending_patch: Dict
+  llm_review: Dict
+  review_model?: string
+  review_status?: string
+  review_error?: string
+}
+
+export interface EventPolicyPromotionReviewsPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  reviews: Dict[]
+  pagination?: Dict
+}
+
+export interface EventPolicyPromotionDecisionResult {
+  status: string
+  api_schema?: OperatorApiSchema
+  decided_at?: string
+  reviewed_at?: string
+  evaluated_at?: string
+  horizon_days?: number
+  group_type: string
+  group_value: string
+  decision: string
+  operator_id?: string
+  decision_reason?: string
+  final_patch: Dict
+  review?: Dict
+  applied: boolean
+  note?: string
+}
+
 export interface ConfigChangePreviewResult {
   status: string
   api_schema?: OperatorApiSchema
@@ -392,6 +543,29 @@ export interface ConfigChangePreviewsPayload {
   pagination?: Dict
 }
 
+export interface ConfigChangeApplicationResult {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  application_id?: string
+  preview_id?: string
+  application_decision?: string
+  verification_status?: string
+  verification?: Dict
+  safety_checks?: string[]
+  applied_by_system: boolean
+  applied: boolean
+  note?: string
+}
+
+export interface ConfigChangeApplicationsPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  applications: Dict[]
+  pagination?: Dict
+}
+
 export interface PromptRegistryPayload {
   generated_at?: string
   api_schema?: OperatorApiSchema
@@ -402,8 +576,37 @@ export interface PromptRegistryPayload {
   pagination?: Dict
 }
 
+export interface ScreenerPreviewPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  query_name?: string
+  query_slug?: string
+  query_hash?: string
+  screener_url?: string
+  validation_issues: Dict[]
+  row_count: number
+  rows: Dict[]
+  headers?: unknown[]
+  meta?: Dict
+  operator_boundary?: Dict
+}
+
+export interface ScreenerCoveragePayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  asof_date?: string
+  lookback_days?: number
+  window?: Dict
+  summary: Dict
+  screeners: Dict[]
+  notes?: string[]
+}
+
 export interface TechnicalPromotionReviewResult {
   status: string
+  api_schema?: OperatorApiSchema
   reviewed_at?: string
   setup_id: string
   config_id: string
@@ -417,6 +620,7 @@ export interface TechnicalPromotionReviewResult {
   review_model?: string
   review_status?: string
   review_error?: string
+  applied?: boolean
 }
 
 export interface TechnicalPromotionReviewsPayload {
@@ -429,6 +633,7 @@ export interface TechnicalPromotionReviewsPayload {
 
 export interface TechnicalPromotionDecisionResult {
   status: string
+  api_schema?: OperatorApiSchema
   decided_at?: string
   reviewed_at?: string
   setup_id: string

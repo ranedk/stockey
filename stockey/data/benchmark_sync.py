@@ -5,6 +5,7 @@ import json
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.ohlcv import DAILY_TABLE, ensure_ohlcv_tables
 from utils.db import sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
@@ -18,6 +19,35 @@ DEFAULT_BENCHMARKS = {
         "instrument": "INDEX",
     },
 }
+SYNC_SOURCE_NAME = "data.benchmark_sync"
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
+def _record_benchmark_sync_fallback(
+    *,
+    symbol: str,
+    error: Exception,
+    from_date: pd.Timestamp | None,
+    to_date: pd.Timestamp | None,
+    dry_run: bool,
+) -> None:
+    record_local_fallback_event(
+        module="data.benchmark_sync",
+        fallback_type="benchmark_sync_symbol_failed",
+        source="benchmark_sync",
+        severity="warn",
+        reason=(
+            "Canonical benchmark sync failed for one symbol; regime, relative-strength, and "
+            "benchmark comparison features may be stale for that benchmark."
+        ),
+        error=error,
+        metadata={
+            "symbol": str(symbol).upper(),
+            "from_date": None if from_date is None else str(from_date),
+            "to_date": None if to_date is None else str(to_date),
+            "dry_run": bool(dry_run),
+        },
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -172,14 +202,50 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    global STOCKEY_RUN_STATE
     args = parse_args()
     from_date = parse_datetime_arg(args.from_date)
     to_date = parse_datetime_arg(args.to_date)
-    results = [
-        sync_benchmark(symbol, from_date=from_date, to_date=to_date, dry_run=bool(args.dry_run))
-        for symbol in args.symbols
-    ]
-    payload = {"status": "ok", "results": results}
+    results = []
+    failures = []
+    for symbol in args.symbols:
+        try:
+            results.append(sync_benchmark(symbol, from_date=from_date, to_date=to_date, dry_run=bool(args.dry_run)))
+        except Exception as exc:
+            _record_benchmark_sync_fallback(
+                symbol=str(symbol),
+                error=exc,
+                from_date=from_date,
+                to_date=to_date,
+                dry_run=bool(args.dry_run),
+            )
+            failures.append({"symbol": str(symbol).upper(), "error": f"{type(exc).__name__}: {exc}"})
+            print(f"benchmark sync failed symbol={symbol} error={type(exc).__name__}: {exc}", flush=True)
+    rows_loaded = sum(int(result.get("rows_loaded") or 0) for result in results)
+    STOCKEY_RUN_STATE = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": int(rows_loaded),
+        "rows_read": int(rows_loaded),
+        "rows_written": 0 if args.dry_run else int(rows_loaded),
+        "symbol_count": int(len(args.symbols)),
+        "succeeded_symbol_count": int(len(results)),
+        "failed_symbol_count": int(len(failures)),
+        "attempt_count": int(len(args.symbols)),
+        "failed_attempt_count": int(len(failures)),
+        "source_unavailable_count": 0,
+        "no_data_count": sum(1 for result in results if int(result.get("rows_loaded") or 0) == 0),
+        "fallback_used": False,
+        "state_advanced": bool((not args.dry_run) and rows_loaded > 0),
+        "dry_run": bool(args.dry_run),
+    }
+    if from_date is not None:
+        STOCKEY_RUN_STATE["from_date"] = from_date.date().isoformat()
+    if to_date is not None:
+        STOCKEY_RUN_STATE["to_date"] = to_date.date().isoformat()
+    if failures:
+        STOCKEY_RUN_STATE["failed_symbols"] = failures[:20]
+    status = "partial" if failures and results else "failed" if failures else "ok"
+    payload = {"status": status, "results": results, **STOCKEY_RUN_STATE}
     print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
     return 0
 

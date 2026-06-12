@@ -11,7 +11,7 @@ TIMEOUT_SECONDS="${ANALYSIS_AGENT_CODEX_TIMEOUT_SECONDS:-3600}"
 
 mkdir -p "${LOG_DIR}"
 
-exec "${PYTHON_BIN}" "${SCRIPT_DIR}/scripts/analysis_agent_loop.py" \
+exec "${SCRIPT_DIR}/scripts/run_with_markers.sh" "all_analysis_codex" "${PYTHON_BIN}" "${SCRIPT_DIR}/scripts/analysis_agent_loop.py" \
   --max-cycles "${MAX_CYCLES}" \
   --log-dir "${LOG_DIR}" \
   --codex-timeout-seconds "${TIMEOUT_SECONDS}" \

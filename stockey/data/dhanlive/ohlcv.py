@@ -11,7 +11,9 @@ import pandas as pd
 from data.dhanlive.auth import DhanAuthError
 from data.dhanlive.client import DhanAPIError, DhanHistoricalClient, candles_to_df
 from data.dhanlive.dhan_db import resolve_dhan_identity
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import load_tracked_symbols, normalize_date_window, parse_datetime_arg
 
 
@@ -27,7 +29,91 @@ MARKET_CLOSE_MINUTE = 30
 
 DAILY_TABLE = "dhan_ohlcv_daily"
 INTRADAY_TABLE = "dhan_ohlcv_intraday"
+OHLCV_SCHEMA_MIGRATION_ID = "20260611_dhan_ohlcv_base_asset_type"
 _OHLCV_TABLES_ENSURED = False
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+OHLCV_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {DAILY_TABLE} (
+        company_master_id TEXT,
+        asset_type TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        security_id BIGINT NOT NULL,
+        exchange_segment TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        date TIMESTAMPTZ NOT NULL,
+        open DOUBLE PRECISION,
+        high DOUBLE PRECISION,
+        low DOUBLE PRECISION,
+        close DOUBLE PRECISION,
+        volume DOUBLE PRECISION,
+        open_interest DOUBLE PRECISION,
+        source_timestamp TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ NOT NULL,
+        UNIQUE (exchange, security_id, date)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {INTRADAY_TABLE} (
+        company_master_id TEXT,
+        asset_type TEXT NOT NULL,
+        exchange TEXT NOT NULL,
+        ticker TEXT NOT NULL,
+        security_id BIGINT NOT NULL,
+        exchange_segment TEXT NOT NULL,
+        instrument TEXT NOT NULL,
+        interval_minutes INTEGER NOT NULL,
+        "timestamp" TIMESTAMPTZ NOT NULL,
+        open DOUBLE PRECISION,
+        high DOUBLE PRECISION,
+        low DOUBLE PRECISION,
+        close DOUBLE PRECISION,
+        volume DOUBLE PRECISION,
+        open_interest DOUBLE PRECISION,
+        load_ts TIMESTAMPTZ NOT NULL,
+        UNIQUE (exchange, security_id, interval_minutes, "timestamp")
+    )
+    """,
+    f"ALTER TABLE {DAILY_TABLE} ALTER COLUMN company_master_id DROP NOT NULL",
+    f"ALTER TABLE {INTRADAY_TABLE} ALTER COLUMN company_master_id DROP NOT NULL",
+    f"ALTER TABLE {DAILY_TABLE} ADD COLUMN IF NOT EXISTS asset_type TEXT",
+    f"ALTER TABLE {INTRADAY_TABLE} ADD COLUMN IF NOT EXISTS asset_type TEXT",
+    f"UPDATE {DAILY_TABLE} SET asset_type = 'stock' WHERE asset_type IS NULL",
+    f"UPDATE {INTRADAY_TABLE} SET asset_type = 'stock' WHERE asset_type IS NULL",
+    f"ALTER TABLE {DAILY_TABLE} ALTER COLUMN asset_type SET NOT NULL",
+    f"ALTER TABLE {INTRADAY_TABLE} ALTER COLUMN asset_type SET NOT NULL",
+]
+
+
+def _record_ohlcv_bulk_sync_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    ticker: str,
+    exchange: str,
+    asset_type: str,
+    error: Exception,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="data.dhanlive.ohlcv",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=(
+            "Dhan OHLCV bulk sync failed for one symbol; the batch continues, but downstream "
+            "prices, technical features, and advisory decisions may be stale for that symbol."
+        ),
+        error=error,
+        metadata={
+            "ticker": ticker,
+            "exchange": exchange.upper(),
+            "asset_type": asset_type,
+            **(metadata or {}),
+        },
+    )
 
 
 def _to_naive_utc_datetime(value: object) -> datetime | None:
@@ -41,61 +127,12 @@ def ensure_ohlcv_tables() -> None:
     global _OHLCV_TABLES_ENSURED
     if _OHLCV_TABLES_ENSURED:
         return
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {DAILY_TABLE} (
-                company_master_id TEXT,
-                asset_type TEXT NOT NULL,
-                exchange TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                security_id BIGINT NOT NULL,
-                exchange_segment TEXT NOT NULL,
-                instrument TEXT NOT NULL,
-                date TIMESTAMPTZ NOT NULL,
-                open DOUBLE PRECISION,
-                high DOUBLE PRECISION,
-                low DOUBLE PRECISION,
-                close DOUBLE PRECISION,
-                volume DOUBLE PRECISION,
-                open_interest DOUBLE PRECISION,
-                source_timestamp TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ NOT NULL,
-                UNIQUE (exchange, security_id, date)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {INTRADAY_TABLE} (
-                company_master_id TEXT,
-                asset_type TEXT NOT NULL,
-                exchange TEXT NOT NULL,
-                ticker TEXT NOT NULL,
-                security_id BIGINT NOT NULL,
-                exchange_segment TEXT NOT NULL,
-                instrument TEXT NOT NULL,
-                interval_minutes INTEGER NOT NULL,
-                "timestamp" TIMESTAMPTZ NOT NULL,
-                open DOUBLE PRECISION,
-                high DOUBLE PRECISION,
-                low DOUBLE PRECISION,
-                close DOUBLE PRECISION,
-                volume DOUBLE PRECISION,
-                open_interest DOUBLE PRECISION,
-                load_ts TIMESTAMPTZ NOT NULL,
-                UNIQUE (exchange, security_id, interval_minutes, "timestamp")
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {DAILY_TABLE} ALTER COLUMN company_master_id DROP NOT NULL")
-        cur.execute(f"ALTER TABLE {INTRADAY_TABLE} ALTER COLUMN company_master_id DROP NOT NULL")
-        cur.execute(f"ALTER TABLE {DAILY_TABLE} ADD COLUMN IF NOT EXISTS asset_type TEXT")
-        cur.execute(f"ALTER TABLE {INTRADAY_TABLE} ADD COLUMN IF NOT EXISTS asset_type TEXT")
-        cur.execute(f"UPDATE {DAILY_TABLE} SET asset_type = 'stock' WHERE asset_type IS NULL")
-        cur.execute(f"UPDATE {INTRADAY_TABLE} SET asset_type = 'stock' WHERE asset_type IS NULL")
-        cur.execute(f"ALTER TABLE {DAILY_TABLE} ALTER COLUMN asset_type SET NOT NULL")
-        cur.execute(f"ALTER TABLE {INTRADAY_TABLE} ALTER COLUMN asset_type SET NOT NULL")
+    apply_schema_migration(
+        migration_id=OHLCV_SCHEMA_MIGRATION_ID,
+        description="Create and normalize Dhan daily/intraday OHLCV tables.",
+        statements=OHLCV_SCHEMA_STATEMENTS,
+        metadata={"module": "data.dhanlive.ohlcv", "tables": [DAILY_TABLE, INTRADAY_TABLE]},
+    )
     _OHLCV_TABLES_ENSURED = True
 
 
@@ -547,6 +584,18 @@ def sync_many_daily(
                 }
             )
         except (DhanAPIError, ValueError) as exc:
+            _record_ohlcv_bulk_sync_fallback(
+                fallback_type="dhan_ohlcv_daily_symbol_sync_failed",
+                source=DAILY_TABLE,
+                ticker=ticker,
+                exchange=exchange,
+                asset_type=asset_type,
+                error=exc,
+                metadata={
+                    "from_date": None if from_date is None else str(from_date),
+                    "to_date": None if to_date is None else str(to_date),
+                },
+            )
             print(
                 {
                     "mode": "daily",
@@ -607,6 +656,19 @@ def sync_many_intraday(
                 }
             )
         except (DhanAPIError, ValueError) as exc:
+            _record_ohlcv_bulk_sync_fallback(
+                fallback_type="dhan_ohlcv_intraday_symbol_sync_failed",
+                source=INTRADAY_TABLE,
+                ticker=ticker,
+                exchange=exchange,
+                asset_type=asset_type,
+                error=exc,
+                metadata={
+                    "interval_minutes": interval_minutes,
+                    "from_date": None if from_date is None else str(from_date),
+                    "to_date": None if to_date is None else str(to_date),
+                },
+            )
             print(
                 {
                     "mode": "intraday",
@@ -635,7 +697,53 @@ def sync_many_intraday(
     return results
 
 
+def build_run_state(
+    *,
+    daily_results: list[dict[str, object]],
+    intraday_results: list[dict[str, object]],
+    only: str,
+    symbols: list[str],
+    exchange: str,
+    asset_type: str,
+    interval_minutes: int,
+) -> dict[str, object]:
+    rows = [*daily_results, *intraday_results]
+    dates = [
+        str(value)
+        for row in daily_results
+        for value in [row.get("from_date"), row.get("to_date")]
+        if value
+    ]
+    timestamps = [
+        str(value)
+        for row in intraday_results
+        for value in [row.get("from_timestamp"), row.get("to_timestamp")]
+        if value
+    ]
+    errors = [row for row in rows if row.get("error")]
+    return {
+        "from_date": min(dates) if dates else None,
+        "to_date": max(dates) if dates else None,
+        "from_datetime": min(timestamps) if timestamps else None,
+        "to_datetime": max(timestamps) if timestamps else None,
+        "rows": int(sum(int(row.get("rows") or 0) for row in rows)),
+        "rows_written": int(sum(int(row.get("rows") or 0) for row in rows)),
+        "rows_read": int(sum(int(row.get("rows") or 0) for row in rows)),
+        "fallback_used": False,
+        "daily_rows": int(sum(int(row.get("rows") or 0) for row in daily_results)),
+        "intraday_rows": int(sum(int(row.get("rows") or 0) for row in intraday_results)),
+        "symbol_count": len(symbols),
+        "error_count": len(errors),
+        "failed_symbols": [str(row.get("ticker") or "") for row in errors if row.get("ticker")],
+        "only": only,
+        "exchange": exchange.upper(),
+        "asset_type": asset_type,
+        "interval_minutes": int(interval_minutes),
+    }
+
+
 def main() -> None:
+    global STOCKEY_RUN_STATE
     parser = argparse.ArgumentParser(description="Sync Dhan OHLCV history for tracked symbols")
     parser.add_argument("--symbols", nargs="*", help="Symbols, comma-separated or repeated")
     parser.add_argument("--exchange", default="NSE", choices=["NSE", "BSE"], help="Cash equity exchange")
@@ -672,26 +780,39 @@ def main() -> None:
     to_date = parse_datetime_arg(args.to_date)
 
     try:
+        daily_results: list[dict[str, object]] = []
+        intraday_results: list[dict[str, object]] = []
         if args.only in {"daily", "both"}:
-            for row in sync_many_daily(
+            daily_results = sync_many_daily(
                 symbols,
                 exchange=args.exchange,
                 asset_type=args.asset_type,
                 from_date=from_date,
                 to_date=to_date,
-            ):
+            )
+            for row in daily_results:
                 print({"mode": "daily", **row}, flush=True)
 
         if args.only in {"intraday", "both"}:
-            for row in sync_many_intraday(
+            intraday_results = sync_many_intraday(
                 symbols,
                 exchange=args.exchange,
                 asset_type=args.asset_type,
                 interval_minutes=args.intraday_interval,
                 from_date=from_date,
                 to_date=to_date,
-            ):
+            )
+            for row in intraday_results:
                 print({"mode": "intraday", **row}, flush=True)
+        STOCKEY_RUN_STATE = build_run_state(
+            daily_results=daily_results,
+            intraday_results=intraday_results,
+            only=str(args.only),
+            symbols=symbols,
+            exchange=str(args.exchange),
+            asset_type=str(args.asset_type),
+            interval_minutes=int(args.intraday_interval),
+        )
     except (DhanAPIError, DhanAuthError) as exc:
         raise SystemExit(str(exc))
 

@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import force_refresh_access_token, get_access_token
 from environs import Env
 
@@ -17,6 +19,33 @@ env.read_env()
 
 class DhanAPIError(RuntimeError):
     pass
+
+
+def _record_dhan_client_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | None = None,
+    response: requests.Response | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    response_url = getattr(response, "url", None)
+    host = urlparse(str(response_url)).netloc if response_url else None
+    path = urlparse(str(response_url)).path if response_url else None
+    record_local_fallback_event(
+        module="data.dhanlive.client",
+        source="dhan_api",
+        fallback_type=fallback_type,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata={
+            "status_code": getattr(response, "status_code", None),
+            "url_host": host,
+            "url_path": path,
+            **(metadata or {}),
+        },
+    )
 
 
 class DhanHistoricalClient:
@@ -124,7 +153,14 @@ class DhanHistoricalClient:
             raise DhanAPIError("Dhan API request failed before receiving a response")
         try:
             payload = response.json()
-        except ValueError:
+        except ValueError as exc:
+            _record_dhan_client_fallback(
+                fallback_type="dhan_response_json_parse_failed",
+                reason="Dhan API response could not be parsed as JSON; falling back to raw response text.",
+                error=exc,
+                response=response,
+                metadata={"response_ok": bool(response.ok)},
+            )
             payload = {"raw_text": response.text}
 
         if response.ok:

@@ -8,11 +8,12 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
-from advisory.fallback_telemetry import record_fallback_event
+from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.codex_cli import run_codex_structured
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
@@ -20,6 +21,7 @@ env = Env()
 env.read_env()
 
 TABLE_NAME = "advisory_company_memory_reviews"
+COMPANY_MEMORY_SCHEMA_MIGRATION_ID = "20260611_advisory_company_memory_reviews_base"
 ANNOUNCEMENT_EVIDENCE_TABLE = "advisory_announcement_evidence"
 BHAVCOPY_EVIDENCE_TABLE = "advisory_bhavcopy_evidence_daily"
 TECHNICAL_TABLE = "advisory_technical_daily"
@@ -39,6 +41,47 @@ DEFAULT_LOOKBACK_DAYS = env.int("COMPANY_MEMORY_REVIEW_LOOKBACK_DAYS", default=1
 LLM_ENABLED = env.bool("COMPANY_MEMORY_REVIEW_LLM_ENABLED", default=False)
 
 SIGNALS = {"BUY", "BUY_MORE", "HOLD", "WATCH", "SELL_PARTIAL", "SELL", "NO_ACTION"}
+COMPANY_MEMORY_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        review_date TIMESTAMPTZ NOT NULL,
+        symbol TEXT NOT NULL,
+        recommended_signal TEXT NOT NULL,
+        confidence DOUBLE PRECISION,
+        conviction_score DOUBLE PRECISION,
+        summary TEXT,
+        thesis TEXT,
+        risk_flags_json TEXT,
+        evidence_used_json TEXT,
+        wait_for_json TEXT,
+        deterministic_boundary TEXT,
+        authority_scope TEXT,
+        model_name TEXT,
+        prompt_id TEXT,
+        prompt_version TEXT,
+        prompt_schema_version TEXT,
+        review_status TEXT,
+        fallback_used BOOLEAN,
+        error TEXT,
+        payload_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (review_date, symbol)
+    )
+    """,
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS risk_flags_json TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS evidence_used_json TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS wait_for_json TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS deterministic_boundary TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS authority_scope TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS model_name TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS prompt_id TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS prompt_version TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS prompt_schema_version TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS review_status TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS fallback_used BOOLEAN",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS error TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS payload_json TEXT",
+]
 
 
 class CompanyMemoryReview(BaseModel):
@@ -70,8 +113,16 @@ def _json_ready(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_json_ready_missing_check_failed",
+            source="json_ready",
+            severity="warn",
+            reason="Company-memory review could not evaluate missingness while preparing JSON and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
 
 
@@ -89,8 +140,16 @@ def _text(value: Any) -> str | None:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_text_missing_check_failed",
+            source="text",
+            severity="warn",
+            reason="Company-memory review could not evaluate missingness while normalizing text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     text = str(value).strip()
     return text or None
 
@@ -121,57 +180,26 @@ def table_exists(table_name: str) -> bool:
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_source_table_lookup_failed",
+            source=table_name,
+            severity="warn",
+            reason="Company-memory context skipped a source because table existence lookup failed.",
+            error=exc,
+        )
         return False
     return not df.empty
 
 
 def ensure_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                review_date TIMESTAMPTZ NOT NULL,
-                symbol TEXT NOT NULL,
-                recommended_signal TEXT NOT NULL,
-                confidence DOUBLE PRECISION,
-                conviction_score DOUBLE PRECISION,
-                summary TEXT,
-                thesis TEXT,
-                risk_flags_json TEXT,
-                evidence_used_json TEXT,
-                wait_for_json TEXT,
-                deterministic_boundary TEXT,
-                authority_scope TEXT,
-                model_name TEXT,
-                prompt_id TEXT,
-                prompt_version TEXT,
-                prompt_schema_version TEXT,
-                review_status TEXT,
-                fallback_used BOOLEAN,
-                error TEXT,
-                payload_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (review_date, symbol)
-            )
-            """
-        )
-        for column, sql_type in {
-            "risk_flags_json": "TEXT",
-            "evidence_used_json": "TEXT",
-            "wait_for_json": "TEXT",
-            "deterministic_boundary": "TEXT",
-            "authority_scope": "TEXT",
-            "model_name": "TEXT",
-            "prompt_id": "TEXT",
-            "prompt_version": "TEXT",
-            "prompt_schema_version": "TEXT",
-            "review_status": "TEXT",
-            "fallback_used": "BOOLEAN",
-            "error": "TEXT",
-            "payload_json": "TEXT",
-        }.items():
-            cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    apply_schema_migration(
+        migration_id=COMPANY_MEMORY_SCHEMA_MIGRATION_ID,
+        description="Create review-only company memory signal table.",
+        statements=COMPANY_MEMORY_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME], "authority_scope": "review_input_only"},
+    )
 
 
 def load_review_symbols(*, asof_date: pd.Timestamp, symbols: list[str] | None = None, limit: int = DEFAULT_MAX_SYMBOLS) -> list[str]:
@@ -205,7 +233,20 @@ def load_review_symbols(*, asof_date: pd.Timestamp, symbols: list[str] | None = 
                     statement_timeout_ms=10000,
                 )
             )
-        except Exception:
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.company_memory_review",
+                fallback_type="company_memory_review_symbols_load_failed",
+                source=table_name,
+                severity="warn",
+                reason="Company-memory review skipped a candidate-symbol source because symbol discovery failed.",
+                error=exc,
+                metadata={
+                    "date_column": date_col,
+                    "asof_date": None if pd.isna(asof_date) else pd.Timestamp(asof_date).isoformat(),
+                    "limit": max(1, int(limit) * 4),
+                },
+            )
             continue
     if not frames:
         return []
@@ -254,7 +295,21 @@ def _load_table_rows(
             retries=2,
             statement_timeout_ms=10000,
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_source_rows_load_failed",
+            source=table_name,
+            severity="warn",
+            symbol=symbol.upper(),
+            reason="Company-memory context skipped source rows because source loading failed.",
+            error=exc,
+            metadata={
+                "date_column": date_column,
+                "lookback_days": int(lookback_days),
+                "limit": max(1, int(limit)),
+            },
+        )
         return pd.DataFrame()
 
 
@@ -292,7 +347,20 @@ def _load_wait_signal_rows(
             retries=2,
             statement_timeout_ms=10000,
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_wait_signals_load_failed",
+            source=WAIT_SIGNALS_TABLE,
+            severity="warn",
+            symbol=symbol.upper(),
+            reason="Company-memory context skipped wait-signal rows because source loading failed.",
+            error=exc,
+            metadata={
+                "lookback_days": int(lookback_days),
+                "limit": max(1, int(limit)),
+            },
+        )
         return pd.DataFrame()
 
 

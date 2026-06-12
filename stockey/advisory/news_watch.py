@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.announcement_watch import (
     DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
     is_material_context_event,
@@ -16,13 +17,55 @@ from advisory.announcement_watch import (
     normalize_timestamp,
 )
 from data.economictimes.rss import build_feed_rows, persist_feed_rows
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 EVENTS_TABLE = "advisory_news_events"
+EVENTS_SCHEMA_MIGRATION_ID = "20260611_advisory_news_events_base"
 NEWS_TABLE = "economictimes_rss_items"
 DEFAULT_LOOKBACK_DAYS = 7
+EVENTS_EXTRA_COLUMNS = {
+    "event_source": "TEXT",
+    "source_name": "TEXT",
+    "feed_name": "TEXT",
+    "source_url": "TEXT",
+    "match_reasons_json": "TEXT",
+    "match_score": "DOUBLE PRECISION",
+    "monitor_source": "TEXT",
+}
+EVENTS_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
+        published_on TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        unique_id TEXT NOT NULL,
+        event_source TEXT,
+        source_name TEXT,
+        feed_name TEXT,
+        source_url TEXT,
+        subject TEXT,
+        concise_summary_text TEXT,
+        categories_json TEXT,
+        watch_reasons_json TEXT,
+        match_reasons_json TEXT,
+        match_score DOUBLE PRECISION,
+        monitor_source TEXT,
+        event_status TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    *[
+        f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+        for column, sql_type in EVENTS_EXTRA_COLUMNS.items()
+    ],
+]
 
 _SPACE_RE = re.compile(r"[^a-z0-9]+")
 _COMMON_SUFFIXES = (
@@ -57,41 +100,12 @@ def strip_company_suffixes(value: str) -> str:
 
 
 def ensure_output_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
-                published_on TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                unique_id TEXT NOT NULL,
-                event_source TEXT,
-                source_name TEXT,
-                feed_name TEXT,
-                source_url TEXT,
-                subject TEXT,
-                concise_summary_text TEXT,
-                categories_json TEXT,
-                watch_reasons_json TEXT,
-                match_reasons_json TEXT,
-                match_score DOUBLE PRECISION,
-                monitor_source TEXT,
-                event_status TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT")
-        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS source_name TEXT")
-        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS feed_name TEXT")
-        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS source_url TEXT")
-        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS match_reasons_json TEXT")
-        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS match_score DOUBLE PRECISION")
-        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT")
+    apply_schema_migration(
+        migration_id=EVENTS_SCHEMA_MIGRATION_ID,
+        description="Create advisory news watch event table.",
+        statements=EVENTS_SCHEMA_STATEMENTS,
+        metadata={"tables": [EVENTS_TABLE]},
+    )
 
 
 def load_watch_company_meta(company_master_ids: list[str]) -> pd.DataFrame:
@@ -137,7 +151,20 @@ def load_recent_news(
             """,
             params=tuple(params),
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.news_watch",
+            fallback_type="news_watch_recent_news_load_failed",
+            source=NEWS_TABLE,
+            severity="warn",
+            reason="News watch returned no recent news because the source news table could not be queried.",
+            error=exc,
+            metadata={
+                "published_from": str(published_from),
+                "published_to": None if published_to is None else str(published_to),
+                "feed_names": feed_names or [],
+            },
+        )
         return pd.DataFrame()
     if df.empty:
         return df

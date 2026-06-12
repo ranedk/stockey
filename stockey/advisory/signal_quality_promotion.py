@@ -7,12 +7,54 @@ from typing import Any, Literal
 import pandas as pd
 from pydantic import BaseModel, Field
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.signal_quality_evaluator import SUMMARY_TABLE
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 REVIEWS_TABLE = "advisory_signal_quality_promotion_reviews"
 DECISIONS_TABLE = "advisory_signal_quality_promotion_decisions"
+SIGNAL_QUALITY_PROMOTION_SCHEMA_MIGRATION_ID = "20260611_advisory_signal_quality_promotion_base"
+
+SIGNAL_QUALITY_PROMOTION_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {REVIEWS_TABLE} (
+        reviewed_at TIMESTAMPTZ NOT NULL,
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        horizon_days BIGINT NOT NULL,
+        variant TEXT NOT NULL,
+        signal_quality_evidence_json TEXT,
+        coverage_json TEXT,
+        llm_review_json TEXT,
+        recommendation TEXT,
+        confidence DOUBLE PRECISION,
+        patch_json TEXT,
+        review_model TEXT,
+        review_status TEXT,
+        review_error TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (reviewed_at, evaluated_at, horizon_days, variant)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {DECISIONS_TABLE} (
+        decided_at TIMESTAMPTZ NOT NULL,
+        reviewed_at TIMESTAMPTZ NOT NULL,
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        horizon_days BIGINT NOT NULL,
+        variant TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        operator_id TEXT,
+        decision_reason TEXT,
+        final_patch_json TEXT,
+        review_snapshot_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (reviewed_at, evaluated_at, horizon_days, variant, decided_at)
+    )
+    """,
+    f"ALTER TABLE {DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS final_patch_json TEXT",
+]
 
 ManualDecision = Literal["approved", "rejected", "needs_more_data"]
 
@@ -31,7 +73,7 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def parse_jsonish(value: Any, default: Any) -> Any:
+def parse_jsonish(value: Any, default: Any, *, source: str = "signal_quality_promotion_json") -> Any:
     if value is None:
         return default
     if isinstance(value, (dict, list)):
@@ -39,56 +81,60 @@ def parse_jsonish(value: Any, default: Any) -> Any:
     try:
         if pd.isna(value):
             return default
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_quality_promotion",
+            fallback_type="signal_quality_promotion_json_missing_check_failed",
+            source=source,
+            severity="warn",
+            reason="Signal-quality promotion could not evaluate missingness for stored JSON and continued parsing.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "default_type": type(default).__name__},
+        )
     try:
         return json.loads(str(value))
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_quality_promotion",
+            fallback_type="signal_quality_promotion_json_parse_failed",
+            source=source,
+            severity="warn",
+            reason="Signal-quality promotion could not parse stored JSON; using the existing default fallback.",
+            error=exc,
+            metadata={"source": source, "payload_length": len(str(value))},
+        )
         return default
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {REVIEWS_TABLE} (
-                reviewed_at TIMESTAMPTZ NOT NULL,
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                horizon_days BIGINT NOT NULL,
-                variant TEXT NOT NULL,
-                signal_quality_evidence_json TEXT,
-                coverage_json TEXT,
-                llm_review_json TEXT,
-                recommendation TEXT,
-                confidence DOUBLE PRECISION,
-                patch_json TEXT,
-                review_model TEXT,
-                review_status TEXT,
-                review_error TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (reviewed_at, evaluated_at, horizon_days, variant)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {DECISIONS_TABLE} (
-                decided_at TIMESTAMPTZ NOT NULL,
-                reviewed_at TIMESTAMPTZ NOT NULL,
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                horizon_days BIGINT NOT NULL,
-                variant TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                operator_id TEXT,
-                decision_reason TEXT,
-                final_patch_json TEXT,
-                review_snapshot_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (reviewed_at, evaluated_at, horizon_days, variant, decided_at)
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS final_patch_json TEXT")
+    apply_schema_migration(
+        migration_id=SIGNAL_QUALITY_PROMOTION_SCHEMA_MIGRATION_ID,
+        description="Create advisory signal-quality promotion review and decision tables.",
+        statements=SIGNAL_QUALITY_PROMOTION_SCHEMA_STATEMENTS,
+        metadata={
+            "tables": [REVIEWS_TABLE, DECISIONS_TABLE],
+            "authority_scope": "manual_config_review_only",
+        },
+    )
+
+
+def _record_promotion_source_failure(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.signal_quality_promotion",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def load_signal_quality_summary(*, evaluated_at: Any, horizon_days: int, variant: str) -> dict[str, Any]:
@@ -98,18 +144,32 @@ def load_signal_quality_summary(*, evaluated_at: Any, horizon_days: int, variant
     normalized_variant = str(variant or "").strip()
     if not normalized_variant or normalized_variant == "technical_only":
         raise ValueError("variant must be a non-technical_only overlay variant")
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {SUMMARY_TABLE}
-        WHERE evaluated_at = %(evaluated_at)s
-          AND horizon_days = %(horizon_days)s
-          AND variant = %(variant)s
-        LIMIT 1
-        """,
-        params={"evaluated_at": parsed_evaluated_at, "horizon_days": int(horizon_days), "variant": normalized_variant},
-        retries=3,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {SUMMARY_TABLE}
+            WHERE evaluated_at = %(evaluated_at)s
+              AND horizon_days = %(horizon_days)s
+              AND variant = %(variant)s
+            LIMIT 1
+            """,
+            params={"evaluated_at": parsed_evaluated_at, "horizon_days": int(horizon_days), "variant": normalized_variant},
+            retries=3,
+        )
+    except Exception as exc:
+        _record_promotion_source_failure(
+            fallback_type="signal_quality_promotion_summary_load_failed",
+            source=SUMMARY_TABLE,
+            reason="Signal-quality promotion could not load overlay summary evidence for review.",
+            error=exc,
+            metadata={
+                "evaluated_at": str(parsed_evaluated_at),
+                "horizon_days": int(horizon_days),
+                "variant": normalized_variant,
+            },
+        )
+        raise
     if df.empty:
         raise ValueError(f"Unknown signal-quality row: {evaluated_at}/{horizon_days}/{variant}")
     return df.iloc[0].to_dict()

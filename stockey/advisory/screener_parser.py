@@ -7,7 +7,7 @@ from datetime import date as date_cls
 
 import pandas as pd
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 
 
 CONSTITUENTS_TABLE = "advisory_screener_constituents"
@@ -287,12 +287,19 @@ def persist_constituents(df: pd.DataFrame) -> None:
         .drop_duplicates()
         .itertuples(index=False, name=None)
     )
-    with db_session() as (_, cur):
-        for snapshot_date, screener_slug in keys:
-            cur.execute(
-                f"DELETE FROM {CONSTITUENTS_TABLE} WHERE date = %s AND screener_slug = %s",
-                (snapshot_date, screener_slug),
-            )
+
+    def _delete_existing_constituents() -> None:
+        with db_session() as (_, cur):
+            for snapshot_date, screener_slug in keys:
+                cur.execute(
+                    f"DELETE FROM {CONSTITUENTS_TABLE} WHERE date = %s AND screener_slug = %s",
+                    (snapshot_date, screener_slug),
+                )
+
+    execute_db_operation(
+        _delete_existing_constituents,
+        operation_name="screener_parser:persist_constituents:delete_existing",
+    )
     upsert_to_db(
         df,
         CONSTITUENTS_TABLE,

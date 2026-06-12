@@ -7,17 +7,75 @@ from typing import Any
 import pandas as pd
 
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.technical_threshold_calibration import attach_forward_returns, load_price_history_for_returns
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 EVALUATIONS_TABLE = "advisory_event_policy_evaluations"
 SUMMARY_TABLE = "advisory_event_policy_eval_summary"
+EVENT_POLICY_EVAL_SCHEMA_MIGRATION_ID = "20260611_advisory_event_policy_evaluator_base"
 DEFAULT_HORIZONS = [5, 10, 20]
 DEFAULT_RETURN_THRESHOLD = 0.03
 DEFAULT_COST_BPS = 25.0
 DEFAULT_MIN_MATURED_ROWS = 10
+EVENT_POLICY_EVAL_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        horizon_days BIGINT NOT NULL,
+        published_on TIMESTAMPTZ,
+        asof_date TIMESTAMPTZ,
+        setup_id TEXT,
+        symbol TEXT NOT NULL,
+        unique_id TEXT,
+        event_source TEXT,
+        event_class TEXT,
+        policy_class TEXT,
+        action_type TEXT,
+        action_status TEXT,
+        policy_score DOUBLE PRECISION,
+        confidence DOUBLE PRECISION,
+        score_bucket TEXT,
+        confidence_bucket TEXT,
+        entry_date TIMESTAMPTZ,
+        exit_date TIMESTAMPTZ,
+        entry_close DOUBLE PRECISION,
+        exit_close DOUBLE PRECISION,
+        forward_return DOUBLE PRECISION,
+        forward_return_after_cost DOUBLE PRECISION,
+        hit_after_cost BOOLEAN,
+        matured BOOLEAN,
+        raw_context_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (evaluated_at, horizon_days, published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        horizon_days BIGINT NOT NULL,
+        group_type TEXT NOT NULL,
+        group_value TEXT NOT NULL,
+        sample_count BIGINT,
+        matured_count BIGINT,
+        avg_forward_return DOUBLE PRECISION,
+        median_forward_return DOUBLE PRECISION,
+        avg_forward_return_after_cost DOUBLE PRECISION,
+        hit_rate_after_cost DOUBLE PRECISION,
+        positive_return_rate DOUBLE PRECISION,
+        avg_policy_score DOUBLE PRECISION,
+        avg_confidence DOUBLE PRECISION,
+        sample_start TIMESTAMPTZ,
+        sample_end TIMESTAMPTZ,
+        recommendation TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (evaluated_at, horizon_days, group_type, group_value)
+    )
+    """,
+]
 EVALUATION_NUMERIC_COLUMNS = [
     "policy_score",
     "confidence",
@@ -103,64 +161,12 @@ def normalize_summary_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                horizon_days BIGINT NOT NULL,
-                published_on TIMESTAMPTZ,
-                asof_date TIMESTAMPTZ,
-                setup_id TEXT,
-                symbol TEXT NOT NULL,
-                unique_id TEXT,
-                event_source TEXT,
-                event_class TEXT,
-                policy_class TEXT,
-                action_type TEXT,
-                action_status TEXT,
-                policy_score DOUBLE PRECISION,
-                confidence DOUBLE PRECISION,
-                score_bucket TEXT,
-                confidence_bucket TEXT,
-                entry_date TIMESTAMPTZ,
-                exit_date TIMESTAMPTZ,
-                entry_close DOUBLE PRECISION,
-                exit_close DOUBLE PRECISION,
-                forward_return DOUBLE PRECISION,
-                forward_return_after_cost DOUBLE PRECISION,
-                hit_after_cost BOOLEAN,
-                matured BOOLEAN,
-                raw_context_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (evaluated_at, horizon_days, published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                horizon_days BIGINT NOT NULL,
-                group_type TEXT NOT NULL,
-                group_value TEXT NOT NULL,
-                sample_count BIGINT,
-                matured_count BIGINT,
-                avg_forward_return DOUBLE PRECISION,
-                median_forward_return DOUBLE PRECISION,
-                avg_forward_return_after_cost DOUBLE PRECISION,
-                hit_rate_after_cost DOUBLE PRECISION,
-                positive_return_rate DOUBLE PRECISION,
-                avg_policy_score DOUBLE PRECISION,
-                avg_confidence DOUBLE PRECISION,
-                sample_start TIMESTAMPTZ,
-                sample_end TIMESTAMPTZ,
-                recommendation TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (evaluated_at, horizon_days, group_type, group_value)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=EVENT_POLICY_EVAL_SCHEMA_MIGRATION_ID,
+        description="Create event-policy evaluator output tables.",
+        statements=EVENT_POLICY_EVAL_SCHEMA_STATEMENTS,
+        metadata={"tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
+    )
 
 
 def table_columns(table_name: str) -> set[str]:
@@ -175,7 +181,15 @@ def table_columns(table_name: str) -> set[str]:
             params=(table_name,),
             retries=2,
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.event_policy_evaluator",
+            fallback_type="event_policy_evaluator_schema_lookup_failed",
+            source=table_name,
+            severity="warn",
+            reason="Event-policy evaluator treated source table as unavailable because schema lookup failed.",
+            error=exc,
+        )
         return set()
     return set(df["column_name"].astype(str).tolist()) if not df.empty else set()
 
@@ -210,6 +224,58 @@ def _confidence_bucket(value: Any) -> str:
     return "confidence_very_low"
 
 
+def _parse_raw_context(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    try:
+        if pd.isna(value):
+            return {}
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.event_policy_evaluator",
+            fallback_type="event_policy_evaluator_raw_context_missing_check_failed",
+            source=EVENT_POLICY_TABLE,
+            severity="warn",
+            reason="Event-policy evaluator could not evaluate missingness for raw_context_json and continued parsing.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
+    try:
+        parsed = json.loads(str(value))
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.event_policy_evaluator",
+            fallback_type="event_policy_evaluator_raw_context_parse_failed",
+            source=EVENT_POLICY_TABLE,
+            severity="warn",
+            reason="Event-policy evaluator could not parse raw_context_json; using empty context for grouping.",
+            error=exc,
+            metadata={"payload_length": len(str(value))},
+        )
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _nested_text(payload: dict[str, Any], path: list[str], default: str = "unknown") -> str:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+    text = str(current or "").strip()
+    return text if text and text.lower() not in {"none", "nan", "null", "<na>"} else default
+
+
+def _actionability_group_value(raw_context_json: Any, path: list[str]) -> str:
+    raw_context = _parse_raw_context(raw_context_json)
+    actionability = raw_context.get("actionability")
+    if not isinstance(actionability, dict):
+        return "unknown"
+    return _nested_text(actionability, path)
+
+
 def load_event_policy_rows(
     *,
     from_date: pd.Timestamp | None = None,
@@ -221,6 +287,15 @@ def load_event_policy_rows(
         return pd.DataFrame()
     required = {"symbol", "published_on", "action_type", "policy_class"}
     if not required.issubset(available):
+        missing = sorted(required - available)
+        record_local_fallback_event(
+            module="advisory.event_policy_evaluator",
+            fallback_type="event_policy_evaluator_required_columns_missing",
+            source=EVENT_POLICY_TABLE,
+            severity="warn",
+            reason="Event-policy evaluator returned empty output because required source columns were missing.",
+            metadata={"missing_columns": missing},
+        )
         return pd.DataFrame()
     wanted = [
         "published_on",
@@ -251,18 +326,34 @@ def load_event_policy_rows(
     if symbols:
         clauses.append("UPPER(TRIM(symbol)) = ANY(%s)")
         params.append([str(value).upper() for value in symbols])
-    df = sql_to_df(
-        f"""
-        SELECT {', '.join(selected)}
-        FROM {EVENT_POLICY_TABLE}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY COALESCE(asof_date, published_on), symbol, setup_id, unique_id
-        """,
-        params=tuple(params) if params else None,
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT {', '.join(selected)}
+            FROM {EVENT_POLICY_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY COALESCE(asof_date, published_on), symbol, setup_id, unique_id
+            """,
+            params=tuple(params) if params else None,
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.event_policy_evaluator",
+            fallback_type="event_policy_evaluator_policy_rows_load_failed",
+            source=EVENT_POLICY_TABLE,
+            severity="warn",
+            reason="Event-policy evaluator returned empty output because policy row loading failed.",
+            error=exc,
+            metadata={
+                "from_date": str(from_date) if from_date is not None else None,
+                "to_date": str(to_date) if to_date is not None else None,
+                "symbol_count": len(symbols or []),
+            },
+        )
+        return pd.DataFrame()
     if df.empty:
         return df
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
@@ -356,17 +447,39 @@ def summarize_evaluations(
 ) -> pd.DataFrame:
     if evaluations.empty:
         return pd.DataFrame()
+    evals = evaluations.copy()
+    if "raw_context_json" in evals.columns:
+        evals["source_quality_bucket"] = evals["raw_context_json"].map(
+            lambda value: _actionability_group_value(value, ["source_quality", "quality"])
+        )
+        evals["source_family"] = evals["raw_context_json"].map(
+            lambda value: _actionability_group_value(value, ["source_quality", "source_family"])
+        )
+        evals["source_authority"] = evals["raw_context_json"].map(
+            lambda value: _actionability_group_value(value, ["source_quality", "authority"])
+        )
+        evals["source_confirmation_required"] = evals["raw_context_json"].map(
+            lambda value: _actionability_group_value(value, ["source_quality", "confirmation_required"])
+        )
+        evals["market_scope_type"] = evals["raw_context_json"].map(
+            lambda value: _actionability_group_value(value, ["market_scope", "scope_type"])
+        )
     group_specs = [
         ("action_type", ["action_type"]),
         ("policy_class", ["policy_class"]),
         ("event_class", ["event_class"]),
         ("score_bucket", ["score_bucket"]),
         ("confidence_bucket", ["confidence_bucket"]),
+        ("source_quality", ["source_quality_bucket"]),
+        ("source_family", ["source_family"]),
+        ("source_authority", ["source_authority"]),
+        ("source_confirmation_required", ["source_confirmation_required"]),
+        ("market_scope", ["market_scope_type"]),
         ("policy_class_action", ["policy_class", "action_type"]),
         ("action_score_bucket", ["action_type", "score_bucket"]),
     ]
     rows: list[dict[str, Any]] = []
-    for horizon, horizon_group in evaluations.groupby("horizon_days", dropna=False):
+    for horizon, horizon_group in evals.groupby("horizon_days", dropna=False):
         for group_type, columns in group_specs:
             available = [column for column in columns if column in horizon_group.columns]
             if not available:

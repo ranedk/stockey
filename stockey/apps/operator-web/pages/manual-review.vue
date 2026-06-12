@@ -285,7 +285,8 @@ async function submitDecision(item: Dict) {
       follow_up_event: followUpByItem.value[id] || '',
       operator_id: operatorId.value || 'operator'
     })
-    saveSuccess.value = `${result.decision} recorded for ${id}.`
+    const nextState = String(result.manual_review_state?.state || result.next_state || '').replaceAll('_', ' ')
+    saveSuccess.value = nextState ? `${result.decision} recorded for ${id}. Next state: ${nextState}.` : `${result.decision} recorded for ${id}.`
     decisionByItem.value[id] = String(item.suggested_decision || 'needs_more_data')
     rationaleByItem.value[id] = ''
     followUpByItem.value[id] = ''
@@ -530,6 +531,9 @@ async function submitDecision(item: Dict) {
         </div>
         <details class="mt-3">
           <summary class="cursor-pointer text-sm font-black text-moss">Show source row</summary>
+          <p v-if="item.raw_compacted" class="mt-2 rounded-2xl border border-sun/30 bg-sun/10 p-3 text-xs font-semibold leading-5 text-ink/65">
+            This is a compact source preview for fast page loads. {{ item.raw_omitted_key_count || 0 }} bulky/raw keys are omitted from the list response. Use the linked trace/detail pages for full evidence.
+          </p>
           <pre class="mt-3 max-h-80 overflow-auto rounded-2xl bg-ink p-4 text-xs leading-5 text-paper">{{ JSON.stringify(item.raw || {}, null, 2) }}</pre>
         </details>
       </article>

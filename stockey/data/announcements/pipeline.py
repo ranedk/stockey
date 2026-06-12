@@ -22,7 +22,7 @@ from .categorize import report_category_map
 from .models import Announcement, CompanyMasterTarget, ParsedReport
 from .prompts import CATEGORY_PROMPTS, REPORT_PROMPTS
 from .schemas import DOCUMENT_PYDANTIC_MAP, MODEL_TYPE_MAP
-from advisory.fallback_telemetry import record_fallback_event
+from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.http import get_dynamic_headers
@@ -61,6 +61,42 @@ Provider = Literal["openai", "gemini", "codex"]
 _AUDIO_EXTENSIONS = {"mp3", "wav", "mp4", "m4a", "aac", "ogg", "webm"}
 _AUDIO_LINK_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 _AUDIO_HINT_PATTERN = re.compile(r"(audio|recording|transcript|conference|earnings).{0,80}(mp3|wav|mp4|m4a|aac|ogg|webm)", re.IGNORECASE)
+
+
+def _announcement_document_metadata(announcement: Announcement, **extra: object) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "unique_id": announcement.unique_id,
+        "ticker": announcement.ticker,
+        "exchange": announcement.exchange,
+        "company_master_id": announcement.company_master_id,
+        "subject": announcement.subject,
+        "attachment_name": announcement.attachment_name,
+        "attachment_content_type": announcement.attachment_content_type,
+        "is_pdf": announcement.is_pdf_attachment(),
+        "is_audio": announcement.is_audio_attachment(),
+    }
+    metadata.update(extra)
+    return metadata
+
+
+def _record_announcement_document_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    announcement: Announcement,
+    **metadata: object,
+) -> None:
+    record_local_fallback_event(
+        module="data.announcements.pipeline",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=_announcement_document_metadata(announcement, **metadata),
+    )
 
 
 class AnnouncementPipeline:
@@ -231,6 +267,17 @@ class AnnouncementPipeline:
                     announcement.ocr_prompt_schema_version = OCR_PDF_PAGE_PROMPT_SCHEMA_VERSION
             except Exception as exc:
                 announcement.ocr_error = str(exc)
+                _record_announcement_document_fallback(
+                    fallback_type="announcement_ocr_first_pages_failed",
+                    source="announcement_ocr_first_pages",
+                    reason=(
+                        "Announcement first-page OCR/transcription failed; downstream event summaries may rely "
+                        "only on exchange-provided text until OCR dependencies or source document issues are fixed."
+                    ),
+                    error=exc,
+                    announcement=announcement,
+                    max_pages=max_pages,
+                )
                 logger.warning("OCR/transcription failed for %s: %s", announcement.unique_id, exc)
         return list(announcements)
 
@@ -255,6 +302,16 @@ class AnnouncementPipeline:
                     announcement.ocr_prompt_schema_version = OCR_PDF_PAGE_PROMPT_SCHEMA_VERSION
             except Exception as exc:
                 announcement.ocr_error = str(exc)
+                _record_announcement_document_fallback(
+                    fallback_type="announcement_full_ocr_failed",
+                    source="announcement_full_ocr",
+                    reason=(
+                        "Announcement full-document OCR failed; structured parsing may miss details outside "
+                        "the exchange text or first-page OCR excerpt."
+                    ),
+                    error=exc,
+                    announcement=announcement,
+                )
                 logger.warning("Full OCR failed for %s: %s", announcement.unique_id, exc)
         return list(announcements)
 
@@ -292,6 +349,18 @@ class AnnouncementPipeline:
                     suffix=self._suffix_for_audio_url(audio_url, response.headers.get("Content-Type")),
                 ).strip()
             except Exception as exc:
+                _record_announcement_document_fallback(
+                    fallback_type="announcement_audio_transcription_failed",
+                    source="announcement_earnings_audio_transcription",
+                    reason=(
+                        "Announcement earnings-call audio transcription failed; downstream analysis may miss "
+                        "management commentary from the linked recording."
+                    ),
+                    error=exc,
+                    announcement=announcement,
+                    audio_url_present=bool(audio_url),
+                    audio_attachment_name=audio_url.split("?", 1)[0].rsplit("/", 1)[-1] if audio_url else None,
+                )
                 logger.warning("Audio transcription failed for %s: %s", announcement.unique_id, exc)
         return list(announcements)
 
@@ -622,6 +691,18 @@ class AnnouncementPipeline:
                 return cookies
             except requests.RequestException as exc:
                 last_error = exc
+                record_local_fallback_event(
+                    module="data.announcements.pipeline",
+                    fallback_type="nse_cookie_bootstrap_failed",
+                    source="nse_http",
+                    severity="warn",
+                    reason=(
+                        "NSE cookie bootstrap URL failed; announcement ingestion will try the next bootstrap "
+                        "URL or continue without cookies if all bootstrap attempts fail."
+                    ),
+                    error=exc,
+                    metadata={"url": bootstrap_url},
+                )
                 logger.warning("NSE session bootstrap failed url=%s error=%s: %s", bootstrap_url, exc.__class__.__name__, exc)
         if last_error is not None:
             raise last_error
@@ -642,6 +723,15 @@ class AnnouncementPipeline:
         try:
             self._nse_cookies = self._bootstrap_nse_cookies_once(self._nse_headers)
         except requests.RequestException as exc:
+            record_local_fallback_event(
+                module="data.announcements.pipeline",
+                fallback_type="nse_cookie_bootstrap_after_reset_failed",
+                source="nse_http",
+                severity="warn",
+                reason="NSE cookie bootstrap failed after an HTTP session reset; announcement ingestion continued with empty cookies.",
+                error=exc,
+                metadata={"reason": reason},
+            )
             self._log_nse_wait(
                 "NSE cookie bootstrap after reset failed; continuing with empty cookies error=%s: %s",
                 exc.__class__.__name__,
@@ -656,6 +746,18 @@ class AnnouncementPipeline:
             try:
                 return headers, self._bootstrap_nse_cookies_once(headers)
             except requests.RequestException as exc:
+                record_local_fallback_event(
+                    module="data.announcements.pipeline",
+                    fallback_type="nse_session_bootstrap_retry_failed",
+                    source="nse_http",
+                    severity="warn",
+                    reason="NSE session bootstrap failed; announcement ingestion will retry or continue without bootstrap cookies after max attempts.",
+                    error=exc,
+                    metadata={
+                        "attempt": attempt,
+                        "max_attempts": "infinite" if NSE_HTTP_MAX_ATTEMPTS <= 0 else NSE_HTTP_MAX_ATTEMPTS,
+                    },
+                )
                 self._log_nse_wait(
                     "NSE session bootstrap failed; retrying attempt=%s max_attempts=%s error=%s: %s",
                     attempt,
@@ -861,20 +963,44 @@ class AnnouncementPipeline:
 
     @staticmethod
     def _parse_bse_datetime(value: str) -> datetime:
-        for pattern in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        patterns = ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S")
+        for index, pattern in enumerate(patterns):
             try:
                 parsed = datetime.strptime(value, pattern)
                 return pytz.UTC.localize(parsed)
-            except ValueError:
+            except ValueError as exc:
+                if index == len(patterns) - 1:
+                    record_local_fallback_event(
+                        module="data.announcements.pipeline",
+                        fallback_type="bse_announcement_datetime_parse_failed",
+                        source="bse_announcements",
+                        severity="warn",
+                        reason="BSE announcement timestamp did not match supported formats; the announcement row cannot be parsed causally.",
+                        error=exc,
+                        metadata={"value": value},
+                    )
+                    raise ValueError(f"Unsupported BSE datetime: {value}") from exc
                 continue
         raise ValueError(f"Unsupported BSE datetime: {value}")
 
     @staticmethod
     def _parse_nse_datetime(value: str) -> datetime:
-        for pattern in ("%d-%b-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        patterns = ("%d-%b-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S")
+        for index, pattern in enumerate(patterns):
             try:
                 parsed = datetime.strptime(value, pattern)
                 return pytz.UTC.localize(parsed)
-            except ValueError:
+            except ValueError as exc:
+                if index == len(patterns) - 1:
+                    record_local_fallback_event(
+                        module="data.announcements.pipeline",
+                        fallback_type="nse_announcement_datetime_parse_failed",
+                        source="nse_announcements",
+                        severity="warn",
+                        reason="NSE announcement timestamp did not match supported formats; the announcement row cannot be parsed causally.",
+                        error=exc,
+                        metadata={"value": value},
+                    )
+                    raise ValueError(f"Unsupported NSE datetime: {value}") from exc
                 continue
         raise ValueError(f"Unsupported NSE datetime: {value}")

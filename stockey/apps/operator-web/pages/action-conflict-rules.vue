@@ -249,7 +249,7 @@ async function promoteConflict(row: Dict) {
       <div>
         <h2 class="text-2xl font-black text-ink">Promote unresolved conflicts</h2>
         <p class="mt-2 max-w-3xl text-sm leading-6 text-ink/60">
-          Promotion creates an exact action/source match rule candidate. It stays disabled until an operator enables it.
+          Promotion creates a disabled rule candidate. Use exact action/source matches by default, or action-only pairs when repeated manual reviews prove a broader rule is safe.
         </p>
       </div>
       <MetaChip label="scope" tone="blue">manual resolution</MetaChip>

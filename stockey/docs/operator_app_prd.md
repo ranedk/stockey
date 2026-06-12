@@ -102,6 +102,7 @@ For a symbol/date/action, display:
 - reason contract status, missing evidence, original action, and grouped rationale sections
 - screener provenance
 - technical state
+- feature freshness and missing/stale data-input blockers
 - technical threshold calibration summaries with copyable config JSON
 - LLM-assisted technical threshold promotion reviews with manual-only pending patch payloads
 - manual approval/rejection audit state for threshold-review patches
@@ -283,21 +284,23 @@ It should consume:
 13. Done: build Investor Playbooks creation, scan, action-plan flow, and production-safe action-consolidation bridge.
 14. Done: expose event-policy action counts, operator notes, wait-for events, and questions in the Event Inbox.
 15. Done: expose research-only event-policy realized-return summary in the Event Inbox.
-16. Next: add UI-first operations workbench.
-17. Add live update stream.
+16. Done: add UI-first operations workbench foundations, including Health, Operations, Manual Review, Wait Signals, Identity Issues, Signal Quality, Prompt Registry, and Research Evidence pages.
+17. Done: add Action Queue and Symbol Detail data-input freshness visibility.
+18. Done: persist action decision-time feature freshness and show it in Action Queue/Symbol Detail.
+19. Done: enforce feature dependencies in rules, risk, portfolio, lifecycle, and actions, and surface blocked stage gates through Operator Health.
+20. Next: add richer per-symbol UI drill-down for stage gate effects.
+21. Add live update stream.
 
 ## UI-First Operations Workbench
 
 Remaining gaps before the project can be managed almost entirely from UI:
 
-- Health action: run a read-only smoke check and render fix hints, stale sources, cron failures, dependency failures, and fallback spikes.
-- Manual Review queue: merge action conflicts, event-policy manual rows, failed extraction rows, execution blockers, and threshold-review decisions into one operator queue.
-- Hypothesis/playbook lifecycle: create, preview, edit, version, activate/deactivate, run scans, inspect reliability checks, and mark trusted overlays from UI.
-- Research evidence: show event-model promotion-check gates, S3 artifact upload status, TS forecast evaluation, event-policy evaluation, technical calibration, and research ledger runs.
-- Config-change assistant: generate reviewed copyable diffs for approved technical/playbook/config changes without auto-applying YAML edits.
-- Cron/log viewer: show schedule, next/last run, lock status, bounded log tails, recovered/manual-interrupt state, and latest tracebacks.
-- Data lineage: show raw event -> OCR/summary -> tensor -> policy/review -> action -> lifecycle/execution plan.
-- API performance: use summary-first/paginated endpoints for events, actions, portfolio, traces, research runs, and logs.
+- Feature dependency enforcement: show and enforce which stage was downgraded or blocked by stale/missing required inputs.
+- Broader decision-time freshness: extend persisted snapshots beyond consolidated action rows where needed, especially non-action Manual Review sources.
+- Ingestion state: expose standardized downloader/parser run rows and source-specific failure classes.
+- Research/config operations: finish S3 artifact inspection, research-ledger review, and safe reviewed-config application workflows.
+- Data lineage: keep improving raw event -> OCR/summary -> tensor -> policy/review -> action -> lifecycle/execution plan visibility without raw JSON.
+- Retention/performance: keep summary-first/paginated endpoints and add hot/cold retention for old trace and intraday rows.
 
 ## Frontend Commands
 

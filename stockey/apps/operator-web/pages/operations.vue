@@ -24,6 +24,8 @@ const logs = computed(() => asList(cronLogs.value?.logs))
 const logPageMeta = computed(() => asDict(cronLogs.value?.pagination?.logs))
 const failedGates = computed(() => mlGate.value?.failed_gates || [])
 const gates = computed(() => asList(mlGate.value?.gates))
+const mlScorecard = computed(() => asDict(mlGate.value?.scorecard))
+const mlScorecardMetrics = computed(() => asDict(mlScorecard.value.key_metrics))
 const latestHeads = computed(() => asList(artifacts.value?.latest_s3_heads))
 const artifactPageMeta = computed(() => asDict(artifacts.value?.pagination?.artifact_files))
 const commandList = computed(() => asList(commands.value?.commands))
@@ -58,8 +60,8 @@ function asStringList(value: unknown): string[] {
 
 function statusClass(value: unknown) {
   const status = String(value || '').toLowerCase()
-  if (status === 'ok' || status === 'uploaded' || status === 'review_candidate') return 'bg-moss text-paper'
-  if (status === 'error' || status === 'failed' || status === 'timeout' || status === 'missing_artifact' || status === 'hold_research_only') return 'bg-rust text-paper'
+  if (status === 'ok' || status === 'uploaded' || status === 'review_candidate' || status === 'usable_for_manual_review') return 'bg-moss text-paper'
+  if (status === 'error' || status === 'failed' || status === 'timeout' || status === 'missing_artifact' || status === 'hold_research_only' || status === 'not_usable') return 'bg-rust text-paper'
   return 'bg-sun text-ink'
 }
 
@@ -149,7 +151,7 @@ async function runSmokeCommand() {
     <MetricTile label="Smoke" :value="String(smoke?.status || '-').toUpperCase()" :note="smoke?.generated_at || '-'" />
     <MetricTile label="Trust" :value="String(smoke?.trust_level || smokeContract.trust_level || '-').replaceAll('_', ' ').toUpperCase()" :note="String(smoke?.trust_status || smokeContract.trust_status || '-')" />
     <MetricTile label="Fix Hints" :value="String(fixHints.length)" note="Errors and stale-data next steps" />
-    <MetricTile label="ML Gate" :value="String(mlGate?.decision || '-')" :note="mlGate?.ready_for_operator_review ? 'Ready for manual review' : 'Research-only for now'" />
+    <MetricTile label="ML Gate" :value="String(mlScorecard.status || mlGate?.decision || '-')" :note="String(mlScorecard.operator_action || (mlGate?.ready_for_operator_review ? 'Ready for manual review' : 'Research-only for now'))" />
     <MetricTile label="API Errors" :value="String(operatorApiErrors.length)" :note="`${recentRuns.length} command runs`" />
   </section>
 
@@ -291,26 +293,47 @@ async function runSmokeCommand() {
           <p class="text-xs font-bold uppercase tracking-[0.3em] text-ink/45">Research evidence</p>
           <h2 class="mt-2 text-2xl font-black">Event-model promotion gate</h2>
         </div>
-        <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(mlGate?.decision)">{{ String(mlGate?.decision || 'unknown').toUpperCase() }}</span>
+        <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(mlScorecard.status || mlGate?.decision)">{{ String(mlScorecard.status || mlGate?.decision || 'unknown').toUpperCase() }}</span>
       </div>
       <p class="mt-3 text-sm leading-6 text-ink/60">
-        Passing this gate means “review for low-weight integration”, not auto-promotion.
+        {{ mlScorecard.headline || 'Passing this gate means “review for low-weight integration”, not auto-promotion.' }}
       </p>
+      <div class="mt-4 rounded-2xl bg-ink p-4 text-paper">
+        <p class="text-xs font-black uppercase tracking-[0.2em] text-paper/50">Operator action</p>
+        <p class="mt-2 text-sm font-bold leading-6">{{ mlScorecard.operator_action || 'Keep model research-only until the gate passes.' }}</p>
+        <p class="mt-2 text-xs text-paper/55">
+          Authority: {{ mlScorecard.authority || 'research_only_manual_review' }} · broker allowed: {{ mlScorecard.broker_execution_allowed ? 'yes' : 'no' }} · auto promotion: {{ mlScorecard.policy_auto_promotion_allowed ? 'yes' : 'no' }}
+        </p>
+      </div>
       <div class="mt-5 grid gap-3 md:grid-cols-3">
         <div class="rounded-2xl bg-white/75 p-4">
           <p class="text-xs font-bold uppercase tracking-[0.2em] text-ink/45">Labels</p>
-          <p class="mt-2 text-2xl font-black">{{ display(mlGate?.coverage?.labeled_rows) }}</p>
-          <p class="mt-1 text-xs text-ink/55">rows across {{ display(mlGate?.coverage?.date_count) }} dates</p>
+          <p class="mt-2 text-2xl font-black">{{ display(mlScorecardMetrics.labeled_rows ?? mlGate?.coverage?.labeled_rows) }}</p>
+          <p class="mt-1 text-xs text-ink/55">rows across {{ display(mlScorecardMetrics.date_count ?? mlGate?.coverage?.date_count) }} dates</p>
         </div>
         <div class="rounded-2xl bg-white/75 p-4">
           <p class="text-xs font-bold uppercase tracking-[0.2em] text-ink/45">Weekly Runs</p>
-          <p class="mt-2 text-2xl font-black">{{ display(mlGate?.weekly_runs?.successful_runs) }}</p>
+          <p class="mt-2 text-2xl font-black">{{ display(mlScorecardMetrics.successful_runs ?? mlGate?.weekly_runs?.successful_runs) }}</p>
           <p class="mt-1 text-xs text-ink/55">last {{ display(mlGate?.weekly_runs?.since_days) }} days</p>
         </div>
         <div class="rounded-2xl bg-white/75 p-4">
           <p class="text-xs font-bold uppercase tracking-[0.2em] text-ink/45">Score Rows</p>
-          <p class="mt-2 text-2xl font-black">{{ display(mlGate?.score_freshness?.score_rows) }}</p>
+          <p class="mt-2 text-2xl font-black">{{ display(mlScorecardMetrics.score_rows ?? mlGate?.score_freshness?.score_rows) }}</p>
           <p class="mt-1 text-xs text-ink/55">{{ display(mlGate?.score_freshness?.latest_scored_at) }}</p>
+        </div>
+      </div>
+      <div class="mt-3 grid gap-3 md:grid-cols-3">
+        <div class="rounded-2xl bg-white/75 p-4">
+          <p class="text-xs font-bold uppercase tracking-[0.2em] text-ink/45">Precision Lift</p>
+          <p class="mt-2 text-2xl font-black">{{ display(mlScorecardMetrics.precision_lift_vs_positive_rate_test) }}</p>
+        </div>
+        <div class="rounded-2xl bg-white/75 p-4">
+          <p class="text-xs font-bold uppercase tracking-[0.2em] text-ink/45">ROC-AUC</p>
+          <p class="mt-2 text-2xl font-black">{{ display(mlScorecardMetrics.roc_auc) }}</p>
+        </div>
+        <div class="rounded-2xl bg-white/75 p-4">
+          <p class="text-xs font-bold uppercase tracking-[0.2em] text-ink/45">Failed Gates</p>
+          <p class="mt-2 text-2xl font-black">{{ display(mlScorecard.failed_gate_count ?? failedGates.length) }}</p>
         </div>
       </div>
       <div class="mt-5">

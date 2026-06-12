@@ -5,9 +5,10 @@ const api = useOperatorApi()
 const route = useRoute()
 const symbol = computed(() => String(route.params.symbol || '').trim().toUpperCase())
 
-const [{ data: actions, error: actionsError }, { data: portfolio, error: portfolioError }, { data: events, error: eventsError }, { data: traceData, error: traceError }, { data: featureFreshness, error: featureFreshnessError }] = await Promise.all([
-  useAsyncData(`symbol-actions-${symbol.value}`, () => api.getActions({ symbol: symbol.value, limit: 100 })),
+const [{ data: actions, error: actionsError }, { data: portfolio, error: portfolioError }, { data: portfolioDetail, error: portfolioDetailError }, { data: events, error: eventsError }, { data: traceData, error: traceError }, { data: featureFreshness, error: featureFreshnessError }] = await Promise.all([
+  useAsyncData(`symbol-actions-${symbol.value}`, () => api.getActions({ symbol: symbol.value, limit: 100, include_feature_freshness: true })),
   useAsyncData(`symbol-portfolio-${symbol.value}`, () => api.getPortfolio({ symbol: symbol.value, limit: 100 })),
+  useAsyncData(`symbol-portfolio-detail-${symbol.value}`, () => api.getPortfolioDetail(symbol.value)),
   useAsyncData(`symbol-events-${symbol.value}`, () => api.getEvents(100, { symbol: symbol.value })),
   useAsyncData(`symbol-trace-${symbol.value}`, () => api.getSymbolTraceSummary(symbol.value, 250)),
   useAsyncData(`symbol-feature-freshness-${symbol.value}`, () => api.getFeatureFreshness(symbol.value))
@@ -17,6 +18,7 @@ const trace = computed<TraceSummary | null>(() => traceData.value || null)
 const loadErrors = computed(() => [
   { title: `${symbol.value} actions failed`, error: actionsError.value },
   { title: `${symbol.value} portfolio failed`, error: portfolioError.value },
+  { title: `${symbol.value} portfolio detail failed`, error: portfolioDetailError.value },
   { title: `${symbol.value} events failed`, error: eventsError.value },
   { title: `${symbol.value} trace failed`, error: traceError.value },
   { title: `${symbol.value} data inputs failed`, error: featureFreshnessError.value }
@@ -29,6 +31,7 @@ const portfolioRows = computed(() => filterSymbolRows(portfolio.value?.portfolio
 const lifecycleRows = computed(() => filterSymbolRows(portfolio.value?.lifecycle || []))
 const recommendationRows = computed(() => [...todayRows.value, ...currentRows.value, ...portfolioRows.value, ...lifecycleRows.value])
 const exitedRows = computed(() => filterSymbolRows(portfolio.value?.exited_recommendations || []))
+const policyChangeRows = computed(() => Array.isArray(portfolioDetail.value?.policy_changes) ? portfolioDetail.value.policy_changes : [])
 const eventRows = computed(() => filterSymbolRows([...(events.value?.events || []), ...(events.value?.operator_feed || []), ...(events.value?.alerts || [])]))
 const finalAction = computed(() => mergeRows(
   actionRows.value[0],
@@ -41,6 +44,9 @@ const finalAction = computed(() => mergeRows(
 const reasonContract = computed(() => finalAction.value.recommendation_reason || finalAction.value.reason_contract || finalAction.value.recommendation_reason_json)
 const reasonStatus = computed(() => finalAction.value.reason_contract_status || finalAction.value.status)
 const companyMemory = computed(() => companyMemoryReview(finalAction.value))
+const decisionTimeFreshness = computed(() => asDict(finalAction.value.feature_freshness))
+const decisionTimeFreshnessSummary = computed(() => asDict(finalAction.value.feature_freshness_summary))
+const featureGateEffects = computed(() => collectFeatureGateEffects([finalAction.value, ...actionRows.value, ...recommendationRows.value]))
 const dataInputs = computed(() => Array.isArray(featureFreshness.value?.inputs) ? featureFreshness.value.inputs : [])
 const dataInputCounts = computed(() => asDict(featureFreshness.value?.counts))
 const dataInputBlockers = computed(() => Array.isArray(featureFreshness.value?.blockers) ? featureFreshness.value.blockers : [])
@@ -67,6 +73,10 @@ function nestedValue(source: unknown, path: string[]): unknown {
 function stringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return []
   return value.map((item) => String(item || '').trim()).filter(Boolean)
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
 }
 
 function filterSymbolRows(rows: Dict[]): Dict[] {
@@ -192,6 +202,29 @@ function dataInputClass(value: unknown) {
   if (status === 'stale' || status === 'warning') return 'bg-sun text-ink'
   if (status === 'missing' || status === 'error' || status === 'blocked') return 'bg-rust text-paper'
   return 'bg-ink/10 text-ink'
+}
+
+function collectFeatureGateEffects(rows: Dict[]) {
+  const seen = new Set<string>()
+  const out: Dict[] = []
+  for (const row of rows) {
+    for (const effect of asArray(row.feature_gate_effects)) {
+      const item = asDict(effect)
+      if (!Object.keys(item).length) continue
+      const key = [item.stage, item.gate, item.original_action, JSON.stringify(item.blocked_inputs || [])].join('|')
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(item)
+    }
+  }
+  return out
+}
+
+function featureGateTone(effect: Dict) {
+  const stage = String(effect.stage || '').toLowerCase()
+  if (stage === 'actions' || stage === 'risk' || stage === 'portfolio') return 'border-rust/20 bg-rust/10 text-rust'
+  if (stage === 'lifecycle') return 'border-sun/30 bg-sun/15 text-ink'
+  return 'border-moss/20 bg-moss/10 text-moss'
 }
 
 function actionLabel(row: Dict) {
@@ -354,6 +387,35 @@ function companyMemoryReview(row: Dict) {
         <p class="rounded-2xl bg-white/75 p-3"><b>Manual review:</b> {{ display(firstValue(['manual_revision_summary', 'manual_revision_pointers', 'review_action'])) }}</p>
       </div>
 
+      <div v-if="policyChangeRows.length" class="mt-6 rounded-3xl border border-black/10 bg-white/70 p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Policy Change Audit</p>
+            <h3 class="mt-2 text-xl font-black">Stop and target changes</h3>
+            <p class="mt-2 text-sm leading-6 text-ink/60">
+              Durable lifecycle policy changes applied to this symbol. Stop tightening changes are recorded only when the portfolio baseline was actually updated.
+            </p>
+          </div>
+          <span class="rounded-full bg-sun/20 px-3 py-1 text-xs font-black text-ink">{{ policyChangeRows.length }} rows</span>
+        </div>
+        <div class="mt-4 space-y-3">
+          <div v-for="row in policyChangeRows.slice(0, 5)" :key="String(row.change_id || `${row.changed_at}-${row.change_type}`)" class="rounded-2xl bg-paper/85 p-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="font-black text-ink">{{ display(row.change_type) }}</p>
+                <p class="mt-1 text-sm text-ink/60">{{ display(row.reason) }}</p>
+              </div>
+              <span class="rounded-full bg-white px-3 py-1 text-xs font-black text-ink/60">{{ display(row.changed_at) }}</span>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+              <p class="rounded-xl bg-white/75 px-3 py-2"><b>Old:</b> {{ money(row.old_value) }}</p>
+              <p class="rounded-xl bg-white/75 px-3 py-2"><b>New:</b> {{ money(row.new_value) }}</p>
+              <p class="rounded-xl bg-white/75 px-3 py-2"><b>Source:</b> {{ display(row.source_action) }}</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="mt-6 rounded-3xl border border-black/10 bg-white/70 p-5">
         <div class="flex flex-wrap items-start justify-between gap-3">
           <div>
@@ -392,6 +454,61 @@ function companyMemoryReview(row: Dict) {
             </div>
           </div>
         </details>
+      </div>
+
+      <div v-if="Object.keys(decisionTimeFreshness).length || Object.keys(decisionTimeFreshnessSummary).length" class="mt-4 rounded-3xl border border-black/10 bg-paper/80 p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Decision-Time Data Inputs</p>
+            <h3 class="mt-2 text-xl font-black">What the action saw when it was created</h3>
+            <p class="mt-2 text-sm leading-6 text-ink/60">
+              This persisted snapshot is different from the current check above. Use it to understand why the original action was approved, blocked, or sent to review.
+            </p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="dataInputClass(decisionTimeFreshness.status || decisionTimeFreshnessSummary.status)">{{ String(decisionTimeFreshness.status || decisionTimeFreshnessSummary.status || 'unknown').toUpperCase() }}</span>
+        </div>
+        <div class="mt-4 grid gap-2 md:grid-cols-4">
+          <p class="rounded-2xl bg-white/80 p-3 text-sm"><b>Captured:</b> {{ display(decisionTimeFreshness.captured_at || decisionTimeFreshnessSummary.captured_at) }}</p>
+          <p class="rounded-2xl bg-white/80 p-3 text-sm"><b>Fresh:</b> {{ display(asDict(decisionTimeFreshness.counts || decisionTimeFreshnessSummary.counts).fresh || 0) }}</p>
+          <p class="rounded-2xl bg-white/80 p-3 text-sm"><b>Stale:</b> {{ display(asDict(decisionTimeFreshness.counts || decisionTimeFreshnessSummary.counts).stale || 0) }}</p>
+          <p class="rounded-2xl bg-white/80 p-3 text-sm"><b>Missing:</b> {{ display(asDict(decisionTimeFreshness.counts || decisionTimeFreshnessSummary.counts).missing || 0) }}</p>
+        </div>
+      </div>
+
+      <div v-if="featureGateEffects.length" class="mt-4 rounded-3xl border border-black/10 bg-paper/80 p-5">
+        <div>
+          <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Stage Gate Effects</p>
+          <h3 class="mt-2 text-xl font-black">What stale or missing inputs changed</h3>
+          <p class="mt-2 text-sm leading-6 text-ink/60">
+            These rows explain the concrete pipeline effect: watch downgrade, manual review, deferred capital, lifecycle warning, or final action downgrade.
+          </p>
+        </div>
+        <div class="mt-4 grid gap-3">
+          <div v-for="effect in featureGateEffects" :key="`${effect.stage}-${effect.gate}-${effect.original_action || ''}`" class="rounded-2xl border p-4" :class="featureGateTone(effect)">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-sm font-black">{{ effect.label || effect.stage || 'Feature gate' }}</p>
+                <p class="mt-1 text-sm leading-6 opacity-80">{{ effect.summary || effect.gate_effect || effect.gate || 'Required feature input was blocked.' }}</p>
+              </div>
+              <span class="rounded-full bg-white/80 px-3 py-1 text-xs font-black text-ink/65">{{ String(effect.status || 'blocked').toUpperCase() }}</span>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+              <p class="rounded-xl bg-white/75 px-3 py-2"><b>Original action:</b> {{ display(effect.original_action) }}</p>
+              <p class="rounded-xl bg-white/75 px-3 py-2"><b>Broker allowed:</b> {{ display(effect.broker_execution_allowed) }}</p>
+              <p class="rounded-xl bg-white/75 px-3 py-2"><b>Source:</b> {{ display(effect.source) }}</p>
+            </div>
+            <div v-if="asArray(effect.blocked_inputs).length" class="mt-3 rounded-xl bg-white/75 p-3">
+              <p class="text-xs font-black uppercase tracking-[0.18em] opacity-60">Blocked inputs</p>
+              <ul class="mt-2 space-y-1 text-sm leading-6">
+                <li v-for="input in asArray(effect.blocked_inputs)" :key="String(asDict(input).input_key || asDict(input).label)">
+                  <b>{{ asDict(input).label || asDict(input).input_key }}</b>
+                  <span v-if="asDict(input).status"> · {{ asDict(input).status }}</span>
+                  <span v-if="asDict(input).reason"> · {{ asDict(input).reason }}</span>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </section>

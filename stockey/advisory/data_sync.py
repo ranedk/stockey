@@ -5,6 +5,7 @@ import sys
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.client import DhanAPIError
 from data.dhanlive.ohlcv import sync_daily_ohlcv
 from data.sharpelydata.sharpely_data import sync_sharpely_data
@@ -106,6 +107,22 @@ def ensure_symbol_ohlcv(
                 f"[advisory.data_sync] daily OHLCV issue symbol={symbol} error_type={exc.__class__.__name__} error={exc}",
                 file=sys.stderr,
                 flush=True,
+            )
+            record_local_fallback_event(
+                module="advisory.data_sync",
+                source="dhan_ohlcv_daily",
+                fallback_type="advisory_daily_ohlcv_sync_failed",
+                severity="error",
+                symbol=symbol,
+                reason="Daily OHLCV refresh for an advisory symbol failed; downstream rules may use stale or missing price inputs.",
+                error=exc,
+                metadata={
+                    "symbol": symbol,
+                    "exchange": "NSE",
+                    "asset_type": "stock",
+                    "from_date": None if from_date is None else pd.Timestamp(from_date).isoformat(),
+                    "to_date": pd.Timestamp(target_day).isoformat(),
+                },
             )
             results.append(result)
             continue

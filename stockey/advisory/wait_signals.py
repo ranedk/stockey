@@ -9,12 +9,63 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.hypothesis_engine import ACTION_PLANS_TABLE, MATCHES_TABLE, parse_jsonish
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 WAIT_SIGNALS_TABLE = "advisory_wait_signals"
 WAIT_SIGNAL_MATCHES_TABLE = "advisory_wait_signal_matches"
+WAIT_SIGNALS_SCHEMA_MIGRATION_ID = "20260611_advisory_wait_signals_base"
+WAIT_SIGNALS_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {WAIT_SIGNALS_TABLE} (
+        signal_id TEXT PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL,
+        hypothesis_id TEXT,
+        hypothesis_title TEXT,
+        source_table TEXT,
+        source_key TEXT,
+        symbol TEXT,
+        scope TEXT,
+        signal_type TEXT NOT NULL,
+        status TEXT,
+        priority BIGINT,
+        expected_action TEXT,
+        operator_summary TEXT,
+        wait_question TEXT,
+        condition_json TEXT,
+        valid_from TIMESTAMPTZ,
+        valid_until TIMESTAMPTZ,
+        generated_by TEXT,
+        load_ts TIMESTAMPTZ
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {WAIT_SIGNAL_MATCHES_TABLE} (
+        matched_at TIMESTAMPTZ NOT NULL,
+        signal_id TEXT NOT NULL,
+        hypothesis_id TEXT,
+        symbol TEXT,
+        signal_type TEXT,
+        expected_action TEXT,
+        match_status TEXT,
+        match_score DOUBLE PRECISION,
+        source_table TEXT,
+        source_key TEXT,
+        observed_at TIMESTAMPTZ,
+        observed_value DOUBLE PRECISION,
+        threshold_value DOUBLE PRECISION,
+        match_reason TEXT,
+        evidence_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (signal_id, source_table, source_key)
+    )
+    """,
+    f"CREATE INDEX IF NOT EXISTS idx_{WAIT_SIGNALS_TABLE}_status_symbol ON {WAIT_SIGNALS_TABLE} (status, symbol, valid_until)",
+    f"CREATE INDEX IF NOT EXISTS idx_{WAIT_SIGNAL_MATCHES_TABLE}_matched ON {WAIT_SIGNAL_MATCHES_TABLE} (matched_at DESC, symbol)",
+]
 POSITIVE_ACTIONS = {"BUY", "BUY_MORE", "BUY_WATCH", "WATCH_SYMBOLS", "ADD_TO_WATCHLIST", "WATCH"}
 NEGATIVE_ACTIONS = {"REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW", "FULL_EXIT", "PARTIAL_EXIT", "SELL", "PARTIAL_SELL"}
 PRICE_CONDITION_TYPES = {"price_level"}
@@ -29,6 +80,25 @@ DEFAULT_EVENT_KEYWORDS: dict[str, list[str]] = {
     "sector_event": ["sector", "industry", "policy", "regulation", "demand", "prices"],
 }
 DEFAULT_EVENT_SOURCES = ["news", "announcement", "announcement_document"]
+
+
+def _record_wait_signal_source_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.wait_signals",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 @dataclass(frozen=True)
@@ -89,8 +159,16 @@ def _text(value: Any, default: str | None = None) -> str | None:
     try:
         if pd.isna(value):
             return default
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.wait_signals",
+            fallback_type="wait_signals_text_missing_check_failed",
+            source="text",
+            severity="warn",
+            reason="Wait-signal normalization could not evaluate missingness while normalizing text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     text = str(value).strip()
     if text.lower() in {"", "nan", "none", "null", "<na>"}:
         return default
@@ -288,7 +366,13 @@ def _table_exists(table_name: str) -> bool:
             params=(table_name,),
         )
         return not df.empty
-    except Exception:
+    except Exception as exc:
+        _record_wait_signal_source_fallback(
+            fallback_type="wait_signal_source_table_lookup_failed",
+            source=table_name,
+            reason="Wait-signal matching skipped a source because table existence lookup failed.",
+            error=exc,
+        )
         return False
 
 
@@ -308,61 +392,22 @@ def _table_columns(table_name: str) -> set[str]:
         return set(df["column_name"].dropna().astype(str).tolist())
     except Exception as exc:
         print(f"[advisory.wait_signals] source_column_check_failed table={table_name} error={type(exc).__name__}:{exc}", file=sys.stderr)
+        _record_wait_signal_source_fallback(
+            fallback_type="wait_signal_source_column_check_failed",
+            source=table_name,
+            reason="Wait-signal matching skipped a source because source-column lookup failed.",
+            error=exc,
+        )
         return set()
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {WAIT_SIGNALS_TABLE} (
-                signal_id TEXT PRIMARY KEY,
-                created_at TIMESTAMPTZ NOT NULL,
-                hypothesis_id TEXT,
-                hypothesis_title TEXT,
-                source_table TEXT,
-                source_key TEXT,
-                symbol TEXT,
-                scope TEXT,
-                signal_type TEXT NOT NULL,
-                status TEXT,
-                priority BIGINT,
-                expected_action TEXT,
-                operator_summary TEXT,
-                wait_question TEXT,
-                condition_json TEXT,
-                valid_from TIMESTAMPTZ,
-                valid_until TIMESTAMPTZ,
-                generated_by TEXT,
-                load_ts TIMESTAMPTZ
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {WAIT_SIGNAL_MATCHES_TABLE} (
-                matched_at TIMESTAMPTZ NOT NULL,
-                signal_id TEXT NOT NULL,
-                hypothesis_id TEXT,
-                symbol TEXT,
-                signal_type TEXT,
-                expected_action TEXT,
-                match_status TEXT,
-                match_score DOUBLE PRECISION,
-                source_table TEXT,
-                source_key TEXT,
-                observed_at TIMESTAMPTZ,
-                observed_value DOUBLE PRECISION,
-                threshold_value DOUBLE PRECISION,
-                match_reason TEXT,
-                evidence_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (signal_id, source_table, source_key)
-            )
-            """
-        )
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{WAIT_SIGNALS_TABLE}_status_symbol ON {WAIT_SIGNALS_TABLE} (status, symbol, valid_until)")
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{WAIT_SIGNAL_MATCHES_TABLE}_matched ON {WAIT_SIGNAL_MATCHES_TABLE} (matched_at DESC, symbol)")
+    apply_schema_migration(
+        migration_id=WAIT_SIGNALS_SCHEMA_MIGRATION_ID,
+        description="Create wait-signal and wait-signal match tables.",
+        statements=WAIT_SIGNALS_SCHEMA_STATEMENTS,
+        metadata={"tables": [WAIT_SIGNALS_TABLE, WAIT_SIGNAL_MATCHES_TABLE]},
+    )
 
 
 def make_signal_id(row: dict[str, Any]) -> str:
@@ -592,6 +637,12 @@ def _load_source_events_for_match(*, from_ts: pd.Timestamp, to_ts: pd.Timestamp,
         missing_columns = sorted(required_columns - columns)
         if missing_columns:
             print(f"[advisory.wait_signals] source_table_skipped table={table} missing_columns={','.join(missing_columns)}", file=sys.stderr)
+            _record_wait_signal_source_fallback(
+                fallback_type="wait_signal_source_table_missing_columns",
+                source=table,
+                reason="Wait-signal matching skipped a source because required columns were missing.",
+                metadata={"missing_columns": missing_columns},
+            )
             continue
         if table == "announcement_pipeline_documents" and "attachment_url" in columns:
             url_select = "attachment_url AS source_url"
@@ -627,6 +678,13 @@ def _load_source_events_for_match(*, from_ts: pd.Timestamp, to_ts: pd.Timestamp,
             )
         except Exception as exc:
             print(f"[advisory.wait_signals] source_event_load_failed table={table} error={type(exc).__name__}:{exc}", file=sys.stderr)
+            _record_wait_signal_source_fallback(
+                fallback_type="wait_signal_source_event_load_failed",
+                source=table,
+                reason="Wait-signal matching skipped source events because event evidence loading failed.",
+                error=exc,
+                metadata={"symbol": symbol, "from_ts": str(from_ts), "to_ts": str(to_ts)},
+            )
     frames = [frame for frame in frames if not frame.empty]
     return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
@@ -782,11 +840,19 @@ def match_wait_signals(*, symbols: list[str] | None = None, limit: int = 250, pe
         for column in ["match_score", "observed_value", "threshold_value"]:
             out[column] = pd.to_numeric(out[column], errors="coerce")
         upsert_to_db(out, WAIT_SIGNAL_MATCHES_TABLE, unique_keys=["signal_id", "source_table", "source_key"])
-        with db_session() as (_, cur):
-            cur.execute(
-                f"UPDATE {WAIT_SIGNALS_TABLE} SET status = 'matched', load_ts = %s WHERE signal_id = ANY(%s)",
-                (now, matches["signal_id"].dropna().astype(str).tolist()),
-            )
+        signal_ids = matches["signal_id"].dropna().astype(str).tolist()
+
+        def _mark_wait_signals_matched() -> None:
+            with db_session() as (_, cur):
+                cur.execute(
+                    f"UPDATE {WAIT_SIGNALS_TABLE} SET status = 'matched', load_ts = %s WHERE signal_id = ANY(%s)",
+                    (now, signal_ids),
+                )
+
+        execute_db_operation(
+            _mark_wait_signals_matched,
+            operation_name="wait_signals:mark_matched",
+        )
     return {
         "status": "ok",
         "active_signal_rows": int(len(active)),

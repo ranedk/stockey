@@ -1,5 +1,6 @@
 # bhavcopy download from S3 and parse
 import io
+import json
 import tempfile
 import zipfile
 import glob
@@ -11,6 +12,7 @@ import pandas as pd
 from environs import Env
 import redis
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.company_master import attach_company_master_id
 from utils.db import sql_to_df, upsert_to_db
 from utils.ingestion_state import get_failed_entries, get_processed_keys, mark_failed, mark_processed
@@ -26,7 +28,10 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 REDIS_SET = "bhav:parsed"
 SOURCE_PREFIX = "bhavcopy"
+EMPTY_VALID_STATUS = "empty_valid_source"
 NSE_BHAVCOPY_PARSE_LOOKBACK_DAYS = max(env.int("NSE_BHAVCOPY_PARSE_LOOKBACK_DAYS", 365), 1)
+SYNC_SOURCE_NAME = "data.nseindia.bhavcopy_parser"
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
@@ -43,7 +48,16 @@ def chunked(values: list[str], size: int) -> Iterable[list[str]]:
 def extract_bhavcopy_date_from_key(key: str) -> pd.Timestamp | None:
     try:
         return pd.to_datetime(os.path.basename(key), format="bhavcopy_%Y-%m-%d.zip")
-    except ValueError:
+    except ValueError as exc:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=str(key),
+            fallback_type="nse_bhavcopy_key_date_parse_failed",
+            severity="warn",
+            reason="Bhavcopy object key did not match the expected bhavcopy_YYYY-MM-DD.zip format and was skipped by the parser.",
+            error=exc,
+            metadata={"key": str(key), "source_prefix": SOURCE_PREFIX},
+        )
         return None
 
 
@@ -87,14 +101,84 @@ def load_existing_ohlcv_dates(target_dates: Iterable[pd.Timestamp]) -> set[str]:
     return existing
 
 
-def run_parser() -> None:
-    files = [key for key in store.list_files("bhavcopy") if should_consider_key(key)]
+def load_completed_keys(source_prefix: str) -> set[str]:
+    return set(get_processed_keys(source_prefix)) | set(get_processed_keys(source_prefix, status=EMPTY_VALID_STATUS))
+
+
+def classify_bhavcopy_parse_failure(exc: Exception) -> str:
+    message = f"{exc.__class__.__name__}: {exc}".lower()
+    if isinstance(exc, zipfile.BadZipFile) or "bad_bhavcopy_zip" in message or "badzipfile" in message:
+        return "bad_file_retryable"
+    if "nested_cm_zip" in message or "nested_bhavcopy_zip" in message or "nested_pr_zip" in message:
+        return "bad_file_retryable"
+    if "not a zip" in message or "file is not a zip" in message or "corrupt" in message:
+        return "bad_file_retryable"
+    if isinstance(exc, KeyError):
+        return "schema_changed"
+    if isinstance(exc, pd.errors.ParserError):
+        return "schema_changed"
+    schema_markers = [
+        "columns are missing",
+        "columns overlap",
+        "columns passed",
+        "not in index",
+        "usecols do not match",
+        "length mismatch",
+        "expected axis has",
+        "expected fields",
+        "found in axis",
+    ]
+    if any(marker in message for marker in schema_markers):
+        return "schema_changed"
+    return "parser_bug"
+
+
+def _date_window_from_keys(keys: Iterable[str]) -> tuple[str | None, str | None]:
+    dates = [
+        value.strftime("%Y-%m-%d")
+        for value in (extract_bhavcopy_date_from_key(key) for key in keys)
+        if value is not None
+    ]
+    if not dates:
+        return None, None
+    return min(dates), max(dates)
+
+
+def run_parser() -> dict[str, object]:
+    all_files = list(store.list_files("bhavcopy"))
+    files = [key for key in all_files if should_consider_key(key)]
     keyed_dates = {key: extract_bhavcopy_date_from_key(key) for key in files}
-    processed_keys = get_processed_keys(SOURCE_PREFIX)
+    processed_keys = load_completed_keys(SOURCE_PREFIX)
     parsed_dates = load_existing_ohlcv_dates(
         value for value in keyed_dates.values() if value is not None
     )
     failed_entries = {row["object_key"]: row for row in get_failed_entries(SOURCE_PREFIX)}
+    summary: dict[str, object] = {
+        "source": SOURCE_PREFIX,
+        "rows": 0,
+        "rows_read": len(files),
+        "rows_written": 0,
+        "files_seen": len(all_files),
+        "files_considered": len(files),
+        "skipped_lookback_count": max(len(all_files) - len(files), 0),
+        "already_processed_count": 0,
+        "already_parsed_db_count": 0,
+        "parsed_count": 0,
+        "empty_processed_count": 0,
+        "failed_count": 0,
+        "failed_classifications": {},
+        "prior_failed_count": len(failed_entries),
+        "failed_keys": [],
+        "empty_keys": [],
+        "from_date": None,
+        "to_date": None,
+        "lookback_days": NSE_BHAVCOPY_PARSE_LOOKBACK_DAYS,
+        "fallback_used": False,
+        "state_advanced": False,
+    }
+    from_date, to_date = _date_window_from_keys(files)
+    summary["from_date"] = from_date
+    summary["to_date"] = to_date
 
     if failed_entries:
         emit(f"⚠️ Found {len(failed_entries)} previously failed bhavcopy key(s) in DB state")
@@ -105,32 +189,68 @@ def run_parser() -> None:
     for key in files:
         if key in processed_keys:
             emit(f"⏩ Already processed in DB state: {key}")
+            summary["already_processed_count"] = int(summary["already_processed_count"]) + 1
             continue
         parsed_date = keyed_dates.get(key)
         if parsed_date is not None and parsed_date.strftime("%Y-%m-%d") in parsed_dates:
             emit(f"⏩ Already parsed in DB: {key}")
             mark_processed(SOURCE_PREFIX, key)
             processed_keys.add(key)
+            summary["already_parsed_db_count"] = int(summary["already_parsed_db_count"]) + 1
             continue
         file_path = store.get_as_temp_file(key)
         emit(f"For: {key}")
         try:
             parsed = unzip_and_process(file_path)
         except Exception as exc:
-            error_message = f"{exc.__class__.__name__}: {exc}"
+            classification = classify_bhavcopy_parse_failure(exc)
+            error_message = f"classification={classification}; {exc.__class__.__name__}: {exc}"
             emit(f"❌ Failed to parse bhavcopy key={key}: {error_message}")
+            record_local_fallback_event(
+                module=SYNC_SOURCE_NAME,
+                source=str(key),
+                fallback_type="nse_bhavcopy_parse_failed",
+                severity="error" if classification == "parser_bug" else "warn",
+                reason="Bhavcopy archive parse failed; this market-wide evidence file remains marked failed for retry/review.",
+                error=exc,
+                metadata={
+                    "classification": classification,
+                    "key": str(key),
+                    "file_path": str(file_path),
+                    "source_prefix": SOURCE_PREFIX,
+                },
+            )
             mark_failed(SOURCE_PREFIX, key, error_message)
+            summary["failed_count"] = int(summary["failed_count"]) + 1
+            classifications = dict(summary["failed_classifications"])
+            classifications[classification] = int(classifications.get(classification, 0)) + 1
+            summary["failed_classifications"] = classifications
+            failed_keys = list(summary["failed_keys"])
+            if len(failed_keys) < 20:
+                failed_keys.append(key)
+            summary["failed_keys"] = failed_keys
             continue
         if parsed:
             mark_processed(SOURCE_PREFIX, key)
             processed_keys.add(key)
             rop.sadd(REDIS_SET, key)
+            summary["parsed_count"] = int(summary["parsed_count"]) + 1
         else:
             emit(f"⏭️ Marking bhavcopy key as processed without OHLCV rows: {key}")
-            mark_processed(SOURCE_PREFIX, key)
+            mark_processed(SOURCE_PREFIX, key, status=EMPTY_VALID_STATUS)
             processed_keys.add(key)
+            summary["empty_processed_count"] = int(summary["empty_processed_count"]) + 1
+            empty_keys = list(summary["empty_keys"])
+            if len(empty_keys) < 20:
+                empty_keys.append(key)
+            summary["empty_keys"] = empty_keys
 
     rop.close()
+    advanced_count = int(summary["parsed_count"]) + int(summary["empty_processed_count"]) + int(summary["already_parsed_db_count"])
+    summary["rows"] = advanced_count
+    summary["rows_written"] = advanced_count
+    summary["state_advanced"] = advanced_count > 0
+    return summary
 
 
 def with_company_master(df: pd.DataFrame) -> pd.DataFrame:
@@ -174,7 +294,17 @@ def parse_circuit_hit(path):
     parts = os.path.basename(path)
     try:
         for_date = pd.to_datetime(parts, format="bh%d%m%y.csv")
-    except ValueError: # Format issue
+    except ValueError as exc: # Format issue
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=str(path),
+            fallback_type="nse_bhavcopy_circuit_hit_date_fallback",
+            severity="info",
+            reason="Circuit-hit file date did not match short-year format; trying long-year fallback parser.",
+            deterministic_fallback=True,
+            error=exc,
+            metadata={"path": str(path), "filename": parts, "fallback_format": "bh%d%m%Y.csv"},
+        )
         for_date = pd.to_datetime(parts, format="bh%d%m%Y.csv")
 
     df = pd.read_csv(path, usecols=[0, 1, 3], encoding='utf-8', encoding_errors='ignore')
@@ -588,7 +718,16 @@ def parse_catg(path):
 def is_empty_zip(path: str) -> bool:
     try:
         return os.path.getsize(path) == 0
-    except OSError:
+    except OSError as exc:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=str(path),
+            fallback_type="nse_bhavcopy_zip_stat_failed",
+            severity="warn",
+            reason="Could not stat bhavcopy zip size before parsing; parser will treat it as non-empty and continue.",
+            error=exc,
+            metadata={"path": str(path)},
+        )
         return False
 
 
@@ -616,6 +755,19 @@ def unzip_and_process(zip_path):
             except Exception as exc:
                 failures.append(f"{label}:{os.path.basename(file_path)}:{exc.__class__.__name__}:{exc}")
                 emit(f"❌ Failed {label} file={file_path}: {exc.__class__.__name__}: {exc}")
+                record_local_fallback_event(
+                    module=SYNC_SOURCE_NAME,
+                    source=str(file_path),
+                    fallback_type="nse_bhavcopy_file_parse_failed",
+                    severity="warn",
+                    reason="A file inside the bhavcopy archive failed to parse; the parent archive will be marked failed for retry/review.",
+                    error=exc,
+                    metadata={
+                        "label": str(label),
+                        "file_path": str(file_path),
+                        "filename": os.path.basename(file_path),
+                    },
+                )
 
         catg_files = glob.glob(os.path.join(tmpdir, "**", "C_CATG_*.T*"), recursive=True)
         for file_path in catg_files:
@@ -661,6 +813,15 @@ def unzip_and_process(zip_path):
                 except zipfile.BadZipFile as exc:
                     failures.append(f"nested_cm_zip:{os.path.basename(nested_zip)}:{exc.__class__.__name__}:{exc}")
                     emit(f"❌ Bad nested CM zip: {nested_zip} - {exc}")
+                    record_local_fallback_event(
+                        module=SYNC_SOURCE_NAME,
+                        source=str(nested_zip),
+                        fallback_type="nse_bhavcopy_nested_zip_failed",
+                        severity="warn",
+                        reason="Nested CM bhavcopy archive is corrupt; parent archive will be marked failed for retry/review.",
+                        error=exc,
+                        metadata={"nested_zip": str(nested_zip), "nested_type": "cm"},
+                    )
                     continue
 
                 cm_files = glob.glob(os.path.join(nested_tmpdir, "**", "cm*.csv"), recursive=True)
@@ -680,6 +841,15 @@ def unzip_and_process(zip_path):
                 except zipfile.BadZipFile as exc:
                     failures.append(f"nested_bhavcopy_zip:{os.path.basename(nested_zip)}:{exc.__class__.__name__}:{exc}")
                     emit(f"❌ Bad nested BhavCopy zip: {nested_zip} - {exc}")
+                    record_local_fallback_event(
+                        module=SYNC_SOURCE_NAME,
+                        source=str(nested_zip),
+                        fallback_type="nse_bhavcopy_nested_zip_failed",
+                        severity="warn",
+                        reason="Nested BhavCopy archive is corrupt; parent archive will be marked failed for retry/review.",
+                        error=exc,
+                        metadata={"nested_zip": str(nested_zip), "nested_type": "bhavcopy"},
+                    )
                     continue
 
                 bhav_files = glob.glob(os.path.join(nested_tmpdir, "**", "BhavCopy*.csv"), recursive=True)
@@ -699,6 +869,15 @@ def unzip_and_process(zip_path):
                 except zipfile.BadZipFile as exc:
                     failures.append(f"nested_pr_zip:{os.path.basename(nested_zip)}:{exc.__class__.__name__}:{exc}")
                     emit(f"❌ Bad nested PR zip: {nested_zip} - {exc}")
+                    record_local_fallback_event(
+                        module=SYNC_SOURCE_NAME,
+                        source=str(nested_zip),
+                        fallback_type="nse_bhavcopy_nested_zip_failed",
+                        severity="warn",
+                        reason="Nested PR bhavcopy archive is corrupt; parent archive will be marked failed for retry/review.",
+                        error=exc,
+                        metadata={"nested_zip": str(nested_zip), "nested_type": "pr"},
+                    )
                     continue
 
                 bc_files = glob.glob(os.path.join(nested_tmpdir, "**", "Bc*.csv"), recursive=True)
@@ -721,5 +900,12 @@ def unzip_and_process(zip_path):
     return True
 
 
+def main() -> int:
+    global STOCKEY_RUN_STATE
+    STOCKEY_RUN_STATE = run_parser()
+    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
 if __name__ == "__main__":
-    run_parser()
+    raise SystemExit(main())

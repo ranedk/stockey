@@ -11,6 +11,8 @@ import psycopg2
 import psycopg2.extras
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 env = Env()
 env.read_env()
@@ -136,6 +138,15 @@ def main():
                 print(json.dumps(result, indent=2, default=json_default))
 
     except Exception as e:
+        record_local_fallback_event(
+            module="scripts.sql_query_runner",
+            source="postgres",
+            fallback_type="sql_query_runner_failed",
+            severity="error",
+            reason="SQL query runner failed before returning a normal query result.",
+            error=e,
+            metadata={"read_only": bool(getattr(args, "read_only", False)), "has_file": bool(getattr(args, "file", None))},
+        )
         print(
             json.dumps(
                 {

@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import pyotp
 from environs import Env
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import DhanAuthError, extract_token_id, normalize_token_id
 
 
@@ -27,6 +29,31 @@ PIN_INPUT_SELECTOR = "code-input span.code-hidden input[autocomplete='one-time-c
 TOKEN_URL_MARKER = "tokenId="
 
 
+def _url_host(value: str | None) -> str | None:
+    if not value:
+        return None
+    return urlparse(str(value)).netloc or None
+
+
+def _record_dhan_web_login_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | str,
+    severity: str = "warn",
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="data.dhanlive.web_login",
+        source="dhan_web_login",
+        fallback_type=fallback_type,
+        severity=severity,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 @dataclass
 class DhanBrowserSession:
     playwright: object
@@ -38,16 +65,34 @@ class DhanBrowserSession:
     def close(self) -> None:
         try:
             self.page.close()
-        except Exception:
+        except Exception as exc:
+            _record_dhan_web_login_fallback(
+                fallback_type="dhan_web_login_page_close_failed",
+                reason="Dhan automated login could not close the Playwright page.",
+                error=exc,
+                metadata={"owns_context": self.owns_context},
+            )
             pass
         if self.owns_context:
             try:
                 self.context.close()
-            except Exception:
+            except Exception as exc:
+                _record_dhan_web_login_fallback(
+                    fallback_type="dhan_web_login_context_close_failed",
+                    reason="Dhan automated login could not close the Playwright context it created.",
+                    error=exc,
+                    metadata={"owns_context": self.owns_context},
+                )
                 pass
         try:
             self.playwright.stop()
-        except Exception:
+        except Exception as exc:
+            _record_dhan_web_login_fallback(
+                fallback_type="dhan_web_login_playwright_stop_failed",
+                reason="Dhan automated login could not stop Playwright cleanly.",
+                error=exc,
+                metadata={"owns_context": self.owns_context},
+            )
             pass
 
 
@@ -74,7 +119,13 @@ def _click_enabled_proceed(page, *, timeout_ms: int = 30000) -> None:
     try:
         button.wait_for(state="visible", timeout=timeout_ms)
         button.click(timeout=timeout_ms)
-    except Exception:
+    except Exception as exc:
+        _record_dhan_web_login_fallback(
+            fallback_type="dhan_web_login_proceed_click_fallback",
+            reason="Dhan automated login normal Proceed click failed; retrying with force click.",
+            error=exc,
+            metadata={"timeout_ms": int(timeout_ms)},
+        )
         page.locator(PROCEED_BUTTON_SELECTOR).last.click(force=True, timeout=timeout_ms)
 
 
@@ -173,10 +224,28 @@ def run_dhan_consent_login(
         try:
             page.wait_for_function(f"() => window.location.href.includes('{TOKEN_URL_MARKER}')", timeout=timeout_ms)
             token_id = extract_token_id(str(page.url))
-        except PlaywrightTimeoutError:
+        except PlaywrightTimeoutError as exc:
+            _record_dhan_web_login_fallback(
+                fallback_type="dhan_web_login_token_wait_timeout",
+                reason="Dhan automated login did not observe tokenId before timeout.",
+                error=exc,
+                metadata={"timeout_ms": int(timeout_ms), "current_url_host": _url_host(getattr(page, "url", None))},
+            )
             token_id = None
 
     if not token_id:
+        _record_dhan_web_login_fallback(
+            fallback_type="dhan_web_login_token_missing",
+            reason="Dhan automated login redirected without tokenId.",
+            error="missing_token_id",
+            severity="error",
+            metadata={
+                "current_url_host": _url_host(getattr(page, "url", None)),
+                "failed_url_host": _url_host(nav_capture.get("failed_url")),
+                "response_url_host": _url_host(nav_capture.get("response_url")),
+                "requested_url_host": _url_host(nav_capture.get("requested_url")),
+            },
+        )
         raise DhanAuthError(f"Dhan login redirected without tokenId. Current page: {page.url}")
     return token_id
 

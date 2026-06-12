@@ -18,13 +18,37 @@ from advisory.ts_forecast_features import (
     persist_ts_forecasts,
     resolve_symbol_universe,
 )
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.ohlcv import sync_many_daily
 from data.screenerin.ad_hoc_query import build_raw_screen_url, fetch_ad_hoc_payload
-from utils.db import db_session, upsert_to_db
+from utils.db import upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 WATCHLIST_TABLE = "advisory_ts_forecast_watchlist"
+TS_FORECAST_WORKFLOW_SCHEMA_MIGRATION_ID = "20260611_advisory_ts_forecast_workflow_base"
+TS_FORECAST_WORKFLOW_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        symbol TEXT NOT NULL,
+        source_name TEXT,
+        source_slug TEXT,
+        model_name TEXT NOT NULL,
+        forecast_horizon_days BIGINT NOT NULL,
+        forecast_return DOUBLE PRECISION,
+        probability_positive DOUBLE PRECISION,
+        signal_quality DOUBLE PRECISION,
+        action_hint TEXT,
+        watch_status TEXT,
+        watch_reason TEXT,
+        raw_context_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)
+    )
+    """,
+]
 DEFAULT_CONFIG_PATH = Path("config/ts_forecast_screeners.yaml")
 DEFAULT_MAX_SYMBOLS = int(os.getenv("TS_FORECAST_MAX_SYMBOLS", "80"))
 
@@ -53,29 +77,32 @@ def _cap_symbols(symbols: list[str], *, max_symbols: int | None) -> list[str]:
     return unique[: int(max_symbols)]
 
 
+def _record_ts_workflow_fallback(
+    *,
+    source: str,
+    fallback_type: str,
+    reason: str,
+    error: Exception | str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.ts_forecast_workflow",
+        source=source,
+        fallback_type=fallback_type,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 def ensure_watchlist_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                symbol TEXT NOT NULL,
-                source_name TEXT,
-                source_slug TEXT,
-                model_name TEXT NOT NULL,
-                forecast_horizon_days BIGINT NOT NULL,
-                forecast_return DOUBLE PRECISION,
-                probability_positive DOUBLE PRECISION,
-                signal_quality DOUBLE PRECISION,
-                action_hint TEXT,
-                watch_status TEXT,
-                watch_reason TEXT,
-                raw_context_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=TS_FORECAST_WORKFLOW_SCHEMA_MIGRATION_ID,
+        description="Create advisory TS forecast workflow watchlist table.",
+        statements=TS_FORECAST_WORKFLOW_SCHEMA_STATEMENTS,
+        metadata={"tables": [WATCHLIST_TABLE], "workflow": "ts_forecast_watchlist"},
+    )
 
 
 def load_default_screener(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, str]:
@@ -202,6 +229,18 @@ def run_workflow(
         except Exception as exc:
             planned_query_name = query_name or "TS Forecast Watch"
             planned_url = build_raw_screen_url(query_text or "")
+            _record_ts_workflow_fallback(
+                source="screenerin_ad_hoc",
+                fallback_type="ts_forecast_workflow_screener_failed",
+                reason="TS forecast workflow could not load Screener.in ad hoc symbols and fell back to the tracked Dhan/OHLCV symbol universe.",
+                error=exc,
+                metadata={
+                    "query_name": planned_query_name,
+                    "source_slug": source_slug,
+                    "screener_url": planned_url,
+                    "query_text_chars": len(query_text or ""),
+                },
+            )
             warning = (
                 f"screener_failed:{type(exc).__name__}:{exc}; "
                 f"query_name={planned_query_name!r}; source_slug={source_slug!r}; screener_url={planned_url!r}"

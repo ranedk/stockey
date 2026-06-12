@@ -14,6 +14,8 @@ from typing import Any, Iterator
 
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 env = Env()
 env.read_env()
@@ -38,7 +40,16 @@ def _safe_json(value: Any) -> Any:
     try:
         json.dumps(value, default=_json_default)
         return value
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.performance_slowlog",
+            fallback_type="performance_slowlog_json_safety_failed",
+            source="slow_operation_details",
+            severity="warn",
+            reason="Slow-operation details were not JSON serializable and were stringified.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
         return str(value)
 
 
@@ -65,7 +76,16 @@ def load_slow_state(state_file: str | Path = DEFAULT_SLOW_STATE_FILE) -> dict[st
         return {"version": 1, "issues": {}}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        record_local_fallback_event(
+            module="advisory.performance_slowlog",
+            fallback_type="performance_slowlog_state_parse_failed",
+            source=str(path),
+            severity="warn",
+            reason="Slow-operation state file could not be parsed; an empty state was used.",
+            error=exc,
+            metadata={"state_file": str(path)},
+        )
         return {"version": 1, "issues": {}}
     if not isinstance(payload, dict):
         return {"version": 1, "issues": {}}
@@ -165,8 +185,20 @@ def slow_operation(
                 threshold_ms=threshold_ms,
                 details=details,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.performance_slowlog",
+                fallback_type="performance_slowlog_context_record_failed",
+                source=str(operation),
+                severity="warn",
+                reason="Slow-operation context manager could not record elapsed operation telemetry.",
+                error=exc,
+                metadata={
+                    "kind": str(kind),
+                    "operation": str(operation),
+                    "elapsed_ms": round(float(elapsed_ms), 2),
+                },
+            )
 
 
 def summarize_slow_operations(

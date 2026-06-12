@@ -16,6 +16,8 @@ from environs import Env
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 env = Env()
 env.read_env()
 _CACHE_DIR = Path(env("HTTP_CACHE"))
@@ -104,6 +106,28 @@ def _build_cache_key(url: str) -> tuple[str, str]:
     return base_name, file_pattern
 
 
+def _record_http_cache_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | None = None,
+    cache_file: Path | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="utils.http",
+        source="http_cache",
+        fallback_type=fallback_type,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata={
+            "cache_file": cache_file.name if cache_file else None,
+            **(metadata or {}),
+        },
+    )
+
+
 def _load_from_cache(file_pattern: str, max_age_days: int = 10) -> str | None:
     """Return cached text if the newest copy is recent enough, else None."""
     files = sorted(glob.glob(file_pattern), key=os.path.getmtime, reverse=True)
@@ -115,11 +139,27 @@ def _load_from_cache(file_pattern: str, max_age_days: int = 10) -> str | None:
     try:
         date_part = newest.stem.rsplit("__", 1)[-1]
         cached_date = dt.datetime.strptime(date_part, "%Y_%d_%m")
-    except ValueError:
+    except ValueError as exc:
+        _record_http_cache_fallback(
+            fallback_type="http_cache_date_parse_failed",
+            reason="HTTP cache filename date could not be parsed; falling back to file modified time.",
+            error=exc,
+            cache_file=newest,
+            metadata={"date_part": date_part},
+        )
         cached_date = dt.datetime.fromtimestamp(newest.stat().st_mtime)
 
     if (dt.datetime.now() - cached_date).days <= max_age_days:
-        return newest.read_text(encoding="utf-8")
+        try:
+            return newest.read_text(encoding="utf-8")
+        except Exception as exc:
+            _record_http_cache_fallback(
+                fallback_type="http_cache_read_failed",
+                reason="HTTP cache file could not be read; falling back to network request.",
+                error=exc,
+                cache_file=newest,
+            )
+            return None
 
     return None
 

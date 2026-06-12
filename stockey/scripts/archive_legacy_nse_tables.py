@@ -17,6 +17,7 @@ from environs import Env
 from psycopg2 import sql
 
 from scripts.db_table_retention_report import DEFAULT_RETENTION_DAYS, LEGACY_NSE_TABLES
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER, qualified_identifier, sql_to_df
 from utils.store import save_file
 
@@ -297,8 +298,16 @@ def archive_table(
         conn.close()
         try:
             tmp_root.rmdir()
-        except OSError:
-            pass
+        except OSError as exc:
+            record_local_fallback_event(
+                module="scripts.archive_legacy_nse_tables",
+                fallback_type="legacy_nse_archive_tempdir_cleanup_failed",
+                source="archive_table",
+                severity="warn",
+                reason="Legacy NSE archive cleanup could not remove the temporary directory after archive processing.",
+                error=exc,
+                metadata={"tmp_root": str(tmp_root), "table": table_name},
+            )
     summary["status"] = "ok"
     summary["deleted_rows"] = sum(int(chunk.get("deleted_rows") or 0) for chunk in summary["chunks"])
     summary["archived_chunks"] = sum(1 for chunk in summary["chunks"] if chunk.get("s3_key"))

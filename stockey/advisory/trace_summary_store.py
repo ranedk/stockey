@@ -7,45 +7,80 @@ from typing import Any
 import pandas as pd
 
 from advisory.decision_trace import ACTION_CONFLICTS_TABLE, EVENT_PROCESSING_TABLE, TRACES_TABLE, load_event_trace, load_symbol_trace
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 TABLE_NAME = "advisory_trace_summaries"
 DEFAULT_LIMIT = 100
+TRACE_SUMMARY_SCHEMA_MIGRATION_ID = "20260611_advisory_trace_summaries_base"
+TRACE_SUMMARY_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        entity_type TEXT NOT NULL,
+        entity_key TEXT NOT NULL,
+        limit_rows BIGINT NOT NULL,
+        source_max_ts TIMESTAMPTZ,
+        summary_json TEXT NOT NULL,
+        raw_counts_json TEXT,
+        generated_at TIMESTAMPTZ NOT NULL,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (entity_type, entity_key, limit_rows)
+    )
+    """,
+]
 
 
 def ensure_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                entity_type TEXT NOT NULL,
-                entity_key TEXT NOT NULL,
-                limit_rows BIGINT NOT NULL,
-                source_max_ts TIMESTAMPTZ,
-                summary_json TEXT NOT NULL,
-                raw_counts_json TEXT,
-                generated_at TIMESTAMPTZ NOT NULL,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (entity_type, entity_key, limit_rows)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=TRACE_SUMMARY_SCHEMA_MIGRATION_ID,
+        description="Create materialized operator trace summary cache table.",
+        statements=TRACE_SUMMARY_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME]},
+    )
 
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
-def json_loads(value: Any) -> Any:
+def json_loads(value: Any, *, source: str = "trace_summary_json") -> Any:
     if value is None:
         return None
     if isinstance(value, (dict, list)):
         return value
     try:
         return json.loads(str(value))
-    except Exception:
+    except Exception as exc:
+        text = str(value)
+        _record_trace_summary_fallback(
+            fallback_type="trace_summary_json_parse_failed",
+            source=source,
+            reason="Trace summary cache contained malformed JSON and will be ignored.",
+            error=exc,
+            metadata={"value_length": len(text), "value_excerpt": text[:240]},
+        )
         return None
+
+
+def _record_trace_summary_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.trace_summary_store",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def normalize_trace_payload(raw: dict[str, Any]) -> dict[str, Any]:
@@ -117,23 +152,33 @@ def load_summary(entity_type: str, entity_key: str, *, limit: int = DEFAULT_LIMI
     ensure_table()
     normalized_type = str(entity_type or "").strip().lower()
     normalized_key = str(entity_key or "").strip().upper() if normalized_type == "symbol" else str(entity_key or "").strip()
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {TABLE_NAME}
-        WHERE entity_type = %(entity_type)s
-          AND entity_key = %(entity_key)s
-          AND limit_rows = %(limit_rows)s
-        ORDER BY generated_at DESC
-        LIMIT 1
-        """,
-        params={"entity_type": normalized_type, "entity_key": normalized_key, "limit_rows": int(limit)},
-        retries=3,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {TABLE_NAME}
+            WHERE entity_type = %(entity_type)s
+              AND entity_key = %(entity_key)s
+              AND limit_rows = %(limit_rows)s
+            ORDER BY generated_at DESC
+            LIMIT 1
+            """,
+            params={"entity_type": normalized_type, "entity_key": normalized_key, "limit_rows": int(limit)},
+            retries=3,
+        )
+    except Exception as exc:
+        _record_trace_summary_fallback(
+            fallback_type="trace_summary_cache_load_failed",
+            source=TABLE_NAME,
+            reason="Trace summary cache lookup failed; caller may need to use live trace fallback.",
+            error=exc,
+            metadata={"entity_type": normalized_type, "entity_key": normalized_key, "limit_rows": int(limit)},
+        )
+        return None
     if df.empty:
         return None
     row = df.iloc[0].to_dict()
-    summary = json_loads(row.get("summary_json"))
+    summary = json_loads(row.get("summary_json"), source="summary_json")
     if not isinstance(summary, dict):
         return None
     summary["_trace_summary_cache"] = {
@@ -148,45 +193,65 @@ def load_summary(entity_type: str, entity_key: str, *, limit: int = DEFAULT_LIMI
 
 
 def recent_entities(*, symbol_limit: int = 100, event_limit: int = 100) -> tuple[list[str], list[str]]:
-    symbols = sql_to_df(
-        f"""
-        SELECT symbol, max(updated_at) AS latest_at
-        FROM {TRACES_TABLE}
-        WHERE symbol IS NOT NULL
-        GROUP BY symbol
-        UNION
-        SELECT symbol, max(load_ts) AS latest_at
-        FROM {EVENT_PROCESSING_TABLE}
-        WHERE symbol IS NOT NULL
-        GROUP BY symbol
-        UNION
-        SELECT symbol, max(load_ts) AS latest_at
-        FROM {ACTION_CONFLICTS_TABLE}
-        WHERE symbol IS NOT NULL
-        GROUP BY symbol
-        ORDER BY latest_at DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(symbol_limit))},
-        retries=3,
-    )
-    events = sql_to_df(
-        f"""
-        SELECT unique_id, max(updated_at) AS latest_at
-        FROM {TRACES_TABLE}
-        WHERE unique_id IS NOT NULL
-        GROUP BY unique_id
-        UNION
-        SELECT unique_id, max(load_ts) AS latest_at
-        FROM {EVENT_PROCESSING_TABLE}
-        WHERE unique_id IS NOT NULL
-        GROUP BY unique_id
-        ORDER BY latest_at DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(event_limit))},
-        retries=3,
-    )
+    try:
+        symbols = sql_to_df(
+            f"""
+            SELECT symbol, max(updated_at) AS latest_at
+            FROM {TRACES_TABLE}
+            WHERE symbol IS NOT NULL
+            GROUP BY symbol
+            UNION
+            SELECT symbol, max(load_ts) AS latest_at
+            FROM {EVENT_PROCESSING_TABLE}
+            WHERE symbol IS NOT NULL
+            GROUP BY symbol
+            UNION
+            SELECT symbol, max(load_ts) AS latest_at
+            FROM {ACTION_CONFLICTS_TABLE}
+            WHERE symbol IS NOT NULL
+            GROUP BY symbol
+            ORDER BY latest_at DESC NULLS LAST
+            LIMIT %(limit)s
+            """,
+            params={"limit": max(1, int(symbol_limit))},
+            retries=3,
+        )
+    except Exception as exc:
+        _record_trace_summary_fallback(
+            fallback_type="trace_summary_recent_symbols_load_failed",
+            source=TRACES_TABLE,
+            reason="Trace summary rebuild could not load recent symbols.",
+            error=exc,
+            metadata={"symbol_limit": int(symbol_limit)},
+        )
+        symbols = pd.DataFrame()
+    try:
+        events = sql_to_df(
+            f"""
+            SELECT unique_id, max(updated_at) AS latest_at
+            FROM {TRACES_TABLE}
+            WHERE unique_id IS NOT NULL
+            GROUP BY unique_id
+            UNION
+            SELECT unique_id, max(load_ts) AS latest_at
+            FROM {EVENT_PROCESSING_TABLE}
+            WHERE unique_id IS NOT NULL
+            GROUP BY unique_id
+            ORDER BY latest_at DESC NULLS LAST
+            LIMIT %(limit)s
+            """,
+            params={"limit": max(1, int(event_limit))},
+            retries=3,
+        )
+    except Exception as exc:
+        _record_trace_summary_fallback(
+            fallback_type="trace_summary_recent_events_load_failed",
+            source=TRACES_TABLE,
+            reason="Trace summary rebuild could not load recent events.",
+            error=exc,
+            metadata={"event_limit": int(event_limit)},
+        )
+        events = pd.DataFrame()
     symbol_rows = [] if symbols.empty else symbols["symbol"].dropna().astype(str).str.upper().drop_duplicates().tolist()
     event_rows = [] if events.empty else events["unique_id"].dropna().astype(str).drop_duplicates().tolist()
     return symbol_rows, event_rows
@@ -213,12 +278,26 @@ def rebuild_summaries(*, symbol_limit: int = 100, event_limit: int = 100, trace_
             build_symbol_summary(symbol, limit=trace_limit, persist=True)
             summary["symbols_built"] += 1
         except Exception as exc:
+            _record_trace_summary_fallback(
+                fallback_type="trace_summary_symbol_build_failed",
+                source=TABLE_NAME,
+                reason="Trace summary rebuild failed for a symbol.",
+                error=exc,
+                metadata={"entity_type": "symbol", "entity_key": symbol, "trace_limit": int(trace_limit)},
+            )
             summary["errors"].append({"entity_type": "symbol", "entity_key": symbol, "error": f"{type(exc).__name__}: {exc}"})
     for unique_id in events:
         try:
             build_event_summary(unique_id, persist=True)
             summary["events_built"] += 1
         except Exception as exc:
+            _record_trace_summary_fallback(
+                fallback_type="trace_summary_event_build_failed",
+                source=TABLE_NAME,
+                reason="Trace summary rebuild failed for an event.",
+                error=exc,
+                metadata={"entity_type": "event", "entity_key": unique_id},
+            )
             summary["errors"].append({"entity_type": "event", "entity_key": unique_id, "error": f"{type(exc).__name__}: {exc}"})
     if summary["errors"]:
         summary["status"] = "partial"
@@ -266,37 +345,43 @@ def cleanup_summaries(*, keep_latest_per_entity: int = 1, older_than_days: int |
     if dry_run or candidates.empty:
         result["sample"] = [] if candidates.empty else candidates.head(10).to_dict(orient="records")
         return result
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            WITH ranked AS (
-                SELECT
-                    entity_type,
-                    entity_key,
-                    limit_rows,
-                    generated_at,
-                    row_number() OVER (
-                        PARTITION BY entity_type, entity_key
-                        ORDER BY generated_at DESC
-                    ) AS rn
-                FROM {TABLE_NAME}
-            ),
-            doomed AS (
-                SELECT entity_type, entity_key, limit_rows, generated_at
-                FROM ranked
-                WHERE rn > %(keep)s
-                {age_clause}
+    def _delete_old_trace_summaries() -> int:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                WITH ranked AS (
+                    SELECT
+                        entity_type,
+                        entity_key,
+                        limit_rows,
+                        generated_at,
+                        row_number() OVER (
+                            PARTITION BY entity_type, entity_key
+                            ORDER BY generated_at DESC
+                        ) AS rn
+                    FROM {TABLE_NAME}
+                ),
+                doomed AS (
+                    SELECT entity_type, entity_key, limit_rows, generated_at
+                    FROM ranked
+                    WHERE rn > %(keep)s
+                    {age_clause}
+                )
+                DELETE FROM {TABLE_NAME} t
+                USING doomed d
+                WHERE t.entity_type = d.entity_type
+                  AND t.entity_key = d.entity_key
+                  AND t.limit_rows = d.limit_rows
+                  AND t.generated_at = d.generated_at
+                """,
+                params,
             )
-            DELETE FROM {TABLE_NAME} t
-            USING doomed d
-            WHERE t.entity_type = d.entity_type
-              AND t.entity_key = d.entity_key
-              AND t.limit_rows = d.limit_rows
-              AND t.generated_at = d.generated_at
-            """,
-            params,
-        )
-        result["deleted_rows"] = int(cur.rowcount or 0)
+            return int(cur.rowcount or 0)
+
+    result["deleted_rows"] = execute_db_operation(
+        _delete_old_trace_summaries,
+        operation_name="trace_summary_store:cleanup_old_summaries",
+    )
     return result
 
 

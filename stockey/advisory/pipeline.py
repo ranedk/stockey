@@ -15,6 +15,7 @@ import pandas as pd
 from advisory.announcement_watch import build_watch_updates_from_ingest, persist_watch_outputs, run_announcement_ingest
 from advisory.action_recommender import build_action_recommendations, persist_action_recommendations
 from advisory.adversarial_review import build_reviews as build_adversarial_reviews
+from advisory.adversarial_review import DEFAULT_EVENT_MODEL_SCORE_POLICY_MODE, EVENT_MODEL_SCORE_POLICY_MODE_ENV, EVENT_MODEL_SCORE_POLICY_MODES
 from advisory.adversarial_review import persist_reviews as persist_adversarial_reviews
 from advisory.company_memory_review import (
     DEFAULT_LOOKBACK_DAYS as DEFAULT_COMPANY_MEMORY_LOOKBACK_DAYS,
@@ -41,6 +42,8 @@ from advisory.event_meta_model import (
 from advisory.event_policy import build_event_policy_actions, load_policy_inputs, persist_event_policy_actions
 from advisory.exchange_events import build_exchange_events, persist_exchange_events
 from advisory.exchange_features import build_exchange_features, persist_exchange_features
+from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.feature_freshness import evaluate_stage_feature_gate
 from advisory.fundamental_snapshot import build_fundamental_snapshot, persist_fundamental_snapshot
 from advisory.intraday_features import (
     build_intraday_features,
@@ -125,6 +128,135 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
+def _with_feature_gate(value: Any, gate: dict[str, Any]) -> dict[str, Any]:
+    payload = _json_ready(value)
+    if isinstance(payload, dict):
+        return {**payload, "feature_gate": _json_ready(gate)}
+    return {"data": payload, "feature_gate": _json_ready(gate)}
+
+
+def _parse_json_object(value: Any, *, source: str = "pipeline_json_context") -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if value is None:
+        return {}
+    try:
+        if pd.isna(value):
+            return {}
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.pipeline",
+            fallback_type="pipeline_json_missing_check_failed",
+            source=source,
+            severity="warn",
+            reason="Advisory pipeline could not evaluate missingness for JSON context and continued parsing.",
+            error=exc,
+            metadata={"source": source, "value_type": type(value).__name__},
+        )
+    try:
+        parsed = json.loads(str(value))
+    except Exception as exc:
+        text = str(value)
+        record_local_fallback_event(
+            module="advisory.pipeline",
+            fallback_type="pipeline_json_parse_failed",
+            source=source,
+            severity="warn",
+            reason="Advisory pipeline could not parse JSON context and used an empty object fallback.",
+            error=exc,
+            metadata={"value_length": len(text), "value_excerpt": text[:240]},
+        )
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _blocked_feature_symbols(gate: dict[str, Any]) -> set[str]:
+    if str(gate.get("status") or "").lower() != "blocked":
+        return set()
+    return {str(symbol or "").strip().upper() for symbol in gate.get("blocked_symbols") or [] if str(symbol or "").strip()}
+
+
+def _annotate_stage_context(value: Any, *, stage: str, gate: dict[str, Any]) -> str:
+    context = _parse_json_object(value, source=f"{stage}_context_json")
+    context.update(
+        {
+            "feature_freshness_gate": "blocked_stage_output",
+            "feature_freshness_stage": stage,
+            "feature_freshness_status": gate.get("status"),
+            "feature_freshness_blocked_inputs": gate.get("required_input_keys"),
+            "feature_freshness_gate_effect": gate.get("gate_effect"),
+            "broker_execution_allowed": False,
+        }
+    )
+    return json.dumps(context, ensure_ascii=False, default=str, sort_keys=True)
+
+
+def apply_stage_feature_gate_policy(stage: str, df: pd.DataFrame, gate: dict[str, Any]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    blocked_symbols = _blocked_feature_symbols(gate)
+    if not blocked_symbols or "symbol" not in df.columns:
+        out = df.copy()
+        out.attrs["feature_gate_changed_count"] = 0
+        return out
+    out = df.copy()
+    symbols = out["symbol"].astype("string").str.strip().str.upper()
+    changed = 0
+    if stage == "rules" and "candidate_state" in out.columns:
+        mask = symbols.isin(blocked_symbols) & out["candidate_state"].astype("string").str.upper().eq("PASS_NOW")
+        changed = int(mask.sum())
+        if changed:
+            out.loc[mask, "candidate_state"] = "WATCH_EVENT"
+            if "rule_pass" in out.columns:
+                out.loc[mask, "rule_pass"] = False
+            note = "Feature freshness gate blocked PASS_NOW; keep on watch until required OHLCV/technical inputs refresh."
+            if "watch_reason_detail" in out.columns:
+                out.loc[mask, "watch_reason_detail"] = out.loc[mask, "watch_reason_detail"].map(lambda value: f"{value}; {note}" if str(value or "").strip() else note)
+    elif stage == "risk" and "allocation_status" in out.columns:
+        mask = symbols.isin(blocked_symbols) & out["allocation_status"].astype("string").str.lower().eq("allocated")
+        changed = int(mask.sum())
+        if changed:
+            out.loc[mask, "allocation_status"] = "review_manual"
+            if "suggested_allocation_inr" in out.columns:
+                out.loc[mask, "suggested_allocation_inr"] = 0.0
+            if "allocation_pct_of_adv20d" in out.columns:
+                out.loc[mask, "allocation_pct_of_adv20d"] = pd.NA
+            note = "Feature freshness gate blocked automatic allocation; refresh required OHLCV/technical inputs before broker-capable action."
+            if "notes" in out.columns:
+                out.loc[mask, "notes"] = out.loc[mask, "notes"].map(lambda value: f"{value} {note}" if str(value or "").strip() else note)
+            if "context_snapshot_json" in out.columns:
+                out.loc[mask, "context_snapshot_json"] = out.loc[mask, "context_snapshot_json"].map(lambda value: _annotate_stage_context(value, stage=stage, gate=gate))
+    elif stage == "portfolio" and "portfolio_status" in out.columns:
+        mask = symbols.isin(blocked_symbols) & out["portfolio_status"].astype("string").str.lower().isin(["approved", "trimmed"])
+        changed = int(mask.sum())
+        if changed:
+            out.loc[mask, "portfolio_status"] = "deferred"
+            out.loc[mask, "portfolio_reason"] = "feature_freshness_blocked"
+            if "approved_allocation_inr" in out.columns:
+                out.loc[mask, "approved_allocation_inr"] = 0.0
+            if "remaining_capital_after_inr" in out.columns:
+                out.loc[mask, "remaining_capital_after_inr"] = pd.NA
+            note = "Deferred because required OHLCV/technical inputs were stale, missing, or errored at planning time."
+            if "execution_notes" in out.columns:
+                out.loc[mask, "execution_notes"] = out.loc[mask, "execution_notes"].map(lambda value: f"{value} {note}" if str(value or "").strip() else note)
+            if "context_snapshot_json" in out.columns:
+                out.loc[mask, "context_snapshot_json"] = out.loc[mask, "context_snapshot_json"].map(lambda value: _annotate_stage_context(value, stage=stage, gate=gate))
+    elif stage == "lifecycle":
+        mask = symbols.isin(blocked_symbols)
+        changed = int(mask.sum())
+        if changed:
+            note = "Feature freshness gate blocked current price confidence; verify latest OHLCV before acting on lifecycle output."
+            for column in ["lifecycle_reason", "next_action_reason", "action_reason"]:
+                if column in out.columns:
+                    out.loc[mask, column] = out.loc[mask, column].map(lambda value: f"{value} {note}" if str(value or "").strip() else note)
+            if "context_snapshot_json" in out.columns:
+                out.loc[mask, "context_snapshot_json"] = out.loc[mask, "context_snapshot_json"].map(lambda value: _annotate_stage_context(value, stage=stage, gate=gate))
+    else:
+        changed = 0
+    out.attrs["feature_gate_changed_count"] = changed
+    return out
+
+
 def _emit_progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
@@ -193,6 +325,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-lifecycle", action="store_true", help="Run paper-position lifecycle after portfolio planning")
     parser.add_argument("--include-execution", action="store_true", help="Build execution orders after portfolio planning")
     parser.add_argument("--live-execution", action="store_true", help="Submit execution orders live through Dhan when execution stage runs")
+    parser.add_argument("--live-execution-confirmation", help="Per-run confirmation token required when --live-execution submits broker orders")
     parser.add_argument("--execution-reconcile", action="store_true", help="Reconcile broker execution state after execution planning")
     parser.add_argument("--eval-include-evaluated", action="store_true", help="Re-evaluate already evaluated watch events")
     parser.add_argument("--portfolio-capital-inr", type=float, default=300000.0)
@@ -202,6 +335,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--portfolio-max-positions-per-overlap-group", type=int, default=1)
     parser.add_argument("--event-model", help="Override advisory LLM event evaluation model")
     parser.add_argument("--event-model-artifact-dir", default=str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR), help="Directory containing trained event meta-model artifacts")
+    parser.add_argument(
+        "--event-model-score-policy-mode",
+        choices=sorted(EVENT_MODEL_SCORE_POLICY_MODES),
+        default=os.getenv(EVENT_MODEL_SCORE_POLICY_MODE_ENV, DEFAULT_EVENT_MODEL_SCORE_POLICY_MODE),
+        help="Controls whether persisted event meta-model scores can influence adversarial review. Default research_only keeps scores research-only.",
+    )
     parser.add_argument("--skip-company-memory", action="store_true", help="Skip review-only company-memory summaries")
     parser.add_argument("--company-memory-limit", type=int, default=DEFAULT_COMPANY_MEMORY_MAX_SYMBOLS)
     parser.add_argument("--company-memory-lookback-days", type=int, default=DEFAULT_COMPANY_MEMORY_LOOKBACK_DAYS)
@@ -256,6 +395,16 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         args.rule_max_intraday_prefetch_age_days = 14
     if not hasattr(args, "event_model_artifact_dir"):
         args.event_model_artifact_dir = str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR)
+    if not hasattr(args, "skip_company_memory"):
+        args.skip_company_memory = False
+    if not hasattr(args, "company_memory_limit"):
+        args.company_memory_limit = DEFAULT_COMPANY_MEMORY_MAX_SYMBOLS
+    if not hasattr(args, "company_memory_lookback_days"):
+        args.company_memory_lookback_days = DEFAULT_COMPANY_MEMORY_LOOKBACK_DAYS
+    if not hasattr(args, "company_memory_model"):
+        args.company_memory_model = DEFAULT_COMPANY_MEMORY_MODEL
+    if not hasattr(args, "company_memory_llm"):
+        args.company_memory_llm = COMPANY_MEMORY_LLM_ENABLED
     if not hasattr(args, "parallel_local_stages"):
         args.parallel_local_stages = False
     if not hasattr(args, "local_stage_workers"):
@@ -540,6 +689,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     meta: dict[str, Any] = {}
     if stage_enabled("rules", args.start_at, args.stop_at):
         stage_started = _start_stage("rules")
+        rules_feature_gate = evaluate_stage_feature_gate("rules", advisory_symbols, asof_date=asof_date)
         candidates, rejections, meta = run_rule_engine(
             asof_date=asof_date,
             setup_ids=setup_ids,
@@ -549,6 +699,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             max_snapshot_refresh_age_days=int(args.rule_max_snapshot_refresh_age_days),
             max_intraday_prefetch_age_days=int(args.rule_max_intraday_prefetch_age_days),
         )
+        candidates = apply_stage_feature_gate_policy("rules", candidates, rules_feature_gate)
         effective_date = pd.to_datetime(meta.get("effective_date"), utc=True, errors="coerce")
         if not args.dry_run:
             persist_rule_outputs(
@@ -558,11 +709,12 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 rebuild=bool(args.rebuild),
             )
         summary["stages"]["rules"] = {
+            "feature_gate": _json_ready(rules_feature_gate),
             "meta": _json_ready(meta),
             "candidates": _json_ready(candidates),
             "rejections": _json_ready(rejections),
         }
-        _finish_stage("rules", stage_started, f"candidates={len(candidates)} rejections={len(rejections)}")
+        _finish_stage("rules", stage_started, f"candidates={len(candidates)} rejections={len(rejections)} freshness={rules_feature_gate.get('status')} gated={candidates.attrs.get('feature_gate_changed_count', 0)}")
 
     if args.include_watch:
         watch_ingest_state: dict[str, object] | None = None
@@ -691,6 +843,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 symbols=symbols,
                 setup_ids=setup_ids,
                 include_reviewed=bool(args.eval_include_evaluated),
+                event_model_score_policy_mode=args.event_model_score_policy_mode,
             )
             review_df, review_meta = build_adversarial_reviews(review_inputs)
             if not args.dry_run:
@@ -733,14 +886,17 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
     if stage_enabled("risk", args.start_at, args.stop_at):
         stage_started = _start_stage("risk")
+        risk_feature_gate = evaluate_stage_feature_gate("risk", symbols or advisory_symbols or screener_symbols or None, asof_date=asof_date)
         allocations_df = build_allocations(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids, include_allocated=bool(args.rebuild))
+        allocations_df = apply_stage_feature_gate_policy("risk", allocations_df, risk_feature_gate)
         if not args.dry_run:
             persist_allocations(allocations_df)
-        summary["stages"]["risk"] = _json_ready(allocations_df)
-        _finish_stage("risk", stage_started, f"rows={len(allocations_df)}")
+        summary["stages"]["risk"] = _with_feature_gate(allocations_df, risk_feature_gate)
+        _finish_stage("risk", stage_started, f"rows={len(allocations_df)} freshness={risk_feature_gate.get('status')} gated={allocations_df.attrs.get('feature_gate_changed_count', 0)}")
 
     if stage_enabled("portfolio", args.start_at, args.stop_at):
         stage_started = _start_stage("portfolio")
+        portfolio_feature_gate = evaluate_stage_feature_gate("portfolio", symbols or advisory_symbols or screener_symbols or None, asof_date=asof_date)
         portfolio_df = build_portfolio_orders(
             asof_date=asof_date,
             symbols=symbols,
@@ -754,29 +910,43 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 max_positions_per_overlap_group=int(args.portfolio_max_positions_per_overlap_group),
             ),
         )
+        portfolio_df = apply_stage_feature_gate_policy("portfolio", portfolio_df, portfolio_feature_gate)
         if not args.dry_run:
             persist_portfolio_orders(portfolio_df)
-        summary["stages"]["portfolio"] = _json_ready(portfolio_df)
-        _finish_stage("portfolio", stage_started, f"rows={len(portfolio_df)}")
+        summary["stages"]["portfolio"] = _with_feature_gate(portfolio_df, portfolio_feature_gate)
+        _finish_stage("portfolio", stage_started, f"rows={len(portfolio_df)} freshness={portfolio_feature_gate.get('status')} gated={portfolio_df.attrs.get('feature_gate_changed_count', 0)}")
 
     if args.include_lifecycle and stage_enabled("lifecycle", args.start_at, args.stop_at):
         stage_started = _start_stage("lifecycle")
+        lifecycle_feature_gate = evaluate_stage_feature_gate("lifecycle", symbols or advisory_symbols or screener_symbols or None, asof_date=asof_date)
         lifecycle_df, rebalance_df = build_lifecycle_outputs(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
+        lifecycle_df = apply_stage_feature_gate_policy("lifecycle", lifecycle_df, lifecycle_feature_gate)
+        rebalance_df = apply_stage_feature_gate_policy("lifecycle", rebalance_df, lifecycle_feature_gate)
         if not args.dry_run:
             persist_lifecycle_outputs(lifecycle_df, rebalance_df)
         summary["stages"]["lifecycle"] = {
+            "feature_gate": _json_ready(lifecycle_feature_gate),
             "lifecycle": _json_ready(lifecycle_df),
             "rebalance": _json_ready(rebalance_df),
         }
-        _finish_stage("lifecycle", stage_started, f"lifecycle_rows={len(lifecycle_df)} rebalance_rows={len(rebalance_df)}")
+        lifecycle_changed = int(lifecycle_df.attrs.get("feature_gate_changed_count", 0) or 0) + int(rebalance_df.attrs.get("feature_gate_changed_count", 0) or 0)
+        _finish_stage("lifecycle", stage_started, f"lifecycle_rows={len(lifecycle_df)} rebalance_rows={len(rebalance_df)} freshness={lifecycle_feature_gate.get('status')} gated={lifecycle_changed}")
 
     if stage_enabled("actions", args.start_at, args.stop_at):
         stage_started = _start_stage("actions")
+        action_gate_symbols = symbols or advisory_symbols or screener_symbols or None
+        action_feature_gate = evaluate_stage_feature_gate("actions", action_gate_symbols, asof_date=asof_date)
         actions_df = build_action_recommendations(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
         if not args.dry_run:
             persist_action_recommendations(actions_df)
-        summary["stages"]["actions"] = _json_ready(actions_df)
-        _finish_stage("actions", stage_started, f"rows={len(actions_df)}")
+        summary["stages"]["actions"] = {
+            "feature_gate": _json_ready(action_feature_gate),
+            "actions": _json_ready(actions_df),
+        }
+        gate_suffix = f" freshness={action_feature_gate.get('status')}"
+        if action_feature_gate.get("blocked_count"):
+            gate_suffix += f" blocked_symbols={action_feature_gate.get('blocked_count')}"
+        _finish_stage("actions", stage_started, f"rows={len(actions_df)}{gate_suffix}")
 
     if args.include_execution and stage_enabled("execution", args.start_at, args.stop_at):
         stage_started = _start_stage("execution")
@@ -788,7 +958,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
             use_broker_account=bool(args.live_execution),
         )
         if args.live_execution:
-            execution_df = submit_live_orders(execution_df)
+            execution_df = submit_live_orders(execution_df, live_confirmation=args.live_execution_confirmation)
         if not args.dry_run:
             persist_execution_orders(execution_df)
 

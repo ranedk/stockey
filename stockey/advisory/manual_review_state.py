@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import pandas as pd
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.wait_signals import WAIT_SIGNALS_TABLE, build_event_condition, infer_event_condition_type, make_signal_id, persist_wait_signals
 
 
@@ -127,8 +128,16 @@ def json_ready(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.manual_review_state",
+            fallback_type="manual_review_json_ready_missing_check_failed",
+            source="json_ready",
+            severity="warn",
+            reason="Manual review state could not evaluate missingness while preparing JSON and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
 
 
@@ -138,8 +147,16 @@ def text(value: Any, default: str | None = None) -> str | None:
     try:
         if pd.isna(value):
             return default
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.manual_review_state",
+            fallback_type="manual_review_text_missing_check_failed",
+            source="text",
+            severity="warn",
+            reason="Manual review state could not evaluate missingness while normalizing text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     out = str(value).strip()
     if out.lower() in {"", "nan", "none", "null", "<na>"}:
         return default
@@ -155,6 +172,10 @@ def validate_decision(decision: str) -> str:
 
 def decision_effect(decision: str) -> ManualReviewDecisionEffect:
     return DECISION_EFFECTS[validate_decision(decision)]
+
+
+def decision_effect_payload(decision: str) -> dict[str, Any]:
+    return asdict(decision_effect(decision))
 
 
 def decision_closes_item(decision: str) -> bool:
@@ -185,6 +206,10 @@ def runtime_state_for_decision(decision: str, *, has_matched_wait_signal: bool =
         closes_item=False,
         reopened_by_wait_signal=False,
     )
+
+
+def runtime_state_payload(decision: str, *, has_matched_wait_signal: bool = False) -> dict[str, Any]:
+    return asdict(runtime_state_for_decision(decision, has_matched_wait_signal=has_matched_wait_signal))
 
 
 def _manual_wait_signal_keywords(value: str) -> list[str]:

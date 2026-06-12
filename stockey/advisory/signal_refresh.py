@@ -10,16 +10,47 @@ import pandas as pd
 from advisory.action_recommender import TABLE_NAME as ACTIONS_TABLE
 from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.position_lifecycle import LIFECYCLE_TABLE, REBALANCE_TABLE
 from advisory.sync_state import persist_sync_state, publish_bus_message
 from advisory.trace_summary_store import build_event_summary, build_symbol_summary
 from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, match_wait_signals
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 TABLE_NAME = "advisory_signal_refresh_actions"
+SIGNAL_REFRESH_SCHEMA_MIGRATION_ID = "20260611_advisory_signal_refresh_actions_base"
 ROUTER_ACTIONS_TABLE = "advisory_live_router_actions"
 STATE_SOURCE_NAME = "advisory:signal_refresh"
+
+SIGNAL_REFRESH_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        refresh_id TEXT PRIMARY KEY,
+        refreshed_at TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        symbol TEXT NOT NULL,
+        unique_id TEXT,
+        reason TEXT,
+        signal_action TEXT NOT NULL,
+        signal_status TEXT,
+        signal_source TEXT,
+        confidence DOUBLE PRECISION,
+        action_reason TEXT,
+        effect_type TEXT,
+        effect_summary TEXT,
+        action_payload_json TEXT,
+        trace_id TEXT,
+        dry_run BOOLEAN,
+        load_ts TIMESTAMPTZ
+    )
+    """,
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS effect_type TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS effect_summary TEXT",
+    f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_symbol_refreshed ON {TABLE_NAME} (symbol, refreshed_at DESC)",
+    f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_unique_id ON {TABLE_NAME} (unique_id)",
+]
 
 EXIT_ACTIONS = {"SELL", "FULL_EXIT", "EMERGENCY_EXIT", "PARTIAL_SELL", "PARTIAL_EXIT", "REDUCE", "REDUCE_REVIEW", "REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW"}
 BUY_ACTIONS = {"BUY", "BUY_MORE", "ADD_ON_PULLBACK", "BUY_TRIGGERED"}
@@ -38,8 +69,16 @@ def _text(value: Any, default: str | None = None) -> str | None:
     try:
         if pd.isna(value):
             return default
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_refresh",
+            fallback_type="signal_refresh_text_missing_check_failed",
+            source="text",
+            severity="warn",
+            reason="Signal-refresh normalization could not evaluate missingness while normalizing text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     text = str(value).strip()
     if text.lower() in {"", "nan", "none", "null", "<na>"}:
         return default
@@ -63,7 +102,7 @@ def _date(value: Any = None) -> pd.Timestamp:
     return out.normalize()
 
 
-def _jsonish(value: Any, default: Any = None) -> Any:
+def _jsonish(value: Any, default: Any = None, *, source: str = "signal_refresh_json_context") -> Any:
     if isinstance(value, (dict, list)):
         return value
     text = _text(value)
@@ -71,7 +110,20 @@ def _jsonish(value: Any, default: Any = None) -> Any:
         return {} if default is None else default
     try:
         return json.loads(text)
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_refresh",
+            fallback_type="signal_refresh_json_parse_failed",
+            source=source,
+            severity="warn",
+            reason="Signal refresh could not parse stored JSON context and used the provided default.",
+            error=exc,
+            metadata={
+                "default_type": type(default).__name__,
+                "value_length": len(text),
+                "value_excerpt": text[:240],
+            },
+        )
         return {} if default is None else default
 
 
@@ -88,39 +140,26 @@ def table_exists(table_name: str) -> bool:
             params=(table_name,),
         )
         return not df.empty
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_refresh",
+            fallback_type="signal_refresh_table_exists_check_failed",
+            source=table_name,
+            severity="warn",
+            reason="Signal refresh could not verify whether a source table exists and will treat it as unavailable.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return False
 
 
 def ensure_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                refresh_id TEXT PRIMARY KEY,
-                refreshed_at TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                symbol TEXT NOT NULL,
-                unique_id TEXT,
-                reason TEXT,
-                signal_action TEXT NOT NULL,
-                signal_status TEXT,
-                signal_source TEXT,
-                confidence DOUBLE PRECISION,
-                action_reason TEXT,
-                effect_type TEXT,
-                effect_summary TEXT,
-                action_payload_json TEXT,
-                trace_id TEXT,
-                dry_run BOOLEAN,
-                load_ts TIMESTAMPTZ
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS effect_type TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS effect_summary TEXT")
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_symbol_refreshed ON {TABLE_NAME} (symbol, refreshed_at DESC)")
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_unique_id ON {TABLE_NAME} (unique_id)")
+    apply_schema_migration(
+        migration_id=SIGNAL_REFRESH_SCHEMA_MIGRATION_ID,
+        description="Create and normalize incremental signal refresh action table.",
+        statements=SIGNAL_REFRESH_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.signal_refresh", "tables": [TABLE_NAME]},
+    )
 
 
 def _latest_row(table_name: str, symbol: str, *, asof_date: pd.Timestamp | None = None, date_column: str = "asof_date") -> dict[str, Any] | None:
@@ -142,7 +181,17 @@ def _latest_row(table_name: str, symbol: str, *, asof_date: pd.Timestamp | None 
             """,
             params=tuple(params),
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_refresh",
+            source=table_name,
+            fallback_type="signal_refresh_latest_row_unavailable",
+            severity="warn",
+            symbol=symbol,
+            reason="Signal refresh continued without latest source row because lookup failed.",
+            error=exc,
+            metadata={"date_column": date_column, "asof_date": asof_date},
+        )
         return None
     if df.empty:
         return None
@@ -183,7 +232,18 @@ def load_event_policy(symbol: str, *, unique_id: str | None = None, asof_date: p
             """,
             params=tuple([*params, max(1, min(int(limit), 50))]),
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_refresh",
+            source=EVENT_POLICY_TABLE,
+            fallback_type="signal_refresh_event_policy_unavailable",
+            severity="warn",
+            symbol=symbol,
+            unique_id=unique_id,
+            reason="Signal refresh continued without event-policy rows because lookup failed.",
+            error=exc,
+            metadata={"asof_date": asof_date, "limit": limit},
+        )
         return []
     return df.to_dict(orient="records") if not df.empty else []
 
@@ -191,16 +251,28 @@ def load_event_policy(symbol: str, *, unique_id: str | None = None, asof_date: p
 def load_recent_router_actions(*, limit: int = 25) -> list[dict[str, Any]]:
     if not table_exists(ROUTER_ACTIONS_TABLE):
         return []
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {ROUTER_ACTIONS_TABLE}
-        WHERE symbol IS NOT NULL
-        ORDER BY routed_at DESC NULLS LAST, load_ts DESC NULLS LAST
-        LIMIT %s
-        """,
-        params=(max(1, min(int(limit), 250)),),
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {ROUTER_ACTIONS_TABLE}
+            WHERE symbol IS NOT NULL
+            ORDER BY routed_at DESC NULLS LAST, load_ts DESC NULLS LAST
+            LIMIT %s
+            """,
+            params=(max(1, min(int(limit), 250)),),
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_refresh",
+            source=ROUTER_ACTIONS_TABLE,
+            fallback_type="signal_refresh_router_actions_unavailable",
+            severity="warn",
+            reason="Signal refresh continued without recent router actions because lookup failed.",
+            error=exc,
+            metadata={"limit": limit},
+        )
+        return []
     if df.empty:
         return []
     rows: list[dict[str, Any]] = []
@@ -240,7 +312,7 @@ def _extract_action_payload(*, action: dict[str, Any] | None, lifecycle: dict[st
 
 def wait_signal_escalation(match: dict[str, Any]) -> dict[str, Any]:
     expected = _normalized_action(match.get("expected_action")) or "MANUAL_REVIEW"
-    evidence = _jsonish(match.get("evidence_json"), {})
+    evidence = _jsonish(match.get("evidence_json"), {}, source="wait_signal_evidence_json")
     wait_context = evidence.get("wait_signal") if isinstance(evidence, dict) else {}
     if not isinstance(wait_context, dict):
         wait_context = {}
@@ -475,8 +547,18 @@ def refresh_symbol(
                 build_symbol_summary(normalized_symbol, persist=True)
                 if unique_id:
                     build_event_summary(str(unique_id), persist=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                record_local_fallback_event(
+                    module="advisory.signal_refresh",
+                    fallback_type="signal_refresh_trace_summary_refresh_failed",
+                    source="advisory.trace_summary_store",
+                    severity="warn",
+                    symbol=normalized_symbol,
+                    unique_id=unique_id,
+                    reason="Signal refresh row was persisted but trace-summary cache refresh failed.",
+                    error=exc,
+                    metadata={"refresh_id": refresh_id, "reason": reason},
+                )
     return row
 
 
@@ -501,6 +583,20 @@ def refresh_from_router(*, limit: int = 25, dry_run: bool = False) -> dict[str, 
                 )
             )
         except Exception as exc:  # pragma: no cover - runtime guard
+            record_local_fallback_event(
+                module="advisory.signal_refresh",
+                fallback_type="signal_refresh_router_item_failed",
+                source=ROUTER_ACTIONS_TABLE,
+                severity="warn",
+                symbol=symbol or None,
+                reason="Router-triggered signal refresh failed for one symbol while the batch continued.",
+                error=exc,
+                metadata={
+                    "router_reason": reason,
+                    "unique_id": _text(item.get("unique_id")),
+                    "asof_date": str(item.get("asof_date")) if item.get("asof_date") is not None else None,
+                },
+            )
             errors.append({"symbol": symbol, "error": f"{exc.__class__.__name__}: {exc}"})
     if not dry_run:
         persist_sync_state(

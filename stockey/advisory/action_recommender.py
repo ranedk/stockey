@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 
 from advisory.decision_trace import ACTION_CONFLICT_RULES_TABLE
 from advisory.decision_trace import append_trace, append_trace_step, build_action_conflicts, persist_action_conflicts, safe_trace_call
-from advisory.fallback_telemetry import record_fallback_event
+from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
+from advisory.feature_freshness import build_feature_freshness_contract
 from advisory.hypothesis_engine import ACTION_PLANS_TABLE, HYPOTHESES_TABLE, ensure_tables as ensure_hypothesis_tables
 from advisory.market_context import load_latest_market_context
 from advisory.portfolio_engine import PORTFOLIO_TABLE
@@ -21,8 +22,9 @@ from advisory.prompt_registry import response_schema_version
 from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, WAIT_SIGNALS_TABLE
 from advisory.watchlist_builder import TABLE_NAME as WATCHLIST_TABLE
 from utils.codex_cli import run_codex_structured
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.display_time import to_display_value
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
@@ -31,6 +33,7 @@ env.read_env()
 logger = logging.getLogger(__name__)
 
 TABLE_NAME = "advisory_action_recommendations"
+ACTIONS_SCHEMA_MIGRATION_ID = "20260611_advisory_action_recommendations_base"
 MANUAL_REVISION_PROMPT_ID = "manual_revision_pointers"
 MANUAL_REVISION_PROMPT_VERSION = registry_prompt_version(MANUAL_REVISION_PROMPT_ID)
 MANUAL_REVISION_PROMPT_SCHEMA_VERSION = response_schema_version(MANUAL_REVISION_PROMPT_ID)
@@ -39,6 +42,60 @@ REGIME_TABLE = "advisory_market_regime"
 EVENT_EVALUATIONS_TABLE = "advisory_event_evaluations"
 EVENT_REVIEWS_TABLE = "advisory_event_reviews"
 EVENT_POLICY_TABLE = "advisory_event_policy_actions"
+
+ACTIONS_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        published_on TIMESTAMPTZ,
+        symbol TEXT NOT NULL,
+        setup_id TEXT,
+        unique_id TEXT,
+        action_code TEXT NOT NULL,
+        action_priority BIGINT,
+        action_source TEXT,
+        source_action TEXT,
+        transaction_type TEXT,
+        execution_mode TEXT,
+        action_fraction DOUBLE PRECISION,
+        approved_allocation_inr DOUBLE PRECISION,
+        reference_price DOUBLE PRECISION,
+        stop_price DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        recommended_stop_price DOUBLE PRECISION,
+        recommended_target_price DOUBLE PRECISION,
+        expected_horizon_days BIGINT,
+        invest_score_pct DOUBLE PRECISION,
+        action_reason TEXT,
+        action_detail TEXT,
+        recommendation_reason_json TEXT,
+        reason_contract_status TEXT,
+        feature_freshness_json TEXT,
+        manual_revision_summary TEXT,
+        manual_revision_pointers_json TEXT,
+        manual_revision_prompt_id TEXT,
+        manual_revision_prompt_version TEXT,
+        manual_revision_prompt_schema_version TEXT,
+        manual_revision_model TEXT,
+        manual_revision_status TEXT,
+        raw_context_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, symbol)
+    )
+    """,
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS recommended_target_price DOUBLE PRECISION",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS expected_horizon_days BIGINT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS recommendation_reason_json TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS reason_contract_status TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS feature_freshness_json TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_summary TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_pointers_json TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_id TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_version TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_schema_version TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_model TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_status TEXT",
+]
 
 ACTION_PRIORITY = {
     "SELL": 100,
@@ -83,6 +140,8 @@ MANUAL_REVIEW_WAIT_SIGNAL_SETUP_ID = "MANUAL_REVIEW_WAIT_SIGNAL"
 
 RISK_OFF_STATES = {"RISK_OFF", "HIGH", "STRESS", "CRASH", "HOSTILE"}
 POSITIVE_BROKER_ACTIONS = {"BUY", "BUY_MORE"}
+BROKER_CAPABLE_ACTIONS = {"BUY", "BUY_MORE", "SELL", "PARTIAL_SELL"}
+FEATURE_FRESHNESS_BLOCKED_POSITIVE_ACTIONS = POSITIVE_BROKER_ACTIONS
 MARKET_CONTEXT_RISK_OFF_SCORE_THRESHOLD = env.float("ACTION_MARKET_CONTEXT_RISK_OFF_SCORE_THRESHOLD", default=0.60)
 MARKET_CONTEXT_WEAK_BREADTH_THRESHOLD = env.float("ACTION_MARKET_CONTEXT_WEAK_BREADTH_THRESHOLD", default=40.0)
 MARKET_CONTEXT_CAUTION_RISK_OFF_SCORE_THRESHOLD = env.float("ACTION_MARKET_CONTEXT_CAUTION_RISK_OFF_SCORE_THRESHOLD", default=0.45)
@@ -113,6 +172,68 @@ def table_exists(table_name: str) -> bool:
     return not df.empty
 
 
+def load_action_identity_gaps(symbols: list[str]) -> pd.DataFrame:
+    clean_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+    if not clean_symbols:
+        return pd.DataFrame()
+    if not table_exists("company_master"):
+        return pd.DataFrame(
+            [
+                {
+                    "symbol": symbol,
+                    "identity_gap": "company_master_table_missing",
+                    "company_master_id": None,
+                    "nse_ticker": None,
+                    "bse_ticker": None,
+                    "dhan_nse_id": None,
+                    "dhan_bse_id": None,
+                }
+                for symbol in clean_symbols
+            ]
+        )
+    return sql_to_df(
+        """
+        WITH requested(symbol) AS (
+            SELECT UPPER(UNNEST(%(symbols)s::text[]))
+        ),
+        matches AS (
+            SELECT
+                r.symbol,
+                cm.company_master_id,
+                cm.nse_ticker,
+                cm.bse_ticker,
+                cm.dhan_nse_id,
+                cm.dhan_bse_id
+            FROM requested r
+            LEFT JOIN company_master cm
+              ON UPPER(cm.nse_ticker) = r.symbol
+              OR UPPER(cm.bse_ticker) = r.symbol
+        ),
+        mapped AS (
+            SELECT
+                symbol,
+                MAX(company_master_id::text) FILTER (WHERE company_master_id IS NOT NULL) AS company_master_id,
+                MAX(nse_ticker) FILTER (WHERE nse_ticker IS NOT NULL) AS nse_ticker,
+                MAX(bse_ticker) FILTER (WHERE bse_ticker IS NOT NULL) AS bse_ticker,
+                MAX(dhan_nse_id::text) FILTER (WHERE dhan_nse_id IS NOT NULL) AS dhan_nse_id,
+                MAX(dhan_bse_id::text) FILTER (WHERE dhan_bse_id IS NOT NULL) AS dhan_bse_id,
+                CASE
+                    WHEN NOT BOOL_OR(company_master_id IS NOT NULL) THEN 'missing_company_master'
+                    WHEN NOT BOOL_OR(dhan_nse_id IS NOT NULL OR dhan_bse_id IS NOT NULL) THEN 'missing_dhan_security_id'
+                    ELSE NULL
+                END AS identity_gap
+            FROM matches
+            GROUP BY symbol
+        )
+        SELECT *
+        FROM mapped
+        WHERE identity_gap IS NOT NULL
+        ORDER BY symbol
+        """,
+        params={"symbols": clean_symbols},
+    )
+
+
 def table_columns(table_name: str) -> set[str]:
     df = sql_to_df(
         """
@@ -129,58 +250,12 @@ def table_columns(table_name: str) -> set[str]:
 
 
 def ensure_actions_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                published_on TIMESTAMPTZ,
-                symbol TEXT NOT NULL,
-                setup_id TEXT,
-                unique_id TEXT,
-                action_code TEXT NOT NULL,
-                action_priority BIGINT,
-                action_source TEXT,
-                source_action TEXT,
-                transaction_type TEXT,
-                execution_mode TEXT,
-                action_fraction DOUBLE PRECISION,
-                approved_allocation_inr DOUBLE PRECISION,
-                reference_price DOUBLE PRECISION,
-                stop_price DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                recommended_stop_price DOUBLE PRECISION,
-                recommended_target_price DOUBLE PRECISION,
-                expected_horizon_days BIGINT,
-                invest_score_pct DOUBLE PRECISION,
-                action_reason TEXT,
-                action_detail TEXT,
-                recommendation_reason_json TEXT,
-                reason_contract_status TEXT,
-                manual_revision_summary TEXT,
-                manual_revision_pointers_json TEXT,
-                manual_revision_prompt_id TEXT,
-                manual_revision_prompt_version TEXT,
-                manual_revision_prompt_schema_version TEXT,
-                manual_revision_model TEXT,
-                manual_revision_status TEXT,
-                raw_context_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, symbol)
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS recommended_target_price DOUBLE PRECISION")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS expected_horizon_days BIGINT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS recommendation_reason_json TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS reason_contract_status TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_summary TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_pointers_json TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_id TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_version TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_prompt_schema_version TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_model TEXT")
-        cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS manual_revision_status TEXT")
+    apply_schema_migration(
+        migration_id=ACTIONS_SCHEMA_MIGRATION_ID,
+        description="Create and normalize consolidated advisory action recommendations table.",
+        statements=ACTIONS_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.action_recommender", "tables": [TABLE_NAME]},
+    )
 
 
 def _normalize_asof_date(asof_date: pd.Timestamp | None) -> pd.Timestamp:
@@ -516,11 +591,36 @@ def _parse_jsonish(value: Any, default: Any) -> Any:
     try:
         if pd.isna(value):
             return default
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.action_recommender",
+            fallback_type="action_recommender_missing_check_failed",
+            source="parse_jsonish",
+            severity="warn",
+            reason="Action recommender could not evaluate missingness for a stored JSON context value and continued parsing.",
+            error=exc,
+            metadata={
+                "value_type": type(value).__name__,
+                "default_type": type(default).__name__,
+            },
+        )
     try:
         return json.loads(str(value))
-    except Exception:
+    except Exception as exc:
+        if isinstance(value, str) and value.strip():
+            record_local_fallback_event(
+                module="advisory.action_recommender",
+                fallback_type="action_recommender_json_parse_failed",
+                source="json_context",
+                severity="warn",
+                reason="Action recommender could not parse stored JSON context and used the provided default.",
+                error=exc,
+                metadata={
+                    "default_type": type(default).__name__,
+                    "value_length": len(value),
+                    "value_excerpt": value[:240],
+                },
+            )
         return default
 
 
@@ -530,8 +630,16 @@ def _json_context_value(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.action_recommender",
+            fallback_type="action_recommender_context_missing_check_failed",
+            source="json_context_value",
+            severity="warn",
+            reason="Action recommender could not evaluate missingness for a context value and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
 
 
@@ -1065,6 +1173,15 @@ def load_enabled_conflict_rule_ids() -> set[str]:
             type(exc).__name__,
             exc,
         )
+        record_local_fallback_event(
+            module="advisory.action_recommender",
+            fallback_type="action_conflict_rule_lookup_failed_default_rules",
+            source=ACTION_CONFLICT_RULES_TABLE,
+            severity="warn",
+            reason="Action consolidation used default deterministic conflict rules because conflict-rule table lookup failed.",
+            error=exc,
+            metadata={"fallback_rule_count": len(DEFAULT_CONFLICT_RULE_IDS)},
+        )
         return set(DEFAULT_CONFLICT_RULE_IDS)
     if not exists:
         logger.warning(
@@ -1088,6 +1205,15 @@ def load_enabled_conflict_rule_ids() -> set[str]:
             type(exc).__name__,
             exc,
         )
+        record_local_fallback_event(
+            module="advisory.action_recommender",
+            fallback_type="action_conflict_rule_load_failed_default_rules",
+            source=ACTION_CONFLICT_RULES_TABLE,
+            severity="warn",
+            reason="Action consolidation used default deterministic conflict rules because enabled conflict-rule load failed.",
+            error=exc,
+            metadata={"fallback_rule_count": len(DEFAULT_CONFLICT_RULE_IDS)},
+        )
         return set(DEFAULT_CONFLICT_RULE_IDS)
     return {str(value) for value in df["rule_id"].dropna().tolist()} if not df.empty else set()
 
@@ -1106,6 +1232,14 @@ def load_enabled_dynamic_conflict_rules_for_ranking() -> list[dict[str, Any]]:
             ACTION_CONFLICT_RULES_TABLE,
             type(exc).__name__,
             exc,
+        )
+        record_local_fallback_event(
+            module="advisory.action_recommender",
+            fallback_type="action_dynamic_conflict_rule_lookup_failed",
+            source=ACTION_CONFLICT_RULES_TABLE,
+            severity="warn",
+            reason="Action consolidation ignored promoted dynamic conflict rules because conflict-rule table lookup failed.",
+            error=exc,
         )
         return []
     if not exists:
@@ -1128,6 +1262,14 @@ def load_enabled_dynamic_conflict_rules_for_ranking() -> list[dict[str, Any]]:
             type(exc).__name__,
             exc,
         )
+        record_local_fallback_event(
+            module="advisory.action_recommender",
+            fallback_type="action_dynamic_conflict_rule_load_failed",
+            source=ACTION_CONFLICT_RULES_TABLE,
+            severity="warn",
+            reason="Action consolidation ignored promoted dynamic conflict rules because dynamic conflict-rule load failed.",
+            error=exc,
+        )
         return []
     return df.to_dict(orient="records") if not df.empty else []
 
@@ -1136,16 +1278,22 @@ def _dynamic_conflict_rule_matches_candidate(row: pd.Series, peer: pd.Series, ru
     condition = _parse_jsonish(rule.get("condition_json"), {})
     if not isinstance(condition, dict):
         return False
-    if str(condition.get("condition_type") or "") != "action_pair_exact":
+    condition_type = str(condition.get("condition_type") or "action_pair_exact").strip().lower()
+    if condition_type not in {"action_pair", "action_pair_exact"}:
         return False
     if str(rule.get("resolution_action") or "keep_winner").strip() != "keep_winner":
         return False
     checks = [
         ("winning_action_code", row.get("action_code"), True),
         ("losing_action_code", peer.get("action_code"), True),
-        ("winning_source", row.get("action_source"), False),
-        ("losing_source", peer.get("action_source"), False),
     ]
+    if condition_type == "action_pair_exact":
+        checks.extend(
+            [
+                ("winning_source", row.get("action_source"), False),
+                ("losing_source", peer.get("action_source"), False),
+            ]
+        )
     for field, actual, upper in checks:
         expected = condition.get(field)
         if expected in (None, ""):
@@ -1290,8 +1438,16 @@ def _json_ready_record(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
             if pd.isna(value):
                 out[key] = None
                 continue
-        except Exception:
-            pass
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.action_recommender",
+                fallback_type="action_recommender_record_missing_check_failed",
+                source="json_ready_record",
+                severity="warn",
+                reason="Action recommender could not evaluate missingness for a record value and kept the original value.",
+                error=exc,
+                metadata={"key": str(key), "value_type": type(value).__name__},
+            )
         out[key] = value
     return out
 
@@ -1482,6 +1638,15 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
             raw_context,
             ["wait_signal_followup", "signal_id", "match_reason", "condition_json", "wait_question"],
         ),
+        "feature_freshness": _contract_section_from_context(
+            raw_context,
+            [
+                "feature_freshness_status",
+                "feature_freshness_gate",
+                "feature_freshness_blockers",
+                "blocked_original_action_code",
+            ],
+        ),
         "manual_review": _manual_review_contract_section(row, raw_context, action),
         "macro_regime": _contract_section_from_context(raw_context, ["macro_risk_state", "macro_stress_score", "regime_state", "market_regime"]),
         "conflict_resolution": conflict_resolution,
@@ -1613,6 +1778,155 @@ def add_recommendation_reason_contracts(df: pd.DataFrame, all_candidates: pd.Dat
         statuses.append(str(contract["status"]))
     out["recommendation_reason_json"] = contracts
     out["reason_contract_status"] = statuses
+    return out
+
+
+def add_feature_freshness_contracts(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    snapshots: list[str] = []
+    for _, row in out.iterrows():
+        symbol = str(row.get("symbol") or "").strip().upper()
+        asof_date = row.get("asof_date")
+        if not symbol:
+            snapshots.append(json.dumps({"status": "error", "reason": "symbol_missing"}, sort_keys=True))
+            continue
+        contract = build_feature_freshness_contract(symbol, asof_date=asof_date)
+        contract["captured_at"] = pd.Timestamp.utcnow().isoformat()
+        contract["captured_for"] = "advisory_action_recommendation"
+        snapshots.append(json.dumps(contract, ensure_ascii=False, default=str, sort_keys=True))
+    out["feature_freshness_json"] = snapshots
+    return out
+
+
+def _feature_freshness_blockers(contract: Any) -> list[dict[str, Any]]:
+    payload = _parse_jsonish(contract, {})
+    if not isinstance(payload, dict):
+        return []
+    blockers = payload.get("blockers")
+    if not isinstance(blockers, list):
+        return []
+    return [
+        row
+        for row in blockers
+        if isinstance(row, dict)
+        and bool(row.get("required", True))
+        and str(row.get("status") or "").lower() in {"missing", "stale", "error"}
+    ]
+
+
+def apply_feature_freshness_gates(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "feature_freshness_json" not in out.columns or out["feature_freshness_json"].isna().any():
+        out = add_feature_freshness_contracts(out)
+    changed = 0
+    for idx, row in out.iterrows():
+        action = str(row.get("action_code") or "").upper()
+        if action not in FEATURE_FRESHNESS_BLOCKED_POSITIVE_ACTIONS:
+            continue
+        contract = _parse_jsonish(row.get("feature_freshness_json"), {})
+        if not isinstance(contract, dict) or str(contract.get("status") or "").lower() != "blocked":
+            continue
+        blockers = _feature_freshness_blockers(contract)
+        if not blockers:
+            continue
+        context = _parse_jsonish(row.get("raw_context_json"), {})
+        if not isinstance(context, dict):
+            context = {}
+        blocker_labels = [
+            str(item.get("label") or item.get("input_key") or "required input")
+            for item in blockers
+        ]
+        existing_reason = _text(row.get("action_reason"))
+        context.update(
+            {
+                "manual_review_boundary": "feature_freshness_required_input_blocked",
+                "manual_review_effect": "review_only_no_broker_execution",
+                "operator_question": "Repair or refresh the stale/missing required inputs before allowing this positive action to become broker-executable.",
+                "review_reason": "Required decision inputs were stale, missing, or errored when this action was created.",
+                "blocked_original_action_code": action,
+                "feature_freshness_gate": "blocked_positive_broker_action",
+                "feature_freshness_status": contract.get("status"),
+                "feature_freshness_blockers": blockers,
+                "broker_execution_allowed": False,
+            }
+        )
+        out.at[idx, "action_code"] = "MANUAL_REVIEW"
+        out.at[idx, "action_priority"] = int(ACTION_PRIORITY["MANUAL_REVIEW"])
+        out.at[idx, "transaction_type"] = None
+        out.at[idx, "execution_mode"] = "review_only"
+        out.at[idx, "raw_context_json"] = json.dumps(context, ensure_ascii=False, default=str, sort_keys=True)
+        blocker_text = ", ".join(blocker_labels)
+        prefix = f"Manual review required: required data inputs are blocked ({blocker_text})."
+        out.at[idx, "action_reason"] = prefix if not existing_reason else f"{prefix} Original reason: {existing_reason}"
+        changed += 1
+    out.attrs["feature_freshness_gate_changed_count"] = changed
+    return out
+
+
+def apply_identity_resolution_gates(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "action_code" not in out.columns or "symbol" not in out.columns:
+        out.attrs["identity_gate_changed_count"] = 0
+        return out
+    action_series = out["action_code"].astype("string").str.upper()
+    execution_mode = out["execution_mode"].astype("string").str.lower() if "execution_mode" in out.columns else pd.Series("", index=out.index)
+    broker_mask = action_series.isin(BROKER_CAPABLE_ACTIONS) & ~execution_mode.isin({"review_only", "no_broker_execution"})
+    symbols = out.loc[broker_mask, "symbol"].dropna().astype(str).str.upper().drop_duplicates().tolist()
+    if not symbols:
+        out.attrs["identity_gate_changed_count"] = 0
+        return out
+    gaps = load_action_identity_gaps(symbols)
+    if gaps.empty or "symbol" not in gaps.columns:
+        out.attrs["identity_gate_changed_count"] = 0
+        return out
+    gap_by_symbol = {
+        str(row.get("symbol") or "").strip().upper(): row
+        for row in gaps.to_dict(orient="records")
+        if str(row.get("symbol") or "").strip()
+    }
+    changed = 0
+    for idx, row in out.loc[broker_mask].iterrows():
+        symbol = str(row.get("symbol") or "").strip().upper()
+        gap = gap_by_symbol.get(symbol)
+        if not gap:
+            continue
+        original_action = str(row.get("action_code") or "").upper()
+        identity_gap = str(gap.get("identity_gap") or "identity_unresolved")
+        context = _parse_jsonish(row.get("raw_context_json"), {})
+        if not isinstance(context, dict):
+            context = {}
+        context.update(
+            {
+                "manual_review_boundary": "broker_identity_unresolved",
+                "manual_review_effect": "review_only_no_broker_execution",
+                "operator_question": "Repair company/Dhan identity before this action can become broker-executable.",
+                "review_reason": "Broker-capable action was downgraded because company/security identity is missing.",
+                "blocked_original_action_code": original_action,
+                "identity_gap": identity_gap,
+                "company_master_id": _json_context_value(gap.get("company_master_id")),
+                "nse_ticker": _json_context_value(gap.get("nse_ticker")),
+                "bse_ticker": _json_context_value(gap.get("bse_ticker")),
+                "dhan_nse_id": _json_context_value(gap.get("dhan_nse_id")),
+                "dhan_bse_id": _json_context_value(gap.get("dhan_bse_id")),
+                "broker_execution_allowed": False,
+            }
+        )
+        out.at[idx, "action_code"] = "MANUAL_REVIEW"
+        out.at[idx, "action_priority"] = int(ACTION_PRIORITY["MANUAL_REVIEW"])
+        out.at[idx, "transaction_type"] = None
+        out.at[idx, "execution_mode"] = "review_only"
+        out.at[idx, "raw_context_json"] = json.dumps(context, ensure_ascii=False, default=str, sort_keys=True)
+        prefix = f"Manual review required: broker identity unresolved ({identity_gap})."
+        existing_reason = _text(row.get("action_reason"))
+        out.at[idx, "action_reason"] = prefix if not existing_reason else f"{prefix} Original reason: {existing_reason}"
+        changed += 1
+    out.attrs["identity_gate_changed_count"] = changed
     return out
 
 
@@ -2097,6 +2411,9 @@ def build_action_recommendations(
     candidate_df = apply_market_context_adjustments(candidate_df, asof_date=monitor_date)
     winners = rank_action_candidates(candidate_df)
     winners = add_recommendation_reason_contracts(winners, candidate_df)
+    winners = apply_identity_resolution_gates(winners)
+    if int(winners.attrs.get("identity_gate_changed_count") or 0) > 0:
+        winners = add_recommendation_reason_contracts(winners, candidate_df)
     winners = add_manual_revision_pointers(winners, candidate_df)
     winners.attrs["all_action_candidates"] = candidate_df
     return winners
@@ -2152,6 +2469,15 @@ def persist_action_recommendations(df: pd.DataFrame) -> None:
     }
     if not existing_pointer_columns.issubset(set(winners.columns)) or winners["manual_revision_pointers_json"].isna().any():
         winners = add_manual_revision_pointers(winners, all_candidates)
+    if "feature_freshness_json" not in winners.columns or winners["feature_freshness_json"].isna().any():
+        winners = add_feature_freshness_contracts(winners)
+    winners = apply_feature_freshness_gates(winners)
+    feature_gate_changed_count = int(winners.attrs.get("feature_freshness_gate_changed_count") or 0)
+    winners = apply_identity_resolution_gates(winners)
+    identity_gate_changed_count = int(winners.attrs.get("identity_gate_changed_count") or 0)
+    if feature_gate_changed_count > 0 or identity_gate_changed_count > 0:
+        winners = add_recommendation_reason_contracts(winners, all_candidates)
+        winners = add_manual_revision_pointers(winners, all_candidates)
     conflicts = build_action_conflicts(all_candidates, winners)
     out = winners.copy()
     out = out.drop(columns=[column for column in ["_conflict_rule_precedence", "_conflict_precedence_rule_id", "_conflict_precedence_reason"] if column in out.columns])
@@ -2172,21 +2498,28 @@ def persist_action_recommendations(df: pd.DataFrame) -> None:
     for column in ["asof_date", "published_on", "load_ts"]:
         if column in out.columns:
             out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
-    with db_session() as (_, cur):
-        pairs = (
-            out[["asof_date", "symbol"]]
-            .dropna()
-            .drop_duplicates()
-            .to_dict(orient="records")
-        )
-        for item in pairs:
-            cur.execute(
-                f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s AND symbol = %s",
-                (
-                    pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
-                    str(item["symbol"]).upper(),
-                ),
-            )
+    pairs = (
+        out[["asof_date", "symbol"]]
+        .dropna()
+        .drop_duplicates()
+        .to_dict(orient="records")
+    )
+
+    def _delete_existing_action_recommendations() -> None:
+        with db_session() as (_, cur):
+            for item in pairs:
+                cur.execute(
+                    f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s AND symbol = %s",
+                    (
+                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                        str(item["symbol"]).upper(),
+                    ),
+                )
+
+    execute_db_operation(
+        _delete_existing_action_recommendations,
+        operation_name="action_recommender:delete_existing_recommendations",
+    )
     upsert_to_db(
         out,
         TABLE_NAME,
@@ -2233,6 +2566,7 @@ def _trace_action_consolidation(all_candidates: pd.DataFrame, winners: pd.DataFr
                 "candidate_count": len(candidate_rows),
                 "reason_contract_status": row.get("reason_contract_status"),
                 "recommendation_reason": _parse_jsonish(row.get("recommendation_reason_json"), {}),
+                "feature_freshness": _parse_jsonish(row.get("feature_freshness_json"), {}),
                 "manual_revision_summary": row.get("manual_revision_summary"),
                 "manual_revision_pointers": _parse_jsonish(row.get("manual_revision_pointers_json"), {}),
                 "manual_revision_status": row.get("manual_revision_status"),
@@ -2261,6 +2595,7 @@ def _trace_action_consolidation(all_candidates: pd.DataFrame, winners: pd.DataFr
                         "review_boundary": "Playbook candidates are review/risk overlays only, not direct broker orders.",
                         "reason_contract_status": row.get("reason_contract_status"),
                         "recommendation_reason": _parse_jsonish(row.get("recommendation_reason_json"), {}),
+                        "feature_freshness": _parse_jsonish(row.get("feature_freshness_json"), {}),
                         "manual_revision_summary": row.get("manual_revision_summary"),
                         "manual_revision_pointers": _parse_jsonish(row.get("manual_revision_pointers_json"), {}),
                     },
@@ -2281,6 +2616,7 @@ def _trace_action_consolidation(all_candidates: pd.DataFrame, winners: pd.DataFr
                     "conflict_count": int(conflict_counts.get(key, 0)),
                     "reason_contract_status": row.get("reason_contract_status"),
                     "recommendation_reason": _parse_jsonish(row.get("recommendation_reason_json"), {}),
+                    "feature_freshness": _parse_jsonish(row.get("feature_freshness_json"), {}),
                     "manual_revision_summary": row.get("manual_revision_summary"),
                     "manual_revision_pointers": _parse_jsonish(row.get("manual_revision_pointers_json"), {}),
                     "manual_revision_model": row.get("manual_revision_model"),

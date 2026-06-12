@@ -1,5 +1,6 @@
 import tempfile
 import time
+import json
 from datetime import date, datetime
 
 import numpy as np
@@ -8,6 +9,7 @@ import redis
 import requests
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers
 from utils.date import daterange
@@ -24,6 +26,30 @@ rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
 
 HEADERS = get_dynamic_headers()
 FBIL_GSEC_LOOKBACK_DAYS = max(env.int("RBI_FBIL_GSEC_LOOKBACK_DAYS", 365), 1)
+SYNC_SOURCE_NAME = "data.rbi.download_fbil_gsec"
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
+def _record_fbil_gsec_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | None = None,
+    fdate: date | datetime | None = None,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module=SYNC_SOURCE_NAME,
+        source="rbi_fbil_gsec",
+        fallback_type=fallback_type,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata={
+            "date": pd.Timestamp(fdate).date().isoformat() if fdate is not None else None,
+            **(metadata or {}),
+        },
+    )
 
 
 def get_cookies():
@@ -35,8 +61,14 @@ def try_parsing_date(text):
     for fmt in ("%d-%b-%Y", "%d %b, %Y", "%d/%b/%Y", "%d/%b/%y"):
         try:
             return datetime.strptime(text, fmt)
-        except ValueError:
-            pass
+        except ValueError as exc:
+            _record_fbil_gsec_fallback(
+                fallback_type="fbil_gsec_date_format_parse_failed",
+                source="rbi_fbil_gsec",
+                reason="RBI FBIL G-sec date parser rejected one candidate format and will try the next supported format.",
+                error=exc,
+                metadata={"raw_date": str(text), "format": fmt},
+            )
     raise ValueError("no valid date format found")
 
 
@@ -46,7 +78,14 @@ def parse_xls(xls_path, fdate):
     try:
         if not isinstance(trade_date, (date, datetime)):
             trade_date = try_parsing_date(trade_date)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError) as exc:
+        _record_fbil_gsec_fallback(
+            fallback_type="fbil_gsec_trade_date_parse_failed",
+            reason="FBIL G-sec sheet trade date could not be parsed; using requested file date.",
+            error=exc,
+            fdate=fdate,
+            metadata={"raw_trade_date": str(trade_date)},
+        )
         trade_date = fdate
 
     expected_cols = [
@@ -71,7 +110,13 @@ def parse_xls(xls_path, fdate):
 
     try:
         df_par = pd.read_excel(xls_path, sheet_name="Par Yield", skiprows=5)
-    except ValueError:
+    except ValueError as exc:
+        _record_fbil_gsec_fallback(
+            fallback_type="fbil_gsec_par_yield_sheet_fallback",
+            reason="FBIL G-sec workbook did not contain 'Par Yield'; trying legacy 'Par-Yield' sheet.",
+            error=exc,
+            fdate=fdate,
+        )
         df_par = pd.read_excel(xls_path, sheet_name="Par-Yield", skiprows=5)
     df_par = df_par.iloc[:, :3]
     df_par.columns = [
@@ -106,7 +151,13 @@ def parse_xls(xls_path, fdate):
 
 def download_gsec(fdate: date, cookies):
     if fdate.strftime("%a").lower() in ["sat", "sun"]:
-        return
+        return {
+            "date": fdate.isoformat(),
+            "status": "skipped_weekend",
+            "rows": 0,
+            "quote_rows": 0,
+            "par_rows": 0,
+        }
 
     formatted_date = fdate.strftime("%Y-%m-%d")
     print("GSec for ", formatted_date)
@@ -122,7 +173,14 @@ def download_gsec(fdate: date, cookies):
     )
     if response.status_code != 200:
         print("Skipping (with error) GSec for ", formatted_date, fdate.strftime("%a"))
-        return
+        return {
+            "date": formatted_date,
+            "status": "source_unavailable",
+            "status_code": int(response.status_code),
+            "rows": 0,
+            "quote_rows": 0,
+            "par_rows": 0,
+        }
 
     with tempfile.NamedTemporaryFile(suffix=".xls", delete=False) as tmp:
         tmp.write(response.content)
@@ -151,22 +209,106 @@ def download_gsec(fdate: date, cookies):
     rop.set(DOWNLOADED, formatted_date)
     time.sleep(1)
     print("Downloaded GSec for ", formatted_date)
+    return {
+        "date": formatted_date,
+        "status": "downloaded",
+        "rows": int(len(df_quote) + len(df_par)),
+        "quote_rows": int(len(df_quote)),
+        "par_rows": int(len(df_par)),
+    }
 
 
-def download_all_gsec_data():
+def download_all_gsec_data() -> dict[str, object]:
     cookies = get_cookies()
     today = datetime.now()
     from_date = rop.get(DOWNLOADED)
     if from_date:
         from_date = datetime.strptime(from_date, "%Y-%m-%d")
     else:
-        from_date = datetime.combine(date.today(), datetime.min.time()) - pd.Timedelta(days=FBIL_GSEC_LOOKBACK_DAYS)
+        from_date = datetime.combine(date.today(), datetime.min.time()) - pd.Timedelta(
+            days=FBIL_GSEC_LOOKBACK_DAYS
+        )
 
+    state: dict[str, object] = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": 0,
+        "rows_read": 0,
+        "rows_written": 0,
+        "from_date": pd.Timestamp(from_date).date().isoformat(),
+        "to_date": pd.Timestamp(today).date().isoformat(),
+        "date_count": 0,
+        "downloaded_date_count": 0,
+        "skipped_weekend_count": 0,
+        "failed_date_count": 0,
+        "attempt_count": 0,
+        "download_attempts": 0,
+        "failed_attempt_count": 0,
+        "source_unavailable_count": 0,
+        "fallback_used": False,
+        "state_advanced": False,
+    }
     for fdate in daterange(from_date, today):
-        download_gsec(fdate, cookies=cookies)
+        state["date_count"] = int(state["date_count"]) + 1
+        try:
+            result = download_gsec(fdate, cookies=cookies) or {
+                "date": pd.Timestamp(fdate).date().isoformat(),
+                "status": "no_result",
+                "rows": 0,
+            }
+        except Exception as exc:
+            _record_fbil_gsec_fallback(
+                fallback_type="fbil_gsec_download_failed",
+                reason="FBIL G-sec date download or parse failed; stopping catch-up at this date.",
+                error=exc,
+                fdate=fdate,
+            )
+            state["attempt_count"] = int(state["attempt_count"]) + 1
+            state["download_attempts"] = int(state["download_attempts"]) + 1
+            state["failed_attempt_count"] = int(state["failed_attempt_count"]) + 1
+            state["failed_date_count"] = int(state["failed_date_count"]) + 1
+            state["source_unavailable_count"] = int(state["source_unavailable_count"]) + 1
+            failed_dates = state.setdefault("failed_dates", [])
+            if isinstance(failed_dates, list):
+                failed_dates.append(
+                    {
+                        "date": pd.Timestamp(fdate).date().isoformat(),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            break
+        status = str(result.get("status") or "")
+        if status == "downloaded":
+            rows = int(result.get("rows") or 0)
+            state["attempt_count"] = int(state["attempt_count"]) + 1
+            state["download_attempts"] = int(state["download_attempts"]) + 1
+            state["downloaded_date_count"] = int(state["downloaded_date_count"]) + 1
+            state["rows"] = int(state["rows"]) + rows
+            state["rows_written"] = int(state["rows_written"]) + rows
+            state["state_advanced"] = bool(state["state_advanced"]) or rows > 0
+        elif status == "skipped_weekend":
+            state["skipped_weekend_count"] = int(state["skipped_weekend_count"]) + 1
+        else:
+            state["attempt_count"] = int(state["attempt_count"]) + 1
+            state["download_attempts"] = int(state["download_attempts"]) + 1
+            state["failed_attempt_count"] = int(state["failed_attempt_count"]) + 1
+            state["failed_date_count"] = int(state["failed_date_count"]) + 1
+            state["source_unavailable_count"] = int(state["source_unavailable_count"]) + 1
+    state["rows_read"] = int(state["date_count"])
+    return state
+
+
+def main() -> int:
+    global STOCKEY_RUN_STATE
+    STOCKEY_RUN_STATE = download_all_gsec_data()
+    status = "partial" if int(STOCKEY_RUN_STATE.get("failed_date_count") or 0) else "ok"
+    print(
+        json.dumps({"status": status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str),
+        flush=True,
+    )
+    return 0
 
 
 if __name__ == "__main__":
     # parse_xls("")
     # parse_xls("")
-    download_all_gsec_data()
+    raise SystemExit(main())

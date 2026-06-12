@@ -1,13 +1,63 @@
 import pandas as pd
 from environs import Env
 
-from advisory.fallback_telemetry import record_fallback_event
+from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
 from advisory.identity_issues import record_dhan_identity_issue
 from utils.db import get_sql, sql_to_df
 from utils.company_master import load_company_master_records
 
 env = Env()
 env.read_env()
+
+
+INDEX_ALIASES = {
+    "NIFTY": ("NIFTY", "NIFTY 50", "NIFTY50", "NIFTY 50 INDEX", "NIFTY50 INDEX"),
+    "NIFTY50": ("NIFTY", "NIFTY 50", "NIFTY50", "NIFTY 50 INDEX", "NIFTY50 INDEX"),
+    "NIFTY 50": ("NIFTY", "NIFTY 50", "NIFTY50", "NIFTY 50 INDEX", "NIFTY50 INDEX"),
+    "BANKNIFTY": ("BANKNIFTY", "NIFTY BANK", "NIFTYBANK", "BANK NIFTY", "NIFTY BANK INDEX"),
+    "NIFTYBANK": ("BANKNIFTY", "NIFTY BANK", "NIFTYBANK", "BANK NIFTY", "NIFTY BANK INDEX"),
+    "NIFTY BANK": ("BANKNIFTY", "NIFTY BANK", "NIFTYBANK", "BANK NIFTY", "NIFTY BANK INDEX"),
+    "INDIAVIX": ("INDIAVIX", "INDIA VIX", "INDIA VIX INDEX"),
+    "INDIA VIX": ("INDIAVIX", "INDIA VIX", "INDIA VIX INDEX"),
+}
+
+
+def index_search_terms(symbol: str) -> tuple[str, ...]:
+    symbol_upper = str(symbol or "").strip().upper()
+    compact = symbol_upper.replace(" ", "")
+    raw_terms = INDEX_ALIASES.get(symbol_upper) or INDEX_ALIASES.get(compact) or (symbol_upper,)
+    ordered: list[str] = []
+    for term in [symbol_upper, compact, *raw_terms]:
+        text = str(term or "").strip().upper()
+        if text and text not in ordered:
+            ordered.append(text)
+    return tuple(ordered)
+
+
+def _record_dhan_identity_local_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception,
+    symbol: str,
+    requested_exchange: str,
+    asset_type: str,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="data.dhanlive.dhan_db",
+        fallback_type=fallback_type,
+        source="dhan_identity",
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata={
+            "symbol": symbol,
+            "requested_exchange": requested_exchange,
+            "asset_type": asset_type,
+            **(metadata or {}),
+        },
+    )
 
 
 def get_nse_equity(ticker: str):
@@ -48,7 +98,7 @@ def get_company_master_equity(ticker: str, exchange: str):
 
 def get_index_instrument(symbol: str, exchange: str):
     exchange_upper = exchange.upper()
-    symbol_upper = symbol.strip().upper()
+    terms = index_search_terms(symbol)
     query = """
         SELECT *
         FROM master_dhan_instruments
@@ -58,14 +108,23 @@ def get_index_instrument(symbol: str, exchange: str):
           AND instrument = 'INDEX'
           AND instrument_type = 'INDEX'
           AND (
-                UPPER(COALESCE(underlying_symbol, '')) = %s
-             OR UPPER(COALESCE(symbol_name, '')) = %s
-             OR UPPER(COALESCE(display_name, '')) = %s
+                UPPER(COALESCE(underlying_symbol, '')) = ANY(%s)
+             OR UPPER(COALESCE(symbol_name, '')) = ANY(%s)
+             OR UPPER(COALESCE(display_name, '')) = ANY(%s)
           )
-        ORDER BY load_ts DESC, valid_from DESC
+        ORDER BY
+            CASE
+                WHEN UPPER(COALESCE(underlying_symbol, '')) = %s THEN 0
+                WHEN UPPER(COALESCE(symbol_name, '')) = %s THEN 1
+                WHEN UPPER(COALESCE(display_name, '')) = %s THEN 2
+                ELSE 3
+            END,
+            load_ts DESC,
+            valid_from DESC
         LIMIT 1
     """
-    return get_sql(query, (exchange_upper, symbol_upper, symbol_upper, symbol_upper))
+    preferred = terms[0]
+    return get_sql(query, (exchange_upper, list(terms), list(terms), list(terms), preferred, preferred, preferred))
 
 
 def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "stock") -> dict[str, object]:
@@ -133,8 +192,16 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
                     fallback_used=bool(fallback_tried),
                     metadata={"requested_exchange": exchange_upper, "asset_type": asset_type_lower, "fallback_tried": fallback_tried},
                 )
-            except Exception:
-                pass
+            except Exception as telemetry_exc:
+                _record_dhan_identity_local_fallback(
+                    fallback_type="dhan_identity_telemetry_failed",
+                    reason="DB-backed Dhan identity unresolved telemetry failed; local fallback telemetry was recorded instead.",
+                    error=telemetry_exc,
+                    symbol=identifier,
+                    requested_exchange=exchange_upper,
+                    asset_type=asset_type_lower,
+                    metadata={"original_error": error_text, "fallback_tried": fallback_tried},
+                )
             try:
                 record_dhan_identity_issue(
                     symbol=identifier,
@@ -145,6 +212,15 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
                     error_text=error_text,
                 )
             except Exception as exc:
+                _record_dhan_identity_local_fallback(
+                    fallback_type="dhan_identity_issue_record_failed",
+                    reason="Dhan identity issue persistence failed; unresolved identity will still raise to the caller.",
+                    error=exc,
+                    symbol=identifier,
+                    requested_exchange=exchange_upper,
+                    asset_type=asset_type_lower,
+                    metadata={"original_error": error_text, "fallback_tried": fallback_tried},
+                )
                 print(f"[dhan.identity] failed to record identity issue for {exchange_upper}:{identifier}: {exc}", flush=True)
             raise ValueError(error_text)
         if fallback_tried:
@@ -173,7 +249,60 @@ def resolve_dhan_identity(identifier: str, exchange: str, asset_type: str = "sto
         }
 
     if asset_type_lower in {"index", "benchmark"}:
-        instrument = get_index_instrument(identifier, exchange_upper)
+        try:
+            instrument = get_index_instrument(identifier, exchange_upper)
+        except Exception as exc:
+            error_text = f"No Dhan index security id mapped for {exchange_upper}:{identifier}"
+            fallback_tried = [
+                {
+                    "exchange": exchange_upper,
+                    "method": "index_alias_lookup",
+                    "aliases": list(index_search_terms(identifier)),
+                    "result": "missing",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            ]
+            try:
+                record_fallback_event(
+                    module="data.dhanlive.dhan_db",
+                    source="dhan_identity",
+                    fallback_type="dhan_index_identity_unresolved",
+                    severity="error",
+                    symbol=identifier,
+                    reason=error_text,
+                    fallback_used=True,
+                    metadata={"requested_exchange": exchange_upper, "asset_type": asset_type_lower, "fallback_tried": fallback_tried},
+                )
+            except Exception as telemetry_exc:
+                _record_dhan_identity_local_fallback(
+                    fallback_type="dhan_index_identity_telemetry_failed",
+                    reason="DB-backed Dhan index identity unresolved telemetry failed; local fallback telemetry was recorded instead.",
+                    error=telemetry_exc,
+                    symbol=identifier,
+                    requested_exchange=exchange_upper,
+                    asset_type=asset_type_lower,
+                    metadata={"original_error": error_text, "fallback_tried": fallback_tried},
+                )
+            try:
+                record_dhan_identity_issue(
+                    symbol=identifier,
+                    requested_exchange=exchange_upper,
+                    asset_type=asset_type_lower,
+                    fallback_tried=fallback_tried,
+                    error_text=error_text,
+                )
+            except Exception as record_exc:
+                _record_dhan_identity_local_fallback(
+                    fallback_type="dhan_index_identity_issue_record_failed",
+                    reason="Dhan index identity issue persistence failed; unresolved identity will still raise to the caller.",
+                    error=record_exc,
+                    symbol=identifier,
+                    requested_exchange=exchange_upper,
+                    asset_type=asset_type_lower,
+                    metadata={"original_error": error_text, "fallback_tried": fallback_tried},
+                )
+                print(f"[dhan.identity] failed to record index identity issue for {exchange_upper}:{identifier}: {record_exc}", flush=True)
+            raise ValueError(error_text) from exc
         return {
             "company_master_id": None,
             "asset_type": asset_type_lower,

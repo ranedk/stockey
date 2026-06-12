@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from advisory.data_sync import ensure_advisory_symbol_inputs
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.fundamental_snapshot import build_fundamental_snapshot, persist_fundamental_snapshot
 from advisory.intraday_features import TABLE_NAME as INTRADAY_FEATURES_TABLE
 from advisory.intraday_features import build_intraday_features, persist_intraday_features
@@ -16,13 +17,174 @@ from advisory.peer_sync import sync_peer_data
 from advisory.setup_registry import load_setup_registry
 from advisory.technical_engine import evaluate_pre_entry_state as evaluate_technical_pre_entry_state
 from advisory.technical_features import build_technical_features, persist_technical_features
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 CANDIDATES_TABLE = "advisory_candidates"
 REJECTIONS_TABLE = "advisory_candidate_rejections"
 OVERLAY_TABLE = "advisory_market_overlay_daily"
+RULE_ENGINE_SCHEMA_MIGRATION_ID = "20260611_advisory_rule_outputs_base"
+CANDIDATE_COLUMNS = {
+    "screener_date": "TIMESTAMPTZ",
+    "setup_name": "TEXT",
+    "setup_family": "TEXT",
+    "holding_horizon_note": "TEXT",
+    "regime_name": "TEXT",
+    "base_regime": "TEXT",
+    "news_overlay": "TEXT",
+    "theme_ids": "TEXT",
+    "company_master_id": "TEXT",
+    "screener_slug": "TEXT",
+    "source_screener_slug": "TEXT",
+    "source_screener_list": "TEXT",
+    "rank": "BIGINT",
+    "candidate_state": "TEXT",
+    "watch_reason_detail": "TEXT",
+    "technical_state": "TEXT",
+    "technical_trigger_type": "TEXT",
+    "technical_trigger_note": "TEXT",
+    "technical_trend_score": "DOUBLE PRECISION",
+    "technical_structure_score": "DOUBLE PRECISION",
+    "technical_participation_score": "DOUBLE PRECISION",
+    "technical_relative_strength_score": "DOUBLE PRECISION",
+    "technical_tradability_score": "DOUBLE PRECISION",
+    "technical_score": "DOUBLE PRECISION",
+    "fundamental_score": "DOUBLE PRECISION",
+    "regime_fit_score": "DOUBLE PRECISION",
+    "event_score": "DOUBLE PRECISION",
+    "setup_score": "DOUBLE PRECISION",
+    "avg_traded_value_20d": "DOUBLE PRECISION",
+    "rs_vs_benchmark": "DOUBLE PRECISION",
+    "rs_vs_sector": "DOUBLE PRECISION",
+    "intraday_close_vs_vwap_pct": "DOUBLE PRECISION",
+    "intraday_pct_bars_above_vwap": "DOUBLE PRECISION",
+    "intraday_close_location_pct": "DOUBLE PRECISION",
+    "intraday_opening_range_breakout_up": "BOOLEAN",
+    "intraday_prev_day_breakout_up": "BOOLEAN",
+    "intraday_failed_prev_day_breakout": "BOOLEAN",
+    "intraday_volume_vs_20d": "DOUBLE PRECISION",
+    "intraday_breakout_score": "DOUBLE PRECISION",
+    "intraday_pattern_label": "TEXT",
+    "intraday_interval_minutes": "INTEGER",
+    "total_revenue_qoq_growth_vs_sector": "DOUBLE PRECISION",
+    "profit_after_tax_qoq_growth_vs_sector": "DOUBLE PRECISION",
+    "debt_to_equity_vs_sector": "DOUBLE PRECISION",
+    "entry_style": "TEXT",
+    "attractive_price_low": "DOUBLE PRECISION",
+    "attractive_price_high": "DOUBLE PRECISION",
+    "invalidation_price": "DOUBLE PRECISION",
+    "entry_note": "TEXT",
+    "near_miss_flag": "BOOLEAN",
+    "watch_enabled": "BOOLEAN",
+    "watch_reasons": "TEXT",
+    "rule_pass": "BOOLEAN",
+    "load_ts": "TIMESTAMPTZ",
+}
+REJECTION_COLUMNS = {
+    "screener_date": "TIMESTAMPTZ",
+    "setup_name": "TEXT",
+    "company_master_id": "TEXT",
+    "base_regime": "TEXT",
+    "news_overlay": "TEXT",
+    "severity": "TEXT",
+    "is_near_miss": "BOOLEAN",
+    "delta_to_pass": "DOUBLE PRECISION",
+    "reason_detail": "TEXT",
+    "load_ts": "TIMESTAMPTZ",
+}
+RULE_ENGINE_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {CANDIDATES_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        screener_date TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        setup_family TEXT,
+        holding_horizon_note TEXT,
+        regime_name TEXT,
+        base_regime TEXT,
+        news_overlay TEXT,
+        theme_ids TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        screener_slug TEXT,
+        source_screener_slug TEXT,
+        source_screener_list TEXT,
+        rank BIGINT,
+        candidate_state TEXT,
+        watch_reason_detail TEXT,
+        technical_state TEXT,
+        technical_trigger_type TEXT,
+        technical_trigger_note TEXT,
+        technical_trend_score DOUBLE PRECISION,
+        technical_structure_score DOUBLE PRECISION,
+        technical_participation_score DOUBLE PRECISION,
+        technical_relative_strength_score DOUBLE PRECISION,
+        technical_tradability_score DOUBLE PRECISION,
+        technical_score DOUBLE PRECISION,
+        fundamental_score DOUBLE PRECISION,
+        regime_fit_score DOUBLE PRECISION,
+        event_score DOUBLE PRECISION,
+        setup_score DOUBLE PRECISION,
+        avg_traded_value_20d DOUBLE PRECISION,
+        rs_vs_benchmark DOUBLE PRECISION,
+        rs_vs_sector DOUBLE PRECISION,
+        intraday_close_vs_vwap_pct DOUBLE PRECISION,
+        intraday_pct_bars_above_vwap DOUBLE PRECISION,
+        intraday_close_location_pct DOUBLE PRECISION,
+        intraday_opening_range_breakout_up BOOLEAN,
+        intraday_prev_day_breakout_up BOOLEAN,
+        intraday_failed_prev_day_breakout BOOLEAN,
+        intraday_volume_vs_20d DOUBLE PRECISION,
+        intraday_breakout_score DOUBLE PRECISION,
+        intraday_pattern_label TEXT,
+        intraday_interval_minutes INTEGER,
+        total_revenue_qoq_growth_vs_sector DOUBLE PRECISION,
+        profit_after_tax_qoq_growth_vs_sector DOUBLE PRECISION,
+        debt_to_equity_vs_sector DOUBLE PRECISION,
+        entry_style TEXT,
+        attractive_price_low DOUBLE PRECISION,
+        attractive_price_high DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        entry_note TEXT,
+        near_miss_flag BOOLEAN,
+        watch_enabled BOOLEAN,
+        watch_reasons TEXT,
+        rule_pass BOOLEAN,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, setup_id, symbol)
+    )
+    """,
+    *[
+        f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+        for column, sql_type in CANDIDATE_COLUMNS.items()
+    ],
+    f"""
+    CREATE TABLE IF NOT EXISTS {REJECTIONS_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        symbol TEXT,
+        reason_code TEXT NOT NULL,
+        screener_date TIMESTAMPTZ,
+        setup_name TEXT,
+        company_master_id TEXT,
+        base_regime TEXT,
+        news_overlay TEXT,
+        severity TEXT,
+        is_near_miss BOOLEAN,
+        delta_to_pass DOUBLE PRECISION,
+        reason_detail TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, setup_id, symbol, reason_code)
+    )
+    """,
+    *[
+        f"ALTER TABLE {REJECTIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+        for column, sql_type in REJECTION_COLUMNS.items()
+    ],
+]
 
 DEFAULT_SCORING_WEIGHTS = {
     "technical": 0.35,
@@ -44,17 +206,46 @@ def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
 
 
-def table_exists(table_name: str) -> bool:
-    df = sql_to_df(
-        """
-        SELECT 1 AS exists_flag
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        LIMIT 1
-        """,
-        params=(table_name,),
+def _record_rule_engine_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.rule_engine",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
     )
+
+
+def table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        _record_rule_engine_fallback(
+            fallback_type="rule_engine_table_lookup_failed",
+            source=table_name,
+            reason="Rule engine could not inspect whether a source/output table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        return False
     return not df.empty
 
 
@@ -66,165 +257,13 @@ def safe_float(value: Any) -> float | None:
 
 
 def ensure_rule_output_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {CANDIDATES_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                screener_date TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                setup_family TEXT,
-                holding_horizon_note TEXT,
-                regime_name TEXT,
-                base_regime TEXT,
-                news_overlay TEXT,
-                theme_ids TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                screener_slug TEXT,
-                source_screener_slug TEXT,
-                source_screener_list TEXT,
-                rank BIGINT,
-                candidate_state TEXT,
-                watch_reason_detail TEXT,
-                technical_state TEXT,
-                technical_trigger_type TEXT,
-                technical_trigger_note TEXT,
-                technical_trend_score DOUBLE PRECISION,
-                technical_structure_score DOUBLE PRECISION,
-                technical_participation_score DOUBLE PRECISION,
-                technical_relative_strength_score DOUBLE PRECISION,
-                technical_tradability_score DOUBLE PRECISION,
-                technical_score DOUBLE PRECISION,
-                fundamental_score DOUBLE PRECISION,
-                regime_fit_score DOUBLE PRECISION,
-                event_score DOUBLE PRECISION,
-                setup_score DOUBLE PRECISION,
-                avg_traded_value_20d DOUBLE PRECISION,
-                rs_vs_benchmark DOUBLE PRECISION,
-                rs_vs_sector DOUBLE PRECISION,
-                intraday_close_vs_vwap_pct DOUBLE PRECISION,
-                intraday_pct_bars_above_vwap DOUBLE PRECISION,
-                intraday_close_location_pct DOUBLE PRECISION,
-                intraday_opening_range_breakout_up BOOLEAN,
-                intraday_prev_day_breakout_up BOOLEAN,
-                intraday_failed_prev_day_breakout BOOLEAN,
-                intraday_volume_vs_20d DOUBLE PRECISION,
-                intraday_breakout_score DOUBLE PRECISION,
-                intraday_pattern_label TEXT,
-                intraday_interval_minutes INTEGER,
-                total_revenue_qoq_growth_vs_sector DOUBLE PRECISION,
-                profit_after_tax_qoq_growth_vs_sector DOUBLE PRECISION,
-                debt_to_equity_vs_sector DOUBLE PRECISION,
-                entry_style TEXT,
-                attractive_price_low DOUBLE PRECISION,
-                attractive_price_high DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                entry_note TEXT,
-                near_miss_flag BOOLEAN,
-                watch_enabled BOOLEAN,
-                watch_reasons TEXT,
-                rule_pass BOOLEAN,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, setup_id, symbol)
-            )
-            """
-        )
-        candidate_columns = {
-            "screener_date": "TIMESTAMPTZ",
-            "setup_name": "TEXT",
-            "setup_family": "TEXT",
-            "holding_horizon_note": "TEXT",
-            "regime_name": "TEXT",
-            "base_regime": "TEXT",
-            "news_overlay": "TEXT",
-            "theme_ids": "TEXT",
-            "company_master_id": "TEXT",
-            "screener_slug": "TEXT",
-            "source_screener_slug": "TEXT",
-            "source_screener_list": "TEXT",
-            "rank": "BIGINT",
-            "candidate_state": "TEXT",
-            "watch_reason_detail": "TEXT",
-            "technical_state": "TEXT",
-            "technical_trigger_type": "TEXT",
-            "technical_trigger_note": "TEXT",
-            "technical_trend_score": "DOUBLE PRECISION",
-            "technical_structure_score": "DOUBLE PRECISION",
-            "technical_participation_score": "DOUBLE PRECISION",
-            "technical_relative_strength_score": "DOUBLE PRECISION",
-            "technical_tradability_score": "DOUBLE PRECISION",
-            "technical_score": "DOUBLE PRECISION",
-            "fundamental_score": "DOUBLE PRECISION",
-            "regime_fit_score": "DOUBLE PRECISION",
-            "event_score": "DOUBLE PRECISION",
-            "setup_score": "DOUBLE PRECISION",
-            "avg_traded_value_20d": "DOUBLE PRECISION",
-            "rs_vs_benchmark": "DOUBLE PRECISION",
-            "rs_vs_sector": "DOUBLE PRECISION",
-            "intraday_close_vs_vwap_pct": "DOUBLE PRECISION",
-            "intraday_pct_bars_above_vwap": "DOUBLE PRECISION",
-            "intraday_close_location_pct": "DOUBLE PRECISION",
-            "intraday_opening_range_breakout_up": "BOOLEAN",
-            "intraday_prev_day_breakout_up": "BOOLEAN",
-            "intraday_failed_prev_day_breakout": "BOOLEAN",
-            "intraday_volume_vs_20d": "DOUBLE PRECISION",
-            "intraday_breakout_score": "DOUBLE PRECISION",
-            "intraday_pattern_label": "TEXT",
-            "intraday_interval_minutes": "INTEGER",
-            "total_revenue_qoq_growth_vs_sector": "DOUBLE PRECISION",
-            "profit_after_tax_qoq_growth_vs_sector": "DOUBLE PRECISION",
-            "debt_to_equity_vs_sector": "DOUBLE PRECISION",
-            "entry_style": "TEXT",
-            "attractive_price_low": "DOUBLE PRECISION",
-            "attractive_price_high": "DOUBLE PRECISION",
-            "invalidation_price": "DOUBLE PRECISION",
-            "entry_note": "TEXT",
-            "near_miss_flag": "BOOLEAN",
-            "watch_enabled": "BOOLEAN",
-            "watch_reasons": "TEXT",
-            "rule_pass": "BOOLEAN",
-            "load_ts": "TIMESTAMPTZ",
-        }
-        for column, sql_type in candidate_columns.items():
-            cur.execute(f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {REJECTIONS_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                symbol TEXT,
-                reason_code TEXT NOT NULL,
-                screener_date TIMESTAMPTZ,
-                setup_name TEXT,
-                company_master_id TEXT,
-                base_regime TEXT,
-                news_overlay TEXT,
-                severity TEXT,
-                is_near_miss BOOLEAN,
-                delta_to_pass DOUBLE PRECISION,
-                reason_detail TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, setup_id, symbol, reason_code)
-            )
-            """
-        )
-        rejection_columns = {
-            "screener_date": "TIMESTAMPTZ",
-            "setup_name": "TEXT",
-            "company_master_id": "TEXT",
-            "base_regime": "TEXT",
-            "news_overlay": "TEXT",
-            "severity": "TEXT",
-            "is_near_miss": "BOOLEAN",
-            "delta_to_pass": "DOUBLE PRECISION",
-            "reason_detail": "TEXT",
-            "load_ts": "TIMESTAMPTZ",
-        }
-        for column, sql_type in rejection_columns.items():
-            cur.execute(f"ALTER TABLE {REJECTIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    apply_schema_migration(
+        migration_id=RULE_ENGINE_SCHEMA_MIGRATION_ID,
+        statements=RULE_ENGINE_SCHEMA_STATEMENTS,
+        owner="advisory.rule_engine",
+        description="Create advisory rule candidate and rejection output tables.",
+        metadata={"tables": [CANDIDATES_TABLE, REJECTIONS_TABLE], "workflow": "rule_engine_outputs"},
+    )
 
 
 DEFAULT_FRESHNESS_POLICY = {
@@ -241,7 +280,16 @@ DEFAULT_MAX_INTRADAY_PREFETCH_AGE_DAYS = 14
 def get_effective_dates(asof_date: pd.Timestamp | None = None) -> dict[str, pd.Timestamp | None]:
     screener_cutoff = asof_date
     if screener_cutoff is None:
-        screener_df = sql_to_df("SELECT MAX(date) AS screener_date FROM advisory_screener_constituents")
+        try:
+            screener_df = sql_to_df("SELECT MAX(date) AS screener_date FROM advisory_screener_constituents")
+        except Exception as exc:
+            _record_rule_engine_fallback(
+                fallback_type="rule_engine_screener_date_lookup_failed",
+                source="advisory_screener_constituents",
+                reason="Rule engine could not resolve the latest screener date.",
+                error=exc,
+            )
+            raise
         if screener_df.empty or pd.isna(pd.to_datetime(screener_df.iloc[0]["screener_date"], utc=True, errors="coerce")):
             return {
                 "requested_asof_date": None,
@@ -253,16 +301,26 @@ def get_effective_dates(asof_date: pd.Timestamp | None = None) -> dict[str, pd.T
             }
         screener_cutoff = pd.to_datetime(screener_df.iloc[0]["screener_date"], utc=True, errors="coerce").normalize()
 
-    df = sql_to_df(
-        """
-        SELECT
-            (SELECT MAX(date) FROM advisory_screener_constituents WHERE date <= %(asof_date)s) AS screener_date,
-            (SELECT MAX(asof_date) FROM advisory_market_regime WHERE asof_date <= %(asof_date)s) AS regime_date,
-            (SELECT MAX(asof_date) FROM advisory_technical_daily WHERE asof_date <= %(asof_date)s) AS technical_date,
-            (SELECT MAX(asof_date) FROM advisory_fundamentals_daily WHERE asof_date <= %(asof_date)s) AS fundamentals_date
-        """,
-        params={"asof_date": screener_cutoff},
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT
+                (SELECT MAX(date) FROM advisory_screener_constituents WHERE date <= %(asof_date)s) AS screener_date,
+                (SELECT MAX(asof_date) FROM advisory_market_regime WHERE asof_date <= %(asof_date)s) AS regime_date,
+                (SELECT MAX(asof_date) FROM advisory_technical_daily WHERE asof_date <= %(asof_date)s) AS technical_date,
+                (SELECT MAX(asof_date) FROM advisory_fundamentals_daily WHERE asof_date <= %(asof_date)s) AS fundamentals_date
+            """,
+            params={"asof_date": screener_cutoff},
+        )
+    except Exception as exc:
+        _record_rule_engine_fallback(
+            fallback_type="rule_engine_effective_dates_lookup_failed",
+            source="advisory_screener_constituents,advisory_market_regime,advisory_technical_daily,advisory_fundamentals_daily",
+            reason="Rule engine could not resolve effective source dates.",
+            error=exc,
+            metadata={"asof_date": str(screener_cutoff)},
+        )
+        raise
     if df.empty:
         return {
             "requested_asof_date": screener_cutoff.normalize(),
@@ -279,10 +337,20 @@ def get_effective_dates(asof_date: pd.Timestamp | None = None) -> dict[str, pd.T
     fundamentals_date = pd.to_datetime(row.get("fundamentals_date"), utc=True, errors="coerce")
     intraday_date = None
     if table_exists(INTRADAY_FEATURES_TABLE):
-        intraday_df = sql_to_df(
-            f"SELECT MAX(asof_date) AS intraday_date FROM {INTRADAY_FEATURES_TABLE} WHERE asof_date <= %s",
-            params=(screener_cutoff,),
-        )
+        try:
+            intraday_df = sql_to_df(
+                f"SELECT MAX(asof_date) AS intraday_date FROM {INTRADAY_FEATURES_TABLE} WHERE asof_date <= %s",
+                params=(screener_cutoff,),
+            )
+        except Exception as exc:
+            _record_rule_engine_fallback(
+                fallback_type="rule_engine_intraday_date_lookup_failed",
+                source=INTRADAY_FEATURES_TABLE,
+                reason="Rule engine could not resolve latest intraday feature date.",
+                error=exc,
+                metadata={"asof_date": str(screener_cutoff)},
+            )
+            raise
         if not intraday_df.empty:
             intraday_date = pd.to_datetime(intraday_df.iloc[0].get("intraday_date"), utc=True, errors="coerce")
     return {
@@ -296,47 +364,53 @@ def get_effective_dates(asof_date: pd.Timestamp | None = None) -> dict[str, pd.T
 
 
 def load_regime(asof_date: pd.Timestamp) -> dict[str, Any] | None:
-    df = sql_to_df(
-        """
-        SELECT *
-        FROM advisory_market_regime
-        WHERE asof_date <= %s
-        ORDER BY asof_date DESC
-        LIMIT 1
-        """,
-        params=(asof_date,),
-    )
-    if df.empty:
-        return None
-    return df.iloc[0].to_dict()
-
-
-def table_exists(table_name: str) -> bool:
-    df = sql_to_df(
-        """
-        SELECT 1 AS exists_flag
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        LIMIT 1
-        """,
-        params=(table_name,),
-    )
-    return not df.empty
-
-
-def load_overlay(asof_date: pd.Timestamp, regime_name: str | None = None) -> dict[str, Any]:
-    if table_exists(OVERLAY_TABLE):
+    try:
         df = sql_to_df(
-            f"""
+            """
             SELECT *
-            FROM {OVERLAY_TABLE}
+            FROM advisory_market_regime
             WHERE asof_date <= %s
             ORDER BY asof_date DESC
             LIMIT 1
             """,
             params=(asof_date,),
         )
+    except Exception as exc:
+        _record_rule_engine_fallback(
+            fallback_type="rule_engine_regime_load_failed",
+            source="advisory_market_regime",
+            reason="Rule engine could not load market-regime context.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        raise
+    if df.empty:
+        return None
+    return df.iloc[0].to_dict()
+
+
+def load_overlay(asof_date: pd.Timestamp, regime_name: str | None = None) -> dict[str, Any]:
+    if table_exists(OVERLAY_TABLE):
+        try:
+            df = sql_to_df(
+                f"""
+                SELECT *
+                FROM {OVERLAY_TABLE}
+                WHERE asof_date <= %s
+                ORDER BY asof_date DESC
+                LIMIT 1
+                """,
+                params=(asof_date,),
+            )
+        except Exception as exc:
+            _record_rule_engine_fallback(
+                fallback_type="rule_engine_overlay_load_failed",
+                source=OVERLAY_TABLE,
+                reason="Rule engine could not load market-overlay context.",
+                error=exc,
+                metadata={"asof_date": str(asof_date)},
+            )
+            raise
         if not df.empty:
             row = df.iloc[0].to_dict()
             row["overlay_name"] = str(row.get("overlay_name") or "NONE").upper()
@@ -383,26 +457,40 @@ def load_screener_universe(asof_date: pd.Timestamp, screener_slugs: list[str] | 
     if normalized_slugs:
         clauses.append("screener_slug = ANY(%s)")
         params.append(normalized_slugs)
-    df = sql_to_df(
-        f"""
-        SELECT
-            date AS screener_date,
-            screener_slug,
-            screener_name,
-            ticker AS symbol,
-            exchange,
-            company_master_id,
-            rank,
-            last_price,
-            volume,
-            market_cap,
-            pe_ratio
-        FROM advisory_screener_constituents
-        WHERE {' AND '.join(clauses)}
-        ORDER BY rank, symbol
-        """,
-        params=tuple(params),
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                date AS screener_date,
+                screener_slug,
+                screener_name,
+                ticker AS symbol,
+                exchange,
+                company_master_id,
+                rank,
+                last_price,
+                volume,
+                market_cap,
+                pe_ratio
+            FROM advisory_screener_constituents
+            WHERE {' AND '.join(clauses)}
+            ORDER BY rank, symbol
+            """,
+            params=tuple(params),
+        )
+    except Exception as exc:
+        _record_rule_engine_fallback(
+            fallback_type="rule_engine_screener_universe_load_failed",
+            source="advisory_screener_constituents",
+            reason="Rule engine could not load screener universe rows.",
+            error=exc,
+            metadata={
+                "asof_date": str(asof_date),
+                "screener_slugs": normalized_slugs,
+                "screener_mode": screener_mode,
+            },
+        )
+        raise
     if df.empty:
         return df
     df["screener_date"] = normalize_timestamp(df["screener_date"])
@@ -427,52 +515,62 @@ def load_screener_universe(asof_date: pd.Timestamp, screener_slugs: list[str] | 
 
 
 def load_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
-    df = sql_to_df(
-        """
-        SELECT DISTINCT ON (symbol)
-            asof_date AS technical_snapshot_date,
-            company_master_id,
-            symbol,
-            series,
-            security_id,
-            isin,
-            benchmark_name,
-            sector_code,
-            sector_name,
-            adj_close,
-            adj_high,
-            adj_low,
-            volume,
-            total_value,
-            dma_20,
-            dma_50,
-            dma_200,
-            atr_20,
-            atr_compression_pct,
-            bb_width,
-            dist_20d_high,
-            dist_50d_high,
-            dist_52w_high,
-            avg_traded_value_20d,
-            avg_traded_value_60d,
-            rs_vs_benchmark,
-            sector_peer_ret_20d,
-            sector_peer_count,
-            rs_vs_sector,
-            breakout_extension_pct,
-            pass_above_dma_20,
-            pass_above_dma_50,
-            pass_above_dma_200,
-            pass_liquidity_20d,
-            pass_near_52w_high,
-            pass_breakout_extension,
-            load_ts
-        FROM advisory_technical_daily
-        WHERE asof_date <= %s
-        ORDER BY symbol, asof_date DESC
-        """,
-        params=(asof_date,),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT DISTINCT ON (symbol)
+                asof_date AS technical_snapshot_date,
+                company_master_id,
+                symbol,
+                series,
+                security_id,
+                isin,
+                benchmark_name,
+                sector_code,
+                sector_name,
+                adj_close,
+                adj_high,
+                adj_low,
+                volume,
+                total_value,
+                dma_20,
+                dma_50,
+                dma_200,
+                atr_20,
+                atr_compression_pct,
+                bb_width,
+                dist_20d_high,
+                dist_50d_high,
+                dist_52w_high,
+                avg_traded_value_20d,
+                avg_traded_value_60d,
+                rs_vs_benchmark,
+                sector_peer_ret_20d,
+                sector_peer_count,
+                rs_vs_sector,
+                breakout_extension_pct,
+                pass_above_dma_20,
+                pass_above_dma_50,
+                pass_above_dma_200,
+                pass_liquidity_20d,
+                pass_near_52w_high,
+                pass_breakout_extension,
+                load_ts
+            FROM advisory_technical_daily
+            WHERE asof_date <= %s
+            ORDER BY symbol, asof_date DESC
+            """,
+            params=(asof_date,),
+        )
+    except Exception as exc:
+        _record_rule_engine_fallback(
+            fallback_type="rule_engine_technical_load_failed",
+            source="advisory_technical_daily",
+            reason="Rule engine could not load latest technical feature rows.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        raise
     if df.empty:
         return df
     df["technical_snapshot_date"] = normalize_timestamp(df["technical_snapshot_date"])
@@ -483,48 +581,58 @@ def load_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
 def load_intraday(asof_date: pd.Timestamp) -> pd.DataFrame:
     if not table_exists(INTRADAY_FEATURES_TABLE):
         return pd.DataFrame()
-    df = sql_to_df(
-        f"""
-        SELECT DISTINCT ON (symbol)
-            asof_date AS intraday_snapshot_date,
-            symbol,
-            company_master_id,
-            interval_minutes,
-            bar_count,
-            session_open,
-            session_high,
-            session_low,
-            session_close,
-            session_volume,
-            intraday_vwap,
-            intraday_range_pct,
-            intraday_open_to_close_pct,
-            intraday_close_vs_vwap_pct,
-            intraday_pct_bars_above_vwap,
-            intraday_close_location_pct,
-            intraday_opening_range_high,
-            intraday_opening_range_low,
-            intraday_opening_range_breakout_up,
-            intraday_opening_range_breakout_down,
-            intraday_prev_day_high,
-            intraday_prev_day_low,
-            intraday_prev_day_breakout_up,
-            intraday_failed_prev_day_breakout,
-            intraday_first_30m_return_pct,
-            intraday_last_60m_return_pct,
-            intraday_volume_vs_20d,
-            intraday_breakout_score,
-            intraday_pattern_label,
-            model_name,
-            model_score,
-            load_ts
-        FROM {INTRADAY_FEATURES_TABLE}
-        WHERE asof_date <= %s
-          AND interval_minutes = 1
-        ORDER BY symbol, asof_date DESC
-        """,
-        params=(asof_date,),
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT DISTINCT ON (symbol)
+                asof_date AS intraday_snapshot_date,
+                symbol,
+                company_master_id,
+                interval_minutes,
+                bar_count,
+                session_open,
+                session_high,
+                session_low,
+                session_close,
+                session_volume,
+                intraday_vwap,
+                intraday_range_pct,
+                intraday_open_to_close_pct,
+                intraday_close_vs_vwap_pct,
+                intraday_pct_bars_above_vwap,
+                intraday_close_location_pct,
+                intraday_opening_range_high,
+                intraday_opening_range_low,
+                intraday_opening_range_breakout_up,
+                intraday_opening_range_breakout_down,
+                intraday_prev_day_high,
+                intraday_prev_day_low,
+                intraday_prev_day_breakout_up,
+                intraday_failed_prev_day_breakout,
+                intraday_first_30m_return_pct,
+                intraday_last_60m_return_pct,
+                intraday_volume_vs_20d,
+                intraday_breakout_score,
+                intraday_pattern_label,
+                model_name,
+                model_score,
+                load_ts
+            FROM {INTRADAY_FEATURES_TABLE}
+            WHERE asof_date <= %s
+              AND interval_minutes = 1
+            ORDER BY symbol, asof_date DESC
+            """,
+            params=(asof_date,),
+        )
+    except Exception as exc:
+        _record_rule_engine_fallback(
+            fallback_type="rule_engine_intraday_load_failed",
+            source=INTRADAY_FEATURES_TABLE,
+            reason="Rule engine could not load latest intraday feature rows.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        raise
     if df.empty:
         return df
     df["intraday_snapshot_date"] = normalize_timestamp(df["intraday_snapshot_date"])
@@ -533,17 +641,27 @@ def load_intraday(asof_date: pd.Timestamp) -> pd.DataFrame:
 
 
 def load_fundamentals(asof_date: pd.Timestamp) -> pd.DataFrame:
-    df = sql_to_df(
-        """
-        SELECT DISTINCT ON (symbol)
-            asof_date AS fundamentals_snapshot_date,
-            *
-        FROM advisory_fundamentals_daily
-        WHERE asof_date <= %s
-        ORDER BY symbol, asof_date DESC
-        """,
-        params=(asof_date,),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT DISTINCT ON (symbol)
+                asof_date AS fundamentals_snapshot_date,
+                *
+            FROM advisory_fundamentals_daily
+            WHERE asof_date <= %s
+            ORDER BY symbol, asof_date DESC
+            """,
+            params=(asof_date,),
+        )
+    except Exception as exc:
+        _record_rule_engine_fallback(
+            fallback_type="rule_engine_fundamentals_load_failed",
+            source="advisory_fundamentals_daily",
+            reason="Rule engine could not load latest fundamental snapshot rows.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        raise
     if df.empty:
         return df
     df["fundamentals_snapshot_date"] = normalize_timestamp(df["fundamentals_snapshot_date"])
@@ -1561,9 +1679,15 @@ def run_rule_engine(
 def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, asof_date: pd.Timestamp | None, rebuild: bool = False) -> None:
     ensure_rule_output_tables()
     if rebuild and asof_date is not None:
-        with db_session() as (_, cur):
-            cur.execute(f"DELETE FROM {CANDIDATES_TABLE} WHERE asof_date = %s", (asof_date,))
-            cur.execute(f"DELETE FROM {REJECTIONS_TABLE} WHERE asof_date = %s", (asof_date,))
+        def _delete_existing_rule_outputs() -> None:
+            with db_session() as (_, cur):
+                cur.execute(f"DELETE FROM {CANDIDATES_TABLE} WHERE asof_date = %s", (asof_date,))
+                cur.execute(f"DELETE FROM {REJECTIONS_TABLE} WHERE asof_date = %s", (asof_date,))
+
+        execute_db_operation(
+            _delete_existing_rule_outputs,
+            operation_name="rule_engine:delete_rebuild_outputs",
+        )
     if not candidates.empty:
         candidates = candidates.copy()
         for column in ["asof_date", "screener_date", "load_ts"]:

@@ -9,6 +9,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SETUP_CONFIG = REPO_ROOT / "config" / "advisory_setups.yaml"
+TS_FORECAST_RULE_STATUSES = {"disabled_review_candidate", "active_review", "trusted_overlay", "rejected", "archived"}
 
 
 @lru_cache(maxsize=1)
@@ -76,3 +77,127 @@ def load_setup_registry(config_path: str | None = None) -> list[dict[str, Any]]:
             }
         )
     return normalized
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_ts_forecast_review_rules(config_path: str | None = None) -> dict[str, Any]:
+    path = Path(config_path) if config_path else DEFAULT_SETUP_CONFIG
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    raw_rules = payload.get("ts_forecast_review_rules") or []
+    if not isinstance(raw_rules, list):
+        raw_rules = []
+        source_issue = {
+            "code": "invalid_rules_block",
+            "severity": "error",
+            "message": "ts_forecast_review_rules must be a list.",
+        }
+    else:
+        source_issue = None
+
+    rules: list[dict[str, Any]] = []
+    issues: list[dict[str, Any]] = []
+    if source_issue:
+        issues.append(source_issue)
+
+    for idx, raw in enumerate(raw_rules):
+        if not isinstance(raw, dict):
+            issues.append(
+                {
+                    "code": "invalid_rule_type",
+                    "severity": "error",
+                    "index": idx,
+                    "message": "TS forecast review rule must be a mapping.",
+                }
+            )
+            continue
+        model_name = str(raw.get("model_name") or raw.get("ts_forecast_model_name") or "").strip().lower()
+        horizon_days = _coerce_int(raw.get("horizon_days") or raw.get("ts_forecast_horizon_days"))
+        status = str(raw.get("status") or "disabled_review_candidate").strip().lower()
+        authority = str(raw.get("authority") or "review_input_only").strip().lower()
+        broker_execution_allowed = bool(raw.get("broker_execution_allowed", False))
+        rule_issues: list[dict[str, Any]] = []
+        if not model_name:
+            rule_issues.append({"code": "missing_model_name", "severity": "error", "message": "model_name is required."})
+        if horizon_days is None or horizon_days <= 0:
+            rule_issues.append({"code": "invalid_horizon_days", "severity": "error", "message": "horizon_days must be a positive integer."})
+        if status not in TS_FORECAST_RULE_STATUSES:
+            rule_issues.append({"code": "invalid_status", "severity": "error", "message": f"Unsupported status: {status}."})
+        if authority != "review_input_only":
+            rule_issues.append(
+                {
+                    "code": "unsafe_authority",
+                    "severity": "error",
+                    "message": "TS forecast review rules must use authority=review_input_only.",
+                }
+            )
+        if broker_execution_allowed:
+            rule_issues.append(
+                {
+                    "code": "unsafe_broker_execution",
+                    "severity": "error",
+                    "message": "TS forecast review rules cannot enable broker execution.",
+                }
+            )
+        normalized = {
+            "rule_id": f"{model_name or 'unknown'}:{horizon_days or 'unknown'}:{idx}",
+            "index": idx,
+            "model_name": model_name,
+            "horizon_days": horizon_days,
+            "status": status,
+            "authority": "review_input_only",
+            "broker_execution_allowed": False,
+            "policy_auto_promotion_allowed": False,
+            "minimum_evaluated_trades": _coerce_int(raw.get("minimum_evaluated_trades")),
+            "minimum_win_rate": _coerce_float(raw.get("minimum_win_rate")),
+            "minimum_avg_cost_adjusted_return": _coerce_float(raw.get("minimum_avg_cost_adjusted_return")),
+            "minimum_lift_vs_momentum": _coerce_float(raw.get("minimum_lift_vs_momentum")),
+            "maximum_exit_conflict_rate": _coerce_float(raw.get("maximum_exit_conflict_rate")),
+            "raw_status": raw.get("status"),
+            "issues": rule_issues,
+            "valid": not any(issue.get("severity") == "error" for issue in rule_issues),
+            "readable_as_review_input": status in {"active_review", "trusted_overlay"} and not rule_issues,
+            "usable_for_live_policy": False,
+        }
+        rules.append(normalized)
+        for issue in rule_issues:
+            issues.append({"index": idx, "rule_id": normalized["rule_id"], **issue})
+
+    return {
+        "status": "ok" if not any(issue.get("severity") == "error" for issue in issues) else "issues_found",
+        "config_path": str(path),
+        "rules": rules,
+        "issues": issues,
+        "summary": {
+            "row_count": len(rules),
+            "valid_count": sum(1 for rule in rules if rule.get("valid")),
+            "active_review_count": sum(1 for rule in rules if rule.get("status") == "active_review"),
+            "trusted_overlay_count": sum(1 for rule in rules if rule.get("status") == "trusted_overlay"),
+            "disabled_count": sum(1 for rule in rules if rule.get("status") == "disabled_review_candidate"),
+            "issue_count": len(issues),
+            "broker_execution_allowed": False,
+            "policy_auto_promotion_allowed": False,
+        },
+        "operator_boundary": {
+            "read_only": True,
+            "broker_execution_enabled": False,
+            "policy_auto_promotion_allowed": False,
+            "note": "TS forecast review rules are config-visible review inputs only; no live action/risk/model layer consumes them automatically.",
+        },
+    }

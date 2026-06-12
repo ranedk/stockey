@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
@@ -14,6 +15,26 @@ from utils.sync import parse_datetime_arg
 BHAVCOPY_EVIDENCE_TABLE = "advisory_bhavcopy_evidence_daily"
 ANNOUNCEMENT_EVIDENCE_TABLE = "advisory_announcement_evidence"
 DEFAULT_LOOKBACK_DAYS = 365
+STOCKEY_RUN_STATE: dict[str, Any] = {}
+
+
+def _record_event_evidence_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.event_evidence_store",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def _sql_num(expression: str) -> str:
@@ -26,8 +47,14 @@ def _json_ready(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_event_evidence_fallback(
+            fallback_type="event_evidence_json_ready_missing_check_failed",
+            source="event_evidence_payload",
+            reason="Compact event evidence could not evaluate a value for missingness while preparing JSON output and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
 
 
@@ -52,7 +79,14 @@ def table_exists(table_name: str) -> bool:
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_evidence_fallback(
+            fallback_type="event_evidence_table_lookup_failed",
+            source=table_name,
+            reason="Compact event evidence could not check whether a source or target table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return False
     return not df.empty
 
@@ -70,7 +104,14 @@ def table_columns(table_name: str) -> set[str]:
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_evidence_fallback(
+            fallback_type="event_evidence_schema_lookup_failed",
+            source=table_name,
+            reason="Compact event evidence could not inspect source or target table columns.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return set()
     return set(df["column_name"].astype(str).tolist()) if not df.empty else set()
 
@@ -84,7 +125,14 @@ def _max_date(table_name: str, column: str) -> pd.Timestamp | None:
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_evidence_fallback(
+            fallback_type="event_evidence_max_date_lookup_failed",
+            source=table_name,
+            reason="Compact event evidence could not read the existing target max date; full lookback fallback may be used.",
+            error=exc,
+            metadata={"table_name": table_name, "date_column": column},
+        )
         return None
     if df.empty:
         return None
@@ -317,13 +365,23 @@ def build_bhavcopy_evidence(
         WHERE r.asof_date BETWEEN %(start_date)s AND %(end_date)s
         ORDER BY r.asof_date, r.symbol
     """
-    df = sql_to_df(
-        query,
-        params={"warmup_start": warmup_start.date(), "start_date": start_date.date(), "end_date": end_date.date()},
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    try:
+        df = sql_to_df(
+            query,
+            params={"warmup_start": warmup_start.date(), "start_date": start_date.date(), "end_date": end_date.date()},
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        _record_event_evidence_fallback(
+            fallback_type="event_evidence_bhavcopy_source_load_failed",
+            source="nseindia_ohlcv,nseindia_cmvolt,nseindia_var1,nseindia_block_deals,nseindia_bulk_deals,nseindia_short_selling,nseindia_circuit_hit",
+            reason="Compact bhavcopy evidence source query failed; evidence store refresh cannot safely continue for bhavcopy.",
+            error=exc,
+            metadata={"start_date": start_date.date().isoformat(), "end_date": end_date.date().isoformat(), "warmup_start": warmup_start.date().isoformat()},
+        )
+        raise
     if df.empty:
         return df
     numeric_cols = [col for col in df.columns if col not in {"asof_date", "symbol", "company_master_id", "circuit_hit_types"}]
@@ -458,13 +516,23 @@ def build_announcement_evidence(
         WHERE d.published_on BETWEEN %(start_date)s AND (%(end_date)s::date + interval '1 day')
         ORDER BY d.published_on, d.ticker, d.unique_id
     """
-    df = sql_to_df(
-        query,
-        params={"start_date": start_date.date(), "end_date": end_date.date()},
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=20000,
-    )
+    try:
+        df = sql_to_df(
+            query,
+            params={"start_date": start_date.date(), "end_date": end_date.date()},
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=20000,
+        )
+    except Exception as exc:
+        _record_event_evidence_fallback(
+            fallback_type="event_evidence_announcement_source_load_failed",
+            source="announcement_pipeline_documents,advisory_event_evaluations",
+            reason="Compact announcement evidence source query failed; evidence store refresh cannot safely continue for announcements.",
+            error=exc,
+            metadata={"start_date": start_date.date().isoformat(), "end_date": end_date.date().isoformat(), "has_evaluations": bool(has_evaluations)},
+        )
+        raise
     if df.empty:
         return df
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
@@ -557,6 +625,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    global STOCKEY_RUN_STATE
     args = parse_args()
     payload = build_event_evidence_store(
         from_date=args.from_date,
@@ -567,9 +636,24 @@ def main() -> int:
         include_announcements=not bool(args.skip_announcements),
         dry_run=bool(args.dry_run),
     )
+    bhavcopy = payload.get("bhavcopy") if isinstance(payload.get("bhavcopy"), dict) else {}
+    announcements = payload.get("announcements") if isinstance(payload.get("announcements"), dict) else {}
+    STOCKEY_RUN_STATE = {
+        "from_date": min([value for value in [bhavcopy.get("date_min"), announcements.get("date_min")] if value], default=None),
+        "to_date": max([value for value in [bhavcopy.get("date_max"), announcements.get("date_max")] if value], default=None),
+        "rows": int(bhavcopy.get("rows") or 0) + int(announcements.get("rows") or 0),
+        "rows_written": 0 if payload.get("dry_run") else int(bhavcopy.get("rows") or 0) + int(announcements.get("rows") or 0),
+        "rows_read": int(bhavcopy.get("rows") or 0) + int(announcements.get("rows") or 0),
+        "fallback_used": False,
+        "bhavcopy_rows": int(bhavcopy.get("rows") or 0),
+        "announcement_rows": int(announcements.get("rows") or 0),
+        "dry_run": bool(payload.get("dry_run")),
+    }
     print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _exit_code = main()
+    if _exit_code:
+        raise SystemExit(_exit_code)

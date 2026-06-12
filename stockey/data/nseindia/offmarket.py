@@ -1,3 +1,4 @@
+import json
 import random
 import os
 from datetime import datetime, timedelta
@@ -5,6 +6,7 @@ from datetime import datetime, timedelta
 import redis
 from environs import Env
 from playwright.sync_api import sync_playwright
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils import store
 from utils.date import daterange
 from utils.sync import get_redis_client
@@ -17,6 +19,8 @@ REDIS_PORT = env.int("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")  # Chromium or webkit won't work with NSE website
 MAX_DOWNLOAD_ATTEMPTS = 2
 NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS = max(env.int("NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS", 365), 1)
+SYNC_SOURCE_NAME = "data.nseindia.offmarket"
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def extract_downloaded_dates_from_key(key: str, dtype: str) -> set[str]:
@@ -30,7 +34,16 @@ def extract_downloaded_dates_from_key(key: str, dtype: str) -> set[str]:
         from_date_str, to_date_str = body.split("_", 1)
         start_date = datetime.strptime(from_date_str, "%d-%m-%Y")
         end_date = datetime.strptime(to_date_str, "%d-%m-%Y")
-    except ValueError:
+    except ValueError as exc:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=str(key),
+            fallback_type="nse_offmarket_download_key_date_parse_failed",
+            severity="warn",
+            reason="Stored NSE off-market/deals file key matched the expected prefix but did not contain a parseable date range, so it will not be treated as downloaded.",
+            error=exc,
+            metadata={"key": str(key), "dtype": str(dtype), "filename": filename},
+        )
         return set()
     return {dt.strftime("%Y-%m-%d") for dt in daterange(start_date, end_date)}
 
@@ -106,6 +119,21 @@ def download_data(
 
     except Exception as err:
         print(f"❌ Failed: {from_date_str} - {to_date_str} - {err}")
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=f"nsedeals:{dtype}:{from_date.strftime('%Y-%m-%d')}:{to_date.strftime('%Y-%m-%d')}",
+            fallback_type="nse_offmarket_download_failed",
+            severity="warn",
+            reason="NSE off-market/deals download failed for this date block; block/bulk/short-selling evidence may be incomplete until catch-up succeeds.",
+            error=err,
+            metadata={
+                "dtype": dtype,
+                "from_date": from_date.strftime("%Y-%m-%d"),
+                "to_date": to_date.strftime("%Y-%m-%d"),
+                "from_date_display": from_date_str,
+                "to_date_display": to_date_str,
+            },
+        )
         return False
 
     finally:
@@ -157,11 +185,34 @@ def get_next_download_block(rop, dtype, g_start, g_end, skipped_dates=None):
     return start, end  # inclusive
 
 
-def main() -> None:
+def main() -> int:
+    global STOCKEY_RUN_STATE
+    rop = None
+    state: dict[str, object] = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": 0,
+        "rows_read": 0,
+        "rows_written": 0,
+        "dtype_count": 3,
+        "blocks_attempted": 0,
+        "download_attempts": 0,
+        "attempt_count": 0,
+        "failed_attempt_count": 0,
+        "retry_count": 0,
+        "fallback_count": 0,
+        "skipped_blocks": 0,
+        "downloaded_blocks": 0,
+        "dates_downloaded": 0,
+        "dates_skipped": 0,
+        "fallback_used": False,
+        "state_advanced": False,
+    }
     try:
         rop = get_redis_client(REDIS_HOST, REDIS_PORT)
         global_start = datetime.today() - timedelta(days=NSE_OFFMARKET_DOWNLOAD_LOOKBACK_DAYS)
         global_end = latest_completed_day()
+        state["from_date"] = global_start.strftime("%Y-%m-%d")
+        state["to_date"] = global_end.strftime("%Y-%m-%d")
 
         print(f"Downloading NSE offmarket data through {global_end.strftime('%d-%m-%Y')}")
 
@@ -175,26 +226,46 @@ def main() -> None:
                     if not block:
                         print(f"All data downloaded for {dtype} ✅")
                         break
+                    block_dates = [dt.strftime("%Y-%m-%d") for dt in daterange(block[0], block[1])]
+                    state["blocks_attempted"] = int(state["blocks_attempted"]) + 1
                     print(f"Download {dtype} {block[0].strftime('%d-%m-%Y')} and {block[1].strftime('%d-%m-%Y')}")
                     success = False
                     for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+                        state["download_attempts"] = int(state["download_attempts"]) + 1
+                        state["attempt_count"] = int(state["attempt_count"]) + 1
+                        if attempt > 1:
+                            state["retry_count"] = int(state["retry_count"]) + 1
                         print(
                             f"Attempt {attempt}/{MAX_DOWNLOAD_ATTEMPTS} for {dtype} "
                             f"{block[0].strftime('%d-%m-%Y')} -> {block[1].strftime('%d-%m-%Y')}"
                         )
                         success = download_data(p, dtype, block[0], block[1], rop)
                         if success:
+                            state["downloaded_blocks"] = int(state["downloaded_blocks"]) + 1
+                            state["dates_downloaded"] = int(state["dates_downloaded"]) + len(block_dates)
                             break
+                        state["failed_attempt_count"] = int(state["failed_attempt_count"]) + 1
                     if not success:
-                        skipped = [dt.strftime("%Y-%m-%d") for dt in daterange(block[0], block[1])]
+                        skipped = block_dates
                         skipped_dates.update(skipped)
+                        state["skipped_blocks"] = int(state["skipped_blocks"]) + 1
+                        state["dates_skipped"] = int(state["dates_skipped"]) + len(skipped)
                         print(
                             f"⏭️ Skipping {dtype} {block[0].strftime('%d-%m-%Y')} -> "
                             f"{block[1].strftime('%d-%m-%Y')} after {MAX_DOWNLOAD_ATTEMPTS} failed attempts"
                         )
     finally:
-        rop.close()
+        if rop is not None:
+            rop.close()
+    state["rows"] = int(state["dates_downloaded"])
+    state["rows_read"] = int(state["blocks_attempted"])
+    state["rows_written"] = int(state["dates_downloaded"])
+    state["source_unavailable_count"] = int(state["skipped_blocks"])
+    state["state_advanced"] = int(state["downloaded_blocks"]) > 0
+    STOCKEY_RUN_STATE = state
+    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

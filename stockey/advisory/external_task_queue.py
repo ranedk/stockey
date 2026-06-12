@@ -11,11 +11,38 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.sync import parse_datetime_arg
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 TABLE_NAME = "advisory_external_task_queue"
+EXTERNAL_TASK_QUEUE_SCHEMA_MIGRATION_ID = "20260611_advisory_external_task_queue_base"
+EXTERNAL_TASK_QUEUE_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        task_id TEXT PRIMARY KEY,
+        queue_name TEXT NOT NULL,
+        task_type TEXT NOT NULL,
+        task_args_json TEXT,
+        priority BIGINT,
+        status TEXT NOT NULL,
+        attempt_count BIGINT,
+        max_attempts BIGINT,
+        next_attempt_at TIMESTAMPTZ,
+        claimed_at TIMESTAMPTZ,
+        claimed_by TEXT,
+        completed_at TIMESTAMPTZ,
+        last_error TEXT,
+        result_json TEXT,
+        created_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ
+    )
+    """,
+    f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_claim ON {TABLE_NAME} (queue_name, status, next_attempt_at, priority DESC, created_at)",
+]
 SINGLE_CLIENT_QUEUES = {"nse", "dhan", "screener"}
 ALLOWED_NSE_MODULES = {
     "data.nseindia.holidays",
@@ -32,36 +59,37 @@ ALLOWED_NSE_MODULES = {
 }
 
 
+def _record_queue_fallback(
+    fallback_type: str,
+    *,
+    source: str,
+    reason: str,
+    error: Exception,
+    severity: str = "warn",
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.external_task_queue",
+        fallback_type=fallback_type,
+        source=source,
+        severity=severity,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def ensure_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                task_id TEXT PRIMARY KEY,
-                queue_name TEXT NOT NULL,
-                task_type TEXT NOT NULL,
-                task_args_json TEXT,
-                priority BIGINT,
-                status TEXT NOT NULL,
-                attempt_count BIGINT,
-                max_attempts BIGINT,
-                next_attempt_at TIMESTAMPTZ,
-                claimed_at TIMESTAMPTZ,
-                claimed_by TEXT,
-                completed_at TIMESTAMPTZ,
-                last_error TEXT,
-                result_json TEXT,
-                created_at TIMESTAMPTZ,
-                updated_at TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ
-            )
-            """
-        )
-        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_claim ON {TABLE_NAME} (queue_name, status, next_attempt_at, priority DESC, created_at)")
+    apply_schema_migration(
+        migration_id=EXTERNAL_TASK_QUEUE_SCHEMA_MIGRATION_ID,
+        description="Create serialized external task queue table.",
+        statements=EXTERNAL_TASK_QUEUE_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME]},
+    )
 
 
 def enqueue_task(
@@ -108,70 +136,91 @@ def enqueue_task(
 def claim_task(*, queue_name: str, worker_id: str, lease_seconds: int = 900) -> dict[str, Any] | None:
     ensure_table()
     now = pd.Timestamp.utcnow()
-    with db_session(dict_factory=True) as (_, cur):
-        cur.execute(
-            f"""
-            WITH candidate AS (
-                SELECT task_id
-                FROM {TABLE_NAME}
-                WHERE queue_name = %s
-                  AND status IN ('pending', 'retry')
-                  AND COALESCE(next_attempt_at, '-infinity'::timestamptz) <= %s
-                ORDER BY priority DESC NULLS LAST, created_at ASC
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
+
+    def _claim() -> dict[str, Any] | None:
+        with db_session(dict_factory=True) as (_, cur):
+            cur.execute(
+                f"""
+                WITH candidate AS (
+                    SELECT task_id
+                    FROM {TABLE_NAME}
+                    WHERE queue_name = %s
+                      AND status IN ('pending', 'retry')
+                      AND COALESCE(next_attempt_at, '-infinity'::timestamptz) <= %s
+                    ORDER BY priority DESC NULLS LAST, created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                UPDATE {TABLE_NAME} q
+                   SET status = 'claimed',
+                       claimed_at = %s,
+                       claimed_by = %s,
+                       attempt_count = COALESCE(attempt_count, 0) + 1,
+                       updated_at = %s,
+                       load_ts = %s
+                  FROM candidate
+                 WHERE q.task_id = candidate.task_id
+                 RETURNING q.*
+                """,
+                (str(queue_name).strip().lower(), now, now, worker_id, now, now),
             )
-            UPDATE {TABLE_NAME} q
-               SET status = 'claimed',
-                   claimed_at = %s,
-                   claimed_by = %s,
-                   attempt_count = COALESCE(attempt_count, 0) + 1,
-                   updated_at = %s,
-                   load_ts = %s
-              FROM candidate
-             WHERE q.task_id = candidate.task_id
-             RETURNING q.*
-            """,
-            (str(queue_name).strip().lower(), now, now, worker_id, now, now),
-        )
-        row = cur.fetchone()
-    return dict(row) if row else None
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    return execute_db_operation(
+        _claim,
+        operation_name="external_task_queue:claim_task",
+    )
 
 
 def complete_task(*, task_id: str, result: dict[str, Any] | None = None) -> None:
     ensure_table()
     now = pd.Timestamp.utcnow()
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            UPDATE {TABLE_NAME}
-               SET status = 'completed',
-                   completed_at = %s,
-                   result_json = %s,
-                   updated_at = %s,
-                   load_ts = %s
-             WHERE task_id = %s
-            """,
-            (now, json_dumps(result or {}), now, now, str(task_id)),
-        )
+
+    def _complete() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                UPDATE {TABLE_NAME}
+                   SET status = 'completed',
+                       completed_at = %s,
+                       result_json = %s,
+                       updated_at = %s,
+                       load_ts = %s
+                 WHERE task_id = %s
+                """,
+                (now, json_dumps(result or {}), now, now, str(task_id)),
+            )
+
+    execute_db_operation(
+        _complete,
+        operation_name="external_task_queue:complete_task",
+    )
 
 
 def fail_task(*, task_id: str, error: str, retry_delay_seconds: int = 60) -> None:
     ensure_table()
     now = pd.Timestamp.utcnow()
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            UPDATE {TABLE_NAME}
-               SET status = CASE WHEN COALESCE(attempt_count, 0) >= COALESCE(max_attempts, 3) THEN 'failed' ELSE 'retry' END,
-                   last_error = %s,
-                   next_attempt_at = %s,
-                   updated_at = %s,
-                   load_ts = %s
-             WHERE task_id = %s
-            """,
-            (str(error), now + pd.Timedelta(seconds=max(1, int(retry_delay_seconds))), now, now, str(task_id)),
-        )
+
+    def _fail() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                UPDATE {TABLE_NAME}
+                   SET status = CASE WHEN COALESCE(attempt_count, 0) >= COALESCE(max_attempts, 3) THEN 'failed' ELSE 'retry' END,
+                       last_error = %s,
+                       next_attempt_at = %s,
+                       updated_at = %s,
+                       load_ts = %s
+                 WHERE task_id = %s
+                """,
+                (str(error), now + pd.Timedelta(seconds=max(1, int(retry_delay_seconds))), now, now, str(task_id)),
+            )
+
+    execute_db_operation(
+        _fail,
+        operation_name="external_task_queue:fail_task",
+    )
 
 
 def load_queue_status(*, queue_name: str | None = None, limit: int = 100) -> pd.DataFrame:
@@ -181,16 +230,26 @@ def load_queue_status(*, queue_name: str | None = None, limit: int = 100) -> pd.
     if queue_name:
         clauses.append("queue_name = %s")
         params.append(str(queue_name).strip().lower())
-    return sql_to_df(
-        f"""
-        SELECT *
-        FROM {TABLE_NAME}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY created_at DESC
-        LIMIT %s
-        """,
-        params=tuple([*params, max(1, int(limit))]),
-    )
+    try:
+        return sql_to_df(
+            f"""
+            SELECT *
+            FROM {TABLE_NAME}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            params=tuple([*params, max(1, int(limit))]),
+        )
+    except Exception as exc:
+        _record_queue_fallback(
+            "external_task_queue_status_load_failed",
+            source=TABLE_NAME,
+            reason="External task queue status could not be loaded; operator queue visibility may be stale or unavailable.",
+            error=exc,
+            metadata={"queue_name": queue_name, "limit": int(limit)},
+        )
+        return pd.DataFrame()
 
 
 def _parse_dt(value: Any) -> datetime | None:
@@ -336,6 +395,20 @@ def run_worker(
             processed += 1
         except Exception as exc:  # pragma: no cover - runtime guard
             failed += 1
+            _record_queue_fallback(
+                "external_task_queue_task_failed",
+                source=str(task.get("queue_name") or queue_name),
+                reason="Serialized external task failed in the worker and was marked for retry or failure according to its attempt policy.",
+                error=exc,
+                severity="error",
+                metadata={
+                    "task_id": task.get("task_id"),
+                    "task_type": task.get("task_type"),
+                    "attempt_count": task.get("attempt_count"),
+                    "max_attempts": task.get("max_attempts"),
+                    "worker_id": worker_id,
+                },
+            )
             fail_task(task_id=str(task["task_id"]), error=f"{exc.__class__.__name__}: {exc}")
         if once:
             break

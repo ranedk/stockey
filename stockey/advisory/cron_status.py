@@ -8,6 +8,8 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 DEFAULT_CRONTAB_PATH = Path("config/stockey.generated.crontab")
 DEFAULT_LOG_DIR = Path("logs/cron")
@@ -34,7 +36,16 @@ def _expand_field(field: str, minimum: int, maximum: int) -> set[int]:
             part = base or "*"
             try:
                 step = max(1, int(step_text))
-            except ValueError:
+            except ValueError as exc:
+                record_local_fallback_event(
+                    module="advisory.cron_status",
+                    fallback_type="cron_status_invalid_step_fallback",
+                    source="crontab",
+                    severity="warn",
+                    reason="Cron status could not parse a step expression and defaulted the step to 1.",
+                    error=exc,
+                    metadata={"field": text, "part": base, "step_text": step_text},
+                )
                 step = 1
         if part == "*":
             start, end = minimum, maximum
@@ -150,11 +161,31 @@ def _latest_marker(lines: list[str]) -> dict[str, Any]:
 def _pid_running(pid_text: str | None) -> bool:
     try:
         pid = int(str(pid_text or "").strip())
-    except ValueError:
+    except ValueError as exc:
+        record_local_fallback_event(
+            module="advisory.cron_status",
+            fallback_type="cron_status_invalid_pid_file",
+            source="cron_lock_pid",
+            severity="warn",
+            reason="Cron lock PID file did not contain a valid process id; lock may be treated as stale.",
+            error=exc,
+            metadata={"pid_text": str(pid_text or "")[:120]},
+        )
         return False
     try:
         os.kill(pid, 0)
-    except OSError:
+    except OSError as exc:
+        if isinstance(exc, ProcessLookupError):
+            return False
+        record_local_fallback_event(
+            module="advisory.cron_status",
+            fallback_type="cron_status_pid_check_failed",
+            source="cron_lock_pid",
+            severity="warn",
+            reason="Cron lock PID liveness check failed; lock status may be unreliable.",
+            error=exc,
+            metadata={"pid": pid},
+        )
         return False
     return True
 

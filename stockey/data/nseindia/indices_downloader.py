@@ -1,14 +1,15 @@
 # indices_downloader.py
 import argparse
+import json
 import os
 import sys
-import time
 import random
 from datetime import datetime, timedelta
 
 import redis
 from environs import Env
 from playwright.sync_api import sync_playwright
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils import store
 from utils.date import reverse_daterange
 from utils.sync import get_redis_client
@@ -23,12 +24,24 @@ REDIS_PORT = env("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:indices:downloaded"
 NSE_INDICES_DOWNLOAD_LOOKBACK_DAYS = max(env.int("NSE_INDICES_DOWNLOAD_LOOKBACK_DAYS", 365), 1)
+SOURCE_PREFIX = "indices"
+SYNC_SOURCE_NAME = "data.nseindia.indices_downloader"
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def extract_downloaded_date_from_key(key: str) -> str | None:
     try:
         return datetime.strptime(os.path.basename(key), "indices_%Y-%m-%d.zip").strftime("%Y-%m-%d")
-    except ValueError:
+    except ValueError as exc:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=str(key),
+            fallback_type="nse_indices_download_key_date_parse_failed",
+            severity="warn",
+            reason="Stored indices archive key did not match indices_YYYY-MM-DD.zip and will not be treated as downloaded.",
+            error=exc,
+            metadata={"key": str(key), "source_prefix": SOURCE_PREFIX},
+        )
         return None
 
 
@@ -51,7 +64,16 @@ def latest_downloaded_date(existing_members: set[str]) -> datetime | None:
     for value in existing_members:
         try:
             parsed.append(datetime.strptime(value, "%Y-%m-%d"))
-        except ValueError:
+        except ValueError as exc:
+            record_local_fallback_event(
+                module=SYNC_SOURCE_NAME,
+                source=str(value),
+                fallback_type="nse_indices_downloaded_member_parse_failed",
+                severity="warn",
+                reason="Stored indices downloaded-date member was not YYYY-MM-DD and will be ignored for incremental anchoring.",
+                error=exc,
+                metadata={"member": str(value), "source_prefix": SOURCE_PREFIX},
+            )
             continue
     return max(parsed) if parsed else None
 
@@ -114,6 +136,20 @@ def download_indices_for_date(
     except Exception as err:
         weekday = datetime.strptime(display_date, "%d-%b-%Y").strftime("%A")
         print(f"❌ Failed: {formatted_date} ({weekday})  — {err}")
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=f"indices:{formatted_date}",
+            fallback_type="nse_indices_download_failed",
+            severity="warn",
+            reason="NSE indices archive download failed for this date; index/benchmark evidence may be incomplete until catch-up succeeds.",
+            error=err,
+            metadata={
+                "formatted_date": formatted_date,
+                "display_date": display_date,
+                "weekday": weekday,
+                "source_prefix": "indices",
+            },
+        )
         return False
 
     finally:
@@ -121,7 +157,8 @@ def download_indices_for_date(
         browser.close()
 
 
-def main() -> None:
+def main() -> int:
+    global STOCKEY_RUN_STATE
     parser = argparse.ArgumentParser(description="Download NSE indices archive zips.")
     parser.add_argument("--backfill", action="store_true", help="Scan a historical date window instead of incremental mode")
     parser.add_argument("--from-date", dest="from_date", help="Start date in YYYY-MM-DD")
@@ -130,6 +167,9 @@ def main() -> None:
 
     rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
     failures = 0
+    downloaded_count = 0
+    failed_attempt_count = 0
+    attempted_count = 0
     existing_members = load_downloaded_dates_from_store()
     latest_done = latest_downloaded_date(existing_members)
     default_start_date = datetime.today() - timedelta(days=NSE_INDICES_DOWNLOAD_LOOKBACK_DAYS)
@@ -144,7 +184,26 @@ def main() -> None:
     if start_date > end_date:
         print("All caught up! Done")
         rop.close()
-        return
+        STOCKEY_RUN_STATE = {
+            "source": SYNC_SOURCE_NAME,
+            "rows": 0,
+            "rows_read": 0,
+            "rows_written": 0,
+            "from_date": start_date.strftime("%Y-%m-%d"),
+            "to_date": end_date.strftime("%Y-%m-%d"),
+            "mode": "backfill" if args.backfill else "incremental",
+            "candidate_dates": 0,
+            "missing_dates": 0,
+            "download_attempts": 0,
+            "attempt_count": 0,
+            "failed_attempt_count": 0,
+            "retry_count": 0,
+            "source_unavailable_count": 0,
+            "fallback_used": False,
+            "state_advanced": False,
+        }
+        print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+        return 0
 
     print(
         "Indices download window:",
@@ -165,24 +224,57 @@ def main() -> None:
     else:
         candidate_dates = list(reverse_daterange(start_date, end_date))
 
-    with sync_playwright() as p:
-        for date_obj in candidate_dates:
-            if failures >= 7:
-                break
-            formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
-            display_date = date_obj.strftime("%d-%b-%Y")  # 19-Jun-2025
+    try:
+        with sync_playwright() as p:
+            for date_obj in candidate_dates:
+                if failures >= 7:
+                    break
+                attempted_count += 1
+                formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
+                display_date = date_obj.strftime("%d-%b-%Y")  # 19-Jun-2025
 
-            success = download_indices_for_date(
-                p, formatted_date, display_date, rop
-            )
-            failures = 0 if success else failures + 1
+                success = download_indices_for_date(
+                    p, formatted_date, display_date, rop
+                )
+                if success:
+                    downloaded_count += 1
+                    failures = 0
+                else:
+                    failed_attempt_count += 1
+                    failures += 1
+    finally:
+        rop.close()
 
-    if failures >= 7:
+    stopped_after_failures = failures >= 7
+    skipped_after_failure_stop = max(len(candidate_dates) - attempted_count, 0)
+    STOCKEY_RUN_STATE = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": downloaded_count,
+        "rows_read": attempted_count,
+        "rows_written": downloaded_count,
+        "from_date": start_date.strftime("%Y-%m-%d"),
+        "to_date": end_date.strftime("%Y-%m-%d"),
+        "mode": "backfill" if args.backfill else "incremental",
+        "latest_downloaded": None if latest_done is None else latest_done.strftime("%Y-%m-%d"),
+        "candidate_dates": len(candidate_dates),
+        "missing_dates": len(candidate_dates),
+        "download_attempts": attempted_count,
+        "attempt_count": attempted_count,
+        "failed_attempt_count": failed_attempt_count,
+        "retry_count": 0,
+        "downloaded_dates": downloaded_count,
+        "source_unavailable_count": failed_attempt_count,
+        "skipped_after_failure_stop": skipped_after_failure_stop,
+        "stopped_after_consecutive_failures": stopped_after_failures,
+        "fallback_used": False,
+        "state_advanced": downloaded_count > 0,
+    }
+    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    if stopped_after_failures:
         sys.exit("Stopped after 7 consecutive failures during backfill.")
-    else:
-        print("All caught up! Done")
-    rop.close()
+    print("All caught up! Done")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

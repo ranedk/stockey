@@ -180,19 +180,19 @@ This avoids the old behavior where the whole advisory run could fall back to one
 
 The codebase has moved past the earlier multi-screener and overlay build-out. The main open work now is:
 
-1. make the Nuxt Decision Trace and Event Inbox explain each stage without raw JSON
-2. make every clean stock recommendation carry a complete logical reason contract
-3. build the top-50% market context universe and use its announcements/macro/sector data as decision context
-4. seed the initial production investor playbook config and validate the first 5-10 playbooks
-5. strengthen deterministic event-class policies for earnings beats, growth acceleration, order wins, margin expansion, promoter actions, pledge reduction, regulatory notices, and management changes
-6. make macro/regime state a first-class gate for event-driven candidates
-7. integrate event-driven candidates with technical entry/exit timing
-8. tighten continuous-watch routing with cooldowns and duplicate suppression
+1. extend feature dependency and freshness contracts stage-by-stage; the `actions` stage now emits a feature gate and final action consolidation already downgrades positive broker actions to Manual Review when required decision-time inputs are blocked
+2. standardize downloader/parser run-state reporting across all ingestion sources
+3. add DB schema migration/version tracking before more table/offload changes
+4. implement hot/cold retention for old trace and intraday rows
+5. continue UI-first operations for remaining manual, research, S3 artifact, and reviewed-config workflows
+6. tighten continuous-watch routing with cooldowns, duplicate suppression, and explicit per-source failure counters
 
 LLMs are intentionally kept in:
 
 - structured event extraction
 - adversarial review
+- company-memory/manual-review context
+- playbook action-plan assistance
 
 They are intentionally not the final trade-decision engine.
 
@@ -301,7 +301,7 @@ Important guardrails:
 
 `advisory/ts_forecast_workflow.py` ties the research path together: optional Screener.in ad hoc query, Dhan daily OHLCV refresh, forecast generation, and an experimental TS watchlist. If no symbols or query are supplied, it uses `config/ts_forecast_screeners.yaml`.
 
-The live dashboard shows these rows near the top as TS Watch Recommendations and also shows the latest matured forecast evaluation summary in an Experimental TimesFM Watch section. This is display-only research evidence and does not affect the consolidated action queue.
+The Nuxt operator UI shows these rows as TS Watch Recommendations and also shows the latest matured forecast evaluation summary in an Experimental TimesFM Watch section. This is display-only research evidence and does not affect the consolidated action queue.
 
 The dashboard collapses multiple forecast horizons into one symbol-level TS card:
 
@@ -322,9 +322,40 @@ python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 2
 python -m advisory.ts_forecast_features --refresh-ohlcv --symbols RELIANCE TCS --model-name timesfm_2p5_200m --horizons 5 10 20
 python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30
 python -m advisory.ts_forecast_evaluator --from-date 2026-04-01 --to-date 2026-04-30 --cost-bps 25
+python -m advisory.ts_forecast_paper_portfolio --dry-run --from-date 2026-04-01 --to-date 2026-04-30
+python -m advisory.ts_forecast_paper_portfolio --from-date 2026-04-01 --to-date 2026-04-30 --log-research-ledger
 python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m
 python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m
 ```
+
+`advisory/ts_forecast_paper_portfolio.py` is the promotion gate between forecast rows and any future policy integration. It converts forecast rows into research-only `PAPER_BUY` / `PAPER_SKIP` decisions, evaluates matured outcomes after costs, compares them with a simple momentum baseline, records advisory-action alignment, and can write a research-ledger row. It does not write action recommendations, portfolio rows, or Dhan execution orders.
+
+The Operator home page and generated legacy dashboard show the latest compact TS paper summary: model, horizon, paper decision, evaluated trades, win rate, after-cost average return, momentum baseline average, advisory alignment count, and exit-conflict count. Use it to decide whether the forecast layer deserves a manual promotion review; do not trade directly from it.
+
+`advisory/ts_forecast_promotion_check.py` is the read-only gate for that manual review. It requires enough evaluated paper trades, enough distinct dates and symbols, positive after-cost performance, lift versus the naive momentum baseline, and low conflict with advisory exit actions. A passing result returns `review_candidate`; it still does not change policy or execution. A failing result returns `hold_research_only`.
+
+```sh
+python -m advisory.ts_forecast_promotion_check --format json
+python -m advisory.ts_forecast_promotion_check --model-name timesfm_2p5_200m --horizon-days 10
+```
+
+`advisory/ts_forecast_promotion.py` is the manual review layer after the read-only gate passes. It writes review and operator-decision audit rows plus copyable `ts_forecast_review_rules` guidance. It does not edit config, action rules, portfolio rows, or broker behavior.
+
+```sh
+python -m advisory.ts_forecast_promotion --model-name timesfm_2p5_200m --horizon-days 10 --dry-run
+```
+
+The Operator API exposes this as `/api/research/ts-forecast-promotion-review`, `/api/research/ts-forecast-promotion-reviews`, and `/api/research/ts-forecast-promotion-review/decision`. Approval records operator intent only; a separate reviewed config-change step is still required before TS forecasts can become low-weight inputs.
+
+After an operator records an approved TS promotion decision, create a preview-only disabled config diff with:
+
+```sh
+python -m advisory.config_change_assistant --source-type ts_forecast_review_rule --model-name timesfm_2p5_200m --horizon-days 10 --dry-run
+```
+
+The Operator API exposes the same preview at `/api/config-change/ts-forecast-preview`. The generated diff adds a disabled `ts_forecast_review_rules` entry and does not apply policy.
+
+If an operator manually applies that disabled diff, verify what the backend sees with `/api/research/ts-forecast-review-rules`. The endpoint validates required model/horizon fields, unsafe authority values, and broker-execution flags. It is read-only and reports `policy_auto_promotion_allowed=false`. The Operator home TS forecast section shows the same configured-rule counts, statuses, and issues.
 
 For a dependency-free dry run, use `--model-name naive_momentum_v1`. For TimesFM, install the optional TimesFM torch package first.
 
@@ -474,6 +505,8 @@ This model is a research and scoring aid. It is not auto-trained inside the dail
 ## Optional model training prerequisites
 
 The production advisory path does not require event-model training. Use this section only for research experiments or to test whether a tabular event model adds incremental value over playbooks, deterministic event policies, macro gates, and technical timing.
+
+Persisted event-model scores are also research-only by default. Adversarial review ignores `advisory_event_model_scores` unless `STOCKEY_EVENT_MODEL_SCORE_POLICY_MODE=promoted` or `--event-model-score-policy-mode promoted` is set, and even then it fails closed unless `advisory.event_model_promotion_check` returns a usable scorecard.
 
 Use the prep command first:
 

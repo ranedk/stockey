@@ -10,8 +10,10 @@ from typing import Any
 import pandas as pd
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.announcements.managed_pipeline import ManagedAnnouncementPipeline
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
@@ -19,6 +21,7 @@ env = Env()
 env.read_env()
 WATCHLIST_TABLE = "advisory_watchlist"
 EVENTS_TABLE = "advisory_watch_events"
+WATCH_OUTPUTS_SCHEMA_MIGRATION_ID = "20260611_advisory_announcement_watch_outputs_base"
 MARKET_CONTEXT_UNIVERSE_TABLE = "advisory_market_context_universe_daily"
 MARKET_CONTEXT_SETUP_ID = "MARKET_CONTEXT_TOP50"
 INITIAL_INGEST_LOOKBACK_DAYS = 3
@@ -39,20 +42,32 @@ MATERIAL_EVENT_KEYWORDS = {
     "cfo",
     "chairman",
     "change in management",
+    "commercial production",
+    "contract",
     "credit rating",
     "default",
+    "demerger",
+    "director resignation",
     "dividend",
+    "downgrade",
     "earnings",
     "enforcement directorate",
+    "expansion",
+    "fund raise",
     "fraud",
     "guidance",
     "income tax",
     "insolvency",
+    "investigation",
     "joint venture",
     "large order",
+    "license",
+    "litigation",
     "merger",
     "nclt",
+    "notice",
     "order win",
+    "penalty",
     "pledge",
     "promoter",
     "qip",
@@ -62,11 +77,106 @@ MATERIAL_EVENT_KEYWORDS = {
     "regulatory",
     "resignation",
     "results",
+    "rights issue",
     "sebi",
     "split",
     "stake sale",
     "scheme of arrangement",
+    "shutdown",
+    "slump sale",
+    "tax demand",
+    "termination",
+    "upgrade",
 }
+WATCHLIST_EXTRA_COLUMNS = {
+    "setup_name": "TEXT",
+    "regime_name": "TEXT",
+    "company_master_id": "TEXT",
+    "screener_slug": "TEXT",
+    "rank": "BIGINT",
+    "candidate_state": "TEXT",
+    "current_state": "TEXT",
+    "watch_reason_detail": "TEXT",
+    "entry_style": "TEXT",
+    "attractive_price_low": "DOUBLE PRECISION",
+    "attractive_price_high": "DOUBLE PRECISION",
+    "invalidation_price": "DOUBLE PRECISION",
+    "entry_note": "TEXT",
+    "near_miss_flag": "BOOLEAN",
+    "last_event_class": "TEXT",
+    "last_state_transition_hint": "TEXT",
+    "last_event_score_impact": "DOUBLE PRECISION",
+    "watch_enabled": "BOOLEAN",
+    "watch_reasons_json": "TEXT",
+    "watch_status": "TEXT",
+    "state_updated_at": "TIMESTAMPTZ",
+    "watch_started_at": "TIMESTAMPTZ",
+    "last_checked_at": "TIMESTAMPTZ",
+    "last_document_published_on": "TIMESTAMPTZ",
+    "load_ts": "TIMESTAMPTZ",
+}
+WATCH_OUTPUTS_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        regime_name TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        screener_slug TEXT,
+        rank BIGINT,
+        candidate_state TEXT,
+        current_state TEXT,
+        watch_reason_detail TEXT,
+        entry_style TEXT,
+        attractive_price_low DOUBLE PRECISION,
+        attractive_price_high DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        entry_note TEXT,
+        near_miss_flag BOOLEAN,
+        last_event_class TEXT,
+        last_state_transition_hint TEXT,
+        last_event_score_impact DOUBLE PRECISION,
+        watch_enabled BOOLEAN,
+        watch_reasons_json TEXT,
+        watch_status TEXT,
+        state_updated_at TIMESTAMPTZ,
+        watch_started_at TIMESTAMPTZ,
+        last_checked_at TIMESTAMPTZ,
+        last_document_published_on TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, setup_id, symbol)
+    )
+    """,
+    *[
+        f"ALTER TABLE {WATCHLIST_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+        for column, sql_type in WATCHLIST_EXTRA_COLUMNS.items()
+    ],
+    f"""
+    CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
+        published_on TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        unique_id TEXT NOT NULL,
+        exchange TEXT,
+        subject TEXT,
+        filed_under_category TEXT,
+        parse_status TEXT,
+        concise_summary_text TEXT,
+        categories_json TEXT,
+        watch_reasons_json TEXT,
+        monitor_source TEXT,
+        event_status TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT",
+]
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -87,96 +197,12 @@ def inclusive_end_of_day(ts: pd.Timestamp | None) -> pd.Timestamp | None:
 
 
 def ensure_watch_outputs_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                regime_name TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                screener_slug TEXT,
-                rank BIGINT,
-                candidate_state TEXT,
-                current_state TEXT,
-                watch_reason_detail TEXT,
-                entry_style TEXT,
-                attractive_price_low DOUBLE PRECISION,
-                attractive_price_high DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                entry_note TEXT,
-                near_miss_flag BOOLEAN,
-                last_event_class TEXT,
-                last_state_transition_hint TEXT,
-                last_event_score_impact DOUBLE PRECISION,
-                watch_enabled BOOLEAN,
-                watch_reasons_json TEXT,
-                watch_status TEXT,
-                state_updated_at TIMESTAMPTZ,
-                watch_started_at TIMESTAMPTZ,
-                last_checked_at TIMESTAMPTZ,
-                last_document_published_on TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, setup_id, symbol)
-            )
-            """
-        )
-        watchlist_columns = {
-            "setup_name": "TEXT",
-            "regime_name": "TEXT",
-            "company_master_id": "TEXT",
-            "screener_slug": "TEXT",
-            "rank": "BIGINT",
-            "candidate_state": "TEXT",
-            "current_state": "TEXT",
-            "watch_reason_detail": "TEXT",
-            "entry_style": "TEXT",
-            "attractive_price_low": "DOUBLE PRECISION",
-            "attractive_price_high": "DOUBLE PRECISION",
-            "invalidation_price": "DOUBLE PRECISION",
-            "entry_note": "TEXT",
-            "near_miss_flag": "BOOLEAN",
-            "last_event_class": "TEXT",
-            "last_state_transition_hint": "TEXT",
-            "last_event_score_impact": "DOUBLE PRECISION",
-            "watch_enabled": "BOOLEAN",
-            "watch_reasons_json": "TEXT",
-            "watch_status": "TEXT",
-            "state_updated_at": "TIMESTAMPTZ",
-            "watch_started_at": "TIMESTAMPTZ",
-            "last_checked_at": "TIMESTAMPTZ",
-            "last_document_published_on": "TIMESTAMPTZ",
-            "load_ts": "TIMESTAMPTZ",
-        }
-        for column, sql_type in watchlist_columns.items():
-            cur.execute(f"ALTER TABLE {WATCHLIST_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVENTS_TABLE} (
-                published_on TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                unique_id TEXT NOT NULL,
-                exchange TEXT,
-                subject TEXT,
-                filed_under_category TEXT,
-                parse_status TEXT,
-                concise_summary_text TEXT,
-                categories_json TEXT,
-                watch_reasons_json TEXT,
-                monitor_source TEXT,
-                event_status TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {EVENTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT")
+    apply_schema_migration(
+        migration_id=WATCH_OUTPUTS_SCHEMA_MIGRATION_ID,
+        description="Create advisory announcement watchlist and event output tables.",
+        statements=WATCH_OUTPUTS_SCHEMA_STATEMENTS,
+        metadata={"tables": [WATCHLIST_TABLE, EVENTS_TABLE]},
+    )
 
 
 def load_watchlist(
@@ -208,7 +234,20 @@ def load_watchlist(
             """,
             params=tuple(params) if params else None,
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source=WATCHLIST_TABLE,
+            fallback_type="announcement_watchlist_load_failed",
+            severity="error",
+            reason="Announcement watcher could not load the active watchlist and continued with an empty watchlist.",
+            error=exc,
+            metadata={
+                "asof_date": None if asof_date is None else str(asof_date),
+                "symbols_count": len(symbols or []),
+                "setup_ids_count": len(setup_ids or []),
+            },
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -230,7 +269,16 @@ def _table_exists(table_name: str) -> bool:
             """,
             params=(table_name,),
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source=table_name,
+            fallback_type="announcement_watch_table_lookup_failed",
+            severity="warn",
+            reason="Announcement watcher could not inspect source table availability and treated the table as unavailable.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return False
     return not df.empty
 
@@ -656,6 +704,8 @@ def build_watch_updates_from_ingest(ingest_state: dict[str, object]) -> tuple[pd
     meta = {
         "watch_count": int(len(watchlist)),
         "match_count": int(len(events_df)),
+        "triggered_event_count": int(events_df["event_status"].astype(str).eq("triggered").sum()) if not events_df.empty and "event_status" in events_df.columns else 0,
+        "context_observed_count": int(events_df["event_status"].astype(str).eq("context_observed").sum()) if not events_df.empty and "event_status" in events_df.columns else 0,
     }
     return watch_update_df, events_df, meta
 
@@ -702,6 +752,8 @@ def summarize(watchlist_updates: pd.DataFrame, events: pd.DataFrame, meta: dict[
         "events_table": EVENTS_TABLE,
         "watch_count": meta.get("watch_count", 0),
         "event_count": int(len(events)),
+        "triggered_event_count": meta.get("triggered_event_count", 0),
+        "context_observed_count": meta.get("context_observed_count", 0),
         "ingest_runs": meta.get("ingest_runs", []),
         "event_sample": events.head(10).to_dict(orient="records") if not events.empty else [],
     }

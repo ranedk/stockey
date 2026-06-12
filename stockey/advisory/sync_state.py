@@ -7,34 +7,43 @@ from typing import Any
 import pandas as pd
 import redis
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import sql_to_df, upsert_to_db
 from utils.redis_utils import get_redis_client
+from utils.schema_migrations import apply_schema_migration
 
 
 TABLE_NAME = "advisory_sync_state"
+SYNC_STATE_SCHEMA_MIGRATION_ID = "20260611_advisory_sync_state_base"
 DEFAULT_REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 DEFAULT_REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
+SYNC_STATE_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        source_name TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        cursor_value TEXT,
+        last_success_at TIMESTAMPTZ,
+        last_item_ts TIMESTAMPTZ,
+        state_json TEXT,
+        status TEXT,
+        error_text TEXT,
+        updated_at TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (source_name, scope_key)
+    )
+    """,
+]
+
 
 def ensure_sync_state_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                source_name TEXT NOT NULL,
-                scope_key TEXT NOT NULL,
-                cursor_value TEXT,
-                last_success_at TIMESTAMPTZ,
-                last_item_ts TIMESTAMPTZ,
-                state_json TEXT,
-                status TEXT,
-                error_text TEXT,
-                updated_at TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (source_name, scope_key)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=SYNC_STATE_SCHEMA_MIGRATION_ID,
+        description="Create advisory sync-state cursor/status table.",
+        statements=SYNC_STATE_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.sync_state", "tables": [TABLE_NAME]},
+    )
 
 
 def load_sync_states(*, source_name: str | None = None) -> pd.DataFrame:
@@ -73,7 +82,20 @@ def load_sync_state(source_name: str, scope_key: str = "default") -> dict[str, A
     if state_json:
         try:
             row["state"] = json.loads(str(state_json))
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            record_local_fallback_event(
+                module="advisory.sync_state",
+                fallback_type="sync_state_state_json_parse_failed",
+                source=str(source_name),
+                severity="warn",
+                reason="Sync-state row contains malformed JSON; falling back to an empty state payload.",
+                error=exc,
+                metadata={
+                    "source_name": str(source_name),
+                    "scope_key": str(scope_key),
+                    "state_json_length": len(str(state_json)),
+                },
+            )
             row["state"] = {}
     else:
         row["state"] = {}
@@ -117,5 +139,20 @@ def publish_bus_message(channel: str, payload: dict[str, Any]) -> bool:
         client.publish(str(channel), json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
         client.close()
         return True
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.sync_state",
+            fallback_type="sync_state_bus_publish_failed",
+            source=str(channel),
+            severity="warn",
+            reason="Sync-state bus publish failed; database state remains authoritative but live subscribers may miss this update.",
+            error=exc,
+            metadata={
+                "channel": str(channel),
+                "payload_keys": sorted(str(key) for key in payload.keys()) if isinstance(payload, dict) else [],
+                "payload_type": type(payload).__name__,
+                "redis_host": str(DEFAULT_REDIS_HOST),
+                "redis_port": int(DEFAULT_REDIS_PORT),
+            },
+        )
         return False

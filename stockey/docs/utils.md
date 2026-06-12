@@ -100,6 +100,8 @@ Open Dhan security mapping failures are stored in `advisory_identity_issues` and
 
 Preferred operator path: open the Nuxt `Identity Issues` page, click `Recheck mappings`, review the `would_resolve` rows, then click `Close resolved mappings`. This only closes identity issue rows; it does not edit Dhan/company mappings or broker execution.
 
+The recheck path also understands common index aliases such as `NIFTY50`, `NIFTY 50`, `BANKNIFTY`, `NIFTY BANK`, `INDIAVIX`, and `INDIA VIX`, so alias-only benchmark/index failures should be closed through the same preview/apply flow after the Dhan master is fresh.
+
 Use the dry run first:
 
 ```sh

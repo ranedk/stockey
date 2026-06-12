@@ -8,13 +8,40 @@ from typing import Any
 
 import pandas as pd
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 TABLE_NAME = "advisory_market_overlay_daily"
 DEFAULT_OVERLAY = "NONE"
 LOOKBACK_DAYS = 3
+NEWS_OVERLAY_SCHEMA_MIGRATION_ID = "20260611_advisory_market_overlay_daily_base"
+NEWS_OVERLAY_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        base_regime TEXT,
+        overlay_name TEXT,
+        overlay_intensity DOUBLE PRECISION,
+        overlay_reason TEXT,
+        source_count BIGINT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date)
+    )
+    """,
+    *[
+        f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+        for column, sql_type in {
+            "base_regime": "TEXT",
+            "overlay_name": "TEXT",
+            "overlay_intensity": "DOUBLE PRECISION",
+            "overlay_reason": "TEXT",
+            "source_count": "BIGINT",
+            "load_ts": "TIMESTAMPTZ",
+        }.items()
+    ],
+]
 KEYWORD_BUCKETS = {
     "GEOPOLITICAL_RISK": ("war", "missile", "attack", "conflict", "border", "sanction", "geopolit"),
     "OIL_SHOCK": ("oil", "crude", "brent", "opec", "fuel", "diesel", "gas prices"),
@@ -50,30 +77,13 @@ def table_exists(table_name: str) -> bool:
 
 
 def ensure_output_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                base_regime TEXT,
-                overlay_name TEXT,
-                overlay_intensity DOUBLE PRECISION,
-                overlay_reason TEXT,
-                source_count BIGINT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date)
-            )
-            """
-        )
-        for column, sql_type in {
-            "base_regime": "TEXT",
-            "overlay_name": "TEXT",
-            "overlay_intensity": "DOUBLE PRECISION",
-            "overlay_reason": "TEXT",
-            "source_count": "BIGINT",
-            "load_ts": "TIMESTAMPTZ",
-        }.items():
-            cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    apply_schema_migration(
+        migration_id=NEWS_OVERLAY_SCHEMA_MIGRATION_ID,
+        statements=NEWS_OVERLAY_SCHEMA_STATEMENTS,
+        owner="advisory.news_overlay_engine",
+        description="Create daily market news overlay output table.",
+        metadata={"tables": [TABLE_NAME], "workflow": "market_news_overlay"},
+    )
 
 
 def resolve_asof_date(requested_date: pd.Timestamp | None = None) -> pd.Timestamp | None:
@@ -201,8 +211,14 @@ def persist_overlay_state(df: pd.DataFrame, *, rebuild: bool = False, asof_date:
     if df.empty:
         return
     if rebuild and asof_date is not None:
-        with db_session() as (_, cur):
-            cur.execute(f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s", (asof_date,))
+        def _delete_existing_overlay() -> None:
+            with db_session() as (_, cur):
+                cur.execute(f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s", (asof_date,))
+
+        execute_db_operation(
+            _delete_existing_overlay,
+            operation_name="news_overlay_engine:delete_rebuild_overlay",
+        )
     upsert_to_db(df, TABLE_NAME, unique_keys=["asof_date"], timescaledb_column="asof_date")
 
 

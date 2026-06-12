@@ -10,6 +10,7 @@ from environs import Env
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.http import get_dynamic_headers
 
 
@@ -27,6 +28,25 @@ PASSWORD_SELECTOR = "input#id_password[name='password']"
 SUBMIT_SELECTOR = "button[type='submit'].button-primary"
 
 
+def _record_screener_auth_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | str,
+    severity: str = "warn",
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="data.screenerin.auth",
+        source="screener_in_auth",
+        fallback_type=fallback_type,
+        severity=severity,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 @dataclass
 class ScreenerBrowserSession:
     playwright: object
@@ -38,16 +58,34 @@ class ScreenerBrowserSession:
     def close(self) -> None:
         try:
             self.page.close()
-        except Exception:
+        except Exception as exc:
+            _record_screener_auth_fallback(
+                fallback_type="screener_auth_page_close_failed",
+                reason="Screener.in authenticated browser session could not close the Playwright page.",
+                error=exc,
+                metadata={"owns_context": self.owns_context},
+            )
             pass
         if self.owns_context:
             try:
                 self.context.close()
-            except Exception:
+            except Exception as exc:
+                _record_screener_auth_fallback(
+                    fallback_type="screener_auth_context_close_failed",
+                    reason="Screener.in authenticated browser session could not close the Playwright context it created.",
+                    error=exc,
+                    metadata={"owns_context": self.owns_context},
+                )
                 pass
         try:
             self.playwright.stop()
-        except Exception:
+        except Exception as exc:
+            _record_screener_auth_fallback(
+                fallback_type="screener_auth_playwright_stop_failed",
+                reason="Screener.in authenticated browser session could not stop Playwright cleanly.",
+                error=exc,
+                metadata={"owns_context": self.owns_context},
+            )
             pass
 
 
@@ -66,7 +104,13 @@ def is_logged_in(page) -> bool:
     try:
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
         page.wait_for_timeout(1500)
-    except PlaywrightTimeoutError:
+    except PlaywrightTimeoutError as exc:
+        _record_screener_auth_fallback(
+            fallback_type="screener_auth_login_status_timeout",
+            reason="Screener.in login-status check timed out; current page state was used.",
+            error=exc,
+            metadata={"login_url": LOGIN_URL, "current_url": str(getattr(page, "url", ""))},
+        )
         pass
     return "login" not in str(page.url).lower() and "/dash/" in str(page.url)
 
@@ -87,7 +131,13 @@ def auto_login(page, *, username: str | None = None, password: str | None = None
     page.click(SUBMIT_SELECTOR)
     try:
         page.wait_for_url("**/dash/**", timeout=30000)
-    except PlaywrightTimeoutError:
+    except PlaywrightTimeoutError as exc:
+        _record_screener_auth_fallback(
+            fallback_type="screener_auth_dashboard_wait_timeout",
+            reason="Screener.in automated login did not observe dashboard URL before timeout; falling back to short wait and final URL check.",
+            error=exc,
+            metadata={"wait_ms": int(wait_ms), "current_url": str(getattr(page, "url", ""))},
+        )
         page.wait_for_timeout(3000)
     if "login" in str(page.url).lower() or "/dash/" not in str(page.url):
         raise RuntimeError(f"Screener.in automated login did not reach dashboard. Current page: {page.url}")

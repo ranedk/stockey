@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
 
@@ -19,6 +20,25 @@ DEFAULT_EVENT_LOOKBACK_DAYS = 20
 DEFAULT_NEWS_LOOKBACK_DAYS = 7
 DEFAULT_MIN_AVG_TRADED_VALUE_20D = 1_00_00_000.0
 DEFAULT_MIN_PRICE = 20.0
+
+
+def _record_market_context_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.market_context",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -33,17 +53,27 @@ def _asof(value: pd.Timestamp | None) -> pd.Timestamp:
 
 
 def _table_exists(table_name: str) -> bool:
-    df = sql_to_df(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name = %s
-        ) AS exists_flag
-        """,
-        params=(table_name,),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = %s
+            ) AS exists_flag
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        _record_market_context_fallback(
+            fallback_type="market_context_table_lookup_failed",
+            source=table_name,
+            reason="Market context could not check whether a source or target table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        return False
     return bool(not df.empty and df.iloc[0]["exists_flag"])
 
 
@@ -51,10 +81,21 @@ def _json_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
+def _safe_float(value: Any, default: float = 0.0, *, source: str = "market_context_numeric") -> float:
     try:
         num = float(value)
-    except Exception:
+    except Exception as exc:
+        _record_market_context_fallback(
+            fallback_type="market_context_numeric_parse_failed",
+            source=source,
+            reason="Market context could not parse a numeric value and used the configured default.",
+            error=exc,
+            metadata={
+                "default": default,
+                "value_excerpt": str(value)[:240],
+                "value_type": type(value).__name__,
+            },
+        )
         return default
     if not math.isfinite(num):
         return default
@@ -84,46 +125,56 @@ def _clean_records(df: pd.DataFrame) -> list[dict[str, Any]]:
 def load_latest_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
     if not _table_exists("advisory_technical_daily"):
         return pd.DataFrame()
-    df = sql_to_df(
-        """
-        WITH ranked AS (
-            SELECT
-                asof_date,
-                company_master_id,
-                symbol,
-                series,
-                sector_code,
-                sector_name,
-                adj_close,
-                total_value,
-                avg_traded_value_20d,
-                avg_traded_value_60d,
-                rs_vs_benchmark,
-                rs_vs_sector,
-                dist_52w_high,
-                dma_50_slope_20d_pct,
-                trend_persistence_60d,
-                accumulation_days_20d,
-                distribution_days_20d,
-                pass_liquidity_20d,
-                pass_above_dma_50,
-                pass_trend_alignment,
-                pass_near_52w_high,
-                ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(symbol)) ORDER BY asof_date DESC, load_ts DESC) AS rn
-            FROM advisory_technical_daily
-            WHERE asof_date <= %(asof_date)s
-              AND NULLIF(TRIM(symbol), '') IS NOT NULL
-              AND COALESCE(series, 'EQ') = 'EQ'
+    try:
+        df = sql_to_df(
+            """
+            WITH ranked AS (
+                SELECT
+                    asof_date,
+                    company_master_id,
+                    symbol,
+                    series,
+                    sector_code,
+                    sector_name,
+                    adj_close,
+                    total_value,
+                    avg_traded_value_20d,
+                    avg_traded_value_60d,
+                    rs_vs_benchmark,
+                    rs_vs_sector,
+                    dist_52w_high,
+                    dma_50_slope_20d_pct,
+                    trend_persistence_60d,
+                    accumulation_days_20d,
+                    distribution_days_20d,
+                    pass_liquidity_20d,
+                    pass_above_dma_50,
+                    pass_trend_alignment,
+                    pass_near_52w_high,
+                    ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(symbol)) ORDER BY asof_date DESC, load_ts DESC) AS rn
+                FROM advisory_technical_daily
+                WHERE asof_date <= %(asof_date)s
+                  AND NULLIF(TRIM(symbol), '') IS NOT NULL
+                  AND COALESCE(series, 'EQ') = 'EQ'
+            )
+            SELECT *
+            FROM ranked
+            WHERE rn = 1
+            """,
+            params={"asof_date": asof_date},
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
         )
-        SELECT *
-        FROM ranked
-        WHERE rn = 1
-        """,
-        params={"asof_date": asof_date},
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    except Exception as exc:
+        _record_market_context_fallback(
+            fallback_type="market_context_technical_load_failed",
+            source="advisory_technical_daily",
+            reason="Market context could not load latest technical universe.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        raise
     if df.empty:
         return df
     df["asof_date"] = normalize_timestamp(df["asof_date"])
@@ -150,26 +201,36 @@ def load_latest_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
 def load_latest_market_cap(asof_date: pd.Timestamp) -> pd.DataFrame:
     if not _table_exists("advisory_screener_constituents"):
         return pd.DataFrame(columns=["symbol", "market_cap", "market_cap_source_date"])
-    df = sql_to_df(
-        """
-        WITH ranked AS (
-            SELECT
-                UPPER(TRIM(ticker)) AS symbol,
-                market_cap,
-                date AS market_cap_source_date,
-                ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(ticker)) ORDER BY date DESC, load_ts DESC) AS rn
-            FROM advisory_screener_constituents
-            WHERE date <= %(asof_date)s
-              AND NULLIF(TRIM(ticker), '') IS NOT NULL
-              AND market_cap IS NOT NULL
+    try:
+        df = sql_to_df(
+            """
+            WITH ranked AS (
+                SELECT
+                    UPPER(TRIM(ticker)) AS symbol,
+                    market_cap,
+                    date AS market_cap_source_date,
+                    ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(ticker)) ORDER BY date DESC, load_ts DESC) AS rn
+                FROM advisory_screener_constituents
+                WHERE date <= %(asof_date)s
+                  AND NULLIF(TRIM(ticker), '') IS NOT NULL
+                  AND market_cap IS NOT NULL
+            )
+            SELECT symbol, market_cap, market_cap_source_date
+            FROM ranked
+            WHERE rn = 1
+            """,
+            params={"asof_date": asof_date},
+            retries=4,
         )
-        SELECT symbol, market_cap, market_cap_source_date
-        FROM ranked
-        WHERE rn = 1
-        """,
-        params={"asof_date": asof_date},
-        retries=4,
-    )
+    except Exception as exc:
+        _record_market_context_fallback(
+            fallback_type="market_context_market_cap_load_failed",
+            source="advisory_screener_constituents",
+            reason="Market context skipped market-cap enrichment after source load failure.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        return pd.DataFrame(columns=["symbol", "market_cap", "market_cap_source_date"])
     if df.empty:
         return pd.DataFrame(columns=["symbol", "market_cap", "market_cap_source_date"])
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -181,36 +242,46 @@ def load_latest_market_cap(asof_date: pd.Timestamp) -> pd.DataFrame:
 def load_exchange_context(asof_date: pd.Timestamp, symbols: list[str]) -> pd.DataFrame:
     if not symbols or not _table_exists("advisory_exchange_features_daily"):
         return pd.DataFrame(columns=["symbol"])
-    df = sql_to_df(
-        """
-        WITH ranked AS (
+    try:
+        df = sql_to_df(
+            """
+            WITH ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(symbol)) ORDER BY asof_date DESC, load_ts DESC) AS rn
+                FROM advisory_exchange_features_daily
+                WHERE asof_date <= %(asof_date)s
+                  AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
+            )
             SELECT
-                *,
-                ROW_NUMBER() OVER (PARTITION BY UPPER(TRIM(symbol)) ORDER BY asof_date DESC, load_ts DESC) AS rn
-            FROM advisory_exchange_features_daily
-            WHERE asof_date <= %(asof_date)s
-              AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
+                symbol,
+                latest_exchange_event_date,
+                latest_exchange_event_source,
+                latest_exchange_event_type,
+                deal_cluster_count_20d,
+                insider_net_value_90d,
+                short_selling_event_count_20d,
+                upcoming_earnings_14d,
+                exchange_accumulation_score,
+                exchange_distribution_score,
+                exchange_event_score
+            FROM ranked
+            WHERE rn = 1
+            """,
+            params={"asof_date": asof_date, "symbols": symbols},
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
         )
-        SELECT
-            symbol,
-            latest_exchange_event_date,
-            latest_exchange_event_source,
-            latest_exchange_event_type,
-            deal_cluster_count_20d,
-            insider_net_value_90d,
-            short_selling_event_count_20d,
-            upcoming_earnings_14d,
-            exchange_accumulation_score,
-            exchange_distribution_score,
-            exchange_event_score
-        FROM ranked
-        WHERE rn = 1
-        """,
-        params={"asof_date": asof_date, "symbols": symbols},
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    except Exception as exc:
+        _record_market_context_fallback(
+            fallback_type="market_context_exchange_context_load_failed",
+            source="advisory_exchange_features_daily",
+            reason="Market context skipped exchange-event enrichment after source load failure.",
+            error=exc,
+            metadata={"asof_date": str(asof_date), "symbol_count": len(symbols)},
+        )
+        return pd.DataFrame(columns=["symbol"])
     if df.empty:
         return pd.DataFrame(columns=["symbol"])
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -231,25 +302,35 @@ def load_exchange_context(asof_date: pd.Timestamp, symbols: list[str]) -> pd.Dat
 def load_regime_context(asof_date: pd.Timestamp) -> dict[str, Any]:
     if not _table_exists("advisory_market_regime"):
         return {}
-    df = sql_to_df(
-        """
-        SELECT
-            asof_date,
-            regime_name,
-            macro_risk_state,
-            macro_stress_score,
-            macro_sizing_multiplier,
-            risk_off_flag,
-            shock_flag,
-            regime_notes
-        FROM advisory_market_regime
-        WHERE asof_date <= %(asof_date)s
-        ORDER BY asof_date DESC
-        LIMIT 1
-        """,
-        params={"asof_date": asof_date},
-        retries=4,
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT
+                asof_date,
+                regime_name,
+                macro_risk_state,
+                macro_stress_score,
+                macro_sizing_multiplier,
+                risk_off_flag,
+                shock_flag,
+                regime_notes
+            FROM advisory_market_regime
+            WHERE asof_date <= %(asof_date)s
+            ORDER BY asof_date DESC
+            LIMIT 1
+            """,
+            params={"asof_date": asof_date},
+            retries=4,
+        )
+    except Exception as exc:
+        _record_market_context_fallback(
+            fallback_type="market_context_regime_load_failed",
+            source="advisory_market_regime",
+            reason="Market context skipped regime enrichment after source load failure.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        return {}
     return df.iloc[0].to_dict() if not df.empty else {}
 
 
@@ -273,23 +354,33 @@ def _count_events(
     extra_select = ""
     if extra_parts:
         extra_select = "\n            , " + "\n            , ".join(extra_parts)
-    df = sql_to_df(
-        f"""
-        SELECT
-            UPPER(TRIM(symbol)) AS symbol,
-            COUNT(*) AS event_count
-            {extra_select}
-        FROM {table_name}
-        WHERE {date_col} >= %(start_date)s
-          AND {date_col} <= %(asof_date)s
-          AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
-        GROUP BY UPPER(TRIM(symbol))
-        """,
-        params={"start_date": start_date, "asof_date": asof_date, "symbols": symbols},
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                UPPER(TRIM(symbol)) AS symbol,
+                COUNT(*) AS event_count
+                {extra_select}
+            FROM {table_name}
+            WHERE {date_col} >= %(start_date)s
+              AND {date_col} <= %(asof_date)s
+              AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
+            GROUP BY UPPER(TRIM(symbol))
+            """,
+            params={"start_date": start_date, "asof_date": asof_date, "symbols": symbols},
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        _record_market_context_fallback(
+            fallback_type="market_context_event_count_load_failed",
+            source=table_name,
+            reason="Market context skipped event-count enrichment after source load failure.",
+            error=exc,
+            metadata={"date_column": date_col, "asof_date": str(asof_date), "lookback_days": int(lookback_days), "symbol_count": len(symbols)},
+        )
+        return pd.DataFrame(columns=["symbol"])
     if df.empty:
         return pd.DataFrame(columns=["symbol"])
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -307,6 +398,10 @@ def load_event_counts(asof_date: pd.Timestamp, symbols: list[str]) -> pd.DataFra
         asof_date=asof_date,
         symbols=symbols,
         lookback_days=DEFAULT_NEWS_LOOKBACK_DAYS,
+        extra_cols="""
+            , SUM(CASE WHEN COALESCE(event_status, 'triggered') = 'triggered' THEN 1 ELSE 0 END) AS triggered_announcement_event_count_7d
+            , SUM(CASE WHEN COALESCE(event_status, 'triggered') = 'context_observed' THEN 1 ELSE 0 END) AS context_observed_announcement_event_count_7d
+        """,
     ).rename(columns={"event_count": "announcement_event_count_7d"})
     news = _count_events(
         table_name="advisory_news_events",
@@ -314,6 +409,10 @@ def load_event_counts(asof_date: pd.Timestamp, symbols: list[str]) -> pd.DataFra
         asof_date=asof_date,
         symbols=symbols,
         lookback_days=DEFAULT_NEWS_LOOKBACK_DAYS,
+        extra_cols="""
+            , SUM(CASE WHEN COALESCE(event_status, 'triggered') = 'triggered' THEN 1 ELSE 0 END) AS triggered_news_event_count_7d
+            , SUM(CASE WHEN COALESCE(event_status, 'triggered') = 'context_observed' THEN 1 ELSE 0 END) AS context_observed_news_event_count_7d
+        """,
     ).rename(columns={"event_count": "news_event_count_7d"})
     evals = _count_events(
         table_name="advisory_event_evaluations",
@@ -329,7 +428,11 @@ def load_event_counts(asof_date: pd.Timestamp, symbols: list[str]) -> pd.DataFra
     out = base.merge(watch, on="symbol", how="left").merge(news, on="symbol", how="left").merge(evals, on="symbol", how="left")
     count_cols = [
         "announcement_event_count_7d",
+        "triggered_announcement_event_count_7d",
+        "context_observed_announcement_event_count_7d",
         "news_event_count_7d",
+        "triggered_news_event_count_7d",
+        "context_observed_news_event_count_7d",
         "evaluated_event_count_20d",
         "positive_event_count_20d",
         "negative_event_count_20d",
@@ -401,7 +504,11 @@ def build_market_context(
 
     for col in [
         "announcement_event_count_7d",
+        "triggered_announcement_event_count_7d",
+        "context_observed_announcement_event_count_7d",
         "news_event_count_7d",
+        "triggered_news_event_count_7d",
+        "context_observed_news_event_count_7d",
         "evaluated_event_count_20d",
         "positive_event_count_20d",
         "negative_event_count_20d",
@@ -481,6 +588,12 @@ def _event_clusters(frame: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]
     return grouped.head(limit).replace({np.nan: None}).to_dict(orient="records")
 
 
+def _sum_numeric_column(df: pd.DataFrame, column: str) -> int:
+    if column not in df.columns:
+        return 0
+    return int(pd.to_numeric(df[column], errors="coerce").fillna(0).sum())
+
+
 def build_market_context_summary(
     top: pd.DataFrame,
     *,
@@ -495,8 +608,14 @@ def build_market_context_summary(
     breadth_above_dma50 = float(_bool_series(top, "pass_above_dma_50").mean())
     breadth_trend = float(_bool_series(top, "pass_trend_alignment").mean())
     breadth_rs = float(rs_signal.fillna(-1.0).gt(0).mean())
-    positive_events = int(pd.to_numeric(top["positive_event_count_20d"], errors="coerce").fillna(0).sum())
-    negative_events = int(pd.to_numeric(top["negative_event_count_20d"], errors="coerce").fillna(0).sum())
+    positive_events = _sum_numeric_column(top, "positive_event_count_20d")
+    negative_events = _sum_numeric_column(top, "negative_event_count_20d")
+    triggered_announcements = _sum_numeric_column(top, "triggered_announcement_event_count_7d")
+    context_announcements = _sum_numeric_column(top, "context_observed_announcement_event_count_7d")
+    triggered_news = _sum_numeric_column(top, "triggered_news_event_count_7d")
+    context_news = _sum_numeric_column(top, "context_observed_news_event_count_7d")
+    triggered_context_events = triggered_announcements + triggered_news
+    context_observed_events = context_announcements + context_news
     risk_on_score = float(np.nanmean([breadth_above_dma50, breadth_trend, breadth_rs]))
     risk_off_score = float(1.0 - risk_on_score)
     macro_risk_state = str(regime.get("macro_risk_state") or "")
@@ -518,8 +637,16 @@ def build_market_context_summary(
         "top_context_count": int(len(top)),
         "regime_name": regime_name,
         "macro_risk_state": regime.get("macro_risk_state"),
-        "macro_stress_score": _safe_float(regime.get("macro_stress_score"), default=np.nan),
-        "macro_sizing_multiplier": _safe_float(regime.get("macro_sizing_multiplier"), default=np.nan),
+        "macro_stress_score": _safe_float(
+            regime.get("macro_stress_score"),
+            default=np.nan,
+            source="regime.macro_stress_score",
+        ),
+        "macro_sizing_multiplier": _safe_float(
+            regime.get("macro_sizing_multiplier"),
+            default=np.nan,
+            source="regime.macro_sizing_multiplier",
+        ),
         "risk_on_score": round(risk_on_score, 6),
         "risk_off_score": round(risk_off_score, 6),
         "breadth_above_dma50_pct": round(breadth_above_dma50 * 100.0, 6),
@@ -527,8 +654,14 @@ def build_market_context_summary(
         "breadth_rs_positive_pct": round(breadth_rs * 100.0, 6),
         "positive_event_count_20d": positive_events,
         "negative_event_count_20d": negative_events,
-        "news_event_count_7d": int(pd.to_numeric(top["news_event_count_7d"], errors="coerce").fillna(0).sum()),
-        "announcement_event_count_7d": int(pd.to_numeric(top["announcement_event_count_7d"], errors="coerce").fillna(0).sum()),
+        "news_event_count_7d": _sum_numeric_column(top, "news_event_count_7d"),
+        "announcement_event_count_7d": _sum_numeric_column(top, "announcement_event_count_7d"),
+        "triggered_event_count_7d": triggered_context_events,
+        "context_observed_event_count_7d": context_observed_events,
+        "triggered_news_event_count_7d": triggered_news,
+        "context_observed_news_event_count_7d": context_news,
+        "triggered_announcement_event_count_7d": triggered_announcements,
+        "context_observed_announcement_event_count_7d": context_announcements,
         "leading_sectors_json": _json_text(leading),
         "lagging_sectors_json": _json_text(lagging),
         "event_clusters_json": _json_text(clusters),
@@ -569,7 +702,11 @@ def _ordered_universe(df: pd.DataFrame) -> pd.DataFrame:
         "technical_leadership_score",
         "trend_leader_flag",
         "announcement_event_count_7d",
+        "triggered_announcement_event_count_7d",
+        "context_observed_announcement_event_count_7d",
         "news_event_count_7d",
+        "triggered_news_event_count_7d",
+        "context_observed_news_event_count_7d",
         "evaluated_event_count_20d",
         "positive_event_count_20d",
         "negative_event_count_20d",
@@ -604,34 +741,54 @@ def load_latest_market_context(asof_date: pd.Timestamp | None = None, *, limit: 
     summary = pd.DataFrame()
     universe = pd.DataFrame()
     if _table_exists(SUMMARY_TABLE):
-        summary = sql_to_df(
-            f"""
-            SELECT *
-            FROM {SUMMARY_TABLE}
-            WHERE asof_date <= %(asof_date)s
-            ORDER BY asof_date DESC
-            LIMIT 1
-            """,
-            params={"asof_date": effective_asof},
-            retries=4,
-        )
-    if _table_exists(UNIVERSE_TABLE):
-        universe = sql_to_df(
-            f"""
-            SELECT *
-            FROM {UNIVERSE_TABLE}
-            WHERE asof_date = (
-                SELECT MAX(asof_date)
-                FROM {UNIVERSE_TABLE}
+        try:
+            summary = sql_to_df(
+                f"""
+                SELECT *
+                FROM {SUMMARY_TABLE}
                 WHERE asof_date <= %(asof_date)s
+                ORDER BY asof_date DESC
+                LIMIT 1
+                """,
+                params={"asof_date": effective_asof},
+                retries=4,
             )
-              AND in_top_context = TRUE
-            ORDER BY context_rank ASC
-            LIMIT %(limit)s
-            """,
-            params={"asof_date": effective_asof, "limit": int(limit)},
-            retries=4,
-        )
+        except Exception as exc:
+            _record_market_context_fallback(
+                fallback_type="market_context_summary_cache_load_failed",
+                source=SUMMARY_TABLE,
+                reason="Market context API cache summary lookup failed.",
+                error=exc,
+                metadata={"asof_date": str(effective_asof)},
+            )
+            summary = pd.DataFrame()
+    if _table_exists(UNIVERSE_TABLE):
+        try:
+            universe = sql_to_df(
+                f"""
+                SELECT *
+                FROM {UNIVERSE_TABLE}
+                WHERE asof_date = (
+                    SELECT MAX(asof_date)
+                    FROM {UNIVERSE_TABLE}
+                    WHERE asof_date <= %(asof_date)s
+                )
+                  AND in_top_context = TRUE
+                ORDER BY context_rank ASC
+                LIMIT %(limit)s
+                """,
+                params={"asof_date": effective_asof, "limit": int(limit)},
+                retries=4,
+            )
+        except Exception as exc:
+            _record_market_context_fallback(
+                fallback_type="market_context_universe_cache_load_failed",
+                source=UNIVERSE_TABLE,
+                reason="Market context API cache universe lookup failed.",
+                error=exc,
+                metadata={"asof_date": str(effective_asof), "limit": int(limit)},
+            )
+            universe = pd.DataFrame()
     return {
         "summary": _clean_records(summary)[0] if not summary.empty else {},
         "top_universe": _clean_records(universe) if not universe.empty else [],

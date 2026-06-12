@@ -6,23 +6,53 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.news_theme_engine import load_active_theme_screener_mapping
 from advisory.setup_registry import load_setup_registry
 from utils.db import sql_to_df
 from utils.sync import parse_datetime_arg
 
 
-def table_exists(table_name: str) -> bool:
-    df = sql_to_df(
-        """
-        SELECT 1 AS exists_flag
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        LIMIT 1
-        """,
-        params=(table_name,),
+def _record_setup_trace_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.setup_trace",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
     )
+
+
+def table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        _record_setup_trace_fallback(
+            fallback_type="setup_trace_table_lookup_failed",
+            source=table_name,
+            reason="Setup trace could not check whether a source table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        raise
     return not df.empty
 
 
@@ -100,14 +130,24 @@ def resolve_asof_date(setup_id: str, requested_date: pd.Timestamp | None = None)
     ]:
         if not table_exists(table_name):
             continue
-        df = sql_to_df(
-            f"""
-            SELECT MAX({column_name}) AS asof_date
-            FROM {table_name}
-            WHERE setup_id = %s
-            """,
-            params=(setup_id.upper(),),
-        )
+        try:
+            df = sql_to_df(
+                f"""
+                SELECT MAX({column_name}) AS asof_date
+                FROM {table_name}
+                WHERE setup_id = %s
+                """,
+                params=(setup_id.upper(),),
+            )
+        except Exception as exc:
+            _record_setup_trace_fallback(
+                fallback_type="setup_trace_asof_lookup_failed",
+                source=table_name,
+                reason="Setup trace could not resolve latest as-of date from a source table.",
+                error=exc,
+                metadata={"setup_id": setup_id.upper(), "date_column": column_name},
+            )
+            raise
         if df.empty:
             continue
         resolved = normalize_timestamp(df.iloc[0].get("asof_date"))
@@ -119,16 +159,26 @@ def resolve_asof_date(setup_id: str, requested_date: pd.Timestamp | None = None)
 def load_setup_regime(asof_date: pd.Timestamp | None) -> dict[str, Any] | None:
     if asof_date is None or not table_exists("advisory_market_regime"):
         return None
-    df = sql_to_df(
-        """
-        SELECT *
-        FROM advisory_market_regime
-        WHERE asof_date <= %s
-        ORDER BY asof_date DESC
-        LIMIT 1
-        """,
-        params=(asof_date,),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT *
+            FROM advisory_market_regime
+            WHERE asof_date <= %s
+            ORDER BY asof_date DESC
+            LIMIT 1
+            """,
+            params=(asof_date,),
+        )
+    except Exception as exc:
+        _record_setup_trace_fallback(
+            fallback_type="setup_trace_regime_load_failed",
+            source="advisory_market_regime",
+            reason="Setup trace could not load market regime context.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        raise
     if df.empty:
         return None
     return df.iloc[0].to_dict()
@@ -137,16 +187,26 @@ def load_setup_regime(asof_date: pd.Timestamp | None) -> dict[str, Any] | None:
 def load_market_overlay(asof_date: pd.Timestamp | None) -> dict[str, Any] | None:
     if asof_date is None or not table_exists("advisory_market_overlay_daily"):
         return None
-    df = sql_to_df(
-        """
-        SELECT *
-        FROM advisory_market_overlay_daily
-        WHERE asof_date <= %s
-        ORDER BY asof_date DESC
-        LIMIT 1
-        """,
-        params=(asof_date,),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT *
+            FROM advisory_market_overlay_daily
+            WHERE asof_date <= %s
+            ORDER BY asof_date DESC
+            LIMIT 1
+            """,
+            params=(asof_date,),
+        )
+    except Exception as exc:
+        _record_setup_trace_fallback(
+            fallback_type="setup_trace_overlay_load_failed",
+            source="advisory_market_overlay_daily",
+            reason="Setup trace could not load market overlay context.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        raise
     if df.empty:
         return None
     return df.iloc[0].to_dict()
@@ -189,23 +249,33 @@ def load_latest_setup_screener(setup_id: str, overlay_name: str | None = None) -
     screener_slugs, _ = resolve_setup_screeners(setup_id, overlay_name=overlay_name)
     if not screener_slugs:
         return pd.DataFrame()
-    return sql_to_df(
-        """
-        WITH
-        latest AS (
-            SELECT MAX(date) AS screener_date
-            FROM advisory_screener_constituents
-            WHERE screener_slug = ANY(%s)
+    try:
+        return sql_to_df(
+            """
+            WITH
+            latest AS (
+                SELECT MAX(date) AS screener_date
+                FROM advisory_screener_constituents
+                WHERE screener_slug = ANY(%s)
+            )
+            SELECT s.*
+            FROM advisory_screener_constituents s
+            JOIN latest l
+              ON l.screener_date = s.date
+            WHERE s.screener_slug = ANY(%s)
+            ORDER BY s.rank, s.ticker
+            """,
+            params=(screener_slugs, screener_slugs),
         )
-        SELECT s.*
-        FROM advisory_screener_constituents s
-        JOIN latest l
-          ON l.screener_date = s.date
-        WHERE s.screener_slug = ANY(%s)
-        ORDER BY s.rank, s.ticker
-        """,
-        params=(screener_slugs, screener_slugs),
-    )
+    except Exception as exc:
+        _record_setup_trace_fallback(
+            fallback_type="setup_trace_screener_rows_load_failed",
+            source="advisory_screener_constituents",
+            reason="Setup trace could not load latest setup screener rows.",
+            error=exc,
+            metadata={"setup_id": setup_id.upper(), "screener_count": len(screener_slugs)},
+        )
+        raise
 
 
 def load_setup_rows(table_name: str, setup_id: str, asof_date: pd.Timestamp | None, limit: int = 50) -> pd.DataFrame:
@@ -213,15 +283,26 @@ def load_setup_rows(table_name: str, setup_id: str, asof_date: pd.Timestamp | No
         return pd.DataFrame()
     clauses = ["setup_id = %s"]
     params: list[object] = [setup_id.upper()]
-    if asof_date is not None and "asof_date" in sql_to_df(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        """,
-        params=(table_name,),
-    )["column_name"].tolist():
+    try:
+        columns = sql_to_df(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        _record_setup_trace_fallback(
+            fallback_type="setup_trace_column_lookup_failed",
+            source=table_name,
+            reason="Setup trace could not inspect source table columns.",
+            error=exc,
+            metadata={"setup_id": setup_id.upper()},
+        )
+        raise
+    if asof_date is not None and "asof_date" in columns["column_name"].tolist():
         clauses.append("asof_date = %s")
         params.append(asof_date)
     order_column = "published_on" if table_name in {
@@ -233,16 +314,30 @@ def load_setup_rows(table_name: str, setup_id: str, asof_date: pd.Timestamp | No
         "advisory_position_lifecycle",
         "advisory_execution_orders",
     } else "asof_date"
-    return sql_to_df(
-        f"""
-        SELECT *
-        FROM {table_name}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY {order_column} DESC NULLS LAST, load_ts DESC NULLS LAST
-        LIMIT {int(limit)}
-        """,
-        params=tuple(params),
-    )
+    try:
+        return sql_to_df(
+            f"""
+            SELECT *
+            FROM {table_name}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY {order_column} DESC NULLS LAST, load_ts DESC NULLS LAST
+            LIMIT {int(limit)}
+            """,
+            params=tuple(params),
+        )
+    except Exception as exc:
+        _record_setup_trace_fallback(
+            fallback_type="setup_trace_stage_rows_load_failed",
+            source=table_name,
+            reason="Setup trace could not load rows for a pipeline stage.",
+            error=exc,
+            metadata={
+                "setup_id": setup_id.upper(),
+                "asof_date": str(asof_date) if asof_date is not None else None,
+                "limit": int(limit),
+            },
+        )
+        raise
 
 
 def load_top_rejection_reasons(setup_id: str, asof_date: pd.Timestamp | None) -> dict[str, int]:

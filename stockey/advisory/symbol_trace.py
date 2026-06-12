@@ -6,21 +6,51 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df
 from utils.sync import parse_datetime_arg
 
 
-def table_exists(table_name: str) -> bool:
-    df = sql_to_df(
-        """
-        SELECT 1 AS exists_flag
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        LIMIT 1
-        """,
-        params=(table_name,),
+def _record_symbol_trace_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.symbol_trace",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
     )
+
+
+def table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        _record_symbol_trace_fallback(
+            fallback_type="symbol_trace_table_lookup_failed",
+            source=table_name,
+            reason="Symbol trace could not check whether a source table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        raise
     return not df.empty
 
 
@@ -57,16 +87,31 @@ def latest_rows(
     if extra_params:
         params.extend(extra_params)
     order_by = date_column if date_column else "load_ts"
-    return sql_to_df(
-        f"""
-        SELECT *
-        FROM {table_name}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY {order_by} DESC NULLS LAST, load_ts DESC NULLS LAST
-        LIMIT {int(limit)}
-        """,
-        params=tuple(params),
-    )
+    try:
+        return sql_to_df(
+            f"""
+            SELECT *
+            FROM {table_name}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY {order_by} DESC NULLS LAST, load_ts DESC NULLS LAST
+            LIMIT {int(limit)}
+            """,
+            params=tuple(params),
+        )
+    except Exception as exc:
+        _record_symbol_trace_fallback(
+            fallback_type="symbol_trace_stage_rows_load_failed",
+            source=table_name,
+            reason="Symbol trace could not load rows for a pipeline stage.",
+            error=exc,
+            metadata={
+                "symbol": symbol.upper(),
+                "setup_id": setup_id.upper() if setup_id else None,
+                "date_column": date_column,
+                "limit": int(limit),
+            },
+        )
+        raise
 
 
 def latest_single_row(
@@ -109,21 +154,31 @@ def load_latest_screener_rows(symbol: str, setup_id: str | None = None) -> pd.Da
           ON cfg.screener_slug = s.screener_slug
         """
         params.append(setup_id.upper())
-    return sql_to_df(
-        f"""
-        SELECT s.*
-        FROM advisory_screener_constituents s
-        {setup_join}
-        WHERE s.ticker = %s
-          AND s.date = (
-              SELECT MAX(date)
-              FROM advisory_screener_constituents
-              WHERE ticker = %s
-          )
-        ORDER BY s.rank, s.screener_slug
-        """,
-        params=tuple(params + [symbol.upper()]),
-    )
+    try:
+        return sql_to_df(
+            f"""
+            SELECT s.*
+            FROM advisory_screener_constituents s
+            {setup_join}
+            WHERE s.ticker = %s
+              AND s.date = (
+                  SELECT MAX(date)
+                  FROM advisory_screener_constituents
+                  WHERE ticker = %s
+              )
+            ORDER BY s.rank, s.screener_slug
+            """,
+            params=tuple(params + [symbol.upper()]),
+        )
+    except Exception as exc:
+        _record_symbol_trace_fallback(
+            fallback_type="symbol_trace_screener_rows_load_failed",
+            source="advisory_screener_constituents",
+            reason="Symbol trace could not load latest screener rows.",
+            error=exc,
+            metadata={"symbol": symbol.upper(), "setup_id": setup_id.upper() if setup_id else None},
+        )
+        raise
 
 
 def load_latest_rejections(symbol: str, setup_id: str | None = None) -> pd.DataFrame:
@@ -144,15 +199,25 @@ def load_latest_rejections(symbol: str, setup_id: str | None = None) -> pd.DataF
         """
     )
     params.append(symbol.upper())
-    return sql_to_df(
-        f"""
-        SELECT *
-        FROM advisory_candidate_rejections
-        WHERE {' AND '.join(clauses)}
-        ORDER BY setup_id, reason_code
-        """,
-        params=tuple(params),
-    )
+    try:
+        return sql_to_df(
+            f"""
+            SELECT *
+            FROM advisory_candidate_rejections
+            WHERE {' AND '.join(clauses)}
+            ORDER BY setup_id, reason_code
+            """,
+            params=tuple(params),
+        )
+    except Exception as exc:
+        _record_symbol_trace_fallback(
+            fallback_type="symbol_trace_rejections_load_failed",
+            source="advisory_candidate_rejections",
+            reason="Symbol trace could not load latest rejection rows.",
+            error=exc,
+            metadata={"symbol": symbol.upper(), "setup_id": setup_id.upper() if setup_id else None},
+        )
+        raise
 
 
 def row_to_json_ready(row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -229,15 +294,25 @@ def load_aggregated_event_decision(symbol: str, setup_id: str | None = None) -> 
     )
     params.append(symbol.upper())
 
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM advisory_event_evaluations
-        WHERE {' AND '.join(clauses)}
-        ORDER BY published_on, load_ts NULLS LAST
-        """,
-        params=tuple(params),
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM advisory_event_evaluations
+            WHERE {' AND '.join(clauses)}
+            ORDER BY published_on, load_ts NULLS LAST
+            """,
+            params=tuple(params),
+        )
+    except Exception as exc:
+        _record_symbol_trace_fallback(
+            fallback_type="symbol_trace_aggregated_event_load_failed",
+            source="advisory_event_evaluations",
+            reason="Symbol trace could not load aggregated event decision rows.",
+            error=exc,
+            metadata={"symbol": symbol.upper(), "setup_id": setup_id.upper() if setup_id else None},
+        )
+        raise
     if df.empty:
         return None
 

@@ -75,6 +75,11 @@ const losingCandidates = computed(() => arrayValue(conflictResolution.value.losi
 const conflictSummary = computed(() => String(conflictResolution.value.source_precedence_reason || '').trim())
 const hasConflictResolution = computed(() => Object.keys(conflictResolution.value).length > 0)
 const eventEvidence = computed(() => objectValue(evidence.value.event))
+const technicalEvidence = computed(() => objectValue(evidence.value.technical))
+const technicalPanelRecord = computed(() => ({
+  recommendation_reason: parsed.value,
+  reason_contract_status: effectiveStatus.value
+}))
 const adversarialReview = computed(() => {
   const reviewAction = String(eventEvidence.value.review_action || '').trim()
   const reviewReason = String(eventEvidence.value.review_reason || '').trim()
@@ -164,6 +169,13 @@ const hasContract = computed(() => Object.keys(parsed.value).length > 0 || Boole
     <p v-if="reasonDetail && reasonDetail !== primaryReason" class="mt-2 rounded-2xl bg-white/60 p-3 text-sm leading-6 text-ink/65">
       {{ reasonDetail }}
     </p>
+
+    <TechnicalDecisionPanel
+      v-if="Object.keys(technicalEvidence).length"
+      class="mt-3"
+      :record="technicalPanelRecord"
+      compact
+    />
 
     <section v-if="adversarialReview.hasData" class="mt-3 rounded-2xl border border-rust/25 bg-rust/10 p-3">
       <div class="flex flex-wrap items-start justify-between gap-3">

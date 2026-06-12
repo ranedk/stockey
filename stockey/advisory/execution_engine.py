@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -11,9 +12,11 @@ import pandas as pd
 
 from advisory.action_recommender import TABLE_NAME as ACTIONS_TABLE, build_action_recommendations
 from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.client import DhanAPIError, DhanTradingClient
 from data.dhanlive.dhan_db import resolve_dhan_identity
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
@@ -21,9 +24,76 @@ PORTFOLIO_TABLE = "advisory_portfolio_orders"
 REBALANCE_TABLE = "advisory_rebalance_actions"
 EXECUTION_TABLE = "advisory_execution_orders"
 FILLS_TABLE = "advisory_execution_fills"
+EXECUTION_SCHEMA_MIGRATION_ID = "20260611_advisory_execution_orders_base"
+EXECUTION_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {EXECUTION_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        published_on TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        unique_id TEXT NOT NULL,
+        company_master_id TEXT,
+        correlation_id TEXT NOT NULL,
+        security_id BIGINT,
+        exchange_segment TEXT,
+        transaction_type TEXT,
+        product_type TEXT,
+        order_type TEXT,
+        validity TEXT,
+        quantity BIGINT,
+        filled_quantity BIGINT,
+        limit_price DOUBLE PRECISION,
+        trigger_price DOUBLE PRECISION,
+        reference_price DOUBLE PRECISION,
+        reference_price_source TEXT,
+        reference_price_asof TIMESTAMPTZ,
+        approved_allocation_inr DOUBLE PRECISION,
+        invest_score_pct DOUBLE PRECISION,
+        estimated_order_value_inr DOUBLE PRECISION,
+        safety_checks_json TEXT,
+        broker_order_id TEXT,
+        exchange_order_id TEXT,
+        execution_status TEXT,
+        execution_reason TEXT,
+        broker_order_status TEXT,
+        submitted_at TIMESTAMPTZ,
+        broker_update_time TIMESTAMPTZ,
+        live_mode BOOLEAN,
+        raw_broker_json TEXT,
+        raw_trade_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {FILLS_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        published_on TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        unique_id TEXT NOT NULL,
+        correlation_id TEXT NOT NULL,
+        broker_order_id TEXT,
+        exchange_trade_id TEXT,
+        traded_quantity BIGINT,
+        traded_price DOUBLE PRECISION,
+        exchange_time TIMESTAMPTZ,
+        raw_trade_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, correlation_id, exchange_trade_id)
+    )
+    """,
+    f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS invest_score_pct DOUBLE PRECISION",
+    f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS reference_price_source TEXT",
+    f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS reference_price_asof TIMESTAMPTZ",
+    f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS estimated_order_value_inr DOUBLE PRECISION",
+    f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS safety_checks_json TEXT",
+]
 DEFAULT_MAX_LIVE_ORDERS_PER_RUN = 5
 DEFAULT_MAX_LIVE_ORDER_VALUE_INR = 50_000.0
 DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES = 30
+LIVE_RUN_CONFIRMATION_ENV = "STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION"
 EXECUTION_APPROVAL_APPROVED_STATUSES = {"approved", "operator_approved"}
 EXECUTION_RECONCILIATION_PASSED_STATUSES = {"passed", "ok", "reconciled"}
 ACTION_ROW_CLOSED_STATUSES = {
@@ -36,6 +106,7 @@ ACTION_ROW_CLOSED_STATUSES = {
     "canceled",
     "rejected",
 }
+logger = logging.getLogger(__name__)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -51,7 +122,16 @@ def _env_int(name: str, default: int) -> int:
         return default
     try:
         return int(float(str(raw).strip()))
-    except ValueError:
+    except ValueError as exc:
+        record_local_fallback_event(
+            module="advisory.execution_engine",
+            fallback_type="execution_env_int_parse_failed",
+            source=name,
+            severity="warn",
+            reason="Execution engine environment integer setting was invalid; default value was used.",
+            error=exc,
+            metadata={"env_var": name, "raw_value": str(raw), "default": int(default)},
+        )
         return default
 
 
@@ -61,11 +141,50 @@ def _env_float(name: str, default: float) -> float:
         return default
     try:
         return float(str(raw).strip())
-    except ValueError:
+    except ValueError as exc:
+        record_local_fallback_event(
+            module="advisory.execution_engine",
+            fallback_type="execution_env_float_parse_failed",
+            source=name,
+            severity="warn",
+            reason="Execution engine environment numeric setting was invalid; default value was used.",
+            error=exc,
+            metadata={"env_var": name, "raw_value": str(raw), "default": float(default)},
+        )
         return default
 
 
 DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK = _env_bool("EXECUTION_ALLOW_LEGACY_PORTFOLIO_FALLBACK", False)
+
+
+def _record_execution_fallback(
+    fallback_type: str,
+    *,
+    source: str,
+    reason: str,
+    error: Exception,
+    severity: str = "warn",
+    symbol: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    logger.warning(
+        "execution degraded fallback_type=%s source=%s symbol=%s error=%s: %s",
+        fallback_type,
+        source,
+        symbol,
+        type(error).__name__,
+        error,
+    )
+    record_local_fallback_event(
+        module="advisory.execution_engine",
+        fallback_type=fallback_type,
+        source=source,
+        severity=severity,
+        reason=reason,
+        error=error,
+        symbol=symbol,
+        metadata=metadata or {},
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -87,74 +206,12 @@ def table_exists(table_name: str) -> bool:
 
 
 def ensure_execution_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EXECUTION_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                published_on TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                unique_id TEXT NOT NULL,
-                company_master_id TEXT,
-                correlation_id TEXT NOT NULL,
-                security_id BIGINT,
-                exchange_segment TEXT,
-                transaction_type TEXT,
-                product_type TEXT,
-                order_type TEXT,
-                validity TEXT,
-                quantity BIGINT,
-                filled_quantity BIGINT,
-                limit_price DOUBLE PRECISION,
-                trigger_price DOUBLE PRECISION,
-                reference_price DOUBLE PRECISION,
-                reference_price_source TEXT,
-                reference_price_asof TIMESTAMPTZ,
-                approved_allocation_inr DOUBLE PRECISION,
-                invest_score_pct DOUBLE PRECISION,
-                estimated_order_value_inr DOUBLE PRECISION,
-                safety_checks_json TEXT,
-                broker_order_id TEXT,
-                exchange_order_id TEXT,
-                execution_status TEXT,
-                execution_reason TEXT,
-                broker_order_status TEXT,
-                submitted_at TIMESTAMPTZ,
-                broker_update_time TIMESTAMPTZ,
-                live_mode BOOLEAN,
-                raw_broker_json TEXT,
-                raw_trade_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {FILLS_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                published_on TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                unique_id TEXT NOT NULL,
-                correlation_id TEXT NOT NULL,
-                broker_order_id TEXT,
-                exchange_trade_id TEXT,
-                traded_quantity BIGINT,
-                traded_price DOUBLE PRECISION,
-                exchange_time TIMESTAMPTZ,
-                raw_trade_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, correlation_id, exchange_trade_id)
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS invest_score_pct DOUBLE PRECISION")
-        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS reference_price_source TEXT")
-        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS reference_price_asof TIMESTAMPTZ")
-        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS estimated_order_value_inr DOUBLE PRECISION")
-        cur.execute(f"ALTER TABLE {EXECUTION_TABLE} ADD COLUMN IF NOT EXISTS safety_checks_json TEXT")
+    apply_schema_migration(
+        migration_id=EXECUTION_SCHEMA_MIGRATION_ID,
+        description="Create dry-run execution order and fill handoff tables.",
+        statements=EXECUTION_SCHEMA_STATEMENTS,
+        metadata={"tables": [EXECUTION_TABLE, FILLS_TABLE]},
+    )
 
 
 def load_portfolio_orders(
@@ -508,12 +565,27 @@ def load_live_account_budget(client: DhanTradingClient, *, strict: bool = False)
         available_cash = extract_available_cash(client.get_fund_limits())
     except Exception as exc:
         errors.append(f"fund_limits:{exc.__class__.__name__}:{exc}")
+        _record_execution_fallback(
+            "execution_broker_fund_limits_failed",
+            source="dhan_fund_limits",
+            reason="Execution planning could not read broker fund limits; account-aware sizing may be unavailable.",
+            error=exc,
+            metadata={"strict": bool(strict)},
+        )
         available_cash = None
     for loader in [client.get_holdings, client.get_positions]:
         try:
             frame = normalize_live_inventory(loader())
         except Exception as exc:
-            errors.append(f"{getattr(loader, '__name__', 'inventory_loader')}:{exc.__class__.__name__}:{exc}")
+            loader_name = getattr(loader, "__name__", "inventory_loader")
+            errors.append(f"{loader_name}:{exc.__class__.__name__}:{exc}")
+            _record_execution_fallback(
+                "execution_broker_inventory_failed",
+                source=f"dhan_{loader_name}",
+                reason="Execution planning could not read broker inventory; sell sizing and reconciliation context may be unavailable.",
+                error=exc,
+                metadata={"strict": bool(strict), "loader": loader_name},
+            )
             continue
         if not frame.empty:
             inventory_frames.append(frame)
@@ -554,6 +626,31 @@ def map_execution_status(order_status: str | None) -> str:
     if status in {"REJECTED"}:
         return "rejected"
     return "planned"
+
+
+def finalize_execution_plan_safety_contract(
+    contract: dict[str, Any],
+    *,
+    execution_status: str,
+    execution_reason: object = None,
+    identity_status: str = "not_checked",
+    identity_error: object = None,
+    security_id: object = None,
+) -> dict[str, Any]:
+    out = dict(contract or {})
+    issues = list(out.get("issues") or [])
+    reason_text = str(execution_reason or "").strip()
+    if execution_status != "planned" and reason_text and reason_text not in issues:
+        issues.append(reason_text)
+    out["issues"] = issues
+    out["execution_plan_status"] = execution_status
+    out["broker_identity_required"] = True
+    out["broker_identity_status"] = identity_status
+    out["broker_identity_resolved"] = identity_status == "resolved" and pd.notna(pd.to_numeric(security_id, errors="coerce"))
+    if identity_error:
+        out["broker_identity_error"] = str(identity_error)
+    out["live_submission_allowed"] = False
+    return out
 
 
 def build_execution_orders(
@@ -638,6 +735,8 @@ def build_execution_orders(
             execution_reason = None
             security_id = None
             exchange_segment = None
+            identity_status = "not_checked"
+            identity_error = None
             inventory = inventory_map.get(symbol, {})
             available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
             action_fraction = pd.to_numeric(row.get("action_fraction"), errors="coerce")
@@ -653,17 +752,35 @@ def build_execution_orders(
             if row_block_reasons:
                 execution_status = "submit_blocked"
                 execution_reason = " ".join(row_block_reasons)
+                identity_status = "skipped"
             elif reason_contract_status != "complete":
                 execution_status = "submit_blocked"
                 execution_reason = f"Reason contract is not complete: {reason_contract_status or 'missing'}."
+                identity_status = "skipped"
             else:
                 try:
                     identity = resolve_dhan_identity(symbol, "NSE", asset_type="stock")
                     security_id = int(identity["security_id"])
                     exchange_segment = str(identity["exchange_segment"])
+                    identity_status = "resolved"
                 except Exception as exc:
                     execution_status = "submit_blocked"
                     execution_reason = f"Identity resolution failed: {exc}"
+                    identity_status = "failed"
+                    identity_error = exc
+                    _record_execution_fallback(
+                        "execution_identity_resolution_failed",
+                        source="dhan_identity",
+                        reason="Execution planning blocked a broker-capable action because Dhan security identity could not be resolved.",
+                        error=exc,
+                        severity="error",
+                        symbol=symbol,
+                        metadata={
+                            "action_code": action_code,
+                            "transaction_type": transaction,
+                            "execution_mode": execution_mode,
+                        },
+                    )
 
             if execution_status == "planned" and transaction == "BUY" and action_code == "BUY":
                 approved_allocation = pd.to_numeric(row.get("approved_allocation_inr"), errors="coerce")
@@ -717,6 +834,22 @@ def build_execution_orders(
                     else:
                         quantity = available_qty_int
 
+            safety_contract = finalize_execution_plan_safety_contract(
+                safety_contract,
+                execution_status=execution_status,
+                execution_reason=execution_reason,
+                identity_status=identity_status,
+                identity_error=identity_error,
+                security_id=security_id or inventory.get("security_id"),
+            )
+            order_intent_lineage = _build_action_order_intent_lineage(
+                row,
+                safety_contract=safety_contract,
+                reference_price=reference_price,
+                reference_price_source=reference_price_source,
+                reference_price_asof=reference_price_asof,
+            )
+            safety_contract["order_intent_lineage"] = order_intent_lineage
             correlation_id = sanitize_correlation_id(f"{action_code}-{symbol}-{row.get('unique_id') or 'na'}")
             limit_price = None if order_type.upper() == "MARKET" else float(reference_price) if pd.notna(reference_price) else None
             rows.append(
@@ -761,7 +894,13 @@ def build_execution_orders(
                             "action_fraction": pd.to_numeric(row.get("action_fraction"), errors="coerce"),
                             "execution_mode": row.get("execution_mode"),
                             "reason_contract_status": row.get("reason_contract_status"),
+                            "recommendation_reason_json": row.get("recommendation_reason_json"),
+                            "order_intent_lineage": order_intent_lineage,
                             "recommended_stop_price": pd.to_numeric(row.get("recommended_stop_price"), errors="coerce"),
+                            "recommended_target_price": pd.to_numeric(row.get("recommended_target_price"), errors="coerce"),
+                            "stop_price": pd.to_numeric(row.get("stop_price"), errors="coerce"),
+                            "target_price": pd.to_numeric(row.get("target_price"), errors="coerce"),
+                            "invalidation_price": pd.to_numeric(row.get("invalidation_price"), errors="coerce"),
                             "reference_price_source": reference_price_source,
                             "reference_price_asof": reference_price_asof,
                             "execution_safety_contract": safety_contract,
@@ -792,6 +931,18 @@ def build_execution_orders(
             security_id = int(identity["security_id"])
             exchange_segment = str(identity["exchange_segment"])
         except Exception as exc:
+            _record_execution_fallback(
+                "execution_portfolio_identity_resolution_failed",
+                source="dhan_identity",
+                reason="portfolio execution planning could not resolve broker security identity",
+                error=exc,
+                symbol=symbol,
+                metadata={
+                    "action_path": "portfolio_order",
+                    "setup_id": str(row.get("setup_id") or ""),
+                    "unique_id": str(row.get("unique_id") or ""),
+                },
+            )
             execution_status = "submit_blocked"
             execution_reason = f"Identity resolution failed: {exc}"
             identity = None
@@ -874,6 +1025,19 @@ def build_execution_orders(
             security_id = int(identity["security_id"])
             exchange_segment = str(identity["exchange_segment"])
         except Exception as exc:
+            _record_execution_fallback(
+                "execution_exit_identity_resolution_failed",
+                source="dhan_identity",
+                reason="exit/add-on execution planning could not resolve broker security identity",
+                error=exc,
+                symbol=symbol,
+                metadata={
+                    "action_path": "exit_action",
+                    "suggested_action": suggested_action,
+                    "setup_id": str(row.get("setup_id") or ""),
+                    "unique_id": str(row.get("unique_id") or ""),
+                },
+            )
             execution_status = "submit_blocked"
             execution_reason = f"Identity resolution failed: {exc}"
         available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
@@ -997,18 +1161,34 @@ def persist_execution_orders(df: pd.DataFrame) -> None:
     _trace_execution_rows(out, stage="execution_planning", step_idx=60)
 
 
-def _jsonish(value: Any) -> dict[str, Any]:
+def _jsonish(value: Any, *, source: str = "execution_json_context", symbol: str | None = None) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     try:
         if pd.isna(value):
             return {}
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_execution_fallback(
+            "execution_json_missing_check_failed",
+            source=source,
+            symbol=symbol,
+            reason="Execution engine could not evaluate missingness for stored JSON context and continued parsing.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     try:
         parsed = json.loads(str(value or "{}"))
         return parsed if isinstance(parsed, dict) else {}
-    except Exception:
+    except Exception as exc:
+        text = str(value or "")
+        _record_execution_fallback(
+            "execution_json_parse_failed",
+            source=source,
+            symbol=symbol,
+            reason="Execution engine could not parse stored JSON context and used an empty object fallback.",
+            error=exc,
+            metadata={"value_length": len(text), "value_excerpt": text[:240]},
+        )
         return {}
 
 
@@ -1016,8 +1196,9 @@ def _trace_execution_rows(df: pd.DataFrame, *, stage: str, step_idx: int) -> Non
     if df.empty:
         return
     for _, row in df.iterrows():
-        safety_checks = _jsonish(row.get("safety_checks_json"))
-        raw_broker = _jsonish(row.get("raw_broker_json"))
+        symbol = _clean_optional_text(row.get("symbol")).upper() or None
+        safety_checks = _jsonish(row.get("safety_checks_json"), source="safety_checks_json", symbol=symbol)
+        raw_broker = _jsonish(row.get("raw_broker_json"), source="raw_broker_json", symbol=symbol)
         payload = {
             "execution_status": row.get("execution_status"),
             "execution_reason": row.get("execution_reason"),
@@ -1099,11 +1280,79 @@ def build_execution_plan_safety_contract(
     }
 
 
+def _optional_number(value: object) -> float | None:
+    numeric = pd.to_numeric(value, errors="coerce")
+    return None if pd.isna(numeric) else float(numeric)
+
+
+def _build_action_order_intent_lineage(
+    row: pd.Series,
+    *,
+    safety_contract: dict[str, Any],
+    reference_price: object = None,
+    reference_price_source: object = None,
+    reference_price_asof: object = None,
+) -> dict[str, Any]:
+    reason_contract = _jsonish(
+        row.get("recommendation_reason_json"),
+        source="recommendation_reason_json",
+        symbol=_clean_optional_text(row.get("symbol")).upper() or None,
+    )
+    lineage = {
+        "source": "advisory_action_recommendations",
+        "asof_date": row.get("asof_date"),
+        "published_on": row.get("published_on"),
+        "setup_id": row.get("setup_id"),
+        "symbol": row.get("symbol"),
+        "unique_id": row.get("unique_id"),
+        "action_code": row.get("action_code"),
+        "action_source": row.get("action_source"),
+        "source_action": row.get("source_action"),
+        "transaction_type": row.get("transaction_type"),
+        "execution_mode": row.get("execution_mode"),
+        "action_status": row.get("action_status") if "action_status" in row.index else row.get("status"),
+        "reason_contract_status": row.get("reason_contract_status"),
+        "reason_contract_available": bool(reason_contract),
+        "risk_sizing": {
+            "approved_allocation_inr": _optional_number(row.get("approved_allocation_inr")),
+            "invest_score_pct": _optional_number(row.get("invest_score_pct")),
+            "action_fraction": _optional_number(row.get("action_fraction")),
+        },
+        "risk_levels": {
+            "reference_price": _optional_number(reference_price),
+            "reference_price_source": reference_price_source,
+            "reference_price_asof": reference_price_asof,
+            "stop_price": _optional_number(row.get("stop_price")),
+            "target_price": _optional_number(row.get("target_price")),
+            "invalidation_price": _optional_number(row.get("invalidation_price")),
+            "recommended_stop_price": _optional_number(row.get("recommended_stop_price")),
+            "recommended_target_price": _optional_number(row.get("recommended_target_price")),
+        },
+        "approval": {
+            "operator_approval_required": safety_contract.get("operator_approval_required"),
+            "operator_approval_status": safety_contract.get("operator_approval_status"),
+            "broker_reconciliation_required": safety_contract.get("broker_reconciliation_required"),
+            "broker_reconciliation_status": safety_contract.get("broker_reconciliation_status"),
+        },
+    }
+    if reason_contract:
+        lineage["reason_contract"] = {
+            "status": reason_contract.get("status"),
+            "action": reason_contract.get("action"),
+            "summary": reason_contract.get("summary") or reason_contract.get("headline"),
+            "missing_fields": reason_contract.get("missing_fields"),
+            "manual_review_boundary": reason_contract.get("manual_review_boundary"),
+            "sections_present": sorted([key for key, value in reason_contract.items() if isinstance(value, dict) and value]),
+        }
+    return lineage
+
+
 def _safety_contract_from_row(row: pd.Series) -> dict[str, Any]:
-    parsed = _jsonish(row.get("safety_checks_json"))
+    symbol = _clean_optional_text(row.get("symbol")).upper() or None
+    parsed = _jsonish(row.get("safety_checks_json"), source="safety_checks_json", symbol=symbol)
     if parsed:
         return parsed
-    raw = _jsonish(row.get("raw_broker_json"))
+    raw = _jsonish(row.get("raw_broker_json"), source="raw_broker_json", symbol=symbol)
     return raw.get("execution_safety_contract") if isinstance(raw.get("execution_safety_contract"), dict) else {}
 
 
@@ -1111,8 +1360,15 @@ def _clean_optional_text(value: object) -> str:
     try:
         if pd.isna(value):
             return ""
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_execution_fallback(
+            "execution_text_missing_check_failed",
+            source="clean_optional_text",
+            symbol=None,
+            reason="Execution engine could not evaluate missingness for optional text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return str(value or "").strip()
 
 
@@ -1147,7 +1403,7 @@ def annotate_reconciliation_safety_contracts(df: pd.DataFrame) -> pd.DataFrame:
             )
         contract = {**contract, **updates, "live_submission_allowed": False}
         out.at[idx, "safety_checks_json"] = json.dumps(contract, ensure_ascii=False, default=str, sort_keys=True)
-        raw = _jsonish(row.get("raw_broker_json"))
+        raw = _jsonish(row.get("raw_broker_json"), source="raw_broker_json", symbol=_clean_optional_text(row.get("symbol")).upper() or None)
         if raw:
             raw["execution_safety_contract"] = contract
             out.at[idx, "raw_broker_json"] = json.dumps(raw, ensure_ascii=False, default=str, sort_keys=True)
@@ -1179,7 +1435,19 @@ def _action_row_block_reasons(row: pd.Series, *, monitor_date: pd.Timestamp) -> 
     return reasons
 
 
-def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
+def build_live_execution_confirmation_token(df: pd.DataFrame) -> str:
+    planned_count = int(len(df))
+    date_value = None
+    if "asof_date" in df.columns and not df.empty:
+        dates = pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dropna()
+        if not dates.empty:
+            date_value = dates.min().normalize().date().isoformat()
+    if not date_value:
+        date_value = pd.Timestamp.utcnow().normalize().date().isoformat()
+    return f"STOCKEY-LIVE-{date_value}-{planned_count}"
+
+
+def apply_live_execution_safety(df: pd.DataFrame, *, live_confirmation: str | None = None) -> pd.DataFrame:
     out = df.copy()
     if out.empty:
         return out
@@ -1194,6 +1462,7 @@ def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
     max_price_age_minutes = _env_int("STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES", DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES)
     require_operator_approval = _env_bool("STOCKEY_EXECUTION_REQUIRE_OPERATOR_APPROVAL", True)
     require_reconciliation = _env_bool("STOCKEY_EXECUTION_REQUIRE_RECONCILIATION", True)
+    provided_confirmation = (live_confirmation or os.getenv(LIVE_RUN_CONFIRMATION_ENV) or "").strip()
 
     def block(idx: int, reason: str, checks: dict[str, Any]) -> None:
         out.at[idx, "execution_status"] = "submit_blocked"
@@ -1202,6 +1471,7 @@ def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
         out.at[idx, "safety_checks_json"] = json.dumps(checks, ensure_ascii=False, default=str, sort_keys=True)
 
     planned_indexes = out.index[planned_mask].tolist()
+    confirmation_token = build_live_execution_confirmation_token(out.loc[planned_indexes])
     base_checks = {
         "live_enabled": live_enabled,
         "max_orders_per_run": max_orders,
@@ -1210,10 +1480,22 @@ def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
         "max_intraday_price_age_minutes": max_price_age_minutes,
         "require_operator_approval": require_operator_approval,
         "require_reconciliation": require_reconciliation,
+        "live_run_confirmation_required": True,
+        "live_run_confirmation_env": LIVE_RUN_CONFIRMATION_ENV,
+        "live_run_confirmation_expected": confirmation_token,
+        "live_run_confirmation_provided": bool(provided_confirmation),
     }
     if not live_enabled:
         for idx in planned_indexes:
             block(idx, "Live trading disabled; set STOCKEY_LIVE_TRADING_ENABLED=true to submit.", base_checks)
+        return out
+    if provided_confirmation != confirmation_token:
+        for idx in planned_indexes:
+            block(
+                idx,
+                f"Live run confirmation is required; pass --live-confirmation {confirmation_token} or set {LIVE_RUN_CONFIRMATION_ENV}.",
+                base_checks,
+            )
         return out
     if max_orders > 0 and len(planned_indexes) > max_orders:
         checks = {**base_checks, "planned_order_count": len(planned_indexes)}
@@ -1275,10 +1557,10 @@ def apply_live_execution_safety(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def submit_live_orders(df: pd.DataFrame) -> pd.DataFrame:
+def submit_live_orders(df: pd.DataFrame, *, live_confirmation: str | None = None) -> pd.DataFrame:
     if df.empty:
         return df
-    out = apply_live_execution_safety(df)
+    out = apply_live_execution_safety(df, live_confirmation=live_confirmation)
     if not out["execution_status"].astype(str).eq("planned").any():
         _trace_execution_rows(out, stage="execution_safety", step_idx=61)
         return out
@@ -1311,6 +1593,19 @@ def submit_live_orders(df: pd.DataFrame) -> pd.DataFrame:
             out.at[idx, "execution_status"] = "submit_error"
             out.at[idx, "execution_reason"] = str(exc)
             out.at[idx, "live_mode"] = True
+            _record_execution_fallback(
+                "execution_live_submit_failed",
+                source="dhan_place_order",
+                reason="Live broker order submission failed; row was marked submit_error and no success was assumed.",
+                error=exc,
+                severity="error",
+                symbol=str(row.get("symbol") or "").strip().upper() or None,
+                metadata={
+                    "correlation_id": row.get("correlation_id"),
+                    "transaction_type": row.get("transaction_type"),
+                    "security_id": row.get("security_id"),
+                },
+            )
     _trace_execution_rows(out, stage="execution_submission", step_idx=62)
     return out
 
@@ -1321,7 +1616,17 @@ def load_recon_targets(
     symbols: list[str] | None = None,
     setup_ids: list[str] | None = None,
 ) -> pd.DataFrame:
-    if not table_exists(EXECUTION_TABLE):
+    try:
+        exists = table_exists(EXECUTION_TABLE)
+    except Exception as exc:
+        _record_execution_fallback(
+            "execution_recon_table_lookup_failed",
+            source=EXECUTION_TABLE,
+            reason="Execution reconciliation could not check the execution-order table; reconciliation target load was skipped.",
+            error=exc,
+        )
+        return pd.DataFrame()
+    if not exists:
         return pd.DataFrame()
     clauses = ["execution_status IN ('planned', 'submitted', 'partial_filled', 'submit_error', 'submit_blocked', 'reconcile_error', 'filled')"]
     params: list[object] = []
@@ -1334,15 +1639,25 @@ def load_recon_targets(
     if setup_ids:
         clauses.append("setup_id = ANY(%s)")
         params.append([value.upper() for value in setup_ids])
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {EXECUTION_TABLE}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY published_on, setup_id, symbol
-        """,
-        params=tuple(params) if params else None,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {EXECUTION_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY published_on, setup_id, symbol
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception as exc:
+        _record_execution_fallback(
+            "execution_recon_targets_load_failed",
+            source=EXECUTION_TABLE,
+            reason="Execution reconciliation could not load target rows; broker reconciliation may be stale or unavailable.",
+            error=exc,
+            metadata={"symbols": symbols or [], "setup_ids": setup_ids or [], "asof_date": str(asof_date) if asof_date is not None else None},
+        )
+        return pd.DataFrame()
     if df.empty:
         return df
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
@@ -1411,6 +1726,19 @@ def reconcile_live_orders(
             row_dict["execution_status"] = "reconcile_error"
             row_dict["execution_reason"] = str(exc)
             row_dict["broker_update_time"] = pd.Timestamp.utcnow()
+            _record_execution_fallback(
+                "execution_broker_reconcile_failed",
+                source="dhan_order_reconciliation",
+                reason="Execution reconciliation failed for a broker order; row was marked reconcile_error and no success was assumed.",
+                error=exc,
+                severity="error",
+                symbol=str(row.get("symbol") or "").strip().upper() or None,
+                metadata={
+                    "correlation_id": row.get("correlation_id"),
+                    "broker_order_id": row.get("broker_order_id"),
+                    "execution_status": row.get("execution_status"),
+                },
+            )
         row_dict["load_ts"] = pd.Timestamp.utcnow()
         order_rows.append(row_dict)
     return pd.DataFrame(order_rows), pd.DataFrame(fill_rows)
@@ -1461,6 +1789,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--order-type", default="MARKET")
     parser.add_argument("--validity", default="DAY")
     parser.add_argument("--use-broker-account", action="store_true", help="Use Dhan cash/holdings to cap staged order quantities")
+    parser.add_argument("--live-confirmation", help="Per-run confirmation token required for --live submissions; preview token is shown in blocked safety checks")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
@@ -1498,7 +1827,7 @@ def main() -> int:
             use_broker_account=bool(args.use_broker_account or (args.live and _env_bool("STOCKEY_LIVE_TRADING_ENABLED", False))),
         )
         if args.live:
-            planned_df = submit_live_orders(planned_df)
+            planned_df = submit_live_orders(planned_df, live_confirmation=args.live_confirmation)
         if not args.dry_run:
             persist_execution_orders(planned_df)
 

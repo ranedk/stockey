@@ -9,6 +9,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOG_DIR = REPO_ROOT / "logs" / "analysis_agents"
@@ -243,6 +245,15 @@ def post_cycle_checks(
         try:
             returncode, output = run_local_command(command, timeout_seconds=timeout_seconds)
         except subprocess.TimeoutExpired as exc:
+            record_local_fallback_event(
+                module="scripts.analysis_agent_loop",
+                source=label,
+                fallback_type="analysis_agent_post_check_timeout",
+                severity="warn",
+                reason="Analysis agent post-cycle validation command timed out; the cycle will stop with failed post-check status.",
+                error=exc,
+                metadata={"cycle": int(cycle), "timeout_seconds": int(timeout_seconds), "command": command},
+            )
             ok = False
             lines.append(f"[analysis_agent_loop] post-check {label} timed out after {timeout_seconds}s")
             if exc.stdout:

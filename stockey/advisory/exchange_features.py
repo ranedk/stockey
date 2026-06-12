@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from features.tutils import get_max_date
 from utils.db import sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg
@@ -13,6 +14,25 @@ from utils.sync import parse_datetime_arg
 
 TABLE_NAME = "advisory_exchange_features_daily"
 EVENTS_TABLE = "advisory_exchange_events"
+
+
+def _record_exchange_feature_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.exchange_features",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -31,7 +51,14 @@ def table_exists(table_name: str) -> bool:
             """,
             params=(table_name,),
         )
-    except Exception:
+    except Exception as exc:
+        _record_exchange_feature_fallback(
+            fallback_type="exchange_features_table_lookup_failed",
+            source=table_name,
+            reason="Exchange feature builder could not check whether a source or target table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return False
     return not df.empty
 
@@ -54,9 +81,19 @@ def load_target_dates(
     effective_from = _as_utc_timestamp(from_date)
     effective_to = _as_utc_timestamp(to_date) or pd.Timestamp.utcnow().normalize()
     if not rebuild and from_date is None and table_exists(TABLE_NAME):
-        max_date = get_max_date(TABLE_NAME, "asof_date")
-        if max_date is not None:
-            effective_from = _as_utc_timestamp(pd.Timestamp(max_date) + pd.Timedelta(days=1))
+        try:
+            max_date = get_max_date(TABLE_NAME, "asof_date")
+            if max_date is not None:
+                effective_from = _as_utc_timestamp(pd.Timestamp(max_date) + pd.Timedelta(days=1))
+        except Exception as exc:
+            _record_exchange_feature_fallback(
+                fallback_type="exchange_features_max_date_lookup_failed",
+                source=TABLE_NAME,
+                reason="Exchange feature builder could not read the target max date; explicit/rebuild date bounds may be needed.",
+                error=exc,
+                metadata={"date_column": "asof_date"},
+            )
+            raise
 
     clauses = ["date <= %(to_date)s"]
     params: dict[str, Any] = {"to_date": effective_to}
@@ -64,15 +101,25 @@ def load_target_dates(
         clauses.append("date >= %(from_date)s")
         params["from_date"] = effective_from
 
-    dates = sql_to_df(
-        f"""
-        SELECT date
-        FROM dim_trading_days
-        WHERE {' AND '.join(clauses)}
-        ORDER BY date
-        """,
-        params=params,
-    )
+    try:
+        dates = sql_to_df(
+            f"""
+            SELECT date
+            FROM dim_trading_days
+            WHERE {' AND '.join(clauses)}
+            ORDER BY date
+            """,
+            params=params,
+        )
+    except Exception as exc:
+        _record_exchange_feature_fallback(
+            fallback_type="exchange_features_trading_days_load_failed",
+            source="dim_trading_days",
+            reason="Exchange feature builder could not load target trading days.",
+            error=exc,
+            metadata={"from_date": None if effective_from is None else str(effective_from), "to_date": str(effective_to)},
+        )
+        raise
     if dates.empty:
         return dates
     dates["asof_date"] = normalize_timestamp(dates["date"])
@@ -99,34 +146,48 @@ def load_exchange_events(
         clauses.append("symbol = ANY(%(symbols)s)")
         params["symbols"] = [symbol.upper() for symbol in symbols]
     where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    df = sql_to_df(
-        f"""
-        SELECT
-            event_id,
-            event_source,
-            event_type,
-            symbol,
-            company_master_id,
-            event_date,
-            known_on,
-            disclosure_date,
-            participant,
-            side,
-            quantity,
-            price,
-            value_inr,
-            holding_pct_before,
-            holding_pct_after,
-            event_summary
-        FROM {EVENTS_TABLE}
-        {where_sql}
-        ORDER BY known_on, symbol, event_source
-        """,
-        params=params or None,
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                event_id,
+                event_source,
+                event_type,
+                symbol,
+                company_master_id,
+                event_date,
+                known_on,
+                disclosure_date,
+                participant,
+                side,
+                quantity,
+                price,
+                value_inr,
+                holding_pct_before,
+                holding_pct_after,
+                event_summary
+            FROM {EVENTS_TABLE}
+            {where_sql}
+            ORDER BY known_on, symbol, event_source
+            """,
+            params=params or None,
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        _record_exchange_feature_fallback(
+            fallback_type="exchange_features_events_load_failed",
+            source=EVENTS_TABLE,
+            reason="Exchange feature builder could not load normalized exchange events.",
+            error=exc,
+            metadata={
+                "start_date": None if start_date is None else str(start_date),
+                "end_date": None if end_date is None else str(end_date),
+                "symbol_count": 0 if not symbols else len(symbols),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["known_on"] = normalize_timestamp(df["known_on"])

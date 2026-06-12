@@ -9,18 +9,64 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.ohlcv import sync_many_daily
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import load_tracked_symbols, parse_datetime_arg
 
 
 TABLE_NAME = "advisory_ts_forecasts_daily"
+TS_FORECAST_FEATURES_SCHEMA_MIGRATION_ID = "20260611_advisory_ts_forecast_features_base"
+TS_FORECAST_FEATURES_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        symbol TEXT NOT NULL,
+        model_name TEXT NOT NULL,
+        model_version TEXT,
+        forecast_horizon_days BIGINT NOT NULL,
+        forecast_return DOUBLE PRECISION,
+        forecast_price DOUBLE PRECISION,
+        downside_return_p10 DOUBLE PRECISION,
+        upside_return_p90 DOUBLE PRECISION,
+        probability_positive DOUBLE PRECISION,
+        realized_volatility_20d DOUBLE PRECISION,
+        momentum_return_20d DOUBLE PRECISION,
+        momentum_return_60d DOUBLE PRECISION,
+        signal_quality DOUBLE PRECISION,
+        action_hint TEXT,
+        feature_context_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)
+    )
+    """,
+]
 DEFAULT_MODEL_NAME = "naive_momentum_v1"
 TIMESFM_MODEL_NAME = "timesfm_2p5_200m"
 DEFAULT_TIMESFM_CHECKPOINT = os.getenv("TS_TIMESFM_CHECKPOINT", "google/timesfm-2.5-200m-pytorch")
 DEFAULT_HORIZONS = (5, 10, 20)
 DEFAULT_LOOKBACK_DAYS = 260
 MIN_HISTORY_ROWS = 80
+
+
+def _record_ts_forecast_feature_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.ts_forecast_features",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def _normalize_asof_date(value: Any | None) -> pd.Timestamp:
@@ -44,15 +90,24 @@ def resolve_symbol_universe(symbols: list[str] | None) -> list[str]:
     tracked = load_tracked_symbols(symbols)
     if tracked:
         return sorted({str(value).strip().upper() for value in tracked if str(value).strip()})
-    df = sql_to_df(
-        """
-        SELECT DISTINCT ticker AS symbol
-        FROM dhan_ohlcv_daily
-        WHERE asset_type = 'stock'
-          AND exchange = 'NSE'
-        ORDER BY ticker
-        """
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT DISTINCT ticker AS symbol
+            FROM dhan_ohlcv_daily
+            WHERE asset_type = 'stock'
+              AND exchange = 'NSE'
+            ORDER BY ticker
+            """
+        )
+    except Exception as exc:
+        _record_ts_forecast_feature_fallback(
+            fallback_type="ts_forecast_features_universe_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="TS forecast feature builder could not load the default Dhan OHLCV symbol universe.",
+            error=exc,
+        )
+        raise
     if df.empty:
         return []
     return _as_symbol_list(df["symbol"].dropna().astype(str).tolist())
@@ -67,26 +122,41 @@ def load_ohlcv_history(
     if not symbols:
         return pd.DataFrame()
     start_date = asof_date - pd.Timedelta(days=max(int(lookback_days), 1) * 2)
-    df = sql_to_df(
-        """
-        SELECT
-            ticker AS symbol,
-            date,
-            open,
-            high,
-            low,
-            close,
-            volume
-        FROM dhan_ohlcv_daily
-        WHERE ticker = ANY(%s)
-          AND asset_type = 'stock'
-          AND exchange = 'NSE'
-          AND date >= %s
-          AND date <= %s
-        ORDER BY ticker, date
-        """,
-        params=(symbols, start_date, asof_date),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT
+                ticker AS symbol,
+                date,
+                open,
+                high,
+                low,
+                close,
+                volume
+            FROM dhan_ohlcv_daily
+            WHERE ticker = ANY(%s)
+              AND asset_type = 'stock'
+              AND exchange = 'NSE'
+              AND date >= %s
+              AND date <= %s
+            ORDER BY ticker, date
+            """,
+            params=(symbols, start_date, asof_date),
+        )
+    except Exception as exc:
+        _record_ts_forecast_feature_fallback(
+            fallback_type="ts_forecast_features_ohlcv_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="TS forecast feature builder could not load Dhan daily OHLCV history.",
+            error=exc,
+            metadata={
+                "symbol_count": len(symbols),
+                "from_date": str(start_date),
+                "to_date": str(asof_date),
+                "lookback_days": int(lookback_days),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -362,31 +432,12 @@ def build_ts_forecasts(
 
 
 def ensure_ts_forecast_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                symbol TEXT NOT NULL,
-                model_name TEXT NOT NULL,
-                model_version TEXT,
-                forecast_horizon_days BIGINT NOT NULL,
-                forecast_return DOUBLE PRECISION,
-                forecast_price DOUBLE PRECISION,
-                downside_return_p10 DOUBLE PRECISION,
-                upside_return_p90 DOUBLE PRECISION,
-                probability_positive DOUBLE PRECISION,
-                realized_volatility_20d DOUBLE PRECISION,
-                momentum_return_20d DOUBLE PRECISION,
-                momentum_return_60d DOUBLE PRECISION,
-                signal_quality DOUBLE PRECISION,
-                action_hint TEXT,
-                feature_context_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=TS_FORECAST_FEATURES_SCHEMA_MIGRATION_ID,
+        description="Create advisory TS forecast feature table.",
+        statements=TS_FORECAST_FEATURES_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME], "workflow": "ts_forecast_features"},
+    )
 
 
 def persist_ts_forecasts(df: pd.DataFrame) -> None:
@@ -441,13 +492,23 @@ def main() -> int:
     symbol_universe = resolve_symbol_universe(args.symbols)
     refresh_result = None
     if bool(args.refresh_ohlcv) and symbol_universe and not bool(args.dry_run):
-        refresh_result = sync_many_daily(
-            symbol_universe,
-            exchange="NSE",
-            asset_type="stock",
-            from_date=args.refresh_from_date,
-            to_date=args.refresh_to_date or args.date,
-        )
+        try:
+            refresh_result = sync_many_daily(
+                symbol_universe,
+                exchange="NSE",
+                asset_type="stock",
+                from_date=args.refresh_from_date,
+                to_date=args.refresh_to_date or args.date,
+            )
+        except Exception as exc:
+            _record_ts_forecast_feature_fallback(
+                fallback_type="ts_forecast_features_ohlcv_refresh_failed",
+                source="dhan_ohlcv_daily",
+                reason="TS forecast feature builder could not refresh Dhan daily OHLCV before forecasting.",
+                error=exc,
+                metadata={"symbol_count": len(symbol_universe)},
+            )
+            raise
     df = build_ts_forecasts(
         symbols=symbol_universe,
         asof_date=pd.Timestamp(args.date, tz="UTC") if args.date else None,

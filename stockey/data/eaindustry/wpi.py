@@ -1,5 +1,6 @@
 import time
 from datetime import date
+import json
 
 import pandas as pd
 import requests
@@ -7,6 +8,7 @@ import urllib3
 from bs4 import BeautifulSoup
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_dynamic_headers
 from utils.date import last_of_month
@@ -22,6 +24,35 @@ MAX_ITEM_ATTEMPTS = 5
 REQUEST_TIMEOUT = 120
 REQUEST_SLEEP_SECONDS = 2.0
 WPI_LOOKBACK_DAYS = max(env.int("EAINDUSTRY_WPI_LOOKBACK_DAYS", 365), 1)
+SYNC_SOURCE_NAME = "data.eaindustry.wpi"
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
+def _record_wpi_download_fallback(
+    *,
+    year: int,
+    item: list[str],
+    attempt: int,
+    error: Exception,
+) -> None:
+    record_local_fallback_event(
+        module="data.eaindustry.wpi",
+        fallback_type="wpi_item_download_attempt_failed",
+        source="eaindustry_wpi",
+        severity="warn",
+        reason=(
+            "WPI item download failed on one retry attempt; the item will be retried and may remain "
+            "stale if all attempts fail."
+        ),
+        error=error,
+        metadata={
+            "year": int(year),
+            "cname": str(item[0]).strip() if item else "",
+            "name": str(item[1]).strip() if len(item) > 1 else "",
+            "attempt": int(attempt),
+            "max_attempts": int(MAX_ITEM_ATTEMPTS),
+        },
+    )
 
 
 def expected_month_count_for_year(year: int, today: date | None = None) -> int:
@@ -193,6 +224,9 @@ def sync_wpi_for_year(year: int, *, today: date | None = None) -> dict[str, obje
 
     downloaded_count = 0
     skipped_count = 0
+    attempt_count = 0
+    retry_count = 0
+    failed_attempt_count = 0
     failed: list[dict[str, object]] = []
 
     for position, item in enumerate(items, start=1):
@@ -205,6 +239,9 @@ def sync_wpi_for_year(year: int, *, today: date | None = None) -> dict[str, obje
         print(f"Downloading WPI for {year} [{position}/{len(items)}]: {item[1]}", flush=True)
         last_error: Exception | None = None
         for attempt in range(1, MAX_ITEM_ATTEMPTS + 1):
+            attempt_count += 1
+            if attempt > 1:
+                retry_count += 1
             try:
                 df = download_wpi_item(year=year, item=item, session=session, cookies=cookies)
                 persist_wpi_item(df, year=year, cname=cname)
@@ -216,7 +253,14 @@ def sync_wpi_for_year(year: int, *, today: date | None = None) -> dict[str, obje
                 time.sleep(0.2)
                 break
             except (requests.RequestException, ValueError) as exc:
+                failed_attempt_count += 1
                 last_error = exc
+                _record_wpi_download_fallback(
+                    year=year,
+                    item=item,
+                    attempt=attempt,
+                    error=exc,
+                )
                 print(f"WPI retry {attempt}/{MAX_ITEM_ATTEMPTS} for {year} {item[1]}: {exc}", flush=True)
                 time.sleep(REQUEST_SLEEP_SECONDS * attempt)
                 session, cookies = bootstrap_wpi_session()
@@ -231,6 +275,10 @@ def sync_wpi_for_year(year: int, *, today: date | None = None) -> dict[str, obje
         "downloaded_count": downloaded_count,
         "skipped_count": skipped_count,
         "failed_count": len(failed),
+        "attempt_count": attempt_count,
+        "retry_count": retry_count,
+        "failed_attempt_count": failed_attempt_count,
+        "source_unavailable_count": len(failed),
         "failed_items": failed,
     }
 
@@ -249,14 +297,55 @@ def sync_wpi() -> list[dict[str, object]]:
     return results
 
 
-def run():
+def build_run_state(results: list[dict[str, object]]) -> dict[str, object]:
+    row_count = sum(int(item.get("downloaded_count") or 0) for item in results)
+    skipped_count = sum(int(item.get("skipped_count") or 0) for item in results)
+    failed_count = sum(int(item.get("failed_count") or 0) for item in results)
+    item_count = sum(int(item.get("item_count") or 0) for item in results)
+    attempt_count = sum(int(item.get("attempt_count") or 0) for item in results)
+    retry_count = sum(int(item.get("retry_count") or 0) for item in results)
+    failed_attempt_count = sum(int(item.get("failed_attempt_count") or 0) for item in results)
+    years = [int(item["year"]) for item in results if item.get("year") is not None]
+    failed_items = []
+    for item in results:
+        for failed in item.get("failed_items") or []:
+            if isinstance(failed, dict):
+                failed_items.append({"year": item.get("year"), **failed})
+    return {
+        "source": SYNC_SOURCE_NAME,
+        "rows": row_count,
+        "rows_read": item_count,
+        "rows_written": row_count,
+        "from_date": f"{min(years)}-01-01" if years else None,
+        "to_date": f"{max(years)}-12-31" if years else None,
+        "year_count": len(years),
+        "years": years,
+        "item_count": item_count,
+        "downloaded_count": row_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "attempt_count": attempt_count,
+        "download_attempts": attempt_count,
+        "retry_count": retry_count,
+        "failed_attempt_count": failed_attempt_count,
+        "source_unavailable_count": failed_count,
+        "failed_items": failed_items[:20],
+        "fallback_used": False,
+        "state_advanced": row_count > 0,
+    }
+
+
+def run() -> int:
+    global STOCKEY_RUN_STATE
     results = sync_wpi()
+    STOCKEY_RUN_STATE = build_run_state(results)
     failed_years = [item for item in results if int(item.get("failed_count") or 0) > 0]
     if failed_years:
-        print({"status": "partial", "failed_years": failed_years}, flush=True)
+        print(json.dumps({"status": "partial", "failed_years": failed_years, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
     else:
-        print({"status": "ok", "years": results}, flush=True)
+        print(json.dumps({"status": "ok", "years": results, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    run()
+    raise SystemExit(run())

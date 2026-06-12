@@ -9,8 +9,10 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
 from xgboost import XGBClassifier
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.llm_event_evaluator import ensure_output_tables as ensure_event_evaluation_tables
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
@@ -23,6 +25,47 @@ DEFAULT_ARTIFACT_DIR = Path(".cache/advisory_event_meta_model")
 DEFAULT_MODEL_BASENAME = "event_meta_model"
 DEFAULT_HORIZON_DAYS = 10
 DEFAULT_RETURN_THRESHOLD = 0.02
+EVENT_META_MODEL_SCHEMA_MIGRATION_ID = "20260611_advisory_event_meta_model_scores_base"
+EVENT_META_MODEL_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {SCORES_TABLE} (
+        published_on TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        unique_id TEXT NOT NULL,
+        scored_at TIMESTAMPTZ,
+        model_name TEXT,
+        model_version TEXT,
+        horizon_days INTEGER,
+        event_meta_score DOUBLE PRECISION,
+        event_meta_label INTEGER,
+        feature_snapshot_json TEXT,
+        model_meta_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id, model_name, model_version, horizon_days)
+    )
+    """,
+]
+
+
+def _record_event_meta_model_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.event_meta_model",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -48,28 +91,13 @@ def table_exists(table_name: str) -> bool:
 
 
 def ensure_scores_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {SCORES_TABLE} (
-                published_on TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                unique_id TEXT NOT NULL,
-                scored_at TIMESTAMPTZ,
-                model_name TEXT,
-                model_version TEXT,
-                horizon_days INTEGER,
-                event_meta_score DOUBLE PRECISION,
-                event_meta_label INTEGER,
-                feature_snapshot_json TEXT,
-                model_meta_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id, model_name, model_version, horizon_days)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=EVENT_META_MODEL_SCHEMA_MIGRATION_ID,
+        statements=EVENT_META_MODEL_SCHEMA_STATEMENTS,
+        owner="advisory.event_meta_model",
+        description="Create event meta-model score output table.",
+        metadata={"tables": [SCORES_TABLE], "workflow": "event_meta_model_scores"},
+    )
 
 
 def _artifact_paths(artifact_dir: Path, model_basename: str) -> tuple[Path, Path]:
@@ -91,8 +119,18 @@ def load_event_rows(
     setup_ids: list[str] | None = None,
 ) -> pd.DataFrame:
     ensure_event_evaluation_tables()
-    if not table_exists(EVENTS_TABLE):
-        return pd.DataFrame()
+    try:
+        if not table_exists(EVENTS_TABLE):
+            return pd.DataFrame()
+    except Exception as exc:
+        _record_event_meta_model_fallback(
+            fallback_type="event_meta_model_event_table_lookup_failed",
+            source=EVENTS_TABLE,
+            reason="Event meta-model could not verify event-evaluation source table before loading events.",
+            error=exc,
+            metadata={"asof_date": None if asof_date is None else str(asof_date), "symbols": symbols or [], "setup_ids": setup_ids or []},
+        )
+        raise
     clauses = ["1 = 1"]
     params: list[object] = []
     if asof_date is not None:
@@ -104,39 +142,49 @@ def load_event_rows(
     if setup_ids:
         clauses.append("setup_id = ANY(%s)")
         params.append([value.upper() for value in setup_ids])
-    df = sql_to_df(
-        f"""
-        SELECT
-            published_on,
-            asof_date,
-            setup_id,
-            symbol,
-            unique_id,
-            event_source,
-            sentiment,
-            materiality,
-            setup_effect,
-            direction,
-            surprise,
-            novelty,
-            contradiction,
-            expected_decay_days,
-            source_reliability,
-            governance_risk,
-            balance_sheet_risk,
-            execution_risk,
-            investable_now,
-            verdict,
-            event_class,
-            state_transition_hint,
-            score_impact,
-            confidence
-        FROM {EVENTS_TABLE}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY published_on, setup_id, symbol, unique_id
-        """,
-        params=tuple(params) if params else None,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                published_on,
+                asof_date,
+                setup_id,
+                symbol,
+                unique_id,
+                event_source,
+                sentiment,
+                materiality,
+                setup_effect,
+                direction,
+                surprise,
+                novelty,
+                contradiction,
+                expected_decay_days,
+                source_reliability,
+                governance_risk,
+                balance_sheet_risk,
+                execution_risk,
+                investable_now,
+                verdict,
+                event_class,
+                state_transition_hint,
+                score_impact,
+                confidence
+            FROM {EVENTS_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY published_on, setup_id, symbol, unique_id
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception as exc:
+        _record_event_meta_model_fallback(
+            fallback_type="event_meta_model_event_rows_load_failed",
+            source=EVENTS_TABLE,
+            reason="Event meta-model could not load evaluated event rows.",
+            error=exc,
+            metadata={"asof_date": None if asof_date is None else str(asof_date), "symbols": symbols or [], "setup_ids": setup_ids or []},
+        )
+        raise
     if df.empty:
         return df
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
@@ -148,18 +196,28 @@ def load_event_rows(
 def load_price_history(symbols: list[str], start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
-    df = sql_to_df(
-        """
-        SELECT ticker AS symbol, date, close
-        FROM dhan_ohlcv_daily
-        WHERE exchange = 'NSE'
-          AND asset_type = 'stock'
-          AND ticker = ANY(%(symbols)s)
-          AND date BETWEEN %(start_date)s AND %(end_date)s
-        ORDER BY ticker, date
-        """,
-        params={"symbols": symbols, "start_date": start_date, "end_date": end_date},
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT ticker AS symbol, date, close
+            FROM dhan_ohlcv_daily
+            WHERE exchange = 'NSE'
+              AND asset_type = 'stock'
+              AND ticker = ANY(%(symbols)s)
+              AND date BETWEEN %(start_date)s AND %(end_date)s
+            ORDER BY ticker, date
+            """,
+            params={"symbols": symbols, "start_date": start_date, "end_date": end_date},
+        )
+    except Exception as exc:
+        _record_event_meta_model_fallback(
+            fallback_type="event_meta_model_price_history_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Event meta-model could not load Dhan OHLCV history for event labeling.",
+            error=exc,
+            metadata={"symbol_count": len(symbols), "start_date": str(start_date), "end_date": str(end_date)},
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.upper()
@@ -199,7 +257,14 @@ def load_intraday_event_features(symbols: list[str], start_date: pd.Timestamp, e
             """,
             params={"symbols": symbols, "start_date": start_date, "end_date": end_date},
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_meta_model_fallback(
+            fallback_type="event_meta_model_intraday_context_load_failed",
+            source=INTRADAY_FEATURES_TABLE,
+            reason="Event meta-model skipped optional intraday context after source lookup/load failure.",
+            error=exc,
+            metadata={"symbol_count": len(symbols), "start_date": str(start_date), "end_date": str(end_date)},
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -252,7 +317,14 @@ def load_macro_event_features(start_date: pd.Timestamp, end_date: pd.Timestamp) 
             """,
             params={"start_date": start_date - pd.Timedelta(days=7), "end_date": end_date},
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_meta_model_fallback(
+            fallback_type="event_meta_model_macro_context_load_failed",
+            source=MACRO_FEATURES_TABLE,
+            reason="Event meta-model skipped optional macro context after source lookup/load failure.",
+            error=exc,
+            metadata={"start_date": str(start_date), "end_date": str(end_date)},
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -313,7 +385,14 @@ def load_exchange_event_features(symbols: list[str], start_date: pd.Timestamp, e
             """,
             params={"symbols": symbols, "start_date": start_date - pd.Timedelta(days=7), "end_date": end_date},
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_meta_model_fallback(
+            fallback_type="event_meta_model_exchange_context_load_failed",
+            source=EXCHANGE_FEATURES_TABLE,
+            reason="Event meta-model skipped optional exchange-event context after source lookup/load failure.",
+            error=exc,
+            metadata={"symbol_count": len(symbols), "start_date": str(start_date), "end_date": str(end_date)},
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -785,6 +864,25 @@ def main() -> int:
         print(json.dumps({"status": "ok", "dry_run": bool(args.dry_run), **meta, "sample": scores.head(10).to_dict(orient="records")}, indent=2, ensure_ascii=False, default=str))
         return 0
     except Exception as exc:
+        _record_event_meta_model_fallback(
+            fallback_type="event_meta_model_main_failed",
+            source=f"event_meta_model:{args.command}",
+            reason=(
+                "Event meta-model CLI command failed; train/score output may be missing until the "
+                "underlying data, artifact, or persistence issue is fixed."
+            ),
+            error=exc,
+            metadata={
+                "command": args.command,
+                "artifact_dir": str(artifact_dir),
+                "model_basename": args.model_basename,
+                "horizon_days": getattr(args, "horizon_days", None),
+                "return_threshold": getattr(args, "return_threshold", None),
+                "dry_run": getattr(args, "dry_run", None),
+                "symbols": args.symbols,
+                "setup_ids": args.setup_ids,
+            },
+        )
         print(json.dumps({"status": "error", "command": args.command, "error": str(exc)}, indent=2, ensure_ascii=False, default=str))
         return 1
 

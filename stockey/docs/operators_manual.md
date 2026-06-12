@@ -78,6 +78,10 @@ python -m data.screenerin.auth
 
 If `https://www.screener.in/login/` redirects to `/dash/`, the session is already logged in. Otherwise the helper fills the login form from env, submits it, and verifies `/dash/`. Credentials are not printed.
 
+Use the operator UI `/screeners` page before promoting a new Screener.in idea. The page validates known local syntax problems without opening Chrome, and its “fetch preview rows” action calls `POST /api/screeners/preview` with `persist=false`. This can use the authenticated Screener.in session and can record failure audit rows, but it does not store query results, register a screener, change recommendations, or submit broker orders. Register a screener only after preview rows look correct.
+
+The same page shows read-only coverage metrics from `GET /api/screeners/coverage`: constituent count, candidate count, final action count, positive-action rate, manual-review count, and exit count by screener. Use this to retire noisy screeners or investigate why a screener is not contributing useful candidates. Do not treat coverage alone as proof that a screener is profitable; it is attribution, not outcome validation.
+
 ## Scheduled runs
 
 The repo now ships with a cron template at `config/stockey.crontab.template`.
@@ -88,10 +92,13 @@ Recommended: run it with `go-crond`:
 ```sh
 mkdir -p /home/rane/code/stockey/logs/cron
 python builder.py
+python scripts/cron_preflight.py
 ./go-crond config/stockey.generated.crontab --allow-unprivileged
 ```
 
 If you install it with a normal per-user `crontab`, first remove the username column from every job line. The generated file is system-crontab/go-crond style.
+
+`python scripts/cron_preflight.py` is read-only. It fails on missing generated crontab, missing required environment lines, missing/non-executable referenced scripts, unresolved Python, or other setup errors. It warns on stale lock directories and reports whether the operator API/web ports are currently available or already reachable. The same check is available in the Operations UI as `Cron Preflight`.
 
 ```sh
 mkdir -p /home/rane/code/stockey/logs/cron
@@ -113,14 +120,16 @@ Current schedule:
 - `08:35`, `12:35`, `16:35` weekdays: `./all_external_workers.sh` to drain Dhan, Screener, and NSE queues serially
 - every `10` minutes from `09:00` to `15:59` on weekdays: one-shot `./all_watchers.sh`
 - `16:05` weekdays: one final post-close `./all_watchers.sh`
-- `08:05`, `12:05`, `17:05`, `22:05` weekdays: `python -m advisory.operator_health --skip-dhan`
-- `10:25`, `13:25`, `16:25`, `21:25` weekdays: investor hypothesis/playbook scan over newly collected events
-- `11:20`, `14:20`, `17:20`, `20:20` weekdays: experimental TS forecast workflow using `config/ts_forecast_screeners.yaml`
-- `18:20`, `21:20` weekdays: matured TS forecast evaluation after costs
+- `07:55`, `11:55`, `16:55`, `21:55` weekdays: `./all_api_latency_probe.sh`
+- `08:05`, `12:05`, `17:05`, `22:05` weekdays: `./all_operator_health.sh`
+- `10:25`, `13:25`, `16:25`, `21:25` weekdays: `./all_hypothesis_scan.sh` over newly collected events
+- `11:20`, `14:20`, `17:20`, `20:20` weekdays: `./all_ts_forecast_workflow.sh` using `config/ts_forecast_screeners.yaml`
+- `18:20`, `21:20` weekdays: `./all_ts_forecast_evaluator.sh` after costs
+- `21:35` weekdays: `./all_ts_forecast_paper_portfolio.sh` for research-only forecast paper-portfolio validation
 - `17:30` weekdays: `./complete_data.sh` end-of-day catch-up before advisory
 - `19:10` weekdays: `./all_advisory.sh`, after waiting for data catch-up and external worker locks to clear
-- `23:10` weekdays: event-policy realized-return evaluation after costs
-- `04:20` Saturdays: technical threshold calibration after costs
+- `23:10` weekdays: `./all_event_policy_evaluator.sh` after costs
+- `04:20` Saturdays: `./all_technical_threshold_calibration.sh` after costs
 - `03:10` Sundays: weekly `./all_ml.sh` for event-model research training
 
 Why the split looks like this:
@@ -137,7 +146,7 @@ Why the split looks like this:
 
 Script groups:
 
-- recurring cron scripts: `all_frontend.sh`, `all_watchers.sh`, `all_downloaders_queue.sh`, `all_external_workers.sh`, morning and pre-advisory `complete_data.sh`, post-close `all_advisory.sh`, and weekly research `all_ml.sh` if enabled
+- recurring cron scripts: `all_frontend.sh`, `all_watchers.sh`, `all_downloaders_queue.sh`, `all_external_workers.sh`, morning and pre-advisory `complete_data.sh`, post-close `all_advisory.sh`, `all_api_latency_probe.sh`, `all_operator_health.sh`, `all_hypothesis_scan.sh`, TS/event-policy/technical research wrappers, and weekly `all_ml.sh` if enabled
 - manual / catch-up / long-running scripts: `all_downloaders.sh`, `all_parsers.sh`, manual `complete_data.sh`, manual `all_ml.sh`, and `all_advisory_codex.sh`
 - use the manual group end-of-day, after missed runs, before major reruns, or during debugging; do not add them to high-frequency cron
 
@@ -146,6 +155,7 @@ Important constraint:
 - cron commands use `scripts/with_lock.sh` where needed so duplicate overlapping runs are skipped instead of piling up
 - `all_watchers.sh` also self-locks with `/tmp/stockey_watchers.lock`, so manual and cron watcher runs cannot overlap
 - watcher source cursors live in `advisory_sync_state`; if a watcher tick is skipped because the previous run is still active, the next run resumes from the last successful cursor instead of only checking the last `10` minutes
+- downloader/parser runner state also lives in `advisory_sync_state` under `download_runner:<module>` source names; failed rows are visible in Operator Health with classifications such as `source_unavailable`, `auth_unavailable`, `parse_failed`, and `no_data`
 - the shell wrappers resolve Python automatically, so cron does not need `source .xstockey/bin/activate`
 
 ## Operator Health
@@ -173,13 +183,16 @@ Together these checks cover:
 - Redis reachability
 - Dhan token validity through a lightweight profile call; it does not initiate broker login
 - Dhan cached-token metadata including cache age, expiry timestamp, and seconds to expiry
+- identity readiness, including open Dhan/security mapping issue rows and latest broker-capable action rows that do not join to `company_master` or have no Dhan NSE/BSE security id
 - announcement and NSE/bhavcopy evidence readiness through `advisory.event_data_quality`
+- NSE announcement HTTP retry and cookie/session reset counts through fallback telemetry (`nse_retry`, `nse_session_reset`) with a specific Health fix hint when those counters are nonzero
+- recent Screener.in query/fetch/parse failure rows from `screenerin_parse_failures` in full Health mode, including fix hints, trust-gate impact, and degradation rows for bad query syntax, login/session, or parse failures
 - recent `logs/cron/*.log` tails for tracebacks, errors, failures, connection refusals, and timeouts
 - Poppler, Codex CLI, Node/npm, TimesFM, and frontend dependency presence
 
 The same data is exposed at `GET /api/health/details` and rendered in the Nuxt `Data Health` page. Warnings mean the system may still run with degraded functionality; errors mean a required dependency or recent cron run likely needs attention.
 
-The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, Redis reachability, Postgres connectivity, and event-evidence quality issues. The Nuxt `Data Health` page shows the hints near the top with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix. The page can filter health rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
+The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, identity/action mapping gaps, Redis reachability, Postgres connectivity, event-evidence quality issues, Screener.in failures, and feature stage-gate blockers. The Nuxt `Data Health` page shows the hints near the top with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix. The page can filter health rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
 
 Run the event-evidence quality gate directly when announcement/bhavcopy inputs look suspicious:
 
@@ -199,9 +212,11 @@ python -m advisory.event_evidence_store --dry-run --lookback-days 30
 
 It writes `advisory_bhavcopy_evidence_daily` and `advisory_announcement_evidence`. These are intended for UI, LLM context, and future deterministic event intelligence so those paths do not scan raw bhavcopy tables or large announcement text columns.
 
-The Health page also shows a read-only superseded cleanup preview when recovered event-processing failures or recovered announcement-document errors can be marked superseded. Inspect the sample rows first, then run `python -m advisory.superseded_failures --limit 500` or `./all_superseded_cleanup_audit.sh` for the dry-run JSON. Cron runs `./all_superseded_cleanup_audit.sh` after market close as a preview-only audit, and the Operations page exposes the same dry-run through `superseded_failure_cleanup_dry_run`. Only run `python -m advisory.superseded_failures --apply --limit 500` after explicit operator intent; this marks durable superseded metadata and does not submit broker orders or change portfolio/action/config state.
+The Health page also shows a superseded cleanup preview when recovered event-processing failures or recovered announcement-document errors can be marked superseded. Inspect the sample rows first, then either use the guarded Health-page `Mark Superseded` form with an operator reason or run `python -m advisory.superseded_failures --limit 500` / `./all_superseded_cleanup_audit.sh` for the dry-run JSON. Cron runs `./all_superseded_cleanup_audit.sh` after market close as a preview-only audit, and the Operations page exposes the same dry-run through `superseded_failure_cleanup_dry_run`. The UI apply path writes only durable superseded metadata, audits `superseded_failure_cleanup_apply`, and does not submit broker orders or change portfolio/action/config state. Only use the shell `python -m advisory.superseded_failures --apply --limit 500` as a manual fallback after explicit operator intent.
 
 The Health page also reads `advisory_fallback_events` and shows a persisted fallback telemetry card. Treat warning spikes as review-only signals until understood; error-severity fallbacks such as synthetic event-evaluation fallback should block trust in the affected fresh advisory output. The first emitters cover Redis fail-soft, Dhan identity fallback/unresolved identity, NSE retry/session reset, and key LLM/Codex deterministic fallbacks.
+
+Operator-facing telemetry and log snippets are redacted before they are written or returned by the API where practical. Fallback telemetry, Operator API error rows, Health cron summaries, and Operations cron-log tails mask common access tokens, auth URLs, bearer/basic auth headers, mobile numbers, PIN/TOTP/password fields, and sensitive mapping keys. This does not rewrite existing raw files on disk, so do not commit `.env`, `.cache`, Chrome profiles, token caches, or raw `logs/` output.
 
 Useful API/token env knobs:
 
@@ -230,6 +245,19 @@ Current marker-enabled wrappers:
 - `all_ml.sh`
 - `all_advisory.sh`
 - `all_watchers.sh`
+- `all_frontend.sh`
+- `all_advisory_codex.sh`
+- `all_analysis_codex.sh`
+- `all_api_latency_probe.sh`
+- `all_operator_health.sh`
+- `all_hypothesis_scan.sh`
+- `all_ts_forecast_workflow.sh`
+- `all_ts_forecast_evaluator.sh`
+- `all_ts_forecast_paper_portfolio.sh`
+- `all_event_policy_evaluator.sh`
+- `all_technical_threshold_calibration.sh`
+
+Most wrappers use `scripts/run_with_markers.sh`; `all_frontend.sh` emits markers internally so it can still clean up supervised API/Nuxt child processes on exit or interruption.
 
 ## Database robustness knobs
 
@@ -243,6 +271,10 @@ Useful environment variables:
 - `SQL_TO_DF_CHUNK_SIZE`: optional fetch chunk size for reads, default `0` which keeps the old fetch-all behavior
 - `DB_OPERATION_ATTEMPTS`: minimum attempts for DB connects, metadata reads, and upserts, default `3`
 - `DB_POOL_RECYCLE_SECONDS`: SQLAlchemy pool recycle interval, default `300`
+- `DB_RETRY_TELEMETRY_FILE`: local JSONL spool for Postgres retry/exhaustion events, default `logs/fallback/db_retry_events.jsonl`
+- `LOCAL_FALLBACK_TELEMETRY_FILE`: local JSONL spool for fallback events that should not attempt a DB write, default `logs/fallback/local_fallback_events.jsonl`
+
+DB retry telemetry and selected hot-path fallback telemetry are file-backed instead of DB-backed so they still work when Postgres is the failing component. Full Operator Health folds recent rows from these spools into the fallback/degradation summary and emits specific fix hints, including Postgres retry spikes, operator current-price cache fallback, operator snapshot fallback when DB snapshots or snapshot price refresh fail, risk sizing that had to use max allocation as the liquidity cap because ADV20 was missing, risk sizing that skipped macro or exchange-event context after lookup failures, event-router failures that can skip or delay watcher-triggered fast refreshes, external-task-queue failures that can delay or hide serialized NSE/Dhan/Screener work, config-change assistant failures that block reviewed config diff generation without applying config, research-ledger failures that can leave false-discovery or model-validation audit rows incomplete, signal refreshes that continued without action/lifecycle/event-policy/router context after lookup failures, action consolidation that had to use default conflict rules or ignore promoted dynamic conflict rules after lookup failures, wait-signal matching that skipped news/announcement/source evidence after lookup or schema failures, feature freshness checks that marked required inputs errored after lookup failures, company-memory reviews that skipped source context after lookup/load failures, news-theme routing that returned empty output after as-of or market-news lookup failures, event-policy evaluation that returned empty research output after schema/source-load failures, event-data-quality checks that degraded while checking source freshness/readiness, trace-summary cache or rebuild failures that force symbol/event pages toward live or partial trace fallback, compact event-evidence refresh failures that leave announcement/bhavcopy evidence stale or unavailable, event meta-model failures that prevent labels or omit optional intraday/macro/exchange context, exchange-feature failures that leave deal/insider/short/corporate-action context missing, market-context failures that can make broad-market gating stale or partial, fundamental-snapshot failures that leave peer/fundamental context unavailable or partial, TS forecast feature/evaluator failures that leave experimental TS Watch rows or validation summaries missing, watchlist-builder failures that can skip event-driven state changes or prior watch metadata, symbol-trace source failures that can make symbol detail pages incomplete or unavailable, setup-trace source failures that can make setup funnel pages incomplete or unavailable, technical-threshold calibration failures that can make threshold review output missing or incomplete, signal-quality evaluator failures that can make overlay-promotion evidence incomplete or unavailable, promotion-review evidence lookup failures that can prevent manual review rows from being created, event-model promotion-check failures that can make model readiness evidence unavailable, macro-feature failures that can make macro/regime context stale or unavailable, regime-engine failures that can make market-regime snapshots stale or unavailable, technical-feature failures that can make rule-scoring inputs stale or unavailable, intraday-feature failures that can make intraday breakout/context inputs stale or unavailable, rule-engine failures that can make candidate pass/watch/rejection output stale or unavailable, portfolio-engine failures that can make portfolio approval/defer/overlap output stale or unavailable, position-lifecycle failures that can make hold/exit/partial-exit output stale or unavailable, and execution-engine failures that can make broker handoff or reconciliation state stale, incomplete, or blocked.
 
 Model-training backfills deliberately skip intraday prefetch during snapshot repair. This avoids wasting time on old 1-minute windows when the goal is event-label coverage, not perfect intraday reconstruction.
 
@@ -408,7 +440,7 @@ Watcher trigger boundaries:
 | Bounded watcher catch-up is truncated by lookback limits | Publishes catch-up metadata with `catchup_truncated` | Yes | Run `complete_data.sh` or the relevant downloader/parser catch-up before trusting daily advisory output. |
 | Scheduled post-close advisory window arrives after data catch-up | `./all_advisory.sh` performs full advisory reconciliation | This is the authoritative path | It recomputes cross-sectional advisory state and dry-run execution-plan state, but still does not submit live broker orders without explicit gates. |
 
-Manual Review decision effects:
+### Operator Decision Effects
 
 | Decision | Runtime state after save | Active queue effect | Side effects | What it never does |
 | --- | --- | --- | --- | --- |
@@ -419,6 +451,8 @@ Manual Review decision effects:
 | `ignore` | `closed_ignored` | Removes the item from the active queue | Records that the item is noise or not worth further review | Mutate source rows, portfolio rows, action recommendations, config, or broker orders |
 | `downgrade_to_no_action` | `closed_no_action` | Removes the item from the active queue | Records an explicit no-action operator decision | Rewrite the stored recommendation, mutate portfolio rows, or broker orders |
 | `mark_fixed` | `closed_fixed` | Removes the item from the active queue | Records that an operational issue was fixed or a rerun succeeded | Clean old DB rows, mutate source rows, portfolio rows, action recommendations, or broker orders |
+
+The `/api/manual-review/decision` write response returns the saved `manual_review_state` and `decision_effect` payloads immediately. The Manual Review UI uses that to show the next state after save before the refreshed queue removes, keeps, or reopens the item.
 
 Matched Manual Review wait-signal behavior:
 
@@ -622,6 +656,16 @@ Run the operator API and Nuxt app together with:
 
 This starts `advisory.api.app` on `127.0.0.1:8765` and Nuxt on `127.0.0.1:3000` by default. It loads `nvm use default` before running Node/npm, logs the resolved Node path/version, and installs frontend dependencies automatically if `apps/operator-web/node_modules` is missing.
 
+Targeted restart commands:
+
+```sh
+./all_frontend.sh --api-only
+./all_frontend.sh --web-only
+./all_frontend.sh --both
+```
+
+Use `--api-only` after Python/API changes, `--web-only` after Nuxt-only changes, and `--both` when ports or shared API contracts changed. The equivalent environment knob is `OPERATOR_FRONTEND_COMPONENT=both|api|web`.
+
 The operator API reads `advisory_operator_snapshots` by default. `all_advisory.sh` and `all_watchers.sh` refresh this snapshot after successful runs. To refresh it manually:
 
 ```sh
@@ -630,15 +674,30 @@ python -m advisory.operator_snapshot
 
 Set `OPERATOR_API_USE_SNAPSHOT=false` only when debugging the live dashboard builder directly. `OPERATOR_SNAPSHOT_MAX_AGE_SECONDS=86400` means the API treats snapshots generated in the last day as fresh. With `OPERATOR_API_ALLOW_STALE_SNAPSHOT=true`, the operator UI still serves the latest stale snapshot instead of blocking a page load on a live rebuild; the payload metadata marks it as stale. `OPERATOR_API_PAYLOAD_CACHE_SECONDS=15` keeps the parsed snapshot in API memory briefly so dashboard pages do not reload the same JSON for every section. `OPERATOR_API_LARGE_RESPONSE_BYTES=250000` records oversized API responses in the slow-operation log so endpoints can be compacted or paginated deliberately. Keep `OPERATOR_API_INTRADAY_PRICE_FALLBACK=false` unless debugging prices; ad-hoc intraday scans can make the main Action Queue slow, while watcher alerts should already persist live `last_price`.
 
+Action Queue and Symbol Detail pages also show feature freshness. Consolidated action rows preserve the decision-time freshness snapshot, while the separate current panel shows present source state. The advisory pipeline also emits `feature_gate` summaries under `rules`, `risk`, `portfolio`, `lifecycle`, and `actions`, which tells you whether required `daily_ohlcv` / `technical_daily` inputs were blocked for the symbols being processed. Operator Health samples the latest action symbols and reports these stage gates in `feature_stage_gates`, fix hints, current blockers, and the trust gate. Symbol Detail shows `Stage Gate Effects`, which explains the concrete row-level impact when available: watch downgrade, review-only allocation, deferred capital, lifecycle warning, or final action downgrade. Blocked `rules` gates move immediate `PASS_NOW` candidates to `WATCH_EVENT`; blocked `risk` gates move automatic allocations to `review_manual`; blocked `portfolio` gates defer approved/trimmed capital; blocked lifecycle gates add warnings without suppressing exit/risk-reduction actions; blocked final `BUY` or `BUY_MORE` rows become `MANUAL_REVIEW`, review-only/no-broker-execution. Action consolidation also downgrades broker-capable winners to `MANUAL_REVIEW` when company/Dhan identity is missing; Health still reports active identity coverage gaps for visibility and repair. Execution dry-run previews add a final guard for older or non-standard broker-capable action rows: unresolved Dhan identity becomes `submit_blocked` with `broker_identity_status=failed` in the execution safety contract and an execution fallback telemetry row. Each action-table order preview also carries `order_intent_lineage`, so an operator can trace the order back to the action row, reason-contract summary/status, risk sizing, stop/target levels, and approval/reconciliation gates before any live broker handoff.
+
+For cross-step debugging, use the Nuxt `/operator-journey` page. It is backed by the read-only `/api/operator-journey` endpoint and stitches manual-review decisions, wait signals, wait-signal matches, signal-refresh rows, action recommendations, portfolio rows, and execution previews into stage buckets plus a single newest-first timeline. Use filters such as `symbol`, `item_id`, or `unique_id` to narrow the journey.
+
 Slow API and snapshot operations are recorded under `logs/performance/`:
 
 ```sh
-python scripts/api_latency_probe.py
+python scripts/api_latency_probe.py --output-path logs/performance/latest_api_latency_probe.json
+python scripts/api_performance_report.py --limit 20
 python -m advisory.performance_slowlog report --limit 20
 python -m advisory.performance_slowlog mark <fingerprint> triaged --note "tracked in todo.md"
 ```
 
-The JSONL file keeps every slow occurrence. The state file dedupes by fingerprint, so the same slow endpoint or snapshot stage is counted repeatedly but does not create a new issue every run.
+Cron runs the API latency probe at 07:55, 11:55, 16:55, and 21:55 on weekdays. The latest JSON summary is read by Operator Health; stale, slow, or failed probes appear in fix hints and the degradation feed. Use `scripts/api_performance_report.py` to rank which endpoint to fix next before adding indexes or changing payload shapes. The JSONL file keeps every slow occurrence. The state file dedupes by fingerprint, so the same slow endpoint or snapshot stage is counted repeatedly but does not create a new issue every run.
+
+Manual Review list payloads are compact by default because this page can aggregate many source tables. The source-row expander shows a compact preview and tells you how many raw keys were omitted. Use `/api/manual-review?include_raw=true&limit=<n>` only for short debugging sessions when you explicitly need full raw rows.
+
+Operator Health details are also compact by default. The Health page calls `/api/health/details?compact=true`, which bounds list sizes and truncates very long strings so tracebacks or full diagnostic rows do not make the page slow. Use `/api/health/details?mode=full&compact=false` only for short debugging sessions. `OPERATOR_HEALTH_COMPACT_LIST_LIMIT` and `OPERATOR_HEALTH_COMPACT_STRING_CHARS` control the default API bounds.
+
+The operator smoke preflight is also compacted at source. `OPERATOR_SMOKE_COMPACT_LIST_LIMIT` and `OPERATOR_SMOKE_COMPACT_STRING_CHARS` bound fix hints and blocker details so `/api/operations/smoke` and `python -m advisory.operator_smoke` stay lightweight even when Health contains long tracebacks.
+
+Actions and Portfolio responses include payload-size telemetry in compact mode. Check `/api/actions?compact=true` and `/api/portfolio?compact=true` response `meta.<section>.payload_bytes`, `avg_row_bytes`, and `max_row_bytes` before changing indexes or payload shapes. High latency with low payload bytes points to DB/query work; high `max_row_bytes` points to row compaction or detail-endpoint work.
+
+Event-policy list rows are compact by default. `/api/event-policy` keeps parsed `checks`, `operator_notes`, `llm_review`, and compact `raw_context`, but omits bulky source JSON strings like `raw_context_json` and `operator_notes_json`. Use `/api/event-policy?limit=<n>&include_raw=true` only for bounded debugging.
 
 Legacy NSE retention and archive:
 
@@ -687,7 +746,7 @@ npm install
 NUXT_PUBLIC_API_BASE=http://127.0.0.1:8765 npm run dev
 ```
 
-Static `live_dashboard/` generation is deprecated. The frontend reads current state directly from `advisory.api.app`, so cron no longer runs `python -m advisory.live_dashboard`.
+Static `live_dashboard/` generation is deprecated. The frontend reads current state directly from `advisory.api.app`, so cron no longer runs the legacy static dashboard generator.
 
 Use the Decision Trace page when you need to understand why a symbol changed action or why an event did not change the action. It reads normalized trace summaries from:
 

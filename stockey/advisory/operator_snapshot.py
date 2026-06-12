@@ -11,6 +11,7 @@ import pandas as pd
 from environs import Env
 
 from advisory.current_prices import refresh_current_prices
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.live_dashboard import DEFAULT_OUTPUT_DIR, build_live_dashboard_payload
 from advisory.performance_slowlog import slow_operation
 from utils.db import sql_to_df, upsert_to_db
@@ -23,6 +24,25 @@ TABLE_NAME = "advisory_operator_snapshots"
 SECTION_TABLE_NAME = "advisory_operator_snapshot_sections"
 SNAPSHOT_NAME = "operator_dashboard_v1"
 DEFAULT_MAX_AGE_SECONDS = env.int("OPERATOR_SNAPSHOT_MAX_AGE_SECONDS", 86400)
+
+
+def _record_snapshot_fallback(
+    fallback_type: str,
+    *,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.operator_snapshot",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def _json_default(value: Any) -> str:
@@ -141,6 +161,13 @@ def build_operator_snapshot(
         try:
             price_cache = refresh_current_prices(symbols=symbols, persist=persist)
         except Exception as exc:
+            _record_snapshot_fallback(
+                "operator_snapshot_price_cache_refresh_failed",
+                source="advisory_current_prices",
+                reason="Operator snapshot could not refresh current prices; snapshot was still generated but price freshness may be degraded.",
+                error=exc,
+                metadata={"symbol_count": len(symbols), "persist": bool(persist)},
+            )
             price_cache = {"status": "error", "error": f"{type(exc).__name__}: {exc}", "requested_symbols": len(symbols)}
     row = _payload_to_row(payload, asof_date=parsed_asof)
     if persist:
@@ -183,7 +210,14 @@ def load_operator_snapshot(
     """
     try:
         df = sql_to_df(query, params=tuple(params), retries=2)
-    except Exception:
+    except Exception as exc:
+        _record_snapshot_fallback(
+            "operator_snapshot_load_failed",
+            source=TABLE_NAME,
+            reason="Operator API could not load the DB-backed dashboard snapshot; callers may fall back to live payload building or stale/missing UI data.",
+            error=exc,
+            metadata={"snapshot_key": key, "max_age_seconds": max_age_seconds},
+        )
         return None
     if df.empty:
         return None
@@ -223,7 +257,14 @@ def load_operator_snapshot_sections(
     """
     try:
         df = sql_to_df(query, params=tuple(params), retries=2)
-    except Exception:
+    except Exception as exc:
+        _record_snapshot_fallback(
+            "operator_snapshot_section_load_failed",
+            source=SECTION_TABLE_NAME,
+            reason="Operator API could not load DB-backed section snapshots; callers may fall back to larger live payloads or stale/missing UI sections.",
+            error=exc,
+            metadata={"snapshot_key": key, "section_names": names, "max_age_seconds": max_age_seconds},
+        )
         return None
     if df.empty:
         return None

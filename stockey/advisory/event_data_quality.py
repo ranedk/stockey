@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df
 
 
@@ -56,6 +57,25 @@ EXCHANGE_FEATURE_COLUMNS = {
 }
 
 
+def _record_event_data_quality_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.event_data_quality",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 def _quote_identifier(name: str) -> str:
     if not IDENTIFIER_RE.match(str(name)):
         raise ValueError(f"unsafe SQL identifier: {name}")
@@ -68,8 +88,14 @@ def _json_ready(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_json_ready_missing_check_failed",
+            source="event_data_quality_payload",
+            reason="Event data quality could not evaluate a value for missingness while preparing JSON output and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
 
 
@@ -98,7 +124,13 @@ def table_exists(table_name: str) -> bool:
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_table_lookup_failed",
+            source=table_name,
+            reason="Event data quality treated a source table as unavailable because table lookup failed.",
+            error=exc,
+        )
         return False
     return not df.empty
 
@@ -116,7 +148,13 @@ def table_columns(table_name: str) -> set[str]:
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_schema_lookup_failed",
+            source=table_name,
+            reason="Event data quality treated a source schema as unavailable because column lookup failed.",
+            error=exc,
+        )
         return set()
     return set(df["column_name"].astype(str).tolist()) if not df.empty else set()
 
@@ -142,7 +180,13 @@ def _row_count(table_name: str) -> int | None:
             retries=2,
             statement_timeout_ms=15000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_row_count_failed",
+            source=table_name,
+            reason="Event data quality could not count a heavy source table.",
+            error=exc,
+        )
         return None
     if df.empty:
         return 0
@@ -189,7 +233,14 @@ def _load_sync_state(source_name: str) -> dict[str, Any] | None:
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_sync_state_load_failed",
+            source="advisory_sync_state",
+            reason="Event data quality skipped source sync-state context because sync-state lookup failed.",
+            error=exc,
+            metadata={"sync_source": source_name},
+        )
         return None
     if df.empty:
         return None
@@ -242,6 +293,13 @@ def check_source_freshness(now: pd.Timestamp | None = None) -> list[dict[str, An
                 statement_timeout_ms=15000,
             )
         except Exception as exc:
+            _record_event_data_quality_fallback(
+                fallback_type="event_data_quality_source_freshness_query_failed",
+                source=table,
+                reason="Event data quality freshness query failed for a source table.",
+                error=exc,
+                metadata={"name": name, "required": required, "date_columns": list(spec.get("date_columns") or [])},
+            )
             rows.append(_status("error" if required else "warn", "Freshness query failed.", name=name, table=table, error=f"{type(exc).__name__}: {exc}", required=required, suggested_fix="Check table schema, DB connectivity, and query timeout."))
             continue
         row = df.iloc[0].to_dict() if not df.empty else {}
@@ -312,6 +370,12 @@ def check_announcement_readiness() -> dict[str, Any]:
             statement_timeout_ms=15000,
         )
     except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_announcement_readiness_query_failed",
+            source=table,
+            reason="Event data quality announcement readiness query failed.",
+            error=exc,
+        )
         return _status("error", "Announcement readiness query failed.", table=table, error=f"{type(exc).__name__}: {exc}", suggested_fix="Inspect announcement_pipeline_documents schema and DB connectivity.")
     row = df.iloc[0].to_dict() if not df.empty else {}
     total = int(row.get("row_count") or 0)
@@ -393,6 +457,12 @@ def check_exchange_event_readiness(limit: int = DEFAULT_LIMIT) -> dict[str, Any]
             statement_timeout_ms=15000,
         )
     except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_exchange_event_readiness_query_failed",
+            source=table,
+            reason="Event data quality exchange-event readiness query failed.",
+            error=exc,
+        )
         return _status("error", "Exchange event readiness query failed.", table=table, error=f"{type(exc).__name__}: {exc}", suggested_fix="Check DB timeout and exchange event schema.")
     row = summary.iloc[0].to_dict() if not summary.empty else {}
     total = int(row.get("row_count") or 0)
@@ -462,6 +532,12 @@ def check_exchange_feature_readiness(now: pd.Timestamp | None = None) -> dict[st
             statement_timeout_ms=15000,
         )
     except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_exchange_feature_readiness_query_failed",
+            source=table,
+            reason="Event data quality exchange-feature readiness query failed.",
+            error=exc,
+        )
         return _status("error", "Exchange feature readiness query failed.", table=table, error=f"{type(exc).__name__}: {exc}", suggested_fix="Check DB timeout and exchange feature schema.")
     row = df.iloc[0].to_dict() if not df.empty else {}
     total = int(row.get("row_count") or 0)

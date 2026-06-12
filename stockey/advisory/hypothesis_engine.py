@@ -12,11 +12,12 @@ import yaml
 from environs import Env
 from pydantic import BaseModel, Field
 
-from advisory.fallback_telemetry import record_fallback_event
+from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
 from advisory.market_context import load_latest_market_context
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 from utils.codex_cli import run_codex_structured
 
@@ -25,6 +26,104 @@ HYPOTHESES_TABLE = "advisory_hypotheses"
 MATCHES_TABLE = "advisory_hypothesis_matches"
 ACTION_PLANS_TABLE = "advisory_playbook_action_plans"
 PROMOTION_AUDITS_TABLE = "advisory_playbook_promotion_audits"
+HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID = "20260611_advisory_hypothesis_engine_base"
+HYPOTHESIS_ENGINE_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {HYPOTHESES_TABLE} (
+        hypothesis_id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        source TEXT,
+        status TEXT,
+        trigger_scope TEXT,
+        trigger_patterns_json TEXT,
+        expected_effect_json TEXT,
+        holding_window_days BIGINT,
+        decision_policy_json TEXT,
+        created_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {MATCHES_TABLE} (
+        matched_at TIMESTAMPTZ NOT NULL,
+        hypothesis_id TEXT NOT NULL,
+        hypothesis_title TEXT,
+        status TEXT,
+        source_type TEXT NOT NULL,
+        source_table TEXT NOT NULL,
+        source_key TEXT NOT NULL,
+        published_on TIMESTAMPTZ,
+        symbol TEXT,
+        subject TEXT,
+        source_url TEXT,
+        match_score DOUBLE PRECISION,
+        matched_terms_json TEXT,
+        evidence_text TEXT,
+        expected_effect_json TEXT,
+        suggested_action TEXT,
+        action_reason TEXT,
+        decision_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (hypothesis_id, source_table, source_key)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {ACTION_PLANS_TABLE} (
+        planned_at TIMESTAMPTZ NOT NULL,
+        hypothesis_id TEXT NOT NULL,
+        source_table TEXT NOT NULL,
+        source_key TEXT NOT NULL,
+        symbol TEXT,
+        trigger_scope TEXT,
+        suggested_action TEXT,
+        action_type TEXT,
+        urgency TEXT,
+        confidence DOUBLE PRECISION,
+        production_allowed BOOLEAN,
+        operator_summary TEXT,
+        decision_reason TEXT,
+        checks_json TEXT,
+        risk_controls_json TEXT,
+        action_plan_json TEXT,
+        market_context_json TEXT,
+        market_context_adjustment_json TEXT,
+        market_context_adjustment TEXT,
+        prompt_id TEXT,
+        prompt_version TEXT,
+        prompt_schema_version TEXT,
+        llm_model TEXT,
+        llm_status TEXT,
+        llm_error TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (hypothesis_id, source_table, source_key)
+    )
+    """,
+    f"ALTER TABLE {ACTION_PLANS_TABLE} ADD COLUMN IF NOT EXISTS prompt_id TEXT",
+    f"ALTER TABLE {ACTION_PLANS_TABLE} ADD COLUMN IF NOT EXISTS prompt_version TEXT",
+    f"ALTER TABLE {ACTION_PLANS_TABLE} ADD COLUMN IF NOT EXISTS prompt_schema_version TEXT",
+    f"""
+    CREATE TABLE IF NOT EXISTS {PROMOTION_AUDITS_TABLE} (
+        audited_at TIMESTAMPTZ NOT NULL,
+        hypothesis_id TEXT NOT NULL,
+        audit_status TEXT NOT NULL,
+        match_count BIGINT,
+        source_type_count BIGINT,
+        symbol_count BIGINT,
+        first_match_at TIMESTAMPTZ,
+        last_match_at TIMESTAMPTZ,
+        min_matches_required BIGINT,
+        lookback_days BIGINT,
+        audit_reason TEXT,
+        evidence_json TEXT,
+        operator_notes TEXT,
+        approved_by TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (hypothesis_id, audited_at)
+    )
+    """,
+]
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HYPOTHESES_CONFIG = REPO_ROOT / "config" / "hypotheses.yaml"
 
@@ -94,113 +193,15 @@ def ensure_tables(*, force: bool = False) -> None:
     global _TABLES_READY
     if _TABLES_READY and not force:
         return
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {HYPOTHESES_TABLE} (
-                hypothesis_id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                description TEXT,
-                source TEXT,
-                status TEXT,
-                trigger_scope TEXT,
-                trigger_patterns_json TEXT,
-                expected_effect_json TEXT,
-                holding_window_days BIGINT,
-                decision_policy_json TEXT,
-                created_at TIMESTAMPTZ,
-                updated_at TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {MATCHES_TABLE} (
-                matched_at TIMESTAMPTZ NOT NULL,
-                hypothesis_id TEXT NOT NULL,
-                hypothesis_title TEXT,
-                status TEXT,
-                source_type TEXT NOT NULL,
-                source_table TEXT NOT NULL,
-                source_key TEXT NOT NULL,
-                published_on TIMESTAMPTZ,
-                symbol TEXT,
-                subject TEXT,
-                source_url TEXT,
-                match_score DOUBLE PRECISION,
-                matched_terms_json TEXT,
-                evidence_text TEXT,
-                expected_effect_json TEXT,
-                suggested_action TEXT,
-                action_reason TEXT,
-                decision_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (hypothesis_id, source_table, source_key)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {ACTION_PLANS_TABLE} (
-                planned_at TIMESTAMPTZ NOT NULL,
-                hypothesis_id TEXT NOT NULL,
-                source_table TEXT NOT NULL,
-                source_key TEXT NOT NULL,
-                symbol TEXT,
-                trigger_scope TEXT,
-                suggested_action TEXT,
-                action_type TEXT,
-                urgency TEXT,
-                confidence DOUBLE PRECISION,
-                production_allowed BOOLEAN,
-                operator_summary TEXT,
-                decision_reason TEXT,
-                checks_json TEXT,
-                risk_controls_json TEXT,
-                action_plan_json TEXT,
-                market_context_json TEXT,
-                market_context_adjustment_json TEXT,
-                market_context_adjustment TEXT,
-                prompt_id TEXT,
-                prompt_version TEXT,
-                prompt_schema_version TEXT,
-                llm_model TEXT,
-                llm_status TEXT,
-                llm_error TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (hypothesis_id, source_table, source_key)
-            )
-            """
-        )
-        for column, sql_type in {
-            "prompt_id": "TEXT",
-            "prompt_version": "TEXT",
-            "prompt_schema_version": "TEXT",
-        }.items():
-            cur.execute(f"ALTER TABLE {ACTION_PLANS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {PROMOTION_AUDITS_TABLE} (
-                audited_at TIMESTAMPTZ NOT NULL,
-                hypothesis_id TEXT NOT NULL,
-                audit_status TEXT NOT NULL,
-                match_count BIGINT,
-                source_type_count BIGINT,
-                symbol_count BIGINT,
-                first_match_at TIMESTAMPTZ,
-                last_match_at TIMESTAMPTZ,
-                min_matches_required BIGINT,
-                lookback_days BIGINT,
-                audit_reason TEXT,
-                evidence_json TEXT,
-                operator_notes TEXT,
-                approved_by TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (hypothesis_id, audited_at)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID,
+        description="Create advisory hypothesis, match, action-plan, and promotion-audit tables.",
+        statements=HYPOTHESIS_ENGINE_SCHEMA_STATEMENTS,
+        metadata={
+            "tables": [HYPOTHESES_TABLE, MATCHES_TABLE, ACTION_PLANS_TABLE, PROMOTION_AUDITS_TABLE],
+            "authority_scope": "review_only_playbook_overlay",
+        },
+    )
     _TABLES_READY = True
 
 
@@ -233,14 +234,28 @@ def normalize_terms(value: Any) -> list[str]:
     return terms
 
 
-def parse_jsonish(value: Any, default: Any) -> Any:
+def parse_jsonish(value: Any, default: Any, *, source: str = "hypothesis_json_context") -> Any:
     if value is None or (not isinstance(value, (dict, list)) and pd.isna(value)):
         return default
     if isinstance(value, (dict, list)):
         return value
     try:
         return json.loads(str(value))
-    except Exception:
+    except Exception as exc:
+        text = str(value)
+        record_local_fallback_event(
+            module="advisory.hypothesis_engine",
+            fallback_type="hypothesis_json_parse_failed",
+            source=source,
+            severity="warn",
+            reason="Hypothesis engine could not parse stored JSON context and used the provided default.",
+            error=exc,
+            metadata={
+                "default_type": type(default).__name__,
+                "value_length": len(text),
+                "value_excerpt": text[:240],
+            },
+        )
         return default
 
 
@@ -254,8 +269,16 @@ def _clean_json_record(row: dict[str, Any]) -> dict[str, Any]:
             if pd.isna(value):
                 out[key] = None
                 continue
-        except Exception:
-            pass
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.hypothesis_engine",
+                fallback_type="hypothesis_clean_json_missing_check_failed",
+                source="hypothesis_record_cleanup",
+                severity="warn",
+                reason="Hypothesis engine could not evaluate a value for missingness while preparing JSON output and kept the original value.",
+                error=exc,
+                metadata={"field": str(key), "value_type": type(value).__name__},
+            )
         out[key] = value
     return out
 
@@ -267,6 +290,22 @@ def load_playbook_market_context(match: pd.Series) -> dict[str, Any]:
     try:
         payload = load_latest_market_context(published_on.normalize(), limit=250)
     except Exception as exc:
+        symbol = str(match.get("symbol") or "").strip().upper()
+        record_local_fallback_event(
+            module="advisory.hypothesis_engine",
+            fallback_type="hypothesis_market_context_load_failed",
+            source="advisory.market_context",
+            severity="warn",
+            symbol=symbol or None,
+            reason="Hypothesis/playbook action planning could not load market context and will continue with an explicit error payload.",
+            error=exc,
+            metadata={
+                "published_on": None if pd.isna(published_on) else published_on.isoformat(),
+                "normalized_asof": None if pd.isna(published_on) else published_on.normalize().isoformat(),
+                "unique_id": str(match.get("unique_id") or "") or None,
+                "hypothesis_id": str(match.get("hypothesis_id") or "") or None,
+            },
+        )
         return {
             "summary": {},
             "symbol_context": {},
@@ -716,14 +755,26 @@ def run_promotion_audit(
 def _audit_horizons_for_hypothesis(hypothesis_id: str) -> list[int]:
     try:
         hypotheses = load_hypotheses(include_inactive=True)
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.hypothesis_engine",
+            source=HYPOTHESES_TABLE,
+            fallback_type="hypothesis_audit_horizon_load_failed",
+            severity="warn",
+            reason="Hypothesis promotion audit could not load decision-policy horizons and will use default horizons.",
+            error=exc,
+            metadata={
+                "hypothesis_id": str(hypothesis_id),
+                "default_horizons": DEFAULT_PROMOTION_HORIZONS,
+            },
+        )
         hypotheses = pd.DataFrame()
     if hypotheses.empty:
         return DEFAULT_PROMOTION_HORIZONS
     row = hypotheses[hypotheses["hypothesis_id"].astype(str) == str(hypothesis_id)]
     if row.empty:
         return DEFAULT_PROMOTION_HORIZONS
-    policy = parse_jsonish(row.iloc[0].get("decision_policy_json"), {})
+    policy = parse_jsonish(row.iloc[0].get("decision_policy_json"), {}, source="decision_policy_json")
     holding_window = policy.get("holding_window") if isinstance(policy, dict) else {}
     horizons = _as_list(holding_window.get("horizons_days") if isinstance(holding_window, dict) else None)
     parsed = pd.to_numeric(pd.Series(horizons), errors="coerce").dropna().astype(int).tolist()
@@ -1108,7 +1159,7 @@ def load_source_events(*, from_date: pd.Timestamp, to_date: pd.Timestamp, source
 
 
 def decision_for_match(hypothesis: pd.Series, matched_terms: list[str], row: pd.Series) -> tuple[str, str, dict[str, Any]]:
-    expected_effect = parse_jsonish(hypothesis.get("expected_effect_json"), {})
+    expected_effect = parse_jsonish(hypothesis.get("expected_effect_json"), {}, source="expected_effect_json")
     effect_text = normalize_text(" ".join(str(value) for value in expected_effect.values())) if isinstance(expected_effect, dict) else normalize_text(expected_effect)
     raw_status = str(hypothesis.get("status") or ACTIVE_REVIEW_STATUS).lower()
     status = normalize_playbook_status(raw_status)
@@ -1170,7 +1221,7 @@ def apply_market_context_to_plan(plan: PlaybookActionPlan, market_context: dict[
 def _fallback_action_plan(match: pd.Series, *, market_context: dict[str, Any] | None = None, llm_status: str = "fallback", llm_error: str | None = None) -> tuple[PlaybookActionPlan, str, str | None, dict[str, Any]]:
     suggested_action = str(match.get("suggested_action") or "MANUAL_REVIEW")
     market_context = market_context or load_playbook_market_context(match)
-    expected_effect = parse_jsonish(match.get("expected_effect_json"), {})
+    expected_effect = parse_jsonish(match.get("expected_effect_json"), {}, source="expected_effect_json")
     status = normalize_playbook_status(match.get("status"))
     production_allowed = is_trusted_overlay_status(status)
     urgency = "normal"
@@ -1244,9 +1295,9 @@ def _build_action_prompt(match: pd.Series, *, market_context: dict[str, Any]) ->
         "symbol": match.get("symbol"),
         "subject": match.get("subject"),
         "evidence_text": match.get("evidence_text"),
-        "matched_terms": parse_jsonish(match.get("matched_terms_json"), []),
+        "matched_terms": parse_jsonish(match.get("matched_terms_json"), [], source="matched_terms_json"),
         "match_score": match.get("match_score"),
-        "expected_effect": parse_jsonish(match.get("expected_effect_json"), {}),
+        "expected_effect": parse_jsonish(match.get("expected_effect_json"), {}, source="expected_effect_json"),
         "suggested_action": match.get("suggested_action"),
         "action_reason": match.get("action_reason"),
         "market_context": market_context,
@@ -1364,13 +1415,13 @@ def build_matches(hypotheses: pd.DataFrame, events: pd.DataFrame) -> pd.DataFram
     rows: list[dict[str, Any]] = []
     now = pd.Timestamp.utcnow()
     for _, hypothesis in hypotheses.iterrows():
-        trigger_patterns = parse_jsonish(hypothesis.get("trigger_patterns_json"), {})
+        trigger_patterns = parse_jsonish(hypothesis.get("trigger_patterns_json"), {}, source="trigger_patterns_json")
         terms = normalize_terms(trigger_patterns)
         if not terms:
             terms = normalize_terms(hypothesis.get("description"))
         if not terms:
             continue
-        min_terms = int(parse_jsonish(hypothesis.get("decision_policy_json"), {}).get("min_terms", 1) or 1)
+        min_terms = int(parse_jsonish(hypothesis.get("decision_policy_json"), {}, source="decision_policy_json").get("min_terms", 1) or 1)
         for _, event in events.iterrows():
             evidence_text = " ".join(
                 str(event.get(column) or "")
@@ -1448,7 +1499,19 @@ def run_hypothesis_scan(
                 from advisory.wait_signals import generate_wait_signals
 
                 generate_wait_signals(hypothesis_id=hypothesis_id, limit=max(len(action_plans), 1), persist=True)
-            except Exception:
+            except Exception as exc:
+                record_local_fallback_event(
+                    module="advisory.hypothesis_engine",
+                    source="advisory.wait_signals",
+                    fallback_type="hypothesis_wait_signal_generation_failed",
+                    severity="warn",
+                    reason="Hypothesis scan persisted action plans but could not generate wait signals.",
+                    error=exc,
+                    metadata={
+                        "hypothesis_id": hypothesis_id,
+                        "action_plan_count": int(len(action_plans)),
+                    },
+                )
                 pass
     return {
         "status": "ok",

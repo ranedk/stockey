@@ -5,12 +5,15 @@ import json
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.setup_registry import load_setup_registry
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 TABLE_NAME = "advisory_watchlist"
+WATCHLIST_SCHEMA_MIGRATION_ID = "20260611_advisory_watchlist_base"
 DEFAULT_SCORE_THRESHOLDS = {
     "pass_now": 0.68,
     "watch_breakout": 0.58,
@@ -18,6 +21,101 @@ DEFAULT_SCORE_THRESHOLDS = {
     "abstain": 0.40,
 }
 _TRANSITION_CUTOFF = 0.12
+WATCHLIST_SCHEMA_COLUMNS = {
+    "setup_name": "TEXT",
+    "regime_name": "TEXT",
+    "base_regime": "TEXT",
+    "news_overlay": "TEXT",
+    "theme_ids": "TEXT",
+    "company_master_id": "TEXT",
+    "screener_slug": "TEXT",
+    "source_screener_slug": "TEXT",
+    "source_screener_list": "TEXT",
+    "rank": "BIGINT",
+    "candidate_state": "TEXT",
+    "current_state": "TEXT",
+    "watch_reason_detail": "TEXT",
+    "entry_style": "TEXT",
+    "attractive_price_low": "DOUBLE PRECISION",
+    "attractive_price_high": "DOUBLE PRECISION",
+    "invalidation_price": "DOUBLE PRECISION",
+    "entry_note": "TEXT",
+    "near_miss_flag": "BOOLEAN",
+    "last_event_class": "TEXT",
+    "last_state_transition_hint": "TEXT",
+    "last_event_score_impact": "DOUBLE PRECISION",
+    "watch_enabled": "BOOLEAN",
+    "watch_reasons_json": "TEXT",
+    "watch_status": "TEXT",
+    "state_updated_at": "TIMESTAMPTZ",
+    "watch_started_at": "TIMESTAMPTZ",
+    "last_checked_at": "TIMESTAMPTZ",
+    "last_document_published_on": "TIMESTAMPTZ",
+    "load_ts": "TIMESTAMPTZ",
+}
+WATCHLIST_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        regime_name TEXT,
+        base_regime TEXT,
+        news_overlay TEXT,
+        theme_ids TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        screener_slug TEXT,
+        source_screener_slug TEXT,
+        source_screener_list TEXT,
+        rank BIGINT,
+        candidate_state TEXT,
+        current_state TEXT,
+        watch_reason_detail TEXT,
+        entry_style TEXT,
+        attractive_price_low DOUBLE PRECISION,
+        attractive_price_high DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        entry_note TEXT,
+        near_miss_flag BOOLEAN,
+        last_event_class TEXT,
+        last_state_transition_hint TEXT,
+        last_event_score_impact DOUBLE PRECISION,
+        watch_enabled BOOLEAN,
+        watch_reasons_json TEXT,
+        watch_status TEXT,
+        state_updated_at TIMESTAMPTZ,
+        watch_started_at TIMESTAMPTZ,
+        last_checked_at TIMESTAMPTZ,
+        last_document_published_on TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, setup_id, symbol)
+    )
+    """,
+    *[
+        f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+        for column, sql_type in WATCHLIST_SCHEMA_COLUMNS.items()
+    ],
+]
+
+
+def _record_watchlist_builder_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.watchlist_builder",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -25,81 +123,12 @@ def normalize_timestamp(series: pd.Series) -> pd.Series:
 
 
 def ensure_watchlist_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                regime_name TEXT,
-                base_regime TEXT,
-                news_overlay TEXT,
-                theme_ids TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                screener_slug TEXT,
-                source_screener_slug TEXT,
-                source_screener_list TEXT,
-                rank BIGINT,
-                candidate_state TEXT,
-                current_state TEXT,
-                watch_reason_detail TEXT,
-                entry_style TEXT,
-                attractive_price_low DOUBLE PRECISION,
-                attractive_price_high DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                entry_note TEXT,
-                near_miss_flag BOOLEAN,
-                last_event_class TEXT,
-                last_state_transition_hint TEXT,
-                last_event_score_impact DOUBLE PRECISION,
-                watch_enabled BOOLEAN,
-                watch_reasons_json TEXT,
-                watch_status TEXT,
-                state_updated_at TIMESTAMPTZ,
-                watch_started_at TIMESTAMPTZ,
-                last_checked_at TIMESTAMPTZ,
-                last_document_published_on TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, setup_id, symbol)
-            )
-            """
-        )
-        column_defs = {
-            "setup_name": "TEXT",
-            "regime_name": "TEXT",
-            "base_regime": "TEXT",
-            "news_overlay": "TEXT",
-            "theme_ids": "TEXT",
-            "company_master_id": "TEXT",
-            "screener_slug": "TEXT",
-            "source_screener_slug": "TEXT",
-            "source_screener_list": "TEXT",
-            "rank": "BIGINT",
-            "candidate_state": "TEXT",
-            "current_state": "TEXT",
-            "watch_reason_detail": "TEXT",
-            "entry_style": "TEXT",
-            "attractive_price_low": "DOUBLE PRECISION",
-            "attractive_price_high": "DOUBLE PRECISION",
-            "invalidation_price": "DOUBLE PRECISION",
-            "entry_note": "TEXT",
-            "near_miss_flag": "BOOLEAN",
-            "last_event_class": "TEXT",
-            "last_state_transition_hint": "TEXT",
-            "last_event_score_impact": "DOUBLE PRECISION",
-            "watch_enabled": "BOOLEAN",
-            "watch_reasons_json": "TEXT",
-            "watch_status": "TEXT",
-            "state_updated_at": "TIMESTAMPTZ",
-            "watch_started_at": "TIMESTAMPTZ",
-            "last_checked_at": "TIMESTAMPTZ",
-            "last_document_published_on": "TIMESTAMPTZ",
-            "load_ts": "TIMESTAMPTZ",
-        }
-        for column, sql_type in column_defs.items():
-            cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    apply_schema_migration(
+        migration_id=WATCHLIST_SCHEMA_MIGRATION_ID,
+        description="Create advisory watchlist table with full builder-owned columns.",
+        statements=WATCHLIST_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME]},
+    )
 
 
 def load_candidate_rows(
@@ -182,7 +211,18 @@ def load_latest_event_transitions(
             """,
             params=tuple(params) if params else None,
         )
-    except Exception:
+    except Exception as exc:
+        _record_watchlist_builder_fallback(
+            fallback_type="watchlist_builder_event_transition_load_failed",
+            source="advisory_event_evaluations",
+            reason="Watchlist builder could not load event transition context; watch states may ignore fresh event upgrades/downgrades.",
+            error=exc,
+            metadata={
+                "asof_date": str(asof_date) if asof_date is not None else None,
+                "setup_count": len(setup_ids or []),
+                "symbol_count": len(symbols or []),
+            },
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -285,7 +325,17 @@ def build_watchlist(
             FROM advisory_watchlist
             """
         )
-    except Exception:
+    except Exception as exc:
+        _record_watchlist_builder_fallback(
+            fallback_type="watchlist_builder_existing_state_load_failed",
+            source=TABLE_NAME,
+            reason="Watchlist builder could not load existing watch state; last-checked/document timestamps may reset for this build.",
+            error=exc,
+            metadata={
+                "asof_date": str(asof_date) if asof_date is not None else None,
+                "candidate_count": int(len(candidates)),
+            },
+        )
         existing = pd.DataFrame()
     if not existing.empty:
         existing["asof_date"] = normalize_timestamp(existing["asof_date"])
@@ -424,21 +474,27 @@ def persist_watchlist(df: pd.DataFrame, *, rebuild: bool = False, asof_date: pd.
     if df.empty:
         return
     if rebuild and asof_date is not None:
-        with db_session() as (_, cur):
+        def _delete_existing_watchlist_rows() -> None:
             pairs = (
                 df[["asof_date", "setup_id"]]
                 .dropna()
                 .drop_duplicates()
                 .to_dict(orient="records")
             )
-            for item in pairs:
-                cur.execute(
-                    f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s AND setup_id = %s",
-                    (
-                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
-                        str(item["setup_id"]),
-                    ),
-                )
+            with db_session() as (_, cur):
+                for item in pairs:
+                    cur.execute(
+                        f"DELETE FROM {TABLE_NAME} WHERE asof_date = %s AND setup_id = %s",
+                        (
+                            pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                            str(item["setup_id"]),
+                        ),
+                    )
+
+        execute_db_operation(
+            _delete_existing_watchlist_rows,
+            operation_name="watchlist_builder:delete_rebuild_rows",
+        )
     upsert_to_db(
         df,
         TABLE_NAME,

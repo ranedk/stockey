@@ -14,6 +14,7 @@ but pandas-datareader still works anonymously for these series).
 from __future__ import annotations
 
 import io
+import json
 from environs import Env
 from datetime import date, timedelta
 from typing import Dict
@@ -21,6 +22,7 @@ from urllib.parse import urlencode
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import table_has_date, upsert_to_db
 from utils.http import get_with_retries
 
@@ -50,6 +52,24 @@ FRED_BACKOFF_FACTOR = 0.5
 ISM_TIMEOUT_SECONDS = 20
 ISM_RETRIES = 3
 FRED_MACRO_LOOKBACK_DAYS = max(env.int("FRED_US_MACRO_LOOKBACK_DAYS", 365), 1)
+SYNC_SOURCE_NAME = "data.fred.us_macro"
+STOCKEY_RUN_STATE: dict[str, object] = {}
+LAST_FRED_SERIES_STATE: dict[str, object] = {}
+
+
+def _record_macro_leg_fallback(*, leg: str, error: Exception) -> None:
+    record_local_fallback_event(
+        module=SYNC_SOURCE_NAME,
+        fallback_type="fred_macro_leg_failed",
+        source=f"{SYNC_SOURCE_NAME}:{leg}",
+        severity="warn",
+        reason=(
+            "US macro sync leg failed; macro/regime context may be partial while the remaining "
+            "macro legs continue."
+        ),
+        error=error,
+        metadata={"leg": leg},
+    )
 
 
 def _fetch_single_fred_series(
@@ -92,24 +112,71 @@ def fetch_fred_series(
     Returns a DataFrame with friendly column names, one column per series.
     Missing values (weekends, holidays) are forward-filled after resampling.
     """
+    global LAST_FRED_SERIES_STATE
     today = date.today()
+    state: dict[str, object] = {
+        "source": f"{SYNC_SOURCE_NAME}:fred",
+        "series_count": int(len(series)),
+        "succeeded_series_count": 0,
+        "failed_series_count": 0,
+        "attempt_count": int(len(series)),
+        "download_attempts": int(len(series)),
+        "failed_attempt_count": 0,
+        "source_unavailable_count": 0,
+        "fallback_count": 0,
+        "fallback_used": False,
+        "no_data_count": 0,
+        "rows": 0,
+        "rows_read": 0,
+        "rows_written": 0,
+        "state_advanced": False,
+    }
     try:
         found, latest_date = table_has_date("macro_usa", "date", today)
     except Exception as exc:
+        fallback_latest_date = today - timedelta(days=FRED_MACRO_LOOKBACK_DAYS)
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source="macro_usa:date",
+            fallback_type="fred_macro_table_date_fallback",
+            severity="warn",
+            reason=(
+                "FRED macro latest-date lookup failed; using configured lookback window before fetching "
+                "macro series."
+            ),
+            error=exc,
+            metadata={
+                "table": "macro_usa",
+                "date_column": "date",
+                "fallback_latest_date": fallback_latest_date.isoformat(),
+                "lookback_days": FRED_MACRO_LOOKBACK_DAYS,
+            },
+        )
         print(f"FRED table_has_date fallback for macro_usa: {exc.__class__.__name__}: {exc}", flush=True)
         found = False
-        latest_date = today - timedelta(days=FRED_MACRO_LOOKBACK_DAYS)
+        latest_date = fallback_latest_date
+        state["fallback_count"] = 1
+        state["fallback_used"] = True
+        state["fallback_reason"] = f"{type(exc).__name__}: {exc}"
 
     start = latest_date - timedelta(
         days=15
     )  # Some values like inr_usd get updated later
     end = date.today()
+    state["from_date"] = start.isoformat()
+    state["to_date"] = end.isoformat()
 
     if found:
         # No need to query further if table has latest data
+        state["status"] = "skipped_current"
+        state["no_data_count"] = int(len(series))
+        LAST_FRED_SERIES_STATE = state
         return
     if latest_date >= today:
         # latest_date is today, no need to query further
+        state["status"] = "skipped_current"
+        state["no_data_count"] = int(len(series))
+        LAST_FRED_SERIES_STATE = state
         return
 
     print("Pulling data %s to %s" % (start, end), flush=True)
@@ -122,6 +189,22 @@ def fetch_fred_series(
             series_data = _fetch_single_fred_series(series_id, start=start, end=end)
         except Exception as exc:
             failed_series.append(series_id)
+            record_local_fallback_event(
+                module=SYNC_SOURCE_NAME,
+                source=f"fred:{series_id}",
+                fallback_type="fred_series_fetch_failed",
+                severity="warn",
+                reason=(
+                    "FRED series fetch failed; macro context will be partial while remaining series continue."
+                ),
+                error=exc,
+                metadata={
+                    "series_id": series_id,
+                    "friendly_name": friendly_name,
+                    "from_date": start.isoformat(),
+                    "to_date": end.isoformat(),
+                },
+            )
             print(f"FRED series fetch failed for {series_id}: {exc}", flush=True)
             continue
         if series_data is None:
@@ -133,6 +216,18 @@ def fetch_fred_series(
 
     if not series_frames:
         print("FRED fetch skipped: no series data available after retries", flush=True)
+        state.update(
+            {
+                "status": "source_unavailable" if failed_series else "no_data",
+                "failed_series_count": int(len(failed_series)),
+                "failed_attempt_count": int(len(failed_series)),
+                "source_unavailable_count": int(len(failed_series)),
+                "no_data_count": int(max(len(series) - len(failed_series), 0)),
+            }
+        )
+        if failed_series:
+            state["failed_series"] = sorted(failed_series)
+        LAST_FRED_SERIES_STATE = state
         return pd.DataFrame()
 
     df = pd.concat(series_frames, axis=1).sort_index()
@@ -166,6 +261,22 @@ def fetch_fred_series(
     if failed_series:
         print(f"FRED completed with partial failures: {', '.join(sorted(failed_series))}", flush=True)
 
+    state.update(
+        {
+            "status": "partial" if failed_series else "ok",
+            "succeeded_series_count": int(len(series_frames)),
+            "failed_series_count": int(len(failed_series)),
+            "failed_attempt_count": int(len(failed_series)),
+            "source_unavailable_count": int(len(failed_series)),
+            "rows": int(len(df)),
+            "rows_read": int(len(df)),
+            "rows_written": int(len(df)),
+            "state_advanced": bool(len(df) > 0),
+        }
+    )
+    if failed_series:
+        state["failed_series"] = sorted(failed_series)
+    LAST_FRED_SERIES_STATE = state
     return df
 
 
@@ -209,12 +320,81 @@ def fetch_ism_manufacturing():
     return df
 
 
-if __name__ == "__main__":
+def run_macro_sync() -> dict[str, object]:
+    state: dict[str, object] = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": 0,
+        "rows_read": 0,
+        "rows_written": 0,
+        "leg_count": 2,
+        "succeeded_leg_count": 0,
+        "failed_leg_count": 0,
+        "attempt_count": 2,
+        "download_attempts": 2,
+        "failed_attempt_count": 0,
+        "source_unavailable_count": 0,
+        "fallback_count": 0,
+        "fallback_used": False,
+        "state_advanced": False,
+    }
+    failed_legs: list[dict[str, str]] = []
+
     try:
-        fetch_fred_series()
+        fred_df = fetch_fred_series()
     except Exception as exc:
+        _record_macro_leg_fallback(leg="fred", error=exc)
         print(f"FRED macro download skipped: {exc}", flush=True)
+        fred_df = pd.DataFrame()
+        failed_legs.append({"leg": "fred", "error": f"{type(exc).__name__}: {exc}"})
+    else:
+        fred_state = dict(LAST_FRED_SERIES_STATE)
+        state["fallback_count"] = int(state["fallback_count"]) + int(fred_state.get("fallback_count") or 0)
+        state["fallback_used"] = bool(state["fallback_used"]) or bool(fred_state.get("fallback_used"))
+        state["source_unavailable_count"] = int(state["source_unavailable_count"]) + int(
+            fred_state.get("source_unavailable_count") or 0
+        )
+        if str(fred_state.get("status") or "") in {"ok", "partial", "skipped_current"}:
+            state["succeeded_leg_count"] = int(state["succeeded_leg_count"]) + 1
     try:
-        fetch_ism_manufacturing()
+        ism_df = fetch_ism_manufacturing()
     except Exception as exc:
+        _record_macro_leg_fallback(leg="ism", error=exc)
         print(f"ISM manufacturing download skipped: {exc}", flush=True)
+        ism_df = pd.DataFrame()
+        failed_legs.append({"leg": "ism", "error": f"{type(exc).__name__}: {exc}"})
+    else:
+        state["succeeded_leg_count"] = int(state["succeeded_leg_count"]) + 1
+
+    if failed_legs:
+        state["failed_legs"] = failed_legs
+    state["failed_leg_count"] = int(len(failed_legs))
+    state["failed_attempt_count"] = int(state["failed_attempt_count"]) + int(len(failed_legs))
+
+    fred_rows = int(len(fred_df)) if isinstance(fred_df, pd.DataFrame) else 0
+    ism_rows = int(len(ism_df)) if isinstance(ism_df, pd.DataFrame) else 0
+    state["rows"] = fred_rows + ism_rows
+    state["rows_read"] = fred_rows + ism_rows
+    state["rows_written"] = fred_rows + ism_rows
+    state["fred_rows"] = fred_rows
+    state["ism_rows"] = ism_rows
+    state["state_advanced"] = bool(fred_rows + ism_rows > 0)
+    if state["failed_leg_count"]:
+        state["status"] = "partial" if state["succeeded_leg_count"] else "failed"
+    else:
+        state["status"] = "ok"
+    return state
+
+
+def main() -> int:
+    global STOCKEY_RUN_STATE
+    STOCKEY_RUN_STATE = run_macro_sync()
+    status = str(STOCKEY_RUN_STATE.get("status") or "ok")
+    print(
+        json.dumps({"status": status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str),
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import (
     DEFAULT_TOKEN_CACHE,
     DhanAuthError,
@@ -35,7 +36,16 @@ def parse_expiry(raw_expiry: str | None) -> datetime | None:
         text = text[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(text)
-    except ValueError:
+    except ValueError as exc:
+        record_local_fallback_event(
+            module="data.dhanlive.auth_cli",
+            source="dhan_auth_cache",
+            fallback_type="dhan_auth_cli_cached_expiry_parse_failed",
+            severity="warn",
+            reason="Dhan auth CLI could not parse cached token expiry; cache freshness will be treated as unknown/stale.",
+            error=exc,
+            metadata={"raw_expiry": raw_expiry[:120]},
+        )
         return None
     if parsed.tzinfo is not None:
         return parsed.astimezone().astimezone(tz=None).replace(tzinfo=None)
@@ -75,6 +85,15 @@ def validate_token(access_token: str) -> dict[str, object]:
             "profile_keys": sorted(payload.keys())[:20] if isinstance(payload, dict) else [],
         }
     except (DhanAPIError, DhanAuthError) as exc:
+        record_local_fallback_event(
+            module="data.dhanlive.auth_cli",
+            source="dhan_auth",
+            fallback_type="dhan_token_validation_failed",
+            severity="error",
+            reason="Dhan access-token validation failed; refresh the broker token before running Dhan-backed downloads, watchers, or advisory stages.",
+            error=exc,
+            metadata={"access_token_present": bool(access_token)},
+        )
         return {
             "status": "error",
             "error": str(exc),

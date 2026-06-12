@@ -97,6 +97,22 @@ def run_codex_structured(
             payload = extract_json_object(text)
             return response_model.model_validate(payload)
         except (ValueError, TypeError, ValidationError) as exc:
+            from advisory.fallback_telemetry import record_local_fallback_event
+
+            record_local_fallback_event(
+                module="utils.codex_cli",
+                source=response_model.__name__,
+                fallback_type="codex_structured_validation_retry",
+                severity="warn",
+                reason="Codex structured response failed JSON/schema validation and will be retried if attempts remain.",
+                error=exc,
+                metadata={
+                    "attempt": attempt,
+                    "max_attempts": max(int(max_attempts), 1),
+                    "model": model or DEFAULT_CODEX_MODEL,
+                    "response_excerpt": text[:500],
+                },
+            )
             last_error = exc
             previous_error = (
                 f"Previous attempt {attempt} failed validation: {exc}. "
@@ -109,8 +125,18 @@ def extract_json_object(text: str) -> object:
     stripped = _strip_codex_fences(text).strip()
     try:
         return json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
+    except json.JSONDecodeError as exc:
+        from advisory.fallback_telemetry import record_local_fallback_event
+
+        record_local_fallback_event(
+            module="utils.codex_cli",
+            source="extract_json_object",
+            fallback_type="codex_json_direct_parse_failed",
+            severity="warn",
+            reason="Codex response was not direct JSON; attempting bounded JSON object extraction fallback.",
+            error=exc,
+            metadata={"response_excerpt": stripped[:500]},
+        )
     match = re.search(r"(\{.*\}|\[.*\])", stripped, flags=re.DOTALL)
     if not match:
         raise ValueError("Codex response did not contain JSON")

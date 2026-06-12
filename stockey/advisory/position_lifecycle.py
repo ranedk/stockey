@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from typing import Any
 
 import pandas as pd
 
 from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.technical_engine import evaluate_post_entry_state as evaluate_technical_post_entry_state
 from data.dhanlive.dhan_db import resolve_dhan_identity
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.display_time import to_display_value
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 PORTFOLIO_TABLE = "advisory_portfolio_orders"
 LIFECYCLE_TABLE = "advisory_position_lifecycle"
 REBALANCE_TABLE = "advisory_rebalance_actions"
+POLICY_CHANGES_TABLE = "advisory_lifecycle_policy_changes"
+LIFECYCLE_SCHEMA_MIGRATION_ID = "20260611_advisory_position_lifecycle_base"
 
 DEFAULT_REVIEW_STALE_DAYS = 20
 DEFAULT_TIGHTEN_STOP_GAIN_PCT = 10.0
@@ -39,22 +44,149 @@ POST_ENTRY_TECHNICAL_CONTEXT_COLUMNS = {
     "gap_pct",
 }
 
+LIFECYCLE_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {LIFECYCLE_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        published_on TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        unique_id TEXT NOT NULL,
+        position_status TEXT,
+        lifecycle_reason TEXT,
+        entry_date TIMESTAMPTZ,
+        entry_price DOUBLE PRECISION,
+        current_price DOUBLE PRECISION,
+        pnl_pct DOUBLE PRECISION,
+        days_held BIGINT,
+        approved_allocation_inr DOUBLE PRECISION,
+        overlap_group TEXT,
+        stop_price DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        thesis_bucket TEXT,
+        bucket_reason TEXT,
+        target_price DOUBLE PRECISION,
+        target_basis TEXT,
+        target_confidence DOUBLE PRECISION,
+        expected_horizon_days BIGINT,
+        target_review_date TIMESTAMPTZ,
+        horizon_end_date TIMESTAMPTZ,
+        exit_event_rules_json TEXT,
+        active_exit_condition TEXT,
+        exit_condition_status TEXT,
+        bucket_status_note TEXT,
+        next_action TEXT,
+        next_action_reason TEXT,
+        context_snapshot_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS thesis_bucket TEXT",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS bucket_reason TEXT",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS target_price DOUBLE PRECISION",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS target_basis TEXT",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS target_confidence DOUBLE PRECISION",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS expected_horizon_days BIGINT",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS target_review_date TIMESTAMPTZ",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS horizon_end_date TIMESTAMPTZ",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS exit_event_rules_json TEXT",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS active_exit_condition TEXT",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS exit_condition_status TEXT",
+    f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS bucket_status_note TEXT",
+    f"""
+    CREATE TABLE IF NOT EXISTS {REBALANCE_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        published_on TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        unique_id TEXT NOT NULL,
+        suggested_action TEXT,
+        action_reason TEXT,
+        reference_price DOUBLE PRECISION,
+        stop_price DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        target_price DOUBLE PRECISION,
+        recommended_stop_price DOUBLE PRECISION,
+        recommended_target_price DOUBLE PRECISION,
+        expected_horizon_days BIGINT,
+        action_fraction DOUBLE PRECISION,
+        execution_mode TEXT,
+        context_snapshot_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, published_on, setup_id, symbol, unique_id, suggested_action)
+    )
+    """,
+    f"ALTER TABLE {REBALANCE_TABLE} ADD COLUMN IF NOT EXISTS recommended_stop_price DOUBLE PRECISION",
+    f"ALTER TABLE {REBALANCE_TABLE} ADD COLUMN IF NOT EXISTS target_price DOUBLE PRECISION",
+    f"ALTER TABLE {REBALANCE_TABLE} ADD COLUMN IF NOT EXISTS recommended_target_price DOUBLE PRECISION",
+    f"ALTER TABLE {REBALANCE_TABLE} ADD COLUMN IF NOT EXISTS expected_horizon_days BIGINT",
+    f"ALTER TABLE {REBALANCE_TABLE} ADD COLUMN IF NOT EXISTS action_fraction DOUBLE PRECISION",
+    f"ALTER TABLE {REBALANCE_TABLE} ADD COLUMN IF NOT EXISTS execution_mode TEXT",
+    f"""
+    CREATE TABLE IF NOT EXISTS {POLICY_CHANGES_TABLE} (
+        change_id TEXT PRIMARY KEY,
+        changed_at TIMESTAMPTZ NOT NULL,
+        published_on TIMESTAMPTZ NOT NULL,
+        setup_id TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        unique_id TEXT NOT NULL,
+        change_type TEXT NOT NULL,
+        old_value DOUBLE PRECISION,
+        new_value DOUBLE PRECISION,
+        source_action TEXT,
+        reason TEXT,
+        context_json TEXT,
+        load_ts TIMESTAMPTZ
+    )
+    """,
+]
+
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
 
 
-def table_exists(table_name: str) -> bool:
-    df = sql_to_df(
-        """
-        SELECT 1 AS exists_flag
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-          AND table_name = %s
-        LIMIT 1
-        """,
-        params=(table_name,),
+def _record_lifecycle_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.position_lifecycle",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
     )
+
+
+def table_exists(table_name: str) -> bool:
+    try:
+        df = sql_to_df(
+            """
+            SELECT 1 AS exists_flag
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            LIMIT 1
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        _record_lifecycle_fallback(
+            fallback_type="position_lifecycle_table_lookup_failed",
+            source=table_name,
+            reason="Position lifecycle could not inspect whether a source/output table exists.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        return False
     return not df.empty
 
 
@@ -63,97 +195,12 @@ def has_post_entry_technical_context(row: pd.Series) -> bool:
 
 
 def ensure_lifecycle_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {LIFECYCLE_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                published_on TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                unique_id TEXT NOT NULL,
-                position_status TEXT,
-                lifecycle_reason TEXT,
-                entry_date TIMESTAMPTZ,
-                entry_price DOUBLE PRECISION,
-                current_price DOUBLE PRECISION,
-                pnl_pct DOUBLE PRECISION,
-                days_held BIGINT,
-                approved_allocation_inr DOUBLE PRECISION,
-                overlap_group TEXT,
-                stop_price DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                thesis_bucket TEXT,
-                bucket_reason TEXT,
-                target_price DOUBLE PRECISION,
-                target_basis TEXT,
-                target_confidence DOUBLE PRECISION,
-                expected_horizon_days BIGINT,
-                target_review_date TIMESTAMPTZ,
-                horizon_end_date TIMESTAMPTZ,
-                exit_event_rules_json TEXT,
-                active_exit_condition TEXT,
-                exit_condition_status TEXT,
-                bucket_status_note TEXT,
-                next_action TEXT,
-                next_action_reason TEXT,
-                context_snapshot_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        lifecycle_column_defs = {
-            "thesis_bucket": "TEXT",
-            "bucket_reason": "TEXT",
-            "target_price": "DOUBLE PRECISION",
-            "target_basis": "TEXT",
-            "target_confidence": "DOUBLE PRECISION",
-            "expected_horizon_days": "BIGINT",
-            "target_review_date": "TIMESTAMPTZ",
-            "horizon_end_date": "TIMESTAMPTZ",
-            "exit_event_rules_json": "TEXT",
-            "active_exit_condition": "TEXT",
-            "exit_condition_status": "TEXT",
-            "bucket_status_note": "TEXT",
-        }
-        for column, sql_type in lifecycle_column_defs.items():
-            cur.execute(f"ALTER TABLE {LIFECYCLE_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {REBALANCE_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                published_on TIMESTAMPTZ NOT NULL,
-                setup_id TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                unique_id TEXT NOT NULL,
-                suggested_action TEXT,
-                action_reason TEXT,
-                reference_price DOUBLE PRECISION,
-                stop_price DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                target_price DOUBLE PRECISION,
-                recommended_stop_price DOUBLE PRECISION,
-                recommended_target_price DOUBLE PRECISION,
-                expected_horizon_days BIGINT,
-                action_fraction DOUBLE PRECISION,
-                execution_mode TEXT,
-                context_snapshot_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, published_on, setup_id, symbol, unique_id, suggested_action)
-            )
-            """
-        )
-        rebalance_column_defs = {
-            "recommended_stop_price": "DOUBLE PRECISION",
-            "target_price": "DOUBLE PRECISION",
-            "recommended_target_price": "DOUBLE PRECISION",
-            "expected_horizon_days": "BIGINT",
-            "action_fraction": "DOUBLE PRECISION",
-            "execution_mode": "TEXT",
-        }
-        for column, sql_type in rebalance_column_defs.items():
-            cur.execute(f"ALTER TABLE {REBALANCE_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    apply_schema_migration(
+        migration_id=LIFECYCLE_SCHEMA_MIGRATION_ID,
+        description="Create and normalize advisory position lifecycle and rebalance action tables.",
+        statements=LIFECYCLE_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.position_lifecycle", "tables": [LIFECYCLE_TABLE, REBALANCE_TABLE, POLICY_CHANGES_TABLE]},
+    )
 
 
 def load_open_orders(
@@ -175,15 +222,29 @@ def load_open_orders(
     if setup_ids:
         clauses.append("setup_id = ANY(%s)")
         params.append([value.upper() for value in setup_ids])
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {PORTFOLIO_TABLE}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY published_on, setup_id, symbol
-        """,
-        params=tuple(params) if params else None,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {PORTFOLIO_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY published_on, setup_id, symbol
+            """,
+            params=tuple(params) if params else None,
+        )
+    except Exception as exc:
+        _record_lifecycle_fallback(
+            fallback_type="position_lifecycle_open_orders_load_failed",
+            source=PORTFOLIO_TABLE,
+            reason="Position lifecycle could not load open portfolio orders.",
+            error=exc,
+            metadata={
+                "asof_date": str(asof_date) if asof_date is not None else None,
+                "symbol_count": 0 if symbols is None else len(symbols),
+                "setup_id_count": 0 if setup_ids is None else len(setup_ids),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
@@ -202,7 +263,14 @@ def resolve_price_identities(symbols: list[str]) -> pd.DataFrame:
     for symbol in sorted({str(value).upper() for value in symbols if str(value).strip()}):
         try:
             identity = resolve_dhan_identity(symbol, "NSE", asset_type="stock")
-        except Exception:
+        except Exception as exc:
+            _record_lifecycle_fallback(
+                fallback_type="position_lifecycle_price_identity_failed",
+                source="dhan_scrip_master",
+                reason="Position lifecycle could not resolve a Dhan security id for price lookup.",
+                error=exc,
+                metadata={"symbol": symbol},
+            )
             continue
         rows.append(
             {
@@ -220,17 +288,27 @@ def load_price_points(symbols: list[str], monitor_date: pd.Timestamp) -> pd.Data
     if identities.empty:
         return pd.DataFrame()
     security_ids = identities["security_id"].dropna().astype(int).unique().tolist()
-    df = sql_to_df(
-        """
-        SELECT exchange, security_id, ticker, date, close
-        FROM dhan_ohlcv_daily
-        WHERE asset_type = 'stock'
-          AND security_id = ANY(%(security_ids)s)
-          AND date <= %(monitor_date)s
-        ORDER BY exchange, security_id, date
-        """,
-        params={"security_ids": security_ids, "monitor_date": monitor_date},
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT exchange, security_id, ticker, date, close
+            FROM dhan_ohlcv_daily
+            WHERE asset_type = 'stock'
+              AND security_id = ANY(%(security_ids)s)
+              AND date <= %(monitor_date)s
+            ORDER BY exchange, security_id, date
+            """,
+            params={"security_ids": security_ids, "monitor_date": monitor_date},
+        )
+    except Exception as exc:
+        _record_lifecycle_fallback(
+            fallback_type="position_lifecycle_price_history_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Position lifecycle could not load price history for open positions.",
+            error=exc,
+            metadata={"security_id_count": len(security_ids), "monitor_date": str(monitor_date)},
+        )
+        raise
     if df.empty:
         return df
     merged = df.merge(
@@ -250,17 +328,27 @@ def load_latest_technical_context(symbols: list[str], monitor_date: pd.Timestamp
     normalized = sorted({str(value).upper() for value in symbols if str(value).strip()})
     if not normalized or not table_exists("advisory_technical_daily"):
         return pd.DataFrame()
-    df = sql_to_df(
-        """
-        SELECT DISTINCT ON (symbol)
-            *
-        FROM advisory_technical_daily
-        WHERE symbol = ANY(%(symbols)s)
-          AND asof_date <= %(monitor_date)s
-        ORDER BY symbol, asof_date DESC
-        """,
-        params={"symbols": normalized, "monitor_date": monitor_date},
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT DISTINCT ON (symbol)
+                *
+            FROM advisory_technical_daily
+            WHERE symbol = ANY(%(symbols)s)
+              AND asof_date <= %(monitor_date)s
+            ORDER BY symbol, asof_date DESC
+            """,
+            params={"symbols": normalized, "monitor_date": monitor_date},
+        )
+    except Exception as exc:
+        _record_lifecycle_fallback(
+            fallback_type="position_lifecycle_technical_context_load_failed",
+            source="advisory_technical_daily",
+            reason="Position lifecycle could not load technical context for post-entry exit checks.",
+            error=exc,
+            metadata={"symbol_count": len(normalized), "monitor_date": str(monitor_date)},
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.upper()
@@ -468,33 +556,208 @@ def apply_tightened_stop_baseline(actions_df: pd.DataFrame) -> int:
     if tighten_rows.empty:
         return 0
 
-    updated = 0
-    with db_session() as (_, cur):
-        for _, row in tighten_rows.iterrows():
-            cur.execute(
-                f"""
-                UPDATE {PORTFOLIO_TABLE}
-                SET stop_price = %s
-                WHERE published_on = %s
-                  AND setup_id = %s
-                  AND symbol = %s
-                  AND unique_id = %s
-                  AND (
-                      stop_price IS NULL
-                      OR %s > stop_price
-                  )
-                """,
-                (
-                    float(row["recommended_stop_price"]),
-                    pd.to_datetime(row["published_on"], utc=True, errors="coerce").to_pydatetime(),
-                    str(row["setup_id"]),
-                    str(row["symbol"]).upper(),
-                    str(row["unique_id"]),
-                    float(row["recommended_stop_price"]),
-                ),
-            )
-            updated += int(cur.rowcount or 0)
-    return updated
+    def _apply_tightened_stop_baseline() -> int:
+        updated = 0
+        with db_session() as (_, cur):
+            for _, row in tighten_rows.iterrows():
+                old_stop = None if pd.isna(row.get("stop_price")) else float(row["stop_price"])
+                new_stop = float(row["recommended_stop_price"])
+                cur.execute(
+                    f"""
+                    UPDATE {PORTFOLIO_TABLE}
+                    SET stop_price = %s
+                    WHERE published_on = %s
+                      AND setup_id = %s
+                      AND symbol = %s
+                      AND unique_id = %s
+                      AND (
+                          stop_price IS NULL
+                          OR %s > stop_price
+                      )
+                    """,
+                    (
+                        new_stop,
+                        pd.to_datetime(row["published_on"], utc=True, errors="coerce").to_pydatetime(),
+                        str(row["setup_id"]),
+                        str(row["symbol"]).upper(),
+                        str(row["unique_id"]),
+                        new_stop,
+                    ),
+                )
+                row_updated = int(cur.rowcount or 0)
+                updated += row_updated
+                if row_updated <= 0:
+                    continue
+                changed_at = pd.Timestamp.utcnow().to_pydatetime()
+                published_on = pd.to_datetime(row["published_on"], utc=True, errors="coerce").to_pydatetime()
+                change_key = json.dumps(
+                    {
+                        "published_on": str(published_on),
+                        "setup_id": str(row["setup_id"]),
+                        "symbol": str(row["symbol"]).upper(),
+                        "unique_id": str(row["unique_id"]),
+                        "change_type": "stop_tightened",
+                        "new_value": new_stop,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+                change_id = hashlib.sha256(change_key.encode("utf-8")).hexdigest()
+                context = {
+                    "suggested_action": str(row.get("suggested_action") or ""),
+                    "recommended_stop_price": new_stop,
+                    "previous_stop_price": old_stop,
+                    "reference_price": None if pd.isna(row.get("reference_price")) else float(row.get("reference_price")),
+                    "recommended_target_price": None if pd.isna(row.get("recommended_target_price")) else float(row.get("recommended_target_price")),
+                    "expected_horizon_days": None if pd.isna(row.get("expected_horizon_days")) else int(row.get("expected_horizon_days")),
+                    "source_context_snapshot_json": row.get("context_snapshot_json"),
+                }
+                cur.execute(
+                    f"""
+                    INSERT INTO {POLICY_CHANGES_TABLE}
+                        (change_id, changed_at, published_on, setup_id, symbol, unique_id, change_type,
+                         old_value, new_value, source_action, reason, context_json, load_ts)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (change_id) DO NOTHING
+                    """,
+                    (
+                        change_id,
+                        changed_at,
+                        published_on,
+                        str(row["setup_id"]),
+                        str(row["symbol"]).upper(),
+                        str(row["unique_id"]),
+                        "stop_tightened",
+                        old_stop,
+                        new_stop,
+                        str(row.get("suggested_action") or "tighten_stop"),
+                        None if pd.isna(row.get("action_reason")) else str(row.get("action_reason")),
+                        json.dumps(context, ensure_ascii=False, sort_keys=True, default=str),
+                        changed_at,
+                    ),
+                )
+        return updated
+
+    return execute_db_operation(
+        _apply_tightened_stop_baseline,
+        operation_name="position_lifecycle:apply_tightened_stop_baseline",
+    )
+
+
+def apply_missing_target_baselines(lifecycle_df: pd.DataFrame) -> int:
+    if lifecycle_df.empty:
+        return 0
+    required_columns = {"published_on", "setup_id", "symbol", "unique_id", "target_price"}
+    if not required_columns.issubset(lifecycle_df.columns):
+        return 0
+
+    target_rows = lifecycle_df.copy()
+    target_rows["target_price"] = pd.to_numeric(target_rows["target_price"], errors="coerce")
+    target_rows["published_on"] = pd.to_datetime(target_rows["published_on"], utc=True, errors="coerce")
+    target_rows["symbol"] = target_rows["symbol"].astype("string").str.upper()
+    target_rows["setup_id"] = target_rows["setup_id"].astype("string")
+    target_rows["unique_id"] = target_rows["unique_id"].astype("string")
+    target_rows = target_rows[
+        target_rows["published_on"].notna()
+        & target_rows["target_price"].notna()
+        & (target_rows["target_price"] > 0)
+    ].copy()
+    if target_rows.empty:
+        return 0
+
+    def _apply_missing_target_baselines() -> int:
+        updated = 0
+        with db_session() as (_, cur):
+            for _, row in target_rows.iterrows():
+                new_target = float(row["target_price"])
+                target_review_date = pd.to_datetime(row.get("target_review_date"), utc=True, errors="coerce")
+                horizon_end_date = pd.to_datetime(row.get("horizon_end_date"), utc=True, errors="coerce")
+                expected_horizon_days = pd.to_numeric(row.get("expected_horizon_days"), errors="coerce")
+                changed_at = pd.Timestamp.utcnow().to_pydatetime()
+                published_on = pd.to_datetime(row["published_on"], utc=True, errors="coerce").to_pydatetime()
+                cur.execute(
+                    f"""
+                    UPDATE {PORTFOLIO_TABLE}
+                    SET target_price = %s,
+                        target_basis = COALESCE(target_basis, %s),
+                        target_review_date = COALESCE(target_review_date, %s),
+                        expected_horizon_days = COALESCE(expected_horizon_days, %s),
+                        horizon_end_date = COALESCE(horizon_end_date, %s)
+                    WHERE published_on = %s
+                      AND setup_id = %s
+                      AND symbol = %s
+                      AND unique_id = %s
+                      AND target_price IS NULL
+                    """,
+                    (
+                        new_target,
+                        None if pd.isna(row.get("target_basis")) else str(row.get("target_basis")),
+                        None if pd.isna(target_review_date) else target_review_date.to_pydatetime(),
+                        None if pd.isna(expected_horizon_days) else int(expected_horizon_days),
+                        None if pd.isna(horizon_end_date) else horizon_end_date.to_pydatetime(),
+                        published_on,
+                        str(row["setup_id"]),
+                        str(row["symbol"]).upper(),
+                        str(row["unique_id"]),
+                    ),
+                )
+                row_updated = int(cur.rowcount or 0)
+                updated += row_updated
+                if row_updated <= 0:
+                    continue
+                change_key = json.dumps(
+                    {
+                        "published_on": str(published_on),
+                        "setup_id": str(row["setup_id"]),
+                        "symbol": str(row["symbol"]).upper(),
+                        "unique_id": str(row["unique_id"]),
+                        "change_type": "target_initialized",
+                        "new_value": new_target,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+                change_id = hashlib.sha256(change_key.encode("utf-8")).hexdigest()
+                context = {
+                    "target_price": new_target,
+                    "target_basis": None if pd.isna(row.get("target_basis")) else str(row.get("target_basis")),
+                    "target_confidence": None if pd.isna(row.get("target_confidence")) else float(row.get("target_confidence")),
+                    "target_review_date": None if pd.isna(target_review_date) else target_review_date.isoformat(),
+                    "expected_horizon_days": None if pd.isna(expected_horizon_days) else int(expected_horizon_days),
+                    "horizon_end_date": None if pd.isna(horizon_end_date) else horizon_end_date.isoformat(),
+                    "source_next_action": None if pd.isna(row.get("next_action")) else str(row.get("next_action")),
+                    "source_context_snapshot_json": row.get("context_snapshot_json"),
+                }
+                cur.execute(
+                    f"""
+                    INSERT INTO {POLICY_CHANGES_TABLE}
+                        (change_id, changed_at, published_on, setup_id, symbol, unique_id, change_type,
+                         old_value, new_value, source_action, reason, context_json, load_ts)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (change_id) DO NOTHING
+                    """,
+                    (
+                        change_id,
+                        changed_at,
+                        published_on,
+                        str(row["setup_id"]),
+                        str(row["symbol"]).upper(),
+                        str(row["unique_id"]),
+                        "target_initialized",
+                        None,
+                        new_target,
+                        None if pd.isna(row.get("next_action")) else str(row.get("next_action")),
+                        None if pd.isna(row.get("next_action_reason")) else str(row.get("next_action_reason")),
+                        json.dumps(context, ensure_ascii=False, sort_keys=True, default=str),
+                        changed_at,
+                    ),
+                )
+        return updated
+
+    return execute_db_operation(
+        _apply_missing_target_baselines,
+        operation_name="position_lifecycle:apply_missing_target_baselines",
+    )
 
 
 def classify_position(
@@ -606,8 +869,14 @@ def derive_bucket_lifecycle_fields(row: pd.Series, monitor_date: pd.Timestamp, n
     if pd.isna(target_price):
         target_price = pd.to_numeric(row.get("target_price"), errors="coerce")
 
-    if next_action in {"exit_invalidation", "exit_stop", "exit_time_stop"}:
-        active = {"exit_invalidation": "INVALIDATION_HIT", "exit_stop": "STOP_HIT", "exit_time_stop": "TIME_STOP"}.get(next_action)
+    if next_action in {"exit_invalidation", "exit_stop", "exit_emergency", "exit_technical_failure", "exit_time_stop"}:
+        active = {
+            "exit_invalidation": "INVALIDATION_HIT",
+            "exit_stop": "STOP_HIT",
+            "exit_emergency": "TECHNICAL_EMERGENCY_EXIT",
+            "exit_technical_failure": "TECHNICAL_FULL_EXIT",
+            "exit_time_stop": "TIME_STOP",
+        }.get(next_action)
         return active, "triggered", "Exit event overrides target and horizon policy."
     if next_action == "trim_winner" and pd.notna(target_price) and pd.notna(current_price) and float(current_price) >= float(target_price):
         return "TARGET_REACHED", "partial_exit_due", "Target zone has been reached; book partial profit and trail the rest."
@@ -822,21 +1091,28 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
         ]:
             if column in lifecycle_out.columns:
                 lifecycle_out[column] = pd.to_datetime(lifecycle_out[column], utc=True, errors="coerce")
-        with db_session() as (_, cur):
-            pairs = (
-                lifecycle_out[["asof_date", "symbol"]]
-                .dropna()
-                .drop_duplicates()
-                .to_dict(orient="records")
-            )
-            for item in pairs:
-                cur.execute(
-                    f"DELETE FROM {LIFECYCLE_TABLE} WHERE asof_date = %s AND symbol = %s",
-                    (
-                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
-                        str(item["symbol"]).upper(),
-                    ),
-                )
+        lifecycle_pairs = (
+            lifecycle_out[["asof_date", "symbol"]]
+            .dropna()
+            .drop_duplicates()
+            .to_dict(orient="records")
+        )
+
+        def _delete_existing_lifecycle_rows() -> None:
+            with db_session() as (_, cur):
+                for item in lifecycle_pairs:
+                    cur.execute(
+                        f"DELETE FROM {LIFECYCLE_TABLE} WHERE asof_date = %s AND symbol = %s",
+                        (
+                            pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                            str(item["symbol"]).upper(),
+                        ),
+                    )
+
+        execute_db_operation(
+            _delete_existing_lifecycle_rows,
+            operation_name="position_lifecycle:delete_existing_lifecycle_rows",
+        )
         upsert_to_db(
             lifecycle_out,
             LIFECYCLE_TABLE,
@@ -844,6 +1120,7 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
             timescaledb_column="asof_date",
         )
         _trace_lifecycle_rows(lifecycle_out)
+        apply_missing_target_baselines(lifecycle_out)
     if not actions_df.empty:
         actions_out = actions_df.copy()
         for column in [
@@ -862,21 +1139,28 @@ def persist_outputs(lifecycle_df: pd.DataFrame, actions_df: pd.DataFrame) -> Non
         for column in ["asof_date", "published_on", "load_ts"]:
             if column in actions_out.columns:
                 actions_out[column] = pd.to_datetime(actions_out[column], utc=True, errors="coerce")
-        with db_session() as (_, cur):
-            pairs = (
-                actions_out[["asof_date", "symbol"]]
-                .dropna()
-                .drop_duplicates()
-                .to_dict(orient="records")
-            )
-            for item in pairs:
-                cur.execute(
-                    f"DELETE FROM {REBALANCE_TABLE} WHERE asof_date = %s AND symbol = %s",
-                    (
-                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
-                        str(item["symbol"]).upper(),
-                    ),
-                )
+        action_pairs = (
+            actions_out[["asof_date", "symbol"]]
+            .dropna()
+            .drop_duplicates()
+            .to_dict(orient="records")
+        )
+
+        def _delete_existing_rebalance_rows() -> None:
+            with db_session() as (_, cur):
+                for item in action_pairs:
+                    cur.execute(
+                        f"DELETE FROM {REBALANCE_TABLE} WHERE asof_date = %s AND symbol = %s",
+                        (
+                            pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                            str(item["symbol"]).upper(),
+                        ),
+                    )
+
+        execute_db_operation(
+            _delete_existing_rebalance_rows,
+            operation_name="position_lifecycle:delete_existing_rebalance_rows",
+        )
         upsert_to_db(
             actions_out,
             REBALANCE_TABLE,

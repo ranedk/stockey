@@ -6,11 +6,33 @@ from datetime import datetime
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.client import DhanAPIError
 from data.dhanlive.ohlcv import sync_daily_ohlcv
 from data.sharpelydata.sharpely_data import sync_sharpely_data
 from utils.sync import get_db_max_date, load_tracked_symbols, normalize_date_window, parse_datetime_arg
 from utils.db import sql_to_df
+
+
+def _record_peer_sync_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | str,
+    symbol: str | None = None,
+    severity: str = "warn",
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.peer_sync",
+        source="dhan_ohlcv_daily",
+        fallback_type=fallback_type,
+        severity=severity,
+        reason=reason,
+        error=error,
+        symbol=symbol,
+        metadata=metadata or {},
+    )
 
 
 def load_latest_peer_symbols(anchor_symbols: list[str]) -> dict[str, list[str]]:
@@ -95,6 +117,17 @@ def sync_peer_ohlcv(peer_symbols: list[str], to_date: datetime) -> list[dict[str
         except DhanAPIError as exc:
             error_text = str(exc).lower()
             if "no data present" in error_text:
+                _record_peer_sync_fallback(
+                    fallback_type="peer_ohlcv_no_new_data",
+                    reason="Peer OHLCV sync found no new Dhan data for one peer symbol.",
+                    error=exc,
+                    symbol=symbol,
+                    severity="info",
+                    metadata={
+                        "target_day": str(target_day.date()),
+                        "from_date": None if from_date is None else str(pd.Timestamp(from_date).date()),
+                    },
+                )
                 results.append(
                     {
                         "symbol": symbol,
@@ -103,6 +136,16 @@ def sync_peer_ohlcv(peer_symbols: list[str], to_date: datetime) -> list[dict[str
                     }
                 )
                 continue
+            _record_peer_sync_fallback(
+                fallback_type="peer_ohlcv_sync_failed",
+                reason="Peer OHLCV sync failed for one peer symbol, leaving peer/relative-strength context partial.",
+                error=exc,
+                symbol=symbol,
+                metadata={
+                    "target_day": str(target_day.date()),
+                    "from_date": None if from_date is None else str(pd.Timestamp(from_date).date()),
+                },
+            )
             results.append(
                 {
                     "symbol": symbol,
@@ -112,6 +155,16 @@ def sync_peer_ohlcv(peer_symbols: list[str], to_date: datetime) -> list[dict[str
                 }
             )
         except Exception as exc:
+            _record_peer_sync_fallback(
+                fallback_type="peer_ohlcv_sync_failed",
+                reason="Peer OHLCV sync failed for one peer symbol, leaving peer/relative-strength context partial.",
+                error=exc,
+                symbol=symbol,
+                metadata={
+                    "target_day": str(target_day.date()),
+                    "from_date": None if from_date is None else str(pd.Timestamp(from_date).date()),
+                },
+            )
             results.append(
                 {
                     "symbol": symbol,
@@ -162,6 +215,16 @@ def sync_peer_data(
                     }
                 )
             except Exception as exc:
+                _record_peer_sync_fallback(
+                    fallback_type="peer_fundamentals_sync_failed",
+                    reason="Peer fundamentals sync failed for one peer symbol, leaving peer context partial.",
+                    error=exc,
+                    symbol=peer_symbol,
+                    metadata={
+                        "effective_to_date": str(pd.Timestamp(effective_to_date).date()),
+                        "from_date": None if from_date is None else str(pd.Timestamp(from_date).date()),
+                    },
+                )
                 fundamentals_results.append(
                     {
                         "symbol": peer_symbol,

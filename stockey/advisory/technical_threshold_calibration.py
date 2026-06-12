@@ -7,16 +7,95 @@ from typing import Any
 
 import pandas as pd
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 EVALUATIONS_TABLE = "advisory_technical_threshold_evaluations"
 SUMMARY_TABLE = "advisory_technical_threshold_eval_summary"
+TECHNICAL_THRESHOLD_SCHEMA_MIGRATION_ID = "20260611_advisory_technical_threshold_calibration_base"
 DEFAULT_HORIZONS = [5, 10, 20]
 DEFAULT_RETURN_THRESHOLD = 0.03
 DEFAULT_COST_BPS = 25.0
 DEFAULT_MIN_SIGNALS = 10
+TECHNICAL_THRESHOLD_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        config_id TEXT NOT NULL,
+        horizon_days BIGINT NOT NULL,
+        threshold_config_json TEXT NOT NULL,
+        signal_count BIGINT,
+        eligible_count BIGINT,
+        trade_rate DOUBLE PRECISION,
+        avg_forward_return DOUBLE PRECISION,
+        median_forward_return DOUBLE PRECISION,
+        hit_rate DOUBLE PRECISION,
+        avg_forward_return_after_cost DOUBLE PRECISION,
+        hit_rate_after_cost DOUBLE PRECISION,
+        avg_rejected_forward_return DOUBLE PRECISION,
+        spread_vs_rejected DOUBLE PRECISION,
+        objective_score DOUBLE PRECISION,
+        sample_start TIMESTAMPTZ,
+        sample_end TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (evaluated_at, config_id, horizon_days)
+    )
+    """,
+    f"""
+    DO $$
+    DECLARE
+        rec RECORD;
+    BEGIN
+        FOR rec IN
+            SELECT
+                con.conname AS constraint_name,
+                idx.relname AS index_name
+            FROM pg_index i
+            JOIN pg_class tbl ON tbl.oid = i.indrelid
+            JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+            JOIN pg_class idx ON idx.oid = i.indexrelid
+            LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
+            WHERE ns.nspname = 'public'
+              AND tbl.relname = '{EVALUATIONS_TABLE}'
+              AND i.indisunique
+              AND (
+                  SELECT array_agg(att.attname::text ORDER BY keys.ord)
+                  FROM unnest(i.indkey) WITH ORDINALITY AS keys(attnum, ord)
+                  JOIN pg_attribute att
+                    ON att.attrelid = tbl.oid
+                   AND att.attnum = keys.attnum
+              ) = ARRAY['config_id', 'horizon_days']::text[]
+        LOOP
+            IF rec.constraint_name IS NOT NULL THEN
+                EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', '{EVALUATIONS_TABLE}', rec.constraint_name);
+            ELSE
+                EXECUTE format('DROP INDEX IF EXISTS %I', rec.index_name);
+            END IF;
+        END LOOP;
+    END $$;
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        horizon_days BIGINT NOT NULL,
+        best_config_id TEXT,
+        best_threshold_config_json TEXT,
+        best_objective_score DOUBLE PRECISION,
+        best_eligible_count BIGINT,
+        best_hit_rate_after_cost DOUBLE PRECISION,
+        best_avg_forward_return_after_cost DOUBLE PRECISION,
+        baseline_signal_count BIGINT,
+        baseline_avg_forward_return_after_cost DOUBLE PRECISION,
+        baseline_hit_rate_after_cost DOUBLE PRECISION,
+        recommendation TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (evaluated_at, horizon_days)
+    )
+    """,
+]
 
 DEFAULT_GRID = {
     "trend_min": [0.0, 12.0, 15.0, 18.0],
@@ -53,92 +132,36 @@ OPTIONAL_SIGNAL_COLUMNS = [
 ]
 
 
+def _record_technical_threshold_calibration_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.technical_threshold_calibration",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                config_id TEXT NOT NULL,
-                horizon_days BIGINT NOT NULL,
-                threshold_config_json TEXT NOT NULL,
-                signal_count BIGINT,
-                eligible_count BIGINT,
-                trade_rate DOUBLE PRECISION,
-                avg_forward_return DOUBLE PRECISION,
-                median_forward_return DOUBLE PRECISION,
-                hit_rate DOUBLE PRECISION,
-                avg_forward_return_after_cost DOUBLE PRECISION,
-                hit_rate_after_cost DOUBLE PRECISION,
-                avg_rejected_forward_return DOUBLE PRECISION,
-                spread_vs_rejected DOUBLE PRECISION,
-                objective_score DOUBLE PRECISION,
-                sample_start TIMESTAMPTZ,
-                sample_end TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (evaluated_at, config_id, horizon_days)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            DO $$
-            DECLARE
-                rec RECORD;
-            BEGIN
-                FOR rec IN
-                    SELECT
-                        con.conname AS constraint_name,
-                        idx.relname AS index_name
-                    FROM pg_index i
-                    JOIN pg_class tbl ON tbl.oid = i.indrelid
-                    JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
-                    JOIN pg_class idx ON idx.oid = i.indexrelid
-                    LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
-                    WHERE ns.nspname = 'public'
-                      AND tbl.relname = '{EVALUATIONS_TABLE}'
-                      AND i.indisunique
-                      AND (
-                          SELECT array_agg(att.attname::text ORDER BY keys.ord)
-                          FROM unnest(i.indkey) WITH ORDINALITY AS keys(attnum, ord)
-                          JOIN pg_attribute att
-                            ON att.attrelid = tbl.oid
-                           AND att.attnum = keys.attnum
-                      ) = ARRAY['config_id', 'horizon_days']::text[]
-                LOOP
-                    IF rec.constraint_name IS NOT NULL THEN
-                        EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', '{EVALUATIONS_TABLE}', rec.constraint_name);
-                    ELSE
-                        EXECUTE format('DROP INDEX IF EXISTS %I', rec.index_name);
-                    END IF;
-                END LOOP;
-            END $$;
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                horizon_days BIGINT NOT NULL,
-                best_config_id TEXT,
-                best_threshold_config_json TEXT,
-                best_objective_score DOUBLE PRECISION,
-                best_eligible_count BIGINT,
-                best_hit_rate_after_cost DOUBLE PRECISION,
-                best_avg_forward_return_after_cost DOUBLE PRECISION,
-                baseline_signal_count BIGINT,
-                baseline_avg_forward_return_after_cost DOUBLE PRECISION,
-                baseline_hit_rate_after_cost DOUBLE PRECISION,
-                recommendation TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (evaluated_at, horizon_days)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=TECHNICAL_THRESHOLD_SCHEMA_MIGRATION_ID,
+        description="Create technical-threshold calibration output tables.",
+        statements=TECHNICAL_THRESHOLD_SCHEMA_STATEMENTS,
+        metadata={"tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
+    )
 
 
 def table_columns(table_name: str) -> set[str]:
@@ -153,7 +176,14 @@ def table_columns(table_name: str) -> set[str]:
             params=(table_name,),
             retries=2,
         )
-    except Exception:
+    except Exception as exc:
+        _record_technical_threshold_calibration_fallback(
+            fallback_type="technical_threshold_calibration_schema_lookup_failed",
+            source=table_name,
+            reason="Technical-threshold calibration could not inspect source table columns.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return set()
     return set(df["column_name"].astype(str).tolist()) if not df.empty else set()
 
@@ -195,19 +225,33 @@ def load_technical_signal_rows(
             select_exprs.append("(technical_score * 100.0) AS technical_total_score")
         else:
             select_exprs.append("NULL::double precision AS technical_total_score")
-    df = sql_to_df(
-        f"""
-        SELECT
-            {', '.join(select_exprs)}
-        FROM advisory_candidates
-        WHERE {' AND '.join(clauses)}
-        ORDER BY asof_date, symbol, setup_id
-        """,
-        params=tuple(params) if params else None,
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                {', '.join(select_exprs)}
+            FROM advisory_candidates
+            WHERE {' AND '.join(clauses)}
+            ORDER BY asof_date, symbol, setup_id
+            """,
+            params=tuple(params) if params else None,
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        _record_technical_threshold_calibration_fallback(
+            fallback_type="technical_threshold_calibration_signal_rows_load_failed",
+            source="advisory_candidates",
+            reason="Technical-threshold calibration could not load technical signal rows.",
+            error=exc,
+            metadata={
+                "from_date": str(from_date) if from_date is not None else None,
+                "to_date": str(to_date) if to_date is not None else None,
+                "symbol_count": len(symbols or []),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["asof_date"] = pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dt.normalize()
@@ -235,22 +279,37 @@ def load_price_history_for_returns(
 ) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame()
-    df = sql_to_df(
-        """
-        SELECT ticker AS symbol, date, close
-        FROM dhan_ohlcv_daily
-        WHERE asset_type = 'stock'
-          AND exchange = 'NSE'
-          AND ticker = ANY(%s)
-          AND date >= %s
-          AND date <= %s
-        ORDER BY ticker, date
-        """,
-        params=([str(value).upper() for value in symbols], from_date, to_date),
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=100000,
-    )
+    normalized_symbols = [str(value).upper() for value in symbols]
+    try:
+        df = sql_to_df(
+            """
+            SELECT ticker AS symbol, date, close
+            FROM dhan_ohlcv_daily
+            WHERE asset_type = 'stock'
+              AND exchange = 'NSE'
+              AND ticker = ANY(%s)
+              AND date >= %s
+              AND date <= %s
+            ORDER BY ticker, date
+            """,
+            params=(normalized_symbols, from_date, to_date),
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=100000,
+        )
+    except Exception as exc:
+        _record_technical_threshold_calibration_fallback(
+            fallback_type="technical_threshold_calibration_price_history_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Technical-threshold calibration could not load Dhan OHLCV history for realized returns.",
+            error=exc,
+            metadata={
+                "symbol_count": len(normalized_symbols),
+                "from_date": str(from_date),
+                "to_date": str(to_date),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()

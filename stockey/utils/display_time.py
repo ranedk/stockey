@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 DISPLAY_TZ = ZoneInfo(os.getenv("STOCKEY_DISPLAY_TZ", "Asia/Kolkata"))
 DISPLAY_TS_FORMAT = "%Y-%m-%d %H:%M:%S %Z"
@@ -27,8 +29,16 @@ def to_display_value(value: Any) -> Any:
         if stripped.startswith("{") or stripped.startswith("["):
             try:
                 parsed = json.loads(value)
-            except Exception:
-                pass
+            except Exception as exc:
+                record_local_fallback_event(
+                    module="utils.display_time",
+                    fallback_type="display_time_json_parse_failed",
+                    source="display_value",
+                    severity="warn",
+                    reason="Display-time formatter received JSON-looking text that could not be parsed and kept the original value.",
+                    error=exc,
+                    metadata={"value_length": len(value), "value_excerpt": value[:240]},
+                )
             else:
                 return json.dumps(to_display_value(parsed), ensure_ascii=False, default=str, sort_keys=True)
         if (

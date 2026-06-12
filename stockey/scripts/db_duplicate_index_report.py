@@ -5,6 +5,7 @@ import json
 from datetime import date, datetime
 from typing import Any
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df
 
 
@@ -103,7 +104,21 @@ def build_duplicate_index_report(*, schema: str = "public", limit: int = 50) -> 
         if isinstance(indexes, str):
             try:
                 indexes = json.loads(indexes)
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                record_local_fallback_event(
+                    module="scripts.db_duplicate_index_report",
+                    fallback_type="duplicate_index_report_indexes_json_parse_failed",
+                    source="pg_catalog_duplicate_index_report",
+                    severity="warn",
+                    reason="Duplicate-index report could not parse index metadata JSON and skipped that duplicate group.",
+                    error=exc,
+                    metadata={
+                        "schema_name": row.get("schema_name"),
+                        "table_name": row.get("table_name"),
+                        "indexes_length": len(indexes),
+                        "indexes_excerpt": indexes[:240],
+                    },
+                )
                 indexes = []
         for item in indexes:
             if item.get("safe_drop_candidate"):

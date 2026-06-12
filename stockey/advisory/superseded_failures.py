@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 
 from advisory.decision_trace import EVENT_PROCESSING_TABLE
-from utils.db import db_session, sql_to_df
+from utils.db import db_session, execute_db_operation, sql_to_df
 
 
 ANNOUNCEMENT_DOCUMENTS_TABLE = "announcement_pipeline_documents"
@@ -54,25 +54,31 @@ def _table_columns(table_name: str) -> set[str]:
 
 
 def ensure_superseded_columns() -> None:
-    with db_session() as (_, cur):
-        if _table_exists(EVENT_PROCESSING_TABLE):
-            cur.execute(
-                f"""
-                ALTER TABLE {EVENT_PROCESSING_TABLE}
-                    ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ,
-                    ADD COLUMN IF NOT EXISTS superseded_by_status TEXT,
-                    ADD COLUMN IF NOT EXISTS superseded_by_completed_at TIMESTAMPTZ,
-                    ADD COLUMN IF NOT EXISTS superseded_reason TEXT
-                """
-            )
-        if _table_exists(ANNOUNCEMENT_DOCUMENTS_TABLE):
-            cur.execute(
-                f"""
-                ALTER TABLE {ANNOUNCEMENT_DOCUMENTS_TABLE}
-                    ADD COLUMN IF NOT EXISTS last_error_superseded_at TIMESTAMPTZ,
-                    ADD COLUMN IF NOT EXISTS last_error_superseded_reason TEXT
-                """
-            )
+    def _ensure_columns() -> None:
+        with db_session() as (_, cur):
+            if _table_exists(EVENT_PROCESSING_TABLE):
+                cur.execute(
+                    f"""
+                    ALTER TABLE {EVENT_PROCESSING_TABLE}
+                        ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS superseded_by_status TEXT,
+                        ADD COLUMN IF NOT EXISTS superseded_by_completed_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS superseded_reason TEXT
+                    """
+                )
+            if _table_exists(ANNOUNCEMENT_DOCUMENTS_TABLE):
+                cur.execute(
+                    f"""
+                    ALTER TABLE {ANNOUNCEMENT_DOCUMENTS_TABLE}
+                        ADD COLUMN IF NOT EXISTS last_error_superseded_at TIMESTAMPTZ,
+                        ADD COLUMN IF NOT EXISTS last_error_superseded_reason TEXT
+                    """
+                )
+
+    execute_db_operation(
+        _ensure_columns,
+        operation_name="superseded_failures:ensure_columns",
+    )
 
 
 def load_superseded_event_processing_failures(*, limit: int = 500) -> list[dict[str, Any]]:
@@ -159,63 +165,77 @@ def mark_superseded_event_processing_failures(rows: list[dict[str, Any]]) -> int
     if not rows:
         return 0
     now = pd.Timestamp.utcnow().to_pydatetime()
-    updated = 0
-    with db_session() as (_, cur):
-        for row in rows:
-            cur.execute(
-                f"""
-                UPDATE {EVENT_PROCESSING_TABLE}
-                SET superseded_at = %s,
-                    superseded_by_status = %s,
-                    superseded_by_completed_at = %s,
-                    superseded_reason = %s
-                WHERE unique_id = %s
-                  AND stage = %s
-                  AND started_at IS NOT DISTINCT FROM %s
-                  AND superseded_at IS NULL
-                """,
-                (
-                    now,
-                    row.get("superseded_by_status"),
-                    row.get("superseded_by_completed_at"),
-                    "newer_successful_processing_run",
-                    row.get("unique_id"),
-                    row.get("stage"),
-                    row.get("started_at"),
-                ),
-            )
-            updated += int(getattr(cur, "rowcount", 0) or 0)
-    return updated
+
+    def _mark_rows() -> int:
+        updated = 0
+        with db_session() as (_, cur):
+            for row in rows:
+                cur.execute(
+                    f"""
+                    UPDATE {EVENT_PROCESSING_TABLE}
+                    SET superseded_at = %s,
+                        superseded_by_status = %s,
+                        superseded_by_completed_at = %s,
+                        superseded_reason = %s
+                    WHERE unique_id = %s
+                      AND stage = %s
+                      AND started_at IS NOT DISTINCT FROM %s
+                      AND superseded_at IS NULL
+                    """,
+                    (
+                        now,
+                        row.get("superseded_by_status"),
+                        row.get("superseded_by_completed_at"),
+                        "newer_successful_processing_run",
+                        row.get("unique_id"),
+                        row.get("stage"),
+                        row.get("started_at"),
+                    ),
+                )
+                updated += int(getattr(cur, "rowcount", 0) or 0)
+        return updated
+
+    return execute_db_operation(
+        _mark_rows,
+        operation_name="superseded_failures:mark_event_processing",
+    )
 
 
 def mark_recovered_announcement_document_errors(rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
     now = pd.Timestamp.utcnow().to_pydatetime()
-    updated = 0
-    with db_session() as (_, cur):
-        for row in rows:
-            cur.execute(
-                f"""
-                UPDATE {ANNOUNCEMENT_DOCUMENTS_TABLE}
-                SET last_error_superseded_at = %s,
-                    last_error_superseded_reason = %s
-                WHERE unique_id = %s
-                  AND last_error IS NOT NULL
-                  AND last_error_superseded_at IS NULL
-                  AND LOWER(COALESCE(ocr_status, '')) IN %s
-                  AND LOWER(COALESCE(parse_status, '')) IN %s
-                """,
-                (
-                    now,
-                    "ocr_and_parse_status_recovered",
-                    row.get("unique_id"),
-                    tuple(RECOVERED_DOCUMENT_STATUSES),
-                    tuple(RECOVERED_DOCUMENT_STATUSES),
-                ),
-            )
-            updated += int(getattr(cur, "rowcount", 0) or 0)
-    return updated
+
+    def _mark_rows() -> int:
+        updated = 0
+        with db_session() as (_, cur):
+            for row in rows:
+                cur.execute(
+                    f"""
+                    UPDATE {ANNOUNCEMENT_DOCUMENTS_TABLE}
+                    SET last_error_superseded_at = %s,
+                        last_error_superseded_reason = %s
+                    WHERE unique_id = %s
+                      AND last_error IS NOT NULL
+                      AND last_error_superseded_at IS NULL
+                      AND LOWER(COALESCE(ocr_status, '')) IN %s
+                      AND LOWER(COALESCE(parse_status, '')) IN %s
+                    """,
+                    (
+                        now,
+                        "ocr_and_parse_status_recovered",
+                        row.get("unique_id"),
+                        tuple(RECOVERED_DOCUMENT_STATUSES),
+                        tuple(RECOVERED_DOCUMENT_STATUSES),
+                    ),
+                )
+                updated += int(getattr(cur, "rowcount", 0) or 0)
+        return updated
+
+    return execute_db_operation(
+        _mark_rows,
+        operation_name="superseded_failures:mark_announcement_documents",
+    )
 
 
 def cleanup_superseded_failures(

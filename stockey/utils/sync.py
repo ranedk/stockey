@@ -9,6 +9,7 @@ import pandas as pd
 import redis
 from psycopg2 import sql
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import db_session, with_db_retries
 from utils.redis_utils import get_redis_client as get_resilient_redis_client
 
@@ -69,6 +70,18 @@ def get_redis_set_members(redis_client: redis.Redis, key: str) -> set[str]:
     try:
         return set(redis_client.smembers(key))
     except Exception as exc:
+        record_local_fallback_event(
+            module="utils.sync",
+            source=f"redis:{key}",
+            fallback_type="redis_set_members_unavailable",
+            severity="warn",
+            reason=(
+                "Redis set members could not be loaded; caller will continue with an empty processed-state set, "
+                "which may cause safe reprocessing until Redis recovers."
+            ),
+            error=exc,
+            metadata={"key": key, "command": "smembers"},
+        )
         print(f"[utils.sync] failed to load redis set members key={key}: {exc.__class__.__name__}: {exc}", flush=True)
         return set()
 

@@ -4,13 +4,15 @@ import argparse
 import json
 import sys
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 from psycopg2 import sql
 
 from data.announcements.state import DOCUMENT_TABLE, REPORT_TABLE
 from utils.blob_store import put_text_blob, text_blob_metadata
-from utils.db import db_session, qualified_identifier
+from utils.db import db_session, execute_db_operation, qualified_identifier
+from utils.schema_migrations import apply_schema_migration
 
 
 DOCUMENT_TEXT_FIELDS = {
@@ -38,12 +40,73 @@ REPORT_TEXT_FIELDS = {
         "filename": None,
     }
 }
+DEFAULT_MANIFEST_SAMPLE_LIMIT = 20
+ANNOUNCEMENT_TEXT_OFFLOAD_SCHEMA_MIGRATION_ID = "20260611_announcement_text_offload_storage_columns"
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _quote_table(value: str) -> str:
+    return ".".join(_quote_identifier(part) for part in value.split(".") if part)
 
 
 def _json_default(value: Any) -> str:
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     return str(value)
+
+
+def _new_offload_summary(*, sample_limit: int = DEFAULT_MANIFEST_SAMPLE_LIMIT) -> dict[str, Any]:
+    return {
+        "scanned": 0,
+        "uploaded": 0,
+        "nulled_fields": 0,
+        "bytes": 0,
+        "planned_null_after_upload": False,
+        "sample_limit": int(sample_limit),
+        "sample_items": [],
+    }
+
+
+def _append_manifest_sample(
+    summary: dict[str, Any],
+    *,
+    table_name: str,
+    unique_id: Any,
+    text_column: str,
+    key_column: str,
+    key: str,
+    metadata: Any,
+    null_after_upload: bool,
+) -> None:
+    sample_limit = int(summary.get("sample_limit") or DEFAULT_MANIFEST_SAMPLE_LIMIT)
+    samples = summary.setdefault("sample_items", [])
+    if len(samples) >= sample_limit:
+        return
+    samples.append(
+        {
+            "table_name": table_name,
+            "unique_id": None if unique_id is None else str(unique_id),
+            "text_column": text_column,
+            "key_column": key_column,
+            "s3_key": key,
+            "sha256": metadata.sha256,
+            "chars": metadata.char_count,
+            "bytes": metadata.byte_count,
+            "text_column_will_be_nulled": bool(null_after_upload),
+        }
+    )
+
+
+def write_manifest(path: str | Path | None, payload: dict[str, Any]) -> str | None:
+    if not path:
+        return None
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+    return str(output_path)
 
 
 def _split_table_name(table_name: str) -> tuple[str, str]:
@@ -78,45 +141,64 @@ def _table_columns(cur, table_name: str) -> set[str]:
     return {row[0] for row in cur.fetchall()}
 
 
-def ensure_migration_columns(cur) -> None:
-    if _table_exists(cur, DOCUMENT_TABLE):
+def _offload_schema_statements(*, include_documents: bool, include_reports: bool) -> list[str]:
+    statements: list[str] = []
+    if include_documents:
         for prefix, key_column in [
             ("ocr", "ocr_s3_key"),
             ("full_ocr", "full_ocr_s3_key"),
             ("audio_transcript", "audio_transcript_s3_key"),
         ]:
-            cur.execute(
-                sql.SQL(
-                    """
-                    ALTER TABLE {}
-                    ADD COLUMN IF NOT EXISTS {} TEXT,
-                    ADD COLUMN IF NOT EXISTS {} TEXT,
-                    ADD COLUMN IF NOT EXISTS {} BIGINT,
-                    ADD COLUMN IF NOT EXISTS {} BIGINT,
-                    ADD COLUMN IF NOT EXISTS {} TEXT
-                    """
-                ).format(
-                    qualified_identifier(DOCUMENT_TABLE),
-                    sql.Identifier(key_column),
-                    sql.Identifier(f"{prefix}_sha256"),
-                    sql.Identifier(f"{prefix}_chars"),
-                    sql.Identifier(f"{prefix}_bytes"),
-                    sql.Identifier(f"{prefix}_excerpt"),
-                )
+            statements.append(
+                f"""
+                ALTER TABLE {_quote_table(DOCUMENT_TABLE)}
+                ADD COLUMN IF NOT EXISTS {_quote_identifier(key_column)} TEXT,
+                ADD COLUMN IF NOT EXISTS {_quote_identifier(f"{prefix}_sha256")} TEXT,
+                ADD COLUMN IF NOT EXISTS {_quote_identifier(f"{prefix}_chars")} BIGINT,
+                ADD COLUMN IF NOT EXISTS {_quote_identifier(f"{prefix}_bytes")} BIGINT,
+                ADD COLUMN IF NOT EXISTS {_quote_identifier(f"{prefix}_excerpt")} TEXT
+                """
             )
-    if _table_exists(cur, REPORT_TABLE):
-        cur.execute(
-            sql.SQL(
-                """
-                ALTER TABLE {}
-                ADD COLUMN IF NOT EXISTS report_s3_key TEXT,
-                ADD COLUMN IF NOT EXISTS report_sha256 TEXT,
-                ADD COLUMN IF NOT EXISTS report_chars BIGINT,
-                ADD COLUMN IF NOT EXISTS report_bytes BIGINT,
-                ADD COLUMN IF NOT EXISTS report_excerpt TEXT
-                """
-            ).format(qualified_identifier(REPORT_TABLE))
+    if include_reports:
+        statements.append(
+            f"""
+            ALTER TABLE {_quote_table(REPORT_TABLE)}
+            ADD COLUMN IF NOT EXISTS report_s3_key TEXT,
+            ADD COLUMN IF NOT EXISTS report_sha256 TEXT,
+            ADD COLUMN IF NOT EXISTS report_chars BIGINT,
+            ADD COLUMN IF NOT EXISTS report_bytes BIGINT,
+            ADD COLUMN IF NOT EXISTS report_excerpt TEXT
+            """
         )
+    return statements
+
+
+def ensure_migration_columns(cur) -> None:
+    include_documents = _table_exists(cur, DOCUMENT_TABLE)
+    include_reports = _table_exists(cur, REPORT_TABLE)
+    statements = _offload_schema_statements(
+        include_documents=include_documents,
+        include_reports=include_reports,
+    )
+    if not statements:
+        return
+    apply_schema_migration(
+        migration_id=ANNOUNCEMENT_TEXT_OFFLOAD_SCHEMA_MIGRATION_ID,
+        description="Add S3 pointer/hash/count/excerpt columns for announcement text offload.",
+        owner="scripts.offload_announcement_text_to_s3",
+        metadata={
+            "tables": [
+                table
+                for table, include in [
+                    (DOCUMENT_TABLE, include_documents),
+                    (REPORT_TABLE, include_reports),
+                ]
+                if include
+            ],
+            "source": "announcement_text_offload",
+        },
+        statements=statements,
+    )
 
 
 def _document_storage_prefix(row: dict[str, Any]) -> str:
@@ -229,94 +311,130 @@ def _fetch_report_rows(cur, *, limit: int) -> list[dict[str, Any]]:
     return [dict(zip(select_columns, row)) for row in cur.fetchall()]
 
 
-def offload_documents(*, limit: int, dry_run: bool, null_after_upload: bool) -> dict[str, Any]:
-    summary = {"scanned": 0, "uploaded": 0, "nulled_fields": 0, "bytes": 0}
-    with db_session() as (conn, cur):
-        if not _table_exists(cur, DOCUMENT_TABLE):
-            return {**summary, "status": "missing_table"}
-        ensure_migration_columns(cur)
-        rows = _fetch_document_rows(cur, limit=limit)
-        summary["scanned"] = len(rows)
-        for row in rows:
-            prefix = _document_storage_prefix(row)
-            updates: dict[str, Any] = {}
-            for text_column, config in DOCUMENT_TEXT_FIELDS.items():
-                text = row.get(text_column)
+def offload_documents(*, limit: int, dry_run: bool, null_after_upload: bool, sample_limit: int = DEFAULT_MANIFEST_SAMPLE_LIMIT) -> dict[str, Any]:
+    def _offload_documents() -> dict[str, Any]:
+        summary = _new_offload_summary(sample_limit=sample_limit)
+        summary["planned_null_after_upload"] = bool(null_after_upload)
+        with db_session() as (conn, cur):
+            if not _table_exists(cur, DOCUMENT_TABLE):
+                return {**summary, "status": "missing_table"}
+            ensure_migration_columns(cur)
+            rows = _fetch_document_rows(cur, limit=limit)
+            summary["scanned"] = len(rows)
+            for row in rows:
+                prefix = _document_storage_prefix(row)
+                updates: dict[str, Any] = {}
+                for text_column, config in DOCUMENT_TEXT_FIELDS.items():
+                    text = row.get(text_column)
+                    if not text:
+                        continue
+                    key_column = str(config["key_column"])
+                    key = row.get(key_column) or f"{prefix}/{config['filename']}"
+                    metadata = text_blob_metadata(str(text), key=key)
+                    summary["bytes"] += metadata.byte_count
+                    if not dry_run:
+                        metadata = put_text_blob(str(text), key=key)
+                    summary["uploaded"] += 1
+                    updates[key_column] = key
+                    updates[f"{config['prefix']}_sha256"] = metadata.sha256
+                    updates[f"{config['prefix']}_chars"] = metadata.char_count
+                    updates[f"{config['prefix']}_bytes"] = metadata.byte_count
+                    updates[f"{config['prefix']}_excerpt"] = metadata.excerpt
+                    _append_manifest_sample(
+                        summary,
+                        table_name=DOCUMENT_TABLE,
+                        unique_id=row.get("unique_id"),
+                        text_column=text_column,
+                        key_column=key_column,
+                        key=key,
+                        metadata=metadata,
+                        null_after_upload=null_after_upload,
+                    )
+                    if null_after_upload:
+                        updates[text_column] = None
+                        summary["nulled_fields"] += 1
+                if updates and not dry_run:
+                    set_clause = sql.SQL(", ").join(
+                        sql.SQL("{} = %s").format(sql.Identifier(column)) for column in updates
+                    )
+                    cur.execute(
+                        sql.SQL("UPDATE {} SET {} WHERE unique_id = %s").format(
+                            qualified_identifier(DOCUMENT_TABLE),
+                            set_clause,
+                        ),
+                        [*updates.values(), row["unique_id"]],
+                    )
+            if dry_run:
+                conn.rollback()
+        summary["status"] = "ok"
+        return summary
+
+    return execute_db_operation(
+        _offload_documents,
+        operation_name="offload_announcement_text_to_s3:documents",
+    )
+
+
+def offload_reports(*, limit: int, dry_run: bool, null_after_upload: bool, sample_limit: int = DEFAULT_MANIFEST_SAMPLE_LIMIT) -> dict[str, Any]:
+    def _offload_reports() -> dict[str, Any]:
+        summary = _new_offload_summary(sample_limit=sample_limit)
+        summary["planned_null_after_upload"] = bool(null_after_upload)
+        with db_session() as (conn, cur):
+            if not _table_exists(cur, REPORT_TABLE):
+                return {**summary, "status": "missing_table"}
+            ensure_migration_columns(cur)
+            rows = _fetch_report_rows(cur, limit=limit)
+            summary["scanned"] = len(rows)
+            for row in rows:
+                text = row.get("report_json")
                 if not text:
                     continue
-                key_column = str(config["key_column"])
-                key = row.get(key_column) or f"{prefix}/{config['filename']}"
+                key = _report_key(row)
                 metadata = text_blob_metadata(str(text), key=key)
                 summary["bytes"] += metadata.byte_count
                 if not dry_run:
                     metadata = put_text_blob(str(text), key=key)
                 summary["uploaded"] += 1
-                updates[key_column] = key
-                updates[f"{config['prefix']}_sha256"] = metadata.sha256
-                updates[f"{config['prefix']}_chars"] = metadata.char_count
-                updates[f"{config['prefix']}_bytes"] = metadata.byte_count
-                updates[f"{config['prefix']}_excerpt"] = metadata.excerpt
+                updates: dict[str, Any] = {
+                    "report_s3_key": key,
+                    "report_sha256": metadata.sha256,
+                    "report_chars": metadata.char_count,
+                    "report_bytes": metadata.byte_count,
+                    "report_excerpt": metadata.excerpt,
+                }
+                _append_manifest_sample(
+                    summary,
+                    table_name=REPORT_TABLE,
+                    unique_id=row.get("unique_id"),
+                    text_column="report_json",
+                    key_column="report_s3_key",
+                    key=key,
+                    metadata=metadata,
+                    null_after_upload=null_after_upload,
+                )
                 if null_after_upload:
-                    updates[text_column] = None
+                    updates["report_json"] = None
                     summary["nulled_fields"] += 1
-            if updates and not dry_run:
-                set_clause = sql.SQL(", ").join(
-                    sql.SQL("{} = %s").format(sql.Identifier(column)) for column in updates
-                )
-                cur.execute(
-                    sql.SQL("UPDATE {} SET {} WHERE unique_id = %s").format(
-                        qualified_identifier(DOCUMENT_TABLE),
-                        set_clause,
-                    ),
-                    [*updates.values(), row["unique_id"]],
-                )
-        if dry_run:
-            conn.rollback()
-    return summary
+                if not dry_run:
+                    set_clause = sql.SQL(", ").join(
+                        sql.SQL("{} = %s").format(sql.Identifier(column)) for column in updates
+                    )
+                    cur.execute(
+                        sql.SQL("UPDATE {} SET {} WHERE unique_id = %s AND report_name = %s").format(
+                            qualified_identifier(REPORT_TABLE),
+                            set_clause,
+                        ),
+                        [*updates.values(), row["unique_id"], row["report_name"]],
+                    )
+            if dry_run:
+                conn.rollback()
+        summary["status"] = "ok"
+        return summary
 
-
-def offload_reports(*, limit: int, dry_run: bool, null_after_upload: bool) -> dict[str, Any]:
-    summary = {"scanned": 0, "uploaded": 0, "nulled_fields": 0, "bytes": 0}
-    with db_session() as (conn, cur):
-        if not _table_exists(cur, REPORT_TABLE):
-            return {**summary, "status": "missing_table"}
-        ensure_migration_columns(cur)
-        rows = _fetch_report_rows(cur, limit=limit)
-        summary["scanned"] = len(rows)
-        for row in rows:
-            text = row.get("report_json")
-            if not text:
-                continue
-            key = _report_key(row)
-            metadata = text_blob_metadata(str(text), key=key)
-            summary["bytes"] += metadata.byte_count
-            if not dry_run:
-                metadata = put_text_blob(str(text), key=key)
-            summary["uploaded"] += 1
-            updates: dict[str, Any] = {
-                "report_s3_key": key,
-                "report_sha256": metadata.sha256,
-                "report_chars": metadata.char_count,
-                "report_bytes": metadata.byte_count,
-                "report_excerpt": metadata.excerpt,
-            }
-            if null_after_upload:
-                updates["report_json"] = None
-                summary["nulled_fields"] += 1
-            if not dry_run:
-                set_clause = sql.SQL(", ").join(
-                    sql.SQL("{} = %s").format(sql.Identifier(column)) for column in updates
-                )
-                cur.execute(
-                    sql.SQL("UPDATE {} SET {} WHERE unique_id = %s AND report_name = %s").format(
-                        qualified_identifier(REPORT_TABLE),
-                        set_clause,
-                    ),
-                    [*updates.values(), row["unique_id"], row["report_name"]],
-                )
-        if dry_run:
-            conn.rollback()
-    return summary
+    return execute_db_operation(
+        _offload_reports,
+        operation_name="offload_announcement_text_to_s3:reports",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -332,22 +450,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--skip-documents", action="store_true", help="Skip announcement_pipeline_documents.")
     parser.add_argument("--skip-reports", action="store_true", help="Skip announcement_pipeline_reports.")
+    parser.add_argument("--sample-limit", type=int, default=DEFAULT_MANIFEST_SAMPLE_LIMIT, help="Number of planned/uploaded items to include in JSON output.")
+    parser.add_argument("--manifest-path", help="Optional path to write the full JSON manifest/result.")
     args = parser.parse_args(argv)
 
-    output: dict[str, Any] = {"dry_run": bool(args.dry_run), "limit": int(args.limit)}
+    output: dict[str, Any] = {
+        "status": "ok",
+        "dry_run": bool(args.dry_run),
+        "limit": int(args.limit),
+        "sample_limit": int(args.sample_limit),
+        "null_after_upload": not bool(args.keep_inline),
+    }
     null_after_upload = not bool(args.keep_inline)
     if not args.skip_documents:
         output["documents"] = offload_documents(
             limit=int(args.limit),
             dry_run=bool(args.dry_run),
             null_after_upload=null_after_upload,
+            sample_limit=int(args.sample_limit),
         )
     if not args.skip_reports:
         output["reports"] = offload_reports(
             limit=int(args.limit),
             dry_run=bool(args.dry_run),
             null_after_upload=null_after_upload,
+            sample_limit=int(args.sample_limit),
         )
+    if args.manifest_path:
+        output["manifest_path"] = str(Path(args.manifest_path).expanduser())
+    manifest_path = write_manifest(args.manifest_path, output)
+    if manifest_path:
+        output["manifest_path"] = manifest_path
     print(json.dumps(output, indent=2, default=_json_default))
     return 0
 

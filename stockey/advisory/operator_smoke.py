@@ -4,9 +4,18 @@ import argparse
 import json
 from typing import Any
 
+from environs import Env
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.operator_health import build_operator_health
+
+
+env = Env()
+env.read_env()
+
+OPERATOR_SMOKE_COMPACT_LIST_LIMIT = env.int("OPERATOR_SMOKE_COMPACT_LIST_LIMIT", default=8)
+OPERATOR_SMOKE_COMPACT_STRING_CHARS = env.int("OPERATOR_SMOKE_COMPACT_STRING_CHARS", default=1_000)
 
 
 def _json_ready(value: Any) -> Any:
@@ -19,8 +28,16 @@ def _json_ready(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.operator_smoke",
+            fallback_type="operator_smoke_json_ready_missing_check_failed",
+            source="operator_smoke_payload",
+            severity="warn",
+            reason="Operator smoke could not evaluate a value for missingness while preparing JSON output and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
 
 
@@ -45,6 +62,42 @@ def _next_commands(fix_hints: list[dict[str, Any]], *, limit: int = 8) -> list[s
     return out
 
 
+def _compact_value(value: Any, *, list_limit: int, string_chars: int, stats: dict[str, int]) -> Any:
+    ready = _json_ready(value)
+    if isinstance(ready, str):
+        if len(ready) > string_chars:
+            stats["truncated_strings"] = int(stats.get("truncated_strings") or 0) + 1
+            return ready[:string_chars] + "...[truncated]"
+        return ready
+    if isinstance(ready, list):
+        compacted = [_compact_value(item, list_limit=list_limit, string_chars=string_chars, stats=stats) for item in ready[:list_limit]]
+        omitted = max(0, len(ready) - list_limit)
+        if omitted:
+            stats["truncated_lists"] = int(stats.get("truncated_lists") or 0) + 1
+            stats["omitted_list_items"] = int(stats.get("omitted_list_items") or 0) + omitted
+        return compacted
+    if isinstance(ready, dict):
+        return {str(key): _compact_value(val, list_limit=list_limit, string_chars=string_chars, stats=stats) for key, val in ready.items()}
+    return ready
+
+
+def _compact_rows(rows: list[dict[str, Any]], *, limit: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    stats = {"truncated_lists": 0, "omitted_list_items": max(0, len(rows) - max(0, int(limit))), "truncated_strings": 0}
+    visible = rows[: max(0, int(limit))]
+    compacted = [
+        _compact_value(
+            row,
+            list_limit=max(1, int(OPERATOR_SMOKE_COMPACT_LIST_LIMIT)),
+            string_chars=max(200, int(OPERATOR_SMOKE_COMPACT_STRING_CHARS)),
+            stats=stats,
+        )
+        for row in visible
+    ]
+    if stats["omitted_list_items"]:
+        stats["truncated_lists"] += 1
+    return compacted, stats
+
+
 def build_operator_smoke(
     *,
     log_dir: str = "logs/cron",
@@ -57,7 +110,8 @@ def build_operator_smoke(
     current_blockers = health.get("current_blockers") if isinstance(health.get("current_blockers"), dict) else {}
     fix_hints = _as_list(health.get("fix_hints"))
     blocker_rows = _as_list(current_blockers.get("rows"))
-    visible_fix_hints = fix_hints[: max(0, int(fix_hint_limit))]
+    visible_fix_hints, fix_hint_compact = _compact_rows(fix_hints, limit=max(0, int(fix_hint_limit)))
+    visible_blockers, blocker_compact = _compact_rows(blocker_rows, limit=max(0, int(fix_hint_limit)))
     payload = {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "status": health.get("status") or "unknown",
@@ -86,9 +140,17 @@ def build_operator_smoke(
             "trust_errors": int(trust_gate.get("error_count") or 0),
             "trust_warnings": int(trust_gate.get("warn_count") or 0),
         },
-        "current_blockers": blocker_rows[: max(0, int(fix_hint_limit))],
+        "current_blockers": visible_blockers,
         "fix_hints": visible_fix_hints,
         "next_commands": _next_commands(visible_fix_hints),
+        "compact": True,
+        "compact_meta": {
+            "fix_hint_limit": max(0, int(fix_hint_limit)),
+            "list_limit": max(1, int(OPERATOR_SMOKE_COMPACT_LIST_LIMIT)),
+            "string_chars": max(200, int(OPERATOR_SMOKE_COMPACT_STRING_CHARS)),
+            "fix_hints": fix_hint_compact,
+            "current_blockers": blocker_compact,
+        },
         "health_status": health.get("status"),
         "operator_health_generated_at": health.get("generated_at"),
     }

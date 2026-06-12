@@ -2,9 +2,10 @@
 import type { Dict } from '~/types/api'
 
 const api = useOperatorApi()
-const [{ data: summary, error: summaryError }, { data: details, refresh, error: detailsError }] = await Promise.all([
+const [{ data: summary, error: summaryError }, { data: details, refresh, error: detailsError }, { data: ingestionState, refresh: refreshIngestionState, error: ingestionStateError }] = await Promise.all([
   useAsyncData('summary-health', () => api.getSummary()),
-  useAsyncData('operator-health-details', () => api.getHealthDetails())
+  useAsyncData('operator-health-details', () => api.getHealthDetails()),
+  useAsyncData('operator-ingestion-state', () => api.getIngestionState({ limit: 1000, sample_limit: 8 }))
 ])
 
 const sections = computed(() => details.value?.sections || {})
@@ -24,6 +25,14 @@ const summarySnapshotWarning = computed(() => asDict(summary.value?.snapshot_war
 const slowOperations = computed(() => asDict(sections.value.slow_operations))
 const slowIssues = computed(() => asList(slowOperations.value.issues))
 const syncStateFailures = computed(() => asList(sections.value.sync_state_failures))
+const downloaderRunState = computed(() => asDict(sections.value.downloader_run_state))
+const downloaderRunRows = computed(() => asList(downloaderRunState.value.rows))
+const ingestionStateSummary = computed(() => asDict(ingestionState.value?.summary))
+const ingestionStateSamples = computed(() => asList(ingestionStateSummary.value.sample_rows))
+const ingestionStatusCounts = computed(() => dictEntries(asDict(ingestionStateSummary.value.status_counts)))
+const ingestionSourceCounts = computed(() => dictEntries(asDict(ingestionStateSummary.value.source_counts)))
+const ingestionClassificationCounts = computed(() => dictEntries(asDict(ingestionStateSummary.value.classification_counts)))
+const ingestionBoundary = computed(() => asDict(ingestionState.value?.operator_boundary))
 const degradationFeed = computed(() => asDict(sections.value.degradation_feed))
 const fallbackTelemetry = computed(() => asDict(sections.value.fallback_telemetry))
 const fallbackRows = computed(() => asList(fallbackTelemetry.value.rows))
@@ -36,6 +45,7 @@ const degradations = computed(() => asList(degradationFeed.value.rows))
 const fixHints = computed(() => asList(details.value?.fix_hints))
 const currentBlockers = computed(() => asDict(details.value?.current_blockers))
 const currentBlockerRows = computed(() => asList(currentBlockers.value.rows))
+const compactMeta = computed(() => asDict(details.value?.compact_meta))
 const trustGate = computed(() => asDict(sections.value.trust_gate))
 const trustGateChecks = computed(() => asList(trustGate.value.checks))
 const healthFilter = ref('all')
@@ -46,9 +56,15 @@ const slowIssueNotes = ref<Record<string, string>>({})
 const slowIssueSaving = ref('')
 const slowIssueError = ref('')
 const slowIssueSuccess = ref('')
+const supersededCleanupOperatorId = ref('operator')
+const supersededCleanupReason = ref('')
+const supersededCleanupApplying = ref(false)
+const supersededCleanupError = ref('')
+const supersededCleanupResult = ref<Dict | null>(null)
 const loadErrors = computed(() => [
   { title: 'Summary payload failed', error: summaryError.value },
-  { title: 'Operator health details failed', error: detailsError.value }
+  { title: 'Operator health details failed', error: detailsError.value },
+  { title: 'Ingestion state summary failed', error: ingestionStateError.value }
 ].filter((row) => row.error))
 const healthFilters = [
   { key: 'all', label: 'All' },
@@ -85,7 +101,7 @@ const filteredDegradations = computed(() => degradations.value.filter((row) => {
   return filterOk && kindOk
 }))
 const healthFilterCounts = computed(() => {
-  const rows = [...cronLogs.value, ...fixHints.value, ...syncStateFailures.value, ...degradations.value]
+  const rows = [...cronLogs.value, ...fixHints.value, ...syncStateFailures.value, ...downloaderRunRows.value, ...degradations.value]
   return Object.fromEntries(healthFilters.map((item) => [item.key, rows.filter((row) => matchesHealthFilter(row, item.key)).length]))
 })
 
@@ -99,6 +115,12 @@ function asList(value: unknown): Dict[] {
 
 function asStringList(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)) : []
+}
+
+function dictEntries(value: Dict) {
+  return Object.entries(value)
+    .map(([key, count]) => ({ key, count: Number(count || 0) }))
+    .sort((a, b) => b.count - a.count || a.key.localeCompare(b.key))
 }
 
 function statusClass(value: unknown) {
@@ -156,6 +178,10 @@ function slowIssueFix(row: Dict) {
   return 'Inspect the endpoint payload and add pagination/materialization if this remains open.'
 }
 
+async function refreshHealthPage() {
+  await Promise.all([refresh(), refreshIngestionState()])
+}
+
 async function updateSlowIssue(issue: Dict, status: string) {
   const fingerprint = String(issue.fingerprint || '')
   if (!fingerprint) return
@@ -176,11 +202,37 @@ async function updateSlowIssue(issue: Dict, status: string) {
     })
     slowIssueSuccess.value = `${fingerprint} marked ${status}.`
     slowIssueNotes.value[fingerprint] = ''
-    await refresh()
+    await refreshHealthPage()
   } catch (err) {
     slowIssueError.value = err instanceof Error ? err.message : String(err)
   } finally {
     slowIssueSaving.value = ''
+  }
+}
+
+async function applySupersededCleanup() {
+  const reason = supersededCleanupReason.value.trim()
+  if (!reason) {
+    supersededCleanupError.value = 'A reason is required before marking recovered failures superseded.'
+    return
+  }
+  supersededCleanupError.value = ''
+  supersededCleanupResult.value = null
+  supersededCleanupApplying.value = true
+  try {
+    const result = await api.applySupersededCleanup({
+      confirm: true,
+      operator_id: supersededCleanupOperatorId.value || 'operator',
+      requested_reason: reason,
+      limit: 500
+    })
+    supersededCleanupResult.value = result as unknown as Dict
+    supersededCleanupReason.value = ''
+    await refreshHealthPage()
+  } catch (err) {
+    supersededCleanupError.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    supersededCleanupApplying.value = false
   }
 }
 </script>
@@ -195,7 +247,7 @@ async function updateSlowIssue(issue: Dict, status: string) {
           Generated {{ details?.generated_at || '-' }}. Dashboard payload generated {{ summary?.generated_at || '-' }}.
         </p>
       </div>
-      <button class="rounded-full bg-paper px-5 py-3 text-sm font-black text-ink" type="button" @click="refresh()">
+      <button class="rounded-full bg-paper px-5 py-3 text-sm font-black text-ink" type="button" @click="refreshHealthPage()">
         Refresh
       </button>
     </div>
@@ -205,6 +257,15 @@ async function updateSlowIssue(issue: Dict, status: string) {
 
   <section v-if="loadErrors.length" class="mt-6 grid gap-3">
     <ApiErrorBanner v-for="row in loadErrors" :key="row.title" :title="row.title" :error="row.error" />
+  </section>
+
+  <section v-if="details?.compact" class="mt-6 rounded-3xl border border-sun/30 bg-sun/10 p-5">
+    <p class="text-xs font-black uppercase tracking-[0.25em] text-sun">Compact health payload</p>
+    <p class="mt-2 text-sm leading-6 text-ink/65">
+      Health uses bounded lists and truncated long strings for fast loads.
+      {{ compactMeta.omitted_list_items || 0 }} list item(s) and {{ compactMeta.truncated_strings || 0 }} long string(s) were omitted/truncated in this response.
+      Use <code class="rounded bg-white/70 px-1 py-0.5">/api/health/details?mode=full&amp;compact=false</code> only for short debugging sessions.
+    </p>
   </section>
 
   <section class="mt-6 grid gap-4 md:grid-cols-10">
@@ -416,6 +477,126 @@ async function updateSlowIssue(issue: Dict, status: string) {
     <div class="mt-5 rounded-2xl border border-black/10 bg-white/75 p-4">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Latest Downloader / Parser Run-State</p>
+          <p class="mt-2 text-sm leading-6 text-ink/65">
+            {{ downloaderRunState.message || 'No standardized downloader/parser run-state has been recorded yet.' }}
+          </p>
+        </div>
+        <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(downloaderRunState.status)">
+          {{ statusText(downloaderRunState.status) }}
+        </span>
+      </div>
+      <div class="mt-4 grid gap-3 md:grid-cols-5">
+        <MetricTile label="Runs" :value="String(downloaderRunState.returned_count || 0)" note="Latest source rows" />
+        <MetricTile label="Advanced" :value="String(downloaderRunState.advanced_count || 0)" note="State moved forward" />
+        <MetricTile label="Stalled" :value="String(downloaderRunState.stalled_count || 0)" note="No new rows/state" />
+        <MetricTile label="Errors" :value="String(downloaderRunState.error_count || 0)" note="Needs fix" />
+        <MetricTile label="Retries" :value="String(downloaderRunState.retry_count || 0)" note="Source attempts" />
+      </div>
+      <details v-if="downloaderRunRows.length" class="mt-4" open>
+        <summary class="cursor-pointer text-sm font-black text-moss">Show latest downloader/parser runs</summary>
+        <div class="mt-3 grid gap-2 lg:grid-cols-2">
+          <article v-for="row in downloaderRunRows.slice(0, 10)" :key="`${row.source_name}-${row.updated_at}`" class="rounded-xl bg-paper/80 p-3 text-sm">
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <p class="font-black text-ink">{{ row.module || row.source_name || 'unknown module' }}</p>
+                <p class="mt-1 text-xs font-semibold text-ink/45">
+                  {{ row.purpose || '-' }} · {{ titleCase(row.phase) }} · {{ row.updated_at || '-' }}
+                </p>
+              </div>
+              <span class="rounded-full px-2 py-1 text-[0.65rem] font-black" :class="statusClass(row.status)">{{ statusText(row.status) }}</span>
+            </div>
+            <div class="mt-3 grid gap-2 text-xs md:grid-cols-3">
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Class:</b> {{ titleCase(row.classification) }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Rows:</b> {{ row.rows_written ?? row.rows ?? '-' }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Advanced:</b> {{ row.state_advanced === true ? 'yes' : row.state_advanced === false ? 'no' : '-' }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Attempts:</b> {{ row.attempt_count ?? '-' }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Retries:</b> {{ row.retry_count ?? '-' }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Fallbacks:</b> {{ row.fallback_count ?? (row.fallback_used ? 1 : 0) }}</p>
+            </div>
+            <p v-if="row.error" class="mt-3 rounded-xl bg-rust/10 p-2 text-xs font-semibold text-rust">{{ row.error }}</p>
+            <details class="mt-3">
+              <summary class="cursor-pointer text-xs font-black text-moss">Raw state</summary>
+              <pre class="mt-2 max-h-48 overflow-auto rounded-xl bg-ink p-3 text-xs text-paper">{{ JSON.stringify(row.state || {}, null, 2) }}</pre>
+            </details>
+          </article>
+        </div>
+      </details>
+    </div>
+    <div class="mt-5 rounded-2xl border border-black/10 bg-white/75 p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">File-Level Ingestion State</p>
+          <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/65">
+            Failed files, valid empty source files, and parser classifications from <code>ingestion_file_state</code>.
+            Use this to decide whether a repeated parser item is a retryable bad download, schema drift, parser bug, or a valid no-row source.
+          </p>
+        </div>
+        <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(ingestionState?.status)">
+          {{ statusText(ingestionState?.status) }} · {{ ingestionStateSummary.count || 0 }} rows
+        </span>
+      </div>
+      <div class="mt-4 grid gap-3 md:grid-cols-4">
+        <MetricTile label="State Rows" :value="String(ingestionStateSummary.count || 0)" note="Within API limit" />
+        <MetricTile label="Statuses" :value="String(ingestionStatusCounts.length)" note="Processed / failed / empty" />
+        <MetricTile label="Sources" :value="String(ingestionSourceCounts.length)" note="Source prefixes" />
+        <MetricTile label="Failure Classes" :value="String(ingestionClassificationCounts.length)" note="Classified parser errors" />
+      </div>
+      <div class="mt-4 grid gap-3 lg:grid-cols-3">
+        <div class="rounded-2xl bg-paper/75 p-3">
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Status Counts</p>
+          <div class="mt-3 grid gap-2">
+            <p v-for="item in ingestionStatusCounts" :key="`status-${item.key}`" class="flex items-center justify-between rounded-xl bg-white/70 px-3 py-2 text-sm">
+              <span class="font-bold text-ink/70">{{ titleCase(item.key) }}</span>
+              <span class="font-black text-ink">{{ item.count }}</span>
+            </p>
+            <p v-if="!ingestionStatusCounts.length" class="rounded-xl bg-white/70 px-3 py-2 text-sm text-ink/50">No file state rows in this response.</p>
+          </div>
+        </div>
+        <div class="rounded-2xl bg-paper/75 p-3">
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Failure Class Counts</p>
+          <div class="mt-3 grid gap-2">
+            <p v-for="item in ingestionClassificationCounts" :key="`classification-${item.key}`" class="flex items-center justify-between rounded-xl bg-white/70 px-3 py-2 text-sm">
+              <span class="font-bold text-ink/70">{{ titleCase(item.key) }}</span>
+              <span class="font-black text-ink">{{ item.count }}</span>
+            </p>
+            <p v-if="!ingestionClassificationCounts.length" class="rounded-xl bg-white/70 px-3 py-2 text-sm text-ink/50">No classified failed rows in this response.</p>
+          </div>
+        </div>
+        <div class="rounded-2xl bg-paper/75 p-3">
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Top Sources</p>
+          <div class="mt-3 grid gap-2">
+            <p v-for="item in ingestionSourceCounts.slice(0, 8)" :key="`source-${item.key}`" class="flex items-center justify-between rounded-xl bg-white/70 px-3 py-2 text-sm">
+              <span class="font-bold text-ink/70">{{ item.key }}</span>
+              <span class="font-black text-ink">{{ item.count }}</span>
+            </p>
+            <p v-if="!ingestionSourceCounts.length" class="rounded-xl bg-white/70 px-3 py-2 text-sm text-ink/50">No source counts in this response.</p>
+          </div>
+        </div>
+      </div>
+      <details v-if="ingestionStateSamples.length" class="mt-4">
+        <summary class="cursor-pointer text-sm font-black text-moss">Show sample ingestion state rows</summary>
+        <div class="mt-3 grid gap-2 lg:grid-cols-2">
+          <article v-for="row in ingestionStateSamples" :key="`${row.source_prefix}-${row.object_key}`" class="rounded-xl bg-paper/80 p-3 text-sm">
+            <div class="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <p class="font-black text-ink">{{ row.object_key || '-' }}</p>
+                <p class="mt-1 text-xs font-semibold text-ink/45">{{ row.source_prefix || '-' }} · {{ row.processed_at || '-' }}</p>
+              </div>
+              <span class="rounded-full px-2 py-1 text-[0.65rem] font-black" :class="statusClass(row.status)">{{ statusText(row.status) }}</span>
+            </div>
+            <p v-if="row.error_message" class="mt-3 rounded-xl bg-rust/10 p-2 text-xs font-semibold text-rust">{{ row.error_message }}</p>
+          </article>
+        </div>
+      </details>
+      <p class="mt-4 rounded-xl bg-sun/10 px-3 py-2 text-xs font-semibold text-ink/65">
+        Read-only boundary: {{ ingestionBoundary.note || 'This card does not clear failed rows or retry ingestion.' }}
+        Manual cleanup command: <code class="font-black">{{ ingestionBoundary.clear_command || 'python scripts/ingestion_state_runner.py clear --source <source> --key <object_key>' }}</code>
+      </p>
+    </div>
+    <div class="mt-5 rounded-2xl border border-black/10 bg-white/75 p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
           <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Persisted Fallback Telemetry</p>
           <p class="mt-2 text-sm leading-6 text-ink/65">
             {{ fallbackTelemetry.message || 'No fallback telemetry has been recorded yet.' }}
@@ -471,7 +652,8 @@ async function updateSlowIssue(issue: Dict, status: string) {
         <div>
           <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Superseded Cleanup Preview</p>
           <p class="mt-2 text-sm leading-6 text-ink/60">
-            Candidate rows are read-only here. Marking them superseded requires an explicit shell apply command after reviewing the dry-run output.
+            Candidate rows are recovered failures. Applying this marks only superseded metadata so stale operational errors stop polluting Manual Review and Health.
+            It never changes portfolio rows, action recommendations, config, or broker orders.
           </p>
         </div>
         <span class="rounded-full bg-sun px-3 py-1 text-xs font-black text-ink">
@@ -483,8 +665,40 @@ async function updateSlowIssue(issue: Dict, status: string) {
           Dry run: <code class="font-black">{{ supersededPreview.dry_run_command || 'python -m advisory.superseded_failures --limit 500' }}</code>
         </p>
         <p class="rounded-xl bg-paper/70 px-3 py-2 text-xs font-semibold text-ink/70">
-          Apply: <code class="font-black">{{ supersededPreview.apply_command || 'python -m advisory.superseded_failures --apply --limit 500' }}</code>
+          Manual fallback: <code class="font-black">{{ supersededPreview.apply_command || 'python -m advisory.superseded_failures --apply --limit 500' }}</code>
         </p>
+      </div>
+      <div class="mt-4 rounded-2xl border border-sun/30 bg-sun/10 p-4">
+        <div class="grid gap-3 lg:grid-cols-[1fr_2fr_auto]">
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Operator id
+            <input v-model="supersededCleanupOperatorId" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="operator" />
+          </label>
+          <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+            Apply reason
+            <input v-model="supersededCleanupReason" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="Example: reviewed recovered rows; safe to clear stale failure noise" />
+          </label>
+          <button
+            class="self-end rounded-full bg-ink px-5 py-3 text-sm font-black text-paper disabled:opacity-50"
+            type="button"
+            :disabled="supersededCleanupApplying || !supersededCleanupReason.trim()"
+            @click="applySupersededCleanup"
+          >
+            {{ supersededCleanupApplying ? 'Applying...' : 'Mark Superseded' }}
+          </button>
+        </div>
+        <p class="mt-3 text-xs font-semibold text-ink/60">
+          This writes durable cleanup metadata only. It is audited as <code>superseded_failure_cleanup_apply</code>.
+        </p>
+        <p v-if="supersededCleanupError" class="mt-3 rounded-xl bg-rust/10 px-3 py-2 text-sm font-bold text-rust">{{ supersededCleanupError }}</p>
+        <div v-if="supersededCleanupResult" class="mt-3 rounded-xl bg-moss/10 px-3 py-2 text-sm text-ink/70">
+          <p class="font-black text-moss">
+            Applied {{ asDict(supersededCleanupResult.counts).total_updated ?? 0 }} cleanup marker(s).
+          </p>
+          <p class="mt-1 text-xs">
+            Audit run: {{ asDict(supersededCleanupResult.audit_run).run_id || '-' }}
+          </p>
+        </div>
       </div>
       <div class="mt-4 grid gap-3 lg:grid-cols-2">
         <div>

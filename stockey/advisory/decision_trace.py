@@ -8,8 +8,10 @@ from typing import Any
 
 import pandas as pd
 
-from utils.db import db_session, sql_to_df, upsert_to_db
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.log import setup_logger
+from utils.schema_migrations import apply_schema_migration
 
 
 TRACES_TABLE = "advisory_decision_traces"
@@ -20,6 +22,7 @@ ACTION_CONFLICT_RULES_TABLE = "advisory_action_conflict_rules"
 MANUAL_REVIEW_DECISIONS_TABLE = "advisory_manual_review_decisions"
 WAIT_SIGNALS_TABLE = "advisory_wait_signals"
 WAIT_SIGNAL_MATCHES_TABLE = "advisory_wait_signal_matches"
+TRACE_SCHEMA_MIGRATION_ID = "20260611_advisory_decision_trace_base"
 
 ACTION_CONFLICT_RULES = [
     {
@@ -63,8 +66,105 @@ ACTION_CONFLICT_RULES = [
         "reason": "WATCH is informational and loses to any higher-priority action for the same symbol/date.",
     },
 ]
+ACTION_CONFLICT_RULES_BY_ID = {str(rule["rule_id"]): rule for rule in ACTION_CONFLICT_RULES}
 
 logger = setup_logger("advisory.decision_trace")
+
+TRACE_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TRACES_TABLE} (
+        trace_id TEXT PRIMARY KEY,
+        asof_date TIMESTAMPTZ,
+        symbol TEXT NOT NULL,
+        unique_id TEXT,
+        setup_id TEXT,
+        trigger_type TEXT,
+        previous_action TEXT,
+        new_action TEXT,
+        action_changed BOOLEAN,
+        final_action TEXT,
+        final_reason TEXT,
+        source_table TEXT,
+        source_key TEXT,
+        payload_json TEXT,
+        created_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {TRACE_STEPS_TABLE} (
+        trace_id TEXT NOT NULL,
+        step_idx BIGINT NOT NULL,
+        stage TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT,
+        input_hash TEXT,
+        output_hash TEXT,
+        payload_json TEXT,
+        started_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (trace_id, step_idx, stage)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {EVENT_PROCESSING_TABLE} (
+        unique_id TEXT NOT NULL,
+        symbol TEXT,
+        source_type TEXT,
+        stage TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ,
+        error TEXT,
+        input_hash TEXT,
+        output_hash TEXT,
+        payload_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (unique_id, stage, started_at)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {ACTION_CONFLICTS_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        symbol TEXT NOT NULL,
+        winning_action_code TEXT,
+        losing_action_code TEXT,
+        winning_priority BIGINT,
+        losing_priority BIGINT,
+        winning_source TEXT,
+        losing_source TEXT,
+        losing_setup_id TEXT,
+        losing_unique_id TEXT,
+        lost_reason TEXT,
+        raw_context_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (asof_date, symbol, losing_action_code, losing_source, losing_setup_id, losing_unique_id)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {ACTION_CONFLICT_RULES_TABLE} (
+        rule_id TEXT PRIMARY KEY,
+        rule_name TEXT NOT NULL,
+        rule_scope TEXT,
+        resolution_action TEXT NOT NULL,
+        resolution_reason TEXT,
+        enabled BOOLEAN DEFAULT TRUE,
+        priority BIGINT DEFAULT 100,
+        created_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ
+    )
+    """,
+    f"ALTER TABLE {ACTION_CONFLICTS_TABLE} ADD COLUMN IF NOT EXISTS resolution_status TEXT",
+    f"ALTER TABLE {ACTION_CONFLICTS_TABLE} ADD COLUMN IF NOT EXISTS resolution_rule_id TEXT",
+    f"ALTER TABLE {ACTION_CONFLICTS_TABLE} ADD COLUMN IF NOT EXISTS resolution_action TEXT",
+    f"ALTER TABLE {ACTION_CONFLICTS_TABLE} ADD COLUMN IF NOT EXISTS resolution_reason TEXT",
+    f"ALTER TABLE {ACTION_CONFLICTS_TABLE} ADD COLUMN IF NOT EXISTS requires_manual_resolution BOOLEAN",
+    f"ALTER TABLE {ACTION_CONFLICT_RULES_TABLE} ADD COLUMN IF NOT EXISTS condition_json TEXT",
+    f"ALTER TABLE {ACTION_CONFLICT_RULES_TABLE} ADD COLUMN IF NOT EXISTS promoted_from_conflict_key TEXT",
+    f"ALTER TABLE {ACTION_CONFLICT_RULES_TABLE} ADD COLUMN IF NOT EXISTS promoted_by TEXT",
+    f"ALTER TABLE {ACTION_CONFLICT_RULES_TABLE} ADD COLUMN IF NOT EXISTS promotion_note TEXT",
+]
 
 
 def json_dumps(value: Any) -> str:
@@ -79,7 +179,24 @@ def safe_trace_call(func, **kwargs):
     try:
         return func(**kwargs)
     except Exception as exc:
-        logger.warning("decision trace write failed func=%s error=%s", getattr(func, "__name__", str(func)), exc)
+        func_name = getattr(func, "__name__", str(func))
+        logger.warning("decision trace write failed func=%s error=%s", func_name, exc)
+        record_local_fallback_event(
+            module="advisory.decision_trace",
+            source="decision_trace",
+            fallback_type="decision_trace_write_failed",
+            severity="warn",
+            reason="Decision trace write failed; pipeline continues but trace/audit evidence may be incomplete.",
+            error=exc,
+            metadata={
+                "function": func_name,
+                "kwargs_keys": sorted(str(key) for key in kwargs.keys()),
+                "symbol": str(kwargs.get("symbol") or "").upper() or None,
+                "unique_id": kwargs.get("unique_id"),
+                "setup_id": kwargs.get("setup_id"),
+                "trigger_type": kwargs.get("trigger_type"),
+            },
+        )
         return None
 
 
@@ -96,149 +213,70 @@ def table_exists(table_name: str) -> bool:
             params=(table_name,),
         )
         return not df.empty
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.decision_trace",
+            source=table_name,
+            fallback_type="decision_trace_table_lookup_failed",
+            severity="warn",
+            reason="Decision trace table existence check failed; trace/manual-review links may be incomplete.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return False
 
 
 def ensure_trace_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TRACES_TABLE} (
-                trace_id TEXT PRIMARY KEY,
-                asof_date TIMESTAMPTZ,
-                symbol TEXT NOT NULL,
-                unique_id TEXT,
-                setup_id TEXT,
-                trigger_type TEXT,
-                previous_action TEXT,
-                new_action TEXT,
-                action_changed BOOLEAN,
-                final_action TEXT,
-                final_reason TEXT,
-                source_table TEXT,
-                source_key TEXT,
-                payload_json TEXT,
-                created_at TIMESTAMPTZ,
-                updated_at TIMESTAMPTZ
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TRACE_STEPS_TABLE} (
-                trace_id TEXT NOT NULL,
-                step_idx BIGINT NOT NULL,
-                stage TEXT NOT NULL,
-                status TEXT NOT NULL,
-                reason TEXT,
-                input_hash TEXT,
-                output_hash TEXT,
-                payload_json TEXT,
-                started_at TIMESTAMPTZ,
-                completed_at TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (trace_id, step_idx, stage)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVENT_PROCESSING_TABLE} (
-                unique_id TEXT NOT NULL,
-                symbol TEXT,
-                source_type TEXT,
-                stage TEXT NOT NULL,
-                status TEXT NOT NULL,
-                started_at TIMESTAMPTZ,
-                completed_at TIMESTAMPTZ,
-                error TEXT,
-                input_hash TEXT,
-                output_hash TEXT,
-                payload_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (unique_id, stage, started_at)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {ACTION_CONFLICTS_TABLE} (
-                asof_date TIMESTAMPTZ NOT NULL,
-                symbol TEXT NOT NULL,
-                winning_action_code TEXT,
-                losing_action_code TEXT,
-                winning_priority BIGINT,
-                losing_priority BIGINT,
-                winning_source TEXT,
-                losing_source TEXT,
-                losing_setup_id TEXT,
-                losing_unique_id TEXT,
-                lost_reason TEXT,
-                raw_context_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (asof_date, symbol, losing_action_code, losing_source, losing_setup_id, losing_unique_id)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {ACTION_CONFLICT_RULES_TABLE} (
-                rule_id TEXT PRIMARY KEY,
-                rule_name TEXT NOT NULL,
-                rule_scope TEXT,
-                resolution_action TEXT NOT NULL,
-                resolution_reason TEXT,
-                enabled BOOLEAN DEFAULT TRUE,
-                priority BIGINT DEFAULT 100,
-                created_at TIMESTAMPTZ,
-                updated_at TIMESTAMPTZ
-            )
-            """
-        )
-        for column, sql_type in {
-            "resolution_status": "TEXT",
-            "resolution_rule_id": "TEXT",
-            "resolution_action": "TEXT",
-            "resolution_reason": "TEXT",
-            "requires_manual_resolution": "BOOLEAN",
-        }.items():
-            cur.execute(f"ALTER TABLE {ACTION_CONFLICTS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-        for column, sql_type in {
-            "condition_json": "TEXT",
-            "promoted_from_conflict_key": "TEXT",
-            "promoted_by": "TEXT",
-            "promotion_note": "TEXT",
-        }.items():
-            cur.execute(f"ALTER TABLE {ACTION_CONFLICT_RULES_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
-        now = pd.Timestamp.utcnow()
-        for idx, rule in enumerate(ACTION_CONFLICT_RULES):
-            cur.execute(
-                f"""
-                INSERT INTO {ACTION_CONFLICT_RULES_TABLE}
-                    (rule_id, rule_name, rule_scope, resolution_action, resolution_reason, enabled, priority, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s)
-                ON CONFLICT (rule_id) DO UPDATE SET
-                    rule_name = EXCLUDED.rule_name,
-                    rule_scope = EXCLUDED.rule_scope,
-                    resolution_action = EXCLUDED.resolution_action,
-                    resolution_reason = COALESCE({ACTION_CONFLICT_RULES_TABLE}.resolution_reason, EXCLUDED.resolution_reason),
-                    updated_at = EXCLUDED.updated_at
-                """,
-                (
-                    str(rule["rule_id"]),
-                    str(rule["rule_name"]),
-                    str(rule["rule_scope"]),
-                    str(rule["resolution_action"]),
-                    str(rule["reason"]),
-                    int(100 - idx),
-                    now.to_pydatetime(),
-                    now.to_pydatetime(),
-                ),
-            )
+    apply_schema_migration(
+        migration_id=TRACE_SCHEMA_MIGRATION_ID,
+        description="Create decision trace, trace step, event processing, and action conflict audit tables.",
+        statements=TRACE_SCHEMA_STATEMENTS,
+        metadata={
+            "module": "advisory.decision_trace",
+            "tables": [
+                TRACES_TABLE,
+                TRACE_STEPS_TABLE,
+                EVENT_PROCESSING_TABLE,
+                ACTION_CONFLICTS_TABLE,
+                ACTION_CONFLICT_RULES_TABLE,
+            ],
+        },
+    )
+    def _seed_action_conflict_rules() -> None:
+        with db_session() as (_, cur):
+            now = pd.Timestamp.utcnow()
+            for idx, rule in enumerate(ACTION_CONFLICT_RULES):
+                cur.execute(
+                    f"""
+                    INSERT INTO {ACTION_CONFLICT_RULES_TABLE}
+                        (rule_id, rule_name, rule_scope, resolution_action, resolution_reason, enabled, priority, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, TRUE, %s, %s, %s)
+                    ON CONFLICT (rule_id) DO UPDATE SET
+                        rule_name = EXCLUDED.rule_name,
+                        rule_scope = EXCLUDED.rule_scope,
+                        resolution_action = EXCLUDED.resolution_action,
+                        resolution_reason = COALESCE({ACTION_CONFLICT_RULES_TABLE}.resolution_reason, EXCLUDED.resolution_reason),
+                        updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        str(rule["rule_id"]),
+                        str(rule["rule_name"]),
+                        str(rule["rule_scope"]),
+                        str(rule["resolution_action"]),
+                        str(rule["reason"]),
+                        int(100 - idx),
+                        now.to_pydatetime(),
+                        now.to_pydatetime(),
+                    ),
+                )
+
+    execute_db_operation(
+        _seed_action_conflict_rules,
+        operation_name="decision_trace:seed_action_conflict_rules",
+    )
 
 
-def _parse_jsonish(value: Any, default: Any = None) -> Any:
+def _parse_jsonish(value: Any, default: Any = None, *, source: str = "json_context") -> Any:
     if value is None:
         return default
     if isinstance(value, float) and pd.isna(value):
@@ -252,7 +290,20 @@ def _parse_jsonish(value: Any, default: Any = None) -> Any:
         return default
     try:
         return json.loads(text)
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.decision_trace",
+            fallback_type="decision_trace_json_parse_failed",
+            source=source,
+            severity="warn",
+            reason="Decision trace could not parse stored JSON context and used the provided default.",
+            error=exc,
+            metadata={
+                "default_type": type(default).__name__,
+                "value_length": len(text),
+                "value_excerpt": text[:240],
+            },
+        )
         return default
 
 
@@ -262,18 +313,16 @@ def _norm(value: Any, *, upper: bool = True) -> str:
 
 
 def _dynamic_rule_matches(row: dict[str, Any], rule: dict[str, Any]) -> bool:
-    condition = _parse_jsonish(rule.get("condition_json"), {})
+    condition = _parse_jsonish(rule.get("condition_json"), {}, source="conflict_rule_condition_json")
     if not isinstance(condition, dict):
         return False
-    if str(condition.get("condition_type") or "") != "action_pair_exact":
+    condition_type = str(condition.get("condition_type") or "action_pair_exact").strip().lower()
+    if condition_type not in {"action_pair", "action_pair_exact"}:
         return False
-    checks = {
-        "winning_action_code": True,
-        "losing_action_code": True,
-        "winning_source": False,
-        "losing_source": False,
-    }
-    for field, upper in checks.items():
+    checks = [("winning_action_code", True), ("losing_action_code", True)]
+    if condition_type == "action_pair_exact":
+        checks.extend([("winning_source", False), ("losing_source", False)])
+    for field, upper in checks:
         expected = condition.get(field)
         if expected in (None, ""):
             continue
@@ -481,13 +530,13 @@ def classify_action_conflict(row: dict[str, Any], dynamic_rules: list[dict[str, 
     low_priority_actions = {"WATCH", "HOLD", "MANUAL_REVIEW"}
 
     if winning == losing and winning:
-        rule = ACTION_CONFLICT_RULES[2]
+        rule = ACTION_CONFLICT_RULES_BY_ID["SAME_ACTION_DUPLICATE_COLLAPSE"]
     elif winning in exit_actions and losing in low_priority_actions:
-        rule = ACTION_CONFLICT_RULES[0]
+        rule = ACTION_CONFLICT_RULES_BY_ID["EXIT_BEATS_ENTRY_OR_WATCH"]
     elif winning == "MANUAL_REVIEW" and ("market_context_adjustment" in context_text or "risk-off" in context_text or "risk_off" in context_text or winning_source in {"portfolio", "event_policy"}):
-        rule = ACTION_CONFLICT_RULES[1]
+        rule = ACTION_CONFLICT_RULES_BY_ID["MARKET_GATE_MANUAL_BEATS_POSITIVE"]
     elif losing == "WATCH" and winning:
-        rule = ACTION_CONFLICT_RULES[3]
+        rule = ACTION_CONFLICT_RULES_BY_ID["WATCH_LOSES_TO_HIGHER_PRIORITY"]
     else:
         for rule_row in dynamic_rules or []:
             if not _dynamic_rule_matches(row, rule_row):

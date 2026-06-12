@@ -9,47 +9,55 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from psycopg2.extras import Json
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from data.screenerin.auth import ensure_authenticated_requests_session
-from utils.db import db_session, sql_to_df
+from data.screenerin.failure_log import record_screener_failure
+from utils.db import db_session, execute_db_operation, sql_to_df
+from utils.schema_migrations import apply_schema_migration
 
 
 SNAPSHOT_TABLE = "public.screenerin_screener_snapshots"
 REGISTRY_TABLE = "public.screenerin_screeners"
 SOURCE_NAME = "screener.in"
+SCREENER_PARSER_SCHEMA_MIGRATION_ID = "20260611_screenerin_registered_screeners_base"
+SCREENER_PARSER_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {SNAPSHOT_TABLE} (
+        screener_slug TEXT NOT NULL,
+        screener_name TEXT NOT NULL,
+        screener_url TEXT NOT NULL,
+        screen_id BIGINT,
+        source_name TEXT NOT NULL,
+        row_count BIGINT NOT NULL DEFAULT 0,
+        date DATE NOT NULL,
+        raw_json JSONB NOT NULL,
+        load_ts TIMESTAMPTZ NOT NULL,
+        UNIQUE (date, screener_slug)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {REGISTRY_TABLE} (
+        screener_slug TEXT PRIMARY KEY,
+        screener_name TEXT NOT NULL,
+        screener_url TEXT NOT NULL,
+        screen_id BIGINT,
+        source_name TEXT NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_ts TIMESTAMPTZ NOT NULL,
+        updated_ts TIMESTAMPTZ NOT NULL
+    )
+    """,
+]
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {SNAPSHOT_TABLE} (
-                screener_slug TEXT NOT NULL,
-                screener_name TEXT NOT NULL,
-                screener_url TEXT NOT NULL,
-                screen_id BIGINT,
-                source_name TEXT NOT NULL,
-                row_count BIGINT NOT NULL DEFAULT 0,
-                date DATE NOT NULL,
-                raw_json JSONB NOT NULL,
-                load_ts TIMESTAMPTZ NOT NULL,
-                UNIQUE (date, screener_slug)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {REGISTRY_TABLE} (
-                screener_slug TEXT PRIMARY KEY,
-                screener_name TEXT NOT NULL,
-                screener_url TEXT NOT NULL,
-                screen_id BIGINT,
-                source_name TEXT NOT NULL,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_ts TIMESTAMPTZ NOT NULL,
-                updated_ts TIMESTAMPTZ NOT NULL
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=SCREENER_PARSER_SCHEMA_MIGRATION_ID,
+        description="Create Screener.in registered screener registry and snapshot tables.",
+        statements=SCREENER_PARSER_SCHEMA_STATEMENTS,
+        metadata={"tables": [SNAPSHOT_TABLE, REGISTRY_TABLE], "source": SOURCE_NAME},
+    )
 
 
 def clean_text(value: str | None) -> str | None:
@@ -67,12 +75,30 @@ def to_number(value: str | None):
     if re.fullmatch(r"-?\d+", value):
         try:
             return int(value)
-        except ValueError:
+        except ValueError as exc:
+            record_local_fallback_event(
+                module="data.screenerin.screener_parser",
+                source="screener_numeric_parse",
+                fallback_type="screener_integer_parse_failed",
+                severity="warn",
+                reason="Screener.in parser could not parse an integer-looking value and kept the original text.",
+                error=exc,
+                metadata={"value_excerpt": value[:240]},
+            )
             return value
     if re.fullmatch(r"-?\d*\.\d+", value) or re.fullmatch(r"-?\d+\.\d*", value):
         try:
             return float(value)
-        except ValueError:
+        except ValueError as exc:
+            record_local_fallback_event(
+                module="data.screenerin.screener_parser",
+                source="screener_numeric_parse",
+                fallback_type="screener_float_parse_failed",
+                severity="warn",
+                reason="Screener.in parser could not parse a float-looking value and kept the original text.",
+                error=exc,
+                metadata={"value_excerpt": value[:240]},
+            )
             return value
     return value
 
@@ -210,40 +236,47 @@ def upsert_registered_screener(
     now = datetime.now(timezone.utc)
     effective_name = (screener_name or derive_screener_name(screener_url)).strip()
     screen_id = extract_screen_id(screener_url)
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            INSERT INTO {REGISTRY_TABLE} (
-                screener_slug,
-                screener_name,
-                screener_url,
-                screen_id,
-                source_name,
-                is_active,
-                created_ts,
-                updated_ts
+
+    def _upsert_registered_screener() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                INSERT INTO {REGISTRY_TABLE} (
+                    screener_slug,
+                    screener_name,
+                    screener_url,
+                    screen_id,
+                    source_name,
+                    is_active,
+                    created_ts,
+                    updated_ts
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (screener_slug)
+                DO UPDATE SET
+                    screener_name = EXCLUDED.screener_name,
+                    screener_url = EXCLUDED.screener_url,
+                    screen_id = EXCLUDED.screen_id,
+                    source_name = EXCLUDED.source_name,
+                    is_active = EXCLUDED.is_active,
+                    updated_ts = EXCLUDED.updated_ts
+                """,
+                (
+                    screener_slug,
+                    effective_name,
+                    screener_url,
+                    screen_id,
+                    SOURCE_NAME,
+                    is_active,
+                    now,
+                    now,
+                ),
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (screener_slug)
-            DO UPDATE SET
-                screener_name = EXCLUDED.screener_name,
-                screener_url = EXCLUDED.screener_url,
-                screen_id = EXCLUDED.screen_id,
-                source_name = EXCLUDED.source_name,
-                is_active = EXCLUDED.is_active,
-                updated_ts = EXCLUDED.updated_ts
-            """,
-            (
-                screener_slug,
-                effective_name,
-                screener_url,
-                screen_id,
-                SOURCE_NAME,
-                is_active,
-                now,
-                now,
-            ),
-        )
+
+    execute_db_operation(
+        _upsert_registered_screener,
+        operation_name=f"screener_parser:upsert_registered_screener:{screener_slug}",
+    )
     return {
         "screener_slug": screener_slug,
         "screener_name": effective_name,
@@ -268,12 +301,21 @@ def list_registered_screeners(*, active_only: bool = False):
 
 def remove_registered_screener(identifier: str) -> dict[str, object]:
     ensure_tables()
-    with db_session() as (_, cur):
-        cur.execute(
-            f"DELETE FROM {REGISTRY_TABLE} WHERE screener_slug = %s OR screener_url = %s",
-            (identifier, identifier),
-        )
-        removed = cur.rowcount
+    removed = 0
+
+    def _remove_registered_screener() -> None:
+        nonlocal removed
+        with db_session() as (_, cur):
+            cur.execute(
+                f"DELETE FROM {REGISTRY_TABLE} WHERE screener_slug = %s OR screener_url = %s",
+                (identifier, identifier),
+            )
+            removed = cur.rowcount
+
+    execute_db_operation(
+        _remove_registered_screener,
+        operation_name="screener_parser:remove_registered_screener",
+    )
     return {"identifier": identifier, "removed": removed}
 
 
@@ -292,49 +334,74 @@ def upsert_snapshot(
     snapshot_date: datetime,
     payload: dict[str, object],
 ) -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            INSERT INTO {SNAPSHOT_TABLE} (
-                screener_slug,
-                screener_name,
-                screener_url,
-                screen_id,
-                source_name,
-                row_count,
-                date,
-                raw_json,
-                load_ts
+    def _upsert_snapshot() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                INSERT INTO {SNAPSHOT_TABLE} (
+                    screener_slug,
+                    screener_name,
+                    screener_url,
+                    screen_id,
+                    source_name,
+                    row_count,
+                    date,
+                    raw_json,
+                    load_ts
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (date, screener_slug)
+                DO UPDATE SET
+                    screener_name = EXCLUDED.screener_name,
+                    screener_url = EXCLUDED.screener_url,
+                    screen_id = EXCLUDED.screen_id,
+                    source_name = EXCLUDED.source_name,
+                    row_count = EXCLUDED.row_count,
+                    raw_json = EXCLUDED.raw_json,
+                    load_ts = EXCLUDED.load_ts
+                """,
+                (
+                    screener_slug,
+                    screener_name,
+                    screener_url,
+                    payload.get("screen_id"),
+                    SOURCE_NAME,
+                    len(payload.get("companies", [])),
+                    snapshot_date.date(),
+                    Json(payload),
+                    datetime.now(timezone.utc),
+                ),
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (date, screener_slug)
-            DO UPDATE SET
-                screener_name = EXCLUDED.screener_name,
-                screener_url = EXCLUDED.screener_url,
-                screen_id = EXCLUDED.screen_id,
-                source_name = EXCLUDED.source_name,
-                row_count = EXCLUDED.row_count,
-                raw_json = EXCLUDED.raw_json,
-                load_ts = EXCLUDED.load_ts
-            """,
-            (
-                screener_slug,
-                screener_name,
-                screener_url,
-                payload.get("screen_id"),
-                SOURCE_NAME,
-                len(payload.get("companies", [])),
-                snapshot_date.date(),
-                Json(payload),
-                datetime.now(timezone.utc),
-            ),
-        )
+
+    execute_db_operation(
+        _upsert_snapshot,
+        operation_name=f"screener_parser:upsert_snapshot:{screener_slug}",
+    )
 
 
 def sync_screener(url: str, snapshot_date: datetime | None = None) -> dict[str, object]:
     ensure_tables()
-    html = get_screener_html(url)
-    payload = parse_screener_html(html, url=url)
+    html: str | None = None
+    try:
+        html = get_screener_html(url)
+    except Exception as exc:
+        record_screener_failure(
+            failure_stage="registered_fetch",
+            error=exc,
+            screener_url=url,
+            html=html,
+        )
+        raise
+    try:
+        payload = parse_screener_html(html, url=url)
+    except Exception as exc:
+        record_screener_failure(
+            failure_stage="registered_parse",
+            error=exc,
+            screener_url=url,
+            html=html,
+        )
+        raise
     screener_slug = payload.get("screener_slug") or extract_screener_slug(url)
     screener_name = payload.get("screener_name") or derive_screener_name(url)
     effective_date = snapshot_date or datetime.now(timezone.utc)
@@ -363,7 +430,8 @@ def sync_screener(url: str, snapshot_date: datetime | None = None) -> dict[str, 
 def sync_registered_screeners(snapshot_date: datetime | None = None) -> list[dict[str, object]]:
     urls = load_registered_urls()
     if not urls:
-        seed_default_screeners()
+        # No implicit seed helper is defined in this module. Keep the sync
+        # explicit so the central runner can surface an actionable no-data state.
         urls = load_registered_urls()
     return [sync_screener(url, snapshot_date=snapshot_date) for url in urls]
 
@@ -419,12 +487,45 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
+def build_run_state(*, results: list[dict[str, object]], urls: list[str], snapshot_date: datetime | None = None) -> dict[str, object]:
+    row_counts = [int(row.get("row_count") or 0) for row in results]
+    no_data_screeners = [
+        str(row.get("screener_slug") or row.get("screener_name") or "")
+        for row in results
+        if int(row.get("row_count") or 0) <= 0
+    ]
+    dates = [str(row.get("date")) for row in results if row.get("date")]
+    effective_date = snapshot_date.date().isoformat() if snapshot_date else (dates[0] if dates else None)
+    return {
+        "source": "screener.in",
+        "rows": int(sum(row_counts)),
+        "rows_read": int(sum(row_counts)),
+        "rows_written": int(sum(row_counts)),
+        "screener_count": int(len(urls)),
+        "screeners_synced": int(len(results)),
+        "empty_screener_count": int(len(no_data_screeners)),
+        "empty_screeners": [value for value in no_data_screeners if value][:20],
+        "from_date": effective_date,
+        "to_date": effective_date,
+        "fallback_used": False,
+        "state_advanced": bool(results),
+    }
+
+
+def main() -> int:
+    global STOCKEY_RUN_STATE
     args = parse_args()
     urls = args.urls or load_registered_urls()
+    results: list[dict[str, object]] = []
     for url in urls:
-        print(json.dumps(sync_screener(url), ensure_ascii=False), flush=True)
+        result = sync_screener(url)
+        results.append(result)
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+    STOCKEY_RUN_STATE = build_run_state(results=results, urls=urls)
+    if not results:
+        print(json.dumps({"status": "no_data", "reason": "no_registered_screener_urls"}, ensure_ascii=False), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

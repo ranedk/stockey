@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import json
+from datetime import timezone
 
 import pandas as pd
 from environs import Env
@@ -7,6 +10,8 @@ from utils.db import upsert_to_db
 from utils.http import get_with_retries
 
 from .sharpely_utils import get_sharpely_headers
+
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def get_latest_from_sharpely(headers):
@@ -71,7 +76,7 @@ def get_latest_from_sharpely(headers):
     return dfs
 
 
-def update_masters():
+def update_masters() -> dict[str, object]:
     env = Env()
     env.read_env()
 
@@ -95,7 +100,29 @@ def update_masters():
         "master_sharpely_equity",
         unique_keys=["symbol", "bse_ticker"],
     )
+    load_ts = pd.Timestamp.now(tz=timezone.utc)
+    return {
+        "source": "sharpely",
+        "rows": int(len(df_funds) + len(df_equity)),
+        "rows_read": int(sum(len(df) for df in dfs)),
+        "rows_written": int(len(df_funds) + len(df_equity)),
+        "fund_rows": int(len(df_funds)),
+        "equity_rows": int(len(df_equity)),
+        "raw_fund_rows": int(len(dfs[0]) + len(dfs[1])),
+        "raw_equity_rows": int(len(dfs[2])),
+        "instrument_type_count": int(len(dfs)),
+        "load_ts": load_ts.isoformat(),
+        "fallback_used": False,
+        "state_advanced": True,
+    }
+
+
+def main() -> int:
+    global STOCKEY_RUN_STATE
+    STOCKEY_RUN_STATE = update_masters()
+    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    update_masters()
+    raise SystemExit(main())

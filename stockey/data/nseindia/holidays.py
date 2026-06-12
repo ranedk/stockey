@@ -1,4 +1,5 @@
 # trading_days.py
+import json
 import random
 import numpy as np
 from datetime import datetime
@@ -6,7 +7,10 @@ from datetime import datetime
 import redis
 import pandas as pd
 from environs import Env
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import upsert_to_db
 from utils.sync import get_redis_client
 
@@ -20,6 +24,8 @@ REDIS_PORT = env("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:trading_days"
 rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
+SYNC_SOURCE_NAME = "data.nseindia.holidays"
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 nse_product_info = {
@@ -94,67 +100,145 @@ def get_random(min_ms: int, max_ms: int) -> int:
 
 def download_holidays(
     playwright,
-) -> bool:
+) -> dict[str, object]:
     """
     Download the calendar csv file for all events
     https://www.nseindia.com/resources/exchange-communication-holidays
     """
-    browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
-    context = browser.contexts[0] if browser.contexts else browser.new_context()
-    page = context.new_page()
+    state: dict[str, object] = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": 0,
+        "rows_read": 0,
+        "rows_written": 0,
+        "attempt_count": 1,
+        "download_attempts": 1,
+        "failed_attempt_count": 0,
+        "source_unavailable_count": 0,
+        "fallback_used": False,
+        "state_advanced": False,
+    }
+    browser = None
+    page = None
+    try:
+        browser = playwright.chromium.connect_over_cdp(CDP_ENDPOINT)
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
 
-    page.goto("https://www.nseindia.com")
-    page.wait_for_timeout(get_random(1000, 2000))
-    page.goto('https://www.nseindia.com/resources/exchange-communication-holidays')
-    page.wait_for_timeout(get_random(1000, 2000))
+        page.goto("https://www.nseindia.com")
+        page.wait_for_timeout(get_random(1000, 2000))
+        page.goto('https://www.nseindia.com/resources/exchange-communication-holidays')
+        page.wait_for_timeout(get_random(1000, 2000))
 
-    url = 'https://www.nseindia.com/api/holiday-master?type=trading'
-    data = page.evaluate(
-        """async (url) => {
-            const res = await fetch(url, { credentials: 'same-origin' });
-            if (!res.ok) throw new Error('HTTP ' + res.status);
-            return await res.json();
-        }""",
-        url,
-    )
+        url = 'https://www.nseindia.com/api/holiday-master?type=trading'
+        data = page.evaluate(
+            """async (url) => {
+                const res = await fetch(url, { credentials: 'same-origin' });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                return await res.json();
+            }""",
+            url,
+        )
 
-    full_df = pd.DataFrame()
-    for k,v in data.items():
-        df = pd.DataFrame(v)
-        df['type'] = k
-        df['type_name'] = nse_product_info[k]['name']
-        df = df.rename(columns={
-            'tradingDate': 'date',
-            'weekDay': 'weekday',
-            'description': 'holiday',
-            'morning_session': 'morning_session',
-            "evening_session": "evening_session",
-            "Sr_no": "sr_no"
-        })
-        df = df.drop(columns=["sr_no", "weekday"])
-        df['date'] = pd.to_datetime(df['date'], format="%d-%b-%Y")
-        df = df.replace(to_replace=[None], value=np.nan)
-        full_df = pd.concat([full_df, df])
+        full_df = pd.DataFrame()
+        for k, v in data.items():
+            df = pd.DataFrame(v)
+            df['type'] = k
+            df['type_name'] = nse_product_info[k]['name']
+            df = df.rename(columns={
+                'tradingDate': 'date',
+                'weekDay': 'weekday',
+                'description': 'holiday',
+                'morning_session': 'morning_session',
+                "evening_session": "evening_session",
+                "Sr_no": "sr_no"
+            })
+            df = df.drop(columns=["sr_no", "weekday"])
+            df['date'] = pd.to_datetime(df['date'], format="%d-%b-%Y")
+            df = df.replace(to_replace=[None], value=np.nan)
+            full_df = pd.concat([full_df, df])
 
-    full_df = full_df.reset_index(drop=True)
-    full_df = full_df.drop_duplicates(subset=["date", "type"], keep='last')
-    upsert_to_db(full_df, "nseindia_holidays", unique_keys=["date", "type"], timescaledb_column="date")
-    rop.set(REDIS_SET, datetime.today().strftime("%Y-%m-%d"))
+        full_df = full_df.reset_index(drop=True)
+        full_df = full_df.drop_duplicates(subset=["date", "type"], keep='last')
+        upsert_to_db(full_df, "nseindia_holidays", unique_keys=["date", "type"], timescaledb_column="date")
+        rop.set(REDIS_SET, datetime.today().strftime("%Y-%m-%d"))
+        state.update(
+            {
+                "status": "ok",
+                "rows": int(len(full_df)),
+                "rows_read": int(len(full_df)),
+                "rows_written": int(len(full_df)),
+                "product_type_count": int(full_df["type"].nunique()) if not full_df.empty else 0,
+                "from_date": full_df["date"].min().date().isoformat() if not full_df.empty else None,
+                "to_date": full_df["date"].max().date().isoformat() if not full_df.empty else None,
+                "state_advanced": bool(len(full_df) > 0),
+            }
+        )
+        return state
+    except (PlaywrightTimeoutError, PlaywrightError) as exc:
+        state.update(
+            {
+                "status": "source_unavailable",
+                "failed_attempt_count": 1,
+                "source_unavailable_count": 1,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=SYNC_SOURCE_NAME,
+            fallback_type="nse_holidays_source_unavailable",
+            severity="warn",
+            reason="NSE holidays browser/API source was unavailable; trading calendar freshness may be degraded.",
+            error=exc,
+            metadata={
+                "classification": "source_unavailable",
+                "attempt_count": state["attempt_count"],
+            },
+        )
+        print(f"NSE holidays download skipped: {type(exc).__name__}: {exc}", flush=True)
+        return state
+    except Exception as exc:
+        state.update(
+            {
+                "status": "failed",
+                "failed_attempt_count": 1,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source=SYNC_SOURCE_NAME,
+            fallback_type="nse_holidays_download_failed",
+            severity="error",
+            reason="NSE holidays download or parsing failed; trading calendar freshness may be degraded.",
+            error=exc,
+            metadata={
+                "classification": "failed",
+                "attempt_count": state["attempt_count"],
+            },
+        )
+        print(f"NSE holidays download failed: {type(exc).__name__}: {exc}", flush=True)
+        return state
+    finally:
+        if page is not None:
+            page.close()
+        if browser is not None:
+            browser.close()
 
-    page.close()
-    browser.close()
 
-
-def main() -> None:
-
+def main() -> int:
+    global STOCKEY_RUN_STATE
     with sync_playwright() as p:
         if rop.get(REDIS_SET):
             print("Last crawl on ", rop.get(REDIS_SET))
 
-        download_holidays(p)
+        STOCKEY_RUN_STATE = download_holidays(p)
 
     rop.close()
+    status = str(STOCKEY_RUN_STATE.get("status") or "ok")
+    print(json.dumps({"status": status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

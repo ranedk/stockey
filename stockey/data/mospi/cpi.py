@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_dynamic_headers, get_with_retries, hidden_inputs_to_dict
 from utils.sync import get_db_max_date
@@ -25,6 +26,8 @@ PAGE_LOG_INTERVAL = 10
 MONTH_RETRY_ATTEMPTS = 3
 MONTH_RETRY_SLEEP_SECONDS = 2
 CPI_LOOKBACK_DAYS = max(env.int("MOSPI_CPI_LOOKBACK_DAYS", 365), 1)
+SYNC_SOURCE_NAME = "data.mospi.cpi"
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def first_of_month(d: date) -> date:
@@ -147,7 +150,16 @@ def derive_group_code(value: str | None) -> float:
     first = text.split(".", 1)[0]
     try:
         return float(int(first))
-    except ValueError:
+    except ValueError as exc:
+        record_local_fallback_event(
+            module="data.mospi.cpi",
+            source="cpi_group_code",
+            fallback_type="cpi_group_code_parse_failed",
+            severity="warn",
+            reason="MOSPI CPI group code could not be parsed from sub-group text and used the default group code 0.0.",
+            error=exc,
+            metadata={"value_excerpt": text[:240]},
+        )
         return 0.0
 
 
@@ -323,7 +335,7 @@ def sync_cpi_data(
     from_date: date | None = None,
     to_date: date | None = None,
     force: bool = False,
-):
+) -> dict[str, object]:
     """
     1. Build the list of months in scope.
     2. Check which months already exist in PostgreSQL.
@@ -337,10 +349,31 @@ def sync_cpi_data(
     existing_months = load_existing_cpi_months()
     latest_db_month = get_db_max_date("mospi_cpi", date_column="cpi_for_month")
     missing_months = all_months if force else [m for m in all_months if m not in existing_months]
+    state: dict[str, object] = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": 0,
+        "rows_read": len(missing_months),
+        "rows_written": 0,
+        "from_date": start_month.isoformat(),
+        "to_date": last_month.isoformat(),
+        "month_count": len(all_months),
+        "existing_month_count": len(existing_months),
+        "pending_month_count": len(missing_months),
+        "completed_month_count": 0,
+        "failed_month_count": 0,
+        "attempt_count": 0,
+        "download_attempts": 0,
+        "retry_count": 0,
+        "failed_attempt_count": 0,
+        "source_unavailable_count": 0,
+        "mode": "force" if force else "resume",
+        "fallback_used": False,
+        "state_advanced": False,
+    }
 
     if not missing_months:
         print("CPI data is already up-to-date ✅")
-        return
+        return state
 
     print(
         "CPI sync plan:",
@@ -357,12 +390,21 @@ def sync_cpi_data(
     for index, month_start in enumerate(missing_months, start=1):
         completed = False
         for attempt in range(1, MONTH_RETRY_ATTEMPTS + 1):
+            state["attempt_count"] = int(state["attempt_count"]) + 1
+            state["download_attempts"] = int(state["download_attempts"]) + 1
+            if attempt > 1:
+                state["retry_count"] = int(state["retry_count"]) + 1
             try:
                 print(
                     f"[{index}/{len(missing_months)}] Downloading CPI for {month_label(month_start)} "
                     f"(attempt {attempt}/{MONTH_RETRY_ATTEMPTS})"
                 )
-                download_cpi_month(month_start)
+                df = download_cpi_month(month_start)
+                rows_written = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+                state["rows"] = int(state["rows"]) + rows_written
+                state["rows_written"] = int(state["rows_written"]) + rows_written
+                state["completed_month_count"] = int(state["completed_month_count"]) + 1
+                state["state_advanced"] = bool(state["state_advanced"]) or rows_written > 0
                 print(f"[{index}/{len(missing_months)}] Completed CPI for {month_label(month_start)}")
                 completed = True
                 break
@@ -373,15 +415,39 @@ def sync_cpi_data(
                 )
                 raise
             except Exception as exc:
+                state["failed_attempt_count"] = int(state["failed_attempt_count"]) + 1
+                record_local_fallback_event(
+                    module=SYNC_SOURCE_NAME,
+                    source=f"mospi_cpi:{month_label(month_start)}",
+                    fallback_type="mospi_cpi_month_download_failed",
+                    severity="warn",
+                    reason=(
+                        "MOSPI CPI month download failed; sync will retry the month and resume later if "
+                        "all attempts fail."
+                    ),
+                    error=exc,
+                    metadata={
+                        "month": month_label(month_start),
+                        "attempt": attempt,
+                        "max_attempts": MONTH_RETRY_ATTEMPTS,
+                        "is_final_attempt": attempt == MONTH_RETRY_ATTEMPTS,
+                    },
+                )
                 print(
                     f"[{index}/{len(missing_months)}] Failed CPI for {month_label(month_start)} "
                     f"on attempt {attempt}/{MONTH_RETRY_ATTEMPTS}: {exc}"
                 )
                 if attempt == MONTH_RETRY_ATTEMPTS:
+                    failed_months = state.setdefault("failed_months", [])
+                    if isinstance(failed_months, list):
+                        failed_months.append({"month": month_label(month_start), "error": f"{type(exc).__name__}: {exc}"})
+                    state["failed_month_count"] = int(state["failed_month_count"]) + 1
+                    state["source_unavailable_count"] = int(state["source_unavailable_count"]) + 1
                     break
                 time.sleep(MONTH_RETRY_SLEEP_SECONDS)
         if not completed:
             break
+    return state
 
 
 def parse_args():
@@ -392,6 +458,14 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == "__main__":
+def main() -> int:
+    global STOCKEY_RUN_STATE
     args = parse_args()
-    sync_cpi_data(from_date=args.from_date, to_date=args.to_date, force=args.force)
+    STOCKEY_RUN_STATE = sync_cpi_data(from_date=args.from_date, to_date=args.to_date, force=args.force)
+    status = "partial" if int(STOCKEY_RUN_STATE.get("failed_month_count") or 0) else "ok"
+    print(json.dumps({"status": status, **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

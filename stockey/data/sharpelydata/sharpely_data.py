@@ -5,6 +5,7 @@ from datetime import datetime
 import pandas as pd
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.company_master import attach_company_master_id
 from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_with_retries
@@ -18,6 +19,27 @@ env.read_env()
 HEADERS = su.get_sharpely_headers()
 SHARPELY_STOCK_META_TABLE = "sharpely_stock_meta"
 SHARPELY_STOCK_PEERS_TABLE = "sharpely_stock_peers"
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
+def _record_sharpely_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    error: Exception | None = None,
+    symbol: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="data.sharpelydata.sharpely_data",
+        source="sharpely",
+        fallback_type=fallback_type,
+        severity="warn",
+        symbol=symbol,
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def filter_by_date_range(df: pd.DataFrame, from_date: datetime | None, to_date: datetime | None) -> pd.DataFrame:
@@ -33,7 +55,7 @@ def filter_by_date_range(df: pd.DataFrame, from_date: datetime | None, to_date: 
     return df.reset_index(drop=True)
 
 
-def get_financial_statement(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None):
+def get_financial_statement(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None) -> dict[str, object]:
     resp = get_with_retries(
         f"https://pyapiv2.mintbox.ai/api/core/getFinancialStatementsV2/ticker={symbol}",
         headers=HEADERS,
@@ -133,12 +155,15 @@ def get_financial_statement(symbol: str, from_date: datetime | None = None, to_d
         "stmt_cashflow": parse_consolidated_statement(symbol, fin["cas_consol_interim"], cashflow_fccs),
     }
 
+    row_counts: dict[str, int] = {}
     for table_name, df in table_map.items():
         if df.empty:
+            row_counts[table_name] = 0
             continue
         df["date"] = pd.to_datetime(df["date"])
         df = filter_by_date_range(df, from_date, to_date)
         if df.empty:
+            row_counts[table_name] = 0
             continue
         df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
         upsert_to_db(
@@ -147,6 +172,14 @@ def get_financial_statement(symbol: str, from_date: datetime | None = None, to_d
             unique_keys=["symbol", "date", "period_length"],
             timescaledb_column="date",
         )
+        row_counts[table_name] = int(len(df))
+    return {
+        "symbol": symbol,
+        "rows": int(sum(row_counts.values())),
+        "income_rows": row_counts.get("stmt_income", 0),
+        "balancesheet_rows": row_counts.get("stmt_balancesheet", 0),
+        "cashflow_rows": row_counts.get("stmt_cashflow", 0),
+    }
 
 
 def parse_consolidated_statement(symbol, data, fccs):
@@ -269,7 +302,14 @@ def load_latest_stock_meta(symbol: str) -> dict | None:
     if isinstance(raw_json, str):
         try:
             return json.loads(raw_json)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            _record_sharpely_fallback(
+                fallback_type="sharpely_cached_meta_json_parse_failed",
+                reason="Cached Sharpely stock metadata raw_json could not be parsed; using row fields as fallback.",
+                error=exc,
+                symbol=symbol.upper(),
+                metadata={"table": SHARPELY_STOCK_META_TABLE},
+            )
             return row
     return row
 
@@ -373,7 +413,7 @@ def get_stock_peers(symbol: str, meta: dict | None = None):
     return peers
 
 
-def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None):
+def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None) -> dict[str, object]:
     resp = get_with_retries(
         f"https://pyapiv2.mintbox.ai/api/core/getShareHoldingsDataAccord/symbol={symbol}",
         headers=HEADERS,
@@ -388,6 +428,7 @@ def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: da
             records.append(entry)
 
     df = pd.DataFrame(records)
+    category_rows = 0
     if not df.empty:
         df["symbol"] = symbol
         df = filter_by_date_range(df, from_date, to_date)
@@ -399,6 +440,7 @@ def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: da
                 unique_keys=["symbol", "date", "sh_code"],
                 timescaledb_column="date",
             )
+            category_rows = int(len(df))
 
     type_map = {
         "1": "indian",
@@ -418,13 +460,23 @@ def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: da
 
     df = pd.DataFrame(records)
     if df.empty:
-        return
+        return {
+            "symbol": symbol,
+            "rows": category_rows,
+            "category_rows": category_rows,
+            "top_holder_rows": 0,
+        }
 
     df["symbol"] = symbol
     df = df.drop_duplicates(subset=["symbol", "date", "name", "stype"], keep="last")
     df = filter_by_date_range(df, from_date, to_date)
     if df.empty:
-        return
+        return {
+            "symbol": symbol,
+            "rows": category_rows,
+            "category_rows": category_rows,
+            "top_holder_rows": 0,
+        }
     df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
     upsert_to_db(
         df,
@@ -432,9 +484,16 @@ def get_shareholding(symbol: str, from_date: datetime | None = None, to_date: da
         unique_keys=["symbol", "date", "name", "stype"],
         timescaledb_column="date",
     )
+    top_holder_rows = int(len(df))
+    return {
+        "symbol": symbol,
+        "rows": int(category_rows + top_holder_rows),
+        "category_rows": category_rows,
+        "top_holder_rows": top_holder_rows,
+    }
 
 
-def get_historical_mcap(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None):
+def get_historical_mcap(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None) -> dict[str, object]:
     json_data = {
         "stock": symbol,
         "metric_code": "mcap",
@@ -456,13 +515,13 @@ def get_historical_mcap(symbol: str, from_date: datetime | None = None, to_date:
 
     df = pd.DataFrame(records)
     if df.empty:
-        return
+        return {"symbol": symbol, "rows": 0}
     df["date"] = pd.to_datetime(df["date"])
     df["mcap"] = pd.to_numeric(df["mcap"], errors="coerce")
     df["symbol"] = symbol
     df = filter_by_date_range(df, from_date, to_date)
     if df.empty:
-        return
+        return {"symbol": symbol, "rows": 0}
     df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
     upsert_to_db(
         df,
@@ -470,17 +529,43 @@ def get_historical_mcap(symbol: str, from_date: datetime | None = None, to_date:
         unique_keys=["symbol", "date"],
         timescaledb_column="date",
     )
+    return {"symbol": symbol, "rows": int(len(df))}
 
 
-def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to_date: datetime | None = None):
-    _, to_date = normalize_date_window(from_date, to_date)
+def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to_date: datetime | None = None) -> dict[str, object]:
+    effective_from_date, to_date = normalize_date_window(from_date, to_date)
     snapshot_target = pd.Timestamp(to_date)
     if snapshot_target.tzinfo is not None:
         snapshot_target = snapshot_target.tz_convert("UTC").tz_localize(None)
     snapshot_target = snapshot_target.normalize()
     to_date = snapshot_target.to_pydatetime()
+    normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    summary: dict[str, object] = {
+        "source": "sharpely_fundamentals",
+        "symbols": normalized_symbols[:100],
+        "symbol_count": len(normalized_symbols),
+        "from_date": pd.Timestamp(effective_from_date).date().isoformat() if effective_from_date else None,
+        "to_date": pd.Timestamp(to_date).date().isoformat() if to_date else None,
+        "rows": 0,
+        "rows_read": len(normalized_symbols),
+        "rows_written": 0,
+        "meta_rows": 0,
+        "peer_rows": 0,
+        "statement_rows": 0,
+        "shareholding_rows": 0,
+        "historical_mcap_rows": 0,
+        "meta_refreshed_count": 0,
+        "peer_refreshed_count": 0,
+        "statement_refreshed_count": 0,
+        "shareholding_refreshed_count": 0,
+        "mcap_refreshed_count": 0,
+        "symbols_skipped_no_work": [],
+        "fallback_used": False,
+        "state_advanced": False,
+    }
 
-    for symbol in symbols:
+    for symbol in normalized_symbols:
+        symbol_work_count = 0
         meta_max_date = get_db_max_date(
             SHARPELY_STOCK_META_TABLE,
             date_column="as_on_date",
@@ -502,9 +587,17 @@ def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to
             if not meta_df.empty:
                 raw = meta_df.iloc[-1].get("raw_json")
                 cached_meta = json.loads(raw) if isinstance(raw, str) else None
+            meta_rows = int(len(meta_df))
+            summary["meta_rows"] = int(summary["meta_rows"]) + meta_rows
+            summary["meta_refreshed_count"] = int(summary["meta_refreshed_count"]) + 1
+            symbol_work_count += meta_rows
         if need_peers_snapshot:
             peer_payload = get_stock_peers(symbol, meta=cached_meta)
-            save_stock_peers(symbol, cached_meta or {}, peer_payload)
+            peer_df = save_stock_peers(symbol, cached_meta or {}, peer_payload)
+            peer_rows = int(len(peer_df))
+            summary["peer_rows"] = int(summary["peer_rows"]) + peer_rows
+            summary["peer_refreshed_count"] = int(summary["peer_refreshed_count"]) + 1
+            symbol_work_count += peer_rows
 
         stmt_from_date = choose_from_date(
             from_date,
@@ -515,7 +608,11 @@ def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to
             ],
         )
         if stmt_from_date <= to_date:
-            get_financial_statement(symbol, stmt_from_date, to_date)
+            statement_result = get_financial_statement(symbol, stmt_from_date, to_date)
+            statement_rows = int(statement_result.get("rows") or 0)
+            summary["statement_rows"] = int(summary["statement_rows"]) + statement_rows
+            summary["statement_refreshed_count"] = int(summary["statement_refreshed_count"]) + 1
+            symbol_work_count += statement_rows
 
         shareholding_from_date = choose_from_date(
             from_date,
@@ -525,17 +622,42 @@ def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to
             ],
         )
         if shareholding_from_date <= to_date:
-            get_shareholding(symbol, shareholding_from_date, to_date)
+            shareholding_result = get_shareholding(symbol, shareholding_from_date, to_date)
+            shareholding_rows = int(shareholding_result.get("rows") or 0)
+            summary["shareholding_rows"] = int(summary["shareholding_rows"]) + shareholding_rows
+            summary["shareholding_refreshed_count"] = int(summary["shareholding_refreshed_count"]) + 1
+            symbol_work_count += shareholding_rows
 
         mcap_from_date = choose_from_date(
             from_date,
             [get_db_max_date("historical_mcap", filters={"symbol": symbol})],
         )
         if mcap_from_date <= to_date:
-            get_historical_mcap(symbol, mcap_from_date, to_date)
+            mcap_result = get_historical_mcap(symbol, mcap_from_date, to_date)
+            mcap_rows = int(mcap_result.get("rows") or 0)
+            summary["historical_mcap_rows"] = int(summary["historical_mcap_rows"]) + mcap_rows
+            summary["mcap_refreshed_count"] = int(summary["mcap_refreshed_count"]) + 1
+            symbol_work_count += mcap_rows
+        if symbol_work_count <= 0:
+            skipped = list(summary["symbols_skipped_no_work"])
+            if len(skipped) < 100:
+                skipped.append(symbol)
+            summary["symbols_skipped_no_work"] = skipped
+    rows_written = (
+        int(summary["meta_rows"])
+        + int(summary["peer_rows"])
+        + int(summary["statement_rows"])
+        + int(summary["shareholding_rows"])
+        + int(summary["historical_mcap_rows"])
+    )
+    summary["rows"] = rows_written
+    summary["rows_written"] = rows_written
+    summary["state_advanced"] = rows_written > 0
+    return summary
 
 
-def main():
+def main() -> int:
+    global STOCKEY_RUN_STATE
     parser = argparse.ArgumentParser(description="Sync Sharpely fundamentals for tracked symbols")
     parser.add_argument("--symbols", nargs="*", help="Symbols, comma-separated or repeated")
     parser.add_argument("--from-date", dest="from_date", help="Start date in YYYY-MM-DD")
@@ -546,12 +668,14 @@ def main():
     if not symbols:
         raise SystemExit("No symbols provided. Use --symbols, STOCKEY_SYMBOLS, or config/tracked_symbols.txt")
 
-    sync_sharpely_data(
+    STOCKEY_RUN_STATE = sync_sharpely_data(
         symbols=symbols,
         from_date=parse_datetime_arg(args.from_date),
         to_date=parse_datetime_arg(args.to_date),
     )
+    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

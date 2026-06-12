@@ -8,11 +8,12 @@ import pandas as pd
 from environs import Env
 from pydantic import BaseModel, Field
 
-from advisory.fallback_telemetry import record_fallback_event
+from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.codex_cli import run_codex_structured
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
@@ -20,8 +21,12 @@ env = Env()
 env.read_env()
 
 TABLE_NAME = "advisory_event_policy_actions"
+EVENT_POLICY_SCHEMA_MIGRATION_ID = "20260611_advisory_event_policy_actions_base"
+EVENT_POLICY_ACTIONABILITY_SCHEMA_MIGRATION_ID = "20260611_advisory_event_policy_actionability"
 EVALUATIONS_TABLE = "advisory_event_evaluations"
 REVIEWS_TABLE = "advisory_event_reviews"
+DHAN_DAILY_TABLE = "dhan_ohlcv_daily"
+PORTFOLIO_TABLE = "advisory_portfolio_orders"
 PROMPT_ID = "event_policy_manual_review"
 PROMPT_VERSION = registry_prompt_version(PROMPT_ID)
 PROMPT_SCHEMA_VERSION = response_schema_version(PROMPT_ID)
@@ -87,6 +92,55 @@ def _event_label(policy_class: str) -> str:
     return EVENT_CLASS_LABELS.get(key, key.replace("_", " ").lower() if key else "company event")
 MATERIALITY_ORDER = {"low": 1, "medium": 2, "high": 3}
 RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
+EVENT_POLICY_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+        published_on TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        policy_at TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        unique_id TEXT NOT NULL,
+        event_source TEXT,
+        event_class TEXT,
+        policy_class TEXT,
+        source_verdict TEXT,
+        source_setup_effect TEXT,
+        review_action TEXT,
+        action_type TEXT,
+        action_status TEXT,
+        policy_score DOUBLE PRECISION,
+        confidence DOUBLE PRECISION,
+        action_reason TEXT,
+        action_detail TEXT,
+        checks_json TEXT,
+        operator_notes_json TEXT,
+        llm_review_json TEXT,
+        llm_prompt_id TEXT,
+        llm_prompt_version TEXT,
+        llm_prompt_schema_version TEXT,
+        llm_review_status TEXT,
+        llm_review_model TEXT,
+        llm_review_error TEXT,
+        raw_context_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS operator_notes_json TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS llm_review_json TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS llm_prompt_id TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS llm_prompt_version TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS llm_prompt_schema_version TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS llm_review_status TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS llm_review_model TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS llm_review_error TEXT",
+]
+EVENT_POLICY_ACTIONABILITY_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS actionability_json TEXT",
+]
 
 
 class EventPolicyManualReview(BaseModel):
@@ -110,8 +164,16 @@ def _text(value: Any, default: str = "") -> str:
     try:
         if pd.isna(value):
             return default
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.event_policy",
+            fallback_type="event_policy_text_missing_check_failed",
+            source="text",
+            severity="warn",
+            reason="Event-policy normalization could not evaluate missingness while normalizing text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     text = str(value).strip()
     if text.lower() in {"", "nan", "none", "null", "<na>"}:
         return default
@@ -136,6 +198,306 @@ def _bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _timestamp_text(value: Any) -> str:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return ""
+    return ts.isoformat()
+
+
+def _event_age_days(row: pd.Series) -> float | None:
+    published = pd.to_datetime(row.get("published_on"), utc=True, errors="coerce")
+    asof = pd.to_datetime(row.get("asof_date"), utc=True, errors="coerce")
+    if pd.isna(published) or pd.isna(asof):
+        return None
+    return round(max(0.0, float((asof - published).total_seconds()) / 86400.0), 3)
+
+
+def _freshness_bucket(age_days: float | None, expected_decay_days: float) -> str:
+    if age_days is None:
+        return "unknown"
+    if age_days <= 2:
+        return "fresh"
+    if expected_decay_days > 0 and age_days <= expected_decay_days:
+        return "within_expected_decay"
+    if age_days <= 14:
+        return "aging"
+    return "stale"
+
+
+def _price_reaction_bucket(value: float | None) -> str:
+    if value is None:
+        return "unknown"
+    if value >= 0.05:
+        return "strong_positive"
+    if value >= 0.02:
+        return "positive"
+    if value <= -0.05:
+        return "strong_negative"
+    if value <= -0.02:
+        return "negative"
+    return "muted"
+
+
+def _current_exposure_bucket(row: pd.Series) -> str:
+    for column in ["current_position_state", "portfolio_state", "holding_state", "position_state"]:
+        text = _text(row.get(column)).lower()
+        if text:
+            if any(token in text for token in ["hold", "open", "invested", "long", "approved", "trimmed"]):
+                return "open_position"
+            if any(token in text for token in ["watch", "candidate", "deferred", "planned"]):
+                return "watching"
+            if any(token in text for token in ["exit", "closed", "none", "flat"]):
+                return "no_open_position"
+            return text
+    exposure_value = max(
+        _num(row.get("approved_capital"), 0.0),
+        _num(row.get("approved_allocation_inr"), 0.0),
+        _num(row.get("allocated_capital"), 0.0),
+        _num(row.get("current_position_value"), 0.0),
+        _num(row.get("position_value"), 0.0),
+    )
+    return "open_position" if exposure_value > 0 else "unknown"
+
+
+def _jsonish(value: Any, *, source: str = "event_policy_json_context") -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if value is None or pd.isna(value):
+        return None
+    text = _text(value)
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.event_policy",
+            fallback_type="event_policy_json_parse_failed",
+            source=source,
+            severity="warn",
+            reason="Event policy could not parse stored JSON context and used an empty/default value.",
+            error=exc,
+            metadata={
+                "value_length": len(text),
+                "value_excerpt": text[:240],
+            },
+        )
+        return None
+
+
+def _jsonish_text(value: Any, *, source: str = "event_policy_json_text_context") -> str:
+    parsed = _jsonish(value, source=source)
+    if parsed is None:
+        return _text(value).lower()
+    if isinstance(parsed, dict):
+        return " ".join(f"{key}={val}" for key, val in parsed.items()).lower()
+    if isinstance(parsed, list):
+        return " ".join(str(item) for item in parsed).lower()
+    return str(parsed).lower()
+
+
+def _compact_text_list(value: Any, *, max_items: int = 12, source: str = "event_policy_compact_text_list") -> list[str]:
+    parsed = _jsonish(value, source=source)
+    if isinstance(parsed, dict):
+        for key in ["items", "values", "symbols", "sectors", "peers"]:
+            if key in parsed:
+                return _compact_text_list(parsed.get(key), max_items=max_items)
+        values = parsed.values()
+    elif isinstance(parsed, list):
+        values = parsed
+    else:
+        text = _text(value)
+        values = text.replace(";", ",").split(",") if text else []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = _text(item).strip()
+        if not text:
+            continue
+        key = text.upper()
+        if key in seen:
+            continue
+        out.append(text[:80])
+        seen.add(key)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _first_nonempty(*values: Any) -> Any:
+    for value in values:
+        if _text(value):
+            return value
+    return None
+
+
+def _affected_market_scope(row: pd.Series) -> dict[str, Any]:
+    tensor = _jsonish(row.get("event_tensor_json"), source="event_tensor_json")
+    tensor = tensor if isinstance(tensor, dict) else {}
+    sectors = _compact_text_list(
+        _first_nonempty(row.get("affected_sectors_json"), tensor.get("affected_sectors")),
+        max_items=10,
+        source="affected_sectors_json",
+    )
+    peers = _compact_text_list(
+        _first_nonempty(row.get("affected_peers_json"), tensor.get("affected_peers")),
+        max_items=12,
+        source="affected_peers_json",
+    )
+    if peers and sectors:
+        scope_type = "sector_and_peer_group"
+    elif peers:
+        scope_type = "peer_group"
+    elif sectors:
+        scope_type = "sector"
+    else:
+        scope_type = "single_company_or_unknown"
+    return {
+        "scope_type": scope_type,
+        "affected_sectors": sectors,
+        "affected_peers": peers,
+        "affected_sector_count": len(sectors),
+        "affected_peer_count": len(peers),
+        "note": "Derived from structured event evaluation affected_sectors/affected_peers fields when available.",
+    }
+
+
+def _source_quality(row: pd.Series) -> dict[str, Any]:
+    source = _text(row.get("event_source"), "unknown").lower()
+    source_reliability = _text(row.get("source_reliability"), "medium").lower()
+    parse_status = _text(row.get("parse_status"), "unknown").lower()
+    trace_text = _jsonish_text(row.get("source_trace_json"), source="source_trace_json")
+    tensor_text = _jsonish_text(row.get("event_tensor_json"), source="event_tensor_json")
+    evidence_text = " ".join([source, parse_status, trace_text, tensor_text])
+
+    if any(token in evidence_text for token in ["ocr", "document", "pdf", "raw_announcement_document_fallback"]):
+        family = "derived_document"
+        authority = "derived"
+        base = "medium"
+        confirmation_required = True
+        rationale = "Document/OCR-derived evidence depends on parse quality and should be reviewed before action."
+    elif any(token in source for token in ["exchange", "announcement", "nse"]) and not any(
+        token in source for token in ["news", "rss"]
+    ):
+        family = "exchange_filing"
+        authority = "primary"
+        base = "high"
+        confirmation_required = False
+        rationale = "Exchange/company announcement source is primary evidence."
+    elif any(token in evidence_text for token in ["news", "rss", "economic_times", "economictimes"]):
+        family = "market_news"
+        authority = "secondary"
+        base = "medium"
+        confirmation_required = True
+        rationale = "News/RSS is useful context but should be confirmed by primary filings before action."
+    else:
+        family = "unknown"
+        authority = "unknown"
+        base = "medium" if source_reliability == "high" else source_reliability if source_reliability in {"low", "medium"} else "unknown"
+        confirmation_required = True
+        rationale = "Source type is not mapped; verify reliability manually."
+
+    parse_good = parse_status in {"completed", "complete", "parsed", "success", "ok", "rss"}
+    parse_bad = parse_status in {"failed", "error", "timeout", "ocr_failed", "parse_failed", "unparsed"}
+    if parse_bad:
+        base = "low"
+        confirmation_required = True
+        rationale = f"{rationale} parse_status={parse_status} lowers source quality."
+    elif source_reliability == "low":
+        base = "low"
+        confirmation_required = True
+        rationale = f"{rationale} Extractor marked source_reliability=low."
+    elif source_reliability == "high" and base == "medium" and family == "derived_document" and parse_good:
+        rationale = f"{rationale} Parsed document has high extractor reliability, but derived evidence remains capped at medium."
+    elif source_reliability == "high" and base == "medium" and family == "unknown":
+        rationale = f"{rationale} Extractor reliability is high, but source type is unknown so authority remains capped."
+    elif source_reliability == "medium" and base == "high":
+        rationale = f"{rationale} Extractor reliability is medium; keep primary-source authority but require normal review."
+
+    confidence_ceiling = {"high": 0.9, "medium": 0.7, "low": 0.45}.get(base, 0.5)
+    return {
+        "source_type": source or "unknown",
+        "source_family": family,
+        "quality": base,
+        "authority": authority,
+        "source_reliability": source_reliability or "unknown",
+        "parse_status": parse_status or "unknown",
+        "confirmation_required": confirmation_required,
+        "confidence_ceiling": confidence_ceiling,
+        "rationale": rationale,
+    }
+
+
+def build_actionability_context(row: pd.Series, *, policy_class: str, action_type: str, action_status: str) -> dict[str, Any]:
+    score_impact = _num(row.get("score_impact"))
+    confidence = _num(row.get("confidence"))
+    materiality = _text(row.get("materiality"), "low").lower()
+    expected_decay_days = _num(row.get("expected_decay_days"), 0.0)
+    age_days = _event_age_days(row)
+    price_reaction = None
+    for column in ["price_reaction", "price_reaction_pct", "event_return", "same_day_return", "return_1d"]:
+        if _text(row.get(column)):
+            price_reaction = _num(row.get(column))
+            break
+    market_scope = _affected_market_scope(row)
+    next_evidence: list[str] = []
+    if action_type in {"MANUAL_REVIEW", "REDUCE_EXPOSURE_REVIEW"}:
+        next_evidence.extend(
+            [
+                "Latest price/volume reaction versus the event day",
+                "Whether the stock is currently held, watched, or flat",
+                "Primary-source follow-up or management clarification if available",
+            ]
+        )
+    if policy_class in NEGATIVE_CLASSES:
+        next_evidence.append("Current stop/invalidation level and whether it has been breached")
+    if policy_class in POSITIVE_CLASSES:
+        next_evidence.append("Technical trigger confirmation and liquidity check before any entry")
+    if price_reaction is None:
+        next_evidence.append("Point-in-time price reaction is missing; refresh OHLCV/event evidence before deciding")
+    if market_scope["affected_sector_count"] or market_scope["affected_peer_count"]:
+        next_evidence.append("Check whether affected peers/sectors confirm or contradict the event thesis")
+    return {
+        "version": 1,
+        "materiality": materiality,
+        "confidence": round(float(confidence), 4),
+        "score_impact": round(float(score_impact), 4),
+        "freshness": {
+            "published_on": _timestamp_text(row.get("published_on")),
+            "asof_date": _timestamp_text(row.get("asof_date")),
+            "age_days": age_days,
+            "expected_decay_days": expected_decay_days,
+            "bucket": _freshness_bucket(age_days, expected_decay_days),
+        },
+        "current_exposure": {
+            "bucket": _current_exposure_bucket(row),
+            "note": "Derived from optional current portfolio/position columns when present; otherwise unknown.",
+        },
+        "price_reaction": {
+            "value": price_reaction,
+            "bucket": _price_reaction_bucket(price_reaction),
+            "note": "Uses optional point-in-time event-return columns when available.",
+        },
+        "source_quality": _source_quality(row),
+        "market_scope": market_scope,
+        "suggested_next_evidence": list(dict.fromkeys(next_evidence))[:8],
+        "review_priority": (
+            "high"
+            if action_type == "REDUCE_EXPOSURE_REVIEW" or materiality == "high" or abs(score_impact) >= 0.25
+            else "medium"
+            if action_type == "MANUAL_REVIEW" or materiality == "medium" or abs(score_impact) >= 0.12
+            else "low"
+        ),
+        "deterministic_boundary": {
+            "final_action_authority": "action_consolidation",
+            "broker_executable": False,
+            "policy_action_type": action_type,
+            "policy_action_status": action_status,
+        },
+    }
+
+
 def _table_exists(table_name: str) -> bool:
     df = sql_to_df(
         """
@@ -150,58 +512,32 @@ def _table_exists(table_name: str) -> bool:
     return not df.empty
 
 
+def _table_columns(table_name: str) -> set[str]:
+    df = sql_to_df(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        """,
+        params=(table_name,),
+    )
+    return set(df["column_name"].astype(str).tolist()) if not df.empty else set()
+
+
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                published_on TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                policy_at TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                unique_id TEXT NOT NULL,
-                event_source TEXT,
-                event_class TEXT,
-                policy_class TEXT,
-                source_verdict TEXT,
-                source_setup_effect TEXT,
-                review_action TEXT,
-                action_type TEXT,
-                action_status TEXT,
-                policy_score DOUBLE PRECISION,
-                confidence DOUBLE PRECISION,
-                action_reason TEXT,
-                action_detail TEXT,
-                checks_json TEXT,
-                operator_notes_json TEXT,
-                llm_review_json TEXT,
-                llm_prompt_id TEXT,
-                llm_prompt_version TEXT,
-                llm_prompt_schema_version TEXT,
-                llm_review_status TEXT,
-                llm_review_model TEXT,
-                llm_review_error TEXT,
-                raw_context_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        column_defs = {
-            "operator_notes_json": "TEXT",
-            "llm_review_json": "TEXT",
-            "llm_prompt_id": "TEXT",
-            "llm_prompt_version": "TEXT",
-            "llm_prompt_schema_version": "TEXT",
-            "llm_review_status": "TEXT",
-            "llm_review_model": "TEXT",
-            "llm_review_error": "TEXT",
-        }
-        for column, sql_type in column_defs.items():
-            cur.execute(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    apply_schema_migration(
+        migration_id=EVENT_POLICY_SCHEMA_MIGRATION_ID,
+        description="Create event-policy action overlay table.",
+        statements=EVENT_POLICY_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME], "authority_scope": "review_overlay_only"},
+    )
+    apply_schema_migration(
+        migration_id=EVENT_POLICY_ACTIONABILITY_SCHEMA_MIGRATION_ID,
+        description="Add event-policy actionability context for operator review.",
+        statements=EVENT_POLICY_ACTIONABILITY_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME], "authority_scope": "review_overlay_only", "additive": True},
+    )
 
 
 def load_policy_inputs(
@@ -253,6 +589,69 @@ def load_policy_inputs(
             LIMIT 1
         ) r ON TRUE
         """
+    price_select = ""
+    price_join = ""
+    dhan_columns = _table_columns(DHAN_DAILY_TABLE) if _table_exists(DHAN_DAILY_TABLE) else set()
+    if {"ticker", "date", "close"}.issubset(dhan_columns):
+        daily_desc_order = "d.date DESC NULLS LAST" + (", d.load_ts DESC NULLS LAST" if "load_ts" in dhan_columns else "")
+        daily_asc_order = "d.date ASC NULLS LAST" + (", d.load_ts DESC NULLS LAST" if "load_ts" in dhan_columns else "")
+        price_select = """
+            , current_px.close AS current_reference_price
+            , current_px.date AS current_reference_date
+            , event_px.close AS event_reference_price
+            , event_px.date AS event_reference_date
+            , CASE
+                WHEN current_px.close IS NOT NULL AND event_px.close IS NOT NULL AND event_px.close > 0
+                THEN (current_px.close / event_px.close) - 1.0
+                ELSE NULL
+              END AS price_reaction_pct
+        """
+        price_join = f"""
+        LEFT JOIN LATERAL (
+            SELECT d.close, d.date
+            FROM {DHAN_DAILY_TABLE} d
+            WHERE UPPER(TRIM(d.ticker)) = UPPER(TRIM(e.symbol))
+              AND d.close IS NOT NULL
+              AND d.date::date <= e.asof_date::date
+            ORDER BY {daily_desc_order}
+            LIMIT 1
+        ) current_px ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT d.close, d.date
+            FROM {DHAN_DAILY_TABLE} d
+            WHERE UPPER(TRIM(d.ticker)) = UPPER(TRIM(e.symbol))
+              AND d.close IS NOT NULL
+              AND d.date::date >= e.published_on::date
+              AND d.date::date <= e.asof_date::date
+            ORDER BY {daily_asc_order}
+            LIMIT 1
+        ) event_px ON TRUE
+        """
+    portfolio_select = ""
+    portfolio_join = ""
+    portfolio_columns = _table_columns(PORTFOLIO_TABLE) if _table_exists(PORTFOLIO_TABLE) else set()
+    if {"symbol", "asof_date", "portfolio_status", "approved_allocation_inr"}.issubset(portfolio_columns):
+        portfolio_order_parts = ["p.asof_date DESC NULLS LAST"]
+        if "published_on" in portfolio_columns:
+            portfolio_order_parts.append("p.published_on DESC NULLS LAST")
+        if "load_ts" in portfolio_columns:
+            portfolio_order_parts.append("p.load_ts DESC NULLS LAST")
+        portfolio_reason_expr = "p.portfolio_reason" if "portfolio_reason" in portfolio_columns else "NULL"
+        portfolio_select = """
+            , portfolio_ctx.portfolio_status AS current_position_state
+            , portfolio_ctx.approved_allocation_inr AS approved_allocation_inr
+            , portfolio_ctx.portfolio_reason AS current_position_reason
+        """
+        portfolio_join = f"""
+        LEFT JOIN LATERAL (
+            SELECT p.portfolio_status, p.approved_allocation_inr, {portfolio_reason_expr} AS portfolio_reason
+            FROM {PORTFOLIO_TABLE} p
+            WHERE UPPER(TRIM(p.symbol)) = UPPER(TRIM(e.symbol))
+              AND p.asof_date::date <= e.asof_date::date
+            ORDER BY {', '.join(portfolio_order_parts)}
+            LIMIT 1
+        ) portfolio_ctx ON TRUE
+        """
     return sql_to_df(
         f"""
         SELECT
@@ -265,6 +664,7 @@ def load_policy_inputs(
             e.unique_id,
             e.event_source,
             e.subject,
+            e.parse_status,
             e.materiality,
             e.setup_effect,
             e.direction,
@@ -273,6 +673,8 @@ def load_policy_inputs(
             e.contradiction,
             e.expected_decay_days,
             e.source_reliability,
+            e.affected_sectors_json,
+            e.affected_peers_json,
             e.governance_risk,
             e.balance_sheet_risk,
             e.execution_risk,
@@ -284,10 +686,15 @@ def load_policy_inputs(
             e.confidence,
             e.what_happened,
             e.rationale,
-            e.event_tensor_json
+            e.event_tensor_json,
+            e.source_trace_json
             {review_select}
+            {price_select}
+            {portfolio_select}
         FROM {EVALUATIONS_TABLE} e
         {review_join}
+        {price_join}
+        {portfolio_join}
         WHERE {' AND '.join(clauses)}
         ORDER BY e.published_on DESC, e.setup_id, e.symbol
         """,
@@ -388,6 +795,7 @@ def build_policy_for_event(row: pd.Series) -> dict[str, Any]:
         reason = "Positive event was downgraded because adversarial review requires manual verification."
         checks.append({"check_type": "adversarial_review", "blocking": True, "rationale": f"review_action={review_action}"})
 
+    actionability = build_actionability_context(row, policy_class=policy_class, action_type=action_type, action_status=action_status)
     raw_context = {
         "event_policy_version": 1,
         "event_class": _text(row.get("event_class")),
@@ -401,7 +809,12 @@ def build_policy_for_event(row: pd.Series) -> dict[str, Any]:
         "confidence": confidence,
         "what_happened": _text(row.get("what_happened")),
         "rationale": _text(row.get("rationale")),
+        "parse_status": _text(row.get("parse_status")),
+        "affected_sectors": _compact_text_list(row.get("affected_sectors_json"), source="affected_sectors_json"),
+        "affected_peers": _compact_text_list(row.get("affected_peers_json"), source="affected_peers_json"),
         "event_tensor": row.get("event_tensor_json"),
+        "source_trace": _jsonish(row.get("source_trace_json"), source="source_trace_json") or row.get("source_trace_json"),
+        "actionability": actionability,
     }
     return {
         "published_on": row.get("published_on"),
@@ -433,6 +846,7 @@ def build_policy_for_event(row: pd.Series) -> dict[str, Any]:
         "llm_review_status": "not_requested",
         "llm_review_model": None,
         "llm_review_error": None,
+        "actionability_json": json_dumps(actionability),
         "raw_context_json": json_dumps(raw_context),
         "load_ts": pd.Timestamp.utcnow(),
     }
@@ -454,12 +868,16 @@ def _manual_review_prompt(policy_row: dict[str, Any]) -> str:
 def _deterministic_operator_notes(policy_row: dict[str, Any], *, status: str, error: str | None = None) -> dict[str, Any]:
     action_type = _text(policy_row.get("action_type"), "MANUAL_REVIEW").upper()
     policy_class = _text(policy_row.get("policy_class"), "OTHER")
+    actionability = json.loads(policy_row.get("actionability_json") or "{}")
+    next_evidence = actionability.get("suggested_next_evidence") if isinstance(actionability, dict) else []
     notes = {
         "final_action_type": action_type,
         "confidence": _num(policy_row.get("confidence")),
         "operator_summary": _text(policy_row.get("action_reason"), "Manual review required before this event can affect an action."),
         "possible_action": "Keep this as review-only evidence until follow-up data confirms materiality and market reaction.",
-        "wait_for_events": [
+        "wait_for_events": list(next_evidence)[:5]
+        if isinstance(next_evidence, list) and next_evidence
+        else [
             "Next price/volume reaction after the event",
             "Follow-up exchange clarification or management commentary",
             "Technical trigger or support failure",
@@ -469,6 +887,7 @@ def _deterministic_operator_notes(policy_row: dict[str, Any], *, status: str, er
             "Is the event already priced in?",
             "Does technical structure confirm or contradict the event?",
         ],
+        "actionability": actionability,
         "downgrade_reason": None,
         "rationale": "Deterministic fallback notes generated because LLM review was unavailable or disabled.",
         "status": status,

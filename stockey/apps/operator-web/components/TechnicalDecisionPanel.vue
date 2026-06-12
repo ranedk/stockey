@@ -15,11 +15,13 @@ const scoreKeys = [
 ] as const
 
 const visible = computed(() => Boolean(
-  first(['technical_context', 'technical_state', 'technical_trigger_type', 'technical_score', 'setup_score', 'stop_price', 'recommended_stop_price', 'invalidation_price', 'target_price', 'technical_trigger_note', 'active_exit_condition', 'exit_strategy'])
+  first(['technical_context', 'technical_state', 'technical_trigger_type', 'entry_trigger_type', 'technical_score', 'technical_total_score', 'setup_score', 'stop_price', 'recommended_stop_price', 'invalidation_price', 'target_price', 'technical_trigger_note', 'active_exit_condition', 'exit_condition_status', 'exit_strategy'])
   || nestedFirst([
     ['recommendation_reason', 'evidence', 'technical', 'technical_state'],
     ['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type'],
+    ['recommendation_reason', 'evidence', 'technical', 'entry_trigger_type'],
     ['recommendation_reason', 'evidence', 'technical', 'technical_score'],
+    ['recommendation_reason', 'evidence', 'technical', 'technical_total_score'],
     ['recommendation_reason', 'evidence', 'technical', 'setup_score']
   ])
 ))
@@ -75,6 +77,40 @@ function priceText(value: unknown) {
 function scoreValue(key: string) {
   return first([key]) ?? nested(['recommendation_reason', 'evidence', 'technical', key])
 }
+
+function scoreTotal() {
+  return value(['technical_total_score', 'technical_score', 'setup_score'], [
+    ['recommendation_reason', 'evidence', 'technical', 'technical_total_score'],
+    ['recommendation_reason', 'evidence', 'technical', 'technical_score'],
+    ['recommendation_reason', 'evidence', 'technical', 'setup_score']
+  ])
+}
+
+function triggerType() {
+  return value(['technical_trigger_type', 'entry_trigger_type', 'entry_type', 'trigger_type'], [
+    ['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type'],
+    ['recommendation_reason', 'evidence', 'technical', 'entry_trigger_type'],
+    ['recommendation_reason', 'evidence', 'technical', 'entry_type'],
+    ['recommendation_reason', 'evidence', 'technical', 'trigger_type']
+  ])
+}
+
+function pivotPrice() {
+  return value(['pivot_price', 'trigger_price', 'entry_price'], [
+    ['recommendation_reason', 'evidence', 'technical', 'pivot_price'],
+    ['recommendation_reason', 'evidence', 'technical', 'trigger_price'],
+    ['recommendation_reason', 'evidence', 'technical', 'entry_price']
+  ])
+}
+
+function exitCondition() {
+  return value(['active_exit_condition', 'exit_condition_status', 'technical_exit_condition'], [
+    ['recommendation_reason', 'evidence', 'lifecycle', 'active_exit_condition'],
+    ['recommendation_reason', 'evidence', 'lifecycle', 'exit_condition_status'],
+    ['recommendation_reason', 'evidence', 'technical', 'active_exit_condition'],
+    ['recommendation_reason', 'evidence', 'technical', 'exit_condition_status']
+  ])
+}
 </script>
 
 <template>
@@ -89,15 +125,15 @@ function scoreValue(key: string) {
           ]) || 'Technical context available.' }}
         </p>
       </div>
-      <StatusPill :tone="String(value(['technical_state', 'technical_trigger_type', 'action_code', 'status'], [['recommendation_reason', 'evidence', 'technical', 'technical_state']]) || '').toLowerCase().includes('reject') ? 'danger' : 'info'">
-        {{ value(['technical_state', 'technical_trigger_type'], [['recommendation_reason', 'evidence', 'technical', 'technical_state'], ['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type']]) || 'TECHNICAL' }}
+      <StatusPill :tone="String(value(['technical_state', 'technical_trigger_type', 'active_exit_condition', 'action_code', 'status'], [['recommendation_reason', 'evidence', 'technical', 'technical_state']]) || '').toLowerCase().match(/reject|exit|sell|failure/) ? 'danger' : 'info'">
+        {{ value(['technical_state', 'technical_trigger_type', 'entry_trigger_type'], [['recommendation_reason', 'evidence', 'technical', 'technical_state'], ['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type'], ['recommendation_reason', 'evidence', 'technical', 'entry_trigger_type']]) || 'TECHNICAL' }}
       </StatusPill>
     </div>
 
     <div class="mt-3 grid gap-2 text-sm md:grid-cols-4">
-      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Total:</b> {{ scoreText(value(['technical_score', 'setup_score'], [['recommendation_reason', 'evidence', 'technical', 'technical_score'], ['recommendation_reason', 'evidence', 'technical', 'setup_score']])) }}</p>
-      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Trigger:</b> {{ value(['technical_trigger_type', 'entry_type', 'trigger_type'], [['recommendation_reason', 'evidence', 'technical', 'technical_trigger_type']]) || '-' }}</p>
-      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Pivot:</b> {{ priceText(value(['pivot_price', 'trigger_price', 'entry_price'], [['recommendation_reason', 'evidence', 'technical', 'pivot_price'], ['recommendation_reason', 'evidence', 'technical', 'trigger_price']])) }}</p>
+      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Total:</b> {{ scoreText(scoreTotal()) }}</p>
+      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Trigger:</b> {{ triggerType() || '-' }}</p>
+      <p class="rounded-xl bg-white/80 px-3 py-2"><b>Pivot:</b> {{ priceText(pivotPrice()) }}</p>
       <p class="rounded-xl bg-white/80 px-3 py-2"><b>Stop:</b> {{ priceText(value(['recommended_stop_price', 'stop_price', 'invalidation_price'], [['recommendation_reason', 'evidence', 'risk', 'recommended_stop_price'], ['recommendation_reason', 'evidence', 'risk', 'stop_price'], ['recommendation_reason', 'evidence', 'risk', 'invalidation_price']])) }}</p>
     </div>
 
@@ -117,6 +153,7 @@ function scoreValue(key: string) {
       <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
         <p class="rounded-xl bg-white/75 px-3 py-2"><b>Invalidation:</b> {{ value(['invalidation_rule', 'active_exit_condition'], [['recommendation_reason', 'evidence', 'lifecycle', 'next_action_reason']]) || priceText(value(['invalidation_price'], [['recommendation_reason', 'evidence', 'risk', 'invalidation_price']])) }}</p>
         <p class="rounded-xl bg-white/75 px-3 py-2"><b>Exit plan:</b> {{ first(['exit_strategy', 'partial_exit_plan', 'exit_condition_status']) || '-' }}</p>
+        <p class="rounded-xl bg-white/75 px-3 py-2"><b>Exit condition:</b> {{ exitCondition() || '-' }}</p>
         <p class="rounded-xl bg-white/75 px-3 py-2"><b>Setup score:</b> {{ scoreText(value(['setup_score'], [['recommendation_reason', 'evidence', 'technical', 'setup_score']])) }}</p>
       </div>
     </details>

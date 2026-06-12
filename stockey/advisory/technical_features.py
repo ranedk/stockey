@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import talib
 
 from advisory.data_sync import ensure_advisory_symbol_inputs
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.peer_sync import sync_peer_data
 from features.tutils import get_max_date
 from utils.company_master import map_company_master_ids
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.sync import load_tracked_symbols, parse_datetime_arg
 
 
@@ -24,6 +26,25 @@ MIN_SECTOR_PEER_COUNT = 3
 MAX_GAP_FREQ_60D = 0.15
 
 
+def _record_technical_features_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.technical_features",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
 def normalize_timestamp(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True, errors="coerce").dt.normalize()
 
@@ -32,15 +53,25 @@ def resolve_symbol_universe(symbols: list[str] | None) -> list[str]:
     values = load_tracked_symbols(symbols)
     if values:
         return values
-    df = sql_to_df(
-        """
-        SELECT DISTINCT ticker AS symbol
-        FROM dhan_ohlcv_daily
-        WHERE asset_type = 'stock'
-          AND exchange = 'NSE'
-        ORDER BY symbol
-        """
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT DISTINCT ticker AS symbol
+            FROM dhan_ohlcv_daily
+            WHERE asset_type = 'stock'
+              AND exchange = 'NSE'
+            ORDER BY symbol
+            """
+        )
+    except Exception as exc:
+        _record_technical_features_fallback(
+            fallback_type="technical_features_universe_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Technical feature builder could not load the default stock universe from Dhan daily OHLCV.",
+            error=exc,
+            metadata={"provided_symbol_count": 0 if symbols is None else len(symbols)},
+        )
+        raise
     if df.empty:
         return []
     return (
@@ -69,15 +100,29 @@ def load_benchmark_series(
         if to_date is not None:
             fallback_clauses.append("date <= %(to_date)s")
             fallback_params["to_date"] = to_date
-        nse_df = sql_to_df(
-            f"""
-            SELECT index_name AS ticker, date, close
-            FROM nseindia_indices
-            WHERE {' AND '.join(fallback_clauses)}
-            ORDER BY date
-            """,
-            params=fallback_params,
-        )
+        try:
+            nse_df = sql_to_df(
+                f"""
+                SELECT index_name AS ticker, date, close
+                FROM nseindia_indices
+                WHERE {' AND '.join(fallback_clauses)}
+                ORDER BY date
+                """,
+                params=fallback_params,
+            )
+        except Exception as exc:
+            _record_technical_features_fallback(
+                fallback_type="technical_features_nse_benchmark_load_failed",
+                source="nseindia_indices",
+                reason="Technical feature builder could not load the preferred NSE NIFTY benchmark and will try Dhan benchmark rows.",
+                error=exc,
+                metadata={
+                    "benchmark_name": benchmark_name,
+                    "start_date": str(start_date) if start_date is not None else None,
+                    "to_date": str(to_date) if to_date is not None else None,
+                },
+            )
+            nse_df = pd.DataFrame()
         if not nse_df.empty:
             df = nse_df
             df["date"] = normalize_timestamp(df["date"])
@@ -93,15 +138,29 @@ def load_benchmark_series(
     if to_date is not None:
         clauses.append("date <= %(to_date)s")
         params["to_date"] = to_date
-    df = sql_to_df(
-        f"""
-        SELECT ticker, date, close
-        FROM dhan_ohlcv_daily
-        WHERE {' AND '.join(clauses)}
-        ORDER BY date
-        """,
-        params=params,
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT ticker, date, close
+            FROM dhan_ohlcv_daily
+            WHERE {' AND '.join(clauses)}
+            ORDER BY date
+            """,
+            params=params,
+        )
+    except Exception as exc:
+        _record_technical_features_fallback(
+            fallback_type="technical_features_dhan_benchmark_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Technical feature builder could not load benchmark rows from Dhan daily OHLCV.",
+            error=exc,
+            metadata={
+                "benchmark_name": benchmark_name,
+                "start_date": str(start_date) if start_date is not None else None,
+                "to_date": str(to_date) if to_date is not None else None,
+            },
+        )
+        raise
     if df.empty:
         return df
     df["date"] = normalize_timestamp(df["date"])
@@ -128,26 +187,40 @@ def load_price_history(
         clauses.append("date <= %s")
         params.append(to_date)
 
-    df = sql_to_df(
-        f"""
-        SELECT
-            ticker AS symbol,
-            'EQ' AS series,
-            security_id,
-            NULL::text AS isin,
-            date,
-            open AS adj_open,
-            high AS adj_high,
-            low AS adj_low,
-            close AS adj_close,
-            volume,
-            close * volume AS total_value
-        FROM dhan_ohlcv_daily
-        WHERE {' AND '.join(clauses)}
-        ORDER BY ticker, date
-        """,
-        params=tuple(params),
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                ticker AS symbol,
+                'EQ' AS series,
+                security_id,
+                NULL::text AS isin,
+                date,
+                open AS adj_open,
+                high AS adj_high,
+                low AS adj_low,
+                close AS adj_close,
+                volume,
+                close * volume AS total_value
+            FROM dhan_ohlcv_daily
+            WHERE {' AND '.join(clauses)}
+            ORDER BY ticker, date
+            """,
+            params=tuple(params),
+        )
+    except Exception as exc:
+        _record_technical_features_fallback(
+            fallback_type="technical_features_price_history_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Technical feature builder could not load stock OHLCV history.",
+            error=exc,
+            metadata={
+                "symbol_count": len(symbols),
+                "start_date": str(start_date) if start_date is not None else None,
+                "to_date": str(to_date) if to_date is not None else None,
+            },
+        )
+        raise
     if df.empty:
         return df
     df["date"] = normalize_timestamp(df["date"])
@@ -168,14 +241,24 @@ def load_price_history(
 def load_sector_mapping(symbols: list[str]) -> pd.DataFrame:
     if not symbols:
         return pd.DataFrame(columns=["symbol", "sector_code"])
-    df = sql_to_df(
-        """
-        SELECT symbol, sector_code
-        FROM master_sharpely_equity
-        WHERE symbol = ANY(%s)
-        """,
-        params=(symbols,),
-    )
+    try:
+        df = sql_to_df(
+            """
+            SELECT symbol, sector_code
+            FROM master_sharpely_equity
+            WHERE symbol = ANY(%s)
+            """,
+            params=(symbols,),
+        )
+    except Exception as exc:
+        _record_technical_features_fallback(
+            fallback_type="technical_features_sector_mapping_load_failed",
+            source="master_sharpely_equity",
+            reason="Technical feature builder could not load sector mapping for RS-vs-sector features.",
+            error=exc,
+            metadata={"symbol_count": len(symbols)},
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -186,46 +269,56 @@ def load_sector_mapping(symbols: list[str]) -> pd.DataFrame:
 def load_latest_peer_memberships(anchor_symbols: list[str]) -> pd.DataFrame:
     if not anchor_symbols:
         return pd.DataFrame()
-    df = sql_to_df(
-        """
-        WITH sector_counts AS (
+    try:
+        df = sql_to_df(
+            """
+            WITH sector_counts AS (
+                SELECT
+                    UPPER(TRIM(symbol)) AS symbol,
+                    TRIM(sector_code) AS sector_code,
+                    COUNT(*) AS row_count
+                FROM master_sharpely_equity
+                WHERE NULLIF(TRIM(symbol), '') IS NOT NULL
+                  AND NULLIF(TRIM(sector_code), '') IS NOT NULL
+                  AND UPPER(TRIM(symbol)) = ANY(%s)
+                GROUP BY UPPER(TRIM(symbol)), TRIM(sector_code)
+            ),
+            ranked AS (
+                SELECT
+                    symbol,
+                    sector_code,
+                    ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY row_count DESC, sector_code) AS rn
+                FROM sector_counts
+            ),
+            anchors AS (
+                SELECT symbol AS anchor_symbol, sector_code
+                FROM ranked
+                WHERE rn = 1
+            )
             SELECT
-                UPPER(TRIM(symbol)) AS symbol,
-                TRIM(sector_code) AS sector_code,
-                COUNT(*) AS row_count
-            FROM master_sharpely_equity
-            WHERE NULLIF(TRIM(symbol), '') IS NOT NULL
-              AND NULLIF(TRIM(sector_code), '') IS NOT NULL
-              AND UPPER(TRIM(symbol)) = ANY(%s)
-            GROUP BY UPPER(TRIM(symbol)), TRIM(sector_code)
-        ),
-        ranked AS (
-            SELECT
-                symbol,
-                sector_code,
-                ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY row_count DESC, sector_code) AS rn
-            FROM sector_counts
-        ),
-        anchors AS (
-            SELECT symbol AS anchor_symbol, sector_code
-            FROM ranked
-            WHERE rn = 1
+                anchors.anchor_symbol,
+                ranked.symbol AS peer_symbol,
+                anchors.sector_code,
+                NULL::text AS industry_code,
+                NULL::text AS nse_basic_ind_code
+            FROM anchors
+            JOIN ranked
+              ON ranked.rn = 1
+             AND ranked.sector_code = anchors.sector_code
+             AND ranked.symbol <> anchors.anchor_symbol
+            ORDER BY anchors.anchor_symbol, ranked.symbol
+            """,
+            params=(anchor_symbols,),
         )
-        SELECT
-            anchors.anchor_symbol,
-            ranked.symbol AS peer_symbol,
-            anchors.sector_code,
-            NULL::text AS industry_code,
-            NULL::text AS nse_basic_ind_code
-        FROM anchors
-        JOIN ranked
-          ON ranked.rn = 1
-         AND ranked.sector_code = anchors.sector_code
-         AND ranked.symbol <> anchors.anchor_symbol
-        ORDER BY anchors.anchor_symbol, ranked.symbol
-        """,
-        params=(anchor_symbols,),
-    )
+    except Exception as exc:
+        _record_technical_features_fallback(
+            fallback_type="technical_features_peer_membership_load_failed",
+            source="master_sharpely_equity",
+            reason="Technical feature builder could not load peer memberships for RS-vs-sector features.",
+            error=exc,
+            metadata={"anchor_symbol_count": len(anchor_symbols)},
+        )
+        raise
     if df.empty:
         return df
     df["anchor_symbol"] = df["anchor_symbol"].astype("string").str.upper()
@@ -249,15 +342,29 @@ def load_peer_ohlcv(
     if to_date is not None:
         clauses.append("date <= %s")
         params.append(to_date)
-    df = sql_to_df(
-        f"""
-        SELECT ticker, date, close
-        FROM dhan_ohlcv_daily
-        WHERE {' AND '.join(clauses)}
-        ORDER BY ticker, date
-        """,
-        params=tuple(params),
-    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT ticker, date, close
+            FROM dhan_ohlcv_daily
+            WHERE {' AND '.join(clauses)}
+            ORDER BY ticker, date
+            """,
+            params=tuple(params),
+        )
+    except Exception as exc:
+        _record_technical_features_fallback(
+            fallback_type="technical_features_peer_ohlcv_load_failed",
+            source="dhan_ohlcv_daily",
+            reason="Technical feature builder could not load peer OHLCV for RS-vs-sector features.",
+            error=exc,
+            metadata={
+                "peer_symbol_count": len(peer_symbols),
+                "start_date": str(start_date) if start_date is not None else None,
+                "to_date": str(to_date) if to_date is not None else None,
+            },
+        )
+        raise
     if df.empty:
         return df
     df["date"] = normalize_timestamp(df["date"])
@@ -629,14 +736,20 @@ def persist_technical_features(
     if df.empty:
         return
     if rebuild:
-        with db_session() as (_, cur):
-            if symbols:
-                cur.execute(
-                    f"DELETE FROM {TABLE_NAME} WHERE symbol = ANY(%s)",
-                    (symbols,),
-                )
-            else:
-                cur.execute(f"DELETE FROM {TABLE_NAME}")
+        def _delete_existing_technical_features() -> None:
+            with db_session() as (_, cur):
+                if symbols:
+                    cur.execute(
+                        f"DELETE FROM {TABLE_NAME} WHERE symbol = ANY(%s)",
+                        (symbols,),
+                    )
+                else:
+                    cur.execute(f"DELETE FROM {TABLE_NAME}")
+
+        execute_db_operation(
+            _delete_existing_technical_features,
+            operation_name="technical_features:delete_rebuild_features",
+        )
     upsert_to_db(
         df,
         TABLE_NAME,

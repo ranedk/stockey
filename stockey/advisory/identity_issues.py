@@ -6,18 +6,64 @@ from typing import Any
 
 import pandas as pd
 
-from utils.db import db_session, sql_to_df
+from advisory.fallback_telemetry import record_local_fallback_event
+from utils.db import db_session, execute_db_operation, sql_to_df
+from utils.schema_migrations import apply_schema_migration
 
 
 IDENTITY_ISSUES_TABLE = "advisory_identity_issues"
+IDENTITY_ISSUES_SCHEMA_MIGRATION_ID = "20260611_advisory_identity_issues_base"
+IDENTITY_ISSUES_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {IDENTITY_ISSUES_TABLE} (
+        issue_key TEXT PRIMARY KEY,
+        first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        status TEXT NOT NULL DEFAULT 'open',
+        issue_type TEXT NOT NULL,
+        symbol TEXT,
+        requested_exchange TEXT,
+        asset_type TEXT,
+        company_master_id TEXT,
+        source TEXT,
+        error_text TEXT,
+        exchanges_tried_json TEXT,
+        fallback_tried_json TEXT,
+        suggested_action TEXT,
+        context_json TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 1,
+        resolution_error_text TEXT,
+        resolution_context_json TEXT,
+        resolved_at TIMESTAMPTZ,
+        load_ts TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS source TEXT",
+    f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 1",
+    f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolution_error_text TEXT",
+    f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolution_context_json TEXT",
+    f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ",
+    f"""
+    CREATE INDEX IF NOT EXISTS idx_{IDENTITY_ISSUES_TABLE}_open
+        ON {IDENTITY_ISSUES_TABLE} (status, last_seen_at DESC)
+    """,
+]
 
 
 def _text(value: Any) -> str | None:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.identity_issues",
+            fallback_type="identity_issue_text_missing_check_failed",
+            source="text",
+            severity="warn",
+            reason="Identity issue normalization could not evaluate missingness while normalizing text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     text = str(value).strip()
     return text or None
 
@@ -27,44 +73,12 @@ def _json_dumps(value: Any) -> str:
 
 
 def ensure_identity_issues_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {IDENTITY_ISSUES_TABLE} (
-                issue_key TEXT PRIMARY KEY,
-                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                status TEXT NOT NULL DEFAULT 'open',
-                issue_type TEXT NOT NULL,
-                symbol TEXT,
-                requested_exchange TEXT,
-                asset_type TEXT,
-                company_master_id TEXT,
-                source TEXT,
-                error_text TEXT,
-                exchanges_tried_json TEXT,
-                fallback_tried_json TEXT,
-                suggested_action TEXT,
-                context_json TEXT,
-                attempt_count INTEGER NOT NULL DEFAULT 1,
-                resolution_error_text TEXT,
-                resolution_context_json TEXT,
-                resolved_at TIMESTAMPTZ,
-                load_ts TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            """
-        )
-        cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS source TEXT")
-        cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 1")
-        cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolution_error_text TEXT")
-        cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolution_context_json TEXT")
-        cur.execute(f"ALTER TABLE {IDENTITY_ISSUES_TABLE} ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ")
-        cur.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_{IDENTITY_ISSUES_TABLE}_open
-                ON {IDENTITY_ISSUES_TABLE} (status, last_seen_at DESC)
-            """
-        )
+    apply_schema_migration(
+        migration_id=IDENTITY_ISSUES_SCHEMA_MIGRATION_ID,
+        description="Create Dhan/security identity issue tracking table.",
+        statements=IDENTITY_ISSUES_SCHEMA_STATEMENTS,
+        metadata={"tables": [IDENTITY_ISSUES_TABLE]},
+    )
 
 
 def record_dhan_identity_issue(
@@ -107,74 +121,81 @@ def record_dhan_identity_issue(
         "context_json": _json_dumps({"company_master": company_payload}),
     }
     ensure_identity_issues_table()
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            INSERT INTO {IDENTITY_ISSUES_TABLE} (
-                issue_key,
-                first_seen_at,
-                last_seen_at,
-                status,
-                issue_type,
-                symbol,
-                requested_exchange,
-                asset_type,
-                company_master_id,
-                source,
-                error_text,
-                exchanges_tried_json,
-                fallback_tried_json,
-                suggested_action,
-                context_json,
-                attempt_count,
-                resolution_error_text,
-                resolution_context_json,
-                resolved_at,
-                load_ts
+
+    def _upsert_issue() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                INSERT INTO {IDENTITY_ISSUES_TABLE} (
+                    issue_key,
+                    first_seen_at,
+                    last_seen_at,
+                    status,
+                    issue_type,
+                    symbol,
+                    requested_exchange,
+                    asset_type,
+                    company_master_id,
+                    source,
+                    error_text,
+                    exchanges_tried_json,
+                    fallback_tried_json,
+                    suggested_action,
+                    context_json,
+                    attempt_count,
+                    resolution_error_text,
+                    resolution_context_json,
+                    resolved_at,
+                    load_ts
+                )
+                VALUES (
+                    %(issue_key)s,
+                    now(),
+                    now(),
+                    'open',
+                    %(issue_type)s,
+                    %(symbol)s,
+                    %(requested_exchange)s,
+                    %(asset_type)s,
+                    %(company_master_id)s,
+                    %(source)s,
+                    %(error_text)s,
+                    %(exchanges_tried_json)s,
+                    %(fallback_tried_json)s,
+                    %(suggested_action)s,
+                    %(context_json)s,
+                    1,
+                    NULL,
+                    NULL,
+                    NULL,
+                    now()
+                )
+                ON CONFLICT (issue_key) DO UPDATE SET
+                    last_seen_at = EXCLUDED.last_seen_at,
+                    status = 'open',
+                    attempt_count = COALESCE({IDENTITY_ISSUES_TABLE}.attempt_count, 0) + 1,
+                    symbol = EXCLUDED.symbol,
+                    requested_exchange = EXCLUDED.requested_exchange,
+                    asset_type = EXCLUDED.asset_type,
+                    company_master_id = EXCLUDED.company_master_id,
+                    source = EXCLUDED.source,
+                    error_text = EXCLUDED.error_text,
+                    exchanges_tried_json = EXCLUDED.exchanges_tried_json,
+                    fallback_tried_json = EXCLUDED.fallback_tried_json,
+                    suggested_action = EXCLUDED.suggested_action,
+                    context_json = EXCLUDED.context_json,
+                    resolution_error_text = NULL,
+                    resolution_context_json = NULL,
+                    resolved_at = NULL,
+                    load_ts = EXCLUDED.load_ts
+                """,
+                row,
             )
-            VALUES (
-                %(issue_key)s,
-                now(),
-                now(),
-                'open',
-                %(issue_type)s,
-                %(symbol)s,
-                %(requested_exchange)s,
-                %(asset_type)s,
-                %(company_master_id)s,
-                %(source)s,
-                %(error_text)s,
-                %(exchanges_tried_json)s,
-                %(fallback_tried_json)s,
-                %(suggested_action)s,
-                %(context_json)s,
-                1,
-                NULL,
-                NULL,
-                NULL,
-                now()
-            )
-            ON CONFLICT (issue_key) DO UPDATE SET
-                last_seen_at = EXCLUDED.last_seen_at,
-                status = 'open',
-                attempt_count = COALESCE({IDENTITY_ISSUES_TABLE}.attempt_count, 0) + 1,
-                symbol = EXCLUDED.symbol,
-                requested_exchange = EXCLUDED.requested_exchange,
-                asset_type = EXCLUDED.asset_type,
-                company_master_id = EXCLUDED.company_master_id,
-                source = EXCLUDED.source,
-                error_text = EXCLUDED.error_text,
-                exchanges_tried_json = EXCLUDED.exchanges_tried_json,
-                fallback_tried_json = EXCLUDED.fallback_tried_json,
-                suggested_action = EXCLUDED.suggested_action,
-                context_json = EXCLUDED.context_json,
-                resolution_error_text = NULL,
-                resolution_context_json = NULL,
-                resolved_at = NULL,
-                load_ts = EXCLUDED.load_ts
-            """,
-            row,
-        )
+
+    execute_db_operation(
+        _upsert_issue,
+        operation_name="identity_issues:record_dhan_identity_issue",
+    )
     return row
 
 
@@ -188,19 +209,26 @@ def mark_identity_issue_resolved(
         raise ValueError("issue_key is required")
     ensure_identity_issues_table()
     context_json = _json_dumps(resolution_context or {})
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            UPDATE {IDENTITY_ISSUES_TABLE}
-            SET status = 'resolved',
-                resolved_at = now(),
-                resolution_error_text = NULL,
-                resolution_context_json = %s,
-                load_ts = now()
-            WHERE issue_key = %s
-            """,
-            (context_json, key),
-        )
+
+    def _mark_resolved() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                UPDATE {IDENTITY_ISSUES_TABLE}
+                SET status = 'resolved',
+                    resolved_at = now(),
+                    resolution_error_text = NULL,
+                    resolution_context_json = %s,
+                    load_ts = now()
+                WHERE issue_key = %s
+                """,
+                (context_json, key),
+            )
+
+    execute_db_operation(
+        _mark_resolved,
+        operation_name="identity_issues:mark_resolved",
+    )
     return {"issue_key": key, "status": "resolved", "resolution_context": resolution_context or {}}
 
 
@@ -216,18 +244,25 @@ def mark_identity_issue_resolution_failed(
     ensure_identity_issues_table()
     context_json = _json_dumps(resolution_context or {})
     error = _text(error_text) or "Resolution failed"
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            UPDATE {IDENTITY_ISSUES_TABLE}
-            SET status = 'open',
-                resolution_error_text = %s,
-                resolution_context_json = %s,
-                load_ts = now()
-            WHERE issue_key = %s
-            """,
-            (error, context_json, key),
-        )
+
+    def _mark_failed() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                UPDATE {IDENTITY_ISSUES_TABLE}
+                SET status = 'open',
+                    resolution_error_text = %s,
+                    resolution_context_json = %s,
+                    load_ts = now()
+                WHERE issue_key = %s
+                """,
+                (error, context_json, key),
+            )
+
+    execute_db_operation(
+        _mark_failed,
+        operation_name="identity_issues:mark_resolution_failed",
+    )
     return {"issue_key": key, "status": "open", "error_text": error, "resolution_context": resolution_context or {}}
 
 
@@ -266,6 +301,21 @@ def _resolve_one_issue(row: dict[str, Any], *, apply: bool) -> dict[str, Any]:
     except Exception as exc:
         error_text = f"{type(exc).__name__}: {exc}"
         context = {"checked_symbol": symbol, "requested_exchange": requested_exchange, "asset_type": asset_type}
+        record_local_fallback_event(
+            module="advisory.identity_issues",
+            fallback_type="identity_issue_resolution_failed",
+            source="data.dhanlive.dhan_db.resolve_dhan_identity",
+            severity="warn",
+            symbol=symbol or None,
+            reason="Open Dhan/security identity issue could not be resolved and remains open.",
+            error=exc,
+            metadata={
+                "issue_key": issue_key,
+                "requested_exchange": requested_exchange,
+                "asset_type": asset_type,
+                "apply": bool(apply),
+            },
+        )
         if apply:
             mark_identity_issue_resolution_failed(issue_key, error_text=error_text, resolution_context=context)
         return {

@@ -9,15 +9,32 @@ from typing import Any
 import pandas as pd
 import yaml
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.news_overlay_engine import load_recent_market_news, normalize_text, resolve_asof_date
 from data.screenerin.screener_parser import upsert_registered_screener
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_THEME_CONFIG = REPO_ROOT / "config" / "investment_themes.yaml"
 DEFAULT_LOOKBACK_LIMIT = 25
 THEME_SCREENERS_TABLE = "advisory_news_theme_screeners"
+NEWS_THEME_SCHEMA_MIGRATION_ID = "20260611_advisory_news_theme_screeners_base"
+NEWS_THEME_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {THEME_SCREENERS_TABLE} (
+        theme_id TEXT NOT NULL,
+        screener_slug TEXT NOT NULL,
+        screener_name TEXT,
+        screener_url TEXT NOT NULL,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_ts TIMESTAMPTZ NOT NULL,
+        updated_ts TIMESTAMPTZ NOT NULL,
+        UNIQUE (theme_id, screener_slug)
+    )
+    """,
+]
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -223,12 +240,30 @@ def build_theme_recommendations(*, asof_date: pd.Timestamp | None = None, config
     try:
         resolved = resolve_asof_date(asof_date)
     except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.news_theme_engine",
+            fallback_type="news_theme_asof_resolve_failed",
+            source="advisory_market_overlay_daily",
+            severity="warn",
+            reason="News theme recommendations returned empty output because as-of date resolution failed.",
+            error=exc,
+            metadata={"asof_date": str(asof_date) if asof_date is not None else None},
+        )
         return {"asof_date": None, "recommendations": [], "news_count": 0, "error": f"failed_to_resolve_asof_date: {exc.__class__.__name__}"}
     if resolved is None:
         return {"asof_date": None, "recommendations": [], "news_count": 0}
     try:
         news_rows = load_recent_market_news(resolved)
     except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.news_theme_engine",
+            fallback_type="news_theme_market_news_load_failed",
+            source="advisory_market_overlay_daily",
+            severity="warn",
+            reason="News theme recommendations returned empty output because recent market news loading failed.",
+            error=exc,
+            metadata={"asof_date": str(resolved)},
+        )
         return {
             "asof_date": resolved,
             "recommendations": [],
@@ -245,21 +280,13 @@ def build_theme_recommendations(*, asof_date: pd.Timestamp | None = None, config
 
 
 def ensure_theme_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {THEME_SCREENERS_TABLE} (
-                theme_id TEXT NOT NULL,
-                screener_slug TEXT NOT NULL,
-                screener_name TEXT,
-                screener_url TEXT NOT NULL,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_ts TIMESTAMPTZ NOT NULL,
-                updated_ts TIMESTAMPTZ NOT NULL,
-                UNIQUE (theme_id, screener_slug)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=NEWS_THEME_SCHEMA_MIGRATION_ID,
+        statements=NEWS_THEME_SCHEMA_STATEMENTS,
+        owner="advisory.news_theme_engine",
+        description="Create news theme to Screener.in mapping table.",
+        metadata={"tables": [THEME_SCREENERS_TABLE], "workflow": "news_theme_screeners"},
+    )
 
 
 def register_theme_screener(*, theme_id: str, screener_url: str, screener_name: str | None = None) -> dict[str, Any]:
@@ -327,6 +354,18 @@ def load_active_theme_screener_mapping(*, asof_date: pd.Timestamp | None = None,
     try:
         df = list_theme_screeners()
     except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.news_theme_engine",
+            fallback_type="news_theme_screener_mapping_load_failed",
+            source=THEME_SCREENERS_TABLE,
+            severity="warn",
+            reason="Active news-theme recommendations could not load mapped Screener.in screeners.",
+            error=exc,
+            metadata={
+                "asof_date": None if asof_date is None else str(asof_date),
+                "theme_ids": active_theme_ids,
+            },
+        )
         return {
             "theme_ids": active_theme_ids,
             "screener_slugs": [],

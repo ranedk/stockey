@@ -1,4 +1,6 @@
 # bhavcopy_downloader.py
+import argparse
+import json
 import random
 from datetime import datetime
 
@@ -6,6 +8,8 @@ import redis
 import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
+from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.sync_state import persist_sync_state
 from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
 from utils.sync import get_redis_client
@@ -19,6 +23,8 @@ REDIS_HOST = env("REDIS_HOST")
 REDIS_PORT = env("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:events"
+SYNC_SOURCE_NAME = "data.nseindia.recent_events"
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def get_random(min_ms: int, max_ms: int) -> int:
@@ -30,7 +36,7 @@ def dowload_events(
     playwright,
     formatted_date: str,
     rop: redis.Redis,
-) -> bool:
+) -> dict[str, object]:
     """
     Download the calendar csv file for all events
     Returns True on success, False on any exception.
@@ -51,13 +57,14 @@ def dowload_events(
     file_path = f"calendar_{formatted_date}.csv"
     download.save_as(file_path)
 
-    parse_csv(file_path)
+    df = parse_csv(file_path)
 
     print(f"✅ Success: {formatted_date}")
     rop.sadd(REDIS_SET, formatted_date)
 
     page.close()
     browser.close()
+    return {"formatted_date": formatted_date, "rows": int(len(df)), "file_path": file_path}
 
 
 def parse_event_dates(values: pd.Series) -> pd.Series:
@@ -70,7 +77,20 @@ def parse_event_dates(values: pd.Series) -> pd.Series:
     if missing.any():
         try:
             parsed.loc[missing] = pd.to_datetime(raw.loc[missing], format="mixed", dayfirst=True, errors="coerce")
-        except ValueError:
+        except ValueError as exc:
+            record_local_fallback_event(
+                module=SYNC_SOURCE_NAME,
+                source="nse_recent_events.date",
+                fallback_type="nse_recent_events_mixed_date_parser_failed",
+                severity="info",
+                reason="Pandas mixed date parser was unavailable or rejected NSE event-calendar dates; falling back to dayfirst parser.",
+                deterministic_fallback=True,
+                error=exc,
+                metadata={
+                    "sample_values": raw.loc[missing].head(5).astype(str).tolist(),
+                    "fallback_parser": "pd.to_datetime(dayfirst=True)",
+                },
+            )
             parsed.loc[missing] = pd.to_datetime(raw.loc[missing], dayfirst=True, errors="coerce")
     return parsed
 
@@ -90,19 +110,50 @@ def parse_csv(csv_file):
     return df
 
 
-def main() -> None:
+def main() -> int:
+    global STOCKEY_RUN_STATE
+    parser = argparse.ArgumentParser(description="Download and parse NSE recent event calendar")
+    parser.add_argument("--date", help="Optional event calendar date in YYYY-MM-DD; defaults to today")
+    args = parser.parse_args()
     rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
+    rows_written = 0
+    formatted_date = args.date or datetime.today().strftime("%Y-%m-%d")
 
-    with sync_playwright() as p:
-        date_obj = datetime.today()
-        formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
-
-        dowload_events(
-            p, formatted_date, rop
+    try:
+        with sync_playwright() as p:
+            result = dowload_events(p, formatted_date, rop)
+            rows_written = int(result.get("rows") or 0)
+    except Exception as exc:
+        persist_sync_state(
+            source_name=SYNC_SOURCE_NAME,
+            status="error",
+            error_text=f"{type(exc).__name__}: {exc}",
+            state={"date": formatted_date, "rows_written": rows_written},
         )
-
-    rop.close()
+        raise
+    finally:
+        rop.close()
+    STOCKEY_RUN_STATE = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": rows_written,
+        "rows_read": 1,
+        "rows_written": rows_written,
+        "from_date": formatted_date,
+        "to_date": formatted_date,
+        "event_date": formatted_date,
+        "fallback_used": False,
+        "state_advanced": rows_written > 0,
+    }
+    persist_sync_state(
+        source_name=SYNC_SOURCE_NAME,
+        status="ok",
+        last_success_at=pd.Timestamp.utcnow(),
+        last_item_ts=pd.Timestamp(formatted_date),
+        state=STOCKEY_RUN_STATE,
+    )
+    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

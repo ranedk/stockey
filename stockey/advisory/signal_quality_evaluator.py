@@ -8,24 +8,97 @@ import pandas as pd
 
 from advisory.company_memory_review import TABLE_NAME as COMPANY_MEMORY_TABLE
 from advisory.event_evidence_store import BHAVCOPY_EVIDENCE_TABLE
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
 from advisory.technical_threshold_calibration import (
     attach_forward_returns,
     load_price_history_for_returns,
     load_technical_signal_rows,
 )
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 EVALUATIONS_TABLE = "advisory_signal_quality_evaluations"
 SUMMARY_TABLE = "advisory_signal_quality_eval_summary"
+SIGNAL_QUALITY_SCHEMA_MIGRATION_ID = "20260611_advisory_signal_quality_evaluator_base"
 DEFAULT_HORIZONS = [5, 10, 20]
 DEFAULT_RETURN_THRESHOLD = 0.03
 DEFAULT_COST_BPS = 25.0
 DEFAULT_MIN_MATURED_ROWS = 10
 DEFAULT_TECHNICAL_MIN = 70.0
 DEFAULT_NEAR_TECHNICAL_MIN = 65.0
+SIGNAL_QUALITY_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        horizon_days BIGINT NOT NULL,
+        asof_date TIMESTAMPTZ NOT NULL,
+        setup_id TEXT,
+        symbol TEXT NOT NULL,
+        variant TEXT NOT NULL,
+        technical_pass BOOLEAN,
+        near_technical_pass BOOLEAN,
+        event_positive BOOLEAN,
+        event_negative BOOLEAN,
+        bhavcopy_positive BOOLEAN,
+        bhavcopy_negative BOOLEAN,
+        company_memory_positive BOOLEAN,
+        company_memory_negative BOOLEAN,
+        selected BOOLEAN,
+        technical_total_score DOUBLE PRECISION,
+        technical_state TEXT,
+        candidate_state TEXT,
+        technical_trigger_type TEXT,
+        event_action_type TEXT,
+        event_policy_class TEXT,
+        event_policy_score DOUBLE PRECISION,
+        event_confidence DOUBLE PRECISION,
+        bhavcopy_deal_pressure TEXT,
+        bhavcopy_evidence_score DOUBLE PRECISION,
+        bhavcopy_deal_net_value_inr DOUBLE PRECISION,
+        company_memory_signal TEXT,
+        company_memory_confidence DOUBLE PRECISION,
+        company_memory_conviction_score DOUBLE PRECISION,
+        entry_date TIMESTAMPTZ,
+        exit_date TIMESTAMPTZ,
+        entry_close DOUBLE PRECISION,
+        exit_close DOUBLE PRECISION,
+        forward_return DOUBLE PRECISION,
+        forward_return_after_cost DOUBLE PRECISION,
+        hit_after_cost BOOLEAN,
+        matured BOOLEAN,
+        raw_context_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (evaluated_at, horizon_days, asof_date, setup_id, symbol, variant)
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
+        evaluated_at TIMESTAMPTZ NOT NULL,
+        horizon_days BIGINT NOT NULL,
+        variant TEXT NOT NULL,
+        sample_count BIGINT,
+        selected_count BIGINT,
+        matured_count BIGINT,
+        selection_rate DOUBLE PRECISION,
+        avg_forward_return DOUBLE PRECISION,
+        median_forward_return DOUBLE PRECISION,
+        avg_forward_return_after_cost DOUBLE PRECISION,
+        hit_rate_after_cost DOUBLE PRECISION,
+        positive_return_rate DOUBLE PRECISION,
+        baseline_avg_forward_return_after_cost DOUBLE PRECISION,
+        lift_vs_technical_only DOUBLE PRECISION,
+        avg_selected_technical_score DOUBLE PRECISION,
+        sample_start TIMESTAMPTZ,
+        sample_end TIMESTAMPTZ,
+        recommendation TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (evaluated_at, horizon_days, variant)
+    )
+    """,
+]
 
 VARIANTS = [
     "technical_only",
@@ -93,9 +166,34 @@ def _json_ready(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_signal_quality_fallback(
+            fallback_type="signal_quality_json_ready_missing_check_failed",
+            source="json_ready",
+            reason="Signal-quality evaluator could not evaluate missingness while preparing JSON and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
+
+
+def _record_signal_quality_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.signal_quality_evaluator",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
 
 
 def table_columns(table_name: str) -> set[str]:
@@ -111,7 +209,14 @@ def table_columns(table_name: str) -> set[str]:
             retries=2,
             statement_timeout_ms=5000,
         )
-    except Exception:
+    except Exception as exc:
+        _record_signal_quality_fallback(
+            fallback_type="signal_quality_evaluator_schema_lookup_failed",
+            source=table_name,
+            reason="Signal-quality evaluator could not inspect source table columns.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
         return set()
     return set(df["column_name"].astype(str).tolist()) if not df.empty else set()
 
@@ -173,79 +278,12 @@ def normalize_summary_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def ensure_tables() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                horizon_days BIGINT NOT NULL,
-                asof_date TIMESTAMPTZ NOT NULL,
-                setup_id TEXT,
-                symbol TEXT NOT NULL,
-                variant TEXT NOT NULL,
-                technical_pass BOOLEAN,
-                near_technical_pass BOOLEAN,
-                event_positive BOOLEAN,
-                event_negative BOOLEAN,
-                bhavcopy_positive BOOLEAN,
-                bhavcopy_negative BOOLEAN,
-                company_memory_positive BOOLEAN,
-                company_memory_negative BOOLEAN,
-                selected BOOLEAN,
-                technical_total_score DOUBLE PRECISION,
-                technical_state TEXT,
-                candidate_state TEXT,
-                technical_trigger_type TEXT,
-                event_action_type TEXT,
-                event_policy_class TEXT,
-                event_policy_score DOUBLE PRECISION,
-                event_confidence DOUBLE PRECISION,
-                bhavcopy_deal_pressure TEXT,
-                bhavcopy_evidence_score DOUBLE PRECISION,
-                bhavcopy_deal_net_value_inr DOUBLE PRECISION,
-                company_memory_signal TEXT,
-                company_memory_confidence DOUBLE PRECISION,
-                company_memory_conviction_score DOUBLE PRECISION,
-                entry_date TIMESTAMPTZ,
-                exit_date TIMESTAMPTZ,
-                entry_close DOUBLE PRECISION,
-                exit_close DOUBLE PRECISION,
-                forward_return DOUBLE PRECISION,
-                forward_return_after_cost DOUBLE PRECISION,
-                hit_after_cost BOOLEAN,
-                matured BOOLEAN,
-                raw_context_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (evaluated_at, horizon_days, asof_date, setup_id, symbol, variant)
-            )
-            """
-        )
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {SUMMARY_TABLE} (
-                evaluated_at TIMESTAMPTZ NOT NULL,
-                horizon_days BIGINT NOT NULL,
-                variant TEXT NOT NULL,
-                sample_count BIGINT,
-                selected_count BIGINT,
-                matured_count BIGINT,
-                selection_rate DOUBLE PRECISION,
-                avg_forward_return DOUBLE PRECISION,
-                median_forward_return DOUBLE PRECISION,
-                avg_forward_return_after_cost DOUBLE PRECISION,
-                hit_rate_after_cost DOUBLE PRECISION,
-                positive_return_rate DOUBLE PRECISION,
-                baseline_avg_forward_return_after_cost DOUBLE PRECISION,
-                lift_vs_technical_only DOUBLE PRECISION,
-                avg_selected_technical_score DOUBLE PRECISION,
-                sample_start TIMESTAMPTZ,
-                sample_end TIMESTAMPTZ,
-                recommendation TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (evaluated_at, horizon_days, variant)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=SIGNAL_QUALITY_SCHEMA_MIGRATION_ID,
+        description="Create signal-quality evaluator output tables.",
+        statements=SIGNAL_QUALITY_SCHEMA_STATEMENTS,
+        metadata={"tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
+    )
 
 
 def _load_latest_event_policy(
@@ -267,24 +305,40 @@ def _load_latest_event_policy(
         "confidence AS event_confidence" if "confidence" in columns else "NULL::double precision AS event_confidence",
         "event_class AS event_class" if "event_class" in columns else "NULL::text AS event_class",
     ]
-    df = sql_to_df(
-        f"""
-        SELECT {', '.join(select_exprs)}
-        FROM {EVENT_POLICY_TABLE}
-        WHERE asof_date >= %(from_date)s
-          AND asof_date <= %(to_date)s
-          AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
-        ORDER BY symbol, asof_date
-        """,
-        params={
-            "from_date": from_date - pd.Timedelta(days=max(0, int(lookback_days))),
-            "to_date": to_date,
-            "symbols": [str(symbol).upper() for symbol in symbols],
-        },
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    query_params = {
+        "from_date": from_date - pd.Timedelta(days=max(0, int(lookback_days))),
+        "to_date": to_date,
+        "symbols": [str(symbol).upper() for symbol in symbols],
+    }
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT {', '.join(select_exprs)}
+            FROM {EVENT_POLICY_TABLE}
+            WHERE asof_date >= %(from_date)s
+              AND asof_date <= %(to_date)s
+              AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
+            ORDER BY symbol, asof_date
+            """,
+            params=query_params,
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        _record_signal_quality_fallback(
+            fallback_type="signal_quality_evaluator_event_policy_load_failed",
+            source=EVENT_POLICY_TABLE,
+            reason="Signal-quality evaluator could not load point-in-time event-policy overlay rows.",
+            error=exc,
+            metadata={
+                "from_date": str(query_params["from_date"]),
+                "to_date": str(query_params["to_date"]),
+                "symbol_count": len(query_params["symbols"]),
+                "lookback_days": int(lookback_days),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -312,24 +366,40 @@ def _load_latest_bhavcopy(
         "deal_net_value_inr AS bhavcopy_deal_net_value_inr" if "deal_net_value_inr" in columns else "NULL::double precision AS bhavcopy_deal_net_value_inr",
         "evidence_summary AS bhavcopy_evidence_summary" if "evidence_summary" in columns else "NULL::text AS bhavcopy_evidence_summary",
     ]
-    df = sql_to_df(
-        f"""
-        SELECT {', '.join(select_exprs)}
-        FROM {BHAVCOPY_EVIDENCE_TABLE}
-        WHERE asof_date >= %(from_date)s
-          AND asof_date <= %(to_date)s
-          AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
-        ORDER BY symbol, asof_date
-        """,
-        params={
-            "from_date": from_date - pd.Timedelta(days=max(0, int(lookback_days))),
-            "to_date": to_date,
-            "symbols": [str(symbol).upper() for symbol in symbols],
-        },
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    query_params = {
+        "from_date": from_date - pd.Timedelta(days=max(0, int(lookback_days))),
+        "to_date": to_date,
+        "symbols": [str(symbol).upper() for symbol in symbols],
+    }
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT {', '.join(select_exprs)}
+            FROM {BHAVCOPY_EVIDENCE_TABLE}
+            WHERE asof_date >= %(from_date)s
+              AND asof_date <= %(to_date)s
+              AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
+            ORDER BY symbol, asof_date
+            """,
+            params=query_params,
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        _record_signal_quality_fallback(
+            fallback_type="signal_quality_evaluator_bhavcopy_load_failed",
+            source=BHAVCOPY_EVIDENCE_TABLE,
+            reason="Signal-quality evaluator could not load point-in-time bhavcopy evidence overlay rows.",
+            error=exc,
+            metadata={
+                "from_date": str(query_params["from_date"]),
+                "to_date": str(query_params["to_date"]),
+                "symbol_count": len(query_params["symbols"]),
+                "lookback_days": int(lookback_days),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -357,24 +427,40 @@ def _load_latest_company_memory(
         "conviction_score AS company_memory_conviction_score" if "conviction_score" in columns else "NULL::double precision AS company_memory_conviction_score",
         "summary AS company_memory_summary" if "summary" in columns else "NULL::text AS company_memory_summary",
     ]
-    df = sql_to_df(
-        f"""
-        SELECT {', '.join(select_exprs)}
-        FROM {COMPANY_MEMORY_TABLE}
-        WHERE review_date >= %(from_date)s
-          AND review_date <= %(to_date)s
-          AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
-        ORDER BY symbol, review_date
-        """,
-        params={
-            "from_date": from_date - pd.Timedelta(days=max(0, int(lookback_days))),
-            "to_date": to_date,
-            "symbols": [str(symbol).upper() for symbol in symbols],
-        },
-        retries=4,
-        statement_timeout_ms=0,
-        chunksize=50000,
-    )
+    query_params = {
+        "from_date": from_date - pd.Timedelta(days=max(0, int(lookback_days))),
+        "to_date": to_date,
+        "symbols": [str(symbol).upper() for symbol in symbols],
+    }
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT {', '.join(select_exprs)}
+            FROM {COMPANY_MEMORY_TABLE}
+            WHERE review_date >= %(from_date)s
+              AND review_date <= %(to_date)s
+              AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)
+            ORDER BY symbol, review_date
+            """,
+            params=query_params,
+            retries=4,
+            statement_timeout_ms=0,
+            chunksize=50000,
+        )
+    except Exception as exc:
+        _record_signal_quality_fallback(
+            fallback_type="signal_quality_evaluator_company_memory_load_failed",
+            source=COMPANY_MEMORY_TABLE,
+            reason="Signal-quality evaluator could not load point-in-time company-memory overlay rows.",
+            error=exc,
+            metadata={
+                "from_date": str(query_params["from_date"]),
+                "to_date": str(query_params["to_date"]),
+                "symbol_count": len(query_params["symbols"]),
+                "lookback_days": int(lookback_days),
+            },
+        )
+        raise
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -461,8 +547,14 @@ def _clean_text(value: Any) -> str:
     try:
         if pd.isna(value):
             return ""
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_signal_quality_fallback(
+            fallback_type="signal_quality_clean_text_missing_check_failed",
+            source="clean_text",
+            reason="Signal-quality evaluator could not evaluate missingness while normalizing text and kept string conversion fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return str(value or "").strip().upper()
 
 

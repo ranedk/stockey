@@ -8,18 +8,88 @@ from typing import Any
 import pandas as pd
 
 from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.setup_registry import load_setup_registry
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
 ALLOCATIONS_TABLE = "advisory_allocations"
+ALLOCATIONS_SCHEMA_MIGRATION_ID = "20260611_advisory_allocations_base"
 REVIEWS_TABLE = "advisory_event_reviews"
 MACRO_FEATURES_TABLE = "advisory_macro_features_daily"
 EXCHANGE_FEATURES_TABLE = "advisory_exchange_features_daily"
 _TRANSITION_CUTOFF = 0.12
 _MATERIALITY_ORDER = {"low": 1, "medium": 2, "high": 3}
 _RISK_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
+ALLOCATIONS_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {ALLOCATIONS_TABLE} (
+        published_on TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        allocated_at TIMESTAMPTZ,
+        setup_id TEXT NOT NULL,
+        setup_name TEXT,
+        symbol TEXT NOT NULL,
+        company_master_id TEXT,
+        unique_id TEXT NOT NULL,
+        evaluation_status TEXT,
+        evaluation_verdict TEXT,
+        investable_now BOOLEAN,
+        materiality TEXT,
+        setup_effect TEXT,
+        event_class TEXT,
+        state_transition_hint TEXT,
+        score_impact DOUBLE PRECISION,
+        confidence DOUBLE PRECISION,
+        review_action TEXT,
+        review_score DOUBLE PRECISION,
+        review_veto BOOLEAN,
+        review_reason TEXT,
+        risk_bucket TEXT,
+        conviction_bucket TEXT,
+        allocation_status TEXT,
+        suggested_allocation_inr DOUBLE PRECISION,
+        allocation_pct_of_adv20d DOUBLE PRECISION,
+        stop_price DOUBLE PRECISION,
+        invalidation_price DOUBLE PRECISION,
+        invalidation_rule TEXT,
+        notes TEXT,
+        context_snapshot_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (published_on, setup_id, symbol, unique_id)
+    )
+    """,
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS asof_date TIMESTAMPTZ",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS allocated_at TIMESTAMPTZ",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS setup_name TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS company_master_id TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS evaluation_status TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS evaluation_verdict TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS investable_now BOOLEAN",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS materiality TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS setup_effect TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_class TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS state_transition_hint TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS score_impact DOUBLE PRECISION",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS confidence DOUBLE PRECISION",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS review_action TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS review_score DOUBLE PRECISION",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS review_veto BOOLEAN",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS review_reason TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS risk_bucket TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS conviction_bucket TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS allocation_status TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS suggested_allocation_inr DOUBLE PRECISION",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS allocation_pct_of_adv20d DOUBLE PRECISION",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS stop_price DOUBLE PRECISION",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS invalidation_price DOUBLE PRECISION",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS invalidation_rule TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS notes TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS context_snapshot_json TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS load_ts TIMESTAMPTZ",
+]
 
 
 @dataclass(frozen=True)
@@ -91,7 +161,16 @@ def _is_missing_value(value: Any) -> bool:
         return True
     try:
         return bool(pd.isna(value))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="advisory.risk_engine",
+            source="missing_value_check",
+            fallback_type="risk_missing_value_check_failed",
+            severity="warn",
+            reason="Risk engine could not determine whether a value is missing and treated it as present.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": str(value)[:240]},
+        )
         return False
 
 
@@ -163,78 +242,12 @@ def table_exists(table_name: str) -> bool:
 
 
 def ensure_allocations_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {ALLOCATIONS_TABLE} (
-                published_on TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                allocated_at TIMESTAMPTZ,
-                setup_id TEXT NOT NULL,
-                setup_name TEXT,
-                symbol TEXT NOT NULL,
-                company_master_id TEXT,
-                unique_id TEXT NOT NULL,
-                evaluation_status TEXT,
-                evaluation_verdict TEXT,
-                investable_now BOOLEAN,
-                materiality TEXT,
-                setup_effect TEXT,
-                event_class TEXT,
-                state_transition_hint TEXT,
-                score_impact DOUBLE PRECISION,
-                confidence DOUBLE PRECISION,
-                review_action TEXT,
-                review_score DOUBLE PRECISION,
-                review_veto BOOLEAN,
-                review_reason TEXT,
-                risk_bucket TEXT,
-                conviction_bucket TEXT,
-                allocation_status TEXT,
-                suggested_allocation_inr DOUBLE PRECISION,
-                allocation_pct_of_adv20d DOUBLE PRECISION,
-                stop_price DOUBLE PRECISION,
-                invalidation_price DOUBLE PRECISION,
-                invalidation_rule TEXT,
-                notes TEXT,
-                context_snapshot_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (published_on, setup_id, symbol, unique_id)
-            )
-            """
-        )
-        column_defs = {
-            "asof_date": "TIMESTAMPTZ",
-            "allocated_at": "TIMESTAMPTZ",
-            "setup_name": "TEXT",
-            "company_master_id": "TEXT",
-            "evaluation_status": "TEXT",
-            "evaluation_verdict": "TEXT",
-            "investable_now": "BOOLEAN",
-            "materiality": "TEXT",
-            "setup_effect": "TEXT",
-            "event_class": "TEXT",
-            "state_transition_hint": "TEXT",
-            "score_impact": "DOUBLE PRECISION",
-            "confidence": "DOUBLE PRECISION",
-            "review_action": "TEXT",
-            "review_score": "DOUBLE PRECISION",
-            "review_veto": "BOOLEAN",
-            "review_reason": "TEXT",
-            "risk_bucket": "TEXT",
-            "conviction_bucket": "TEXT",
-            "allocation_status": "TEXT",
-            "suggested_allocation_inr": "DOUBLE PRECISION",
-            "allocation_pct_of_adv20d": "DOUBLE PRECISION",
-            "stop_price": "DOUBLE PRECISION",
-            "invalidation_price": "DOUBLE PRECISION",
-            "invalidation_rule": "TEXT",
-            "notes": "TEXT",
-            "context_snapshot_json": "TEXT",
-            "load_ts": "TIMESTAMPTZ",
-        }
-        for column, sql_type in column_defs.items():
-            cur.execute(f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}")
+    apply_schema_migration(
+        migration_id=ALLOCATIONS_SCHEMA_MIGRATION_ID,
+        description="Create advisory risk allocation table.",
+        statements=ALLOCATIONS_SCHEMA_STATEMENTS,
+        metadata={"tables": [ALLOCATIONS_TABLE]},
+    )
 
 
 def load_event_evaluations(
@@ -683,7 +696,16 @@ def load_macro_context(daily_cutoff: pd.Timestamp) -> dict[str, Any]:
             """,
             params={"daily_cutoff": daily_cutoff},
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.risk_engine",
+            source=MACRO_FEATURES_TABLE,
+            fallback_type="risk_macro_context_unavailable",
+            severity="warn",
+            reason="Risk sizing continued without macro context because macro feature lookup failed.",
+            error=exc,
+            metadata={"daily_cutoff": daily_cutoff},
+        )
         return {}
     if df.empty:
         return {}
@@ -721,7 +743,17 @@ def load_exchange_feature_context(symbol: str, daily_cutoff: pd.Timestamp) -> di
             """,
             params={"symbol": symbol.upper(), "daily_cutoff": daily_cutoff},
         )
-    except Exception:
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.risk_engine",
+            source=EXCHANGE_FEATURES_TABLE,
+            fallback_type="risk_exchange_context_unavailable",
+            severity="warn",
+            symbol=symbol,
+            reason="Risk sizing continued without exchange-event context because exchange feature lookup failed.",
+            error=exc,
+            metadata={"daily_cutoff": daily_cutoff},
+        )
         return {}
     if df.empty:
         return {}
@@ -880,6 +912,36 @@ def round_allocation(value: float) -> float:
     if value <= 0:
         return 0.0
     return float(int(value // 1000) * 1000)
+
+
+def _record_liquidity_cap_fallback(rows: list[dict[str, Any]]) -> None:
+    fallback_rows = [
+        row for row in rows
+        if "Liquidity cap fallback used because ADV20 was missing." in str(row.get("notes") or "")
+    ]
+    if not fallback_rows:
+        return
+    symbols = sorted({str(row.get("symbol") or "").upper() for row in fallback_rows if str(row.get("symbol") or "").strip()})
+    setup_ids = sorted({str(row.get("setup_id") or "").upper() for row in fallback_rows if str(row.get("setup_id") or "").strip()})
+    asof_dates = sorted({
+        str(pd.to_datetime(row.get("asof_date"), utc=True, errors="coerce").date())
+        for row in fallback_rows
+        if pd.notna(pd.to_datetime(row.get("asof_date"), utc=True, errors="coerce"))
+    })
+    record_local_fallback_event(
+        module="advisory.risk_engine",
+        source=ALLOCATIONS_TABLE,
+        fallback_type="risk_liquidity_cap_adv20_missing",
+        severity="warn",
+        reason="Risk sizing used max allocation as liquidity cap because ADV20 was missing.",
+        metadata={
+            "affected_rows": len(fallback_rows),
+            "symbol_count": len(symbols),
+            "symbols_sample": symbols[:25],
+            "setup_ids_sample": setup_ids[:10],
+            "asof_dates_sample": asof_dates[:10],
+        },
+    )
 
 
 def build_allocations(
@@ -1123,6 +1185,7 @@ def build_allocations(
             }
         )
 
+    _record_liquidity_cap_fallback(rows)
     return pd.DataFrame(rows)
 
 
@@ -1156,21 +1219,28 @@ def persist_allocations(df: pd.DataFrame) -> None:
     for column in numeric_columns:
         if column in out.columns:
             out[column] = pd.to_numeric(out[column], errors="coerce")
-    with db_session() as (_, cur):
-        pairs = (
-            out[["asof_date", "setup_id"]]
-            .dropna()
-            .drop_duplicates()
-            .to_dict(orient="records")
-        )
-        for item in pairs:
-            cur.execute(
-                f"DELETE FROM {ALLOCATIONS_TABLE} WHERE asof_date = %s AND setup_id = %s",
-                (
-                    pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
-                    str(item["setup_id"]),
-                ),
-            )
+    pairs = (
+        out[["asof_date", "setup_id"]]
+        .dropna()
+        .drop_duplicates()
+        .to_dict(orient="records")
+    )
+
+    def _delete_existing_allocations() -> None:
+        with db_session() as (_, cur):
+            for item in pairs:
+                cur.execute(
+                    f"DELETE FROM {ALLOCATIONS_TABLE} WHERE asof_date = %s AND setup_id = %s",
+                    (
+                        pd.to_datetime(item["asof_date"], utc=True, errors="coerce").to_pydatetime(),
+                        str(item["setup_id"]),
+                    ),
+                )
+
+    execute_db_operation(
+        _delete_existing_allocations,
+        operation_name="risk_engine:delete_existing_allocations",
+    )
     upsert_to_db(
         out,
         ALLOCATIONS_TABLE,
@@ -1186,12 +1256,34 @@ def _parse_context_snapshot(value: Any) -> dict[str, Any]:
     try:
         if pd.isna(value):
             return {}
-    except Exception:
-        pass
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.risk_engine",
+            fallback_type="risk_context_snapshot_missing_check_failed",
+            source=ALLOCATIONS_TABLE,
+            severity="warn",
+            reason="Risk engine could not evaluate missingness for allocation context and continued parsing.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
+    raw_value = str(value or "{}")
     try:
-        parsed = json.loads(str(value or "{}"))
+        parsed = json.loads(raw_value)
         return parsed if isinstance(parsed, dict) else {}
-    except Exception:
+    except Exception as exc:
+        if raw_value.strip():
+            record_local_fallback_event(
+                module="advisory.risk_engine",
+                source=ALLOCATIONS_TABLE,
+                fallback_type="risk_context_snapshot_parse_failed",
+                severity="warn",
+                reason="Risk allocation trace continued with an empty context because context_snapshot_json was malformed.",
+                error=exc,
+                metadata={
+                    "value_length": len(raw_value),
+                    "value_excerpt": raw_value[:240],
+                },
+            )
         return {}
 
 

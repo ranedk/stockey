@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from utils.db import db_session, sql_to_df
+from utils.db import db_session, execute_db_operation, sql_to_df
 
 
 DEPRECATED_TABLES = [
@@ -32,9 +32,16 @@ def drop_deprecated_tables() -> list[str]:
     existing = list_existing_deprecated_tables()
     if not existing:
         return []
-    with db_session() as (_, cur):
-        for table_name in existing:
-            cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    def _drop_deprecated_tables() -> None:
+        with db_session() as (_, cur):
+            for table_name in existing:
+                cur.execute(f"DROP TABLE IF EXISTS {table_name}")
+
+    execute_db_operation(
+        _drop_deprecated_tables,
+        operation_name="cleanup_deprecated_tables:drop",
+    )
     return existing
 
 

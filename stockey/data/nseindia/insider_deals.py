@@ -1,4 +1,5 @@
 import argparse
+import json
 import random
 from datetime import datetime
 from typing import List
@@ -22,6 +23,7 @@ REDIS_PORT = env.int("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:insider_deals"
 SYNC_SOURCE_NAME = "data.nseindia.insider_deals"
+STOCKEY_RUN_STATE: dict[str, object] = {}
 
 
 def get_random(min_ms: int, max_ms: int) -> int:
@@ -100,11 +102,14 @@ def fetch_insider_deals(page, symbol: str, issuer: str, from_date: datetime, to_
     return df.sort_values("reporting_date").drop_duplicates(subset=unique_keys, keep="last")
 
 
-def sync_insider_deals(symbols: List[str], from_date: datetime | None = None, to_date: datetime | None = None) -> None:
-    _, to_date = normalize_date_window(from_date, to_date)
+def sync_insider_deals(symbols: List[str], from_date: datetime | None = None, to_date: datetime | None = None) -> dict[str, object]:
+    effective_from_date, to_date = normalize_date_window(from_date, to_date)
     redis_client = get_redis_client(REDIS_HOST, REDIS_PORT)
     rows_written = 0
     latest_item_ts = None
+    normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    symbols_queried = 0
+    symbols_skipped = 0
 
     try:
         with sync_playwright() as playwright:
@@ -114,7 +119,7 @@ def sync_insider_deals(symbols: List[str], from_date: datetime | None = None, to
 
             counter = 0
             try:
-                for symbol in symbols:
+                for symbol in normalized_symbols:
                     eqt = get_nse_equity(symbol)
                     issuer = eqt.display_name
 
@@ -126,6 +131,7 @@ def sync_insider_deals(symbols: List[str], from_date: datetime | None = None, to
                         ],
                     )
                     if effective_from_date > to_date:
+                        symbols_skipped += 1
                         continue
 
                     if counter % 10 == 0:
@@ -133,6 +139,7 @@ def sync_insider_deals(symbols: List[str], from_date: datetime | None = None, to
                         page.wait_for_timeout(get_random(1000, 3000))
 
                     df = fetch_insider_deals(page, symbol, issuer, effective_from_date, to_date)
+                    symbols_queried += 1
                     if not df.empty:
                         df = attach_company_master_id(df, ticker_column="symbol", exchange="NSE")
                         rows_written += int(len(df))
@@ -160,12 +167,33 @@ def sync_insider_deals(symbols: List[str], from_date: datetime | None = None, to
                 browser.close()
                 redis_client.close()
     except Exception as exc:
-        persist_sync_state(source_name=SYNC_SOURCE_NAME, status="error", error_text=f"{type(exc).__name__}: {exc}", state={"symbols": len(symbols), "rows_written": rows_written})
+        persist_sync_state(
+            source_name=SYNC_SOURCE_NAME,
+            status="error",
+            error_text=f"{type(exc).__name__}: {exc}",
+            state={"symbols": len(normalized_symbols), "symbols_queried": symbols_queried, "symbols_skipped": symbols_skipped, "rows_written": rows_written},
+        )
         raise
-    persist_sync_state(source_name=SYNC_SOURCE_NAME, status="ok", last_success_at=pd.Timestamp.utcnow(), last_item_ts=latest_item_ts, state={"symbols": len(symbols), "rows_written": rows_written})
+    state = {
+        "source": SYNC_SOURCE_NAME,
+        "rows": rows_written,
+        "rows_read": symbols_queried,
+        "rows_written": rows_written,
+        "symbol_count": len(normalized_symbols),
+        "symbols_queried": symbols_queried,
+        "symbols_skipped": symbols_skipped,
+        "from_date": pd.Timestamp(effective_from_date).date().isoformat() if effective_from_date else None,
+        "to_date": pd.Timestamp(to_date).date().isoformat() if to_date else None,
+        "latest_item_ts": latest_item_ts.isoformat() if latest_item_ts is not None and pd.notna(latest_item_ts) else None,
+        "fallback_used": False,
+        "state_advanced": rows_written > 0 or symbols_queried > 0,
+    }
+    persist_sync_state(source_name=SYNC_SOURCE_NAME, status="ok", last_success_at=pd.Timestamp.utcnow(), last_item_ts=latest_item_ts, state=state)
+    return state
 
 
-def main():
+def main() -> int:
+    global STOCKEY_RUN_STATE
     parser = argparse.ArgumentParser(description="Sync NSE insider deals for tracked symbols")
     parser.add_argument("--symbols", nargs="*", help="Symbols, comma-separated or repeated")
     parser.add_argument("--from-date", dest="from_date", help="Start date in YYYY-MM-DD")
@@ -176,12 +204,14 @@ def main():
     if not symbols:
         raise SystemExit("No symbols provided. Use --symbols, STOCKEY_SYMBOLS, or config/tracked_symbols.txt")
 
-    sync_insider_deals(
+    STOCKEY_RUN_STATE = sync_insider_deals(
         symbols=symbols,
         from_date=parse_datetime_arg(args.from_date),
         to_date=parse_datetime_arg(args.to_date),
     )
+    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

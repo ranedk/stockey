@@ -24,17 +24,35 @@ const { data: policyData, refresh: refreshPolicy } = await useAsyncData('event-p
   watch: [selectedActionType]
 })
 const { data: policyEvalData } = await useAsyncData('event-policy-evaluation', () => api.getEventPolicyEvaluation(80))
+const { data: promotionData, refresh: refreshPromotionReviews } = await useAsyncData('event-policy-promotion-reviews', () => api.getEventPolicyPromotionReviews(25))
 const events = computed(() => data.value?.events || [])
 const eventMeta = computed(() => asDict(data.value?.pagination?.events || data.value?.meta?.events))
 const snapshotMeta = computed(() => asDict(data.value?.snapshot))
 const snapshotWarning = computed(() => asDict(data.value?.snapshot_warning))
 const policyRows = computed(() => policyData.value?.rows || [])
 const policyEvalRows = computed(() => policyEvalData.value?.summary || [])
+const actionabilityEvalGroupTypes = new Set([
+  'source_quality',
+  'source_family',
+  'source_authority',
+  'source_confirmation_required',
+  'market_scope'
+])
+const actionabilityEvalRows = computed(() => policyEvalRows.value.filter((row: Dict) => actionabilityEvalGroupTypes.has(String(row.group_type || ''))))
+const promotionReviews = computed<Dict[]>(() => (promotionData.value?.reviews || []) as Dict[])
 const policySummary = computed(() => policyData.value?.summary || {})
+const policyCompact = computed(() => Boolean(policySummary.value.compact))
 const actionCounts = computed(() => policySummary.value.action_counts as Record<string, number> || {})
 const policyClassCounts = computed(() => policySummary.value.policy_class_counts as Record<string, number> || {})
 const traces = reactive<Record<string, TraceSummary>>({})
 const loadingTrace = reactive<Record<string, boolean>>({})
+const promotionBusy = reactive<Record<string, boolean>>({})
+const previewBusy = reactive<Record<string, boolean>>({})
+const promotionMessage = ref('')
+const previewMessage = ref('')
+const previewDiffs = reactive<Record<string, Dict>>({})
+const promotionOperatorId = ref('operator')
+const promotionDecisionReason = ref('')
 const actionTypes = ['ALL', 'MANUAL_REVIEW', 'BUY_WATCH', 'REDUCE_EXPOSURE_REVIEW', 'NO_ACTION']
 
 function asList(value: unknown): unknown[] {
@@ -51,6 +69,14 @@ function notes(row: Dict): Dict {
 
 function checks(row: Dict): unknown[] {
   return asList(row.checks)
+}
+
+function actionability(row: Dict): Dict {
+  return asDict(row.actionability)
+}
+
+function marketScope(row: Dict): Dict {
+  return asDict(actionability(row).market_scope)
 }
 
 function tone(actionType: unknown) {
@@ -71,6 +97,87 @@ function numberText(value: unknown) {
   const num = Number(value)
   if (Number.isNaN(num)) return String(value || '-')
   return Intl.NumberFormat('en-IN', { maximumFractionDigits: 3 }).format(num)
+}
+
+function signedPct(value: unknown) {
+  const num = Number(value)
+  if (Number.isNaN(num)) return '-'
+  const formatted = `${Math.round(num * 1000) / 10}%`
+  return num > 0 ? `+${formatted}` : formatted
+}
+
+function humanLabel(value: unknown) {
+  return String(value || '-').replaceAll('_', ' ').toUpperCase()
+}
+
+function promotionKey(row: Dict) {
+  return [row.evaluated_at, row.horizon_days, row.group_type, row.group_value, row.reviewed_at].map(value => String(value || '')).join('|')
+}
+
+async function createPromotionReview(row: Dict) {
+  const key = promotionKey(row)
+  promotionBusy[key] = true
+  promotionMessage.value = ''
+  try {
+    await api.reviewEventPolicyGroup({
+      evaluated_at: row.evaluated_at,
+      horizon_days: row.horizon_days,
+      group_type: row.group_type,
+      group_value: row.group_value
+    })
+    promotionMessage.value = `Created event-policy promotion review for ${humanLabel(row.group_type)} = ${humanLabel(row.group_value)}.`
+    await refreshPromotionReviews()
+  } catch (error) {
+    promotionMessage.value = `Promotion review failed: ${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    promotionBusy[key] = false
+  }
+}
+
+async function decidePromotionReview(row: Dict, decision: string) {
+  const key = promotionKey(row)
+  promotionBusy[key] = true
+  promotionMessage.value = ''
+  try {
+    await api.decideEventPolicyPromotionReview({
+      reviewed_at: row.reviewed_at,
+      evaluated_at: row.evaluated_at,
+      horizon_days: row.horizon_days,
+      group_type: row.group_type,
+      group_value: row.group_value,
+      decision,
+      operator_id: promotionOperatorId.value,
+      decision_reason: promotionDecisionReason.value
+    })
+    promotionMessage.value = `Recorded ${humanLabel(decision)} for ${humanLabel(row.group_type)} = ${humanLabel(row.group_value)}. No config or broker behavior changed.`
+    await refreshPromotionReviews()
+  } catch (error) {
+    promotionMessage.value = `Promotion decision failed: ${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    promotionBusy[key] = false
+  }
+}
+
+async function previewEventPolicyConfigChange(row: Dict) {
+  const key = promotionKey(row)
+  previewBusy[key] = true
+  previewMessage.value = ''
+  try {
+    const result = await api.previewEventPolicyConfigChange({
+      reviewed_at: row.reviewed_at,
+      evaluated_at: row.evaluated_at,
+      horizon_days: row.horizon_days,
+      group_type: row.group_type,
+      group_value: row.group_value,
+      persist: true
+    })
+    previewDiffs[key] = result as unknown as Dict
+    previewMessage.value = `Generated reviewed diff preview for ${humanLabel(row.group_type)} = ${humanLabel(row.group_value)}. No config file was changed.`
+  } catch (error) {
+    previewMessage.value = `Reviewed diff preview failed: ${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    previewBusy[key] = false
+  }
 }
 
 async function loadTrace(row: Record<string, unknown>) {
@@ -149,6 +256,9 @@ function eventDetailPath(row: Record<string, unknown>) {
         </span>
       </div>
     </details>
+    <p v-if="policyCompact" class="mt-4 rounded-2xl border border-sun/30 bg-sun/10 p-3 text-sm font-semibold leading-6 text-ink/65">
+      Event-policy rows use compact payloads by default. Parsed checks, operator notes, and LLM review are shown; bulky raw JSON source columns are omitted from this list response.
+    </p>
   </section>
 
   <section class="mt-6 glass-panel rounded-3xl p-5">
@@ -181,7 +291,123 @@ function eventDetailPath(row: Record<string, unknown>) {
         </div>
       </article>
     </div>
-    <p v-else class="mt-4 rounded-2xl bg-white/70 p-4 text-sm text-ink/60">
+    <div v-if="actionabilityEvalRows.length" class="mt-5 rounded-3xl border border-moss/20 bg-moss/5 p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p class="text-xs font-black uppercase tracking-[0.24em] text-moss">Actionability calibration</p>
+          <p class="mt-2 text-sm leading-6 text-ink/65">
+            These rows test whether source quality, source authority, confirmation requirements, and affected-market scope are helping or hurting realized outcomes.
+          </p>
+        </div>
+        <span class="rounded-full bg-white px-3 py-1 text-xs font-black text-ink/55">{{ actionabilityEvalRows.length }} groups</span>
+      </div>
+      <div class="mt-4 grid gap-3 lg:grid-cols-2">
+        <article v-for="(row, idx) in actionabilityEvalRows.slice(0, 8)" :key="`actionability-${idx}`" class="rounded-2xl bg-white/80 p-4">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/45">{{ humanLabel(row.group_type) }} · {{ row.horizon_days }}d</p>
+              <p class="mt-1 text-lg font-black text-ink">{{ humanLabel(row.group_value) }}</p>
+            </div>
+            <span class="rounded-full px-3 py-1 text-xs font-black" :class="String(row.recommendation || '').includes('strengthen') ? 'bg-moss text-paper' : String(row.recommendation || '').includes('tighten') ? 'bg-rust text-paper' : 'bg-sun text-ink'">
+              {{ humanLabel(row.recommendation || 'monitor') }}
+            </span>
+          </div>
+          <div class="mt-3 grid gap-2 text-sm md:grid-cols-4">
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Matured:</b> {{ row.matured_count || 0 }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>After cost:</b> {{ pct(row.avg_forward_return_after_cost) }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Hit:</b> {{ pct(row.hit_rate_after_cost) }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Confidence:</b> {{ pct(row.avg_confidence) }}</p>
+          </div>
+          <div class="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-black/5 bg-paper/70 p-3">
+            <p class="text-xs font-bold leading-5 text-ink/55">
+              Create a manual-only promotion review for this group. This does not change config, portfolio, or broker behavior.
+            </p>
+            <button
+              class="rounded-full bg-ink px-4 py-2 text-xs font-black text-paper disabled:cursor-not-allowed disabled:bg-ink/30"
+              type="button"
+              :disabled="promotionBusy[promotionKey(row)] || !row.evaluated_at"
+              @click="createPromotionReview(row)"
+            >
+              {{ promotionBusy[promotionKey(row)] ? 'Creating...' : 'Create Review' }}
+            </button>
+          </div>
+        </article>
+      </div>
+    </div>
+    <section v-if="promotionReviews.length || promotionMessage" class="mt-5 rounded-3xl border border-sun/30 bg-sun/10 p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p class="text-xs font-black uppercase tracking-[0.24em] text-ink/45">Promotion reviews</p>
+          <h3 class="mt-2 text-xl font-black text-ink">Manual policy-calibration queue</h3>
+          <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/65">
+            These reviews turn realized event-policy evidence into operator notes. Decisions recorded here are audit notes only; they do not apply policy patches, portfolio changes, or broker orders.
+          </p>
+        </div>
+        <span class="rounded-full bg-white px-3 py-1 text-xs font-black text-ink/60">Manual-only</span>
+      </div>
+      <p v-if="promotionMessage" class="mt-4 rounded-2xl bg-white/80 p-3 text-sm font-bold text-ink/70">{{ promotionMessage }}</p>
+      <p v-if="previewMessage" class="mt-3 rounded-2xl bg-white/80 p-3 text-sm font-bold text-ink/70">{{ previewMessage }}</p>
+      <div class="mt-4 grid gap-3 md:grid-cols-2">
+        <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+          Operator ID
+          <input v-model="promotionOperatorId" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="operator" />
+        </label>
+        <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+          Decision reason
+          <input v-model="promotionDecisionReason" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="Why this review was approved, rejected, or deferred" />
+        </label>
+      </div>
+      <div v-if="promotionReviews.length" class="mt-4 grid gap-3 lg:grid-cols-2">
+        <article v-for="(review, idx) in promotionReviews" :key="`${promotionKey(review)}-${idx}`" class="rounded-2xl bg-white/85 p-4">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/45">{{ humanLabel(review.group_type) }} · {{ review.horizon_days }}d</p>
+              <p class="mt-1 text-lg font-black text-ink">{{ humanLabel(review.group_value) }}</p>
+              <p class="mt-1 text-xs font-bold text-ink/45">Reviewed {{ review.reviewed_at || '-' }}</p>
+            </div>
+            <span class="rounded-full bg-ink px-3 py-1 text-xs font-black text-paper">{{ humanLabel(review.recommendation || 'review') }}</span>
+          </div>
+          <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Confidence:</b> {{ pct(review.confidence) }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Patch:</b> {{ humanLabel(asDict(review.patch).mode || 'manual_review_only') }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Decision:</b> {{ humanLabel(asDict(review.manual_decision).decision || 'pending') }}</p>
+          </div>
+          <details v-if="review.manual_patch_text" class="mt-3 rounded-2xl bg-ink p-3">
+            <summary class="cursor-pointer text-xs font-black uppercase tracking-[0.18em] text-paper/60">Manual patch text</summary>
+            <pre class="mt-3 overflow-auto text-xs leading-5 text-paper">{{ review.manual_patch_text }}</pre>
+          </details>
+          <div class="mt-4 flex flex-wrap gap-2">
+            <button class="rounded-full bg-moss px-4 py-2 text-xs font-black text-paper disabled:bg-moss/30" type="button" :disabled="promotionBusy[promotionKey(review)]" @click="decidePromotionReview(review, 'approved')">
+              Approve
+            </button>
+            <button class="rounded-full bg-sun px-4 py-2 text-xs font-black text-ink disabled:bg-sun/30" type="button" :disabled="promotionBusy[promotionKey(review)]" @click="decidePromotionReview(review, 'needs_more_data')">
+              Needs More Data
+            </button>
+            <button class="rounded-full bg-rust px-4 py-2 text-xs font-black text-paper disabled:bg-rust/30" type="button" :disabled="promotionBusy[promotionKey(review)]" @click="decidePromotionReview(review, 'rejected')">
+              Reject
+            </button>
+            <button
+              v-if="String(review.manual_decision || '').toLowerCase() === 'approved'"
+              class="rounded-full bg-ink px-4 py-2 text-xs font-black text-paper disabled:bg-ink/30"
+              type="button"
+              :disabled="previewBusy[promotionKey(review)]"
+              @click="previewEventPolicyConfigChange(review)"
+            >
+              {{ previewBusy[promotionKey(review)] ? 'Generating Diff...' : 'Reviewed Diff' }}
+            </button>
+          </div>
+          <details v-if="previewDiffs[promotionKey(review)]" class="mt-3 rounded-2xl border border-black/10 bg-paper/80 p-3" open>
+            <summary class="cursor-pointer text-xs font-black uppercase tracking-[0.18em] text-ink/45">Reviewed diff preview</summary>
+            <p class="mt-2 text-xs font-bold leading-5 text-ink/60">
+              Preview only. This did not edit config, action rules, portfolio rows, or broker state.
+            </p>
+            <pre class="mt-3 max-h-96 overflow-auto rounded-2xl bg-ink p-4 text-xs leading-5 text-paper">{{ previewDiffs[promotionKey(review)].unified_diff || '-' }}</pre>
+            <p class="mt-3 text-xs font-bold text-ink/55">{{ previewDiffs[promotionKey(review)].rollback_note || 'Rollback by not applying this preview.' }}</p>
+          </details>
+        </article>
+      </div>
+    </section>
+    <p v-if="!policyEvalRows.length" class="mt-4 rounded-2xl bg-white/70 p-4 text-sm text-ink/60">
       No event-policy evaluation summary yet. Run `python -m advisory.event_policy_evaluator --dry-run` first, then without `--dry-run` to persist research rows.
     </p>
   </section>
@@ -206,6 +432,53 @@ function eventDetailPath(row: Record<string, unknown>) {
         <MetricTile label="Status" :value="String(row.action_status || '-')" note="Policy status" />
         <MetricTile label="Score" :value="String(row.policy_score ?? '-')" note="Policy score" />
         <MetricTile label="LLM" :value="String(row.llm_review_status || '-')" note="Manual review refinement" />
+      </div>
+
+      <div v-if="Object.keys(actionability(row)).length" class="mt-4 rounded-2xl border border-moss/20 bg-white/75 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.24em] text-ink/45">Actionability context</p>
+            <p class="mt-2 text-sm leading-6 text-ink/65">
+              Use this to decide whether Manual Review can lead to action, a wait signal, or no action.
+            </p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="String(actionability(row).review_priority) === 'high' ? 'bg-rust text-paper' : String(actionability(row).review_priority) === 'medium' ? 'bg-sun text-ink' : 'bg-moss text-paper'">
+            {{ String(actionability(row).review_priority || 'unknown').replaceAll('_', ' ').toUpperCase() }}
+          </span>
+        </div>
+        <div class="mt-4 grid gap-3 md:grid-cols-3 xl:grid-cols-7">
+          <MetricTile label="Materiality" :value="String(actionability(row).materiality || '-').toUpperCase()" :note="`confidence ${pct(actionability(row).confidence)}`" />
+          <MetricTile label="Freshness" :value="humanLabel(asDict(actionability(row).freshness).bucket)" :note="`${numberText(asDict(actionability(row).freshness).age_days)} day(s) old`" />
+          <MetricTile label="Source" :value="humanLabel(asDict(actionability(row).source_quality).quality)" :note="humanLabel(asDict(actionability(row).source_quality).source_type)" />
+          <MetricTile label="Scope" :value="humanLabel(marketScope(row).scope_type)" :note="`${numberText(marketScope(row).affected_sector_count)} sectors / ${numberText(marketScope(row).affected_peer_count)} peers`" />
+          <MetricTile label="Exposure" :value="humanLabel(asDict(actionability(row).current_exposure).bucket)" note="Current holding context" />
+          <MetricTile label="Reaction" :value="humanLabel(asDict(actionability(row).price_reaction).bucket)" :note="signedPct(asDict(actionability(row).price_reaction).value)" />
+          <MetricTile label="Authority" :value="asDict(actionability(row).deterministic_boundary).broker_executable ? 'BROKER' : 'REVIEW ONLY'" :note="String(asDict(actionability(row).deterministic_boundary).final_action_authority || '-')" />
+        </div>
+        <div v-if="asList(marketScope(row).affected_sectors).length || asList(marketScope(row).affected_peers).length" class="mt-4 grid gap-3 md:grid-cols-2">
+          <div v-if="asList(marketScope(row).affected_sectors).length" class="rounded-2xl bg-paper/70 p-3">
+            <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/45">Affected sectors</p>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <span v-for="sector in asList(marketScope(row).affected_sectors)" :key="String(sector)" class="rounded-full bg-moss/10 px-3 py-1 text-xs font-black text-moss">
+                {{ sector }}
+              </span>
+            </div>
+          </div>
+          <div v-if="asList(marketScope(row).affected_peers).length" class="rounded-2xl bg-paper/70 p-3">
+            <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/45">Affected peers</p>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <span v-for="peer in asList(marketScope(row).affected_peers)" :key="String(peer)" class="rounded-full bg-sun/20 px-3 py-1 text-xs font-black text-ink">
+                {{ peer }}
+              </span>
+            </div>
+          </div>
+        </div>
+        <div v-if="asList(actionability(row).suggested_next_evidence).length" class="mt-4">
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/45">Suggested next evidence</p>
+          <ul class="mt-2 grid gap-2 text-sm text-ink/70 md:grid-cols-2">
+            <li v-for="item in asList(actionability(row).suggested_next_evidence)" :key="String(item)" class="rounded-xl bg-paper/70 px-3 py-2">- {{ item }}</li>
+          </ul>
+        </div>
       </div>
 
       <div v-if="Object.keys(notes(row)).length" class="mt-4 rounded-2xl bg-paper/70 p-4">

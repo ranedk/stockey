@@ -9,6 +9,7 @@ from typing import Any
 import psycopg2
 from psycopg2 import sql
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from scripts.db_duplicate_index_report import build_duplicate_index_report
 from utils.db import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER
 
@@ -104,6 +105,20 @@ def drop_duplicate_indexes(
                 candidate = dict(candidate)
                 candidate["error"] = f"{exc.__class__.__name__}: {exc}"
                 output["skipped"].append(candidate)
+                record_local_fallback_event(
+                    module="scripts.drop_duplicate_indexes",
+                    source="postgres_indexes",
+                    fallback_type="drop_duplicate_index_failed",
+                    severity="warn",
+                    reason="Duplicate-index cleanup skipped one candidate because DROP INDEX failed.",
+                    error=exc,
+                    metadata={
+                        "schema_name": candidate.get("schema_name"),
+                        "table_name": candidate.get("table_name"),
+                        "index_name": candidate.get("index_name"),
+                        "index_bytes": candidate.get("index_bytes"),
+                    },
+                )
                 print(
                     f"[drop_duplicate_indexes] failed {candidate['schema_name']}.{candidate['index_name']} error={exc.__class__.__name__}: {exc}",
                     file=sys.stderr,

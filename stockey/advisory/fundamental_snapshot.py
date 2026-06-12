@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from advisory.data_sync import ensure_advisory_symbol_inputs
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.peer_sync import sync_peer_data
 from features.tutils import get_max_date
 from utils.company_master import map_company_master_ids
@@ -18,6 +19,47 @@ TABLE_NAME = "advisory_fundamentals_daily"
 DEFAULT_STATEMENT_LAG_DAYS = 45
 DEFAULT_SHAREHOLDING_LAG_DAYS = 21
 MIN_PEER_FUNDAMENTAL_COUNT = 3
+
+
+def _record_fundamental_snapshot_fallback(
+    *,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    error: Exception,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.fundamental_snapshot",
+        fallback_type=fallback_type,
+        source=source,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata=metadata or {},
+    )
+
+
+def _source_sql_to_df(
+    query: str,
+    *,
+    params: tuple[object, ...] | None,
+    fallback_type: str,
+    source: str,
+    reason: str,
+    metadata: dict[str, object] | None = None,
+) -> pd.DataFrame:
+    try:
+        return sql_to_df(query, params=params)
+    except Exception as exc:
+        _record_fundamental_snapshot_fallback(
+            fallback_type=fallback_type,
+            source=source,
+            reason=reason,
+            error=exc,
+            metadata=metadata,
+        )
+        raise
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -33,13 +75,29 @@ def resolve_universe(symbols: list[str] | None) -> pd.DataFrame:
             WHERE company_master_id IS NOT NULL
             ORDER BY symbol
         """
-        universe = sql_to_df(query)
+        universe = _source_sql_to_df(
+            query,
+            params=None,
+            fallback_type="fundamental_snapshot_universe_load_failed",
+            source="stmt_income",
+            reason="Fundamental snapshot could not load the default fundamentals universe.",
+        )
         if universe.empty:
             return universe
         universe["symbol"] = universe["symbol"].astype("string").str.upper()
         return universe
 
-    company_master_ids = map_company_master_ids(tickers, exchange="NSE")
+    try:
+        company_master_ids = map_company_master_ids(tickers, exchange="NSE")
+    except Exception as exc:
+        _record_fundamental_snapshot_fallback(
+            fallback_type="fundamental_snapshot_company_master_mapping_failed",
+            source="company_master",
+            reason="Fundamental snapshot could not map requested symbols to company master ids.",
+            error=exc,
+            metadata={"symbol_count": len(tickers)},
+        )
+        raise
     universe = pd.DataFrame(
         {
             "symbol": pd.Series(tickers, dtype="string"),
@@ -55,7 +113,7 @@ def resolve_universe(symbols: list[str] | None) -> pd.DataFrame:
 def load_latest_peer_memberships(anchor_symbols: list[str]) -> pd.DataFrame:
     if not anchor_symbols:
         return pd.DataFrame(columns=["anchor_symbol", "peer_symbol"])
-    df = sql_to_df(
+    df = _source_sql_to_df(
         """
         SELECT p.anchor_symbol, p.peer_symbol
         FROM sharpely_stock_peers p
@@ -74,6 +132,10 @@ def load_latest_peer_memberships(anchor_symbols: list[str]) -> pd.DataFrame:
         ORDER BY p.anchor_symbol, p.peer_rank, p.peer_symbol
         """,
         params=(anchor_symbols, anchor_symbols),
+        fallback_type="fundamental_snapshot_peer_membership_load_failed",
+        source="sharpely_stock_peers",
+        reason="Fundamental snapshot could not load latest peer membership.",
+        metadata={"symbol_count": len(anchor_symbols)},
     )
     if df.empty:
         return df
@@ -112,7 +174,17 @@ def load_target_dates(
     if rebuild:
         lower_bound = from_date
     else:
-        max_date = get_max_date(TABLE_NAME, "asof_date")
+        try:
+            max_date = get_max_date(TABLE_NAME, "asof_date")
+        except Exception as exc:
+            _record_fundamental_snapshot_fallback(
+                fallback_type="fundamental_snapshot_max_date_lookup_failed",
+                source=TABLE_NAME,
+                reason="Fundamental snapshot could not read the latest persisted as-of date.",
+                error=exc,
+                metadata={"rebuild": bool(rebuild)},
+            )
+            raise
         lower_bound = from_date or (
             max_date + pd.Timedelta(days=1) if max_date is not None else None
         )
@@ -125,7 +197,7 @@ def load_target_dates(
     clauses.append("date <= %s")
     params.append(effective_to_date)
 
-    dates = sql_to_df(
+    dates = _source_sql_to_df(
         f"""
         SELECT date
         FROM dim_trading_days
@@ -133,6 +205,10 @@ def load_target_dates(
         ORDER BY date
         """,
         params=tuple(params),
+        fallback_type="fundamental_snapshot_trading_days_load_failed",
+        source="dim_trading_days",
+        reason="Fundamental snapshot could not load target trading days.",
+        metadata={"from_date": str(lower_bound) if lower_bound is not None else None, "to_date": str(effective_to_date)},
     )
     if dates.empty:
         return dates
@@ -154,7 +230,7 @@ def load_release_calendar(universe: pd.DataFrame) -> pd.DataFrame:
     if universe.empty:
         return pd.DataFrame(columns=["company_master_id", "statement_date", "release_date"])
     company_ids = universe["company_master_id"].dropna().astype(str).unique().tolist()
-    events = sql_to_df(
+    events = _source_sql_to_df(
         """
         SELECT
             company_master_id,
@@ -166,6 +242,10 @@ def load_release_calendar(universe: pd.DataFrame) -> pd.DataFrame:
         ORDER BY company_master_id, date, reporting_date
         """,
         params=(company_ids,),
+        fallback_type="fundamental_snapshot_release_calendar_load_failed",
+        source="nseindia_earnings_events",
+        reason="Fundamental snapshot could not load earnings release calendar.",
+        metadata={"company_count": len(company_ids)},
     )
     if events.empty:
         return pd.DataFrame(columns=["company_master_id", "statement_date", "release_date"])
@@ -193,7 +273,7 @@ def load_statement_snapshot(universe: pd.DataFrame) -> pd.DataFrame:
     if universe.empty:
         return pd.DataFrame()
     company_ids = universe["company_master_id"].dropna().astype(str).unique().tolist()
-    income = sql_to_df(
+    income = _source_sql_to_df(
         """
         SELECT
             company_master_id,
@@ -211,10 +291,14 @@ def load_statement_snapshot(universe: pd.DataFrame) -> pd.DataFrame:
         ORDER BY company_master_id, date
         """,
         params=(company_ids,),
+        fallback_type="fundamental_snapshot_income_load_failed",
+        source="stmt_income",
+        reason="Fundamental snapshot could not load quarterly income statements.",
+        metadata={"company_count": len(company_ids)},
     )
     if income.empty:
         return income
-    balance = sql_to_df(
+    balance = _source_sql_to_df(
         """
         SELECT
             company_master_id,
@@ -228,8 +312,12 @@ def load_statement_snapshot(universe: pd.DataFrame) -> pd.DataFrame:
         ORDER BY company_master_id, date
         """,
         params=(company_ids,),
+        fallback_type="fundamental_snapshot_balance_load_failed",
+        source="stmt_balancesheet",
+        reason="Fundamental snapshot could not load balance sheet context.",
+        metadata={"company_count": len(company_ids)},
     )
-    cashflow = sql_to_df(
+    cashflow = _source_sql_to_df(
         """
         SELECT
             company_master_id,
@@ -242,6 +330,10 @@ def load_statement_snapshot(universe: pd.DataFrame) -> pd.DataFrame:
         ORDER BY company_master_id, date
         """,
         params=(company_ids,),
+        fallback_type="fundamental_snapshot_cashflow_load_failed",
+        source="stmt_cashflow",
+        reason="Fundamental snapshot could not load cashflow context.",
+        metadata={"company_count": len(company_ids)},
     )
 
     for frame in [income, balance, cashflow]:
@@ -293,7 +385,7 @@ def load_shareholding_snapshot(universe: pd.DataFrame) -> pd.DataFrame:
     if universe.empty:
         return pd.DataFrame()
     company_ids = universe["company_master_id"].dropna().astype(str).unique().tolist()
-    shareholding = sql_to_df(
+    shareholding = _source_sql_to_df(
         """
         SELECT
             company_master_id,
@@ -307,6 +399,10 @@ def load_shareholding_snapshot(universe: pd.DataFrame) -> pd.DataFrame:
         ORDER BY company_master_id, date
         """,
         params=(company_ids,),
+        fallback_type="fundamental_snapshot_shareholding_load_failed",
+        source="shareholding_category",
+        reason="Fundamental snapshot could not load shareholding context.",
+        metadata={"company_count": len(company_ids)},
     )
     if shareholding.empty:
         return shareholding

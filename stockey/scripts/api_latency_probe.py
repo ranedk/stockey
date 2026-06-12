@@ -5,11 +5,13 @@ import json
 import time
 import urllib.error
 import urllib.request
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from environs import Env
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.performance_slowlog import record_slow_operation
 
 
@@ -29,12 +31,45 @@ DEFAULT_ENDPOINTS = [
 ]
 DEFAULT_THRESHOLD_MS = env.float("API_LATENCY_PROBE_SLOW_MS", 750.0)
 DEFAULT_TIMEOUT_SECONDS = env.float("API_LATENCY_PROBE_TIMEOUT_SECONDS", 30.0)
+DEFAULT_OUTPUT_PATH = Path(env.str("API_LATENCY_PROBE_OUTPUT_FILE", "logs/performance/latest_api_latency_probe.json"))
+
+
+def _record_probe_fallback(
+    *,
+    fallback_type: str,
+    reason: str,
+    endpoint: str,
+    error: Exception,
+    status_code: int | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="scripts.api_latency_probe",
+        source="operator_api",
+        fallback_type=fallback_type,
+        severity="warn",
+        reason=reason,
+        error=error,
+        metadata={
+            "endpoint": endpoint,
+            "route": endpoint.split("?", 1)[0],
+            "status_code": status_code,
+        },
+    )
 
 
 def _json_default(value: Any) -> str:
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     return str(value)
+
+
+def write_probe_summary(path: str | Path | None, payload: dict[str, Any]) -> str | None:
+    if not path:
+        return None
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+    return str(output_path)
 
 
 def probe_endpoint(base_url: str, endpoint: str, *, timeout_seconds: float, threshold_ms: float) -> dict[str, Any]:
@@ -52,8 +87,21 @@ def probe_endpoint(base_url: str, endpoint: str, *, timeout_seconds: float, thre
         status_code = int(exc.code)
         error = f"HTTPError: {exc}"
         body_bytes = len(exc.read() or b"")
+        _record_probe_fallback(
+            fallback_type="api_latency_probe_http_error",
+            reason="Operator API latency probe received an HTTP error response.",
+            endpoint=endpoint,
+            error=exc,
+            status_code=status_code,
+        )
     except Exception as exc:
         error = f"{exc.__class__.__name__}: {exc}"
+        _record_probe_fallback(
+            fallback_type="api_latency_probe_request_failed",
+            reason="Operator API latency probe could not reach or read the endpoint.",
+            endpoint=endpoint,
+            error=exc,
+        )
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     event = record_slow_operation(
         kind="api_latency_probe",
@@ -96,6 +144,7 @@ def run_probe(
     errors = [row for row in rows if row.get("error") or (row.get("status_code") and int(row["status_code"]) >= 400)]
     return {
         "status": "ok" if not errors else "error",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "base_url": base_url,
         "threshold_ms": threshold_ms,
         "timeout_seconds": timeout_seconds,
@@ -112,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--endpoint", action="append", dest="endpoints", help="Endpoint path to probe. Can be repeated.")
     parser.add_argument("--threshold-ms", type=float, default=DEFAULT_THRESHOLD_MS)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    parser.add_argument("--output-path", default=str(DEFAULT_OUTPUT_PATH), help="Where to write the latest probe summary JSON. Use empty string to disable.")
     args = parser.parse_args(argv)
     result = run_probe(
         base_url=args.base_url,
@@ -119,6 +169,10 @@ def main(argv: list[str] | None = None) -> int:
         threshold_ms=float(args.threshold_ms),
         timeout_seconds=float(args.timeout_seconds),
     )
+    output_path = str(Path(args.output_path).expanduser()) if args.output_path else None
+    if output_path:
+        result["output_path"] = output_path
+    write_probe_summary(output_path, result)
     print(json.dumps(result, indent=2, default=_json_default))
     return 0 if result["status"] == "ok" else 1
 

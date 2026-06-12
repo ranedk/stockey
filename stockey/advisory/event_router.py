@@ -6,38 +6,68 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.sync_state import load_sync_state, persist_sync_state, publish_bus_message
-from utils.db import db_session, sql_to_df, upsert_to_db
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 
 
 ALERTS_TABLE = "advisory_live_watch_alerts"
 ANNOUNCEMENT_EVENTS_TABLE = "advisory_watch_events"
 NEWS_EVENTS_TABLE = "advisory_news_events"
 ACTIONS_TABLE = "advisory_live_router_actions"
+EVENT_ROUTER_SCHEMA_MIGRATION_ID = "20260611_advisory_event_router_actions_base"
+EVENT_ROUTER_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {ACTIONS_TABLE} (
+        routed_at TIMESTAMPTZ NOT NULL,
+        asof_date TIMESTAMPTZ,
+        symbol TEXT NOT NULL,
+        setup_ids_json TEXT,
+        source_type TEXT NOT NULL,
+        action_type TEXT NOT NULL,
+        action_status TEXT,
+        action_reason TEXT,
+        summary_json TEXT,
+        load_ts TIMESTAMPTZ,
+        UNIQUE (routed_at, symbol, source_type, action_type)
+    )
+    """,
+]
 STATE_SOURCE_NAME = "continuous_watch:router"
 DEFAULT_MAX_ACTIONS_PER_CYCLE: int | None = None
 DEFAULT_MAX_EVENT_ONLY_ACTIONS: int | None = None
 
 
+def _record_router_fallback(
+    fallback_type: str,
+    *,
+    source: str,
+    reason: str,
+    error: Exception,
+    severity: str = "warn",
+    symbol: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    record_local_fallback_event(
+        module="advisory.event_router",
+        fallback_type=fallback_type,
+        source=source,
+        severity=severity,
+        reason=reason,
+        error=error,
+        symbol=symbol,
+        metadata=metadata or {},
+    )
+
+
 def ensure_actions_table() -> None:
-    with db_session() as (_, cur):
-        cur.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {ACTIONS_TABLE} (
-                routed_at TIMESTAMPTZ NOT NULL,
-                asof_date TIMESTAMPTZ,
-                symbol TEXT NOT NULL,
-                setup_ids_json TEXT,
-                source_type TEXT NOT NULL,
-                action_type TEXT NOT NULL,
-                action_status TEXT,
-                action_reason TEXT,
-                summary_json TEXT,
-                load_ts TIMESTAMPTZ,
-                UNIQUE (routed_at, symbol, source_type, action_type)
-            )
-            """
-        )
+    apply_schema_migration(
+        migration_id=EVENT_ROUTER_SCHEMA_MIGRATION_ID,
+        description="Create live event-router action table.",
+        statements=EVENT_ROUTER_SCHEMA_STATEMENTS,
+        metadata={"tables": [ACTIONS_TABLE]},
+    )
 
 
 def _normalize_series_ts(df: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -64,7 +94,14 @@ def load_recent_source_rows(table_name: str, *, load_from: pd.Timestamp | None) 
             """,
             params=tuple(params) if params else None,
         )
-    except Exception:
+    except Exception as exc:
+        _record_router_fallback(
+            "event_router_source_rows_load_failed",
+            source=table_name,
+            reason="Event router could not load recent watcher source rows; affected updates may not trigger fast symbol refresh until a later run or full advisory.",
+            error=exc,
+            metadata={"load_from": None if load_from is None or pd.isna(load_from) else pd.Timestamp(load_from).isoformat()},
+        )
         return pd.DataFrame()
     for column in ["load_ts", "observed_at", "published_on", "asof_date"]:
         if column in df.columns:
@@ -90,7 +127,13 @@ def load_watchlist_priority() -> pd.DataFrame:
             WHERE asof_date = (SELECT MAX(asof_date) FROM advisory_watchlist)
             """
         )
-    except Exception:
+    except Exception as exc:
+        _record_router_fallback(
+            "event_router_watchlist_priority_load_failed",
+            source="advisory_watchlist",
+            reason="Event router could not load watchlist priority; routing still proceeds but may lose setup rank prioritization.",
+            error=exc,
+        )
         return pd.DataFrame()
     if df.empty:
         return df
@@ -249,6 +292,15 @@ def execute_routing_plan(plan: list[dict[str, Any]]) -> pd.DataFrame:
             summary = {"status": "error", "error": f"{exc.__class__.__name__}: {exc}"}
             status = "error"
             action_reason = f"router_error:{exc.__class__.__name__}"
+            _record_router_fallback(
+                "event_router_symbol_refresh_failed",
+                source="advisory.signal_refresh",
+                reason="Event router could not refresh a symbol after watcher evidence; the router action row was marked error.",
+                error=exc,
+                severity="error",
+                symbol=str(item.get("symbol") or "").strip().upper() or None,
+                metadata={"action_type": item.get("action_type"), "source_types": item.get("source_types") or []},
+            )
         rows.append(
             {
                 "routed_at": routed_at,

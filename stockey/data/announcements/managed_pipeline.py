@@ -8,6 +8,7 @@ from typing import List, Optional, Sequence
 import pytz
 
 from advisory.decision_trace import record_event_processing, safe_trace_call
+from advisory.fallback_telemetry import record_local_fallback_event
 
 from .db import load_company_master_targets
 from .models import Announcement
@@ -29,6 +30,37 @@ from .state import (
 from utils.log import setup_logger
 
 logger = setup_logger("announcement_pipeline.managed")
+
+
+def _record_managed_ingest_fallback(
+    *,
+    announcement: Announcement,
+    error: Exception,
+    existing_document: dict,
+) -> None:
+    record_local_fallback_event(
+        module="data.announcements.managed_pipeline",
+        fallback_type="announcement_managed_ingest_failed",
+        source="announcement_managed_pipeline",
+        severity="warn",
+        reason=(
+            "Managed announcement ingestion failed for one announcement; the batch continues, "
+            "but this announcement may have incomplete OCR, parsing, summary, or persisted report output."
+        ),
+        error=error,
+        metadata={
+            "unique_id": announcement.unique_id,
+            "ticker": announcement.ticker,
+            "exchange": announcement.exchange,
+            "company_master_id": announcement.company_master_id,
+            "subject": announcement.subject,
+            "attachment_url_present": bool(announcement.attachment_url),
+            "existing_document": bool(existing_document),
+            "existing_pdf_status": existing_document.get("pdf_status"),
+            "existing_ocr_status": existing_document.get("ocr_status"),
+            "existing_parse_status": existing_document.get("parse_status"),
+        },
+    )
 
 
 def serialize_stage_payload(value: object) -> object:
@@ -304,6 +336,11 @@ class ManagedAnnouncementPipeline:
                 announcement.attachment_bytes = None
             except Exception as exc:
                 logger.exception("Failed announcement %s", announcement.unique_id)
+                _record_managed_ingest_fallback(
+                    announcement=announcement,
+                    error=exc,
+                    existing_document=existing_document,
+                )
                 self._record_stage(announcement, "managed_ingest", "error", error=str(exc))
                 summary.failed += 1
                 self._persist_document(
