@@ -48,7 +48,7 @@ function ageText(value: unknown) {
         </p>
       </div>
       <p v-if="isStale" class="max-w-2xl text-sm leading-6 text-ink/65">
-        {{ message }} Run <code>python -m advisory.operator_snapshot</code> or wait for the next advisory/watchers cycle.
+        {{ message }} Run <code>operator_snapshot_refresh</code> from Operations, run <code>python -m advisory.operator_snapshot</code>, or wait for the next advisory/watchers cycle.
       </p>
     </div>
   </section>

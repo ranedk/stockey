@@ -236,6 +236,47 @@ def ensure_master_table() -> None:
     )
 
 
+def classify_scrip_master_error(error: object) -> str:
+    text = str(error or "").lower()
+    if "download failed" in text or "timed out" in text or "timeout" in text or "connection" in text:
+        return "source_unavailable"
+    if "response too small" in text:
+        return "source_unavailable"
+    if "undefinedcolumn" in text or "column" in text or "copy" in text or "datatype" in text:
+        return "schema_changed"
+    if "parser" in text or "csv" in text or "tokenizing" in text:
+        return "parse_failed"
+    return "failed"
+
+
+def build_run_state(
+    *,
+    rows: int,
+    column_count: int = 0,
+    source_file: str | None = None,
+    load_ts: datetime | None = None,
+    classification: str = "ok",
+    error: str | None = None,
+) -> dict[str, object]:
+    return {
+        "source": "dhan_scrip_master",
+        "rows": int(rows),
+        "rows_read": int(rows),
+        "rows_written": int(rows) if classification == "ok" else 0,
+        "column_count": int(column_count),
+        "source_file": source_file,
+        "load_ts": load_ts.isoformat() if load_ts else None,
+        "classification": classification,
+        "status": "ok" if classification in {"ok", "no_data"} else "failed",
+        "source_unavailable_count": 1 if classification == "source_unavailable" else 0,
+        "schema_changed_count": 1 if classification == "schema_changed" else 0,
+        "parse_failed_count": 1 if classification == "parse_failed" else 0,
+        "fallback_used": False,
+        "state_advanced": int(rows) > 0 and classification == "ok",
+        "error": error,
+    }
+
+
 def make_insert_sql(columns: list[str]) -> str:
     target_columns = [*columns, "valid_from", "valid_to", "load_ts"]
     quoted_targets = ", ".join(quote_identifier(column) for column in target_columns)
@@ -336,20 +377,45 @@ def update_database(df: pd.DataFrame) -> datetime:
 
 def main() -> int:
     global STOCKEY_RUN_STATE
-    csv_path = download_master_csv()
-    print(f"downloaded → {csv_path}")
-    df_master = load_csv(csv_path)
-    load_ts = update_database(df_master)
-    STOCKEY_RUN_STATE = {
-        "rows": int(len(df_master)),
-        "rows_read": int(len(df_master)),
-        "rows_written": int(len(df_master)),
-        "column_count": int(len(df_master.columns)),
-        "source_file": str(csv_path),
-        "load_ts": load_ts.isoformat(),
-        "fallback_used": False,
-    }
-    return 0
+    csv_path: Path | None = None
+    try:
+        csv_path = download_master_csv()
+        print(f"downloaded → {csv_path}")
+        df_master = load_csv(csv_path)
+        load_ts = update_database(df_master)
+        STOCKEY_RUN_STATE = build_run_state(
+            rows=int(len(df_master)),
+            column_count=int(len(df_master.columns)),
+            source_file=str(csv_path),
+            load_ts=load_ts,
+            classification="ok" if len(df_master) > 0 else "no_data",
+        )
+        return 0
+    except SystemExit as exc:
+        error_text = str(exc)
+        STOCKEY_RUN_STATE = build_run_state(
+            rows=0,
+            source_file=str(csv_path) if csv_path else None,
+            classification=classify_scrip_master_error(error_text),
+            error=error_text,
+        )
+        raise
+    except Exception as exc:
+        error_text = f"{type(exc).__name__}: {exc}"
+        classification = classify_scrip_master_error(error_text)
+        STOCKEY_RUN_STATE = build_run_state(
+            rows=0,
+            source_file=str(csv_path) if csv_path else None,
+            classification=classification,
+            error=error_text,
+        )
+        _record_scrip_master_fallback(
+            fallback_type="dhan_scrip_master_sync_failed",
+            reason="Dhan scrip master sync failed after download; security-id mapping may be stale until fixed and rerun.",
+            error=exc,
+            metadata={"classification": classification, "source_file": str(csv_path) if csv_path else None},
+        )
+        raise
 
 
 if __name__ == "__main__":

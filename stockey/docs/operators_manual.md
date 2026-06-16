@@ -78,6 +78,29 @@ python -m data.screenerin.auth
 
 If `https://www.screener.in/login/` redirects to `/dash/`, the session is already logged in. Otherwise the helper fills the login form from env, submits it, and verifies `/dash/`. Credentials are not printed.
 
+## Chrome CDP session
+
+Screener.in and Dhan automated login use the same Chrome remote-debugging session. Start it before running browser-backed flows:
+
+```sh
+scripts/start_chrome_cdp.sh
+```
+
+Then keep this env in `.env`:
+
+```sh
+CDP_ENDPOINT=http://localhost:9222
+```
+
+Useful overrides:
+
+```sh
+CDP_PORT=9223 CHROME_USER_DATA_DIR=~/.stockey/chrome-cdp-9223 scripts/start_chrome_cdp.sh
+CHROME_BINARY="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" scripts/start_chrome_cdp.sh
+```
+
+This starts Chrome in the foreground with a separate user-data directory. Stop it with `Ctrl-C` when you are done.
+
 Use the operator UI `/screeners` page before promoting a new Screener.in idea. The page validates known local syntax problems without opening Chrome, and its “fetch preview rows” action calls `POST /api/screeners/preview` with `persist=false`. This can use the authenticated Screener.in session and can record failure audit rows, but it does not store query results, register a screener, change recommendations, or submit broker orders. Register a screener only after preview rows look correct.
 
 The same page shows read-only coverage metrics from `GET /api/screeners/coverage`: constituent count, candidate count, final action count, positive-action rate, manual-review count, and exit count by screener. Use this to retire noisy screeners or investigate why a screener is not contributing useful candidates. Do not treat coverage alone as proof that a screener is profitable; it is attribution, not outcome validation.
@@ -114,7 +137,7 @@ Important:
 
 Current schedule:
 
-- every `5` minutes: `./all_frontend.sh` under a lock, which keeps the operator API and Nuxt frontend running without duplicates
+- every `5` minutes: `./all_frontend.sh` under a lock, which keeps the operator API and Nuxt frontend running without duplicates and restarts after source-code changes
 - `07:10` weekdays: `./complete_data.sh` broad morning safety net
 - `08:30`, `12:30`, `16:30` weekdays: `./all_downloaders_queue.sh` to enqueue single-client NSE/Dhan/Screener downloader work while running safe downloader modules inline
 - `08:35`, `12:35`, `16:35` weekdays: `./all_external_workers.sh` to drain Dhan, Screener, and NSE queues serially
@@ -127,6 +150,7 @@ Current schedule:
 - `18:20`, `21:20` weekdays: `./all_ts_forecast_evaluator.sh` after costs
 - `21:35` weekdays: `./all_ts_forecast_paper_portfolio.sh` for research-only forecast paper-portfolio validation
 - `17:30` weekdays: `./complete_data.sh` end-of-day catch-up before advisory
+- `18:55` weekdays: `./all_advisory_preflight.sh` validates/refreshes Dhan auth and runs compact operator smoke before advisory
 - `19:10` weekdays: `./all_advisory.sh`, after waiting for data catch-up and external worker locks to clear
 - `23:10` weekdays: `./all_event_policy_evaluator.sh` after costs
 - `04:20` Saturdays: `./all_technical_threshold_calibration.sh` after costs
@@ -148,6 +172,7 @@ Script groups:
 
 - recurring cron scripts: `all_frontend.sh`, `all_watchers.sh`, `all_downloaders_queue.sh`, `all_external_workers.sh`, morning and pre-advisory `complete_data.sh`, post-close `all_advisory.sh`, `all_api_latency_probe.sh`, `all_operator_health.sh`, `all_hypothesis_scan.sh`, TS/event-policy/technical research wrappers, and weekly `all_ml.sh` if enabled
 - manual / catch-up / long-running scripts: `all_downloaders.sh`, `all_parsers.sh`, manual `complete_data.sh`, manual `all_ml.sh`, and `all_advisory_codex.sh`
+- preflight/debug scripts: `all_advisory_preflight.sh` validates Dhan/CDP/token readiness and compact Health before spending hours on `all_advisory.sh`; it can refresh the Dhan token cache but does not run advisory or submit orders
 - use the manual group end-of-day, after missed runs, before major reruns, or during debugging; do not add them to high-frequency cron
 
 Important constraint:
@@ -194,6 +219,32 @@ The same data is exposed at `GET /api/health/details` and rendered in the Nuxt `
 
 The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, identity/action mapping gaps, Redis reachability, Postgres connectivity, event-evidence quality issues, Screener.in failures, and feature stage-gate blockers. The Nuxt `Data Health` page shows the hints near the top with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix. The page can filter health rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
 
+## Operator Paper Portfolio
+
+Use the Nuxt `/recommendations` page when you want to manually build a clean paper portfolio from the latest consolidated recommendations.
+
+The workflow is intentionally separate from the advisory model portfolio:
+
+- The page shows only action-capable rows: `BUY`, `BUY_MORE`, `SELL`, and `PARTIAL_SELL`.
+- `WATCH`, `HOLD`, and `MANUAL_REVIEW` stay out of this page; use Watchlist or Manual Review for those.
+- Each row shows exactly one operator action button: `BUY`, `BUY_50%`, `SELL`, or `SELL_50%`.
+- `BUY` writes one paper-ledger entry for the symbol at the visible current/reference price.
+- `BUY_50%` records a paper add/half-entry action.
+- `SELL` closes the currently open paper position at the visible current/reference price.
+- `SELL_50%` records a partial-exit paper action without closing the position.
+- `/paper-portfolio` shows only entry price, exit price, current price, and percentage gain/loss.
+- The paper ledger does not mutate `advisory_action_recommendations`, `advisory_portfolio_orders`, Dhan execution rows, or live broker orders.
+
+Reset command:
+
+```sh
+python scripts/reset_operator_portfolio.py --confirm
+```
+
+This deletes only rows from `advisory_operator_portfolio_ledger`. It does not reset advisory history, recommendations, model output, execution approvals, or Dhan state. Use it when you want the operator paper portfolio to start from scratch while keeping the research/advisory database intact.
+
+Dhan cache health also reports whether a non-interactive refresh path is ready. `auth_refresh_ready=false` with `auto_login_configured=true` usually means `CDP_ENDPOINT` is configured but Chrome remote debugging is not reachable; Health fix hints put `scripts/start_chrome_cdp.sh` before the Dhan refresh command in this case. Dhan auto-login is intentionally fail-hard when Chrome/CDP is unavailable. Run that Chrome CDP session first, then run `python -m data.dhanlive.auth_cli ensure --auto-login`, then rerun `all_advisory.sh`. If the Dhan page is reachable but slow between mobile, TOTP, PIN, and redirect steps, tune `DHAN_AUTO_LOGIN_STEP_TIMEOUT_MS`.
+
 Run the event-evidence quality gate directly when announcement/bhavcopy inputs look suspicious:
 
 ```sh
@@ -221,7 +272,12 @@ Operator-facing telemetry and log snippets are redacted before they are written 
 Useful API/token env knobs:
 
 - `OPERATOR_API_HEALTH_URL`: endpoint checked by operator health, default `http://127.0.0.1:8765/api/health`
+- `OPERATOR_API_RUNTIME_URL`: runtime metadata endpoint checked by operator health for stale API code, default `http://127.0.0.1:8765/api/runtime`
 - `OPERATOR_API_HEALTH_TIMEOUT_SECONDS`: API health timeout, default `3`
+- `OPERATOR_WEB_HEALTH_URL`: frontend URL checked by operator health, default `http://127.0.0.1:3000/`
+- `OPERATOR_WEB_HEALTH_TIMEOUT_SECONDS`: frontend runtime health timeout, default `3`
+
+`python -m advisory.operator_health --skip-dhan` defaults to JSON for cron/API consumers. Use `--format text` for a short terminal summary, or `--format json` when piping into another script.
 
 Cron log health is run-aware. A traceback followed by a later success marker is shown as a warning with `latest_run_status=ok_after_historical_errors`; a traceback or failed status after the latest success marker remains an error. This prevents old failures from keeping the page red after a recovered run while still preserving historical errors for audit.
 
@@ -294,7 +350,7 @@ sudo apt-get install poppler-utils
 
 The OCR code resolves Poppler from `POPPLER_PATH`, then `PATH`, then common Homebrew/system locations. The generated cron `PATH` includes `/opt/homebrew/bin` for macOS Homebrew installs.
 
-By default, announcement OCR, concise document summaries, structured report parsing, and event evaluation can run through Codex CLI instead of hosted ChatGPT/Gemini APIs. Use `OCR_USING=codex`, `SUMMARIZE_WITH=codex`, `ADVISORY_EVENT_EVAL_MODEL=codex`, `CODEX_CLI_OCR_MODEL`, `CODEX_CLI_SUMMARIZE_MODEL`, and `CODEX_CLI_EVENT_MODEL`.
+By default, announcement OCR, concise document summaries, structured report parsing, and event evaluation can run through Codex CLI instead of hosted ChatGPT/Gemini APIs. Use `OCR_USING=codex`, `SUMMARIZE_WITH=codex`, `ADVISORY_EVENT_EVAL_MODEL=codex`, `CODEX_CLI_OCR_MODEL`, `CODEX_CLI_SUMMARIZE_MODEL`, and `CODEX_CLI_EVENT_MODEL`. Cron often has a narrower `PATH` than your shell; set `CODEX_CLI_BIN` to an absolute path when possible. The Python wrapper also searches common nvm, local npm, Homebrew, and `/usr/local/bin` locations and records fallback telemetry if Codex is still unavailable.
 
 ## Redis robustness knobs
 
@@ -356,14 +412,17 @@ Use when:
 Command:
 
 ```sh
+./all_advisory_preflight.sh
 ./all_advisory.sh
 ```
 
 Default performance behavior:
 
+- runs `dhan_auth_preflight` first unless `ADVISORY_DHAN_PREFLIGHT=false`; this validates or refreshes Dhan auth before expensive advisory stages
 - runs independent local/DB feature stages with bounded threads
 - skips hidden rule-engine daily/intraday repair by default
 - expects data gaps to be handled by `complete_data.sh`, watchers, or the external task queue
+- emits machine-readable `stage_timings`, `slow_stages`, and `stage_budget` in the JSON summary so long runs can be diagnosed by stage without reading the full log
 
 Useful overrides:
 
@@ -371,9 +430,41 @@ Useful overrides:
 ADVISORY_LOCAL_STAGE_WORKERS=2 ./all_advisory.sh
 ADVISORY_PARALLEL_LOCAL_STAGES=0 ./all_advisory.sh
 ADVISORY_DISABLE_RULE_REPAIR=0 ./all_advisory.sh
+ADVISORY_STAGE_BUDGET_SECONDS=900 ./all_advisory.sh
+ADVISORY_STAGE_BUDGET_OVERRIDES=rules=1800,exchange_features=900 ./all_advisory.sh
+ADVISORY_DHAN_PREFLIGHT=false ./all_advisory.sh
 ```
 
 Use `ADVISORY_DISABLE_RULE_REPAIR=0` only when you deliberately want the advisory batch to repair missing Dhan/fundamental inputs inline. That can make the run much slower.
+
+Use `ADVISORY_DHAN_PREFLIGHT=false` only for targeted dry-runs that do not need Dhan-backed price refresh. Normal advisory runs should keep the preflight enabled so an expired token fails or refreshes before the expensive pipeline starts. If this preflight fails, `all_advisory.sh` reports `step=dhan_auth_preflight`, prints `scripts/start_chrome_cdp.sh` as the first repair step when CDP may be unavailable, and then prints the auth refresh command instead of an old advisory stage report. `python -m data.dhanlive.auth_cli ensure --auto-login` returns structured JSON for refresh failures such as CDP/Chrome being unavailable, so cron logs should show `status=error`, `error_type`, `error`, and `operator_action` rather than a Python traceback. Related knobs are `ADVISORY_DHAN_PREFLIGHT_AUTO_LOGIN`, `ADVISORY_DHAN_PREFLIGHT_MIN_FRESH_MINUTES`, and `ADVISORY_DHAN_PREFLIGHT_SKIP_VALIDATE`.
+
+Use `./all_advisory_preflight.sh` before manual long advisory runs when you want to verify Dhan/CDP/token readiness and compact operator trust state without launching `advisory.master_pipeline`. It accepts the same Dhan preflight env knobs plus `ADVISORY_PREFLIGHT_SKIP_SMOKE=true` and `ADVISORY_PREFLIGHT_FIX_HINT_LIMIT`.
+
+If `./all_advisory_preflight.sh` fails before smoke, it prints the failing step plus the same CDP-first recovery path directly in the log. If smoke fails after Dhan auth succeeds, it tells you to inspect the compact smoke output and rerun Health.
+
+Operator Health inspects `logs/cron/all_advisory_preflight.log` separately from the full advisory log. If CDP or Dhan auth fails there, Health and the degradation feed classify it as a Dhan auth/CDP preflight failure and show the repair order: inspect the log, start `scripts/start_chrome_cdp.sh`, rerun `./all_advisory_preflight.sh`, then rerun Health.
+
+The compact smoke output from `./all_advisory_preflight.sh` includes a `dhan_readiness` block with token validation status, cache status, `auth_refresh_ready`, auto-login configuration, CDP status, and whether CDP recovery is required. Treat `auth_refresh_ready=false` or `cdp_recovery_required=true` as a blocker before running `./all_advisory.sh`.
+
+Stage budgets are reporting-only. They mark slow stages in stderr and in the final JSON summary but do not fail or stop the run. Use them to decide whether to move more work into downloader/external queues, add indexes, or tighten stage inputs.
+
+After a long cron/manual advisory run, extract the latest stage timing summary from the mixed log with:
+
+```sh
+python scripts/advisory_stage_report.py --log-path logs/cron/all_advisory.log --limit 20
+python scripts/advisory_stage_report.py --format json
+```
+
+The same read-only report is also available from the Operations page as the audited `advisory_stage_report` command. Use the UI command when you want the run recorded in operator command history.
+
+Operator Health also checks this report. If the latest `all_advisory.log` has no parseable stage summary, if any stage is over budget, or if a failed/incomplete run only emitted stage markers before the traceback, Health emits a fix hint pointing to the CLI command and the audited Operations command. Failed marker-only runs should show the nearest failed stage, for example `intraday`, instead of a generic missing-summary warning.
+
+`all_advisory.sh` also prints this stage report automatically when the wrapped advisory command fails. If Dhan automated login hits Playwright's sync API inside an existing asyncio loop, the auth layer retries the automated login in a subprocess before giving up; this avoids the historical intraday-stage crash where the traceback ended with `Playwright Sync API inside the asyncio loop`.
+
+For targeted dry-run verification, set `ADVISORY_SKIP_POST_REFRESH=true` to skip the post-run `operator_snapshot` and `trace_summary_store` refreshes. Do not use this for scheduled production advisory runs, because the frontend depends on those refreshes after a successful full run.
+
+Use the report before guessing where to optimize. If `rules`, `exchange_features`, or another stage is repeatedly over budget, fix that specific stage instead of changing the whole pipeline.
 
 Codex-supervised variant:
 
@@ -414,7 +505,8 @@ Use this table when deciding whether to run a full advisory pass, rely on watche
 | --- | --- | --- | --- | --- | --- |
 | Full advisory | `./all_advisory.sh` after fresh data, normally post-close | Screener universe, snapshots, event policy, adversarial review, risk, portfolio, lifecycle, action history | Current advisory tables including portfolio/order plans, lifecycle, consolidated action recommendations, execution previews, traces, and operator snapshot | Authoritative daily portfolio/action reconciliation and dry-run execution-plan state | Submit live broker orders without explicit live-execution gates |
 | Watchers | `./all_watchers.sh` cron or loop during market hours | Active watchlist names, open positions, recent OHLCV, news, announcements, wait signals, persisted watcher cursors | Watch alerts, fresh source rows, wait-signal matches, signal-refresh rows, trace summaries, operator snapshot | Fast operator visibility for fresh evidence and per-symbol action/evidence changes | Replace the full cross-sectional advisory, recompute authoritative portfolio allocation, or submit orders |
-| Fast signal refresh | Watcher router or `python -m advisory.signal_refresh ...` | Latest consolidated action, lifecycle/rebalance rows, event-policy rows, matched wait signals for one symbol | `advisory_signal_refresh_actions`, trace rows, materialized trace summaries | Show whether a symbol-level signal changed, created a wait-match action, or only refreshed evidence | Run full allocation/risk sizing across the universe or mutate authoritative portfolio rows |
+| Fast signal refresh | Watcher router or `python -m advisory.signal_refresh ...` | Latest consolidated action, lifecycle/rebalance rows, event-policy rows, matched wait signals for one symbol, and router price/news/announcement trigger context when available | `advisory_signal_refresh_actions`, trace rows, materialized trace summaries | Show whether a symbol-level signal changed, created a wait-match action, matched a review-only stop/entry watcher trigger, or only refreshed evidence, including previous action and action-changed trace fields | Run full allocation/risk sizing across the universe or mutate authoritative portfolio rows |
+| Execution Approvals | `/execution-approvals` or `/api/execution/approvals` after dry-run execution previews exist | Latest `advisory_execution_orders` rows, execution safety contracts, audit-only approval decisions, broker order-state reads when reconciliation is requested, historical execution evidence rows when evidence review is requested, and current planned rows when live-submit preflight is requested | Optional audit rows in `advisory_execution_approval_decisions`; optional safety-contract update to `operator_approval_status=approved` after latest `approve_dry_run` audit; optional reconciliation/fill persistence through `/api/execution/reconcile` with `confirm=true`; optional evidence review rows in `advisory_execution_evidence_reviews`; optional live-allowance rows in `advisory_execution_live_allowance_reviews` | Show missing operator approval, broker reconciliation, live-evidence checklist, live-submission, and dry-run blockers; record review intent; mark operator approval status after reviewed audit; preview or persist broker reconciliation; mark evidence passed after enough reviewed cycles; set `live_submission_allowed=true` after all safety gates and exact phrase are satisfied; generate the read-only live-submit preflight token and manual CLI command | Bypass approval, bypass evidence checklist, submit orders from the UI/API, or treat reconciliation/evidence/live allowance/preflight as broker submission |
 | Wait signals | Playbook action plans, Manual Review `watch_for_event`, or `python -m advisory.wait_signals ...` | Typed wait conditions plus price/news/announcement evidence | `advisory_wait_signals` and `advisory_wait_signal_matches` | Record that a future condition is active, matched, expired, or closed | Trade, approve actions, or change portfolio state by itself |
 | Manual Review | Operator decision in `/manual-review` or API decision endpoint | Active manual items, source row context, decision/effect table, optional wait-signal fields | `advisory_manual_review_decisions`; for `watch_for_event`, an active wait signal | Close or annotate a review item; create a watched condition; reopen matched Manual Review wait-signal follow-up work | Submit broker orders, directly mutate portfolio rows, or directly rewrite action recommendations |
 
@@ -431,7 +523,7 @@ Watcher trigger boundaries:
 | Trigger or observation | Immediate watcher effect | Full advisory required before treating as authoritative? | Notes |
 | --- | --- | --- | --- |
 | Fresh intraday OHLCV for a watched symbol or open position | Writes watcher alerts and can refresh that symbol into `advisory_signal_refresh_actions` | Yes, for portfolio sizing, final allocation, and dry-run execution previews | Intraday refresh is symbol-scoped visibility. It does not rebuild the universe or reconcile the portfolio. |
-| Fresh exchange announcement or news for an active watch/open position | Persists the source evidence, routes material events, and refreshes the affected symbol | Yes, when the evidence changes investability, sizing, or final action state | The watcher can show `action_changed` or `evidence_only`; that is not final approval. |
+| Fresh exchange announcement or news for an active watch/open position | Persists the source evidence, routes material events, and refreshes the affected symbol | Yes, when the evidence changes investability, sizing, or final action state | The watcher can show `previous_action`, `action_changed`, or `evidence_only`; that is not final approval. |
 | Top market-context news or announcement without deterministic materiality keywords | Persists `context_observed` evidence only | Yes, if the operator wants it considered in cross-sectional advisory state | Context-only observations do not trigger action authority by themselves. |
 | Top market-context news or announcement with deterministic materiality keywords | Marks the item `triggered` and routes it for symbol-level refresh/evaluation | Yes, before using it as authoritative portfolio/action state | Materiality routing improves freshness, but still remains a watcher overlay. |
 | Active wait signal matches price/news/announcement evidence | Writes `advisory_wait_signal_matches`; signal refresh may create a review-only `WATCH`, `MANUAL_REVIEW`, or reduce-review signal | Yes, before any broker-capable action or portfolio mutation | Matched waits are evidence. Manual Review follow-up is expected for operator-created waits. |
@@ -458,7 +550,10 @@ Matched Manual Review wait-signal behavior:
 
 - If the original item is still in `watch_for_event`, a matched wait signal suppresses the stale waiting item and reopens follow-up work as `reopened_wait_signal_matched`.
 - If the original item was closed later by `ignore`, `mark_fixed`, `downgrade_to_no_action`, or `approve_for_manual_config`, the matched wait signal is suppressed from active Manual Review instead of reopening stale work.
+- If the matched follow-up item itself is later closed by an operator decision, that follow-up is also suppressed from active Manual Review and does not keep reappearing.
 - A matched wait can create a review-only action candidate linked to the original item and match evidence. It remains evidence for operator review; it is not approval and cannot submit an order.
+
+Manual Review also collapses repeated unresolved conflict rows for the same symbol/action pair to the newest active item. The API summary reports `duplicate_suppressed` so repeated source rows are visible as queue hygiene rather than multiple decisions for the same conflict. If an operator closes one of those repeated conflict items, later rows with the same canonical symbol/action conflict are suppressed even when the transient source key changes.
 
 ### 3. Model prep and training
 
@@ -563,6 +658,9 @@ Important behavior:
 - OHLCV, news, and announcements use persisted cursors in `advisory_sync_state`, not cron wall-clock assumptions
 - OHLCV keeps a small overlap on every pull and does not advance `last_item_ts` when no fresh intraday candle was actually observed
 - OHLCV watcher catch-up is capped by `WATCHER_OHLCV_MAX_LOOKBACK_MINUTES` to avoid a stale cursor making every `10` minute cron run download days of 1-minute candles; `complete_data.sh` remains the broad catch-up path
+- Live price alerts use `WATCHER_ALERT_COOLDOWN_SECONDS` to suppress repeated alerts with the same setup/symbol/type/source/state fingerprint. The watcher publishes `alert_input_count`, `alert_persisted_count`, and `alert_suppressed_count`; if the dedupe lookup fails, it records fallback telemetry and persists alerts fail-open so evidence is not lost.
+- Each watcher cycle writes normalized `source_counters` into its result and `advisory_sync_state`: OHLCV reports symbols, sync results, latest-price rows, alert persisted/suppressed counts; news reports watch rows, RSS item count, matched/persisted event counts, triggered/context counts, and feed count; announcements report watch rows, unique ingest targets, ingest run/discovered/parsed/failed counts, matched/persisted event counts, and watch-update count.
+- Operator Health and the Health page show the latest watcher `source_counters`, including stale/missing/error status and a fix hint to rerun `./all_watchers.sh` when OHLCV/news/announcement watcher output is not healthy.
 - if a run fails before cursor persistence, the next due run retries from the previous successful cursor
 - `complete_data.sh` or `all_downloaders.sh` remains the broad end-of-day catch-up path if a full day was missed
 - there is no default cap on how many symbols the router may reevaluate
@@ -576,6 +674,7 @@ Advisory intraday behavior:
 - open positions remain monitored for exit-related alerts
 - watcher/router updates now write fast per-symbol rows to `advisory_signal_refresh_actions`
 - signal refresh is for live visibility and manual/operator reaction; the full post-close advisory remains the authoritative portfolio reconciliation
+- signal-refresh rows/API payloads carry `authority_scope=review_input_only`, `portfolio_authority=none`, `broker_execution_allowed=false`, and `full_advisory_required=true`
 - alerts and cycle summaries are also published over Redis pub-sub
 
 ### Fast signal refresh
@@ -599,9 +698,11 @@ What it does:
 - reads the latest consolidated action, lifecycle/rebalance, and event-policy rows for the symbol
 - checks matched hypothesis Wait Signals for the symbol
 - gives priority to exit/reduce lifecycle signals over stale buy/watch signals
+- uses watcher-router trigger context when available: stop/invalidation price alerts become review-only `REDUCE_EXPOSURE_REVIEW`, entry-zone/breakout alerts become review-only `WATCH`, and fresh news/announcement router context becomes `MANUAL_REVIEW` until event-policy/full advisory catches up
 - writes `advisory_signal_refresh_actions`
 - appends decision trace rows and refreshes materialized symbol/event trace summaries
 - does not run cross-sectional portfolio allocation or mutate the authoritative portfolio
+- does not create broker authority; use the persisted authority fields above to verify this in SQL/API/UI
 
 ### Hypothesis Wait Signals
 
@@ -656,6 +757,8 @@ Run the operator API and Nuxt app together with:
 
 This starts `advisory.api.app` on `127.0.0.1:8765` and Nuxt on `127.0.0.1:3000` by default. It loads `nvm use default` before running Node/npm, logs the resolved Node path/version, and installs frontend dependencies automatically if `apps/operator-web/node_modules` is missing.
 
+The supervisor watches a lightweight source signature for the operator API and Nuxt app. With `OPERATOR_FRONTEND_RESTART_ON_CODE_CHANGE=true`, a long-running frontend process exits with a `[stockey.script] ... status=restart_requested` marker when relevant Python or Nuxt files change. The cron lock is released and the next `all_frontend.sh` cron tick starts a fresh API/frontend process, which prevents stale API code from serving fixed endpoints for hours. Use `OPERATOR_FRONTEND_CODE_CHECK_SECONDS=60` to tune the check interval.
+
 Targeted restart commands:
 
 ```sh
@@ -672,9 +775,13 @@ The operator API reads `advisory_operator_snapshots` by default. `all_advisory.s
 python -m advisory.operator_snapshot
 ```
 
+The same repair is available from the Operations page as the audited `operator_snapshot_refresh` command. It rebuilds only DB-backed operator snapshot/cache rows and does not change recommendations, portfolio state, config, or broker orders.
+
 Set `OPERATOR_API_USE_SNAPSHOT=false` only when debugging the live dashboard builder directly. `OPERATOR_SNAPSHOT_MAX_AGE_SECONDS=86400` means the API treats snapshots generated in the last day as fresh. With `OPERATOR_API_ALLOW_STALE_SNAPSHOT=true`, the operator UI still serves the latest stale snapshot instead of blocking a page load on a live rebuild; the payload metadata marks it as stale. `OPERATOR_API_PAYLOAD_CACHE_SECONDS=15` keeps the parsed snapshot in API memory briefly so dashboard pages do not reload the same JSON for every section. `OPERATOR_API_LARGE_RESPONSE_BYTES=250000` records oversized API responses in the slow-operation log so endpoints can be compacted or paginated deliberately. Keep `OPERATOR_API_INTRADAY_PRICE_FALLBACK=false` unless debugging prices; ad-hoc intraday scans can make the main Action Queue slow, while watcher alerts should already persist live `last_price`.
 
-Action Queue and Symbol Detail pages also show feature freshness. Consolidated action rows preserve the decision-time freshness snapshot, while the separate current panel shows present source state. The advisory pipeline also emits `feature_gate` summaries under `rules`, `risk`, `portfolio`, `lifecycle`, and `actions`, which tells you whether required `daily_ohlcv` / `technical_daily` inputs were blocked for the symbols being processed. Operator Health samples the latest action symbols and reports these stage gates in `feature_stage_gates`, fix hints, current blockers, and the trust gate. Symbol Detail shows `Stage Gate Effects`, which explains the concrete row-level impact when available: watch downgrade, review-only allocation, deferred capital, lifecycle warning, or final action downgrade. Blocked `rules` gates move immediate `PASS_NOW` candidates to `WATCH_EVENT`; blocked `risk` gates move automatic allocations to `review_manual`; blocked `portfolio` gates defer approved/trimmed capital; blocked lifecycle gates add warnings without suppressing exit/risk-reduction actions; blocked final `BUY` or `BUY_MORE` rows become `MANUAL_REVIEW`, review-only/no-broker-execution. Action consolidation also downgrades broker-capable winners to `MANUAL_REVIEW` when company/Dhan identity is missing; Health still reports active identity coverage gaps for visibility and repair. Execution dry-run previews add a final guard for older or non-standard broker-capable action rows: unresolved Dhan identity becomes `submit_blocked` with `broker_identity_status=failed` in the execution safety contract and an execution fallback telemetry row. Each action-table order preview also carries `order_intent_lineage`, so an operator can trace the order back to the action row, reason-contract summary/status, risk sizing, stop/target levels, and approval/reconciliation gates before any live broker handoff.
+Manual Review is lane-filtered at the API boundary. `/api/manual-review` defaults to `lane=investment_review` so the active queue is not polluted by parser, identity, OCR, or execution-planning repair work. Use `lane=technical_issue` for system/data fixes, `lane=research_config` for research/config approvals, or `lane=all` for a full audit view. The payload still returns `all_active_by_lane` and `lane_filtered_out` so the UI can show hidden technical/research counts while keeping the default investment queue focused.
+
+Action Queue and Symbol Detail pages also show feature freshness. Consolidated action rows preserve the decision-time freshness snapshot, while the separate current panel shows present source state. The advisory pipeline also emits `feature_gate` summaries under `rules`, `risk`, `portfolio`, `lifecycle`, and `actions`, which tells you whether required `daily_ohlcv` / `technical_daily` inputs were blocked for the symbols being processed. Operator Health samples the latest action symbols and reports these stage gates in `feature_stage_gates`, fix hints, current blockers, and the trust gate. Symbol Detail shows `Stage Gate Effects`, which explains the concrete row-level impact when available: watch downgrade, review-only allocation, deferred capital, lifecycle warning, or final action downgrade. Blocked `rules` gates move immediate `PASS_NOW` candidates to `WATCH_EVENT`; blocked `risk` gates move automatic allocations to `review_manual`; blocked `portfolio` gates defer approved/trimmed capital; blocked lifecycle gates add warnings without suppressing exit/risk-reduction actions; blocked final `BUY` or `BUY_MORE` rows become `MANUAL_REVIEW`, review-only/no-broker-execution. Action consolidation also downgrades broker-capable winners to `MANUAL_REVIEW` when company/Dhan identity is missing; Health still reports active identity coverage gaps for visibility and repair. Execution dry-run previews add a final guard for older or non-standard broker-capable action rows: unresolved Dhan identity becomes `submit_blocked` with `broker_identity_status=failed` in the execution safety contract and an execution fallback telemetry row. The Action Queue execution section also shows the portfolio handoff boundary when present: `PLANNED_ENTRY` versus non-entry state, required entry evidence, broker-direct block status, and transition-contract issues. Each action-table order preview also carries `order_intent_lineage`, so an operator can trace the order back to the action row, reason-contract summary/status, risk sizing, stop/target levels, and approval/reconciliation gates before any live broker handoff. Live submission additionally needs an order-set-specific confirmation token, so a token from another same-day batch cannot approve a different symbol/quantity set.
 
 For cross-step debugging, use the Nuxt `/operator-journey` page. It is backed by the read-only `/api/operator-journey` endpoint and stitches manual-review decisions, wait signals, wait-signal matches, signal-refresh rows, action recommendations, portfolio rows, and execution previews into stage buckets plus a single newest-first timeline. Use filters such as `symbol`, `item_id`, or `unique_id` to narrow the journey.
 
@@ -687,11 +794,15 @@ python -m advisory.performance_slowlog report --limit 20
 python -m advisory.performance_slowlog mark <fingerprint> triaged --note "tracked in todo.md"
 ```
 
-Cron runs the API latency probe at 07:55, 11:55, 16:55, and 21:55 on weekdays. The latest JSON summary is read by Operator Health; stale, slow, or failed probes appear in fix hints and the degradation feed. Use `scripts/api_performance_report.py` to rank which endpoint to fix next before adding indexes or changing payload shapes. The JSONL file keeps every slow occurrence. The state file dedupes by fingerprint, so the same slow endpoint or snapshot stage is counted repeatedly but does not create a new issue every run.
+Cron runs the API latency probe at 07:55, 11:55, 16:55, and 21:55 on weekdays. The default probe uses compact, paged list routes for Actions, Portfolio, and Watchlist so it measures normal operator traffic rather than full debug payloads. The latest JSON summary is read by Operator Health; stale, slow, or failed probes appear in fix hints and the degradation feed. Use `scripts/api_performance_report.py` to rank which endpoint to fix next before adding indexes or changing payload shapes. When probe evidence is fresh, report rows are ranked by the current probe first and labelled `fresh_probe`; older unprobed slowlog rows remain visible as `historical_slowlog` and should be targeted only after a route-specific probe confirms the issue. The JSONL file keeps every slow occurrence. The state file dedupes by fingerprint, so the same slow endpoint or snapshot stage is counted repeatedly but does not create a new issue every run.
 
 Manual Review list payloads are compact by default because this page can aggregate many source tables. The source-row expander shows a compact preview and tells you how many raw keys were omitted. Use `/api/manual-review?include_raw=true&limit=<n>` only for short debugging sessions when you explicitly need full raw rows.
 
-Operator Health details are also compact by default. The Health page calls `/api/health/details?compact=true`, which bounds list sizes and truncates very long strings so tracebacks or full diagnostic rows do not make the page slow. Use `/api/health/details?mode=full&compact=false` only for short debugging sessions. `OPERATOR_HEALTH_COMPACT_LIST_LIMIT` and `OPERATOR_HEALTH_COMPACT_STRING_CHARS` control the default API bounds.
+Action Queue and Portfolio API reads are also compact by default. Use `/api/actions?compact=false&limit=<n>` or `/api/portfolio?compact=false&limit=<n>` only for short debugging sessions; normal UI and probe traffic should rely on compact list routes plus `/api/actions/detail` or `/api/portfolio/<symbol>/detail` for row-level evidence. `/api/home` omits duplicated action/today cards by default; use `/api/home?include_action_cards=true` only for legacy/debug reads. The Portfolio UI should pass `bucket=<selected section>` to `/api/portfolio` so only the selected tab is returned; omit `bucket` only for symbol/detail/debug reads that need every section. `/api/actions?include_feature_freshness=true` uses persisted decision-time freshness snapshots by default; use `refresh_feature_freshness=true` only for explicit current-live diagnostics because it can perform per-symbol freshness checks.
+
+Watchlist API reads support `section=<selected section>` and compact rows. Use `/api/watchlist?section=ts_forecast_watch&compact=true&limit=25` for TS Watch lists and `/api/watchlist?compact=false&section=ts_forecast_watch&limit=<n>` only when inspecting raw TS forecast swing/position windows.
+
+Operator Health details are also compact by default. The Health page calls `/api/health/details?compact=true`, which bounds list sizes and truncates very long strings so tracebacks or full diagnostic rows do not make the page slow. Fast Health still checks the operator snapshot freshness because stale snapshots can make the UI show old advisory actions. It intentionally defers heavier DB diagnostics such as trace-cache scans, identity coverage, signal-quality evidence, feature stage gates, downloader state, ingestion file-state, and schema registry inspection; the API returns a `deferred_diagnostics` summary and the Health page shows the skipped checks plus the full-health command to run when you need that evidence. Use `/api/health/details?mode=full&compact=false` only for short debugging sessions. `OPERATOR_HEALTH_FAST_WORKERS`, `OPERATOR_HEALTH_COMPACT_LIST_LIMIT`, and `OPERATOR_HEALTH_COMPACT_STRING_CHARS` control the default API bounds.
 
 The operator smoke preflight is also compacted at source. `OPERATOR_SMOKE_COMPACT_LIST_LIMIT` and `OPERATOR_SMOKE_COMPACT_STRING_CHARS` bound fix hints and blocker details so `/api/operations/smoke` and `python -m advisory.operator_smoke` stay lightweight even when Health contains long tracebacks.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -178,11 +179,97 @@ def is_auto_login_configured() -> bool:
     )
 
 
+def _is_inside_running_event_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _extract_token_id_from_auto_login_stdout(stdout: str) -> str:
+    text = str(stdout or "").strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        _record_dhan_auth_fallback(
+            fallback_type="dhan_auto_login_subprocess_json_parse_failed",
+            reason="Dhan automated-login subprocess did not return parseable JSON.",
+            error=exc,
+            metadata={"stdout_tail": text[-500:]},
+        )
+        raise DhanAuthError("Dhan auto-login subprocess returned non-JSON output") from exc
+    token_id = normalize_token_id(str(payload.get("token_id") or ""))
+    if not token_id:
+        raise DhanAuthError(f"Dhan auto-login subprocess returned no token_id: {payload}")
+    return token_id
+
+
+def _get_token_id_via_auto_login_subprocess(consent_url: str) -> str:
+    command = [
+        sys.executable,
+        "-m",
+        "data.dhanlive.web_login",
+        "--consent-url",
+        consent_url,
+        "--print-token-id",
+    ]
+    timeout_seconds = max(int(env.int("DHAN_AUTO_LOGIN_SUBPROCESS_TIMEOUT_SECONDS", default=180)), 1)
+    print(
+        "[data.dhanlive.auth] running Dhan automated login in subprocess to avoid Playwright sync API inside an asyncio loop",
+        file=sys.stderr,
+        flush=True,
+    )
+    try:
+        proc = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _record_dhan_auth_fallback(
+            fallback_type="dhan_auto_login_subprocess_failed",
+            reason="Dhan automated-login subprocess could not complete.",
+            error=exc,
+            metadata={"timeout_seconds": timeout_seconds},
+        )
+        raise DhanAuthError(f"Dhan auto-login subprocess failed: {exc}") from exc
+    if proc.returncode != 0:
+        _record_dhan_auth_fallback(
+            fallback_type="dhan_auto_login_subprocess_nonzero",
+            reason="Dhan automated-login subprocess exited with a non-zero status.",
+            error=f"returncode={proc.returncode}",
+            metadata={"stderr_tail": str(proc.stderr or "")[-1000:], "stdout_tail": str(proc.stdout or "")[-500:]},
+        )
+        raise DhanAuthError(f"Dhan auto-login subprocess failed with exit code {proc.returncode}: {str(proc.stderr or '').strip()}")
+    return _extract_token_id_from_auto_login_stdout(proc.stdout)
+
+
+def _is_playwright_sync_inside_loop_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return "playwright sync api" in text and "asyncio loop" in text
+
+
 def get_token_id_from_auto_login() -> str:
     from data.dhanlive.web_login import get_token_id_via_automated_login
 
     consent_url = build_new_consent_url()
-    return get_token_id_via_automated_login(consent_url)
+    if _is_inside_running_event_loop():
+        return _get_token_id_via_auto_login_subprocess(consent_url)
+    try:
+        return get_token_id_via_automated_login(consent_url)
+    except Exception as exc:
+        if not _is_playwright_sync_inside_loop_error(exc):
+            raise
+        _record_dhan_auth_fallback(
+            fallback_type="dhan_auto_login_sync_playwright_inside_async_loop",
+            reason="Dhan automated login hit Playwright sync API inside an asyncio loop; retrying in subprocess.",
+            error=exc,
+            metadata={"consent_url_host": "auth.dhan.co"},
+        )
+        return _get_token_id_via_auto_login_subprocess(consent_url)
 
 
 def get_access_token() -> str:

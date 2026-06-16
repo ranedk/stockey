@@ -9,8 +9,13 @@ from environs import Env
 from sqlalchemy.exc import ProgrammingError
 
 from .models import Announcement, ParsedReport
-from advisory.prompt_registry import prompt_version as registry_prompt_version
-from advisory.prompt_registry import response_schema_version
+from advisory.prompt_registry import (
+    ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID,
+    ANNOUNCEMENT_SUMMARY_PROMPT_ID,
+    OCR_PDF_PAGE_PROMPT_ID,
+    prompt_version as registry_prompt_version,
+    response_schema_version,
+)
 from utils.blob_store import text_blob_metadata
 from utils.db import sql_to_df, upsert_to_db
 from utils.store import get_file_content, save_file_content
@@ -24,13 +29,10 @@ env.read_env()
 
 POSTGRES_TEXT_MODE = env.str("ANNOUNCEMENT_POSTGRES_TEXT_MODE", "pointer").strip().lower()
 POSTGRES_TEXT_EXCERPT_CHARS = env.int("ANNOUNCEMENT_POSTGRES_TEXT_EXCERPT_CHARS", 1200)
-ANNOUNCEMENT_SUMMARY_PROMPT_ID = "announcement_summary"
 ANNOUNCEMENT_SUMMARY_PROMPT_VERSION = registry_prompt_version(ANNOUNCEMENT_SUMMARY_PROMPT_ID)
 ANNOUNCEMENT_SUMMARY_PROMPT_SCHEMA_VERSION = response_schema_version(ANNOUNCEMENT_SUMMARY_PROMPT_ID)
-ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID = "announcement_structured_report"
 ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_VERSION = registry_prompt_version(ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID)
 ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_SCHEMA_VERSION = response_schema_version(ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID)
-OCR_PDF_PAGE_PROMPT_ID = "ocr_pdf_page"
 OCR_PDF_PAGE_PROMPT_VERSION = registry_prompt_version(OCR_PDF_PAGE_PROMPT_ID)
 OCR_PDF_PAGE_PROMPT_SCHEMA_VERSION = response_schema_version(OCR_PDF_PAGE_PROMPT_ID)
 

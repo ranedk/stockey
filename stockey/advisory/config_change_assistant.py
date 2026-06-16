@@ -70,6 +70,89 @@ APPLICATIONS_SCHEMA_STATEMENTS = [
 ]
 
 
+def application_decision_effect(application_decision: str, *, verification_status: str | None = None) -> dict[str, Any]:
+    normalized = str(application_decision or "").strip().lower()
+    base = {
+        "application_decision": normalized,
+        "mutates_config": False,
+        "mutates_policy": False,
+        "mutates_action_recommendation": False,
+        "mutates_portfolio": False,
+        "submits_order": False,
+        "broker_execution_allowed": False,
+        "applied_by_system": False,
+        "verification_status": verification_status,
+    }
+    if normalized == "approved_to_apply":
+        base.update(
+            {
+                "state": "approved_for_manual_application",
+                "closes_review": False,
+                "next_step": "Operator may manually apply the reviewed patch outside Stockey, then record marked_applied after verifying config.",
+                "effect": "Audit decision only; no config, policy, portfolio, action, or broker state changed.",
+            }
+        )
+    elif normalized == "marked_applied":
+        base.update(
+            {
+                "state": "operator_marked_manual_application",
+                "closes_review": verification_status == "verified",
+                "next_step": (
+                    "Rerun the relevant dry-run checks and advisory flow after the manually applied config is verified."
+                    if verification_status == "verified"
+                    else "Verify the manually applied config before trusting this application record."
+                ),
+                "effect": "Audit marker only; Stockey did not edit config or promote live policy.",
+            }
+        )
+    elif normalized == "rejected":
+        base.update(
+            {
+                "state": "rejected",
+                "closes_review": True,
+                "next_step": "No action. Generate a new reviewed preview if the evidence changes.",
+                "effect": "Audit decision only; preview should not be applied.",
+            }
+        )
+    elif normalized == "needs_more_data":
+        base.update(
+            {
+                "state": "needs_more_data",
+                "closes_review": False,
+                "next_step": "Collect more validation evidence before approving or rejecting this preview.",
+                "effect": "Audit decision only; preview remains unapplied.",
+            }
+        )
+    else:
+        base.update(
+            {
+                "state": "unknown",
+                "closes_review": False,
+                "next_step": "Use a supported application decision.",
+                "effect": "No trusted effect can be inferred.",
+            }
+        )
+    return {key: value for key, value in base.items() if value is not None}
+
+
+def application_operator_boundary(application_decision: str, *, verification_status: str | None = None) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "workflow": "config_change_application",
+        "read_only_policy_application": True,
+        "system_applies_config": False,
+        "system_promotes_policy": False,
+        "mutates_portfolio": False,
+        "submits_order": False,
+        "broker_execution_allowed": False,
+        "decision_effect": application_decision_effect(
+            application_decision,
+            verification_status=verification_status,
+        ),
+        "note": "Config-change application decisions are audit records. Stockey never edits config files or enables broker execution from this workflow.",
+    }
+
+
 def _record_config_change_fallback(
     fallback_type: str,
     *,
@@ -482,6 +565,8 @@ def record_application_decision(
         "Broker execution remains disabled by this application audit.",
         "Policy auto-promotion remains disabled; downstream code must explicitly consume reviewed config in a separate change.",
     ]
+    decision_effect = application_decision_effect(normalized_decision, verification_status=verification.get("status"))
+    operator_boundary = application_operator_boundary(normalized_decision, verification_status=verification.get("status"))
     result = {
         "status": "ok",
         "application_id": application_id,
@@ -504,6 +589,8 @@ def record_application_decision(
             "patch_payload": preview.get("patch_payload"),
         },
         "safety_checks": safety_checks,
+        "decision_effect": decision_effect,
+        "operator_boundary": operator_boundary,
         "applied_by_system": False,
         "applied": False,
         "note": "Decision recorded only. Stockey did not modify config files, action rules, portfolio rows, or broker behavior.",
@@ -534,18 +621,37 @@ def record_application_decision(
     return result
 
 
-def load_application_decisions(limit: int = 25) -> list[dict[str, Any]]:
+def load_application_decisions(limit: int = 25, *, include_preview_snapshot: bool = False) -> list[dict[str, Any]]:
     ensure_tables()
+    select_columns = [
+        "application_id",
+        "preview_id",
+        "decided_at",
+        "application_decision",
+        "operator_id",
+        "operator_note",
+        "source_type",
+        "source_key",
+        "config_path",
+        "verification_status",
+        "verification_json",
+        "safety_checks_json",
+        "applied_by_system",
+        "load_ts",
+    ]
+    if include_preview_snapshot:
+        select_columns.append("preview_snapshot_json")
     try:
         df = sql_to_df(
             f"""
-            SELECT *
+            SELECT {", ".join(select_columns)}
             FROM {APPLICATIONS_TABLE}
             ORDER BY decided_at DESC
             LIMIT %(limit)s
             """,
             params={"limit": max(1, int(limit))},
             retries=3,
+            statement_timeout_ms=10000,
         )
     except Exception as exc:
         _record_config_change_fallback(
@@ -553,7 +659,7 @@ def load_application_decisions(limit: int = 25) -> list[dict[str, Any]]:
             source=APPLICATIONS_TABLE,
             reason="Config-change application audit list could not be loaded; operator application history may be unavailable.",
             error=exc,
-            metadata={"limit": int(limit)},
+            metadata={"limit": int(limit), "include_preview_snapshot": bool(include_preview_snapshot)},
         )
         raise
     if df.empty:
@@ -563,7 +669,13 @@ def load_application_decisions(limit: int = 25) -> list[dict[str, Any]]:
         if col in out.columns:
             out[col.replace("_json", "")] = out[col].map(lambda value: parse_jsonish(value, [] if col == "safety_checks_json" else {}))
     out = out.astype(object).where(pd.notna(out), None)
-    return out.to_dict(orient="records")
+    rows = out.to_dict(orient="records")
+    for row in rows:
+        decision = str(row.get("application_decision") or "").strip().lower()
+        verification_status = str(row.get("verification_status") or "").strip() or None
+        row["decision_effect"] = application_decision_effect(decision, verification_status=verification_status)
+        row["operator_boundary"] = application_operator_boundary(decision, verification_status=verification_status)
+    return rows
 
 
 def load_latest_approved_technical_decision(*, setup_id: str, config_id: str, reviewed_at: Any | None = None) -> dict[str, Any]:

@@ -87,12 +87,124 @@ def _first_present(mapping: dict[str, Any], keys: list[str]) -> Any:
     return None
 
 
+def _as_int(value: Any) -> int | None:
+    if value in (None, "", [], {}):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="data.download_runner",
+            source="run_state_counter",
+            fallback_type="download_runner_counter_parse_failed",
+            severity="warn",
+            reason="Download runner could not parse a run-state counter while refining source classification.",
+            error=exc,
+            metadata={"value": str(value)[:200]},
+        )
+        return None
+
+
+def _emptyish(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value == ""
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    if pd.api.types.is_scalar(value):
+        return bool(pd.isna(value))
+    return False
+
+
+def _as_json_safe(value: Any) -> Any:
+    if _emptyish(value):
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _as_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_as_json_safe(item) for item in value]
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return str(value)
+
+
+def _source_specific_run_state(result: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in result.items():
+        if key in {
+            "module_run_state",
+            "module",
+            "args",
+            "purpose",
+            "status",
+            "classification",
+            "elapsed_seconds",
+            "returncode",
+            "from_date",
+            "from_datetime",
+            "to_date",
+            "to_datetime",
+            "rows",
+            "rows_written",
+            "rows_read",
+            "row_count",
+            "retries",
+            "retry_count",
+            "retry_attempts",
+            "attempts",
+            "attempt_count",
+            "download_attempts",
+            "failed_attempt_count",
+            "failed_attempts",
+            "failure_count",
+            "fallback_count",
+            "fallbacks",
+            "source_unavailable_count",
+            "source_unavailable",
+            "no_data_count",
+            "empty_count",
+            "empty_processed_count",
+            "fallback_used",
+            "error",
+            "error_class",
+            "state_advanced",
+        }:
+            continue
+        if key.endswith("_count") or key.endswith("_counts") or key in {"failed_symbols", "classification_counts"}:
+            safe_value = _as_json_safe(value)
+            if safe_value not in (None, "", [], {}):
+                out[key] = safe_value
+    return out
+
+
+def _refine_success_classification(classification: str, result: dict[str, Any]) -> str:
+    if classification != "ok":
+        return classification
+    rows = _as_int(_first_present(result, ["rows", "rows_written", "row_count"]))
+    no_data_count = _as_int(_first_present(result, ["no_data_count", "empty_count", "empty_processed_count"])) or 0
+    source_unavailable_count = _as_int(_first_present(result, ["source_unavailable_count", "source_unavailable"])) or 0
+    state_advanced = result.get("state_advanced")
+    did_not_advance = state_advanced is False or str(state_advanced).lower() == "false"
+    if source_unavailable_count > 0 and did_not_advance and rows == 0:
+        return "source_unavailable"
+    if no_data_count > 0 and rows == 0:
+        return "no_data"
+    if did_not_advance and rows == 0:
+        return "no_data"
+    return classification
+
+
 def build_run_state_result(result: dict[str, Any], *, step: dict[str, Any]) -> dict[str, Any]:
     module_name = str(result.get("module") or step.get("module") or "")
     status = str(result.get("status") or "failed")
     error = str(result.get("error") or "") or None
     returncode = int(result.get("returncode") or 0)
-    classification = classify_run_status(status=status, module_name=module_name, error=error, returncode=returncode)
+    explicit_classification = str(result.get("classification") or "").strip()
+    classification = explicit_classification or classify_run_status(status=status, module_name=module_name, error=error, returncode=returncode)
+    classification = _refine_success_classification(classification, result)
     now = pd.Timestamp.utcnow()
     explicit_state_advanced = result.get("state_advanced")
     state = {
@@ -123,6 +235,7 @@ def build_run_state_result(result: dict[str, Any], *, step: dict[str, Any]) -> d
         "error": error,
         "state_advanced": bool(explicit_state_advanced) if explicit_state_advanced is not None else bool(classification in {"ok", "no_data"}),
         "updated_at": now.isoformat(),
+        **_source_specific_run_state(result),
     }
     return {key: value for key, value in state.items() if value not in (None, "", [], {})}
 
@@ -166,8 +279,15 @@ def merge_module_run_state(result: dict[str, Any], module_state: dict[str, Any])
         "source_unavailable",
         "no_data_count",
         "empty_count",
+        "empty_processed_count",
+        "classification",
         "fallback_used",
         "state_advanced",
+        "auth_unavailable_count",
+        "reference_mapping_missing_count",
+        "classification_counts",
+        "error_count",
+        "failed_symbols",
     ]:
         if key in module_state and out.get(key) in (None, "", [], {}):
             out[key] = module_state[key]

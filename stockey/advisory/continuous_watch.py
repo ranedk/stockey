@@ -24,6 +24,7 @@ from utils.schema_migrations import apply_schema_migration
 WATCHLIST_TABLE = "advisory_watchlist"
 ALERTS_TABLE = "advisory_live_watch_alerts"
 ALERTS_SCHEMA_MIGRATION_ID = "20260611_advisory_live_watch_alerts_base"
+DEFAULT_ALERT_COOLDOWN_SECONDS = int(os.getenv("WATCHER_ALERT_COOLDOWN_SECONDS", "900"))
 
 ALERTS_SCHEMA_STATEMENTS = [
     f"""
@@ -41,12 +42,14 @@ ALERTS_SCHEMA_STATEMENTS = [
         stop_price DOUBLE PRECISION,
         invalidation_price DOUBLE PRECISION,
         current_state TEXT,
+        alert_fingerprint TEXT,
         load_ts TIMESTAMPTZ,
         UNIQUE (observed_at, setup_id, symbol, alert_type)
     )
     """,
     f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS monitor_source TEXT",
     f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS stop_price DOUBLE PRECISION",
+    f"ALTER TABLE {ALERTS_TABLE} ADD COLUMN IF NOT EXISTS alert_fingerprint TEXT",
 ]
 
 
@@ -351,10 +354,53 @@ def build_price_alerts(watchlist: pd.DataFrame, latest_prices: pd.DataFrame, *, 
     return pd.DataFrame(rows).drop_duplicates(subset=["symbol", "alert_type"], keep="last")
 
 
-def persist_alerts(df: pd.DataFrame) -> None:
+def _alert_fingerprint(row: pd.Series | dict[str, Any]) -> str:
+    get = row.get if isinstance(row, dict) else row.get
+    parts = [
+        str(get("setup_id") or "").strip().upper(),
+        str(get("symbol") or "").strip().upper(),
+        str(get("alert_type") or "").strip().upper(),
+        str(get("monitor_source") or "").strip().lower(),
+        str(get("current_state") or "").strip().upper(),
+    ]
+    return "|".join(parts)
+
+
+def _load_recent_alert_fingerprints(*, cutoff: pd.Timestamp) -> set[str]:
+    df = sql_to_df(
+        f"""
+        SELECT DISTINCT
+            COALESCE(
+                alert_fingerprint,
+                UPPER(COALESCE(setup_id, '')) || '|' ||
+                UPPER(COALESCE(symbol, '')) || '|' ||
+                UPPER(COALESCE(alert_type, '')) || '|' ||
+                LOWER(COALESCE(monitor_source, '')) || '|' ||
+                UPPER(COALESCE(current_state, ''))
+            ) AS alert_fingerprint
+        FROM {ALERTS_TABLE}
+        WHERE observed_at >= %s
+        """,
+        params=(cutoff,),
+    )
+    if df.empty or "alert_fingerprint" not in df.columns:
+        return set()
+    return {
+        str(value).strip()
+        for value in df["alert_fingerprint"].dropna().tolist()
+        if str(value).strip()
+    }
+
+
+def persist_alerts(df: pd.DataFrame, *, cooldown_seconds: int | None = None) -> dict[str, Any]:
     ensure_alerts_table()
     if df.empty:
-        return
+        return {
+            "input_count": 0,
+            "persisted_count": 0,
+            "suppressed_count": 0,
+            "cooldown_seconds": int(cooldown_seconds if cooldown_seconds is not None else DEFAULT_ALERT_COOLDOWN_SECONDS),
+        }
     out = df.copy()
     for column in [
         "last_price",
@@ -368,15 +414,73 @@ def persist_alerts(df: pd.DataFrame) -> None:
     for column in ["observed_at", "asof_date", "load_ts"]:
         if column in out.columns:
             out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
+    out["alert_fingerprint"] = out.apply(_alert_fingerprint, axis=1)
+    input_count = int(len(out))
+    effective_cooldown = max(0, int(cooldown_seconds if cooldown_seconds is not None else DEFAULT_ALERT_COOLDOWN_SECONDS))
+    recent_fingerprints: set[str] = set()
+    if effective_cooldown > 0:
+        observed_max = pd.to_datetime(out["observed_at"], utc=True, errors="coerce").max() if "observed_at" in out.columns else pd.Timestamp.utcnow()
+        if pd.isna(observed_max):
+            observed_max = pd.Timestamp.utcnow()
+        cutoff = pd.Timestamp(observed_max) - pd.Timedelta(seconds=effective_cooldown)
+        try:
+            recent_fingerprints = _load_recent_alert_fingerprints(cutoff=cutoff)
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.continuous_watch",
+                source=ALERTS_TABLE,
+                fallback_type="continuous_watch_alert_dedupe_lookup_failed",
+                severity="warn",
+                reason="Continuous watch could not load recent alert fingerprints; alerts will be persisted fail-open to avoid missing evidence.",
+                error=exc,
+                metadata={"cooldown_seconds": effective_cooldown, "input_count": input_count},
+            )
+            recent_fingerprints = set()
+    if recent_fingerprints:
+        keep_mask = ~out["alert_fingerprint"].isin(recent_fingerprints)
+        suppressed_count = int((~keep_mask).sum())
+        out = out.loc[keep_mask].copy()
+    else:
+        suppressed_count = 0
+    persisted_count = int(len(out))
+    if out.empty:
+        publish_bus_message(
+            "stockey:continuous_watch:alerts",
+            {
+                "published_at": pd.Timestamp.utcnow(),
+                "alert_count": 0,
+                "input_count": input_count,
+                "persisted_count": 0,
+                "suppressed_count": suppressed_count,
+                "cooldown_seconds": effective_cooldown,
+                "alerts": [],
+            },
+        )
+        return {
+            "input_count": input_count,
+            "persisted_count": 0,
+            "suppressed_count": suppressed_count,
+            "cooldown_seconds": effective_cooldown,
+        }
     upsert_to_db(out, ALERTS_TABLE, unique_keys=["observed_at", "setup_id", "symbol", "alert_type"], timescaledb_column="observed_at")
     publish_bus_message(
         "stockey:continuous_watch:alerts",
         {
             "published_at": pd.Timestamp.utcnow(),
-            "alert_count": int(len(out)),
+            "alert_count": persisted_count,
+            "input_count": input_count,
+            "persisted_count": persisted_count,
+            "suppressed_count": suppressed_count,
+            "cooldown_seconds": effective_cooldown,
             "alerts": out.head(25).to_dict(orient="records"),
         },
     )
+    return {
+        "input_count": input_count,
+        "persisted_count": persisted_count,
+        "suppressed_count": suppressed_count,
+        "cooldown_seconds": effective_cooldown,
+    }
 
 
 def _is_due(source_name: str, interval_seconds: int) -> bool:
@@ -430,6 +534,96 @@ def _bounded_event_from_cursor(
     return pd.Timestamp(from_cursor), False
 
 
+def _safe_count(value: Any) -> int:
+    try:
+        parsed = pd.to_numeric(value, errors="coerce")
+        if pd.isna(parsed):
+            return 0
+        return int(parsed)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.continuous_watch",
+            source="watcher_source_counters",
+            fallback_type="watcher_count_parse_failed",
+            severity="warn",
+            reason="Continuous watcher could not parse a source counter and used zero.",
+            error=exc,
+            metadata={"value": str(value)[:200]},
+        )
+        return 0
+
+
+def watcher_source_counters(
+    *,
+    source: str,
+    meta: dict[str, Any] | None = None,
+    events: pd.DataFrame | None = None,
+    watch_updates: pd.DataFrame | None = None,
+    latest_prices: pd.DataFrame | None = None,
+    alerts: pd.DataFrame | None = None,
+    sync_results: list[dict[str, Any]] | None = None,
+    alert_persist: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    meta = meta if isinstance(meta, dict) else {}
+    counters: dict[str, Any] = {"source": source}
+    if source == "ohlcv":
+        sync_results = sync_results or []
+        failed_sync = [
+            row for row in sync_results
+            if isinstance(row, dict) and str(row.get("status") or "").lower() not in {"ok", "success", "skipped_no_data", "no_data", ""}
+        ]
+        counters.update(
+            {
+                "symbol_count": _safe_count(meta.get("symbol_count")),
+                "sync_result_count": len(sync_results),
+                "sync_failure_count": len(failed_sync),
+                "latest_price_count": 0 if latest_prices is None else int(len(latest_prices)),
+                "alert_input_count": _safe_count((alert_persist or {}).get("input_count") if alert_persist else (0 if alerts is None else len(alerts))),
+                "alert_persisted_count": _safe_count((alert_persist or {}).get("persisted_count")),
+                "alert_suppressed_count": _safe_count((alert_persist or {}).get("suppressed_count")),
+                "alert_cooldown_seconds": _safe_count((alert_persist or {}).get("cooldown_seconds") or DEFAULT_ALERT_COOLDOWN_SECONDS),
+            }
+        )
+    elif source == "news":
+        counters.update(
+            {
+                "watch_count": _safe_count(meta.get("watch_count")),
+                "market_context_watch_count": _safe_count(meta.get("market_context_watch_count")),
+                "news_item_count": _safe_count(meta.get("news_item_count")),
+                "matched_event_count": _safe_count(meta.get("matched_event_count")),
+                "triggered_event_count": _safe_count(meta.get("triggered_event_count")),
+                "context_observed_count": _safe_count(meta.get("context_observed_count")),
+                "persisted_event_count": 0 if events is None else int(len(events)),
+                "feed_count": len(meta.get("feed_names") or []) if isinstance(meta.get("feed_names"), list) else 0,
+            }
+        )
+    elif source == "announcements":
+        ingest_runs = meta.get("ingest_runs") if isinstance(meta.get("ingest_runs"), list) else []
+        failed = sum(_safe_count(row.get("failed")) for row in ingest_runs if isinstance(row, dict))
+        discovered = sum(_safe_count(row.get("discovered")) for row in ingest_runs if isinstance(row, dict))
+        parsed = sum(_safe_count(row.get("parsed")) for row in ingest_runs if isinstance(row, dict))
+        counters.update(
+            {
+                "watch_count": _safe_count(meta.get("watch_count")),
+                "unique_ingest_targets": _safe_count(meta.get("unique_ingest_targets")),
+                "ingest_run_count": len(ingest_runs),
+                "discovered_count": discovered,
+                "parsed_count": parsed,
+                "failed_count": failed,
+                "match_count": _safe_count(meta.get("match_count")),
+                "triggered_event_count": _safe_count(meta.get("triggered_event_count")),
+                "context_observed_count": _safe_count(meta.get("context_observed_count")),
+                "watch_update_count": 0 if watch_updates is None else int(len(watch_updates)),
+                "persisted_event_count": 0 if events is None else int(len(events)),
+                "market_context_watch_count": _safe_count(meta.get("market_context_watch_count")),
+                "capped_watch_rows": _safe_count(meta.get("capped_watch_rows")),
+            }
+        )
+    else:
+        counters.update({key: _safe_count(value) for key, value in meta.items() if isinstance(value, (int, float))})
+    return counters
+
+
 def run_ohlcv_cycle(
     *,
     interval_seconds: int,
@@ -469,7 +663,15 @@ def run_ohlcv_cycle(
     )
     latest_prices = load_latest_intraday_prices(symbols, interval_minutes=intraday_interval_minutes)
     alerts = build_price_alerts(watchlist, latest_prices, observed_at=to_cursor)
-    persist_alerts(alerts)
+    alert_persist = persist_alerts(alerts)
+    source_counters = watcher_source_counters(
+        source="ohlcv",
+        meta={"symbol_count": len(symbols)},
+        latest_prices=latest_prices,
+        alerts=alerts,
+        sync_results=sync_results,
+        alert_persist=alert_persist,
+    )
     candidate_latest = latest_prices["timestamp"].max() if not latest_prices.empty else pd.NaT
     last_item_ts = _next_cursor_after_pull(previous_cursor, from_cursor, candidate_latest)
     persist_sync_state(
@@ -482,6 +684,11 @@ def run_ohlcv_cycle(
             "interval_minutes": int(intraday_interval_minutes),
             "max_lookback_minutes": effective_max_lookback,
             "catchup_truncated": bool(catchup_truncated),
+            "alert_input_count": int(alert_persist.get("input_count") or 0),
+            "alert_persisted_count": int(alert_persist.get("persisted_count") or 0),
+            "alert_suppressed_count": int(alert_persist.get("suppressed_count") or 0),
+            "alert_cooldown_seconds": int(alert_persist.get("cooldown_seconds") or DEFAULT_ALERT_COOLDOWN_SECONDS),
+            "source_counters": source_counters,
         },
         status="ok",
     )
@@ -490,6 +697,11 @@ def run_ohlcv_cycle(
         "symbol_count": len(symbols),
         "sync_results": sync_results,
         "alert_count": int(len(alerts)),
+        "alert_input_count": int(alert_persist.get("input_count") or 0),
+        "alert_persisted_count": int(alert_persist.get("persisted_count") or 0),
+        "alert_suppressed_count": int(alert_persist.get("suppressed_count") or 0),
+        "alert_cooldown_seconds": int(alert_persist.get("cooldown_seconds") or DEFAULT_ALERT_COOLDOWN_SECONDS),
+        "source_counters": source_counters,
         "catchup_truncated": bool(catchup_truncated),
         "max_lookback_minutes": effective_max_lookback,
     }
@@ -526,6 +738,7 @@ def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90, max_loo
         market_context_last_checked_at=published_from,
     )
     persist_news_events(events)
+    source_counters = watcher_source_counters(source="news", meta=meta, events=events)
     last_item_ts = events["published_on"].max() if not events.empty else now
     persist_sync_state(
         source_name=source_name,
@@ -539,6 +752,7 @@ def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90, max_loo
             "replay_minutes": 15,
             "max_lookback_minutes": effective_max_lookback,
             "catchup_truncated": bool(catchup_truncated),
+            "source_counters": source_counters,
         },
         status="ok",
     )
@@ -549,6 +763,7 @@ def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90, max_loo
         "requested_to": now.isoformat(),
         "catchup_truncated": bool(catchup_truncated),
         "max_lookback_minutes": effective_max_lookback,
+        "source_counters": source_counters,
     }
     publish_bus_message("stockey:continuous_watch:news", {"published_at": pd.Timestamp.utcnow(), **result})
     return result
@@ -580,6 +795,7 @@ def run_announcement_cycle(*, interval_seconds: int, initial_lookback_minutes: i
         market_context_last_checked_at=last_checked_at,
     )
     persist_watch_outputs(watch_updates, events)
+    source_counters = watcher_source_counters(source="announcements", meta=meta, events=events, watch_updates=watch_updates)
     last_item_ts = events["published_on"].max() if not events.empty else now
     persist_sync_state(
         source_name=source_name,
@@ -593,6 +809,7 @@ def run_announcement_cycle(*, interval_seconds: int, initial_lookback_minutes: i
             "replay_minutes": 15,
             "max_lookback_minutes": effective_max_lookback,
             "catchup_truncated": bool(catchup_truncated),
+            "source_counters": source_counters,
         },
         status="ok",
     )
@@ -603,6 +820,7 @@ def run_announcement_cycle(*, interval_seconds: int, initial_lookback_minutes: i
         "requested_to": now.isoformat(),
         "catchup_truncated": bool(catchup_truncated),
         "max_lookback_minutes": effective_max_lookback,
+        "source_counters": source_counters,
     }
     publish_bus_message("stockey:continuous_watch:announcements", {"published_at": pd.Timestamp.utcnow(), **result})
     return result

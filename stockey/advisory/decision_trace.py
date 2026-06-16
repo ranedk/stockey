@@ -50,6 +50,14 @@ ACTION_CONFLICT_RULES = [
         "reason": "When adversarial review vetoes event evidence, MANUAL_REVIEW beats positive broker and watch candidates until the operator resolves the contradiction.",
     },
     {
+        "rule_id": "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY",
+        "rule_name": "Event-policy review blocks positive entry/add-on",
+        "rule_scope": "event_policy",
+        "resolution_status": "resolved",
+        "resolution_action": "keep_winner",
+        "reason": "Event-policy MANUAL_REVIEW is an explicit evidence gate and beats BUY/BUY_MORE candidates until the event is reviewed.",
+    },
+    {
         "rule_id": "SAME_ACTION_DUPLICATE_COLLAPSE",
         "rule_name": "Same-action duplicate collapse",
         "rule_scope": "dedupe",
@@ -533,6 +541,8 @@ def classify_action_conflict(row: dict[str, Any], dynamic_rules: list[dict[str, 
         rule = ACTION_CONFLICT_RULES_BY_ID["SAME_ACTION_DUPLICATE_COLLAPSE"]
     elif winning in exit_actions and losing in low_priority_actions:
         rule = ACTION_CONFLICT_RULES_BY_ID["EXIT_BEATS_ENTRY_OR_WATCH"]
+    elif winning == "MANUAL_REVIEW" and winning_source == "event_policy" and losing in {"BUY", "BUY_MORE"}:
+        rule = ACTION_CONFLICT_RULES_BY_ID["EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY"]
     elif winning == "MANUAL_REVIEW" and ("market_context_adjustment" in context_text or "risk-off" in context_text or "risk_off" in context_text or winning_source in {"portfolio", "event_policy"}):
         rule = ACTION_CONFLICT_RULES_BY_ID["MARKET_GATE_MANUAL_BEATS_POSITIVE"]
     elif losing == "WATCH" and winning:

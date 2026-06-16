@@ -3,6 +3,7 @@ import type { Dict, ScreenerPreviewPayload } from '~/types/api'
 
 const api = useOperatorApi()
 const { data: coverage, refresh: refreshCoverage, error: coverageError } = await useAsyncData('screener-coverage', () => api.getScreenerCoverage({ lookback_days: 30, limit: 50 }))
+const { data: failures, refresh: refreshFailures, error: failuresError } = await useAsyncData('screener-failures', () => api.getScreenerFailures({ hours: 24, limit: 25 }))
 const queryName = ref('Operator Screener Preview')
 const queryText = ref(`Market capitalization > 1000 AND
 Current price > 50 AND
@@ -17,6 +18,8 @@ const validationIssues = computed(() => asList(result.value?.validation_issues))
 const rows = computed(() => asList(result.value?.rows))
 const coverageRows = computed(() => asList(coverage.value?.screeners))
 const coverageSummary = computed(() => asDict(coverage.value?.summary))
+const failureRows = computed(() => asList(failures.value?.rows))
+const failureBoundary = computed(() => asDict(failures.value?.operator_boundary))
 const meta = computed(() => asDict(result.value?.meta))
 const boundary = computed(() => asDict(result.value?.operator_boundary))
 const hasResult = computed(() => Boolean(result.value))
@@ -130,6 +133,58 @@ async function runPreview(fetchRows: boolean) {
 
   <ApiErrorBanner v-if="errorText" class="mt-6" title="Screener preview failed" :error="errorText" />
   <ApiErrorBanner v-if="coverageError" class="mt-6" title="Screener coverage failed" :error="coverageError" />
+  <ApiErrorBanner v-if="failuresError" class="mt-6" title="Screener failure audit failed" :error="failuresError" />
+
+  <section class="mt-8 glass-panel rounded-3xl p-6">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-bold uppercase tracking-[0.3em] text-rust">Operational failures</p>
+        <h2 class="mt-2 text-2xl font-black">Recent Screener.in failures</h2>
+        <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/60">
+          Source-specific audit rows from the last {{ failures?.window_hours || 24 }} hours. These are operational repair signals, not investment Manual Review items.
+        </p>
+      </div>
+      <button class="rounded-full bg-rust px-4 py-2 text-sm font-black text-paper" type="button" @click="refreshFailures()">Refresh failures</button>
+    </div>
+    <div class="mt-5 grid gap-4 md:grid-cols-5">
+      <MetricTile label="Status" :value="String(failures?.status || '-').toUpperCase()" :note="failures?.message || 'Screener failure audit'" />
+      <MetricTile label="Active" :value="display(failures?.active_count)" note="Recent failure rows" />
+      <MetricTile label="Validation" :value="display(failures?.validation_count)" note="Local syntax/query issues" />
+      <MetricTile label="Fetch" :value="display(failures?.fetch_count)" note="Auth/session/network" />
+      <MetricTile label="Parse" :value="display(failures?.parse_count)" note="HTML/results-table changes" />
+    </div>
+    <div class="mt-5 rounded-2xl border border-black/10 bg-white/70 p-4">
+      <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Repair boundary</p>
+      <p class="mt-2 text-sm leading-6 text-ink/65">
+        {{ failureBoundary.operator_action || 'Fix the Screener query/session/parser issue, rerun the screener workflow, then refresh this page.' }}
+      </p>
+      <p class="mt-2 text-sm leading-6 text-ink/55">
+        {{ failureBoundary.side_effects || 'This read-only panel does not clear failures, register screeners, change recommendations, or submit orders.' }}
+      </p>
+    </div>
+    <div v-if="failureRows.length" class="mt-5 grid gap-4">
+      <article v-for="row in failureRows" :key="String(row.failure_id || row.observed_at || row.screener_url)" class="rounded-3xl border border-rust/20 bg-rust/5 p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-lg font-black text-ink">{{ row.query_name || row.failure_stage || 'Screener failure' }}</p>
+            <p class="mt-1 text-sm text-ink/55">{{ display(row.observed_at) }} · {{ display(row.failure_stage) }} · {{ display(row.error_type) }}</p>
+          </div>
+          <StatusPill tone="danger">{{ row.failure_stage || 'failure' }}</StatusPill>
+        </div>
+        <p class="mt-3 rounded-2xl bg-white/80 px-4 py-3 text-sm leading-6 text-ink/70">{{ row.error_message || 'No error message recorded.' }}</p>
+        <div class="mt-3 grid gap-3 md:grid-cols-2">
+          <p class="break-words rounded-2xl bg-white/80 px-4 py-3 text-sm"><b>URL:</b> {{ display(row.screener_url || row.final_url) }}</p>
+          <p class="break-words rounded-2xl bg-white/80 px-4 py-3 text-sm"><b>Query:</b> {{ display(row.query_text || row.query_hash) }}</p>
+        </div>
+        <p v-if="row.body_excerpt" class="mt-3 rounded-2xl bg-white/80 px-4 py-3 text-sm leading-6 text-ink/60">
+          <b>Page excerpt:</b> {{ row.body_excerpt }}
+        </p>
+      </article>
+    </div>
+    <p v-else class="mt-5 rounded-2xl bg-white/70 p-4 text-sm font-semibold text-ink/60">
+      No recent Screener.in failures in this window.
+    </p>
+  </section>
 
   <section class="mt-8 glass-panel rounded-3xl p-6">
     <div class="flex flex-wrap items-start justify-between gap-4">

@@ -60,6 +60,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon-days", type=int, default=1)
     parser.add_argument("--min-labeled-rows", type=int, default=20)
     parser.add_argument("--return-threshold", type=float, default=0.02)
+    parser.add_argument("--cost-bps", type=float, default=25.0)
     parser.add_argument("--artifact-dir", default=".cache/advisory_event_meta_model")
     parser.add_argument("--model-basename", default="event_meta_model")
     parser.add_argument("--from-date")
@@ -134,6 +135,8 @@ def main() -> int:
         str(args.horizon_days),
         "--return-threshold",
         str(args.return_threshold),
+        "--cost-bps",
+        str(args.cost_bps),
         "--artifact-dir",
         args.artifact_dir,
         "--model-basename",

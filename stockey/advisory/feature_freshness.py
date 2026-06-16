@@ -156,6 +156,14 @@ def _status_for_age(latest_at: pd.Timestamp | None, *, asof: pd.Timestamp, max_a
     return ("fresh" if age_days <= float(max_age_days) else "stale"), age_days
 
 
+def _point_in_time_cutoff(asof: pd.Timestamp) -> tuple[pd.Timestamp, str]:
+    # Date-only advisory runs should include the full trading date. Exact-time
+    # watcher/ad-hoc checks must not count rows that were not known yet.
+    if asof == asof.normalize():
+        return asof + pd.Timedelta(days=1), "<"
+    return asof, "<="
+
+
 def _latest_row_for_spec(spec: FeatureInputSpec, *, symbol: str, asof: pd.Timestamp) -> dict[str, Any]:
     table = _safe_identifier(spec.table)
     date_column = _safe_identifier(spec.date_column)
@@ -168,8 +176,9 @@ def _latest_row_for_spec(spec: FeatureInputSpec, *, symbol: str, asof: pd.Timest
             "table": spec.table,
             "date_column": spec.date_column,
         }
-    where = [f'"{date_column}" <= %(cutoff)s']
-    params: dict[str, Any] = {"cutoff": asof + pd.Timedelta(days=1)}
+    cutoff, cutoff_operator = _point_in_time_cutoff(asof)
+    where = [f'"{date_column}" {cutoff_operator} %(cutoff)s']
+    params: dict[str, Any] = {"cutoff": cutoff}
     symbol_column = spec.symbol_column
     if symbol_column:
         if symbol_column not in columns:

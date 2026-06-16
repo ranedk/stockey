@@ -5,13 +5,14 @@ const api = useOperatorApi()
 const route = useRoute()
 const symbol = computed(() => String(route.params.symbol || '').trim().toUpperCase())
 
-const [{ data: actions, error: actionsError }, { data: portfolio, error: portfolioError }, { data: portfolioDetail, error: portfolioDetailError }, { data: events, error: eventsError }, { data: traceData, error: traceError }, { data: featureFreshness, error: featureFreshnessError }] = await Promise.all([
+const [{ data: actions, error: actionsError }, { data: portfolio, error: portfolioError }, { data: portfolioDetail, error: portfolioDetailError }, { data: events, error: eventsError }, { data: traceData, error: traceError }, { data: featureFreshness, error: featureFreshnessError }, { data: identityIssues, error: identityIssuesError }] = await Promise.all([
   useAsyncData(`symbol-actions-${symbol.value}`, () => api.getActions({ symbol: symbol.value, limit: 100, include_feature_freshness: true })),
   useAsyncData(`symbol-portfolio-${symbol.value}`, () => api.getPortfolio({ symbol: symbol.value, limit: 100 })),
   useAsyncData(`symbol-portfolio-detail-${symbol.value}`, () => api.getPortfolioDetail(symbol.value)),
   useAsyncData(`symbol-events-${symbol.value}`, () => api.getEvents(100, { symbol: symbol.value })),
   useAsyncData(`symbol-trace-${symbol.value}`, () => api.getSymbolTraceSummary(symbol.value, 250)),
-  useAsyncData(`symbol-feature-freshness-${symbol.value}`, () => api.getFeatureFreshness(symbol.value))
+  useAsyncData(`symbol-feature-freshness-${symbol.value}`, () => api.getFeatureFreshness(symbol.value)),
+  useAsyncData(`symbol-identity-issues-${symbol.value}`, () => api.getIdentityIssues({ symbol: symbol.value, limit: 25 }))
 ])
 
 const trace = computed<TraceSummary | null>(() => traceData.value || null)
@@ -21,7 +22,8 @@ const loadErrors = computed(() => [
   { title: `${symbol.value} portfolio detail failed`, error: portfolioDetailError.value },
   { title: `${symbol.value} events failed`, error: eventsError.value },
   { title: `${symbol.value} trace failed`, error: traceError.value },
-  { title: `${symbol.value} data inputs failed`, error: featureFreshnessError.value }
+  { title: `${symbol.value} data inputs failed`, error: featureFreshnessError.value },
+  { title: `${symbol.value} identity issues failed`, error: identityIssuesError.value }
 ].filter((row) => row.error))
 const actionRows = computed(() => filterSymbolRows([...(actions.value?.top_action_recommendations || []), ...(actions.value?.action_recommendations || [])]))
 const alertRows = computed(() => filterSymbolRows(actions.value?.alerts || []))
@@ -50,12 +52,61 @@ const featureGateEffects = computed(() => collectFeatureGateEffects([finalAction
 const dataInputs = computed(() => Array.isArray(featureFreshness.value?.inputs) ? featureFreshness.value.inputs : [])
 const dataInputCounts = computed(() => asDict(featureFreshness.value?.counts))
 const dataInputBlockers = computed(() => Array.isArray(featureFreshness.value?.blockers) ? featureFreshness.value.blockers : [])
+const currentStageGates = computed(() => Array.isArray(featureFreshness.value?.stage_gates) ? featureFreshness.value.stage_gates : [])
+const currentStageGateSummary = computed(() => asDict(featureFreshness.value?.stage_gate_summary))
+const currentStageGateBlockedInputs = computed(() => Array.isArray(currentStageGateSummary.value.blocked_inputs) ? currentStageGateSummary.value.blocked_inputs : [])
+const symbolIdentityIssues = computed(() => Array.isArray(identityIssues.value?.issues) ? identityIssues.value.issues : [])
+const identityIssueSummary = computed(() => asDict(identityIssues.value?.summary))
+const identitySourceWarnings = computed(() => Array.isArray(identityIssues.value?.source_warnings) ? identityIssues.value.source_warnings : [])
 const explicitTarget = computed(() => numericFirstValue(['target_price', 'recommended_target_price']))
 const derivedTarget = computed(() => computeDerivedTarget())
 const displayTarget = computed(() => explicitTarget.value ?? derivedTarget.value)
 const runupRead = computed(() => buildRunupRead())
 const snapshotMeta = computed(() => asDict(actions.value?.snapshot || portfolio.value?.snapshot || events.value?.snapshot))
 const snapshotWarning = computed(() => asDict(actions.value?.snapshot_warning || portfolio.value?.snapshot_warning || events.value?.snapshot_warning))
+const tracePayloadMeta = computed(() => asDict(traceData.value))
+const payloadFreshnessItems = computed(() => [
+  {
+    label: 'Actions',
+    generated_at: actions.value?.generated_at,
+    snapshot: actions.value?.snapshot,
+    warning: actions.value?.snapshot_warning,
+    source: 'actions'
+  },
+  {
+    label: 'Portfolio',
+    generated_at: portfolio.value?.generated_at,
+    snapshot: portfolio.value?.snapshot,
+    warning: portfolio.value?.snapshot_warning,
+    source: 'portfolio'
+  },
+  {
+    label: 'Events',
+    generated_at: events.value?.generated_at,
+    snapshot: events.value?.snapshot,
+    warning: events.value?.snapshot_warning,
+    source: 'events'
+  },
+  {
+    label: 'Trace',
+    generated_at: tracePayloadMeta.value.generated_at,
+    status: tracePayloadMeta.value.status,
+    source: 'trace'
+  },
+  {
+    label: 'Data inputs',
+    generated_at: featureFreshness.value?.generated_at,
+    status: featureFreshness.value?.status,
+    source: 'feature_freshness'
+  },
+  {
+    label: 'Identity',
+    generated_at: identityIssues.value?.generated_at,
+    status: identityIssues.value?.status,
+    source: 'identity_issues',
+    warning: identitySourceWarnings.value[0]
+  }
+])
 
 function asDict(value: unknown): Dict {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
@@ -204,6 +255,64 @@ function dataInputClass(value: unknown) {
   return 'bg-ink/10 text-ink'
 }
 
+function preconditionLabel(value: unknown) {
+  const key = String(value || '').trim()
+  const labels: Record<string, string> = {
+    broker_order_execution_mode: 'Broker-order execution mode',
+    buy_transaction_type: 'BUY transaction type',
+    sell_transaction_type: 'SELL transaction type',
+    risk_level_present: 'Stop / invalidation level present',
+    entry_evidence_after_publication: 'Entry evidence after recommendation',
+    open_position_context: 'Open-position context',
+    add_on_evidence_present: 'Add-on evidence',
+    exit_trigger_present: 'Exit trigger',
+    partial_exit_trigger_present: 'Partial-exit trigger',
+    partial_exit_fraction_resolved: 'Partial-exit fraction',
+    full_exit_implied: 'Full exit implied',
+    recommended_stop_present: 'Recommended stop present',
+    policy_audit_only: 'Policy audit only',
+    no_exit_trigger_present: 'No exit trigger',
+    watch_evidence_present: 'Watch evidence',
+    no_broker_order: 'No broker order',
+    operator_question_present: 'Operator question'
+  }
+  return labels[key] || key.replaceAll('_', ' ')
+}
+
+function actionTransitionSummary(row: Dict) {
+  const transition = asDict(nestedValue(row, ['recommendation_reason', 'evidence', 'action_transition']))
+  const required = stringArray(transition.required_preconditions)
+  const missing = stringArray(transition.missing_preconditions)
+  const preconditionStatus = String(transition.precondition_status || (missing.length ? 'incomplete' : '')).toLowerCase()
+  const hasData = Object.keys(transition).length > 0
+  const brokerCandidate = transition.broker_order_candidate === true
+  const headline = !hasData
+    ? ''
+    : brokerCandidate
+      ? 'This action can only move toward execution after a separate safety-gated preview and the listed preconditions are satisfied.'
+      : 'This action is monitoring, policy, or review context and does not create a broker order.'
+  return {
+    hasData,
+    stateEffect: String(transition.state_effect || '').trim(),
+    nextRequiredStage: String(transition.next_required_stage || '').trim(),
+    brokerCandidate,
+    allowedAfterPreview: transition.allowed_after_preview === true,
+    status: preconditionStatus || (hasData ? 'unknown' : ''),
+    headline,
+    required,
+    missing,
+    brokerBoundary: String(transition.broker_boundary || '').trim()
+  }
+}
+
+function actionTransitionClass(row: Dict) {
+  const summary = actionTransitionSummary(row)
+  if (!summary.hasData) return 'bg-ink/10 text-ink'
+  if (summary.missing.length) return 'bg-sun text-ink'
+  if (summary.brokerCandidate) return 'bg-sky text-paper'
+  return 'bg-ink/10 text-ink'
+}
+
 function collectFeatureGateEffects(rows: Dict[]) {
   const seen = new Set<string>()
   const out: Dict[] = []
@@ -227,6 +336,14 @@ function featureGateTone(effect: Dict) {
   return 'border-moss/20 bg-moss/10 text-moss'
 }
 
+function stageGateClass(value: unknown) {
+  const status = String(value || '').toLowerCase()
+  if (status === 'ok') return 'border-moss/20 bg-moss/10 text-moss'
+  if (status === 'blocked' || status === 'error') return 'border-rust/20 bg-rust/10 text-rust'
+  if (status === 'skipped' || status === 'not_configured') return 'border-ink/10 bg-ink/5 text-ink/70'
+  return 'border-sun/30 bg-sun/15 text-ink'
+}
+
 function actionLabel(row: Dict) {
   return row.action_code || row.action || row.next_action || row.reason || row.alert_type || row.portfolio_status || row.status || 'NO ACTION'
 }
@@ -244,6 +361,8 @@ function companyMemoryReview(row: Dict) {
   const riskFlags = stringArray(review.risk_flags)
   const evidenceUsed = stringArray(review.evidence_used)
   const waitFor = stringArray(review.wait_for)
+  const sourceContract = asDict(review.evidence_source_contract)
+  const missingSources = stringArray(sourceContract.missing_required_sources)
   return {
     hasData: Object.keys(review).length > 0,
     signal: String(review.recommended_signal || '').toUpperCase(),
@@ -256,7 +375,9 @@ function companyMemoryReview(row: Dict) {
     reviewDate: String(review.review_date || '').trim(),
     riskFlags,
     evidenceUsed,
-    waitFor
+    waitFor,
+    sourceContract,
+    missingSources
   }
 }
 </script>
@@ -278,9 +399,69 @@ function companyMemoryReview(row: Dict) {
   </section>
 
   <SnapshotWarning class="mt-4" :snapshot="snapshotMeta" :warning="snapshotWarning" :generated-at="actions?.generated_at || portfolio?.generated_at || events?.generated_at" />
+  <PayloadFreshnessStrip class="mt-4" :items="payloadFreshnessItems" />
 
   <section v-if="loadErrors.length" class="mt-6 grid gap-3">
     <ApiErrorBanner v-for="row in loadErrors" :key="row.title" :title="row.title" :error="row.error" />
+  </section>
+
+  <section
+    v-if="symbolIdentityIssues.length || identitySourceWarnings.length"
+    class="mt-6 rounded-3xl border border-rust/25 bg-rust/10 p-5 shadow-soft"
+  >
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-black uppercase tracking-[0.25em] text-rust">Identity / Source Blockers</p>
+        <h2 class="mt-2 text-2xl font-black text-ink">Broker and reference mapping issues for {{ symbol }}</h2>
+        <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/65">
+          These are operational data issues, not investment recommendations. They can explain skipped OHLCV pulls, missing latest prices, and blocked execution previews until the Dhan/company mapping is fixed and the failed source is rerun.
+        </p>
+      </div>
+      <NuxtLink class="rounded-full bg-rust px-4 py-2 text-sm font-black text-paper" :to="`/identity-issues?symbol=${encodeURIComponent(symbol)}`">
+        Open identity workbench
+      </NuxtLink>
+    </div>
+    <div class="mt-4 grid gap-3 md:grid-cols-4">
+      <p class="rounded-2xl bg-white/80 p-3 text-sm"><b>Open:</b> {{ display(identityIssueSummary.total_open || symbolIdentityIssues.length) }}</p>
+      <p class="rounded-2xl bg-white/80 p-3 text-sm"><b>Broker execution:</b> {{ display(identityIssueSummary.broker_execution_enabled) }}</p>
+      <p class="rounded-2xl bg-white/80 p-3 text-sm"><b>Types:</b> {{ Object.keys(asDict(identityIssueSummary.by_type)).join(', ') || '-' }}</p>
+      <p class="rounded-2xl bg-white/80 p-3 text-sm"><b>Source warnings:</b> {{ display(identitySourceWarnings.length) }}</p>
+    </div>
+    <div v-if="identitySourceWarnings.length" class="mt-4 grid gap-2">
+      <p
+        v-for="warning in identitySourceWarnings"
+        :key="`${warning.source || 'identity'}-${warning.reason || 'warning'}`"
+        class="rounded-2xl bg-white/80 px-4 py-3 text-sm leading-6 text-rust"
+      >
+        <b>{{ warning.title || 'Identity source warning' }}:</b> {{ warning.message || warning.reason }}
+        <span class="text-ink/55">Action: {{ warning.operator_action || 'rerun source or refresh advisory' }}</span>
+      </p>
+    </div>
+    <div v-if="symbolIdentityIssues.length" class="mt-4 grid gap-3 lg:grid-cols-2">
+      <article
+        v-for="issue in symbolIdentityIssues"
+        :key="String(issue.issue_key || issue.manual_review_item_id || issue.symbol)"
+        class="rounded-2xl bg-white/85 p-4"
+      >
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/45">{{ display(issue.issue_type || 'identity issue') }}</p>
+            <h3 class="mt-1 font-black text-ink">{{ display(issue.requested_exchange) }}:{{ display(issue.symbol) }}</h3>
+          </div>
+          <span class="rounded-full bg-rust/10 px-3 py-1 text-xs font-black text-rust">{{ display(issue.status || 'open') }}</span>
+        </div>
+        <p class="mt-3 text-sm leading-6 text-ink/70">{{ issue.error_text || issue.repair_hint || issue.suggested_action || 'Unresolved identity issue.' }}</p>
+        <div class="mt-3 grid gap-2 text-sm md:grid-cols-2">
+          <p class="rounded-xl bg-paper/80 px-3 py-2"><b>Asset:</b> {{ display(issue.asset_type) }}</p>
+          <p class="rounded-xl bg-paper/80 px-3 py-2"><b>Source:</b> {{ display(issue.source) }}</p>
+          <p class="rounded-xl bg-paper/80 px-3 py-2"><b>Attempts:</b> {{ display(issue.attempt_count) }}</p>
+          <p class="rounded-xl bg-paper/80 px-3 py-2"><b>Last seen:</b> {{ display(issue.last_seen_at) }}</p>
+        </div>
+        <p class="mt-3 rounded-xl bg-paper/80 px-3 py-2 text-sm leading-6 text-ink/70">
+          <b>Repair:</b> {{ issue.repair_hint || issue.suggested_action || 'Refresh Dhan scrip master/company master and rerun the failed source.' }}
+        </p>
+      </article>
+    </div>
   </section>
 
   <section class="mt-6 grid gap-4 md:grid-cols-5">
@@ -325,6 +506,54 @@ function companyMemoryReview(row: Dict) {
       </p>
       <ReasonContractPanel v-if="reasonContract || reasonStatus" class="mt-4" :contract="reasonContract" :status="reasonStatus" />
       <section
+        v-if="actionTransitionSummary(finalAction).hasData"
+        class="mt-4 rounded-2xl border border-sky/20 bg-sky/10 p-4"
+      >
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.22em] text-sky">Execution preconditions</p>
+            <p class="mt-1 text-sm leading-6 text-ink/65">
+              {{ actionTransitionSummary(finalAction).headline }}
+            </p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="actionTransitionClass(finalAction)">
+            {{ actionTransitionSummary(finalAction).status || 'tracked' }}
+          </span>
+        </div>
+        <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+          <p class="rounded-xl bg-white/80 px-3 py-2">
+            <b>State effect:</b> {{ actionTransitionSummary(finalAction).stateEffect || '-' }}
+          </p>
+          <p class="rounded-xl bg-white/80 px-3 py-2">
+            <b>Next stage:</b> {{ actionTransitionSummary(finalAction).nextRequiredStage || '-' }}
+          </p>
+          <p class="rounded-xl bg-white/80 px-3 py-2">
+            <b>After preview:</b> {{ actionTransitionSummary(finalAction).allowedAfterPreview ? 'eligible' : 'not eligible' }}
+          </p>
+        </div>
+        <div v-if="actionTransitionSummary(finalAction).required.length" class="mt-3 rounded-xl bg-white/80 p-3">
+          <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">Required checks</p>
+          <div class="mt-2 flex flex-wrap gap-2">
+            <span
+              v-for="item in actionTransitionSummary(finalAction).required.slice(0, 8)"
+              :key="item"
+              class="rounded-full bg-moss/10 px-3 py-1 text-xs font-bold text-moss"
+            >
+              {{ preconditionLabel(item) }}
+            </span>
+          </div>
+        </div>
+        <div v-if="actionTransitionSummary(finalAction).missing.length" class="mt-3 rounded-xl bg-rust/10 p-3">
+          <p class="text-xs font-black uppercase tracking-[0.18em] text-rust">Missing before execution</p>
+          <ul class="mt-2 space-y-1 text-sm leading-6 text-rust">
+            <li v-for="item in actionTransitionSummary(finalAction).missing.slice(0, 6)" :key="item">- {{ preconditionLabel(item) }}</li>
+          </ul>
+        </div>
+        <p v-if="actionTransitionSummary(finalAction).brokerBoundary" class="mt-3 rounded-xl bg-white/80 px-3 py-2 text-sm leading-6 text-ink/70">
+          <b>Broker boundary:</b> {{ actionTransitionSummary(finalAction).brokerBoundary }}
+        </p>
+      </section>
+      <section
         class="mt-4 rounded-2xl border p-4"
         :class="companyMemory.hasData ? 'border-moss/25 bg-moss/10' : 'border-black/10 bg-white/65'"
       >
@@ -345,7 +574,13 @@ function companyMemoryReview(row: Dict) {
           <p class="rounded-xl bg-white/80 px-3 py-2"><b>Conviction:</b> {{ display(companyMemory.conviction) }}</p>
           <p class="rounded-xl bg-white/80 px-3 py-2"><b>Status:</b> {{ companyMemory.status || '-' }}</p>
           <p class="rounded-xl bg-white/80 px-3 py-2"><b>Date:</b> {{ companyMemory.reviewDate || '-' }}</p>
+          <p v-if="companyMemory.sourceContract.coverage_status" class="rounded-xl bg-white/80 px-3 py-2">
+            <b>Evidence coverage:</b> {{ companyMemory.sourceContract.coverage_status }}
+          </p>
         </div>
+        <p v-if="companyMemory.hasData && companyMemory.missingSources.length" class="mt-3 rounded-xl bg-rust/10 px-3 py-2 text-sm font-semibold leading-6 text-rust">
+          Missing compact evidence: {{ companyMemory.missingSources.join(', ') }}. Treat this review as partial.
+        </p>
         <p v-if="companyMemory.hasData && companyMemory.thesis && companyMemory.thesis !== companyMemory.summary" class="mt-3 rounded-xl bg-white/75 p-3 text-sm leading-6 text-ink/70">
           {{ companyMemory.thesis }}
         </p>
@@ -451,6 +686,53 @@ function companyMemoryReview(row: Dict) {
               <p class="mt-1 text-xs font-semibold text-ink/45">
                 {{ row.table }} · latest {{ display(row.latest_at) }} · age {{ display(row.age_days) }}d · rows {{ display(row.row_count) }} · {{ row.reason || '-' }}
               </p>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div v-if="currentStageGates.length" class="mt-4 rounded-3xl border border-black/10 bg-white/70 p-5">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.25em] text-ink/45">Current Stage Gates</p>
+            <h3 class="mt-2 text-xl font-black">What would be blocked if the pipeline ran now</h3>
+            <p class="mt-2 text-sm leading-6 text-ink/60">
+              This is a read-only current check. It explains stale/missing input consequences but does not change actions, portfolio rows, or broker execution until the advisory/action pipeline reruns.
+            </p>
+          </div>
+          <span class="rounded-full px-3 py-1 text-xs font-black" :class="dataInputClass(currentStageGateSummary.blocked_stage_count ? 'blocked' : 'ok')">
+            {{ display(currentStageGateSummary.blocked_stage_count || 0) }} BLOCKED
+          </span>
+        </div>
+        <div class="mt-4 grid gap-2 md:grid-cols-3">
+          <p class="rounded-2xl bg-paper/80 p-3 text-sm"><b>Stages checked:</b> {{ display(currentStageGateSummary.stage_count || currentStageGates.length) }}</p>
+          <p class="rounded-2xl bg-paper/80 p-3 text-sm"><b>Error stages:</b> {{ display(currentStageGateSummary.error_stage_count || 0) }}</p>
+          <p class="rounded-2xl bg-paper/80 p-3 text-sm"><b>Broker execution:</b> {{ display(asDict(currentStageGateSummary.operator_boundary).broker_execution_allowed) }}</p>
+        </div>
+        <div v-if="currentStageGateBlockedInputs.length" class="mt-4 rounded-2xl bg-rust/10 p-4">
+          <p class="text-sm font-black text-rust">Stage blockers</p>
+          <ul class="mt-2 space-y-1 text-sm font-semibold text-rust">
+            <li v-for="row in currentStageGateBlockedInputs" :key="`${row.stage || ''}-${row.input_key || row.label}`">
+              {{ row.stage ? `${row.stage}: ` : '' }}{{ row.label || row.input_key }} · {{ row.status }} · {{ row.reason || 'blocked' }}
+            </li>
+          </ul>
+        </div>
+        <details class="mt-4">
+          <summary class="cursor-pointer text-sm font-black text-moss">Show stage gate details</summary>
+          <div class="mt-3 grid gap-3 md:grid-cols-2">
+            <div v-for="gate in currentStageGates" :key="String(gate.stage)" class="rounded-2xl border p-4" :class="stageGateClass(gate.status)">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="font-black">{{ display(gate.stage) }}</p>
+                  <p class="mt-1 text-sm leading-6 opacity-80">{{ display(gate.gate_effect) }}</p>
+                </div>
+                <span class="rounded-full bg-white/80 px-3 py-1 text-xs font-black text-ink/65">{{ String(gate.status || 'unknown').toUpperCase() }}</span>
+              </div>
+              <div class="mt-3 grid gap-2 text-sm md:grid-cols-2">
+                <p class="rounded-xl bg-white/75 px-3 py-2"><b>Symbols checked:</b> {{ display(gate.symbols_checked || 0) }}</p>
+                <p class="rounded-xl bg-white/75 px-3 py-2"><b>Blocked symbols:</b> {{ display(gate.blocked_count || 0) }}</p>
+              </div>
+              <p class="mt-3 text-xs font-semibold opacity-70">Required inputs: {{ stringArray(gate.required_input_keys).join(', ') || '-' }}</p>
             </div>
           </div>
         </details>

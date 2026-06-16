@@ -23,9 +23,9 @@ DEFAULT_ENDPOINTS = [
     "/api/health",
     "/api/home",
     "/api/summary",
-    "/api/actions",
-    "/api/portfolio",
-    "/api/watchlist",
+    "/api/actions?limit=25&compact=true",
+    "/api/portfolio?limit=25&compact=true",
+    "/api/watchlist?limit=25&compact=true",
     "/api/events?limit=100",
     "/api/data-health",
 ]
@@ -161,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--endpoint", action="append", dest="endpoints", help="Endpoint path to probe. Can be repeated.")
     parser.add_argument("--threshold-ms", type=float, default=DEFAULT_THRESHOLD_MS)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
-    parser.add_argument("--output-path", default=str(DEFAULT_OUTPUT_PATH), help="Where to write the latest probe summary JSON. Use empty string to disable.")
+    parser.add_argument("--output-path", "--output", dest="output_path", default=str(DEFAULT_OUTPUT_PATH), help="Where to write the latest probe summary JSON. Use empty string to disable.")
     args = parser.parse_args(argv)
     result = run_probe(
         base_url=args.base_url,

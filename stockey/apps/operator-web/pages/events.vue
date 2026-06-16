@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import type { Dict } from '~/types/api'
+import type { ConfigChangeApplicationResult, ConfigChangeApplicationsPayload, Dict } from '~/types/api'
 import type { TraceSummary } from '~/types/api'
 
 const api = useOperatorApi()
@@ -25,6 +25,7 @@ const { data: policyData, refresh: refreshPolicy } = await useAsyncData('event-p
 })
 const { data: policyEvalData } = await useAsyncData('event-policy-evaluation', () => api.getEventPolicyEvaluation(80))
 const { data: promotionData, refresh: refreshPromotionReviews } = await useAsyncData('event-policy-promotion-reviews', () => api.getEventPolicyPromotionReviews(25))
+const { data: applicationsData, refresh: refreshApplications } = await useAsyncData<ConfigChangeApplicationsPayload>('config-change-applications-event-policy', () => api.getConfigChangeApplications(10))
 const events = computed(() => data.value?.events || [])
 const eventMeta = computed(() => asDict(data.value?.pagination?.events || data.value?.meta?.events))
 const snapshotMeta = computed(() => asDict(data.value?.snapshot))
@@ -40,6 +41,7 @@ const actionabilityEvalGroupTypes = new Set([
 ])
 const actionabilityEvalRows = computed(() => policyEvalRows.value.filter((row: Dict) => actionabilityEvalGroupTypes.has(String(row.group_type || ''))))
 const promotionReviews = computed<Dict[]>(() => (promotionData.value?.reviews || []) as Dict[])
+const applicationRows = computed(() => applicationsData.value?.applications || [])
 const policySummary = computed(() => policyData.value?.summary || {})
 const policyCompact = computed(() => Boolean(policySummary.value.compact))
 const actionCounts = computed(() => policySummary.value.action_counts as Record<string, number> || {})
@@ -51,6 +53,11 @@ const previewBusy = reactive<Record<string, boolean>>({})
 const promotionMessage = ref('')
 const previewMessage = ref('')
 const previewDiffs = reactive<Record<string, Dict>>({})
+const applicationDecision = ref<'approved_to_apply' | 'marked_applied' | 'rejected' | 'needs_more_data'>('approved_to_apply')
+const applicationNote = ref('')
+const applicationBusy = reactive<Record<string, boolean>>({})
+const applicationResult = reactive<Record<string, ConfigChangeApplicationResult>>({})
+const applicationMessage = ref('')
 const promotionOperatorId = ref('operator')
 const promotionDecisionReason = ref('')
 const actionTypes = ['ALL', 'MANUAL_REVIEW', 'BUY_WATCH', 'REDUCE_EXPOSURE_REVIEW', 'NO_ACTION']
@@ -108,6 +115,15 @@ function signedPct(value: unknown) {
 
 function humanLabel(value: unknown) {
   return String(value || '-').replaceAll('_', ' ').toUpperCase()
+}
+
+function titleLabel(value: unknown) {
+  const text = String(value || '').replaceAll('_', ' ')
+  return text ? text.replace(/\b\w/g, (char) => char.toUpperCase()) : '-'
+}
+
+function boolLabel(value: unknown) {
+  return value ? 'yes' : 'no'
 }
 
 function promotionKey(row: Dict) {
@@ -177,6 +193,32 @@ async function previewEventPolicyConfigChange(row: Dict) {
     previewMessage.value = `Reviewed diff preview failed: ${error instanceof Error ? error.message : String(error)}`
   } finally {
     previewBusy[key] = false
+  }
+}
+
+async function recordEventPolicyConfigApplication(row: Dict) {
+  const key = promotionKey(row)
+  const previewId = String(previewDiffs[key]?.preview_id || '').trim()
+  applicationMessage.value = ''
+  if (!previewId) {
+    applicationMessage.value = 'Generate and persist a reviewed diff preview before recording an application decision.'
+    return
+  }
+  applicationBusy[key] = true
+  try {
+    applicationResult[key] = await api.decideConfigChangeApplication({
+      preview_id: previewId,
+      application_decision: applicationDecision.value,
+      operator_note: applicationNote.value,
+      verify_config: true
+    })
+    applicationNote.value = ''
+    applicationMessage.value = 'Recorded event-policy config application audit. No config, policy, portfolio, or broker state was changed.'
+    await refreshApplications()
+  } catch (error) {
+    applicationMessage.value = `Application audit failed: ${error instanceof Error ? error.message : String(error)}`
+  } finally {
+    applicationBusy[key] = false
   }
 }
 
@@ -347,6 +389,7 @@ function eventDetailPath(row: Record<string, unknown>) {
       </div>
       <p v-if="promotionMessage" class="mt-4 rounded-2xl bg-white/80 p-3 text-sm font-bold text-ink/70">{{ promotionMessage }}</p>
       <p v-if="previewMessage" class="mt-3 rounded-2xl bg-white/80 p-3 text-sm font-bold text-ink/70">{{ previewMessage }}</p>
+      <p v-if="applicationMessage" class="mt-3 rounded-2xl bg-white/80 p-3 text-sm font-bold text-ink/70">{{ applicationMessage }}</p>
       <div class="mt-4 grid gap-3 md:grid-cols-2">
         <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
           Operator ID
@@ -357,6 +400,36 @@ function eventDetailPath(row: Record<string, unknown>) {
           <input v-model="promotionDecisionReason" class="rounded-xl border border-black/10 bg-white/80 px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="Why this review was approved, rejected, or deferred" />
         </label>
       </div>
+      <section class="mt-4 rounded-2xl border border-black/10 bg-white/70 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.24em] text-ink/45">Recent application decisions</p>
+            <p class="mt-2 text-sm leading-6 text-ink/60">
+              Audit trail for reviewed event-policy/config previews. These rows confirm Stockey did not apply config, policy, portfolio, or broker changes.
+            </p>
+          </div>
+          <button class="rounded-full bg-white px-4 py-2 text-xs font-black text-ink shadow-sm" type="button" @click="refreshApplications()">
+            Refresh applications
+          </button>
+        </div>
+        <div v-if="applicationRows.length" class="mt-4 grid gap-3 md:grid-cols-2">
+          <article v-for="row in applicationRows.slice(0, 6)" :key="String(row.application_id)" class="rounded-2xl bg-paper/80 p-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">{{ titleLabel(row.application_decision) }}</p>
+                <p class="mt-1 text-sm font-black text-ink">{{ row.preview_id || row.application_id }}</p>
+              </div>
+              <span class="rounded-full bg-ink px-3 py-1 text-xs font-black text-paper">{{ titleLabel(row.verification_status) }}</span>
+            </div>
+            <p class="mt-3 text-sm leading-6 text-ink/65">{{ asDict(row.decision_effect).next_step || row.note || 'Audit decision recorded.' }}</p>
+            <div class="mt-3 grid gap-2 text-xs font-bold text-ink/60 md:grid-cols-2">
+              <span class="rounded-xl bg-white px-3 py-2">Config mutated: {{ boolLabel(asDict(row.decision_effect).mutates_config) }}</span>
+              <span class="rounded-xl bg-white px-3 py-2">Broker allowed: {{ boolLabel(asDict(row.operator_boundary).broker_execution_allowed) }}</span>
+            </div>
+          </article>
+        </div>
+        <p v-else class="mt-4 rounded-2xl bg-paper/80 p-4 text-sm text-ink/60">No config application audit rows yet.</p>
+      </section>
       <div v-if="promotionReviews.length" class="mt-4 grid gap-3 lg:grid-cols-2">
         <article v-for="(review, idx) in promotionReviews" :key="`${promotionKey(review)}-${idx}`" class="rounded-2xl bg-white/85 p-4">
           <div class="flex flex-wrap items-start justify-between gap-3">
@@ -403,6 +476,41 @@ function eventDetailPath(row: Record<string, unknown>) {
             </p>
             <pre class="mt-3 max-h-96 overflow-auto rounded-2xl bg-ink p-4 text-xs leading-5 text-paper">{{ previewDiffs[promotionKey(review)].unified_diff || '-' }}</pre>
             <p class="mt-3 text-xs font-bold text-ink/55">{{ previewDiffs[promotionKey(review)].rollback_note || 'Rollback by not applying this preview.' }}</p>
+            <div class="mt-4 rounded-2xl border border-black/10 bg-white/80 p-4">
+              <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/45">Application audit</p>
+              <p class="mt-2 text-sm leading-6 text-ink/65">
+                Record whether this reviewed event-policy diff was manually applied, rejected, or needs more data. This writes only audit state.
+              </p>
+              <div class="mt-3 grid gap-3 md:grid-cols-[220px_1fr_auto]">
+                <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+                  Decision
+                  <select v-model="applicationDecision" class="rounded-xl border border-black/10 bg-paper px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss">
+                    <option value="approved_to_apply">Approved to apply manually</option>
+                    <option value="marked_applied">Marked applied manually</option>
+                    <option value="needs_more_data">Needs more data</option>
+                    <option value="rejected">Rejected</option>
+                  </select>
+                </label>
+                <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-ink/45">
+                  Operator note
+                  <input v-model="applicationNote" class="rounded-xl border border-black/10 bg-paper px-3 py-2 text-sm normal-case tracking-normal text-ink outline-none focus:border-moss" placeholder="What did you verify or decide?" />
+                </label>
+                <button class="self-end rounded-full bg-sun px-4 py-2 text-xs font-black text-ink disabled:opacity-50" type="button" :disabled="applicationBusy[promotionKey(review)]" @click="recordEventPolicyConfigApplication(review)">
+                  {{ applicationBusy[promotionKey(review)] ? 'Recording...' : 'Record Audit' }}
+                </button>
+              </div>
+            </div>
+            <div v-if="applicationResult[promotionKey(review)]" class="mt-3 rounded-2xl border border-moss/20 bg-moss/10 p-4">
+              <p class="text-xs font-black uppercase tracking-[0.2em] text-moss">Saved application decision</p>
+              <p class="mt-2 text-sm font-bold text-ink">{{ titleLabel(asDict(applicationResult[promotionKey(review)].decision_effect).state) }}</p>
+              <p class="mt-2 text-sm leading-6 text-ink/65">{{ asDict(applicationResult[promotionKey(review)].decision_effect).next_step || applicationResult[promotionKey(review)].note }}</p>
+              <div class="mt-3 grid gap-2 text-xs font-bold text-ink/60 md:grid-cols-4">
+                <span class="rounded-xl bg-white px-3 py-2">Config mutated: {{ boolLabel(asDict(applicationResult[promotionKey(review)].decision_effect).mutates_config) }}</span>
+                <span class="rounded-xl bg-white px-3 py-2">Policy mutated: {{ boolLabel(asDict(applicationResult[promotionKey(review)].decision_effect).mutates_policy) }}</span>
+                <span class="rounded-xl bg-white px-3 py-2">Portfolio mutated: {{ boolLabel(asDict(applicationResult[promotionKey(review)].decision_effect).mutates_portfolio) }}</span>
+                <span class="rounded-xl bg-white px-3 py-2">Broker allowed: {{ boolLabel(asDict(applicationResult[promotionKey(review)].operator_boundary).broker_execution_allowed) }}</span>
+              </div>
+            </div>
           </details>
         </article>
       </div>

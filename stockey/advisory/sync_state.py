@@ -102,6 +102,11 @@ def load_sync_state(source_name: str, scope_key: str = "default") -> dict[str, A
     return row
 
 
+def _utc_timestamp_series(value: Any) -> pd.Series:
+    parsed = pd.to_datetime(value, utc=True, errors="coerce")
+    return pd.Series([parsed], dtype="datetime64[ns, UTC]")
+
+
 def persist_sync_state(
     *,
     source_name: str,
@@ -120,16 +125,17 @@ def persist_sync_state(
                 "source_name": str(source_name),
                 "scope_key": str(scope_key),
                 "cursor_value": None if cursor_value is None else str(cursor_value),
-                "last_success_at": pd.to_datetime(last_success_at, utc=True, errors="coerce"),
-                "last_item_ts": pd.to_datetime(last_item_ts, utc=True, errors="coerce"),
                 "state_json": json.dumps(state or {}, ensure_ascii=False, sort_keys=True, default=str),
                 "status": str(status),
                 "error_text": None if error_text is None else str(error_text),
-                "updated_at": pd.Timestamp.utcnow(),
-                "load_ts": pd.Timestamp.utcnow(),
             }
         ]
     )
+    now = pd.Timestamp.utcnow()
+    df["last_success_at"] = _utc_timestamp_series(last_success_at)
+    df["last_item_ts"] = _utc_timestamp_series(last_item_ts)
+    df["updated_at"] = _utc_timestamp_series(now)
+    df["load_ts"] = _utc_timestamp_series(now)
     upsert_to_db(df, TABLE_NAME, unique_keys=["source_name", "scope_key"])
 
 

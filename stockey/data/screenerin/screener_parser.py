@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -487,7 +488,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_run_state(*, results: list[dict[str, object]], urls: list[str], snapshot_date: datetime | None = None) -> dict[str, object]:
+def classify_screener_sync_error(error: object) -> str:
+    text = str(error or "").lower()
+    if "redirected to login" in text or "has_login_form=true" in text or (
+        "login" in text and ("username" in text or "password" in text)
+    ):
+        return "auth_unavailable"
+    if "timed out" in text or "timeout" in text or "status 502" in text or "status 503" in text or "status 504" in text:
+        return "source_unavailable"
+    if "could not find screener.in results table" in text:
+        return "parse_failed"
+    return "failed"
+
+
+def classify_run_state(*, row_count: int, failures: list[dict[str, object]], urls: list[str]) -> str:
+    if not urls:
+        return "no_data"
+    if failures:
+        classifications = [str(row.get("classification") or classify_screener_sync_error(row.get("error"))) for row in failures]
+        if row_count > 0:
+            return "partial_failed"
+        if classifications and all(item == "auth_unavailable" for item in classifications):
+            return "auth_unavailable"
+        if classifications and all(item == "source_unavailable" for item in classifications):
+            return "source_unavailable"
+        if classifications and all(item == "parse_failed" for item in classifications):
+            return "parse_failed"
+        return "failed"
+    return "ok" if row_count > 0 else "no_data"
+
+
+def build_run_state(
+    *,
+    results: list[dict[str, object]],
+    urls: list[str],
+    failures: list[dict[str, object]] | None = None,
+    snapshot_date: datetime | None = None,
+) -> dict[str, object]:
+    failures = failures or []
     row_counts = [int(row.get("row_count") or 0) for row in results]
     no_data_screeners = [
         str(row.get("screener_slug") or row.get("screener_name") or "")
@@ -496,19 +534,35 @@ def build_run_state(*, results: list[dict[str, object]], urls: list[str], snapsh
     ]
     dates = [str(row.get("date")) for row in results if row.get("date")]
     effective_date = snapshot_date.date().isoformat() if snapshot_date else (dates[0] if dates else None)
+    rows_written = int(sum(row_counts))
+    failure_classifications = [
+        str(row.get("classification") or classify_screener_sync_error(row.get("error")))
+        for row in failures
+    ]
+    classification_counts = {key: failure_classifications.count(key) for key in sorted(set(failure_classifications))}
+    classification = classify_run_state(row_count=rows_written, failures=failures, urls=urls)
     return {
         "source": "screener.in",
-        "rows": int(sum(row_counts)),
-        "rows_read": int(sum(row_counts)),
-        "rows_written": int(sum(row_counts)),
+        "rows": rows_written,
+        "rows_read": rows_written,
+        "rows_written": rows_written,
+        "classification": classification,
+        "status": "ok" if classification in {"ok", "no_data"} else "failed",
         "screener_count": int(len(urls)),
         "screeners_synced": int(len(results)),
+        "failed_screener_count": int(len(failures)),
+        "failed_screeners": [str(row.get("screener_url") or "") for row in failures if row.get("screener_url")][:20],
         "empty_screener_count": int(len(no_data_screeners)),
         "empty_screeners": [value for value in no_data_screeners if value][:20],
+        "no_data_count": int(len(no_data_screeners) + (1 if not urls else 0)),
+        "source_unavailable_count": int(classification_counts.get("source_unavailable", 0)),
+        "auth_unavailable_count": int(classification_counts.get("auth_unavailable", 0)),
+        "parse_failed_count": int(classification_counts.get("parse_failed", 0)),
+        "classification_counts": classification_counts,
         "from_date": effective_date,
         "to_date": effective_date,
         "fallback_used": False,
-        "state_advanced": bool(results),
+        "state_advanced": rows_written > 0,
     }
 
 
@@ -517,14 +571,40 @@ def main() -> int:
     args = parse_args()
     urls = args.urls or load_registered_urls()
     results: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
     for url in urls:
-        result = sync_screener(url)
-        results.append(result)
-        print(json.dumps(result, ensure_ascii=False), flush=True)
-    STOCKEY_RUN_STATE = build_run_state(results=results, urls=urls)
-    if not results:
+        try:
+            result = sync_screener(url)
+            results.append(result)
+            print(json.dumps(result, ensure_ascii=False), flush=True)
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            classification = classify_screener_sync_error(error_text)
+            record_local_fallback_event(
+                module="data.screenerin.screener_parser",
+                source="screener_registered_sync",
+                fallback_type="screener_registered_sync_failed",
+                severity="warn" if results else "error",
+                reason=(
+                    "A registered Screener.in sync failed; candidate sourcing may be incomplete "
+                    "until the screener auth/source/parser issue is fixed and the sync reruns."
+                ),
+                error=exc,
+                metadata={"screener_url": url, "classification": classification},
+            )
+            failure = {
+                "screener_url": url,
+                "rows": 0,
+                "row_count": 0,
+                "classification": classification,
+                "error": error_text,
+            }
+            failures.append(failure)
+            print(json.dumps({"status": "failed", **failure}, ensure_ascii=False), file=sys.stderr, flush=True)
+    STOCKEY_RUN_STATE = build_run_state(results=results, urls=urls, failures=failures)
+    if not urls:
         print(json.dumps({"status": "no_data", "reason": "no_registered_screener_urls"}, ensure_ascii=False), flush=True)
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

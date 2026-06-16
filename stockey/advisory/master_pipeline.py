@@ -11,7 +11,24 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.pipeline import PIPELINE_STAGES, parse_stage, run_pipeline
+from advisory.adversarial_review import (
+    DEFAULT_EVENT_MODEL_SCORE_POLICY_MODE,
+    EVENT_MODEL_SCORE_POLICY_MODE_ENV,
+    EVENT_MODEL_SCORE_POLICY_MODES,
+)
+from advisory.company_memory_review import (
+    DEFAULT_LOOKBACK_DAYS as DEFAULT_COMPANY_MEMORY_LOOKBACK_DAYS,
+    DEFAULT_MAX_SYMBOLS as DEFAULT_COMPANY_MEMORY_MAX_SYMBOLS,
+    DEFAULT_MODEL as DEFAULT_COMPANY_MEMORY_MODEL,
+    LLM_ENABLED as COMPANY_MEMORY_LLM_ENABLED,
+)
+from advisory.pipeline import (
+    DEFAULT_STAGE_BUDGET_OVERRIDES,
+    DEFAULT_STAGE_BUDGET_SECONDS,
+    PIPELINE_STAGES,
+    parse_stage,
+    run_pipeline,
+)
 from advisory.research_ledger import (
     build_data_snapshot as build_research_data_snapshot,
     build_result_metrics as build_research_result_metrics,
@@ -108,6 +125,8 @@ def parse_args() -> argparse.Namespace:
         default=[1],
         help="Intraday candle intervals to fetch/build for advisory intraday features",
     )
+    parser.add_argument("--rule-max-snapshot-refresh-age-days", type=int, default=7, help="Only repair missing daily/fundamental snapshots on the fly when the screener date is this recent; use -1 to always allow")
+    parser.add_argument("--rule-max-intraday-prefetch-age-days", type=int, default=14, help="Only prefetch missing intraday features on the fly when the screener date is this recent; use -1 to always allow")
     parser.add_argument("--skip-downloads", action="store_true", help="Skip the raw download shell script")
     parser.add_argument("--fast", action="store_true", help="Run a faster advisory pass by skipping slow repair/watch work")
     parser.add_argument("--skip-watch", action="store_true", help="Skip announcement watchlist stages")
@@ -115,6 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-lifecycle", action="store_true", help="Skip lifecycle stage")
     parser.add_argument("--include-execution", action="store_true", help="Include execution planning stage")
     parser.add_argument("--live-execution", action="store_true", help="Submit execution orders live through Dhan when execution stage runs")
+    parser.add_argument("--live-execution-confirmation", help="Per-run confirmation token required when --live-execution submits broker orders")
     parser.add_argument("--execution-reconcile", action="store_true", help="Reconcile broker execution state after execution planning")
     parser.add_argument("--eval-include-evaluated", action="store_true")
     parser.add_argument("--portfolio-capital-inr", type=float, default=300000.0)
@@ -124,6 +144,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--portfolio-max-positions-per-overlap-group", type=int, default=1)
     parser.add_argument("--event-model")
     parser.add_argument("--event-model-artifact-dir", default=".cache/advisory_event_meta_model")
+    parser.add_argument(
+        "--event-model-score-policy-mode",
+        choices=sorted(EVENT_MODEL_SCORE_POLICY_MODES),
+        default=os.getenv(EVENT_MODEL_SCORE_POLICY_MODE_ENV, DEFAULT_EVENT_MODEL_SCORE_POLICY_MODE),
+        help="Controls whether persisted event meta-model scores can influence adversarial review. Default research_only keeps scores research-only.",
+    )
+    parser.add_argument("--skip-company-memory", action="store_true", help="Skip review-only company-memory summaries")
+    parser.add_argument("--company-memory-limit", type=int, default=DEFAULT_COMPANY_MEMORY_MAX_SYMBOLS)
+    parser.add_argument("--company-memory-lookback-days", type=int, default=DEFAULT_COMPANY_MEMORY_LOOKBACK_DAYS)
+    parser.add_argument("--company-memory-model", default=DEFAULT_COMPANY_MEMORY_MODEL)
+    parser.add_argument("--company-memory-llm", action="store_true", default=COMPANY_MEMORY_LLM_ENABLED, help="Use Codex for company-memory reviews; deterministic V1 is default")
     parser.add_argument("--log-research-ledger", action="store_true", help="Record this run in the advisory research ledger")
     parser.add_argument("--ledger-label", help="Optional research-ledger label")
     parser.add_argument("--ledger-objective", help="Optional research-ledger objective")
@@ -133,6 +164,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--parallel-local-stages", action="store_true", help="Run independent DB/local feature stages with bounded threads")
     parser.add_argument("--local-stage-workers", type=int, default=3, help="Max workers for --parallel-local-stages")
+    parser.add_argument("--stage-budget-seconds", type=float, default=DEFAULT_STAGE_BUDGET_SECONDS, help="Reporting-only slow-stage budget in seconds; set 0 to disable slow-stage marking")
+    parser.add_argument("--stage-budget-overrides", default=DEFAULT_STAGE_BUDGET_OVERRIDES, help="Comma-separated reporting-only per-stage budgets, for example rules=1800,exchange_features=900")
     parser.add_argument("--format", choices=["json", "text"], default="json")
     return parser.parse_args()
 
@@ -235,6 +268,8 @@ def main() -> int:
             skip_intraday=bool(args.skip_intraday),
             skip_rule_snapshot_refresh=bool(args.skip_rule_snapshot_refresh),
             skip_intraday_prefetch=bool(args.skip_intraday_prefetch),
+            rule_max_snapshot_refresh_age_days=int(args.rule_max_snapshot_refresh_age_days),
+            rule_max_intraday_prefetch_age_days=int(args.rule_max_intraday_prefetch_age_days),
             intraday_lookback_days=int(args.intraday_lookback_days),
             intraday_intervals=list(args.intraday_intervals or [1]),
             include_watch=not bool(args.skip_watch),
@@ -242,6 +277,7 @@ def main() -> int:
             include_lifecycle=not bool(args.skip_lifecycle),
             include_execution=bool(args.include_execution),
             live_execution=bool(args.live_execution),
+            live_execution_confirmation=args.live_execution_confirmation,
             execution_reconcile=bool(args.execution_reconcile),
             eval_include_evaluated=bool(args.eval_include_evaluated),
             portfolio_capital_inr=float(args.portfolio_capital_inr),
@@ -251,8 +287,16 @@ def main() -> int:
             portfolio_max_positions_per_overlap_group=int(args.portfolio_max_positions_per_overlap_group),
             event_model=args.event_model,
             event_model_artifact_dir=args.event_model_artifact_dir,
+            event_model_score_policy_mode=args.event_model_score_policy_mode,
+            skip_company_memory=bool(args.skip_company_memory),
+            company_memory_limit=int(args.company_memory_limit),
+            company_memory_lookback_days=int(args.company_memory_lookback_days),
+            company_memory_model=args.company_memory_model,
+            company_memory_llm=bool(args.company_memory_llm),
             parallel_local_stages=bool(args.parallel_local_stages),
             local_stage_workers=int(args.local_stage_workers),
+            stage_budget_seconds=float(args.stage_budget_seconds or 0),
+            stage_budget_overrides=args.stage_budget_overrides,
             dry_run=bool(args.dry_run),
         )
         advisory_heartbeat = _start_heartbeat("advisory run")

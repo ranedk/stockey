@@ -2,12 +2,13 @@
 import type { Dict } from '~/types/api'
 
 const api = useOperatorApi()
-const [{ data: smoke, refresh: refreshSmoke, pending: smokePending, error: smokeError }, { data: cronStatus, refresh: refreshCronStatus, error: cronStatusError }, { data: cronLogs, refresh: refreshLogs, error: cronLogsError }, { data: mlGate, refresh: refreshMlGate, error: mlGateError }, { data: artifacts, refresh: refreshArtifacts, error: artifactsError }, { data: commands, refresh: refreshCommands, error: commandsError }, { data: apiErrors, refresh: refreshApiErrors, error: apiErrorsLoadError }] = await Promise.all([
+const [{ data: smoke, refresh: refreshSmoke, pending: smokePending, error: smokeError }, { data: cronStatus, refresh: refreshCronStatus, error: cronStatusError }, { data: cronLogs, refresh: refreshLogs, error: cronLogsError }, { data: mlGate, refresh: refreshMlGate, error: mlGateError }, { data: artifacts, refresh: refreshArtifacts, error: artifactsError }, { data: ledger, refresh: refreshLedger, error: ledgerError }, { data: commands, refresh: refreshCommands, error: commandsError }, { data: apiErrors, refresh: refreshApiErrors, error: apiErrorsLoadError }] = await Promise.all([
   useAsyncData('operations-smoke', () => api.runOperationsSmoke(), { immediate: true }),
   useAsyncData('operations-cron-status', () => api.getCronStatus(50, 10)),
   useAsyncData('operations-cron-logs', () => api.getCronLogs(12, 60)),
   useAsyncData('operations-event-model-promotion-check', () => api.getEventModelPromotionCheck()),
   useAsyncData('operations-event-model-artifacts', () => api.getEventModelArtifacts()),
+  useAsyncData('operations-research-ledger', () => api.getResearchLedger({ limit: 10 })),
   useAsyncData('operations-commands', () => api.getOperatorCommands(20)),
   useAsyncData('operations-api-errors', () => api.getOperatorApiErrors(25))
 ])
@@ -26,8 +27,40 @@ const failedGates = computed(() => mlGate.value?.failed_gates || [])
 const gates = computed(() => asList(mlGate.value?.gates))
 const mlScorecard = computed(() => asDict(mlGate.value?.scorecard))
 const mlScorecardMetrics = computed(() => asDict(mlScorecard.value.key_metrics))
+const mlResearchSafety = computed(() => asDict(mlScorecard.value.research_safety || mlGate.value?.research_safety))
+const researchSafetyControls = computed(() => [
+  researchSafetyControl(
+    'Leakage control',
+    'Confirms event-model features are point-in-time and future returns are labels only.',
+    ['leakage_control', 'leakage_control_evidence', 'point_in_time']
+  ),
+  researchSafetyControl(
+    'False-discovery control',
+    'Confirms the run is tied to a bounded research ledger/config instead of cherry-picked prompt or screener trials.',
+    ['false_discovery_control', 'false_discovery_control_evidence', 'fixed_config', 'research_ledger']
+  ),
+  researchSafetyControl(
+    'Cost-adjusted baseline',
+    'Confirms predicted-positive holdout trades beat a passive event baseline after costs.',
+    ['cost_adjusted_baseline', 'cost_adjusted_baseline_evidence', 'baseline']
+  ),
+  {
+    label: 'Research-only authority',
+    description: 'Confirms this page cannot auto-promote policy or submit broker orders.',
+    passed: mlScorecard.value.broker_execution_allowed === false && mlScorecard.value.policy_auto_promotion_allowed === false,
+    source: 'scorecard authority boundary',
+    reason: `broker allowed: ${display(mlScorecard.value.broker_execution_allowed)}; auto promotion: ${display(mlScorecard.value.policy_auto_promotion_allowed)}`,
+    operatorAction: 'Model stays research-only/manual-review even when evidence gates pass.'
+  }
+])
 const latestHeads = computed(() => asList(artifacts.value?.latest_s3_heads))
+const artifactFiles = computed(() => asList(artifacts.value?.artifact?.files))
+const artifactBoundary = computed(() => asDict(artifacts.value?.operator_boundary || artifacts.value?.api_schema))
 const artifactPageMeta = computed(() => asDict(artifacts.value?.pagination?.artifact_files))
+const ledgerRuns = computed(() => asList(ledger.value?.runs))
+const ledgerSummary = computed(() => asDict(ledger.value?.summary))
+const ledgerBoundary = computed(() => asDict(ledger.value?.operator_boundary || ledger.value?.api_schema))
+const ledgerPageMeta = computed(() => asDict(ledger.value?.pagination?.runs))
 const commandList = computed(() => asList(commands.value?.commands))
 const recentRuns = computed(() => asList(commands.value?.recent_runs))
 const operatorApiErrors = computed(() => asList(apiErrors.value?.errors))
@@ -37,6 +70,7 @@ const loadErrors = computed(() => [
   { title: 'Cron logs failed', error: cronLogsError.value },
   { title: 'ML gate failed', error: mlGateError.value },
   { title: 'Artifact check failed', error: artifactsError.value },
+  { title: 'Research ledger failed', error: ledgerError.value },
   { title: 'Command list failed', error: commandsError.value },
   { title: 'API error history failed', error: apiErrorsLoadError.value }
 ].filter((row) => row.error))
@@ -60,8 +94,8 @@ function asStringList(value: unknown): string[] {
 
 function statusClass(value: unknown) {
   const status = String(value || '').toLowerCase()
-  if (status === 'ok' || status === 'uploaded' || status === 'review_candidate' || status === 'usable_for_manual_review') return 'bg-moss text-paper'
-  if (status === 'error' || status === 'failed' || status === 'timeout' || status === 'missing_artifact' || status === 'hold_research_only' || status === 'not_usable') return 'bg-rust text-paper'
+  if (status === 'ok' || status === 'uploaded' || status === 'review_candidate' || status === 'usable_for_manual_review' || status === 'pass') return 'bg-moss text-paper'
+  if (status === 'error' || status === 'failed' || status === 'timeout' || status === 'missing_artifact' || status === 'hold_research_only' || status === 'not_usable' || status === 'fail') return 'bg-rust text-paper'
   return 'bg-sun text-ink'
 }
 
@@ -86,8 +120,37 @@ function tailLines(value: unknown): string[] {
   return Array.isArray(value) ? value.map((line) => String(line)) : []
 }
 
+function findGate(tokens: string[]): Dict {
+  return gates.value.find((gate) => {
+    const name = String(gate.gate || '').toLowerCase()
+    return tokens.some((token) => name.includes(token))
+  }) || {}
+}
+
+function safetyStatus(value: unknown) {
+  if (value === true) return 'pass'
+  if (value === false) return 'fail'
+  return 'unknown'
+}
+
+function researchSafetyControl(label: string, description: string, tokens: string[]) {
+  const directKey = tokens[0] || ''
+  const direct = asDict(mlResearchSafety.value[directKey])
+  const gate = findGate(tokens)
+  const gateValue = asDict(gate.value)
+  const passed = direct.passed ?? gate.passed
+  return {
+    label,
+    description,
+    passed,
+    source: direct.source || gateValue.source || gate.gate || 'missing evidence',
+    reason: direct.reason || gateValue.reason || `value: ${display(gate.value)}; threshold: ${display(gate.threshold)}`,
+    operatorAction: passed === true ? 'Evidence is present; still manual review only.' : 'Do not use model output beyond research until this evidence passes.'
+  }
+}
+
 async function refreshAll() {
-  await Promise.all([refreshSmoke(), refreshCronStatus(), refreshLogs(), refreshMlGate(), refreshArtifacts(), refreshCommands(), refreshApiErrors()])
+  await Promise.all([refreshSmoke(), refreshCronStatus(), refreshLogs(), refreshMlGate(), refreshArtifacts(), refreshLedger(), refreshCommands(), refreshApiErrors()])
 }
 
 function commandArgs(value: unknown): string {
@@ -343,6 +406,31 @@ async function runSmokeCommand() {
           <span v-if="!failedGates.length" class="rounded-full bg-moss px-3 py-1 text-xs font-black text-paper">none</span>
         </div>
       </div>
+      <div class="mt-5 rounded-3xl border border-ink/10 bg-white/75 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-sm font-black text-ink">Research Safety Controls</p>
+            <p class="mt-1 max-w-3xl text-xs leading-5 text-ink/60">
+              These controls must pass before event-model output can move beyond research/manual review. They do not grant broker authority.
+            </p>
+          </div>
+          <span class="rounded-full bg-ink px-3 py-1 text-xs font-black text-paper">NO AUTO-PROMOTION</span>
+        </div>
+        <div class="mt-4 grid gap-3">
+          <article v-for="control in researchSafetyControls" :key="control.label" class="rounded-2xl border border-black/5 bg-paper/80 p-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-sm font-black text-ink">{{ control.label }}</p>
+                <p class="mt-1 text-xs leading-5 text-ink/60">{{ control.description }}</p>
+              </div>
+              <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(safetyStatus(control.passed))">{{ safetyStatus(control.passed).toUpperCase() }}</span>
+            </div>
+            <p class="mt-3 text-xs font-semibold text-ink/55">Source: {{ display(control.source) }}</p>
+            <p class="mt-1 text-xs leading-5 text-ink/65">Evidence: {{ display(control.reason) }}</p>
+            <p class="mt-1 text-xs font-bold text-ink">{{ control.operatorAction }}</p>
+          </article>
+        </div>
+      </div>
       <details class="mt-5">
         <summary class="cursor-pointer text-sm font-black text-ink">Show all gates</summary>
         <div class="mt-3 grid gap-2">
@@ -429,6 +517,18 @@ async function runSmokeCommand() {
         <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(artifacts?.status)">{{ String(artifacts?.status || 'unknown').toUpperCase() }}</span>
       </div>
       <p class="mt-3 text-sm leading-6 text-ink/60">Local manifest plus latest S3 object heads when credentials are available.</p>
+      <div class="mt-4 rounded-2xl border border-moss/20 bg-moss/10 p-4 text-sm leading-6 text-ink/70">
+        <p class="font-black text-moss">Read-only artifact inspection</p>
+        <p class="mt-1">
+          {{ artifactBoundary.operator_action || 'Verify local artifact hashes and S3 HEAD status only. Uploads still happen through explicit scripts.' }}
+        </p>
+        <div class="mt-3 grid gap-2 text-xs font-bold md:grid-cols-4">
+          <span class="rounded-xl bg-white/70 px-3 py-2">Applies model: {{ display(artifactBoundary.system_applies_model) }}</span>
+          <span class="rounded-xl bg-white/70 px-3 py-2">Policy promotion: {{ display(artifactBoundary.policy_auto_promotion_allowed) }}</span>
+          <span class="rounded-xl bg-white/70 px-3 py-2">S3 writes: {{ display(artifactBoundary.s3_write_allowed) }}</span>
+          <span class="rounded-xl bg-white/70 px-3 py-2">Broker allowed: {{ display(artifactBoundary.broker_execution_allowed) }}</span>
+        </div>
+      </div>
       <div class="mt-5 rounded-2xl bg-white/75 p-4 text-sm">
         <p><b>Version:</b> {{ display(artifacts?.artifact?.model_version) }}</p>
         <p><b>Latest prefix:</b> {{ shortPath(artifacts?.artifact?.latest_prefix) }}</p>
@@ -436,13 +536,94 @@ async function runSmokeCommand() {
         <p><b>Files shown:</b> {{ display(artifactPageMeta.returned_count) }} / {{ display(artifactPageMeta.total_count) }}</p>
       </div>
       <div class="mt-4 space-y-3">
+        <p class="text-xs font-black uppercase tracking-[0.24em] text-ink/45">Local artifact files</p>
+        <div v-for="row in artifactFiles" :key="String(row.latest_key || row.local_path || row.filename)" class="rounded-2xl bg-white/70 p-3 text-sm">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p class="font-black text-ink">{{ display(row.role) }} · {{ display(row.filename || row.path) }}</p>
+              <p class="mt-1 break-all text-xs text-ink/55">{{ shortPath(row.local_path || row.path) }}</p>
+            </div>
+            <span class="rounded-full bg-paper px-3 py-1 text-xs font-black text-ink">{{ display(row.bytes) }} bytes</span>
+          </div>
+          <p class="mt-2 break-all text-xs text-ink/55">sha256: {{ display(row.sha256) }}</p>
+          <p class="mt-1 break-all text-xs text-ink/55">latest key: {{ shortPath(row.latest_key) }}</p>
+        </div>
+        <p v-if="!artifactFiles.length" class="rounded-2xl bg-white/70 p-3 text-sm text-ink/55">
+          No local artifact files are available. Run the model training flow before trusting event-model artifact backup status.
+        </p>
+      </div>
+      <div class="mt-4 space-y-3">
+        <p class="text-xs font-black uppercase tracking-[0.24em] text-ink/45">S3 object HEAD checks</p>
         <div v-for="row in latestHeads" :key="String(row.key || row.status)" class="rounded-2xl bg-white/70 p-3 text-sm">
           <div class="flex flex-wrap items-start justify-between gap-3">
             <p class="break-all font-bold">{{ shortPath(row.key || row.error || row.status) }}</p>
             <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(row.status)">{{ String(row.status || 'unknown').toUpperCase() }}</span>
           </div>
           <p class="mt-1 text-ink/55">bytes: {{ display(row.content_length) }} | modified: {{ display(row.last_modified) }}</p>
+          <p v-if="row.error" class="mt-1 text-xs font-bold text-rust">{{ row.error }}</p>
         </div>
+        <p v-if="!latestHeads.length" class="rounded-2xl bg-white/70 p-3 text-sm text-ink/55">
+          No S3 object heads returned. This is acceptable only when the local manifest is missing or object-store credentials are not configured.
+        </p>
+      </div>
+    </div>
+
+    <div class="glass-panel rounded-3xl p-6 lg:col-span-2">
+      <div class="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <p class="text-xs font-bold uppercase tracking-[0.3em] text-ink/45">Research ledger</p>
+          <h2 class="mt-2 text-2xl font-black">Experiment audit trail</h2>
+          <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/60">
+            {{ ledgerBoundary.operator_action || 'Review experiment provenance, validation protocol, and outcomes before trusting research promotion evidence.' }}
+          </p>
+        </div>
+        <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(ledger?.status)">{{ String(ledger?.status || 'unknown').toUpperCase() }}</span>
+      </div>
+      <div class="mt-4 grid gap-3 md:grid-cols-5">
+        <MetricTile label="Runs" :value="display(ledgerSummary.total_count)" :note="`${display(ledgerPageMeta.returned_count)} shown`" />
+        <MetricTile label="Failed" :value="display(ledgerSummary.failed_count)" note="Failed/error rows shown" />
+        <MetricTile label="Running" :value="display(ledgerSummary.running_count)" note="Incomplete rows shown" />
+        <MetricTile label="Missing Protocol" :value="display(ledgerSummary.missing_validation_protocol_count)" note="Rows needing review" />
+        <MetricTile label="Broker Allowed" :value="display(ledgerBoundary.broker_execution_allowed)" note="Always no for ledger review" />
+      </div>
+      <div class="mt-4 rounded-2xl border border-moss/20 bg-moss/10 p-4 text-sm leading-6 text-ink/70">
+        <p class="font-black text-moss">Read-only research review</p>
+        <div class="mt-3 grid gap-2 text-xs font-bold md:grid-cols-4">
+          <span class="rounded-xl bg-white/70 px-3 py-2">Starts runs: {{ display(ledgerBoundary.system_starts_research_runs) }}</span>
+          <span class="rounded-xl bg-white/70 px-3 py-2">Finishes runs: {{ display(ledgerBoundary.system_finishes_research_runs) }}</span>
+          <span class="rounded-xl bg-white/70 px-3 py-2">Policy promotion: {{ display(ledgerBoundary.policy_auto_promotion_allowed) }}</span>
+          <span class="rounded-xl bg-white/70 px-3 py-2">Broker allowed: {{ display(ledgerBoundary.broker_execution_allowed) }}</span>
+        </div>
+      </div>
+      <div class="mt-5 grid gap-4 lg:grid-cols-2">
+        <article v-for="run in ledgerRuns" :key="String(run.research_run_id)" class="rounded-3xl bg-white/75 p-5">
+          <div class="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p class="font-black text-ink">{{ run.label || run.run_type || 'Research run' }}</p>
+              <p class="mt-1 text-sm text-ink/60">{{ run.entrypoint || '-' }} · {{ run.research_run_id || '-' }}</p>
+            </div>
+            <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(run.status)">{{ String(run.status || 'unknown').toUpperCase() }}</span>
+          </div>
+          <div class="mt-4 grid gap-2 text-sm md:grid-cols-2">
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Started:</b> {{ display(run.started_ts) }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Completed:</b> {{ display(run.completed_ts) }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Asof:</b> {{ display(run.asof_date) }}</p>
+            <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Config hash:</b> {{ shortPath(run.config_hash) }}</p>
+          </div>
+          <p class="mt-3 text-sm leading-6 text-ink/65">{{ run.objective || asDict(run.notes).objective || 'No objective recorded.' }}</p>
+          <details class="mt-3 rounded-2xl bg-paper/80 p-3">
+            <summary class="cursor-pointer text-sm font-black text-moss">Validation, result, and config evidence</summary>
+            <div class="mt-3 grid gap-3 md:grid-cols-3">
+              <pre class="max-h-64 overflow-auto rounded-2xl bg-ink p-3 text-xs leading-5 text-paper">{{ JSON.stringify(asDict(run.validation_protocol), null, 2) }}</pre>
+              <pre class="max-h-64 overflow-auto rounded-2xl bg-ink p-3 text-xs leading-5 text-paper">{{ JSON.stringify(asDict(run.result_metrics), null, 2) }}</pre>
+              <pre class="max-h-64 overflow-auto rounded-2xl bg-ink p-3 text-xs leading-5 text-paper">{{ JSON.stringify(asDict(run.config), null, 2) }}</pre>
+            </div>
+          </details>
+          <p v-if="run.error_text" class="mt-3 rounded-2xl bg-rust/10 p-3 text-sm font-bold text-rust">{{ run.error_text }}</p>
+        </article>
+        <p v-if="!ledgerRuns.length" class="rounded-2xl bg-white/70 p-4 text-sm text-ink/60">
+          No research ledger rows returned. Use `--log-research-ledger` on research-only scripts before treating model or policy experiments as auditable evidence.
+        </p>
       </div>
     </div>
 

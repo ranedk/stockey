@@ -23,6 +23,8 @@ HEALTH_INTERVAL_SECONDS="${OPERATOR_FRONTEND_HEALTH_INTERVAL_SECONDS:-30}"
 HEALTH_FAILURE_LIMIT="${OPERATOR_FRONTEND_HEALTH_FAILURE_LIMIT:-3}"
 HEALTH_STARTUP_GRACE_SECONDS="${OPERATOR_FRONTEND_HEALTH_STARTUP_GRACE_SECONDS:-45}"
 HEALTH_TIMEOUT_SECONDS="${OPERATOR_FRONTEND_HEALTH_TIMEOUT_SECONDS:-5}"
+restart_on_code_change="${OPERATOR_FRONTEND_RESTART_ON_CODE_CHANGE:-true}"
+code_check_seconds="${OPERATOR_FRONTEND_CODE_CHECK_SECONDS:-60}"
 script_marker_started=0
 
 emit_script_marker() {
@@ -41,6 +43,8 @@ script_status_for_exit_code() {
   local exit_code="$1"
   if [[ "${exit_code}" == "130" || "${exit_code}" == "143" ]]; then
     printf "interrupted"
+  elif [[ "${exit_code}" == "75" ]]; then
+    printf "restart_requested"
   elif [[ "${exit_code}" == "0" ]]; then
     printf "done"
   else
@@ -207,6 +211,61 @@ health_check_url() {
   curl -fsS --max-time "${HEALTH_TIMEOUT_SECONDS}" "${url}" >/dev/null 2>&1
 }
 
+frontend_code_signature() {
+  "${PYTHON_BIN}" - "${SCRIPT_DIR}" <<'PY'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+paths = [
+    root / "all_frontend.sh",
+    root / "advisory" / "api",
+    root / "advisory" / "operator_health.py",
+    root / "advisory" / "operator_snapshot.py",
+    root / "advisory" / "ts_forecast_promotion_check.py",
+    root / "apps" / "operator-web",
+]
+ignored_dirs = {
+    ".git",
+    ".nuxt",
+    ".output",
+    "__pycache__",
+    "coverage",
+    "dist",
+    "node_modules",
+}
+digest = hashlib.sha256()
+for base in paths:
+    if not base.exists():
+        digest.update(f"missing\0{base.relative_to(root)}\0".encode())
+        continue
+    if base.is_file():
+        files = [base]
+    else:
+        files = []
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [name for name in dirnames if name not in ignored_dirs]
+            current = Path(dirpath)
+            for filename in filenames:
+                files.append(current / filename)
+    for path in sorted(files, key=lambda item: str(item.relative_to(root))):
+        try:
+            stat = path.stat()
+        except OSError:
+            digest.update(f"stat_error\0{path.relative_to(root)}\0".encode())
+            continue
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(b"\0")
+        digest.update(str(stat.st_mtime_ns).encode())
+        digest.update(b"\0")
+        digest.update(str(stat.st_size).encode())
+        digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
 emit_script_marker "start"
 script_marker_started=1
 
@@ -220,8 +279,14 @@ fi
 
 started_at="$(date +%s)"
 next_health_check=$((started_at + HEALTH_STARTUP_GRACE_SECONDS))
+next_code_check=$((started_at + code_check_seconds))
 health_failures=0
 status="0"
+initial_code_signature=""
+if [[ "${restart_on_code_change}" == "1" || "${restart_on_code_change}" == "true" ]]; then
+  initial_code_signature="$(frontend_code_signature)"
+  echo "[all_frontend] code_change_restart enabled check_seconds=${code_check_seconds} signature=${initial_code_signature}"
+fi
 while true; do
   if [[ -n "${api_pid}" ]] && ! kill -0 "${api_pid}" >/dev/null 2>&1; then
     wait "${api_pid}" || status="$?"
@@ -232,6 +297,15 @@ while true; do
     break
   fi
   now="$(date +%s)"
+  if [[ -n "${initial_code_signature}" ]] && (( now >= next_code_check )); then
+    current_code_signature="$(frontend_code_signature)"
+    if [[ "${current_code_signature}" != "${initial_code_signature}" ]]; then
+      echo "[all_frontend] code_change detected old_signature=${initial_code_signature} new_signature=${current_code_signature}; requesting restart"
+      status="75"
+      break
+    fi
+    next_code_check=$((now + code_check_seconds))
+  fi
   if (( now >= next_health_check )); then
     api_ok=1
     web_ok=1

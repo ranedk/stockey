@@ -32,6 +32,11 @@ LOG_DIR={{LOG_DIR}}
 # portfolio/action reconciliation.
 30 17 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
 
+# Advisory readiness preflight before the expensive post-close reconciliation.
+# This validates/refreshes Dhan auth and runs compact operator smoke, but does
+# not run the advisory pipeline or submit broker orders.
+55 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory_preflight.lock ./all_advisory_preflight.sh >> "$LOG_DIR/all_advisory_preflight.log" 2>&1
+
 # Portfolio/advisory run daily after market close. Wait for end-of-day data
 # catch-up and queued single-client workers before reconciling actions.
 10 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${ADVISORY_WAIT_FOR_DATA_TIMEOUT_SECONDS:-7200}" /tmp/stockey_complete_data.lock /tmp/stockey_download_queue.lock /tmp/stockey_external_workers.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh; } >> "$LOG_DIR/all_advisory.log" 2>&1

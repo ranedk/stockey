@@ -20,6 +20,12 @@ DEFAULT_HORIZONS = [5, 10, 20]
 DEFAULT_RETURN_THRESHOLD = 0.03
 DEFAULT_COST_BPS = 25.0
 DEFAULT_MIN_SIGNALS = 10
+
+
+class SourceUnavailableError(RuntimeError):
+    """Raised when required calibration inputs cannot be read reliably."""
+
+
 TECHNICAL_THRESHOLD_SCHEMA_STATEMENTS = [
     f"""
     CREATE TABLE IF NOT EXISTS {EVALUATIONS_TABLE} (
@@ -164,7 +170,7 @@ def ensure_tables() -> None:
     )
 
 
-def table_columns(table_name: str) -> set[str]:
+def table_columns(table_name: str, *, raise_on_error: bool = False) -> set[str]:
     try:
         df = sql_to_df(
             """
@@ -184,6 +190,8 @@ def table_columns(table_name: str) -> set[str]:
             error=exc,
             metadata={"table_name": table_name},
         )
+        if raise_on_error:
+            raise SourceUnavailableError(f"Technical-threshold calibration could not inspect {table_name} columns: {exc}") from exc
         return set()
     return set(df["column_name"].astype(str).tolist()) if not df.empty else set()
 
@@ -194,7 +202,7 @@ def load_technical_signal_rows(
     to_date: pd.Timestamp | None = None,
     symbols: list[str] | None = None,
 ) -> pd.DataFrame:
-    available = table_columns("advisory_candidates")
+    available = table_columns("advisory_candidates", raise_on_error=True)
     if not available:
         return pd.DataFrame()
     score_source_col = "technical_total_score" if "technical_total_score" in available else "technical_score" if "technical_score" in available else None
@@ -251,7 +259,7 @@ def load_technical_signal_rows(
                 "symbol_count": len(symbols or []),
             },
         )
-        raise
+        raise SourceUnavailableError(f"Technical-threshold calibration could not load technical signal rows: {exc}") from exc
     if df.empty:
         return df
     df["asof_date"] = pd.to_datetime(df["asof_date"], utc=True, errors="coerce").dt.normalize()
@@ -309,7 +317,7 @@ def load_price_history_for_returns(
                 "to_date": str(to_date),
             },
         )
-        raise
+        raise SourceUnavailableError(f"Technical-threshold calibration could not load Dhan OHLCV history for realized returns: {exc}") from exc
     if df.empty:
         return df
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
@@ -322,6 +330,15 @@ def attach_forward_returns(signals: pd.DataFrame, prices: pd.DataFrame, *, horiz
     if signals.empty or prices.empty:
         return signals.copy()
     out = signals.copy().reset_index(drop=True)
+    out["point_in_time_return_contract_json"] = json.dumps(
+        {
+            "entry_rule": "Use first available close strictly after signal asof_date.",
+            "exit_rule": "Use the horizon-th available close from the same strictly-after-asof price window.",
+            "same_day_price_allowed": False,
+            "forward_returns_are_labels_only": True,
+        },
+        sort_keys=True,
+    )
     price_map = {
         symbol: group.sort_values("date").reset_index(drop=True)
         for symbol, group in prices.groupby("symbol", dropna=False)
@@ -566,15 +583,53 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    evaluations, summary, meta = calibrate_thresholds(
-        from_date=pd.Timestamp(args.from_date, tz="UTC") if args.from_date else None,
-        to_date=pd.Timestamp(args.to_date, tz="UTC") if args.to_date else None,
-        symbols=args.symbols,
-        horizons=args.horizons,
-        return_threshold=float(args.return_threshold),
-        cost_bps=float(args.cost_bps),
-        min_signals=int(args.min_signals),
-    )
+    try:
+        evaluations, summary, meta = calibrate_thresholds(
+            from_date=pd.Timestamp(args.from_date, tz="UTC") if args.from_date else None,
+            to_date=pd.Timestamp(args.to_date, tz="UTC") if args.to_date else None,
+            symbols=args.symbols,
+            horizons=args.horizons,
+            return_threshold=float(args.return_threshold),
+            cost_bps=float(args.cost_bps),
+            min_signals=int(args.min_signals),
+        )
+    except SourceUnavailableError as exc:
+        record_local_fallback_event(
+            module="advisory.technical_threshold_calibration",
+            source="threshold_calibration",
+            fallback_type="source_unavailable",
+            severity="error",
+            reason="Technical threshold calibration could not run because required source data was unavailable.",
+            error=exc,
+            metadata={
+                "from_date": args.from_date,
+                "to_date": args.to_date,
+                "symbols": list(args.symbols or []),
+                "horizons": list(args.horizons or []),
+            },
+        )
+        print(
+            json.dumps(
+                {
+                    "status": "source_unavailable",
+                    "evaluations_table": EVALUATIONS_TABLE,
+                    "summary_table": SUMMARY_TABLE,
+                    "evaluation_rows": 0,
+                    "summary_rows": 0,
+                    "meta": {
+                        "signal_rows": None,
+                        "matured_rows": None,
+                        "source_unavailable": True,
+                    },
+                    "error": str(exc),
+                    "dry_run": bool(args.dry_run),
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return 2
     if not args.dry_run:
         persist_outputs(evaluations, summary)
     print(

@@ -110,6 +110,9 @@ def build_operator_smoke(
     current_blockers = health.get("current_blockers") if isinstance(health.get("current_blockers"), dict) else {}
     fix_hints = _as_list(health.get("fix_hints"))
     blocker_rows = _as_list(current_blockers.get("rows"))
+    dhan = sections.get("dhan") if isinstance(sections.get("dhan"), dict) else {}
+    dhan_cache = sections.get("dhan_cache") if isinstance(sections.get("dhan_cache"), dict) else {}
+    dhan_cdp = dhan_cache.get("cdp_status") if isinstance(dhan_cache.get("cdp_status"), dict) else {}
     visible_fix_hints, fix_hint_compact = _compact_rows(fix_hints, limit=max(0, int(fix_hint_limit)))
     visible_blockers, blocker_compact = _compact_rows(blocker_rows, limit=max(0, int(fix_hint_limit)))
     payload = {
@@ -124,6 +127,10 @@ def build_operator_smoke(
             "database": (sections.get("database") or {}).get("status") if isinstance(sections.get("database"), dict) else None,
             "operator_api": (sections.get("operator_api") or {}).get("status") if isinstance(sections.get("operator_api"), dict) else None,
             "frontend": (sections.get("frontend") or {}).get("status") if isinstance(sections.get("frontend"), dict) else None,
+            "frontend_runtime": (sections.get("frontend_runtime") or {}).get("status") if isinstance(sections.get("frontend_runtime"), dict) else None,
+            "dhan": dhan.get("status") if dhan else None,
+            "dhan_cache": dhan_cache.get("status") if dhan_cache else None,
+            "dhan_cdp": dhan_cdp.get("status") if dhan_cdp else None,
             "operator_snapshot": (sections.get("operator_snapshot") or {}).get("status") if isinstance(sections.get("operator_snapshot"), dict) else None,
             "signal_quality": (sections.get("signal_quality") or {}).get("status") if isinstance(sections.get("signal_quality"), dict) else None,
             "identity_issues": (sections.get("identity_issues") or {}).get("status") if isinstance(sections.get("identity_issues"), dict) else None,
@@ -139,6 +146,20 @@ def build_operator_smoke(
             "trust_checks": int(trust_gate.get("count") or 0),
             "trust_errors": int(trust_gate.get("error_count") or 0),
             "trust_warnings": int(trust_gate.get("warn_count") or 0),
+        },
+        "dhan_readiness": {
+            "included_token_validation": bool(include_dhan),
+            "token_validation_status": dhan.get("status") if dhan else None,
+            "cache_status": dhan_cache.get("status") if dhan_cache else None,
+            "auth_refresh_ready": dhan_cache.get("auth_refresh_ready") if dhan_cache else None,
+            "auto_login_configured": dhan_cache.get("auto_login_configured") if dhan_cache else None,
+            "cdp_status": dhan_cdp.get("status") if dhan_cdp else None,
+            "cdp_recovery_required": bool(
+                dhan_cache
+                and dhan_cache.get("auto_login_configured")
+                and not dhan_cache.get("auth_refresh_ready")
+                and dhan_cdp.get("status") != "ok"
+            ),
         },
         "current_blockers": visible_blockers,
         "fix_hints": visible_fix_hints,

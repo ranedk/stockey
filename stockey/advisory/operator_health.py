@@ -11,6 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -26,8 +27,13 @@ from advisory.identity_issues import IDENTITY_ISSUES_TABLE
 from advisory.signal_quality_evaluator import EVALUATIONS_TABLE as SIGNAL_QUALITY_EVALUATIONS_TABLE
 from advisory.signal_quality_evaluator import SUMMARY_TABLE as SIGNAL_QUALITY_SUMMARY_TABLE
 from advisory.superseded_failures import cleanup_superseded_failures
+from scripts.advisory_stage_report import build_stage_report
+from scripts.api_performance_report import build_api_performance_report
 from data.screenerin.failure_log import FAILURES_TABLE as SCREENER_FAILURES_TABLE
 from utils.db import sql_to_df
+from utils.ingestion_state import classification_metadata as ingestion_classification_metadata
+from utils.ingestion_state import get_state_entries as get_ingestion_state_entries
+from utils.ingestion_state import summarize_state_entries as summarize_ingestion_state_entries
 from utils.redaction import redact_mapping, redact_text
 from utils.redis_utils import get_redis_client
 from utils.schema_migrations import TABLE_NAME as SCHEMA_MIGRATIONS_TABLE
@@ -40,6 +46,8 @@ DEFAULT_LOG_DIR = Path("logs/cron")
 DEFAULT_LOG_TAIL_LINES = 80
 DEFAULT_LOG_ANALYSIS_LINES = 5000
 DEFAULT_OPERATOR_API_URL = "http://127.0.0.1:8765/api/health"
+DEFAULT_OPERATOR_API_RUNTIME_URL = "http://127.0.0.1:8765/api/runtime"
+DEFAULT_OPERATOR_WEB_URL = "http://127.0.0.1:3000/"
 OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
 TRACE_SUMMARIES_TABLE = "advisory_trace_summaries"
 ACTION_RECOMMENDATIONS_TABLE = "advisory_action_recommendations"
@@ -48,7 +56,8 @@ LIFECYCLE_POLICY_CHANGES_TABLE = "advisory_lifecycle_policy_changes"
 COMPANY_MASTER_TABLE = "company_master"
 BROKER_CAPABLE_ACTION_CODES = ("BUY", "BUY_MORE", "SELL", "PARTIAL_SELL")
 DHAN_TOKEN_EXPIRY_WARN_SECONDS = 6 * 60 * 60
-OPERATOR_HEALTH_FAST_WORKERS = env.int("OPERATOR_HEALTH_FAST_WORKERS", default=8)
+OPERATOR_HEALTH_FAST_WORKERS = env.int("OPERATOR_HEALTH_FAST_WORKERS", default=3)
+OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS = env.int("OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS", default=30)
 API_LATENCY_PROBE_OUTPUT_FILE = Path(env.str("API_LATENCY_PROBE_OUTPUT_FILE", "logs/performance/latest_api_latency_probe.json"))
 API_LATENCY_PROBE_MAX_AGE_SECONDS = env.float("API_LATENCY_PROBE_MAX_AGE_SECONDS", default=24 * 60 * 60)
 SIGNAL_QUALITY_MAX_AGE_DAYS = env.float("SIGNAL_QUALITY_MAX_AGE_DAYS", default=14.0)
@@ -93,6 +102,16 @@ DEGRADATION_PATTERNS = [
         "pattern": re.compile(r"dhan_no_data_(?P<mode>retry|skip).*?'ticker': '?(?P<symbol>[A-Z0-9&\-.]+)'?", re.IGNORECASE),
         "title": "Dhan returned no OHLCV rows",
         "suggested_fix": "Check whether the symbol is suspended/newly listed, retry with BSE fallback, or reduce requested date window.",
+    },
+    {
+        "kind": "dhan_auth_preflight_failed",
+        "severity": "error",
+        "pattern": re.compile(
+            r"Dhan auth preflight failed|advisory_dhan_preflight|dhan_auth_preflight|connect_over_cdp|access token is invalid or expired|Client ID or user generated access token is invalid or expired",
+            re.IGNORECASE,
+        ),
+        "title": "Dhan auth/CDP preflight failed",
+        "suggested_fix": "Start Chrome CDP if needed, then run ./all_advisory_preflight.sh before retrying all_advisory.sh.",
     },
     {
         "kind": "llm_fallback",
@@ -324,14 +343,75 @@ def check_operator_api() -> dict[str, Any]:
         return _status("error", "Operator API health endpoint is not reachable.", url=url, latency_ms=latency_ms, error=f"{type(exc).__name__}: {exc}")
 
 
+def check_operator_api_runtime() -> dict[str, Any]:
+    url = env("OPERATOR_API_RUNTIME_URL", default=DEFAULT_OPERATOR_API_RUNTIME_URL)
+    timeout_seconds = env.float("OPERATOR_API_HEALTH_TIMEOUT_SECONDS", default=3.0)
+    started = time.monotonic()
+    try:
+        response = requests.get(url, timeout=timeout_seconds)
+        latency_ms = round((time.monotonic() - started) * 1000.0, 2)
+        payload = response.json() if response.headers.get("content-type", "").lower().startswith("application/json") else {}
+        if not response.ok or not isinstance(payload, dict):
+            return _status(
+                "error",
+                "Operator API runtime endpoint returned an unhealthy response.",
+                url=url,
+                latency_ms=latency_ms,
+                status_code=response.status_code,
+                response_text=response.text[:500],
+            )
+        if payload.get("stale_code"):
+            return _status(
+                "error",
+                "Operator API is serving stale code.",
+                url=url,
+                latency_ms=latency_ms,
+                status_code=response.status_code,
+                stale_code=True,
+                stale_reason=payload.get("stale_reason"),
+                operator_action=payload.get("operator_action") or "restart_operator_api",
+                process_started_at=payload.get("process_started_at"),
+                latest_source_mtime=payload.get("latest_source_mtime"),
+                latest_source_path=payload.get("latest_source_path"),
+                git_rev=payload.get("git_rev"),
+                git_dirty=payload.get("git_dirty"),
+            )
+        return _status(
+            "ok",
+            "Operator API runtime is current.",
+            url=url,
+            latency_ms=latency_ms,
+            status_code=response.status_code,
+            stale_code=False,
+            process_started_at=payload.get("process_started_at"),
+            latest_source_mtime=payload.get("latest_source_mtime"),
+            latest_source_path=payload.get("latest_source_path"),
+            git_rev=payload.get("git_rev"),
+            git_dirty=payload.get("git_dirty"),
+        )
+    except Exception as exc:
+        latency_ms = round((time.monotonic() - started) * 1000.0, 2)
+        _record_health_local_fallback(
+            source=url,
+            fallback_type="operator_health_api_runtime_check_failed",
+            reason="Operator Health could not inspect the Operator API runtime metadata.",
+            error=exc,
+            metadata={"url": url, "latency_ms": latency_ms},
+        )
+        return _status("error", "Operator API runtime endpoint is not reachable.", url=url, latency_ms=latency_ms, error=f"{type(exc).__name__}: {exc}")
+
+
 def check_api_latency_probe(path: str | Path = API_LATENCY_PROBE_OUTPUT_FILE, *, max_age_seconds: float = API_LATENCY_PROBE_MAX_AGE_SECONDS) -> dict[str, Any]:
     probe_path = Path(path)
+    probe_command = f"python scripts/api_latency_probe.py --output-path {probe_path}"
+    performance_report_command = "python scripts/api_performance_report.py --limit 20"
     if not probe_path.exists():
         return _status(
             "warn",
             "API latency probe has not produced a latest summary yet.",
             path=str(probe_path),
-            command=f"python scripts/api_latency_probe.py --output-path {probe_path}",
+            command=probe_command,
+            performance_report_command=performance_report_command,
         )
     try:
         payload = json.loads(probe_path.read_text(encoding="utf-8"))
@@ -372,7 +452,161 @@ def check_api_latency_probe(path: str | Path = API_LATENCY_PROBE_OUTPUT_FILE, *,
         error_count=error_count,
         endpoint_count=int(payload.get("endpoint_count") or 0),
         rows=payload.get("rows") or [],
-        command=f"python scripts/api_latency_probe.py --output-path {probe_path}",
+        command=probe_command,
+        performance_report_command=performance_report_command,
+        operator_action=(
+            f"Run `{probe_command}`, then `{performance_report_command}` to rank current API fixes."
+            if status in {"warn", "error"}
+            else f"Run `{performance_report_command}` after normal UI traffic to rank any current API fixes."
+        ),
+    )
+
+
+def check_slow_operations(
+    *,
+    limit: int = 20,
+    state_file: str | Path | None = None,
+    probe_path: str | Path = API_LATENCY_PROBE_OUTPUT_FILE,
+    max_probe_age_seconds: float = API_LATENCY_PROBE_MAX_AGE_SECONDS,
+) -> dict[str, Any]:
+    slow_kwargs: dict[str, Any] = {"limit": limit}
+    if state_file is not None:
+        slow_kwargs["state_file"] = state_file
+    slow = summarize_slow_operations(**slow_kwargs)
+    try:
+        report_kwargs: dict[str, Any] = {
+            "probe_path": probe_path,
+            "limit": limit,
+            "max_probe_age_hours": max(float(max_probe_age_seconds), 0.0) / 3600.0,
+        }
+        if state_file is not None:
+            report_kwargs["state_file"] = state_file
+        report = build_api_performance_report(**report_kwargs)
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=str(probe_path),
+            fallback_type="operator_health_slow_operations_probe_context_failed",
+            reason="Operator Health could not enrich slow-operation state with API probe context.",
+            error=exc,
+            severity="warn",
+            metadata={"probe_path": str(probe_path), "limit": int(limit)},
+        )
+        slow["message"] = "Open slow-operation issues exist; API probe context could not be loaded."
+        slow["active_issue_count"] = int(slow.get("returned_count") or 0)
+        slow["historical_issue_count"] = 0
+        slow["probe_status"] = "unknown"
+        return slow
+
+    evidence = report.get("evidence_freshness") if isinstance(report.get("evidence_freshness"), dict) else {}
+    probe_status = str(evidence.get("probe_status") or "unknown").lower()
+    report_rows = [row for row in report.get("rows") or [] if isinstance(row, dict)]
+    active_routes = {
+        str(row.get("route") or "").split("?", 1)[0]
+        for row in report_rows
+        if str(row.get("ranking_basis") or "") == "fresh_probe"
+        and (
+            bool(row.get("latest_probe_slow_logged"))
+            or bool(row.get("slow_logged"))
+            or bool(row.get("latest_probe_error"))
+            or float(row.get("latest_probe_elapsed_ms") or 0.0) >= 1000.0
+            or int(row.get("latest_probe_error_count") or 0) > 0
+            or int(row.get("error_count") or 0) > 0
+        )
+    }
+    if probe_status == "fresh":
+        active_issues = []
+        historical_issues = []
+        for issue in slow.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            operation = str(issue.get("operation") or "")
+            route = operation.split(" ", 1)[1].split("?", 1)[0] if operation.upper().startswith("GET ") else operation.split("?", 1)[0]
+            if route in active_routes:
+                active_issues.append(issue)
+            else:
+                historical_issues.append({**issue, "historical_context": True})
+        slow["issues"] = active_issues
+        slow["historical_issues"] = historical_issues[: max(int(limit), 0)]
+        slow["active_issue_count"] = len(active_issues)
+        slow["historical_issue_count"] = len(historical_issues)
+        slow["probe_status"] = probe_status
+        slow["probe_generated_at"] = report.get("probe_generated_at")
+        slow["performance_report_command"] = "python scripts/api_performance_report.py --limit 20"
+        if active_issues:
+            slow["status"] = "warn"
+            slow["message"] = "Fresh API probe still reproduces slow or failing routes."
+        else:
+            slow["status"] = "ok"
+            slow["message"] = "Historical slow-operation rows exist, but the latest API probe did not reproduce active slow routes."
+        return slow
+
+    slow["probe_status"] = probe_status
+    slow["probe_generated_at"] = report.get("probe_generated_at")
+    slow["performance_report_command"] = "python scripts/api_performance_report.py --limit 20"
+    slow["active_issue_count"] = int(slow.get("returned_count") or 0)
+    slow["historical_issue_count"] = 0
+    slow["message"] = str(evidence.get("warning") or "Open slow-operation issues exist and probe freshness is not current enough to suppress them.")
+    return slow
+
+
+def check_advisory_stage_report(log_dir: str | Path = DEFAULT_LOG_DIR) -> dict[str, Any]:
+    log_path = Path(log_dir) / "all_advisory.log"
+    command = f"python scripts/advisory_stage_report.py --log-path {log_path} --limit 20"
+    try:
+        report = build_stage_report(log_path=log_path, limit=20)
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=str(log_path),
+            fallback_type="operator_health_advisory_stage_report_failed",
+            reason="Operator Health could not build the advisory stage timing report.",
+            error=exc,
+            severity="warn",
+            metadata={"log_path": str(log_path)},
+        )
+        return _status(
+            "error",
+            "Could not build advisory stage timing report.",
+            error=f"{type(exc).__name__}: {exc}",
+            log_path=str(log_path),
+            command=command,
+            operations_command="advisory_stage_report",
+        )
+
+    stage_count = int(report.get("stage_count") or 0)
+    slow_stage_count = int(report.get("slow_stage_count") or 0)
+    report_status = str(report.get("status") or "missing")
+    report_payload = dict(report)
+    report_payload["report_status"] = report_payload.pop("status", report_status)
+    status = "ok"
+    message = "Latest advisory stage timing report is available and no stage is over budget."
+    failed_stage = str(report.get("failed_stage") or "").strip()
+    if report_status == "failed" and stage_count:
+        status = "warn"
+        message = (
+            f"Latest advisory run failed in or near stage {failed_stage}."
+            if failed_stage
+            else "Latest advisory run failed after emitting stage markers."
+        )
+    elif report_status == "running" and stage_count:
+        status = "warn"
+        message = (
+            f"Latest advisory run is still running or incomplete near stage {failed_stage}."
+            if failed_stage
+            else "Latest advisory run is still running or incomplete after emitting stage markers."
+        )
+    elif report_status != "ok" or stage_count == 0:
+        status = "warn"
+        message = "No usable advisory stage timing summary was found in the latest all_advisory log."
+    elif slow_stage_count:
+        status = "warn"
+        message = "Latest advisory run has one or more over-budget stages."
+
+    return _status(
+        status,
+        message,
+        **report_payload,
+        command=command,
+        operations_command="advisory_stage_report",
     )
 
 
@@ -573,13 +807,149 @@ def check_sync_state_failures(limit: int = 25) -> list[dict[str, Any]]:
         return [_status("error", "Sync-state failure check failed.", table="advisory_sync_state", error=f"{type(exc).__name__}: {exc}")]
 
 
+def check_watcher_source_counters(max_age_minutes: int = 90) -> dict[str, Any]:
+    expected_sources = {
+        "continuous_watch:ohlcv": "ohlcv",
+        "continuous_watch:news": "news",
+        "continuous_watch:announcements": "announcements",
+    }
+    try:
+        if not table_exists("advisory_sync_state"):
+            return _status(
+                "warn",
+                "Sync-state table does not exist yet; watcher source counters are unavailable.",
+                table="advisory_sync_state",
+                rows=[],
+                missing_sources=sorted(expected_sources),
+            )
+        df = sql_to_df(
+            """
+            SELECT source_name, scope_key, status, error_text, updated_at, last_success_at, state_json
+            FROM advisory_sync_state
+            WHERE source_name = ANY(%s)
+            ORDER BY source_name, updated_at DESC NULLS LAST
+            """,
+            params=(list(expected_sources.keys()),),
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+        latest: dict[str, dict[str, Any]] = {}
+        for row in _records(df):
+            source_name = str(row.get("source_name") or "")
+            if source_name and source_name not in latest:
+                latest[source_name] = row
+
+        now = pd.Timestamp.utcnow()
+        rows: list[dict[str, Any]] = []
+        missing_sources: list[str] = []
+        stale_count = 0
+        error_count = 0
+        empty_count = 0
+        for source_name, short_name in expected_sources.items():
+            row = latest.get(source_name)
+            if not row:
+                missing_sources.append(source_name)
+                rows.append(
+                    _status(
+                        "warn",
+                        f"No watcher sync-state row found for {short_name}.",
+                        source_name=source_name,
+                        watcher_source=short_name,
+                        counters={},
+                    )
+                )
+                continue
+            state = _json_dict(
+                row.get("state_json"),
+                source=f"{source_name}:state_json",
+                metadata={"source_name": source_name},
+            )
+            counters = state.get("source_counters") if isinstance(state.get("source_counters"), dict) else {}
+            updated_at = pd.to_datetime(row.get("updated_at"), utc=True, errors="coerce")
+            last_success_at = pd.to_datetime(row.get("last_success_at"), utc=True, errors="coerce")
+            age_minutes = None if pd.isna(updated_at) else max((now - updated_at).total_seconds() / 60.0, 0.0)
+            status = str(row.get("status") or "").lower()
+            is_stale = age_minutes is not None and age_minutes > float(max_age_minutes)
+            has_error = status == "error" or bool(row.get("error_text"))
+            produced = any(
+                int(counters.get(key) or 0) > 0
+                for key in (
+                    "latest_price_count",
+                    "alert_persisted_count",
+                    "matched_event_count",
+                    "match_count",
+                    "persisted_event_count",
+                    "discovered_count",
+                    "parsed_count",
+                )
+            )
+            if has_error:
+                row_status = "error"
+                error_count += 1
+            elif is_stale:
+                row_status = "warn"
+                stale_count += 1
+            elif not counters:
+                row_status = "warn"
+                empty_count += 1
+            else:
+                row_status = "ok"
+            rows.append(
+                _status(
+                    row_status,
+                    "Latest OHLCV/news/announcement watcher counters loaded."
+                    if counters
+                    else "Watcher row has no source counters yet.",
+                    source_name=source_name,
+                    watcher_source=short_name,
+                    sync_status=row.get("status"),
+                    updated_at=_json_ready(updated_at),
+                    last_success_at=_json_ready(last_success_at),
+                    age_minutes=None if age_minutes is None else round(age_minutes, 2),
+                    stale=is_stale,
+                    produced_data=bool(produced),
+                    error=row.get("error_text"),
+                    counters=counters,
+                )
+            )
+        status = "error" if error_count else "warn" if (stale_count or empty_count or missing_sources) else "ok"
+        return _status(
+            status,
+            "Latest OHLCV/news/announcement watcher counters loaded.",
+            table="advisory_sync_state",
+            rows=rows,
+            returned_count=len(rows),
+            missing_sources=missing_sources,
+            stale_count=stale_count,
+            error_count=error_count,
+            empty_counter_count=empty_count,
+            max_age_minutes=int(max_age_minutes),
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="advisory_sync_state",
+            fallback_type="operator_health_watcher_source_counters_failed",
+            reason="Operator Health could not inspect watcher source counters.",
+            error=exc,
+            metadata={"max_age_minutes": int(max_age_minutes)},
+        )
+        return _status(
+            "error",
+            "Watcher source counter check failed.",
+            table="advisory_sync_state",
+            error=f"{type(exc).__name__}: {exc}",
+            rows=[],
+            returned_count=0,
+        )
+
+
 def _download_runner_severity(row_status: str, classification: str) -> str:
     status = str(row_status or "").lower()
     klass = str(classification or "").lower()
-    if status == "error" or klass in {"failed", "parse_failed", "auth_unavailable"}:
-        return "error"
-    if klass in {"source_unavailable", "sync_state_persist_failed"}:
+    if klass in {"source_unavailable", "sync_state_persist_failed", "partial_failed"}:
         return "warn"
+    if status == "error" or klass in {"failed", "parse_failed", "auth_unavailable", "reference_mapping_missing"}:
+        return "error"
     return "ok"
 
 
@@ -623,6 +993,7 @@ def check_downloader_run_state(limit: int = 30) -> dict[str, Any]:
             source_name = str(row.get("source_name") or "")
             module = str(state.get("module") or source_name.removeprefix("download_runner:") or "unknown")
             classification = str(state.get("classification") or state.get("status") or row.get("status") or "unknown")
+            classification_meta = ingestion_classification_metadata(classification)
             phase = str(state.get("phase") or "unknown")
             severity = _download_runner_severity(str(row.get("status") or ""), classification)
             counts_by_classification[classification] = counts_by_classification.get(classification, 0) + 1
@@ -638,6 +1009,10 @@ def check_downloader_run_state(limit: int = 30) -> dict[str, Any]:
                     "purpose": state.get("purpose"),
                     "phase": phase,
                     "classification": classification,
+                    "classification_label": classification_meta["label"],
+                    "classification_meaning": classification_meta["meaning"],
+                    "classification_operator_action": classification_meta["operator_action"],
+                    "trust_impact": classification_meta["trust_impact"],
                     "run_status": state.get("status"),
                     "sync_status": row.get("status"),
                     "rows": state.get("rows"),
@@ -650,6 +1025,10 @@ def check_downloader_run_state(limit: int = 30) -> dict[str, Any]:
                     "fallback_count": state.get("fallback_count"),
                     "source_unavailable_count": state.get("source_unavailable_count"),
                     "no_data_count": state.get("no_data_count"),
+                    "auth_unavailable_count": state.get("auth_unavailable_count"),
+                    "reference_mapping_missing_count": state.get("reference_mapping_missing_count"),
+                    "classification_counts": state.get("classification_counts"),
+                    "failed_symbols": state.get("failed_symbols"),
                     "from": state.get("from"),
                     "to": state.get("to"),
                     "updated_at": _json_ready(updated_at),
@@ -697,6 +1076,65 @@ def check_downloader_run_state(limit: int = 30) -> dict[str, Any]:
             "error",
             "Downloader/parser run-state check failed.",
             table="advisory_sync_state",
+            error=f"{type(exc).__name__}: {exc}",
+            rows=[],
+            returned_count=0,
+        )
+
+
+def check_ingestion_file_state_failures(limit: int = 100) -> dict[str, Any]:
+    try:
+        rows = get_ingestion_state_entries(status="failed", limit=max(1, int(limit)))
+        summary = summarize_ingestion_state_entries(
+            rows,
+            sample_limit=10,
+            active_failure_days=OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS,
+        )
+        active_count = int(summary.get("active_failure_count") or 0)
+        stale_count = int(summary.get("stale_historical_failure_count") or 0)
+        classifications = summary.get("classification_counts") if isinstance(summary.get("classification_counts"), dict) else {}
+        active_rows = summary.get("active_failure_sample_rows") if isinstance(summary.get("active_failure_sample_rows"), list) else []
+        active_error_classes = {
+            str(row.get("classification") or "unknown")
+            for row in active_rows
+            if isinstance(row, dict) and str(row.get("classification") or "unknown") in {"parser_bug", "schema_changed"}
+        }
+        status = "error" if active_error_classes else "warn" if active_count else "ok"
+        return _status(
+            status,
+            (
+                "Recent actionable file-level parser failures found."
+                if active_count
+                else "No recent actionable file-level parser failures found."
+            ),
+            table="ingestion_file_state",
+            active_failure_days=OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS,
+            returned_count=len(rows),
+            active_failure_count=active_count,
+            stale_historical_failure_count=stale_count,
+            classification_counts=classifications,
+            failure_lifecycle_counts=summary.get("failure_lifecycle_counts") or {},
+            active_failure_sample_rows=active_rows,
+            stale_historical_failure_sample_rows=summary.get("stale_historical_failure_sample_rows") or [],
+            operator_boundary={
+                "read_only": True,
+                "mutates_ingestion_state": False,
+                "stale_historical_failures_block_trust": False,
+                "note": "Old file-level parser failures stay visible for audit, but only recent failures inside the active window are treated as current blockers.",
+            },
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="ingestion_file_state",
+            fallback_type="operator_health_ingestion_file_state_failed",
+            reason="Operator Health could not inspect file-level ingestion parser failures.",
+            error=exc,
+            metadata={"limit": int(limit), "active_days": OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS},
+        )
+        return _status(
+            "error",
+            "File-level ingestion-state failure check failed.",
+            table="ingestion_file_state",
             error=f"{type(exc).__name__}: {exc}",
             rows=[],
             returned_count=0,
@@ -807,19 +1245,89 @@ def check_dhan_token() -> dict[str, Any]:
         return _status("error", "Dhan token validation failed.", error=f"{type(exc).__name__}: {exc}")
 
 
+def _cdp_version_url(cdp_endpoint: str) -> str | None:
+    text = str(cdp_endpoint or "").strip()
+    if not text:
+        return None
+    parsed = urlparse(text)
+    if parsed.scheme in {"ws", "wss"}:
+        scheme = "https" if parsed.scheme == "wss" else "http"
+        return f"{scheme}://{parsed.netloc}/json/version"
+    if parsed.scheme in {"http", "https"}:
+        base = text.rstrip("/")
+        if base.endswith("/json/version"):
+            return base
+        return f"{base}/json/version"
+    return f"http://{text.rstrip('/')}/json/version"
+
+
+def check_dhan_cdp_endpoint(timeout_seconds: float = 1.0) -> dict[str, Any]:
+    cdp_endpoint = env("CDP_ENDPOINT", default="")
+    url = _cdp_version_url(cdp_endpoint)
+    if not url:
+        return _status("warn", "CDP_ENDPOINT is not configured.", configured=False, cdp_endpoint=cdp_endpoint)
+    started = time.monotonic()
+    try:
+        response = requests.get(url, timeout=timeout_seconds)
+        latency_ms = round((time.monotonic() - started) * 1000.0, 2)
+        payload = response.json() if response.headers.get("content-type", "").lower().startswith("application/json") else {}
+        if response.ok:
+            return _status(
+                "ok",
+                "Chrome CDP endpoint responded.",
+                configured=True,
+                cdp_endpoint=cdp_endpoint,
+                url=url,
+                latency_ms=latency_ms,
+                browser=payload.get("Browser") if isinstance(payload, dict) else None,
+            )
+        return _status(
+            "warn",
+            "Chrome CDP endpoint returned an unhealthy response.",
+            configured=True,
+            cdp_endpoint=cdp_endpoint,
+            url=url,
+            latency_ms=latency_ms,
+            status_code=response.status_code,
+            response_text=response.text[:300],
+        )
+    except Exception as exc:
+        latency_ms = round((time.monotonic() - started) * 1000.0, 2)
+        _record_health_local_fallback(
+            source=str(url),
+            fallback_type="operator_health_dhan_cdp_check_failed",
+            reason="Operator Health could not reach the configured Chrome CDP endpoint used for Dhan automated login.",
+            error=exc,
+            severity="warn",
+            metadata={"cdp_endpoint": cdp_endpoint, "url": url, "latency_ms": latency_ms},
+        )
+        return _status(
+            "warn",
+            "Chrome CDP endpoint is not reachable.",
+            configured=True,
+            cdp_endpoint=cdp_endpoint,
+            url=url,
+            latency_ms=latency_ms,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
 def check_dhan_cache() -> dict[str, Any]:
     try:
-        from data.dhanlive.auth import DEFAULT_TOKEN_CACHE, load_cached_access_token_payload
-        from data.dhanlive.auth_cli import mask_token, parse_expiry
+        from data.dhanlive.auth import DEFAULT_TOKEN_CACHE, is_auto_login_configured, load_cached_access_token_payload
+        from data.dhanlive.auth_cli import mask_token
 
         direct_token = env("DHAN_ACCESS_TOKEN", default=None)
+        env_token_id = env("DHAN_TOKEN_ID", default=None)
+        auto_login_configured = is_auto_login_configured()
+        cdp_status = check_dhan_cdp_endpoint() if auto_login_configured else _status("warn", "Dhan automated login is not fully configured.", configured=False)
+        auth_refresh_ready = bool(direct_token or env_token_id or (auto_login_configured and cdp_status.get("status") == "ok"))
         payload = load_cached_access_token_payload()
         cache_exists = DEFAULT_TOKEN_CACHE.exists()
         file_mtime = pd.to_datetime(DEFAULT_TOKEN_CACHE.stat().st_mtime, unit="s", utc=True) if cache_exists else pd.NaT
         now = pd.Timestamp.utcnow()
         expiry_time = payload.get("expiryTime") if payload else None
-        expires_at_raw = parse_expiry(expiry_time) if expiry_time else None
-        expires_at = pd.to_datetime(expires_at_raw, utc=True, errors="coerce") if expires_at_raw else pd.NaT
+        expires_at = pd.to_datetime(expiry_time, utc=True, errors="coerce") if expiry_time else pd.NaT
         seconds_to_expiry = None if pd.isna(expires_at) else round((expires_at - now).total_seconds(), 2)
         cache_age_seconds = None if pd.isna(file_mtime) else round((now - file_mtime).total_seconds(), 2)
         if direct_token:
@@ -837,6 +1345,8 @@ def check_dhan_cache() -> dict[str, Any]:
         elif seconds_to_expiry <= 0:
             severity = "error"
             message = "Dhan cached token is expired."
+            if not auth_refresh_ready:
+                message = "Dhan cached token is expired and no ready non-interactive refresh path was detected."
         elif seconds_to_expiry <= DHAN_TOKEN_EXPIRY_WARN_SECONDS:
             severity = "warn"
             message = "Dhan cached token expires soon."
@@ -851,6 +1361,10 @@ def check_dhan_cache() -> dict[str, Any]:
             cache_mtime=_json_ready(file_mtime),
             cache_age_seconds=cache_age_seconds,
             has_direct_env_token=bool(direct_token),
+            has_env_token_id=bool(env_token_id),
+            auto_login_configured=bool(auto_login_configured),
+            auth_refresh_ready=bool(auth_refresh_ready),
+            cdp_status=cdp_status,
             has_cached_access_token=bool(payload and payload.get("accessToken")),
             cached_access_token=mask_token(payload.get("accessToken") if payload else None),
             expiry_time=expiry_time,
@@ -922,6 +1436,10 @@ def analyze_cron_log_lines(lines: list[str]) -> dict[str, Any]:
             severity = "warn"
             latest_run_status = "interrupted_by_operator"
             message = "Latest script marker shows operator interruption."
+        elif marker_status == "restart_requested":
+            severity = "warn"
+            latest_run_status = "restart_requested"
+            message = "Latest script marker requested a supervised restart, usually after source-code changes."
         elif marker_status == "start":
             severity = "warn"
             latest_run_status = "running_or_started"
@@ -1115,7 +1633,17 @@ def _dedupe_degradations(rows: list[dict[str, Any]], *, limit: int = 100) -> lis
     for row in rows:
         key = (str(row.get("kind") or ""), str(row.get("symbol") or ""), str(row.get("source") or ""))
         existing = deduped.get(key)
-        if existing is None or str(row.get("observed_at") or "") >= str(existing.get("observed_at") or ""):
+        if existing is None:
+            deduped[key] = row
+            continue
+        row_recovered = bool(row.get("recovered"))
+        existing_recovered = bool(existing.get("recovered"))
+        if existing_recovered and not row_recovered:
+            deduped[key] = row
+            continue
+        if not existing_recovered and row_recovered:
+            continue
+        if str(row.get("observed_at") or "") >= str(existing.get("observed_at") or ""):
             deduped[key] = row
     out = list(deduped.values())
     out.sort(key=lambda row: (str(row.get("status") or ""), str(row.get("observed_at") or "")), reverse=True)
@@ -1294,6 +1822,7 @@ def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DE
         if not isinstance(row, dict) or row.get("status") == "ok":
             continue
         classification = str(row.get("classification") or "unknown")
+        classification_meta = ingestion_classification_metadata(classification)
         rows.append(
             {
                 "status": row.get("status") or "warn",
@@ -1303,17 +1832,77 @@ def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DE
                 "message": str(row.get("error") or f"classification={classification}, phase={row.get('phase') or 'unknown'}"),
                 "source": row.get("source_name") or "download_runner",
                 "observed_at": row.get("updated_at"),
-                "suggested_fix": "Run the relevant downloader/parser or complete_data.sh, then recheck Health.",
+                "suggested_fix": classification_meta["operator_action"],
                 "recovered": False,
                 "details": {
                     "module": row.get("module"),
                     "purpose": row.get("purpose"),
                     "classification": classification,
+                    "classification_label": classification_meta["label"],
+                    "classification_meaning": classification_meta["meaning"],
+                    "trust_impact": classification_meta["trust_impact"],
                     "phase": row.get("phase"),
                     "rows": row.get("rows"),
                     "rows_written": row.get("rows_written"),
                     "state_advanced": row.get("state_advanced"),
                     "fallback_used": row.get("fallback_used"),
+                },
+            }
+        )
+
+    ingestion_state = sections.get("ingestion_file_state") if isinstance(sections.get("ingestion_file_state"), dict) else {}
+    for row in ingestion_state.get("active_failure_sample_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        classification = str(row.get("classification") or "unknown")
+        classification_meta = ingestion_classification_metadata(classification)
+        rows.append(
+            {
+                "status": "error" if classification in {"parser_bug", "schema_changed"} else "warn",
+                "severity": "error" if classification in {"parser_bug", "schema_changed"} else "warn",
+                "kind": "ingestion_file_failure",
+                "title": f"Recent ingestion failure: {row.get('source_prefix') or 'unknown'}",
+                "message": str(row.get("error_message") or f"classification={classification}"),
+                "source": row.get("source_prefix") or "ingestion_file_state",
+                "observed_at": row.get("processed_at"),
+                "suggested_fix": classification_meta["operator_action"],
+                "recovered": False,
+                "details": {
+                    "object_key": row.get("object_key"),
+                    "classification": classification,
+                    "classification_label": classification_meta["label"],
+                    "classification_meaning": classification_meta["meaning"],
+                    "trust_impact": classification_meta["trust_impact"],
+                    "failure_lifecycle": row.get("failure_lifecycle"),
+                    "active_failure_days": ingestion_state.get("active_failure_days"),
+                },
+            }
+        )
+    for row in ingestion_state.get("stale_historical_failure_sample_rows") or []:
+        if not isinstance(row, dict):
+            continue
+        classification = str(row.get("classification") or "unknown")
+        classification_meta = ingestion_classification_metadata(classification)
+        rows.append(
+            {
+                "status": "warn",
+                "severity": "warn",
+                "kind": "stale_historical_ingestion_failure",
+                "title": f"Suppressed stale parser/file-state failure: {row.get('source_prefix') or 'unknown'}",
+                "message": str(row.get("error_message") or f"classification={classification}"),
+                "source": row.get("source_prefix") or "ingestion_file_state",
+                "observed_at": row.get("processed_at"),
+                "suggested_fix": f"Suppressed from active blockers. {classification_meta['operator_action']}",
+                "recovered": True,
+                "details": {
+                    "object_key": row.get("object_key"),
+                    "classification": classification,
+                    "classification_label": classification_meta["label"],
+                    "classification_meaning": classification_meta["meaning"],
+                    "trust_impact": classification_meta["trust_impact"],
+                    "failure_lifecycle": row.get("failure_lifecycle"),
+                    "active_failure_days": ingestion_state.get("active_failure_days"),
+                    "suppressed_from_active_blockers": True,
                 },
             }
         )
@@ -1420,6 +2009,23 @@ def build_degradation_feed(sections: dict[str, Any], *, log_dir: str | Path = DE
                 "observed_at": issue.get("last_seen_at"),
                 "suggested_fix": "Inspect slow-operation report and materialize/paginate expensive endpoints or queries.",
                 "recovered": False,
+                "details": issue,
+            }
+        )
+    for issue in slow.get("historical_issues") or []:
+        if not isinstance(issue, dict):
+            continue
+        rows.append(
+            {
+                "status": "ok",
+                "severity": "info",
+                "kind": "slow_operation_historical",
+                "title": "Historical slow operation not reproduced",
+                "message": str(issue.get("operation") or issue.get("kind") or "Slow operation"),
+                "source": "slow_operation_state",
+                "observed_at": issue.get("last_seen_at"),
+                "suggested_fix": "Keep as historical context. Reprobe or mark fixed/triaged only if this route becomes slow again.",
+                "recovered": True,
                 "details": issue,
             }
         )
@@ -1536,6 +2142,35 @@ def check_frontend_dependencies() -> dict[str, Any]:
         node_version=node_version.stdout.strip(),
         npm_version=npm_version.stdout.strip(),
     )
+
+
+def check_frontend_runtime() -> dict[str, Any]:
+    url = env("OPERATOR_WEB_HEALTH_URL", default=DEFAULT_OPERATOR_WEB_URL)
+    timeout_seconds = env.float("OPERATOR_WEB_HEALTH_TIMEOUT_SECONDS", default=3.0)
+    started = time.monotonic()
+    try:
+        response = requests.get(url, timeout=timeout_seconds)
+        latency_ms = round((time.monotonic() - started) * 1000.0, 2)
+        if response.ok:
+            return _status("ok", "Operator web frontend responded.", url=url, latency_ms=latency_ms, status_code=response.status_code)
+        return _status(
+            "error",
+            "Operator web frontend returned an unhealthy response.",
+            url=url,
+            latency_ms=latency_ms,
+            status_code=response.status_code,
+            response_text=response.text[:500],
+        )
+    except Exception as exc:
+        latency_ms = round((time.monotonic() - started) * 1000.0, 2)
+        _record_health_local_fallback(
+            source=url,
+            fallback_type="operator_health_frontend_runtime_check_failed",
+            reason="Operator Health could not reach the operator web frontend.",
+            error=exc,
+            metadata={"url": url, "latency_ms": latency_ms},
+        )
+        return _status("error", "Operator web frontend is not reachable.", url=url, latency_ms=latency_ms, error=f"{type(exc).__name__}: {exc}")
 
 
 def check_operator_api_errors(limit: int = 25) -> dict[str, Any]:
@@ -2252,6 +2887,45 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             details={"url": operator_api.get("url"), "latency_ms": operator_api.get("latency_ms"), "status_code": operator_api.get("status_code")},
         )
 
+    operator_api_runtime = sections.get("operator_api_runtime") if isinstance(sections.get("operator_api_runtime"), dict) else {}
+    if operator_api_runtime.get("status") in {"warn", "error"}:
+        add(
+            status=str(operator_api_runtime.get("status") or "error"),
+            title="Operator API runtime is stale or unavailable",
+            reason=str(operator_api_runtime.get("error") or operator_api_runtime.get("message") or "Operator API runtime metadata check failed."),
+            commands=["./all_frontend.sh", "python -m advisory.operator_health --skip-dhan"],
+            details={
+                "url": operator_api_runtime.get("url"),
+                "latency_ms": operator_api_runtime.get("latency_ms"),
+                "status_code": operator_api_runtime.get("status_code"),
+                "stale_code": operator_api_runtime.get("stale_code"),
+                "stale_reason": operator_api_runtime.get("stale_reason"),
+                "operator_action": operator_api_runtime.get("operator_action"),
+                "process_started_at": operator_api_runtime.get("process_started_at"),
+                "latest_source_mtime": operator_api_runtime.get("latest_source_mtime"),
+                "latest_source_path": operator_api_runtime.get("latest_source_path"),
+            },
+        )
+
+    watcher_counters = sections.get("watcher_source_counters") if isinstance(sections.get("watcher_source_counters"), dict) else {}
+    if watcher_counters.get("status") in {"warn", "error"}:
+        add(
+            status=str(watcher_counters.get("status") or "warn"),
+            title="Watcher source counters are stale, missing, or failing",
+            reason=str(
+                watcher_counters.get("message")
+                or "Latest watcher runs do not have healthy OHLCV/news/announcement source counters."
+            ),
+            commands=["./all_watchers.sh", "python -m advisory.operator_health --skip-dhan"],
+            details={
+                "section": "watcher_source_counters",
+                "missing_sources": watcher_counters.get("missing_sources"),
+                "stale_count": watcher_counters.get("stale_count"),
+                "error_count": watcher_counters.get("error_count"),
+                "empty_counter_count": watcher_counters.get("empty_counter_count"),
+            },
+        )
+
     trace_summaries = sections.get("trace_summaries") if isinstance(sections.get("trace_summaries"), dict) else {}
     if trace_summaries.get("status") in {"warn", "error"}:
         add(
@@ -2277,9 +2951,17 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
         add(
             status=str(slow.get("status") or "warn"),
             title="Open slow-operation issues exist",
-            reason=f"{slow.get('returned_count', 0)} open slow-operation issue(s) returned from {slow.get('state_file')}.",
-            commands=["python -m advisory.performance_slowlog report --limit 20"],
-            details={"issue_count": slow.get("issue_count"), "returned_count": slow.get("returned_count"), "state_file": slow.get("state_file")},
+            reason=str(slow.get("message") or f"{slow.get('returned_count', 0)} open slow-operation issue(s) returned from {slow.get('state_file')}."),
+            commands=["python -m advisory.performance_slowlog report --limit 20", str(slow.get("performance_report_command") or "python scripts/api_performance_report.py --limit 20")],
+            details={
+                "issue_count": slow.get("issue_count"),
+                "returned_count": slow.get("returned_count"),
+                "active_issue_count": slow.get("active_issue_count"),
+                "historical_issue_count": slow.get("historical_issue_count"),
+                "probe_status": slow.get("probe_status"),
+                "probe_generated_at": slow.get("probe_generated_at"),
+                "state_file": slow.get("state_file"),
+            },
         )
 
     api_latency = sections.get("api_latency_probe") if isinstance(sections.get("api_latency_probe"), dict) else {}
@@ -2288,13 +2970,39 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             status=str(api_latency.get("status") or "warn"),
             title="Operator API latency probe is stale or unhealthy",
             reason=str(api_latency.get("message") or "Latest API latency probe is stale, slow, or failed."),
-            commands=[str(api_latency.get("command") or "python scripts/api_latency_probe.py"), "python -m advisory.performance_slowlog report --limit 20"],
+            commands=[
+                str(api_latency.get("command") or "python scripts/api_latency_probe.py"),
+                str(api_latency.get("performance_report_command") or "python scripts/api_performance_report.py --limit 20"),
+                "python -m advisory.performance_slowlog report --limit 20",
+            ],
             details={
                 "path": api_latency.get("path"),
                 "age_seconds": api_latency.get("age_seconds"),
                 "max_age_seconds": api_latency.get("max_age_seconds"),
                 "slow_count": api_latency.get("slow_count"),
                 "error_count": api_latency.get("error_count"),
+                "operator_action": api_latency.get("operator_action"),
+            },
+        )
+
+    advisory_stage_report = sections.get("advisory_stage_report") if isinstance(sections.get("advisory_stage_report"), dict) else {}
+    if advisory_stage_report.get("status") in {"warn", "error"}:
+        add(
+            status=str(advisory_stage_report.get("status") or "warn"),
+            title="Advisory stage timing report needs attention",
+            reason=str(advisory_stage_report.get("error") or advisory_stage_report.get("message") or advisory_stage_report.get("operator_action") or "Advisory stage timing report is missing or has over-budget stages."),
+            commands=[
+                str(advisory_stage_report.get("command") or "python scripts/advisory_stage_report.py --log-path logs/cron/all_advisory.log --limit 20"),
+                "Run the Operations command: advisory_stage_report",
+            ],
+            details={
+                "section": "advisory_stage_report",
+                "log_path": advisory_stage_report.get("log_path"),
+                "stage_count": advisory_stage_report.get("stage_count"),
+                "slow_stage_count": advisory_stage_report.get("slow_stage_count"),
+                "operations_command": advisory_stage_report.get("operations_command"),
+                "operator_action": advisory_stage_report.get("operator_action"),
+                "ranked_stages": advisory_stage_report.get("ranked_stages"),
             },
         )
 
@@ -3513,16 +4221,33 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
 
     dhan_cache = sections.get("dhan_cache") if isinstance(sections.get("dhan_cache"), dict) else {}
     if dhan_cache.get("status") in {"warn", "error"}:
+        auto_login_configured = bool(dhan_cache.get("auto_login_configured"))
+        auth_refresh_ready = bool(dhan_cache.get("auth_refresh_ready"))
+        cdp_status = dhan_cache.get("cdp_status") if isinstance(dhan_cache.get("cdp_status"), dict) else {}
+        cdp_unready = auto_login_configured and not auth_refresh_ready and cdp_status.get("status") != "ok"
+        commands = ["python -m data.dhanlive.auth_cli status"]
+        if cdp_unready:
+            commands.append("scripts/start_chrome_cdp.sh")
+        commands.extend(
+            [
+                "python -m data.dhanlive.auth_cli ensure --auto-login",
+                "python -m advisory.operator_health --skip-dhan",
+            ]
+        )
         add(
             status=str(dhan_cache.get("status") or "warn"),
             title="Dhan cached token needs attention",
             reason=str(dhan_cache.get("message") or "Dhan cached token health check did not pass."),
-            commands=["python -m data.dhanlive.auth_cli status", "python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login"],
+            commands=commands,
             details={
                 "cache_path": dhan_cache.get("cache_path"),
                 "expires_at": dhan_cache.get("expires_at"),
                 "seconds_to_expiry": dhan_cache.get("seconds_to_expiry"),
                 "cache_age_seconds": dhan_cache.get("cache_age_seconds"),
+                "auth_refresh_ready": auth_refresh_ready,
+                "auto_login_configured": auto_login_configured,
+                "cdp_status": cdp_status or dhan_cache.get("cdp_status"),
+                "cdp_recovery_required": cdp_unready,
             },
         )
 
@@ -3553,18 +4278,28 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(row, dict) or row.get("status") == "ok":
             continue
         log_file = str(row.get("log_file") or "logs/cron")
+        log_name = Path(log_file).name
         recent_errors = row.get("recent_errors") if isinstance(row.get("recent_errors"), list) else []
         recovered = row.get("latest_run_status") in {"ok_after_historical_errors", "recovered_after_manual_interrupt"} and not recent_errors
+        commands = [f"tail -100 {log_file}", "python -m advisory.operator_health --skip-dhan"]
+        if log_name == "all_advisory_preflight.log" and not recovered:
+            commands = [
+                f"tail -100 {log_file}",
+                "scripts/start_chrome_cdp.sh",
+                "./all_advisory_preflight.sh",
+                "python -m advisory.operator_health --skip-dhan",
+            ]
         add(
             status=str(row.get("status") or "warn"),
-            title=f"Historical cron errors recovered in {Path(log_file).name}" if recovered else f"Recent cron errors in {Path(log_file).name}",
+            title=f"Historical cron errors recovered in {log_name}" if recovered else f"Recent cron errors in {log_name}",
             reason=str(row.get("message") if recovered else recent_errors[-1] if recent_errors else row.get("message")),
-            commands=[f"tail -100 {log_file}", "python -m advisory.operator_health --skip-dhan"],
+            commands=commands,
             details={
                 "log_file": log_file,
                 "latest_run_status": row.get("latest_run_status"),
                 "recent_error_count": row.get("recent_error_count"),
                 "historical_error_count": row.get("historical_error_count"),
+                "preflight_recovery": log_name == "all_advisory_preflight.log" and not recovered,
             },
         )
 
@@ -3638,6 +4373,20 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             details={"node_modules": frontend.get("node_modules"), "node_version": frontend.get("node_version"), "npm_version": frontend.get("npm_version")},
         )
 
+    frontend_runtime = sections.get("frontend_runtime") if isinstance(sections.get("frontend_runtime"), dict) else {}
+    if frontend_runtime.get("status") in {"warn", "error"}:
+        add(
+            status=str(frontend_runtime.get("status") or "error"),
+            title="Operator frontend is not reachable",
+            reason=str(frontend_runtime.get("error") or frontend_runtime.get("message") or "Frontend runtime check did not pass."),
+            commands=["./all_frontend.sh", "python -m advisory.operator_health --skip-dhan"],
+            details={
+                "url": frontend_runtime.get("url"),
+                "latency_ms": frontend_runtime.get("latency_ms"),
+                "status_code": frontend_runtime.get("status_code"),
+            },
+        )
+
     if not hints:
         add(
             status="ok",
@@ -3665,6 +4414,7 @@ TRUST_BLOCKER_SECTION_TITLES = {
     "dhan": "Dhan token validation",
     "dhan_cache": "Dhan token cache",
     "frontend": "Operator frontend dependencies",
+    "frontend_runtime": "Operator frontend runtime",
     "degradation_feed": "Runtime degradation feed",
 }
 
@@ -3674,7 +4424,7 @@ def _blocker_category(row: dict[str, Any]) -> str:
     section = str(details.get("section") or "").lower()
     kind = str(details.get("kind") or "").lower()
     title = str(row.get("title") or "").lower()
-    if section in {"database", "operator_api"} or "postgres" in title or "operator api" in title:
+    if section in {"database", "operator_api", "frontend_runtime"} or "postgres" in title or "operator api" in title or "operator frontend" in title:
         return "runtime"
     if section in {"dhan", "dhan_cache"} or kind.startswith("dhan") or "dhan" in title:
         return "broker_data"
@@ -3719,6 +4469,34 @@ def _trust_impact(row: dict[str, Any]) -> str:
     return "This warning should be triaged before relying on fresh advisory output."
 
 
+def _blocker_dedupe_key(row: dict[str, Any]) -> tuple[str, str]:
+    details = row.get("details") if isinstance(row.get("details"), dict) else {}
+    category = str(row.get("category") or _blocker_category(row) or "unknown")
+    section = str(details.get("section") or "").strip().lower()
+    kind = str(details.get("kind") or "").strip().lower()
+    title = str(row.get("title") or "").strip().lower()
+    source = str(row.get("source") or "").strip().lower()
+    path = str(details.get("path") or "").strip().lower()
+
+    if section == "dhan_cache" or "dhan cached token" in title or title == "dhan token cache":
+        return ("health_source", "dhan_cache")
+    if section == "dhan" or "dhan check is skipped" in title or title == "dhan token validation":
+        return ("health_source", "dhan_token_validation")
+    if section == "api_latency_probe" or kind == "api_latency_probe" or "api latency probe" in title or "api_latency_probe" in path:
+        return ("health_source", "api_latency_probe")
+    if section == "slow_operations" or kind == "slow_operation" or "slow-operation" in title or title == "slow operator paths":
+        return ("health_source", "slow_operations")
+    if section == "advisory_stage_report" or "advisory stage timing" in title:
+        return ("health_source", "advisory_stage_report")
+    if section:
+        return (category, section)
+    if kind:
+        return (category, kind)
+    if source and source != "fix_hint":
+        return (category, source)
+    return (category, title)
+
+
 def build_trust_gate(sections: dict[str, Any]) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
 
@@ -3749,11 +4527,24 @@ def build_trust_gate(sections: dict[str, Any]) -> dict[str, Any]:
     for name, title, impact in [
         ("database", "Postgres is reachable", "Without DB access, advisory state cannot be trusted."),
         ("operator_api", "Operator API is reachable", "Without API access, UI state may be stale or incomplete."),
+        ("operator_api_runtime", "Operator API runtime is current", "If the API process is stale, the UI may serve fixed bugs as active failures."),
+        ("frontend_runtime", "Operator frontend is reachable", "Without frontend access, manual review and operator controls may be unavailable."),
         ("dhan", "Dhan token validates", "Without broker data access, prices/identity/execution planning may be stale."),
     ]:
         row = section(name)
         if row.get("status") == "error":
             add_check(name, "error", title, str(row.get("error") or row.get("message") or "Check failed."), impact=impact, details=row)
+
+    snapshot = section("operator_snapshot")
+    if snapshot.get("status") in {"warn", "error"}:
+        add_check(
+            "operator_snapshot",
+            str(snapshot.get("status") or "warn"),
+            "Operator snapshot freshness",
+            str(snapshot.get("error") or snapshot.get("message") or "Operator snapshot is stale or unavailable."),
+            impact="The UI may be serving stale advisory actions, portfolio rows, prices, targets, or reasons.",
+            details=snapshot,
+        )
 
     freshness_rows = sections.get("table_freshness") if isinstance(sections.get("table_freshness"), list) else []
     required_freshness = {"dhan_daily", "actions", "event_policy", "operator_snapshot"}
@@ -3932,6 +4723,8 @@ def build_current_blockers(sections: dict[str, Any], fix_hints: list[dict[str, A
         )
 
     for key, value in sections.items():
+        if key in {"trust_gate", "deferred_diagnostics"}:
+            continue
         rows = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
         for row in rows:
             if not isinstance(row, dict):
@@ -3958,16 +4751,19 @@ def build_current_blockers(sections: dict[str, Any], fix_hints: list[dict[str, A
                 }
             )
 
-    deduped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    severity_rank = {"error": 0, "warn": 1}
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
     for row in candidates:
-        details = row.get("details") if isinstance(row.get("details"), dict) else {}
-        dedupe_name = str(details.get("section") or details.get("table") or details.get("kind") or row.get("title") or "")
-        key = (str(row.get("status") or ""), str(row.get("category") or ""), dedupe_name)
+        key = _blocker_dedupe_key(row)
         existing = deduped.get(key)
-        if existing is None or (existing.get("source") != "fix_hint" and row.get("source") == "fix_hint"):
+        if existing is None:
+            deduped[key] = row
+            continue
+        existing_rank = severity_rank.get(str(existing.get("status") or ""), 9)
+        row_rank = severity_rank.get(str(row.get("status") or ""), 9)
+        if row_rank < existing_rank or (row_rank == existing_rank and existing.get("source") != "fix_hint" and row.get("source") == "fix_hint"):
             deduped[key] = row
     rows = list(deduped.values())
-    severity_rank = {"error": 0, "warn": 1}
     category_rank = {
         "runtime": 0,
         "operator_visibility": 1,
@@ -4003,6 +4799,38 @@ def _deferred_section(name: str, *, command: str, reason: str) -> dict[str, Any]
         command=command,
         suggested_fix=f"Run `{command}` when you need the full diagnostic output.",
     )
+
+
+def build_deferred_diagnostics(sections: dict[str, Any]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for section, value in sections.items():
+        items = value if isinstance(value, list) else [value] if isinstance(value, dict) else []
+        for item in items:
+            if not isinstance(item, dict) or not item.get("deferred"):
+                continue
+            rows.append(
+                {
+                    "section": section,
+                    "status": item.get("status") or "ok",
+                    "message": item.get("message") or f"{section} deferred in fast health mode.",
+                    "reason": item.get("reason") or "",
+                    "command": item.get("command") or "python -m advisory.operator_health --full --skip-dhan",
+                    "suggested_fix": item.get("suggested_fix") or "Run full Operator Health when you need this diagnostic evidence.",
+                }
+            )
+    rows.sort(key=lambda row: str(row.get("section") or ""))
+    return {
+        "status": "warn" if rows else "ok",
+        "count": len(rows),
+        "rows": rows,
+        "operator_action": (
+            "Fast Health intentionally skipped deep diagnostics. Run full Health only when you need the listed evidence."
+            if rows
+            else "No diagnostics were deferred in this Health payload."
+        ),
+        "full_diagnostics_command": "python -m advisory.operator_health --full --skip-dhan",
+        "api_full_payload_hint": "/api/health/details?mode=full&compact=false",
+    }
 
 
 def _run_health_checks(checks: dict[str, Any], *, workers: int) -> dict[str, Any]:
@@ -4050,9 +4878,11 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
         sections: dict[str, Any] = {
             "database": check_database(),
             "operator_api": check_operator_api(),
+            "operator_api_runtime": check_operator_api_runtime(),
             "trace_summaries": check_trace_summaries(),
-            "slow_operations": summarize_slow_operations(limit=20),
+            "slow_operations": check_slow_operations(limit=20),
             "api_latency_probe": check_api_latency_probe(),
+            "advisory_stage_report": check_advisory_stage_report(log_dir),
             "operator_snapshot": check_operator_snapshot(),
             "event_data_quality": build_event_data_quality_report(limit=20),
             "identity_issues": check_identity_issues(limit=10),
@@ -4063,36 +4893,86 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
             "fallback_telemetry": summarize_fallback_events(hours=24, limit=25),
             "table_freshness": check_table_freshness(include_counts=True),
             "sync_state_failures": check_sync_state_failures(),
+            "watcher_source_counters": check_watcher_source_counters(),
             "downloader_run_state": check_downloader_run_state(),
+            "ingestion_file_state": check_ingestion_file_state_failures(),
             "schema_migrations": check_schema_migrations(),
             "operator_api_errors": check_operator_api_errors(),
             "redis": check_redis(),
             "cron_logs": check_cron_logs(log_dir),
             "optional_dependencies": check_optional_dependencies(),
             "frontend": check_frontend_dependencies(),
+            "frontend_runtime": check_frontend_runtime(),
             "dhan_cache": check_dhan_cache(),
         }
     else:
         fast_checks = {
             "database": check_database,
             "operator_api": check_operator_api,
-            "trace_summaries": check_trace_summaries,
-            "slow_operations": lambda: summarize_slow_operations(limit=20),
+            "operator_api_runtime": check_operator_api_runtime,
+            "slow_operations": lambda: check_slow_operations(limit=20),
             "api_latency_probe": check_api_latency_probe,
+            "advisory_stage_report": lambda: check_advisory_stage_report(log_dir),
             "operator_snapshot": check_operator_snapshot,
-            "identity_issues": lambda: check_identity_issues(limit=10),
-            "signal_quality": check_signal_quality,
-            "feature_stage_gates": check_feature_stage_gates,
-            "lifecycle_policy_audit": check_lifecycle_policy_change_audit,
-            "sync_state_failures": check_sync_state_failures,
-            "downloader_run_state": check_downloader_run_state,
-            "schema_migrations": check_schema_migrations,
             "redis": check_redis,
             "optional_dependencies": check_optional_dependencies,
             "frontend": check_frontend_dependencies,
+            "frontend_runtime": check_frontend_runtime,
             "dhan_cache": check_dhan_cache,
         }
         sections = _run_health_checks(fast_checks, workers=OPERATOR_HEALTH_FAST_WORKERS)
+        sections["trace_summaries"] = _deferred_section(
+            "Trace summary cache",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Trace-summary cache checks query materialized trace tables and are available in full health mode.",
+        )
+        sections["identity_issues"] = _deferred_section(
+            "Dhan/security identity issues",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Identity coverage checks join action rows, company master, and broker ids; use full health for source-blocker details.",
+        )
+        sections["signal_quality"] = _deferred_section(
+            "Signal-quality evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Signal-quality evidence checks inspect evaluation summary tables and are available in full health mode.",
+        )
+        sections["feature_stage_gates"] = _deferred_section(
+            "Feature freshness stage gates",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Stage-gate checks evaluate required feature inputs for recent symbols and are available in full health mode.",
+        )
+        sections["lifecycle_policy_audit"] = _deferred_section(
+            "Lifecycle policy-change audit",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Lifecycle audit checks compare rebalance and policy-change rows and are available in full health mode.",
+        )
+        sections["sync_state_failures"] = [
+            _deferred_section(
+                "Sync-state failures",
+                command="python -m advisory.operator_health --full --skip-dhan",
+                reason="Sync-state failure scans read durable downloader/watcher state and are available in full health mode.",
+            )
+        ]
+        sections["watcher_source_counters"] = _deferred_section(
+            "Watcher source counters",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Watcher source-counter checks read latest OHLCV/news/announcement sync-state rows and are available in full health mode.",
+        )
+        sections["downloader_run_state"] = _deferred_section(
+            "Downloader run state",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Downloader classification checks read latest run-state rows and failed-symbol samples; use full health for details.",
+        )
+        sections["ingestion_file_state"] = _deferred_section(
+            "Ingestion file-state failures",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="File-state failure scans inspect parser state rows and are available in full health mode.",
+        )
+        sections["schema_migrations"] = _deferred_section(
+            "Schema migration registry",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Schema migration registry inspection is available in full health mode.",
+        )
         sections["event_data_quality"] = _deferred_section(
             "Announcement/bhavcopy evidence quality",
             command="python -m advisory.event_data_quality --format json",
@@ -4133,6 +5013,7 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
         sections["dhan"] = _status("warn", "Dhan token validation skipped by request.")
     sections["degradation_feed"] = build_degradation_feed(sections, log_dir=log_dir, include_deep_checks=full_mode)
     sections["trust_gate"] = build_trust_gate(sections)
+    deferred_diagnostics = build_deferred_diagnostics(sections)
     fix_hints = build_fix_hints(sections)
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
@@ -4140,6 +5021,7 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
         "full_diagnostics_command": "python -m advisory.operator_health --full --skip-dhan",
         "status": summarize_status(sections),
         "sections": sections,
+        "deferred_diagnostics": deferred_diagnostics,
         "fix_hints": fix_hints,
         "current_blockers": build_current_blockers(sections, fix_hints),
     }
@@ -4150,13 +5032,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     parser.add_argument("--skip-dhan", action="store_true", help="Skip Dhan profile token validation.")
     parser.add_argument("--full", action="store_true", help="Run expensive deep diagnostics against source data tables and full cron logs.")
+    parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format. Defaults to json for cron/API tooling.")
     return parser.parse_args()
+
+
+def format_text(payload: dict[str, Any]) -> str:
+    trust_gate = payload.get("sections", {}).get("trust_gate", {}) if isinstance(payload.get("sections"), dict) else {}
+    blockers = payload.get("current_blockers", {}) if isinstance(payload.get("current_blockers"), dict) else {}
+    lines = [
+        "Stockey Operator Health",
+        f"Status: {payload.get('status')}",
+        f"Detail level: {payload.get('detail_level')}",
+        f"Trust level: {trust_gate.get('trust_level') or trust_gate.get('status')}",
+        f"Current blockers: {blockers.get('count', 0)}",
+        "",
+        "Top fix hints:",
+    ]
+    hints = payload.get("fix_hints") if isinstance(payload.get("fix_hints"), list) else []
+    for hint in hints[:8]:
+        commands = hint.get("commands") if isinstance(hint.get("commands"), list) else []
+        lines.append(f"- [{hint.get('status')}] {hint.get('title')}: {hint.get('reason')}")
+        if commands:
+            lines.append(f"  first command: {commands[0]}")
+    if not hints:
+        lines.append("- none")
+    return "\n".join(lines)
 
 
 def main() -> int:
     args = parse_args()
     payload = build_operator_health(log_dir=args.log_dir, include_dhan=not bool(args.skip_dhan), detail_level="full" if bool(args.full) else "fast")
-    print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+    if args.format == "text":
+        print(format_text(payload))
+    else:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
     return 0 if payload["status"] in {"ok", "warn"} else 1
 
 

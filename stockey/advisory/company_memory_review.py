@@ -521,7 +521,73 @@ def load_company_memory_context(
             limit=8,
         )
     )
+    context["evidence_source_contract"] = build_evidence_source_contract(context)
     return context
+
+
+def build_evidence_source_contract(context: dict[str, Any]) -> dict[str, Any]:
+    sources = {
+        "announcement_evidence": {
+            "source_table": ANNOUNCEMENT_EVIDENCE_TABLE,
+            "purpose": "compact_event_context",
+            "required_for_confident_upgrade": True,
+        },
+        "bhavcopy_evidence": {
+            "source_table": BHAVCOPY_EVIDENCE_TABLE,
+            "purpose": "compact_market_participation_context",
+            "required_for_confident_upgrade": True,
+        },
+        "event_policy": {
+            "source_table": EVENT_POLICY_TABLE,
+            "purpose": "deterministic_event_policy_context",
+            "required_for_confident_upgrade": False,
+        },
+        "technical": {
+            "source_table": TECHNICAL_TABLE,
+            "purpose": "technical_state_context",
+            "required_for_confident_upgrade": True,
+        },
+        "actions": {
+            "source_table": ACTIONS_TABLE,
+            "purpose": "latest_consolidated_action_context",
+            "required_for_confident_upgrade": False,
+        },
+        "wait_signals": {
+            "source_table": WAIT_SIGNALS_TABLE,
+            "purpose": "operator_wait_condition_context",
+            "required_for_confident_upgrade": False,
+        },
+    }
+    rows: list[dict[str, Any]] = []
+    missing_required: list[str] = []
+    for key, metadata in sources.items():
+        count = len(context.get(key) or [])
+        status = "present" if count > 0 else "missing"
+        row = {
+            "source": key,
+            "source_table": metadata["source_table"],
+            "purpose": metadata["purpose"],
+            "row_count": int(count),
+            "status": status,
+            "required_for_confident_upgrade": bool(metadata["required_for_confident_upgrade"]),
+        }
+        rows.append(row)
+        if status == "missing" and row["required_for_confident_upgrade"]:
+            missing_required.append(key)
+    return {
+        "schema_version": 1,
+        "authority_scope": "review_input_only",
+        "uses_compact_evidence": True,
+        "raw_announcement_scan_allowed": False,
+        "raw_bhavcopy_scan_allowed": False,
+        "sources": rows,
+        "missing_required_sources": missing_required,
+        "coverage_status": "complete" if not missing_required else "partial",
+        "operator_note": (
+            "Company-memory review used compact point-in-time evidence stores. "
+            "Missing required sources should keep upgrades conservative and review-only."
+        ),
+    }
 
 
 def _has_positive_event(context: dict[str, Any]) -> bool:
@@ -562,6 +628,8 @@ def deterministic_review(context: dict[str, Any]) -> CompanyMemoryReview:
     evidence: list[str] = []
     risks: list[str] = []
     wait_for: list[str] = []
+    source_contract = context.get("evidence_source_contract") if isinstance(context.get("evidence_source_contract"), dict) else {}
+    missing_required_sources = [str(item) for item in source_contract.get("missing_required_sources") or []]
 
     if action_code in {"SELL", "PARTIAL_SELL", "BUY", "BUY_MORE", "HOLD", "WATCH"}:
         signal = "SELL_PARTIAL" if action_code == "PARTIAL_SELL" else action_code
@@ -591,6 +659,8 @@ def deterministic_review(context: dict[str, Any]) -> CompanyMemoryReview:
         risks.append("relative strength versus benchmark is weak")
     if not context.get("announcement_evidence"):
         wait_for.append("wait for fresh company-specific announcement/news evidence before upgrading confidence")
+    if missing_required_sources:
+        risks.append(f"company-memory evidence coverage is partial; missing {', '.join(missing_required_sources)}")
 
     summary = f"{context['symbol']} memory review suggests {signal}; confidence {confidence:.0%}."
     thesis = " | ".join(evidence or ["No strong compact company-memory signal was found; keep deterministic policy authoritative."])

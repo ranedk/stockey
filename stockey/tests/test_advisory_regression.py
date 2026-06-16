@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import subprocess
@@ -8,6 +9,7 @@ import sys
 import types
 from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from pathlib import Path
 
@@ -133,18 +135,21 @@ def test_ingestion_state_runner_summarizes_statuses_and_classifications():
             "object_key": "bhavcopy/bhavcopy_2026-01-01.zip",
             "status": "failed",
             "error_message": "classification=bad_file_retryable; bad zip",
+            "processed_at": pd.Timestamp("2026-01-02T00:00:00Z"),
         },
         {
             "source_prefix": "indices",
             "object_key": "indices/indices_2026-01-01.zip",
             "status": "empty_valid_source",
             "error_message": None,
+            "processed_at": pd.Timestamp("2026-01-02T00:00:00Z"),
         },
         {
             "source_prefix": "bhavcopy",
-            "object_key": "bhavcopy/bhavcopy_2026-01-02.zip",
+            "object_key": "bhavcopy/bhavcopy_2026-05-31.zip",
             "status": "failed",
             "error_message": "classification=schema_changed; missing columns",
+            "processed_at": pd.Timestamp("2026-06-01T00:00:00Z"),
         },
     ]
 
@@ -154,6 +159,16 @@ def test_ingestion_state_runner_summarizes_statuses_and_classifications():
     assert summary["status_counts"] == {"empty_valid_source": 1, "failed": 2}
     assert summary["source_counts"] == {"bhavcopy": 2, "indices": 1}
     assert summary["classification_counts"] == {"bad_file_retryable": 1, "schema_changed": 1}
+    assert summary["classification_details"]["bad_file_retryable"]["label"] == "Retryable bad file"
+    assert "downloaded file was corrupt" in summary["classification_details"]["bad_file_retryable"]["meaning"]
+    assert summary["classification_details"]["schema_changed"]["trust_impact"] == "active_recent_failures_block_trust"
+    assert summary["failure_lifecycle_counts"] == {"active": 1, "not_failed": 1, "stale_historical": 1}
+    assert summary["active_failure_count"] == 1
+    assert summary["stale_historical_failure_count"] == 1
+    assert summary["active_failure_sample_rows"][0]["object_key"] == "bhavcopy/bhavcopy_2026-05-31.zip"
+    assert summary["active_failure_sample_rows"][0]["classification_detail"]["label"] == "Schema changed"
+    assert summary["stale_historical_failure_sample_rows"][0]["object_key"] == "bhavcopy/bhavcopy_2026-01-01.zip"
+    assert summary["enriched_sample_rows"][0]["classification_detail"]["label"] == "Retryable bad file"
     assert summary["sample_rows"] == rows[:1]
 
 
@@ -246,12 +261,14 @@ def test_operator_api_ingestion_state_payload_summarizes_rows(monkeypatch):
             "object_key": "bhavcopy/bhavcopy_2026-01-01.zip",
             "status": "failed",
             "error_message": "classification=bad_file_retryable; bad zip",
+            "processed_at": pd.Timestamp("2026-01-02T00:00:00Z"),
         },
         {
             "source_prefix": "bhavcopy",
             "object_key": "bhavcopy/bhavcopy_2026-01-02.zip",
             "status": "empty_valid_source",
             "error_message": None,
+            "processed_at": pd.Timestamp("2026-01-02T00:00:00Z"),
         },
     ]
 
@@ -269,9 +286,49 @@ def test_operator_api_ingestion_state_payload_summarizes_rows(monkeypatch):
     assert payload["filters"]["source"] == "bhavcopy"
     assert payload["summary"]["status_counts"] == {"empty_valid_source": 1, "failed": 1}
     assert payload["summary"]["classification_counts"] == {"bad_file_retryable": 1}
+    assert payload["summary"]["classification_details"]["bad_file_retryable"]["operator_action"].startswith("Clear or redownload")
+    assert payload["summary"]["enriched_sample_rows"][0]["classification_detail"]["label"] == "Retryable bad file"
+    assert payload["summary"]["stale_historical_failure_count"] == 1
+    assert payload["operator_boundary"]["stale_historical_failures_block_trust"] is False
     assert len(payload["summary"]["sample_rows"]) == 1
     assert payload["operator_boundary"]["read_only"] is True
     assert payload["operator_boundary"]["mutates_state"] is False
+
+
+def test_operator_health_ingestion_file_state_separates_active_and_stale_failures(monkeypatch):
+    rows = [
+        {
+            "source_prefix": "bhavcopy",
+            "object_key": "bhavcopy/bhavcopy_2026-01-01.zip",
+            "status": "failed",
+            "error_message": "classification=bad_file_retryable; old bad zip",
+            "processed_at": pd.Timestamp("2026-01-02T00:00:00Z"),
+        },
+        {
+            "source_prefix": "indices",
+            "object_key": "indices/indices_2026-06-01.zip",
+            "status": "failed",
+            "error_message": "classification=parser_bug; new parser bug",
+            "processed_at": pd.Timestamp("2026-06-02T00:00:00Z"),
+        },
+    ]
+
+    monkeypatch.setattr(operator_health, "get_ingestion_state_entries", lambda **_kwargs: rows)
+
+    section = operator_health.check_ingestion_file_state_failures(limit=10)
+    feed = operator_health.build_degradation_feed({"ingestion_file_state": section}, include_deep_checks=False)
+
+    assert section["status"] == "error"
+    assert section["active_failure_count"] == 1
+    assert section["stale_historical_failure_count"] == 1
+    active = [row for row in feed["rows"] if row["kind"] == "ingestion_file_failure"]
+    stale = [row for row in feed["rows"] if row["kind"] == "stale_historical_ingestion_failure"]
+    assert active[0]["recovered"] is False
+    assert active[0]["details"]["classification"] == "parser_bug"
+    assert active[0]["details"]["classification_label"] == "Parser bug"
+    assert active[0]["suggested_fix"].startswith("Fix parser logic")
+    assert stale[0]["recovered"] is True
+    assert stale[0]["details"]["suppressed_from_active_blockers"] is True
 
 
 def test_security_history_ensure_identity_tables_uses_schema_registry(monkeypatch):
@@ -576,6 +633,8 @@ def test_portfolio_engine_ensure_portfolio_table_uses_schema_registry(monkeypatc
     assert any(portfolio_engine.PORTFOLIO_TABLE in statement for statement in calls[0]["statements"])
     assert any("approved_allocation_inr" in statement for statement in calls[0]["statements"])
     assert any("exit_event_rules_json" in statement for statement in calls[0]["statements"])
+    assert any("position_state" in statement for statement in calls[0]["statements"])
+    assert any("state_transition_contract_json" in statement for statement in calls[0]["statements"])
 
 
 def test_portfolio_engine_persist_cleanup_uses_retryable_operation(monkeypatch):
@@ -858,6 +917,16 @@ def test_portfolio_engine_overlap_cap(monkeypatch):
     assert status_map["ICICIBANK"] == "deferred"
     assert reason_map["ICICIBANK"] == "overlap_cap"
     assert status_map["RELIANCE"] == "approved"
+    state_map = df.set_index("symbol")["position_state"].to_dict()
+    assert state_map["HDFCBANK"] == "PLANNED_ENTRY"
+    assert state_map["ICICIBANK"] == "DEFERRED"
+    contract = json.loads(df.set_index("symbol").loc["HDFCBANK", "state_transition_contract_json"])
+    assert contract["current_state"] == "PLANNED_ENTRY"
+    assert contract["entry_assumption"] == "No holding is assumed at portfolio stage."
+    assert contract["next_required_stage"] == "position_lifecycle"
+    assert contract["entry_evidence_required"] is True
+    assert "first available close on or after portfolio published_on" in contract["entry_evidence_rule"]
+    assert contract["broker_execution_allowed"] is False
 
 
 def test_db_retry_wrapper_reconnects_on_transient_error(monkeypatch):
@@ -1091,6 +1160,31 @@ def test_fallback_telemetry_coverage_report_records_parse_fallback(monkeypatch, 
     assert events[0]["module"] == "scripts.fallback_telemetry_coverage_report"
     assert events[0]["source"] == "pkg/broken.py"
     assert events[0]["fallback_type"] == "fallback_coverage_parse_failed"
+
+
+def test_fallback_telemetry_coverage_report_marks_self_protection(tmp_path):
+    from scripts import fallback_telemetry_coverage_report
+
+    package = tmp_path / "advisory"
+    package.mkdir()
+    body = """def _json_ready(value):
+    try:
+        risky(value)
+    except Exception:
+        pass
+    return value
+"""
+    except_line = 4
+    padding = "\n" * (61 - except_line)
+    (package / "fallback_telemetry.py").write_text(
+        padding + body,
+        encoding="utf-8",
+    )
+
+    report = fallback_telemetry_coverage_report.build_report(root=tmp_path, roots=["advisory"])
+
+    assert report["counts"] == {"self_protection": 1}
+    assert report["rows"][0]["status"] == "self_protection"
 
 
 def test_agent_tool_runner_records_local_fallback_on_failure(monkeypatch):
@@ -1542,6 +1636,25 @@ def test_action_conflict_classifies_watch_loser_with_watch_rule():
     assert "WATCH is informational" in resolution["resolution_reason"]
 
 
+def test_action_conflict_classifies_event_policy_review_over_positive_entry():
+    resolution = decision_trace.classify_action_conflict(
+        {
+            "winning_action_code": "MANUAL_REVIEW",
+            "losing_action_code": "BUY",
+            "winning_source": "event_policy",
+            "losing_source": "portfolio",
+            "lost_reason": "Event policy review beat portfolio buy.",
+            "raw_context_json": json.dumps({"event_class": "ORDER_WIN", "review_action": "clear"}),
+        }
+    )
+
+    assert resolution["resolution_status"] == "resolved"
+    assert resolution["resolution_rule_id"] == "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY"
+    assert resolution["resolution_action"] == "keep_winner"
+    assert resolution["requires_manual_resolution"] is False
+    assert "Event-policy MANUAL_REVIEW" in resolution["resolution_reason"]
+
+
 def test_action_conflict_resolver_json_ready_missing_check_records_fallback(monkeypatch):
     from advisory import action_conflict_resolver
 
@@ -1907,6 +2020,56 @@ def test_dhan_web_login_fills_mobile_totp_pin_and_extracts_token(monkeypatch):
     assert ("fill", "pin[5]", "6") in page.actions
 
 
+def test_dhan_web_login_submits_totp_when_pin_inputs_do_not_auto_appear(monkeypatch):
+    events = []
+    actions = []
+
+    class FakePinFirst:
+        def __init__(self):
+            self.wait_count = 0
+
+        def wait_for(self, **kwargs):
+            self.wait_count += 1
+            actions.append(("pin_wait", self.wait_count, kwargs))
+            if self.wait_count == 1:
+                raise dhan_web_login.PlaywrightTimeoutError("pin did not appear")
+
+    class FakePinLocator:
+        def __init__(self):
+            self.first = FakePinFirst()
+
+    class FakeProceedButton:
+        def wait_for(self, **kwargs):
+            actions.append(("proceed_wait", kwargs))
+
+        def click(self, **kwargs):
+            actions.append(("proceed_click", kwargs))
+
+    class FakeProceedLocator:
+        @property
+        def last(self):
+            return FakeProceedButton()
+
+    class FakePage:
+        def __init__(self):
+            self.pin_locator = FakePinLocator()
+
+        def locator(self, selector):
+            if selector == dhan_web_login.PIN_INPUT_SELECTOR:
+                return self.pin_locator
+            if selector == dhan_web_login.PROCEED_BUTTON_SELECTOR:
+                return FakeProceedLocator()
+            raise AssertionError(selector)
+
+    monkeypatch.setattr(dhan_web_login, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    dhan_web_login._wait_for_pin_inputs_or_submit_totp(FakePage(), timeout_ms=9000)
+
+    assert ("proceed_click", {"timeout": 9000}) in actions
+    assert actions[-1][0] == "pin_wait"
+    assert events[0]["fallback_type"] == "dhan_web_login_pin_wait_before_totp_submit_timeout"
+
+
 def test_dhan_web_login_generates_totp(monkeypatch):
     class FakeTOTP:
         def __init__(self, secret):
@@ -2074,6 +2237,81 @@ def test_dhan_access_token_uses_auto_login_when_configured(monkeypatch):
     assert dhan_auth.get_access_token() == "access:TOKEN123"
 
 
+def test_dhan_auto_login_uses_subprocess_inside_running_event_loop(monkeypatch):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, "kwargs": kwargs})
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"status": "ok", "token_id": "TOKEN123", "printed_raw_token": True}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(dhan_auth, "build_new_consent_url", lambda: "https://auth.dhan.co/login/consentApp-login?consentAppId=ABC")
+    monkeypatch.setattr(dhan_auth.subprocess, "run", fake_run)
+
+    async def inside_loop():
+        return dhan_auth.get_token_id_from_auto_login()
+
+    assert asyncio.run(inside_loop()) == "TOKEN123"
+    assert calls
+    assert calls[0]["command"][:3] == [sys.executable, "-m", "data.dhanlive.web_login"]
+    assert calls[0]["command"][-1] == "--print-token-id"
+    assert calls[0]["kwargs"]["capture_output"] is True
+
+
+def test_dhan_auto_login_retries_subprocess_when_playwright_sync_detects_loop(monkeypatch):
+    events = []
+    calls = []
+
+    def fake_login(_consent_url):
+        raise RuntimeError("It looks like you are using Playwright Sync API inside the asyncio loop. Please use the Async API instead.")
+
+    def fake_run(command, **kwargs):
+        calls.append({"command": command, "kwargs": kwargs})
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"status": "ok", "token_id": "TOKEN456", "printed_raw_token": True}),
+            stderr="",
+        )
+
+    class FakeWebLogin:
+        @staticmethod
+        def get_token_id_via_automated_login(consent_url):
+            return fake_login(consent_url)
+
+    monkeypatch.setitem(sys.modules, "data.dhanlive.web_login", FakeWebLogin)
+    monkeypatch.setattr(dhan_auth, "build_new_consent_url", lambda: "https://auth.dhan.co/login/consentApp-login?consentAppId=ABC")
+    monkeypatch.setattr(dhan_auth, "_is_inside_running_event_loop", lambda: False)
+    monkeypatch.setattr(dhan_auth.subprocess, "run", fake_run)
+    monkeypatch.setattr(dhan_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    assert dhan_auth.get_token_id_from_auto_login() == "TOKEN456"
+    assert calls
+    assert events[0]["fallback_type"] == "dhan_auto_login_sync_playwright_inside_async_loop"
+
+
+def test_dhan_auto_login_subprocess_failure_records_fallback(monkeypatch):
+    events = []
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 2, stdout="", stderr="playwright failed")
+
+    monkeypatch.setattr(dhan_auth.subprocess, "run", fake_run)
+    monkeypatch.setattr(dhan_auth, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(dhan_auth.DhanAuthError):
+        dhan_auth._get_token_id_via_auto_login_subprocess("https://auth.dhan.co/login/consentApp-login?consentAppId=ABC")
+
+    assert events[0]["module"] == "data.dhanlive.auth"
+    assert events[0]["source"] == "dhan_auth"
+    assert events[0]["fallback_type"] == "dhan_auto_login_subprocess_nonzero"
+    assert events[0]["metadata"]["stderr_tail"] == "playwright failed"
+
+
 def test_dhan_auth_cli_refresh_auto_login_without_manual_browser(monkeypatch):
     monkeypatch.setattr(dhan_auth_cli, "normalize_token_id", lambda value: None)
     monkeypatch.setattr(dhan_auth_cli, "is_auto_login_configured", lambda: True)
@@ -2087,6 +2325,76 @@ def test_dhan_auth_cli_refresh_auto_login_without_manual_browser(monkeypatch):
     assert result["status"] == "ok"
     assert result["token_id_used"] == "TOKEN123"
     assert result["validation"] == {"status": "ok", "access_token": "access:TOKEN123"}
+
+
+def test_dhan_auth_cli_ensure_uses_fresh_cached_token(monkeypatch):
+    expires_at = datetime.now() + timedelta(hours=2)
+
+    monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("DHAN_TOKEN_ID", raising=False)
+    monkeypatch.setattr(
+        dhan_auth_cli,
+        "load_cached_access_token_payload",
+        lambda: {"accessToken": "cached-token", "expiryTime": expires_at.isoformat()},
+    )
+    monkeypatch.setattr(dhan_auth_cli, "validate_token", lambda access_token: {"status": "ok", "access_token": access_token})
+    monkeypatch.setattr(dhan_auth_cli, "refresh_token", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("refresh not expected")))
+
+    result = dhan_auth_cli.ensure_token(min_fresh_minutes=30)
+
+    assert result["status"] == "ok"
+    assert result["source"] == "cached_access_token"
+    assert result["refreshed"] is False
+    assert result["validation"]["access_token"] == "cached-token"
+
+
+def test_dhan_auth_cli_ensure_fails_without_noninteractive_refresh_path(monkeypatch, tmp_path):
+    expired_at = datetime.now() - timedelta(hours=1)
+
+    monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("DHAN_TOKEN_ID", raising=False)
+    monkeypatch.setattr(dhan_auth_cli, "DEFAULT_TOKEN_CACHE", tmp_path / "dhan.json")
+    monkeypatch.setattr(
+        dhan_auth_cli,
+        "load_cached_access_token_payload",
+        lambda: {"accessToken": "expired-token", "expiryTime": expired_at.isoformat()},
+    )
+    monkeypatch.setattr(dhan_auth_cli, "is_auto_login_configured", lambda: True)
+    monkeypatch.setattr(dhan_auth_cli, "refresh_token", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("manual refresh not expected")))
+
+    result = dhan_auth_cli.ensure_token(min_fresh_minutes=30, auto_login=False)
+
+    assert result["status"] == "error"
+    assert result["source"] == "dhan_auth_preflight"
+    assert "Refresh Dhan auth" in result["operator_action"]
+
+
+def test_dhan_auth_cli_ensure_refresh_failure_returns_structured_error(monkeypatch, tmp_path):
+    expired_at = datetime.now() - timedelta(hours=1)
+    events = []
+
+    monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("DHAN_TOKEN_ID", raising=False)
+    monkeypatch.setattr(dhan_auth_cli, "DEFAULT_TOKEN_CACHE", tmp_path / "dhan.json")
+    monkeypatch.setattr(
+        dhan_auth_cli,
+        "load_cached_access_token_payload",
+        lambda: {"accessToken": "expired-token", "expiryTime": expired_at.isoformat()},
+    )
+    monkeypatch.setattr(dhan_auth_cli, "is_auto_login_configured", lambda: True)
+    monkeypatch.setattr(dhan_auth_cli, "refresh_token", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cdp refused")))
+    monkeypatch.setattr(dhan_auth_cli, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = dhan_auth_cli.ensure_token(min_fresh_minutes=30, auto_login=True)
+
+    assert result["status"] == "error"
+    assert result["source"] == "dhan_auth_preflight"
+    assert result["error_type"] == "RuntimeError"
+    assert "cdp refused" in result["error"]
+    assert "Refresh Dhan auth" in result["operator_action"]
+    assert events[0]["fallback_type"] == "dhan_auth_cli_ensure_refresh_failed"
+    assert events[0]["source"] == "dhan_auth_preflight"
+    assert events[0]["metadata"]["auto_login"] is True
 
 
 def test_dhan_auth_cli_parse_expiry_records_local_fallback_on_malformed_value(monkeypatch):
@@ -2925,6 +3233,84 @@ def test_recent_events_always_refreshes_today(monkeypatch):
     recent_events.main()
 
     assert len(calls) == 1
+    assert recent_events.STOCKEY_RUN_STATE["classification"] == "ok"
+    assert recent_events.STOCKEY_RUN_STATE["status"] == "ok"
+    assert recent_events.STOCKEY_RUN_STATE["rows_written"] == 1
+    assert recent_events.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_recent_events_exports_source_unavailable_run_state(monkeypatch):
+    persisted: list[dict[str, object]] = []
+    fallbacks: list[dict[str, object]] = []
+
+    class DummyPlaywright:
+        def __enter__(self):
+            return "playwright"
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class DummyRedis:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(recent_events, "get_redis_client", lambda *_args, **_kwargs: DummyRedis())
+    monkeypatch.setattr(recent_events, "sync_playwright", lambda: DummyPlaywright())
+    monkeypatch.setattr(
+        recent_events,
+        "dowload_events",
+        lambda playwright, formatted_date, rop: (_ for _ in ()).throw(RuntimeError("CDP connection refused")),
+    )
+    monkeypatch.setattr(recent_events, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+    monkeypatch.setattr(recent_events, "record_local_fallback_event", lambda **kwargs: fallbacks.append(kwargs) or kwargs)
+    monkeypatch.setattr(sys, "argv", ["data.nseindia.recent_events", "--date", "2026-06-12"])
+
+    with pytest.raises(RuntimeError, match="CDP connection refused"):
+        recent_events.main()
+
+    assert recent_events.STOCKEY_RUN_STATE["classification"] == "source_unavailable"
+    assert recent_events.STOCKEY_RUN_STATE["status"] == "failed"
+    assert recent_events.STOCKEY_RUN_STATE["rows_written"] == 0
+    assert recent_events.STOCKEY_RUN_STATE["source_unavailable_count"] == 1
+    assert recent_events.STOCKEY_RUN_STATE["state_advanced"] is False
+    assert persisted[0]["status"] == "error"
+    assert persisted[0]["state"]["classification"] == "source_unavailable"
+    assert fallbacks[0]["fallback_type"] == "nse_recent_events_sync_failed"
+    assert fallbacks[0]["metadata"]["classification"] == "source_unavailable"
+
+
+def test_recent_events_exports_parse_failed_run_state(monkeypatch):
+    persisted: list[dict[str, object]] = []
+
+    class DummyPlaywright:
+        def __enter__(self):
+            return "playwright"
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class DummyRedis:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(recent_events, "get_redis_client", lambda *_args, **_kwargs: DummyRedis())
+    monkeypatch.setattr(recent_events, "sync_playwright", lambda: DummyPlaywright())
+    monkeypatch.setattr(
+        recent_events,
+        "dowload_events",
+        lambda playwright, formatted_date, rop: (_ for _ in ()).throw(ValueError("Could not parse recent event dates: ['bad']")),
+    )
+    monkeypatch.setattr(recent_events, "persist_sync_state", lambda **kwargs: persisted.append(kwargs))
+    monkeypatch.setattr(recent_events, "record_local_fallback_event", lambda **kwargs: kwargs)
+    monkeypatch.setattr(sys, "argv", ["data.nseindia.recent_events", "--date", "2026-06-12"])
+
+    with pytest.raises(ValueError, match="Could not parse recent event dates"):
+        recent_events.main()
+
+    assert recent_events.STOCKEY_RUN_STATE["classification"] == "parse_failed"
+    assert recent_events.STOCKEY_RUN_STATE["status"] == "failed"
+    assert recent_events.STOCKEY_RUN_STATE["parse_failed_count"] == 1
+    assert persisted[0]["state"]["classification"] == "parse_failed"
 
 
 def test_recent_events_date_parser_falls_back_to_abbreviated_month():
@@ -4395,6 +4781,14 @@ def test_execution_engine_clean_optional_text_missing_check_records_fallback(mon
 
 def test_execution_engine_builds_planned_orders(monkeypatch):
     monkeypatch.setattr(execution_engine, "DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK", True)
+    transition_contract = json.dumps(
+        {
+            "current_state": "PLANNED_ENTRY",
+            "entry_evidence_required": True,
+            "entry_evidence_rule": "Lifecycle must use the first available close on or after portfolio published_on.",
+            "broker_execution_allowed": False,
+        }
+    )
     portfolio_orders = pd.DataFrame(
         [
             {
@@ -4405,6 +4799,9 @@ def test_execution_engine_builds_planned_orders(monkeypatch):
                 "unique_id": "uid-1",
                 "company_master_id": "nse:HDFCBANK",
                 "approved_allocation_inr": 40000.0,
+                "portfolio_status": "approved",
+                "position_state": "PLANNED_ENTRY",
+                "state_transition_contract_json": transition_contract,
             }
         ]
     )
@@ -4435,11 +4832,64 @@ def test_execution_engine_builds_planned_orders(monkeypatch):
     assert row["security_id"] == 1333
     assert row["exchange_segment"] == "NSE_EQ"
     assert len(row["correlation_id"]) <= 30
+    safety = json.loads(row["safety_checks_json"])
+    assert safety["source"] == "portfolio_order"
+    assert safety["portfolio_transition_contract"]["current_state"] == "PLANNED_ENTRY"
+    assert safety["live_submission_allowed"] is False
+
+
+def test_execution_engine_blocks_portfolio_rows_without_planned_entry_contract(monkeypatch):
+    identity_calls = []
+    monitor_date = pd.Timestamp("2026-03-23T00:00:00Z")
+    portfolio_orders = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-03-23T09:00:00Z"),
+                "asof_date": monitor_date,
+                "setup_id": "TEST",
+                "symbol": "HDFCBANK",
+                "unique_id": "uid-ambiguous",
+                "company_master_id": "nse:HDFCBANK",
+                "approved_allocation_inr": 40000.0,
+                "portfolio_status": "approved",
+            }
+        ]
+    )
+    latest_prices = pd.DataFrame(
+        [{"symbol": "HDFCBANK", "price_asof": pd.Timestamp("2026-03-23T09:15:00Z"), "price": 800.0, "price_source": "intraday"}]
+    )
+
+    monkeypatch.setattr(execution_engine, "DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK", True)
+    monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: portfolio_orders.copy())
+    monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "build_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_latest_execution_prices", lambda symbols, asof_date: latest_prices.copy())
+    monkeypatch.setattr(execution_engine, "resolve_dhan_identity", lambda *args, **kwargs: identity_calls.append(args) or {"security_id": 1333, "exchange_segment": "NSE_EQ"})
+
+    df = execution_engine.build_execution_orders(asof_date=monitor_date)
+
+    row = df.iloc[0]
+    assert row["execution_status"] == "submit_blocked"
+    assert "position_state is missing" in row["execution_reason"]
+    assert "Missing portfolio state transition contract" in row["execution_reason"]
+    assert identity_calls == []
+    safety = json.loads(row["safety_checks_json"])
+    assert safety["broker_identity_status"] == "skipped"
+    assert "Missing portfolio state transition contract." in safety["issues"]
 
 
 def test_execution_engine_records_portfolio_identity_resolution_fallback(monkeypatch):
     events: list[dict[str, object]] = []
     monitor_date = pd.Timestamp("2026-03-23T00:00:00Z")
+    transition_contract = json.dumps(
+        {
+            "current_state": "PLANNED_ENTRY",
+            "entry_evidence_required": True,
+            "entry_evidence_rule": "Lifecycle must use the first available close on or after portfolio published_on.",
+            "broker_execution_allowed": False,
+        }
+    )
     portfolio_orders = pd.DataFrame(
         [
             {
@@ -4450,6 +4900,9 @@ def test_execution_engine_records_portfolio_identity_resolution_fallback(monkeyp
                 "unique_id": "uid-identity",
                 "company_master_id": "nse:HUIL",
                 "approved_allocation_inr": 40000.0,
+                "portfolio_status": "approved",
+                "position_state": "PLANNED_ENTRY",
+                "state_transition_contract_json": transition_contract,
             }
         ]
     )
@@ -5032,6 +5485,67 @@ def test_execution_engine_blocks_action_rows_without_complete_reason_contract(mo
     assert lineage["approval"]["operator_approval_required"] is True
 
 
+def test_execution_engine_blocks_action_rows_with_incomplete_action_transition(monkeypatch):
+    action_rows = pd.DataFrame(
+        [
+            {
+                "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "HDFCBANK",
+                "unique_id": "action-transition-incomplete",
+                "action_code": "BUY",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "approved_allocation_inr": 40000.0,
+                "reason_contract_status": "complete",
+                "recommendation_reason_json": json.dumps(
+                    {
+                        "status": "complete",
+                        "action": "BUY",
+                        "summary": "Buy candidate still missing post-publication entry evidence.",
+                        "evidence": {
+                            "action_transition": {
+                                "state_effect": "planned_entry_candidate",
+                                "broker_order_candidate": True,
+                                "precondition_status": "incomplete",
+                                "missing_preconditions": ["entry_evidence_after_publication"],
+                                "broker_execution_allowed": False,
+                            }
+                        },
+                    }
+                ),
+                "action_status": "approved",
+            }
+        ]
+    )
+    latest_prices = pd.DataFrame(
+        [{"symbol": "HDFCBANK", "price_asof": pd.Timestamp("2026-05-01T09:15:00Z"), "price": 800.0, "price_source": "intraday"}]
+    )
+    identity_calls = []
+
+    monkeypatch.setattr(execution_engine, "load_action_recommendations", lambda **kwargs: action_rows.copy())
+    monkeypatch.setattr(execution_engine, "build_action_recommendations", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_portfolio_orders", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_exit_actions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(execution_engine, "load_latest_execution_prices", lambda symbols, asof_date: latest_prices.copy())
+    monkeypatch.setattr(execution_engine, "resolve_dhan_identity", lambda *args, **kwargs: identity_calls.append(args) or {"security_id": 1333, "exchange_segment": "NSE_EQ"})
+
+    df = execution_engine.build_execution_orders(asof_date=pd.Timestamp("2026-05-01T00:00:00Z"))
+    row = df.iloc[0]
+    safety = json.loads(row["safety_checks_json"])
+    lineage = safety["order_intent_lineage"]
+
+    assert row["execution_status"] == "submit_blocked"
+    assert "Action transition preconditions incomplete: entry_evidence_after_publication" in row["execution_reason"]
+    assert row["quantity"] == 0
+    assert identity_calls == []
+    assert any("entry_evidence_after_publication" in issue for issue in safety["issues"])
+    assert lineage["reason_contract_status"] == "complete"
+    assert lineage["reason_contract"]["action_transition"]["precondition_status"] == "incomplete"
+    assert lineage["reason_contract"]["action_transition"]["missing_preconditions"] == ["entry_evidence_after_publication"]
+
+
 def test_execution_engine_marks_action_order_preview_as_approval_gated(monkeypatch):
     action_rows = pd.DataFrame(
         [
@@ -5291,6 +5805,29 @@ def test_submit_live_orders_requires_operator_approval_after_live_confirmation(m
     assert "Operator approval is required" in out.iloc[0]["execution_reason"]
 
 
+def test_live_execution_confirmation_token_fingerprints_order_set():
+    base = {
+        "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
+        "setup_id": "SETUP",
+        "unique_id": "u1",
+        "execution_status": "planned",
+        "transaction_type": "BUY",
+        "security_id": 1333,
+        "quantity": 10,
+        "estimated_order_value_inr": 1000.0,
+    }
+    first = pd.DataFrame([{**base, "symbol": "HDFCBANK", "correlation_id": "BUY-HDFCBANK-u1"}])
+    second = pd.DataFrame([{**base, "symbol": "ICICIBANK", "correlation_id": "BUY-ICICIBANK-u1"}])
+
+    first_token = execution_engine.build_live_execution_confirmation_token(first)
+    second_token = execution_engine.build_live_execution_confirmation_token(second)
+
+    assert first_token.startswith("STOCKEY-LIVE-2026-05-01-1-")
+    assert second_token.startswith("STOCKEY-LIVE-2026-05-01-1-")
+    assert first_token != second_token
+
+
 def test_submit_live_orders_submits_only_with_live_confirmation_and_safety_gates(monkeypatch):
     monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
     monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
@@ -5336,6 +5873,9 @@ def test_submit_live_orders_submits_only_with_live_confirmation_and_safety_gates
                         source="action_recommendation",
                         approval_status="approved",
                         reconciliation_status="reconciled",
+                        evidence_status="passed",
+                        evidence_successful_runs=3,
+                        live_submission_allowed=True,
                     )
                 ),
             }
@@ -5364,8 +5904,280 @@ def test_submit_live_orders_submits_only_with_live_confirmation_and_safety_gates
     assert bool(out.iloc[0]["live_mode"]) is True
 
 
+def test_submit_live_orders_requires_evidence_checklist_after_approval_and_reconciliation(monkeypatch):
+    monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "50000")
+    monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "false")
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
+
+    class DummyClient:
+        def __init__(self):
+            raise AssertionError("missing evidence should not create broker client")
+
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "HDFCBANK",
+                "unique_id": "u1",
+                "correlation_id": "BUY-HDFCBANK-u1",
+                "execution_status": "planned",
+                "execution_reason": None,
+                "transaction_type": "BUY",
+                "exchange_segment": "NSE_EQ",
+                "product_type": "CNC",
+                "order_type": "MARKET",
+                "validity": "DAY",
+                "security_id": 1333,
+                "quantity": 10,
+                "limit_price": 0.0,
+                "trigger_price": 0.0,
+                "reference_price": 100.0,
+                "reference_price_source": "intraday",
+                "reference_price_asof": pd.Timestamp.utcnow(),
+                "estimated_order_value_inr": 1000.0,
+                "live_mode": False,
+                "safety_checks_json": json.dumps(
+                    execution_engine.build_execution_plan_safety_contract(
+                        source="action_recommendation",
+                        approval_status="approved",
+                        reconciliation_status="reconciled",
+                        live_submission_allowed=True,
+                    )
+                ),
+            }
+        ]
+    )
+    token = execution_engine.build_live_execution_confirmation_token(df)
+
+    out = execution_engine.submit_live_orders(df, live_confirmation=token)
+
+    assert out.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Live execution evidence checklist is required" in out.iloc[0]["execution_reason"]
+    safety = json.loads(out.iloc[0]["safety_checks_json"])
+    assert safety["require_evidence_checklist"] is True
+    assert safety["execution_safety_contract"]["live_evidence_status"] == "missing"
+
+
+def test_submit_live_orders_requires_contract_live_submission_allowed(monkeypatch):
+    monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "50000")
+    monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "false")
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
+
+    class DummyClient:
+        def __init__(self):
+            raise AssertionError("contract live_submission_allowed=false should not create broker client")
+
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "HDFCBANK",
+                "unique_id": "u1",
+                "correlation_id": "BUY-HDFCBANK-u1",
+                "execution_status": "planned",
+                "execution_reason": None,
+                "transaction_type": "BUY",
+                "exchange_segment": "NSE_EQ",
+                "product_type": "CNC",
+                "order_type": "MARKET",
+                "validity": "DAY",
+                "security_id": 1333,
+                "quantity": 10,
+                "limit_price": 0.0,
+                "trigger_price": 0.0,
+                "reference_price": 100.0,
+                "reference_price_source": "intraday",
+                "reference_price_asof": pd.Timestamp.utcnow(),
+                "estimated_order_value_inr": 1000.0,
+                "live_mode": False,
+                "safety_checks_json": json.dumps(
+                    execution_engine.build_execution_plan_safety_contract(
+                        source="action_recommendation",
+                        approval_status="approved",
+                        reconciliation_status="reconciled",
+                        evidence_status="passed",
+                        evidence_successful_runs=3,
+                        live_submission_allowed=False,
+                    )
+                ),
+            }
+        ]
+    )
+    token = execution_engine.build_live_execution_confirmation_token(df)
+
+    out = execution_engine.submit_live_orders(df, live_confirmation=token)
+
+    assert out.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Execution safety contract does not allow live submission" in out.iloc[0]["execution_reason"]
+
+
+def test_submit_live_orders_requires_fresh_approval_after_live_allowance(monkeypatch):
+    monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "50000")
+    monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "false")
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
+
+    class DummyClient:
+        def __init__(self):
+            raise AssertionError("missing post-live-allowance approval should not create broker client")
+
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "HDFCBANK",
+                "unique_id": "u1",
+                "correlation_id": "BUY-HDFCBANK-u1",
+                "execution_status": "planned",
+                "execution_reason": None,
+                "transaction_type": "BUY",
+                "exchange_segment": "NSE_EQ",
+                "product_type": "CNC",
+                "order_type": "MARKET",
+                "validity": "DAY",
+                "security_id": 1333,
+                "quantity": 10,
+                "limit_price": 0.0,
+                "trigger_price": 0.0,
+                "reference_price": 100.0,
+                "reference_price_source": "intraday",
+                "reference_price_asof": pd.Timestamp.utcnow(),
+                "estimated_order_value_inr": 1000.0,
+                "live_mode": False,
+                "safety_checks_json": json.dumps(
+                    execution_engine.build_execution_plan_safety_contract(
+                        source="action_recommendation",
+                        approval_status="approved",
+                        reconciliation_status="reconciled",
+                        evidence_status="passed",
+                        evidence_successful_runs=3,
+                        live_submission_allowed=True,
+                    )
+                    | {
+                        "live_allowance_allowed_at": "2026-06-10T10:00:00+00:00",
+                        "post_live_allowance_approval_required": True,
+                        "post_live_allowance_approval_status": "missing",
+                    }
+                ),
+            }
+        ]
+    )
+    token = execution_engine.build_live_execution_confirmation_token(df)
+
+    out = execution_engine.submit_live_orders(df, live_confirmation=token)
+
+    assert out.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Fresh operator approval after live allowance is required" in out.iloc[0]["execution_reason"]
+
+
+def test_submit_live_orders_blocks_stale_dry_run_rows(monkeypatch):
+    monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_LIVE_ORDERS_PER_RUN", "2")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR", "50000")
+    monkeypatch.setenv("STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE", "false")
+    monkeypatch.setenv("STOCKEY_EXECUTION_MAX_ROW_AGE_HOURS", "24")
+    monkeypatch.setattr(execution_engine, "_trace_execution_rows", lambda *_args, **_kwargs: None)
+
+    class DummyClient:
+        def __init__(self):
+            raise AssertionError("stale dry-run execution rows should not create broker client")
+
+    monkeypatch.setattr(execution_engine, "DhanTradingClient", DummyClient)
+    df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:00:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "HDFCBANK",
+                "unique_id": "u1",
+                "correlation_id": "BUY-HDFCBANK-u1",
+                "execution_status": "planned",
+                "execution_reason": None,
+                "transaction_type": "BUY",
+                "exchange_segment": "NSE_EQ",
+                "product_type": "CNC",
+                "order_type": "MARKET",
+                "validity": "DAY",
+                "security_id": 1333,
+                "quantity": 10,
+                "limit_price": 0.0,
+                "trigger_price": 0.0,
+                "reference_price": 100.0,
+                "reference_price_source": "intraday",
+                "reference_price_asof": pd.Timestamp.utcnow(),
+                "estimated_order_value_inr": 1000.0,
+                "live_mode": False,
+                "load_ts": pd.Timestamp.utcnow() - pd.Timedelta(hours=25),
+                "safety_checks_json": json.dumps(
+                    execution_engine.build_execution_plan_safety_contract(
+                        source="action_recommendation",
+                        approval_status="approved",
+                        reconciliation_status="reconciled",
+                        evidence_status="passed",
+                        evidence_successful_runs=3,
+                        live_submission_allowed=True,
+                    )
+                ),
+            }
+        ]
+    )
+    token = execution_engine.build_live_execution_confirmation_token(df)
+
+    out = execution_engine.submit_live_orders(df, live_confirmation=token)
+
+    assert out.iloc[0]["execution_status"] == "submit_blocked"
+    assert "Execution dry-run row is" in out.iloc[0]["execution_reason"]
+    assert "regenerate before live submission" in out.iloc[0]["execution_reason"]
+
+
+def test_operator_api_live_preflight_blocks_stale_dry_run_rows():
+    contract = execution_engine.build_execution_plan_safety_contract(
+        source="action_recommendation",
+        approval_status="approved",
+        reconciliation_status="reconciled",
+        evidence_status="passed",
+        evidence_successful_runs=3,
+        live_submission_allowed=True,
+    )
+    row = {
+        "execution_status": "planned",
+        "security_id": 1333,
+        "quantity": 10,
+        "reference_price": 100.0,
+        "load_ts": pd.Timestamp.utcnow() - pd.Timedelta(hours=25),
+    }
+
+    blockers = operator_api._live_submit_row_blockers(row, contract)
+
+    assert any("Execution dry-run row is" in blocker for blocker in blockers)
+    assert any("regenerate before live submission" in blocker for blocker in blockers)
+
+
 def test_execution_engine_uses_broker_cash_cap_and_exit_holdings(monkeypatch):
     monkeypatch.setattr(execution_engine, "DEFAULT_ALLOW_LEGACY_EXECUTION_FALLBACK", True)
+    transition_contract = json.dumps(
+        {
+            "current_state": "PLANNED_ENTRY",
+            "entry_evidence_required": True,
+            "entry_evidence_rule": "Lifecycle must use the first available close on or after portfolio published_on.",
+            "broker_execution_allowed": False,
+        }
+    )
     portfolio_orders = pd.DataFrame(
         [
             {
@@ -5377,6 +6189,9 @@ def test_execution_engine_uses_broker_cash_cap_and_exit_holdings(monkeypatch):
                 "company_master_id": "nse:HDFCBANK",
                 "approved_allocation_inr": 40000.0,
                 "invest_score_pct": 88.0,
+                "portfolio_status": "approved",
+                "position_state": "PLANNED_ENTRY",
+                "state_transition_contract_json": transition_contract,
             }
         ]
     )
@@ -6091,6 +6906,8 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
                         "conflict_resolution": {
                             "same_symbol_candidate_count": 2,
                             "same_symbol_conflict_count": 1,
+                            "conflict_precedence_rule_id": "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY",
+                            "conflict_precedence_reason": "Event-policy manual review blocks positive entry.",
                             "winning_action_code": "BUY",
                             "winning_action_source": "portfolio",
                             "winning_action_priority": 50,
@@ -6180,6 +6997,13 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
                 "wait_for": ["wait for breadth recovery"],
                 "authority_scope": "review_input_only",
                 "review_status": "completed",
+                "evidence_source_contract": {
+                    "schema_version": 1,
+                    "coverage_status": "partial",
+                    "missing_required_sources": ["bhavcopy_evidence"],
+                    "raw_announcement_scan_allowed": False,
+                    "raw_bhavcopy_scan_allowed": False,
+                },
             }
         },
     )
@@ -6203,6 +7027,8 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
     assert compact_action["manual_revision_status"] == "disabled"
     assert compact_action["company_memory_review"]["recommended_signal"] == "WATCH"
     assert compact_action["company_memory_review"]["authority_scope"] == "review_input_only"
+    assert compact_action["company_memory_review"]["evidence_source_contract"]["coverage_status"] == "partial"
+    assert compact_action["company_memory_review"]["evidence_source_contract"]["missing_required_sources"] == ["bhavcopy_evidence"]
     assert compact_action["recommendation_reason"]["evidence"]["company_memory"]["summary"] == "ABC memory review suggests WATCH."
     assert compact_action["execution_safety_contract"]["operator_approval_status"] == "missing"
     assert compact_action["execution_safety_contract"]["broker_reconciliation_status"] == "not_run"
@@ -6216,6 +7042,8 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
     assert compact_action["recommendation_reason"]["original_action_code"] == "BUY"
     compact_conflict = compact_action["recommendation_reason"]["evidence"]["conflict_resolution"]
     assert compact_conflict["source_precedence_reason"].startswith("Selected BUY from portfolio")
+    assert compact_conflict["conflict_precedence_rule_id"] == "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY"
+    assert compact_conflict["conflict_precedence_reason"] == "Event-policy manual review blocks positive entry."
     assert compact_conflict["losing_candidates"][0]["action_source"] == "watchlist"
     compact_event = compact_action["recommendation_reason"]["evidence"]["event"]
     assert compact_event["review_action"] == "veto"
@@ -6258,6 +7086,12 @@ def test_operator_api_compact_signal_refresh_keeps_effect_fields():
                 "signal_source": "wait_signal",
                 "effect_type": "wait_match_created",
                 "effect_summary": "Created a wait-signal match.",
+                "previous_action": "BUY",
+                "action_changed": True,
+                "authority_scope": "review_input_only",
+                "portfolio_authority": "none",
+                "broker_execution_allowed": False,
+                "full_advisory_required": True,
                 "action_payload_json": "large omitted payload",
             }
         ],
@@ -6272,8 +7106,136 @@ def test_operator_api_compact_signal_refresh_keeps_effect_fields():
             "signal_source": "wait_signal",
             "effect_type": "wait_match_created",
             "effect_summary": "Created a wait-signal match.",
+            "previous_action": "BUY",
+            "action_changed": True,
+            "authority_scope": "review_input_only",
+            "portfolio_authority": "none",
+            "broker_execution_allowed": False,
+            "full_advisory_required": True,
         }
     ]
+
+
+def test_operator_api_signal_refresh_defaults_authority_boundary_for_legacy_schema(monkeypatch):
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.SIGNAL_REFRESH_TABLE)
+    monkeypatch.setattr(
+        operator_api,
+        "_table_columns",
+        lambda table_name: {"effect_type", "effect_summary", "previous_action", "action_changed"},
+    )
+
+    def fake_sql_to_df(query, params=None, **kwargs):
+        sql = str(query)
+        if "COUNT(*) AS total" in sql:
+            return pd.DataFrame([{"total": 1}])
+        assert "'review_input_only'::TEXT AS authority_scope" in sql
+        assert "'none'::TEXT AS portfolio_authority" in sql
+        assert "FALSE::BOOLEAN AS broker_execution_allowed" in sql
+        assert "TRUE::BOOLEAN AS full_advisory_required" in sql
+        return pd.DataFrame(
+            [
+                {
+                    "refresh_id": "refresh-1",
+                    "refreshed_at": pd.Timestamp("2026-06-11T09:06:00Z"),
+                    "asof_date": pd.Timestamp("2026-06-11T00:00:00Z"),
+                    "symbol": "ABC",
+                    "signal_action": "WATCH",
+                    "signal_status": "watch_or_review",
+                    "signal_source": "wait_signal",
+                    "effect_type": "wait_match_created",
+                    "effect_summary": "Created wait signal.",
+                    "authority_scope": "review_input_only",
+                    "portfolio_authority": "none",
+                    "broker_execution_allowed": False,
+                    "full_advisory_required": True,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+
+    payload = operator_api.build_signal_refresh_payload(limit=10, compact=True)
+
+    row = payload["signals"][0]
+    assert row["authority_scope"] == "review_input_only"
+    assert row["portfolio_authority"] == "none"
+    assert row["broker_execution_allowed"] is False
+    assert row["full_advisory_required"] is True
+
+
+def test_operator_api_signal_refresh_compacts_router_context_from_payload(monkeypatch):
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.SIGNAL_REFRESH_TABLE)
+    monkeypatch.setattr(
+        operator_api,
+        "_table_columns",
+        lambda table_name: {
+            "effect_type",
+            "effect_summary",
+            "previous_action",
+            "action_changed",
+            "authority_scope",
+            "portfolio_authority",
+            "broker_execution_allowed",
+            "full_advisory_required",
+            "action_payload_json",
+        },
+    )
+
+    def fake_sql_to_df(query, params=None, **kwargs):
+        sql = str(query)
+        if "COUNT(*) AS total" in sql:
+            return pd.DataFrame([{"total": 1}])
+        assert "action_payload_json" in sql
+        return pd.DataFrame(
+            [
+                {
+                    "refresh_id": "refresh-1",
+                    "refreshed_at": pd.Timestamp("2026-06-11T09:06:00Z"),
+                    "asof_date": pd.Timestamp("2026-06-11T00:00:00Z"),
+                    "symbol": "ABC",
+                    "reason": "router:price_alert:refresh_symbol_price",
+                    "signal_action": "WATCH",
+                    "signal_status": "watch_or_review",
+                    "signal_source": "router_price_alert",
+                    "effect_type": "action_changed",
+                    "effect_summary": "Fast refresh changed the symbol-level action.",
+                    "authority_scope": "review_input_only",
+                    "portfolio_authority": "none",
+                    "broker_execution_allowed": False,
+                    "full_advisory_required": True,
+                    "action_payload_json": json.dumps(
+                        {
+                            "router_context": {
+                                "source_types": ["price_alert"],
+                                "action_type": "refresh_symbol_price",
+                                "reasons": ["ENTRY_ZONE_HIT"],
+                                "setup_ids": ["SETUP_A"],
+                                "priority_score": 3.0,
+                                "best_rank": 4,
+                            },
+                            "large_raw_context": "x" * 1000,
+                        }
+                    ),
+                }
+            ]
+        )
+
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+
+    payload = operator_api.build_signal_refresh_payload(limit=10, compact=True)
+
+    row = payload["signals"][0]
+    assert "action_payload_json" not in row
+    assert row["router_context"] == {
+        "source_types": ["price_alert"],
+        "action_type": "refresh_symbol_price",
+        "reasons": ["ENTRY_ZONE_HIT"],
+        "setup_ids": ["SETUP_A"],
+        "priority_score": 3.0,
+        "best_rank": 4,
+    }
+    assert row["operator_next_step_kind"] == "watch_for_confirmation"
+    assert "Run full advisory" in row["operator_next_step"]
 
 
 def test_operator_api_operator_journey_stitches_read_only_pipeline_sources(monkeypatch):
@@ -6493,6 +7455,89 @@ def test_operator_api_actions_events_compact_pagination_caps_large_payloads(monk
     assert events["pagination"]["operator_feed"]["returned_count"] == 4
 
 
+def test_operator_api_actions_route_defaults_to_compact(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_actions_payload(**kwargs):
+        calls.append(kwargs)
+        return {
+            "generated_at": "2026-06-12T00:00:00Z",
+            "api_schema": operator_api._operator_api_schema("/api/actions", schema_name="operator_actions"),
+            "asof_date": "2026-06-12",
+            "snapshot": {},
+            "snapshot_warning": None,
+            "top_action_recommendations": [{"symbol": "ABC", "action_code": "BUY"}],
+            "action_recommendations": [],
+            "alerts": [],
+            "meta": {"filters": {"compact": kwargs.get("compact")}},
+        }
+
+    monkeypatch.setattr(operator_api, "build_actions_payload", _fake_actions_payload)
+
+    client = TestClient(operator_api.create_app())
+    default_response = client.get("/api/actions?limit=1")
+    full_response = client.get("/api/actions?limit=1&compact=false")
+
+    assert default_response.status_code == 200
+    assert full_response.status_code == 200
+    assert calls[0]["compact"] is True
+    assert default_response.json()["meta"]["filters"]["compact"] is True
+    assert calls[1]["compact"] is False
+    assert full_response.json()["meta"]["filters"]["compact"] is False
+
+
+def test_operator_api_action_approved_filter_uses_final_broker_candidate_contract():
+    manual_review_row = {
+        "symbol": "ABC",
+        "action_code": "MANUAL_REVIEW",
+        "action_status": "manual_review",
+        "portfolio_status": "approved",
+        "source_action": "approved",
+        "recommendation_reason": {
+            "status": "complete_review_only",
+            "evidence": {
+                "action_transition": {
+                    "action_code": "MANUAL_REVIEW",
+                    "state_effect": "review_only",
+                    "broker_order_candidate": False,
+                    "broker_execution_allowed": False,
+                    "precondition_status": "complete",
+                }
+            },
+        },
+    }
+    broker_candidate_row = {
+        "symbol": "XYZ",
+        "action_code": "BUY",
+        "action_status": "approved",
+        "portfolio_status": "approved",
+        "recommendation_reason": {
+            "status": "complete",
+            "evidence": {
+                "action_transition": {
+                    "action_code": "BUY",
+                    "state_effect": "planned_entry",
+                    "broker_order_candidate": True,
+                    "broker_execution_allowed": False,
+                    "precondition_status": "complete",
+                }
+            },
+        },
+    }
+
+    approved = operator_api._filter_rows([manual_review_row, broker_candidate_row], status="approved")
+    manual = operator_api._filter_rows([manual_review_row, broker_candidate_row], status="manual")
+
+    assert [row["symbol"] for row in approved] == ["XYZ"]
+    assert [row["symbol"] for row in manual] == ["ABC"]
+    assert operator_api._action_queue_contract(manual_review_row)["display_status"] == "review_only"
+    assert operator_api._action_queue_contract(manual_review_row)["approved_filter_match"] is False
+    assert operator_api._action_queue_contract(broker_candidate_row)["display_status"] == "broker_candidate"
+    assert operator_api._action_queue_contract(broker_candidate_row)["approved_filter_match"] is True
+
+
 def test_operator_api_portfolio_compact_pagination_caps_large_payloads(monkeypatch):
     large_text = "x" * 10_000
     payload = {
@@ -6525,6 +7570,56 @@ def test_operator_api_portfolio_compact_pagination_caps_large_payloads(monkeypat
     assert portfolio["meta"]["portfolio"]["payload_bytes"] > 0
     assert portfolio["meta"]["portfolio"]["max_row_bytes"] > 0
     assert portfolio["meta"]["today_recommendations"]["payload_bytes"] > 0
+
+    today_only = operator_api.build_portfolio_payload(limit=12, offset=0, compact=True, bucket="today_recommendations")
+    assert [row["symbol"] for row in today_only["today_recommendations"]] == ["TODAY"]
+    assert today_only["current_recommendations"] == []
+    assert today_only["exited_recommendations"] == []
+    assert today_only["portfolio"] == []
+    assert today_only["lifecycle"] == []
+    assert today_only["pagination"]["current_recommendations"]["total_count"] == 1
+    assert today_only["meta"]["current_recommendations"]["payload_bytes"] == 0
+    assert today_only["meta"]["bucket_contract"]["requested_bucket"] == "today_recommendations"
+    assert today_only["meta"]["bucket_contract"]["included_sections"] == ["today_recommendations"]
+
+
+def test_operator_api_portfolio_route_defaults_to_compact(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_portfolio_payload(**kwargs):
+        calls.append(kwargs)
+        return {
+            "generated_at": "2026-06-12T00:00:00Z",
+            "api_schema": operator_api._operator_api_schema("/api/portfolio", schema_name="operator_portfolio"),
+            "asof_date": "2026-06-12",
+            "snapshot": {},
+            "snapshot_warning": None,
+            "today_recommendations": [],
+            "current_recommendations": [{"symbol": "ABC", "action_code": "HOLD"}],
+            "exited_recommendations": [],
+            "portfolio": [],
+            "lifecycle": [],
+            "meta": {"filters": {"compact": kwargs.get("compact"), "bucket": kwargs.get("bucket")}},
+        }
+
+    monkeypatch.setattr(operator_api, "build_portfolio_payload", _fake_portfolio_payload)
+
+    client = TestClient(operator_api.create_app())
+    default_response = client.get("/api/portfolio?limit=1")
+    full_response = client.get("/api/portfolio?limit=1&compact=false")
+    bucket_response = client.get("/api/portfolio?limit=1&bucket=current_recommendations")
+
+    assert default_response.status_code == 200
+    assert full_response.status_code == 200
+    assert bucket_response.status_code == 200
+    assert calls[0]["compact"] is True
+    assert default_response.json()["meta"]["filters"]["compact"] is True
+    assert calls[2]["bucket"] == "current_recommendations"
+    assert bucket_response.json()["meta"]["filters"]["bucket"] == "current_recommendations"
+    assert calls[1]["compact"] is False
+    assert full_response.json()["meta"]["filters"]["compact"] is False
 
 
 def test_operator_api_logs_and_research_payloads_expose_pagination(monkeypatch, tmp_path):
@@ -6760,6 +7855,48 @@ def test_operator_api_company_memory_review_load_failures_record_fallback(monkey
     assert events[0]["metadata"] == {"symbol_count": 2}
 
 
+def test_operator_api_company_memory_review_loader_preserves_evidence_contract(monkeypatch):
+    payload = {
+        "evidence_source_contract": {
+            "schema_version": 1,
+            "coverage_status": "partial",
+            "missing_required_sources": ["announcement_evidence", "bhavcopy_evidence"],
+            "raw_announcement_scan_allowed": False,
+            "raw_bhavcopy_scan_allowed": False,
+        }
+    }
+    row = {
+        "review_date": pd.Timestamp("2026-06-09T00:00:00Z"),
+        "symbol": "ABC",
+        "recommended_signal": "WATCH",
+        "confidence": 0.61,
+        "conviction_score": 67.0,
+        "summary": "ABC memory review says watch.",
+        "thesis": "Partial compact evidence keeps this review conservative.",
+        "risk_flags_json": json.dumps(["partial evidence"]),
+        "evidence_used_json": json.dumps(["latest action is MANUAL_REVIEW"]),
+        "wait_for_json": json.dumps(["fresh announcement evidence"]),
+        "deterministic_boundary": "Review input only.",
+        "authority_scope": "review_input_only",
+        "model_name": "deterministic_company_memory_v1",
+        "review_status": "completed",
+        "fallback_used": False,
+        "error": None,
+        "payload_json": json.dumps(payload),
+        "load_ts": pd.Timestamp("2026-06-09T01:00:00Z"),
+    }
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: True)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: pd.DataFrame([row]))
+
+    reviews = operator_api._load_latest_company_memory_reviews(["ABC"])
+
+    assert reviews["ABC"]["evidence_source_contract"]["coverage_status"] == "partial"
+    assert reviews["ABC"]["evidence_source_contract"]["missing_required_sources"] == [
+        "announcement_evidence",
+        "bhavcopy_evidence",
+    ]
+
+
 def test_operator_api_table_columns_lookup_records_fallback(monkeypatch):
     events: list[dict[str, object]] = []
 
@@ -6849,6 +7986,30 @@ def test_operator_snapshot_records_section_load_failure(monkeypatch):
     assert events[0]["metadata"]["section_names"] == ["alerts", "top_action_recommendations"]
 
 
+def test_operator_snapshot_section_load_can_allow_missing_sections(monkeypatch):
+    rows = pd.DataFrame(
+        [
+            {
+                "section_name": "summary",
+                "payload_json": json.dumps({"action_count": 1}),
+                "generated_at": "2026-06-10T08:30:00+00:00",
+                "asof_date": None,
+                "payload_bytes": 18,
+                "payload_sha256": "abc",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(operator_snapshot, "sql_to_df", lambda *args, **kwargs: rows.copy())
+
+    strict = operator_snapshot.load_operator_snapshot_sections(["summary", "missing_optional"])
+    partial = operator_snapshot.load_operator_snapshot_sections(["summary", "missing_optional"], allow_missing=True)
+
+    assert strict is None
+    assert partial["summary"] == {"action_count": 1}
+    assert partial["_snapshot"]["missing_sections"] == ["missing_optional"]
+
+
 def test_operator_snapshot_records_price_cache_refresh_failure(monkeypatch):
     events = []
     payload = {
@@ -6907,6 +8068,11 @@ def test_operator_api_event_model_artifacts_paginates_manifest_files(monkeypatch
         "has_more": True,
         "next_offset": 5,
     }
+    assert payload["operator_boundary"]["authority_scope"] == "read_only_artifact_inspection"
+    assert payload["operator_boundary"]["system_applies_model"] is False
+    assert payload["operator_boundary"]["policy_auto_promotion_allowed"] is False
+    assert payload["operator_boundary"]["broker_execution_allowed"] is False
+    assert payload["operator_boundary"]["s3_write_allowed"] is False
 
 
 def test_operator_api_event_model_artifact_manifest_missing_records_fallback(monkeypatch):
@@ -6973,6 +8139,69 @@ def test_operator_api_event_model_artifact_s3_failures_record_fallback(monkeypat
     assert payload["latest_s3_heads"][0]["status"] == "s3_unavailable"
     assert events[0]["fallback_type"] == "operator_api_event_model_artifact_s3_unavailable"
     assert events[0]["metadata"] == {"latest_prefix": "models/latest"}
+
+
+def test_operator_api_research_ledger_payload_is_read_only(monkeypatch):
+    rows = pd.DataFrame(
+        [
+            {
+                "research_run_id": "run-1",
+                "run_type": "ts_forecast",
+                "entrypoint": "advisory.ts_forecast_paper_portfolio",
+                "label": "ts-paper",
+                "objective": "compare TS forecast to momentum baseline",
+                "asof_date": pd.Timestamp("2026-06-01T00:00:00Z"),
+                "status": "completed",
+                "git_rev": "abc",
+                "started_ts": pd.Timestamp("2026-06-12T08:00:00Z"),
+                "completed_ts": pd.Timestamp("2026-06-12T08:05:00Z"),
+                "config_hash": "hash-1",
+                "config_json": json.dumps({"horizon_days": 10}),
+                "validation_protocol_json": json.dumps({"baseline": "momentum"}),
+                "data_snapshot_json": json.dumps({"rows": 100}),
+                "result_metrics_json": json.dumps({"win_rate": 0.6}),
+                "notes_json": json.dumps({"known_failure_cases": ["thin breadth"]}),
+                "error_text": None,
+            },
+            {
+                "research_run_id": "run-2",
+                "run_type": "event_model",
+                "entrypoint": "advisory.event_meta_model",
+                "label": "missing-protocol",
+                "objective": None,
+                "asof_date": None,
+                "status": "failed",
+                "git_rev": "def",
+                "started_ts": pd.Timestamp("2026-06-12T07:00:00Z"),
+                "completed_ts": pd.Timestamp("2026-06-12T07:02:00Z"),
+                "config_hash": "hash-2",
+                "config_json": json.dumps({"horizon_days": 5}),
+                "validation_protocol_json": None,
+                "data_snapshot_json": None,
+                "result_metrics_json": None,
+                "notes_json": None,
+                "error_text": "training failed",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == research_ledger.LEDGER_TABLE)
+    monkeypatch.setattr(operator_api, "list_research_ledger_runs", lambda **kwargs: rows)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: pd.DataFrame([{"total_count": 2}]))
+
+    payload = operator_api.build_research_ledger_payload(limit=10)
+
+    assert payload["status"] == "ok"
+    assert payload["summary"]["total_count"] == 2
+    assert payload["summary"]["failed_count"] == 1
+    assert payload["summary"]["missing_validation_protocol_count"] == 1
+    assert payload["runs"][0]["config"] == {"horizon_days": 10}
+    assert payload["runs"][0]["validation_protocol"] == {"baseline": "momentum"}
+    assert payload["runs"][0]["result_metrics"] == {"win_rate": 0.6}
+    assert payload["operator_boundary"]["authority_scope"] == "read_only_research_audit"
+    assert payload["operator_boundary"]["mutates_research_ledger"] is False
+    assert payload["operator_boundary"]["policy_auto_promotion_allowed"] is False
+    assert payload["operator_boundary"]["broker_execution_allowed"] is False
 
 
 def test_operator_api_builds_signal_quality_payload(monkeypatch):
@@ -7064,6 +8293,23 @@ def test_operator_api_compact_actions_keep_raw_broker_execution_safety_contract(
             {
                 "symbol": "ABC",
                 "action": "BUY",
+                "reason_contract_status": "complete",
+                "recommendation_reason": {
+                    "status": "complete",
+                    "action_code": "BUY",
+                    "primary_reason": "Technical breakout candidate.",
+                    "evidence": {
+                        "action_transition": {
+                            "action_code": "BUY",
+                            "state_effect": "planned_entry",
+                            "broker_order_candidate": True,
+                            "broker_execution_allowed": False,
+                            "precondition_status": "complete",
+                            "missing_preconditions": [],
+                            "next_required_stage": "execution_preview",
+                        }
+                    },
+                },
                 "raw_broker_json": json.dumps(
                     {
                         "execution_safety_contract": {
@@ -7071,8 +8317,18 @@ def test_operator_api_compact_actions_keep_raw_broker_execution_safety_contract(
                             "operator_approval_status": "approved",
                             "broker_reconciliation_required": True,
                             "broker_reconciliation_status": "reconciled",
+                            "live_evidence_required": True,
+                            "live_evidence_status": "missing",
+                            "live_evidence_successful_runs": 0,
+                            "live_evidence_min_successful_runs": 3,
                             "live_submission_allowed": False,
                             "source": "execution_reconciliation",
+                            "portfolio_transition_contract": {
+                                "current_state": "PLANNED_ENTRY",
+                                "entry_evidence_required": True,
+                                "entry_evidence_rule": "Use first close on/after portfolio published_on.",
+                                "broker_execution_allowed": False,
+                            },
                             "issues": ["Live submission remains disabled."],
                         }
                     }
@@ -7084,19 +8340,1060 @@ def test_operator_api_compact_actions_keep_raw_broker_execution_safety_contract(
     }
 
     monkeypatch.setattr(operator_api, "load_operator_payload", lambda **kwargs: payload)
+    monkeypatch.setattr(operator_api, "load_operator_sections_payload", lambda *_args, **_kwargs: payload)
     monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda symbols: {})
+    monkeypatch.setattr(operator_api, "_load_latest_company_memory_reviews", lambda symbols: {})
 
     compact_action = operator_api.build_actions_payload(compact=True)["action_recommendations"][0]
 
-    assert compact_action["execution_safety_contract"] == {
+    assert {
+        key: compact_action["execution_safety_contract"].get(key)
+        for key in [
+            "operator_approval_required",
+            "operator_approval_status",
+            "broker_reconciliation_required",
+            "broker_reconciliation_status",
+            "live_evidence_required",
+            "live_evidence_status",
+            "live_evidence_successful_runs",
+            "live_evidence_min_successful_runs",
+            "live_submission_allowed",
+            "source",
+            "portfolio_transition_contract",
+            "issues",
+        ]
+    } == {
         "operator_approval_required": True,
         "operator_approval_status": "approved",
         "broker_reconciliation_required": True,
         "broker_reconciliation_status": "reconciled",
+        "live_evidence_required": True,
+        "live_evidence_status": "missing",
+        "live_evidence_successful_runs": 0,
+        "live_evidence_min_successful_runs": 3,
         "live_submission_allowed": False,
         "source": "execution_reconciliation",
+        "portfolio_transition_contract": {
+            "current_state": "PLANNED_ENTRY",
+            "entry_evidence_required": True,
+            "entry_evidence_rule": "Use first close on/after portfolio published_on.",
+            "broker_execution_allowed": False,
+        },
         "issues": ["Live submission remains disabled."],
     }
+    assert compact_action["final_state_trust"]["final_action"] == "BUY"
+    assert compact_action["final_state_trust"]["status"] == "blocked"
+    assert compact_action["final_state_trust"]["broker_order_candidate"] is True
+    assert compact_action["final_state_trust"]["approved_filter_match"] is True
+    boundary_check = next(check for check in compact_action["final_state_trust"]["checks"] if check["key"] == "execution_boundary")
+    assert boundary_check["status"] == "blocked"
+    assert "live submission" in boundary_check["detail"].lower()
+
+
+def test_operator_api_execution_approvals_are_read_only_and_show_blockers(monkeypatch):
+    safety_contract = execution_engine.build_execution_plan_safety_contract(
+        source="dry_run_order_preview",
+        approval_status="missing",
+        reconciliation_status="not_run",
+        live_submission_allowed=False,
+        issues=["Dry-run only."],
+    )
+    execution_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "correlation_id": "c1",
+                "transaction_type": "BUY",
+                "quantity": 10,
+                "reference_price": 100.0,
+                "estimated_order_value_inr": 1000.0,
+                "execution_status": "planned",
+                "execution_reason": "Dry-run order preview.",
+                "safety_checks_json": json.dumps(safety_contract),
+                "raw_broker_json": json.dumps({"execution_safety_contract": safety_contract}),
+                "load_ts": pd.Timestamp("2026-06-10T09:35:00Z"),
+            }
+        ]
+    )
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda query, *args, **kwargs: execution_rows.copy() if operator_api.EXECUTION_TABLE in query else pd.DataFrame())
+
+    payload = operator_api.build_execution_approvals_payload(limit=10)
+
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["api_schema"]["broker_execution_enabled"] is False
+    assert payload["operator_boundary"]["approves_execution"] is False
+    assert payload["operator_boundary"]["submits_broker_orders"] is False
+    assert payload["summary"]["row_count"] == 1
+    assert payload["summary"]["blocked_count"] == 1
+    assert payload["summary"]["missing_approval_count"] == 1
+    assert payload["summary"]["missing_reconciliation_count"] == 1
+    assert payload["summary"]["missing_evidence_count"] == 1
+    row = payload["rows"][0]
+    assert row["symbol"] == "ABC"
+    assert row["safety_contract"]["operator_approval_status"] == "missing"
+    assert row["safety_contract"]["live_evidence_status"] == "missing"
+    assert "Operator approval is missing." in row["blockers"]
+    assert "Broker reconciliation is not_run." in row["blockers"]
+    assert "Live evidence checklist is missing." in row["blockers"]
+    assert "Live evidence has 0 successful run(s); requires 3." in row["blockers"]
+    assert "Live submission is not allowed by the safety contract." in row["blockers"]
+    assert "Dry-run only." in row["blockers"]
+    readiness = {item["key"]: item for item in row["readiness_checks"]}
+    assert readiness["dry_run_row"]["status"] == "passed"
+    assert readiness["operator_approval"]["status"] == "blocked"
+    assert readiness["broker_reconciliation"]["status"] == "blocked"
+    assert readiness["live_evidence"]["status"] == "blocked"
+    assert readiness["live_allowance"]["status"] == "blocked"
+    assert row["readiness_summary"]["blocked_count"] >= 4
+
+
+def test_operator_api_execution_approvals_show_post_live_allowance_approval_blocker(monkeypatch):
+    safety_contract = execution_engine.build_execution_plan_safety_contract(
+        source="live_allowance_review",
+        approval_status="approved",
+        reconciliation_status="reconciled",
+        evidence_status="passed",
+        evidence_successful_runs=3,
+        live_submission_allowed=True,
+    ) | {
+        "live_allowance_allowed_at": "2026-06-10T10:00:00+00:00",
+        "post_live_allowance_approval_required": True,
+        "post_live_allowance_approval_status": "missing",
+    }
+    execution_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "correlation_id": "c1",
+                "transaction_type": "BUY",
+                "quantity": 10,
+                "reference_price": 100.0,
+                "estimated_order_value_inr": 1000.0,
+                "execution_status": "planned",
+                "execution_reason": "Live allowance applied.",
+                "safety_checks_json": json.dumps(safety_contract),
+                "raw_broker_json": json.dumps({"execution_safety_contract": safety_contract}),
+                "load_ts": pd.Timestamp("2026-06-10T10:01:00Z"),
+            }
+        ]
+    )
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda query, *args, **kwargs: execution_rows.copy() if operator_api.EXECUTION_TABLE in query else pd.DataFrame())
+
+    payload = operator_api.build_execution_approvals_payload(limit=10)
+
+    assert payload["summary"]["live_allowed_count"] == 1
+    assert payload["summary"]["missing_post_live_allowance_approval_count"] == 1
+    assert payload["operator_boundary"]["requires_post_live_allowance_approval"] is True
+    row = payload["rows"][0]
+    assert row["safety_contract"]["post_live_allowance_approval_status"] == "missing"
+    assert any("Fresh operator approval after live allowance is required" in blocker for blocker in row["blockers"])
+    readiness = {item["key"]: item for item in row["readiness_checks"]}
+    assert readiness["operator_approval"]["status"] == "passed"
+    assert readiness["broker_reconciliation"]["status"] == "passed"
+    assert readiness["live_evidence"]["status"] == "passed"
+    assert readiness["live_allowance"]["status"] == "passed"
+    assert readiness["post_live_allowance_approval"]["status"] == "blocked"
+    assert row["approval_ready"] is False
+
+
+def test_operator_api_execution_approvals_surface_source_warnings_when_table_missing(monkeypatch):
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: False)
+
+    payload = operator_api.build_execution_approvals_payload(limit=10)
+
+    assert payload["summary"]["row_count"] == 0
+    assert payload["skipped"] == [{"source": operator_api.EXECUTION_TABLE, "error": "missing_table"}]
+    assert payload["source_warnings"][0]["reason"] == "source_query_skipped"
+    assert payload["source_warnings"][0]["source"] == operator_api.EXECUTION_TABLE
+    assert payload["source_warnings"][0]["operator_action"] == "inspect_source_error_and_rerun_page"
+
+
+def test_operator_api_records_execution_approval_decision_without_execution_mutation(monkeypatch):
+    migration_calls: list[dict[str, object]] = []
+    upserts: list[tuple[pd.DataFrame, str, dict[str, object]]] = []
+    row = {
+        "asof_date": "2026-06-10T00:00:00Z",
+        "published_on": "2026-06-10T09:30:00Z",
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "correlation_id": "c1",
+        "safety_contract": {
+            "operator_approval_status": "missing",
+            "broker_reconciliation_status": "not_run",
+            "live_submission_allowed": False,
+        },
+    }
+
+    monkeypatch.setattr(operator_api, "apply_schema_migration", lambda **kwargs: migration_calls.append(kwargs) or {"status": "applied"})
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, table, **kwargs: upserts.append((df.copy(), table, kwargs)))
+
+    payload = operator_api.record_execution_approval_decision_payload(
+        {
+            "row": row,
+            "decision": "approve_dry_run",
+            "rationale": "Dry-run order reviewed; keep blocked until reconciliation and explicit contract update exist.",
+            "operator_id": "tester",
+        }
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["api_schema"]["broker_execution_enabled"] is False
+    assert payload["operator_boundary"] == {
+        "records_audit_only": True,
+        "mutates_execution_orders": False,
+        "updates_safety_contract": False,
+        "approves_live_submission": False,
+        "submits_broker_orders": False,
+    }
+    assert migration_calls[0]["migration_id"] == operator_api.EXECUTION_APPROVAL_SCHEMA_MIGRATION_ID
+    assert upserts[0][1] == operator_api.EXECUTION_APPROVAL_DECISIONS_TABLE
+    persisted = upserts[0][0].iloc[0].to_dict()
+    assert persisted["decision"] == "approve_dry_run"
+    assert persisted["symbol"] == "ABC"
+    assert persisted["operator_id"] == "tester"
+    assert "safety_contract_json" in persisted
+    assert upserts[0][2]["unique_keys"] == ["decision_id"]
+
+
+def test_operator_api_applies_execution_approval_contract_without_reconciliation_or_live(monkeypatch):
+    executed: list[tuple[str, dict[str, object]]] = []
+
+    class FakeCursor:
+        rowcount = 1
+
+        def execute(self, query, params=None):
+            executed.append((str(query), dict(params or {})))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    existing_contract = {
+        "operator_approval_required": True,
+        "operator_approval_status": "missing",
+        "broker_reconciliation_required": True,
+        "broker_reconciliation_status": "not_run",
+        "live_submission_allowed": False,
+        "issues": ["Dry-run only."],
+    }
+    execution_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "safety_checks_json": json.dumps(existing_contract),
+        "raw_broker_json": json.dumps({"execution_safety_contract": existing_contract}),
+    }
+    decision_row = {
+        "decision_id": "exec-approval:abc",
+        "decided_at": pd.Timestamp("2026-06-10T10:00:00Z"),
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "decision": "approve_dry_run",
+        "rationale": "Reviewed dry-run.",
+    }
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        query_text = str(query)
+        if operator_api.EXECUTION_APPROVAL_DECISIONS_TABLE in query_text:
+            return pd.DataFrame([decision_row])
+        if operator_api.EXECUTION_TABLE in query_text:
+            return pd.DataFrame([execution_row])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table in {operator_api.EXECUTION_TABLE, operator_api.EXECUTION_APPROVAL_DECISIONS_TABLE})
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(operator_api, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(operator_api, "execute_db_operation", lambda operation, **_kwargs: operation())
+
+    payload = operator_api.apply_execution_approval_contract_payload(
+        {
+            "confirm": True,
+            "rationale": "Operator reviewed dry-run, sizing, and blockers.",
+            "row": {
+                "asof_date": "2026-06-10T00:00:00Z",
+                "published_on": "2026-06-10T09:30:00Z",
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+            },
+        }
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["operator_boundary"]["updates_operator_approval_status"] is True
+    assert payload["operator_boundary"]["updates_reconciliation_status"] is False
+    assert payload["operator_boundary"]["live_submission_allowed"] is False
+    assert payload["operator_boundary"]["submits_broker_orders"] is False
+    contract = payload["safety_contract"]
+    assert contract["operator_approval_status"] == "approved"
+    assert contract["broker_reconciliation_status"] == "not_run"
+    assert contract["live_submission_allowed"] is False
+    assert contract["operator_approval_decision_id"] == "exec-approval:abc"
+    assert len(executed) == 1
+    params = executed[0][1]
+    persisted_contract = json.loads(params["safety_checks_json"])
+    persisted_raw = json.loads(params["raw_broker_json"])
+    assert persisted_contract["operator_approval_status"] == "approved"
+    assert persisted_contract["broker_reconciliation_status"] == "not_run"
+    assert persisted_contract["live_submission_allowed"] is False
+    assert persisted_raw["execution_safety_contract"] == persisted_contract
+
+
+def test_operator_api_execution_approval_after_live_allowance_preserves_live_gate(monkeypatch):
+    executed: list[tuple[str, dict[str, object]]] = []
+
+    class FakeCursor:
+        rowcount = 1
+
+        def execute(self, query, params=None):
+            executed.append((str(query), dict(params or {})))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    existing_contract = {
+        "operator_approval_required": True,
+        "operator_approval_status": "approved",
+        "broker_reconciliation_required": True,
+        "broker_reconciliation_status": "reconciled",
+        "live_evidence_status": "passed",
+        "live_evidence_successful_runs": 3,
+        "live_submission_allowed": True,
+        "live_allowance_allowed_at": "2026-06-10T10:00:00+00:00",
+        "post_live_allowance_approval_required": True,
+        "post_live_allowance_approval_status": "missing",
+    }
+    execution_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "safety_checks_json": json.dumps(existing_contract),
+        "raw_broker_json": json.dumps({"execution_safety_contract": existing_contract}),
+    }
+    decision_row = {
+        "decision_id": "exec-approval:fresh",
+        "decided_at": pd.Timestamp("2026-06-10T10:05:00Z"),
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "decision": "approve_dry_run",
+        "rationale": "Freshly reviewed after live allowance was granted.",
+    }
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        query_text = str(query)
+        if operator_api.EXECUTION_APPROVAL_DECISIONS_TABLE in query_text:
+            return pd.DataFrame([decision_row])
+        if operator_api.EXECUTION_TABLE in query_text:
+            return pd.DataFrame([execution_row])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table in {operator_api.EXECUTION_TABLE, operator_api.EXECUTION_APPROVAL_DECISIONS_TABLE})
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(operator_api, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(operator_api, "execute_db_operation", lambda operation, **_kwargs: operation())
+
+    payload = operator_api.apply_execution_approval_contract_payload(
+        {
+            "confirm": True,
+            "rationale": "Operator reviewed dry-run again after live allowance.",
+            "row": {
+                "asof_date": "2026-06-10T00:00:00Z",
+                "published_on": "2026-06-10T09:30:00Z",
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+            },
+        }
+    )
+
+    assert payload["status"] == "ok"
+    contract = payload["safety_contract"]
+    assert contract["live_submission_allowed"] is True
+    assert contract["post_live_allowance_approval_required"] is True
+    assert contract["post_live_allowance_approval_status"] == "approved"
+    assert contract["post_live_allowance_approval_decision_id"] == "exec-approval:fresh"
+    params = executed[0][1]
+    persisted_contract = json.loads(params["safety_checks_json"])
+    persisted_raw = json.loads(params["raw_broker_json"])
+    assert persisted_contract["live_submission_allowed"] is True
+    assert persisted_contract["post_live_allowance_approval_status"] == "approved"
+    assert persisted_raw["execution_safety_contract"] == persisted_contract
+
+
+def test_operator_api_execution_reconciliation_preview_does_not_persist_or_submit(monkeypatch):
+    persisted: list[tuple[pd.DataFrame, pd.DataFrame]] = []
+    target_df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "correlation_id": "c1",
+                "execution_status": "planned",
+            }
+        ]
+    )
+    order_df = target_df.assign(
+        broker_order_id="broker-1",
+        broker_order_status="TRADED",
+        execution_status="filled",
+        safety_checks_json=json.dumps({"broker_reconciliation_status": "reconciled", "live_submission_allowed": False}),
+    )
+    fills_df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "correlation_id": "c1",
+                "broker_order_id": "broker-1",
+                "exchange_trade_id": "trade-1",
+                "traded_quantity": 10,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(operator_api, "load_recon_targets", lambda **kwargs: target_df.copy())
+    monkeypatch.setattr(operator_api, "reconcile_live_orders", lambda **kwargs: (order_df.copy(), fills_df.copy()))
+    monkeypatch.setattr(operator_api, "persist_reconciliation", lambda orders, fills: persisted.append((orders.copy(), fills.copy())))
+
+    payload = operator_api.run_execution_reconciliation_payload(
+        {
+            "dry_run": True,
+            "row": {
+                "asof_date": "2026-06-10T00:00:00Z",
+                "setup_id": "SETUP",
+                "symbol": "abc",
+            },
+        }
+    )
+
+    assert payload["status"] == "ok"
+    assert payload["dry_run"] is True
+    assert payload["mode"] == "dry_run"
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["operator_boundary"]["persists_reconciliation"] is False
+    assert payload["operator_boundary"]["submits_broker_orders"] is False
+    assert payload["operator_boundary"]["live_submission_allowed"] is False
+    assert payload["summary"]["target_count"] == 1
+    assert payload["summary"]["reconciled_count"] == 1
+    assert payload["summary"]["fill_count"] == 1
+    assert payload["summary"]["filters"]["symbols"] == ["ABC"]
+    assert persisted == []
+
+
+def test_operator_api_execution_reconciliation_apply_requires_confirm_and_persists_only_reconciliation(monkeypatch):
+    persisted: list[tuple[pd.DataFrame, pd.DataFrame]] = []
+    target_df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "correlation_id": "c1",
+                "execution_status": "planned",
+            }
+        ]
+    )
+    order_df = target_df.assign(broker_order_id="broker-1", broker_order_status="TRADED", execution_status="filled")
+    fills_df = pd.DataFrame([{"symbol": "ABC", "exchange_trade_id": "trade-1", "traded_quantity": 10}])
+
+    monkeypatch.setattr(operator_api, "load_recon_targets", lambda **kwargs: target_df.copy())
+    monkeypatch.setattr(operator_api, "reconcile_live_orders", lambda **kwargs: (order_df.copy(), fills_df.copy()))
+    monkeypatch.setattr(operator_api, "persist_reconciliation", lambda orders, fills: persisted.append((orders.copy(), fills.copy())))
+
+    with pytest.raises(ValueError, match="confirm=true"):
+        operator_api.run_execution_reconciliation_payload({"apply": True, "row": {"symbol": "ABC"}})
+
+    payload = operator_api.run_execution_reconciliation_payload(
+        {
+            "apply": True,
+            "confirm": True,
+            "row": {
+                "asof_date": "2026-06-10T00:00:00Z",
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+            },
+        }
+    )
+
+    assert payload["mode"] == "apply"
+    assert payload["dry_run"] is False
+    assert payload["api_schema"]["read_only"] is False
+    assert payload["operator_boundary"] == {
+        "reads_broker_order_state": True,
+        "persists_reconciliation": True,
+        "updates_reconciliation_status": True,
+        "updates_operator_approval_status": False,
+        "approves_live_submission": False,
+        "live_submission_allowed": False,
+        "submits_broker_orders": False,
+        "requires_confirm_for_apply": True,
+    }
+    assert len(persisted) == 1
+    assert persisted[0][0].iloc[0]["execution_status"] == "filled"
+
+
+def test_operator_api_execution_evidence_preview_is_read_only(monkeypatch):
+    upserts: list[tuple[pd.DataFrame, str, dict[str, object]]] = []
+    executed: list[tuple[str, dict[str, object]]] = []
+    base_contract = {
+        "operator_approval_required": True,
+        "operator_approval_status": "approved",
+        "broker_reconciliation_required": True,
+        "broker_reconciliation_status": "reconciled",
+        "live_evidence_required": True,
+        "live_evidence_status": "missing",
+        "live_evidence_successful_runs": 0,
+        "live_evidence_min_successful_runs": 3,
+        "live_submission_allowed": False,
+    }
+
+    def row_for(date: str, unique_id: str) -> dict[str, object]:
+        return {
+            "asof_date": pd.Timestamp(f"{date}T00:00:00Z"),
+            "published_on": pd.Timestamp(f"{date}T09:30:00Z"),
+            "setup_id": "SETUP",
+            "symbol": "ABC",
+            "unique_id": unique_id,
+            "transaction_type": "BUY",
+            "execution_status": "planned",
+            "live_mode": False,
+            "safety_checks_json": json.dumps(base_contract),
+            "raw_broker_json": json.dumps({"execution_safety_contract": base_contract}),
+            "load_ts": pd.Timestamp(f"{date}T09:35:00Z"),
+        }
+
+    current_row = row_for("2026-06-10", "u1")
+    evidence_rows = [current_row, row_for("2026-06-09", "u0"), row_for("2026-06-08", "u-1")]
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        query_text = str(query)
+        if "asof_date <=" in query_text:
+            return pd.DataFrame(evidence_rows)
+        if operator_api.EXECUTION_TABLE in query_text:
+            return pd.DataFrame([current_row])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, table, **kwargs: upserts.append((df.copy(), table, kwargs)))
+    monkeypatch.setattr(operator_api, "execute_db_operation", lambda operation, **kwargs: executed.append(("execute", kwargs)) or operation())
+
+    payload = operator_api.apply_execution_evidence_review_payload(
+        {
+            "dry_run": True,
+            "row": {
+                "asof_date": "2026-06-10T00:00:00Z",
+                "published_on": "2026-06-10T09:30:00Z",
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "transaction_type": "BUY",
+            },
+        }
+    )
+
+    assert payload["mode"] == "preview"
+    assert payload["dry_run"] is True
+    assert payload["decision"] == "passed"
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["operator_boundary"]["records_audit"] is False
+    assert payload["operator_boundary"]["mutates_execution_orders"] is False
+    assert payload["operator_boundary"]["submits_broker_orders"] is False
+    assert payload["evidence"]["successful_runs"] == 3
+    assert payload["evidence"]["required_runs"] == 3
+    assert upserts == []
+    assert executed == []
+
+
+def test_operator_api_execution_evidence_apply_writes_audit_and_evidence_only(monkeypatch):
+    upserts: list[tuple[pd.DataFrame, str, dict[str, object]]] = []
+    executed: list[tuple[str, dict[str, object]]] = []
+
+    class FakeCursor:
+        rowcount = 1
+
+        def execute(self, query, params=None):
+            executed.append((str(query), dict(params or {})))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    base_contract = {
+        "operator_approval_required": True,
+        "operator_approval_status": "approved",
+        "broker_reconciliation_required": True,
+        "broker_reconciliation_status": "reconciled",
+        "live_evidence_required": True,
+        "live_evidence_status": "missing",
+        "live_evidence_successful_runs": 0,
+        "live_evidence_min_successful_runs": 3,
+        "live_submission_allowed": False,
+    }
+
+    def row_for(date: str, unique_id: str) -> dict[str, object]:
+        return {
+            "asof_date": pd.Timestamp(f"{date}T00:00:00Z"),
+            "published_on": pd.Timestamp(f"{date}T09:30:00Z"),
+            "setup_id": "SETUP",
+            "symbol": "ABC",
+            "unique_id": unique_id,
+            "transaction_type": "BUY",
+            "execution_status": "planned",
+            "live_mode": False,
+            "safety_checks_json": json.dumps(base_contract),
+            "raw_broker_json": json.dumps({"execution_safety_contract": base_contract}),
+            "load_ts": pd.Timestamp(f"{date}T09:35:00Z"),
+        }
+
+    current_row = row_for("2026-06-10", "u1")
+    evidence_rows = [current_row, row_for("2026-06-09", "u0"), row_for("2026-06-08", "u-1")]
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        query_text = str(query)
+        if "asof_date <=" in query_text:
+            return pd.DataFrame(evidence_rows)
+        if operator_api.EXECUTION_TABLE in query_text:
+            return pd.DataFrame([current_row])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(operator_api, "apply_schema_migration", lambda **kwargs: {"status": "applied", **kwargs})
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, table, **kwargs: upserts.append((df.copy(), table, kwargs)))
+    monkeypatch.setattr(operator_api, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(operator_api, "execute_db_operation", lambda operation, **kwargs: operation())
+
+    payload = operator_api.apply_execution_evidence_review_payload(
+        {
+            "apply": True,
+            "confirm": True,
+            "rationale": "Reviewed three clean dry-run/reconciliation cycles.",
+            "operator_id": "tester",
+            "row": {
+                "asof_date": "2026-06-10T00:00:00Z",
+                "published_on": "2026-06-10T09:30:00Z",
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "transaction_type": "BUY",
+            },
+        }
+    )
+
+    assert payload["mode"] == "apply"
+    assert payload["decision"] == "passed"
+    assert payload["operator_boundary"] == {
+        "records_audit": True,
+        "mutates_execution_orders": True,
+        "updates_live_evidence_status": True,
+        "updates_operator_approval_status": False,
+        "updates_reconciliation_status": False,
+        "live_submission_allowed": False,
+        "submits_broker_orders": False,
+        "requires_confirm_for_apply": True,
+    }
+    assert upserts[0][1] == operator_api.EXECUTION_EVIDENCE_REVIEWS_TABLE
+    audit_row = upserts[0][0].iloc[0].to_dict()
+    assert audit_row["decision"] == "passed"
+    assert audit_row["successful_runs"] == 3
+    assert audit_row["applied"] is True
+    assert len(executed) == 1
+    params = executed[0][1]
+    persisted_contract = json.loads(params["safety_checks_json"])
+    persisted_raw = json.loads(params["raw_broker_json"])
+    assert persisted_contract["live_evidence_status"] == "passed"
+    assert persisted_contract["live_evidence_successful_runs"] == 3
+    assert persisted_contract["live_submission_allowed"] is False
+    assert persisted_contract["operator_approval_status"] == "approved"
+    assert persisted_contract["broker_reconciliation_status"] == "reconciled"
+    assert persisted_raw["execution_safety_contract"] == persisted_contract
+
+
+def test_operator_api_execution_evidence_apply_refuses_insufficient_runs(monkeypatch):
+    base_contract = {
+        "operator_approval_status": "approved",
+        "broker_reconciliation_status": "reconciled",
+        "live_submission_allowed": False,
+    }
+    current_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "transaction_type": "BUY",
+        "execution_status": "planned",
+        "live_mode": False,
+        "safety_checks_json": json.dumps(base_contract),
+        "raw_broker_json": json.dumps({"execution_safety_contract": base_contract}),
+    }
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        return pd.DataFrame([current_row])
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+
+    with pytest.raises(ValueError, match="Only 1 successful evidence date"):
+        operator_api.apply_execution_evidence_review_payload(
+            {
+                "apply": True,
+                "confirm": True,
+                "rationale": "not enough evidence",
+                "row": {
+                    "asof_date": "2026-06-10T00:00:00Z",
+                    "published_on": "2026-06-10T09:30:00Z",
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "transaction_type": "BUY",
+                },
+            }
+        )
+
+
+def test_operator_api_execution_live_allowance_preview_is_read_only(monkeypatch):
+    executed: list[tuple[str, dict[str, object]]] = []
+    upserts: list[tuple[pd.DataFrame, str, dict[str, object]]] = []
+    contract = {
+        "operator_approval_status": "approved",
+        "broker_reconciliation_status": "reconciled",
+        "live_evidence_status": "passed",
+        "live_evidence_successful_runs": 3,
+        "live_evidence_min_successful_runs": 3,
+        "live_submission_allowed": False,
+    }
+    execution_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "transaction_type": "BUY",
+        "safety_checks_json": json.dumps(contract),
+        "raw_broker_json": json.dumps({"execution_safety_contract": contract}),
+    }
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: pd.DataFrame([execution_row]))
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, table, **kwargs: upserts.append((df.copy(), table, kwargs)))
+    monkeypatch.setattr(operator_api, "execute_db_operation", lambda operation, **kwargs: executed.append(("execute", kwargs)) or operation())
+
+    payload = operator_api.apply_execution_live_allowance_payload(
+        {
+            "dry_run": True,
+            "row": {
+                "asof_date": "2026-06-10T00:00:00Z",
+                "published_on": "2026-06-10T09:30:00Z",
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "transaction_type": "BUY",
+            },
+        }
+    )
+
+    assert payload["mode"] == "preview"
+    assert payload["decision"] == "ready"
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["operator_boundary"]["expected_confirmation_phrase"] == "ALLOW LIVE ABC SETUP u1"
+    assert payload["operator_boundary"]["mutates_execution_orders"] is False
+    assert payload["operator_boundary"]["submits_broker_orders"] is False
+    assert upserts == []
+    assert executed == []
+
+
+def test_operator_api_execution_live_allowance_apply_sets_only_live_allowed(monkeypatch):
+    upserts: list[tuple[pd.DataFrame, str, dict[str, object]]] = []
+    executed: list[tuple[str, dict[str, object]]] = []
+
+    class FakeCursor:
+        rowcount = 1
+
+        def execute(self, query, params=None):
+            executed.append((str(query), dict(params or {})))
+
+    class FakeSession:
+        def __enter__(self):
+            return None, FakeCursor()
+
+        def __exit__(self, *_args):
+            return False
+
+    contract = {
+        "operator_approval_status": "approved",
+        "broker_reconciliation_status": "reconciled",
+        "live_evidence_status": "passed",
+        "live_evidence_successful_runs": 3,
+        "live_evidence_min_successful_runs": 3,
+        "live_submission_allowed": False,
+    }
+    execution_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "transaction_type": "BUY",
+        "safety_checks_json": json.dumps(contract),
+        "raw_broker_json": json.dumps({"execution_safety_contract": contract}),
+    }
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: pd.DataFrame([execution_row]))
+    monkeypatch.setattr(operator_api, "apply_schema_migration", lambda **kwargs: {"status": "applied", **kwargs})
+    monkeypatch.setattr(operator_api, "upsert_to_db", lambda df, table, **kwargs: upserts.append((df.copy(), table, kwargs)))
+    monkeypatch.setattr(operator_api, "db_session", lambda: FakeSession())
+    monkeypatch.setattr(operator_api, "execute_db_operation", lambda operation, **kwargs: operation())
+
+    payload = operator_api.apply_execution_live_allowance_payload(
+        {
+            "apply": True,
+            "confirm": True,
+            "confirmation_phrase": "ALLOW LIVE ABC SETUP u1",
+            "rationale": "All approval, reconciliation, and evidence gates reviewed.",
+            "operator_id": "tester",
+            "row": {
+                "asof_date": "2026-06-10T00:00:00Z",
+                "published_on": "2026-06-10T09:30:00Z",
+                "setup_id": "SETUP",
+                "symbol": "ABC",
+                "unique_id": "u1",
+                "transaction_type": "BUY",
+            },
+        }
+    )
+
+    assert payload["mode"] == "apply"
+    assert payload["decision"] == "ready"
+    assert payload["operator_boundary"]["updates_live_submission_allowed"] is True
+    assert payload["operator_boundary"]["submits_broker_orders"] is False
+    assert upserts[0][1] == operator_api.EXECUTION_LIVE_ALLOWANCE_REVIEWS_TABLE
+    audit_row = upserts[0][0].iloc[0].to_dict()
+    assert audit_row["applied"] is True
+    assert audit_row["confirmation_phrase"] == "ALLOW LIVE ABC SETUP u1"
+    params = executed[0][1]
+    persisted_contract = json.loads(params["safety_checks_json"])
+    persisted_raw = json.loads(params["raw_broker_json"])
+    assert persisted_contract["live_submission_allowed"] is True
+    assert persisted_contract["operator_approval_status"] == "approved"
+    assert persisted_contract["broker_reconciliation_status"] == "reconciled"
+    assert persisted_contract["live_evidence_status"] == "passed"
+    assert persisted_contract["post_live_allowance_approval_required"] is True
+    assert persisted_contract["post_live_allowance_approval_status"] == "missing"
+    assert persisted_raw["execution_safety_contract"] == persisted_contract
+
+
+def test_operator_api_execution_live_allowance_refuses_unmet_prerequisites(monkeypatch):
+    contract = {
+        "operator_approval_status": "approved",
+        "broker_reconciliation_status": "not_run",
+        "live_evidence_status": "passed",
+        "live_evidence_successful_runs": 3,
+        "live_evidence_min_successful_runs": 3,
+        "live_submission_allowed": False,
+    }
+    execution_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "transaction_type": "BUY",
+        "safety_checks_json": json.dumps(contract),
+        "raw_broker_json": json.dumps({"execution_safety_contract": contract}),
+    }
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: pd.DataFrame([execution_row]))
+
+    with pytest.raises(ValueError, match="Broker reconciliation is not_run"):
+        operator_api.apply_execution_live_allowance_payload(
+            {
+                "apply": True,
+                "confirm": True,
+                "confirmation_phrase": "ALLOW LIVE ABC SETUP u1",
+                "rationale": "missing recon",
+                "row": {
+                    "asof_date": "2026-06-10T00:00:00Z",
+                    "published_on": "2026-06-10T09:30:00Z",
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "transaction_type": "BUY",
+                },
+            }
+        )
+
+
+def test_operator_api_execution_live_submit_preflight_builds_manual_command_without_submitting(monkeypatch):
+    contract = {
+        "operator_approval_required": True,
+        "operator_approval_status": "approved",
+        "broker_reconciliation_required": True,
+        "broker_reconciliation_status": "reconciled",
+        "live_evidence_required": True,
+        "live_evidence_status": "passed",
+        "live_evidence_successful_runs": 3,
+        "live_evidence_min_successful_runs": 3,
+        "live_submission_allowed": True,
+    }
+    execution_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "correlation_id": "c1",
+        "transaction_type": "BUY",
+        "security_id": 12345,
+        "quantity": 10,
+        "reference_price": 101.5,
+        "estimated_order_value_inr": 1015.0,
+        "execution_status": "planned",
+        "safety_checks_json": json.dumps(contract),
+        "raw_broker_json": json.dumps({"execution_safety_contract": contract}),
+    }
+    df = pd.DataFrame([execution_row])
+
+    monkeypatch.setenv("STOCKEY_LIVE_TRADING_ENABLED", "true")
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: df.copy())
+
+    payload = operator_api.build_execution_live_submit_preflight_payload(
+        {
+            "asof_date": "2026-06-10",
+            "symbols": ["abc"],
+            "setup_ids": ["SETUP"],
+        }
+    )
+
+    expected_token = execution_engine.build_live_execution_confirmation_token(df)
+    assert payload["decision"] == "ready"
+    assert payload["expected_live_token"] == expected_token
+    assert payload["cli_command_preview"] == (
+        "STOCKEY_LIVE_TRADING_ENABLED=true python -m advisory.execution_engine --live --include-existing --date 2026-06-10 --symbols ABC --setup SETUP "
+        f"--live-confirmation {expected_token}"
+    )
+    assert payload["operator_boundary"]["read_only"] is True
+    assert payload["operator_boundary"]["submits_broker_orders"] is False
+    assert payload["operator_boundary"]["mutates_execution_orders"] is False
+    assert payload["summary"]["eligible_planned_rows"] == 1
+    assert payload["blockers"] == []
+
+
+def test_operator_api_execution_live_submit_preflight_blocks_without_env_or_contract(monkeypatch):
+    contract = {
+        "operator_approval_status": "approved",
+        "broker_reconciliation_status": "not_run",
+        "live_evidence_status": "passed",
+        "live_evidence_successful_runs": 3,
+        "live_evidence_min_successful_runs": 3,
+        "live_submission_allowed": False,
+    }
+    execution_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "transaction_type": "BUY",
+        "security_id": 12345,
+        "quantity": 10,
+        "reference_price": 101.5,
+        "execution_status": "planned",
+        "safety_checks_json": json.dumps(contract),
+        "raw_broker_json": json.dumps({"execution_safety_contract": contract}),
+    }
+
+    monkeypatch.delenv("STOCKEY_LIVE_TRADING_ENABLED", raising=False)
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: table == operator_api.EXECUTION_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *args, **kwargs: pd.DataFrame([execution_row]))
+
+    payload = operator_api.build_execution_live_submit_preflight_payload({"asof_date": "2026-06-10"})
+
+    assert payload["decision"] == "blocked"
+    assert payload["expected_live_token"] is None
+    assert payload["operator_boundary"]["submits_broker_orders"] is False
+    assert "No planned execution rows are eligible for live submission." in payload["blockers"]
+    assert any("Broker reconciliation is not_run." in blocker for blocker in payload["blockers"])
+
+
+def test_operator_api_refuses_execution_contract_update_without_approve_decision(monkeypatch):
+    execution_row = {
+        "asof_date": pd.Timestamp("2026-06-10T00:00:00Z"),
+        "published_on": pd.Timestamp("2026-06-10T09:30:00Z"),
+        "setup_id": "SETUP",
+        "symbol": "ABC",
+        "unique_id": "u1",
+        "safety_checks_json": json.dumps({"operator_approval_status": "missing"}),
+        "raw_broker_json": "{}",
+    }
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        if operator_api.EXECUTION_APPROVAL_DECISIONS_TABLE in str(query):
+            return pd.DataFrame([{"decision": "needs_reconciliation"}])
+        return pd.DataFrame([execution_row])
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table: True)
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+
+    with pytest.raises(ValueError, match="approve_dry_run is required"):
+        operator_api.apply_execution_approval_contract_payload(
+            {
+                "confirm": True,
+                "rationale": "try",
+                "row": {
+                    "asof_date": "2026-06-10T00:00:00Z",
+                    "published_on": "2026-06-10T09:30:00Z",
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                },
+            }
+        )
 
 
 def test_operator_api_runtime_payload_flags_stale_code(monkeypatch):
@@ -7335,13 +9632,14 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     monkeypatch.setattr(operator_health, "check_operator_api_errors", lambda: {"status": "ok", "message": "api errors ok", "rows": []})
     monkeypatch.setattr(operator_health, "check_screener_failures", lambda limit=10: {"status": "ok", "message": "screener ok", "active_count": 0, "rows": []})
     monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
-    monkeypatch.setattr(operator_health, "summarize_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
+    monkeypatch.setattr(operator_health, "check_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
     monkeypatch.setattr(operator_health, "check_table_freshness", lambda **_kwargs: [{"status": "warn", "message": "stale", "name": "actions"}])
     monkeypatch.setattr(operator_health, "check_redis", lambda: {"status": "ok", "message": "redis ok"})
     monkeypatch.setattr(operator_health, "check_dhan_token", lambda: {"status": "ok", "message": "dhan ok"})
     monkeypatch.setattr(operator_health, "check_dhan_cache", lambda: {"status": "ok", "message": "dhan cache ok"})
     monkeypatch.setattr(operator_health, "check_optional_dependencies", lambda: [{"status": "ok", "message": "deps ok"}])
     monkeypatch.setattr(operator_health, "check_frontend_dependencies", lambda: {"status": "ok", "message": "frontend ok"})
+    monkeypatch.setattr(operator_health, "check_frontend_runtime", lambda: {"status": "ok", "message": "frontend runtime ok"})
 
     payload = operator_health.build_operator_health(log_dir=log_dir, detail_level="full")
 
@@ -7356,6 +9654,95 @@ def test_operator_health_summarizes_worst_status(monkeypatch, tmp_path):
     assert any(row["category"] == "pipeline" for row in payload["current_blockers"]["rows"])
     assert payload["sections"]["trust_gate"]["status"] == "warn"
     assert payload["sections"]["trust_gate"]["trust_level"] == "review_required"
+
+
+def test_operator_health_fast_mode_defers_heavy_db_diagnostics(monkeypatch, tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory.log").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "stage_timings": [{"stage": "rules", "elapsed_seconds": 1.0, "budget_seconds": 900.0, "over_budget": False}],
+                "stage_budget": {"active_budget_seconds": 900.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(operator_health, "check_database", lambda: {"status": "ok", "message": "db ok"})
+    monkeypatch.setattr(operator_health, "check_operator_api", lambda: {"status": "ok", "message": "api ok"})
+    monkeypatch.setattr(operator_health, "check_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
+    monkeypatch.setattr(operator_health, "check_api_latency_probe", lambda: {"status": "ok", "message": "latency ok"})
+    monkeypatch.setattr(operator_health, "check_operator_snapshot", lambda: {"status": "ok", "message": "snapshot ok"})
+    monkeypatch.setattr(operator_health, "check_redis", lambda: {"status": "ok", "message": "redis ok"})
+    monkeypatch.setattr(operator_health, "check_optional_dependencies", lambda: [{"status": "ok", "message": "deps ok"}])
+    monkeypatch.setattr(operator_health, "check_frontend_dependencies", lambda: {"status": "ok", "message": "frontend ok"})
+    monkeypatch.setattr(operator_health, "check_frontend_runtime", lambda: {"status": "ok", "message": "frontend runtime ok"})
+    monkeypatch.setattr(operator_health, "check_dhan_cache", lambda: {"status": "ok", "message": "dhan cache ok"})
+
+    heavy_checks = [
+        "check_trace_summaries",
+        "check_identity_issues",
+        "check_signal_quality",
+        "check_feature_stage_gates",
+        "check_lifecycle_policy_change_audit",
+        "check_sync_state_failures",
+        "check_watcher_source_counters",
+        "check_downloader_run_state",
+        "check_ingestion_file_state_failures",
+        "check_schema_migrations",
+    ]
+    for name in heavy_checks:
+        monkeypatch.setattr(operator_health, name, lambda *args, _name=name, **kwargs: (_ for _ in ()).throw(AssertionError(f"{_name} should be deferred in fast mode")))
+
+    payload = operator_health.build_operator_health(log_dir=log_dir, include_dhan=False, detail_level="fast")
+
+    assert payload["detail_level"] == "fast"
+    assert payload["sections"]["trace_summaries"]["deferred"] is True
+    assert payload["sections"]["operator_snapshot"]["status"] == "ok"
+    assert payload["sections"]["identity_issues"]["deferred"] is True
+    assert payload["sections"]["feature_stage_gates"]["deferred"] is True
+    assert payload["sections"]["sync_state_failures"][0]["deferred"] is True
+    assert payload["sections"]["advisory_stage_report"]["status"] == "ok"
+    assert payload["deferred_diagnostics"]["status"] == "warn"
+    assert payload["deferred_diagnostics"]["count"] >= 10
+    deferred_sections = {row["section"] for row in payload["deferred_diagnostics"]["rows"]}
+    assert {"trace_summaries", "identity_issues", "feature_stage_gates", "sync_state_failures"}.issubset(deferred_sections)
+    assert payload["deferred_diagnostics"]["full_diagnostics_command"] == "python -m advisory.operator_health --full --skip-dhan"
+
+
+def test_operator_health_fast_mode_surfaces_stale_operator_snapshot(monkeypatch, tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory.log").write_text('{"status": "ok", "stage_timings": []}', encoding="utf-8")
+
+    monkeypatch.setattr(operator_health, "check_database", lambda: {"status": "ok", "message": "db ok"})
+    monkeypatch.setattr(operator_health, "check_operator_api", lambda: {"status": "ok", "message": "api ok"})
+    monkeypatch.setattr(operator_health, "check_slow_operations", lambda limit=20: {"status": "ok", "returned_count": 0, "issues": []})
+    monkeypatch.setattr(operator_health, "check_api_latency_probe", lambda: {"status": "ok", "message": "latency ok"})
+    monkeypatch.setattr(
+        operator_health,
+        "check_operator_snapshot",
+        lambda: {
+            "status": "warn",
+            "message": "Operator snapshot is stale.",
+            "generated_at": "2026-06-09T08:51:04Z",
+            "age_seconds": 280000,
+            "max_age_seconds": 86400,
+        },
+    )
+    monkeypatch.setattr(operator_health, "check_redis", lambda: {"status": "ok", "message": "redis ok"})
+    monkeypatch.setattr(operator_health, "check_optional_dependencies", lambda: [{"status": "ok", "message": "deps ok"}])
+    monkeypatch.setattr(operator_health, "check_frontend_dependencies", lambda: {"status": "ok", "message": "frontend ok"})
+    monkeypatch.setattr(operator_health, "check_frontend_runtime", lambda: {"status": "ok", "message": "frontend runtime ok"})
+    monkeypatch.setattr(operator_health, "check_dhan_cache", lambda: {"status": "ok", "message": "dhan cache ok"})
+
+    payload = operator_health.build_operator_health(log_dir=log_dir, include_dhan=False, detail_level="fast")
+
+    assert payload["sections"]["operator_snapshot"]["status"] == "warn"
+    assert any(row["key"] == "operator_snapshot" for row in payload["sections"]["trust_gate"]["checks"])
+    assert any(hint["title"] == "Operator snapshot is stale or unavailable" for hint in payload["fix_hints"])
 
 
 def test_operator_health_schema_migrations_warns_when_registry_missing(monkeypatch):
@@ -7442,6 +9829,219 @@ def test_operator_health_schema_migrations_surface_fix_hint():
     assert "utils.schema_migrations --list" in commands
 
 
+def test_operator_health_api_latency_probe_fix_hint_uses_ranked_report():
+    hints = operator_health.build_fix_hints(
+        {
+            "api_latency_probe": {
+                "status": "warn",
+                "message": "API latency probe found slow endpoints.",
+                "path": "logs/performance/latest_api_latency_probe.json",
+                "command": "python scripts/api_latency_probe.py --output-path logs/performance/latest_api_latency_probe.json",
+                "performance_report_command": "python scripts/api_performance_report.py --limit 20",
+                "slow_count": 1,
+                "error_count": 0,
+            }
+        }
+    )
+
+    hint = next(row for row in hints if row["title"] == "Operator API latency probe is stale or unhealthy")
+    assert "python scripts/api_latency_probe.py --output-path logs/performance/latest_api_latency_probe.json" in hint["commands"]
+    assert "python scripts/api_performance_report.py --limit 20" in hint["commands"]
+
+
+def test_operator_health_slow_operations_suppresses_unreproduced_history(tmp_path):
+    probe_path = tmp_path / "latest_api_latency_probe.json"
+    state_file = tmp_path / "slow_operation_state.json"
+    probe_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-11T00:00:00+00:00",
+                "rows": [
+                    {"endpoint": "/api/actions", "elapsed_ms": 120.0, "body_bytes": 1200, "status_code": 200, "error": None},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-06-11T00:05:00+00:00",
+                "issues": {
+                    "manual": {
+                        "fingerprint": "manual",
+                        "kind": "operator_api_request",
+                        "operation": "GET /api/manual-review",
+                        "status": "open",
+                        "count": 4,
+                        "max_elapsed_ms": 4000,
+                        "last_elapsed_ms": 3000,
+                        "last_seen_at": "2026-06-10T00:00:00+00:00",
+                        "last_details": {"route": "/api/manual-review"},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    section = operator_health.check_slow_operations(
+        limit=5,
+        state_file=state_file,
+        probe_path=probe_path,
+        max_probe_age_seconds=100000 * 3600,
+    )
+    hints = operator_health.build_fix_hints({"slow_operations": section})
+    feed = operator_health.build_degradation_feed({"slow_operations": section, "cron_logs": [], "sync_state_failures": []})
+
+    assert section["status"] == "ok"
+    assert section["active_issue_count"] == 0
+    assert section["historical_issue_count"] == 1
+    assert section["issues"] == []
+    assert section["historical_issues"][0]["historical_context"] is True
+    assert all(hint["title"] != "Open slow-operation issues exist" for hint in hints)
+    assert any(row["kind"] == "slow_operation_historical" and row["recovered"] is True for row in feed["rows"])
+
+
+def test_operator_health_slow_operations_keeps_reproduced_probe_slow_route_active(tmp_path):
+    probe_path = tmp_path / "latest_api_latency_probe.json"
+    state_file = tmp_path / "slow_operation_state.json"
+    probe_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-11T00:00:00+00:00",
+                "rows": [
+                    {"endpoint": "/api/actions?compact=true", "elapsed_ms": 760.0, "body_bytes": 1200, "status_code": 200, "error": None, "slow_logged": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-06-11T00:05:00+00:00",
+                "issues": {
+                    "actions": {
+                        "fingerprint": "actions",
+                        "kind": "operator_api_request",
+                        "operation": "GET /api/actions",
+                        "status": "open",
+                        "count": 4,
+                        "max_elapsed_ms": 2500,
+                        "last_elapsed_ms": 1800,
+                        "last_seen_at": "2026-06-11T00:00:00+00:00",
+                        "last_details": {"route": "/api/actions"},
+                    },
+                    "manual": {
+                        "fingerprint": "manual",
+                        "kind": "operator_api_request",
+                        "operation": "GET /api/manual-review",
+                        "status": "open",
+                        "count": 4,
+                        "max_elapsed_ms": 4000,
+                        "last_elapsed_ms": 3000,
+                        "last_seen_at": "2026-06-10T00:00:00+00:00",
+                        "last_details": {"route": "/api/manual-review"},
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    section = operator_health.check_slow_operations(
+        limit=5,
+        state_file=state_file,
+        probe_path=probe_path,
+        max_probe_age_seconds=100000 * 3600,
+    )
+
+    assert section["status"] == "warn"
+    assert section["active_issue_count"] == 1
+    assert section["historical_issue_count"] == 1
+    assert section["issues"][0]["operation"] == "GET /api/actions"
+    assert section["historical_issues"][0]["operation"] == "GET /api/manual-review"
+
+
+def test_operator_health_advisory_stage_report_warns_when_summary_missing(tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory.log").write_text("Traceback: failed before summary\n", encoding="utf-8")
+
+    report = operator_health.check_advisory_stage_report(log_dir)
+    hints = operator_health.build_fix_hints({"advisory_stage_report": report})
+
+    assert report["status"] == "warn"
+    assert report["stage_count"] == 0
+    assert report["operations_command"] == "advisory_stage_report"
+    hint = next(row for row in hints if row["title"] == "Advisory stage timing report needs attention")
+    assert "advisory_stage_report.py" in " ".join(hint["commands"])
+    assert hint["details"]["operations_command"] == "advisory_stage_report"
+
+
+def test_operator_health_advisory_stage_report_surfaces_failed_marker_stage(tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory.log").write_text(
+        "\n".join(
+            [
+                "[stockey.script] name=all_advisory status=start timestamp=2026-06-12T13:40:00Z",
+                "[advisory.pipeline] stage=screeners start",
+                "[advisory.pipeline] stage=screeners done elapsed=2.85s rows=126",
+                "[advisory.pipeline] stage=peer_sync start",
+                "[advisory.pipeline] stage=peer_sync running elapsed=30.01s",
+                "[advisory.pipeline] stage=peer_sync done elapsed=255.48s",
+                "[advisory.pipeline] stage=intraday start",
+                "Traceback (most recent call last):",
+                "playwright._impl._errors.Error: It looks like you are using Playwright Sync API inside the asyncio loop.",
+                "[stockey.script] name=all_advisory status=failed exit_code=1 timestamp=2026-06-12T13:45:43Z",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = operator_health.check_advisory_stage_report(log_dir)
+    hints = operator_health.build_fix_hints({"advisory_stage_report": report})
+
+    assert report["status"] == "warn"
+    assert report["report_status"] == "failed"
+    assert report["summary_source"] == "log_markers"
+    assert report["failed_stage"] == "intraday"
+    assert report["stage_count"] == 3
+    assert "intraday" in report["message"]
+    assert report["ranked_stages"][0]["stage"] == "peer_sync"
+    hint = next(row for row in hints if row["title"] == "Advisory stage timing report needs attention")
+    assert "intraday" in hint["reason"]
+
+
+def test_operator_health_advisory_stage_report_warns_on_slow_stage(tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory.log").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "asof_date": "2026-06-11",
+                "stage_timings": [
+                    {"stage": "rules", "elapsed_seconds": 901.0, "budget_seconds": 900.0, "over_budget": True},
+                    {"stage": "portfolio", "elapsed_seconds": 5.0, "budget_seconds": 900.0, "over_budget": False},
+                ],
+                "stage_budget": {"active_budget_seconds": 900.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = operator_health.check_advisory_stage_report(log_dir)
+
+    assert report["status"] == "warn"
+    assert report["slow_stage_count"] == 1
+    assert report["ranked_stages"][0]["stage"] == "rules"
+
+
 def test_operator_health_current_blockers_prioritize_active_trust_issues():
     sections = {
         "database": {"status": "error", "message": "db down"},
@@ -7485,6 +10085,84 @@ def test_operator_health_current_blockers_prioritize_active_trust_issues():
     assert blockers["rows"][0]["category"] == "runtime"
     assert any(row["category"] == "data_freshness" for row in blockers["rows"])
     assert all("Historical cron errors recovered" not in row["title"] for row in blockers["rows"])
+
+
+def test_operator_health_current_blockers_dedupes_fix_hint_and_section_rows():
+    sections = {
+        "api_latency_probe": {
+            "status": "warn",
+            "message": "API latency probe found slow endpoints or stale probe data.",
+            "path": "logs/performance/latest_api_latency_probe.json",
+        },
+        "dhan_cache": {
+            "status": "error",
+            "message": "Dhan cached token is expired.",
+            "cache_path": ".cache/dhan/token.json",
+        },
+        "slow_operations": {
+            "status": "warn",
+            "returned_count": 20,
+            "issues": [{"operation": "GET /api/config-change/applications"}],
+        },
+        "degradation_feed": {
+            "status": "warn",
+            "active_count": 2,
+            "rows": [
+                {
+                    "status": "warn",
+                    "kind": "api_latency_probe",
+                    "title": "Operator API latency probe needs attention",
+                    "message": "API latency probe found slow endpoints or stale probe data.",
+                    "source": "logs/performance/latest_api_latency_probe.json",
+                },
+                {
+                    "status": "warn",
+                    "kind": "slow_operation",
+                    "title": "Slow operation open",
+                    "message": "GET /api/config-change/applications",
+                    "source": "slow_operation_state",
+                }
+            ],
+        },
+        "trust_gate": {
+            "status": "warn",
+            "message": "Summary should not become its own blocker.",
+            "trust_level": "review_required",
+        },
+    }
+    fix_hints = operator_health.build_fix_hints(sections)
+
+    blockers = operator_health.build_current_blockers(sections, fix_hints, limit=20)
+    titles = [str(row["title"]) for row in blockers["rows"]]
+
+    assert sum("API latency probe" in title for title in titles) == 1
+    assert sum("Dhan" in title and "token" in title.lower() for title in titles) == 1
+    assert sum("slow" in title.lower() for title in titles) == 1
+    assert all("trust gate" not in title.lower() for title in titles)
+    assert any(row["status"] == "error" and row["category"] == "broker_data" for row in blockers["rows"])
+
+
+def test_operator_health_dhan_cache_fix_hint_starts_cdp_before_refresh():
+    sections = {
+        "dhan_cache": {
+            "status": "error",
+            "message": "Dhan cached token is expired and no ready non-interactive refresh path was detected.",
+            "auth_refresh_ready": False,
+            "auto_login_configured": True,
+            "cdp_status": {"status": "warn", "message": "Chrome CDP endpoint is not reachable."},
+        }
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+    dhan_hint = next(hint for hint in hints if hint["title"] == "Dhan cached token needs attention")
+
+    assert dhan_hint["commands"] == [
+        "python -m data.dhanlive.auth_cli status",
+        "scripts/start_chrome_cdp.sh",
+        "python -m data.dhanlive.auth_cli ensure --auto-login",
+        "python -m advisory.operator_health --skip-dhan",
+    ]
+    assert dhan_hint["details"]["cdp_recovery_required"] is True
 
 
 def test_operator_health_trust_gate_blocks_on_runtime_and_warns_on_signal_quality():
@@ -8751,6 +11429,36 @@ def test_operator_health_screener_failures_check_failure_records_fallback(monkey
     assert events[0]["metadata"] == {"hours": 12, "limit": 4}
 
 
+def test_operator_api_screener_failures_payload_is_read_only(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "check_screener_failures",
+        lambda hours=24, limit=25: {
+            "status": "warn",
+            "message": "Recent Screener.in query/fetch/parse failures found.",
+            "window_hours": hours,
+            "active_count": 1,
+            "validation_count": 0,
+            "fetch_count": 0,
+            "parse_count": 1,
+            "counts_by_stage": {"registered_parse": 1},
+            "rows": [{"failure_id": "sf-1", "failure_stage": "registered_parse"}],
+        },
+    )
+
+    payload = operator_api.build_screener_failures_api_payload(hours=12, limit=4)
+
+    assert payload["api_schema"]["endpoint"] == "/api/screeners/failures"
+    assert payload["api_schema"]["read_only"] is True
+    assert payload["status"] == "warn"
+    assert payload["active_count"] == 1
+    assert payload["rows"][0]["failure_stage"] == "registered_parse"
+    assert payload["operator_boundary"]["manual_review_item_source"] is False
+    assert payload["operator_boundary"]["broker_execution_enabled"] is False
+    assert payload["operator_boundary"]["registers_production_screener"] is False
+    assert payload["operator_boundary"]["clears_failure_rows"] is False
+
+
 def test_operator_health_surfaces_screener_failures_in_fix_hints_trust_and_degradation(monkeypatch):
     monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
     screener_section = {
@@ -8926,6 +11634,126 @@ def test_operator_health_frontend_dependency_failure_records_fallback(monkeypatc
     assert events[0]["metadata"] == {"web_dir": "apps/operator-web"}
 
 
+def test_operator_health_frontend_runtime_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def fake_get(*_args, **_kwargs):
+        raise RuntimeError("frontend down")
+
+    monkeypatch.setattr(operator_health.requests, "get", fake_get)
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_frontend_runtime()
+
+    assert payload["status"] == "error"
+    assert "not reachable" in payload["message"]
+    assert payload["url"] == "http://127.0.0.1:3000/"
+    assert events[0]["fallback_type"] == "operator_health_frontend_runtime_check_failed"
+    assert events[0]["source"] == "http://127.0.0.1:3000/"
+
+
+def test_operator_health_api_runtime_flags_stale_code(monkeypatch):
+    class Response:
+        ok = True
+        status_code = 200
+        text = "{}"
+        headers = {"content-type": "application/json"}
+
+        @staticmethod
+        def json():
+            return {
+                "status": "ok",
+                "stale_code": True,
+                "stale_reason": "source_newer_than_api_process",
+                "operator_action": "restart_operator_api",
+                "process_started_at": "2026-06-12T10:00:00Z",
+                "latest_source_mtime": "2026-06-12T10:05:00Z",
+                "latest_source_path": "advisory/api/app.py",
+            }
+
+    monkeypatch.setattr(operator_health.requests, "get", lambda *_args, **_kwargs: Response())
+
+    payload = operator_health.check_operator_api_runtime()
+
+    assert payload["status"] == "error"
+    assert payload["stale_code"] is True
+    assert payload["operator_action"] == "restart_operator_api"
+    assert payload["latest_source_path"] == "advisory/api/app.py"
+
+
+def test_operator_health_fix_hints_include_stale_api_runtime_restart():
+    sections = {
+        "operator_api_runtime": {
+            "status": "error",
+            "message": "Operator API is serving stale code.",
+            "stale_code": True,
+            "stale_reason": "source_newer_than_api_process",
+            "operator_action": "restart_operator_api",
+            "process_started_at": "2026-06-12T10:00:00Z",
+            "latest_source_mtime": "2026-06-12T10:05:00Z",
+            "latest_source_path": "advisory/api/app.py",
+        }
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+    hint = next(row for row in hints if row["title"] == "Operator API runtime is stale or unavailable")
+    gate = operator_health.build_trust_gate(sections)
+
+    assert hint["status"] == "error"
+    assert hint["commands"] == ["./all_frontend.sh", "python -m advisory.operator_health --skip-dhan"]
+    assert hint["details"]["latest_source_path"] == "advisory/api/app.py"
+    assert gate["status"] == "error"
+    assert any(row["key"] == "operator_api_runtime" for row in gate["checks"])
+
+
+def test_operator_health_format_text_summarizes_fix_hints():
+    text = operator_health.format_text(
+        {
+            "status": "error",
+            "detail_level": "fast",
+            "sections": {"trust_gate": {"trust_level": "blocked"}},
+            "current_blockers": {"count": 2},
+            "fix_hints": [
+                {
+                    "status": "error",
+                    "title": "Operator API runtime is stale or unavailable",
+                    "reason": "Operator API is serving stale code.",
+                    "commands": ["./all_frontend.sh"],
+                }
+            ],
+        }
+    )
+
+    assert "Stockey Operator Health" in text
+    assert "Status: error" in text
+    assert "Trust level: blocked" in text
+    assert "first command: ./all_frontend.sh" in text
+
+
+def test_operator_health_cli_accepts_explicit_format(monkeypatch, capsys):
+    monkeypatch.setattr(
+        operator_health,
+        "parse_args",
+        lambda: argparse.Namespace(log_dir="logs/cron", skip_dhan=True, full=False, format="text"),
+    )
+    monkeypatch.setattr(
+        operator_health,
+        "build_operator_health",
+        lambda **_kwargs: {
+            "status": "warn",
+            "detail_level": "fast",
+            "sections": {"trust_gate": {"trust_level": "review_required"}},
+            "current_blockers": {"count": 1},
+            "fix_hints": [],
+        },
+    )
+
+    assert operator_health.main() == 0
+    out = capsys.readouterr().out
+    assert "Stockey Operator Health" in out
+    assert "Status: warn" in out
+
+
 def test_operator_smoke_builds_compact_trust_contract(monkeypatch):
     monkeypatch.setattr(
         operator_smoke,
@@ -8937,6 +11765,14 @@ def test_operator_smoke_builds_compact_trust_contract(monkeypatch):
                 "database": {"status": "ok"},
                 "operator_api": {"status": "ok"},
                 "frontend": {"status": "ok"},
+                "frontend_runtime": {"status": "ok"},
+                "dhan": {"status": "warn"},
+                "dhan_cache": {
+                    "status": "error",
+                    "auth_refresh_ready": False,
+                    "auto_login_configured": True,
+                    "cdp_status": {"status": "warn"},
+                },
                 "operator_snapshot": {"status": "warn"},
                 "signal_quality": {"status": "warn"},
                 "identity_issues": {"status": "ok"},
@@ -8958,12 +11794,24 @@ def test_operator_smoke_builds_compact_trust_contract(monkeypatch):
         },
     )
 
-    payload = operator_smoke.build_operator_smoke(fix_hint_limit=1)
+    payload = operator_smoke.build_operator_smoke(include_dhan=True, fix_hint_limit=1)
 
     assert payload["status"] == "warn"
     assert payload["trust_level"] == "review_required"
     assert payload["read_only"] is True
     assert payload["broker_execution_enabled"] is False
+    assert payload["checks"]["dhan"] == "warn"
+    assert payload["checks"]["dhan_cache"] == "error"
+    assert payload["checks"]["dhan_cdp"] == "warn"
+    assert payload["dhan_readiness"] == {
+        "included_token_validation": True,
+        "token_validation_status": "warn",
+        "cache_status": "error",
+        "auth_refresh_ready": False,
+        "auto_login_configured": True,
+        "cdp_status": "warn",
+        "cdp_recovery_required": True,
+    }
     assert payload["counts"]["current_blockers"] == 2
     assert payload["next_commands"] == ["python -m advisory.operator_snapshot"]
     assert payload["compact"] is True
@@ -9056,6 +11904,74 @@ def test_operator_health_sync_state_check_failure_records_fallback(monkeypatch):
     assert events[0]["metadata"] == {"limit": 7}
 
 
+def test_dhan_ohlcv_run_state_classifies_reference_mapping_failures():
+    state = dhan_ohlcv.build_run_state(
+        daily_results=[
+            {
+                "ticker": "HUIL",
+                "asset_type": "stock",
+                "exchange": "NSE",
+                "rows": 0,
+                "from_date": None,
+                "to_date": None,
+                "error": "ValueError: No Dhan security id mapped for NSE:HUIL",
+                "classification": "reference_mapping_missing",
+            }
+        ],
+        intraday_results=[],
+        only="daily",
+        symbols=["HUIL"],
+        exchange="NSE",
+        asset_type="stock",
+        interval_minutes=1,
+    )
+
+    assert state["classification"] == "reference_mapping_missing"
+    assert state["status"] == "failed"
+    assert state["rows_written"] == 0
+    assert state["state_advanced"] is False
+    assert state["reference_mapping_missing_count"] == 1
+    assert state["classification_counts"] == {"reference_mapping_missing": 1}
+
+
+def test_dhan_ohlcv_run_state_classifies_partial_failures():
+    state = dhan_ohlcv.build_run_state(
+        daily_results=[
+            {
+                "ticker": "AAA",
+                "asset_type": "stock",
+                "exchange": "NSE",
+                "rows": 3,
+                "from_date": "2026-06-01",
+                "to_date": "2026-06-03",
+            },
+            {
+                "ticker": "BBB",
+                "asset_type": "stock",
+                "exchange": "NSE",
+                "rows": 0,
+                "from_date": None,
+                "to_date": None,
+                "error": "DhanAPIError: Dhan API request failed with status 503: unavailable",
+                "classification": "source_unavailable",
+            },
+        ],
+        intraday_results=[],
+        only="daily",
+        symbols=["AAA", "BBB"],
+        exchange="NSE",
+        asset_type="stock",
+        interval_minutes=1,
+    )
+
+    assert state["classification"] == "partial_failed"
+    assert state["status"] == "failed"
+    assert state["rows_written"] == 3
+    assert state["state_advanced"] is True
+    assert state["source_unavailable_count"] == 1
+    assert state["classification_counts"] == {"source_unavailable": 1}
+
+
 def test_operator_health_downloader_run_state_summarizes_latest_rows(monkeypatch):
     monkeypatch.setattr(operator_health, "table_exists", lambda table_name: table_name == "advisory_sync_state")
 
@@ -9106,6 +12022,44 @@ def test_operator_health_downloader_run_state_summarizes_latest_rows(monkeypatch
                         "state_advanced": False,
                     },
                 },
+                {
+                    "source_name": "download_runner:data.nseindia.recent_events",
+                    "scope_key": "events",
+                    "status": "error",
+                    "error_text": "source_unavailable",
+                    "updated_at": pd.Timestamp("2026-06-10T08:00:00Z"),
+                    "last_success_at": pd.Timestamp("2026-06-09T08:00:00Z"),
+                    "state_json": {
+                        "module": "data.nseindia.recent_events",
+                        "purpose": "events",
+                        "phase": "downloader",
+                        "classification": "source_unavailable",
+                        "status": "ok",
+                        "rows": 0,
+                        "source_unavailable_count": 1,
+                        "state_advanced": False,
+                    },
+                },
+                {
+                    "source_name": "download_runner:data.dhanlive.ohlcv",
+                    "scope_key": "dhan_ohlcv_precheck",
+                    "status": "ok",
+                    "error_text": None,
+                    "updated_at": pd.Timestamp("2026-06-10T07:00:00Z"),
+                    "last_success_at": pd.Timestamp("2026-06-09T07:00:00Z"),
+                    "state_json": {
+                        "module": "data.dhanlive.ohlcv",
+                        "purpose": "dhan_ohlcv_precheck",
+                        "phase": "downloader",
+                        "classification": "reference_mapping_missing",
+                        "status": "failed",
+                        "rows": 0,
+                        "classification_counts": {"reference_mapping_missing": 1},
+                        "reference_mapping_missing_count": 1,
+                        "failed_symbols": ["HUIL"],
+                        "state_advanced": False,
+                    },
+                },
             ]
         )
 
@@ -9114,16 +12068,27 @@ def test_operator_health_downloader_run_state_summarizes_latest_rows(monkeypatch
     payload = operator_health.check_downloader_run_state()
 
     assert payload["status"] == "error"
-    assert payload["returned_count"] == 2
+    assert payload["returned_count"] == 4
     assert payload["ok_count"] == 1
-    assert payload["error_count"] == 1
+    assert payload["error_count"] == 2
+    assert payload["warn_count"] == 1
     assert payload["advanced_count"] == 1
     assert payload["retry_count"] == 3
     assert payload["fallback_count"] == 1
     assert payload["counts_by_classification"]["parse_failed"] == 1
+    assert payload["counts_by_classification"]["source_unavailable"] == 1
+    assert payload["counts_by_classification"]["reference_mapping_missing"] == 1
     assert payload["rows"][1]["module"] == "data.nseindia.bhavcopy_parser"
     assert payload["rows"][1]["status"] == "error"
     assert payload["rows"][1]["attempt_count"] == 3
+    assert payload["rows"][2]["status"] == "warn"
+    assert payload["rows"][2]["classification_label"] == "Source unavailable"
+    assert "not valid no-data" in payload["rows"][2]["classification_meaning"]
+    assert payload["rows"][3]["status"] == "error"
+    assert payload["rows"][3]["classification_label"] == "Reference mapping missing"
+    assert payload["rows"][3]["classification_counts"] == {"reference_mapping_missing": 1}
+    assert payload["rows"][3]["reference_mapping_missing_count"] == 1
+    assert payload["rows"][3]["failed_symbols"] == ["HUIL"]
 
 
 def test_operator_health_downloader_run_state_failure_records_fallback(monkeypatch):
@@ -9175,6 +12140,8 @@ def test_operator_health_degradation_feed_includes_downloader_run_state(monkeypa
     assert feed["status"] == "error"
     assert feed["rows"][0]["kind"] == "download_runner_state"
     assert "bhavcopy_parser" in feed["rows"][0]["title"]
+    assert feed["rows"][0]["suggested_fix"].startswith("Inspect the error")
+    assert feed["rows"][0]["details"]["classification_label"] == "Parse failed"
 
 
 def test_operator_health_degradation_feed_extracts_dhan_master_miss(monkeypatch, tmp_path):
@@ -9195,6 +12162,58 @@ def test_operator_health_degradation_feed_extracts_dhan_master_miss(monkeypatch,
     assert row["kind"] == "dhan_master_miss"
     assert row["symbol"] == "HUIL"
     assert "Dhan master" in row["title"]
+
+
+def test_operator_health_degradation_feed_extracts_dhan_auth_preflight_failure(monkeypatch, tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory_preflight.log").write_text(
+        "\n".join(
+            [
+                "[stockey.script] name=advisory_dhan_preflight status=start",
+                "BrowserType.connect_over_cdp: connect ECONNREFUSED ::1:9222",
+                "[stockey.script] name=advisory_dhan_preflight status=failed exit_code=1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
+
+    cron_rows = operator_health.check_cron_logs(log_dir)
+    feed = operator_health.build_degradation_feed({"cron_logs": cron_rows, "sync_state_failures": [], "slow_operations": {"issues": []}}, log_dir=log_dir)
+
+    assert feed["status"] == "error"
+    row = feed["rows"][0]
+    assert row["kind"] == "dhan_auth_preflight_failed"
+    assert "Dhan auth/CDP" in row["title"]
+    assert "./all_advisory_preflight.sh" in row["suggested_fix"]
+
+
+def test_operator_health_preflight_cron_fix_hint_orders_cdp_before_preflight(tmp_path):
+    log_path = tmp_path / "all_advisory_preflight.log"
+    sections = {
+        "cron_logs": [
+            {
+                "status": "error",
+                "log_file": str(log_path),
+                "latest_run_status": "failed",
+                "recent_error_count": 1,
+                "historical_error_count": 0,
+                "recent_errors": ["BrowserType.connect_over_cdp: connect ECONNREFUSED ::1:9222"],
+            }
+        ]
+    }
+
+    hints = operator_health.build_fix_hints(sections)
+    hint = next(row for row in hints if row["title"] == "Recent cron errors in all_advisory_preflight.log")
+
+    assert hint["commands"] == [
+        f"tail -100 {log_path}",
+        "scripts/start_chrome_cdp.sh",
+        "./all_advisory_preflight.sh",
+        "python -m advisory.operator_health --skip-dhan",
+    ]
+    assert hint["details"]["preflight_recovery"] is True
 
 
 def test_cron_status_parses_generated_style_crontab_and_estimates_next_run(tmp_path):
@@ -9489,6 +12508,61 @@ def test_feature_freshness_contract_classifies_required_and_optional_inputs(monk
     assert skipped["reason"] == "optional_table_missing"
 
 
+def test_feature_freshness_uses_exact_point_in_time_cutoff_for_intraday_asof(monkeypatch):
+    spec = feature_freshness.FeatureInputSpec(
+        "daily_ohlcv",
+        "Daily OHLCV",
+        "dhan_ohlcv_daily",
+        "date",
+        symbol_column="ticker",
+        max_age_days=5,
+        required=True,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(feature_freshness, "table_exists", lambda table: True)
+    monkeypatch.setattr(feature_freshness, "table_columns", lambda table: {"date", "ticker"})
+
+    def fake_sql(query, *args, **kwargs):
+        captured["query"] = str(query)
+        captured["params"] = kwargs.get("params") or {}
+        return pd.DataFrame([{"latest_at": pd.Timestamp("2026-06-10T09:30:00Z"), "row_count": 1}])
+
+    monkeypatch.setattr(feature_freshness, "sql_to_df", fake_sql)
+
+    out = feature_freshness.evaluate_feature_input(spec, symbol="ABC", asof_date=pd.Timestamp("2026-06-10T10:15:00Z"))
+
+    assert out["status"] == "fresh"
+    assert '"date" <= %(cutoff)s' in str(captured["query"])
+    assert captured["params"]["cutoff"] == pd.Timestamp("2026-06-10T10:15:00Z")
+
+
+def test_feature_freshness_date_only_asof_uses_exclusive_next_day_cutoff(monkeypatch):
+    spec = feature_freshness.FeatureInputSpec(
+        "daily_ohlcv",
+        "Daily OHLCV",
+        "dhan_ohlcv_daily",
+        "date",
+        symbol_column="ticker",
+        max_age_days=5,
+        required=True,
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(feature_freshness, "table_exists", lambda table: True)
+    monkeypatch.setattr(feature_freshness, "table_columns", lambda table: {"date", "ticker"})
+
+    def fake_sql(query, *args, **kwargs):
+        captured["query"] = str(query)
+        captured["params"] = kwargs.get("params") or {}
+        return pd.DataFrame([{"latest_at": pd.Timestamp("2026-06-10T00:00:00Z"), "row_count": 1}])
+
+    monkeypatch.setattr(feature_freshness, "sql_to_df", fake_sql)
+
+    feature_freshness.evaluate_feature_input(spec, symbol="ABC", asof_date=pd.Timestamp("2026-06-10T00:00:00Z"))
+
+    assert '"date" < %(cutoff)s' in str(captured["query"])
+    assert captured["params"]["cutoff"] == pd.Timestamp("2026-06-11T00:00:00Z")
+
+
 def test_feature_freshness_contract_flags_stale_and_missing_required(monkeypatch):
     specs = (
         feature_freshness.FeatureInputSpec("daily_ohlcv", "Daily OHLCV", "dhan_ohlcv_daily", "date", symbol_column="ticker", max_age_days=2, required=True),
@@ -9540,6 +12614,60 @@ def test_feature_freshness_records_lookup_fallback_on_error(monkeypatch):
     assert events[0]["source"] == "dhan_ohlcv_daily"
     assert events[0]["metadata"]["input_key"] == "daily_ohlcv"
     assert events[0]["metadata"]["symbol"] == "ABC"
+
+
+def test_operator_api_feature_freshness_payload_includes_current_stage_gates(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "build_feature_freshness_contract",
+        lambda symbol, asof_date=None: {
+            "symbol": str(symbol).upper(),
+            "asof_date": str(asof_date or "2026-06-10"),
+            "status": "blocked",
+            "counts": {"fresh": 1, "stale": 1},
+            "blockers": [{"input_key": "technical_daily", "label": "Technical Features", "status": "stale", "required": True}],
+            "inputs": [],
+        },
+    )
+
+    def fake_stage_gate(stage, symbols, *, asof_date=None):
+        symbol = symbols[0]
+        status = "blocked" if stage == "actions" else "ok"
+        blockers = (
+            [{"input_key": "technical_daily", "label": "Technical Features", "status": "stale", "reason": "older_than_freshness_window"}]
+            if status == "blocked"
+            else []
+        )
+        return {
+            "stage": stage,
+            "status": status,
+            "symbols_checked": 1,
+            "blocked_symbols": [symbol] if status == "blocked" else [],
+            "blocked_count": 1 if status == "blocked" else 0,
+            "required_input_keys": ["technical_daily"],
+            "gate_effect": "Blocked positive action until technical features are fresh.",
+            "block_positive_actions": True,
+            "symbols": {
+                symbol: {
+                    "symbol": symbol,
+                    "status": status,
+                    "counts": {"stale": 1} if status == "blocked" else {"fresh": 1},
+                    "blockers": blockers,
+                    "required_inputs": [],
+                }
+            },
+        }
+
+    monkeypatch.setattr(operator_api, "evaluate_stage_feature_gate", fake_stage_gate)
+
+    payload = operator_api.build_feature_freshness_payload(symbol="abc", asof_date="2026-06-10")
+
+    assert payload["stage_gate_summary"]["blocked_stage_count"] == 1
+    assert payload["stage_gate_summary"]["blocked_stages"] == ["actions"]
+    assert payload["stage_gate_summary"]["operator_boundary"]["mutates_recommendations"] is False
+    assert payload["stage_gate_summary"]["operator_boundary"]["broker_execution_allowed"] is False
+    assert payload["stage_gate_summary"]["blocked_inputs"][0]["input_key"] == "technical_daily"
+    assert any(row["stage"] == "actions" and row["status"] == "blocked" for row in payload["stage_gates"])
 
 
 def test_action_recommender_adds_decision_time_feature_freshness(monkeypatch):
@@ -9872,6 +13000,8 @@ def test_pipeline_actions_stage_includes_feature_gate(monkeypatch):
         portfolio_max_positions_per_overlap_group=1,
         event_model=None,
         dry_run=True,
+        stage_budget_seconds=0.000001,
+        stage_budget_overrides="",
     )
 
     summary = pipeline.run_pipeline(args)
@@ -9880,6 +13010,11 @@ def test_pipeline_actions_stage_includes_feature_gate(monkeypatch):
     assert summary["stages"]["actions"]["feature_gate"]["status"] == "blocked"
     assert summary["stages"]["actions"]["feature_gate"]["blocked_symbols"] == ["ABC"]
     assert summary["stages"]["actions"]["actions"]["row_count"] == 1
+    assert summary["stage_budget"]["reporting_only"] is True
+    assert summary["stage_budget"]["slow_stage_count"] >= 1
+    assert summary["slow_stages"][0]["stage"] == "actions"
+    assert summary["stage_timings"][0]["stage"] == "actions"
+    assert summary["stage_timings"][0]["over_budget"] is True
 
 
 def test_pipeline_portfolio_stage_preserves_rows_and_adds_feature_gate(monkeypatch):
@@ -10166,6 +13301,191 @@ def test_operator_api_prefers_persisted_feature_freshness_snapshot(monkeypatch):
     assert effects[0]["stage"] == "actions"
     assert effects[0]["broker_execution_allowed"] is False
     assert effects[0]["blocked_inputs"][0]["input_key"] == "technical_daily"
+
+
+def test_operator_api_home_omits_duplicate_action_cards_by_default(monkeypatch):
+    full_payload = {
+        "generated_at": "2026-06-10T08:30:00Z",
+        "asof_date": "2026-06-10",
+        "summary": {"action_count": 1},
+        "runtime_processes": [],
+        "cron_status": [],
+        "sync_state": [],
+        "top_action_recommendations": [
+            {
+                "symbol": "ABC",
+                "action_code": "BUY",
+                "status": "approved",
+                "final_state_trust": {"status": "blocked", "checks": [{"key": "heavy", "evidence": {"raw": "x" * 1000}}]},
+            }
+        ],
+        "today_recommendations": [{"symbol": "XYZ", "action_code": "SELL", "status": "approved"}],
+        "ts_forecast_paper_summary": [],
+    }
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **_kwargs: full_payload)
+    monkeypatch.setattr(operator_api, "load_operator_sections_payload", lambda *_args, **_kwargs: None)
+
+    default_payload = operator_api.build_home_payload()
+    legacy_payload = operator_api.build_home_payload(include_action_cards=True)
+
+    assert default_payload["top_action_recommendations"] == []
+    assert default_payload["today_recommendations"] == []
+    assert default_payload["meta"]["include_action_cards"] is False
+    assert legacy_payload["top_action_recommendations"][0]["symbol"] == "ABC"
+    assert legacy_payload["today_recommendations"][0]["symbol"] == "XYZ"
+    assert legacy_payload["meta"]["include_action_cards"] is True
+
+
+def test_operator_api_home_uses_section_snapshot_before_full_payload(monkeypatch):
+    calls: list[tuple[str, list[str] | None]] = []
+
+    def fake_sections(section_names, **_kwargs):
+        calls.append(("sections", list(section_names)))
+        return {
+            "generated_at": "2026-06-10T08:30:00Z",
+            "asof_date": "2026-06-10",
+            "summary": {"action_count": 1},
+            "runtime_processes": [{"name": "api"}],
+            "cron_status": [{"job": "all_frontend"}],
+            "sync_state": [{"source": "watchers"}],
+            "ts_forecast_paper_summary": [{"model_name": "timesfm_2p5_200m"}],
+            "_snapshot": {"source": "db_section_snapshot", "freshness": "fresh"},
+        }
+
+    monkeypatch.setattr(operator_api, "load_operator_sections_payload", fake_sections)
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("full payload should not be loaded")))
+
+    payload = operator_api.build_home_payload()
+
+    assert payload["summary"] == {"action_count": 1}
+    assert payload["runtime_processes"] == [{"name": "api"}]
+    assert payload["top_action_recommendations"] == []
+    assert payload["today_recommendations"] == []
+    assert payload["snapshot"]["source"] == "db_section_snapshot"
+    assert calls == [
+        ("sections", ["summary", "runtime_processes", "cron_status", "sync_state", "ts_forecast_paper_summary"]),
+    ]
+
+
+def test_operator_api_home_section_snapshot_includes_action_cards_only_when_requested(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_sections(section_names, **_kwargs):
+        calls.append(list(section_names))
+        return {
+            "generated_at": "2026-06-10T08:30:00Z",
+            "asof_date": "2026-06-10",
+            "summary": {},
+            "runtime_processes": [],
+            "cron_status": [],
+            "sync_state": [],
+            "top_action_recommendations": [{"symbol": "ABC", "action_code": "BUY"}],
+            "today_recommendations": [{"symbol": "XYZ", "action_code": "SELL"}],
+            "ts_forecast_paper_summary": [],
+            "_snapshot": {"source": "db_section_snapshot", "freshness": "fresh"},
+        }
+
+    monkeypatch.setattr(operator_api, "load_operator_sections_payload", fake_sections)
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("full payload should not be loaded")))
+
+    payload = operator_api.build_home_payload(include_action_cards=True)
+
+    assert calls == [
+        ["summary", "runtime_processes", "cron_status", "sync_state", "ts_forecast_paper_summary", "top_action_recommendations", "today_recommendations"],
+    ]
+    assert payload["top_action_recommendations"][0]["symbol"] == "ABC"
+    assert payload["today_recommendations"][0]["symbol"] == "XYZ"
+    assert payload["meta"]["include_action_cards"] is True
+
+
+def test_operator_api_summary_uses_section_snapshot_before_full_payload(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_sections(section_names, **_kwargs):
+        calls.append(list(section_names))
+        return {
+            "generated_at": "2026-06-10T08:30:00Z",
+            "asof_date": "2026-06-10",
+            "summary": {"action_count": 2},
+            "runtime_processes": [{"name": "api"}],
+            "cron_status": [{"job": "all_frontend"}],
+            "sync_state": [{"source": "watchers"}],
+            "_snapshot": {"source": "db_section_snapshot", "freshness": "fresh"},
+        }
+
+    monkeypatch.setattr(operator_api, "load_operator_sections_payload", fake_sections)
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **_kwargs: (_ for _ in ()).throw(AssertionError("full payload should not be loaded")))
+
+    payload = operator_api.build_summary_payload()
+
+    assert calls == [["summary", "runtime_processes", "cron_status", "sync_state"]]
+    assert payload["summary"] == {"action_count": 2}
+    assert payload["runtime_processes"] == [{"name": "api"}]
+    assert payload["snapshot"]["source"] == "db_section_snapshot"
+
+
+def test_operator_api_action_list_does_not_live_refresh_feature_freshness_by_default(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "load_operator_sections_payload",
+        lambda *_args, **_kwargs: {
+            "generated_at": "2026-06-10T08:30:00Z",
+            "asof_date": "2026-06-10",
+            "top_action_recommendations": [{"symbol": "ABC", "action_code": "BUY", "status": "approved"}],
+            "action_recommendations": [],
+            "alerts": [],
+        },
+    )
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(operator_api, "_load_latest_company_memory_reviews", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        operator_api,
+        "build_required_feature_freshness_summaries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("live freshness must be explicit")),
+    )
+
+    payload = operator_api.build_actions_payload(include_feature_freshness=True, compact=True)
+
+    assert payload["top_action_recommendations"][0]["symbol"] == "ABC"
+    assert "feature_freshness_summary" not in payload["top_action_recommendations"][0]
+    assert payload["meta"]["feature_freshness_contract"]["refresh_feature_freshness"] is False
+    assert payload["meta"]["feature_freshness_contract"]["default_source"] == "decision_time_snapshot"
+
+
+def test_operator_api_action_list_live_refresh_feature_freshness_when_requested(monkeypatch):
+    monkeypatch.setattr(
+        operator_api,
+        "load_operator_sections_payload",
+        lambda *_args, **_kwargs: {
+            "generated_at": "2026-06-10T08:30:00Z",
+            "asof_date": "2026-06-10",
+            "top_action_recommendations": [{"symbol": "ABC", "action_code": "BUY", "status": "approved"}],
+            "action_recommendations": [],
+            "alerts": [],
+        },
+    )
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(operator_api, "_load_latest_company_memory_reviews", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        operator_api,
+        "build_required_feature_freshness_summaries",
+        lambda symbols, **_kwargs: {
+            "ABC": {
+                "symbol": "ABC",
+                "status": "ok",
+                "counts": {"fresh": 2},
+                "blockers": [],
+                "required_inputs": [{"input_key": "daily_ohlcv", "status": "fresh", "required": True}],
+            }
+        },
+    )
+
+    payload = operator_api.build_actions_payload(include_feature_freshness=True, refresh_feature_freshness=True, compact=True)
+
+    summary = payload["top_action_recommendations"][0]["feature_freshness_summary"]
+    assert summary["source"] == "current_live_check"
+    assert summary["counts"] == {"fresh": 2}
+    assert payload["meta"]["feature_freshness_contract"]["refresh_feature_freshness"] is True
 
 
 def test_operator_api_feature_gate_effects_prefer_decision_context(monkeypatch):
@@ -10495,6 +13815,21 @@ def test_operator_health_marks_failed_script_marker_as_error():
     assert analysis["latest_script_marker"]["exit_code"] == "1"
 
 
+def test_operator_health_treats_frontend_restart_marker_as_expected():
+    analysis = operator_health.analyze_cron_log_lines(
+        [
+            "[stockey.script] name=all_frontend status=start timestamp=2026-06-12T10:00:00Z",
+            "[all_frontend] code_change detected old_signature=aaa new_signature=bbb; requesting restart",
+            "[stockey.script] name=all_frontend status=restart_requested exit_code=75 timestamp=2026-06-12T10:01:00Z",
+        ]
+    )
+
+    assert analysis["status"] == "warn"
+    assert analysis["latest_run_status"] == "restart_requested"
+    assert analysis["recent_error_count"] == 0
+    assert analysis["latest_error_line"] is None
+
+
 def test_operator_health_api_check_reports_latency(monkeypatch):
     class DummyResponse:
         ok = True
@@ -10729,6 +14064,81 @@ def test_operator_health_dhan_cache_warns_when_expiring(monkeypatch, tmp_path):
     assert payload["has_cached_access_token"] is True
 
 
+def test_operator_health_dhan_cache_flags_unready_auto_login_when_cdp_down(monkeypatch, tmp_path):
+    cache_path = tmp_path / "dhan.json"
+    cache_path.write_text("{}", encoding="utf-8")
+    expires_at = pd.Timestamp.utcnow() - pd.Timedelta(minutes=30)
+
+    monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("DHAN_TOKEN_ID", raising=False)
+
+    import data.dhanlive.auth as dhan_auth_module
+    import data.dhanlive.auth_cli as dhan_auth_cli_module
+
+    monkeypatch.setattr(dhan_auth_module, "DEFAULT_TOKEN_CACHE", cache_path)
+    monkeypatch.setattr(
+        dhan_auth_module,
+        "load_cached_access_token_payload",
+        lambda: {"accessToken": "abcdef1234567890", "expiryTime": expires_at.isoformat()},
+    )
+    monkeypatch.setattr(dhan_auth_module, "is_auto_login_configured", lambda: True)
+    monkeypatch.setattr(dhan_auth_cli_module, "DEFAULT_TOKEN_CACHE", cache_path)
+    monkeypatch.setattr(operator_health, "check_dhan_cdp_endpoint", lambda: {"status": "warn", "message": "Chrome CDP endpoint is not reachable.", "configured": True})
+
+    payload = operator_health.check_dhan_cache()
+
+    assert payload["status"] == "error"
+    assert "no ready non-interactive refresh path" in payload["message"]
+    assert payload["auto_login_configured"] is True
+    assert payload["auth_refresh_ready"] is False
+    assert payload["cdp_status"]["status"] == "warn"
+
+
+def test_operator_health_dhan_cache_marks_refresh_ready_with_cdp(monkeypatch, tmp_path):
+    cache_path = tmp_path / "dhan.json"
+    cache_path.write_text("{}", encoding="utf-8")
+    expires_at = pd.Timestamp.utcnow() - pd.Timedelta(minutes=30)
+
+    monkeypatch.delenv("DHAN_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("DHAN_TOKEN_ID", raising=False)
+
+    import data.dhanlive.auth as dhan_auth_module
+    import data.dhanlive.auth_cli as dhan_auth_cli_module
+
+    monkeypatch.setattr(dhan_auth_module, "DEFAULT_TOKEN_CACHE", cache_path)
+    monkeypatch.setattr(
+        dhan_auth_module,
+        "load_cached_access_token_payload",
+        lambda: {"accessToken": "abcdef1234567890", "expiryTime": expires_at.isoformat()},
+    )
+    monkeypatch.setattr(dhan_auth_module, "is_auto_login_configured", lambda: True)
+    monkeypatch.setattr(dhan_auth_cli_module, "DEFAULT_TOKEN_CACHE", cache_path)
+    monkeypatch.setattr(operator_health, "check_dhan_cdp_endpoint", lambda: {"status": "ok", "message": "Chrome CDP endpoint responded.", "configured": True})
+
+    payload = operator_health.check_dhan_cache()
+
+    assert payload["status"] == "error"
+    assert payload["message"] == "Dhan cached token is expired."
+    assert payload["auth_refresh_ready"] is True
+    assert payload["cdp_status"]["status"] == "ok"
+
+
+def test_operator_health_dhan_cdp_failure_records_fallback(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(operator_health, "env", lambda key, default=None: "http://localhost:9222" if key == "CDP_ENDPOINT" else default)
+    monkeypatch.setattr(operator_health.requests, "get", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cdp down")))
+    monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
+
+    payload = operator_health.check_dhan_cdp_endpoint()
+
+    assert payload["status"] == "warn"
+    assert "not reachable" in payload["message"]
+    assert events[0]["fallback_type"] == "operator_health_dhan_cdp_check_failed"
+    assert events[0]["source"] == "http://localhost:9222/json/version"
+    assert events[0]["metadata"]["cdp_endpoint"] == "http://localhost:9222"
+
+
 def test_operator_health_dhan_cached_token_inspect_failure_records_fallback(monkeypatch):
     events: list[dict[str, object]] = []
 
@@ -10774,6 +14184,7 @@ def test_operator_health_dhan_cache_check_failure_records_fallback(monkeypatch):
     import data.dhanlive.auth as dhan_auth_module
 
     monkeypatch.setattr(dhan_auth_module, "load_cached_access_token_payload", lambda: (_ for _ in ()).throw(RuntimeError("cache parse failed")))
+    monkeypatch.setattr(dhan_auth_module, "is_auto_login_configured", lambda: False)
     monkeypatch.setattr(operator_health, "_record_health_local_fallback", lambda **kwargs: events.append(kwargs))
 
     payload = operator_health.check_dhan_cache()
@@ -10859,6 +14270,7 @@ def test_operator_api_critical_payloads_include_schema_metadata(monkeypatch):
         operator_api.build_identity_issues_payload(limit=1),
         operator_api.build_wait_signals_payload(limit=1),
         operator_api.build_action_conflict_rules_payload(),
+        operator_api.build_execution_approvals_payload(limit=1),
     ]
 
     for payload in payloads:
@@ -10886,6 +14298,13 @@ def test_operator_api_critical_routes_publish_typed_response_models():
         ("/api/action-conflict-rules", "get"): "ActionConflictRulesResponse",
         ("/api/action-conflict-rules/promote", "post"): "ActionConflictRuleWriteResponse",
         ("/api/action-conflict-rules/{rule_id}", "post"): "ActionConflictRuleWriteResponse",
+        ("/api/execution/approvals", "get"): "ExecutionApprovalsResponse",
+        ("/api/execution/approval-decision", "post"): "ExecutionApprovalDecisionResponse",
+        ("/api/execution/approval-contract-update", "post"): "ExecutionApprovalContractUpdateResponse",
+        ("/api/execution/reconcile", "post"): "ExecutionReconciliationRunResponse",
+        ("/api/execution/evidence-review", "post"): "ExecutionEvidenceReviewResponse",
+        ("/api/execution/live-allowance", "post"): "ExecutionLiveAllowanceResponse",
+        ("/api/execution/live-submit-preflight", "post"): "ExecutionLiveSubmitPreflightResponse",
     }
     trace_expected = {
         ("/api/events/{unique_id}/detail", "get"): "EventDetailResponse",
@@ -10912,6 +14331,7 @@ def test_operator_api_critical_routes_publish_typed_response_models():
         ("/api/research/ts-forecast-promotion-review/decision", "post"): "PromotionDecisionResponse",
         ("/api/research/ts-forecast-review-rules", "get"): "TsForecastReviewRulesResponse",
         ("/api/research/event-model-artifacts", "get"): "EventModelArtifactsResponse",
+        ("/api/research/ledger", "get"): "ResearchLedgerResponse",
         ("/api/research/prompt-registry", "get"): "PromptRegistryResponse",
     }
     calibration_expected = {
@@ -11234,6 +14654,80 @@ def test_operator_api_summary_watchlist_market_context_read_routes_smoke_with_ty
     assert responses[0].json()["summary"]["action_count"] == 1
     assert responses[1].json()["watchlist"][0]["setup_id"] == "SETUP"
     assert responses[2].json()["top_universe"][0]["symbol"] == "ABC"
+
+
+def test_operator_api_watchlist_sections_and_ts_compaction(monkeypatch):
+    payload = {
+        "generated_at": "2026-06-07T00:00:00Z",
+        "asof_date": "2026-06-07",
+        "watch_recommendations": [{"symbol": "WATCH", "action_code": "WATCH", "recommendation_reason": {"status": "complete"}}],
+        "watchlist": [{"symbol": "BASE", "setup_id": "SETUP"}],
+        "ts_watch_recommendations": [{"symbol": "TSREC", "technical_context": {"summary": "ok"}}],
+        "ts_forecast_watch": [
+            {
+                "symbol": "TSF",
+                "model_name": "timesfm",
+                "horizon_days": 5,
+                "watch_status": "TS_WATCH",
+                "swing_window": {"raw": "x" * 5000},
+                "position_window": {"raw": "y" * 5000},
+                "history_summary": {"latest_close": 100.0},
+                "watch_reason": "Forecast positive",
+            }
+        ],
+        "ts_forecast_eval_summary": [{"model_name": "timesfm", "row_count": 10}],
+        "ts_forecast_paper_summary": [{"model_name": "timesfm", "paper_decision": "PAPER_BUY"}],
+    }
+    monkeypatch.setattr(operator_api, "load_operator_payload", lambda **_kwargs: payload)
+
+    all_sections = operator_api.build_watchlist_payload(limit=10, compact=True)
+    ts_only = operator_api.build_watchlist_payload(section="ts_forecast_watch", limit=10, compact=True)
+    full_ts = operator_api.build_watchlist_payload(section="ts_forecast_watch", limit=10, compact=False)
+
+    assert all_sections["meta"]["section_contract"]["requested_section"] is None
+    assert ts_only["watch_recommendations"] == []
+    assert ts_only["watchlist"] == []
+    assert ts_only["ts_forecast_watch"][0]["symbol"] == "TSF"
+    assert "swing_window" not in ts_only["ts_forecast_watch"][0]
+    assert "position_window" not in ts_only["ts_forecast_watch"][0]
+    assert ts_only["meta"]["ts_forecast_watch"]["payload_bytes"] < all_sections["meta"]["ts_forecast_watch"]["total"] * 2000
+    assert ts_only["meta"]["section_contract"]["included_sections"] == ["ts_forecast_watch"]
+    assert "swing_window" in full_ts["ts_forecast_watch"][0]
+    assert "position_window" in full_ts["ts_forecast_watch"][0]
+
+
+def test_operator_api_watchlist_route_forwards_section_and_compact(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    calls: list[dict[str, object]] = []
+
+    def _fake_watchlist_payload(**kwargs):
+        calls.append(kwargs)
+        return {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": operator_api._operator_api_schema("/api/watchlist", schema_name="operator_watchlist"),
+            "asof_date": "2026-06-07",
+            "snapshot": {},
+            "snapshot_warning": None,
+            "watch_recommendations": [],
+            "watchlist": [],
+            "ts_watch_recommendations": [],
+            "ts_forecast_watch": [{"symbol": "TSF"}],
+            "ts_forecast_eval_summary": [],
+            "ts_forecast_paper_summary": [],
+            "pagination": {},
+            "meta": {"filters": {"section": kwargs.get("section"), "compact": kwargs.get("compact"), "limit": kwargs.get("limit")}},
+        }
+
+    monkeypatch.setattr(operator_api, "build_watchlist_payload", _fake_watchlist_payload)
+
+    response = TestClient(operator_api.create_app()).get("/api/watchlist?section=ts_forecast_watch&limit=7&compact=true")
+
+    assert response.status_code == 200
+    assert calls[0]["section"] == "ts_forecast_watch"
+    assert calls[0]["limit"] == 7
+    assert calls[0]["compact"] is True
+    assert response.json()["meta"]["filters"]["section"] == "ts_forecast_watch"
 
 
 def test_operator_api_signal_refresh_read_route_smoke_with_typed_payload(monkeypatch):
@@ -11620,6 +15114,167 @@ def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
     )
     monkeypatch.setattr(
         operator_api,
+        "build_execution_approvals_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/execution/approvals", "execution_approvals"),
+            "status": "ok",
+            "summary": {"row_count": 0},
+            "rows": [],
+            "operator_boundary": {
+                "read_only": True,
+                "approves_execution": False,
+                "submits_broker_orders": False,
+                "mutates_execution_orders": False,
+            },
+            "skipped": [],
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "record_execution_approval_decision_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": {**schema("/api/execution/approval-decision", "execution_approval_decision"), "read_only": False},
+            "status": "ok",
+            "decision": {"decision": payload["decision"], "symbol": payload["row"]["symbol"]},
+            "operator_boundary": {
+                "records_audit_only": True,
+                "mutates_execution_orders": False,
+                "updates_safety_contract": False,
+                "approves_live_submission": False,
+                "submits_broker_orders": False,
+            },
+            "note": "audit only",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "apply_execution_approval_contract_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": {**schema("/api/execution/approval-contract-update", "execution_approval_contract_update"), "read_only": False},
+            "status": "ok",
+            "updated_row": {"symbol": payload["row"]["symbol"], "updated_rows": 1},
+            "safety_contract": {
+                "operator_approval_status": "approved",
+                "broker_reconciliation_status": "not_run",
+                "live_submission_allowed": False,
+            },
+            "operator_boundary": {
+                "mutates_execution_orders": True,
+                "updates_operator_approval_status": True,
+                "updates_reconciliation_status": False,
+                "live_submission_allowed": False,
+                "submits_broker_orders": False,
+            },
+            "note": "contract update only",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "run_execution_reconciliation_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": {**schema("/api/execution/reconcile", "execution_reconciliation_run"), "read_only": not payload.get("apply")},
+            "status": "ok",
+            "mode": "apply" if payload.get("apply") else "dry_run",
+            "dry_run": not payload.get("apply"),
+            "summary": {"target_count": 1, "reconciled_count": 1, "fill_count": 0},
+            "orders": [{"symbol": "ABC", "execution_status": "filled"}],
+            "fills": [],
+            "targets": [{"symbol": "ABC", "execution_status": "planned"}],
+            "operator_boundary": {
+                "reads_broker_order_state": True,
+                "persists_reconciliation": bool(payload.get("apply")),
+                "updates_reconciliation_status": bool(payload.get("apply")),
+                "updates_operator_approval_status": False,
+                "approves_live_submission": False,
+                "live_submission_allowed": False,
+                "submits_broker_orders": False,
+            },
+            "note": "reconciliation only",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "apply_execution_evidence_review_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": {**schema("/api/execution/evidence-review", "execution_evidence_review"), "read_only": not payload.get("apply")},
+            "status": "ok",
+            "mode": "apply" if payload.get("apply") else "preview",
+            "dry_run": not payload.get("apply"),
+            "decision": "passed",
+            "review": {"decision": "passed", "successful_runs": 3, "required_runs": 3},
+            "evidence": {"successful_runs": 3, "required_runs": 3, "failed_runs": 0, "blockers": []},
+            "updated_row": {"symbol": payload["row"]["symbol"], "updated_rows": 1} if payload.get("apply") else {},
+            "safety_contract": {"live_evidence_status": "passed", "live_submission_allowed": False} if payload.get("apply") else {},
+            "operator_boundary": {
+                "records_audit": bool(payload.get("apply")),
+                "mutates_execution_orders": bool(payload.get("apply")),
+                "updates_live_evidence_status": bool(payload.get("apply")),
+                "updates_operator_approval_status": False,
+                "updates_reconciliation_status": False,
+                "live_submission_allowed": False,
+                "submits_broker_orders": False,
+            },
+            "note": "evidence review only",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "apply_execution_live_allowance_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": {**schema("/api/execution/live-allowance", "execution_live_allowance"), "read_only": not payload.get("apply")},
+            "status": "ok",
+            "mode": "apply" if payload.get("apply") else "preview",
+            "dry_run": not payload.get("apply"),
+            "decision": "ready",
+            "allowance": {"confirmation_phrase": "ALLOW LIVE ABC SETUP u1"},
+            "blockers": [],
+            "updated_row": {"symbol": payload["row"]["symbol"], "updated_rows": 1} if payload.get("apply") else {},
+            "safety_contract": {"live_submission_allowed": True} if payload.get("apply") else {},
+            "operator_boundary": {
+                "records_audit": bool(payload.get("apply")),
+                "mutates_execution_orders": bool(payload.get("apply")),
+                "updates_live_submission_allowed": bool(payload.get("apply")),
+                "updates_operator_approval_status": False,
+                "updates_reconciliation_status": False,
+                "updates_live_evidence_status": False,
+                "submits_broker_orders": False,
+            },
+            "note": "live allowance only",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "build_execution_live_submit_preflight_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/execution/live-submit-preflight", "execution_live_submit_preflight"),
+            "status": "ok",
+            "decision": "ready",
+            "summary": {"matched_rows": 1, "eligible_planned_rows": 1, "skipped_rows": 0},
+            "expected_live_token": "STOCKEY-LIVE-2026-06-10-1-abcdef123456",
+            "cli_command_preview": "STOCKEY_LIVE_TRADING_ENABLED=true python -m advisory.execution_engine --live --include-existing --date 2026-06-10 --live-confirmation STOCKEY-LIVE-2026-06-10-1-abcdef123456",
+            "env_required": {"STOCKEY_LIVE_TRADING_ENABLED": "true"},
+            "blockers": [],
+            "planned_orders": [{"symbol": "ABC", "execution_status": "planned"}],
+            "skipped_orders": [],
+            "operator_boundary": {
+                "read_only": True,
+                "records_audit": False,
+                "mutates_execution_orders": False,
+                "submits_broker_orders": False,
+                "requires_manual_cli_execution": True,
+            },
+            "note": "preflight only",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
         "promote_action_conflict_rule_payload",
         lambda payload: {
             "status": "promoted",
@@ -11658,6 +15313,82 @@ def test_operator_api_critical_routes_smoke_with_typed_payloads(monkeypatch):
         client.get("/api/action-conflict-rules"),
         client.post("/api/action-conflict-rules/promote", json={"rule_id": "TEST_RULE"}),
         client.post("/api/action-conflict-rules/TEST_RULE", json={"enabled": True}),
+        client.get("/api/execution/approvals?limit=1"),
+        client.post(
+            "/api/execution/approval-decision",
+            json={
+                "row": {
+                    "asof_date": "2026-06-10T00:00:00Z",
+                    "published_on": "2026-06-10T09:30:00Z",
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                },
+                "decision": "approve_dry_run",
+                "rationale": "test",
+            },
+        ),
+        client.post(
+            "/api/execution/approval-contract-update",
+            json={
+                "confirm": True,
+                "rationale": "test",
+                "row": {
+                    "asof_date": "2026-06-10T00:00:00Z",
+                    "published_on": "2026-06-10T09:30:00Z",
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                },
+            },
+        ),
+        client.post(
+            "/api/execution/reconcile",
+            json={
+                "dry_run": True,
+                "row": {
+                    "asof_date": "2026-06-10T00:00:00Z",
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                },
+            },
+        ),
+        client.post(
+            "/api/execution/evidence-review",
+            json={
+                "dry_run": True,
+                "row": {
+                    "asof_date": "2026-06-10T00:00:00Z",
+                    "published_on": "2026-06-10T09:30:00Z",
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "transaction_type": "BUY",
+                },
+            },
+        ),
+        client.post(
+            "/api/execution/live-allowance",
+            json={
+                "dry_run": True,
+                "row": {
+                    "asof_date": "2026-06-10T00:00:00Z",
+                    "published_on": "2026-06-10T09:30:00Z",
+                    "setup_id": "SETUP",
+                    "symbol": "ABC",
+                    "unique_id": "u1",
+                    "transaction_type": "BUY",
+                },
+            },
+        ),
+        client.post(
+            "/api/execution/live-submit-preflight",
+            json={
+                "asof_date": "2026-06-10T00:00:00Z",
+                "symbols": ["ABC"],
+                "setup_ids": ["SETUP"],
+            },
+        ),
     ]
 
     for response in responses:
@@ -11890,6 +15621,34 @@ def test_operator_api_technical_calibration_read_routes_smoke_with_typed_payload
     )
     monkeypatch.setattr(
         operator_api,
+        "build_config_change_applications_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/config-change/applications", "config_change_applications"),
+            "status": "ok",
+            "applications": [{"application_id": "app-1", "preview_id": "p1", "applied_by_system": False}],
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "build_config_change_application_decision_payload",
+        lambda payload: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/config-change/application-decision", "config_change_application_decision"),
+            "status": "ok",
+            "application_id": "app-2",
+            "preview_id": payload.get("preview_id"),
+            "application_decision": payload.get("application_decision"),
+            "verification_status": "verified",
+            "verification": {"status": "verified"},
+            "safety_checks": ["Application workflow is audit-only; no config file was modified by Stockey."],
+            "applied_by_system": False,
+            "applied": False,
+            "note": "Decision recorded only.",
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
         "build_event_policy_config_change_preview_payload",
         lambda payload: {
             "generated_at": "2026-06-07T00:00:00Z",
@@ -11937,6 +15696,15 @@ def test_operator_api_technical_calibration_read_routes_smoke_with_typed_payload
             },
         ),
         client.get("/api/config-change/previews?limit=1"),
+        client.get("/api/config-change/applications?limit=1"),
+        client.post(
+            "/api/config-change/application-decision",
+            json={
+                "preview_id": "p1",
+                "application_decision": "marked_applied",
+                "operator_id": "tester",
+            },
+        ),
         client.post(
             "/api/config-change/event-policy-preview",
             json={
@@ -11963,8 +15731,11 @@ def test_operator_api_technical_calibration_read_routes_smoke_with_typed_payload
     assert responses[4].json()["review_status"] == "ok"
     assert responses[5].json()["decision"] == "approved"
     assert responses[6].json()["previews"][0]["applied"] is False
-    assert responses[7].json()["source_type"] == "event_policy_review_rule"
-    assert responses[7].json()["applied"] is False
+    assert responses[7].json()["applications"][0]["applied_by_system"] is False
+    assert responses[8].json()["applied"] is False
+    assert responses[8].json()["application_decision"] == "marked_applied"
+    assert responses[9].json()["source_type"] == "event_policy_review_rule"
+    assert responses[9].json()["applied"] is False
 
 
 def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads(monkeypatch):
@@ -12014,7 +15785,30 @@ def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads
             "status": "ok",
             "artifact": {"model_version": "event_meta_model_h10", "latest_prefix": "models/event/latest"},
             "latest_s3_heads": [{"key": "models/event/latest/event_meta_model.json", "status": "ok"}],
+            "operator_boundary": {
+                "authority_scope": "read_only_artifact_inspection",
+                "system_applies_model": False,
+                "policy_auto_promotion_allowed": False,
+                "broker_execution_allowed": False,
+                "s3_write_allowed": False,
+            },
             "read_only": True,
+        },
+    )
+    monkeypatch.setattr(
+        operator_api,
+        "build_research_ledger_payload",
+        lambda **_kwargs: {
+            "generated_at": "2026-06-07T00:00:00Z",
+            "api_schema": schema("/api/research/ledger", "research_ledger"),
+            "status": "ok",
+            "runs": [{"research_run_id": "run-1", "status": "completed"}],
+            "summary": {"total_count": 1},
+            "pagination": {"runs": {"total_count": 1, "returned_count": 1}},
+            "operator_boundary": {
+                "authority_scope": "read_only_research_audit",
+                "broker_execution_allowed": False,
+            },
         },
     )
     monkeypatch.setattr(
@@ -12034,6 +15828,7 @@ def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads
     responses = [
         client.get("/api/research/event-model-promotion-check"),
         client.get("/api/research/event-model-artifacts"),
+        client.get("/api/research/ledger"),
         client.get("/api/research/prompt-registry"),
     ]
 
@@ -13771,6 +17566,8 @@ def test_action_recommender_reason_contract_complete_for_risk_bounded_buy():
                 "action_source": "portfolio",
                 "transaction_type": "BUY",
                 "execution_mode": "broker_order",
+                "reference_price": 112.0,
+                "reference_price_asof": pd.Timestamp("2026-05-01T09:45:00Z"),
                 "stop_price": 100.0,
                 "action_reason": "Breakout confirmed.",
                 "action_detail": "Strong technical setup.",
@@ -14025,6 +17822,8 @@ def test_action_recommender_reason_contract_explains_event_review_beating_portfo
     assert manual_review["boundary"] == "event_policy_review_required"
     assert manual_review["blocked_original_action"] == "MANUAL_REVIEW"
     assert manual_review["broker_execution_allowed"] is False
+    assert conflict["conflict_precedence_rule_id"] == "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY"
+    assert "Event-policy review blocks" in conflict["conflict_precedence_reason"]
     assert conflict["same_symbol_conflict_count"] == 1
     assert conflict["winning_action_code"] == "MANUAL_REVIEW"
     assert conflict["winning_action_source"] == "event_policy"
@@ -16136,6 +19935,68 @@ def test_action_recommender_enriches_event_and_playbook_context(monkeypatch):
     assert set(contract["evidence_sections_present"]) >= {"event", "playbook"}
 
 
+def test_action_recommender_event_context_uses_exact_point_in_time_cutoff(monkeypatch):
+    captured: dict[str, object] = {}
+    event_columns = {
+        "published_on",
+        "asof_date",
+        "evaluated_at",
+        "setup_id",
+        "symbol",
+        "unique_id",
+        "event_class",
+    }
+    monkeypatch.setattr(action_recommender, "table_exists", lambda table: table == action_recommender.EVENT_EVALUATIONS_TABLE)
+    monkeypatch.setattr(action_recommender, "table_columns", lambda table: event_columns)
+
+    def fake_sql(query, *args, **kwargs):
+        captured["query"] = str(query)
+        captured["params"] = kwargs.get("params") or {}
+        return pd.DataFrame()
+
+    monkeypatch.setattr(action_recommender, "sql_to_df", fake_sql)
+
+    exact, by_symbol = action_recommender._load_latest_event_context(
+        pd.Timestamp("2026-05-01T10:15:00Z"),
+        ["TCS"],
+    )
+
+    assert exact == {}
+    assert by_symbol == {}
+    assert "COALESCE(e.asof_date, e.published_on) <= %(asof_date)s" in str(captured["query"])
+    assert captured["params"]["asof_date"] == pd.Timestamp("2026-05-01T10:15:00Z")
+
+
+def test_action_recommender_playbook_context_uses_exact_point_in_time_cutoff(monkeypatch):
+    captured: dict[str, object] = {}
+    playbook_columns = {
+        "planned_at",
+        "hypothesis_id",
+        "source_key",
+        "symbol",
+        "confidence",
+    }
+    monkeypatch.setattr(action_recommender, "table_exists", lambda table: table == action_recommender.ACTION_PLANS_TABLE)
+    monkeypatch.setattr(action_recommender, "table_columns", lambda table: playbook_columns)
+
+    def fake_sql(query, *args, **kwargs):
+        captured["query"] = str(query)
+        captured["params"] = kwargs.get("params") or {}
+        return pd.DataFrame()
+
+    monkeypatch.setattr(action_recommender, "sql_to_df", fake_sql)
+
+    by_symbol, by_source = action_recommender._load_latest_playbook_context(
+        pd.Timestamp("2026-05-01T10:15:00Z"),
+        ["TCS"],
+    )
+
+    assert by_symbol == {}
+    assert by_source == {}
+    assert "planned_at <= %(asof_date)s" in str(captured["query"])
+    assert captured["params"]["asof_date"] == pd.Timestamp("2026-05-01T10:15:00Z")
+
+
 def test_action_recommender_reason_contract_downgrades_missing_buy_reason():
     winners = pd.DataFrame(
         [
@@ -16162,6 +20023,53 @@ def test_action_recommender_reason_contract_downgrades_missing_buy_reason():
     assert out.iloc[0]["execution_mode"] == "review_only"
     assert out.iloc[0]["reason_contract_status"] == "incomplete_downgraded"
     assert "action_reason" in str(contract["missing_fields"])
+
+
+def test_action_recommender_reason_contract_downgrades_missing_broker_transaction_side():
+    winners = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "symbol": "TCS",
+                "setup_id": "SETUP",
+                "action_code": "SELL",
+                "action_priority": 100,
+                "action_source": "rebalance",
+                "source_action": "exit_stop",
+                "transaction_type": None,
+                "execution_mode": "broker_order",
+                "reference_price": 95.0,
+                "reference_price_asof": pd.Timestamp("2026-05-01T09:45:00Z"),
+                "stop_price": 100.0,
+                "action_reason": "Stop failed after the close.",
+                "action_detail": "Exit because support failed.",
+                "raw_context_json": json.dumps(
+                    {
+                        "position_status": "open",
+                        "suggested_action": "exit_stop",
+                        "lifecycle_reason": "Stop failed.",
+                    }
+                ),
+            }
+        ]
+    )
+
+    out = action_recommender.add_recommendation_reason_contracts(winners, winners)
+    contract = json.loads(out.iloc[0]["recommendation_reason_json"])
+    manual_review = contract["evidence"]["manual_review"]
+    transition = contract["evidence"]["action_transition"]
+
+    assert out.iloc[0]["action_code"] == "MANUAL_REVIEW"
+    assert out.iloc[0]["transaction_type"] is None
+    assert out.iloc[0]["execution_mode"] == "review_only"
+    assert out.iloc[0]["reason_contract_status"] == "incomplete_downgraded"
+    assert contract["original_action_code"] == "SELL"
+    assert "sell_transaction_type" in manual_review["blocked_reason_contract_missing_fields"]
+    assert manual_review["manual_review_boundary"] == "incomplete_reason_contract"
+    assert manual_review["broker_execution_allowed"] is False
+    assert transition["state_effect"] == "review_only"
+    assert transition["broker_execution_allowed"] is False
 
 
 def test_action_recommender_incomplete_contract_manual_review_boundary_is_explicit():
@@ -17253,6 +21161,7 @@ def test_event_policy_evaluator_loads_policy_rows_and_attaches_returns(monkeypat
     )
     prices = pd.DataFrame(
         [
+            {"symbol": "ABC", "date": pd.Timestamp("2026-05-01T00:00:00Z"), "close": 90.0},
             {"symbol": "ABC", "date": pd.Timestamp("2026-05-02T00:00:00Z"), "close": 100.0},
             {"symbol": "ABC", "date": pd.Timestamp("2026-05-04T00:00:00Z"), "close": 103.0},
         ]
@@ -17264,6 +21173,9 @@ def test_event_policy_evaluator_loads_policy_rows_and_attaches_returns(monkeypat
 
     assert len(evaluations) == 1
     assert round(float(evaluations.iloc[0]["forward_return"]), 4) == 0.03
+    assert evaluations.iloc[0]["entry_close"] == 100.0
+    assert meta["point_in_time_return_contract"]["same_day_price_allowed"] is False
+    assert meta["point_in_time_return_contract"]["forward_returns_are_labels_only"] is True
     assert meta["matured_rows_by_horizon"]["2"] == 1
     action_summary = summary[(summary["group_type"] == "action_type") & (summary["group_value"] == "BUY_WATCH")].iloc[0]
     assert action_summary["matured_count"] == 1
@@ -17294,7 +21206,10 @@ def test_action_recommender_bridges_event_policy_actions(monkeypatch):
     monkeypatch.setattr(action_recommender, "load_watch_actions", lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr(action_recommender, "load_event_policy_actions", lambda **kwargs: policies)
     monkeypatch.setattr(action_recommender, "load_playbook_action_plans", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(action_recommender, "load_matched_manual_review_wait_signals", lambda **kwargs: pd.DataFrame())
     monkeypatch.setattr(action_recommender, "enrich_action_candidate_context", lambda df, asof_date: df)
+    monkeypatch.setattr(action_recommender, "apply_market_context_adjustments", lambda df, asof_date: df)
+    monkeypatch.setattr(action_recommender, "apply_identity_resolution_gates", lambda df: df)
     monkeypatch.setattr(action_recommender, "add_manual_revision_pointers", lambda df, all_candidates, **kwargs: df)
 
     out = action_recommender.build_action_recommendations(asof_date=asof_date)
@@ -17302,6 +21217,509 @@ def test_action_recommender_bridges_event_policy_actions(monkeypatch):
     assert out.iloc[0]["symbol"] == "ABC"
     assert out.iloc[0]["action_source"] == "event_policy"
     assert out.iloc[0]["action_code"] == "MANUAL_REVIEW"
+
+
+def test_action_recommender_preserves_portfolio_transition_contract(monkeypatch):
+    asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
+    transition_contract = {
+        "version": 1,
+        "current_state": "PLANNED_ENTRY",
+        "entry_evidence_required": True,
+        "entry_evidence_rule": "Lifecycle must use the first available close on or after portfolio published_on.",
+        "broker_execution_allowed": False,
+        "broker_boundary": "Portfolio rows are planning outputs only.",
+        "next_required_stage": "position_lifecycle",
+        "can_transition_to": ["ASSUMED_ENTERED", "PENDING_ENTRY_REVIEW"],
+    }
+    portfolio = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "setup_id": "TECH",
+                "symbol": "ABC",
+                "unique_id": "ABC-portfolio",
+                "portfolio_status": "approved",
+                "portfolio_reason": "Approved after risk sizing.",
+                "approved_allocation_inr": 50000.0,
+                "position_state": "PLANNED_ENTRY",
+                "state_transition_contract_json": json.dumps(transition_contract),
+                "stop_price": 95.0,
+                "invalidation_price": 92.0,
+                "target_price": 125.0,
+                "expected_horizon_days": 30,
+                "invest_score_pct": 82.0,
+                "execution_notes": "Wait for post-publication price evidence.",
+            }
+        ]
+    )
+    monkeypatch.setattr(action_recommender, "load_portfolio_actions", lambda **kwargs: portfolio.copy())
+    monkeypatch.setattr(action_recommender, "load_lifecycle_actions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(action_recommender, "load_rebalance_actions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(action_recommender, "load_watch_actions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(action_recommender, "load_event_policy_actions", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(action_recommender, "load_playbook_action_plans", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(action_recommender, "load_matched_manual_review_wait_signals", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(action_recommender, "enrich_action_candidate_context", lambda df, asof_date: df)
+    monkeypatch.setattr(action_recommender, "apply_market_context_adjustments", lambda df, asof_date: df)
+    monkeypatch.setattr(action_recommender, "apply_identity_resolution_gates", lambda df: df)
+    monkeypatch.setattr(action_recommender, "add_manual_revision_pointers", lambda df, all_candidates, **kwargs: df)
+
+    out = action_recommender.build_action_recommendations(asof_date=asof_date)
+
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert row["action_code"] == "BUY"
+    assert row["action_source"] == "portfolio"
+    assert row["recommended_target_price"] == 125.0
+    assert row["expected_horizon_days"] == 30
+    raw_context = json.loads(row["raw_context_json"])
+    assert raw_context["position_state"] == "PLANNED_ENTRY"
+    assert json.loads(raw_context["state_transition_contract_json"]) == transition_contract
+    reason_contract = json.loads(row["recommendation_reason_json"])
+    assert reason_contract["status"] == "complete"
+    assert reason_contract["evidence"]["portfolio_transition"]["current_state"] == "PLANNED_ENTRY"
+    assert reason_contract["evidence"]["portfolio_transition"]["entry_evidence_required"] is True
+    assert reason_contract["evidence"]["portfolio_transition"]["broker_execution_allowed"] is False
+    assert reason_contract["evidence"]["risk"]["recommended_target_price"] == 125.0
+    assert reason_contract["evidence"]["risk"]["expected_horizon_days"] == 30
+
+
+def test_action_recommender_portfolio_loader_tolerates_missing_transition_columns(monkeypatch):
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(action_recommender, "table_exists", lambda table_name: table_name == action_recommender.PORTFOLIO_TABLE)
+    monkeypatch.setattr(
+        action_recommender,
+        "table_columns",
+        lambda table_name: {
+            "asof_date",
+            "published_on",
+            "setup_id",
+            "symbol",
+            "unique_id",
+            "portfolio_status",
+            "portfolio_reason",
+            "approved_allocation_inr",
+            "stop_price",
+            "invalidation_price",
+            "invest_score_pct",
+            "execution_notes",
+        },
+    )
+
+    def fake_sql_to_df(query, params=None):
+        captured["query"] = query
+        captured["params"] = params
+        return pd.DataFrame()
+
+    monkeypatch.setattr(action_recommender, "sql_to_df", fake_sql_to_df)
+
+    result = action_recommender.load_portfolio_actions(asof_date=pd.Timestamp("2026-05-01T00:00:00Z"))
+
+    assert result.empty
+    assert "NULL AS position_state" in str(captured["query"])
+    assert "NULL AS state_transition_contract_json" in str(captured["query"])
+    assert "NULL AS target_price" in str(captured["query"])
+    assert "NULL AS expected_horizon_days" in str(captured["query"])
+
+
+def test_action_recommender_reason_contract_has_non_entry_transition_contracts():
+    asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "symbol": "HOLDCO",
+                "setup_id": "LIFE",
+                "unique_id": "hold-1",
+                "action_code": "HOLD",
+                "action_priority": 20,
+                "action_source": "lifecycle",
+                "source_action": "hold",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "reference_price": 100.0,
+                "stop_price": 90.0,
+                "action_reason": "Position remains valid.",
+                "action_detail": "No lifecycle exit trigger.",
+                "raw_context_json": json.dumps({"position_status": "open", "next_action": "hold"}),
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T09:31:00Z"),
+                "symbol": "ADDCO",
+                "setup_id": "LIFE",
+                "unique_id": "add-1",
+                "action_code": "BUY_MORE",
+                "action_priority": 60,
+                "action_source": "rebalance",
+                "source_action": "add_on_pullback",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "reference_price": 100.0,
+                "reference_price_asof": pd.Timestamp("2026-05-01T09:45:00Z"),
+                "stop_price": 94.0,
+                "action_reason": "Constructive pullback.",
+                "action_detail": "Add-on pullback held support.",
+                "raw_context_json": json.dumps({"position_status": "open", "suggested_action": "add_on_pullback"}),
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T09:32:00Z"),
+                "symbol": "EXITCO",
+                "setup_id": "LIFE",
+                "unique_id": "sell-1",
+                "action_code": "SELL",
+                "action_priority": 100,
+                "action_source": "rebalance",
+                "source_action": "exit_stop",
+                "transaction_type": "SELL",
+                "execution_mode": "broker_order",
+                "reference_price": 88.0,
+                "reference_price_asof": pd.Timestamp("2026-05-01T09:45:00Z"),
+                "stop_price": 90.0,
+                "action_reason": "Stop failed.",
+                "action_detail": "Exit because close broke stop.",
+                "raw_context_json": json.dumps({"position_status": "open", "suggested_action": "exit_stop"}),
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T09:33:00Z"),
+                "symbol": "TRIMCO",
+                "setup_id": "LIFE",
+                "unique_id": "trim-1",
+                "action_code": "PARTIAL_SELL",
+                "action_priority": 90,
+                "action_source": "rebalance",
+                "source_action": "trim_winner",
+                "transaction_type": "SELL",
+                "execution_mode": "broker_order",
+                "reference_price": 130.0,
+                "reference_price_asof": pd.Timestamp("2026-05-01T09:45:00Z"),
+                "stop_price": 115.0,
+                "action_fraction": 0.5,
+                "action_reason": "Winner extended.",
+                "action_detail": "Trim winner while keeping core.",
+                "raw_context_json": json.dumps({"position_status": "open", "suggested_action": "trim_winner"}),
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T09:34:00Z"),
+                "symbol": "STOPCO",
+                "setup_id": "LIFE",
+                "unique_id": "stop-1",
+                "action_code": "TIGHTEN_STOP",
+                "action_priority": 70,
+                "action_source": "rebalance",
+                "source_action": "tighten_stop",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "reference_price": 130.0,
+                "stop_price": 110.0,
+                "recommended_stop_price": 122.0,
+                "action_reason": "Raise trailing stop.",
+                "action_detail": "Policy update only.",
+                "raw_context_json": json.dumps({"position_status": "open", "suggested_action": "tighten_stop"}),
+            },
+            {
+                "asof_date": asof_date,
+                "published_on": pd.Timestamp("2026-05-01T09:35:00Z"),
+                "symbol": "REVCO",
+                "setup_id": "LIFE",
+                "unique_id": "review-1",
+                "action_code": "MANUAL_REVIEW",
+                "action_priority": 80,
+                "action_source": "rebalance",
+                "source_action": "review_target",
+                "transaction_type": None,
+                "execution_mode": "review_only",
+                "reference_price": 125.0,
+                "stop_price": 110.0,
+                "action_reason": "Target review required.",
+                "action_detail": "Operator must decide.",
+                "raw_context_json": json.dumps({"position_status": "open", "suggested_action": "review_target"}),
+            },
+        ]
+    )
+
+    out = action_recommender.add_recommendation_reason_contracts(rows, rows)
+    by_action = {
+        row["action_code"]: json.loads(row["recommendation_reason_json"])["evidence"]["action_transition"]
+        for _, row in out.iterrows()
+    }
+
+    assert by_action["HOLD"]["state_effect"] == "no_position_change"
+    assert by_action["HOLD"]["next_required_stage"] == "continue_monitoring"
+    assert by_action["HOLD"]["broker_order_candidate"] is False
+    assert by_action["HOLD"]["precondition_status"] == "complete"
+    assert by_action["BUY_MORE"]["state_effect"] == "planned_add_candidate"
+    assert by_action["BUY_MORE"]["broker_order_candidate"] is True
+    assert by_action["BUY_MORE"]["entry_evidence_required"] is True
+    assert by_action["BUY_MORE"]["precondition_status"] == "complete"
+    assert by_action["BUY_MORE"]["allowed_after_preview"] is True
+    assert "open_position_context" in by_action["BUY_MORE"]["required_preconditions"]
+    assert "add_on_evidence_present" in by_action["BUY_MORE"]["required_preconditions"]
+    assert by_action["SELL"]["state_effect"] == "planned_full_exit_candidate"
+    assert by_action["SELL"]["broker_order_candidate"] is True
+    assert by_action["SELL"]["exit_evidence_required"] is True
+    assert by_action["SELL"]["precondition_status"] == "complete"
+    assert by_action["SELL"]["allowed_after_preview"] is True
+    assert "full_exit_implied" in by_action["SELL"]["required_preconditions"]
+    assert by_action["PARTIAL_SELL"]["state_effect"] == "planned_partial_exit_candidate"
+    assert by_action["PARTIAL_SELL"]["exit_evidence_required"] is True
+    assert by_action["PARTIAL_SELL"]["precondition_status"] == "complete"
+    assert "partial_exit_fraction_resolved" in by_action["PARTIAL_SELL"]["required_preconditions"]
+    assert by_action["TIGHTEN_STOP"]["state_effect"] == "policy_update_review"
+    assert by_action["TIGHTEN_STOP"]["policy_audit_required"] is True
+    assert by_action["TIGHTEN_STOP"]["broker_order_candidate"] is False
+    assert by_action["TIGHTEN_STOP"]["precondition_status"] == "complete"
+    assert by_action["MANUAL_REVIEW"]["state_effect"] == "review_only"
+    assert by_action["MANUAL_REVIEW"]["next_required_stage"] == "operator_manual_review"
+    assert all(contract["broker_execution_allowed"] is False for contract in by_action.values())
+    assert all(contract.get("missing_preconditions", []) == [] for contract in by_action.values())
+
+
+def test_action_recommender_action_transition_reports_missing_preconditions():
+    row = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:33:00Z"),
+                "symbol": "TRIMCO",
+                "setup_id": "LIFE",
+                "unique_id": "trim-1",
+                "action_code": "PARTIAL_SELL",
+                "action_priority": 90,
+                "action_source": "rebalance",
+                "source_action": "trim_winner",
+                "transaction_type": "SELL",
+                "execution_mode": "broker_order",
+                "reference_price": 130.0,
+                "stop_price": 115.0,
+                "action_reason": "Winner extended.",
+                "action_detail": "Trim winner while keeping core.",
+                "raw_context_json": json.dumps({"suggested_action": "trim_winner"}),
+            }
+        ]
+    )
+
+    out = action_recommender.add_recommendation_reason_contracts(row, row)
+    contract = json.loads(out.iloc[0]["recommendation_reason_json"])
+    transition = contract["evidence"]["action_transition"]
+
+    assert transition["state_effect"] == "planned_partial_exit_candidate"
+    assert transition["broker_order_candidate"] is True
+    assert transition["precondition_status"] == "incomplete"
+    assert "open_position_context" in transition["missing_preconditions"]
+    assert "partial_exit_fraction_resolved" in transition["missing_preconditions"]
+    assert transition["broker_execution_allowed"] is False
+
+
+def test_action_recommender_buy_transition_requires_post_publication_entry_evidence():
+    row = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "symbol": "BUYCO",
+                "setup_id": "PORT",
+                "unique_id": "buy-1",
+                "action_code": "BUY",
+                "action_priority": 50,
+                "action_source": "portfolio",
+                "source_action": "approved",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "reference_price": 100.0,
+                "stop_price": 92.0,
+                "action_reason": "Approved planned entry.",
+                "action_detail": "Portfolio candidate without post-publication price evidence.",
+                "raw_context_json": json.dumps(
+                    {
+                        "position_state": "PLANNED_ENTRY",
+                        "state_transition_contract_json": json.dumps(
+                            {
+                                "current_state": "PLANNED_ENTRY",
+                                "entry_evidence_required": True,
+                                "entry_evidence_rule": "Lifecycle must use the first available close on or after portfolio published_on.",
+                                "broker_execution_allowed": False,
+                            }
+                        ),
+                    }
+                ),
+            }
+        ]
+    )
+
+    out = action_recommender.add_recommendation_reason_contracts(row, row)
+    contract = json.loads(out.iloc[0]["recommendation_reason_json"])
+    transition = contract["evidence"]["action_transition"]
+
+    assert transition["state_effect"] == "planned_entry_candidate"
+    assert transition["broker_order_candidate"] is True
+    assert transition["precondition_status"] == "incomplete"
+    assert "entry_evidence_after_publication" in transition["missing_preconditions"]
+    assert transition["allowed_after_preview"] is True
+    assert transition["broker_execution_allowed"] is False
+
+
+def test_action_recommender_buy_transition_accepts_post_publication_entry_evidence():
+    row = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "symbol": "BUYCO",
+                "setup_id": "PORT",
+                "unique_id": "buy-1",
+                "action_code": "BUY",
+                "action_priority": 50,
+                "action_source": "portfolio",
+                "source_action": "approved",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "reference_price": 100.0,
+                "reference_price_asof": pd.Timestamp("2026-05-01T09:45:00Z"),
+                "stop_price": 92.0,
+                "action_reason": "Approved planned entry.",
+                "action_detail": "Portfolio candidate with post-publication price evidence.",
+                "raw_context_json": json.dumps({"position_state": "PLANNED_ENTRY"}),
+            }
+        ]
+    )
+
+    out = action_recommender.add_recommendation_reason_contracts(row, row)
+    contract = json.loads(out.iloc[0]["recommendation_reason_json"])
+    transition = contract["evidence"]["action_transition"]
+
+    assert transition["state_effect"] == "planned_entry_candidate"
+    assert transition["precondition_status"] == "complete"
+    assert "entry_evidence_after_publication" in transition["required_preconditions"]
+    assert transition.get("missing_preconditions", []) == []
+    assert transition["broker_execution_allowed"] is False
+
+
+def test_action_recommender_add_and_exit_transitions_require_post_publication_price_evidence():
+    rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "symbol": "ADDCO",
+                "setup_id": "LIFE",
+                "unique_id": "add-1",
+                "action_code": "BUY_MORE",
+                "action_priority": 60,
+                "action_source": "rebalance",
+                "source_action": "add_on_pullback",
+                "transaction_type": "BUY",
+                "execution_mode": "broker_order",
+                "reference_price": 105.0,
+                "stop_price": 99.0,
+                "action_reason": "Add on pullback.",
+                "action_detail": "Pullback held support but timestamped evidence is missing.",
+                "raw_context_json": json.dumps({"position_status": "open", "suggested_action": "add_on_pullback"}),
+            },
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "symbol": "SELLCO",
+                "setup_id": "LIFE",
+                "unique_id": "sell-1",
+                "action_code": "SELL",
+                "action_priority": 100,
+                "action_source": "rebalance",
+                "source_action": "exit_stop",
+                "transaction_type": "SELL",
+                "execution_mode": "broker_order",
+                "reference_price": 88.0,
+                "stop_price": 90.0,
+                "action_reason": "Exit on stop failure.",
+                "action_detail": "Stop failed but timestamped evidence is missing.",
+                "raw_context_json": json.dumps({"position_status": "open", "suggested_action": "exit_stop"}),
+            },
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-01T09:30:00Z"),
+                "symbol": "TRIMCO",
+                "setup_id": "LIFE",
+                "unique_id": "trim-1",
+                "action_code": "PARTIAL_SELL",
+                "action_priority": 90,
+                "action_source": "rebalance",
+                "source_action": "trim_winner",
+                "transaction_type": "SELL",
+                "execution_mode": "broker_order",
+                "reference_price": 130.0,
+                "stop_price": 115.0,
+                "action_fraction": 0.5,
+                "action_reason": "Trim extended winner.",
+                "action_detail": "Trim trigger exists but timestamped evidence is missing.",
+                "raw_context_json": json.dumps({"position_status": "open", "suggested_action": "trim_winner"}),
+            },
+        ]
+    )
+
+    out = action_recommender.add_recommendation_reason_contracts(rows, rows)
+    transitions = {
+        row["action_code"]: json.loads(row["recommendation_reason_json"])["evidence"]["action_transition"]
+        for _, row in out.iterrows()
+    }
+
+    assert transitions["BUY_MORE"]["precondition_status"] == "incomplete"
+    assert "add_on_evidence_present" in transitions["BUY_MORE"]["missing_preconditions"]
+    assert transitions["SELL"]["precondition_status"] == "incomplete"
+    assert "exit_trigger_present" in transitions["SELL"]["missing_preconditions"]
+    assert transitions["PARTIAL_SELL"]["precondition_status"] == "incomplete"
+    assert "exit_trigger_present" in transitions["PARTIAL_SELL"]["missing_preconditions"]
+    assert transitions["PARTIAL_SELL"]["missing_preconditions"].count("exit_trigger_present") == 1
+    assert all(transition["broker_execution_allowed"] is False for transition in transitions.values())
+
+
+def test_operator_api_compact_reason_contract_preserves_action_transition():
+    contract = {
+        "status": "complete",
+        "action_code": "SELL",
+        "primary_reason": "Stop failed.",
+        "evidence": {
+            "action_transition": {
+                "schema_version": 1,
+                "action_code": "SELL",
+                "source_stage": "rebalance",
+                "source_action": "exit_stop",
+                "state_effect": "planned_full_exit_candidate",
+                "transaction_type": "SELL",
+                "execution_mode": "broker_order",
+                "broker_order_candidate": True,
+                "broker_execution_allowed": False,
+                "broker_boundary": "Action row is not a broker order.",
+                "next_required_stage": "execution_engine_order_preview",
+                "allowed_after_preview": True,
+                "required_preconditions": ["open_position_context", "sell_transaction_type", "exit_trigger_present"],
+                "missing_preconditions": [],
+                "precondition_status": "complete",
+                "entry_evidence_required": False,
+                "exit_evidence_required": True,
+                "policy_audit_required": False,
+            }
+        },
+    }
+
+    compact = operator_api._compact_reason_contract(json.dumps(contract))
+    transition = compact["evidence"]["action_transition"]
+
+    assert transition["action_code"] == "SELL"
+    assert transition["state_effect"] == "planned_full_exit_candidate"
+    assert transition["broker_order_candidate"] is True
+    assert transition["broker_execution_allowed"] is False
+    assert transition["next_required_stage"] == "execution_engine_order_preview"
+    assert transition["allowed_after_preview"] is True
+    assert transition["required_preconditions"] == ["open_position_context", "sell_transaction_type", "exit_trigger_present"]
+    assert transition["missing_preconditions"] == []
+    assert transition["precondition_status"] == "complete"
+    assert transition["exit_evidence_required"] is True
 
 
 def test_hypothesis_engine_builds_matches_and_decision():
@@ -17802,6 +22220,7 @@ def test_codex_cli_uses_output_last_message(monkeypatch, tmp_path):
         return DummyCompleted()
 
     monkeypatch.setattr(codex_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(codex_cli, "resolve_codex_binary", lambda configured=None: "codex")
 
     result = codex_cli.run_codex_cli("Summarize this", model="gpt-test", images=[tmp_path / "page.png"])
 
@@ -17810,6 +22229,33 @@ def test_codex_cli_uses_output_last_message(monkeypatch, tmp_path):
     assert cmd[:2] == ["codex", "exec"]
     assert ["--model", "gpt-test"] == cmd[cmd.index("--model") : cmd.index("--model") + 2]
     assert ["--image", str(tmp_path / "page.png")] == cmd[cmd.index("--image") : cmd.index("--image") + 2]
+
+
+def test_codex_cli_resolves_common_nvm_binary(monkeypatch, tmp_path):
+    nvm_codex = tmp_path / ".nvm" / "versions" / "node" / "v22.14.0" / "bin" / "codex"
+    nvm_codex.parent.mkdir(parents=True)
+    nvm_codex.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setattr(codex_cli.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(codex_cli.shutil, "which", lambda _name: None)
+
+    assert codex_cli.resolve_codex_binary("codex") == str(nvm_codex)
+
+
+def test_codex_cli_missing_binary_records_fallback(monkeypatch, tmp_path):
+    events = []
+
+    monkeypatch.setattr(codex_cli.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(codex_cli.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(fallback_telemetry, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(codex_cli.CodexCLIError):
+        codex_cli.resolve_codex_binary("codex")
+
+    assert events[0]["module"] == "utils.codex_cli"
+    assert events[0]["source"] == "codex_cli"
+    assert events[0]["fallback_type"] == "codex_cli_binary_not_found"
+    assert events[0]["metadata"]["configured_binary"] == "codex"
 
 
 def test_codex_cli_structured_validates_json(monkeypatch):
@@ -17944,6 +22390,8 @@ def test_managed_announcement_stage_serializes_dataclass_reports():
         model_name="codex",
         data={"revenue": 100},
     )
+
+    assert report.model_dump()["report_name"] == "QuarterlyResult"
 
     payload = announcement_managed_pipeline.serialize_stage_payload([report])
 
@@ -18171,8 +22619,13 @@ def test_ts_forecast_evaluator_scores_matured_rows_after_costs():
     assert len(evaluated) == 1
     assert len(not_matured) == 1
     row = evaluated.iloc[0]
-    assert round(float(row["realized_return"]), 4) == 0.1
-    assert round(float(row["cost_adjusted_return"]), 4) == 0.0975
+    contract = json.loads(row["point_in_time_return_contract_json"])
+    assert contract["same_day_price_allowed"] is False
+    assert contract["forward_returns_are_labels_only"] is True
+    assert contract["entry_rule"] == "Use first available close strictly after forecast asof_date."
+    assert float(row["entry_price"]) == 101.0
+    assert round(float(row["realized_return"]), 4) == 0.099
+    assert round(float(row["cost_adjusted_return"]), 4) == 0.0965
     assert bool(row["direction_hit"]) is True
     assert len(summary) == 1
     assert int(summary.iloc[0]["row_count"]) == 1
@@ -18530,6 +22983,37 @@ def test_ts_forecast_promotion_check_load_failure_records_fallback(monkeypatch):
     assert events[0]["source"] == ts_forecast_paper_portfolio.PAPER_TABLE
 
 
+def test_ts_forecast_promotion_check_missing_paper_table_returns_blocked_payload(monkeypatch):
+    class UndefinedTable(Exception):
+        pass
+
+    error = UndefinedTable(f'relation "{ts_forecast_paper_portfolio.PAPER_TABLE}" does not exist')
+    args = argparse.Namespace(
+        from_date=None,
+        to_date=None,
+        model_name="timesfm_2p5_200m",
+        horizon_days=10,
+        min_evaluated_trades=ts_forecast_promotion_check.DEFAULT_MIN_EVALUATED_TRADES,
+        min_win_rate=ts_forecast_promotion_check.DEFAULT_MIN_WIN_RATE,
+        min_avg_cost_adjusted_return=ts_forecast_promotion_check.DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN,
+        min_lift_vs_momentum=ts_forecast_promotion_check.DEFAULT_MIN_LIFT_VS_MOMENTUM,
+        max_exit_conflict_rate=ts_forecast_promotion_check.DEFAULT_MAX_EXIT_CONFLICT_RATE,
+        min_distinct_dates=ts_forecast_promotion_check.DEFAULT_MIN_DISTINCT_DATES,
+        min_symbols=ts_forecast_promotion_check.DEFAULT_MIN_SYMBOLS,
+    )
+    monkeypatch.setattr(ts_forecast_promotion_check, "load_paper_evidence", lambda **_kwargs: (_ for _ in ()).throw(error))
+
+    payload = ts_forecast_promotion_check.build_promotion_check(args)
+
+    assert payload["status"] == "blocked"
+    assert payload["decision"] == "hold_research_only"
+    assert payload["ready_for_operator_review"] is False
+    assert payload["scorecard"]["status"] == "evidence_unavailable"
+    assert payload["scorecard"]["broker_execution_allowed"] is False
+    assert payload["evidence"]["available"] is False
+    assert payload["evidence"]["paper_table"] == ts_forecast_paper_portfolio.PAPER_TABLE
+
+
 def test_operator_api_builds_ts_forecast_promotion_payload(monkeypatch):
     monkeypatch.setattr(
         operator_api,
@@ -18551,6 +23035,42 @@ def test_operator_api_builds_ts_forecast_promotion_payload(monkeypatch):
     assert payload["decision"] == "hold_research_only"
     assert payload["scorecard"]["configured_gates"]["min_evaluated_trades"] == ts_forecast_promotion_check.DEFAULT_MIN_EVALUATED_TRADES
     assert payload["api_schema"]["broker_execution_enabled"] is False
+
+
+def test_operator_api_ts_forecast_promotion_payload_handles_missing_paper_table(monkeypatch):
+    class UndefinedTable(Exception):
+        pass
+
+    error = UndefinedTable(f'relation "{ts_forecast_paper_portfolio.PAPER_TABLE}" does not exist')
+    monkeypatch.setattr(operator_api, "load_ts_forecast_review_rules", lambda: {"status": "ok", "rules": []})
+    monkeypatch.setattr(ts_forecast_promotion_check, "load_paper_evidence", lambda **_kwargs: (_ for _ in ()).throw(error))
+
+    payload = operator_api.build_ts_forecast_promotion_check_payload(model_name="timesfm_2p5_200m", horizon_days=10)
+
+    assert payload["api_schema"]["endpoint"] == "/api/research/ts-forecast-promotion-check"
+    assert payload["status"] == "blocked"
+    assert payload["decision"] == "hold_research_only"
+    assert payload["evidence"]["available"] is False
+    assert payload["api_schema"]["broker_execution_enabled"] is False
+
+
+def test_operator_api_ts_forecast_promotion_route_handles_missing_paper_table(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    class UndefinedTable(Exception):
+        pass
+
+    error = UndefinedTable(f'relation "{ts_forecast_paper_portfolio.PAPER_TABLE}" does not exist')
+    monkeypatch.setattr(ts_forecast_promotion_check, "load_paper_evidence", lambda **_kwargs: (_ for _ in ()).throw(error))
+
+    response = TestClient(operator_api.create_app()).get("/api/research/ts-forecast-promotion-check")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["api_schema"]["endpoint"] == "/api/research/ts-forecast-promotion-check"
+    assert body["status"] == "blocked"
+    assert body["decision"] == "hold_research_only"
+    assert body["evidence"]["available"] is False
 
 
 def test_ts_forecast_promotion_review_is_manual_only(monkeypatch):
@@ -20147,6 +24667,48 @@ def test_download_runner_classifies_standard_run_statuses():
     assert download_runner.classify_run_status(status="failed", module_name="data.nsdl.fpi", error="No data for date") == "no_data"
 
 
+def test_download_runner_refines_successful_zero_row_run_state():
+    no_data = download_runner.build_run_state_result(
+        {
+            "module": "data.mospi.cpi",
+            "status": "ok",
+            "returncode": 0,
+            "rows": 0,
+            "no_data_count": 1,
+            "state_advanced": False,
+        },
+        step={"module": "data.mospi.cpi", "args": [], "purpose": "macro"},
+    )
+    unavailable = download_runner.build_run_state_result(
+        {
+            "module": "data.nseindia.recent_events",
+            "status": "ok",
+            "returncode": 0,
+            "rows": 0,
+            "source_unavailable_count": 1,
+            "state_advanced": False,
+        },
+        step={"module": "data.nseindia.recent_events", "args": [], "purpose": "events"},
+    )
+    explicit = download_runner.build_run_state_result(
+        {
+            "module": "data.nseindia.recent_events",
+            "status": "ok",
+            "returncode": 0,
+            "rows": 0,
+            "classification": "auth_unavailable",
+            "state_advanced": False,
+        },
+        step={"module": "data.nseindia.recent_events", "args": [], "purpose": "events"},
+    )
+
+    assert no_data["classification"] == "no_data"
+    assert no_data["state_advanced"] is False
+    assert unavailable["classification"] == "source_unavailable"
+    assert unavailable["state_advanced"] is False
+    assert explicit["classification"] == "auth_unavailable"
+
+
 def test_download_runner_persists_standard_run_state_on_success(monkeypatch):
     persisted: list[dict[str, object]] = []
     monkeypatch.setattr(download_runner, "_execute_module_entrypoint", lambda _module_name: (0, {}))
@@ -20182,6 +24744,10 @@ def test_download_runner_merges_exported_module_run_state(monkeypatch):
                 "failed_attempt_count": 2,
                 "fallback_count": 1,
                 "source_unavailable_count": 1,
+                "auth_unavailable_count": 0,
+                "reference_mapping_missing_count": 1,
+                "classification_counts": {"reference_mapping_missing": 1, "source_unavailable": 1},
+                "failed_symbols": ["HUIL"],
                 "fallback_used": True,
                 "state_advanced": False,
             },
@@ -20202,9 +24768,15 @@ def test_download_runner_merges_exported_module_run_state(monkeypatch):
     assert result["run_state"]["failed_attempt_count"] == 2
     assert result["run_state"]["fallback_count"] == 1
     assert result["run_state"]["source_unavailable_count"] == 1
+    assert result["run_state"]["reference_mapping_missing_count"] == 1
+    assert result["run_state"]["classification_counts"] == {"reference_mapping_missing": 1, "source_unavailable": 1}
+    assert result["run_state"]["failed_symbols"] == ["HUIL"]
     assert result["run_state"]["fallback_used"] is True
     assert result["run_state"]["state_advanced"] is False
     assert persisted[0]["state"]["rows"] == 12
+    assert persisted[0]["state"]["reference_mapping_missing_count"] == 1
+    assert persisted[0]["state"]["classification_counts"] == {"reference_mapping_missing": 1, "source_unavailable": 1}
+    assert persisted[0]["state"]["failed_symbols"] == ["HUIL"]
 
 
 def test_download_runner_merges_exported_module_run_state_on_nonzero_exit(monkeypatch):
@@ -21752,10 +26324,55 @@ def test_dhan_scrip_master_main_exports_runner_state(monkeypatch, tmp_path):
     assert dhan_scrip_master.STOCKEY_RUN_STATE["rows"] == 2
     assert dhan_scrip_master.STOCKEY_RUN_STATE["rows_read"] == 2
     assert dhan_scrip_master.STOCKEY_RUN_STATE["rows_written"] == 2
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["classification"] == "ok"
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["status"] == "ok"
     assert dhan_scrip_master.STOCKEY_RUN_STATE["column_count"] == 4
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["source"] == "dhan_scrip_master"
     assert dhan_scrip_master.STOCKEY_RUN_STATE["source_file"] == str(csv_path)
     assert dhan_scrip_master.STOCKEY_RUN_STATE["load_ts"] == load_ts.isoformat()
     assert dhan_scrip_master.STOCKEY_RUN_STATE["fallback_used"] is False
+
+
+def test_dhan_scrip_master_main_exports_download_failure_state(monkeypatch):
+    monkeypatch.setattr(
+        dhan_scrip_master,
+        "download_master_csv",
+        lambda: (_ for _ in ()).throw(SystemExit("[ERROR] download failed: network down")),
+    )
+
+    with pytest.raises(SystemExit):
+        dhan_scrip_master.main()
+
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["classification"] == "source_unavailable"
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["status"] == "failed"
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["rows_written"] == 0
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["source_unavailable_count"] == 1
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["state_advanced"] is False
+
+
+def test_dhan_scrip_master_main_exports_schema_failure_state(monkeypatch, tmp_path):
+    events: list[dict[str, object]] = []
+    csv_path = tmp_path / "dhan_master.csv"
+    df = pd.DataFrame({"exch_id": ["NSE"], "segment": ["E"], "security_id": [1]})
+
+    monkeypatch.setattr(dhan_scrip_master, "download_master_csv", lambda: csv_path)
+    monkeypatch.setattr(dhan_scrip_master, "load_csv", lambda path: df.copy())
+    monkeypatch.setattr(
+        dhan_scrip_master,
+        "update_database",
+        lambda frame: (_ for _ in ()).throw(RuntimeError('UndefinedColumn: column "sm_freeze_qty" of relation "_stage" does not exist')),
+    )
+    monkeypatch.setattr(dhan_scrip_master, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(RuntimeError, match="UndefinedColumn"):
+        dhan_scrip_master.main()
+
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["classification"] == "schema_changed"
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["status"] == "failed"
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["schema_changed_count"] == 1
+    assert dhan_scrip_master.STOCKEY_RUN_STATE["source_file"] == str(csv_path)
+    assert events[0]["fallback_type"] == "dhan_scrip_master_sync_failed"
+    assert events[0]["metadata"]["classification"] == "schema_changed"
 
 
 def test_screener_parser_main_exports_runner_state(monkeypatch, capsys):
@@ -21781,8 +26398,11 @@ def test_screener_parser_main_exports_runner_state(monkeypatch, capsys):
     assert screener_parser_module.STOCKEY_RUN_STATE["rows"] == 3
     assert screener_parser_module.STOCKEY_RUN_STATE["rows_read"] == 3
     assert screener_parser_module.STOCKEY_RUN_STATE["rows_written"] == 3
+    assert screener_parser_module.STOCKEY_RUN_STATE["classification"] == "ok"
+    assert screener_parser_module.STOCKEY_RUN_STATE["status"] == "ok"
     assert screener_parser_module.STOCKEY_RUN_STATE["screener_count"] == 1
     assert screener_parser_module.STOCKEY_RUN_STATE["screeners_synced"] == 1
+    assert screener_parser_module.STOCKEY_RUN_STATE["failed_screener_count"] == 0
     assert screener_parser_module.STOCKEY_RUN_STATE["from_date"] == "2026-06-11"
     assert screener_parser_module.STOCKEY_RUN_STATE["to_date"] == "2026-06-11"
     assert screener_parser_module.STOCKEY_RUN_STATE["state_advanced"] is True
@@ -21797,7 +26417,66 @@ def test_screener_parser_main_exports_no_data_state(monkeypatch, capsys):
 
     assert "no_registered_screener_urls" in captured.out
     assert screener_parser_module.STOCKEY_RUN_STATE["rows"] == 0
+    assert screener_parser_module.STOCKEY_RUN_STATE["classification"] == "no_data"
+    assert screener_parser_module.STOCKEY_RUN_STATE["status"] == "ok"
     assert screener_parser_module.STOCKEY_RUN_STATE["screener_count"] == 0
+    assert screener_parser_module.STOCKEY_RUN_STATE["state_advanced"] is False
+
+
+def test_screener_parser_main_exports_partial_failure_state(monkeypatch, capsys):
+    urls = [
+        "https://www.screener.in/screens/1/demo/",
+        "https://www.screener.in/screens/2/broken/",
+    ]
+    monkeypatch.setattr(screener_parser_module, "load_registered_urls", lambda: urls)
+
+    def fake_sync_screener(url):
+        if "broken" in url:
+            raise ValueError("Could not find Screener.in results table; page_title='Broken'")
+        return {
+            "source_name": "screener.in",
+            "screener_slug": "demo",
+            "screener_name": "Demo",
+            "screen_id": 1,
+            "date": "2026-06-11",
+            "row_count": 3,
+        }
+
+    monkeypatch.setattr(screener_parser_module, "sync_screener", fake_sync_screener)
+    monkeypatch.setattr(sys, "argv", ["data.screenerin.screener_parser"])
+
+    assert screener_parser_module.main() == 1
+    captured = capsys.readouterr()
+
+    assert "Could not find Screener.in results table" in captured.err
+    assert "no_registered_screener_urls" not in captured.out
+    assert screener_parser_module.STOCKEY_RUN_STATE["classification"] == "partial_failed"
+    assert screener_parser_module.STOCKEY_RUN_STATE["status"] == "failed"
+    assert screener_parser_module.STOCKEY_RUN_STATE["rows"] == 3
+    assert screener_parser_module.STOCKEY_RUN_STATE["screeners_synced"] == 1
+    assert screener_parser_module.STOCKEY_RUN_STATE["failed_screener_count"] == 1
+    assert screener_parser_module.STOCKEY_RUN_STATE["parse_failed_count"] == 1
+    assert screener_parser_module.STOCKEY_RUN_STATE["classification_counts"] == {"parse_failed": 1}
+    assert screener_parser_module.STOCKEY_RUN_STATE["state_advanced"] is True
+
+
+def test_screener_parser_main_exports_auth_failure_state(monkeypatch, capsys):
+    monkeypatch.setattr(screener_parser_module, "load_registered_urls", lambda: ["https://www.screener.in/screens/1/demo/"])
+    monkeypatch.setattr(
+        screener_parser_module,
+        "sync_screener",
+        lambda url: (_ for _ in ()).throw(RuntimeError("Screener.in redirected to login while fetching registered screener")),
+    )
+    monkeypatch.setattr(sys, "argv", ["data.screenerin.screener_parser"])
+
+    assert screener_parser_module.main() == 1
+    capsys.readouterr()
+
+    assert screener_parser_module.STOCKEY_RUN_STATE["classification"] == "auth_unavailable"
+    assert screener_parser_module.STOCKEY_RUN_STATE["status"] == "failed"
+    assert screener_parser_module.STOCKEY_RUN_STATE["rows"] == 0
+    assert screener_parser_module.STOCKEY_RUN_STATE["failed_screener_count"] == 1
+    assert screener_parser_module.STOCKEY_RUN_STATE["auth_unavailable_count"] == 1
     assert screener_parser_module.STOCKEY_RUN_STATE["state_advanced"] is False
 
 
@@ -22495,13 +27174,96 @@ def test_sharpely_data_sync_exports_fundamental_run_state(monkeypatch):
     assert result["historical_mcap_rows"] == 8
     assert result["rows_written"] == 22
     assert result["rows"] == 22
+    assert result["classification"] == "ok"
+    assert result["status"] == "ok"
     assert result["meta_refreshed_count"] == 2
     assert result["peer_refreshed_count"] == 2
     assert result["statement_refreshed_count"] == 2
     assert result["shareholding_refreshed_count"] == 2
     assert result["mcap_refreshed_count"] == 2
+    assert result["failed_symbol_count"] == 0
     assert result["symbols_skipped_no_work"] == []
     assert result["state_advanced"] is True
+
+
+def test_sharpely_data_sync_exports_partial_failure_run_state(monkeypatch):
+    events: list[dict[str, object]] = []
+    max_dates = {
+        sharpely_data.SHARPELY_STOCK_META_TABLE: None,
+        sharpely_data.SHARPELY_STOCK_PEERS_TABLE: None,
+        "stmt_income": pd.Timestamp("2026-05-30"),
+        "stmt_balancesheet": pd.Timestamp("2026-05-30"),
+        "stmt_cashflow": pd.Timestamp("2026-05-30"),
+        "shareholding_category": pd.Timestamp("2026-05-30"),
+        "shareholding_top_holders": pd.Timestamp("2026-05-30"),
+        "historical_mcap": pd.Timestamp("2026-05-30"),
+    }
+
+    monkeypatch.setattr(
+        sharpely_data,
+        "normalize_date_window",
+        lambda from_date, to_date: (pd.Timestamp("2026-06-01").to_pydatetime(), pd.Timestamp("2026-06-11").to_pydatetime()),
+    )
+    monkeypatch.setattr(sharpely_data, "get_db_max_date", lambda table_name, **_kwargs: max_dates.get(table_name))
+    monkeypatch.setattr(sharpely_data, "choose_from_date", lambda explicit, candidates: pd.Timestamp("2026-06-01").to_pydatetime())
+
+    def fake_get_stock_meta(symbol):
+        if symbol == "BAD":
+            raise RuntimeError("Sharpely API timed out")
+        return [{"symbol": symbol, "as_on_date": "2026-06-11", "nse_basic_ind_code": "IND"}]
+
+    monkeypatch.setattr(sharpely_data, "get_stock_meta", fake_get_stock_meta)
+    monkeypatch.setattr(sharpely_data, "save_stock_meta", lambda symbol, payload: pd.DataFrame([{"raw_json": json.dumps(payload[0])}]))
+    monkeypatch.setattr(sharpely_data, "get_stock_peers", lambda symbol, meta=None: [{"symbol": f"{symbol}P"}])
+    monkeypatch.setattr(sharpely_data, "save_stock_peers", lambda symbol, meta, peers: pd.DataFrame([{"peer_symbol": peers[0]["symbol"]}]))
+    monkeypatch.setattr(sharpely_data, "get_financial_statement", lambda symbol, from_date, to_date: {"symbol": symbol, "rows": 3})
+    monkeypatch.setattr(sharpely_data, "get_shareholding", lambda symbol, from_date, to_date: {"symbol": symbol, "rows": 2})
+    monkeypatch.setattr(sharpely_data, "get_historical_mcap", lambda symbol, from_date, to_date: {"symbol": symbol, "rows": 4})
+    monkeypatch.setattr(sharpely_data, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    result = sharpely_data.sync_sharpely_data(["AAA", "BAD"], from_date=None, to_date=None)
+
+    assert result["classification"] == "partial_failed"
+    assert result["status"] == "failed"
+    assert result["rows_written"] == 11
+    assert result["failed_symbol_count"] == 1
+    assert result["failed_symbols"] == ["BAD"]
+    assert result["source_unavailable_count"] == 1
+    assert result["classification_counts"] == {"source_unavailable": 1}
+    assert result["state_advanced"] is True
+    assert events[0]["fallback_type"] == "sharpely_symbol_sync_failed"
+    assert events[0]["symbol"] == "BAD"
+    assert events[0]["metadata"]["classification"] == "source_unavailable"
+
+
+def test_sharpely_data_main_returns_nonzero_on_failed_run_state(monkeypatch, capsys):
+    monkeypatch.setattr(sharpely_data, "load_tracked_symbols", lambda symbols: ["AAA", "BAD"])
+    monkeypatch.setattr(sharpely_data, "parse_datetime_arg", lambda value: pd.Timestamp(value).to_pydatetime() if value else None)
+    monkeypatch.setattr(
+        sharpely_data,
+        "sync_sharpely_data",
+        lambda **kwargs: {
+            "source": "sharpely_fundamentals",
+            "symbol_count": len(kwargs["symbols"]),
+            "rows": 5,
+            "rows_read": len(kwargs["symbols"]),
+            "rows_written": 5,
+            "classification": "partial_failed",
+            "status": "failed",
+            "failed_symbol_count": 1,
+            "from_date": "2026-06-01",
+            "to_date": "2026-06-11",
+            "fallback_used": False,
+            "state_advanced": True,
+        },
+    )
+    monkeypatch.setattr(sys, "argv", ["data.sharpelydata.sharpely_data", "--symbols", "AAA", "BAD"])
+
+    assert sharpely_data.main() == 1
+    capsys.readouterr()
+
+    assert sharpely_data.STOCKEY_RUN_STATE["classification"] == "partial_failed"
+    assert sharpely_data.STOCKEY_RUN_STATE["status"] == "failed"
 
 
 def test_sharpely_data_main_exports_runner_state(monkeypatch, capsys):
@@ -22516,6 +27278,8 @@ def test_sharpely_data_main_exports_runner_state(monkeypatch, capsys):
             "rows": 5,
             "rows_read": len(kwargs["symbols"]),
             "rows_written": 5,
+            "classification": "ok",
+            "status": "ok",
             "from_date": "2026-06-01",
             "to_date": "2026-06-11",
             "fallback_used": False,
@@ -22536,6 +27300,8 @@ def test_sharpely_data_main_exports_runner_state(monkeypatch, capsys):
     assert sharpely_data.STOCKEY_RUN_STATE["rows"] == 5
     assert sharpely_data.STOCKEY_RUN_STATE["rows_read"] == 2
     assert sharpely_data.STOCKEY_RUN_STATE["rows_written"] == 5
+    assert sharpely_data.STOCKEY_RUN_STATE["classification"] == "ok"
+    assert sharpely_data.STOCKEY_RUN_STATE["status"] == "ok"
     assert sharpely_data.STOCKEY_RUN_STATE["state_advanced"] is True
 
 
@@ -23411,6 +28177,16 @@ def test_pipeline_stage_order_includes_macro_features_before_regime():
     assert pipeline.PIPELINE_STAGES.index("exchange_features") < pipeline.PIPELINE_STAGES.index("evaluate")
 
 
+def test_pipeline_stage_budget_override_parser_ignores_unknown_and_invalid_values():
+    parsed = pipeline._parse_stage_budget_overrides("rules=1800,watch=120,bad=10,portfolio=nope,actions=30")
+
+    assert parsed["rules"] == 1800.0
+    assert parsed["watch_ingest"] == 120.0
+    assert parsed["actions"] == 30.0
+    assert "bad" not in parsed
+    assert "portfolio" not in parsed
+
+
 def test_pipeline_parse_json_object_records_malformed_context_fallback(monkeypatch):
     events = []
     monkeypatch.setattr(pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
@@ -23710,7 +28486,7 @@ def test_macro_features_records_source_load_fallback(monkeypatch):
     assert events[0]["metadata"]["lookback_days"] == 140
 
 
-def test_event_model_dataset_joins_macro_features_by_anchor_date(monkeypatch):
+def test_event_model_dataset_joins_macro_features_by_event_day_not_label_anchor(monkeypatch):
     events = pd.DataFrame(
         [
             {
@@ -23750,6 +28526,11 @@ def test_event_model_dataset_joins_macro_features_by_anchor_date(monkeypatch):
     macro = pd.DataFrame(
         [
             {
+                "macro_asof_date": pd.Timestamp("2026-01-03T00:00:00Z"),
+                "macro_stress_score": 0.20,
+                "macro_sizing_multiplier": 0.90,
+            },
+            {
                 "macro_asof_date": pd.Timestamp("2026-01-04T00:00:00Z"),
                 "macro_stress_score": 0.45,
                 "macro_sizing_multiplier": 0.75,
@@ -23763,13 +28544,18 @@ def test_event_model_dataset_joins_macro_features_by_anchor_date(monkeypatch):
 
     out = event_meta_model.build_labeled_event_dataset(horizon_days=1, return_threshold=0.02)
     assert len(out) == 1
-    assert out.iloc[0]["macro_stress_score"] == 0.45
+    assert out.iloc[0]["anchor_date"] == pd.Timestamp("2026-01-04T00:00:00Z")
+    assert out.iloc[0]["feature_context_date"] == pd.Timestamp("2026-01-03T00:00:00Z")
+    assert out.iloc[0]["macro_stress_score"] == 0.20
+    contract = json.loads(out.iloc[0]["point_in_time_contract_json"])
+    assert contract["feature_context_date_rule"] == "Use only feature rows known on or before the event published_on date."
+    assert contract["label_anchor_rule"] == "Use the first available close strictly after the event published_on date."
     features, feature_cols = event_meta_model._prepare_feature_frame(out)
     assert "macro_stress_score" in feature_cols
-    assert features.iloc[0]["macro_sizing_multiplier"] == 0.75
+    assert features.iloc[0]["macro_sizing_multiplier"] == 0.90
 
 
-def test_event_model_dataset_joins_exchange_features_by_anchor_date(monkeypatch):
+def test_event_model_dataset_joins_exchange_features_by_event_day_not_label_anchor(monkeypatch):
     events = pd.DataFrame(
         [
             {
@@ -23810,6 +28596,13 @@ def test_event_model_dataset_joins_exchange_features_by_anchor_date(monkeypatch)
         [
             {
                 "symbol": "HDFCBANK",
+                "exchange_asof_date": pd.Timestamp("2026-01-03T00:00:00Z"),
+                "exchange_distribution_score": 0.10,
+                "exchange_event_score": -0.10,
+                "short_selling_event_count_20d": 1,
+            },
+            {
+                "symbol": "HDFCBANK",
                 "exchange_asof_date": pd.Timestamp("2026-01-04T00:00:00Z"),
                 "exchange_distribution_score": 0.40,
                 "exchange_event_score": -0.40,
@@ -23825,10 +28618,12 @@ def test_event_model_dataset_joins_exchange_features_by_anchor_date(monkeypatch)
 
     out = event_meta_model.build_labeled_event_dataset(horizon_days=1, return_threshold=0.02)
     assert len(out) == 1
-    assert out.iloc[0]["exchange_distribution_score"] == 0.40
+    assert out.iloc[0]["anchor_date"] == pd.Timestamp("2026-01-04T00:00:00Z")
+    assert out.iloc[0]["feature_context_date"] == pd.Timestamp("2026-01-03T00:00:00Z")
+    assert out.iloc[0]["exchange_distribution_score"] == 0.10
     features, feature_cols = event_meta_model._prepare_feature_frame(out)
     assert "exchange_distribution_score" in feature_cols
-    assert features.iloc[0]["short_selling_event_count_20d"] == 3
+    assert features.iloc[0]["short_selling_event_count_20d"] == 1
 
 
 def test_event_model_live_dataset_uses_event_day_context_not_next_day_anchor(monkeypatch):
@@ -24546,6 +29341,7 @@ def test_event_meta_model_main_records_command_failure(monkeypatch, capsys):
         "model_basename": "event_meta_model",
         "horizon_days": None,
         "return_threshold": None,
+        "cost_bps": None,
         "dry_run": True,
         "symbols": ["ABC"],
         "setup_ids": ["EVENT_OPPORTUNITY_V1"],
@@ -24654,7 +29450,7 @@ def test_event_model_data_prep_summarizes_label_coverage(monkeypatch):
     assert summary["any_train_ready"] is True
 
 
-def test_event_meta_model_joins_anchor_day_intraday_features(monkeypatch):
+def test_event_meta_model_joins_event_day_intraday_features_not_label_anchor(monkeypatch):
     monkeypatch.setattr(
         event_meta_model,
         "load_event_rows",
@@ -24706,6 +29502,21 @@ def test_event_meta_model_joins_anchor_day_intraday_features(monkeypatch):
             [
                 {
                     "symbol": "ABC",
+                    "asof_date": pd.Timestamp("2026-03-20T00:00:00Z"),
+                    "intraday_close_vs_vwap_pct": 0.2,
+                    "intraday_pct_bars_above_vwap": 0.52,
+                    "intraday_close_location_pct": 0.61,
+                    "intraday_opening_range_breakout_up": False,
+                    "intraday_prev_day_breakout_up": False,
+                    "intraday_failed_prev_day_breakout": False,
+                    "intraday_first_30m_return_pct": 0.1,
+                    "intraday_last_60m_return_pct": 0.2,
+                    "intraday_volume_vs_20d": 1.1,
+                    "intraday_breakout_score": 0.33,
+                    "intraday_pattern_label": "EVENT_DAY_CONTEXT",
+                },
+                {
+                    "symbol": "ABC",
                     "asof_date": pd.Timestamp("2026-03-21T00:00:00Z"),
                     "intraday_close_vs_vwap_pct": 0.6,
                     "intraday_pct_bars_above_vwap": 0.72,
@@ -24722,13 +29533,74 @@ def test_event_meta_model_joins_anchor_day_intraday_features(monkeypatch):
             ]
         ),
     )
+    monkeypatch.setattr(event_meta_model, "load_macro_event_features", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(event_meta_model, "load_exchange_event_features", lambda *args, **kwargs: pd.DataFrame())
 
     dataset = event_meta_model.build_labeled_event_dataset(horizon_days=1, return_threshold=0.02)
     row = dataset.iloc[0]
     assert row["anchor_date"] == pd.Timestamp("2026-03-21T00:00:00Z")
-    assert float(row["intraday_close_vs_vwap_pct"]) == 0.6
-    assert float(row["intraday_breakout_score"]) == 0.88
-    assert row["intraday_pattern_label"] == "BREAKOUT_CONFIRMATION"
+    assert row["feature_context_date"] == pd.Timestamp("2026-03-20T00:00:00Z")
+    assert float(row["intraday_close_vs_vwap_pct"]) == 0.2
+    assert float(row["intraday_breakout_score"]) == 0.33
+    assert row["intraday_pattern_label"] == "EVENT_DAY_CONTEXT"
+
+
+def test_event_meta_model_research_controls_pass_cost_baseline_when_holdout_beats_passive():
+    labeled = pd.DataFrame(
+        [
+            {"published_on": pd.Timestamp("2026-01-01T00:00:00Z"), "directional_return_5d": 0.01},
+            {"published_on": pd.Timestamp("2026-01-02T00:00:00Z"), "directional_return_5d": -0.01},
+            {"published_on": pd.Timestamp("2026-01-03T00:00:00Z"), "directional_return_5d": 0.08},
+            {"published_on": pd.Timestamp("2026-01-04T00:00:00Z"), "directional_return_5d": -0.02},
+            {"published_on": pd.Timestamp("2026-01-05T00:00:00Z"), "directional_return_5d": 0.07},
+        ]
+    )
+
+    controls = event_meta_model.build_event_model_research_controls(
+        labeled=labeled,
+        test_index=slice(2, 5),
+        test_pred=[1, 0, 1],
+        horizon_days=5,
+        return_threshold=0.02,
+        cost_bps=25,
+        feature_columns=["surprise", "event_source_x"],
+    )
+
+    assert controls["leakage_control"]["passed"] is True
+    assert controls["false_discovery_control"]["passed"] is True
+    assert controls["false_discovery_control"]["trial_count"] == 1
+    assert controls["cost_adjusted_baseline"]["passed"] is True
+    assert controls["cost_adjusted_baseline"]["model_trade_count"] == 2
+    assert controls["cost_adjusted_baseline"]["baseline_trade_count"] == 3
+    assert controls["cost_adjusted_baseline"]["model_avg_after_cost_return"] > controls["cost_adjusted_baseline"]["baseline_avg_after_cost_return"]
+
+
+def test_event_meta_model_research_controls_fail_cost_baseline_when_model_does_not_beat_passive():
+    labeled = pd.DataFrame(
+        [
+            {"published_on": pd.Timestamp("2026-01-01T00:00:00Z"), "directional_return_5d": 0.01},
+            {"published_on": pd.Timestamp("2026-01-02T00:00:00Z"), "directional_return_5d": -0.01},
+            {"published_on": pd.Timestamp("2026-01-03T00:00:00Z"), "directional_return_5d": -0.04},
+            {"published_on": pd.Timestamp("2026-01-04T00:00:00Z"), "directional_return_5d": 0.08},
+            {"published_on": pd.Timestamp("2026-01-05T00:00:00Z"), "directional_return_5d": 0.07},
+        ]
+    )
+
+    controls = event_meta_model.build_event_model_research_controls(
+        labeled=labeled,
+        test_index=slice(2, 5),
+        test_pred=[1, 0, 0],
+        horizon_days=5,
+        return_threshold=0.02,
+        cost_bps=25,
+        feature_columns=["surprise"],
+    )
+
+    assert controls["false_discovery_control"]["passed"] is True
+    assert controls["cost_adjusted_baseline"]["passed"] is False
+    assert controls["cost_adjusted_baseline"]["model_trade_count"] == 1
+    assert controls["cost_adjusted_baseline"]["model_avg_after_cost_return"] < 0
+    assert controls["cost_adjusted_baseline"]["lift_after_cost_return"] < 0
 
 
 def test_training_universe_normalizes_ad_hoc_payload(monkeypatch):
@@ -24848,6 +29720,11 @@ def test_event_model_promotion_check_passes_for_strong_evidence(monkeypatch):
             "positive_rate_test": 0.45,
             "roc_auc": 0.64,
         },
+        "research_controls": {
+            "leakage_control": {"passed": True, "method": "point_in_time_purged_embargo_validation"},
+            "false_discovery_control": {"passed": True, "method": "research_ledger_multiple_testing_review"},
+            "cost_adjusted_baseline": {"passed": True, "method": "transaction_cost_adjusted_passive_baseline"},
+        },
     }
     monkeypatch.setattr(
         event_model_promotion_check,
@@ -24914,6 +29791,90 @@ def test_event_model_promotion_check_passes_for_strong_evidence(monkeypatch):
     assert payload["scorecard"]["broker_execution_allowed"] is False
     assert payload["scorecard"]["policy_auto_promotion_allowed"] is False
     assert payload["scorecard"]["key_metrics"]["precision_lift_vs_positive_rate_test"] == 0.27
+    assert payload["scorecard"]["research_safety"]["leakage_control"]["passed"] is True
+    assert payload["scorecard"]["research_safety"]["false_discovery_control"]["passed"] is True
+    assert payload["scorecard"]["research_safety"]["cost_adjusted_baseline"]["passed"] is True
+
+
+def test_event_model_promotion_check_fails_closed_without_research_safety(monkeypatch):
+    metadata = {
+        "model_name": "xgboost_event_meta_model",
+        "model_version": "event_meta_model_h1",
+        "horizon_days": 1,
+        "return_threshold": 0.02,
+        "metrics": {
+            "train_rows": 120,
+            "test_rows": 35,
+            "precision": 0.72,
+            "positive_rate_test": 0.45,
+            "roc_auc": 0.64,
+        },
+    }
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "load_artifact_metadata",
+        lambda artifact_dir, model_basename: (metadata, {"model_exists": True, "meta_exists": True}),
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_label_coverage",
+        lambda **kwargs: {
+            "horizon_days": 1,
+            "dataset_rows": 180,
+            "labeled_rows": 150,
+            "date_count": 30,
+            "symbol_count": 45,
+            "event_class_count": 8,
+            "positive_rate": 0.48,
+        },
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_successful_runs",
+        lambda *args, **kwargs: {
+            "successful_runs": 4,
+            "since_days": 35,
+            "latest_status": "done",
+            "latest_timestamp": "2026-06-01T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        event_model_promotion_check,
+        "summarize_score_freshness",
+        lambda **kwargs: {"score_rows": 40, "latest_scored_at": "2026-06-01T00:00:00+00:00", "fresh": True},
+    )
+
+    payload = event_model_promotion_check.build_promotion_check(
+        argparse.Namespace(
+            artifact_dir=".cache/advisory_event_meta_model",
+            model_basename="event_meta_model",
+            horizon_days=1,
+            return_threshold=0.02,
+            log_path="logs/cron/all_ml.log",
+            run_window_days=35,
+            max_score_age_days=14,
+            min_successful_runs=3,
+            min_train_rows=80,
+            min_test_rows=20,
+            min_labeled_rows=100,
+            min_dates=20,
+            min_symbols=25,
+            min_event_classes=4,
+            min_score_rows=10,
+            min_precision=0.55,
+            min_precision_lift=0.10,
+            min_roc_auc=0.55,
+        )
+    )
+
+    assert payload["decision"] == "hold_research_only"
+    assert payload["ready_for_operator_review"] is False
+    assert "leakage_control_evidence" in payload["failed_gates"]
+    assert "false_discovery_control_evidence" in payload["failed_gates"]
+    assert "cost_adjusted_baseline_evidence" in payload["failed_gates"]
+    assert payload["scorecard"]["research_safety"]["leakage_control"]["passed"] is False
+    assert payload["scorecard"]["research_safety"]["false_discovery_control"]["passed"] is False
+    assert payload["scorecard"]["research_safety"]["cost_adjusted_baseline"]["passed"] is False
 
 
 def test_event_model_promotion_check_holds_when_gates_fail(monkeypatch):
@@ -27199,10 +32160,15 @@ def test_technical_threshold_calibration_attaches_point_in_time_forward_returns(
 
     out = technical_threshold_calibration.attach_forward_returns(signals, prices, horizons=[2])
 
+    contract = json.loads(out.iloc[0]["point_in_time_return_contract_json"])
+    assert contract["same_day_price_allowed"] is False
+    assert contract["forward_returns_are_labels_only"] is True
+    assert contract["entry_rule"] == "Use first available close strictly after signal asof_date."
     assert out.iloc[0]["entry_date_h2"] == pd.Timestamp("2026-05-04T00:00:00Z")
     assert out.iloc[0]["exit_date_h2"] == pd.Timestamp("2026-05-05T00:00:00Z")
     assert round(float(out.iloc[0]["forward_return_h2"]), 4) == 0.1
     assert out.iloc[1]["entry_date_h2"] == pd.Timestamp("2026-05-04T00:00:00Z")
+    assert out.iloc[0]["entry_close_h2"] == 100.0
 
 
 def test_technical_threshold_calibration_ensure_tables_uses_schema_registry(monkeypatch):
@@ -27224,6 +32190,61 @@ def test_technical_threshold_calibration_ensure_tables_uses_schema_registry(monk
     assert any("DROP CONSTRAINT" in statement for statement in calls[0]["statements"])
 
 
+def test_technical_threshold_calibration_persist_outputs_uses_timescale_safe_unique_keys(monkeypatch):
+    writes: list[dict[str, object]] = []
+    evaluated_at = pd.Timestamp("2026-06-05T12:00:00Z")
+    evaluations = pd.DataFrame(
+        [
+            {
+                "evaluated_at": evaluated_at,
+                "config_id": "cfg",
+                "horizon_days": 5,
+                "threshold_config_json": "{}",
+            }
+        ]
+    )
+    summary = pd.DataFrame(
+        [
+            {
+                "evaluated_at": evaluated_at,
+                "horizon_days": 5,
+                "best_config_id": "cfg",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(technical_threshold_calibration, "ensure_tables", lambda: None)
+
+    def fake_upsert(df, table, unique_keys, timescaledb_column=None):
+        writes.append(
+            {
+                "table": table,
+                "unique_keys": list(unique_keys),
+                "timescaledb_column": timescaledb_column,
+                "rows": len(df),
+            }
+        )
+
+    monkeypatch.setattr(technical_threshold_calibration, "upsert_to_db", fake_upsert)
+
+    technical_threshold_calibration.persist_outputs(evaluations, summary)
+
+    assert writes == [
+        {
+            "table": technical_threshold_calibration.EVALUATIONS_TABLE,
+            "unique_keys": ["evaluated_at", "config_id", "horizon_days"],
+            "timescaledb_column": "evaluated_at",
+            "rows": 1,
+        },
+        {
+            "table": technical_threshold_calibration.SUMMARY_TABLE,
+            "unique_keys": ["evaluated_at", "horizon_days"],
+            "timescaledb_column": "evaluated_at",
+            "rows": 1,
+        },
+    ]
+
+
 def test_technical_threshold_calibration_records_schema_lookup_failure(monkeypatch):
     events = []
 
@@ -27237,18 +32258,30 @@ def test_technical_threshold_calibration_records_schema_lookup_failure(monkeypat
     assert events[0]["metadata"]["table_name"] == "advisory_candidates"
 
 
+def test_technical_threshold_calibration_strict_schema_lookup_raises_source_unavailable(monkeypatch):
+    events = []
+
+    monkeypatch.setattr(technical_threshold_calibration, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("schema failed")))
+    monkeypatch.setattr(technical_threshold_calibration, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    with pytest.raises(technical_threshold_calibration.SourceUnavailableError, match="schema failed"):
+        technical_threshold_calibration.table_columns("advisory_candidates", raise_on_error=True)
+
+    assert events[0]["fallback_type"] == "technical_threshold_calibration_schema_lookup_failed"
+
+
 def test_technical_threshold_calibration_records_signal_rows_load_failure(monkeypatch):
     events = []
 
     monkeypatch.setattr(
         technical_threshold_calibration,
         "table_columns",
-        lambda table_name: {"asof_date", "setup_id", "symbol", "technical_total_score"},
+        lambda table_name, **_kwargs: {"asof_date", "setup_id", "symbol", "technical_total_score"},
     )
     monkeypatch.setattr(technical_threshold_calibration, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("signals failed")))
     monkeypatch.setattr(technical_threshold_calibration, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
 
-    with pytest.raises(RuntimeError, match="signals failed"):
+    with pytest.raises(technical_threshold_calibration.SourceUnavailableError, match="signals failed"):
         technical_threshold_calibration.load_technical_signal_rows(
             from_date=pd.Timestamp("2026-04-01", tz="UTC"),
             to_date=pd.Timestamp("2026-04-30", tz="UTC"),
@@ -27259,6 +32292,25 @@ def test_technical_threshold_calibration_records_signal_rows_load_failure(monkey
     assert events[0]["source"] == "advisory_candidates"
     assert events[0]["metadata"]["symbol_count"] == 1
     assert events[0]["metadata"]["from_date"] == "2026-04-01 00:00:00+00:00"
+
+
+def test_technical_threshold_calibration_main_reports_source_unavailable(monkeypatch, capsys):
+    monkeypatch.setattr(
+        technical_threshold_calibration,
+        "calibrate_thresholds",
+        lambda **_kwargs: (_ for _ in ()).throw(technical_threshold_calibration.SourceUnavailableError("db unavailable")),
+    )
+    monkeypatch.setattr(technical_threshold_calibration, "persist_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not persist")))
+    monkeypatch.setattr("sys.argv", ["technical_threshold_calibration.py", "--dry-run", "--horizons", "5"])
+
+    exit_code = technical_threshold_calibration.main()
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 2
+    assert payload["status"] == "source_unavailable"
+    assert payload["meta"]["source_unavailable"] is True
+    assert payload["error"] == "db unavailable"
+    assert payload["dry_run"] is True
 
 
 def test_technical_threshold_calibration_records_price_history_load_failure(monkeypatch):
@@ -27430,6 +32482,41 @@ def test_signal_quality_evaluator_compares_overlay_variants():
     risk_event = evaluations[(evaluations["symbol"] == "RISK") & (evaluations["variant"] == "technical_plus_event")].iloc[0]
     assert bool(risk_event["event_negative"]) is True
     assert bool(risk_event["selected"]) is False
+
+
+def test_signal_quality_evaluator_meta_exposes_point_in_time_return_contract(monkeypatch):
+    signals = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-01T00:00:00Z"),
+                "setup_id": "TECH_V1",
+                "symbol": "ABC",
+                "technical_total_score": 72.0,
+                "technical_state": "READY",
+                "candidate_state": "READY",
+                "technical_trigger_type": "breakout",
+            }
+        ]
+    )
+    prices = pd.DataFrame(
+        [
+            {"symbol": "ABC", "date": pd.Timestamp("2026-05-01T00:00:00Z"), "close": 90.0},
+            {"symbol": "ABC", "date": pd.Timestamp("2026-05-02T00:00:00Z"), "close": 100.0},
+            {"symbol": "ABC", "date": pd.Timestamp("2026-05-04T00:00:00Z"), "close": 103.0},
+        ]
+    )
+    monkeypatch.setattr(signal_quality_evaluator, "load_technical_signal_rows", lambda **kwargs: signals.copy())
+    monkeypatch.setattr(signal_quality_evaluator, "enrich_technical_signals", lambda frame, **kwargs: frame.copy())
+    monkeypatch.setattr(signal_quality_evaluator, "load_price_history_for_returns", lambda **kwargs: prices.copy())
+
+    evaluations, _summary, meta = signal_quality_evaluator.evaluate_signal_quality(horizons=[2], cost_bps=0.0, min_matured_rows=1)
+
+    assert "technical_only" in set(evaluations["variant"])
+    technical_row = evaluations[evaluations["variant"].eq("technical_only")].iloc[0]
+    assert technical_row["entry_close"] == 100.0
+    assert round(float(technical_row["forward_return"]), 4) == 0.03
+    assert meta["point_in_time_return_contract"]["same_day_price_allowed"] is False
+    assert meta["point_in_time_return_contract"]["forward_returns_are_labels_only"] is True
 
 
 def test_signal_quality_evaluator_ensure_tables_uses_schema_registry(monkeypatch):
@@ -27810,7 +32897,7 @@ def test_operator_api_builds_manual_review_payload(monkeypatch):
 
     monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
 
-    payload = operator_api.build_manual_review_payload(limit=20)
+    payload = operator_api.build_manual_review_payload(limit=20, lane="all")
 
     assert payload["status"] == "ok"
     assert payload["summary"]["total_items"] == 8
@@ -27823,11 +32910,23 @@ def test_operator_api_builds_manual_review_payload(monkeypatch):
     assert payload["summary"]["by_type"]["announcement_failure"] == 1
     assert payload["summary"]["by_type"]["identity_issue"] == 1
     assert payload["summary"]["by_severity"]["error"] == 3
+    assert payload["summary"]["by_lane"]["investment_review"] == 3
+    assert payload["summary"]["by_lane"]["technical_issue"] == 4
+    assert payload["summary"]["by_lane"]["research_config"] == 1
     assert any(row["reason"] == "source_rows_stale" for row in payload["source_warnings"])
     assert payload["items"][0]["item_type"] == "identity_issue"
     assert payload["items"][0]["review_lane"] == "technical_issue"
     assert payload["items"][0]["suggested_decision"] == "mark_fixed"
+    assert payload["items"][0]["operator_boundary"]["review_category"] == "technical_or_operational_issue"
+    assert payload["items"][0]["operator_boundary"]["manual_review_decision_mutates_portfolio"] is False
+    assert payload["items"][0]["operator_boundary"]["manual_review_decision_submits_order"] is False
+    assert payload["items"][0]["decision_effects"]["mark_fixed"]["closes_item"] is True
+    assert payload["items"][0]["decision_effects"]["watch_for_event"]["creates_wait_signal"] is True
     assert "Dhan security id" in payload["items"][0]["reason"]
+    threshold_item = next(item for item in payload["items"] if item["item_type"] == "threshold_review")
+    assert threshold_item["operator_boundary"]["review_category"] == "research_or_config_review"
+    action_review_item = next(item for item in payload["items"] if item["item_type"] == "action_manual_review")
+    assert action_review_item["operator_boundary"]["review_category"] == "investment_judgment_review"
     execution_item = next(item for item in payload["items"] if item["item_type"] == "execution_blocker")
     assert execution_item["raw"]["updated_at"] == "2026-05-30T10:00:00+00:00"
     action_item = next(item for item in payload["items"] if item["item_type"] == "action_manual_review")
@@ -28139,6 +33238,94 @@ def test_manual_review_suppresses_superseded_processing_and_recovered_document_f
     assert skipped == []
     assert [item["source_key"] for item in items] == ["event-active", "doc-active"]
     assert [item["item_type"] for item in items] == ["event_processing_failure", "announcement_failure"]
+
+
+def test_manual_review_suppresses_superseded_llm_error_event_policy_rows(monkeypatch):
+    skipped: list[dict[str, str]] = []
+    items: list[dict[str, object]] = []
+    policy_rows = pd.DataFrame(
+        [
+            {
+                "unique_id": "event-old-error",
+                "symbol": "ABC",
+                "setup_id": "SETUP",
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-30T09:00:00Z"),
+                "action_type": "MANUAL_REVIEW",
+                "action_status": "manual_review_required",
+                "action_reason": "Automatic LLM evaluation failed: schema mismatch",
+                "raw_context_json": json.dumps({"source_trace": ["llm_error"]}),
+                "latest_evaluation_status": "completed",
+                "latest_evaluation_source_trace_json": json.dumps(["structured_event"]),
+                "latest_evaluation_asof_date": pd.Timestamp("2026-05-31T00:00:00Z"),
+            },
+            {
+                "unique_id": "event-active-review",
+                "symbol": "XYZ",
+                "setup_id": "SETUP",
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "published_on": pd.Timestamp("2026-05-30T10:00:00Z"),
+                "action_type": "MANUAL_REVIEW",
+                "action_status": "manual_review_required",
+                "action_reason": "Regulatory event needs exposure review.",
+                "raw_context_json": json.dumps({"source_trace": ["structured_event"]}),
+                "latest_evaluation_status": "completed",
+                "latest_evaluation_source_trace_json": json.dumps(["structured_event"]),
+                "latest_evaluation_asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+            },
+        ]
+    )
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name in {operator_api.EVENT_POLICY_TABLE, "advisory_event_evaluations"})
+    monkeypatch.setattr(operator_api, "_safe_manual_query", lambda *args, **kwargs: policy_rows.copy())
+
+    operator_api._append_event_policy_review_items(items, skipped, limit=10)
+
+    assert skipped == []
+    assert [item["unique_id"] for item in items] == ["event-active-review"]
+    assert items[0]["item_type"] == "event_policy_manual_review"
+
+
+def test_manual_review_suppresses_shadow_action_for_superseded_llm_error_event_policy(monkeypatch):
+    skipped: list[dict[str, str]] = []
+    items = [
+        {
+            "item_id": "action:ABC",
+            "item_type": "action_manual_review",
+            "unique_id": "event-old-error",
+            "raw": {"action_source": "event_policy", "unique_id": "event-old-error"},
+        },
+        {
+            "item_id": "action:XYZ",
+            "item_type": "action_manual_review",
+            "unique_id": "event-active-review",
+            "raw": {"action_source": "event_policy", "unique_id": "event-active-review"},
+        },
+    ]
+    policy_rows = pd.DataFrame(
+        [
+            {
+                "unique_id": "event-old-error",
+                "symbol": "ABC",
+                "setup_id": "SETUP",
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "action_reason": "Automatic LLM evaluation failed: provider timeout",
+                "raw_context_json": json.dumps({"source_trace": ["llm_error"]}),
+                "latest_evaluation_status": "completed",
+                "latest_evaluation_source_trace_json": json.dumps(["structured_event"]),
+                "latest_evaluation_asof_date": pd.Timestamp("2026-05-31T00:00:00Z"),
+            }
+        ]
+    )
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name in {operator_api.EVENT_POLICY_TABLE, "advisory_event_evaluations"})
+    monkeypatch.setattr(operator_api, "_safe_manual_query", lambda *args, **kwargs: policy_rows.copy())
+    monkeypatch.setattr(operator_api, "_load_event_policy_no_action_unique_ids", lambda _skipped: set())
+
+    out = operator_api._suppress_shadow_manual_review_items(items, skipped)
+
+    assert skipped == []
+    assert [item["item_id"] for item in out] == ["action:XYZ"]
 
 
 def test_superseded_failure_cleanup_dry_run_discovers_recovered_rows(monkeypatch):
@@ -28625,6 +33812,7 @@ def test_company_memory_deterministic_review_is_review_input_only():
         "actions": [],
         "wait_signals": [],
     }
+    context["evidence_source_contract"] = company_memory_review.build_evidence_source_contract(context)
 
     review = company_memory_review.deterministic_review(context)
 
@@ -28633,6 +33821,39 @@ def test_company_memory_deterministic_review_is_review_input_only():
     assert "Review input only" in review.deterministic_boundary
     assert any("technical score" in item for item in review.evidence_used)
     assert any("accumulation" in item for item in review.evidence_used)
+    contract = context["evidence_source_contract"]
+    assert contract["coverage_status"] == "complete"
+    assert contract["raw_announcement_scan_allowed"] is False
+    assert contract["raw_bhavcopy_scan_allowed"] is False
+    assert contract["uses_compact_evidence"] is True
+    source_rows = {row["source"]: row for row in contract["sources"]}
+    assert source_rows["announcement_evidence"]["row_count"] == 1
+    assert source_rows["bhavcopy_evidence"]["row_count"] == 1
+    assert source_rows["technical"]["row_count"] == 1
+    assert contract["missing_required_sources"] == []
+
+
+def test_company_memory_deterministic_review_marks_partial_evidence_coverage():
+    context = {
+        "symbol": "ABC",
+        "technical": [{"rs_vs_benchmark": 0.03}],
+        "candidates": [{"technical_score": 76.0}],
+        "announcement_evidence": [],
+        "bhavcopy_evidence": [],
+        "event_policy": [],
+        "actions": [],
+        "wait_signals": [],
+    }
+    context["evidence_source_contract"] = company_memory_review.build_evidence_source_contract(context)
+
+    review = company_memory_review.deterministic_review(context)
+
+    assert context["evidence_source_contract"]["coverage_status"] == "partial"
+    assert context["evidence_source_contract"]["missing_required_sources"] == [
+        "announcement_evidence",
+        "bhavcopy_evidence",
+    ]
+    assert any("evidence coverage is partial" in item for item in review.risk_flags)
 
 
 def test_company_memory_deterministic_review_downgrades_buy_on_distribution_pressure():
@@ -28782,6 +34003,8 @@ def test_company_memory_build_reviews_uses_bounded_symbols_and_persists_contract
             "wait_signals": [],
         },
     }
+    for context in contexts.values():
+        context["evidence_source_contract"] = company_memory_review.build_evidence_source_contract(context)
     writes = []
 
     monkeypatch.setattr(company_memory_review, "load_review_symbols", lambda **kwargs: ["AAA", "BBB"])
@@ -28810,6 +34033,12 @@ def test_company_memory_build_reviews_uses_bounded_symbols_and_persists_contract
     assert writes[0][1] == company_memory_review.TABLE_NAME
     assert writes[0][2] == ["review_date", "symbol"]
     assert str(writes[0][0]["fallback_used"].dtype) == "boolean"
+    payloads = {
+        row["symbol"]: json.loads(row["payload_json"])
+        for row in writes[0][0].to_dict(orient="records")
+    }
+    assert payloads["AAA"]["evidence_source_contract"]["coverage_status"] == "partial"
+    assert payloads["BBB"]["evidence_source_contract"]["missing_required_sources"] == ["bhavcopy_evidence", "technical"]
 
 
 def test_company_memory_stage_is_registered_before_risk():
@@ -29193,6 +34422,527 @@ def test_operator_api_filters_closed_manual_review_items(monkeypatch):
     payload = operator_api.build_manual_review_payload(limit=20)
 
     assert payload["summary"]["closed_by_operator"] == 1
+    assert payload["summary"]["queue_contract"]["active_displayed_items"] == 0
+    assert payload["summary"]["queue_contract"]["active_untrimmed_items"] == 0
+    assert payload["summary"]["queue_contract"]["closed_by_operator_suppressed"] == 1
+    assert payload["summary"]["queue_contract"]["closed_rows_visible_in_queue"] is False
+    assert payload["summary"]["queue_contract"]["suppressed_rows_are_audit_only"] is True
+    assert payload["summary"]["queue_contract"]["manual_review_decisions_mutate_portfolio"] is False
+    assert payload["summary"]["queue_contract"]["manual_review_decisions_mutate_action_recommendation"] is False
+    assert payload["summary"]["queue_contract"]["manual_review_decisions_submit_order"] is False
+    assert payload["items"] == []
+
+
+def test_operator_api_compacts_manual_review_latest_decision_snapshots(monkeypatch):
+    def noop_append(_items, _skipped, *, limit):
+        return None
+
+    def append_items(items, _skipped, *, limit):
+        items.append(
+            operator_api._manual_review_item(
+                item_type="action_manual_review",
+                severity="warning",
+                status="MANUAL_REVIEW",
+                title="ABC action needs review",
+                reason="Entry evidence needs human judgment.",
+                source_table=operator_api.ACTION_RECOMMENDATIONS_TABLE,
+                source_key="abc",
+                row={
+                    "symbol": "ABC",
+                    "action_code": "BUY",
+                    "action_reason": "Entry evidence needs human judgment.",
+                    "wait_signal_followup": [{"value": idx, "blob": "x" * 200} for idx in range(25)],
+                },
+                symbol="ABC",
+                updated_at=pd.Timestamp("2026-06-10T09:00:00Z"),
+            )
+        )
+
+    for name in [
+        "_append_execution_blocker_items",
+        "_append_latest_action_review_items",
+        "_append_event_policy_review_items",
+        "_append_action_conflict_items",
+        "_append_threshold_review_items",
+        "_append_wait_signal_followup_items",
+        "_append_processing_failure_items",
+        "_append_announcement_failure_items",
+        "_append_identity_issue_items",
+    ]:
+        monkeypatch.setattr(operator_api, name, noop_append)
+    monkeypatch.setattr(operator_api, "_append_latest_action_review_items", append_items)
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+    monkeypatch.setattr(operator_api, "_load_event_policy_no_action_unique_ids", lambda _skipped: set())
+    monkeypatch.setattr(operator_api, "_load_superseded_event_policy_failure_unique_ids", lambda _skipped: set())
+
+    item_id = f"action_manual_review:{operator_api.ACTION_RECOMMENDATIONS_TABLE}:abc"
+    decision = {
+        "item_id": item_id,
+        "decision": "add_operator_note",
+        "rationale": "Keep visible with operator context.",
+        "decided_at": pd.Timestamp("2026-06-10T10:00:00Z"),
+        "item_snapshot": {
+            "item_id": item_id,
+            "raw": {
+                "very_large_text": "x" * 5000,
+                "large_nested": [{"value": idx, "blob": "y" * 200} for idx in range(25)],
+            },
+        },
+    }
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: {item_id: decision})
+
+    compact_payload = operator_api.build_manual_review_payload(limit=10, include_raw=False)
+    compact_item = compact_payload["items"][0]
+
+    assert compact_payload["summary"]["compact"] is True
+    assert compact_payload["summary"]["payload"]["payload_bytes"] > 0
+    assert compact_payload["summary"]["payload"]["max_row_bytes"] > 0
+    assert compact_payload["summary"]["queue_contract"]["payload_bytes"] == compact_payload["summary"]["payload"]["payload_bytes"]
+    assert compact_item["raw_compacted"] is True
+    assert len(compact_item["raw"]["wait_signal_followup"]) == 8
+    assert "item_snapshot" not in compact_item["latest_operator_decision"]
+    assert compact_item["latest_operator_decision"]["decision"] == "add_operator_note"
+
+    raw_payload = operator_api.build_manual_review_payload(limit=10, include_raw=True)
+
+    assert raw_payload["summary"]["compact"] is False
+    assert "item_snapshot" in raw_payload["items"][0]["latest_operator_decision"]
+
+
+def test_operator_api_manual_review_summarizes_lanes_categories_and_impacts(monkeypatch):
+    def noop_append(_items, _skipped, *, limit):
+        return None
+
+    def append_items(items, _skipped, *, limit):
+        items.extend(
+            [
+                operator_api._manual_review_item(
+                    item_type="action_manual_review",
+                    severity="warning",
+                    status="MANUAL_REVIEW",
+                    title="ABC action needs review",
+                    reason="Entry evidence needs human judgment.",
+                    source_table=operator_api.ACTION_RECOMMENDATIONS_TABLE,
+                    source_key="abc",
+                    row={"symbol": "ABC", "action_code": "BUY", "action_reason": "Entry evidence needs human judgment."},
+                    symbol="ABC",
+                    updated_at=pd.Timestamp("2026-06-10T09:00:00Z"),
+                ),
+                operator_api._manual_review_item(
+                    item_type="identity_issue",
+                    severity="error",
+                    status="open",
+                    title="HUIL identity issue",
+                    reason="No Dhan security id mapped.",
+                    source_table=operator_api.IDENTITY_ISSUES_TABLE,
+                    source_key="huil",
+                    row={"symbol": "HUIL", "issue_type": "dhan_security_id_missing", "suggested_action": "Refresh master."},
+                    symbol="HUIL",
+                    updated_at=pd.Timestamp("2026-06-10T08:00:00Z"),
+                ),
+                operator_api._manual_review_item(
+                    item_type="threshold_review",
+                    severity="review",
+                    status="pending",
+                    title="Threshold promotion review",
+                    reason="Review candidate threshold.",
+                    source_table="advisory_threshold_reviews",
+                    source_key="threshold",
+                    row={"symbol": "XYZ", "review_status": "pending"},
+                    symbol="XYZ",
+                    updated_at=pd.Timestamp("2026-06-10T07:00:00Z"),
+                ),
+            ]
+        )
+
+    for name in [
+        "_append_execution_blocker_items",
+        "_append_latest_action_review_items",
+        "_append_event_policy_review_items",
+        "_append_action_conflict_items",
+        "_append_threshold_review_items",
+        "_append_wait_signal_followup_items",
+        "_append_processing_failure_items",
+        "_append_announcement_failure_items",
+        "_append_identity_issue_items",
+    ]:
+        monkeypatch.setattr(operator_api, name, noop_append)
+    monkeypatch.setattr(operator_api, "_append_latest_action_review_items", append_items)
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: {})
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+    monkeypatch.setattr(operator_api, "_load_event_policy_no_action_unique_ids", lambda _skipped: set())
+    monkeypatch.setattr(operator_api, "_load_superseded_event_policy_failure_unique_ids", lambda _skipped: set())
+
+    payload = operator_api.build_manual_review_payload(limit=10, lane="all")
+
+    summary = payload["summary"]
+    assert summary["by_review_lane"] == {"investment_review": 1, "technical_issue": 1, "research_config": 1}
+    assert summary["by_review_category"] == {
+        "investment_judgment_review": 1,
+        "technical_or_operational_issue": 1,
+        "research_or_config_review": 1,
+    }
+    assert summary["by_item_impact"]["investment_entry_or_watch"] == 1
+    assert summary["by_item_impact"]["technical_or_operational"] == 1
+    assert summary["by_item_impact"]["research_or_config"] == 1
+    assert payload["items"][0]["item_impact"] in set(summary["by_item_impact"])
+    assert "technical_or_operational_issue" in summary["plain_english"]
+    identity_item = next(row for row in payload["items"] if row["item_type"] == "identity_issue")
+    assert identity_item["source_evidence"]["source_kind"] == "identity_issue"
+    assert any(fact["label"] == "Issue type" and fact["value"] == "dhan_security_id_missing" for fact in identity_item["source_evidence"]["facts"])
+
+
+def test_operator_api_manual_review_defaults_to_investment_lane_and_preserves_lane_counts(monkeypatch):
+    def noop_append(_items, _skipped, *, limit):
+        return None
+
+    def append_items(items, _skipped, *, limit):
+        items.extend(
+            [
+                operator_api._manual_review_item(
+                    item_type="action_manual_review",
+                    severity="warning",
+                    status="MANUAL_REVIEW",
+                    title="ABC action needs review",
+                    reason="Entry evidence needs human judgment.",
+                    source_table=operator_api.ACTION_RECOMMENDATIONS_TABLE,
+                    source_key="abc",
+                    row={"symbol": "ABC", "action_code": "BUY", "action_reason": "Entry evidence needs human judgment."},
+                    symbol="ABC",
+                    updated_at=pd.Timestamp("2026-06-10T09:00:00Z"),
+                ),
+                operator_api._manual_review_item(
+                    item_type="identity_issue",
+                    severity="error",
+                    status="open",
+                    title="HUIL identity issue",
+                    reason="No Dhan security id mapped.",
+                    source_table=operator_api.IDENTITY_ISSUES_TABLE,
+                    source_key="huil",
+                    row={"symbol": "HUIL", "issue_type": "dhan_security_id_missing", "suggested_action": "Refresh master."},
+                    symbol="HUIL",
+                    updated_at=pd.Timestamp("2026-06-10T08:00:00Z"),
+                ),
+            ]
+        )
+
+    for name in [
+        "_append_execution_blocker_items",
+        "_append_latest_action_review_items",
+        "_append_event_policy_review_items",
+        "_append_action_conflict_items",
+        "_append_threshold_review_items",
+        "_append_wait_signal_followup_items",
+        "_append_processing_failure_items",
+        "_append_announcement_failure_items",
+        "_append_identity_issue_items",
+    ]:
+        monkeypatch.setattr(operator_api, name, noop_append)
+    monkeypatch.setattr(operator_api, "_append_latest_action_review_items", append_items)
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: {})
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+    monkeypatch.setattr(operator_api, "_load_event_policy_no_action_unique_ids", lambda _skipped: set())
+    monkeypatch.setattr(operator_api, "_load_superseded_event_policy_failure_unique_ids", lambda _skipped: set())
+
+    default_payload = operator_api.build_manual_review_payload(limit=10)
+
+    assert default_payload["summary"]["lane"] == "investment_review"
+    assert default_payload["summary"]["total_items"] == 1
+    assert default_payload["summary"]["all_active_items"] == 2
+    assert default_payload["summary"]["lane_filtered_out"] == 1
+    assert default_payload["summary"]["all_active_by_lane"] == {"investment_review": 1, "technical_issue": 1}
+    assert default_payload["items"][0]["symbol"] == "ABC"
+    assert default_payload["summary"]["by_review_lane"] == {"investment_review": 1}
+    assert default_payload["summary"]["queue_contract"]["lane"] == "investment_review"
+    assert default_payload["summary"]["queue_contract"]["all_active_by_lane"] == {"investment_review": 1, "technical_issue": 1}
+
+    technical_payload = operator_api.build_manual_review_payload(limit=10, lane="technical_issue")
+    assert technical_payload["summary"]["lane"] == "technical_issue"
+    assert technical_payload["items"][0]["item_type"] == "identity_issue"
+
+    all_payload = operator_api.build_manual_review_payload(limit=10, lane="all")
+    assert all_payload["summary"]["total_items"] == 2
+
+
+def test_operator_api_manual_review_event_policy_source_evidence_is_compact():
+    item = operator_api._manual_review_item(
+        item_type="event_policy_manual_review",
+        severity="review",
+        status="MANUAL_REVIEW",
+        title="ABC policy review",
+        reason="Review order size.",
+        source_table=operator_api.EVENT_POLICY_TABLE,
+        source_key="evt-1",
+        row={
+            "symbol": "ABC",
+            "unique_id": "evt-1",
+            "policy_class": "ORDER_WIN",
+            "source_action": "BUY_WATCH",
+            "materiality": "high",
+            "confidence": 0.72,
+            "policy_score": 0.44,
+            "published_on": pd.Timestamp("2026-06-10T09:00:00Z"),
+            "action_detail": "Order win is large relative to trailing revenue.",
+            "latest_evaluation_status": "completed",
+        },
+    )
+
+    evidence = item["source_evidence"]
+    assert evidence["source_kind"] == "event_policy"
+    assert evidence["headline"] == "Order win is large relative to trailing revenue."
+    facts = {fact["label"]: fact["value"] for fact in evidence["facts"]}
+    assert facts["Event class"] == "order win"
+    assert facts["Source action"] == "BUY_WATCH"
+    assert facts["Materiality"] == "high"
+    assert facts["Latest evaluation"] == "completed"
+
+
+def test_operator_api_reopens_manual_review_when_source_updates_after_closing_decision(monkeypatch):
+    def noop_append(_items, _skipped, *, limit):
+        return None
+
+    item_id = "action_manual_review:advisory_action_recommendations:2026-05-30 00:00:00+00:00:ABC:SETUP"
+
+    def append_item(items, _skipped, *, limit):
+        items.append(
+            {
+                "item_id": item_id,
+                "item_type": "action_manual_review",
+                "severity": "review",
+                "status": "MANUAL_REVIEW",
+                "title": "ABC action needs review",
+                "reason": "New evidence changed the review row.",
+                "source_table": operator_api.ACTION_RECOMMENDATIONS_TABLE,
+                "source_key": "2026-05-30 00:00:00+00:00:ABC:SETUP",
+                "symbol": "ABC",
+                "setup_id": "SETUP",
+                "updated_at": "2026-05-30T11:00:00+00:00",
+                "raw": {
+                    "symbol": "ABC",
+                    "setup_id": "SETUP",
+                    "action_code": "MANUAL_REVIEW",
+                    "action_source": "event_policy",
+                    "load_ts": "2026-05-30T11:00:00+00:00",
+                },
+            }
+        )
+
+    for name in [
+        "_append_execution_blocker_items",
+        "_append_event_policy_review_items",
+        "_append_action_conflict_items",
+        "_append_threshold_review_items",
+        "_append_wait_signal_followup_items",
+        "_append_processing_failure_items",
+        "_append_announcement_failure_items",
+        "_append_identity_issue_items",
+    ]:
+        monkeypatch.setattr(operator_api, name, noop_append)
+    monkeypatch.setattr(operator_api, "_append_latest_action_review_items", append_item)
+    monkeypatch.setattr(operator_api, "_suppress_shadow_manual_review_items", lambda items, skipped: items)
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: {
+        item_id: {
+            "item_id": item_id,
+            "decision": "ignore",
+            "decided_at": pd.Timestamp("2026-05-30T10:00:00Z"),
+        }
+    })
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+
+    payload = operator_api.build_manual_review_payload(limit=20)
+
+    assert payload["summary"]["closed_by_operator"] == 0
+    assert payload["summary"]["stale_operator_decision"] == 1
+    assert len(payload["items"]) == 1
+    state = payload["items"][0]["manual_review_state"]
+    assert state["state"] == "source_updated_after_operator_decision"
+    assert state["active"] is True
+    assert state["decision_stale"] is True
+    assert state["source_updated_at"] == "2026-05-30T11:00:00+00:00"
+    assert state["decided_at"] == "2026-05-30T10:00:00+00:00"
+    lifecycle = payload["items"][0]["visibility_lifecycle"]
+    assert lifecycle["active"] is True
+    assert lifecycle["visibility_state"] == "source_updated_after_operator_decision"
+    assert lifecycle["is_reopened"] is True
+    assert "newer source evidence" in lifecycle["active_reason"]
+    assert "ignore" in lifecycle["closing_decisions"]
+    assert "watch_for_event" in lifecycle["non_closing_decisions"]
+    assert lifecycle["mutates_portfolio"] is False
+    assert lifecycle["mutates_action_recommendation"] is False
+    assert lifecycle["submits_order"] is False
+    assert payload["summary"]["by_visibility_state"] == {"source_updated_after_operator_decision": 1}
+
+
+def test_operator_api_reopens_canonical_manual_review_when_newer_duplicate_arrives(monkeypatch):
+    conflict_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-05-30T10:00:00Z"),
+                "symbol": "INOXINDIA",
+                "winning_action_code": "MANUAL_REVIEW",
+                "losing_action_code": "BUY",
+                "losing_setup_id": "TECH_A",
+                "losing_unique_id": "newer",
+                "resolution_status": "manual_required",
+                "requires_manual_resolution": True,
+                "lost_reason": "Fresh duplicate conflict after operator ignored the old one.",
+            },
+        ]
+    )
+    closed_snapshot = {
+        "item_id": "action_conflict:advisory_action_conflicts:older-transient-key",
+        "item_type": "action_conflict",
+        "source_table": operator_api.ACTION_CONFLICTS_TABLE,
+        "symbol": "INOXINDIA",
+        "updated_at": "2026-05-30T09:00:00+00:00",
+        "raw": {
+            "winning_action_code": "MANUAL_REVIEW",
+            "losing_action_code": "BUY",
+            "resolution_status": "manual_required",
+        },
+    }
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.ACTION_CONFLICTS_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda query, *args, **kwargs: conflict_rows.copy() if operator_api.ACTION_CONFLICTS_TABLE in query else pd.DataFrame())
+    monkeypatch.setattr(
+        operator_api,
+        "load_latest_manual_review_decisions",
+        lambda **_kwargs: {
+            closed_snapshot["item_id"]: {
+                "item_id": closed_snapshot["item_id"],
+                "item_type": "action_conflict",
+                "source_table": operator_api.ACTION_CONFLICTS_TABLE,
+                "symbol": "INOXINDIA",
+                "decision": "ignore",
+                "decided_at": pd.Timestamp("2026-05-30T09:30:00Z"),
+                "item_snapshot": closed_snapshot,
+            }
+        },
+    )
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+
+    payload = operator_api.build_manual_review_payload(limit=20)
+
+    assert payload["summary"]["closed_by_operator"] == 0
+    assert payload["summary"]["stale_operator_decision"] == 1
+    assert payload["summary"]["by_type"] == {"action_conflict": 1}
+    assert payload["items"][0]["manual_review_state"]["state"] == "source_updated_after_operator_decision"
+    assert payload["items"][0]["reason"] == "Fresh duplicate conflict after operator ignored the old one."
+
+
+def test_operator_api_dedupes_repeated_manual_review_conflicts(monkeypatch):
+    conflict_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-05-30T09:00:00Z"),
+                "symbol": "INOXINDIA",
+                "winning_action_code": "MANUAL_REVIEW",
+                "losing_action_code": "BUY",
+                "losing_setup_id": "TECH_A",
+                "losing_unique_id": "older",
+                "resolution_status": "manual_required",
+                "requires_manual_resolution": True,
+                "lost_reason": "Older duplicate conflict.",
+            },
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-05-30T10:00:00Z"),
+                "symbol": "INOXINDIA",
+                "winning_action_code": "MANUAL_REVIEW",
+                "losing_action_code": "BUY",
+                "losing_setup_id": "TECH_B",
+                "losing_unique_id": "newer",
+                "resolution_status": "manual_required",
+                "requires_manual_resolution": True,
+                "lost_reason": "Newest duplicate conflict.",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.ACTION_CONFLICTS_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda query, *args, **kwargs: conflict_rows.copy() if operator_api.ACTION_CONFLICTS_TABLE in query else pd.DataFrame())
+    monkeypatch.setattr(operator_api, "load_latest_manual_review_decisions", lambda **_kwargs: {})
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+
+    payload = operator_api.build_manual_review_payload(limit=20)
+
+    assert payload["summary"]["total_items"] == 1
+    assert payload["summary"]["duplicate_suppressed"] == 1
+    assert payload["summary"]["queue_contract"]["active_displayed_items"] == 1
+    assert payload["summary"]["queue_contract"]["duplicate_suppressed"] == 1
+    assert payload["summary"]["queue_contract"]["suppressed_rows_are_audit_only"] is True
+    assert payload["summary"]["by_type"] == {"action_conflict": 1}
+    assert payload["items"][0]["symbol"] == "INOXINDIA"
+    assert payload["items"][0]["reason"] == "Newest duplicate conflict."
+
+
+def test_operator_api_suppresses_canonically_closed_manual_review_conflict(monkeypatch):
+    conflict_rows = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-05-30T09:00:00Z"),
+                "symbol": "INOXINDIA",
+                "winning_action_code": "MANUAL_REVIEW",
+                "losing_action_code": "BUY",
+                "losing_setup_id": "TECH_A",
+                "losing_unique_id": "older",
+                "resolution_status": "manual_required",
+                "requires_manual_resolution": True,
+                "lost_reason": "Older duplicate conflict.",
+            },
+            {
+                "asof_date": pd.Timestamp("2026-05-30T00:00:00Z"),
+                "load_ts": pd.Timestamp("2026-05-30T10:00:00Z"),
+                "symbol": "INOXINDIA",
+                "winning_action_code": "MANUAL_REVIEW",
+                "losing_action_code": "BUY",
+                "losing_setup_id": "TECH_B",
+                "losing_unique_id": "newer",
+                "resolution_status": "manual_required",
+                "requires_manual_resolution": True,
+                "lost_reason": "Newest duplicate conflict.",
+            },
+        ]
+    )
+    closed_snapshot = {
+        "item_id": "action_conflict:advisory_action_conflicts:older-transient-key",
+        "item_type": "action_conflict",
+        "source_table": operator_api.ACTION_CONFLICTS_TABLE,
+        "symbol": "INOXINDIA",
+        "raw": {
+            "winning_action_code": "MANUAL_REVIEW",
+            "losing_action_code": "BUY",
+            "resolution_status": "manual_required",
+        },
+    }
+
+    monkeypatch.setattr(operator_api, "_table_exists", lambda table_name: table_name == operator_api.ACTION_CONFLICTS_TABLE)
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda query, *args, **kwargs: conflict_rows.copy() if operator_api.ACTION_CONFLICTS_TABLE in query else pd.DataFrame())
+    monkeypatch.setattr(
+        operator_api,
+        "load_latest_manual_review_decisions",
+        lambda **_kwargs: {
+            closed_snapshot["item_id"]: {
+                "item_id": closed_snapshot["item_id"],
+                "item_type": "action_conflict",
+                "source_table": operator_api.ACTION_CONFLICTS_TABLE,
+                "symbol": "INOXINDIA",
+                "decision": "ignore",
+                "decided_at": pd.Timestamp("2026-05-30T11:00:00Z"),
+                "item_snapshot": closed_snapshot,
+            }
+        },
+    )
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+
+    payload = operator_api.build_manual_review_payload(limit=20)
+
+    assert payload["summary"]["duplicate_suppressed"] == 1
+    assert payload["summary"]["closed_by_operator"] == 1
+    assert payload["summary"]["by_type"] == {}
     assert payload["items"] == []
 
 
@@ -29444,6 +35194,90 @@ def test_operator_api_suppresses_matched_wait_followup_after_original_closed(mon
     assert payload["items"] == []
 
 
+def test_operator_api_suppresses_matched_wait_followup_after_followup_closed(monkeypatch):
+    manual_item_id = "action_manual_review:advisory_action_recommendations:2026-05-30 00:00:00+00:00:ABC:SETUP"
+    followup_item_id = "wait_signal_followup:advisory_wait_signal_matches:sig-manual:advisory_watch_events:ANN-3"
+
+    def fake_table_exists(table_name):
+        return table_name in {operator_api.WAIT_SIGNALS_TABLE, operator_api.WAIT_SIGNAL_MATCHES_TABLE}
+
+    def fake_sql_to_df(query, *args, **kwargs):
+        if "advisory_wait_signal_matches" in query and "advisory_wait_signals" in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "matched_at": pd.Timestamp("2026-06-03T09:00:00Z"),
+                        "signal_id": "sig-manual",
+                        "hypothesis_id": "manual_review",
+                        "symbol": "ABC",
+                        "signal_type": "clarification_filing",
+                        "expected_action": "MANUAL_REVIEW",
+                        "match_status": "matched",
+                        "match_score": 1.0,
+                        "match_source_table": "advisory_watch_events",
+                        "match_source_key": "ANN-3",
+                        "observed_at": pd.Timestamp("2026-06-03T08:30:00Z"),
+                        "observed_value": None,
+                        "threshold_value": None,
+                        "match_reason": "Matched clarification filing required wait term: order cancellation.",
+                        "evidence_json": json.dumps(
+                            {
+                                "wait_signal": {
+                                    "signal_id": "sig-manual",
+                                    "manual_review_item_id": manual_item_id,
+                                    "manual_review_source_table": "advisory_manual_review_decisions",
+                                    "manual_review_source_key": manual_item_id,
+                                    "wait_question": "Has management clarified the order cancellation?",
+                                    "generated_by": "manual_review_decision",
+                                }
+                            }
+                        ),
+                        "signal_created_at": pd.Timestamp("2026-06-01T09:00:00Z"),
+                        "hypothesis_title": "Operator manual-review follow-up",
+                        "signal_source_table": "advisory_manual_review_decisions",
+                        "signal_source_key": manual_item_id,
+                        "signal_symbol": "ABC",
+                        "signal_status": "matched",
+                        "priority": 75,
+                        "signal_expected_action": "MANUAL_REVIEW",
+                        "operator_summary": "Wait for management clarification.",
+                        "wait_question": "Has management clarified the order cancellation?",
+                        "condition_json": json.dumps({"condition_type": "clarification_filing", "keywords": ["order cancellation"]}),
+                        "valid_until": pd.Timestamp("2026-06-15T09:00:00Z"),
+                        "generated_by": "manual_review_decision",
+                    }
+                ]
+            )
+        return pd.DataFrame()
+
+    monkeypatch.setattr(operator_api, "_table_exists", fake_table_exists)
+    monkeypatch.setattr(operator_api, "sql_to_df", fake_sql_to_df)
+    monkeypatch.setattr(operator_api, "load_promotion_reviews", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        operator_api,
+        "load_latest_manual_review_decisions",
+        lambda **_kwargs: {
+            manual_item_id: {
+                "item_id": manual_item_id,
+                "decision": "watch_for_event",
+                "decided_at": pd.Timestamp("2026-06-01T09:00:00Z"),
+            },
+            followup_item_id: {
+                "item_id": followup_item_id,
+                "decision": "downgrade_to_no_action",
+                "decided_at": pd.Timestamp("2026-06-03T10:00:00Z"),
+            },
+        },
+    )
+
+    payload = operator_api.build_manual_review_payload(limit=20)
+
+    assert payload["summary"]["closed_by_operator"] == 1
+    assert payload["summary"]["reopened_by_wait_signal"] == 0
+    assert payload["summary"]["by_type"] == {}
+    assert payload["items"] == []
+
+
 def test_operator_journey_manual_review_wait_signal_match_reopens_review_only_candidate(monkeypatch):
     manual_item_id = "action_manual_review:advisory_action_recommendations:2026-05-30 00:00:00+00:00:ABC:SETUP"
     decision_writes: list[pd.DataFrame] = []
@@ -29594,6 +35428,18 @@ def test_operator_journey_manual_review_wait_signal_match_reopens_review_only_ca
     assert candidate_context["wait_signal_followup"]["manual_review_item_id"] == manual_item_id
     assert "do not create broker-executable trades" in candidate_context["wait_signal_followup"]["bridge_note"]
 
+    enriched = action_recommender.add_recommendation_reason_contracts(pd.DataFrame(candidates))
+    enriched_row = enriched.iloc[0]
+    reason_contract = json.loads(enriched_row["recommendation_reason_json"])
+    assert enriched_row["action_code"] == "MANUAL_REVIEW"
+    assert enriched_row["execution_mode"] == "review_only"
+    assert enriched_row["reason_contract_status"] == "complete"
+    assert reason_contract["evidence"]["manual_review"]["manual_review_boundary"] == "manual_review_wait_signal_matched"
+    assert reason_contract["evidence"]["manual_review"]["broker_execution_allowed"] is False
+    assert reason_contract["evidence"]["action_transition"]["broker_execution_allowed"] is False
+    assert reason_contract["evidence"]["action_transition"]["broker_order_candidate"] is False
+    assert reason_contract["evidence"]["wait_signal"]["wait_signal_followup"]["manual_review_item_id"] == manual_item_id
+
 
 def test_operator_api_lists_operator_commands(monkeypatch):
     monkeypatch.setattr(operator_api, "ensure_operator_command_runs_table", lambda: None)
@@ -29605,10 +35451,23 @@ def test_operator_api_lists_operator_commands(monkeypatch):
     assert payload["commands"][0]["key"] == "operator_smoke"
     assert payload["commands"][0]["risk"] == "safe_read_only"
     assert any(row["key"] == "operator_health_skip_dhan" for row in payload["commands"])
+    snapshot_command = next(row for row in payload["commands"] if row["key"] == "operator_snapshot_refresh")
+    assert snapshot_command["dry_run"] is False
+    assert snapshot_command["risk"] == "cache_write"
+    assert any("advisory.operator_snapshot" in str(arg) for arg in snapshot_command["args"])
     cron_command = next(row for row in payload["commands"] if row["key"] == "cron_preflight")
     assert cron_command["dry_run"] is True
     assert cron_command["risk"] == "safe_read_only"
     assert any("cron_preflight.py" in str(arg) for arg in cron_command["args"])
+    stage_command = next(row for row in payload["commands"] if row["key"] == "advisory_stage_report")
+    assert stage_command["dry_run"] is True
+    assert stage_command["risk"] == "safe_read_only"
+    assert any("advisory_stage_report.py" in str(arg) for arg in stage_command["args"])
+    assert "logs/cron/all_advisory.log" in stage_command["args"]
+    advisory_preflight = next(row for row in payload["commands"] if row["key"] == "advisory_preflight")
+    assert advisory_preflight["dry_run"] is False
+    assert advisory_preflight["risk"] == "auth_cache_write"
+    assert "./all_advisory_preflight.sh" in advisory_preflight["args"]
     superseded_command = next(row for row in payload["commands"] if row["key"] == "superseded_failure_cleanup_dry_run")
     assert superseded_command["dry_run"] is True
     assert superseded_command["risk"] == "safe_read_only"
@@ -30637,7 +36496,7 @@ def test_config_change_assistant_verifies_ts_forecast_review_rule_config(tmp_pat
     assert result["model_name"] == "timesfm_2p5_200m"
     assert result["horizon_days"] == 10
     assert result["valid_matched_count"] == 1
-    assert result["config_summary"]["valid_rules"] == 1
+    assert result["config_summary"]["valid_count"] == 1
 
 
 def test_config_change_assistant_records_application_decision_as_audit_only(monkeypatch):
@@ -30681,6 +36540,12 @@ def test_config_change_assistant_records_application_decision_as_audit_only(monk
     assert result["verification_status"] == "verified"
     assert result["applied_by_system"] is False
     assert result["applied"] is False
+    assert result["decision_effect"]["state"] == "operator_marked_manual_application"
+    assert result["decision_effect"]["mutates_config"] is False
+    assert result["decision_effect"]["submits_order"] is False
+    assert result["operator_boundary"]["system_applies_config"] is False
+    assert result["operator_boundary"]["system_promotes_policy"] is False
+    assert result["operator_boundary"]["broker_execution_allowed"] is False
     assert "did not modify config files" in result["note"]
     assert captured["table"] == config_change_assistant.APPLICATIONS_TABLE
     assert captured["unique_keys"] == ["application_id"]
@@ -30689,6 +36554,87 @@ def test_config_change_assistant_records_application_decision_as_audit_only(monk
     assert row["application_decision"] == "marked_applied"
     assert row["applied_by_system"] is False
     assert "verified" in row["verification_json"]
+
+
+def test_config_change_assistant_loads_application_decision_boundaries(monkeypatch):
+    monkeypatch.setattr(config_change_assistant, "ensure_tables", lambda: None)
+    captured: dict[str, object] = {}
+
+    def fake_sql_to_df(sql, *args, **kwargs):
+        captured["sql"] = sql
+        captured["kwargs"] = kwargs
+        return pd.DataFrame(
+            [
+                {
+                    "application_id": "app-1",
+                    "preview_id": "preview-1",
+                    "decided_at": pd.Timestamp("2026-06-01T00:00:00Z"),
+                    "application_decision": "approved_to_apply",
+                    "operator_id": "tester",
+                    "operator_note": "Looks safe for manual application.",
+                    "source_type": "technical_threshold",
+                    "source_key": "SETUP:cfg",
+                    "config_path": "config/advisory_setups.yaml",
+                    "verification_status": "not_requested",
+                    "verification_json": "{}",
+                    "preview_snapshot_json": "{}",
+                    "safety_checks_json": "[]",
+                    "applied_by_system": False,
+                    "load_ts": pd.Timestamp("2026-06-01T00:00:00Z"),
+                }
+            ]
+        )
+
+    monkeypatch.setattr(config_change_assistant, "sql_to_df", fake_sql_to_df)
+
+    rows = config_change_assistant.load_application_decisions(limit=1)
+    row = rows[0]
+
+    assert row["decision_effect"]["state"] == "approved_for_manual_application"
+    assert row["decision_effect"]["mutates_config"] is False
+    assert row["decision_effect"]["mutates_policy"] is False
+    assert row["decision_effect"]["submits_order"] is False
+    assert row["operator_boundary"]["read_only_policy_application"] is True
+    assert row["operator_boundary"]["system_applies_config"] is False
+    assert row["operator_boundary"]["broker_execution_allowed"] is False
+    assert "preview_snapshot_json" not in str(captured["sql"]).split("FROM")[0]
+    assert captured["kwargs"]["statement_timeout_ms"] == 10000
+
+
+def test_config_change_assistant_can_opt_into_preview_snapshot_load(monkeypatch):
+    monkeypatch.setattr(config_change_assistant, "ensure_tables", lambda: None)
+    captured: dict[str, object] = {}
+
+    def fake_sql_to_df(sql, *args, **kwargs):
+        captured["sql"] = sql
+        return pd.DataFrame(
+            [
+                {
+                    "application_id": "app-1",
+                    "preview_id": "preview-1",
+                    "decided_at": pd.Timestamp("2026-06-01T00:00:00Z"),
+                    "application_decision": "marked_applied",
+                    "operator_id": "tester",
+                    "operator_note": "Applied manually.",
+                    "source_type": "technical_threshold",
+                    "source_key": "SETUP:cfg",
+                    "config_path": "config/advisory_setups.yaml",
+                    "verification_status": "verified",
+                    "verification_json": "{}",
+                    "preview_snapshot_json": '{"preview_id": "preview-1", "patch_payload": {"large": "omitted by default"}}',
+                    "safety_checks_json": "[]",
+                    "applied_by_system": False,
+                    "load_ts": pd.Timestamp("2026-06-01T00:00:00Z"),
+                }
+            ]
+        )
+
+    monkeypatch.setattr(config_change_assistant, "sql_to_df", fake_sql_to_df)
+
+    rows = config_change_assistant.load_application_decisions(limit=1, include_preview_snapshot=True)
+
+    assert "preview_snapshot_json" in str(captured["sql"]).split("FROM")[0]
+    assert rows[0]["preview_snapshot"]["preview_id"] == "preview-1"
 
 
 def test_operator_api_builds_config_change_previews(monkeypatch):
@@ -30813,6 +36759,16 @@ def test_operator_api_builds_config_change_application_payloads(monkeypatch):
             "verification_status": "verified",
             "verification": {"status": "verified"},
             "safety_checks": ["audit only"],
+            "decision_effect": {
+                "state": "operator_marked_manual_application",
+                "mutates_config": False,
+                "submits_order": False,
+            },
+            "operator_boundary": {
+                "system_applies_config": False,
+                "system_promotes_policy": False,
+                "broker_execution_allowed": False,
+            },
             "applied_by_system": False,
             "applied": False,
             "note": "Decision recorded only.",
@@ -30836,6 +36792,9 @@ def test_operator_api_builds_config_change_application_payloads(monkeypatch):
     assert decision["api_schema"]["endpoint"] == "/api/config-change/application-decision"
     assert decision["applied_by_system"] is False
     assert decision["applied"] is False
+    assert decision["decision_effect"]["mutates_config"] is False
+    assert decision["operator_boundary"]["system_applies_config"] is False
+    assert decision["operator_boundary"]["broker_execution_allowed"] is False
     assert decision_called["preview_id"] == "preview-1"
     assert decision_called["application_decision"] == "marked_applied"
     assert decision_called["operator_id"] == "tester"
@@ -30860,6 +36819,58 @@ def test_prompt_registry_filters_by_owner_and_scope():
     assert {row["owner_area"] for row in owner_payload["contracts"]} == {"company_memory"}
     assert scope_payload["contracts"]
     assert {row["authority_scope"] for row in scope_payload["contracts"]} == {"extraction_only"}
+
+
+def test_prompt_registry_marks_announcement_callers_migrated():
+    contracts = {row["prompt_id"]: row for row in prompt_registry.build_prompt_registry_payload()["contracts"]}
+
+    assert contracts[prompt_registry.ANNOUNCEMENT_SUMMARY_PROMPT_ID]["migration_status"] == "caller_migrated"
+    assert contracts[prompt_registry.ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID]["migration_status"] == "caller_migrated"
+    assert contracts[prompt_registry.OCR_PDF_PAGE_PROMPT_ID]["migration_status"] == "caller_migrated"
+
+
+def test_announcement_rows_use_prompt_registry_metadata(monkeypatch):
+    published_on = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    announcement = Announcement(
+        company_master_id="nse:ABC",
+        exchange="NSE",
+        ticker="ABC",
+        company_name="ABC Ltd",
+        unique_id="ABC-20260601",
+        subject="Board meeting outcome",
+        text="Dividend and order update.",
+        filed_under_category="Corporate",
+        exchange_category_id="corp",
+        raw={},
+        published_on=published_on,
+        exchange_published_on=published_on,
+        three_page_ocr_text="Visible OCR text",
+        concise_summary_text="ABC announced a dividend and order update.",
+        parsed_reports=[
+            ParsedReport(
+                category="Corporate",
+                report_name="OrderWin",
+                model_name="codex",
+                data={"order_value": "100 crore"},
+            )
+        ],
+    )
+    monkeypatch.setattr(announcement_state, "save_report_artifact", lambda _announcement, _report: "reports/abc.json")
+
+    document = announcement_state.document_row_from_announcement(announcement)
+    reports = announcement_state.report_rows_from_announcement(announcement)
+
+    assert document["ocr_prompt_id"] == prompt_registry.OCR_PDF_PAGE_PROMPT_ID
+    assert document["ocr_prompt_version"] == prompt_registry.prompt_version(prompt_registry.OCR_PDF_PAGE_PROMPT_ID)
+    assert document["ocr_prompt_schema_version"] == prompt_registry.response_schema_version(prompt_registry.OCR_PDF_PAGE_PROMPT_ID)
+    assert document["concise_summary_prompt_id"] == prompt_registry.ANNOUNCEMENT_SUMMARY_PROMPT_ID
+    assert document["concise_summary_prompt_version"] == prompt_registry.prompt_version(prompt_registry.ANNOUNCEMENT_SUMMARY_PROMPT_ID)
+    assert document["concise_summary_prompt_schema_version"] == prompt_registry.response_schema_version(prompt_registry.ANNOUNCEMENT_SUMMARY_PROMPT_ID)
+    assert reports[0]["prompt_id"] == prompt_registry.ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID
+    assert reports[0]["prompt_version"] == prompt_registry.prompt_version(prompt_registry.ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID)
+    assert reports[0]["prompt_schema_version"] == prompt_registry.response_schema_version(
+        prompt_registry.ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID
+    )
 
 
 def test_operator_api_builds_prompt_registry_payload():
@@ -31271,6 +37282,136 @@ def test_continuous_watch_ensure_alerts_table_uses_schema_registry(monkeypatch):
     assert any(continuous_watch.ALERTS_TABLE in statement for statement in calls[0]["statements"])
     assert any("monitor_source" in statement for statement in calls[0]["statements"])
     assert any("stop_price" in statement for statement in calls[0]["statements"])
+    assert any("alert_fingerprint" in statement for statement in calls[0]["statements"])
+
+
+def test_continuous_watch_persist_alerts_suppresses_recent_duplicates(monkeypatch):
+    writes: list[pd.DataFrame] = []
+    published: list[tuple[str, dict[str, object]]] = []
+    existing = pd.DataFrame(
+        [
+            {
+                "alert_fingerprint": "TEST|ABC|ENTRY_ZONE_HIT|watchlist|WATCH_BREAKOUT",
+            }
+        ]
+    )
+
+    monkeypatch.setattr(continuous_watch, "ensure_alerts_table", lambda: None)
+    monkeypatch.setattr(continuous_watch, "sql_to_df", lambda *args, **kwargs: existing.copy())
+    monkeypatch.setattr(continuous_watch, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+    monkeypatch.setattr(continuous_watch, "publish_bus_message", lambda channel, payload: published.append((channel, payload)) or True)
+
+    alerts = pd.DataFrame(
+        [
+            {
+                "observed_at": pd.Timestamp("2026-04-08T09:21:00Z"),
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "ABC",
+                "alert_type": "ENTRY_ZONE_HIT",
+                "alert_reason": "same alert",
+                "monitor_source": "watchlist",
+                "last_price": 100.0,
+                "current_state": "WATCH_BREAKOUT",
+                "load_ts": pd.Timestamp("2026-04-08T09:21:01Z"),
+            }
+        ]
+    )
+
+    summary = continuous_watch.persist_alerts(alerts, cooldown_seconds=900)
+
+    assert summary == {"input_count": 1, "persisted_count": 0, "suppressed_count": 1, "cooldown_seconds": 900}
+    assert writes == []
+    assert published[0][0] == "stockey:continuous_watch:alerts"
+    assert published[0][1]["suppressed_count"] == 1
+
+
+def test_continuous_watch_persist_alerts_fail_open_when_dedupe_lookup_fails(monkeypatch):
+    writes: list[pd.DataFrame] = []
+    events: list[dict[str, object]] = []
+
+    monkeypatch.setattr(continuous_watch, "ensure_alerts_table", lambda: None)
+    monkeypatch.setattr(continuous_watch, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("alerts lookup timeout")))
+    monkeypatch.setattr(continuous_watch, "upsert_to_db", lambda df, *args, **kwargs: writes.append(df.copy()))
+    monkeypatch.setattr(continuous_watch, "publish_bus_message", lambda channel, payload: True)
+    monkeypatch.setattr(continuous_watch, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    alerts = pd.DataFrame(
+        [
+            {
+                "observed_at": pd.Timestamp("2026-04-08T09:21:00Z"),
+                "asof_date": pd.Timestamp("2026-04-08T00:00:00Z"),
+                "setup_id": "TEST",
+                "symbol": "ABC",
+                "alert_type": "ENTRY_ZONE_HIT",
+                "alert_reason": "same alert",
+                "monitor_source": "watchlist",
+                "last_price": 100.0,
+                "current_state": "WATCH_BREAKOUT",
+                "load_ts": pd.Timestamp("2026-04-08T09:21:01Z"),
+            }
+        ]
+    )
+
+    summary = continuous_watch.persist_alerts(alerts, cooldown_seconds=900)
+
+    assert summary["persisted_count"] == 1
+    assert summary["suppressed_count"] == 0
+    assert writes[0]["alert_fingerprint"].tolist() == ["TEST|ABC|ENTRY_ZONE_HIT|watchlist|WATCH_BREAKOUT"]
+    assert events[0]["fallback_type"] == "continuous_watch_alert_dedupe_lookup_failed"
+    assert events[0]["source"] == continuous_watch.ALERTS_TABLE
+
+
+def test_continuous_watch_source_counters_normalize_ohlcv_news_and_announcements():
+    ohlcv = continuous_watch.watcher_source_counters(
+        source="ohlcv",
+        meta={"symbol_count": 3},
+        sync_results=[{"status": "ok"}, {"status": "error"}],
+        latest_prices=pd.DataFrame([{"symbol": "ABC"}, {"symbol": "XYZ"}]),
+        alerts=pd.DataFrame([{"symbol": "ABC"}]),
+        alert_persist={"input_count": 1, "persisted_count": 0, "suppressed_count": 1, "cooldown_seconds": 900},
+    )
+    news = continuous_watch.watcher_source_counters(
+        source="news",
+        meta={
+            "watch_count": 2,
+            "market_context_watch_count": 1,
+            "news_item_count": 7,
+            "matched_event_count": 3,
+            "triggered_event_count": 2,
+            "context_observed_count": 1,
+            "feed_names": ["markets", "stocks"],
+        },
+        events=pd.DataFrame([{"symbol": "ABC"}, {"symbol": "XYZ"}, {"symbol": "PQR"}]),
+    )
+    announcements = continuous_watch.watcher_source_counters(
+        source="announcements",
+        meta={
+            "watch_count": 2,
+            "unique_ingest_targets": 2,
+            "ingest_runs": [
+                {"discovered": 3, "parsed": 2, "failed": 1},
+                {"discovered": 4, "parsed": 4, "failed": 0},
+            ],
+            "match_count": 2,
+            "triggered_event_count": 1,
+            "context_observed_count": 1,
+            "market_context_watch_count": 1,
+            "capped_watch_rows": 0,
+        },
+        events=pd.DataFrame([{"symbol": "ABC"}, {"symbol": "XYZ"}]),
+        watch_updates=pd.DataFrame([{"symbol": "ABC"}]),
+    )
+
+    assert ohlcv["sync_failure_count"] == 1
+    assert ohlcv["latest_price_count"] == 2
+    assert ohlcv["alert_suppressed_count"] == 1
+    assert news["feed_count"] == 2
+    assert news["persisted_event_count"] == 3
+    assert announcements["ingest_run_count"] == 2
+    assert announcements["discovered_count"] == 7
+    assert announcements["parsed_count"] == 6
+    assert announcements["failed_count"] == 1
 
 
 def test_continuous_watch_build_price_alerts_entry_and_invalidation():
@@ -31741,6 +37882,54 @@ def test_signal_refresh_maps_event_buy_watch_to_watch():
     assert signal["signal_source"] == "event_policy"
 
 
+def test_signal_refresh_uses_router_stop_context_as_review_only_reduce_signal():
+    signal = signal_refresh.choose_signal(
+        symbol="ABC",
+        reason="router:price_alert:refresh_symbol_price",
+        action={"action_code": "BUY", "action_reason": "Older buy setup"},
+        lifecycle=None,
+        rebalance=None,
+        events=[],
+        router_context={
+            "source_types": ["price_alert"],
+            "action_type": "refresh_symbol_price",
+            "reasons": ["STOP_HIT"],
+            "priority_score": 4.5,
+        },
+    )
+
+    assert signal["signal_action"] == "REDUCE_EXPOSURE_REVIEW"
+    assert signal["signal_status"] == "exit_or_reduce"
+    assert signal["signal_source"] == "router_price_alert"
+    assert signal["confidence"] == 0.9
+    assert "STOP_HIT" in signal["action_reason"]
+    assert "Review exposure" in signal["action_reason"]
+
+
+def test_signal_refresh_uses_router_entry_context_as_review_only_watch_signal():
+    signal = signal_refresh.choose_signal(
+        symbol="ABC",
+        reason="router:price_alert:refresh_symbol_price",
+        action={"action_code": "NO_ACTION", "action_reason": "Older no-action row"},
+        lifecycle=None,
+        rebalance=None,
+        events=[],
+        router_context={
+            "source_types": ["price_alert"],
+            "action_type": "refresh_symbol_price",
+            "reasons": ["ENTRY_ZONE_HIT"],
+            "priority_score": 3.0,
+        },
+    )
+
+    assert signal["signal_action"] == "WATCH"
+    assert signal["signal_status"] == "watch_or_review"
+    assert signal["signal_source"] == "router_price_alert"
+    assert signal["confidence"] == 0.6
+    assert "ENTRY_ZONE_HIT" in signal["action_reason"]
+    assert "review-only entry signal" in signal["action_reason"]
+
+
 def test_signal_refresh_jsonish_records_malformed_context_fallback(monkeypatch):
     events: list[dict[str, object]] = []
     monkeypatch.setattr(signal_refresh, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
@@ -31862,6 +38051,62 @@ def test_signal_refresh_records_trace_summary_refresh_fallback(monkeypatch):
     assert events[0]["source"] == "advisory.trace_summary_store"
     assert events[0]["symbol"] == "ABC"
     assert events[0]["metadata"]["reason"] == "news"
+
+
+def test_signal_refresh_persists_previous_action_and_traces_action_change(monkeypatch):
+    persisted_rows: list[list[dict[str, object]]] = []
+    trace_calls: list[dict[str, object]] = []
+    step_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(signal_refresh, "ensure_table", lambda: None)
+    monkeypatch.setattr(signal_refresh, "load_latest_action", lambda *args, **kwargs: {"action_code": "BUY", "action_reason": "Older buy setup", "invest_score_pct": 80})
+    monkeypatch.setattr(signal_refresh, "load_latest_lifecycle", lambda *args, **kwargs: {"next_action": "FULL_EXIT", "next_action_reason": "Stop failed", "target_confidence": 0.8})
+    monkeypatch.setattr(signal_refresh, "load_latest_rebalance", lambda *args, **kwargs: None)
+    monkeypatch.setattr(signal_refresh, "load_event_policy", lambda *args, **kwargs: [])
+    monkeypatch.setattr(signal_refresh, "match_wait_signals", lambda **kwargs: {"matches": []})
+    monkeypatch.setattr(signal_refresh, "persist_signal_rows", lambda rows: persisted_rows.append([dict(row) for row in rows]))
+    monkeypatch.setattr(signal_refresh, "build_symbol_summary", lambda *args, **kwargs: {"status": "ok"})
+    monkeypatch.setattr(signal_refresh, "build_event_summary", lambda *args, **kwargs: {"status": "ok"})
+
+    def fake_append_trace(**kwargs):
+        trace_calls.append(kwargs)
+        return "trace-1"
+
+    def fake_append_trace_step(**kwargs):
+        step_calls.append(kwargs)
+        return "trace-1:step-1"
+
+    def fake_safe_trace_call(func, **kwargs):
+        return func(**kwargs)
+
+    monkeypatch.setattr(signal_refresh, "append_trace", fake_append_trace)
+    monkeypatch.setattr(signal_refresh, "append_trace_step", fake_append_trace_step)
+    monkeypatch.setattr(signal_refresh, "safe_trace_call", fake_safe_trace_call)
+
+    row = signal_refresh.refresh_symbol(
+        symbol="ABC",
+        reason="ohlcv",
+        asof_date=pd.Timestamp("2026-04-01T00:00:00Z"),
+        dry_run=False,
+    )
+
+    assert row["signal_action"] == "FULL_EXIT"
+    assert row["previous_action"] == "BUY"
+    assert row["action_changed"] is True
+    assert row["effect_type"] == "action_changed"
+    assert row["authority_scope"] == "review_input_only"
+    assert row["portfolio_authority"] == "none"
+    assert row["broker_execution_allowed"] is False
+    assert row["full_advisory_required"] is True
+    assert json.loads(row["action_payload_json"])["authority_contract"] == signal_refresh.SIGNAL_REFRESH_AUTHORITY_CONTRACT
+    assert persisted_rows[0][0]["previous_action"] == "BUY"
+    assert persisted_rows[0][0]["action_changed"] is True
+    assert persisted_rows[0][0]["broker_execution_allowed"] is False
+    assert persisted_rows[0][0]["full_advisory_required"] is True
+    assert trace_calls[0]["previous_action"] == "BUY"
+    assert trace_calls[0]["new_action"] == "FULL_EXIT"
+    assert step_calls[0]["output_payload"]["previous_action"] == "BUY"
+    assert step_calls[0]["output_payload"]["action_changed"] is True
 
 
 def test_signal_refresh_records_router_item_failure_fallback(monkeypatch):
@@ -32549,6 +38794,31 @@ def _sample_announcement(**overrides):
     return Announcement(**payload)
 
 
+def test_announcement_download_skips_invalid_placeholder_attachment_url(monkeypatch):
+    events = []
+    pipe = object.__new__(announcement_pipeline.AnnouncementPipeline)
+    pipe.request_timeout = 5
+    announcement = _sample_announcement(attachment_url="-", attachment_name="-", attachment_bytes=None)
+
+    monkeypatch.setattr(announcement_pipeline, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        announcement_pipeline.requests,
+        "get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invalid placeholder URL must not be fetched")),
+    )
+
+    result = pipe.download_announcements([announcement])
+
+    assert result == [announcement]
+    assert announcement.attachment_url is None
+    assert announcement.attachment_name is None
+    assert announcement.attachment_bytes is None
+    assert events[0]["module"] == "data.announcements.pipeline"
+    assert events[0]["source"] == "announcement_download"
+    assert events[0]["fallback_type"] == "announcement_attachment_url_invalid"
+    assert events[0]["metadata"]["unique_id"] == "ABC-20260408100000"
+
+
 def test_announcement_first_page_ocr_failure_records_local_fallback(monkeypatch):
     events = []
     pipe = object.__new__(announcement_pipeline.AnnouncementPipeline)
@@ -32864,6 +39134,12 @@ def test_signal_refresh_ensure_table_uses_schema_registry(monkeypatch):
     assert calls[0]["metadata"]["tables"] == [signal_refresh.TABLE_NAME]
     assert any(signal_refresh.TABLE_NAME in statement for statement in calls[0]["statements"])
     assert any("effect_summary" in statement for statement in calls[0]["statements"])
+    assert any("previous_action" in statement for statement in calls[0]["statements"])
+    assert any("action_changed" in statement for statement in calls[0]["statements"])
+    assert any("authority_scope" in statement for statement in calls[0]["statements"])
+    assert any("portfolio_authority" in statement for statement in calls[0]["statements"])
+    assert any("broker_execution_allowed" in statement for statement in calls[0]["statements"])
+    assert any("full_advisory_required" in statement for statement in calls[0]["statements"])
     assert any("CREATE INDEX IF NOT EXISTS" in statement for statement in calls[0]["statements"])
 
 
@@ -32884,12 +39160,30 @@ def test_event_router_execute_uses_signal_refresh(monkeypatch):
                 "action_type": "refresh_symbol_price",
                 "asof_date": "2026-04-08T00:00:00Z",
                 "reasons": ["ENTRY_ZONE_HIT"],
+                "priority_score": 3.0,
+                "best_rank": 4,
+                "start_at": "technicals",
+                "stop_at": "portfolio",
+                "include_watch": False,
+                "include_lifecycle": False,
             }
         ]
     )
 
     assert calls[0]["symbol"] == "ABC"
     assert str(calls[0]["reason"]).startswith("router:price_alert")
+    assert calls[0]["router_context"] == {
+        "source_types": ["price_alert"],
+        "action_type": "refresh_symbol_price",
+        "reasons": ["ENTRY_ZONE_HIT"],
+        "setup_ids": ["SETUP_A"],
+        "priority_score": 3.0,
+        "best_rank": 4,
+        "start_at": "technicals",
+        "stop_at": "portfolio",
+        "include_watch": False,
+        "include_lifecycle": False,
+    }
     assert actions.iloc[0]["action_status"] == "ok"
 
 
@@ -33053,6 +39347,35 @@ def test_sync_state_ensure_table_uses_schema_registry(monkeypatch):
     assert any("source_name" in statement and "scope_key" in statement for statement in calls[0]["statements"])
 
 
+def test_sync_state_persist_keeps_missing_timestamps_as_nullable_timestamptz(monkeypatch):
+    captured = {}
+
+    def fake_upsert(df, table_name, unique_keys):
+        captured["df"] = df.copy()
+        captured["table_name"] = table_name
+        captured["unique_keys"] = list(unique_keys)
+
+    monkeypatch.setattr(sync_state, "ensure_sync_state_table", lambda: None)
+    monkeypatch.setattr(sync_state, "upsert_to_db", fake_upsert)
+
+    sync_state.persist_sync_state(
+        source_name="download_runner:data.sharpelydata.scrip_master",
+        scope_key="sharpely_master_precheck",
+        last_success_at=pd.Timestamp("2026-06-15T07:12:45Z"),
+        last_item_ts=None,
+        state={"rows": 8387},
+    )
+
+    df = captured["df"]
+    assert captured["table_name"] == sync_state.TABLE_NAME
+    assert captured["unique_keys"] == ["source_name", "scope_key"]
+    assert str(df["last_success_at"].dtype) == "datetime64[ns, UTC]"
+    assert str(df["last_item_ts"].dtype) == "datetime64[ns, UTC]"
+    assert str(df["updated_at"].dtype) == "datetime64[ns, UTC]"
+    assert str(df["load_ts"].dtype) == "datetime64[ns, UTC]"
+    assert pd.isna(df["last_item_ts"].iloc[0])
+
+
 def test_sync_state_load_records_state_json_parse_fallback(monkeypatch):
     events = []
 
@@ -33163,9 +39486,13 @@ def test_continuous_watch_news_cycle_persists_bounded_catchup_window(monkeypatch
     requested_from = pd.to_datetime(captured["published_from"], utc=True)
     assert 0 <= (pd.Timestamp.utcnow() - requested_from).total_seconds() <= 65 * 60
     assert result["catchup_truncated"] is True
+    assert result["source_counters"]["source"] == "news"
+    assert result["source_counters"]["watch_count"] == 1
+    assert result["source_counters"]["matched_event_count"] == 0
     assert persisted[0]["state"]["catchup_truncated"] is True
     assert persisted[0]["state"]["max_lookback_minutes"] == 60
     assert "requested_from" in persisted[0]["state"]
+    assert persisted[0]["state"]["source_counters"]["news_item_count"] == 0
     assert published[0][0] == "stockey:continuous_watch:news"
 
 
@@ -33193,9 +39520,13 @@ def test_continuous_watch_announcement_cycle_passes_bounded_catchup_window(monke
     requested_from = pd.to_datetime(captured["market_context_last_checked_at"], utc=True)
     assert 0 <= (pd.Timestamp.utcnow() - requested_from).total_seconds() <= 125 * 60
     assert result["catchup_truncated"] is True
+    assert result["source_counters"]["source"] == "announcements"
+    assert result["source_counters"]["watch_count"] == 1
+    assert result["source_counters"]["match_count"] == 0
     assert persisted[0]["state"]["catchup_truncated"] is True
     assert persisted[0]["state"]["max_lookback_minutes"] == 120
     assert "requested_from" in persisted[0]["state"]
+    assert persisted[0]["state"]["source_counters"]["persisted_event_count"] == 0
 
 
 def test_continuous_watch_publishes_skipped_due_cycles(monkeypatch):
@@ -34187,6 +40518,33 @@ def test_market_context_records_optional_event_count_fallback(monkeypatch):
     assert events[0]["metadata"]["symbol_count"] == 1
 
 
+def test_market_context_load_event_counts_defaults_missing_count_columns(monkeypatch):
+    def fake_count_events(*, table_name, **kwargs):
+        if table_name == "advisory_watch_events":
+            return pd.DataFrame([{"symbol": "AAA", "event_count": 2}])
+        return pd.DataFrame(columns=["symbol"])
+
+    monkeypatch.setattr(market_context, "_count_events", fake_count_events)
+
+    out = market_context.load_event_counts(pd.Timestamp("2026-06-01", tz="UTC"), ["AAA", "BBB"])
+
+    assert out["symbol"].tolist() == ["AAA", "BBB"]
+    assert out.loc[out["symbol"].eq("AAA"), "announcement_event_count_7d"].item() == 2
+    assert out.loc[out["symbol"].eq("BBB"), "announcement_event_count_7d"].item() == 0
+    assert out[
+        [
+            "triggered_announcement_event_count_7d",
+            "context_observed_announcement_event_count_7d",
+            "news_event_count_7d",
+            "triggered_news_event_count_7d",
+            "context_observed_news_event_count_7d",
+            "evaluated_event_count_20d",
+            "positive_event_count_20d",
+            "negative_event_count_20d",
+        ]
+    ].sum().sum() == 0
+
+
 def test_market_context_safe_float_records_parse_fallback(monkeypatch):
     events = []
 
@@ -34285,6 +40643,105 @@ def test_operator_health_surfaces_fundamental_snapshot_fallback_hint():
     hint = next(item for item in hints if item["title"] == "Fundamental snapshot source context failed")
     assert hint["details"]["fundamental_snapshot_peer_membership_load_failed"] == 2
     assert "python -m advisory.fundamental_snapshot --dry-run" in hint["commands"]
+
+
+def test_operator_health_surfaces_watcher_source_counters(monkeypatch):
+    now = pd.Timestamp.utcnow()
+    rows = pd.DataFrame(
+        [
+            {
+                "source_name": "continuous_watch:ohlcv",
+                "scope_key": "default",
+                "status": "ok",
+                "error_text": None,
+                "updated_at": now,
+                "last_success_at": now,
+                "state_json": json.dumps(
+                    {
+                        "source_counters": {
+                            "source": "ohlcv",
+                            "symbol_count": 5,
+                            "latest_price_count": 5,
+                            "alert_persisted_count": 1,
+                            "alert_suppressed_count": 2,
+                        }
+                    }
+                ),
+            },
+            {
+                "source_name": "continuous_watch:news",
+                "scope_key": "default",
+                "status": "ok",
+                "error_text": None,
+                "updated_at": now - pd.Timedelta(hours=4),
+                "last_success_at": now - pd.Timedelta(hours=4),
+                "state_json": json.dumps(
+                    {
+                        "source_counters": {
+                            "source": "news",
+                            "watch_count": 3,
+                            "news_item_count": 0,
+                            "matched_event_count": 0,
+                        }
+                    }
+                ),
+            },
+            {
+                "source_name": "continuous_watch:announcements",
+                "scope_key": "default",
+                "status": "error",
+                "error_text": "NSE timeout",
+                "updated_at": now,
+                "last_success_at": now - pd.Timedelta(hours=1),
+                "state_json": json.dumps(
+                    {
+                        "source_counters": {
+                            "source": "announcements",
+                            "unique_ingest_targets": 2,
+                            "failed_count": 1,
+                        }
+                    }
+                ),
+            },
+        ]
+    )
+
+    monkeypatch.setattr(operator_health, "table_exists", lambda table_name: table_name == "advisory_sync_state")
+    monkeypatch.setattr(operator_health, "sql_to_df", lambda *args, **kwargs: rows.copy())
+
+    result = operator_health.check_watcher_source_counters(max_age_minutes=90)
+
+    assert result["status"] == "error"
+    assert result["stale_count"] == 1
+    assert result["error_count"] == 1
+    by_source = {row["watcher_source"]: row for row in result["rows"]}
+    assert by_source["ohlcv"]["status"] == "ok"
+    assert by_source["ohlcv"]["produced_data"] is True
+    assert by_source["ohlcv"]["counters"]["alert_suppressed_count"] == 2
+    assert by_source["news"]["status"] == "warn"
+    assert by_source["news"]["stale"] is True
+    assert by_source["announcements"]["status"] == "error"
+    assert by_source["announcements"]["error"] == "NSE timeout"
+
+
+def test_operator_health_watcher_source_counters_fix_hint():
+    hints = operator_health.build_fix_hints(
+        {
+            "watcher_source_counters": {
+                "status": "warn",
+                "message": "Latest watcher source counters loaded.",
+                "missing_sources": ["continuous_watch:news"],
+                "stale_count": 1,
+                "error_count": 0,
+                "empty_counter_count": 0,
+            }
+        }
+    )
+
+    assert any(hint["title"] == "Watcher source counters are stale, missing, or failing" for hint in hints)
+    hint = next(item for item in hints if item["title"] == "Watcher source counters are stale, missing, or failing")
+    assert "./all_watchers.sh" in hint["commands"]
+    assert hint["details"]["missing_sources"] == ["continuous_watch:news"]
 
 
 def test_playbook_action_plan_downgrades_positive_action_in_weak_market(monkeypatch):
@@ -35023,6 +41480,70 @@ def test_all_frontend_script_exposes_component_modes():
     assert "emit_script_marker \"start\"" in script
     assert "name=all_frontend" in script
     assert "script_status_for_exit_code" in script
+    assert "OPERATOR_FRONTEND_RESTART_ON_CODE_CHANGE" in script
+    assert "OPERATOR_FRONTEND_CODE_CHECK_SECONDS" in script
+    assert "frontend_code_signature()" in script
+    assert "restart_requested" in script
+    assert "status=\"75\"" in script
+
+
+def test_start_chrome_cdp_script_documents_remote_debugging_contract():
+    script_path = Path("scripts/start_chrome_cdp.sh")
+    script = script_path.read_text(encoding="utf-8")
+
+    assert script_path.exists()
+    assert script_path.stat().st_mode & 0o111
+    assert 'CDP_HOST="${CDP_HOST:-127.0.0.1}"' in script
+    assert 'CDP_PORT="${CDP_PORT:-9222}"' in script
+    assert "CHROME_USER_DATA_DIR" in script
+    assert "--remote-debugging-address=" in script
+    assert "--remote-debugging-port=" in script
+    assert "--user-data-dir=" in script
+    assert "CDP_ENDPOINT=http://localhost:9222" in script
+
+
+def test_all_advisory_script_reports_stage_summary_on_failure():
+    script = Path("all_advisory.sh").read_text(encoding="utf-8")
+
+    assert "report_advisory_failure()" in script
+    assert "trap report_advisory_failure ERR" in script
+    assert 'advisory_failure_context="dhan_auth_preflight"' in script
+    assert 'advisory_failure_context="all_advisory"' in script
+    assert 'if [[ "${advisory_failure_context}" == "all_advisory" ]]; then' in script
+    assert "Dhan auth preflight failed before advisory stages started." in script
+    assert "scripts/start_chrome_cdp.sh" in script
+    assert "data.dhanlive.auth_cli ensure --auto-login" in script
+    assert "scripts/advisory_stage_report.py" in script
+    assert "--log-path" in script
+    assert "ADVISORY_LOG_PATH" in script
+    assert "dhan_auth_preflight" in script
+    assert "data.dhanlive.auth_cli" in script
+    assert "ADVISORY_DHAN_PREFLIGHT" in script
+    assert "ADVISORY_SKIP_POST_REFRESH" in script
+    assert "operator_snapshot" in script
+    assert "trace_summary_store" in script
+
+
+def test_all_advisory_preflight_script_checks_auth_and_smoke_without_running_advisory():
+    script_path = Path("all_advisory_preflight.sh")
+    script = script_path.read_text(encoding="utf-8")
+
+    assert script_path.stat().st_mode & 0o111
+    assert "data.dhanlive.auth_cli" in script
+    assert "ensure --min-fresh-minutes" in script
+    assert "--auto-login" in script
+    assert "ADVISORY_DHAN_PREFLIGHT_SKIP_VALIDATE" in script
+    assert "advisory.operator_smoke" in script
+    assert "--include-dhan" in script
+    assert "trap report_preflight_failure ERR" in script
+    assert 'preflight_failure_context="advisory_dhan_preflight"' in script
+    assert 'preflight_failure_context="advisory_preflight_smoke"' in script
+    assert "Dhan auth preflight failed before advisory smoke ran." in script
+    assert "scripts/start_chrome_cdp.sh" in script
+    assert "Operator smoke failed after Dhan auth preflight completed." in script
+    assert "advisory.master_pipeline" not in script
+    assert "advisory.operator_snapshot" not in script
+    assert "trace_summary_store" not in script
 
 
 def test_codex_wrappers_emit_script_markers():
@@ -35037,6 +41558,7 @@ def test_codex_wrappers_emit_script_markers():
 
 def test_cron_python_jobs_use_named_marker_wrappers():
     wrapper_names = [
+        "all_advisory_preflight.sh",
         "all_api_latency_probe.sh",
         "all_operator_health.sh",
         "all_hypothesis_scan.sh",
@@ -35059,6 +41581,9 @@ def test_cron_python_jobs_use_named_marker_wrappers():
         cron_text = "\n".join(active_lines)
         for wrapper_name in wrapper_names:
             assert f"./{wrapper_name}" in cron_text
+        assert "55 18 * * 1-5" in cron_text
+        assert "all_advisory_preflight.log" in cron_text
+        assert "/tmp/stockey_advisory_preflight.lock" in cron_text
         assert "scripts/resolve_python.sh" not in cron_text
         assert " -m advisory." not in cron_text
         assert " scripts/api_latency_probe.py" not in cron_text
@@ -35598,6 +42123,40 @@ def test_api_latency_probe_writes_latest_summary(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8")) == payload
 
 
+def test_api_latency_probe_accepts_output_alias(monkeypatch, tmp_path):
+    from scripts import api_latency_probe
+
+    output_path = tmp_path / "latest_api_latency_probe.json"
+    monkeypatch.setattr(
+        api_latency_probe,
+        "run_probe",
+        lambda **kwargs: {
+            "status": "ok",
+            "generated_at": "2026-06-12T00:00:00+00:00",
+            "base_url": kwargs["base_url"],
+            "rows": [],
+        },
+    )
+
+    exit_code = api_latency_probe.main(["--output", str(output_path), "--endpoint", "/api/health"])
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "ok"
+    assert payload["output_path"] == str(output_path)
+
+
+def test_api_latency_probe_defaults_use_compact_paged_operator_routes():
+    from scripts import api_latency_probe
+
+    assert "/api/actions?limit=25&compact=true" in api_latency_probe.DEFAULT_ENDPOINTS
+    assert "/api/portfolio?limit=25&compact=true" in api_latency_probe.DEFAULT_ENDPOINTS
+    assert "/api/watchlist?limit=25&compact=true" in api_latency_probe.DEFAULT_ENDPOINTS
+    assert "/api/actions" not in api_latency_probe.DEFAULT_ENDPOINTS
+    assert "/api/portfolio" not in api_latency_probe.DEFAULT_ENDPOINTS
+    assert "/api/watchlist" not in api_latency_probe.DEFAULT_ENDPOINTS
+
+
 def test_api_latency_probe_http_error_records_fallback(monkeypatch):
     import io
     from scripts import api_latency_probe
@@ -35712,6 +42271,8 @@ def test_operator_health_api_latency_probe_warns_on_slow(tmp_path):
     assert result["status"] == "warn"
     assert result["slow_count"] == 1
     assert "api_latency_probe.py" in result["command"]
+    assert result["performance_report_command"] == "python scripts/api_performance_report.py --limit 20"
+    assert "api_performance_report.py" in result["operator_action"]
 
 
 def test_operator_health_api_latency_probe_warns_when_missing(tmp_path):
@@ -35719,6 +42280,8 @@ def test_operator_health_api_latency_probe_warns_when_missing(tmp_path):
 
     assert result["status"] == "warn"
     assert "not produced" in result["message"]
+    assert "api_latency_probe.py" in result["command"]
+    assert result["performance_report_command"] == "python scripts/api_performance_report.py --limit 20"
 
 
 def test_operator_health_api_latency_probe_unreadable_records_fallback(monkeypatch, tmp_path):
@@ -35787,13 +42350,69 @@ def test_api_performance_report_ranks_probe_and_slowlog_rows(tmp_path):
         encoding="utf-8",
     )
 
-    report = api_performance_report.build_api_performance_report(probe_path=probe_path, state_file=state_file, limit=5)
+    report = api_performance_report.build_api_performance_report(probe_path=probe_path, state_file=state_file, limit=5, max_probe_age_hours=100000)
 
     assert report["status"] == "warn"
+    assert report["evidence_freshness"]["probe_status"] == "fresh"
+    assert report["operator_action"] == "Probe evidence is fresh enough for endpoint triage."
     assert report["rows"][0]["route"] == "/api/health/details"
     assert report["rows"][0]["error_count"] >= 1
     assert "Fix endpoint errors first" in report["rows"][0]["recommendation"]
     assert any(row["route"] == "/api/actions" for row in report["rows"])
+
+
+def test_api_performance_report_prioritizes_fresh_probe_over_unprobed_history(tmp_path):
+    from scripts import api_performance_report
+
+    probe_path = tmp_path / "latest_api_latency_probe.json"
+    state_file = tmp_path / "slow_operation_state.json"
+    probe_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-11T00:00:00+00:00",
+                "rows": [
+                    {"endpoint": "/api/actions?limit=25&compact=true", "elapsed_ms": 900, "body_bytes": 50_000, "status_code": 200, "slow_logged": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_file.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "updated_at": "2026-06-11T00:05:00+00:00",
+                "issues": {
+                    "manual": {
+                        "fingerprint": "manual",
+                        "kind": "operator_api_large_response",
+                        "operation": "GET /api/manual-review",
+                        "status": "open",
+                        "count": 20,
+                        "max_elapsed_ms": 3_000_000,
+                        "last_elapsed_ms": 2_000_000,
+                        "last_seen_at": "2026-06-11T00:04:00+00:00",
+                        "last_details": {"route": "/api/manual-review", "response_bytes": 1_500_000, "status_code": 200},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = api_performance_report.build_api_performance_report(probe_path=probe_path, state_file=state_file, limit=5, max_probe_age_hours=100000)
+    text = api_performance_report._format_text(report)
+
+    assert report["evidence_freshness"]["probe_status"] == "fresh"
+    assert report["rows"][0]["route"] == "/api/actions"
+    assert report["rows"][0]["ranking_basis"] == "fresh_probe"
+    assert report["rows"][0]["latest_probe_slow_logged"] is True
+    assert report["rows"][0]["fresh_probe_priority_score"] > 0
+    assert report["rows"][1]["route"] == "/api/manual-review"
+    assert report["rows"][1]["ranking_basis"] == "historical_slowlog"
+    assert "not exercised by the latest probe" in report["rows"][1]["recommendation"]
+    assert "basis=fresh_probe" in text
+    assert "fresh_probe: ms=900.0 bytes=50000 status=200 error=-" in text
 
 
 def test_api_performance_report_flags_large_payloads(tmp_path):
@@ -35823,8 +42442,30 @@ def test_api_performance_report_flags_large_payloads(tmp_path):
 
     report = api_performance_report.build_api_performance_report(probe_path=tmp_path / "missing.json", state_file=state_file)
 
+    assert report["evidence_freshness"]["probe_status"] == "missing"
+    assert "api_latency_probe.py" in report["operator_action"]
     assert report["rows"][0]["route"] == "/api/manual-review"
     assert "Split or compact" in report["rows"][0]["recommendation"]
+
+
+def test_api_performance_report_formats_stale_probe_warning(tmp_path):
+    from scripts import api_performance_report
+
+    probe_path = tmp_path / "latest_api_latency_probe.json"
+    state_file = tmp_path / "slow_operation_state.json"
+    probe_path.write_text(
+        json.dumps({"generated_at": "2020-01-01T00:00:00+00:00", "rows": []}),
+        encoding="utf-8",
+    )
+    state_file.write_text(json.dumps({"version": 1, "updated_at": "2026-06-11T00:00:00+00:00", "issues": {}}), encoding="utf-8")
+
+    report = api_performance_report.build_api_performance_report(probe_path=probe_path, state_file=state_file, max_probe_age_hours=1)
+    text = api_performance_report._format_text(report)
+
+    assert report["evidence_freshness"]["probe_status"] == "stale"
+    assert "Latest API probe evidence is stale" in report["evidence_freshness"]["warning"]
+    assert "evidence_status: stale" in text
+    assert "operator_action: Run `python scripts/api_latency_probe.py" in text
 
 
 def test_api_performance_report_records_bad_probe_json_fallback(monkeypatch, tmp_path):
@@ -35907,6 +42548,62 @@ def test_api_performance_report_records_numeric_parse_fallbacks(monkeypatch, tmp
     assert [event["fallback_type"] for event in events] == ["api_performance_numeric_parse_failed"] * 4
     assert {event["metadata"]["field"] for event in events} == {"response_bytes", "status_code", "body_bytes"}
     assert {event["metadata"]["source"] for event in events} == {"/api/actions"}
+
+
+def test_advisory_stage_report_extracts_latest_summary_from_mixed_log(tmp_path):
+    from scripts import advisory_stage_report
+
+    log_path = tmp_path / "all_advisory.log"
+    first = {
+        "status": "ok",
+        "asof_date": "2026-06-10T00:00:00+00:00",
+        "stage_timings": [{"stage": "rules", "elapsed_seconds": 10.0, "budget_seconds": 20.0, "over_budget": False}],
+        "stage_budget": {"active_budget_seconds": 20.0, "slow_stage_count": 0},
+    }
+    latest = {
+        "status": "ok",
+        "asof_date": "2026-06-11T00:00:00+00:00",
+        "stage_timings": [
+            {"stage": "rules", "elapsed_seconds": 1801.0, "budget_seconds": 1800.0, "over_budget": True, "detail": "candidates=10"},
+            {"stage": "portfolio", "elapsed_seconds": 12.0, "budget_seconds": 900.0, "over_budget": False},
+        ],
+        "stage_budget": {"active_budget_seconds": 900.0, "overrides": {"rules": 1800.0}, "slow_stage_count": 1},
+    }
+    log_path.write_text(
+        "\n".join(
+            [
+                "[stockey.script] name=all_advisory status=start",
+                json.dumps(first),
+                "[advisory.pipeline] stage=rules running elapsed=30.00s",
+                json.dumps(latest),
+                "[stockey.script] name=all_advisory status=done exit_code=0",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = advisory_stage_report.build_stage_report(log_path=log_path, limit=5)
+    text = advisory_stage_report._format_text(report)
+
+    assert report["status"] == "ok"
+    assert report["asof_date"] == "2026-06-11T00:00:00+00:00"
+    assert report["slow_stage_count"] == 1
+    assert report["ranked_stages"][0]["stage"] == "rules"
+    assert "SLOW stage=rules" in text
+    assert "stage=portfolio" in text
+
+
+def test_advisory_stage_report_missing_summary_is_actionable(tmp_path):
+    from scripts import advisory_stage_report
+
+    log_path = tmp_path / "all_advisory.log"
+    log_path.write_text("[stockey.script] name=all_advisory status=failed\nTraceback: sample\n", encoding="utf-8")
+
+    report = advisory_stage_report.build_stage_report(log_path=log_path)
+
+    assert report["status"] == "missing"
+    assert report["stage_count"] == 0
+    assert "increase --max-bytes" in report["operator_action"]
 
 
 class _BadPandasMissingCheck:
@@ -36110,3 +42807,150 @@ def test_transcribe_cleanup_missing_temp_file_records_fallback(monkeypatch, tmp_
 
     assert events[0]["fallback_type"] == "transcribe_temp_file_cleanup_missing"
     assert events[0]["metadata"] == {"path": str(missing)}
+
+
+def test_operator_portfolio_recommendations_are_paper_only(monkeypatch):
+    from advisory import operator_portfolio
+
+    def fake_sql(query, *args, **kwargs):
+        if operator_portfolio.ACTION_RECOMMENDATIONS_TABLE in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "asof_date": pd.Timestamp("2026-06-16T00:00:00Z"),
+                        "published_on": pd.Timestamp("2026-06-16T10:00:00Z"),
+                        "symbol": "ABC",
+                        "setup_id": "S1",
+                        "unique_id": "U1",
+                        "action_code": "BUY",
+                        "reference_price": 100.0,
+                        "invest_score_pct": 82.0,
+                        "action_reason": "unit test",
+                    }
+                ]
+            )
+        if operator_portfolio.LEDGER_TABLE in query:
+            return pd.DataFrame()
+        raise AssertionError(query)
+
+    monkeypatch.setattr(operator_portfolio, "ensure_operator_portfolio_tables", lambda: None)
+    monkeypatch.setattr(operator_portfolio, "sql_to_df", fake_sql)
+    monkeypatch.setattr(operator_portfolio, "load_current_prices", lambda symbols, max_age_seconds=None: {"ABC": {"price": 111.0, "price_source": "unit"}})
+
+    payload = operator_portfolio.build_recommendations_payload(limit=10)
+
+    assert payload["summary"]["paper_portfolio_only"] is True
+    assert payload["recommendations"][0]["symbol"] == "ABC"
+    assert payload["recommendations"][0]["current_price"] == 111.0
+    assert payload["recommendations"][0]["operator_recommended_action"] == "buy"
+    assert payload["recommendations"][0]["operator_display_action"] == "buy"
+    assert payload["recommendations"][0]["operator_position_status"] == "not_in_portfolio"
+    assert payload["recommendations"][0]["operator_portfolio_boundary"]["mutates_broker_execution"] is False
+
+
+def test_operator_portfolio_maps_partial_actions_to_single_operator_button(monkeypatch):
+    from advisory import operator_portfolio
+
+    def fake_sql(query, *args, **kwargs):
+        if operator_portfolio.ACTION_RECOMMENDATIONS_TABLE in query:
+            assert "PARTIAL_SELL" in query
+            assert "MANUAL_REVIEW" not in query.split("WHERE", 1)[1].split("ORDER BY", 1)[0]
+            return pd.DataFrame(
+                [
+                    {
+                        "asof_date": pd.Timestamp("2026-06-16T00:00:00Z"),
+                        "published_on": pd.Timestamp("2026-06-16T10:00:00Z"),
+                        "symbol": "ABC",
+                        "setup_id": "S1",
+                        "unique_id": "U1",
+                        "action_code": "PARTIAL_SELL",
+                        "reference_price": 100.0,
+                        "invest_score_pct": 82.0,
+                    }
+                ]
+            )
+        if operator_portfolio.LEDGER_TABLE in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "event_id": "e1",
+                        "event_at": pd.Timestamp("2026-06-15T10:00:00Z"),
+                        "symbol": "ABC",
+                        "action": "buy",
+                        "price": 90.0,
+                    }
+                ]
+            )
+        raise AssertionError(query)
+
+    monkeypatch.setattr(operator_portfolio, "ensure_operator_portfolio_tables", lambda: None)
+    monkeypatch.setattr(operator_portfolio, "sql_to_df", fake_sql)
+    monkeypatch.setattr(operator_portfolio, "load_current_prices", lambda symbols, max_age_seconds=None: {"ABC": {"price": 111.0, "price_source": "unit"}})
+
+    row = operator_portfolio.build_recommendations_payload(limit=10)["recommendations"][0]
+
+    assert row["operator_recommended_action"] == "sell_50%"
+    assert row["operator_ledger_action"] == "sell_50"
+    assert row["operator_action_disabled_reason"] is None
+
+
+def test_operator_portfolio_apply_buy_writes_only_paper_ledger(monkeypatch):
+    from advisory import operator_portfolio
+
+    captured = {}
+    monkeypatch.setattr(operator_portfolio, "ensure_operator_portfolio_tables", lambda: None)
+    monkeypatch.setattr(operator_portfolio, "_position_by_symbol", lambda symbol: None)
+    monkeypatch.setattr(operator_portfolio, "load_current_prices", lambda symbols, max_age_seconds=None: {"ABC": {"price": 123.0}})
+    monkeypatch.setattr(operator_portfolio, "build_portfolio_payload", lambda: {"positions": []})
+    monkeypatch.setattr(operator_portfolio, "upsert_to_db", lambda df, table_name, unique_keys: captured.update({"df": df.copy(), "table": table_name, "keys": list(unique_keys)}))
+
+    result = operator_portfolio.apply_operator_action(symbol="abc", action="buy", recommendation_id="R1", recommendation_action="BUY")
+
+    assert result["status"] == "ok"
+    assert result["boundary"]["paper_portfolio_only"] is True
+    assert result["boundary"]["submits_order"] is False
+    assert captured["table"] == operator_portfolio.LEDGER_TABLE
+    assert captured["keys"] == ["event_id"]
+    assert captured["df"]["symbol"].iloc[0] == "ABC"
+    assert captured["df"]["action"].iloc[0] == "buy"
+    assert captured["df"]["price"].iloc[0] == 123.0
+
+
+def test_operator_portfolio_apply_partial_sell_keeps_position_open(monkeypatch):
+    from advisory import operator_portfolio
+
+    rows = [
+        {
+            "event_id": "buy-1",
+            "event_at": pd.Timestamp("2026-06-15T10:00:00Z"),
+            "symbol": "ABC",
+            "action": "buy",
+            "price": 100.0,
+        },
+        {
+            "event_id": "sell-half",
+            "event_at": pd.Timestamp("2026-06-16T10:00:00Z"),
+            "symbol": "ABC",
+            "action": "sell_50",
+            "price": 120.0,
+        },
+    ]
+
+    monkeypatch.setattr(operator_portfolio, "ensure_operator_portfolio_tables", lambda: None)
+    monkeypatch.setattr(operator_portfolio, "_load_ledger", lambda: rows)
+    monkeypatch.setattr(operator_portfolio, "load_current_prices", lambda symbols, max_age_seconds=None: {"ABC": {"price": 125.0}})
+
+    position = operator_portfolio.build_positions()[0]
+
+    assert position["status"] == "open"
+    assert position["entry_price"] == 100.0
+    assert position["last_partial_exit_price"] == 120.0
+    assert position["partial_exit_count"] == 1
+    assert position["pnl_pct"] == 25.0
+
+
+def test_operator_portfolio_reset_requires_confirmation():
+    from advisory import operator_portfolio
+
+    with pytest.raises(ValueError, match="confirm=true"):
+        operator_portfolio.reset_operator_portfolio(confirm=False)

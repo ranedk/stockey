@@ -285,6 +285,18 @@ def execute_routing_plan(plan: list[dict[str, Any]]) -> pd.DataFrame:
                 asof_date=None if pd.isna(asof_date) else asof_date,
                 dry_run=False,
                 refresh_trace_summary=False,
+                router_context={
+                    "source_types": item.get("source_types") or [],
+                    "action_type": item.get("action_type"),
+                    "reasons": item.get("reasons") or [],
+                    "setup_ids": item.get("setup_ids") or [],
+                    "priority_score": item.get("priority_score"),
+                    "best_rank": item.get("best_rank"),
+                    "start_at": item.get("start_at"),
+                    "stop_at": item.get("stop_at"),
+                    "include_watch": item.get("include_watch"),
+                    "include_lifecycle": item.get("include_lifecycle"),
+                },
             )
             status = "ok"
             action_reason = ",".join(item.get("reasons") or [])

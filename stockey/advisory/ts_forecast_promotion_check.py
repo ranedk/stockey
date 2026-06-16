@@ -265,13 +265,62 @@ def build_scorecard(
     }
 
 
-def build_promotion_check(args: argparse.Namespace) -> dict[str, Any]:
-    evidence = load_paper_evidence(
-        from_date=_timestamp_or_none(args.from_date),
-        to_date=_timestamp_or_none(args.to_date),
-        model_name=args.model_name,
-        horizon_days=args.horizon_days,
+def _is_missing_table_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return exc.__class__.__name__ in {"UndefinedTable", "ProgrammingError"} and (
+        "does not exist" in text or "undefinedtable" in text
     )
+
+
+def _build_unavailable_payload(*, args: argparse.Namespace, error: Exception) -> dict[str, Any]:
+    scorecard = build_scorecard(groups=[], args=args)
+    scorecard.update(
+        {
+            "status": "evidence_unavailable",
+            "headline": "TS forecast paper evidence table is unavailable.",
+            "operator_action": "Run the TS forecast paper portfolio workflow before reviewing TS forecasts for promotion.",
+            "evidence_unavailable": True,
+            "evidence_error_type": error.__class__.__name__,
+        }
+    )
+    return {
+        "status": "blocked",
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "decision": "hold_research_only",
+        "ready_for_operator_review": False,
+        "promotion_mode": "manual_low_weight_input_only",
+        "scorecard": scorecard,
+        "evidence": {
+            "paper_table": PAPER_TABLE,
+            "row_count": 0,
+            "from_date": None,
+            "to_date": None,
+            "model_name_filter": args.model_name,
+            "horizon_days_filter": args.horizon_days,
+            "available": False,
+            "error_type": error.__class__.__name__,
+            "error": str(error)[:500],
+        },
+        "notes": [
+            "This check never promotes TS forecasts automatically.",
+            "TS forecast paper evidence is unavailable, so forecasts remain research-only.",
+            "Run advisory.ts_forecast_paper_portfolio after forecasts/evaluations are available.",
+        ],
+    }
+
+
+def build_promotion_check(args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        evidence = load_paper_evidence(
+            from_date=_timestamp_or_none(args.from_date),
+            to_date=_timestamp_or_none(args.to_date),
+            model_name=args.model_name,
+            horizon_days=args.horizon_days,
+        )
+    except Exception as exc:
+        if _is_missing_table_error(exc):
+            return _build_unavailable_payload(args=args, error=exc)
+        raise
     groups = summarize_groups(evidence)
     scorecard = build_scorecard(groups=groups, args=args)
     return {

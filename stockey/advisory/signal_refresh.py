@@ -40,6 +40,12 @@ SIGNAL_REFRESH_SCHEMA_STATEMENTS = [
         action_reason TEXT,
         effect_type TEXT,
         effect_summary TEXT,
+        previous_action TEXT,
+        action_changed BOOLEAN,
+        authority_scope TEXT,
+        portfolio_authority TEXT,
+        broker_execution_allowed BOOLEAN,
+        full_advisory_required BOOLEAN,
         action_payload_json TEXT,
         trace_id TEXT,
         dry_run BOOLEAN,
@@ -48,15 +54,30 @@ SIGNAL_REFRESH_SCHEMA_STATEMENTS = [
     """,
     f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS effect_type TEXT",
     f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS effect_summary TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS previous_action TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS action_changed BOOLEAN",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS authority_scope TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS portfolio_authority TEXT",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS broker_execution_allowed BOOLEAN",
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS full_advisory_required BOOLEAN",
     f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_symbol_refreshed ON {TABLE_NAME} (symbol, refreshed_at DESC)",
     f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_unique_id ON {TABLE_NAME} (unique_id)",
 ]
+
+SIGNAL_REFRESH_AUTHORITY_CONTRACT = {
+    "authority_scope": "review_input_only",
+    "portfolio_authority": "none",
+    "broker_execution_allowed": False,
+    "full_advisory_required": True,
+}
 
 EXIT_ACTIONS = {"SELL", "FULL_EXIT", "EMERGENCY_EXIT", "PARTIAL_SELL", "PARTIAL_EXIT", "REDUCE", "REDUCE_REVIEW", "REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW"}
 BUY_ACTIONS = {"BUY", "BUY_MORE", "ADD_ON_PULLBACK", "BUY_TRIGGERED"}
 WATCH_ACTIONS = {"WATCH", "WATCHLIST", "NEAR_PIVOT", "READY", "MANUAL_REVIEW"}
 WAIT_SIGNAL_NEGATIVE_ACTIONS = {"REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW", "FULL_EXIT", "PARTIAL_EXIT", "SELL", "PARTIAL_SELL", "REDUCE", "REDUCE_REVIEW"}
 WAIT_SIGNAL_POSITIVE_ACTIONS = {"BUY", "BUY_MORE", "BUY_TRIGGERED", "ADD_ON_PULLBACK", "BUY_WATCH", "WATCH_SYMBOLS", "ADD_TO_WATCHLIST", "WATCH"}
+ROUTER_NEGATIVE_ALERTS = {"POSITION_INVALIDATION_HIT", "STOP_HIT", "INVALIDATION_HIT"}
+ROUTER_POSITIVE_ALERTS = {"ENTRY_ZONE_HIT", "BREAKOUT_ABOVE_RANGE"}
 
 
 def json_dumps(value: Any) -> str:
@@ -341,6 +362,59 @@ def wait_signal_escalation(match: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def router_context_signal(router_context: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(router_context, dict) or not router_context:
+        return None
+    source_types = {
+        str(item).strip().lower()
+        for item in (router_context.get("source_types") or [])
+        if str(item or "").strip()
+    }
+    reasons = [
+        str(item).strip().upper()
+        for item in (router_context.get("reasons") or [])
+        if str(item or "").strip()
+    ]
+    action_type = _text(router_context.get("action_type")) or "router_update"
+    priority_score = _num(router_context.get("priority_score"))
+    confidence = None if priority_score is None else max(0.0, min(float(priority_score) / 5.0, 1.0))
+
+    if any(reason in ROUTER_NEGATIVE_ALERTS for reason in reasons):
+        matched = [reason for reason in reasons if reason in ROUTER_NEGATIVE_ALERTS]
+        return {
+            "action": "REDUCE_EXPOSURE_REVIEW",
+            "source": "router_price_alert",
+            "confidence": confidence,
+            "reason": (
+                "Live price watcher matched stop/invalidation evidence "
+                f"({', '.join(matched)}). Review exposure immediately; daily advisory remains authoritative."
+            ),
+        }
+    if any(reason in ROUTER_POSITIVE_ALERTS for reason in reasons):
+        matched = [reason for reason in reasons if reason in ROUTER_POSITIVE_ALERTS]
+        return {
+            "action": "WATCH",
+            "source": "router_price_alert",
+            "confidence": confidence,
+            "reason": (
+                "Live price watcher matched entry/breakout evidence "
+                f"({', '.join(matched)}). Treat this as a review-only entry signal until advisory confirms stop, target, and sizing."
+            ),
+        }
+    if "announcement_event" in source_types or "news_event" in source_types:
+        readable_sources = ", ".join(sorted(source_types)) or action_type
+        return {
+            "action": "MANUAL_REVIEW",
+            "source": "router_event",
+            "confidence": confidence,
+            "reason": (
+                f"Watcher routed fresh {readable_sources} context before a full advisory reconciliation. "
+                "Review the event evidence or wait for the daily advisory/event-policy pass."
+            ),
+        }
+    return None
+
+
 def choose_signal(
     *,
     symbol: str,
@@ -350,12 +424,14 @@ def choose_signal(
     rebalance: dict[str, Any] | None,
     events: list[dict[str, Any]],
     wait_matches: list[dict[str, Any]] | None = None,
+    router_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     lifecycle_action = _normalized_action((lifecycle or {}).get("next_action"))
     rebalance_action = _normalized_action((rebalance or {}).get("suggested_action"))
     action_code = _normalized_action((action or {}).get("action_code"))
 
     wait_matches = wait_matches or []
+    router_signal = router_context_signal(router_context)
     if lifecycle_action in EXIT_ACTIONS or rebalance_action in EXIT_ACTIONS:
         source = "lifecycle"
         signal_action = rebalance_action or lifecycle_action or "SELL"
@@ -368,6 +444,11 @@ def choose_signal(
         signal_action = escalation["action"]
         action_reason = escalation["reason"]
         confidence = escalation["confidence"]
+    elif router_signal and router_signal["action"] in EXIT_ACTIONS:
+        source = str(router_signal["source"])
+        signal_action = str(router_signal["action"])
+        action_reason = str(router_signal["reason"])
+        confidence = _num(router_signal.get("confidence"))
     elif events:
         top_event = events[0]
         event_action = _normalized_action(top_event.get("action_type")) or "MANUAL_REVIEW"
@@ -375,6 +456,11 @@ def choose_signal(
         signal_action = "WATCH" if event_action == "BUY_WATCH" else "MANUAL_REVIEW" if event_action in {"MANUAL_REVIEW", "REDUCE_EXPOSURE_REVIEW"} else event_action
         action_reason = _text(top_event.get("action_reason")) or _text(top_event.get("action_detail")) or f"Latest event policy action: {event_action}"
         confidence = _row_confidence(top_event, "confidence", "policy_score")
+    elif router_signal:
+        source = str(router_signal["source"])
+        signal_action = str(router_signal["action"])
+        action_reason = str(router_signal["reason"])
+        confidence = _num(router_signal.get("confidence"))
     elif action_code:
         source = "action_recommendation"
         signal_action = action_code
@@ -461,6 +547,12 @@ def persist_signal_rows(rows: list[dict[str, Any]]) -> None:
         df["confidence"] = pd.to_numeric(df["confidence"], errors="coerce")
     if "dry_run" in df.columns:
         df["dry_run"] = df["dry_run"].astype("boolean")
+    if "action_changed" in df.columns:
+        df["action_changed"] = df["action_changed"].astype("boolean")
+    if "broker_execution_allowed" in df.columns:
+        df["broker_execution_allowed"] = df["broker_execution_allowed"].astype("boolean")
+    if "full_advisory_required" in df.columns:
+        df["full_advisory_required"] = df["full_advisory_required"].astype("boolean")
     upsert_to_db(df, TABLE_NAME, unique_keys=["refresh_id"])
 
 
@@ -472,6 +564,7 @@ def refresh_symbol(
     asof_date: Any = None,
     dry_run: bool = False,
     refresh_trace_summary: bool = True,
+    router_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ensure_table()
     normalized_symbol = str(symbol).strip().upper()
@@ -484,7 +577,16 @@ def refresh_symbol(
     events = load_event_policy(normalized_symbol, unique_id=unique_id, asof_date=effective_asof)
     wait_result = match_wait_signals(symbols=[normalized_symbol], limit=100, persist=not bool(dry_run))
     wait_matches = wait_result.get("matches") or []
-    signal = choose_signal(symbol=normalized_symbol, reason=reason, action=action, lifecycle=lifecycle, rebalance=rebalance, events=events, wait_matches=wait_matches)
+    signal = choose_signal(
+        symbol=normalized_symbol,
+        reason=reason,
+        action=action,
+        lifecycle=lifecycle,
+        rebalance=rebalance,
+        events=events,
+        wait_matches=wait_matches,
+        router_context=router_context,
+    )
     effect = classify_signal_effect(signal=signal, action=action, wait_matches=wait_matches)
     refreshed_at = pd.Timestamp.utcnow()
     refresh_id = make_refresh_id(refreshed_at=refreshed_at, symbol=normalized_symbol, unique_id=unique_id, reason=reason)
@@ -492,6 +594,10 @@ def refresh_symbol(
     payload["wait_signal_matches"] = wait_matches
     payload["wait_signal_match_table"] = WAIT_SIGNAL_MATCHES_TABLE
     payload["watcher_effect"] = effect
+    payload["authority_contract"] = SIGNAL_REFRESH_AUTHORITY_CONTRACT
+    payload["router_context"] = router_context or {}
+    previous_action = effect.get("previous_action")
+    action_changed = bool(previous_action and signal["signal_action"] != previous_action and signal["signal_action"] != "NO_CHANGE")
     trace_id = None
     if not dry_run:
         trace_id = safe_trace_call(
@@ -500,7 +606,7 @@ def refresh_symbol(
             symbol=normalized_symbol,
             unique_id=unique_id,
             trigger_type=f"signal_refresh:{reason}",
-            previous_action=None,
+            previous_action=previous_action,
             new_action=signal["signal_action"],
             final_action=signal["signal_action"],
             final_reason=signal["action_reason"],
@@ -517,7 +623,7 @@ def refresh_symbol(
                 status=signal["signal_status"],
                 reason=signal["action_reason"],
                 input_payload={"symbol": normalized_symbol, "reason": reason, "unique_id": unique_id, "asof_date": str(effective_asof)},
-                output_payload=signal,
+                output_payload={**signal, "previous_action": previous_action, "action_changed": action_changed},
                 payload={"source_tables": [ACTIONS_TABLE, LIFECYCLE_TABLE, REBALANCE_TABLE, EVENT_POLICY_TABLE]},
             )
 
@@ -535,6 +641,9 @@ def refresh_symbol(
         "action_reason": signal["action_reason"],
         "effect_type": effect["effect_type"],
         "effect_summary": effect["effect_summary"],
+        "previous_action": previous_action,
+        "action_changed": action_changed,
+        **SIGNAL_REFRESH_AUTHORITY_CONTRACT,
         "action_payload_json": json_dumps(payload),
         "trace_id": trace_id,
         "dry_run": bool(dry_run),
@@ -580,6 +689,13 @@ def refresh_from_router(*, limit: int = 25, dry_run: bool = False) -> dict[str, 
                     asof_date=_ts(item.get("asof_date")),
                     dry_run=dry_run,
                     refresh_trace_summary=False,
+                    router_context={
+                        "source_types": [part for part in str(item.get("source_type") or "").split(",") if part],
+                        "action_type": _text(item.get("action_type")),
+                        "reasons": [part for part in str(item.get("action_reason") or "").split(",") if part],
+                        "setup_ids": _jsonish(item.get("setup_ids_json"), [], source="signal_refresh_router_setup_ids_json"),
+                        "routed_at": _text(item.get("routed_at")),
+                    },
                 )
             )
         except Exception as exc:  # pragma: no cover - runtime guard

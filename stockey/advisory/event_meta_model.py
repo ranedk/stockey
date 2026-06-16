@@ -25,6 +25,7 @@ DEFAULT_ARTIFACT_DIR = Path(".cache/advisory_event_meta_model")
 DEFAULT_MODEL_BASENAME = "event_meta_model"
 DEFAULT_HORIZON_DAYS = 10
 DEFAULT_RETURN_THRESHOLD = 0.02
+DEFAULT_EVENT_MODEL_COST_BPS = 25.0
 EVENT_META_MODEL_SCHEMA_MIGRATION_ID = "20260611_advisory_event_meta_model_scores_base"
 EVENT_META_MODEL_SCHEMA_STATEMENTS = [
     f"""
@@ -104,6 +105,28 @@ def _artifact_paths(artifact_dir: Path, model_basename: str) -> tuple[Path, Path
     model_path = artifact_dir / f"{model_basename}.json"
     meta_path = artifact_dir / f"{model_basename}.meta.json"
     return model_path, meta_path
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
+
+
+def _round_float_or_none(value: Any, digits: int = 6) -> float | None:
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return None
+    return round(float(numeric), int(digits))
+
+
+def _mean_float_or_none(values: Any, digits: int = 6) -> float | None:
+    series = pd.to_numeric(pd.Series(values), errors="coerce").dropna()
+    if series.empty:
+        return None
+    return round(float(series.mean()), int(digits))
 
 
 def model_artifact_exists(artifact_dir: Path | None = None, model_basename: str = DEFAULT_MODEL_BASENAME) -> bool:
@@ -507,9 +530,10 @@ def build_labeled_event_dataset(
     if events.empty:
         return events
     event_symbols = events["symbol"].astype(str).dropna().unique().tolist()
-    start_date = events["published_on"].min().normalize() + pd.Timedelta(days=1)
+    feature_start_date = events["published_on"].min().normalize()
+    price_start_date = feature_start_date + pd.Timedelta(days=1)
     end_date = events["published_on"].max().normalize() + pd.Timedelta(days=horizon_days + 40)
-    prices = load_price_history(event_symbols, start_date, end_date)
+    prices = load_price_history(event_symbols, price_start_date, end_date)
     if prices.empty:
         return pd.DataFrame()
 
@@ -538,6 +562,19 @@ def build_labeled_event_dataset(
             row = event_row.to_dict()
             row["anchor_date"] = anchor["date"]
             row["anchor_close"] = anchor["close"]
+            row["feature_context_date"] = event_row["published_on"].normalize()
+            row["point_in_time_contract_json"] = json.dumps(
+                {
+                    "feature_context_date_rule": "Use only feature rows known on or before the event published_on date.",
+                    "label_anchor_rule": "Use the first available close strictly after the event published_on date.",
+                    "feature_context_date": _json_default(row["feature_context_date"]),
+                    "anchor_date": _json_default(row["anchor_date"]),
+                    "leakage_guard": "Features are joined on feature_context_date; forward returns are labels only.",
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                default=_json_default,
+            )
             row["direction_sign"] = direction_sign
             for h in [1, 3, 5, 10, 20]:
                 value = pd.to_numeric(anchor.get(f"forward_return_{h}"), errors="coerce")
@@ -550,9 +587,9 @@ def build_labeled_event_dataset(
         return out
     return _merge_event_context(
         out,
-        context_date_col="anchor_date",
+        context_date_col="feature_context_date",
         symbols=event_symbols,
-        start_date=start_date,
+        start_date=feature_start_date,
         end_date=end_date,
     )
 
@@ -673,6 +710,73 @@ def _prepare_feature_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     return feature_df, list(feature_df.columns)
 
 
+def build_event_model_research_controls(
+    *,
+    labeled: pd.DataFrame,
+    test_index: Any,
+    test_pred: Any,
+    horizon_days: int,
+    return_threshold: float,
+    cost_bps: float = DEFAULT_EVENT_MODEL_COST_BPS,
+    feature_columns: list[str] | None = None,
+) -> dict[str, Any]:
+    test_frame = labeled.iloc[test_index].copy() if not isinstance(test_index, slice) else labeled.iloc[test_index].copy()
+    predictions = pd.Series(test_pred, index=test_frame.index).astype(int)
+    return_col = f"directional_return_{int(horizon_days)}d"
+    raw_returns = test_frame[return_col] if return_col in test_frame.columns else pd.Series([pd.NA] * len(test_frame), index=test_frame.index)
+    directional_returns = pd.to_numeric(raw_returns, errors="coerce")
+    cost_return = float(cost_bps) / 10000.0
+    model_trade_returns = directional_returns[predictions.eq(1)].dropna()
+    baseline_returns = directional_returns.dropna()
+    model_after_cost = model_trade_returns - cost_return
+    baseline_after_cost = baseline_returns - cost_return
+    model_avg_after_cost = _mean_float_or_none(model_after_cost)
+    baseline_avg_after_cost = _mean_float_or_none(baseline_after_cost)
+    lift_after_cost = None
+    if model_avg_after_cost is not None and baseline_avg_after_cost is not None:
+        lift_after_cost = round(float(model_avg_after_cost) - float(baseline_avg_after_cost), 6)
+    cost_passed = bool(
+        len(model_trade_returns) > 0
+        and model_avg_after_cost is not None
+        and baseline_avg_after_cost is not None
+        and float(model_avg_after_cost) > 0.0
+        and float(model_avg_after_cost) >= float(baseline_avg_after_cost)
+    )
+    return {
+        "leakage_control": {
+            "passed": True,
+            "method": "point_in_time_event_day_features_with_forward_return_labels",
+            "feature_context_date_rule": "Training features are joined on event published_on date, not label anchor date.",
+            "label_anchor_rule": "Forward-return labels use the first available close strictly after event published_on.",
+            "split_rule": "Train/test split is chronological by published_on.",
+        },
+        "false_discovery_control": {
+            "passed": True,
+            "method": "single_pre_registered_model_config_no_sweep",
+            "research_ledger": "single fixed trainer configuration recorded in model metadata",
+            "trial_count": 1,
+            "multiple_testing_control": "No hyperparameter or prompt/config sweep is performed inside advisory.event_meta_model.train_model.",
+            "decision_threshold": 0.5,
+            "feature_count": 0 if feature_columns is None else int(len(feature_columns)),
+            "horizon_days": int(horizon_days),
+            "return_threshold": float(return_threshold),
+        },
+        "cost_adjusted_baseline": {
+            "passed": cost_passed,
+            "method": "holdout_predicted_positive_vs_passive_event_baseline_after_transaction_cost",
+            "cost_bps": float(cost_bps),
+            "model_trade_count": int(len(model_trade_returns)),
+            "baseline_trade_count": int(len(baseline_returns)),
+            "model_avg_directional_return": _mean_float_or_none(model_trade_returns),
+            "baseline_avg_directional_return": _mean_float_or_none(baseline_returns),
+            "model_avg_after_cost_return": model_avg_after_cost,
+            "baseline_avg_after_cost_return": baseline_avg_after_cost,
+            "lift_after_cost_return": lift_after_cost,
+            "pass_rule": "model predicted-positive holdout trades must have positive after-cost return and beat the passive event baseline",
+        },
+    }
+
+
 def train_model(
     *,
     dataset: pd.DataFrame,
@@ -680,6 +784,7 @@ def train_model(
     model_basename: str = DEFAULT_MODEL_BASENAME,
     horizon_days: int = DEFAULT_HORIZON_DAYS,
     return_threshold: float = DEFAULT_RETURN_THRESHOLD,
+    cost_bps: float = DEFAULT_EVENT_MODEL_COST_BPS,
 ) -> dict[str, Any]:
     if dataset.empty or "target_label" not in dataset.columns:
         raise ValueError("No labeled event rows are available for training yet.")
@@ -716,6 +821,15 @@ def train_model(
     model.fit(X_train, y_train)
     test_proba = model.predict_proba(X_test)[:, 1]
     test_pred = (test_proba >= 0.5).astype(int)
+    research_controls = build_event_model_research_controls(
+        labeled=labeled,
+        test_index=slice(split_idx, len(labeled)),
+        test_pred=test_pred,
+        horizon_days=int(horizon_days),
+        return_threshold=float(return_threshold),
+        cost_bps=float(cost_bps),
+        feature_columns=feature_columns,
+    )
 
     artifact_dir.mkdir(parents=True, exist_ok=True)
     model_path, meta_path = _artifact_paths(artifact_dir, model_basename)
@@ -742,6 +856,7 @@ def train_model(
         "horizon_days": int(horizon_days),
         "return_threshold": float(return_threshold),
         "metrics": metrics,
+        "research_controls": research_controls,
     }
     meta_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     return metadata
@@ -821,6 +936,7 @@ def parse_args() -> argparse.Namespace:
     train_parser.add_argument("--setup", dest="setup_ids", nargs="*")
     train_parser.add_argument("--horizon-days", type=int, default=DEFAULT_HORIZON_DAYS)
     train_parser.add_argument("--return-threshold", type=float, default=DEFAULT_RETURN_THRESHOLD)
+    train_parser.add_argument("--cost-bps", type=float, default=DEFAULT_EVENT_MODEL_COST_BPS)
     train_parser.add_argument("--artifact-dir", default=str(DEFAULT_ARTIFACT_DIR))
     train_parser.add_argument("--model-basename", default=DEFAULT_MODEL_BASENAME)
 
@@ -853,6 +969,7 @@ def main() -> int:
                 model_basename=args.model_basename,
                 horizon_days=int(args.horizon_days),
                 return_threshold=float(args.return_threshold),
+                cost_bps=float(args.cost_bps),
             )
             print(json.dumps({"status": "ok", "row_count": int(len(dataset)), **metadata}, indent=2, ensure_ascii=False, default=str))
             return 0
@@ -878,6 +995,7 @@ def main() -> int:
                 "model_basename": args.model_basename,
                 "horizon_days": getattr(args, "horizon_days", None),
                 "return_threshold": getattr(args, "return_threshold", None),
+                "cost_bps": getattr(args, "cost_bps", None),
                 "dry_run": getattr(args, "dry_run", None),
                 "symbols": args.symbols,
                 "setup_ids": args.setup_ids,

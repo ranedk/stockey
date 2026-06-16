@@ -56,6 +56,8 @@ PORTFOLIO_SCHEMA_STATEMENTS = [
         plan_rank BIGINT,
         portfolio_status TEXT,
         portfolio_reason TEXT,
+        position_state TEXT,
+        state_transition_contract_json TEXT,
         priority_score DOUBLE PRECISION,
         overlap_group TEXT,
         overlap_reason TEXT,
@@ -82,6 +84,8 @@ PORTFOLIO_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS plan_rank BIGINT",
     f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS portfolio_status TEXT",
     f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS portfolio_reason TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS position_state TEXT",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS state_transition_contract_json TEXT",
     f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS priority_score DOUBLE PRECISION",
     f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS overlap_group TEXT",
     f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS overlap_reason TEXT",
@@ -477,12 +481,115 @@ def build_execution_notes(row: pd.Series, approved_allocation: float, portfolio_
     return " ".join(notes) if notes else None
 
 
+def portfolio_position_state(portfolio_status: str, approved_allocation: float) -> str:
+    status = str(portfolio_status or "").strip().lower()
+    if status in {"approved", "trimmed"} and float(approved_allocation or 0.0) > 0:
+        return "PLANNED_ENTRY"
+    if status == "deferred":
+        return "DEFERRED"
+    return "NOT_ACTIONABLE"
+
+
+def build_state_transition_contract(row: pd.Series, portfolio_row: dict[str, Any]) -> dict[str, Any]:
+    position_state = str(portfolio_row.get("position_state") or "")
+    approved = pd.to_numeric(portfolio_row.get("approved_allocation_inr"), errors="coerce")
+    published_on = portfolio_row.get("published_on")
+    source_published_on = portfolio_row.get("source_published_on")
+    contract = {
+        "version": 1,
+        "current_state": position_state,
+        "source_stage": "portfolio",
+        "source_action": "allocate_capital" if position_state == "PLANNED_ENTRY" else "defer_capital",
+        "portfolio_status": portfolio_row.get("portfolio_status"),
+        "portfolio_reason": portfolio_row.get("portfolio_reason"),
+        "published_on": published_on,
+        "source_published_on": source_published_on,
+        "approved_allocation_inr": None if pd.isna(approved) else float(approved),
+        "entry_assumption": "No holding is assumed at portfolio stage.",
+        "next_required_stage": "position_lifecycle" if position_state == "PLANNED_ENTRY" else None,
+        "entry_evidence_required": position_state == "PLANNED_ENTRY",
+        "entry_evidence_rule": (
+            "Lifecycle must use the first available close on or after portfolio published_on before setting entry_date/entry_price."
+            if position_state == "PLANNED_ENTRY"
+            else None
+        ),
+        "broker_execution_allowed": False,
+        "broker_boundary": "Portfolio rows are planning outputs only; execution_engine must create a separate safety-gated order preview.",
+        "can_transition_to": (
+            ["ASSUMED_ENTERED", "PENDING_ENTRY_REVIEW", "CANCELLED_OR_DEFERRED"]
+            if position_state == "PLANNED_ENTRY"
+            else ["REMAIN_DEFERRED"]
+        ),
+        "stop_price": portfolio_row.get("stop_price"),
+        "invalidation_price": portfolio_row.get("invalidation_price"),
+        "target_price": portfolio_row.get("target_price"),
+        "expected_horizon_days": portfolio_row.get("expected_horizon_days"),
+        "source_unique_id": row.get("unique_id"),
+        "source_setup_id": row.get("setup_id"),
+    }
+    return contract
+
+
 def select_primary_symbol_rows(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "symbol" not in df.columns:
         return df
     working = df.copy()
     working["symbol"] = working["symbol"].astype("string").str.upper()
     return working.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.portfolio_engine",
+            source="portfolio_json_ready",
+            fallback_type="portfolio_json_na_check_failed",
+            severity="warn",
+            reason="Portfolio engine could not evaluate missingness while preparing JSON output and kept the raw value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
+        pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.portfolio_engine",
+                source="portfolio_json_ready",
+                fallback_type="portfolio_json_isoformat_failed",
+                severity="warn",
+                reason="Portfolio engine could not serialize a date-like value and kept the raw value.",
+                error=exc,
+                metadata={"value_type": type(value).__name__},
+            )
+            pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.portfolio_engine",
+                source="portfolio_json_ready",
+                fallback_type="portfolio_json_scalar_extract_failed",
+                severity="warn",
+                reason="Portfolio engine could not extract a scalar value while preparing JSON output and kept the raw value.",
+                error=exc,
+                metadata={"value_type": type(value).__name__},
+            )
+            pass
+    return value
 
 
 def _parse_horizon_days(note: object) -> int | None:
@@ -682,6 +789,7 @@ def build_portfolio_orders(
                 "plan_rank": idx,
                 "portfolio_status": status,
                 "portfolio_reason": portfolio_reason,
+                "position_state": portfolio_position_state(status, approved),
                 "priority_score": row["priority_score"],
                 "invest_score_pct": row.get("invest_score_pct"),
                 "overlap_group": overlap_group,
@@ -698,8 +806,14 @@ def build_portfolio_orders(
                 "execution_notes": build_execution_notes(row, approved, status, portfolio_reason),
                 "context_snapshot_json": row.get("context_snapshot_json"),
                 "load_ts": pd.Timestamp.utcnow(),
-            }
+        }
         portfolio_row.update(derive_thesis_policy(pd.Series({**row.to_dict(), **portfolio_row})))
+        portfolio_row["state_transition_contract_json"] = json.dumps(
+            _json_ready(build_state_transition_contract(row, portfolio_row)),
+            ensure_ascii=False,
+            default=str,
+            allow_nan=False,
+        )
         rows.append(portfolio_row)
 
     return pd.DataFrame(rows)
@@ -778,6 +892,8 @@ def _trace_portfolio_rows(df: pd.DataFrame) -> None:
             payload={
                 "portfolio_status": row.get("portfolio_status"),
                 "portfolio_reason": row.get("portfolio_reason"),
+                "position_state": row.get("position_state"),
+                "state_transition_contract_json": row.get("state_transition_contract_json"),
                 "plan_rank": row.get("plan_rank"),
                 "priority_score": row.get("priority_score"),
                 "invest_score_pct": row.get("invest_score_pct"),
@@ -801,6 +917,8 @@ def _trace_portfolio_rows(df: pd.DataFrame) -> None:
                 payload={
                     "portfolio_status": row.get("portfolio_status"),
                     "portfolio_reason": row.get("portfolio_reason"),
+                    "position_state": row.get("position_state"),
+                    "state_transition_contract_json": row.get("state_transition_contract_json"),
                     "plan_rank": row.get("plan_rank"),
                     "priority_score": row.get("priority_score"),
                     "invest_score_pct": row.get("invest_score_pct"),

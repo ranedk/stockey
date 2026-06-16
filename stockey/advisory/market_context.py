@@ -438,7 +438,7 @@ def load_event_counts(asof_date: pd.Timestamp, symbols: list[str]) -> pd.DataFra
         "negative_event_count_20d",
     ]
     for col in count_cols:
-        out[col] = pd.to_numeric(out.get(col), errors="coerce").fillna(0).astype(int)
+        out[col] = _numeric_series(out, col).astype(int)
     return out
 
 

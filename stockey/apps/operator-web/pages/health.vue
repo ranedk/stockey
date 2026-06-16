@@ -2,6 +2,10 @@
 import type { Dict } from '~/types/api'
 
 const api = useOperatorApi()
+type SourceFailureRow = Dict & {
+  failed_symbol_list: string[]
+  issue_count: number
+}
 const [{ data: summary, error: summaryError }, { data: details, refresh, error: detailsError }, { data: ingestionState, refresh: refreshIngestionState, error: ingestionStateError }] = await Promise.all([
   useAsyncData('summary-health', () => api.getSummary()),
   useAsyncData('operator-health-details', () => api.getHealthDetails()),
@@ -22,16 +26,31 @@ const frontend = computed(() => asDict(sections.value.frontend))
 const operatorSnapshot = computed(() => asDict(sections.value.operator_snapshot))
 const summarySnapshot = computed(() => asDict(summary.value?.snapshot))
 const summarySnapshotWarning = computed(() => asDict(summary.value?.snapshot_warning))
+const apiLatencyProbe = computed(() => asDict(sections.value.api_latency_probe))
 const slowOperations = computed(() => asDict(sections.value.slow_operations))
 const slowIssues = computed(() => asList(slowOperations.value.issues))
 const syncStateFailures = computed(() => asList(sections.value.sync_state_failures))
+const watcherSourceCounters = computed(() => asDict(sections.value.watcher_source_counters))
+const watcherSourceRows = computed(() => asList(watcherSourceCounters.value.rows))
 const downloaderRunState = computed(() => asDict(sections.value.downloader_run_state))
 const downloaderRunRows = computed(() => asList(downloaderRunState.value.rows))
+const sourceFailureRows = computed<SourceFailureRow[]>(() => downloaderRunRows.value
+  .map((row): SourceFailureRow => ({
+    ...row,
+    failed_symbol_list: failedSymbolList(row),
+    issue_count: sourceIssueCount(row)
+  }))
+  .filter((row) => row.failed_symbol_list.length || row.issue_count > 0 || Number(row.reference_mapping_missing_count || 0) > 0 || Number(row.source_unavailable_count || 0) > 0 || Number(row.no_data_count || 0) > 0 || Number(row.auth_unavailable_count || 0) > 0)
+  .slice(0, 6))
 const ingestionStateSummary = computed(() => asDict(ingestionState.value?.summary))
-const ingestionStateSamples = computed(() => asList(ingestionStateSummary.value.sample_rows))
+const ingestionStateSamples = computed(() => {
+  const enriched = asList(ingestionStateSummary.value.enriched_sample_rows)
+  return enriched.length ? enriched : asList(ingestionStateSummary.value.sample_rows)
+})
 const ingestionStatusCounts = computed(() => dictEntries(asDict(ingestionStateSummary.value.status_counts)))
 const ingestionSourceCounts = computed(() => dictEntries(asDict(ingestionStateSummary.value.source_counts)))
 const ingestionClassificationCounts = computed(() => dictEntries(asDict(ingestionStateSummary.value.classification_counts)))
+const ingestionClassificationDetails = computed(() => asDict(ingestionStateSummary.value.classification_details))
 const ingestionBoundary = computed(() => asDict(ingestionState.value?.operator_boundary))
 const degradationFeed = computed(() => asDict(sections.value.degradation_feed))
 const fallbackTelemetry = computed(() => asDict(sections.value.fallback_telemetry))
@@ -46,6 +65,8 @@ const fixHints = computed(() => asList(details.value?.fix_hints))
 const currentBlockers = computed(() => asDict(details.value?.current_blockers))
 const currentBlockerRows = computed(() => asList(currentBlockers.value.rows))
 const compactMeta = computed(() => asDict(details.value?.compact_meta))
+const deferredDiagnostics = computed(() => asDict(details.value?.deferred_diagnostics))
+const deferredDiagnosticRows = computed(() => asList(deferredDiagnostics.value.rows))
 const trustGate = computed(() => asDict(sections.value.trust_gate))
 const trustGateChecks = computed(() => asList(trustGate.value.checks))
 const healthFilter = ref('all')
@@ -101,7 +122,7 @@ const filteredDegradations = computed(() => degradations.value.filter((row) => {
   return filterOk && kindOk
 }))
 const healthFilterCounts = computed(() => {
-  const rows = [...cronLogs.value, ...fixHints.value, ...syncStateFailures.value, ...downloaderRunRows.value, ...degradations.value]
+  const rows = [...cronLogs.value, ...fixHints.value, ...syncStateFailures.value, ...watcherSourceRows.value, ...downloaderRunRows.value, ...degradations.value]
   return Object.fromEntries(healthFilters.map((item) => [item.key, rows.filter((row) => matchesHealthFilter(row, item.key)).length]))
 })
 
@@ -115,6 +136,15 @@ function asList(value: unknown): Dict[] {
 
 function asStringList(value: unknown): string[] {
   return Array.isArray(value) ? value.map((item) => String(item)) : []
+}
+
+function ingestionClassDetail(value: unknown): Dict {
+  return asDict(ingestionClassificationDetails.value[String(value || '')])
+}
+
+function ingestionRowClassDetail(row: Dict): Dict {
+  const detail = asDict(row.classification_detail)
+  return Object.keys(detail).length ? detail : ingestionClassDetail(row.classification)
 }
 
 function dictEntries(value: Dict) {
@@ -149,6 +179,34 @@ function secondsText(value: unknown) {
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`
   if (seconds < 86400) return `${Math.round(seconds / 3600)}h`
   return `${Math.round(seconds / 86400)}d`
+}
+
+function counterText(row: Dict, key: string) {
+  const counters = asDict(row.counters)
+  const value = Number(counters[key] || 0)
+  return Number.isFinite(value) ? Intl.NumberFormat('en-IN').format(value) : '0'
+}
+
+function failedSymbolList(row: Dict): string[] {
+  const raw = row.failed_symbols
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((item) => {
+      if (typeof item === 'object' && item !== null) {
+        return String((item as Dict).symbol || (item as Dict).ticker || (item as Dict).identifier || JSON.stringify(item))
+      }
+      return String(item || '')
+    })
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function sourceIssueCount(row: Dict) {
+  return Number(row.failed_attempt_count || 0)
+    + Number(row.source_unavailable_count || 0)
+    + Number(row.no_data_count || 0)
+    + Number(row.auth_unavailable_count || 0)
+    + Number(row.reference_mapping_missing_count || 0)
 }
 
 function isRecovered(row: Dict) {
@@ -266,6 +324,33 @@ async function applySupersededCleanup() {
       {{ compactMeta.omitted_list_items || 0 }} list item(s) and {{ compactMeta.truncated_strings || 0 }} long string(s) were omitted/truncated in this response.
       Use <code class="rounded bg-white/70 px-1 py-0.5">/api/health/details?mode=full&amp;compact=false</code> only for short debugging sessions.
     </p>
+  </section>
+
+  <section v-if="deferredDiagnosticRows.length" class="mt-6 rounded-3xl border border-moss/25 bg-moss/10 p-5">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div>
+        <p class="text-xs font-black uppercase tracking-[0.25em] text-moss">Deferred diagnostics</p>
+        <h2 class="mt-2 text-2xl font-black">{{ deferredDiagnostics.count || deferredDiagnosticRows.length }} deep check(s) skipped in fast Health</h2>
+        <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/65">
+          {{ deferredDiagnostics.operator_action || 'Fast Health intentionally skips expensive diagnostics. Run full Health when you need the listed evidence.' }}
+        </p>
+      </div>
+      <code class="max-w-full overflow-auto rounded-2xl bg-ink px-3 py-2 text-xs text-paper">
+        {{ deferredDiagnostics.full_diagnostics_command || 'python -m advisory.operator_health --full --skip-dhan' }}
+      </code>
+    </div>
+    <details class="mt-4">
+      <summary class="cursor-pointer text-sm font-black text-moss">Show deferred checks</summary>
+      <div class="mt-4 grid gap-3 lg:grid-cols-2">
+        <article v-for="row in deferredDiagnosticRows" :key="String(row.section || row.message)" class="rounded-2xl bg-white/75 p-4">
+          <p class="font-black text-ink">{{ titleCase(row.section) }}</p>
+          <p class="mt-1 text-sm leading-6 text-ink/60">{{ row.reason || row.message || '-' }}</p>
+          <code class="mt-3 block overflow-auto rounded-xl bg-ink px-3 py-2 text-xs text-paper">
+            {{ row.command || deferredDiagnostics.full_diagnostics_command || 'python -m advisory.operator_health --full --skip-dhan' }}
+          </code>
+        </article>
+      </div>
+    </details>
   </section>
 
   <section class="mt-6 grid gap-4 md:grid-cols-10">
@@ -477,6 +562,62 @@ async function applySupersededCleanup() {
     <div class="mt-5 rounded-2xl border border-black/10 bg-white/75 p-4">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <div>
+          <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Watcher Source Counters</p>
+          <p class="mt-2 text-sm leading-6 text-ink/65">
+            {{ watcherSourceCounters.message || 'Latest OHLCV/news/announcement watcher counters have not been recorded yet.' }}
+          </p>
+        </div>
+        <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(watcherSourceCounters.status)">
+          {{ statusText(watcherSourceCounters.status) }} · {{ watcherSourceCounters.returned_count || 0 }} sources
+        </span>
+      </div>
+      <div class="mt-4 grid gap-3 md:grid-cols-4">
+        <MetricTile label="Sources" :value="String(watcherSourceCounters.returned_count || 0)" note="OHLCV/news/announcements" />
+        <MetricTile label="Stale" :value="String(watcherSourceCounters.stale_count || 0)" note="Older than max age" />
+        <MetricTile label="Errors" :value="String(watcherSourceCounters.error_count || 0)" note="Sync-state errors" />
+        <MetricTile label="Missing" :value="String(asStringList(watcherSourceCounters.missing_sources).length)" note="No sync row" />
+      </div>
+      <div class="mt-4 grid gap-3 lg:grid-cols-3">
+        <article v-for="row in watcherSourceRows" :key="String(row.source_name || row.watcher_source)" class="rounded-2xl bg-paper/80 p-4 text-sm">
+          <div class="flex flex-wrap items-start justify-between gap-2">
+            <div>
+              <p class="font-black text-ink">{{ titleCase(row.watcher_source || row.source_name) }}</p>
+              <p class="mt-1 text-xs font-semibold text-ink/45">
+                {{ row.updated_at || '-' }} · age {{ row.age_minutes ?? '-' }}m
+              </p>
+            </div>
+            <span class="rounded-full px-2 py-1 text-[0.65rem] font-black" :class="statusClass(row.status)">
+              {{ statusText(row.status) }}
+            </span>
+          </div>
+          <p class="mt-2 text-sm leading-6 text-ink/60">
+            {{ row.produced_data ? 'Fresh data or matched events were produced.' : 'No produced-data counter was positive in the latest run.' }}
+          </p>
+          <div class="mt-3 grid gap-2 text-xs">
+            <template v-if="String(row.watcher_source) === 'ohlcv'">
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Symbols:</b> {{ counterText(row, 'symbol_count') }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Latest prices:</b> {{ counterText(row, 'latest_price_count') }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Alerts persisted/suppressed:</b> {{ counterText(row, 'alert_persisted_count') }} / {{ counterText(row, 'alert_suppressed_count') }}</p>
+            </template>
+            <template v-else-if="String(row.watcher_source) === 'news'">
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Watch rows:</b> {{ counterText(row, 'watch_count') }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>RSS items:</b> {{ counterText(row, 'news_item_count') }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Matched/persisted events:</b> {{ counterText(row, 'matched_event_count') }} / {{ counterText(row, 'persisted_event_count') }}</p>
+            </template>
+            <template v-else-if="String(row.watcher_source) === 'announcements'">
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Targets/runs:</b> {{ counterText(row, 'unique_ingest_targets') }} / {{ counterText(row, 'ingest_run_count') }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Discovered/parsed/failed:</b> {{ counterText(row, 'discovered_count') }} / {{ counterText(row, 'parsed_count') }} / {{ counterText(row, 'failed_count') }}</p>
+              <p class="rounded-lg bg-white/70 px-2 py-1"><b>Matched/persisted events:</b> {{ counterText(row, 'match_count') }} / {{ counterText(row, 'persisted_event_count') }}</p>
+            </template>
+          </div>
+          <p v-if="row.error" class="mt-3 rounded-xl bg-rust/10 p-2 text-xs font-semibold text-rust">{{ row.error }}</p>
+        </article>
+        <p v-if="!watcherSourceRows.length" class="rounded-2xl bg-paper/80 p-4 text-sm text-ink/50">No watcher source counter rows are available yet.</p>
+      </div>
+    </div>
+    <div class="mt-5 rounded-2xl border border-black/10 bg-white/75 p-4">
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <div>
           <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Latest Downloader / Parser Run-State</p>
           <p class="mt-2 text-sm leading-6 text-ink/65">
             {{ downloaderRunState.message || 'No standardized downloader/parser run-state has been recorded yet.' }}
@@ -492,6 +633,40 @@ async function applySupersededCleanup() {
         <MetricTile label="Stalled" :value="String(downloaderRunState.stalled_count || 0)" note="No new rows/state" />
         <MetricTile label="Errors" :value="String(downloaderRunState.error_count || 0)" note="Needs fix" />
         <MetricTile label="Retries" :value="String(downloaderRunState.retry_count || 0)" note="Source attempts" />
+      </div>
+      <div v-if="sourceFailureRows.length" class="mt-4 rounded-2xl border border-rust/20 bg-rust/10 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.2em] text-rust">Failed Symbols / Source Skips</p>
+            <p class="mt-2 max-w-4xl text-sm leading-6 text-ink/65">
+              These are source-specific failures from the latest downloader/parser run-state. They explain missing OHLCV, missing Dhan security ids, source outages, no-data windows, and partial symbol failures before they become confusing action or portfolio gaps.
+            </p>
+          </div>
+          <span class="rounded-full bg-rust px-3 py-1 text-xs font-black text-paper">{{ sourceFailureRows.length }} source issue{{ sourceFailureRows.length === 1 ? '' : 's' }}</span>
+        </div>
+        <div class="mt-4 grid gap-3 lg:grid-cols-2">
+          <article v-for="row in sourceFailureRows" :key="`source-issue-${row.source_name}-${row.updated_at}`" class="rounded-2xl bg-white/80 p-4 text-sm">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="font-black text-ink">{{ row.module || row.source_name || 'unknown source' }}</p>
+                <p class="mt-1 text-xs font-semibold text-ink/45">{{ row.purpose || '-' }} · {{ titleCase(row.classification) }} · {{ row.updated_at || '-' }}</p>
+              </div>
+              <span class="rounded-full px-2 py-1 text-[0.65rem] font-black" :class="statusClass(row.status)">{{ statusText(row.status) }}</span>
+            </div>
+            <div class="mt-3 grid gap-2 text-xs md:grid-cols-3">
+              <p class="rounded-lg bg-paper/80 px-2 py-1"><b>Failed symbols:</b> {{ row.failed_symbol_list.length }}</p>
+              <p class="rounded-lg bg-paper/80 px-2 py-1"><b>Mapping misses:</b> {{ row.reference_mapping_missing_count ?? 0 }}</p>
+              <p class="rounded-lg bg-paper/80 px-2 py-1"><b>No-data/source:</b> {{ row.no_data_count ?? 0 }} / {{ row.source_unavailable_count ?? 0 }}</p>
+            </div>
+            <p v-if="row.failed_symbol_list.length" class="mt-3 rounded-xl bg-paper/80 p-2 text-xs font-semibold leading-5 text-rust">
+              Symbols: {{ row.failed_symbol_list.slice(0, 12).join(', ') }}{{ row.failed_symbol_list.length > 12 ? '...' : '' }}
+            </p>
+            <p v-if="row.classification_operator_action" class="mt-3 rounded-xl bg-sun/15 p-2 text-xs font-semibold leading-5 text-ink/70">
+              {{ row.classification_operator_action }}
+            </p>
+            <p v-if="row.error" class="mt-3 rounded-xl bg-rust/10 p-2 text-xs font-semibold text-rust">{{ row.error }}</p>
+          </article>
+        </div>
       </div>
       <details v-if="downloaderRunRows.length" class="mt-4" open>
         <summary class="cursor-pointer text-sm font-black text-moss">Show latest downloader/parser runs</summary>
@@ -514,6 +689,13 @@ async function applySupersededCleanup() {
               <p class="rounded-lg bg-white/70 px-2 py-1"><b>Retries:</b> {{ row.retry_count ?? '-' }}</p>
               <p class="rounded-lg bg-white/70 px-2 py-1"><b>Fallbacks:</b> {{ row.fallback_count ?? (row.fallback_used ? 1 : 0) }}</p>
             </div>
+            <p v-if="row.classification_meaning" class="mt-3 rounded-xl bg-white/70 p-2 text-xs leading-5 text-ink/65">
+              <b>{{ row.classification_label || titleCase(row.classification) }}:</b>
+              {{ row.classification_meaning }}
+              <span v-if="row.classification_operator_action" class="mt-1 block font-semibold">
+                {{ row.classification_operator_action }}
+              </span>
+            </p>
             <p v-if="row.error" class="mt-3 rounded-xl bg-rust/10 p-2 text-xs font-semibold text-rust">{{ row.error }}</p>
             <details class="mt-3">
               <summary class="cursor-pointer text-xs font-black text-moss">Raw state</summary>
@@ -556,10 +738,18 @@ async function applySupersededCleanup() {
         <div class="rounded-2xl bg-paper/75 p-3">
           <p class="text-xs font-black uppercase tracking-[0.2em] text-ink/40">Failure Class Counts</p>
           <div class="mt-3 grid gap-2">
-            <p v-for="item in ingestionClassificationCounts" :key="`classification-${item.key}`" class="flex items-center justify-between rounded-xl bg-white/70 px-3 py-2 text-sm">
-              <span class="font-bold text-ink/70">{{ titleCase(item.key) }}</span>
-              <span class="font-black text-ink">{{ item.count }}</span>
-            </p>
+            <div v-for="item in ingestionClassificationCounts" :key="`classification-${item.key}`" class="rounded-xl bg-white/70 px-3 py-2 text-sm">
+              <div class="flex items-center justify-between gap-3">
+                <span class="font-bold text-ink/70">{{ ingestionClassDetail(item.key).label || titleCase(item.key) }}</span>
+                <span class="font-black text-ink">{{ item.count }}</span>
+              </div>
+              <p v-if="ingestionClassDetail(item.key).meaning" class="mt-1 text-xs leading-5 text-ink/55">
+                {{ ingestionClassDetail(item.key).meaning }}
+              </p>
+              <p v-if="ingestionClassDetail(item.key).operator_action" class="mt-1 text-xs font-semibold leading-5 text-ink/65">
+                Action: {{ ingestionClassDetail(item.key).operator_action }}
+              </p>
+            </div>
             <p v-if="!ingestionClassificationCounts.length" class="rounded-xl bg-white/70 px-3 py-2 text-sm text-ink/50">No classified failed rows in this response.</p>
           </div>
         </div>
@@ -586,6 +776,13 @@ async function applySupersededCleanup() {
               <span class="rounded-full px-2 py-1 text-[0.65rem] font-black" :class="statusClass(row.status)">{{ statusText(row.status) }}</span>
             </div>
             <p v-if="row.error_message" class="mt-3 rounded-xl bg-rust/10 p-2 text-xs font-semibold text-rust">{{ row.error_message }}</p>
+            <p v-if="ingestionRowClassDetail(row).meaning" class="mt-3 rounded-xl bg-white/70 p-2 text-xs leading-5 text-ink/65">
+              <b>{{ ingestionRowClassDetail(row).label || titleCase(row.classification) }}:</b>
+              {{ ingestionRowClassDetail(row).meaning }}
+              <span v-if="ingestionRowClassDetail(row).operator_action" class="mt-1 block font-semibold">
+                {{ ingestionRowClassDetail(row).operator_action }}
+              </span>
+            </p>
           </article>
         </div>
       </details>
@@ -907,6 +1104,25 @@ async function applySupersededCleanup() {
                   <pre class="mt-3 max-h-56 overflow-auto rounded-2xl bg-ink p-3 text-xs leading-5 text-paper">{{ JSON.stringify(issue, null, 2) }}</pre>
                 </details>
               </article>
+            </div>
+          </article>
+          <article class="rounded-2xl bg-white/70 p-4">
+            <div class="flex items-start justify-between gap-3">
+              <div>
+                <p class="font-black text-ink">API latency probe</p>
+                <p class="mt-1 break-all text-xs text-ink/50">{{ apiLatencyProbe.path || '-' }}</p>
+              </div>
+              <span class="rounded-full px-3 py-1 text-xs font-black" :class="statusClass(apiLatencyProbe.status)">{{ statusText(apiLatencyProbe.status) }}</span>
+            </div>
+            <div class="mt-3 grid gap-2 text-sm md:grid-cols-3">
+              <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Age:</b> {{ secondsText(apiLatencyProbe.age_seconds) }}</p>
+              <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Slow:</b> {{ apiLatencyProbe.slow_count ?? 0 }}</p>
+              <p class="rounded-xl bg-paper/70 px-3 py-2"><b>Errors:</b> {{ apiLatencyProbe.error_count ?? 0 }}</p>
+            </div>
+            <p class="mt-2 text-sm text-ink/60">{{ apiLatencyProbe.operator_action || apiLatencyProbe.message }}</p>
+            <div class="mt-3 grid gap-2">
+              <code v-if="apiLatencyProbe.command" class="block overflow-auto rounded-xl bg-ink px-3 py-2 text-xs text-paper">{{ apiLatencyProbe.command }}</code>
+              <code v-if="apiLatencyProbe.performance_report_command" class="block overflow-auto rounded-xl bg-ink px-3 py-2 text-xs text-paper">{{ apiLatencyProbe.performance_report_command }}</code>
             </div>
           </article>
           <article class="rounded-2xl bg-white/70 p-4">

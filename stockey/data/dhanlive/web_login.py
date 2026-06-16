@@ -27,6 +27,7 @@ PROCEED_BUTTON_SELECTOR = "button[type='submit']:has-text('Proceed'), button.btn
 CODE_INPUT_SELECTOR = "code-input input[autocomplete='one-time-code'], code-input input[type='tel']"
 PIN_INPUT_SELECTOR = "code-input span.code-hidden input[autocomplete='one-time-code'], code-input span.code-hidden input[type='tel']"
 TOKEN_URL_MARKER = "tokenId="
+DEFAULT_STEP_TIMEOUT_MS = max(int(env.int("DHAN_AUTO_LOGIN_STEP_TIMEOUT_MS", default=30000)), 1000)
 
 
 def _url_host(value: str | None) -> str | None:
@@ -129,6 +130,22 @@ def _click_enabled_proceed(page, *, timeout_ms: int = 30000) -> None:
         page.locator(PROCEED_BUTTON_SELECTOR).last.click(force=True, timeout=timeout_ms)
 
 
+def _wait_for_pin_inputs_or_submit_totp(page, *, timeout_ms: int = 30000) -> None:
+    pin_inputs = page.locator(PIN_INPUT_SELECTOR)
+    try:
+        pin_inputs.first.wait_for(state="visible", timeout=min(int(timeout_ms), 5000))
+        return
+    except PlaywrightTimeoutError as exc:
+        _record_dhan_web_login_fallback(
+            fallback_type="dhan_web_login_pin_wait_before_totp_submit_timeout",
+            reason="Dhan automated login did not show PIN inputs after TOTP fill; clicking the visible Proceed button.",
+            error=exc,
+            metadata={"timeout_ms": min(int(timeout_ms), 5000)},
+        )
+    _click_enabled_proceed(page, timeout_ms=timeout_ms)
+    pin_inputs.first.wait_for(state="visible", timeout=timeout_ms)
+
+
 def fill_digit_code(page, code: str, *, selector: str = CODE_INPUT_SELECTOR, timeout_ms: int = 30000) -> None:
     digits = "".join(ch for ch in str(code) if ch.isdigit())
     if len(digits) != 6:
@@ -153,8 +170,9 @@ def run_dhan_consent_login(
     mobile: str | None = None,
     pin: str | None = None,
     totp_secret: str | None = None,
-    timeout_ms: int = 5000,
+    timeout_ms: int | None = None,
 ) -> str:
+    effective_timeout_ms = int(timeout_ms or DEFAULT_STEP_TIMEOUT_MS)
     effective_mobile = mobile or DHAN_LOGIN_MOBILE
     effective_pin = pin or DHAN_LOGIN_PIN
     if not effective_mobile:
@@ -164,16 +182,17 @@ def run_dhan_consent_login(
     if len("".join(ch for ch in str(effective_pin) if ch.isdigit())) != 6:
         raise DhanAuthError("DHAN_LOGIN_PIN must be 6 digits")
 
-    page.goto(consent_url, wait_until="domcontentloaded", timeout=timeout_ms)
+    page.goto(consent_url, wait_until="domcontentloaded", timeout=effective_timeout_ms)
     page.wait_for_timeout(3000)
-    page.locator(MOBILE_INPUT_SELECTOR).first.fill(str(effective_mobile), timeout=timeout_ms)
+    page.locator(MOBILE_INPUT_SELECTOR).first.fill(str(effective_mobile), timeout=effective_timeout_ms)
     page.locator(MOBILE_INPUT_SELECTOR).first.dispatch_event("input")
     page.locator(MOBILE_INPUT_SELECTOR).first.dispatch_event("change")
-    _click_enabled_proceed(page, timeout_ms=timeout_ms)
+    _click_enabled_proceed(page, timeout_ms=effective_timeout_ms)
 
     page.wait_for_timeout(1000)
-    fill_digit_code(page, generate_totp(totp_secret), selector=CODE_INPUT_SELECTOR, timeout_ms=timeout_ms)
-    page.wait_for_timeout(3000)
+    fill_digit_code(page, generate_totp(totp_secret), selector=CODE_INPUT_SELECTOR, timeout_ms=effective_timeout_ms)
+    page.wait_for_timeout(1000)
+    _wait_for_pin_inputs_or_submit_totp(page, timeout_ms=effective_timeout_ms)
 
     # To capture redirection to a non-existent url is tricky
     nav_capture = {
@@ -207,7 +226,7 @@ def run_dhan_consent_login(
         page,
         str(effective_pin),
         selector=PIN_INPUT_SELECTOR,
-        timeout_ms=timeout_ms,
+        timeout_ms=effective_timeout_ms,
     )
 
     page.wait_for_timeout(5000)
@@ -222,14 +241,14 @@ def run_dhan_consent_login(
     token_id = extract_token_id(str(actual_url))
     if not token_id:
         try:
-            page.wait_for_function(f"() => window.location.href.includes('{TOKEN_URL_MARKER}')", timeout=timeout_ms)
+            page.wait_for_function(f"() => window.location.href.includes('{TOKEN_URL_MARKER}')", timeout=effective_timeout_ms)
             token_id = extract_token_id(str(page.url))
         except PlaywrightTimeoutError as exc:
             _record_dhan_web_login_fallback(
                 fallback_type="dhan_web_login_token_wait_timeout",
                 reason="Dhan automated login did not observe tokenId before timeout.",
                 error=exc,
-                metadata={"timeout_ms": int(timeout_ms), "current_url_host": _url_host(getattr(page, "url", None))},
+                metadata={"timeout_ms": int(effective_timeout_ms), "current_url_host": _url_host(getattr(page, "url", None))},
             )
             token_id = None
 

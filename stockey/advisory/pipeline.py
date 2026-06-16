@@ -111,6 +111,82 @@ LEGACY_STAGE_ALIASES = {
     "watch": ("watch_ingest", "watch_match"),
 }
 HEARTBEAT_INTERVAL_SECONDS = 30.0
+DEFAULT_STAGE_BUDGET_SECONDS = float(os.getenv("ADVISORY_STAGE_BUDGET_SECONDS", "900"))
+DEFAULT_STAGE_BUDGET_OVERRIDES = os.getenv("ADVISORY_STAGE_BUDGET_OVERRIDES", "")
+_ACTIVE_STAGE_BUDGET_SECONDS = DEFAULT_STAGE_BUDGET_SECONDS
+_ACTIVE_STAGE_BUDGET_OVERRIDES = DEFAULT_STAGE_BUDGET_OVERRIDES
+_STAGE_TIMINGS: list[dict[str, Any]] = []
+_STAGE_TIMINGS_LOCK = threading.Lock()
+
+
+def _parse_stage_budget_overrides(value: Any) -> dict[str, float]:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        items = value.items()
+    else:
+        items = []
+        for part in str(value).split(","):
+            if "=" not in part:
+                continue
+            stage, seconds = part.split("=", 1)
+            items.append((stage, seconds))
+    out: dict[str, float] = {}
+    for stage, seconds in items:
+        normalized_stage = str(stage or "").strip().lower()
+        normalized_stage = LEGACY_STAGE_ALIASES.get(normalized_stage, (normalized_stage, normalized_stage))[0]
+        if normalized_stage not in PIPELINE_STAGES:
+            continue
+        parsed = pd.to_numeric(seconds, errors="coerce")
+        if pd.notna(parsed) and float(parsed) > 0:
+            out[normalized_stage] = float(parsed)
+    return out
+
+
+def _stage_budget_seconds(stage: str) -> float | None:
+    overrides = _parse_stage_budget_overrides(_ACTIVE_STAGE_BUDGET_OVERRIDES)
+    if stage in overrides:
+        return overrides[stage]
+    return _ACTIVE_STAGE_BUDGET_SECONDS if _ACTIVE_STAGE_BUDGET_SECONDS > 0 else None
+
+
+def _reset_stage_timings() -> None:
+    with _STAGE_TIMINGS_LOCK:
+        _STAGE_TIMINGS.clear()
+
+
+def _record_stage_timing(stage: str, elapsed_seconds: float, detail: str | None = None) -> dict[str, Any]:
+    budget_seconds = _stage_budget_seconds(stage)
+    row = {
+        "stage": stage,
+        "elapsed_seconds": round(float(elapsed_seconds), 4),
+        "budget_seconds": None if budget_seconds is None else round(float(budget_seconds), 4),
+        "over_budget": bool(budget_seconds is not None and elapsed_seconds > budget_seconds),
+        "detail": detail,
+    }
+    with _STAGE_TIMINGS_LOCK:
+        _STAGE_TIMINGS.append(row)
+    return row
+
+
+def _stage_timing_summary() -> dict[str, Any]:
+    with _STAGE_TIMINGS_LOCK:
+        rows = [dict(row) for row in _STAGE_TIMINGS]
+    slow_rows = [row for row in rows if row.get("over_budget")]
+    total_elapsed = sum(float(row.get("elapsed_seconds") or 0.0) for row in rows)
+    return {
+        "stage_timings": rows,
+        "slow_stages": slow_rows,
+        "stage_budget": {
+            "default_budget_seconds": None if DEFAULT_STAGE_BUDGET_SECONDS <= 0 else round(float(DEFAULT_STAGE_BUDGET_SECONDS), 4),
+            "active_budget_seconds": None if _ACTIVE_STAGE_BUDGET_SECONDS <= 0 else round(float(_ACTIVE_STAGE_BUDGET_SECONDS), 4),
+            "overrides": _parse_stage_budget_overrides(_ACTIVE_STAGE_BUDGET_OVERRIDES),
+            "slow_stage_count": len(slow_rows),
+            "measured_stage_count": len(rows),
+            "total_measured_elapsed_seconds": round(total_elapsed, 4),
+            "reporting_only": True,
+        },
+    }
 
 
 def _json_ready(value: Any) -> Any:
@@ -279,8 +355,13 @@ def _finish_stage(stage: str, stage_state: tuple[float, threading.Event, threadi
     started_at, stop_event, thread = stage_state
     stop_event.set()
     thread.join(timeout=0.1)
+    elapsed_seconds = time.monotonic() - started_at
+    timing = _record_stage_timing(stage, elapsed_seconds, detail=detail)
     suffix = f" {detail}" if detail else ""
-    _emit_progress(f"[advisory.pipeline] stage={stage} done elapsed={time.monotonic() - started_at:.2f}s{suffix}")
+    budget_suffix = ""
+    if timing.get("over_budget"):
+        budget_suffix = f" over_budget=true budget={timing.get('budget_seconds')}s"
+    _emit_progress(f"[advisory.pipeline] stage={stage} done elapsed={elapsed_seconds:.2f}s{suffix}{budget_suffix}")
 
 
 def parse_stage(value: str | None) -> str | None:
@@ -353,6 +434,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--parallel-local-stages", action="store_true", help="Run independent DB/local feature stages with bounded threads")
     parser.add_argument("--local-stage-workers", type=int, default=int(os.getenv("ADVISORY_LOCAL_STAGE_WORKERS", "3")), help="Max workers for --parallel-local-stages")
+    parser.add_argument("--stage-budget-seconds", type=float, default=DEFAULT_STAGE_BUDGET_SECONDS, help="Reporting-only slow-stage budget in seconds; set 0 to disable slow-stage marking")
+    parser.add_argument("--stage-budget-overrides", default=DEFAULT_STAGE_BUDGET_OVERRIDES, help="Comma-separated reporting-only per-stage budgets, for example rules=1800,exchange_features=900")
     return parser.parse_args()
 
 
@@ -379,6 +462,7 @@ def _normalize_utc_arg_timestamp(value: Any) -> pd.Timestamp | None:
 
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
+    global _ACTIVE_STAGE_BUDGET_SECONDS, _ACTIVE_STAGE_BUDGET_OVERRIDES
     if not hasattr(args, "skip_intraday"):
         args.skip_intraday = False
     if not hasattr(args, "intraday_lookback_days"):
@@ -395,6 +479,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         args.rule_max_intraday_prefetch_age_days = 14
     if not hasattr(args, "event_model_artifact_dir"):
         args.event_model_artifact_dir = str(DEFAULT_EVENT_MODEL_ARTIFACT_DIR)
+    if not hasattr(args, "event_model_score_policy_mode"):
+        args.event_model_score_policy_mode = os.getenv(
+            EVENT_MODEL_SCORE_POLICY_MODE_ENV,
+            DEFAULT_EVENT_MODEL_SCORE_POLICY_MODE,
+        )
     if not hasattr(args, "skip_company_memory"):
         args.skip_company_memory = False
     if not hasattr(args, "company_memory_limit"):
@@ -405,10 +494,19 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         args.company_memory_model = DEFAULT_COMPANY_MEMORY_MODEL
     if not hasattr(args, "company_memory_llm"):
         args.company_memory_llm = COMPANY_MEMORY_LLM_ENABLED
+    if not hasattr(args, "live_execution_confirmation"):
+        args.live_execution_confirmation = None
     if not hasattr(args, "parallel_local_stages"):
         args.parallel_local_stages = False
     if not hasattr(args, "local_stage_workers"):
         args.local_stage_workers = int(os.getenv("ADVISORY_LOCAL_STAGE_WORKERS", "3"))
+    if not hasattr(args, "stage_budget_seconds"):
+        args.stage_budget_seconds = DEFAULT_STAGE_BUDGET_SECONDS
+    if not hasattr(args, "stage_budget_overrides"):
+        args.stage_budget_overrides = DEFAULT_STAGE_BUDGET_OVERRIDES
+    _ACTIVE_STAGE_BUDGET_SECONDS = float(args.stage_budget_seconds or 0)
+    _ACTIVE_STAGE_BUDGET_OVERRIDES = str(args.stage_budget_overrides or "")
+    _reset_stage_timings()
     asof_date = _normalize_utc_arg_timestamp(args.date)
     summary: dict[str, Any] = {
         "status": "ok",
@@ -975,6 +1073,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         }
         _finish_stage("execution", stage_started, f"planned={len(execution_df)} reconciled={len(reconcile_df)} fills={len(fills_df)}")
 
+    summary.update(_stage_timing_summary())
     return summary
 
 

@@ -110,6 +110,7 @@ ACTION_PRIORITY = {
 DEFAULT_CONFLICT_RULE_IDS = {
     "EXIT_BEATS_ENTRY_OR_WATCH",
     "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH",
+    "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY",
     "MARKET_GATE_MANUAL_BEATS_POSITIVE",
     "SAME_ACTION_DUPLICATE_COLLAPSE",
     "WATCH_LOSES_TO_HIGHER_PRIORITY",
@@ -263,6 +264,17 @@ def _normalize_asof_date(asof_date: pd.Timestamp | None) -> pd.Timestamp:
     return ts.normalize()
 
 
+def _point_in_time_cutoff(asof_date: Any) -> tuple[pd.Timestamp, str]:
+    ts = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    if pd.isna(ts):
+        ts = pd.Timestamp.utcnow()
+    # Date-only advisory runs should see the whole trading date. Intraday/watch
+    # refreshes must not see later same-day rows.
+    if ts == ts.normalize():
+        return ts + pd.Timedelta(days=1), "<"
+    return ts, "<="
+
+
 def _coerce_ts(value: Any) -> pd.Timestamp | None:
     ts = pd.to_datetime(value, utc=True, errors="coerce")
     return None if pd.isna(ts) else ts
@@ -337,6 +349,11 @@ def _build_record(
 def load_portfolio_actions(*, asof_date: pd.Timestamp, symbols: list[str] | None = None, setup_ids: list[str] | None = None) -> pd.DataFrame:
     if not table_exists(PORTFOLIO_TABLE):
         return pd.DataFrame()
+    columns = table_columns(PORTFOLIO_TABLE)
+
+    def optional_column(column: str) -> str:
+        return column if column in columns else f"NULL AS {column}"
+
     clauses = ["asof_date = %s", "portfolio_status IN ('approved', 'trimmed')"]
     params: list[object] = [asof_date]
     if symbols:
@@ -356,8 +373,12 @@ def load_portfolio_actions(*, asof_date: pd.Timestamp, symbols: list[str] | None
             portfolio_status,
             portfolio_reason,
             approved_allocation_inr,
+            {optional_column("position_state")},
+            {optional_column("state_transition_contract_json")},
             stop_price,
             invalidation_price,
+            {optional_column("target_price")},
+            {optional_column("expected_horizon_days")},
             invest_score_pct,
             execution_notes
         FROM {PORTFOLIO_TABLE}
@@ -473,13 +494,13 @@ def load_playbook_action_plans(*, asof_date: pd.Timestamp, symbols: list[str] | 
     ensure_hypothesis_tables()
     if not table_exists(ACTION_PLANS_TABLE):
         return pd.DataFrame()
-    end_ts = asof_date + pd.Timedelta(days=1)
+    end_ts, end_operator = _point_in_time_cutoff(asof_date)
     start_ts = asof_date - pd.Timedelta(days=PLAYBOOK_LOOKBACK_DAYS)
     clauses = [
         "COALESCE(p.production_allowed, FALSE) = TRUE",
         "COALESCE(h.status, '') IN ('trusted_overlay', 'production')",
         "p.planned_at >= %s",
-        "p.planned_at < %s",
+        f"p.planned_at {end_operator} %s",
     ]
     params: list[object] = [start_ts, end_ts]
     if symbols:
@@ -530,11 +551,11 @@ def load_matched_manual_review_wait_signals(*, asof_date: pd.Timestamp, symbols:
         allowed_setup_ids = {str(value).strip().upper() for value in setup_ids if str(value or "").strip()}
         if MANUAL_REVIEW_WAIT_SIGNAL_SETUP_ID not in allowed_setup_ids and "MANUAL_REVIEW" not in allowed_setup_ids:
             return pd.DataFrame()
-    end_ts = asof_date + pd.Timedelta(days=1)
+    end_ts, end_operator = _point_in_time_cutoff(asof_date)
     clauses = [
         "s.generated_by = 'manual_review_decision'",
         "COALESCE(m.match_status, 'matched') = 'matched'",
-        "m.matched_at < %(end_ts)s",
+        f"m.matched_at {end_operator} %(end_ts)s",
     ]
     params: dict[str, Any] = {"end_ts": end_ts}
     if symbols:
@@ -859,6 +880,7 @@ def _load_latest_event_context(asof_date: pd.Timestamp, symbols: list[str]) -> t
              AND r.symbol = e.symbol
              AND r.unique_id = e.unique_id
             """
+    asof_cutoff, asof_operator = _point_in_time_cutoff(asof_date)
     df = sql_to_df(
         f"""
         WITH ranked AS (
@@ -875,14 +897,14 @@ def _load_latest_event_context(asof_date: pd.Timestamp, symbols: list[str]) -> t
                 ) AS rn_symbol
             FROM {EVENT_EVALUATIONS_TABLE} e
             {review_join}
-            WHERE COALESCE(e.asof_date, e.published_on) <= %(asof_date)s
+            WHERE COALESCE(e.asof_date, e.published_on) {asof_operator} %(asof_date)s
               AND UPPER(TRIM(e.symbol)) = ANY(%(symbols)s)
         )
         SELECT *
         FROM ranked
         WHERE rn_setup = 1 OR rn_symbol = 1
         """,
-        params={"asof_date": asof_date + pd.Timedelta(days=1), "symbols": normalized_symbols},
+        params={"asof_date": asof_cutoff, "symbols": normalized_symbols},
     )
     if df.empty:
         return {}, {}
@@ -935,8 +957,9 @@ def _load_latest_playbook_context(asof_date: pd.Timestamp, symbols: list[str]) -
     selected = [column for column in wanted if column in available]
     if not {"planned_at", "hypothesis_id", "source_key"}.issubset(set(selected)):
         return {}, {}
-    clauses = ["planned_at <= %(asof_date)s"]
-    params: dict[str, Any] = {"asof_date": asof_date + pd.Timedelta(days=1)}
+    asof_cutoff, asof_operator = _point_in_time_cutoff(asof_date)
+    clauses = [f"planned_at {asof_operator} %(asof_date)s"]
+    params: dict[str, Any] = {"asof_date": asof_cutoff}
     if "symbol" in selected and normalized_symbols:
         clauses.append("(symbol IS NULL OR symbol = '' OR UPPER(TRIM(symbol)) = ANY(%(symbols)s))")
         params["symbols"] = normalized_symbols
@@ -1367,6 +1390,19 @@ def conflict_precedence_for_row(
             "rule_id": "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH",
             "reason": "Adversarial-review veto keeps the symbol in manual review ahead of buy/watch candidates.",
         }
+    if (
+        "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY" in enabled_rules
+        and action == "MANUAL_REVIEW"
+        and str(row.get("action_source") or "").strip().lower() == "event_policy"
+        and isinstance(peers, pd.DataFrame)
+        and not peers.empty
+        and any(str(peer.get("action_code") or "").strip().upper() in POSITIVE_BROKER_ACTIONS for _, peer in peers.iterrows() if peer.name != row.name)
+    ):
+        return {
+            "score": 250,
+            "rule_id": "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY",
+            "reason": "Event-policy review blocks BUY/BUY_MORE candidates until the operator resolves the event evidence.",
+        }
     if int(dynamic_result.get("score") or 0) > 0:
         return dynamic_result
     if "WATCH_LOSES_TO_HIGHER_PRIORITY" in enabled_rules and action == "WATCH":
@@ -1501,6 +1537,18 @@ def _manual_review_contract_section(row: pd.Series, raw_context: dict[str, Any],
         inferred["manual_review_boundary"] = existing.get("manual_review_boundary") or "event_policy_review_required"
     elif action_source.startswith("playbook"):
         inferred["manual_review_boundary"] = existing.get("manual_review_boundary") or "playbook_review_required"
+    elif action_source == "manual_review_wait_signal":
+        inferred["manual_review_boundary"] = existing.get("manual_review_boundary") or "manual_review_wait_signal_matched"
+        inferred["operator_question"] = (
+            existing.get("operator_question")
+            or raw_context.get("operator_question")
+            or "A previously watched Manual Review condition matched. Decide whether the fresh evidence changes the action state or should be closed as noise."
+        )
+        inferred["review_reason"] = (
+            existing.get("review_reason")
+            or row.get("action_reason")
+            or "Manual Review wait signal matched fresh evidence."
+        )
     market_adjustment = _parse_jsonish(raw_context.get("market_context_adjustment_json"), {})
     if not isinstance(market_adjustment, dict):
         market_adjustment = {}
@@ -1578,6 +1626,176 @@ def _same_symbol_conflict_section(row: pd.Series, candidates: pd.DataFrame | Non
     }
 
 
+def _portfolio_transition_section(raw_context: dict[str, Any]) -> dict[str, Any]:
+    contract = _parse_jsonish(raw_context.get("state_transition_contract_json"), {})
+    if not isinstance(contract, dict):
+        contract = {}
+    section = {
+        "position_state": raw_context.get("position_state") or contract.get("current_state"),
+        "portfolio_status": raw_context.get("portfolio_status") or contract.get("portfolio_status"),
+        "portfolio_reason": raw_context.get("portfolio_reason") or contract.get("portfolio_reason"),
+        "current_state": contract.get("current_state"),
+        "entry_evidence_required": contract.get("entry_evidence_required"),
+        "entry_evidence_rule": contract.get("entry_evidence_rule"),
+        "broker_execution_allowed": contract.get("broker_execution_allowed"),
+        "broker_boundary": contract.get("broker_boundary"),
+        "next_required_stage": contract.get("next_required_stage"),
+        "can_transition_to": contract.get("can_transition_to"),
+    }
+    return {key: value for key, value in section.items() if value not in (None, "", [], {})}
+
+
+def _timestamp_value(*values: Any) -> pd.Timestamp | None:
+    for value in values:
+        ts = pd.to_datetime(value, utc=True, errors="coerce")
+        if not pd.isna(ts):
+            return ts
+    return None
+
+
+def _has_price_evidence_after_publication(row: pd.Series, raw_context: dict[str, Any]) -> bool:
+    published_on = _timestamp_value(row.get("published_on"), raw_context.get("published_on"))
+    evidence_at = _timestamp_value(
+        row.get("reference_price_asof"),
+        raw_context.get("reference_price_asof"),
+        raw_context.get("price_asof"),
+        raw_context.get("entry_date"),
+        row.get("asof_date"),
+        raw_context.get("asof_date"),
+    )
+    evidence_price = (
+        _num(row.get("reference_price"))
+        or _num(raw_context.get("reference_price"))
+        or _num(raw_context.get("entry_price"))
+        or _num(raw_context.get("price"))
+    )
+    return bool(published_on is not None and evidence_at is not None and evidence_at >= published_on and evidence_price is not None)
+
+
+def _action_transition_section(row: pd.Series, raw_context: dict[str, Any], action: str) -> dict[str, Any]:
+    source = _text(row.get("action_source"))
+    source_action = _text(row.get("source_action"))
+    transaction = _text(row.get("transaction_type"))
+    execution_mode = _text(row.get("execution_mode"))
+    broker_order_candidate = action in BROKER_CAPABLE_ACTIONS and execution_mode == "broker_order" and transaction in {"BUY", "SELL"}
+    position_status = raw_context.get("position_status")
+    reference_price = _num(row.get("reference_price"))
+    stop_price = _num(row.get("stop_price"))
+    action_fraction = _num(row.get("action_fraction"))
+    state_effect_by_action = {
+        "BUY": "planned_entry_candidate",
+        "BUY_MORE": "planned_add_candidate",
+        "SELL": "planned_full_exit_candidate",
+        "PARTIAL_SELL": "planned_partial_exit_candidate",
+        "TIGHTEN_STOP": "policy_update_review",
+        "HOLD": "no_position_change",
+        "WATCH": "watch_only",
+        "MANUAL_REVIEW": "review_only",
+    }
+    required_stage_by_action = {
+        "BUY": "execution_engine_order_preview",
+        "BUY_MORE": "execution_engine_order_preview",
+        "SELL": "execution_engine_order_preview",
+        "PARTIAL_SELL": "execution_engine_order_preview",
+        "TIGHTEN_STOP": "position_lifecycle_policy_audit",
+        "HOLD": "continue_monitoring",
+        "WATCH": "watchers_or_next_advisory",
+        "MANUAL_REVIEW": "operator_manual_review",
+    }
+    required_preconditions_by_action = {
+        "BUY": [
+            "broker_order_execution_mode",
+            "buy_transaction_type",
+            "risk_level_present",
+            "entry_evidence_after_publication",
+        ],
+        "BUY_MORE": [
+            "open_position_context",
+            "broker_order_execution_mode",
+            "buy_transaction_type",
+            "risk_level_present",
+            "add_on_evidence_present",
+        ],
+        "SELL": [
+            "open_position_context",
+            "broker_order_execution_mode",
+            "sell_transaction_type",
+            "exit_trigger_present",
+            "full_exit_implied",
+        ],
+        "PARTIAL_SELL": [
+            "open_position_context",
+            "broker_order_execution_mode",
+            "sell_transaction_type",
+            "partial_exit_trigger_present",
+            "partial_exit_fraction_resolved",
+        ],
+        "TIGHTEN_STOP": ["open_position_context", "recommended_stop_present", "policy_audit_only"],
+        "HOLD": ["open_position_context", "no_exit_trigger_present"],
+        "WATCH": ["watch_evidence_present", "no_broker_order"],
+        "MANUAL_REVIEW": ["operator_question_present", "no_broker_order"],
+    }
+    missing_preconditions: list[str] = []
+
+    def add_missing(precondition: str) -> None:
+        if precondition not in missing_preconditions:
+            missing_preconditions.append(precondition)
+
+    if action in BROKER_CAPABLE_ACTIONS and execution_mode != "broker_order":
+        add_missing("broker_order_execution_mode")
+    if action in {"BUY", "BUY_MORE"} and transaction != "BUY":
+        add_missing("buy_transaction_type")
+    if action in {"SELL", "PARTIAL_SELL"} and transaction != "SELL":
+        add_missing("sell_transaction_type")
+    if action in {"BUY_MORE", "SELL", "PARTIAL_SELL", "TIGHTEN_STOP", "HOLD"} and not position_status:
+        add_missing("open_position_context")
+    if action in {"BUY", "BUY_MORE"} and stop_price is None and _num(row.get("invalidation_price")) is None and _num(row.get("recommended_stop_price")) is None:
+        add_missing("risk_level_present")
+    has_post_publication_price_evidence = _has_price_evidence_after_publication(row, raw_context)
+    if action == "BUY" and not has_post_publication_price_evidence:
+        add_missing("entry_evidence_after_publication")
+    if action == "BUY_MORE" and not has_post_publication_price_evidence:
+        add_missing("add_on_evidence_present")
+    if action in {"SELL", "PARTIAL_SELL"} and not (
+        row.get("action_detail") or raw_context.get("suggested_action") or raw_context.get("next_action")
+    ):
+        add_missing("exit_trigger_present")
+    if action in {"SELL", "PARTIAL_SELL"} and not has_post_publication_price_evidence:
+        add_missing("exit_trigger_present")
+    if action == "PARTIAL_SELL" and action_fraction is None:
+        add_missing("partial_exit_fraction_resolved")
+    if action == "TIGHTEN_STOP" and _num(row.get("recommended_stop_price")) is None:
+        add_missing("recommended_stop_present")
+    broker_boundary = (
+        "Action row is not a broker order. Execution engine must create a separate safety-gated preview before any order."
+        if broker_order_candidate
+        else "This action is review-only/monitoring/policy context and does not create a broker order."
+    )
+    section = {
+        "schema_version": 1,
+        "action_code": action,
+        "source_stage": source,
+        "source_action": source_action,
+        "state_effect": state_effect_by_action.get(action, "unknown"),
+        "transaction_type": transaction,
+        "execution_mode": execution_mode,
+        "broker_order_candidate": bool(broker_order_candidate),
+        "broker_execution_allowed": False,
+        "broker_boundary": broker_boundary,
+        "next_required_stage": required_stage_by_action.get(action, "operator_review"),
+        "allowed_after_preview": action in BROKER_CAPABLE_ACTIONS,
+        "required_preconditions": required_preconditions_by_action.get(action, []),
+        "missing_preconditions": missing_preconditions,
+        "precondition_status": "complete" if not missing_preconditions else "incomplete",
+        "position_status": position_status,
+        "lifecycle_next_action": raw_context.get("next_action") or raw_context.get("suggested_action"),
+        "entry_evidence_required": action in {"BUY", "BUY_MORE"},
+        "exit_evidence_required": action in {"SELL", "PARTIAL_SELL"},
+        "policy_audit_required": action == "TIGHTEN_STOP",
+    }
+    return {key: value for key, value in section.items() if value not in (None, "", [], {})}
+
+
 def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFrame | None = None) -> dict[str, Any]:
     raw_context = _parse_jsonish(row.get("raw_context_json"), {})
     if not isinstance(raw_context, dict):
@@ -1652,6 +1870,8 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
         "conflict_resolution": conflict_resolution,
         "risk": risk_fields,
         "lifecycle": _contract_section_from_context(raw_context, ["position_status", "next_action", "suggested_action", "lifecycle_reason", "next_action_reason"]),
+        "portfolio_transition": _portfolio_transition_section(raw_context),
+        "action_transition": _action_transition_section(row, raw_context, action),
     }
     market_context = _parse_jsonish(raw_context.get("market_context_json"), {})
     if not isinstance(market_context, dict):
@@ -1689,6 +1909,11 @@ def build_recommendation_reason_contract(row: pd.Series, candidates: pd.DataFram
     if action in {"BUY", "BUY_MORE", "SELL", "PARTIAL_SELL"}:
         if not execution_mode:
             missing.append("execution_mode")
+        transaction_type = _text(row.get("transaction_type"))
+        if action in {"BUY", "BUY_MORE"} and transaction_type != "BUY":
+            missing.append("buy_transaction_type")
+        if action in {"SELL", "PARTIAL_SELL"} and transaction_type != "SELL":
+            missing.append("sell_transaction_type")
         if action in {"BUY", "BUY_MORE"} and not any(risk_fields.get(key) is not None for key in ["stop_price", "invalidation_price", "recommended_stop_price"]):
             missing.append("buy_risk_level")
         if action in {"SELL", "PARTIAL_SELL"} and not (action_detail or raw_context.get("suggested_action") or raw_context.get("next_action")):
@@ -2276,6 +2501,8 @@ def build_action_recommendations(
                 approved_allocation_inr=row.get("approved_allocation_inr"),
                 stop_price=row.get("stop_price"),
                 invalidation_price=row.get("invalidation_price"),
+                recommended_target_price=row.get("target_price"),
+                expected_horizon_days=row.get("expected_horizon_days"),
                 invest_score_pct=row.get("invest_score_pct"),
                 action_reason=row.get("portfolio_reason"),
                 action_detail=row.get("execution_notes"),

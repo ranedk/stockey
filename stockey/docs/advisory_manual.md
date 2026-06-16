@@ -297,7 +297,7 @@ Important guardrails:
 - TS forecasts are not sent to Dhan execution.
 - Any foundation-model adapter must first beat the simple baseline and existing technical/action flow in walk-forward paper evaluation after costs and slippage.
 
-`advisory/ts_forecast_evaluator.py` evaluates matured forecast rows against future `dhan_ohlcv_daily` returns. It stores row-level realized results in `advisory_ts_forecast_evaluations` and grouped model/horizon/action-hint metrics in `advisory_ts_forecast_eval_summary`.
+`advisory/ts_forecast_evaluator.py` evaluates matured forecast rows against future `dhan_ohlcv_daily` returns. It uses the first close strictly after forecast `asof_date` as entry, never the same-day close, and stores a point-in-time return contract with each in-memory evaluation payload. It stores row-level realized results in `advisory_ts_forecast_evaluations` and grouped model/horizon/action-hint metrics in `advisory_ts_forecast_eval_summary`.
 
 `advisory/ts_forecast_workflow.py` ties the research path together: optional Screener.in ad hoc query, Dhan daily OHLCV refresh, forecast generation, and an experimental TS watchlist. If no symbols or query are supplied, it uses `config/ts_forecast_screeners.yaml`.
 
@@ -330,6 +330,8 @@ python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m
 
 `advisory/ts_forecast_paper_portfolio.py` is the promotion gate between forecast rows and any future policy integration. It converts forecast rows into research-only `PAPER_BUY` / `PAPER_SKIP` decisions, evaluates matured outcomes after costs, compares them with a simple momentum baseline, records advisory-action alignment, and can write a research-ledger row. It does not write action recommendations, portfolio rows, or Dhan execution orders.
 
+If the paper-portfolio table is not present yet, the TS forecast promotion-check API returns a blocked research-only payload instead of failing the operator UI. The operator action is to run `all_ts_forecast_paper_portfolio.sh` after forecast/evaluation rows exist.
+
 The Operator home page and generated legacy dashboard show the latest compact TS paper summary: model, horizon, paper decision, evaluated trades, win rate, after-cost average return, momentum baseline average, advisory alignment count, and exit-conflict count. Use it to decide whether the forecast layer deserves a manual promotion review; do not trade directly from it.
 
 `advisory/ts_forecast_promotion_check.py` is the read-only gate for that manual review. It requires enough evaluated paper trades, enough distinct dates and symbols, positive after-cost performance, lift versus the naive momentum baseline, and low conflict with advisory exit actions. A passing result returns `review_candidate`; it still does not change policy or execution. A failing result returns `hold_research_only`.
@@ -356,6 +358,8 @@ python -m advisory.config_change_assistant --source-type ts_forecast_review_rule
 The Operator API exposes the same preview at `/api/config-change/ts-forecast-preview`. The generated diff adds a disabled `ts_forecast_review_rules` entry and does not apply policy.
 
 If an operator manually applies that disabled diff, verify what the backend sees with `/api/research/ts-forecast-review-rules`. The endpoint validates required model/horizon fields, unsafe authority values, and broker-execution flags. It is read-only and reports `policy_auto_promotion_allowed=false`. The Operator home TS forecast section shows the same configured-rule counts, statuses, and issues.
+
+The Operator API also exposes `/api/config-change/applications` and `/api/config-change/application-decision` for audit-only reviewed-diff application decisions. Valid decisions are `approved_to_apply`, `marked_applied`, `rejected`, and `needs_more_data`. These rows record operator intent and, for TS forecast review rules, verify the matching disabled config rule when possible. They do not write config files, create action rows, alter portfolio rows, or enable broker execution.
 
 For a dependency-free dry run, use `--model-name naive_momentum_v1`. For TimesFM, install the optional TimesFM torch package first.
 
@@ -423,6 +427,10 @@ python -m advisory.symbol_trace HDFCBANK --format text
 python -m advisory.setup_trace LARGECAP_BREAKOUT_V1 --format text
 python -m advisory.dashboard --format text
 ```
+
+Portfolio output is a planning state, not a holding state. Rows in `advisory_portfolio_orders` now carry `position_state` and `state_transition_contract_json`; approved or trimmed rows are `PLANNED_ENTRY` and require `advisory.position_lifecycle` to prove the paper entry from the first available close on or after portfolio `published_on`. Deferred rows are `DEFERRED`. Broker execution still requires a separate `advisory.execution_engine --dry-run` preview and the approval/reconciliation/evidence/live-allowance gates below. If a portfolio row is legacy or ambiguous and does not carry `PLANNED_ENTRY` plus a valid transition contract, execution planning creates a `submit_blocked` preview and skips Dhan identity lookup instead of silently treating the row as executable. The Operator Action Queue shows this as a portfolio handoff boundary: current state, required entry-evidence rule, broker-direct block status, and any transition-contract issues are visible before an operator opens raw JSON.
+
+After dry-run execution previews exist, use `/execution-approvals` or `/api/execution/approvals` to inspect the latest `advisory_execution_orders` safety contracts, missing operator approval, missing broker reconciliation, missing live-evidence checklist, and live-submission blockers. The page can record audit-only operator review decisions through `/api/execution/approval-decision`; those rows do not approve execution, mutate execution rows, update safety contracts, reconcile broker state, or submit orders. A second reviewed action, `/api/execution/approval-contract-update`, can mark `operator_approval_status=approved` only when the latest audit decision is `approve_dry_run`; it leaves reconciliation unchanged, forces `live_submission_allowed=false`, and still does not submit broker orders. Broker reconciliation can be previewed or persisted through `/api/execution/reconcile`; preview is dry-run by default, apply requires `confirm=true`, and the route only reads broker order state plus persists reconciliation/fill rows. It does not change operator approval, allow live submission, or submit orders. Live execution also requires the default-on evidence checklist: `live_evidence_status=passed` and at least `STOCKEY_EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS` successful dry-run/reconciliation cycles. Evidence can be previewed or applied through `/api/execution/evidence-review`; confirmed apply writes `advisory_execution_evidence_reviews`, updates only `live_evidence_*`, keeps `live_submission_allowed=false`, and still does not submit orders. Final live allowance can be previewed or applied through `/api/execution/live-allowance`; confirmed apply requires approval, reconciliation, passed evidence, exact phrase, and rationale, writes `advisory_execution_live_allowance_reviews`, and sets only `live_submission_allowed=true`. `/api/execution/live-submit-preflight` and the `/execution-approvals` page can then generate the current order-set token, blockers, required environment, and exact manual CLI command. The preflight is read-only and still does not submit broker orders; live submission remains a separate CLI execution path requiring `STOCKEY_LIVE_TRADING_ENABLED=true` and the current order-set token.
 
 ### Regression and cleanup
 
@@ -496,7 +504,8 @@ This reviewer can only clear, penalize, force manual review, or veto. It does no
 
 - a train/score scaffold in `advisory.event_meta_model` that:
   - builds leakage-safe labels from point-in-time event rows plus later `dhan_ohlcv_daily` closes
-  - joins first-trading-day intraday response features from `advisory_intraday_features_daily` onto each event anchor date
+  - joins intraday, macro, and exchange features on the event published-on date, not the future label anchor date
+  - keeps first-trading-day forward returns as labels only and records the point-in-time contract in model metadata
   - trains an XGBoost classifier on sign-adjusted forward returns
   - stores current event scores in `advisory_event_model_scores`
 
@@ -506,7 +515,9 @@ This model is a research and scoring aid. It is not auto-trained inside the dail
 
 The production advisory path does not require event-model training. Use this section only for research experiments or to test whether a tabular event model adds incremental value over playbooks, deterministic event policies, macro gates, and technical timing.
 
-Persisted event-model scores are also research-only by default. Adversarial review ignores `advisory_event_model_scores` unless `STOCKEY_EVENT_MODEL_SCORE_POLICY_MODE=promoted` or `--event-model-score-policy-mode promoted` is set, and even then it fails closed unless `advisory.event_model_promotion_check` returns a usable scorecard.
+Persisted event-model scores are also research-only by default. Adversarial review ignores `advisory_event_model_scores` unless `STOCKEY_EVENT_MODEL_SCORE_POLICY_MODE=promoted` or `--event-model-score-policy-mode promoted` is set, and even then it fails closed unless `advisory.event_model_promotion_check` returns a usable scorecard. The promotion check also fails closed when model metadata lacks leakage-control, false-discovery-control, or transaction-cost-adjusted baseline evidence.
+
+Event-model training writes those research controls into artifact metadata. Leakage control records the event-day feature cutoff and future-return label contract. False-discovery control records that the trainer used one fixed model configuration and one threshold rather than an automated sweep. Cost-adjusted baseline evidence compares predicted-positive holdout trades against a passive event baseline after `--cost-bps` transaction costs; this gate fails unless the model beats that after-cost baseline.
 
 Use the prep command first:
 
@@ -548,7 +559,7 @@ Practical operator checklist:
 ```sh
 python scripts/sql_query_runner.py --read-only "select date(published_on) as published_date, count(*) as eval_count from advisory_event_evaluations group by 1 order by 1"
 python scripts/sql_query_runner.py --read-only "select max(date) as max_price_date from dhan_ohlcv_daily"
-python -m advisory.event_meta_model train --horizon-days 1
+python -m advisory.event_meta_model train --horizon-days 1 --cost-bps 25
 python -m advisory.event_meta_model score --dry-run
 ```
 
@@ -836,6 +847,8 @@ This updates `advisory_action_conflicts` resolution fields and buckets unresolve
 
 Resolved action conflicts are intentionally not sent to Manual Review. Manual Review is an action-required queue and should only include conflicts where `requires_manual_resolution = true` or `resolution_status` is `unresolved` / `manual_required`. Resolved conflicts remain available for audit/debug through Decision Trace, symbol detail pages, and the operator Conflict Rules page.
 
+Repeated unresolved conflict rows for the same symbol/action pair are collapsed in the Manual Review API to the newest active item, with `summary.duplicate_suppressed` reporting how many duplicate queue rows were hidden. Closed operator decisions are also matched by canonical conflict identity, so the same symbol/action conflict does not re-enter active Manual Review just because the source row has a new transient key.
+
 Ask Codex/LLM for a manual promotion review after choosing a candidate config:
 
 ```sh
@@ -1032,7 +1045,7 @@ python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login
 python -m data.dhanlive.auth_cli validate
 ```
 
-If `CDP_ENDPOINT`, `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN` are configured, the regular Dhan clients use the automated Playwright login automatically when the cached access token is missing or expired.
+If `CDP_ENDPOINT`, `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN` are configured, the regular Dhan clients use the automated Playwright login automatically when the cached access token is missing or expired. Chrome/CDP is a required dependency for this path; missing or unreachable Chrome fails the preflight and advisory run. Use `DHAN_AUTO_LOGIN_STEP_TIMEOUT_MS` only to allow slower Dhan mobile, TOTP, PIN, or redirect transitions.
 
 ### Screener looks empty
 

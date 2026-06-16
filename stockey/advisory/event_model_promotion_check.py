@@ -79,6 +79,163 @@ def _check_gte(name: str, value: float | int | None, threshold: float | int, det
     return bool(passed)
 
 
+def _compact_json_text(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=_json_default).lower()
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.event_model_promotion_check",
+            source="research_control_text",
+            fallback_type="json_compaction_failed",
+            severity="warn",
+            reason="Event model promotion check could not serialize research-control metadata and used string fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
+        return str(value).lower()
+
+
+def _first_present_mapping_value(mapping: dict[str, Any], keys: list[str]) -> tuple[str | None, Any]:
+    for key in keys:
+        if key in mapping and mapping.get(key) not in (None, "", [], {}):
+            return key, mapping.get(key)
+    return None, None
+
+
+def _find_research_control(metadata: dict[str, Any], aliases: list[str]) -> tuple[str | None, Any]:
+    source, value = _first_present_mapping_value(metadata, aliases)
+    if source:
+        return source, value
+    for container_key in (
+        "research_controls",
+        "research_safety",
+        "safety_controls",
+        "validation",
+        "validation_controls",
+        "promotion_evidence",
+        "promotion_controls",
+    ):
+        container = metadata.get(container_key)
+        if isinstance(container, dict):
+            source, value = _first_present_mapping_value(container, aliases)
+            if source:
+                return f"{container_key}.{source}", value
+    return None, None
+
+
+def _explicit_pass_value(evidence: Any) -> bool | None:
+    if isinstance(evidence, bool):
+        return bool(evidence)
+    if isinstance(evidence, dict):
+        for key in ("passed", "pass", "ok", "validated", "enabled"):
+            if key in evidence:
+                value = evidence.get(key)
+                if isinstance(value, bool):
+                    return bool(value)
+                if isinstance(value, str):
+                    text = value.strip().lower()
+                    if text in {"true", "yes", "y", "pass", "passed", "ok", "valid", "validated"}:
+                        return True
+                    if text in {"false", "no", "n", "fail", "failed", "invalid"}:
+                        return False
+    if isinstance(evidence, str):
+        text = evidence.strip().lower()
+        if text in {"true", "yes", "y", "pass", "passed", "ok", "valid", "validated"}:
+            return True
+        if text in {"false", "no", "n", "fail", "failed", "invalid"}:
+            return False
+    return None
+
+
+def _research_control_summary(
+    *,
+    metadata: dict[str, Any],
+    name: str,
+    aliases: list[str],
+    required_markers: list[str],
+    missing_reason: str,
+) -> dict[str, Any]:
+    source, evidence = _find_research_control(metadata, aliases)
+    if source is None:
+        return {
+            "passed": False,
+            "source": None,
+            "evidence": None,
+            "reason": missing_reason,
+        }
+    explicit = _explicit_pass_value(evidence)
+    if explicit is not None:
+        return {
+            "passed": bool(explicit),
+            "source": source,
+            "evidence": evidence,
+            "reason": "explicit pass marker" if explicit else "explicit fail marker",
+        }
+    evidence_text = _compact_json_text(evidence)
+    matched = [marker for marker in required_markers if marker in evidence_text]
+    return {
+        "passed": bool(matched),
+        "source": source,
+        "evidence": evidence,
+        "reason": f"matched markers: {', '.join(matched)}" if matched else f"{name} evidence lacks required validation markers",
+    }
+
+
+def summarize_research_safety_controls(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    meta = metadata or {}
+    return {
+        "leakage_control": _research_control_summary(
+            metadata=meta,
+            name="leakage_control",
+            aliases=[
+                "leakage_control",
+                "leakage_controls",
+                "point_in_time_validation",
+                "point_in_time_controls",
+                "no_lookahead_validation",
+            ],
+            required_markers=["point_in_time", "point-in-time", "purged", "embargo", "cpcv", "no_lookahead", "no-lookahead", "causal"],
+            missing_reason="missing point-in-time/leakage-control validation evidence",
+        ),
+        "false_discovery_control": _research_control_summary(
+            metadata=meta,
+            name="false_discovery_control",
+            aliases=[
+                "false_discovery_control",
+                "false_discovery_controls",
+                "multiple_testing_control",
+                "research_ledger_control",
+                "trial_ledger",
+            ],
+            required_markers=["research_ledger", "ledger", "false_discovery", "fdr", "multiple_testing", "q_value", "q-value", "trial_count", "cpcv"],
+            missing_reason="missing false-discovery/research-ledger validation evidence",
+        ),
+        "cost_adjusted_baseline": _research_control_summary(
+            metadata=meta,
+            name="cost_adjusted_baseline",
+            aliases=[
+                "cost_adjusted_baseline",
+                "cost_adjusted_baselines",
+                "transaction_cost_baseline",
+                "after_cost_baseline",
+                "baseline_after_costs",
+            ],
+            required_markers=[
+                "cost_adjusted",
+                "cost-adjusted",
+                "transaction_cost",
+                "after_cost",
+                "after-cost",
+                "slippage",
+                "brokerage",
+                "passive_baseline",
+                "baseline",
+            ],
+            missing_reason="missing transaction-cost-adjusted baseline evidence",
+        ),
+    }
+
+
 def load_artifact_metadata(artifact_dir: Path, model_basename: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     model_path, meta_path = event_meta_model._artifact_paths(artifact_dir, model_basename)
     info = {
@@ -237,6 +394,7 @@ def build_research_scorecard(
     coverage: dict[str, Any],
     weekly_runs: dict[str, Any],
     score_freshness: dict[str, Any],
+    research_safety: dict[str, Any],
 ) -> dict[str, Any]:
     failed_gates = [str(gate.get("gate")) for gate in gates if not gate.get("passed")]
     ready = decision == "review_candidate" and not failed_gates
@@ -276,6 +434,14 @@ def build_research_scorecard(
             "successful_runs": weekly_runs.get("successful_runs"),
             "score_rows": score_freshness.get("score_rows"),
             "score_age_days": score_freshness.get("age_days"),
+        },
+        "research_safety": {
+            key: {
+                "passed": bool((value or {}).get("passed")),
+                "source": (value or {}).get("source"),
+                "reason": (value or {}).get("reason"),
+            }
+            for key, value in (research_safety or {}).items()
         },
     }
 
@@ -335,6 +501,17 @@ def build_promotion_check(args: argparse.Namespace) -> dict[str, Any]:
         }
     )
 
+    research_safety = summarize_research_safety_controls(metadata)
+    for gate_name, summary in research_safety.items():
+        gates.append(
+            {
+                "gate": f"{gate_name}_evidence",
+                "passed": bool((summary or {}).get("passed")),
+                "value": summary,
+                "threshold": "explicit pass marker or recognized validation evidence",
+            }
+        )
+
     failed = [gate for gate in gates if not gate.get("passed")]
     decision = "review_candidate" if not failed else "hold_research_only"
     scorecard = build_research_scorecard(
@@ -344,6 +521,7 @@ def build_promotion_check(args: argparse.Namespace) -> dict[str, Any]:
         coverage=coverage,
         weekly_runs=run_summary,
         score_freshness=score_summary,
+        research_safety=research_safety,
     )
     return {
         "status": "ok",
@@ -356,6 +534,7 @@ def build_promotion_check(args: argparse.Namespace) -> dict[str, Any]:
         "coverage": coverage,
         "weekly_runs": run_summary,
         "score_freshness": score_summary,
+        "research_safety": research_safety,
         "gates": gates,
         "failed_gates": [gate["gate"] for gate in failed],
         "notes": [
@@ -383,6 +562,7 @@ def format_text(payload: dict[str, Any]) -> str:
     coverage = payload.get("coverage") or {}
     runs = payload.get("weekly_runs") or {}
     score = payload.get("score_freshness") or {}
+    safety = payload.get("research_safety") or {}
     metrics = ((payload.get("metadata") or {}).get("metrics") or {})
     lines.extend(
         [
@@ -397,6 +577,10 @@ def format_text(payload: dict[str, Any]) -> str:
             f"- score rows/latest score: {score.get('score_rows')}/{score.get('latest_scored_at')}",
         ]
     )
+    lines.extend(["", "Research safety:"])
+    for key in ("leakage_control", "false_discovery_control", "cost_adjusted_baseline"):
+        value = safety.get(key) or {}
+        lines.append(f"- {key}: passed={bool(value.get('passed'))} source={value.get('source')} reason={value.get('reason')}")
     return "\n".join(lines)
 
 

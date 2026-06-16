@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from advisory.fallback_telemetry import record_local_fallback_event
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_SETUP_CONFIG = REPO_ROOT / "config" / "advisory_setups.yaml"
@@ -84,7 +86,16 @@ def _coerce_float(value: Any) -> float | None:
         return None
     try:
         return float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="advisory.setup_registry",
+            source="setup_config",
+            fallback_type="setup_float_parse_failed",
+            severity="warn",
+            reason="Setup registry could not parse a numeric config value and treated it as missing.",
+            error=exc,
+            metadata={"value": str(value)[:200]},
+        )
         return None
 
 
@@ -93,7 +104,16 @@ def _coerce_int(value: Any) -> int | None:
         return None
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="advisory.setup_registry",
+            source="setup_config",
+            fallback_type="setup_int_parse_failed",
+            severity="warn",
+            reason="Setup registry could not parse an integer config value and treated it as missing.",
+            error=exc,
+            metadata={"value": str(value)[:200]},
+        )
         return None
 
 

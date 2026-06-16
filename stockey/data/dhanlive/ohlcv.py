@@ -271,6 +271,19 @@ def is_no_data_error(exc: Exception) -> bool:
     return "no data present" in message or "incorrect parameters" in message
 
 
+def classify_symbol_sync_error(error: object) -> str:
+    text = str(error or "").lower()
+    if "access token is invalid or expired" in text or "status 401" in text or "unauthorized" in text:
+        return "auth_unavailable"
+    if "no dhan security id mapped" in text or "no dhan index security id mapped" in text:
+        return "reference_mapping_missing"
+    if "timed out" in text or "timeout" in text or "status 502" in text or "status 503" in text or "status 504" in text:
+        return "source_unavailable"
+    if "no data present" in text or "incorrect parameters" in text:
+        return "no_data"
+    return "failed"
+
+
 def with_market_close(target: datetime) -> datetime:
     return target.replace(
         hour=MARKET_CLOSE_HOUR,
@@ -584,6 +597,8 @@ def sync_many_daily(
                 }
             )
         except (DhanAPIError, ValueError) as exc:
+            error_text = f"{exc.__class__.__name__}: {exc}"
+            classification = classify_symbol_sync_error(error_text)
             _record_ohlcv_bulk_sync_fallback(
                 fallback_type="dhan_ohlcv_daily_symbol_sync_failed",
                 source=DAILY_TABLE,
@@ -603,7 +618,8 @@ def sync_many_daily(
                     "asset_type": asset_type,
                     "exchange": exchange.upper(),
                     "warning": "symbol_sync_failed",
-                    "error": f"{exc.__class__.__name__}: {exc}",
+                    "classification": classification,
+                    "error": error_text,
                 },
                 file=sys.stderr,
                 flush=True,
@@ -616,7 +632,8 @@ def sync_many_daily(
                     "rows": 0,
                     "from_date": None,
                     "to_date": None,
-                    "error": f"{exc.__class__.__name__}: {exc}",
+                    "classification": classification,
+                    "error": error_text,
                 }
             )
     return results
@@ -656,6 +673,8 @@ def sync_many_intraday(
                 }
             )
         except (DhanAPIError, ValueError) as exc:
+            error_text = f"{exc.__class__.__name__}: {exc}"
+            classification = classify_symbol_sync_error(error_text)
             _record_ohlcv_bulk_sync_fallback(
                 fallback_type="dhan_ohlcv_intraday_symbol_sync_failed",
                 source=INTRADAY_TABLE,
@@ -677,7 +696,8 @@ def sync_many_intraday(
                     "exchange": exchange.upper(),
                     "interval_minutes": interval_minutes,
                     "warning": "symbol_sync_failed",
-                    "error": f"{exc.__class__.__name__}: {exc}",
+                    "classification": classification,
+                    "error": error_text,
                 },
                 file=sys.stderr,
                 flush=True,
@@ -691,10 +711,29 @@ def sync_many_intraday(
                     "rows": 0,
                     "from_timestamp": None,
                     "to_timestamp": None,
-                    "error": f"{exc.__class__.__name__}: {exc}",
+                    "classification": classification,
+                    "error": error_text,
                 }
             )
     return results
+
+
+def classify_run_state(rows: list[dict[str, object]], *, rows_written: int) -> str:
+    errors = [row for row in rows if row.get("error")]
+    if errors:
+        classifications = [str(row.get("classification") or classify_symbol_sync_error(row.get("error"))) for row in errors]
+        if rows_written > 0:
+            return "partial_failed"
+        if classifications and all(item == "auth_unavailable" for item in classifications):
+            return "auth_unavailable"
+        if classifications and all(item == "reference_mapping_missing" for item in classifications):
+            return "reference_mapping_missing"
+        if classifications and all(item == "source_unavailable" for item in classifications):
+            return "source_unavailable"
+        if classifications and all(item == "no_data" for item in classifications):
+            return "no_data"
+        return "failed"
+    return "ok" if rows_written > 0 else "no_data"
 
 
 def build_run_state(
@@ -721,19 +760,38 @@ def build_run_state(
         if value
     ]
     errors = [row for row in rows if row.get("error")]
+    rows_written = int(sum(int(row.get("rows") or 0) for row in rows))
+    classifications = [
+        str(row.get("classification") or classify_symbol_sync_error(row.get("error")))
+        for row in errors
+    ]
+    classification_counts = {key: classifications.count(key) for key in sorted(set(classifications))}
+    no_data_count = sum(1 for row in rows if not row.get("error") and int(row.get("rows") or 0) == 0)
+    source_unavailable_count = classification_counts.get("source_unavailable", 0)
+    auth_unavailable_count = classification_counts.get("auth_unavailable", 0)
+    reference_mapping_missing_count = classification_counts.get("reference_mapping_missing", 0)
+    classification = classify_run_state(rows, rows_written=rows_written)
     return {
         "from_date": min(dates) if dates else None,
         "to_date": max(dates) if dates else None,
         "from_datetime": min(timestamps) if timestamps else None,
         "to_datetime": max(timestamps) if timestamps else None,
-        "rows": int(sum(int(row.get("rows") or 0) for row in rows)),
-        "rows_written": int(sum(int(row.get("rows") or 0) for row in rows)),
-        "rows_read": int(sum(int(row.get("rows") or 0) for row in rows)),
+        "rows": rows_written,
+        "rows_written": rows_written,
+        "rows_read": rows_written,
+        "classification": classification,
+        "status": "ok" if classification in {"ok", "no_data"} else "failed",
         "fallback_used": False,
         "daily_rows": int(sum(int(row.get("rows") or 0) for row in daily_results)),
         "intraday_rows": int(sum(int(row.get("rows") or 0) for row in intraday_results)),
         "symbol_count": len(symbols),
         "error_count": len(errors),
+        "no_data_count": no_data_count,
+        "source_unavailable_count": source_unavailable_count,
+        "auth_unavailable_count": auth_unavailable_count,
+        "reference_mapping_missing_count": reference_mapping_missing_count,
+        "classification_counts": classification_counts,
+        "state_advanced": rows_written > 0,
         "failed_symbols": [str(row.get("ticker") or "") for row in errors if row.get("ticker")],
         "only": only,
         "exchange": exchange.upper(),

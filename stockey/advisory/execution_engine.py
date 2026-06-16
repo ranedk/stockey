@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -93,9 +94,12 @@ EXECUTION_SCHEMA_STATEMENTS = [
 DEFAULT_MAX_LIVE_ORDERS_PER_RUN = 5
 DEFAULT_MAX_LIVE_ORDER_VALUE_INR = 50_000.0
 DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES = 30
+DEFAULT_MAX_EXECUTION_ROW_AGE_HOURS = 24
+DEFAULT_MIN_EVIDENCE_SUCCESSFUL_RUNS = 3
 LIVE_RUN_CONFIRMATION_ENV = "STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION"
 EXECUTION_APPROVAL_APPROVED_STATUSES = {"approved", "operator_approved"}
 EXECUTION_RECONCILIATION_PASSED_STATUSES = {"passed", "ok", "reconciled"}
+EXECUTION_EVIDENCE_PASSED_STATUSES = {"passed", "ready", "approved"}
 ACTION_ROW_CLOSED_STATUSES = {
     "closed",
     "ignored",
@@ -722,6 +726,11 @@ def build_execution_orders(
             transaction = str(row.get("transaction_type") or "").upper()
             execution_mode = str(row.get("execution_mode") or "").lower()
             reason_contract_status = str(row.get("reason_contract_status") or "").strip().lower()
+            reason_contract = _jsonish(
+                row.get("recommendation_reason_json"),
+                source="recommendation_reason_json",
+                symbol=symbol,
+            )
             reference_price = pd.to_numeric(price_map.get(symbol), errors="coerce")
             reference_price_source = price_source_map.get(symbol)
             reference_price_asof = price_asof_map.get(symbol)
@@ -740,7 +749,10 @@ def build_execution_orders(
             inventory = inventory_map.get(symbol, {})
             available_qty = pd.to_numeric(inventory.get("available_quantity"), errors="coerce")
             action_fraction = pd.to_numeric(row.get("action_fraction"), errors="coerce")
-            row_block_reasons = _action_row_block_reasons(row, monitor_date=monitor_date)
+            row_block_reasons = [
+                *_action_row_block_reasons(row, monitor_date=monitor_date),
+                *_action_transition_block_reasons(reason_contract),
+            ]
             safety_contract = build_execution_plan_safety_contract(
                 source="action_recommendation",
                 action_status=row.get("action_status") if "action_status" in row.index else row.get("status"),
@@ -926,34 +938,52 @@ def build_execution_orders(
         execution_reason = None
         security_id = None
         exchange_segment = None
-        try:
-            identity = resolve_dhan_identity(str(row["symbol"]), "NSE", asset_type="stock")
-            security_id = int(identity["security_id"])
-            exchange_segment = str(identity["exchange_segment"])
-        except Exception as exc:
-            _record_execution_fallback(
-                "execution_portfolio_identity_resolution_failed",
-                source="dhan_identity",
-                reason="portfolio execution planning could not resolve broker security identity",
-                error=exc,
-                symbol=symbol,
-                metadata={
-                    "action_path": "portfolio_order",
-                    "setup_id": str(row.get("setup_id") or ""),
-                    "unique_id": str(row.get("unique_id") or ""),
-                },
-            )
+        transition_block_reasons = _portfolio_transition_block_reasons(row)
+        transition_contract = _portfolio_transition_contract(row)
+        safety_contract = build_execution_plan_safety_contract(
+            source="portfolio_order",
+            action_status=row.get("portfolio_status"),
+            issues=transition_block_reasons.copy(),
+        )
+        safety_contract["portfolio_transition_contract"] = transition_contract
+        if transition_block_reasons:
             execution_status = "submit_blocked"
-            execution_reason = f"Identity resolution failed: {exc}"
-            identity = None
-
-        if pd.isna(reference_price) or reference_price <= 0:
+            execution_reason = " ".join(transition_block_reasons)
+            identity_status = "skipped"
+            identity_error = None
+        else:
+            identity_status = "not_checked"
+            identity_error = None
+        if execution_status == "planned":
+            try:
+                identity = resolve_dhan_identity(str(row["symbol"]), "NSE", asset_type="stock")
+                security_id = int(identity["security_id"])
+                exchange_segment = str(identity["exchange_segment"])
+                identity_status = "resolved"
+            except Exception as exc:
+                _record_execution_fallback(
+                    "execution_portfolio_identity_resolution_failed",
+                    source="dhan_identity",
+                    reason="portfolio execution planning could not resolve broker security identity",
+                    error=exc,
+                    symbol=symbol,
+                    metadata={
+                        "action_path": "portfolio_order",
+                        "setup_id": str(row.get("setup_id") or ""),
+                        "unique_id": str(row.get("unique_id") or ""),
+                    },
+                )
+                execution_status = "submit_blocked"
+                execution_reason = f"Identity resolution failed: {exc}"
+                identity_status = "failed"
+                identity_error = exc
+        if execution_status == "planned" and (pd.isna(reference_price) or reference_price <= 0):
             execution_status = "submit_blocked"
             execution_reason = (execution_reason + " " if execution_reason else "") + "Missing reference close price."
-        elif pd.isna(approved_allocation) or approved_allocation <= 0:
+        elif execution_status == "planned" and (pd.isna(approved_allocation) or approved_allocation <= 0):
             execution_status = "submit_blocked"
             execution_reason = (execution_reason + " " if execution_reason else "") + "Approved allocation is not positive."
-        else:
+        elif execution_status == "planned":
             budget = float(approved_allocation)
             if remaining_cash is not None:
                 budget = min(budget, remaining_cash)
@@ -963,6 +993,15 @@ def build_execution_orders(
                 execution_reason = (execution_reason + " " if execution_reason else "") + "Approved allocation or available cash is too small for one share."
             elif remaining_cash is not None:
                 remaining_cash = max(remaining_cash - (quantity * float(reference_price)), 0.0)
+
+        safety_contract = finalize_execution_plan_safety_contract(
+            safety_contract,
+            execution_status=execution_status,
+            execution_reason=execution_reason,
+            identity_status=identity_status,
+            identity_error=identity_error,
+            security_id=security_id,
+        )
 
         correlation_id = sanitize_correlation_id(f"{row['setup_id']}-{row['symbol']}-{row['unique_id']}")
         limit_price = None if order_type.upper() == "MARKET" else float(reference_price) if pd.notna(reference_price) else None
@@ -992,7 +1031,7 @@ def build_execution_orders(
                 "approved_allocation_inr": None if pd.isna(approved_allocation) else float(approved_allocation),
                 "invest_score_pct": pd.to_numeric(row.get("invest_score_pct"), errors="coerce"),
                 "estimated_order_value_inr": None if pd.isna(reference_price) or quantity <= 0 else float(reference_price) * int(quantity),
-                "safety_checks_json": None,
+                "safety_checks_json": json.dumps(safety_contract, ensure_ascii=False, default=str, sort_keys=True),
                 "broker_order_id": None,
                 "exchange_order_id": None,
                 "execution_status": execution_status,
@@ -1001,7 +1040,21 @@ def build_execution_orders(
                 "submitted_at": None,
                 "broker_update_time": None,
                 "live_mode": False,
-                "raw_broker_json": None,
+                "raw_broker_json": json.dumps(
+                    {
+                        "source": "portfolio_order",
+                        "portfolio_status": row.get("portfolio_status"),
+                        "portfolio_reason": row.get("portfolio_reason"),
+                        "position_state": row.get("position_state"),
+                        "state_transition_contract_json": row.get("state_transition_contract_json"),
+                        "execution_safety_contract": safety_contract,
+                        "reference_price_source": reference_price_source,
+                        "reference_price_asof": reference_price_asof,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                    sort_keys=True,
+                ),
                 "raw_trade_json": None,
                 "load_ts": pd.Timestamp.utcnow(),
             }
@@ -1192,6 +1245,30 @@ def _jsonish(value: Any, *, source: str = "execution_json_context", symbol: str 
         return {}
 
 
+def _action_transition_contract(reason_contract: dict[str, Any]) -> dict[str, Any]:
+    evidence = reason_contract.get("evidence") if isinstance(reason_contract, dict) else None
+    if not isinstance(evidence, dict):
+        return {}
+    transition = evidence.get("action_transition")
+    return transition if isinstance(transition, dict) else {}
+
+
+def _action_transition_block_reasons(reason_contract: dict[str, Any]) -> list[str]:
+    transition = _action_transition_contract(reason_contract)
+    if not transition:
+        return []
+    precondition_status = str(transition.get("precondition_status") or "").strip().lower()
+    missing = [
+        str(item).strip()
+        for item in (transition.get("missing_preconditions") or [])
+        if str(item or "").strip()
+    ]
+    if precondition_status == "complete" and not missing:
+        return []
+    details = ", ".join(missing) if missing else precondition_status or "unknown"
+    return [f"Action transition preconditions incomplete: {details}."]
+
+
 def _trace_execution_rows(df: pd.DataFrame, *, stage: str, step_idx: int) -> None:
     if df.empty:
         return
@@ -1265,6 +1342,10 @@ def build_execution_plan_safety_contract(
     reconciliation_status: str = "not_run",
     approval_required: bool = True,
     reconciliation_required: bool = True,
+    evidence_required: bool = True,
+    evidence_status: str = "missing",
+    evidence_successful_runs: int = 0,
+    evidence_min_successful_runs: int = DEFAULT_MIN_EVIDENCE_SUCCESSFUL_RUNS,
     live_submission_allowed: bool = False,
     issues: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -1275,9 +1356,42 @@ def build_execution_plan_safety_contract(
         "operator_approval_status": approval_status,
         "broker_reconciliation_required": bool(reconciliation_required),
         "broker_reconciliation_status": reconciliation_status,
+        "live_evidence_required": bool(evidence_required),
+        "live_evidence_status": evidence_status,
+        "live_evidence_successful_runs": int(evidence_successful_runs or 0),
+        "live_evidence_min_successful_runs": int(evidence_min_successful_runs or DEFAULT_MIN_EVIDENCE_SUCCESSFUL_RUNS),
         "live_submission_allowed": bool(live_submission_allowed),
         "issues": issues or [],
     }
+
+
+def _portfolio_transition_contract(row: pd.Series) -> dict[str, Any]:
+    return _jsonish(
+        row.get("state_transition_contract_json"),
+        source="portfolio_state_transition_contract_json",
+        symbol=_clean_optional_text(row.get("symbol")).upper() or None,
+    )
+
+
+def _portfolio_transition_block_reasons(row: pd.Series) -> list[str]:
+    reasons: list[str] = []
+    position_state = _clean_optional_text(row.get("position_state")).upper()
+    contract = _portfolio_transition_contract(row)
+    if position_state != "PLANNED_ENTRY":
+        reasons.append(f"Portfolio position_state is {position_state or 'missing'}; expected PLANNED_ENTRY.")
+    if not contract:
+        reasons.append("Missing portfolio state transition contract.")
+        return reasons
+    if str(contract.get("current_state") or "").upper() != "PLANNED_ENTRY":
+        reasons.append(f"Portfolio transition contract current_state is {contract.get('current_state') or 'missing'}; expected PLANNED_ENTRY.")
+    if contract.get("entry_evidence_required") is not True:
+        reasons.append("Portfolio transition contract does not require entry evidence.")
+    rule_text = str(contract.get("entry_evidence_rule") or "")
+    if "portfolio published_on" not in rule_text:
+        reasons.append("Portfolio transition contract is missing the post-published_on entry evidence rule.")
+    if bool(contract.get("broker_execution_allowed")):
+        reasons.append("Portfolio transition contract incorrectly allows direct broker execution.")
+    return reasons
 
 
 def _optional_number(value: object) -> float | None:
@@ -1336,6 +1450,7 @@ def _build_action_order_intent_lineage(
         },
     }
     if reason_contract:
+        action_transition = _action_transition_contract(reason_contract)
         lineage["reason_contract"] = {
             "status": reason_contract.get("status"),
             "action": reason_contract.get("action"),
@@ -1344,6 +1459,14 @@ def _build_action_order_intent_lineage(
             "manual_review_boundary": reason_contract.get("manual_review_boundary"),
             "sections_present": sorted([key for key, value in reason_contract.items() if isinstance(value, dict) and value]),
         }
+        if action_transition:
+            lineage["reason_contract"]["action_transition"] = {
+                "state_effect": action_transition.get("state_effect"),
+                "precondition_status": action_transition.get("precondition_status"),
+                "missing_preconditions": action_transition.get("missing_preconditions") or [],
+                "broker_order_candidate": action_transition.get("broker_order_candidate"),
+                "broker_execution_allowed": action_transition.get("broker_execution_allowed"),
+            }
     return lineage
 
 
@@ -1444,7 +1567,73 @@ def build_live_execution_confirmation_token(df: pd.DataFrame) -> str:
             date_value = dates.min().normalize().date().isoformat()
     if not date_value:
         date_value = pd.Timestamp.utcnow().normalize().date().isoformat()
-    return f"STOCKEY-LIVE-{date_value}-{planned_count}"
+    fingerprint_columns = [
+        "asof_date",
+        "setup_id",
+        "symbol",
+        "unique_id",
+        "correlation_id",
+        "transaction_type",
+        "security_id",
+        "quantity",
+        "estimated_order_value_inr",
+    ]
+    if df.empty:
+        fingerprint_payload: list[dict[str, Any]] = []
+    else:
+        available_columns = [column for column in fingerprint_columns if column in df.columns]
+        fingerprint_payload = (
+            df.loc[:, available_columns]
+            .copy()
+            .sort_values(by=[column for column in ["symbol", "setup_id", "unique_id", "correlation_id"] if column in available_columns])
+            .to_dict(orient="records")
+        )
+    fingerprint = hashlib.sha256(json.dumps(fingerprint_payload, default=str, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return f"STOCKEY-LIVE-{date_value}-{planned_count}-{fingerprint}"
+
+
+def live_execution_row_freshness_blocker(
+    row: Any,
+    *,
+    max_age_hours: int | None = None,
+    now: pd.Timestamp | None = None,
+) -> str | None:
+    max_age = DEFAULT_MAX_EXECUTION_ROW_AGE_HOURS if max_age_hours is None else int(max_age_hours)
+    if max_age <= 0:
+        return None
+    if hasattr(row, "get"):
+        load_ts_value = row.get("load_ts")
+    else:
+        load_ts_value = None
+    if load_ts_value is None:
+        return None
+    load_ts = pd.to_datetime(load_ts_value, utc=True, errors="coerce")
+    if pd.isna(load_ts):
+        return "Execution row load_ts is invalid; regenerate the dry-run execution preview before live submission."
+    current = pd.to_datetime(now or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    if pd.isna(current):
+        current = pd.Timestamp.utcnow()
+    age_hours = (current - load_ts).total_seconds() / 3600.0
+    if age_hours < 0:
+        return "Execution row load_ts is in the future; regenerate the dry-run execution preview before live submission."
+    if age_hours > float(max_age):
+        return f"Execution dry-run row is {age_hours:.1f} hours old; regenerate before live submission."
+    return None
+
+
+def _post_live_allowance_approval_blocker(contract: dict[str, Any]) -> str | None:
+    if not contract.get("live_submission_allowed"):
+        return None
+    if not contract.get("post_live_allowance_approval_required", bool(contract.get("live_allowance_allowed_at"))):
+        return None
+    approval_status = str(contract.get("post_live_allowance_approval_status") or "").strip().lower()
+    if approval_status in EXECUTION_APPROVAL_APPROVED_STATUSES:
+        return None
+    allowed_at = contract.get("live_allowance_allowed_at")
+    return (
+        "Fresh operator approval after live allowance is required before live submission"
+        + (f"; live allowance was recorded at {allowed_at}." if allowed_at else ".")
+    )
 
 
 def apply_live_execution_safety(df: pd.DataFrame, *, live_confirmation: str | None = None) -> pd.DataFrame:
@@ -1462,6 +1651,9 @@ def apply_live_execution_safety(df: pd.DataFrame, *, live_confirmation: str | No
     max_price_age_minutes = _env_int("STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES", DEFAULT_MAX_INTRADAY_PRICE_AGE_MINUTES)
     require_operator_approval = _env_bool("STOCKEY_EXECUTION_REQUIRE_OPERATOR_APPROVAL", True)
     require_reconciliation = _env_bool("STOCKEY_EXECUTION_REQUIRE_RECONCILIATION", True)
+    require_evidence = _env_bool("STOCKEY_EXECUTION_REQUIRE_EVIDENCE_CHECKLIST", True)
+    min_evidence_runs = _env_int("STOCKEY_EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS", DEFAULT_MIN_EVIDENCE_SUCCESSFUL_RUNS)
+    max_execution_row_age_hours = _env_int("STOCKEY_EXECUTION_MAX_ROW_AGE_HOURS", DEFAULT_MAX_EXECUTION_ROW_AGE_HOURS)
     provided_confirmation = (live_confirmation or os.getenv(LIVE_RUN_CONFIRMATION_ENV) or "").strip()
 
     def block(idx: int, reason: str, checks: dict[str, Any]) -> None:
@@ -1480,6 +1672,9 @@ def apply_live_execution_safety(df: pd.DataFrame, *, live_confirmation: str | No
         "max_intraday_price_age_minutes": max_price_age_minutes,
         "require_operator_approval": require_operator_approval,
         "require_reconciliation": require_reconciliation,
+        "require_evidence_checklist": require_evidence,
+        "min_evidence_successful_runs": min_evidence_runs,
+        "max_execution_row_age_hours": max_execution_row_age_hours,
         "live_run_confirmation_required": True,
         "live_run_confirmation_env": LIVE_RUN_CONFIRMATION_ENV,
         "live_run_confirmation_expected": confirmation_token,
@@ -1520,7 +1715,20 @@ def apply_live_execution_safety(df: pd.DataFrame, *, live_confirmation: str | No
         plan_contract = _safety_contract_from_row(out.loc[idx])
         approval_status = str(plan_contract.get("operator_approval_status") or "").strip().lower()
         reconciliation_status = str(plan_contract.get("broker_reconciliation_status") or "").strip().lower()
+        contract_live_allowed = bool(plan_contract.get("live_submission_allowed"))
+        evidence_status = str(plan_contract.get("live_evidence_status") or "").strip().lower()
+        evidence_runs = pd.to_numeric(plan_contract.get("live_evidence_successful_runs"), errors="coerce")
+        if pd.isna(evidence_runs):
+            evidence_runs = 0
         checks["execution_safety_contract"] = plan_contract
+        freshness_blocker = live_execution_row_freshness_blocker(
+            out.loc[idx],
+            max_age_hours=max_execution_row_age_hours,
+            now=now,
+        )
+        if freshness_blocker:
+            block(idx, freshness_blocker, checks)
+            continue
         if pd.isna(quantity) or int(quantity) <= 0:
             block(idx, "Quantity is not positive.", checks)
             continue
@@ -1552,6 +1760,19 @@ def apply_live_execution_safety(df: pd.DataFrame, *, live_confirmation: str | No
             continue
         if require_reconciliation and reconciliation_status not in EXECUTION_RECONCILIATION_PASSED_STATUSES:
             block(idx, "Broker account reconciliation is required before live submission.", checks)
+            continue
+        if not contract_live_allowed:
+            block(idx, "Execution safety contract does not allow live submission.", checks)
+            continue
+        post_allowance_blocker = _post_live_allowance_approval_blocker(plan_contract)
+        if post_allowance_blocker:
+            block(idx, post_allowance_blocker, checks)
+            continue
+        if require_evidence and evidence_status not in EXECUTION_EVIDENCE_PASSED_STATUSES:
+            block(idx, "Live execution evidence checklist is required before live submission.", checks)
+            continue
+        if require_evidence and int(evidence_runs) < min_evidence_runs:
+            block(idx, f"Live execution evidence has {int(evidence_runs)} successful run(s); requires at least {min_evidence_runs}.", checks)
             continue
         out.at[idx, "safety_checks_json"] = json.dumps({**checks, "passed": True}, ensure_ascii=False, default=str, sort_keys=True)
     return out

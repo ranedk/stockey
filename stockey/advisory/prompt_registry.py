@@ -11,6 +11,16 @@ import pandas as pd
 AuthorityScope = Literal["extraction_only", "review_input_only", "research_only", "no_broker_execution"]
 Provider = Literal["codex", "openai", "gemini", "mixed", "deterministic_fallback"]
 
+ADVISORY_EVENT_EVALUATION_PROMPT_ID = "advisory_event_evaluation"
+EVENT_POLICY_MANUAL_REVIEW_PROMPT_ID = "event_policy_manual_review"
+COMPANY_MEMORY_REVIEW_PROMPT_ID = "company_memory_review"
+PLAYBOOK_ACTION_PLAN_PROMPT_ID = "playbook_action_plan"
+MANUAL_REVISION_POINTERS_PROMPT_ID = "manual_revision_pointers"
+TECHNICAL_THRESHOLD_PROMOTION_REVIEW_PROMPT_ID = "technical_threshold_promotion_review"
+ANNOUNCEMENT_SUMMARY_PROMPT_ID = "announcement_summary"
+ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID = "announcement_structured_report"
+OCR_PDF_PAGE_PROMPT_ID = "ocr_pdf_page"
+
 
 @dataclass(frozen=True)
 class PromptContract:
@@ -36,7 +46,7 @@ class PromptContract:
 
 PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
     PromptContract(
-        prompt_id="advisory_event_evaluation",
+        prompt_id=ADVISORY_EVENT_EVALUATION_PROMPT_ID,
         version="ADVISORY_EVENT_EVAL_V4",
         title="Advisory event evaluation",
         owner_area="announcement_event_policy",
@@ -54,7 +64,7 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         notes=["Structured event signal only; deterministic action/policy layers remain authoritative."],
     ),
     PromptContract(
-        prompt_id="event_policy_manual_review",
+        prompt_id=EVENT_POLICY_MANUAL_REVIEW_PROMPT_ID,
         version="EVENT_POLICY_MANUAL_REVIEW_V1",
         title="Event-policy manual review notes",
         owner_area="event_policy",
@@ -72,7 +82,7 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         notes=["May downgrade a manual-review event to NO_ACTION, but never creates broker-executable action."],
     ),
     PromptContract(
-        prompt_id="company_memory_review",
+        prompt_id=COMPANY_MEMORY_REVIEW_PROMPT_ID,
         version="COMPANY_MEMORY_REVIEW_V1",
         title="Company-memory review",
         owner_area="company_memory",
@@ -90,7 +100,7 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         notes=["Review input only; deterministic action consolidation remains authoritative."],
     ),
     PromptContract(
-        prompt_id="playbook_action_plan",
+        prompt_id=PLAYBOOK_ACTION_PLAN_PROMPT_ID,
         version="PLAYBOOK_ACTION_PLAN_V1",
         title="Hypothesis/playbook action plan",
         owner_area="hypothesis_engine",
@@ -108,7 +118,7 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         notes=["Trusted-overlay playbooks may influence review overlays, not direct broker execution."],
     ),
     PromptContract(
-        prompt_id="manual_revision_pointers",
+        prompt_id=MANUAL_REVISION_POINTERS_PROMPT_ID,
         version="ACTION_MANUAL_REVISION_POINTERS_V1",
         title="Action manual-revision pointers",
         owner_area="action_recommender",
@@ -126,7 +136,7 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         notes=["Does not override final action or recommend broker submission."],
     ),
     PromptContract(
-        prompt_id="technical_threshold_promotion_review",
+        prompt_id=TECHNICAL_THRESHOLD_PROMOTION_REVIEW_PROMPT_ID,
         version="TECHNICAL_THRESHOLD_PROMOTION_REVIEW_V1",
         title="Technical threshold promotion review",
         owner_area="technical_calibration",
@@ -144,7 +154,7 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         notes=["Creates patch guidance only; config changes require separate manual review."],
     ),
     PromptContract(
-        prompt_id="announcement_summary",
+        prompt_id=ANNOUNCEMENT_SUMMARY_PROMPT_ID,
         version="ANNOUNCEMENT_SUMMARY_V1",
         title="Announcement text summary",
         owner_area="announcement_ingestion",
@@ -158,11 +168,11 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         input_evidence=["OCR text", "announcement metadata"],
         output_tables=["announcement_pipeline_documents", "announcement_pipeline_reports"],
         fallback_behavior="Caller records summarization failure; no investment action is created directly.",
-        migration_status="inventory_only",
+        migration_status="caller_migrated",
         notes=["Keep summaries faithful; no unsupported inference."],
     ),
     PromptContract(
-        prompt_id="announcement_structured_report",
+        prompt_id=ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID,
         version="ANNOUNCEMENT_STRUCTURED_REPORT_V1",
         title="Announcement structured report extraction",
         owner_area="announcement_ingestion",
@@ -176,11 +186,11 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         input_evidence=["OCR text", "announcement metadata", "report prompt template"],
         output_tables=["announcement_pipeline_reports"],
         fallback_behavior="Caller records parse failure; recovered rows are suppressed when later parse succeeds.",
-        migration_status="inventory_only",
+        migration_status="caller_migrated",
         notes=["Output values must be explicitly supported by document text."],
     ),
     PromptContract(
-        prompt_id="ocr_pdf_page",
+        prompt_id=OCR_PDF_PAGE_PROMPT_ID,
         version="OCR_PDF_PAGE_V1",
         title="PDF page OCR",
         owner_area="announcement_ingestion",
@@ -194,7 +204,7 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         input_evidence=["rendered PDF page image"],
         output_tables=["announcement_pipeline_documents"],
         fallback_behavior="Caller records OCR failure; no investment action is created directly.",
-        migration_status="inventory_only",
+        migration_status="caller_migrated",
         notes=["Preserve visible text faithfully."],
     ),
 )

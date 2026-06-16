@@ -849,6 +849,11 @@ def evaluate_signal_quality(
         "event_lookback_days": int(event_lookback_days),
         "bhavcopy_lookback_days": int(bhavcopy_lookback_days),
         "company_memory_lookback_days": int(company_memory_lookback_days),
+        "point_in_time_return_contract": (
+            json.loads(dataset["point_in_time_return_contract_json"].dropna().iloc[0])
+            if "point_in_time_return_contract_json" in dataset.columns and dataset["point_in_time_return_contract_json"].notna().any()
+            else {}
+        ),
     }
     return evaluations, summary, meta
 

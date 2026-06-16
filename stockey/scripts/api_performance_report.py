@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +52,61 @@ def _read_json(path: str | Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _parse_timestamp(value: Any, *, field: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        _record_api_performance_fallback(
+            fallback_type="api_performance_timestamp_parse_failed",
+            reason="API performance report could not parse an evidence timestamp; marking evidence freshness as unknown.",
+            error=exc,
+            metadata={"field": field, "value": text},
+        )
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _evidence_freshness(
+    *,
+    probe: dict[str, Any],
+    state: dict[str, Any],
+    max_probe_age_hours: float,
+) -> dict[str, Any]:
+    generated_at = _parse_timestamp(probe.get("generated_at"), field="probe_generated_at")
+    state_updated_at = _parse_timestamp(state.get("updated_at"), field="slow_state_updated_at")
+    now = datetime.now(timezone.utc)
+    max_age_seconds = max(float(max_probe_age_hours), 0.0) * 3600.0
+    probe_age_seconds = (now - generated_at).total_seconds() if generated_at else None
+    if not generated_at:
+        probe_status = "missing"
+        warning = "Latest API probe evidence is missing; slowlog-only ranking can be historical and should not drive optimization alone."
+    elif probe_age_seconds is not None and max_age_seconds and probe_age_seconds > max_age_seconds:
+        probe_status = "stale"
+        warning = "Latest API probe evidence is stale; rerun the probe before deciding the next API optimization."
+    else:
+        probe_status = "fresh"
+        warning = ""
+    return {
+        "probe_status": probe_status,
+        "probe_generated_at": generated_at.isoformat() if generated_at else None,
+        "probe_age_seconds": round(probe_age_seconds, 2) if probe_age_seconds is not None else None,
+        "max_probe_age_hours": float(max_probe_age_hours),
+        "slow_state_updated_at": state_updated_at.isoformat() if state_updated_at else None,
+        "warning": warning,
+        "operator_action": (
+            "Run `python scripts/api_latency_probe.py --output-path logs/performance/latest_api_latency_probe.json`, then rerun "
+            "`python scripts/api_performance_report.py --limit 20` before choosing the next endpoint."
+            if probe_status in {"missing", "stale"}
+            else "Probe evidence is fresh enough for endpoint triage."
+        ),
+    }
+
+
 def _route_from_issue(issue: dict[str, Any]) -> str:
     details = issue.get("last_details") if isinstance(issue.get("last_details"), dict) else {}
     route = details.get("route") or details.get("endpoint")
@@ -91,15 +146,37 @@ def _route_recommendation(route: str, *, max_response_bytes: int, error_count: i
     return "Monitor; optimize only if this stays above threshold in fresh probe data."
 
 
+def _probe_error_count(row: dict[str, Any]) -> int:
+    if "latest_probe_error_count" in row:
+        return int(row.get("latest_probe_error_count") or 0)
+    status_code = _int_or_none(row.get("latest_probe_status_code"), field="latest_probe_status_code", source=str(row.get("route") or "unknown"))
+    if row.get("latest_probe_error") or (status_code is not None and status_code >= 400):
+        return 1
+    return 0
+
+
+def _fresh_probe_priority(row: dict[str, Any]) -> float:
+    if row.get("latest_probe_elapsed_ms") is None:
+        return 0.0
+    return round(
+        float(row.get("latest_probe_elapsed_ms") or 0.0)
+        + min(int(row.get("latest_probe_response_bytes") or 0), 2_000_000) / 1000.0
+        + _probe_error_count(row) * 1000.0,
+        2,
+    )
+
+
 def build_api_performance_report(
     *,
     probe_path: str | Path = DEFAULT_PROBE_PATH,
     state_file: str | Path = DEFAULT_SLOW_STATE_FILE,
     status: str | None = "open",
     limit: int = 20,
+    max_probe_age_hours: float = 24.0,
 ) -> dict[str, Any]:
     probe = _read_json(probe_path)
     state = load_slow_state(state_file)
+    evidence = _evidence_freshness(probe=probe, state=state, max_probe_age_hours=max_probe_age_hours)
     route_rows: dict[str, dict[str, Any]] = {}
 
     for issue in (state.get("issues") or {}).values():
@@ -125,6 +202,9 @@ def build_api_performance_report(
                 "latest_probe_elapsed_ms": None,
                 "latest_probe_error": None,
                 "latest_probe_status_code": None,
+                "latest_probe_response_bytes": None,
+                "latest_probe_slow_logged": False,
+                "latest_probe_error_count": 0,
             },
         )
         row["issue_count"] += 1
@@ -166,37 +246,72 @@ def build_api_performance_report(
                 "latest_probe_elapsed_ms": None,
                 "latest_probe_error": None,
                 "latest_probe_status_code": None,
+                "latest_probe_response_bytes": None,
+                "latest_probe_slow_logged": False,
+                "latest_probe_error_count": 0,
             },
         )
         elapsed = float(probe_row.get("elapsed_ms") or 0.0)
         row["latest_probe_elapsed_ms"] = elapsed
         row["latest_probe_error"] = probe_row.get("error")
         row["latest_probe_status_code"] = probe_row.get("status_code")
+        row["latest_probe_slow_logged"] = bool(probe_row.get("slow_logged"))
         row["max_elapsed_ms"] = max(float(row["max_elapsed_ms"] or 0.0), elapsed)
         parsed_body_bytes = _int_or_none(probe_row.get("body_bytes"), field="body_bytes", source=route)
         if parsed_body_bytes is not None:
+            row["latest_probe_response_bytes"] = parsed_body_bytes
             row["max_response_bytes"] = max(int(row["max_response_bytes"] or 0), parsed_body_bytes)
         status_code = _int_or_none(probe_row.get("status_code"), field="status_code", source=route)
         if probe_row.get("error") or (status_code is not None and status_code >= 400):
+            row["latest_probe_error_count"] = 1
             row["error_count"] += 1
 
     rows = []
+    probe_is_fresh = str(evidence.get("probe_status") or "").lower() == "fresh"
     for row in route_rows.values():
-        row["priority_score"] = round(
+        historical_priority_score = round(
             float(row.get("max_elapsed_ms") or 0.0)
             + min(int(row.get("occurrence_count") or 0), 100) * 25.0
             + min(int(row.get("max_response_bytes") or 0), 2_000_000) / 1000.0
             + int(row.get("error_count") or 0) * 1000.0,
             2,
         )
-        row["recommendation"] = _route_recommendation(
-            str(row["route"]),
-            max_response_bytes=int(row.get("max_response_bytes") or 0),
-            error_count=int(row.get("error_count") or 0),
-            max_elapsed_ms=float(row.get("max_elapsed_ms") or 0.0),
+        fresh_priority_score = _fresh_probe_priority(row)
+        row["historical_priority_score"] = historical_priority_score
+        row["fresh_probe_priority_score"] = fresh_priority_score
+        row["ranking_basis"] = (
+            "fresh_probe"
+            if probe_is_fresh and row.get("latest_probe_elapsed_ms") is not None
+            else "historical_slowlog"
         )
+        row["priority_score"] = fresh_priority_score if row["ranking_basis"] == "fresh_probe" else historical_priority_score
+        if row["ranking_basis"] == "fresh_probe":
+            row["recommendation"] = _route_recommendation(
+                str(row["route"]),
+                max_response_bytes=int(row.get("latest_probe_response_bytes") or 0),
+                error_count=_probe_error_count(row),
+                max_elapsed_ms=float(row.get("latest_probe_elapsed_ms") or 0.0),
+            )
+        elif probe_is_fresh:
+            row["recommendation"] = (
+                "Historical slowlog issue was not exercised by the latest probe; run a targeted probe for this route before choosing it."
+            )
+        else:
+            row["recommendation"] = _route_recommendation(
+                str(row["route"]),
+                max_response_bytes=int(row.get("max_response_bytes") or 0),
+                error_count=int(row.get("error_count") or 0),
+                max_elapsed_ms=float(row.get("max_elapsed_ms") or 0.0),
+            )
         rows.append(row)
-    rows.sort(key=lambda item: (float(item.get("priority_score") or 0.0), str(item.get("last_seen_at") or "")), reverse=True)
+    rows.sort(
+        key=lambda item: (
+            1 if str(item.get("ranking_basis") or "") == "fresh_probe" else 0,
+            float(item.get("priority_score") or 0.0),
+            str(item.get("last_seen_at") or ""),
+        ),
+        reverse=True,
+    )
     rows = rows[: max(int(limit), 0)]
 
     return {
@@ -205,6 +320,8 @@ def build_api_performance_report(
         "state_file": str(state_file),
         "probe_generated_at": probe.get("generated_at"),
         "slow_state_updated_at": state.get("updated_at"),
+        "evidence_freshness": evidence,
+        "operator_action": evidence["operator_action"],
         "route_count": len(route_rows),
         "returned_count": len(rows),
         "rows": rows,
@@ -216,13 +333,25 @@ def _format_text(report: dict[str, Any]) -> str:
         f"status: {report.get('status')}",
         f"probe_generated_at: {report.get('probe_generated_at') or 'missing'}",
         f"slow_state_updated_at: {report.get('slow_state_updated_at') or 'missing'}",
+        f"evidence_status: {((report.get('evidence_freshness') or {}).get('probe_status') or 'unknown')}",
+        f"operator_action: {report.get('operator_action')}",
         f"returned_count: {report.get('returned_count', 0)}",
     ]
+    warning = (report.get("evidence_freshness") or {}).get("warning")
+    if warning:
+        lines.append(f"warning: {warning}")
     for idx, row in enumerate(report.get("rows") or [], start=1):
         lines.append(
             f"{idx}. {row.get('route')} score={row.get('priority_score')} max_ms={row.get('max_elapsed_ms')} "
-            f"count={row.get('occurrence_count')} bytes={row.get('max_response_bytes')} errors={row.get('error_count')}"
+            f"count={row.get('occurrence_count')} bytes={row.get('max_response_bytes')} errors={row.get('error_count')} "
+            f"basis={row.get('ranking_basis')}"
         )
+        if row.get("latest_probe_elapsed_ms") is not None:
+            lines.append(
+                f"   fresh_probe: ms={row.get('latest_probe_elapsed_ms')} "
+                f"bytes={row.get('latest_probe_response_bytes')} status={row.get('latest_probe_status_code')} "
+                f"error={row.get('latest_probe_error') or '-'}"
+            )
         lines.append(f"   recommendation: {row.get('recommendation')}")
         fingerprints = row.get("fingerprints") or []
         if fingerprints:
@@ -236,6 +365,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-file", default=str(DEFAULT_SLOW_STATE_FILE))
     parser.add_argument("--status", default="open", help="Slow issue status filter. Use empty string for all statuses.")
     parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--max-probe-age-hours", type=float, default=24.0)
     parser.add_argument("--format", choices=["json", "text"], default="text")
     args = parser.parse_args(argv)
     report = build_api_performance_report(
@@ -243,6 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         state_file=args.state_file,
         status=args.status if str(args.status).strip() else None,
         limit=int(args.limit),
+        max_probe_age_hours=float(args.max_probe_age_hours),
     )
     if args.format == "json":
         print(json.dumps(report, indent=2, default=_json_default))

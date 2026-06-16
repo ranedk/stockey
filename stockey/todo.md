@@ -40,12 +40,21 @@ The active stack already has:
 - broad research-only training universes from ad hoc Screener queries, disabled from the default operating loop
 - continuous watch, live alerting, event routing, consolidated action recommendations, and a Nuxt operator frontend backed by an operator-controlled Python API
 - watcher-triggered signal refresh in `advisory_signal_refresh_actions`, which gives fast per-symbol buy/watch/review/exit visibility without rerunning full advisory
+- signal-refresh rows and decision traces now persist `previous_action` and `action_changed`, so watcher-triggered deltas are debuggable without opening large JSON payloads
+- signal-refresh rows and `/api/signal-refresh` compact payloads now expose explicit authority fields: `authority_scope=review_input_only`, `portfolio_authority=none`, `broker_execution_allowed=false`, and `full_advisory_required=true`; the home UI renders these badges on live signal cards
+- event-router trigger context now feeds signal refresh: stop/invalidation price alerts become review-only reduce signals, entry/breakout alerts become review-only watch signals, and news/announcement router context becomes manual review until full advisory/event-policy reconciliation
+- compact `/api/signal-refresh` rows now expose bounded router trigger context, and the Operator home Live Signal Refresh card shows source type, trigger reason, priority, and rank without returning full raw payload JSON
+- compact `/api/signal-refresh` rows now expose a derived operator next-step contract, and the Operator home Live Signal Refresh card states whether to review exposure, inspect Manual Review/event evidence, keep watching, or run full advisory before portfolio/execution changes
 - hypothesis/playbook Wait Signals in `advisory_wait_signals` and `advisory_wait_signal_matches`, generated from action plans and matched by watchers/signal refresh
 - targeted operator frontend supervision with `./all_frontend.sh --api-only`, `--web-only`, and `--both`
 - DB-backed operator snapshots, slow-operation logging, health fix hints, and visible sync-state failure reporting
 - guarded Health-page superseded cleanup apply for recovered processing/document failures, audited as metadata cleanup and explicitly blocked from portfolio/action/config/broker mutation
+- Manual Review suppresses event-policy rows and shadow action rows that came from old `llm_error` fallback evaluations after a newer completed non-LLM-error evaluation exists for the same setup/symbol/event
+- Manual Review reopens rows when the source row updates after the latest operator decision, including canonical duplicate/conflict keys, so an old `ignore`/`downgrade_to_no_action` cannot hide refreshed evidence
 - durable identity issue tracking and guarded identity repair preview/apply flows
 - per-symbol feature freshness contracts visible in Action Queue and Symbol Detail, with action decision-time snapshots persisted in `advisory_action_recommendations`
+- source-specific payload freshness visible on the main operator page and Symbol Detail, so Home/Actions/Portfolio/Signal Refresh/Events/Trace/Data Inputs/Identity age and stale warnings are visible before the operator trusts recommendations
+- company-memory review rows carry a compact evidence-source contract, and Action Queue/Symbol Detail show whether announcement, bhavcopy, and technical evidence coverage is complete or partial before the operator trusts the review
 - read-only cron status, operator smoke, signal-quality, prompt-registry, technical-calibration, and research-evidence UI/API paths
 - `.env.example` coverage is now checked by `python scripts/env_example_audit.py --strict`, which scans Python, shell, cron, and frontend env usage
 - roadmap/docs drift is now checked by `python scripts/docs_state_audit.py --strict`, which flags removed script/static-dashboard references and verifies canonical operator-flow coverage
@@ -79,20 +88,23 @@ The active stack already has:
 
 1. The highest-priority gap is now UI-first operations: every normal operator action should be visible, explainable, and auditable from the Nuxt app.
 2. Remaining high-risk gaps are observability and correctness gaps, not missing major architecture blocks.
-3. Some manual workflows still require CLI/manual edits or copy-paste review: approved config diffs, S3 artifact inspection, and some research-ledger review.
-4. Fast signal refresh is intentionally not the authoritative portfolio allocator. Daily `all_advisory.sh` remains the reconciliation path until enough evidence proves incremental advisory is safe.
+3. Some manual workflows still require CLI/manual edits or copy-paste review: approved config diffs and advanced research-ledger write/reconciliation review. Event-model S3 artifact inspection and recent research-ledger inspection are now visible in Operations as read-only boundary-backed views.
+4. Fast signal refresh is intentionally not the authoritative portfolio allocator. Daily `all_advisory.sh` remains the reconciliation path until enough evidence proves incremental advisory is safe; signal-refresh rows now carry machine-readable no-portfolio/no-broker/full-advisory-required authority fields.
 5. Done: non-home frontend list endpoints now return compact rows or explicit pagination/bounded-list metadata. Actions, Events, Portfolio, trace summary/list payloads, cron logs, prompt registry, hypotheses, artifact manifests, and research review/previews are covered.
-6. Done: `/api/health/details` now defaults to bounded parallel fast mode, uses short API caching, and defers heavyweight source/table/log/fallback/API-error-history scans to `mode=full` or CLI diagnostics; 2026-06-09 probe measured ~0.64s cold and ~0.002s warm.
-7. Done: Action Queue reads use section snapshots plus `advisory_current_prices`; 2026-06-09 probe improved `/api/actions?...compact=true` to ~0.74s cold and ~0.10s warm, below the generic slowlog threshold.
-8. Done: `/api/hypotheses?limit=25` now skips related empty reads, batches promotion-audit lookups, and uses a short API cache; 2026-06-09 probe improved from ~1.45s to ~0.64s cold and ~0.003s warm.
-9. Done: trace summaries are materialized, and `scripts/hot_table_retention.py` now provides report-first archive/delete retention for old trace and intraday rows.
-10. The serialized external task queue now has concrete NSE/Dhan/Screener handlers plus a queued downloader/worker cron path; direct `all_downloaders.sh` and `complete_data.sh` remain the catch-up/backfill path when a day is missed.
-11. `all_advisory.sh` now defaults to bounded local-stage parallelism and skips hidden rule repair; next performance work is stage-budget reporting and moving remaining external repair into queue workers where safe.
-12. Continuous watch should add stronger cooldowns, duplicate suppression, and explicit per-source failure counters.
-13. Approved technical threshold and signal-quality reviews now generate reviewed diffs, but actual production config application remains manual.
-14. Legacy “promotion audit” naming should be migrated to “reliability check” once DB migration is safe.
-15. Done: `.env.example` has been reconciled against runtime env usage and guarded by `scripts/env_example_audit.py --strict`.
-16. Done: README/docs/todo/analysis current-state coverage is guarded by `scripts/docs_state_audit.py --strict`.
+6. Done: compact Manual Review API payloads now strip full previous `item_snapshot` data from `latest_operator_decision`, cap nested compact raw fields, and expose payload byte telemetry in the summary/queue contract and Manual Review UI, while `include_raw=true` remains the explicit debug escape hatch.
+7. Done: `/api/health/details` now defaults to bounded fast mode, uses short API caching, keeps heavy DB diagnostics deferred to `mode=full` or CLI diagnostics, lowers default fast-worker pressure for small Postgres instances, exposes a `deferred_diagnostics` contract that the Health page renders before operators trust the abbreviated result, and dedupes current blockers across fix hints/sections/degradation rows; 2026-06-09 probe measured ~0.64s cold and ~0.002s warm before the latest DB-pressure reduction.
+8. Done: Action Queue reads use section snapshots plus `advisory_current_prices`; 2026-06-09 probe improved `/api/actions?...compact=true` to ~0.74s cold and ~0.10s warm, below the generic slowlog threshold. `/api/actions` and `/api/portfolio` now default to compact at the HTTP route layer, while `?compact=false` and detail routes remain the explicit full-evidence debug paths. On 2026-06-12, `/api/actions?include_feature_freshness=true` was changed to use persisted decision-time freshness by default, with expensive current-live checks behind `refresh_feature_freshness=true`; compact action-list trust/reason fields were trimmed further while preserving detail routes for full contracts. `/api/home` now omits duplicated action/today cards by default and keeps them behind `include_action_cards=true`, reducing measured in-process Home JSON from roughly 275 KB to 16 KB. `/api/portfolio` now supports `bucket=<section>` and the landing page requests only the selected tab, reducing measured in-process portfolio JSON from roughly 160 KB for all sections to roughly 72-74 KB for recommendation tabs and roughly 8 KB for the raw portfolio tab. `/api/watchlist` now supports `section=<section>`, compacts TS forecast watch rows by omitting raw swing/position windows, and reduces measured in-process all-section JSON from roughly 253 KB to 91 KB, with section reads around 6-34 KB. `/api/config-change/applications` now reads compact application-audit list fields by default and excludes bulky preview snapshots unless explicitly requested.
+9. Done: `/api/hypotheses?limit=25` now skips related empty reads, batches promotion-audit lookups, and uses a short API cache; 2026-06-09 probe improved from ~1.45s to ~0.64s cold and ~0.003s warm.
+10. Done: trace summaries are materialized, and `scripts/hot_table_retention.py` now provides report-first archive/delete retention for old trace and intraday rows.
+11. The serialized external task queue now has concrete NSE/Dhan/Screener handlers plus a queued downloader/worker cron path; direct `all_downloaders.sh` and `complete_data.sh` remain the catch-up/backfill path when a day is missed.
+12. `all_advisory.sh` now defaults to bounded local-stage parallelism and skips hidden rule repair. Stage-budget reporting now marks slow stages in stderr and final JSON via `stage_timings`, `slow_stages`, and `stage_budget`; `python scripts/advisory_stage_report.py` extracts the latest timing summary from `logs/cron/all_advisory.log`, the Operations UI exposes the same read-only report as audited command `advisory_stage_report`, and Operator Health emits a fix hint if the report is missing, over budget, failed, or incomplete. Marker-only failed runs now surface the nearest failed stage instead of a generic missing-summary warning. Next performance work is moving remaining external repair into queue workers where safe.
+13. Dhan token auto-refresh now runs the existing Playwright CDP/TOTP login helper in a subprocess when advisory/API code is already inside an asyncio loop, avoiding Playwright sync-API loop failures while preserving the direct CLI login path.
+14. Partial: Continuous watch now suppresses duplicate live alert fingerprints inside `WATCHER_ALERT_COOLDOWN_SECONDS`, publishes persisted/suppressed counts, records fallback telemetry if alert dedupe lookup fails, and keeps cursor-based catch-up behavior. OHLCV, news, and announcement cycles now publish normalized `source_counters` into results and sync state, and Operator Health/UI now shows those counters with fix hints so operators can distinguish empty successful runs from matched/persisted work. Remaining work is deeper source-specific substep diagnostics beyond the normalized counters.
+15. Approved technical threshold and signal-quality reviews now generate reviewed diffs, but actual production config application remains manual.
+16. Legacy “promotion audit” naming should be migrated to “reliability check” once DB migration is safe.
+17. Done: `.env.example` has been reconciled against runtime env usage and guarded by `scripts/env_example_audit.py --strict`.
+17. Done: README/docs/todo/analysis current-state coverage is guarded by `scripts/docs_state_audit.py --strict`.
+18. Done: file-level ingestion and centralized downloader/parser classifications now have a shared operator-facing catalog, and Health/Operations show meaning, trust impact, and operator action so valid empty data is not confused with source outage, auth failure, schema drift, parser bugs, missing reference mappings, or partial source failures. Health also has a first-class Failed Symbols / Source Skips panel sourced from downloader run-state so Dhan mapping misses, no-data windows, source outages, and partial symbol failures are visible without opening raw JSON. Zero-row successful downloader runs now refine to `no_data` or `source_unavailable` when exported counters prove that state. Dhan scrip-master sync now exports classified run-state for source/download failures, parser failures, and schema changes before failing closed. Dhan OHLCV run-state explicitly classifies auth failures, missing security-id mappings, source outages, no-data windows, and partial symbol failures. Screener.in registered screener sync explicitly classifies no registry, login/auth failures, source outages, parser/layout failures, and partial failures so candidate sourcing problems show up in Health instead of becoming ambiguous no-data. NSE recent-events calendar sync now exports classified fail-closed run-state for browser/CDP/source outages and parser failures before raising. Sharpely fundamentals sync now exports failed-symbol classifications and returns non-zero for partial failures while retaining successful symbol rows.
 
 ## Highest Priority: UI-First Operations
 
@@ -110,6 +122,7 @@ Required operator UI coverage:
    - done: add a UI action to run the read-only smoke check and display the resulting fix hints
    - expose recent cron logs with latest-run status, recovered/manual-interrupt state, and traceback snippets
    - done: show per-symbol feature freshness contracts in Action Queue and Symbol Detail so stale/missing required inputs are visible before trusting a decision
+   - done: show multi-source payload freshness on Overview and Symbol Detail so stale Action Queue, portfolio, signal-refresh, trace, data-input, event, and identity payloads are visible without opening raw JSON
    - done: persist decision-time feature freshness snapshots on consolidated action rows
    - done: add the first explicit feature dependency graph entry for the `actions` stage and publish its gate summary in pipeline output
    - done: extend feature dependency graph visibility to `rules`, `risk`, `portfolio`, and `lifecycle` stage summaries
@@ -120,6 +133,16 @@ Required operator UI coverage:
    - done: annotate blocked `lifecycle` and rebalance rows with freshness warnings while preserving exit/risk-reduction actions
    - done: surface stage-level gate outcomes in Operator Health, fix hints, current blockers, and trust gate so blocked rules/risk/portfolio/lifecycle/actions inputs are visible without reading pipeline JSON
    - done: add richer per-symbol UI drill-down for stage-level gate effects, especially which candidate/allocation/action was changed and why
+   - done: add an Action Queue blocker summary explaining why a row is not approved/executable before the operator opens raw JSON or detailed trace rows
+   - done: add an Action Queue consolidation summary explaining the one final action, selected winner, conflict rule/reason, and top losing candidates before the operator opens raw JSON or detailed trace rows
+   - done: add an explicit Action Queue status contract so `approved` filtering means broker-candidate final action only; review-only/manual rows with upstream approved source history are no longer returned as approved and the UI labels this filter as `Broker candidate`
+   - done: add a read-only Action Queue Final State Trust contract/panel that combines reason-contract status, queue classification, transition preconditions, feature freshness, and execution-boundary blockers into one first-read checklist
+   - done: add a first-read Portfolio Eligibility panel to every Action Queue card so approved-looking rows explicitly say whether they are portfolio-handoff candidates, manual review, watch-only, hold/context, exit/risk-reduction, blocked, or not portfolio-eligible, with next step and blockers
+   - done: show open symbol-level identity/source blockers directly on Action Queue cards, including Dhan/security-id mapping errors, repair hints, Identity Issues link, and portfolio/readiness blocker text before the row can be treated as broker-ready
+   - done: show portfolio handoff boundaries in Action Queue, including `PLANNED_ENTRY` state, required entry evidence, broker-direct block status, and transition-contract issues before any broker handoff
+   - done: preserve portfolio `position_state`, `state_transition_contract_json`, target, and horizon through action consolidation so Action Queue/Symbol Detail can show portfolio handoff evidence before execution previews exist
+   - done: add normalized `action_transition` reason-contract evidence for HOLD, BUY, BUY_MORE, SELL, PARTIAL_SELL, TIGHTEN_STOP, WATCH, and MANUAL_REVIEW so every consolidated action states its state effect, broker boundary, next required stage, required preconditions, missing preconditions, and precondition status; broker-capable BUY/BUY_MORE/SELL/PARTIAL_SELL rows now explicitly mark missing post-publication price evidence when no valid entry/reference-price timestamp exists; Action Queue and Symbol Detail render these execution preconditions before the approval/reconciliation gate
+   - done: make shared symbol links and link buttons visually and semantically distinct from status pills by adding explicit link styling plus title/aria-label metadata; Manual Review now uses the shared link button for symbol/trace navigation
    - done: add guarded Health-page apply for superseded recovered failures; requires operator reason, writes only superseded metadata, and audits `superseded_failure_cleanup_apply`
 
 2. Hypothesis and investor playbook management
@@ -133,14 +156,26 @@ Required operator UI coverage:
    - resolved action conflicts must stay audit-only in Decision Trace, symbol detail, and Conflict Rules pages, not in Manual Review
    - allow operator decisions such as `approve_for_manual_config`, `needs_more_data`, `ignore`, `downgrade_to_no_action`, and `watch_for_event`
    - persist every decision with user, timestamp, rationale, before/after payload, and trace links
+   - done: every Manual Review item now carries an operator-boundary contract that separates investment judgment, technical/operational issues, and research/config review; the UI shows the category, primary operator task, and explicit portfolio/action/broker/no-broker effects
+   - done: Manual Review API returns per-decision effect metadata, and the UI uses it so dropdown choices explain whether they close, annotate, or create wait signals without implying portfolio or broker mutation
+   - done: Manual Review now has a page-level decision guide plus a selected-choice effect checklist for active-queue, wait-signal, portfolio, action-row, and broker outcomes before save
    - done: decision writes return the same `manual_review_state` and `decision_effect` contract used by the active queue, so the UI can show the saved next state immediately after recording a decision
+   - done: Manual Review now renders the saved backend decision-effect contract beside the item after a write, including next state, close/annotate effect, wait-signal creation, portfolio boundary, and broker boundary, with frontend write-flow smoke coverage
+   - done: matched Manual Review wait-signal follow-ups disappear from the active queue after the operator closes the follow-up item, so resolved follow-up evidence does not keep reappearing
+   - done: matched Manual Review wait-signal action candidates now keep a complete reason contract with explicit `manual_review_wait_signal_matched` boundary, original Manual Review item id, review-only execution mode, and no-broker action transition after enrichment.
+   - done: stale operator decisions no longer suppress newer source evidence; Manual Review reopens the item with `source_updated_after_operator_decision` when the visible source row timestamp is after the decision timestamp, and the UI shows both the reopened count and per-item explanation
+   - done: repeated unresolved conflict rows for the same symbol/action pair are collapsed to the newest active item, with `duplicate_suppressed` in the Manual Review API summary and a queue-hygiene card in the Manual Review UI
+   - done: closed Manual Review decisions are matched by canonical item identity when exact transient row ids change, preventing already-closed repeated action conflicts from reappearing
+   - done: Manual Review API/UI now publishes an active-queue contract that states displayed active counts, hidden closed/duplicate audit-only counts, and the no-portfolio/no-action/no-broker mutation boundary for manual decisions
+   - done: each active Manual Review row now carries and renders a `visibility_lifecycle` contract explaining why it is active now, whether it reopened after source updates or wait-signal matches, which decisions close it, which decisions keep it active, and the no-portfolio/no-action/no-broker mutation boundary
 
 4. Model/research evidence UI
    - show `advisory.event_model_promotion_check` output in UI: passed gates, failed gates, label coverage, precision lift, ROC-AUC, score freshness, and weekly run count
    - done: event-model promotion output includes a research-only scorecard with usable/not-usable status, operator action, key metrics, failed gates, and explicit no-broker/no-auto-promotion boundaries
+   - done: Operations renders leakage control, false-discovery control, cost-adjusted baseline, and research-only authority as a dedicated Research Safety Controls block before operators can treat model evidence as review-ready
    - done: adversarial review ignores persisted event-model scores by default and only consumes them in `promoted` mode when the promotion-check scorecard is usable
-   - show S3 artifact upload status and latest artifact keys for event-model runs
-   - show TS forecast evaluation, event-policy evaluation, technical threshold calibration, and research ledger runs in one research evidence area
+   - done: show S3 artifact upload status, latest artifact keys, local file hashes, S3 HEAD results, and explicit no-model/no-policy/no-broker boundaries for event-model runs in Operations
+   - done: show TS forecast evaluation, event-policy evaluation, technical threshold calibration, and recent research ledger runs in research/operations evidence views
    - no model or threshold should become live policy from UI without an explicit manual review/audit trail
 
 5. Config-change assistant, not auto-config
@@ -169,14 +204,16 @@ Verified current state on `2026-06-12`:
    - `python scripts/env_example_audit.py --strict`
 2. Central downloader/parser state coverage is in place for configured modules, and latest `download_runner:*` rows are visible through Health/Data Health.
 3. High-risk schema creation for active advisory/runtime tables is now routed through `utils.schema_migrations`; remaining direct DDL is limited to generic table/upsert helpers, temporary/staging tables, and narrow backfill utilities.
-4. The fallback telemetry scanner baseline is `{'records_fallback': 468, 'reraises': 52, 'silent_handler': 2}` with zero `silent_fallback` and zero `logs_then_falls_through` rows. The remaining scanner-visible silent handlers are fallback-telemetry self-protection paths, where emitting telemetry would risk recursive noise.
+4. The fallback telemetry scanner baseline is `{'records_fallback': 503, 'reraises': 53, 'self_protection': 2}` with zero normal `logs_only`, `silent_fallback`, `silent_handler`, or `logs_then_falls_through` rows. `scripts/fallback_telemetry_coverage_report.py --fail-on-silent` now passes; the only non-recorded handlers are explicit fallback-telemetry self-protection paths where emitting telemetry would risk recursive noise.
 
 Next implementation slices:
 
-1. Finish source-specific degraded-state semantics where it still matters operationally: no-data versus source-unavailable versus auth-unavailable versus parser-bug for sources that can mislead advisory trust.
-2. Keep fallback telemetry coverage from regressing as new source/API paths are added. The current remaining scanner-visible `silent_handler` rows are intentionally self-protecting telemetry internals, so future work should focus on newly introduced operator-trust, source-freshness, broker-safety, or advisory-correctness fallbacks.
-3. Continue UI-first operations for remaining manual/research/config workflows, especially S3 artifact inspection, reviewed config application safety, and operator-visible “what happens next” on write actions.
+1. Finish source-specific degraded-state semantics where it still matters operationally: no-data versus source-unavailable versus auth-unavailable versus parser-bug for sources that can mislead advisory trust. Partial: central downloader Health now preserves and surfaces source-specific classification counts and failed-symbol lists from module run-state, so Dhan auth/mapping/source/no-data/partial failures are visible without opening raw logs.
+2. Keep fallback telemetry coverage from regressing as new source/API paths are added by running `scripts/fallback_telemetry_coverage_report.py --roots advisory data scripts utils --format text --fail-on-silent`. The scanner now fails on normal silent handlers and classifies only explicit telemetry recursion guards as `self_protection`.
+3. Continue UI-first operations for remaining manual/research/config workflows, especially advanced research-ledger reconciliation and operator-visible “what happens next” on write actions.
 4. Use `python scripts/api_performance_report.py --limit 20` after normal cron/advisory runs to pick the next frontend/API latency fix from evidence.
+   - done: the report now includes an evidence-freshness contract and prints the exact probe command when latest probe data is missing or stale, so old slowlog rows are not mistaken for current latency evidence.
+   - done: when latest probe evidence is fresh, the report ranks probed routes ahead of unprobed historical slowlog rows and labels each row as `fresh_probe` or `historical_slowlog`, so stale historical payload spikes do not masquerade as today’s top optimization target.
 5. Keep docs current with `python scripts/docs_state_audit.py --strict` after changing top-level scripts, cron, UI paths, or roadmap status.
 
 ## Next development set
@@ -186,6 +223,7 @@ This is the recommended current implementation order.
 1. Recommendation reason contract
    - done: define and persist `recommendation_reason_json` plus `reason_contract_status` for final consolidated action rows
    - done: fail-soft incomplete broker-action reason contracts into `MANUAL_REVIEW` before execution can see them
+   - done: broker-capable rows with missing or wrong `transaction_type` now fail-soft to `MANUAL_REVIEW` with the missing buy/sell side recorded in manual-review evidence
    - done: expose reason-contract status in action traces and dashboard detail views
    - done: enrich action-candidate raw context from latest `advisory_candidates` and `advisory_market_regime` snapshots before reason-contract validation
    - done: enrich action-candidate raw context from latest `advisory_event_evaluations`, `advisory_event_reviews`, and `advisory_playbook_action_plans` snapshots before reason-contract validation
@@ -256,6 +294,7 @@ This is the recommended current implementation order.
    - done: add `python -m advisory.identity_issues` dry-run/apply lifecycle to recheck and close Dhan/security identity issues after master refresh, with attempt counts and resolution metadata
    - done: add common index/benchmark aliases to Dhan identity resolution so `NIFTY50`, `NIFTY 50`, `BANKNIFTY`, `NIFTY BANK`, `INDIAVIX`, and `INDIA VIX` can be rechecked and closed through the same Identity Issues lifecycle
    - done: add Operator Health coverage for latest broker-capable action rows that do not join to `company_master` or have no Dhan NSE/BSE security id
+   - done: Symbol Detail and Action Queue load `/api/identity-issues` rows and show open Dhan/company-master mapping problems as identity/source blockers before price/action interpretation or broker-readiness interpretation
    - done: downgrade broker-capable action winners with missing company/Dhan identity to `MANUAL_REVIEW` before persistence/execution, with explicit no-broker reason-contract context
    - done: add execution-planning defense for older/non-standard broker-capable action rows so Dhan identity failures are `submit_blocked`, recorded in safety contracts, and emitted as execution fallback telemetry
    - done: record dashboard section-loader failures in payloads instead of only printing them
@@ -467,6 +506,7 @@ This is the recommended current implementation order.
    - Done: positive broker-capable final actions are downgraded to Manual Review when required decision-time inputs are blocked.
    - Done: blocked `risk` positive allocations become `review_manual` with zero allocation, and blocked `portfolio` positive plans become `deferred` with zero approved capital.
    - Done: blocked `rules` `PASS_NOW` candidates become `WATCH_EVENT`, and blocked `lifecycle` outputs receive freshness warnings while preserving exits.
+   - Done: feature-freshness latest-row lookups and action context enrichment now use point-in-time cutoffs: date-only advisory runs include the whole trading date, while exact-time watcher/ad-hoc runs cannot see later same-day event, playbook, wait-signal, or feature rows.
    - Keep current and decision-time freshness panels as the operator explanation layer.
 
 2. Standardize ingestion run state.
@@ -482,6 +522,7 @@ This is the recommended current implementation order.
    - done: Screener ad hoc queries validate known DMA moving-average syntax locally before opening Chrome/network.
    - done: Screener fetch/parse failures persist to `screenerin_parse_failures` with sanitized URL/query/body excerpts and HTML context flags before re-raising.
    - done: Operator Health surfaces recent Screener query/fetch/parse failures in fix hints, the Advisory Trust Gate, and Fallbacks & Degradation so they are treated as operational issues before they create confusing downstream symptoms.
+   - done: add read-only `/api/screeners/failures` plus a Nuxt `/screeners` failure panel so recent Screener validation/fetch/parse failures are visible as source-specific operational repair work with no Manual Review, recommendation, production-screener, or broker mutation boundary.
    - done: add the Nuxt `/screeners` workbench plus `/api/screeners/preview` so operators can validate Screener.in query syntax locally and fetch bounded authenticated preview rows with `persist=false` before registering a production screener.
    - done: add read-only screener coverage metrics in `advisory.screener_coverage`, `/api/screeners/coverage`, and the `/screeners` workbench to show constituent, candidate, final-action, positive-action, manual-review, and exit attribution by screener.
    - done: NSE bhavcopy and indices parsers export file-level parse state with date windows, skipped/already-processed/empty/failed counts, and failure samples.
@@ -490,6 +531,7 @@ This is the recommended current implementation order.
    - done: NSE off-market parser now persists failed ingestion state with explicit parser classification and treats valid zero-row files as `empty_valid_source`.
    - done: `scripts/ingestion_state_runner.py summary` now reports ingestion state counts by status, source, and parser failure classification so operators can distinguish retryable bad files, schema drift, parser bugs, and valid empty files without manual SQL.
    - done: `/api/operations/ingestion-state` and the Nuxt Health page now expose the same file-level ingestion state summary with read-only cleanup guidance.
+   - done: file-level ingestion-state failed rows are split into active and stale historical lifecycle buckets; Health treats only recent actionable parser failures as blockers and shows old historical failures as suppressed/recovered audit context.
    - done: add a shared regression contract for bhavcopy, indices, and off-market parser failure classifications so parser-state rows keep using the machine-readable `classification=` vocabulary.
    - done: NSE sparse event crawlers for corporate actions, earnings events, insider deals, and recent event calendar export symbol/date-window rows plus queried/skipped counts.
    - done: surface latest standardized `download_runner:*` rows in Operator Health/Data Health, fix hints, and degradation feed so old log-only failures do not become investment Manual Review noise.
@@ -576,7 +618,7 @@ This is the recommended current implementation order.
    - done: add retention reports before delete/archive; deletes are blocked unless S3 archive is requested or `--allow-delete-without-archive` is explicitly supplied.
 
 5. Continue UI-first operations.
-   - Finish remaining operator flows for S3 artifact inspection, research-ledger review, and safe reviewed-config application.
+   - Finish remaining operator flows for advanced research-ledger reconciliation and any newly added write workflows. Technical Calibration, Signal Quality, and Event Policy reviewed config previews now have audit-only application recording; TS forecast review/application state is visible from the home TS workflow panel; event-model S3 artifact inspection and recent research-ledger review now have Operations UI read-only boundaries and evidence views.
    - Keep broker execution disabled until approval/reconciliation workflows are proven separately.
 
 ### 0A. Build a proper Nuxt operator app
@@ -789,7 +831,12 @@ Suggested `recommendation_reason_json` fields:
 - `selection_reason`
   - concise reason the name survived screening
   - key fundamental/technical/event features
-  - whether it is a new entry, watch continuation, add-on, hold, reduce, or exit
+   - whether it is a new entry, watch continuation, add-on, hold, reduce, or exit
+  - done: portfolio rows now publish explicit `position_state` and `state_transition_contract_json`; approved/trimmed rows are `PLANNED_ENTRY`, not assumed holdings, and lifecycle must prove entry from post-`published_on` price evidence
+  - done: action recommendations now preserve portfolio transition-contract, target, and horizon evidence from portfolio rows in the recommendation reason contract
+  - done: action recommendations now add a normalized `action_transition` evidence contract for non-entry and review-only actions, including state effect, broker-order candidate flag, execution boundary, and next required stage
+  - done: execution planning blocks legacy/ambiguous portfolio rows missing `PLANNED_ENTRY` plus a valid transition contract, records `submit_blocked`, skips Dhan identity lookup, and surfaces the issue in execution safety checks
+  - done: execution planning blocks broker-capable action rows when their nested recommendation `action_transition` contract reports incomplete preconditions, records the issue in safety checks, preserves transition lineage, and skips Dhan identity lookup
 - `event_reason`
   - event ids
   - event class
@@ -1021,8 +1068,8 @@ Implementation slices:
 13. Done: add manual-only `advisory.ts_forecast_promotion` review/decision audit rows and copyable TS forecast review-rule guidance when the read-only gate returns `review_candidate`.
 14. Done: add reviewed config-change preview support for approved TS forecast promotion decisions; the preview emits disabled `ts_forecast_review_rules` guidance and still does not alter live policy.
 15. Done: add config validation/visibility for manually applied disabled `ts_forecast_review_rules`; `/api/research/ts-forecast-review-rules` and the Operator home TS section now show loaded rules, issues, and no-broker/no-auto-policy boundaries.
-16. Next: add an operator-reviewed application workflow for approved config previews, still disabled-by-default, before any low-weight consumption.
-17. Only after validation and reviewed config application, add TS forecast features to the event meta-model / risk model as low-weight inputs.
+16. Done: add an operator-reviewed application audit workflow for approved config previews. `/api/config-change/applications` lists decisions and `/api/config-change/application-decision` records `approved_to_apply`, `marked_applied`, `rejected`, or `needs_more_data`; TS forecast preview applications verify matching disabled config rules when possible; write responses and loaded history now expose structured `decision_effect` and `operator_boundary` contracts; Technical Calibration, Signal Quality, and Event Policy UIs can record and display application audit boundaries after a reviewed diff preview. This remains disabled-by-default and does not edit config, action rules, portfolio rows, or broker behavior.
+17. Only after validation and reviewed application audit stays clean across repeated runs, add TS forecast features to the event meta-model / risk model as low-weight inputs.
 
 ## Active roadmap
 
@@ -1043,20 +1090,25 @@ Done already:
 - weekly Sunday cron for `all_ml.sh`
 - `advisory.event_model_promotion_check` read-only gate for deciding whether weekly ML evidence is ready for manual operator review
 - S3 artifact upload after successful training via `advisory.event_model_artifact_store`
+- event-model promotion now fails closed unless model metadata includes leakage-control, false-discovery-control, and cost-adjusted-baseline evidence
+- event-model labeled data now uses event-day point-in-time features and future returns only as labels; model metadata records this leakage-control contract
+- event-model training metadata now records single fixed-config false-discovery control and holdout predicted-positive versus passive-event after-cost baseline evidence
+- shared realized-return evaluation for technical threshold calibration, event-policy evaluation, and signal-quality evaluation now emits a point-in-time return contract and tests same-day prices are excluded
+- TS forecast evaluation now uses first close strictly after forecast `asof_date`, emits a no-same-day point-in-time return contract, and has focused regression coverage
 
 Still needed:
 
 - more matured labeled rows across dates, sectors, event classes, and regimes
 - statistically usable walk-forward validation after costs
 - baseline comparison against passive benchmark, deterministic event policy, and naive momentum
-- research-ledger records for config, validation protocol, costs, baselines, and known failure cases
+- research-ledger records for broader validation protocol, passive/deterministic-policy/naive-momentum baselines, and known failure cases
 - promotion only as a low-weight review/risk/action input after repeated encouraging weekly runs
 
 Pick this up when:
 
 - `python -m advisory.event_model_promotion_check` returns `Decision: review_candidate`
-- no failed gates are shown for label coverage, diversity, score freshness, successful weekly runs, precision lift, or ROC-AUC
-- the operator review still confirms no leakage, no obvious event-class overfit, and no concentration in one symbol/date cluster
+- no failed gates are shown for label coverage, diversity, score freshness, successful weekly runs, precision lift, ROC-AUC, leakage-control evidence, false-discovery-control evidence, or cost-adjusted-baseline evidence
+- the operator review still confirms no obvious event-class overfit and no concentration in one symbol/date cluster
 
 ### 2. Improve the regime stack
 
@@ -1288,8 +1340,19 @@ Execution integration:
   - `PARTIAL_SELL`
   - `SELL`
 - review-only actions must remain visible but non-submittable
-- live Dhan submission is fail-closed unless `STOCKEY_LIVE_TRADING_ENABLED=true`, approval/reconciliation gates pass, and the operator supplies the current per-run confirmation token through `--live-confirmation` or `STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION`
+- live Dhan submission is fail-closed unless `STOCKEY_LIVE_TRADING_ENABLED=true`, approval/reconciliation gates pass, and the operator supplies the current order-set-specific confirmation token through `--live-confirmation` or `STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION`
 - done: action-table execution previews carry `order_intent_lineage` in the safety contract, linking each order intent to action recommendation, reason-contract summary/status, risk sizing, stop/target levels, and approval/reconciliation gates
+- done: add read-only `/api/execution/approvals` and Nuxt `/execution-approvals` workbench so operators can see dry-run execution rows, missing approval/reconciliation gates, and blockers without approving or submitting orders
+- done: link `/execution-approvals` from the global operator navigation and add a layout smoke test so the safety workbench remains discoverable.
+- done: add audit-only `/api/execution/approval-decision` and `/execution-approvals` form so operators can record review decisions without mutating execution rows, safety contracts, reconciliation state, or broker orders
+- done: add reviewed `/api/execution/approval-contract-update` workflow so `operator_approval_status` can move to `approved` only after the latest audit decision is `approve_dry_run`; reconciliation stays unchanged, `live_submission_allowed=false`, and no broker orders are submitted
+- done: add `/api/execution/reconcile` and `/execution-approvals` broker reconciliation controls. Preview is dry-run by default; apply requires `confirm=true`, persists only reconciliation/fill state from broker order-status reads, keeps approval/live gates separate, and never submits broker orders.
+- done: add a default-on live-evidence checklist gate. Live submission now blocks unless the safety contract has passed evidence status and at least `STOCKEY_EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS` successful dry-run/reconciliation cycles, even when approval and reconciliation are present.
+- done: add `/api/execution/evidence-review` and `/execution-approvals` evidence review controls. Preview is read-only; apply requires `confirm=true`, enough historical successful dry-run/reconciliation cycles for the same symbol/setup/action, writes `advisory_execution_evidence_reviews`, updates only `live_evidence_*`, keeps `live_submission_allowed=false`, and never submits broker orders.
+- done: add `/api/execution/live-allowance` and `/execution-approvals` final live-allowance controls. Preview is read-only; apply requires `confirm=true`, exact phrase, rationale, approval, reconciliation, and passed evidence; it writes `advisory_execution_live_allowance_reviews`, sets only `live_submission_allowed=true`, and never submits broker orders.
+- done: add `/api/execution/live-submit-preflight` and `/execution-approvals` read-only live-submit runbook controls. The preflight loads current execution rows, checks approval/reconciliation/evidence/live-allowance/identity/quantity/price gates, returns blockers, and generates the exact manual CLI command plus current order-set token without submitting broker orders.
+- done: block stale dry-run execution rows from live submit/preflight using `load_ts` age (`STOCKEY_EXECUTION_MAX_ROW_AGE_HOURS`, default 24), so old approved/reconciled previews must be regenerated before any manual live CLI handoff.
+- done: live allowance now deliberately resets the post-allowance approval state to `missing`; live preflight and CLI submission block until a fresh `approve_dry_run` decision after `live_allowance_allowed_at` updates the execution safety contract. Actual live submission remains a deliberate CLI-only operation unless a separate live-submit UX is designed with equal or stronger safety gates.
 
 Dashboard integration:
 
@@ -1316,7 +1379,8 @@ Implementation slices:
 10. Done: allow enabled approved conflict rules to influence `rank_action_candidates()` directly instead of only annotating the selected winner.
 11. Done: fix built-in conflict classifier rule-id mapping and add regressions for same-action duplicate collapse plus WATCH-loser classification.
 12. Done: add explicit `action_pair` promoted conflict-rule conditions for action-code-only precedence across sources, with API, resolver, ranking, and UI-copy coverage.
-13. Next: expand beyond `action_pair_exact` and `action_pair` only when repeated manual resolutions prove a stable semantic rule is useful.
+13. Done: add the built-in `EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY` rule so event-policy `MANUAL_REVIEW` explicitly blocks `BUY` / `BUY_MORE` candidates until operator event review, with conflict-audit and ranking/reason-contract regressions.
+14. Next: expand beyond `action_pair_exact`, `action_pair`, and the current built-in semantic rules only when repeated manual resolutions prove another stable rule is useful.
 
 Do not:
 
@@ -1789,15 +1853,17 @@ Completed performance work:
 - `advisory_operator_snapshots` stores compact operator payloads
 - operator API reads snapshots first and can serve stale snapshots instead of hanging on a live rebuild
 - stale snapshot metadata is exposed to the frontend and health checks
+- stale snapshot warnings now point to the audited Operations `operator_snapshot_refresh` command, which rebuilds only snapshot/cache rows and not recommendations, portfolio state, config, or broker orders
 - payload size warnings are recorded in the slow-operation log
 - process-local API payload cache avoids repeatedly reparsing the same snapshot
 - compact `/api/home` keeps the Nuxt landing page fast
 - DB duplicate index and heavy-text cleanup scripts exist for periodic maintenance
 - Actions, Events, Portfolio, trace summary/list, cron logs, prompt registry, hypotheses, artifact manifests, and research review/previews expose compact rows or stable pagination/bounded-list metadata: `total_count`, `returned_count`, `limit`, `offset`, `has_more`, and `next_offset`
 - Health details use bounded parallel fast/default mode plus short API caching for UI responsiveness; full mode performs the expensive event-data, freshness, cron-log, API-error-history, and fallback scans on demand. `OPERATOR_HEALTH_FAST_WORKERS` controls the fast-check worker count for small Postgres instances.
-- Latest OHLCV price enrichment uses `advisory_current_prices` plus process-local TTL caching, and `/api/actions` uses section snapshots instead of loading the full operator snapshot. Next measured hotspot should be selected from the slow-operation report after the next normal cron/advisory run.
+- Latest OHLCV price enrichment uses `advisory_current_prices` plus process-local TTL caching, and `/api/actions` uses section snapshots plus compact-by-default HTTP responses instead of loading or returning the full operator snapshot. `/api/portfolio` also defaults to compact HTTP responses while preserving full debug opt-out. Next measured hotspot should be selected from the slow-operation report after the next normal cron/advisory run.
 - API latency probe writes the latest endpoint summary to `logs/performance/latest_api_latency_probe.json`, cron runs it at 07:55, 11:55, 16:55, and 21:55 on weekdays, and Operator Health now surfaces stale, slow, or failed probes in fix hints and the degradation feed.
 - `scripts/api_performance_report.py` ranks latest probe rows plus deduped slow-operation state into concrete endpoint priorities and recommendations, so the next API/index optimization can be selected from evidence instead of guessing.
+- Operator Health now uses the fresh API probe to classify slow-operation state. Historical open slowlog rows that are not reproduced by the latest fresh probe stay visible as recovered/contextual evidence, but no longer create an active slow-operation blocker.
 - `/api/actions` and `/api/portfolio` compact responses expose per-section `payload_bytes`, `avg_row_bytes`, and `max_row_bytes` in `meta`, so the next slow API review can separate row bloat from query latency before changing payloads or indexes.
 - `/api/manual-review` now defaults to compact source previews instead of full raw rows; bulky raw keys are omitted from the list response and full debug payloads remain available through `include_raw=true`.
 - `/api/health/details` now defaults to compact bounded lists and truncated long strings; full raw diagnostics remain available through `mode=full&compact=false`.

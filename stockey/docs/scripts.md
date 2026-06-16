@@ -43,7 +43,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `advisory/news_theme_engine.py` | `advisory_news_theme_screeners` | Classifies market news into configured investment themes and maps active themes to Screener.in screeners; mapping schema is registry-managed by `20260611_advisory_news_theme_screeners_base` |
 | `advisory/rule_engine.py` | `advisory_candidates`, `advisory_candidate_rejections` | Scores setup candidates into pass/watch/reject states with technical, fundamental, intraday, regime, and screener context; output schemas are registry-managed by `20260611_advisory_rule_outputs_base` |
 | `advisory/ts_forecast_features.py` | `advisory_ts_forecasts_daily` | Experimental OHLCV time-series forecast features; starts with `naive_momentum_v1` and is designed to host TimesFM / Chronos / Moirai adapters later |
-| `advisory/ts_forecast_evaluator.py` | `advisory_ts_forecast_evaluations`, `advisory_ts_forecast_eval_summary` | Evaluates matured TS forecast rows against future Dhan OHLCV returns after costs |
+| `advisory/ts_forecast_evaluator.py` | `advisory_ts_forecast_evaluations`, `advisory_ts_forecast_eval_summary` | Evaluates matured TS forecast rows against future Dhan OHLCV returns after costs using first close strictly after forecast as-of date |
 | `advisory/ts_forecast_paper_portfolio.py` | `advisory_ts_forecast_paper_portfolio` | Builds research-only forecast paper decisions and compares them with naive momentum and current advisory alignment |
 | `advisory/ts_forecast_promotion_check.py` | read-only checks | Conservative promotion gate for deciding whether TS forecast paper evidence is ready for manual operator review as a low-weight input |
 | `advisory/ts_forecast_workflow.py` | `advisory_ts_forecasts_daily`, `advisory_ts_forecast_watchlist` | Optional Screener.in -> Dhan OHLCV refresh -> TimesFM forecast -> experimental TS watchlist workflow |
@@ -119,7 +119,7 @@ All crawlers are allowed to run daily. Non-daily sources should exit early when 
 | `scripts/offload_announcement_text_to_s3.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Migrates heavy announcement OCR/transcript/report text to object storage while keeping S3 keys, hashes, counts, excerpts, and optional JSON manifests in Postgres/operator logs |
 | `scripts/validate_announcement_s3_pointers.py` | `announcement_pipeline_documents`, `announcement_pipeline_reports` | Read-only validator for offloaded announcement S3 pointers; supports dry-run, HEAD/size checks, and optional SHA-256 verification |
 | `scripts/api_latency_probe.py` | operator API and `logs/performance/latest_api_latency_probe.json` | Probes operator API endpoint latency, writes the latest summary for Operator Health, and records slow endpoints through the deduped slow-operation log |
-| `scripts/api_performance_report.py` | `logs/performance/latest_api_latency_probe.json`, `logs/performance/slow_operation_state.json` | Ranks slow/error/large operator API routes and emits endpoint-specific optimization guidance before adding indexes or changing payloads |
+| `scripts/api_performance_report.py` | `logs/performance/latest_api_latency_probe.json`, `logs/performance/slow_operation_state.json` | Ranks slow/error/large operator API routes and emits endpoint-specific optimization guidance before adding indexes or changing payloads; fresh probe rows are ranked ahead of unprobed historical slowlog rows |
 | `scripts/archive_legacy_nse_tables.py` | legacy NSE tables | Dry-run, S3 archive, and optional delete utility for old legacy NSE rows, chunked by month |
 
 ## Management scripts
@@ -143,7 +143,7 @@ python scripts/ingestion_state_runner.py list --source bhavcopy --status failed
 python scripts/ingestion_state_runner.py clear --source bhavcopy --key bhavcopy/bhavcopy_2015-01-16.zip
 ```
 
-The same summary is exposed read-only in the operator API at `/api/operations/ingestion-state` and on the Nuxt Health page under File-Level Ingestion State.
+The same summary is exposed read-only in the operator API at `/api/operations/ingestion-state` and on the Nuxt Health page under File-Level Ingestion State. Failed file rows are split into active and stale historical lifecycle buckets. Only failures inside `OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS` are treated as current Health blockers; older historical failures remain visible for audit and manual cleanup without polluting active operator review.
 
 Performance inspection and text offload:
 
@@ -197,7 +197,9 @@ Slow-operation tracking writes:
 
 Use `python -m advisory.performance_slowlog mark <fingerprint> triaged --note "..."` after adding a TODO or fix plan, so recurring slow events are counted but not treated as new work.
 
-For `/api/actions?compact=true` and `/api/portfolio?compact=true`, inspect `meta.<section>.payload_bytes`, `avg_row_bytes`, and `max_row_bytes` alongside the probe latency. This tells you whether the next fix should target query/index work or response compaction/detail endpoints.
+Operator Health treats slow-operation state as active only when the latest fresh API probe reproduces a slow or failing route. Unprobed historical slowlog rows remain visible as recovered/contextual degradation rows, but they do not keep the Health trust gate blocked after a fresh healthy probe.
+
+For `/api/actions?compact=true` and `/api/portfolio?compact=true`, inspect `meta.<section>.payload_bytes`, `avg_row_bytes`, and `max_row_bytes` alongside the probe latency. This tells you whether the next fix should target query/index work or response compaction/detail endpoints. For Action Queue feature freshness, list calls use persisted decision-time snapshots unless `refresh_feature_freshness=true` is supplied; reserve live refresh for targeted diagnostics.
 
 Legacy NSE retention workflow:
 
@@ -245,7 +247,7 @@ OSX:
 
 - NSE direct HTTP calls retry transient timeouts, connection errors, `429`, and `5xx` responses. `NSE_HTTP_MAX_ATTEMPTS=0` means keep retrying until the site recovers. Use `NSE_HTTP_RETRY_SLEEP_SECONDS` and `NSE_HTTP_RETRY_MAX_SLEEP_SECONDS` to control backoff. Retries are printed to stderr as `[announcement_pipeline.nse] ...` so cron logs show when the process is waiting; before each retry the announcement client clears stale NSE cookies, rebuilds headers, and tries to bootstrap fresh NSE cookies.
 
-- Announcement document OCR, concise summaries, structured report parsing, and advisory event evaluation can run through Codex CLI instead of hosted ChatGPT/Gemini APIs. Set `OCR_USING=codex`, `SUMMARIZE_WITH=codex`, and `ADVISORY_EVENT_EVAL_MODEL=codex`; tune `CODEX_CLI_OCR_MODEL`, `CODEX_CLI_SUMMARIZE_MODEL`, `CODEX_CLI_EVENT_MODEL`, `CODEX_CLI_BIN`, and `CODEX_CLI_TIMEOUT_SECONDS` as needed.
+- Announcement document OCR, concise summaries, structured report parsing, and advisory event evaluation can run through Codex CLI instead of hosted ChatGPT/Gemini APIs. Set `OCR_USING=codex`, `SUMMARIZE_WITH=codex`, and `ADVISORY_EVENT_EVAL_MODEL=codex`; tune `CODEX_CLI_OCR_MODEL`, `CODEX_CLI_SUMMARIZE_MODEL`, `CODEX_CLI_EVENT_MODEL`, `CODEX_CLI_BIN`, and `CODEX_CLI_TIMEOUT_SECONDS` as needed. For cron, prefer an absolute `CODEX_CLI_BIN`; the wrapper also searches common nvm, local npm, Homebrew, and `/usr/local/bin` paths before failing with fallback telemetry.
 
 - LLM/Codex prompt contracts are inventoried in `advisory.prompt_registry`. Use `python -m advisory.prompt_registry` or the Nuxt `/prompt-registry` page to review prompt ids, schema models, source files, model env vars, authority boundaries, output tables, and fallback behavior. This registry is audit metadata only; it does not execute prompts or grant trading authority.
 
@@ -271,7 +273,7 @@ OSX:
   2. cached token at `.cache/dhan_access_token.json`
   3. API key consent flow using `DHAN_CLIENT_ID`, `DHAN_API_KEY`, `DHAN_API_SECRET`
 - In the API key flow, the default path opens the Dhan consent page in the browser and waits for you to paste the redirected URL back into the terminal. The access token is then cached until expiry.
-- Dhan browser automation uses the running Chrome CDP session plus `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN`. When those values and `CDP_ENDPOINT` are configured, Dhan clients auto-refresh through Playwright after token cache expiry instead of asking for manual pasted consent. You can also force this path with `DHAN_AUTO_LOGIN_ENABLED=true`.
+- Dhan browser automation uses the running Chrome CDP session plus `DHAN_LOGIN_MOBILE`, `DHAN_TOTP_SECRET`, and `DHAN_LOGIN_PIN`. When those values and `CDP_ENDPOINT` are configured, Dhan clients auto-refresh through Playwright after token cache expiry instead of asking for manual pasted consent. You can also force this path with `DHAN_AUTO_LOGIN_ENABLED=true`. If token refresh happens while advisory/API code is already inside an asyncio loop, the auth layer runs the same Playwright login in a separate Python subprocess to avoid Playwright sync-API event-loop failures; control that wait with `DHAN_AUTO_LOGIN_SUBPROCESS_TIMEOUT_SECONDS`.
 
 Quick Dhan token maintenance:
 
@@ -290,11 +292,12 @@ python -m data.dhanlive.auth_cli clear-cache
 
 | Script | Purpose | Scope |
 | --- | --- | --- |
-| `all_frontend.sh` | Operator frontend supervisor | Regular cron restarts/supervises `advisory.api.app` and the Nuxt operator app under a lock; supports `--api-only`, `--web-only`, and `--both` for targeted restarts |
+| `all_frontend.sh` | Operator frontend supervisor | Regular cron restarts/supervises `advisory.api.app` and the Nuxt operator app under a lock; exits with `restart_requested` when watched API/Nuxt source files change; supports `--api-only`, `--web-only`, and `--both` for targeted restarts |
 | `all_watchers.sh` | Continuous monitoring wrapper | Self-locking one-shot/loop wrapper that polls active watchlist OHLCV, announcements, and ET/news incrementally from persisted cursors |
 | `all_downloaders_queue.sh` | Queued download ingestion | Enqueues single-client NSE/Dhan/Screener downloader work and runs safe non-queued downloader modules inline |
 | `all_external_workers.sh` | External queue worker drain | Drains Dhan, Screener, and NSE queues serially under one lock |
 | `complete_data.sh` | Broad ingestion safety net and pre-advisory catch-up | Runs all downloaders and parsers in order; scheduled before market and again before advisory, not in the watcher loop |
+| `all_advisory_preflight.sh` | Advisory readiness preflight | Runs Dhan auth refresh/validation and compact operator smoke with Dhan included; does not run `advisory.master_pipeline`, rebuild portfolios, refresh snapshots, or submit broker orders |
 | `all_advisory.sh` | Advisory orchestrator | Runs post-close advisory pipeline and portfolio generation without raw downloads; defaults to bounded local parallel stages and skips hidden rule repair |
 | `all_superseded_cleanup_audit.sh` | Superseded failure cleanup audit | Preview-only wrapper around `advisory.superseded_failures`; emits script markers and never passes `--apply` |
 | `all_ml.sh` | Weekly research training | Long-running event-model research job; scheduled only in a dedicated weekly window if enabled |
@@ -324,7 +327,7 @@ python -m data.dhanlive.auth_cli clear-cache
 | `all_advisory_codex.sh` | Codex-supervised advisory orchestrator | Manual debug/repair wrapper that runs `all_advisory.sh`, captures logs, sends failure lines to Codex CLI, and reruns |
 | `all_analysis_codex.sh` | Codex analysis-development loop | Manual bounded loop that uses `analysis.md` and `docs/analysis_agent_board.md` to pick the next slice, implement it, validate it, and update docs |
 
-Top-level operator scripts emit `[stockey.script]` start/end markers to stdout while preserving the wrapped command's exit code. Most call `scripts/run_with_markers.sh`; `all_frontend.sh` emits markers internally so it can supervise and clean up API/Nuxt child processes. The health parser uses these markers to classify the latest run as `ok`, `failed`, `interrupted_by_operator`, `ok_after_historical_errors`, or `recovered_after_manual_interrupt`.
+Top-level operator scripts emit `[stockey.script]` start/end markers to stdout while preserving the wrapped command's exit code. Most call `scripts/run_with_markers.sh`; `all_frontend.sh` emits markers internally so it can supervise and clean up API/Nuxt child processes. The health parser uses these markers to classify the latest run as `ok`, `failed`, `interrupted_by_operator`, `restart_requested`, `ok_after_historical_errors`, or `recovered_after_manual_interrupt`.
 
 Fallback telemetry also carries source-specific NSE counters. Announcement NSE HTTP retries record `nse_retry`, cookie/session resets record `nse_session_reset`, `summarize_fallback_events` exposes `nse_retry_count`, `nse_session_reset_count`, and `nse_http_count`, and Operator Health emits a specific NSE session fix hint when these counters are nonzero.
 
@@ -341,8 +344,9 @@ It schedules:
 - `complete_data.sh` again end-of-day before advisory to catch missed downloader/parser work and rebuild compact announcement/bhavcopy evidence
 - `all_downloaders_queue.sh` plus `all_external_workers.sh` during the day for serialized single-client refreshes
 - `all_watchers.sh` every `10` minutes during market hours; the script self-locks, skipped overlaps exit `0`, and watcher routing writes fast live rows to `advisory_signal_refresh_actions` while matching active hypothesis wait signals
+- `all_advisory_preflight.sh` at `18:55` on weekdays, before the expensive post-close advisory run, to validate/refresh Dhan auth and run compact operator smoke without changing portfolio/action state
 - `all_advisory.sh` once daily after 7pm on weekdays, after `scripts/wait_for_locks.sh` confirms data catch-up and external worker locks are clear
-- `all_frontend.sh` every `5` minutes under a lock so API/Nuxt are restarted if they exit
+- `all_frontend.sh` every `5` minutes under a lock so API/Nuxt are restarted if they exit or if the supervisor exits with `restart_requested` after source-code changes
 - `all_advisory.sh` and `all_watchers.sh` refresh `advisory.operator_snapshot` and `advisory.trace_summary_store` after a successful run so frontend endpoints can serve cached dashboard and trace sections quickly
 - `all_advisory.sh` passes `--intraday-lookback-days ${ADVISORY_INTRADAY_LOOKBACK_DAYS:-30}`; intraday feature reads are session-scoped for the target date so advisory does not scan months of 1-minute candles on every run
 - `advisory.operator_health --skip-dhan` at `08:05`, `12:05`, `17:05`, and `22:05` on weekdays
@@ -653,7 +657,7 @@ Recommended model-training flow:
 ```sh
 ./all_ml.sh
 ./all_ml.sh --prep-only
-./all_ml.sh --horizon-days 1 --to-date 2026-04-07
+./all_ml.sh --horizon-days 1 --to-date 2026-04-07 --cost-bps 25
 python -m advisory.event_model_promotion_check
 ./all_advisory.sh
 ```
@@ -664,6 +668,7 @@ Behavior:
 - checks whether the requested horizon is `train_ready`
 - skips training cleanly if coverage is still insufficient
 - trains `advisory.event_meta_model` only when the readiness gate passes
+- stores research-control metadata for point-in-time leakage control, fixed-config false-discovery control, and after-cost baseline comparison
 - uploads trained model artifacts to S3 after successful training unless `--skip-s3-upload` or `EVENT_MODEL_ARTIFACT_UPLOAD_ENABLED=false` is set
 - scores current events after training unless `--skip-score` is used
 - use `python -m advisory.event_model_promotion_check --format json` after weekly runs to see whether the evidence is ready for manual review; the JSON includes a research-only `scorecard` with usable/not-usable status, key metrics, failed gates, and explicit no-broker/no-auto-promotion boundaries
@@ -758,7 +763,7 @@ Useful checks:
 ```sh
 python scripts/sql_query_runner.py --read-only "select date(published_on) as published_date, count(*) as eval_count from advisory_event_evaluations group by 1 order by 1"
 python scripts/sql_query_runner.py --read-only "select max(date) as max_price_date from dhan_ohlcv_daily"
-python -m advisory.event_meta_model train --horizon-days 1
+python -m advisory.event_meta_model train --horizon-days 1 --cost-bps 25
 python -m advisory.event_meta_model score --dry-run
 ```
 
@@ -1046,7 +1051,7 @@ python -m advisory.company_memory_review --dry-run --symbols RELIANCE --llm
 
 The operator API attaches the latest company-memory review to matching action rows, including compact `/api/actions?compact=true` responses. The Nuxt Action Queue and Symbol Detail pages show this as read-only company-memory evidence.
 
-`advisory.signal_quality_evaluator` is the research comparator for deciding whether non-price evidence is helping. It starts from `advisory_candidates`, joins only point-in-time rows from event policy, compact bhavcopy evidence, and company-memory review tables, attaches future Dhan OHLCV returns, and writes variant-level results for `technical_only`, `technical_plus_event`, `technical_plus_bhavcopy`, `technical_plus_company_memory`, and `technical_plus_all`. It does not change live action policy or broker execution.
+`advisory.signal_quality_evaluator` is the research comparator for deciding whether non-price evidence is helping. It starts from `advisory_candidates`, joins only point-in-time rows from event policy, compact bhavcopy evidence, and company-memory review tables, attaches future Dhan OHLCV returns with a shared point-in-time return contract that excludes same-day prices, and writes variant-level results for `technical_only`, `technical_plus_event`, `technical_plus_bhavcopy`, `technical_plus_company_memory`, and `technical_plus_all`. It does not change live action policy or broker execution.
 
 ```sh
 python -m advisory.signal_quality_evaluator --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
@@ -1097,9 +1102,9 @@ python -m advisory.config_change_assistant --source-type event_policy_review_rul
 python -m advisory.config_change_assistant --source-type ts_forecast_review_rule --model-name timesfm_2p5_200m --horizon-days 10 --dry-run
 ```
 
-The operator API exposes recent previews at `/api/config-change/previews` and diff generation at `/api/config-change/technical-threshold-preview`, `/api/config-change/signal-quality-preview`, `/api/config-change/event-policy-preview`, and `/api/config-change/ts-forecast-preview`. The Event Inbox shows a `Reviewed Diff` action for approved event-policy promotion reviews. Generated event-policy and TS forecast diffs add disabled review-rule entries only; they do not change live policy unless an operator manually applies a reviewed diff later.
+The operator API exposes recent previews at `/api/config-change/previews` and diff generation at `/api/config-change/technical-threshold-preview`, `/api/config-change/signal-quality-preview`, `/api/config-change/event-policy-preview`, and `/api/config-change/ts-forecast-preview`. It also exposes audit-only application decisions at `/api/config-change/applications` and `/api/config-change/application-decision`. The Event Inbox shows a `Reviewed Diff` action for approved event-policy promotion reviews. Generated event-policy and TS forecast diffs add disabled review-rule entries only; they do not change live policy. Application decisions record whether an operator approved, rejected, requested more data, or marked the reviewed diff as manually applied; Stockey does not edit config files or enable policy through this endpoint.
 
-After manually applying a disabled TS forecast review-rule diff, inspect `/api/research/ts-forecast-review-rules` to confirm the rule parses and remains `review_input_only`, broker-disabled, and excluded from automatic policy promotion.
+After manually applying a disabled TS forecast review-rule diff, inspect `/api/research/ts-forecast-review-rules` to confirm the rule parses and remains `review_input_only`, broker-disabled, and excluded from automatic policy promotion. If you record `marked_applied` through `/api/config-change/application-decision`, the backend verifies the matching TS rule when possible and stores the result in `advisory_config_change_applications`; this remains audit-only.
 
 `advisory.risk_engine` reads `advisory_event_evaluations`, joins the latest point-in-time technical and fundamental context, and writes `advisory_allocations` with risk bucket, conviction bucket, suggested INR allocation, and invalidation guidance. Its allocation schema is registry-managed by `20260611_advisory_allocations_base`.
 
@@ -1109,7 +1114,7 @@ After manually applying a disabled TS forecast review-rule diff, inspect `/api/r
 
 `advisory.news_watch` writes matched RSS/news rows to `advisory_news_events`. Its news event schema is registry-managed by `20260611_advisory_news_events_base`.
 
-`advisory.config_change_assistant` writes reviewed config preview diffs to `advisory_config_change_previews`. Its preview schema is registry-managed by `20260611_advisory_config_change_previews_base`.
+`advisory.config_change_assistant` writes reviewed config preview diffs to `advisory_config_change_previews` and audit-only application decisions to `advisory_config_change_applications`. The preview schema is registry-managed by `20260611_advisory_config_change_previews_base`; the application-audit schema is registry-managed by `20260612_advisory_config_change_applications_base`.
 
 `advisory.intraday_features` writes intraday confirmation features to `advisory_intraday_features_daily` and ensures supporting Dhan OHLCV read indexes. Its feature-cache schema is registry-managed by `20260611_advisory_intraday_features_base`.
 
@@ -1131,7 +1136,7 @@ After manually applying a disabled TS forecast review-rule diff, inspect `/api/r
 
 Use `--use-broker-account` on a dry run when you want staged quantities capped by live Dhan cash and holdings without submitting orders. `--live` enables the same broker-account sizing automatically before safety checks and submission.
 
-Live Dhan submission is fail-closed. `--live` is not enough by itself; set `STOCKEY_LIVE_TRADING_ENABLED=true` only when you intentionally want broker submission. Each live run also requires a per-run confirmation token. Run once without the token to see the expected token in `safety_checks_json.live_run_confirmation_expected`, then pass `--live-confirmation <token>` or set `STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION=<token>` for that specific run.
+Live Dhan submission is fail-closed. `--live` is not enough by itself; set `STOCKEY_LIVE_TRADING_ENABLED=true` only when you intentionally want broker submission. Each live run also requires a per-run confirmation token tied to that exact planned order set, including symbols, quantities, security ids, and estimated values. Run once without the token to see the expected token in `safety_checks_json.live_run_confirmation_expected`, then pass `--live-confirmation <token>` or set `STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION=<token>` for that specific run. Even after operator approval and broker reconciliation, live submission remains blocked by default until the safety contract has `live_evidence_status=passed` and at least `STOCKEY_EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS` successful dry-run/reconciliation cycles. Persisted dry-run rows also expire for live handoff after `STOCKEY_EXECUTION_MAX_ROW_AGE_HOURS`, so old approved/reconciled previews must be regenerated. Use `/api/execution/evidence-review` from the operator UI to preview/apply that evidence status; apply writes `advisory_execution_evidence_reviews`, updates only `live_evidence_*`, keeps `live_submission_allowed=false`, and never submits broker orders. Use `/api/execution/live-allowance` only after approval, reconciliation, and evidence are passed; apply writes `advisory_execution_live_allowance_reviews`, sets only `live_submission_allowed=true`, and still never submits broker orders.
 
 Keep these caps configured before live use:
 
@@ -1139,6 +1144,9 @@ Keep these caps configured before live use:
 - `STOCKEY_EXECUTION_MAX_ORDER_VALUE_INR`, default `50000`
 - `STOCKEY_EXECUTION_REQUIRE_FRESH_INTRADAY_PRICE`, default `true`
 - `STOCKEY_EXECUTION_MAX_INTRADAY_PRICE_AGE_MINUTES`, default `30`
+- `STOCKEY_EXECUTION_MAX_ROW_AGE_HOURS`, default `24`; set `0` only if you intentionally want to disable stale dry-run row blocking
+- `STOCKEY_EXECUTION_REQUIRE_EVIDENCE_CHECKLIST`, default `true`
+- `STOCKEY_EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS`, default `3`
 - `STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION`, default blank and must match the current run token
 
 Live Dhan order placement also requires the API static IP to be whitelisted.

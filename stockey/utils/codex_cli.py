@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -27,6 +28,56 @@ class CodexCLIError(RuntimeError):
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
+def _candidate_codex_bins(configured: str) -> list[str]:
+    candidates = [configured]
+    home = Path.home()
+    candidates.extend(
+        str(path)
+        for path in sorted((home / ".nvm" / "versions" / "node").glob("*/bin/codex"), reverse=True)
+    )
+    candidates.extend(
+        [
+            str(home / ".local" / "bin" / "codex"),
+            str(home / ".npm-global" / "bin" / "codex"),
+            "/opt/homebrew/bin/codex",
+            "/usr/local/bin/codex",
+        ]
+    )
+    deduped: list[str] = []
+    for item in candidates:
+        if item and item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def resolve_codex_binary(configured: str | None = None) -> str:
+    effective = configured or env("CODEX_CLI_BIN", default=DEFAULT_CODEX_BINARY)
+    for candidate in _candidate_codex_bins(effective):
+        if "/" in candidate:
+            if Path(candidate).exists():
+                return candidate
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    from advisory.fallback_telemetry import record_local_fallback_event
+
+    searched = _candidate_codex_bins(effective)
+    record_local_fallback_event(
+        module="utils.codex_cli",
+        source="codex_cli",
+        fallback_type="codex_cli_binary_not_found",
+        severity="error",
+        reason="Codex CLI binary could not be found on PATH or common local install paths.",
+        error=FileNotFoundError(effective),
+        metadata={"configured_binary": effective, "searched": searched[:20]},
+    )
+    raise CodexCLIError(
+        "Codex CLI binary was not found. Set CODEX_CLI_BIN to the absolute codex path "
+        "or ensure cron/non-interactive PATH includes the Codex install directory."
+    )
+
+
 def run_codex_cli(
     prompt: str,
     *,
@@ -38,7 +89,7 @@ def run_codex_cli(
     effective_model = model or DEFAULT_CODEX_MODEL
     with tempfile.NamedTemporaryFile("r", encoding="utf-8", suffix=".txt", delete=True) as output_file:
         cmd = [
-            env("CODEX_CLI_BIN", default=DEFAULT_CODEX_BINARY),
+            resolve_codex_binary(),
             "exec",
             "--ephemeral",
             "--skip-git-repo-check",

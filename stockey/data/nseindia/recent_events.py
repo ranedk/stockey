@@ -32,6 +32,43 @@ def get_random(min_ms: int, max_ms: int) -> int:
     return int(random.uniform(min_ms, max_ms))
 
 
+def classify_recent_events_error(error: object) -> str:
+    text = str(error or "").lower()
+    if "cdp" in text or "browser" in text or "target closed" in text or "connection refused" in text:
+        return "source_unavailable"
+    if "timed out" in text or "timeout" in text or "net::" in text or "download" in text:
+        return "source_unavailable"
+    if "could not parse recent event dates" in text or "columns" in text or "length mismatch" in text:
+        return "parse_failed"
+    return "failed"
+
+
+def build_run_state(
+    *,
+    formatted_date: str,
+    rows_written: int,
+    classification: str,
+    error: str | None = None,
+) -> dict[str, object]:
+    return {
+        "source": SYNC_SOURCE_NAME,
+        "rows": int(rows_written),
+        "rows_read": int(rows_written),
+        "rows_written": int(rows_written),
+        "classification": classification,
+        "status": "ok" if classification in {"ok", "no_data"} else "failed",
+        "from_date": formatted_date,
+        "to_date": formatted_date,
+        "event_date": formatted_date,
+        "fallback_used": False,
+        "state_advanced": int(rows_written) > 0,
+        "no_data_count": 1 if classification == "no_data" else 0,
+        "source_unavailable_count": 1 if classification == "source_unavailable" else 0,
+        "parse_failed_count": 1 if classification == "parse_failed" else 0,
+        "error": error,
+    }
+
+
 def dowload_events(
     playwright,
     formatted_date: str,
@@ -124,26 +161,37 @@ def main() -> int:
             result = dowload_events(p, formatted_date, rop)
             rows_written = int(result.get("rows") or 0)
     except Exception as exc:
+        error_text = f"{type(exc).__name__}: {exc}"
+        classification = classify_recent_events_error(error_text)
+        STOCKEY_RUN_STATE = build_run_state(
+            formatted_date=formatted_date,
+            rows_written=rows_written,
+            classification=classification,
+            error=error_text,
+        )
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME,
+            source="nse_recent_events",
+            fallback_type="nse_recent_events_sync_failed",
+            severity="error",
+            reason="NSE recent event-calendar sync failed; event-calendar evidence may be stale until this source reruns successfully.",
+            error=exc,
+            metadata={"event_date": formatted_date, "classification": classification},
+        )
         persist_sync_state(
             source_name=SYNC_SOURCE_NAME,
             status="error",
-            error_text=f"{type(exc).__name__}: {exc}",
-            state={"date": formatted_date, "rows_written": rows_written},
+            error_text=error_text,
+            state=STOCKEY_RUN_STATE,
         )
         raise
     finally:
         rop.close()
-    STOCKEY_RUN_STATE = {
-        "source": SYNC_SOURCE_NAME,
-        "rows": rows_written,
-        "rows_read": 1,
-        "rows_written": rows_written,
-        "from_date": formatted_date,
-        "to_date": formatted_date,
-        "event_date": formatted_date,
-        "fallback_used": False,
-        "state_advanced": rows_written > 0,
-    }
+    STOCKEY_RUN_STATE = build_run_state(
+        formatted_date=formatted_date,
+        rows_written=rows_written,
+        classification="ok" if rows_written > 0 else "no_data",
+    )
     persist_sync_state(
         source_name=SYNC_SOURCE_NAME,
         status="ok",

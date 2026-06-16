@@ -26,6 +26,8 @@ const skipped = computed(() => asList(data.value?.skipped))
 const sourceWarnings = computed(() => asList(data.value?.source_warnings || summary.value.source_warnings))
 const previewCounts = computed(() => asDict(previewResult.value?.counts))
 const applyCounts = computed(() => asDict(applyResult.value?.counts))
+const previewBoundary = computed(() => asDict(previewResult.value?.operator_boundary))
+const applyBoundary = computed(() => asDict(applyResult.value?.operator_boundary))
 const previewRows = computed(() => asList(previewResult.value?.results))
 const applyRows = computed(() => asList(applyResult.value?.results))
 const wouldResolveKeys = computed(() => previewRows.value
@@ -166,6 +168,11 @@ async function applyResolution() {
       <div v-if="previewResult" class="rounded-3xl bg-white/75 p-5">
         <p class="text-xs font-black uppercase tracking-[0.22em] text-ink/45">Preview Result</p>
         <p class="mt-2 text-sm font-semibold text-ink/70">{{ display(previewResult.note) }}</p>
+        <div class="mt-3 grid gap-2 text-xs font-bold text-ink/55 md:grid-cols-3">
+          <p class="rounded-2xl bg-paper/80 px-3 py-2">Mutates issue status: {{ display(previewBoundary.mutates_identity_issue_status) }}</p>
+          <p class="rounded-2xl bg-paper/80 px-3 py-2">Mutates mappings: {{ display(previewBoundary.mutates_identity_mapping) }}</p>
+          <p class="rounded-2xl bg-paper/80 px-3 py-2">Broker execution: {{ display(previewBoundary.mutates_broker_execution) }}</p>
+        </div>
         <div class="mt-3 max-h-64 space-y-2 overflow-auto">
           <p v-for="row in previewRows" :key="`preview-${String(row.issue_key)}`" class="rounded-2xl bg-paper/80 p-3 text-xs font-bold text-ink/65">
             {{ display(row.symbol) }} / {{ display(row.requested_exchange) }}: {{ titleCase(row.status) }} {{ row.error ? `- ${display(row.error)}` : '' }}
@@ -175,6 +182,11 @@ async function applyResolution() {
       <div v-if="applyResult" class="rounded-3xl bg-white/75 p-5">
         <p class="text-xs font-black uppercase tracking-[0.22em] text-ink/45">Apply Result</p>
         <p class="mt-2 text-sm font-semibold text-ink/70">{{ display(applyResult.note) }}</p>
+        <div class="mt-3 grid gap-2 text-xs font-bold text-ink/55 md:grid-cols-3">
+          <p class="rounded-2xl bg-paper/80 px-3 py-2">Mutates issue status: {{ display(applyBoundary.mutates_identity_issue_status) }}</p>
+          <p class="rounded-2xl bg-paper/80 px-3 py-2">Mutates mappings: {{ display(applyBoundary.mutates_identity_mapping) }}</p>
+          <p class="rounded-2xl bg-paper/80 px-3 py-2">Broker execution: {{ display(applyBoundary.mutates_broker_execution) }}</p>
+        </div>
         <div class="mt-3 max-h-64 space-y-2 overflow-auto">
           <p v-for="row in applyRows" :key="`apply-${String(row.issue_key)}`" class="rounded-2xl bg-paper/80 p-3 text-xs font-bold text-ink/65">
             {{ display(row.symbol) }} / {{ display(row.requested_exchange) }}: {{ titleCase(row.status) }} {{ row.error ? `- ${display(row.error)}` : '' }}

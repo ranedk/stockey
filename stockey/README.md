@@ -20,11 +20,12 @@ These are safe to run from `config/stockey.generated.crontab` at regular interva
 
 | Script | When | Why |
 | --- | --- | --- |
-| `./all_frontend.sh` | every few minutes | Keeps the FastAPI operator API and Nuxt frontend alive; use `--api-only`, `--web-only`, or `--both` for targeted manual restarts |
+| `./all_frontend.sh` | every few minutes | Keeps the FastAPI operator API and Nuxt frontend alive, exits for cron restart when API/Nuxt source changes, and supports `--api-only`, `--web-only`, or `--both` for targeted manual restarts |
 | `./all_watchers.sh` | every `10` minutes during market hours plus one post-close pass | Watches OHLCV, news, announcements, and wait signals from persisted cursors; self-locks to avoid overlap |
 | `./all_downloaders_queue.sh` | a few times during the day | Enqueues NSE/Dhan/Screener work instead of opening multiple single-client sessions |
 | `./all_external_workers.sh` | after queued downloader enqueue | Drains Dhan, Screener, and NSE queues serially |
 | `./complete_data.sh` | morning safety net and end-of-day pre-advisory catch-up | Runs full raw download + parser refresh; use this to repair anything intraday jobs missed before advisory |
+| `./all_advisory_preflight.sh` | before manual or post-close advisory | Refreshes/validates Dhan auth and runs compact operator smoke without running advisory |
 | `./all_advisory.sh` | once daily after market close | Produces the authoritative portfolio/action reconciliation |
 | `./all_ml.sh` | weekly research window, if enabled | Long-running event-model research training; not part of live decision authority |
 | `./all_api_latency_probe.sh` | several times per market day | Probes operator API latency and records slow endpoints |
@@ -47,6 +48,7 @@ Use these when a day was missed, data looks stale, or you explicitly want a broa
 | `./all_downloaders.sh` | Download-only broad catch-up for missing raw data |
 | `./all_parsers.sh` | Parse-only catch-up after raw files are present |
 | `./complete_data.sh` | Full download + parse catch-up/backfill; useful end-of-day, after a missed day, or before a major advisory rerun |
+| `./all_advisory_preflight.sh` | Dhan/CDP/token and compact smoke preflight before spending hours on `all_advisory.sh` |
 | `./all_ml.sh` | Long-running research/model-training flow; run manually when validating model quality or rerun weekly in a dedicated research cron window |
 | `./all_advisory_codex.sh` | Debug/repair wrapper for advisory failures; use manually, not as normal cron |
 | `./all_analysis_codex.sh` | Manual bounded Codex development loop that picks the next `analysis.md` slice, implements it, validates it, and updates the board |
@@ -69,6 +71,14 @@ python builder.py
 ```
 
 The generated cron file is `go-crond`/system-crontab style and includes a username column. Use the Operations page or `python scripts/cron_preflight.py` before starting it after config changes.
+
+Dhan and Screener browser-backed automation need a Chrome remote-debugging session when auto-login is required:
+
+```sh
+scripts/start_chrome_cdp.sh
+```
+
+Keep `CDP_ENDPOINT=http://localhost:9222` configured. Dhan auto-login fails hard when Chrome/CDP is unavailable; start this session before retrying `python -m data.dhanlive.auth_cli ensure --auto-login` or `./all_advisory.sh`. If Dhan pages are slow between mobile, TOTP, PIN, and redirect steps, tune `DHAN_AUTO_LOGIN_STEP_TIMEOUT_MS` rather than falling back to manual browser consent.
 
 General flow of data:
 

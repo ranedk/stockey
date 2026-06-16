@@ -18,6 +18,12 @@ EVALUATIONS_TABLE = "advisory_ts_forecast_evaluations"
 SUMMARY_TABLE = "advisory_ts_forecast_eval_summary"
 TS_FORECAST_EVAL_SCHEMA_MIGRATION_ID = "20260611_advisory_ts_forecast_evaluator_base"
 DEFAULT_COST_BPS = 25.0
+POINT_IN_TIME_RETURN_CONTRACT = {
+    "entry_rule": "Use first available close strictly after forecast asof_date.",
+    "exit_rule": "Use the horizon-th available close from the same strictly-after-asof price window.",
+    "same_day_price_allowed": False,
+    "forward_returns_are_labels_only": True,
+}
 
 
 def _record_ts_forecast_evaluator_fallback(
@@ -88,6 +94,29 @@ TS_FORECAST_EVAL_SCHEMA_STATEMENTS = [
         UNIQUE (evaluated_at, model_name, forecast_horizon_days, action_hint)
     )
     """,
+]
+
+EVALUATION_PERSIST_COLUMNS = [
+    "asof_date",
+    "symbol",
+    "model_name",
+    "forecast_horizon_days",
+    "action_hint",
+    "forecast_return",
+    "realized_return",
+    "cost_adjusted_return",
+    "forecast_direction",
+    "realized_direction",
+    "direction_hit",
+    "positive_realized",
+    "absolute_error",
+    "squared_error",
+    "future_date",
+    "entry_price",
+    "exit_price",
+    "evaluation_status",
+    "evaluation_detail",
+    "load_ts",
 ]
 
 
@@ -243,7 +272,7 @@ def load_price_window(
 
 
 def _nth_future_price(price_group: pd.DataFrame, asof_date: pd.Timestamp, horizon_days: int) -> tuple[pd.Timestamp | None, float | None, float | None, str]:
-    future = price_group[price_group["date"].ge(asof_date)].sort_values("date").reset_index(drop=True)
+    future = price_group[price_group["date"].gt(asof_date.normalize())].sort_values("date").reset_index(drop=True)
     if future.empty:
         return None, None, None, "missing_entry_price"
     entry_row = future.iloc[0]
@@ -339,6 +368,7 @@ def build_forecast_evaluations(
                 "exit_price": exit_price,
                 "evaluation_status": status,
                 "evaluation_detail": f"horizon={horizon_days}; cost_bps={float(cost_bps):.2f}",
+                "point_in_time_return_contract_json": json.dumps(POINT_IN_TIME_RETURN_CONTRACT, sort_keys=True),
                 "load_ts": now,
             }
         )
@@ -418,6 +448,7 @@ def _prepare_evaluations_for_persist(evaluations: pd.DataFrame) -> pd.DataFrame:
     for col in ["symbol", "model_name", "action_hint", "evaluation_status", "evaluation_detail"]:
         if col in out.columns:
             out[col] = out[col].astype("string")
+    out = out[[col for col in EVALUATION_PERSIST_COLUMNS if col in out.columns]].copy()
     return out
 
 

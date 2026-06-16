@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +30,10 @@ class ParsedReport:
     prompt_id: Optional[str] = None
     prompt_version: Optional[str] = None
     prompt_schema_version: Optional[str] = None
+
+    def model_dump(self) -> Dict[str, Any]:
+        """Pydantic-compatible dump API for shared serializers."""
+        return asdict(self)
 
 
 @dataclass(slots=True)

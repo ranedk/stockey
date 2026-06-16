@@ -41,6 +41,7 @@ export interface OperatorHealthDetails {
   api_schema?: OperatorApiSchema
   status: string
   sections: Dict
+  deferred_diagnostics?: Dict
   fix_hints?: Dict[]
   current_blockers?: Dict
   compact?: boolean
@@ -78,6 +79,8 @@ export interface FeatureFreshnessPayload {
   counts: Dict
   blockers: Dict[]
   inputs: Dict[]
+  stage_gates?: Dict[]
+  stage_gate_summary?: Dict
   notes?: string[]
 }
 
@@ -93,6 +96,96 @@ export interface OperatorSmokePayload {
   recommendation?: string
   next_commands?: string[]
   read_only: boolean
+  note?: string
+}
+
+export interface ExecutionApprovalsPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  summary: Dict
+  rows: Dict[]
+  operator_boundary: Dict
+  source_warnings?: Dict[]
+  skipped?: Dict[]
+}
+
+export interface ExecutionApprovalDecisionResult {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  decision: Dict
+  operator_boundary: Dict
+  note?: string
+}
+
+export interface ExecutionApprovalContractUpdateResult {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  updated_row: Dict
+  safety_contract: Dict
+  operator_boundary: Dict
+  note?: string
+}
+
+export interface ExecutionReconciliationRunResult {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  mode: string
+  dry_run: boolean
+  summary: Dict
+  orders: Dict[]
+  fills: Dict[]
+  targets: Dict[]
+  operator_boundary: Dict
+  note?: string
+}
+
+export interface ExecutionEvidenceReviewResult {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  mode: string
+  dry_run: boolean
+  decision: string
+  review: Dict
+  evidence: Dict
+  updated_row: Dict
+  safety_contract: Dict
+  operator_boundary: Dict
+  note?: string
+}
+
+export interface ExecutionLiveAllowanceResult {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  mode: string
+  dry_run: boolean
+  decision: string
+  allowance: Dict
+  blockers: string[]
+  updated_row: Dict
+  safety_contract: Dict
+  operator_boundary: Dict
+  note?: string
+}
+
+export interface ExecutionLiveSubmitPreflightResult {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  decision: string
+  summary: Dict
+  expected_live_token?: string | null
+  cli_command_preview?: string | null
+  env_required: Dict
+  blockers: string[]
+  planned_orders: Dict[]
+  skipped_orders: Dict[]
+  operator_boundary: Dict
   note?: string
 }
 
@@ -187,6 +280,7 @@ export interface EventModelPromotionCheckPayload {
   coverage: Dict
   weekly_runs: Dict
   score_freshness: Dict
+  research_safety?: Dict
   gates: Dict[]
   failed_gates: string[]
   notes: string[]
@@ -264,7 +358,18 @@ export interface EventModelArtifactsPayload {
   artifact: Dict
   latest_s3_heads: Dict[]
   pagination?: Dict
+  operator_boundary?: Dict
   read_only: boolean
+}
+
+export interface ResearchLedgerPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  runs: Dict[]
+  summary: Dict
+  pagination?: Dict
+  operator_boundary?: Dict
 }
 
 export interface ManualReviewPayload {
@@ -553,6 +658,8 @@ export interface ConfigChangeApplicationResult {
   verification_status?: string
   verification?: Dict
   safety_checks?: string[]
+  decision_effect?: Dict
+  operator_boundary?: Dict
   applied_by_system: boolean
   applied: boolean
   note?: string
@@ -602,6 +709,21 @@ export interface ScreenerCoveragePayload {
   summary: Dict
   screeners: Dict[]
   notes?: string[]
+}
+
+export interface ScreenerFailuresPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  message?: string
+  window_hours?: number
+  active_count?: number
+  validation_count?: number
+  fetch_count?: number
+  parse_count?: number
+  counts_by_stage?: Dict
+  rows: Dict[]
+  operator_boundary?: Dict
 }
 
 export interface TechnicalPromotionReviewResult {

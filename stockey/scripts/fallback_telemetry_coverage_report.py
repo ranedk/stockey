@@ -22,6 +22,11 @@ LOG_METHOD_NAMES = {
     "info",
     "warning",
 }
+SELF_PROTECTION_SILENT_HANDLERS = {
+    ("advisory/fallback_telemetry.py", "_json_ready", 61),
+    ("advisory/fallback_telemetry.py", "record_local_fallback_event", 220),
+    ("data/dhanlive/auth.py", "_is_inside_running_event_loop", 185),
+}
 
 
 @dataclass(frozen=True)
@@ -116,7 +121,15 @@ def _handler_returns_or_continues(handler: ast.ExceptHandler) -> bool:
     return any(isinstance(node, (ast.Return, ast.Continue, ast.Break)) for node in ast.walk(handler))
 
 
-def _classify_handler(handler: ast.ExceptHandler) -> tuple[str, str]:
+def _classify_handler(
+    handler: ast.ExceptHandler,
+    *,
+    relative_path: str,
+    function_name: str | None,
+) -> tuple[str, str]:
+    handler_key = (relative_path, function_name or "", int(getattr(handler, "lineno", 0) or 0))
+    if handler_key in SELF_PROTECTION_SILENT_HANDLERS:
+        return "self_protection", "fallback telemetry self-protection avoids recursive telemetry noise"
     if _handler_records_fallback(handler):
         return "records_fallback", "handler records a fallback/degraded-path telemetry event"
     if _handler_has_raise(handler):
@@ -163,7 +176,11 @@ def analyze_file(path: Path, *, root: Path) -> list[ExceptionHandlerUse]:
         if not isinstance(handler, ast.ExceptHandler):
             continue
         fn = _enclosing_function(handler, parents)
-        status, reason = _classify_handler(handler)
+        status, reason = _classify_handler(
+            handler,
+            relative_path=relative_path,
+            function_name=fn.name if fn else None,
+        )
         rows.append(
             ExceptionHandlerUse(
                 path=relative_path,

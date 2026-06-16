@@ -10,6 +10,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Dict, List, Literal, Optional, Sequence, Type
+from urllib.parse import urlparse
 
 import pytz
 import requests
@@ -202,6 +203,26 @@ class AnnouncementPipeline:
         for announcement in announcements:
             if announcement.attachment_bytes or not announcement.attachment_url:
                 continue
+            if not self._is_downloadable_url(announcement.attachment_url):
+                record_local_fallback_event(
+                    module="data.announcements.pipeline",
+                    fallback_type="announcement_attachment_url_invalid",
+                    source="announcement_download",
+                    severity="warn",
+                    reason="Announcement attachment URL was empty, placeholder, or not an HTTP(S) URL; attachment download was skipped.",
+                    error=ValueError(f"Invalid announcement attachment URL: {announcement.attachment_url}"),
+                    metadata={
+                        "unique_id": announcement.unique_id,
+                        "ticker": announcement.ticker,
+                        "exchange": announcement.exchange,
+                        "attachment_url": str(announcement.attachment_url)[:200],
+                    },
+                )
+                announcement.attachment_url = None
+                announcement.attachment_name = None
+                announcement.attachment_content_type = None
+                announcement.attachment_bytes = None
+                continue
             response = requests.get(
                 announcement.attachment_url,
                 headers=self._headers_for_download(announcement.exchange),
@@ -223,6 +244,14 @@ class AnnouncementPipeline:
             announcement.attachment_content_type = response.headers.get("Content-Type")
             announcement.ocr_error = None
         return list(announcements)
+
+    @staticmethod
+    def _is_downloadable_url(value: str | None) -> bool:
+        text = str(value or "").strip()
+        if not text or text in {"-", "--", "NA", "N/A", "null", "None"}:
+            return False
+        parsed = urlparse(text)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
     def ocr_first_pages(self, announcements: Sequence[Announcement], max_pages: int = 3) -> List[Announcement]:
         for announcement in announcements:

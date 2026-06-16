@@ -42,6 +42,34 @@ def _record_sharpely_fallback(
     )
 
 
+def classify_sharpely_sync_error(error: object) -> str:
+    text = str(error or "").lower()
+    if "unauthorized" in text or "forbidden" in text or "status 401" in text or "status 403" in text:
+        return "auth_unavailable"
+    if "timed out" in text or "timeout" in text or "connection" in text or "status 502" in text or "status 503" in text or "status 504" in text:
+        return "source_unavailable"
+    if "json" in text or "keyerror" in text or "columns" in text:
+        return "parse_failed"
+    return "failed"
+
+
+def classify_sharpely_run_state(*, rows_written: int, failures: list[dict[str, object]], symbol_count: int) -> str:
+    if symbol_count <= 0:
+        return "no_data"
+    if failures:
+        classifications = [str(row.get("classification") or classify_sharpely_sync_error(row.get("error"))) for row in failures]
+        if rows_written > 0:
+            return "partial_failed"
+        if classifications and all(item == "auth_unavailable" for item in classifications):
+            return "auth_unavailable"
+        if classifications and all(item == "source_unavailable" for item in classifications):
+            return "source_unavailable"
+        if classifications and all(item == "parse_failed" for item in classifications):
+            return "parse_failed"
+        return "failed"
+    return "ok" if rows_written > 0 else "no_data"
+
+
 def filter_by_date_range(df: pd.DataFrame, from_date: datetime | None, to_date: datetime | None) -> pd.DataFrame:
     if df.empty or "date" not in df.columns:
         return df
@@ -559,90 +587,110 @@ def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to
         "statement_refreshed_count": 0,
         "shareholding_refreshed_count": 0,
         "mcap_refreshed_count": 0,
+        "failed_symbol_count": 0,
+        "failed_symbols": [],
+        "classification_counts": {},
+        "no_data_count": 0,
+        "source_unavailable_count": 0,
+        "auth_unavailable_count": 0,
+        "parse_failed_count": 0,
         "symbols_skipped_no_work": [],
         "fallback_used": False,
         "state_advanced": False,
     }
+    failures: list[dict[str, object]] = []
 
     for symbol in normalized_symbols:
-        symbol_work_count = 0
-        meta_max_date = get_db_max_date(
-            SHARPELY_STOCK_META_TABLE,
-            date_column="as_on_date",
-            filters={"symbol": symbol},
-        )
-        peers_max_date = get_db_max_date(
-            SHARPELY_STOCK_PEERS_TABLE,
-            date_column="as_on_date",
-            filters={"anchor_symbol": symbol},
-        )
-        meta_max_ts = pd.Timestamp(meta_max_date).normalize() if meta_max_date is not None else None
-        peers_max_ts = pd.Timestamp(peers_max_date).normalize() if peers_max_date is not None else None
-        need_meta_snapshot = meta_max_ts is None or meta_max_ts < snapshot_target
-        need_peers_snapshot = peers_max_ts is None or peers_max_ts < snapshot_target
-        cached_meta: dict | None = None
-        if need_meta_snapshot or need_peers_snapshot:
-            meta_payload = get_stock_meta(symbol)
-            meta_df = save_stock_meta(symbol, meta_payload)
-            if not meta_df.empty:
-                raw = meta_df.iloc[-1].get("raw_json")
-                cached_meta = json.loads(raw) if isinstance(raw, str) else None
-            meta_rows = int(len(meta_df))
-            summary["meta_rows"] = int(summary["meta_rows"]) + meta_rows
-            summary["meta_refreshed_count"] = int(summary["meta_refreshed_count"]) + 1
-            symbol_work_count += meta_rows
-        if need_peers_snapshot:
-            peer_payload = get_stock_peers(symbol, meta=cached_meta)
-            peer_df = save_stock_peers(symbol, cached_meta or {}, peer_payload)
-            peer_rows = int(len(peer_df))
-            summary["peer_rows"] = int(summary["peer_rows"]) + peer_rows
-            summary["peer_refreshed_count"] = int(summary["peer_refreshed_count"]) + 1
-            symbol_work_count += peer_rows
+        try:
+            symbol_work_count = 0
+            meta_max_date = get_db_max_date(
+                SHARPELY_STOCK_META_TABLE,
+                date_column="as_on_date",
+                filters={"symbol": symbol},
+            )
+            peers_max_date = get_db_max_date(
+                SHARPELY_STOCK_PEERS_TABLE,
+                date_column="as_on_date",
+                filters={"anchor_symbol": symbol},
+            )
+            meta_max_ts = pd.Timestamp(meta_max_date).normalize() if meta_max_date is not None else None
+            peers_max_ts = pd.Timestamp(peers_max_date).normalize() if peers_max_date is not None else None
+            need_meta_snapshot = meta_max_ts is None or meta_max_ts < snapshot_target
+            need_peers_snapshot = peers_max_ts is None or peers_max_ts < snapshot_target
+            cached_meta: dict | None = None
+            if need_meta_snapshot or need_peers_snapshot:
+                meta_payload = get_stock_meta(symbol)
+                meta_df = save_stock_meta(symbol, meta_payload)
+                if not meta_df.empty:
+                    raw = meta_df.iloc[-1].get("raw_json")
+                    cached_meta = json.loads(raw) if isinstance(raw, str) else None
+                meta_rows = int(len(meta_df))
+                summary["meta_rows"] = int(summary["meta_rows"]) + meta_rows
+                summary["meta_refreshed_count"] = int(summary["meta_refreshed_count"]) + 1
+                symbol_work_count += meta_rows
+            if need_peers_snapshot:
+                peer_payload = get_stock_peers(symbol, meta=cached_meta)
+                peer_df = save_stock_peers(symbol, cached_meta or {}, peer_payload)
+                peer_rows = int(len(peer_df))
+                summary["peer_rows"] = int(summary["peer_rows"]) + peer_rows
+                summary["peer_refreshed_count"] = int(summary["peer_refreshed_count"]) + 1
+                symbol_work_count += peer_rows
 
-        stmt_from_date = choose_from_date(
-            from_date,
-            [
-                get_db_max_date("stmt_income", filters={"symbol": symbol}),
-                get_db_max_date("stmt_balancesheet", filters={"symbol": symbol}),
-                get_db_max_date("stmt_cashflow", filters={"symbol": symbol}),
-            ],
-        )
-        if stmt_from_date <= to_date:
-            statement_result = get_financial_statement(symbol, stmt_from_date, to_date)
-            statement_rows = int(statement_result.get("rows") or 0)
-            summary["statement_rows"] = int(summary["statement_rows"]) + statement_rows
-            summary["statement_refreshed_count"] = int(summary["statement_refreshed_count"]) + 1
-            symbol_work_count += statement_rows
+            stmt_from_date = choose_from_date(
+                from_date,
+                [
+                    get_db_max_date("stmt_income", filters={"symbol": symbol}),
+                    get_db_max_date("stmt_balancesheet", filters={"symbol": symbol}),
+                    get_db_max_date("stmt_cashflow", filters={"symbol": symbol}),
+                ],
+            )
+            if stmt_from_date <= to_date:
+                statement_result = get_financial_statement(symbol, stmt_from_date, to_date)
+                statement_rows = int(statement_result.get("rows") or 0)
+                summary["statement_rows"] = int(summary["statement_rows"]) + statement_rows
+                summary["statement_refreshed_count"] = int(summary["statement_refreshed_count"]) + 1
+                symbol_work_count += statement_rows
 
-        shareholding_from_date = choose_from_date(
-            from_date,
-            [
-                get_db_max_date("shareholding_category", filters={"symbol": symbol}),
-                get_db_max_date("shareholding_top_holders", filters={"symbol": symbol}),
-            ],
-        )
-        if shareholding_from_date <= to_date:
-            shareholding_result = get_shareholding(symbol, shareholding_from_date, to_date)
-            shareholding_rows = int(shareholding_result.get("rows") or 0)
-            summary["shareholding_rows"] = int(summary["shareholding_rows"]) + shareholding_rows
-            summary["shareholding_refreshed_count"] = int(summary["shareholding_refreshed_count"]) + 1
-            symbol_work_count += shareholding_rows
+            shareholding_from_date = choose_from_date(
+                from_date,
+                [
+                    get_db_max_date("shareholding_category", filters={"symbol": symbol}),
+                    get_db_max_date("shareholding_top_holders", filters={"symbol": symbol}),
+                ],
+            )
+            if shareholding_from_date <= to_date:
+                shareholding_result = get_shareholding(symbol, shareholding_from_date, to_date)
+                shareholding_rows = int(shareholding_result.get("rows") or 0)
+                summary["shareholding_rows"] = int(summary["shareholding_rows"]) + shareholding_rows
+                summary["shareholding_refreshed_count"] = int(summary["shareholding_refreshed_count"]) + 1
+                symbol_work_count += shareholding_rows
 
-        mcap_from_date = choose_from_date(
-            from_date,
-            [get_db_max_date("historical_mcap", filters={"symbol": symbol})],
-        )
-        if mcap_from_date <= to_date:
-            mcap_result = get_historical_mcap(symbol, mcap_from_date, to_date)
-            mcap_rows = int(mcap_result.get("rows") or 0)
-            summary["historical_mcap_rows"] = int(summary["historical_mcap_rows"]) + mcap_rows
-            summary["mcap_refreshed_count"] = int(summary["mcap_refreshed_count"]) + 1
-            symbol_work_count += mcap_rows
-        if symbol_work_count <= 0:
-            skipped = list(summary["symbols_skipped_no_work"])
-            if len(skipped) < 100:
-                skipped.append(symbol)
-            summary["symbols_skipped_no_work"] = skipped
+            mcap_from_date = choose_from_date(
+                from_date,
+                [get_db_max_date("historical_mcap", filters={"symbol": symbol})],
+            )
+            if mcap_from_date <= to_date:
+                mcap_result = get_historical_mcap(symbol, mcap_from_date, to_date)
+                mcap_rows = int(mcap_result.get("rows") or 0)
+                summary["historical_mcap_rows"] = int(summary["historical_mcap_rows"]) + mcap_rows
+                summary["mcap_refreshed_count"] = int(summary["mcap_refreshed_count"]) + 1
+                symbol_work_count += mcap_rows
+            if symbol_work_count <= 0:
+                skipped = list(summary["symbols_skipped_no_work"])
+                if len(skipped) < 100:
+                    skipped.append(symbol)
+                summary["symbols_skipped_no_work"] = skipped
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            classification = classify_sharpely_sync_error(error_text)
+            failures.append({"symbol": symbol, "classification": classification, "error": error_text})
+            _record_sharpely_fallback(
+                fallback_type="sharpely_symbol_sync_failed",
+                reason="Sharpely fundamentals sync failed for one symbol; the batch continued with classified run-state.",
+                error=exc,
+                symbol=symbol,
+                metadata={"classification": classification},
+            )
     rows_written = (
         int(summary["meta_rows"])
         + int(summary["peer_rows"])
@@ -652,6 +700,21 @@ def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to
     )
     summary["rows"] = rows_written
     summary["rows_written"] = rows_written
+    failure_classifications = [str(row.get("classification") or "failed") for row in failures]
+    classification_counts = {key: failure_classifications.count(key) for key in sorted(set(failure_classifications))}
+    summary["classification"] = classify_sharpely_run_state(
+        rows_written=rows_written,
+        failures=failures,
+        symbol_count=len(normalized_symbols),
+    )
+    summary["status"] = "ok" if summary["classification"] in {"ok", "no_data"} else "failed"
+    summary["failed_symbol_count"] = len(failures)
+    summary["failed_symbols"] = [str(row.get("symbol") or "") for row in failures[:100]]
+    summary["classification_counts"] = classification_counts
+    summary["source_unavailable_count"] = int(classification_counts.get("source_unavailable", 0))
+    summary["auth_unavailable_count"] = int(classification_counts.get("auth_unavailable", 0))
+    summary["parse_failed_count"] = int(classification_counts.get("parse_failed", 0))
+    summary["no_data_count"] = len(summary["symbols_skipped_no_work"]) if rows_written <= 0 else 0
     summary["state_advanced"] = rows_written > 0
     return summary
 
@@ -673,8 +736,8 @@ def main() -> int:
         from_date=parse_datetime_arg(args.from_date),
         to_date=parse_datetime_arg(args.to_date),
     )
-    print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
-    return 0
+    print(json.dumps({"status": STOCKEY_RUN_STATE.get("status", "ok"), **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
+    return 1 if STOCKEY_RUN_STATE.get("status") == "failed" else 0
 
 
 if __name__ == "__main__":

@@ -243,17 +243,47 @@ def parse_validation_protocol(text: str | None) -> dict[str, Any] | None:
     return json.loads(text)
 
 
-def list_runs(limit: int = 50) -> pd.DataFrame:
+def list_runs(limit: int = 50, *, offset: int = 0, include_details: bool = False) -> pd.DataFrame:
     ensure_tables()
+    base_columns = [
+        "research_run_id",
+        "run_type",
+        "entrypoint",
+        "label",
+        "objective",
+        "asof_date",
+        "status",
+        "git_rev",
+        "started_ts",
+        "completed_ts",
+    ]
+    detail_columns = [
+        "parent_run_id",
+        "config_hash",
+        "config_json",
+        "validation_protocol_json",
+        "data_snapshot_json",
+        "result_metrics_json",
+        "notes_json",
+        "error_text",
+        "updated_ts",
+    ]
+    selected_columns = base_columns + (detail_columns if include_details else [])
+    metadata: dict[str, Any] = {"limit": int(limit)}
+    if int(offset):
+        metadata["offset"] = int(offset)
+    if include_details:
+        metadata["include_details"] = True
     try:
         return sql_to_df(
             f"""
-            SELECT research_run_id, run_type, entrypoint, label, objective, asof_date, status, git_rev, started_ts, completed_ts
+            SELECT {", ".join(selected_columns)}
             FROM {LEDGER_TABLE}
             ORDER BY started_ts DESC
             LIMIT %s
+            OFFSET %s
             """,
-            params=(int(limit),),
+            params=(int(limit), int(offset)),
         )
     except Exception as exc:
         _record_research_ledger_fallback(
@@ -261,7 +291,7 @@ def list_runs(limit: int = 50) -> pd.DataFrame:
             source=LEDGER_TABLE,
             reason="Research ledger runs could not be listed; research evidence visibility may be unavailable.",
             error=exc,
-            metadata={"limit": int(limit)},
+            metadata=metadata,
         )
         raise
 

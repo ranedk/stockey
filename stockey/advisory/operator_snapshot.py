@@ -238,6 +238,7 @@ def load_operator_snapshot_sections(
     *,
     asof_date: str | pd.Timestamp | None = None,
     max_age_seconds: int | None = DEFAULT_MAX_AGE_SECONDS,
+    allow_missing: bool = False,
 ) -> dict[str, Any] | None:
     names = sorted({str(name or "").strip() for name in section_names if str(name or "").strip()})
     if not names:
@@ -282,7 +283,7 @@ def load_operator_snapshot_sections(
             asof_value = row.get("asof_date")
             payload["asof_date"] = None if pd.isna(asof_value) else str(asof_value)
     missing = [name for name in names if name not in payload]
-    if missing:
+    if missing and not allow_missing:
         return None
     payload["generated_at"] = None if latest_generated_at is None else str(latest_generated_at)
     payload["_snapshot"] = {
@@ -292,6 +293,7 @@ def load_operator_snapshot_sections(
         "generated_at": payload["generated_at"],
         "payload_bytes": total_bytes,
         "sections": names,
+        "missing_sections": missing,
     }
     return payload
 

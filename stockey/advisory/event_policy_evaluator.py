@@ -560,6 +560,11 @@ def evaluate_event_policies(
         "return_threshold": float(return_threshold),
         "cost_bps": float(cost_bps),
         "min_matured_rows": int(min_matured_rows),
+        "point_in_time_return_contract": (
+            json.loads(dataset["point_in_time_return_contract_json"].dropna().iloc[0])
+            if "point_in_time_return_contract_json" in dataset.columns and dataset["point_in_time_return_contract_json"].notna().any()
+            else {}
+        ),
     }
     return evaluations, summary, meta
 

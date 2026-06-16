@@ -32,6 +32,8 @@ The app is operator-controlled, not auto-trading controlled.
 
 Broker execution remains in the Python execution engine and CLI/operator workflow. The app may display staged execution orders and Dhan readiness, but it must not submit orders. Current write paths are limited to operator/audit workflows such as hypothesis creation, hypothesis scans, and technical-calibration review decisions.
 
+The operator paper portfolio is also a UI write path, but it is explicitly paper-only. `/recommendations` Buy/Sell buttons write only to `advisory_operator_portfolio_ledger`; `/paper-portfolio` reads that ledger and displays entry price, exit price, current price, and percentage P&L. These pages must not mutate advisory recommendations, authoritative portfolio rows, Dhan execution rows, execution approvals, or broker orders.
+
 The target operating model is UI-first:
 
 - normal operator work should happen from the Nuxt app
@@ -84,9 +86,39 @@ Status stages:
 - parsed
 - evaluated
 - hypothesis matched
+
+### Action Queue
+
+The Action Queue shows the final consolidated action per symbol after portfolio, lifecycle, watchlist, event-policy, market-gate, and conflict-rule inputs are resolved.
+
+The Overview page must show source-specific payload freshness near the top of the page before the operator reads individual rows. At minimum this includes Home, Actions, Portfolio, and Signal Refresh generated-at/status/stale-warning metadata. Stale payloads should be visibly marked as a trust issue, not hidden inside raw JSON.
+
+The `Broker candidate` status filter maps to the backend `approved` filter value for compatibility, but its meaning is strict: it returns only rows whose final consolidated action is a broker-candidate action. Rows that became `MANUAL_REVIEW` or review-only must not appear in this filter just because an upstream source row had `approved` text such as `portfolio_status=approved`.
+
+Each row should show its `action_queue_contract`, final action, source action, reason contract, conflict winner/losers, execution safety gate, and whether it is review-only, blocked, watch/hold, or broker-candidate.
+
+Each row must also render the backend `final_state_trust` contract before the detailed panels. This is the operator's first-read checklist: final action, queue status, broker-candidate flag, reason-contract state, action-transition preconditions, feature-freshness state, execution-boundary state, blockers, and warnings. This panel is read-only and must not submit broker orders.
+
+Each row must also show a plain-English Portfolio Eligibility panel before the detailed trace blocks. This panel should say whether the row is a portfolio-handoff candidate, broker-candidate but blocked, manual review, watch-only, hold/context, exit/risk-reduction, or not portfolio-eligible, and it must include the next operator step plus the top blockers.
+
+Rows with open symbol-level identity/source issues from `/api/identity-issues` must show an Identity / Source Blocker panel in the Action Queue before deeper trace evidence. The panel must explain that the problem is operational data quality, not investment judgment, include the source error and repair hint, link to the Identity Issues workbench, and include the issue in portfolio/readiness blockers.
 - adversarially reviewed
 - routed
 - action updated
+
+### Recommendations And Paper Portfolio
+
+The `/recommendations` page is the operator-controlled paper-entry surface. It loads the latest consolidated `advisory_action_recommendations`, enriches each row with current price, and shows whether the symbol is already open in the operator paper portfolio.
+
+Required behavior:
+
+- show only action-capable recommendations: `BUY`, `BUY_MORE`, `SELL`, and `PARTIAL_SELL`
+- hide `WATCH`, `HOLD`, and `MANUAL_REVIEW` rows from this page because they belong in watch/manual-review surfaces, not the paper-action surface
+- render exactly one visible button per recommendation row: `BUY`, `BUY_50%`, `SELL`, or `SELL_50%`
+- visible safety copy that the action is paper-only and does not submit broker orders
+- clear price fields: current price, reference price, target, stop, score
+
+The `/paper-portfolio` page is the compact paper-state view. It should show only the operator ledger-derived position state: symbol, open/closed status, entry price, exit price, current price, and percentage P&L. The reset control must require explicit confirmation and call the paper-ledger reset API only.
 
 ### Decision Trace
 
@@ -109,6 +141,7 @@ For a symbol/date/action, display:
 - regime and macro context
 - exchange-event context
 - news/announcement context
+- company-memory compact evidence coverage, including whether required announcement, bhavcopy, and technical evidence was present or missing
 - event model output
 - event-policy action (`BUY_WATCH`, `MANUAL_REVIEW`, `REDUCE_EXPOSURE_REVIEW`, `NO_ACTION`) with policy class, checks, LLM operator notes, wait-for events, and operator questions
 - adversarial review
@@ -116,19 +149,35 @@ For a symbol/date/action, display:
 - lifecycle and exit policy
 - execution eligibility
 
+### Symbol Detail
+
+Symbol Detail must surface symbol-scoped operational blockers before the operator interprets price/action data. Open identity issues from `/api/identity-issues?symbol=...`, especially Dhan security-id mapping failures, should show as identity/source blockers with repair hints and a link to the Identity Issues workbench. These blockers are operational data issues, not investment recommendations, and explain skipped OHLCV pulls, missing latest prices, or blocked execution previews.
+
+Symbol Detail must also show source-specific payload freshness for Actions, Portfolio, Events, Trace, Data Inputs, and Identity. This panel is separate from the stale snapshot warning and exists so the operator can tell whether a symbol page is mixing fresh and stale payloads before interpreting final action, P&L, target, stop, or event evidence.
+
 Resolved action conflicts are shown here for audit/debug. They should not appear in Manual Review unless the conflict still requires operator action.
 
 Event-policy rows refined to `NO_ACTION` are also audit/debug records, not Manual Review work. If action consolidation created a generic manual-review row for the same event, the Manual Review API should suppress that shadow row and keep only the detailed actionable event-policy item when one exists.
 
 Manual Review copy must be written for an operator, not for a developer. The visible card title, reason, summary, questions, and wait signals should use plain English. Internal labels and enums belong in the source-row drawer or trace details, not in the primary decision text.
 
+Manual Review cards must show compact source evidence before the raw source drawer. The evidence contract should include source kind, a short headline, and a small fact list derived from the already-loaded source row so operators can understand event-policy rows, action conflicts, execution blockers, failures, identity issues, threshold reviews, action reviews, and wait-signal follow-ups without loading bulky raw JSON.
+
 The Manual Review page defaults to the `Investment review` lane. Operational failures such as OCR/parser/API/Codex errors remain available under `Technical issues`, but they should not be mixed into the primary investment-decision queue.
+
+The Manual Review API and UI must show backend-authored queue-level category counts before the item list: investment judgment, technical/data repair, research/config review, and item-impact buckets such as entry/watch, exit/risk, follow-up, execution-blocking, and ops/data. These summaries are informational only and must not change portfolio, action, config, or broker state.
+
+The Manual Review API includes an active-queue contract. The UI must show that only displayed active rows require operator action; closed, duplicate, and matched-wait-suppressed rows are audit/debug history. The contract must also state that Manual Review decisions do not mutate portfolio rows, action recommendations, or broker orders.
+
+Each active Manual Review item must also show a `visibility_lifecycle` contract. This explains why the row is active now, whether it is new, annotated, reopened after newer source evidence, or a matched wait-signal follow-up, which decisions will close it, which decisions will keep it active, and that Manual Review decisions do not mutate portfolio, action recommendation, or broker state.
 
 Manual Review decisions have bounded effects:
 
 - `downgrade_to_no_action`, `ignore`, `approve_for_manual_config`, and `mark_fixed` are closing decisions. They remove the item from the active Manual Review queue through `advisory_manual_review_decisions`; they do not mutate portfolio, action recommendations, or broker orders.
 - `watch_for_event` is non-closing. It requires an explicit `Event to wait for`, records the operator note, and creates an active `advisory_wait_signals` row from that text. Watchers/signal refresh can later match that wait signal against fresh news, announcements, and announcement documents.
 - `needs_more_data` and `add_operator_note` annotate the item only.
+
+The Manual Review UI must show a decision guide for all dropdown choices and a selected-choice effect checklist before save. The checklist must state active-queue effect, wait-signal effect, portfolio effect, action-recommendation effect, and broker effect so operators do not confuse a review decision with an action/portfolio mutation.
 
 ### Wait Signals
 
@@ -148,6 +197,16 @@ Use this page to inspect:
 - unresolved/manual-required conflict combinations that need a new deterministic rule or explicit operator decision
 
 Resolved conflicts are audit records, not manual-review tasks. Manual Review should only contain conflicts where `requires_manual_resolution = true` or `resolution_status` is `unresolved` / `manual_required`.
+
+### Execution Approvals
+
+The global navigation must link to `/execution-approvals` because live-broker safety is an operator-critical workflow, not a hidden debug page.
+
+This page shows dry-run execution rows, approval/reconciliation/evidence/live-allowance gates, blockers, and the manual live-submit preflight command/token. UI actions may write approval audit, safety-contract, reconciliation, evidence-review, or live-allowance records, but they must not submit broker orders. Live submission remains a deliberate CLI-only operation unless a separate live-submit UX is designed with equal or stronger safety gates.
+
+Live allowance is not sufficient by itself. Applying live allowance marks `live_submission_allowed=true` but also requires a fresh post-allowance approval decision; preflight and CLI live submission must block until the safety contract records that fresh approval after the allowance timestamp.
+
+Each execution approval row must show a live-readiness checklist, not just a free-text blocker list. Required gates include dry-run row status, broker identity, positive quantity, positive reference price, operator approval, broker reconciliation, repeated dry-run evidence, live allowance, and fresh post-allowance approval. The checklist is explanatory only; it must not submit broker orders.
 
 ### Investor Playbooks
 
@@ -216,6 +275,10 @@ Current endpoints:
 - `GET /api/summary`
 - `GET /api/actions`
 - `GET /api/portfolio`
+- `GET /api/operator-portfolio/recommendations`
+- `GET /api/operator-portfolio`
+- `POST /api/operator-portfolio/action`
+- `POST /api/operator-portfolio/reset`
 - `GET /api/watchlist`
 - `GET /api/market-context`
 - `GET /api/technical-calibration`
@@ -223,6 +286,10 @@ Current endpoints:
 - `GET /api/technical-calibration/promotion-reviews`
 - `POST /api/technical-calibration/promotion-review/decision`
 - `GET /api/events`
+
+List-style operator endpoints should be compact by default when they are used for normal UI reads. `/api/actions` and `/api/portfolio` default to compact rows so the Action Queue, Portfolio views, and latency probe do not pull bulky raw evidence; use `?compact=false` only for short debugging, and prefer `/api/actions/detail` or `/api/portfolio/{symbol}/detail` for full row evidence. `/api/home` omits duplicated action/today cards by default because the UI loads them from `/api/actions` and `/api/portfolio`; use `include_action_cards=true` only for legacy/debug reads. `/api/portfolio` supports `bucket=today_recommendations|current_recommendations|exited_recommendations|portfolio|lifecycle` so normal UI reads fetch only the selected tab and keep the other sections empty while preserving pagination/meta totals. The Action Queue list uses persisted decision-time feature freshness by default; current live freshness recomputation is explicit through `refresh_feature_freshness=true`.
+
+Watchlist reads follow the same list contract. `/api/watchlist` accepts `section=watch_recommendations|watchlist|ts_watch_recommendations|ts_forecast_watch|ts_forecast_eval_summary|ts_forecast_paper_summary` plus `limit` and `compact`; normal UI reads should request one section at a time. Compact TS forecast watch rows omit bulky swing/position window internals and retain summary fields; use `compact=false` only for targeted debugging.
 - `GET /api/event-policy`
 - `GET /api/event-policy/evaluation`
 - `GET /api/events/{unique_id}/trace`
@@ -288,7 +355,7 @@ It should consume:
 17. Done: add Action Queue and Symbol Detail data-input freshness visibility.
 18. Done: persist action decision-time feature freshness and show it in Action Queue/Symbol Detail.
 19. Done: enforce feature dependencies in rules, risk, portfolio, lifecycle, and actions, and surface blocked stage gates through Operator Health.
-20. Next: add richer per-symbol UI drill-down for stage gate effects.
+20. Done: add richer per-symbol UI drill-down for current and decision-time stage gate effects.
 21. Add live update stream.
 
 ## UI-First Operations Workbench
@@ -297,8 +364,8 @@ Remaining gaps before the project can be managed almost entirely from UI:
 
 - Feature dependency enforcement: show and enforce which stage was downgraded or blocked by stale/missing required inputs.
 - Broader decision-time freshness: extend persisted snapshots beyond consolidated action rows where needed, especially non-action Manual Review sources.
-- Ingestion state: expose standardized downloader/parser run rows and source-specific failure classes.
-- Research/config operations: finish S3 artifact inspection, research-ledger review, and safe reviewed-config application workflows.
+- Ingestion state: standardized downloader/parser run rows, source-specific failure classes, and failed-symbol/source-skip summaries are visible in Health; keep expanding source-specific semantics as new ambiguous failures appear.
+- Research/config operations: S3 artifact inspection, event-model research safety controls, and recent research-ledger review are now read-only in Operations; Technical Calibration, Signal Quality, and Event Policy reviewed diffs have audit-only application recording; TS forecast review/application state is visible on the home TS workflow panel. Remaining work is advanced research-ledger reconciliation.
 - Data lineage: keep improving raw event -> OCR/summary -> tensor -> policy/review -> action -> lifecycle/execution plan visibility without raw JSON.
 - Retention/performance: keep summary-first/paginated endpoints and add hot/cold retention for old trace and intraday rows.
 

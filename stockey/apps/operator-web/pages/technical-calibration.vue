@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import type { ConfigChangePreviewResult, Dict, TechnicalPromotionReviewResult } from '~/types/api'
+import type { ConfigChangeApplicationResult, ConfigChangeApplicationsPayload, ConfigChangePreviewResult, Dict, TechnicalPromotionReviewResult } from '~/types/api'
 
 const api = useOperatorApi()
 const { data, refresh } = await useAsyncData('technical-calibration', () => api.getTechnicalCalibration(12))
 const { data: reviewsData, refresh: refreshReviews } = await useAsyncData('technical-promotion-reviews', () => api.getTechnicalPromotionReviews(25))
+const { data: applicationsData, refresh: refreshApplications } = await useAsyncData<ConfigChangeApplicationsPayload>('config-change-applications-technical', () => api.getConfigChangeApplications(10))
 const reviewSetupId = ref('EVENT_OPPORTUNITY_V1')
 const reviewingConfigId = ref('')
 const reviewError = ref('')
@@ -15,10 +16,16 @@ const decisionError = ref('')
 const configPreviewKey = ref('')
 const configPreviewResult = ref<ConfigChangePreviewResult | null>(null)
 const configPreviewError = ref('')
+const applicationDecision = ref<'approved_to_apply' | 'marked_applied' | 'rejected' | 'needs_more_data'>('approved_to_apply')
+const applicationNote = ref('')
+const applicationBusy = ref(false)
+const applicationError = ref('')
+const applicationResult = ref<ConfigChangeApplicationResult | null>(null)
 
 const summaryRows = computed(() => data.value?.summary || [])
 const configRows = computed(() => data.value?.top_configs || [])
 const reviewRows = computed(() => reviewsData.value?.reviews || [])
+const applicationRows = computed(() => applicationsData.value?.applications || [])
 
 function numberText(value: unknown, digits = 2) {
   const num = Number(value)
@@ -75,6 +82,18 @@ function copyPatchText(row: Dict) {
 function copyDiff(value: unknown) {
   if (!import.meta.client) return
   navigator.clipboard?.writeText(String(value || ''))
+}
+
+function asDict(value: unknown): Dict {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Dict : {}
+}
+
+function humanLabel(value: unknown) {
+  return String(value || '-').replaceAll('_', ' ')
+}
+
+function boolLabel(value: unknown) {
+  return value ? 'yes' : 'no'
 }
 
 function configsForHorizon(horizon: unknown) {
@@ -145,6 +164,31 @@ async function previewConfigChange(row: Dict) {
     configPreviewError.value = error instanceof Error ? error.message : String(error)
   } finally {
     configPreviewKey.value = ''
+  }
+}
+
+async function recordConfigApplication() {
+  const previewId = String(configPreviewResult.value?.preview_id || '').trim()
+  applicationError.value = ''
+  applicationResult.value = null
+  if (!previewId) {
+    applicationError.value = 'Generate and persist a reviewed diff preview before recording an application decision.'
+    return
+  }
+  applicationBusy.value = true
+  try {
+    applicationResult.value = await api.decideConfigChangeApplication({
+      preview_id: previewId,
+      application_decision: applicationDecision.value,
+      operator_note: applicationNote.value,
+      verify_config: true
+    })
+    applicationNote.value = ''
+    await refreshApplications()
+  } catch (error) {
+    applicationError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    applicationBusy.value = false
   }
 }
 </script>
@@ -341,6 +385,7 @@ async function previewConfigChange(row: Dict) {
 
       <p v-if="decisionError" class="mt-4 rounded-2xl bg-rust/15 p-4 text-sm font-bold text-rust">{{ decisionError }}</p>
       <p v-if="configPreviewError" class="mt-4 rounded-2xl bg-rust/15 p-4 text-sm font-bold text-rust">{{ configPreviewError }}</p>
+      <p v-if="applicationError" class="mt-4 rounded-2xl bg-rust/15 p-4 text-sm font-bold text-rust">{{ applicationError }}</p>
       <p v-if="decisionResult" class="mt-4 rounded-2xl bg-moss/15 p-4 text-sm font-bold text-moss">
         Decision recorded: {{ decisionResult.decision }}. No config change was applied.
       </p>
@@ -356,7 +401,73 @@ async function previewConfigChange(row: Dict) {
           </button>
         </div>
         <pre class="mt-4 max-h-96 overflow-auto rounded-2xl bg-black/40 p-4 text-xs leading-5">{{ configPreviewResult.unified_diff }}</pre>
+        <div class="mt-4 rounded-2xl border border-paper/15 bg-paper/10 p-4">
+          <p class="text-xs font-black uppercase tracking-[0.24em] text-paper/45">Application audit</p>
+          <p class="mt-2 text-sm leading-6 text-paper/70">
+            Record what happened after reviewing this diff. This API writes only an audit record; it does not edit config, promote policy, mutate portfolio rows, or submit broker orders.
+          </p>
+          <div class="mt-4 grid gap-3 md:grid-cols-[220px_1fr_auto]">
+            <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-paper/45">
+              Decision
+              <select v-model="applicationDecision" class="rounded-xl border border-paper/20 bg-ink px-3 py-2 text-sm normal-case tracking-normal text-paper outline-none focus:border-sun">
+                <option value="approved_to_apply">Approved to apply manually</option>
+                <option value="marked_applied">Marked applied manually</option>
+                <option value="needs_more_data">Needs more data</option>
+                <option value="rejected">Rejected</option>
+              </select>
+            </label>
+            <label class="grid gap-1 text-xs font-black uppercase tracking-[0.18em] text-paper/45">
+              Operator note
+              <input v-model="applicationNote" class="rounded-xl border border-paper/20 bg-ink px-3 py-2 text-sm normal-case tracking-normal text-paper outline-none focus:border-sun" placeholder="What did you verify or decide?" />
+            </label>
+            <button class="self-end rounded-full bg-sun px-4 py-2 text-xs font-black text-ink disabled:opacity-50" type="button" :disabled="applicationBusy" @click="recordConfigApplication">
+              {{ applicationBusy ? 'Recording...' : 'Record Audit' }}
+            </button>
+          </div>
+        </div>
+        <div v-if="applicationResult" class="mt-4 rounded-2xl border border-moss/30 bg-moss/10 p-4">
+          <p class="text-xs font-black uppercase tracking-[0.24em] text-moss">Saved application decision</p>
+          <p class="mt-2 text-sm font-bold text-paper">{{ humanLabel(asDict(applicationResult.decision_effect).state) }}</p>
+          <p class="mt-2 text-sm leading-6 text-paper/70">{{ asDict(applicationResult.decision_effect).next_step || applicationResult.note }}</p>
+          <div class="mt-3 grid gap-2 text-xs font-bold text-paper/70 md:grid-cols-4">
+            <span class="rounded-xl bg-black/20 px-3 py-2">Config mutated: {{ boolLabel(asDict(applicationResult.decision_effect).mutates_config) }}</span>
+            <span class="rounded-xl bg-black/20 px-3 py-2">Policy mutated: {{ boolLabel(asDict(applicationResult.decision_effect).mutates_policy) }}</span>
+            <span class="rounded-xl bg-black/20 px-3 py-2">Portfolio mutated: {{ boolLabel(asDict(applicationResult.decision_effect).mutates_portfolio) }}</span>
+            <span class="rounded-xl bg-black/20 px-3 py-2">Broker allowed: {{ boolLabel(asDict(applicationResult.operator_boundary).broker_execution_allowed) }}</span>
+          </div>
+        </div>
       </article>
+
+      <section class="mt-4 rounded-2xl border border-black/10 bg-white/70 p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p class="text-xs font-black uppercase tracking-[0.24em] text-ink/45">Recent application decisions</p>
+            <p class="mt-2 text-sm leading-6 text-ink/60">
+              Audit trail for reviewed config previews. These rows explain what happens next and confirm Stockey did not apply config or broker changes.
+            </p>
+          </div>
+          <button class="rounded-full bg-white px-4 py-2 text-xs font-black text-ink shadow-sm" type="button" @click="refreshApplications()">
+            Refresh applications
+          </button>
+        </div>
+        <div v-if="applicationRows.length" class="mt-4 grid gap-3 md:grid-cols-2">
+          <article v-for="row in applicationRows.slice(0, 6)" :key="String(row.application_id)" class="rounded-2xl bg-paper/80 p-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-xs font-black uppercase tracking-[0.18em] text-ink/45">{{ humanLabel(row.application_decision) }}</p>
+                <p class="mt-1 text-sm font-black text-ink">{{ row.preview_id || row.application_id }}</p>
+              </div>
+              <span class="rounded-full bg-ink px-3 py-1 text-xs font-black text-paper">{{ humanLabel(row.verification_status) }}</span>
+            </div>
+            <p class="mt-3 text-sm leading-6 text-ink/65">{{ asDict(row.decision_effect).next_step || row.note || 'Audit decision recorded.' }}</p>
+            <div class="mt-3 grid gap-2 text-xs font-bold text-ink/60 md:grid-cols-2">
+              <span class="rounded-xl bg-white px-3 py-2">Config mutated: {{ boolLabel(asDict(row.decision_effect).mutates_config) }}</span>
+              <span class="rounded-xl bg-white px-3 py-2">Broker allowed: {{ boolLabel(asDict(row.operator_boundary).broker_execution_allowed) }}</span>
+            </div>
+          </article>
+        </div>
+        <p v-else class="mt-4 rounded-2xl bg-paper/80 p-4 text-sm text-ink/60">No config application audit rows yet.</p>
+      </section>
 
       <div class="mt-5 space-y-4">
         <div v-for="row in reviewRows" :key="reviewKey(row)" class="rounded-3xl bg-white/70 p-5">
