@@ -156,7 +156,7 @@ async function refreshFiltered() {
             </p>
           </div>
         </div>
-        <div class="mt-4 grid gap-3 text-sm sm:grid-cols-5">
+        <div class="mt-4 flex gap-3 text-sm">
           <p class="rounded-2xl bg-paper/80 p-3"><span class="block text-xs font-black uppercase text-ink/40">Current</span>{{ money(row.current_price) }}</p>
           <p class="rounded-2xl bg-paper/80 p-3"><span class="block text-xs font-black uppercase text-ink/40">Reference</span>{{ money(row.reference_price) }}</p>
           <p class="rounded-2xl bg-paper/80 p-3"><span class="block text-xs font-black uppercase text-ink/40">Target</span>{{ money(row.recommended_target_price) }}</p>
