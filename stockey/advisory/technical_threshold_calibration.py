@@ -16,6 +16,7 @@ from utils.sync import parse_datetime_arg
 EVALUATIONS_TABLE = "advisory_technical_threshold_evaluations"
 SUMMARY_TABLE = "advisory_technical_threshold_eval_summary"
 TECHNICAL_THRESHOLD_SCHEMA_MIGRATION_ID = "20260611_advisory_technical_threshold_calibration_base"
+TECHNICAL_THRESHOLD_REPAIR_MIGRATION_ID = "20260616_advisory_technical_threshold_timescale_unique_keys"
 DEFAULT_HORIZONS = [5, 10, 20]
 DEFAULT_RETURN_THRESHOLD = 0.03
 DEFAULT_COST_BPS = 25.0
@@ -103,6 +104,48 @@ TECHNICAL_THRESHOLD_SCHEMA_STATEMENTS = [
     """,
 ]
 
+TECHNICAL_THRESHOLD_REPAIR_STATEMENTS = [
+    f"""
+    DO $$
+    DECLARE
+        rec RECORD;
+    BEGIN
+        FOR rec IN
+            SELECT
+                tbl.relname AS table_name,
+                con.conname AS constraint_name,
+                idx.relname AS index_name,
+                COALESCE(
+                    (
+                        SELECT array_agg(att.attname::text ORDER BY keys.ord)
+                        FROM unnest(i.indkey) WITH ORDINALITY AS keys(attnum, ord)
+                        JOIN pg_attribute att
+                          ON att.attrelid = tbl.oid
+                         AND att.attnum = keys.attnum
+                    ),
+                    ARRAY[]::text[]
+                ) AS columns
+            FROM pg_index i
+            JOIN pg_class tbl ON tbl.oid = i.indrelid
+            JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+            JOIN pg_class idx ON idx.oid = i.indexrelid
+            LEFT JOIN pg_constraint con ON con.conindid = i.indexrelid
+            WHERE ns.nspname = 'public'
+              AND tbl.relname IN ('{EVALUATIONS_TABLE}', '{SUMMARY_TABLE}')
+              AND i.indisunique
+        LOOP
+            IF NOT ('evaluated_at' = ANY(rec.columns)) THEN
+                IF rec.constraint_name IS NOT NULL THEN
+                    EXECUTE format('ALTER TABLE %I DROP CONSTRAINT IF EXISTS %I', rec.table_name, rec.constraint_name);
+                ELSE
+                    EXECUTE format('DROP INDEX IF EXISTS %I', rec.index_name);
+                END IF;
+            END IF;
+        END LOOP;
+    END $$;
+    """,
+]
+
 DEFAULT_GRID = {
     "trend_min": [0.0, 12.0, 15.0, 18.0],
     "structure_min": [0.0, 15.0, 18.0, 21.0],
@@ -167,6 +210,12 @@ def ensure_tables() -> None:
         description="Create technical-threshold calibration output tables.",
         statements=TECHNICAL_THRESHOLD_SCHEMA_STATEMENTS,
         metadata={"tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
+    )
+    apply_schema_migration(
+        migration_id=TECHNICAL_THRESHOLD_REPAIR_MIGRATION_ID,
+        description="Drop stale technical-threshold unique indexes that omit the Timescale partition column.",
+        statements=TECHNICAL_THRESHOLD_REPAIR_STATEMENTS,
+        metadata={"tables": [EVALUATIONS_TABLE, SUMMARY_TABLE], "partition_column": "evaluated_at"},
     )
 
 

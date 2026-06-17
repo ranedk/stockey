@@ -36,10 +36,34 @@ def _run_json_command(args: list[str]) -> dict[str, Any]:
     stdout, _ = proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(args)}")
+    return _parse_json_command_stdout(stdout or "", args)
+
+
+def _parse_json_command_stdout(stdout: str, args: list[str] | None = None) -> dict[str, Any]:
+    command = "" if args is None else " from " + " ".join(args)
     try:
-        return json.loads(stdout or "")
+        parsed = json.loads(stdout or "")
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"expected JSON output from {' '.join(args)}") from exc
+        decoder = json.JSONDecoder()
+        best: dict[str, Any] | None = None
+        for idx, char in enumerate(stdout):
+            if char != "{":
+                continue
+            try:
+                value, end = decoder.raw_decode(stdout, idx)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                best = value
+                if not stdout[end:].strip():
+                    return value
+        if best is not None:
+            return best
+        excerpt = stdout[-2000:] if stdout else "<empty stdout>"
+        raise RuntimeError(f"expected JSON output{command}; stdout_tail={excerpt!r}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"expected JSON object output{command}; got {type(parsed).__name__}")
+    return parsed
 
 
 def _run_streaming_command(args: list[str]) -> int:

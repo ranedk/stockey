@@ -1049,7 +1049,7 @@ def test_db_retry_coverage_report_classifies_wrapped_and_direct_sessions(tmp_pat
     package.mkdir()
     (package / "sample.py").write_text(
         """
-from utils.db import db_session, execute_db_operation
+from utils.db import db_session, execute_db_operation, upsert_to_db
 
 def direct():
     with db_session() as (_, cur):
@@ -29707,6 +29707,26 @@ def test_model_training_runner_horizon_ready():
     assert model_training_runner._horizon_ready(prep_summary, 5) is False
 
 
+def test_model_training_runner_parses_json_after_stdout_noise():
+    stdout = "\n".join(
+        [
+            "{'mode': 'daily', 'warning': 'dhan_no_data_retry'}",
+            "[advisory.pipeline] stage=evaluate running elapsed=30.00s",
+            '{"status": "ok", "label_coverage": {"coverage": [{"horizon_days": 1, "train_ready": true}]}}',
+        ]
+    )
+
+    parsed = model_training_runner._parse_json_command_stdout(stdout, ["unit"])
+
+    assert parsed["status"] == "ok"
+    assert parsed["label_coverage"]["coverage"][0]["train_ready"] is True
+
+
+def test_model_training_runner_bad_json_error_includes_stdout_tail():
+    with pytest.raises(RuntimeError, match="stdout_tail"):
+        model_training_runner._parse_json_command_stdout("not json", ["unit"])
+
+
 def test_event_model_promotion_check_passes_for_strong_evidence(monkeypatch):
     metadata = {
         "model_name": "xgboost_event_meta_model",
@@ -32178,7 +32198,7 @@ def test_technical_threshold_calibration_ensure_tables_uses_schema_registry(monk
 
     technical_threshold_calibration.ensure_tables()
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0]["migration_id"] == technical_threshold_calibration.TECHNICAL_THRESHOLD_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"]["tables"] == [
         technical_threshold_calibration.EVALUATIONS_TABLE,
@@ -32188,6 +32208,9 @@ def test_technical_threshold_calibration_ensure_tables_uses_schema_registry(monk
     assert any(technical_threshold_calibration.SUMMARY_TABLE in statement for statement in calls[0]["statements"])
     assert any("UNIQUE (evaluated_at, config_id, horizon_days)" in statement for statement in calls[0]["statements"])
     assert any("DROP CONSTRAINT" in statement for statement in calls[0]["statements"])
+    assert calls[1]["migration_id"] == technical_threshold_calibration.TECHNICAL_THRESHOLD_REPAIR_MIGRATION_ID
+    assert calls[1]["metadata"]["partition_column"] == "evaluated_at"
+    assert any("NOT ('evaluated_at' = ANY(rec.columns))" in statement for statement in calls[1]["statements"])
 
 
 def test_technical_threshold_calibration_persist_outputs_uses_timescale_safe_unique_keys(monkeypatch):
@@ -32243,6 +32266,18 @@ def test_technical_threshold_calibration_persist_outputs_uses_timescale_safe_uni
             "rows": 1,
         },
     ]
+
+
+def test_upsert_to_db_rejects_timescale_unique_keys_without_partition_column():
+    from utils.db import upsert_to_db
+
+    with pytest.raises(ValueError, match="partition column"):
+        upsert_to_db(
+            pd.DataFrame([{"evaluated_at": pd.Timestamp("2026-06-16T00:00:00Z"), "config_id": "cfg"}]),
+            "unit_timescale_table",
+            unique_keys=["config_id"],
+            timescaledb_column="evaluated_at",
+        )
 
 
 def test_technical_threshold_calibration_records_schema_lookup_failure(monkeypatch):

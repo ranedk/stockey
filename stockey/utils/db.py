@@ -512,6 +512,11 @@ def _upsert_to_db_once(
     missing = [k for k in unique_keys if k not in cols]
     if missing:
         raise ValueError(f"DataFrame missing unique keys: {missing}")
+    if timescaledb_column and timescaledb_column not in unique_keys:
+        raise ValueError(
+            f"TimescaleDB upsert unique_keys must include partition column "
+            f"{timescaledb_column!r}; got {unique_keys!r}"
+        )
 
     # --- helpers ------------------------------------------------------------
     # Columns & conflicts
