@@ -164,6 +164,14 @@ async function refreshFiltered() {
           <p class="rounded-2xl bg-paper/80 p-3"><span class="block text-xs font-black uppercase text-ink/40">Score</span>{{ pct(row.invest_score_pct) }}</p>
         </div>
       </article>
+      <div v-if="!rows.length" class="rounded-[1.75rem] bg-white/80 p-8 text-center shadow-soft">
+        <p class="text-lg font-black text-ink">No applicable paper action recommendations.</p>
+        <p class="mx-auto mt-2 max-w-3xl text-sm leading-6 text-ink/60">
+          The backend found {{ summary.raw_actionable_recommendation_count ?? 0 }} action-capable advisory rows, but hid
+          {{ summary.hidden_not_applicable_count ?? 0 }} because they do not match the current paper portfolio state.
+          After a reset, sell and partial-sell rows are hidden until a symbol is open in the paper ledger.
+        </p>
+      </div>
     </div>
   </section>
 </template>

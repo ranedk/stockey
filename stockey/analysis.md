@@ -333,6 +333,7 @@ Done:
 
 - Macro snapshots/features exist.
 - Regime snapshots exist.
+- `advisory.regime_overlay` now creates review-only dynamic regime overlay proposals from base regime, market context, macro features, recent market news, and announcement-event counts. It can use Codex structured output when explicitly enabled, but defaults to a deterministic fallback and persists `authority_scope=review_input_only`, `production_status=proposed`, prompt version, evidence, proposed rules, expiry, and operator questions in `advisory_regime_overlay_proposals`. `/api/regime-overlays` and the Nuxt `/regime-overlays` page let the operator approve for testing, promote to review-rule candidate, reject, or request more evidence; all decisions are audit/review state only and do not mutate action policy, portfolio, or broker state.
 - Market context exists.
 - Technical features and technical engine exist.
 - Intraday features exist.
@@ -346,6 +347,7 @@ Gaps:
 - `Partial`: explain in the UI which feature was missing or stale when an action became Manual Review. Required stale/missing core inputs are now visible beside action rows and on symbol detail pages, including persisted decision-time snapshots for action rows, current stage-gate blockers, and positive action downgrades preserve `feature_freshness_blockers` plus `blocked_original_action_code` in action context; remaining work is broader Manual Review source coverage.
 - `To do`: reduce expensive full-table feature queries with materialized/current snapshots.
 - `To do`: add feature-level tests for point-in-time behavior and no lookahead.
+- `Partial`: add an operator-reviewed promotion path for dynamic regime overlay rules before action policy can consume them. Proposal review/decision audit exists in API/UI, but a separate reviewed config/rule implementation is still required before promoted review-rule candidates can affect market gates or sizing.
 
 ## 7A. Announcement, Bhavcopy, And LLM Signal Intelligence
 

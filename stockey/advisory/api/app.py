@@ -59,6 +59,7 @@ from advisory.operator_snapshot import load_operator_snapshot_sections
 from advisory.performance_slowlog import record_slow_operation
 from advisory.performance_slowlog import update_slow_issue_status
 from advisory.prompt_registry import build_prompt_registry_payload
+from advisory.regime_overlay import load_regime_overlay_decisions, load_regime_overlay_reviews, record_regime_overlay_decision
 from advisory.portfolio_engine import PORTFOLIO_TABLE
 from advisory.research_ledger import LEDGER_TABLE as RESEARCH_LEDGER_TABLE
 from advisory.research_ledger import list_runs as list_research_ledger_runs
@@ -454,6 +455,31 @@ class OperatorMarketContextResponse(OperatorApiResponseModel):
     asof_date: str | None = None
     summary: dict[str, Any] = Field(default_factory=dict)
     top_universe: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class RegimeOverlaysResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    proposals: list[dict[str, Any]] = Field(default_factory=list)
+    decisions: list[dict[str, Any]] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    pagination: dict[str, Any] = Field(default_factory=dict)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
+
+
+class RegimeOverlayDecisionResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    decided_at: str | None = None
+    decision: str | None = None
+    proposal_id: str | None = None
+    proposal_status: str | None = None
+    decision_effect: dict[str, Any] = Field(default_factory=dict)
+    proposal: dict[str, Any] = Field(default_factory=dict)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
+    note: str | None = None
 
 
 class OperatorEventsResponse(OperatorApiResponseModel):
@@ -4210,6 +4236,61 @@ def build_market_context_payload(*, asof_date: str | None = None, limit: int = 5
         "summary": payload.get("summary") or {},
         "top_universe": payload.get("top_universe") or [],
     }
+
+
+def build_regime_overlays_payload(*, limit: int = 25, status: str | None = None) -> dict[str, Any]:
+    bounded = _bounded_limit(limit, default=25, maximum=100)
+    proposals = load_regime_overlay_reviews(limit=bounded, status=status)
+    decisions = load_regime_overlay_decisions(limit=bounded)
+    counts: dict[str, int] = {}
+    for row in proposals:
+        key = str(row.get("production_status") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/regime-overlays", schema_name="regime_overlays"),
+        "status": "ok",
+        "proposals": proposals,
+        "decisions": decisions,
+        "summary": {
+            "proposal_count": len(proposals),
+            "decision_count": len(decisions),
+            "by_status": counts,
+            "review_only": True,
+            "production_policy_changed": False,
+        },
+        "pagination": {
+            "proposals": _bounded_list_contract(proposals, limit=bounded, default=25, maximum=100),
+            "decisions": _bounded_list_contract(decisions, limit=bounded, default=25, maximum=100),
+        },
+        "operator_boundary": {
+            "authority_scope": "review_input_only",
+            "changes_action_policy": False,
+            "changes_portfolio": False,
+            "submits_broker_order": False,
+            "operator_note": "Accept/reject decisions are audit/review state only. A separate reviewed config/rule implementation is required before action policy can consume a regime overlay.",
+        },
+    }
+
+
+def build_regime_overlay_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    asof_date = payload.get("asof_date")
+    proposal_id = str(payload.get("proposal_id") or "").strip()
+    decision = str(payload.get("decision") or "").strip().lower()
+    if not asof_date:
+        raise ValueError("asof_date is required")
+    if not proposal_id:
+        raise ValueError("proposal_id is required")
+    result = record_regime_overlay_decision(
+        asof_date=asof_date,
+        proposal_id=proposal_id,
+        decision=decision,
+        decision_reason=str(payload.get("decision_reason") or "") or None,
+        operator_id=str(payload.get("operator_id") or "") or None,
+    )
+    result["generated_at"] = pd.Timestamp.utcnow().isoformat()
+    result["api_schema"] = _operator_api_schema("/api/regime-overlays/decision", schema_name="regime_overlay_decision")
+    return result
 
 
 def _table_exists(table_name: str) -> bool:
@@ -10609,6 +10690,14 @@ def create_app():
     @app.get("/api/market-context", response_model=OperatorMarketContextResponse)
     def market_context(asof_date: str | None = None, limit: int = Query(default=50, ge=0, le=500)):
         return _guard(build_market_context_payload, route="/api/market-context", asof_date=asof_date, limit=limit)
+
+    @app.get("/api/regime-overlays", response_model=RegimeOverlaysResponse)
+    def regime_overlays(limit: int = Query(default=25, ge=1, le=100), status: str | None = None):
+        return _guard(build_regime_overlays_payload, route="/api/regime-overlays", limit=limit, status=status)
+
+    @app.post("/api/regime-overlays/decision", response_model=RegimeOverlayDecisionResponse)
+    def regime_overlay_decision(payload: dict[str, Any] = Body(...)):
+        return _guard(build_regime_overlay_decision_payload, route="/api/regime-overlays/decision", payload=payload)
 
     @app.get("/api/technical-calibration", response_model=TechnicalCalibrationResponse)
     def technical_calibration(limit: int = Query(default=25, ge=1, le=100)):

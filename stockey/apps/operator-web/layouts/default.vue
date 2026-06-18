@@ -47,6 +47,7 @@ const runtimeLabel = computed(() => {
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/hypotheses">Playbooks</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/screeners">Screeners</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/wait-signals">Wait Signals</NuxtLink>
+            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/regime-overlays">Regime Review</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/signal-quality">Signal Quality</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/prompt-registry">Prompt Registry</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/identity-issues">Identity Issues</NuxtLink>

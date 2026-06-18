@@ -42929,6 +42929,49 @@ def test_operator_portfolio_maps_partial_actions_to_single_operator_button(monke
     assert row["operator_action_disabled_reason"] is None
 
 
+def test_operator_portfolio_hides_sell_recommendations_when_paper_portfolio_is_empty(monkeypatch):
+    from advisory import operator_portfolio
+
+    def fake_sql(query, *args, **kwargs):
+        if operator_portfolio.ACTION_RECOMMENDATIONS_TABLE in query:
+            return pd.DataFrame(
+                [
+                    {
+                        "asof_date": pd.Timestamp("2026-06-16T00:00:00Z"),
+                        "published_on": pd.Timestamp("2026-06-16T10:00:00Z"),
+                        "symbol": "EXIT",
+                        "setup_id": "S1",
+                        "unique_id": "U1",
+                        "action_code": "SELL",
+                        "reference_price": 100.0,
+                    },
+                    {
+                        "asof_date": pd.Timestamp("2026-06-16T00:00:00Z"),
+                        "published_on": pd.Timestamp("2026-06-16T10:00:00Z"),
+                        "symbol": "ENTRY",
+                        "setup_id": "S2",
+                        "unique_id": "U2",
+                        "action_code": "BUY",
+                        "reference_price": 50.0,
+                    },
+                ]
+            )
+        if operator_portfolio.LEDGER_TABLE in query:
+            return pd.DataFrame()
+        raise AssertionError(query)
+
+    monkeypatch.setattr(operator_portfolio, "ensure_operator_portfolio_tables", lambda: None)
+    monkeypatch.setattr(operator_portfolio, "sql_to_df", fake_sql)
+    monkeypatch.setattr(operator_portfolio, "load_current_prices", lambda symbols, max_age_seconds=None: {})
+
+    payload = operator_portfolio.build_recommendations_payload(limit=10)
+
+    assert [row["symbol"] for row in payload["recommendations"]] == ["ENTRY"]
+    assert payload["recommendations"][0]["operator_recommended_action"] == "buy"
+    assert payload["summary"]["hidden_not_applicable_count"] == 1
+    assert "BUY when no paper position" in payload["summary"]["operator_action_filter"]
+
+
 def test_operator_portfolio_apply_buy_writes_only_paper_ledger(monkeypatch):
     from advisory import operator_portfolio
 
@@ -42989,3 +43032,167 @@ def test_operator_portfolio_reset_requires_confirmation():
 
     with pytest.raises(ValueError, match="confirm=true"):
         operator_portfolio.reset_operator_portfolio(confirm=False)
+
+
+def test_regime_overlay_transition_proposal_is_review_only():
+    from advisory import regime_overlay
+
+    context = {
+        "asof_date": pd.Timestamp("2026-06-18T00:00:00Z"),
+        "base_regime": {"regime_name": "RISK_OFF", "macro_stress_score": 0.30},
+        "market_context": {"regime_name": "RISK_OFF", "risk_on_score": 0.45, "risk_off_score": 0.55},
+        "macro_features": {"macro_stress_score": 0.30},
+        "recent_market_news": [
+            {
+                "published_on": pd.Timestamp("2026-06-18T09:00:00Z"),
+                "title": "Peace deal de-escalates geopolitical risk as oil falls",
+                "description": "Markets review risk appetite after ceasefire signs.",
+            }
+        ],
+        "event_counts": {"announcement_event_counts": [{"event_class": "ORDER_WIN", "row_count": 2}]},
+    }
+
+    proposal = regime_overlay.deterministic_regime_overlay(context)
+
+    assert proposal.proposed_regime == "TRANSITION_RISK_OFF_TO_NEUTRAL"
+    assert proposal.regime_family == "TRANSITION"
+    assert proposal.recommended_bias == "neutral"
+    assert "manual_review_until_promoted" in proposal.positioning_policy["positive_actions"]
+
+
+def test_regime_overlay_build_uses_fallback_without_llm(monkeypatch):
+    from advisory import regime_overlay
+
+    context = {
+        "asof_date": pd.Timestamp("2026-06-18T00:00:00Z"),
+        "base_regime": {"regime_name": "RISK_OFF", "macro_stress_score": 0.30},
+        "market_context": {"regime_name": "RISK_OFF", "risk_on_score": 0.45, "risk_off_score": 0.55},
+        "macro_features": {},
+        "recent_market_news": [{"title": "Ceasefire brings peace hopes", "description": ""}],
+        "event_counts": {},
+    }
+    monkeypatch.setattr(regime_overlay, "load_regime_overlay_context", lambda **_kwargs: context)
+
+    df, meta = regime_overlay.build_regime_overlay(asof_date="2026-06-18", use_llm=False)
+
+    assert meta["authority_scope"] == "review_input_only"
+    assert meta["production_status"] == "proposed"
+    assert meta["fallback_used"] is True
+    assert df["proposed_regime"].iloc[0] == "TRANSITION_RISK_OFF_TO_NEUTRAL"
+    assert df["authority_scope"].iloc[0] == "review_input_only"
+    assert df["production_status"].iloc[0] == "proposed"
+    assert bool(df["fallback_used"].iloc[0]) is True
+
+
+def test_regime_overlay_persist_uses_timescale_safe_unique_keys(monkeypatch):
+    from advisory import regime_overlay
+
+    calls = {}
+    df = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-06-18T00:00:00Z"),
+                "proposal_id": "P1",
+                "proposed_regime": "BASE_REGIME_CONFIRMED",
+            }
+        ]
+    )
+    monkeypatch.setattr(regime_overlay, "ensure_table", lambda: None)
+    monkeypatch.setattr(
+        regime_overlay,
+        "upsert_to_db",
+        lambda frame, table_name, unique_keys, timescaledb_column=None: calls.update(
+            {
+                "table": table_name,
+                "unique_keys": list(unique_keys),
+                "timescaledb_column": timescaledb_column,
+            }
+        ),
+    )
+
+    regime_overlay.persist_regime_overlay(df)
+
+    assert calls["table"] == regime_overlay.TABLE_NAME
+    assert calls["unique_keys"] == ["asof_date", "proposal_id"]
+    assert calls["timescaledb_column"] == "asof_date"
+
+
+def test_prompt_registry_contains_regime_overlay_review_contract():
+    from advisory.prompt_registry import get_prompt_contract
+
+    contract = get_prompt_contract("regime_overlay_proposal")
+
+    assert contract["authority_scope"] == "review_input_only"
+    assert contract["broker_execution_allowed"] is False
+    assert contract["output_tables"] == ["advisory_regime_overlay_proposals"]
+
+
+def test_regime_overlay_decision_effects_are_non_executable():
+    from advisory import regime_overlay
+
+    effect = regime_overlay.decision_effect("promote_to_review_rule")
+
+    assert effect["proposal_status"] == "promoted_review_rule"
+    assert effect["changes_action_policy"] is False
+    assert effect["changes_portfolio"] is False
+    assert effect["submits_broker_order"] is False
+
+
+def test_operator_api_regime_overlay_payload_has_review_boundary(monkeypatch):
+    from advisory.api import app
+
+    monkeypatch.setattr(
+        app,
+        "load_regime_overlay_reviews",
+        lambda **_kwargs: [
+            {
+                "asof_date": "2026-06-18T00:00:00+00:00",
+                "proposal_id": "P1",
+                "production_status": "proposed",
+                "proposed_regime": "TRANSITION_RISK_OFF_TO_NEUTRAL",
+            }
+        ],
+    )
+    monkeypatch.setattr(app, "load_regime_overlay_decisions", lambda **_kwargs: [])
+
+    payload = app.build_regime_overlays_payload(limit=10)
+
+    assert payload["summary"]["production_policy_changed"] is False
+    assert payload["operator_boundary"]["authority_scope"] == "review_input_only"
+    assert payload["operator_boundary"]["changes_action_policy"] is False
+    assert payload["operator_boundary"]["submits_broker_order"] is False
+
+
+def test_operator_api_regime_overlay_decision_payload(monkeypatch):
+    from advisory.api import app
+
+    captured = {}
+
+    def fake_record(**kwargs):
+        captured.update(kwargs)
+        return {
+            "status": "ok",
+            "decided_at": "2026-06-18T10:00:00+00:00",
+            "decision": kwargs["decision"],
+            "proposal_id": kwargs["proposal_id"],
+            "proposal_status": "rejected",
+            "decision_effect": {"changes_action_policy": False, "submits_broker_order": False},
+            "proposal": {},
+            "operator_boundary": {"authority_scope": "review_input_only"},
+        }
+
+    monkeypatch.setattr(app, "record_regime_overlay_decision", fake_record)
+
+    result = app.build_regime_overlay_decision_payload(
+        {
+            "asof_date": "2026-06-18",
+            "proposal_id": "P1",
+            "decision": "reject",
+            "decision_reason": "Not supported by breadth.",
+        }
+    )
+
+    assert result["status"] == "ok"
+    assert result["api_schema"]["endpoint"] == "/api/regime-overlays/decision"
+    assert captured["decision"] == "reject"
+    assert captured["proposal_id"] == "P1"

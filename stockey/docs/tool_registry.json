@@ -395,6 +395,23 @@
       ]
     },
     {
+      "name": "build_advisory_regime_overlay",
+      "category": "analysis",
+      "description": "Build review-only dynamic regime overlay proposals from macro, market-context, news, and event-count evidence.",
+      "command": ["python", "-m", "advisory.regime_overlay"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": ["--dry-run", "--no-llm"],
+          "description": "Preview the deterministic review-only regime overlay proposal without writing."
+        },
+        {
+          "args": ["--llm"],
+          "description": "Use Codex to propose a structured review-only regime overlay and candidate rules."
+        }
+      ]
+    },
+    {
       "name": "sync_advisory_peers",
       "category": "ingestion",
       "description": "Incrementally refresh Sharpely peer snapshots, peer fundamentals, and Dhan peer OHLCV.",

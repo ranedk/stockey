@@ -20,6 +20,7 @@ TECHNICAL_THRESHOLD_PROMOTION_REVIEW_PROMPT_ID = "technical_threshold_promotion_
 ANNOUNCEMENT_SUMMARY_PROMPT_ID = "announcement_summary"
 ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID = "announcement_structured_report"
 OCR_PDF_PAGE_PROMPT_ID = "ocr_pdf_page"
+REGIME_OVERLAY_PROPOSAL_PROMPT_ID = "regime_overlay_proposal"
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,27 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         fallback_behavior="Caller records OCR failure; no investment action is created directly.",
         migration_status="caller_migrated",
         notes=["Preserve visible text faithfully."],
+    ),
+    PromptContract(
+        prompt_id=REGIME_OVERLAY_PROPOSAL_PROMPT_ID,
+        version="REGIME_OVERLAY_PROPOSAL_V1",
+        title="Regime overlay proposal",
+        owner_area="market_regime",
+        purpose="Propose review-only market-regime overlays and candidate rules from macro, breadth, news, and event evidence.",
+        authority_scope="review_input_only",
+        provider="codex",
+        model_env_vars=["REGIME_OVERLAY_MODEL", "REGIME_OVERLAY_LLM_ENABLED"],
+        response_schema="advisory.regime_overlay.RegimeOverlayProposal",
+        prompt_source="advisory.regime_overlay.build_regime_overlay_prompt",
+        system_prompt_source="advisory.regime_overlay.propose_regime_overlay",
+        input_evidence=["deterministic market regime", "market context summary", "macro features", "recent market news", "event evidence counts"],
+        output_tables=["advisory_regime_overlay_proposals"],
+        fallback_behavior="Deterministic review-only overlay proposal is persisted when LLM is disabled or fails.",
+        migration_status="registered",
+        notes=[
+            "Creates proposed regimes/rules only; action consolidation must not consume them until explicitly promoted.",
+            "Broker execution is never allowed from this prompt.",
+        ],
     ),
 )
 

@@ -520,6 +520,31 @@ export interface OperatorMarketContext {
   top_universe: Dict[]
 }
 
+export interface RegimeOverlaysPayload {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  proposals: Dict[]
+  decisions: Dict[]
+  summary: Dict
+  pagination?: Dict
+  operator_boundary?: Dict
+}
+
+export interface RegimeOverlayDecisionResult {
+  generated_at?: string
+  api_schema?: OperatorApiSchema
+  status: string
+  decided_at?: string
+  decision?: string
+  proposal_id?: string
+  proposal_status?: string
+  decision_effect: Dict
+  proposal: Dict
+  operator_boundary: Dict
+  note?: string
+}
+
 export interface TechnicalCalibrationPayload {
   generated_at?: string
   api_schema?: OperatorApiSchema

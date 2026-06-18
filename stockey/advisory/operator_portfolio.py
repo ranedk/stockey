@@ -151,6 +151,15 @@ def _latest_recommendations(limit: int = 100, symbol: str | None = None) -> list
     return out
 
 
+def _is_applicable_recommendation(row: dict[str, Any], open_position: dict[str, Any] | None) -> bool:
+    action_code = str(row.get("action_code") or "").strip().upper()
+    if action_code == "BUY":
+        return open_position is None
+    if action_code in {"BUY_MORE", "SELL", "PARTIAL_SELL"}:
+        return open_position is not None
+    return False
+
+
 def _load_ledger() -> list[dict[str, Any]]:
     ensure_operator_portfolio_tables()
     df = sql_to_df(
@@ -235,8 +244,12 @@ def _position_by_symbol(symbol: str) -> dict[str, Any] | None:
 
 
 def build_recommendations_payload(*, limit: int = 100, symbol: str | None = None) -> dict[str, Any]:
-    recommendations = _latest_recommendations(limit=limit, symbol=symbol)
-    open_by_symbol = {row["symbol"]: row for row in build_positions() if row.get("status") == "open"}
+    requested_limit = max(1, min(int(limit), 500))
+    positions = build_positions()
+    open_by_symbol = {row["symbol"]: row for row in positions if row.get("status") == "open"}
+    recommendations = _latest_recommendations(limit=min(max(requested_limit * 5, requested_limit), 500), symbol=symbol)
+    applicable_recommendations: list[dict[str, Any]] = []
+    hidden_not_applicable = 0
     for row in recommendations:
         pos = open_by_symbol.get(_normalize_symbol(row.get("symbol")))
         row["operator_position_status"] = "open" if pos else "not_in_portfolio"
@@ -248,15 +261,24 @@ def build_recommendations_payload(*, limit: int = 100, symbol: str | None = None
             row["operator_action_disabled_reason"] = "No open paper position to sell."
         else:
             row["operator_action_disabled_reason"] = None
+        if _is_applicable_recommendation(row, pos):
+            applicable_recommendations.append(row)
+            if len(applicable_recommendations) >= requested_limit:
+                continue
+        else:
+            hidden_not_applicable += 1
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "status": "ok",
-        "recommendations": recommendations,
+        "recommendations": applicable_recommendations[:requested_limit],
         "summary": {
-            "recommendation_count": len(recommendations),
+            "recommendation_count": len(applicable_recommendations[:requested_limit]),
+            "raw_actionable_recommendation_count": len(recommendations),
+            "hidden_not_applicable_count": hidden_not_applicable,
             "open_position_count": len(open_by_symbol),
             "broker_execution_enabled": False,
             "paper_portfolio_only": True,
+            "operator_action_filter": "BUY when no paper position is open; BUY_MORE/SELL/PARTIAL_SELL only when the symbol is already open.",
         },
     }
 
