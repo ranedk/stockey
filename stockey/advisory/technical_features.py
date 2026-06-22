@@ -14,16 +14,52 @@ from advisory.peer_sync import sync_peer_data
 from features.tutils import get_max_date
 from utils.company_master import map_company_master_ids
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import load_tracked_symbols, parse_datetime_arg
 
 
 TABLE_NAME = "advisory_technical_daily"
+REFRESH_STATUS_TABLE = "advisory_technical_feature_refresh_status"
+TECHNICAL_REFRESH_STATUS_SCHEMA_MIGRATION_ID = "20260622_advisory_technical_feature_refresh_status"
+TECHNICAL_STOCK_RET_60D_SCHEMA_MIGRATION_ID = "20260622_advisory_technical_daily_stock_ret_60d"
 DEFAULT_BENCHMARK_NAME = "NIFTY"
 LOOKBACK_BUFFER_DAYS = 400
 MIN_AVG_TRADED_VALUE_20D = 1_00_00_000.0
 MAX_BREAKOUT_EXTENSION_PCT = 10.0
 MIN_SECTOR_PEER_COUNT = 3
 MAX_GAP_FREQ_60D = 0.15
+TECHNICAL_REFRESH_STATUS_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {REFRESH_STATUS_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        symbol TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        status TEXT NOT NULL,
+        action TEXT,
+        reason TEXT,
+        rows BIGINT,
+        error_type TEXT,
+        error_text TEXT,
+        from_date TIMESTAMPTZ,
+        to_date TIMESTAMPTZ,
+        raw_json TEXT,
+        load_ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (asof_date, symbol, stage)
+    )
+    """,
+    f"ALTER TABLE {REFRESH_STATUS_TABLE} ADD COLUMN IF NOT EXISTS raw_json TEXT",
+    f"""
+    CREATE INDEX IF NOT EXISTS idx_{REFRESH_STATUS_TABLE}_symbol_asof
+        ON {REFRESH_STATUS_TABLE} (UPPER(TRIM(symbol)), asof_date DESC)
+    """,
+    f"""
+    CREATE INDEX IF NOT EXISTS idx_{REFRESH_STATUS_TABLE}_status_asof
+        ON {REFRESH_STATUS_TABLE} (status, asof_date DESC)
+    """,
+]
+TECHNICAL_STOCK_RET_60D_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS stock_ret_60d DOUBLE PRECISION",
+]
 
 
 def _record_technical_features_fallback(
@@ -43,6 +79,35 @@ def _record_technical_features_fallback(
         error=error,
         metadata=metadata or {},
     )
+
+
+def ensure_refresh_status_table() -> None:
+    apply_schema_migration(
+        migration_id=TECHNICAL_REFRESH_STATUS_SCHEMA_MIGRATION_ID,
+        description="Create technical feature input/build refresh status table.",
+        statements=TECHNICAL_REFRESH_STATUS_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.technical_features", "tables": [REFRESH_STATUS_TABLE]},
+    )
+
+
+def ensure_technical_feature_schema() -> None:
+    apply_schema_migration(
+        migration_id=TECHNICAL_STOCK_RET_60D_SCHEMA_MIGRATION_ID,
+        description="Add persisted 60-day stock return for technical relative-strength scoring.",
+        statements=TECHNICAL_STOCK_RET_60D_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.technical_features", "tables": [TABLE_NAME]},
+    )
+
+
+def _normalize_asof(value: Any | None) -> pd.Timestamp:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        ts = pd.Timestamp.utcnow()
+    return ts.normalize()
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def normalize_timestamp(series: pd.Series) -> pd.Series:
@@ -679,6 +744,7 @@ def build_technical_features(
         "avg_traded_value_60d",
         "median_volume_20d",
         "median_volume_60d",
+        "stock_ret_60d",
         "stock_ret_120d",
         "rs_vs_benchmark",
         "sector_peer_ret_20d",
@@ -735,6 +801,7 @@ def persist_technical_features(
 ) -> None:
     if df.empty:
         return
+    ensure_technical_feature_schema()
     if rebuild:
         def _delete_existing_technical_features() -> None:
             with db_session() as (_, cur):
@@ -758,6 +825,204 @@ def persist_technical_features(
     )
 
 
+def build_refresh_status_rows(
+    *,
+    symbols: list[str],
+    asof_date: pd.Timestamp | None,
+    data_sync_result: dict[str, object] | None,
+    feature_df: pd.DataFrame,
+) -> pd.DataFrame:
+    effective_asof = _normalize_asof(asof_date)
+    normalized_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+    rows: list[dict[str, object]] = []
+    sync_result = data_sync_result if isinstance(data_sync_result, dict) else {}
+    stage_status_by_symbol: dict[tuple[str, str], dict[str, object]] = {}
+    for stage in ["ohlcv", "fundamentals"]:
+        stage_items = sync_result.get(stage)
+        if not isinstance(stage_items, list):
+            continue
+        for item in stage_items:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            error_text = item.get("error")
+            status = "issue" if item.get("action") == "issue" or error_text else "ok"
+            reason = str(item.get("reason") or "").strip()
+            row_count = pd.to_numeric(item.get("rows"), errors="coerce")
+            if (
+                stage == "ohlcv"
+                and status == "ok"
+                and str(item.get("action") or "").strip().lower() == "sync"
+                and not pd.isna(row_count)
+                and float(row_count) <= 0
+            ):
+                status = "skipped_with_warning"
+                reason = "ohlcv_sync_zero_rows"
+            if str(item.get("action") or "").strip().lower() == "skip" and reason not in {"ohlcv_present", "fundamentals_present"}:
+                status = "skipped_with_warning"
+            stage_status_by_symbol[(symbol, stage)] = {
+                "status": status,
+                "reason": reason or None,
+                "rows": row_count,
+                "error_type": item.get("error_type"),
+                "error_text": error_text,
+            }
+            rows.append(
+                {
+                    "asof_date": effective_asof,
+                    "symbol": symbol,
+                    "stage": stage,
+                    "status": status,
+                    "action": item.get("action"),
+                    "reason": reason or None,
+                    "rows": row_count,
+                    "error_type": item.get("error_type"),
+                    "error_text": None if error_text is None else str(error_text)[:2000],
+                    "from_date": pd.to_datetime(item.get("from_date"), utc=True, errors="coerce"),
+                    "to_date": pd.to_datetime(item.get("to_date"), utc=True, errors="coerce"),
+                    "raw_json": _json_text(item),
+                    "load_ts": pd.Timestamp.utcnow(),
+                }
+            )
+
+    feature_counts: dict[str, int] = {}
+    latest_feature_dates: dict[str, pd.Timestamp] = {}
+    latest_benchmark_rs_dates: dict[str, pd.Timestamp] = {}
+    benchmark_rs_counts: dict[str, int] = {}
+    if not feature_df.empty and "symbol" in feature_df.columns:
+        working = feature_df.copy()
+        working["symbol"] = working["symbol"].astype("string").str.strip().str.upper()
+        if "asof_date" in working.columns:
+            working["asof_date"] = pd.to_datetime(working["asof_date"], utc=True, errors="coerce").dt.normalize()
+        if "rs_vs_benchmark" in working.columns:
+            working["rs_vs_benchmark"] = pd.to_numeric(working["rs_vs_benchmark"], errors="coerce")
+        for symbol, group in working.groupby("symbol", dropna=False):
+            symbol_text = str(symbol or "").strip().upper()
+            if not symbol_text:
+                continue
+            feature_counts[symbol_text] = int(len(group))
+            if "asof_date" in group.columns:
+                valid_dates = pd.to_datetime(group["asof_date"], utc=True, errors="coerce").dropna()
+                if not valid_dates.empty:
+                    latest_feature_dates[symbol_text] = valid_dates.max().normalize()
+                if "rs_vs_benchmark" in group.columns:
+                    valid_rs = group.loc[group["rs_vs_benchmark"].notna()].copy()
+                    benchmark_rs_counts[symbol_text] = int(len(valid_rs))
+                    valid_rs_dates = pd.to_datetime(valid_rs.get("asof_date"), utc=True, errors="coerce").dropna()
+                    if not valid_rs_dates.empty:
+                        latest_benchmark_rs_dates[symbol_text] = valid_rs_dates.max().normalize()
+
+    for symbol in normalized_symbols:
+        row_count = int(feature_counts.get(symbol, 0))
+        latest_feature_date = latest_feature_dates.get(symbol)
+        if row_count <= 0:
+            status = "issue"
+            reason = "technical_rows_missing_after_build"
+            ohlcv_status = stage_status_by_symbol.get((symbol, "ohlcv"), {})
+            if ohlcv_status.get("status") == "issue":
+                reason = "technical_rows_missing_after_ohlcv_issue"
+            elif ohlcv_status.get("reason") == "ohlcv_sync_zero_rows":
+                reason = "technical_rows_missing_after_ohlcv_zero_rows"
+            elif ohlcv_status.get("reason") == "ohlcv_no_new_data":
+                reason = "technical_rows_missing_after_ohlcv_no_new_data"
+        elif latest_feature_date is not None and latest_feature_date < effective_asof:
+            status = "stale"
+            reason = "technical_rows_stale_after_build"
+        else:
+            status = "ok"
+            reason = "technical_rows_built"
+        rows.append(
+            {
+                "asof_date": effective_asof,
+                "symbol": symbol,
+                "stage": "technical_build",
+                "status": status,
+                "action": "build",
+                "reason": reason,
+                "rows": row_count,
+                "error_type": None,
+                "error_text": None,
+                "from_date": None,
+                "to_date": latest_feature_date,
+                "raw_json": _json_text(
+                    {
+                        "symbol": symbol,
+                        "row_count": row_count,
+                        "latest_feature_asof_date": None if latest_feature_date is None else latest_feature_date.isoformat(),
+                        "target_asof_date": effective_asof.isoformat(),
+                    }
+                ),
+                "load_ts": pd.Timestamp.utcnow(),
+            }
+        )
+
+        benchmark_rs_count = int(benchmark_rs_counts.get(symbol, 0))
+        latest_benchmark_rs_date = latest_benchmark_rs_dates.get(symbol)
+        if row_count <= 0:
+            status = "issue"
+            reason = "benchmark_rs_not_evaluated_no_technical_rows"
+        elif benchmark_rs_count <= 0:
+            status = "issue"
+            reason = "benchmark_rs_missing_all_rows"
+        elif latest_feature_date is not None and latest_benchmark_rs_date is not None and latest_benchmark_rs_date < latest_feature_date:
+            status = "stale"
+            reason = "benchmark_rs_stale_for_latest_feature_date"
+        else:
+            status = "ok"
+            reason = "benchmark_rs_available"
+        rows.append(
+            {
+                "asof_date": effective_asof,
+                "symbol": symbol,
+                "stage": "benchmark_rs",
+                "status": status,
+                "action": "validate",
+                "reason": reason,
+                "rows": benchmark_rs_count,
+                "error_type": None,
+                "error_text": None,
+                "from_date": None,
+                "to_date": latest_benchmark_rs_date,
+                "raw_json": _json_text(
+                    {
+                        "symbol": symbol,
+                        "benchmark_rs_row_count": benchmark_rs_count,
+                        "latest_benchmark_rs_asof_date": None if latest_benchmark_rs_date is None else latest_benchmark_rs_date.isoformat(),
+                        "latest_feature_asof_date": None if latest_feature_date is None else latest_feature_date.isoformat(),
+                        "target_asof_date": effective_asof.isoformat(),
+                        "authority": "technical_feature_input_diagnostic_no_portfolio_no_broker",
+                    }
+                ),
+                "load_ts": pd.Timestamp.utcnow(),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    frame["asof_date"] = pd.to_datetime(frame["asof_date"], utc=True, errors="coerce")
+    frame["symbol"] = frame["symbol"].astype("string").str.strip().str.upper()
+    frame["stage"] = frame["stage"].astype("string").str.strip()
+    frame["status"] = frame["status"].astype("string").str.strip()
+    for column in ["from_date", "to_date", "load_ts"]:
+        frame[column] = pd.to_datetime(frame[column], utc=True, errors="coerce")
+    frame["rows"] = pd.to_numeric(frame["rows"], errors="coerce")
+    return frame.drop_duplicates(subset=["asof_date", "symbol", "stage"], keep="last")
+
+
+def persist_refresh_status(rows: pd.DataFrame) -> None:
+    if rows.empty:
+        return
+    ensure_refresh_status_table()
+    upsert_to_db(
+        rows,
+        REFRESH_STATUS_TABLE,
+        unique_keys=["asof_date", "symbol", "stage"],
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build TA-Lib based advisory technical features."
@@ -772,6 +1037,16 @@ def parse_args() -> argparse.Namespace:
         "--skip-peer-sync",
         action="store_true",
         help="Do not refresh Sharpely peer snapshots or Dhan peer OHLCV before building.",
+    )
+    parser.add_argument(
+        "--skip-fundamentals-sync",
+        action="store_true",
+        help="Do not refresh Sharpely fundamentals before building technical features.",
+    )
+    parser.add_argument(
+        "--targeted-context-refresh",
+        action="store_true",
+        help="Fast context-watch refresh: refresh Dhan OHLCV and technical rows only; skip Sharpely fundamentals and peer sync.",
     )
     return parser.parse_args()
 
@@ -808,6 +1083,7 @@ def summarize(df: pd.DataFrame) -> dict[str, object]:
         "pivot_distance_20d_pct",
         "avg_traded_value_20d",
         "median_volume_20d",
+        "stock_ret_60d",
         "rs_vs_benchmark",
         "sector_peer_count",
         "sector_peer_ret_20d",
@@ -841,21 +1117,32 @@ def main() -> int:
     symbol_universe = resolve_symbol_universe(args.symbols)
     peer_sync_result: dict[str, object] | None = None
     data_sync_result: dict[str, object] | None = None
-    if symbol_universe and not args.skip_peer_sync and not args.dry_run:
+    skip_peer_sync = bool(args.skip_peer_sync or args.targeted_context_refresh)
+    skip_fundamentals_sync = bool(args.skip_fundamentals_sync or args.targeted_context_refresh)
+    if symbol_universe and not args.dry_run:
         data_sync_result = ensure_advisory_symbol_inputs(
             symbol_universe,
             to_date=args.to_date,
+            include_fundamentals=not skip_fundamentals_sync,
+            include_ohlcv=True,
         )
+    if symbol_universe and not skip_peer_sync and not args.dry_run:
         peer_sync_result = sync_peer_data(
             symbols=symbol_universe,
             to_date=args.to_date,
         )
     df = build_technical_features(
         symbols=symbol_universe,
-        from_date=pd.Timestamp(args.from_date, tz="UTC") if args.from_date else None,
-        to_date=pd.Timestamp(args.to_date, tz="UTC") if args.to_date else None,
+        from_date=_normalize_asof(args.from_date) if args.from_date else None,
+        to_date=_normalize_asof(args.to_date) if args.to_date else None,
         rebuild=args.rebuild,
         benchmark_name=args.benchmark,
+    )
+    refresh_status = build_refresh_status_rows(
+        symbols=symbol_universe,
+        asof_date=_normalize_asof(args.to_date) if args.to_date else None,
+        data_sync_result=data_sync_result,
+        feature_df=df,
     )
     if not args.dry_run:
         persist_technical_features(
@@ -863,10 +1150,20 @@ def main() -> int:
             rebuild=args.rebuild,
             symbols=symbol_universe,
         )
+        persist_refresh_status(refresh_status)
     result = summarize(df)
     result["dry_run"] = bool(args.dry_run)
+    result["targeted_context_refresh"] = bool(args.targeted_context_refresh)
+    result["skip_peer_sync"] = bool(skip_peer_sync)
+    result["skip_fundamentals_sync"] = bool(skip_fundamentals_sync)
     result["data_sync"] = data_sync_result
     result["peer_sync"] = peer_sync_result
+    result["refresh_status"] = {
+        "table": REFRESH_STATUS_TABLE,
+        "row_count": int(len(refresh_status)),
+        "issue_count": int(refresh_status["status"].astype("string").str.lower().isin(["issue", "stale", "skipped_with_warning"]).sum()) if not refresh_status.empty else 0,
+        "status_counts": refresh_status["status"].astype("string").value_counts(dropna=False).to_dict() if not refresh_status.empty else {},
+    }
     print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
     return 0
 

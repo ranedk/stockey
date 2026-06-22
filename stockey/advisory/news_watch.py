@@ -10,8 +10,17 @@ import pandas as pd
 from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.announcement_watch import (
     DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
+    DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS,
+    DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT,
+    DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT,
+    DEFAULT_MACRO_CONTEXT_WATCH_LIMIT,
+    DEFAULT_THEME_CONTEXT_WATCH_LIMIT,
     is_material_context_event,
+    load_announcement_context_watchlist,
+    load_bhavcopy_context_watchlist,
+    load_macro_context_watchlist,
     load_market_context_watchlist,
+    load_theme_context_watchlist,
     load_watchlist,
     merge_watch_targets,
     normalize_timestamp,
@@ -282,10 +291,10 @@ def build_news_events(
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
-    market_mask = df["monitor_source"].astype("string").str.lower().eq("market_context")
-    if market_mask.any():
+    context_mask = df["monitor_source"].astype("string").str.lower().isin(["market_context", "theme_context"])
+    if context_mask.any():
         material_mask = df.apply(is_material_context_event, axis=1)
-        df.loc[market_mask & ~material_mask, "event_status"] = "context_observed"
+        df.loc[context_mask & ~material_mask, "event_status"] = "context_observed"
     df["asof_date"] = normalize_timestamp(df["asof_date"])
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
     return df.drop_duplicates(subset=["published_on", "setup_id", "symbol", "unique_id"], keep="last")
@@ -316,6 +325,19 @@ def run_news_watch(
     include_market_context: bool = False,
     market_context_limit: int = DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
     market_context_last_checked_at: pd.Timestamp | None = None,
+    include_theme_context: bool = False,
+    theme_context_limit: int = DEFAULT_THEME_CONTEXT_WATCH_LIMIT,
+    theme_context_last_checked_at: pd.Timestamp | None = None,
+    include_announcement_context: bool = False,
+    announcement_context_limit: int = DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT,
+    announcement_context_last_checked_at: pd.Timestamp | None = None,
+    announcement_context_lookback_days: int = DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS,
+    include_macro_context: bool = False,
+    macro_context_limit: int = DEFAULT_MACRO_CONTEXT_WATCH_LIMIT,
+    macro_context_last_checked_at: pd.Timestamp | None = None,
+    include_bhavcopy_context: bool = False,
+    bhavcopy_context_limit: int = DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT,
+    bhavcopy_context_last_checked_at: pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if refresh_feeds:
         persist_feed_rows(build_feed_rows(feed_names=feed_names))
@@ -331,9 +353,74 @@ def run_news_watch(
         if include_market_context
         else pd.DataFrame()
     )
+    theme_context_watchlist = (
+        load_theme_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=theme_context_limit,
+            last_checked_at=theme_context_last_checked_at,
+        )
+        if include_theme_context
+        else pd.DataFrame()
+    )
+    announcement_context_watchlist = (
+        load_announcement_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=announcement_context_limit,
+            last_checked_at=announcement_context_last_checked_at,
+            lookback_days=announcement_context_lookback_days,
+        )
+        if include_announcement_context
+        else pd.DataFrame()
+    )
+    macro_context_watchlist = (
+        load_macro_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=macro_context_limit,
+            last_checked_at=macro_context_last_checked_at,
+        )
+        if include_macro_context
+        else pd.DataFrame()
+    )
+    bhavcopy_context_watchlist = (
+        load_bhavcopy_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=bhavcopy_context_limit,
+            last_checked_at=bhavcopy_context_last_checked_at,
+        )
+        if include_bhavcopy_context
+        else pd.DataFrame()
+    )
+    watchlist = merge_watch_targets(watchlist, announcement_context_watchlist)
+    watchlist = merge_watch_targets(watchlist, theme_context_watchlist)
+    watchlist = merge_watch_targets(watchlist, bhavcopy_context_watchlist)
+    watchlist = merge_watch_targets(watchlist, macro_context_watchlist)
     watchlist = merge_watch_targets(watchlist, market_context_watchlist)
     if watchlist.empty:
-        return pd.DataFrame(), {"watch_count": 0, "news_item_count": 0, "matched_event_count": 0}
+        return pd.DataFrame(), {
+            "watch_count": 0,
+            "news_item_count": 0,
+            "matched_event_count": 0,
+            "market_context_enabled": bool(include_market_context),
+            "market_context_limit": int(market_context_limit),
+            "market_context_watch_count": int(len(market_context_watchlist)),
+            "theme_context_enabled": bool(include_theme_context),
+            "theme_context_limit": int(theme_context_limit),
+            "theme_context_watch_count": int(len(theme_context_watchlist)),
+            "announcement_context_enabled": bool(include_announcement_context),
+            "announcement_context_limit": int(announcement_context_limit),
+            "announcement_context_watch_count": int(len(announcement_context_watchlist)),
+            "announcement_context_lookback_days": int(announcement_context_lookback_days),
+            "macro_context_enabled": bool(include_macro_context),
+            "macro_context_limit": int(macro_context_limit),
+            "macro_context_watch_count": int(len(macro_context_watchlist)),
+            "bhavcopy_context_enabled": bool(include_bhavcopy_context),
+            "bhavcopy_context_limit": int(bhavcopy_context_limit),
+            "bhavcopy_context_watch_count": int(len(bhavcopy_context_watchlist)),
+        }
 
     effective_to = pd.to_datetime(to_date or pd.Timestamp.utcnow(), utc=True, errors="coerce")
     if not pd.isna(effective_to) and effective_to == effective_to.normalize():
@@ -354,6 +441,19 @@ def run_news_watch(
         "market_context_enabled": bool(include_market_context),
         "market_context_limit": int(market_context_limit),
         "market_context_watch_count": int(len(market_context_watchlist)),
+        "theme_context_enabled": bool(include_theme_context),
+        "theme_context_limit": int(theme_context_limit),
+        "theme_context_watch_count": int(len(theme_context_watchlist)),
+        "announcement_context_enabled": bool(include_announcement_context),
+        "announcement_context_limit": int(announcement_context_limit),
+        "announcement_context_watch_count": int(len(announcement_context_watchlist)),
+        "announcement_context_lookback_days": int(announcement_context_lookback_days),
+        "macro_context_enabled": bool(include_macro_context),
+        "macro_context_limit": int(macro_context_limit),
+        "macro_context_watch_count": int(len(macro_context_watchlist)),
+        "bhavcopy_context_enabled": bool(include_bhavcopy_context),
+        "bhavcopy_context_limit": int(bhavcopy_context_limit),
+        "bhavcopy_context_watch_count": int(len(bhavcopy_context_watchlist)),
         "feed_names": sorted(news_items["feed_name"].dropna().astype(str).unique().tolist()) if not news_items.empty else [],
     }
     return events, meta

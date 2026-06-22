@@ -9,6 +9,7 @@ import pandas as pd
 
 from advisory.action_recommender import TABLE_NAME as ACTION_RECOMMENDATIONS_TABLE
 from advisory.current_prices import load_current_prices
+from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import db_session, sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 
@@ -19,6 +20,7 @@ BROKER_ACTION_TO_OPERATOR_ACTION = {
     "BUY_MORE": "buy_50%",
     "SELL": "sell",
     "PARTIAL_SELL": "sell_50%",
+    "REDUCE_EXPOSURE_REVIEW": "sell_50%",
 }
 OPERATOR_ACTION_TO_LEDGER_ACTION = {
     "buy": "buy",
@@ -65,9 +67,20 @@ def _normalize_symbol(value: Any) -> str:
 
 
 def _to_float(value: Any) -> float | None:
+    if value is None:
+        return None
     try:
         out = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="advisory.operator_portfolio",
+            fallback_type="operator_portfolio_numeric_parse_failed",
+            source="operator_portfolio_price_fields",
+            severity="warn",
+            reason="Operator portfolio could not parse a numeric price field and used None fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": str(value)[:200]},
+        )
         return None
     return out if pd.notna(out) and out > 0 else None
 
@@ -88,7 +101,7 @@ def _latest_recommendations(limit: int = 100, symbol: str | None = None) -> list
     ensure_operator_portfolio_tables()
     clauses = [
         "asof_date = (SELECT MAX(asof_date) FROM advisory_action_recommendations)",
-        "UPPER(COALESCE(action_code, '')) IN ('BUY', 'BUY_MORE', 'SELL', 'PARTIAL_SELL')",
+        "UPPER(COALESCE(action_code, '')) IN ('BUY', 'BUY_MORE', 'SELL', 'PARTIAL_SELL', 'REDUCE_EXPOSURE_REVIEW')",
     ]
     params: list[Any] = []
     normalized_symbol = _normalize_symbol(symbol)
@@ -155,7 +168,7 @@ def _is_applicable_recommendation(row: dict[str, Any], open_position: dict[str, 
     action_code = str(row.get("action_code") or "").strip().upper()
     if action_code == "BUY":
         return open_position is None
-    if action_code in {"BUY_MORE", "SELL", "PARTIAL_SELL"}:
+    if action_code in {"BUY_MORE", "SELL", "PARTIAL_SELL", "REDUCE_EXPOSURE_REVIEW"}:
         return open_position is not None
     return False
 
@@ -278,7 +291,7 @@ def build_recommendations_payload(*, limit: int = 100, symbol: str | None = None
             "open_position_count": len(open_by_symbol),
             "broker_execution_enabled": False,
             "paper_portfolio_only": True,
-            "operator_action_filter": "BUY when no paper position is open; BUY_MORE/SELL/PARTIAL_SELL only when the symbol is already open.",
+            "operator_action_filter": "BUY when no paper position is open; BUY_MORE/SELL/PARTIAL_SELL/REDUCE_EXPOSURE_REVIEW only when the symbol is already open.",
         },
     }
 

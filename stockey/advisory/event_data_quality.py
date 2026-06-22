@@ -20,6 +20,7 @@ EXCHANGE_EVENTS_TABLE = "advisory_exchange_events"
 EXCHANGE_FEATURES_TABLE = "advisory_exchange_features_daily"
 BHAVCOPY_EVIDENCE_TABLE = "advisory_bhavcopy_evidence_daily"
 ANNOUNCEMENT_EVIDENCE_TABLE = "advisory_announcement_evidence"
+ACTION_EVIDENCE_PROVENANCE_TABLE = "advisory_action_evidence_provenance"
 
 SOURCE_FRESHNESS_CHECKS = [
     {"name": "nse_ohlcv", "table": "nseindia_ohlcv", "date_columns": ["date", "asof_date"], "max_age_days": 10, "required": True},
@@ -32,7 +33,7 @@ SOURCE_FRESHNESS_CHECKS = [
     {"name": "nse_corporate_actions", "table": "nseindia_corporate_actions", "date_columns": ["date", "ex_date", "record_date"], "max_age_days": 365, "required": False, "sparse_event_source": True, "sync_source": "data.nseindia.corporate_actions", "max_poll_age_days": 10},
     {"name": "nse_corporate_actions_bc_raw", "table": "nseindia_corporate_actions_bc_raw", "date_columns": ["date", "record_date"], "max_age_days": 365, "required": False, "sparse_event_source": True},
     {"name": "nse_corporate_actions_normalized", "table": "nseindia_corporate_actions_normalized", "date_columns": ["date", "ex_date", "record_date"], "max_age_days": 365, "required": False, "sparse_event_source": True},
-    {"name": "nse_earnings_events", "table": "nseindia_earnings_events", "date_columns": ["date", "event_date", "asof_date"], "max_age_days": 180, "required": False, "sync_source": "data.nseindia.earnings_events", "max_poll_age_days": 10},
+    {"name": "nse_earnings_events", "table": "nseindia_earnings_events", "date_columns": ["date", "event_date", "asof_date"], "max_age_days": 180, "required": False, "sparse_event_source": True, "sync_source": "data.nseindia.earnings_events", "max_poll_age_days": 10},
     {"name": "nse_insider_deals", "table": "nseindia_insider_deals", "date_columns": ["date", "reporting_date", "trade_date_to"], "max_age_days": 180, "required": False, "sparse_event_source": True, "sync_source": "data.nseindia.insider_deals", "max_poll_age_days": 10},
     {"name": "announcement_documents", "table": ANNOUNCEMENT_DOCUMENTS_TABLE, "date_columns": ["published_on", "updated_at", "created_at"], "max_age_days": 10, "required": True},
     {"name": "announcement_reports", "table": ANNOUNCEMENT_REPORTS_TABLE, "date_columns": ["published_on", "updated_at", "created_at"], "max_age_days": 10, "required": True},
@@ -47,6 +48,13 @@ HEAVY_TABLE_CHECKS = [
     {"name": "nse_cmvolt", "table": "nseindia_cmvolt", "warn_rows": 500000},
     {"name": "nse_var1", "table": "nseindia_var1", "warn_rows": 500000},
 ]
+RAW_TABLE_COMPACT_CACHE_MAP = {
+    ANNOUNCEMENT_DOCUMENTS_TABLE: {"table": ANNOUNCEMENT_EVIDENCE_TABLE, "date_columns": ["published_on", "asof_date"], "max_age_days": 10},
+    ANNOUNCEMENT_REPORTS_TABLE: {"table": ANNOUNCEMENT_EVIDENCE_TABLE, "date_columns": ["published_on", "asof_date"], "max_age_days": 10},
+    "nseindia_ohlcv": {"table": BHAVCOPY_EVIDENCE_TABLE, "date_columns": ["asof_date"], "max_age_days": 10},
+    "nseindia_cmvolt": {"table": BHAVCOPY_EVIDENCE_TABLE, "date_columns": ["asof_date"], "max_age_days": 10},
+    "nseindia_var1": {"table": BHAVCOPY_EVIDENCE_TABLE, "date_columns": ["asof_date"], "max_age_days": 10},
+}
 
 EXCHANGE_FEATURE_COLUMNS = {
     "nonzero_score_rows": "exchange_event_score",
@@ -55,6 +63,14 @@ EXCHANGE_FEATURE_COLUMNS = {
     "corporate_action_feature_rows": "corporate_action_count_30d",
     "earnings_feature_rows": "upcoming_earnings_14d",
 }
+
+COMPACT_HEALTH_FRESHNESS_CHECKS = [
+    {"name": "bhavcopy_evidence", "table": BHAVCOPY_EVIDENCE_TABLE, "date_columns": ["asof_date"], "max_age_days": 10, "required": True},
+    {"name": "announcement_evidence", "table": ANNOUNCEMENT_EVIDENCE_TABLE, "date_columns": ["published_on", "asof_date"], "max_age_days": 10, "required": True},
+    {"name": "exchange_events", "table": EXCHANGE_EVENTS_TABLE, "date_columns": ["known_on"], "max_age_days": 14, "required": True},
+    {"name": "exchange_features", "table": EXCHANGE_FEATURES_TABLE, "date_columns": ["asof_date"], "max_age_days": 10, "required": True},
+    {"name": "announcement_documents", "table": ANNOUNCEMENT_DOCUMENTS_TABLE, "date_columns": ["published_on", "updated_at", "created_at"], "max_age_days": 10, "required": True},
+]
 
 
 def _record_event_data_quality_fallback(
@@ -191,6 +207,58 @@ def _row_count(table_name: str) -> int | None:
     if df.empty:
         return 0
     return int(df.iloc[0].get("row_count") or 0)
+
+
+def _compact_cache_status_for_raw_table(table_name: str, *, now: pd.Timestamp | None = None) -> dict[str, Any]:
+    spec = RAW_TABLE_COMPACT_CACHE_MAP.get(table_name)
+    if not spec:
+        return {"available": False, "status": "not_mapped"}
+    compact_table = str(spec["table"])
+    if not table_exists(compact_table):
+        return {"available": False, "status": "missing", "compact_table": compact_table}
+    columns = table_columns(compact_table)
+    date_column = _choose_column(columns, list(spec.get("date_columns") or []))
+    if date_column is None:
+        return {
+            "available": False,
+            "status": "missing_date_column",
+            "compact_table": compact_table,
+            "candidate_date_columns": list(spec.get("date_columns") or []),
+        }
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT COUNT(*) AS row_count, MAX({_quote_identifier(date_column)}) AS latest_at
+            FROM {_quote_identifier(compact_table)}
+            """,
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_compact_cache_status_failed",
+            source=compact_table,
+            reason="Event data quality could not inspect compact cache freshness for a raw-table risk advisory.",
+            error=exc,
+            metadata={"raw_table": table_name, "date_column": date_column},
+        )
+        return {"available": False, "status": "query_failed", "compact_table": compact_table, "error": f"{type(exc).__name__}: {exc}"}
+    row = df.iloc[0].to_dict() if not df.empty else {}
+    row_count = int(row.get("row_count") or 0)
+    effective_now = pd.to_datetime(now or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    latest_at = pd.to_datetime(row.get("latest_at"), utc=True, errors="coerce")
+    age_days = _age_days(latest_at, effective_now)
+    max_age_days = float(spec.get("max_age_days") or 10)
+    fresh = row_count > 0 and age_days is not None and age_days <= max_age_days
+    return {
+        "available": bool(fresh),
+        "status": "fresh" if fresh else "stale_or_empty",
+        "compact_table": compact_table,
+        "compact_row_count": row_count,
+        "compact_latest_at": _json_ready(latest_at),
+        "compact_age_days": age_days,
+        "compact_max_age_days": max_age_days,
+    }
 
 
 def _distinct_entity_expr(columns: set[str]) -> str:
@@ -576,7 +644,7 @@ def check_exchange_feature_readiness(now: pd.Timestamp | None = None) -> dict[st
     )
 
 
-def check_raw_table_risk() -> list[dict[str, Any]]:
+def check_raw_table_risk(now: pd.Timestamp | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for spec in HEAVY_TABLE_CHECKS:
         table = str(spec["table"])
@@ -589,18 +657,525 @@ def check_raw_table_risk() -> list[dict[str, Any]]:
             rows.append(_status("warn", "Could not count heavy source table.", name=spec["name"], table=table, suggested_fix="Check DB timeout or table availability."))
             continue
         severity = "warn" if row_count >= warn_rows else "ok"
+        compact_cache = _compact_cache_status_for_raw_table(table, now=now) if severity == "warn" else {}
+        if severity == "warn" and compact_cache.get("available") is True:
+            severity = "info"
         rows.append(
             _status(
                 severity,
-                "Use compact cached evidence tables for UI/advisory access." if severity == "warn" else "Table size is below raw-scan warning threshold.",
+                (
+                    "Compact cached evidence is available; avoid raw scans from UI/advisory paths."
+                    if severity == "info"
+                    else "Use compact cached evidence tables for UI/advisory access."
+                    if severity == "warn"
+                    else "Table size is below raw-scan warning threshold."
+                ),
                 name=spec["name"],
                 table=table,
                 row_count=row_count,
                 warn_rows=warn_rows,
+                compact_cache=compact_cache or None,
                 suggested_fix="Build compact evidence caches before querying this table from UI or LLM prompts." if severity == "warn" else None,
             )
         )
     return rows
+
+
+def check_compact_health_freshness(now: pd.Timestamp | None = None) -> list[dict[str, Any]]:
+    effective_now = pd.to_datetime(now or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    rows: list[dict[str, Any]] = []
+    for spec in COMPACT_HEALTH_FRESHNESS_CHECKS:
+        name = str(spec["name"])
+        table = str(spec["table"])
+        required = bool(spec.get("required"))
+        max_age_days = float(spec["max_age_days"])
+        if not table_exists(table):
+            rows.append(
+                _status(
+                    "error" if required else "warn",
+                    "Compact evidence table is missing.",
+                    name=name,
+                    table=table,
+                    required=required,
+                    suggested_fix="Run complete_data.sh or python -m advisory.event_evidence_store --dry-run to inspect compact evidence readiness.",
+                )
+            )
+            continue
+        columns = table_columns(table)
+        date_column = _choose_column(columns, list(spec.get("date_columns") or []))
+        if date_column is None:
+            rows.append(
+                _status(
+                    "error" if required else "warn",
+                    "No known freshness column exists on compact evidence table.",
+                    name=name,
+                    table=table,
+                    candidate_columns=list(spec.get("date_columns") or []),
+                    required=required,
+                    suggested_fix="Inspect compact evidence schema and update advisory.event_data_quality health mapping.",
+                )
+            )
+            continue
+        try:
+            df = sql_to_df(
+                f"""
+                SELECT MAX({_quote_identifier(date_column)}) AS latest_at
+                FROM {_quote_identifier(table)}
+                """,
+                retries=2,
+                statement_timeout_ms=5000,
+            )
+        except Exception as exc:
+            _record_event_data_quality_fallback(
+                fallback_type="event_data_quality_compact_freshness_query_failed",
+                source=table,
+                reason="Event data quality compact health freshness query failed.",
+                error=exc,
+                metadata={"name": name, "required": required, "date_columns": list(spec.get("date_columns") or [])},
+            )
+            rows.append(
+                _status(
+                    "error" if required else "warn",
+                    "Compact freshness query failed.",
+                    name=name,
+                    table=table,
+                    error=f"{type(exc).__name__}: {exc}",
+                    required=required,
+                    suggested_fix="Check DB timeout and compact evidence table schema.",
+                )
+            )
+            continue
+        latest_at = pd.to_datetime(df.iloc[0].get("latest_at"), utc=True, errors="coerce") if not df.empty else pd.NaT
+        age = _age_days(latest_at, effective_now)
+        severity = "ok" if age is not None and age <= max_age_days else "warn"
+        rows.append(
+            _status(
+                severity,
+                "Compact evidence is fresh enough." if severity == "ok" else "Compact evidence is stale or empty.",
+                name=name,
+                table=table,
+                column=date_column,
+                latest_at=_json_ready(latest_at),
+                age_days=age,
+                max_age_days=max_age_days,
+                required=required,
+                row_count=None,
+                deep_diagnostic_command="python -m advisory.event_data_quality --format json",
+                suggested_fix="Run complete_data.sh, then rerun python -m advisory.event_data_quality --format json.",
+            )
+        )
+    return rows
+
+
+def _optional_num_condition(columns: set[str], column: str, condition: str) -> str:
+    if column not in columns:
+        return "NULL::bigint"
+    return f"SUM(CASE WHEN {condition.format(column=_quote_identifier(column))} THEN 1 ELSE 0 END)"
+
+
+def _optional_text_condition(columns: set[str], column: str, values: set[str]) -> str:
+    if column not in columns:
+        return "NULL::bigint"
+    normalized = ", ".join(f"'{value.lower()}'" for value in sorted(values))
+    return f"SUM(CASE WHEN LOWER(COALESCE({_quote_identifier(column)}::text, '')) IN ({normalized}) THEN 1 ELSE 0 END)"
+
+
+def _optional_truthy_condition(columns: set[str], column: str) -> str:
+    if column not in columns:
+        return "NULL::bigint"
+    return f"SUM(CASE WHEN LOWER(COALESCE({_quote_identifier(column)}::text, '')) IN ('1', 'true', 'yes', 'y', 'on') THEN 1 ELSE 0 END)"
+
+
+def _compact_announcement_storage_counts(columns: set[str], limit: int) -> list[dict[str, Any]]:
+    if "announcement_storage_form" not in columns:
+        return []
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT COALESCE(NULLIF(TRIM("announcement_storage_form"::text), ''), 'missing') AS announcement_storage_form,
+                   COUNT(*) AS rows
+            FROM {_quote_identifier(ANNOUNCEMENT_EVIDENCE_TABLE)}
+            GROUP BY COALESCE(NULLIF(TRIM("announcement_storage_form"::text), ''), 'missing')
+            ORDER BY rows DESC
+            LIMIT %(limit)s
+            """,
+            params={"limit": max(1, int(limit))},
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_compact_announcement_storage_counts_failed",
+            source=ANNOUNCEMENT_EVIDENCE_TABLE,
+            reason="Event data quality could not load compact announcement storage-form counts.",
+            error=exc,
+        )
+        return []
+    return _records(df)
+
+
+def check_compact_evidence_readiness(limit: int = DEFAULT_LIMIT, now: pd.Timestamp | None = None) -> list[dict[str, Any]]:
+    effective_now = pd.to_datetime(now or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    rows: list[dict[str, Any]] = []
+
+    announcement_table = ANNOUNCEMENT_EVIDENCE_TABLE
+    if not table_exists(announcement_table):
+        rows.append(
+            _status(
+                "error",
+                "Compact announcement evidence table is missing.",
+                name="announcement_evidence_readiness",
+                table=announcement_table,
+                suggested_fix="Run complete_data.sh or python -m advisory.event_evidence_store to build compact announcement evidence.",
+            )
+        )
+    else:
+        columns = table_columns(announcement_table)
+        required = {"published_on", "symbol"}
+        missing = sorted(required - columns)
+        taxonomy_columns = {"announcement_storage_form", "llm_evidence_mode", "llm_review_ready", "raw_archive_required"}
+        missing_taxonomy = sorted(taxonomy_columns - columns)
+        if missing:
+            rows.append(
+                _status(
+                    "error",
+                    "Compact announcement evidence is missing required columns.",
+                    name="announcement_evidence_readiness",
+                    table=announcement_table,
+                    missing_columns=missing,
+                    suggested_fix="Run compact evidence migrations or rebuild advisory.event_evidence_store outputs.",
+                )
+            )
+        else:
+            try:
+                df = sql_to_df(
+                    f"""
+                    SELECT
+                        COUNT(*) AS row_count,
+                        COUNT(DISTINCT "symbol") AS distinct_symbols,
+                        MIN("published_on") AS min_published_on,
+                        MAX("published_on") AS max_published_on,
+                        {_optional_truthy_condition(columns, "llm_review_ready")} AS llm_review_ready_rows,
+                        {_optional_truthy_condition(columns, "raw_archive_required")} AS raw_archive_required_rows,
+                        {_optional_text_condition(columns, "announcement_storage_form", {"archived_raw_reference_only"})} AS archive_only_rows,
+                        {_optional_text_condition(columns, "announcement_storage_form", {"compact_structured_event", "structured_event_plus_summary"})} AS compact_decision_support_rows
+                    FROM {_quote_identifier(announcement_table)}
+                    """,
+                    retries=2,
+                    statement_timeout_ms=15000,
+                )
+            except Exception as exc:
+                _record_event_data_quality_fallback(
+                    fallback_type="event_data_quality_compact_announcement_readiness_query_failed",
+                    source=announcement_table,
+                    reason="Event data quality compact announcement readiness query failed.",
+                    error=exc,
+                )
+                rows.append(
+                    _status(
+                        "error",
+                        "Compact announcement readiness query failed.",
+                        name="announcement_evidence_readiness",
+                        table=announcement_table,
+                        error=f"{type(exc).__name__}: {exc}",
+                        suggested_fix="Check DB connectivity, compact evidence schema, and query timeout.",
+                    )
+                )
+            else:
+                row = df.iloc[0].to_dict() if not df.empty else {}
+                total = int(row.get("row_count") or 0)
+                review_ready_rows = None if pd.isna(row.get("llm_review_ready_rows")) else int(row.get("llm_review_ready_rows") or 0)
+                archive_only_rows = None if pd.isna(row.get("archive_only_rows")) else int(row.get("archive_only_rows") or 0)
+                compact_support_rows = None if pd.isna(row.get("compact_decision_support_rows")) else int(row.get("compact_decision_support_rows") or 0)
+                latest = pd.to_datetime(row.get("max_published_on"), utc=True, errors="coerce")
+                age = _age_days(latest, effective_now)
+                review_ready_rate = round(review_ready_rows / total, 4) if total and review_ready_rows is not None else None
+                compact_support_rate = round(compact_support_rows / total, 4) if total and compact_support_rows is not None else None
+                archive_only_rate = round(archive_only_rows / total, 4) if total and archive_only_rows is not None else None
+                severity = "ok"
+                messages: list[str] = []
+                if total == 0:
+                    severity = "error"
+                    messages.append("compact announcement evidence is empty")
+                if age is None or age > 10:
+                    severity = "warn" if severity == "ok" else severity
+                    messages.append("compact announcement evidence is stale")
+                if missing_taxonomy:
+                    severity = "warn" if severity == "ok" else severity
+                    messages.append("taxonomy contract columns are missing")
+                if review_ready_rows is not None and review_ready_rows == 0 and total > 0:
+                    severity = "warn" if severity == "ok" else severity
+                    messages.append("no review-ready announcement evidence")
+                if archive_only_rate is not None and archive_only_rate > 0.75:
+                    severity = "warn" if severity == "ok" else severity
+                    messages.append("most announcement evidence is archive-only")
+                rows.append(
+                    _status(
+                        severity,
+                        "Compact announcement evidence is decision-support ready." if not messages else "; ".join(messages),
+                        name="announcement_evidence_readiness",
+                        table=announcement_table,
+                        row_count=total,
+                        distinct_symbols=int(row.get("distinct_symbols") or 0),
+                        min_published_on=_json_ready(pd.to_datetime(row.get("min_published_on"), utc=True, errors="coerce")),
+                        max_published_on=_json_ready(latest),
+                        age_days=age,
+                        missing_taxonomy_columns=missing_taxonomy,
+                        llm_review_ready_rows=review_ready_rows,
+                        review_ready_rate=review_ready_rate,
+                        raw_archive_required_rows=None if pd.isna(row.get("raw_archive_required_rows")) else int(row.get("raw_archive_required_rows") or 0),
+                        archive_only_rows=archive_only_rows,
+                        archive_only_rate=archive_only_rate,
+                        compact_decision_support_rows=compact_support_rows,
+                        compact_decision_support_rate=compact_support_rate,
+                        storage_form_counts=_compact_announcement_storage_counts(columns, limit=limit),
+                        authority_scope="evidence_quality_only_no_policy_change",
+                        suggested_fix="Run announcement ingest/OCR/evaluation and advisory.event_evidence_store; archive-only rows must not feed compact decision paths.",
+                    )
+                )
+
+    bhavcopy_table = BHAVCOPY_EVIDENCE_TABLE
+    if not table_exists(bhavcopy_table):
+        rows.append(
+            _status(
+                "error",
+                "Compact bhavcopy evidence table is missing.",
+                name="bhavcopy_evidence_readiness",
+                table=bhavcopy_table,
+                suggested_fix="Run complete_data.sh or python -m advisory.event_evidence_store to build compact bhavcopy evidence.",
+            )
+        )
+    else:
+        columns = table_columns(bhavcopy_table)
+        required = {"asof_date", "symbol"}
+        missing = sorted(required - columns)
+        expected = {"evidence_score", "deal_pressure", "deal_net_value_inr", "short_selling_quantity", "circuit_hit_count", "turnover_value_inr", "avg_turnover_value_20d"}
+        missing_expected = sorted(expected - columns)
+        if missing:
+            rows.append(
+                _status(
+                    "error",
+                    "Compact bhavcopy evidence is missing required columns.",
+                    name="bhavcopy_evidence_readiness",
+                    table=bhavcopy_table,
+                    missing_columns=missing,
+                    suggested_fix="Run compact evidence migrations or rebuild advisory.event_evidence_store outputs.",
+                )
+            )
+        else:
+            try:
+                df = sql_to_df(
+                    f"""
+                    SELECT
+                        COUNT(*) AS row_count,
+                        COUNT(DISTINCT "symbol") AS distinct_symbols,
+                        MIN("asof_date") AS min_asof_date,
+                        MAX("asof_date") AS max_asof_date,
+                        {_optional_num_condition(columns, "evidence_score", "COALESCE({column}, 0) <> 0")} AS nonzero_evidence_rows,
+                        {_optional_text_condition(columns, "deal_pressure", {"accumulation"})} AS accumulation_rows,
+                        {_optional_text_condition(columns, "deal_pressure", {"distribution_or_pressure", "circuit_risk"})} AS pressure_rows,
+                        {_optional_num_condition(columns, "short_selling_quantity", "COALESCE({column}, 0) > 0")} AS short_pressure_rows,
+                        {_optional_num_condition(columns, "circuit_hit_count", "COALESCE({column}, 0) > 0")} AS circuit_risk_rows
+                    FROM {_quote_identifier(bhavcopy_table)}
+                    """,
+                    retries=2,
+                    statement_timeout_ms=15000,
+                )
+            except Exception as exc:
+                _record_event_data_quality_fallback(
+                    fallback_type="event_data_quality_compact_bhavcopy_readiness_query_failed",
+                    source=bhavcopy_table,
+                    reason="Event data quality compact bhavcopy readiness query failed.",
+                    error=exc,
+                )
+                rows.append(
+                    _status(
+                        "error",
+                        "Compact bhavcopy readiness query failed.",
+                        name="bhavcopy_evidence_readiness",
+                        table=bhavcopy_table,
+                        error=f"{type(exc).__name__}: {exc}",
+                        suggested_fix="Check DB connectivity, compact evidence schema, and query timeout.",
+                    )
+                )
+            else:
+                row = df.iloc[0].to_dict() if not df.empty else {}
+                total = int(row.get("row_count") or 0)
+                nonzero = None if pd.isna(row.get("nonzero_evidence_rows")) else int(row.get("nonzero_evidence_rows") or 0)
+                latest = pd.to_datetime(row.get("max_asof_date"), utc=True, errors="coerce")
+                age = _age_days(latest, effective_now)
+                severity = "ok"
+                messages: list[str] = []
+                if total == 0:
+                    severity = "error"
+                    messages.append("compact bhavcopy evidence is empty")
+                if age is None or age > 10:
+                    severity = "warn" if severity == "ok" else severity
+                    messages.append("compact bhavcopy evidence is stale")
+                if missing_expected:
+                    severity = "warn" if severity == "ok" else severity
+                    messages.append("expected evidence columns are missing")
+                if total > 0 and int(row.get("distinct_symbols") or 0) < 20:
+                    severity = "warn" if severity == "ok" else severity
+                    messages.append("compact bhavcopy evidence covers too few symbols")
+                if nonzero is not None and nonzero == 0 and total > 0:
+                    severity = "warn" if severity == "ok" else severity
+                    messages.append("no directional bhavcopy evidence rows")
+                rows.append(
+                    _status(
+                        severity,
+                        "Compact bhavcopy evidence is broad enough for review paths." if not messages else "; ".join(messages),
+                        name="bhavcopy_evidence_readiness",
+                        table=bhavcopy_table,
+                        row_count=total,
+                        distinct_symbols=int(row.get("distinct_symbols") or 0),
+                        min_asof_date=_json_ready(pd.to_datetime(row.get("min_asof_date"), utc=True, errors="coerce")),
+                        max_asof_date=_json_ready(latest),
+                        age_days=age,
+                        missing_expected_columns=missing_expected,
+                        nonzero_evidence_rows=nonzero,
+                        nonzero_evidence_rate=round(nonzero / total, 4) if total and nonzero is not None else None,
+                        accumulation_rows=None if pd.isna(row.get("accumulation_rows")) else int(row.get("accumulation_rows") or 0),
+                        pressure_rows=None if pd.isna(row.get("pressure_rows")) else int(row.get("pressure_rows") or 0),
+                        short_pressure_rows=None if pd.isna(row.get("short_pressure_rows")) else int(row.get("short_pressure_rows") or 0),
+                        circuit_risk_rows=None if pd.isna(row.get("circuit_risk_rows")) else int(row.get("circuit_risk_rows") or 0),
+                        authority_scope="evidence_quality_only_no_policy_change",
+                        suggested_fix="Run NSE parsers and advisory.event_evidence_store; keep LLM/research paths on compact evidence rather than raw bhavcopy scans.",
+                    )
+                )
+    return rows
+
+
+def check_action_provenance_readiness(now: pd.Timestamp | None = None) -> dict[str, Any]:
+    table = ACTION_EVIDENCE_PROVENANCE_TABLE
+    if not table_exists(table):
+        return _status(
+            "warn",
+            "Action evidence provenance table is missing.",
+            name="action_evidence_provenance_readiness",
+            table=table,
+            authority_scope="evidence_quality_only_no_policy_change",
+            suggested_fix="Run python -m advisory.action_evidence_provenance after action recommendations are available.",
+        )
+    columns = table_columns(table)
+    required = {
+        "asof_date",
+        "symbol",
+        "evidence_section",
+        "source_ref_json",
+        "broker_execution_allowed",
+        "authority_scope",
+        "load_ts",
+    }
+    missing = sorted(required - columns)
+    if missing:
+        return _status(
+            "warn",
+            "Action evidence provenance is missing required audit columns.",
+            name="action_evidence_provenance_readiness",
+            table=table,
+            missing_columns=missing,
+            authority_scope="evidence_quality_only_no_policy_change",
+            suggested_fix="Run action-evidence provenance schema migration and rebuild provenance rows.",
+        )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                COUNT(*) AS row_count,
+                COUNT(DISTINCT "symbol") AS distinct_symbols,
+                MIN("asof_date") AS min_asof_date,
+                MAX("asof_date") AS max_asof_date,
+                MAX("load_ts") AS latest_load_ts,
+                SUM(CASE WHEN NULLIF(TRIM(COALESCE("source_ref_json", '')), '') IS NOT NULL
+                          AND TRIM(COALESCE("source_ref_json", '')) <> '{{}}' THEN 1 ELSE 0 END) AS source_ref_rows,
+                SUM(CASE WHEN "evidence_section" IN ('context_overlay', 'context_overlays', 'signal_refresh')
+                          AND (
+                              COALESCE("source_ref_json", '') ILIKE '%%source_table%%'
+                              OR COALESCE("evidence_node_json", '') ILIKE '%%top_supporting_overlays%%'
+                              OR COALESCE("evidence_node_json", '') ILIKE '%%top_conflicting_overlays%%'
+                              OR COALESCE("evidence_node_json", '') ILIKE '%%top_suppressed_overlays%%'
+                              OR COALESCE("evidence_node_json", '') ILIKE '%%source_contract%%'
+                          ) THEN 1 ELSE 0 END) AS context_rows,
+                SUM(CASE WHEN "evidence_section" IN ('context_overlay', 'context_overlays', 'signal_refresh')
+                          AND COALESCE("source_ref_json", '') ILIKE '%%source_table%%' THEN 1 ELSE 0 END) AS context_rows_with_source_table,
+                SUM(CASE WHEN COALESCE("broker_execution_allowed", FALSE) THEN 1 ELSE 0 END) AS broker_allowed_rows,
+                SUM(CASE WHEN LOWER(COALESCE("authority_scope", '')) IN ('', 'unknown') THEN 1 ELSE 0 END) AS unknown_authority_rows
+            FROM {_quote_identifier(table)}
+            """,
+            retries=2,
+            statement_timeout_ms=15000,
+        )
+    except Exception as exc:
+        _record_event_data_quality_fallback(
+            fallback_type="event_data_quality_action_provenance_readiness_query_failed",
+            source=table,
+            reason="Event data quality action-provenance readiness query failed.",
+            error=exc,
+        )
+        return _status(
+            "warn",
+            "Action evidence provenance readiness query failed.",
+            name="action_evidence_provenance_readiness",
+            table=table,
+            error=f"{type(exc).__name__}: {exc}",
+            authority_scope="evidence_quality_only_no_policy_change",
+            suggested_fix="Check DB connectivity, provenance schema, and query timeout.",
+        )
+    row = df.iloc[0].to_dict() if not df.empty else {}
+    total = int(row.get("row_count") or 0)
+    source_ref_rows = int(row.get("source_ref_rows") or 0)
+    context_rows = int(row.get("context_rows") or 0)
+    context_rows_with_source_table = int(row.get("context_rows_with_source_table") or 0)
+    broker_allowed_rows = int(row.get("broker_allowed_rows") or 0)
+    unknown_authority_rows = int(row.get("unknown_authority_rows") or 0)
+    latest_load_ts = pd.to_datetime(row.get("latest_load_ts"), utc=True, errors="coerce")
+    age = _age_days(latest_load_ts, pd.to_datetime(now or pd.Timestamp.utcnow(), utc=True, errors="coerce"))
+    source_ref_rate = round(source_ref_rows / total, 4) if total else None
+    context_source_table_rate = round(context_rows_with_source_table / context_rows, 4) if context_rows else None
+    severity = "ok"
+    messages: list[str] = []
+    if total == 0:
+        severity = "warn"
+        messages.append("action provenance has no rows")
+    if age is None or age > 7:
+        severity = "warn"
+        messages.append("action provenance is stale or has no load timestamp")
+    if total > 0 and source_ref_rate is not None and source_ref_rate < 0.5:
+        severity = "warn"
+        messages.append("too few action evidence nodes link back to source references")
+    if context_rows > 0 and context_source_table_rate is not None and context_source_table_rate < 0.8:
+        severity = "warn"
+        messages.append("context-overlay provenance lacks source-table links")
+    if broker_allowed_rows:
+        severity = "error"
+        messages.append("provenance rows unexpectedly carry broker authority")
+    if unknown_authority_rows:
+        severity = "warn" if severity == "ok" else severity
+        messages.append("some provenance rows have unknown authority scope")
+    return _status(
+        severity,
+        "Action evidence provenance is traceable enough for review paths." if not messages else "; ".join(messages),
+        name="action_evidence_provenance_readiness",
+        table=table,
+        row_count=total,
+        distinct_symbols=int(row.get("distinct_symbols") or 0),
+        min_asof_date=_json_ready(pd.to_datetime(row.get("min_asof_date"), utc=True, errors="coerce")),
+        max_asof_date=_json_ready(pd.to_datetime(row.get("max_asof_date"), utc=True, errors="coerce")),
+        latest_load_ts=_json_ready(latest_load_ts),
+        age_days=age,
+        source_ref_rows=source_ref_rows,
+        source_ref_rate=source_ref_rate,
+        context_rows=context_rows,
+        context_rows_with_source_table=context_rows_with_source_table,
+        context_source_table_rate=context_source_table_rate,
+        broker_allowed_rows=broker_allowed_rows,
+        unknown_authority_rows=unknown_authority_rows,
+        authority_scope="evidence_quality_only_no_policy_change",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+        suggested_fix="Run python -m advisory.action_evidence_provenance --limit 10000, then rerun event-data quality.",
+    )
 
 
 def summarize_status(sections: dict[str, Any]) -> str:
@@ -627,9 +1202,11 @@ def build_event_data_quality_report(*, limit: int = DEFAULT_LIMIT, now: pd.Times
     sections: dict[str, Any] = {
         "source_freshness": check_source_freshness(now=effective_now),
         "announcement_readiness": check_announcement_readiness(),
+        "compact_evidence_readiness": check_compact_evidence_readiness(limit=limit, now=effective_now),
+        "action_provenance_readiness": check_action_provenance_readiness(now=effective_now),
         "exchange_event_readiness": check_exchange_event_readiness(limit=limit),
         "exchange_feature_readiness": check_exchange_feature_readiness(now=effective_now),
-        "raw_table_risk": check_raw_table_risk(),
+        "raw_table_risk": check_raw_table_risk(now=effective_now),
     }
     issue_rows: list[dict[str, Any]] = []
     for section_name, value in sections.items():
@@ -648,6 +1225,36 @@ def build_event_data_quality_report(*, limit: int = DEFAULT_LIMIT, now: pd.Times
             "warn_count": sum(1 for row in issue_rows if row.get("status") == "warn"),
             "compact_evidence_required": True,
             "llm_signal_authority": "proposed_signal_only",
+        },
+        "sections": sections,
+        "issues": issue_rows[: max(1, int(limit))],
+    }
+
+
+def build_event_data_quality_health_summary(*, limit: int = DEFAULT_LIMIT, now: pd.Timestamp | None = None) -> dict[str, Any]:
+    effective_now = pd.to_datetime(now or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    sections: dict[str, Any] = {
+        "compact_freshness": check_compact_health_freshness(now=effective_now),
+    }
+    issue_rows: list[dict[str, Any]] = []
+    for section_name, value in sections.items():
+        rows = value if isinstance(value, list) else [value]
+        for row in rows:
+            if isinstance(row, dict) and row.get("status") in {"error", "warn"}:
+                issue_rows.append({"section": section_name, "issue_code": _issue_code(section_name, row), **row})
+    issue_rows.sort(key=lambda row: (0 if row.get("status") == "error" else 1, str(row.get("issue_code") or "")))
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "status": summarize_status(sections),
+        "message": "Compact announcement and NSE/bhavcopy evidence health summary completed.",
+        "summary": {
+            "issue_count": len(issue_rows),
+            "error_count": sum(1 for row in issue_rows if row.get("status") == "error"),
+            "warn_count": sum(1 for row in issue_rows if row.get("status") == "warn"),
+            "compact_evidence_required": True,
+            "deep_diagnostic_command": "python -m advisory.event_data_quality --format json",
+            "llm_signal_authority": "proposed_signal_only",
+            "health_summary_only": True,
         },
         "sections": sections,
         "issues": issue_rows[: max(1, int(limit))],

@@ -15,6 +15,7 @@ from advisory.market_context import load_latest_market_context
 from advisory.prompt_registry import response_schema_version
 from advisory.prompts import ADVISORY_EVENT_PROMPT_VERSION, SYSTEM_PROMPT, render_event_prompt
 from utils.codex_cli import run_codex_structured
+from utils.company_master import map_company_master_ids
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
@@ -117,6 +118,8 @@ EVENT_EVALUATION_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS source_reliability TEXT",
     f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_sectors_json TEXT",
     f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_peers_json TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS validated_affected_peers_json TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS unresolved_affected_peers_json TEXT",
     f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_tensor_json TEXT",
     f"ALTER TABLE {RISKS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT",
 ]
@@ -220,6 +223,30 @@ def _table_exists(table_name: str) -> bool:
         )
         return False
     return not df.empty
+
+
+def _table_columns(table_name: str) -> set[str]:
+    try:
+        df = sql_to_df(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = %s
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            source=table_name,
+            fallback_type="llm_event_table_columns_lookup_failed",
+            severity="warn",
+            reason="Event evaluator could not inspect compact evidence table columns and will use the legacy column set.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        return set()
+    return set(df["column_name"].astype(str).tolist()) if not df.empty and "column_name" in df.columns else set()
 
 
 def _is_missing_scalar(value: Any) -> bool:
@@ -359,6 +386,69 @@ def normalize_string_list(value: Any, *, limit: int, item_limit: int = 80, sourc
         if len(out) >= limit:
             break
     return out
+
+
+def resolve_affected_peer_identity(peers: list[str]) -> dict[str, Any]:
+    unique_peers = sorted({str(peer).strip().upper() for peer in peers if str(peer or "").strip()})
+    if not unique_peers:
+        return {
+            "validated_affected_peers": [],
+            "unresolved_affected_peers": [],
+            "identity_validation": {
+                "status": "not_applicable",
+                "validated_peer_count": 0,
+                "unresolved_peer_count": 0,
+                "requires_company_master_resolution": False,
+                "policy_effect": "no_peer_context",
+                "portfolio_authority": "none",
+                "broker_execution_allowed": False,
+            },
+        }
+    try:
+        nse_ids = map_company_master_ids(unique_peers, exchange="NSE")
+        bse_ids = map_company_master_ids(unique_peers, exchange="BSE")
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            fallback_type="llm_event_affected_peer_identity_lookup_failed",
+            source="company_master",
+            severity="warn",
+            reason="LLM event evaluator could not validate affected peers against company master; peer context remains unresolved.",
+            error=exc,
+            metadata={"peer_count": len(unique_peers), "peer_sample": unique_peers[:10]},
+        )
+        return {
+            "validated_affected_peers": [],
+            "unresolved_affected_peers": unique_peers,
+            "identity_validation": {
+                "status": "lookup_failed",
+                "validated_peer_count": 0,
+                "unresolved_peer_count": len(unique_peers),
+                "requires_company_master_resolution": True,
+                "policy_effect": "context_only_until_resolved",
+                "portfolio_authority": "none",
+                "broker_execution_allowed": False,
+            },
+        }
+    resolved = {
+        peer
+        for peer, nse_id, bse_id in zip(unique_peers, nse_ids.tolist(), bse_ids.tolist(), strict=False)
+        if trim_text(nse_id, 200) or trim_text(bse_id, 200)
+    }
+    unresolved = [peer for peer in unique_peers if peer not in resolved]
+    return {
+        "validated_affected_peers": [peer for peer in unique_peers if peer in resolved],
+        "unresolved_affected_peers": unresolved,
+        "identity_validation": {
+            "status": "validated" if not unresolved else "requires_identity_validation",
+            "validated_peer_count": len(resolved),
+            "unresolved_peer_count": len(unresolved),
+            "requires_company_master_resolution": bool(unresolved),
+            "policy_effect": "identity_context_accepted" if not unresolved else "context_only_until_resolved",
+            "portfolio_authority": "none",
+            "broker_execution_allowed": False,
+        },
+    }
 
 
 def _flatten_jsonish_text(value: Any, *, source: str = "llm_event_flatten_jsonish_text") -> str:
@@ -667,6 +757,8 @@ def normalize_event_evaluation(event_row: pd.Series, parsed: EventEvaluation) ->
 
 
 def build_event_tensor(parsed: EventEvaluation, *, event_class: str, score_impact: float, state_transition_hint: str) -> dict[str, Any]:
+    affected_peers = normalize_string_list(parsed.affected_peers, limit=20)
+    peer_identity = resolve_affected_peer_identity(affected_peers)
     return {
         "event_type": event_class,
         "direction": parsed.direction,
@@ -678,7 +770,10 @@ def build_event_tensor(parsed: EventEvaluation, *, event_class: str, score_impac
         "expected_decay_days": normalize_int(parsed.expected_decay_days, minimum=0, maximum=3650, default=5),
         "source_reliability": parsed.source_reliability,
         "affected_sectors": normalize_string_list(parsed.affected_sectors, limit=12),
-        "affected_peers": normalize_string_list(parsed.affected_peers, limit=20),
+        "affected_peers": affected_peers,
+        "validated_affected_peers": peer_identity["validated_affected_peers"],
+        "unresolved_affected_peers": peer_identity["unresolved_affected_peers"],
+        "affected_peer_identity_validation": peer_identity["identity_validation"],
         "confidence": normalize_float(parsed.confidence, minimum=0.0, maximum=1.0, default=0.0),
         "score_impact": normalize_float(score_impact, minimum=-1.0, maximum=1.0, default=0.0),
         "state_transition_hint": state_transition_hint,
@@ -866,6 +961,18 @@ def load_documents(unique_ids: list[str]) -> pd.DataFrame:
 def load_announcement_evidence(unique_ids: list[str]) -> pd.DataFrame:
     if not unique_ids or not _table_exists(ANNOUNCEMENT_EVIDENCE_TABLE):
         return pd.DataFrame()
+    available = _table_columns(ANNOUNCEMENT_EVIDENCE_TABLE)
+    optional_columns = [
+        "announcement_storage_form",
+        "announcement_storage_reason",
+        "llm_evidence_mode",
+        "llm_review_ready",
+        "raw_archive_required",
+    ]
+    optional_select = ",\n            ".join(
+        f"{column}" for column in optional_columns if column in available
+    )
+    optional_sql = f",\n            {optional_select}" if optional_select else ""
     df = sql_to_df(
         f"""
         SELECT
@@ -900,6 +1007,7 @@ def load_announcement_evidence(unique_ids: list[str]) -> pd.DataFrame:
             rationale,
             event_tensor_json,
             prompt_version
+            {optional_sql}
         FROM {ANNOUNCEMENT_EVIDENCE_TABLE}
         WHERE unique_id = ANY(%s)
         """,
@@ -908,6 +1016,10 @@ def load_announcement_evidence(unique_ids: list[str]) -> pd.DataFrame:
     if df.empty:
         return df
     df["published_on"] = pd.to_datetime(df["published_on"], utc=True, errors="coerce")
+    if "announcement_storage_form" in df.columns:
+        df = df[df["announcement_storage_form"].astype("string").str.lower().ne("archived_raw_reference_only")].copy()
+    if "llm_review_ready" in df.columns:
+        df = df[df["llm_review_ready"].map(lambda value: normalize_bool(value, default=True))].copy()
     return df
 
 
@@ -983,7 +1095,19 @@ def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[
 
 
 def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_days: int = 30, max_events: int = 8) -> dict[str, Any]:
-    out: dict[str, Any] = {"recent_events": []}
+    out: dict[str, Any] = {
+        "recent_events": [],
+        "context_contract": {
+            "authority_scope": "structured_context_only",
+            "action_policy_effect": "llm_classification_support_only",
+            "portfolio_authority": "none",
+            "broker_execution_allowed": False,
+            "point_in_time_required": True,
+            "lookback_days": int(lookback_days),
+            "max_events": int(max_events),
+            "bounded_event_rows": True,
+        },
+    }
     symbol = symbol.upper()
     daily_cutoff = pd.to_datetime(published_on, utc=True, errors="coerce").normalize()
     try:
@@ -1100,6 +1224,13 @@ def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_d
                     }
                     for row in events.to_dict(orient="records")
                 ]
+        out["context_summary"] = {
+            "feature_context_available": bool(out.get("features")),
+            "bhavcopy_context_available": bool(out.get("bhavcopy_evidence")),
+            "recent_event_count": int(len(out.get("recent_events") or [])),
+            "recent_event_limit": int(max_events),
+            "lookback_days": int(lookback_days),
+        }
     except Exception as exc:
         record_local_fallback_event(
             module="advisory.llm_event_evaluator",
@@ -1116,6 +1247,14 @@ def load_exchange_context(symbol: str, published_on: pd.Timestamp, *, lookback_d
             },
         )
         out["error"] = str(exc)
+        out["context_summary"] = {
+            "feature_context_available": bool(out.get("features")),
+            "bhavcopy_context_available": bool(out.get("bhavcopy_evidence")),
+            "recent_event_count": int(len(out.get("recent_events") or [])),
+            "recent_event_limit": int(max_events),
+            "lookback_days": int(lookback_days),
+            "error": type(exc).__name__,
+        }
     return out
 
 
@@ -1201,6 +1340,11 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
                         source="announcement_evidence_event_tensor_json",
                     ),
                     "latest_event_prompt_version": document_row.get("prompt_version"),
+                    "announcement_storage_form": document_row.get("announcement_storage_form"),
+                    "announcement_storage_reason": document_row.get("announcement_storage_reason"),
+                    "llm_evidence_mode": document_row.get("llm_evidence_mode"),
+                    "llm_review_ready": normalize_bool(document_row.get("llm_review_ready"), default=True),
+                    "raw_archive_required": normalize_bool(document_row.get("raw_archive_required"), default=False),
                     "fallback_used": False,
                 }
             )
@@ -1224,6 +1368,15 @@ def build_payload(event_row: pd.Series, document_row: pd.Series | None) -> dict[
 
     return {
         "prompt_version": ADVISORY_EVENT_PROMPT_VERSION,
+        "authority_contract": {
+            "authority_scope": "llm_event_classification_only",
+            "action_policy_effect": "structured_extraction_and_review_signal_only",
+            "portfolio_authority": "none",
+            "broker_execution_allowed": False,
+            "free_form_buy_sell_authority": False,
+            "requires_downstream_policy_gate": True,
+            "point_in_time_context": True,
+        },
         "setup_context": {
             "asof_date": event_row["asof_date"].isoformat() if not pd.isna(event_row["asof_date"]) else None,
             "setup_id": event_row.get("setup_id"),
@@ -1287,6 +1440,26 @@ def build_outputs(
     raw_docs = load_documents(raw_fallback_ids)
     if not raw_docs.empty:
         raw_docs["_source_table"] = "announcement_pipeline_documents"
+    if raw_fallback_ids:
+        raw_loaded_ids = set(raw_docs["unique_id"].dropna().astype(str).tolist()) if not raw_docs.empty and "unique_id" in raw_docs.columns else set()
+        record_local_fallback_event(
+            module="advisory.llm_event_evaluator",
+            source=ANNOUNCEMENT_EVIDENCE_TABLE,
+            fallback_type="llm_event_compact_announcement_evidence_missing_raw_fallback",
+            severity="warn",
+            reason=(
+                "Event evaluator did not find review-ready compact announcement evidence for one or more requested "
+                "announcements and used raw announcement documents when available."
+            ),
+            metadata={
+                "requested_event_count": int(len(unique_ids)),
+                "compact_context_count": int(len(compact_docs)),
+                "raw_fallback_requested_count": int(len(raw_fallback_ids)),
+                "raw_fallback_loaded_count": int(len(raw_loaded_ids)),
+                "missing_raw_document_count": int(len(set(raw_fallback_ids) - raw_loaded_ids)),
+                "raw_fallback_unique_id_sample": raw_fallback_ids[:10],
+            },
+        )
     docs = pd.concat([compact_docs, raw_docs], ignore_index=True, sort=False) if not compact_docs.empty or not raw_docs.empty else pd.DataFrame()
     docs_by_id = {
         str(row["unique_id"]): row
@@ -1447,6 +1620,8 @@ def build_outputs(
                 "source_reliability": parsed.source_reliability,
                 "affected_sectors_json": json_dumps(event_tensor["affected_sectors"]),
                 "affected_peers_json": json_dumps(event_tensor["affected_peers"]),
+                "validated_affected_peers_json": json_dumps(event_tensor["validated_affected_peers"]),
+                "unresolved_affected_peers_json": json_dumps(event_tensor["unresolved_affected_peers"]),
                 "governance_risk": parsed.governance_risk,
                 "balance_sheet_risk": parsed.balance_sheet_risk,
                 "execution_risk": parsed.execution_risk,

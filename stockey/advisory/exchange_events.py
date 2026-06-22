@@ -111,6 +111,13 @@ def _clean_symbol(series: pd.Series) -> pd.Series:
     return series.astype("string").str.strip().str.upper()
 
 
+def _clean_event_type(series: pd.Series | None, *, default: str) -> pd.Series:
+    if series is None:
+        series = pd.Series(default)
+    cleaned = series.astype("string").str.strip().str.upper()
+    return cleaned.mask(cleaned.isna() | cleaned.isin(["", "<NA>", "NAN", "NONE", "NULL"]), default)
+
+
 def _numeric(series: pd.Series | None) -> pd.Series:
     if series is None:
         return pd.Series(dtype="float64")
@@ -243,8 +250,10 @@ def normalize_corporate_actions(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = pd.DataFrame(index=df.index)
     out["event_source"] = "nse_corporate_action"
-    action_type = df.get("action_type", pd.Series("CORPORATE_ACTION", index=df.index)).fillna("CORPORATE_ACTION")
-    out["event_type"] = action_type.astype(str).str.strip().str.upper().replace({"": "CORPORATE_ACTION"})
+    out["event_type"] = _clean_event_type(
+        df.get("action_type", pd.Series("CORPORATE_ACTION", index=df.index)),
+        default="CORPORATE_ACTION",
+    )
     out["symbol"] = df.get("symbol")
     out["company_master_id"] = df.get("company_master_id")
     out["event_date"] = df.get("date")

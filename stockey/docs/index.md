@@ -128,9 +128,16 @@ Primary operator commands:
 ./all_advisory.sh
 ./all_watchers.sh --loop
 ./all_frontend.sh
+./all_research_evidence.sh
+python -m advisory.recommendation_diagnostics --format text
+python -m advisory.context_overlay_reliability_report --horizons 5 10 20 --format text
+python -m advisory.signal_quality_family_report --horizons 5 10 20 --format text
+python -m advisory.llm_provenance_audit --lookback-days 30 --limit-per-table 100 --format text
+python -m advisory.action_evidence_provenance --dry-run --limit 250 --format text
+python -m advisory.causal_event_provenance --dry-run --limit 250 --format text
 ```
 
-`./all_ml.sh` is available for research/event-model training, but it is not part of the default production decision path.
+`./all_research_evidence.sh` is the lighter daily evidence-refresh path. `./all_ml.sh` is available for research/event-model training, but it is not part of the default production decision path.
 
 Scheduled operator flow:
 
@@ -141,6 +148,7 @@ Scheduled operator flow:
 - let the experimental TS forecast cron run at `11:20`, `14:20`, `17:20`, and `20:20`; evaluator runs at `18:20` and `21:20`
 - let operator health run at `08:05`, `12:05`, `17:05`, and `22:05` so fix hints and stale-data warnings stay current
 - let `all_advisory.sh` run once daily after 7pm for the slower batch recommendation cycle
+- let `all_research_evidence.sh` run at `22:20` on weekdays so context/event/action-transition evidence matures without weekly ML
 - let event-policy realized-return evaluation run at `23:10` on weekdays
 - let technical threshold calibration run weekly at `04:20` on Saturdays
 - let `all_ml.sh` run weekly at `03:10` on Sundays for event-model research evidence
@@ -153,6 +161,7 @@ Top-level operator scripts also emit deterministic lifecycle markers through `sc
 Use:
 
 - `./complete_data.sh` for the full raw-data refresh
+- `./all_research_evidence.sh` for daily research-only context/event/action-transition evidence refresh
 - `./all_ml.sh` for optional research prep, readiness checks, model train, and score
 - `python -m advisory.ts_forecast_features --dry-run --symbols RELIANCE TCS` for experimental OHLCV forecast features
 - `python -m advisory.ts_forecast_evaluator --dry-run --from-date 2026-04-01 --to-date 2026-04-30` for matured TS forecast evaluation
@@ -164,7 +173,7 @@ Use:
 - `python -m advisory.ts_forecast_workflow --symbols RELIANCE TCS --model-name timesfm_2p5_200m` for the optional Screener/Dhan/TimesFM/TS-watchlist workflow
 - `python -m advisory.ts_forecast_workflow --model-name timesfm_2p5_200m --max-symbols 80` for the default TS screener workflow
 - `python -m advisory.event_policy_evaluator --dry-run --horizons 5 10 20` for event-policy realized-return evidence
-- `python -m advisory.technical_threshold_calibration --dry-run --horizons 5 10 20` for weekly technical threshold evidence
+- `python -m advisory.technical_threshold_calibration --dry-run --horizons 5 10 20 --max-configs 512 --progress-every 128` for weekly technical threshold evidence
 - `python -m advisory.operator_health --skip-dhan` for a read-only local smoke test
 - `./all_advisory.sh` for the advisory and portfolio run
 

@@ -467,6 +467,11 @@ def build_execution_notes(row: pd.Series, approved_allocation: float, portfolio_
             notes.append(f"Deferred because overlap group {row.get('overlap_group')} already reached its limit.")
         elif portfolio_reason == "max_positions":
             notes.append("Deferred because the portfolio already reached its max position count.")
+        elif portfolio_reason == "technical_entry_not_confirmed":
+            notes.append(
+                "Deferred because risk allocation came from a base technical candidate without confirmed "
+                "technical_state=BUY_TRIGGERED entry evidence."
+            )
         else:
             notes.append("Deferred because portfolio capital or setup cap was exhausted.")
     if pd.notna(row.get("stop_price")):
@@ -488,6 +493,43 @@ def portfolio_position_state(portfolio_status: str, approved_allocation: float) 
     if status == "deferred":
         return "DEFERRED"
     return "NOT_ACTIONABLE"
+
+
+def _safe_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="advisory.portfolio_engine",
+            fallback_type="portfolio_engine_bool_missing_check_failed",
+            source="portfolio_boolean_fields",
+            severity="warn",
+            reason="Portfolio engine could not evaluate a boolean-like field for missingness and used text fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": str(value)[:200]},
+        )
+        pass
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(int(value))
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "", "nan", "none", "null", "<na>"}:
+        return False
+    return default
+
+
+def blocks_unconfirmed_base_technical_entry(row: pd.Series) -> bool:
+    if not _safe_bool(row.get("is_base_candidate_fallback"), False):
+        return False
+    if _safe_bool(row.get("technical_entry_confirmed"), False):
+        return False
+    return True
 
 
 def build_state_transition_contract(row: pd.Series, portfolio_row: dict[str, Any]) -> dict[str, Any]:
@@ -526,6 +568,9 @@ def build_state_transition_contract(row: pd.Series, portfolio_row: dict[str, Any
         "expected_horizon_days": portfolio_row.get("expected_horizon_days"),
         "source_unique_id": row.get("unique_id"),
         "source_setup_id": row.get("setup_id"),
+        "technical_state": row.get("technical_state"),
+        "technical_trigger_type": row.get("technical_trigger_type"),
+        "technical_entry_confirmed": row.get("technical_entry_confirmed"),
     }
     return contract
 
@@ -744,7 +789,11 @@ def build_portfolio_orders(
         overlap_count = overlap_group_counts.get(overlap_group, 0)
         portfolio_reason: str | None = None
 
-        if overlap_count >= overlap_limit:
+        if blocks_unconfirmed_base_technical_entry(row):
+            approved = 0.0
+            status = "deferred"
+            portfolio_reason = "technical_entry_not_confirmed"
+        elif overlap_count >= overlap_limit:
             approved = 0.0
             status = "deferred"
             portfolio_reason = "overlap_cap"

@@ -59,6 +59,7 @@ from advisory.operator_snapshot import load_operator_snapshot_sections
 from advisory.performance_slowlog import record_slow_operation
 from advisory.performance_slowlog import update_slow_issue_status
 from advisory.prompt_registry import build_prompt_registry_payload
+from advisory.recommendation_diagnostics import build_recommendation_diagnostics
 from advisory.regime_overlay import load_regime_overlay_decisions, load_regime_overlay_reviews, record_regime_overlay_decision
 from advisory.portfolio_engine import PORTFOLIO_TABLE
 from advisory.research_ledger import LEDGER_TABLE as RESEARCH_LEDGER_TABLE
@@ -264,7 +265,7 @@ EXECUTION_LIVE_ALLOWANCE_SCHEMA_STATEMENTS = [
 ]
 
 _PAYLOAD_CACHE: dict[tuple[str, str | None], tuple[float, dict[str, Any]]] = {}
-FEATURE_FRESHNESS_OPERATOR_STAGES = ("rules", "risk", "portfolio", "lifecycle", "actions")
+FEATURE_FRESHNESS_OPERATOR_STAGES = ("rules", "risk", "portfolio", "lifecycle", "actions", "company_memory")
 
 
 def _record_operator_local_fallback(
@@ -653,6 +654,25 @@ class TsForecastReviewRulesResponse(OperatorApiResponseModel):
     rules: list[dict[str, Any]] = Field(default_factory=list)
     issues: list[dict[str, Any]] = Field(default_factory=list)
     summary: dict[str, Any] = Field(default_factory=dict)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
+
+
+class RecommendationDiagnosticsResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    asof_date: str | None = None
+    row_count: int | None = None
+    positive_action_count: int | None = None
+    no_buy_diagnosis: str | None = None
+    primary_no_buy_cause: dict[str, Any] = Field(default_factory=dict)
+    layered_underparticipation_attribution: dict[str, Any] = Field(default_factory=dict)
+    advisory_rerun_readiness: dict[str, Any] = Field(default_factory=dict)
+    context_overlay_refresh_preview: dict[str, Any] = Field(default_factory=dict)
+    causal_memory_refresh_preview: dict[str, Any] = Field(default_factory=dict)
+    market_participation_context: dict[str, Any] = Field(default_factory=dict)
+    diagnostic_trust: dict[str, Any] = Field(default_factory=dict)
+    operator_next_steps: list[str] = Field(default_factory=list)
     operator_boundary: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -5336,6 +5356,7 @@ def _build_feature_freshness_stage_gates(*, symbol: str, asof_date: str | None =
                 "blocked_symbols": [normalized_symbol] if normalized_symbol else [],
                 "blocked_count": 1 if normalized_symbol else 0,
                 "required_input_keys": [],
+                "context_input_keys": [],
                 "gate_effect": "Stage feature gate evaluation failed; treat this stage as blocked until the error is fixed.",
                 "block_positive_actions": True,
                 "symbols": {
@@ -5353,6 +5374,7 @@ def _build_feature_freshness_stage_gates(*, symbol: str, asof_date: str | None =
                             }
                         ],
                         "required_inputs": [],
+                        "context_inputs": [],
                     }
                 }
                 if normalized_symbol
@@ -5366,7 +5388,9 @@ def _feature_freshness_stage_gate_summary(stage_gates: list[dict[str, Any]]) -> 
     blocked_stages: list[str] = []
     error_stages: list[str] = []
     blocked_inputs: list[dict[str, Any]] = []
+    context_inputs: list[dict[str, Any]] = []
     seen_inputs: set[tuple[str, str, str]] = set()
+    seen_context_inputs: set[tuple[str, str, str]] = set()
     for gate in stage_gates:
         stage = str(gate.get("stage") or "").strip()
         status = str(gate.get("status") or "").strip().lower()
@@ -5392,6 +5416,21 @@ def _feature_freshness_stage_gate_summary(stage_gates: list[dict[str, Any]]) -> 
                 item = dict(blocker)
                 item.setdefault("stage", stage)
                 blocked_inputs.append(item)
+            for context_input in symbol_summary.get("context_inputs") or []:
+                if not isinstance(context_input, dict):
+                    continue
+                key = (
+                    str(stage),
+                    str(context_input.get("input_key") or context_input.get("label") or ""),
+                    str(context_input.get("status") or ""),
+                )
+                if key in seen_context_inputs:
+                    continue
+                seen_context_inputs.add(key)
+                item = dict(context_input)
+                item.setdefault("stage", stage)
+                item.setdefault("blocking", False)
+                context_inputs.append(item)
     return {
         "stage_count": len(stage_gates),
         "blocked_stage_count": len(blocked_stages),
@@ -5399,6 +5438,13 @@ def _feature_freshness_stage_gate_summary(stage_gates: list[dict[str, Any]]) -> 
         "blocked_stages": blocked_stages,
         "error_stages": error_stages,
         "blocked_inputs": blocked_inputs,
+        "context_input_count": len(context_inputs),
+        "context_warning_count": sum(
+            1
+            for item in context_inputs
+            if str(item.get("status") or "").strip().lower() in {"missing", "stale", "error", "intentionally_skipped"}
+        ),
+        "context_inputs": context_inputs,
         "operator_boundary": {
             "read_only": True,
             "mutates_recommendations": False,
@@ -7444,6 +7490,29 @@ def build_ts_forecast_review_rules_payload() -> dict[str, Any]:
     return payload
 
 
+def build_recommendation_diagnostics_payload(*, asof_date: str | None = None, limit: int = 500) -> dict[str, Any]:
+    parsed_asof = _parse_asof_date(asof_date) if asof_date else None
+    payload = build_recommendation_diagnostics(
+        asof_date=parsed_asof,
+        limit=max(1, min(int(limit), 2_000)),
+    )
+    payload["generated_at"] = pd.Timestamp.utcnow().isoformat()
+    payload["api_schema"] = _operator_api_schema(
+        "/api/research/recommendation-diagnostics",
+        schema_name="recommendation_diagnostics",
+    )
+    payload["operator_boundary"] = {
+        "read_only": True,
+        "portfolio_authority": "none",
+        "broker_execution_allowed": False,
+        "decision_use": (
+            "diagnose missing BUY/BUY_MORE rows, stale artifacts, context-overlay conversion, "
+            "technical confirmation, and downstream consolidation before tuning regime or policy"
+        ),
+    }
+    return payload
+
+
 def build_event_model_artifacts_payload(*, limit: int = 50, offset: int = 0) -> dict[str, Any]:
     artifact_dir = Path(".cache/advisory_event_meta_model")
     try:
@@ -7688,6 +7757,62 @@ OPERATOR_COMMAND_REGISTRY: dict[str, dict[str, Any]] = {
         "risk": "safe_read_only",
         "dry_run": True,
         "timeout_seconds": 60,
+    },
+    "recommendation_diagnostics": {
+        "label": "Recommendation Diagnostics",
+        "description": "Read-only no-BUY and underparticipation diagnosis over persisted advisory/action rows. Does not mutate recommendations, portfolio rows, config, or broker orders.",
+        "args": _python_cmd("-m", "advisory.recommendation_diagnostics", "--format", "text"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 180,
+    },
+    "context_overlay_reliability_report": {
+        "label": "Context Overlay Reliability",
+        "description": "Read-only benchmark-attributed reliability report for announcement, exchange, bhavcopy, theme, and macro context-overlay watch/de-risk evidence. Does not change live policy or broker behavior.",
+        "args": _python_cmd("-m", "advisory.context_overlay_reliability_report", "--horizons", "5", "10", "20", "--format", "text"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 180,
+    },
+    "signal_quality_family_report": {
+        "label": "Signal Quality Family Report",
+        "description": "Read-only source-family outcome report comparing technical-only against technical plus context families after costs. Does not create promotion rows or live policy changes.",
+        "args": _python_cmd("-m", "advisory.signal_quality_family_report", "--horizons", "5", "10", "20", "--format", "text"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 180,
+    },
+    "run_research_evidence": {
+        "label": "Run Research Evidence Refresh",
+        "description": "Runs the daily research-only evidence refresh for context, event, adversarial-review, action-transition, causal-memory, provenance, and reliability evidence. It does not run event-model training, mutate live policy/config, change portfolio rows, or call the broker.",
+        "args": ["./all_research_evidence.sh"],
+        "risk": "research_evidence_write",
+        "dry_run": False,
+        "timeout_seconds": 1800,
+    },
+    "llm_provenance_audit": {
+        "label": "LLM Provenance Audit",
+        "description": "Read-only audit for persisted LLM/Codex-derived signal rows covering prompt id/version, response schema, model, evidence, and authority metadata. Does not repair rows or change policy.",
+        "args": _python_cmd("-m", "advisory.llm_provenance_audit", "--lookback-days", "30", "--limit-per-table", "100", "--format", "text"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 180,
+    },
+    "action_evidence_provenance_dry_run": {
+        "label": "Action Evidence Provenance Dry Run",
+        "description": "Read-only dry run that builds final-action to evidence-section provenance rows for audit review. Does not persist provenance, change recommendations, or call the broker.",
+        "args": _python_cmd("-m", "advisory.action_evidence_provenance", "--dry-run", "--limit", "250", "--format", "text"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 180,
+    },
+    "causal_event_provenance_dry_run": {
+        "label": "Causal Event Provenance Dry Run",
+        "description": "Read-only dry run that builds source-to-memory-to-outcome provenance for causal event memory review. Does not persist provenance, change policy, or call the broker.",
+        "args": _python_cmd("-m", "advisory.causal_event_provenance", "--dry-run", "--limit", "250", "--format", "text"),
+        "risk": "safe_read_only",
+        "dry_run": True,
+        "timeout_seconds": 180,
     },
     "advisory_preflight": {
         "label": "Advisory Preflight",
@@ -8385,6 +8510,14 @@ def _manual_review_final_action(raw: dict[str, Any]) -> str:
     return (_text(notes.get("final_action_type")) or "").upper() if notes else ""
 
 
+EVENT_POLICY_LLM_RESOLVED_ACTIONS = {"NO_ACTION", "BUY_WATCH", "REDUCE_EXPOSURE_REVIEW"}
+
+
+def _event_policy_llm_resolved_action(raw: dict[str, Any]) -> str:
+    final_action = _manual_review_final_action(raw)
+    return final_action if final_action in EVENT_POLICY_LLM_RESOLVED_ACTIONS else ""
+
+
 def _manual_review_detail(raw: dict[str, Any]) -> str:
     reason_payload = _jsonish(raw.get("recommendation_reason_json"))
     detail = ""
@@ -8469,11 +8602,21 @@ def _event_policy_review_text(raw: dict[str, Any], fallback_reason: Any = None) 
 
 
 def _load_event_policy_no_action_unique_ids(skipped: list[dict[str, str]]) -> set[str]:
+    return _load_event_policy_llm_resolved_unique_ids(skipped, resolved_actions={"NO_ACTION"})
+
+
+def _load_event_policy_llm_resolved_unique_ids(
+    skipped: list[dict[str, str]],
+    *,
+    resolved_actions: set[str] | None = None,
+) -> set[str]:
     table = EVENT_POLICY_TABLE
     if not _table_exists(table):
         return set()
+    allowed_actions = {(_text(value) or "").upper() for value in (resolved_actions or EVENT_POLICY_LLM_RESOLVED_ACTIONS)}
+    allowed_actions.discard("")
     df = _safe_manual_query(
-        f"{table}:no_action_notes",
+        f"{table}:llm_resolved_notes",
         f"""
         SELECT unique_id, operator_notes_json, llm_review_json, raw_context_json
         FROM {table}
@@ -8489,7 +8632,8 @@ def _load_event_policy_no_action_unique_ids(skipped: list[dict[str, str]]) -> se
     )
     out: set[str] = set()
     for row in _records(df):
-        if _manual_review_final_action(row) == "NO_ACTION":
+        final_action = _manual_review_final_action(row)
+        if final_action and final_action in allowed_actions:
             uid = _text(row.get("unique_id"))
             if uid:
                 out.add(uid)
@@ -8502,20 +8646,28 @@ def _suppress_shadow_manual_review_items(items: list[dict[str, Any]], skipped: l
         for item in items
         if item.get("item_type") == "event_policy_manual_review" and _text(item.get("unique_id"))
     }
-    no_action_event_uids = _load_event_policy_no_action_unique_ids(skipped)
+    locally_resolved_event_present = any(
+        item.get("item_type") == "event_policy_manual_review"
+        and isinstance(item.get("raw"), dict)
+        and bool(_event_policy_llm_resolved_action(item["raw"]))
+        for item in items
+    )
+    llm_resolved_event_uids = _load_event_policy_llm_resolved_unique_ids(skipped)
     superseded_event_uids = _load_superseded_event_policy_failure_unique_ids(skipped)
-    if not detailed_event_uids and not no_action_event_uids and not superseded_event_uids:
+    if not locally_resolved_event_present and not detailed_event_uids and not llm_resolved_event_uids and not superseded_event_uids:
         return items
     out: list[dict[str, Any]] = []
     for item in items:
         uid = _text(item.get("unique_id"))
         raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
         source = (_text(raw.get("action_source")) or "").lower() if isinstance(raw, dict) else ""
-        if item.get("item_type") == "event_policy_manual_review" and uid in no_action_event_uids:
+        if item.get("item_type") == "event_policy_manual_review" and (
+            uid in llm_resolved_event_uids or _event_policy_llm_resolved_action(raw)
+        ):
             continue
         if item.get("item_type") == "event_policy_manual_review" and uid in superseded_event_uids:
             continue
-        if item.get("item_type") == "action_manual_review" and source == "event_policy" and uid in (detailed_event_uids | no_action_event_uids | superseded_event_uids):
+        if item.get("item_type") == "action_manual_review" and source == "event_policy" and uid in (detailed_event_uids | llm_resolved_event_uids | superseded_event_uids):
             continue
         out.append(item)
     return out
@@ -8662,6 +8814,20 @@ def load_latest_manual_review_decisions(*, limit: int = 1000) -> dict[str, dict[
     return decisions
 
 
+MANUAL_REVIEW_ACTION_CODES = {"BUY", "BUY_MORE", "SELL", "PARTIAL_SELL", "TIGHTEN_STOP"}
+
+
+def _action_recommendation_requires_manual_review(row: dict[str, Any]) -> bool:
+    action_code = (_text(row.get("action_code")) or "").upper()
+    reason_status = (_text(row.get("reason_contract_status")) or "complete").lower()
+    execution_mode = (_text(row.get("execution_mode")) or "").lower()
+    if action_code == "MANUAL_REVIEW":
+        return True
+    if reason_status != "complete":
+        return True
+    return bool(execution_mode == "review_only" and action_code in MANUAL_REVIEW_ACTION_CODES)
+
+
 def _append_latest_action_review_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
     table = ACTION_RECOMMENDATIONS_TABLE
     if not _table_exists(table):
@@ -8676,7 +8842,10 @@ def _append_latest_action_review_items(items: list[dict[str, Any]], skipped: lis
           AND (
             action_code = 'MANUAL_REVIEW'
             OR reason_contract_status IS DISTINCT FROM 'complete'
-            OR execution_mode = 'review_only'
+            OR (
+              execution_mode = 'review_only'
+              AND action_code IN ('BUY', 'BUY_MORE', 'SELL', 'PARTIAL_SELL', 'TIGHTEN_STOP')
+            )
           )
         ORDER BY
             CASE action_code WHEN 'MANUAL_REVIEW' THEN 1 ELSE 2 END,
@@ -8688,6 +8857,8 @@ def _append_latest_action_review_items(items: list[dict[str, Any]], skipped: lis
         skipped=skipped,
     )
     for row in _records(df):
+        if not _action_recommendation_requires_manual_review(row):
+            continue
         status = _text(row.get("action_code")) or "manual_review"
         reason = row.get("action_reason") or row.get("reason") or row.get("reason_detail") or row.get("recommendation_reason")
         if (_text(row.get("action_source")) or "").lower() == "event_policy":
@@ -8756,7 +8927,7 @@ def _append_event_policy_review_items(items: list[dict[str, Any]], skipped: list
         skipped=skipped,
     )
     for row in _records(df):
-        if _manual_review_final_action(row) == "NO_ACTION":
+        if _event_policy_llm_resolved_action(row):
             continue
         if _event_policy_llm_failure_superseded(row):
             continue
@@ -10496,6 +10667,18 @@ def create_app():
     @app.get("/api/research/ts-forecast-review-rules", response_model=TsForecastReviewRulesResponse)
     def research_ts_forecast_review_rules():
         return _guard(build_ts_forecast_review_rules_payload, route="/api/research/ts-forecast-review-rules")
+
+    @app.get("/api/research/recommendation-diagnostics", response_model=RecommendationDiagnosticsResponse)
+    def research_recommendation_diagnostics(
+        asof_date: str | None = None,
+        limit: int = Query(default=500, ge=1, le=2000),
+    ):
+        return _guard(
+            build_recommendation_diagnostics_payload,
+            route="/api/research/recommendation-diagnostics",
+            asof_date=asof_date,
+            limit=limit,
+        )
 
     @app.get("/api/research/event-model-artifacts", response_model=EventModelArtifactsResponse)
     def research_event_model_artifacts(limit: int = Query(default=50, ge=0, le=200), offset: int = Query(default=0, ge=0)):

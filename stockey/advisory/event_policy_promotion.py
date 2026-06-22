@@ -193,7 +193,9 @@ def build_pending_patch(evidence: dict[str, Any]) -> dict[str, Any]:
             "minimum_horizon_days": evidence.get("horizon_days"),
             "minimum_matured_rows": evidence.get("matured_count"),
             "minimum_avg_forward_return_after_cost": evidence.get("avg_forward_return_after_cost"),
+            "minimum_avg_excess_forward_return_after_cost": evidence.get("avg_excess_forward_return_after_cost"),
             "minimum_hit_rate_after_cost": evidence.get("hit_rate_after_cost"),
+            "minimum_excess_hit_rate_after_cost": evidence.get("excess_hit_rate_after_cost"),
             "authority": "review_input_only",
             "broker_execution_allowed": False,
         },
@@ -212,7 +214,9 @@ def build_manual_patch_text(patch: dict[str, Any]) -> str:
         f"    minimum_horizon_days: {json.dumps(suggestion.get('minimum_horizon_days'), ensure_ascii=False, default=str)}",
         f"    minimum_matured_rows: {json.dumps(suggestion.get('minimum_matured_rows'), ensure_ascii=False, default=str)}",
         f"    minimum_avg_forward_return_after_cost: {json.dumps(suggestion.get('minimum_avg_forward_return_after_cost'), ensure_ascii=False, default=str)}",
+        f"    minimum_avg_excess_forward_return_after_cost: {json.dumps(suggestion.get('minimum_avg_excess_forward_return_after_cost'), ensure_ascii=False, default=str)}",
         f"    minimum_hit_rate_after_cost: {json.dumps(suggestion.get('minimum_hit_rate_after_cost'), ensure_ascii=False, default=str)}",
+        f"    minimum_excess_hit_rate_after_cost: {json.dumps(suggestion.get('minimum_excess_hit_rate_after_cost'), ensure_ascii=False, default=str)}",
         "    authority: review_input_only",
         "    broker_execution_allowed: false",
     ]
@@ -222,7 +226,9 @@ def build_manual_patch_text(patch: dict[str, Any]) -> str:
 def deterministic_review(evidence: dict[str, Any]) -> EventPolicyPromotionReview:
     matured = pd.to_numeric(evidence.get("matured_count"), errors="coerce")
     hit_rate = pd.to_numeric(evidence.get("hit_rate_after_cost"), errors="coerce")
+    excess_hit_rate = pd.to_numeric(evidence.get("excess_hit_rate_after_cost"), errors="coerce")
     avg_after_cost = pd.to_numeric(evidence.get("avg_forward_return_after_cost"), errors="coerce")
+    avg_excess_after_cost = pd.to_numeric(evidence.get("avg_excess_forward_return_after_cost"), errors="coerce")
     group_type = str(evidence.get("group_type") or "")
     group_value = str(evidence.get("group_value") or "")
     recommendation: Literal["promote_review_rule", "tighten_or_downgrade", "reject", "needs_more_data"] = "needs_more_data"
@@ -233,13 +239,32 @@ def deterministic_review(evidence: dict[str, Any]) -> EventPolicyPromotionReview
     if matured_count < 30:
         reasons.append("Matured sample is below 30 rows.")
         risks.append("Event-policy result may be dominated by one symbol, event type, or market regime.")
+    if matured_count >= 30 and (pd.isna(avg_excess_after_cost) or pd.isna(excess_hit_rate)):
+        reasons.append("Benchmark-excess attribution is missing, so raw event-policy returns cannot be promoted.")
+        risks.append("Raw positive returns may reflect broad market beta rather than event-policy value.")
     if pd.notna(avg_after_cost) and pd.notna(hit_rate):
-        if matured_count >= 30 and float(avg_after_cost) > 0.0 and float(hit_rate) >= 0.50:
+        if (
+            matured_count >= 30
+            and pd.notna(avg_excess_after_cost)
+            and pd.notna(excess_hit_rate)
+            and float(avg_after_cost) > 0.0
+            and float(hit_rate) >= 0.50
+            and float(avg_excess_after_cost) > 0.0
+            and float(excess_hit_rate) >= 0.50
+        ):
             recommendation = "promote_review_rule"
-            reasons.append("Group has positive average forward return after costs and hit rate at or above 50%.")
-        elif matured_count >= 30 and float(avg_after_cost) < 0.0 and float(hit_rate) < 0.40:
+            reasons.append("Group has positive average forward return after costs, positive benchmark-excess return, and hit rates at or above 50%.")
+        elif (
+            matured_count >= 30
+            and pd.notna(avg_excess_after_cost)
+            and float(avg_after_cost) < 0.0
+            and float(hit_rate) < 0.40
+            and float(avg_excess_after_cost) < 0.0
+        ):
             recommendation = "tighten_or_downgrade"
-            reasons.append("Group has negative average forward return after costs and hit rate below 40%.")
+            reasons.append("Group has negative average forward return after costs, negative benchmark-excess return, and hit rate below 40%.")
+        elif matured_count >= 30 and (pd.isna(avg_excess_after_cost) or pd.isna(excess_hit_rate)):
+            recommendation = "needs_more_data"
         elif matured_count >= 30:
             recommendation = "reject"
             reasons.append("Evidence is not strong enough to justify a review-rule change.")

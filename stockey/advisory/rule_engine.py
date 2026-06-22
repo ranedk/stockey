@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import timezone
 from typing import Any
 
@@ -26,6 +27,8 @@ CANDIDATES_TABLE = "advisory_candidates"
 REJECTIONS_TABLE = "advisory_candidate_rejections"
 OVERLAY_TABLE = "advisory_market_overlay_daily"
 RULE_ENGINE_SCHEMA_MIGRATION_ID = "20260611_advisory_rule_outputs_base"
+RULE_ENGINE_CONTEXT_METADATA_MIGRATION_ID = "20260622_advisory_rule_outputs_context_metadata"
+RULE_ENGINE_TECHNICAL_ENTRY_MIGRATION_ID = "20260622_advisory_rule_outputs_technical_entry_confirmed"
 CANDIDATE_COLUMNS = {
     "screener_date": "TIMESTAMPTZ",
     "setup_name": "TEXT",
@@ -42,9 +45,12 @@ CANDIDATE_COLUMNS = {
     "rank": "BIGINT",
     "candidate_state": "TEXT",
     "watch_reason_detail": "TEXT",
+    "soft_failures_json": "TEXT",
     "technical_state": "TEXT",
     "technical_trigger_type": "TEXT",
     "technical_trigger_note": "TEXT",
+    "technical_setup_archetype": "TEXT",
+    "technical_setup_quality_json": "TEXT",
     "technical_trend_score": "DOUBLE PRECISION",
     "technical_structure_score": "DOUBLE PRECISION",
     "technical_participation_score": "DOUBLE PRECISION",
@@ -53,6 +59,7 @@ CANDIDATE_COLUMNS = {
     "technical_score": "DOUBLE PRECISION",
     "fundamental_score": "DOUBLE PRECISION",
     "regime_fit_score": "DOUBLE PRECISION",
+    "regime_fit_weight_effective": "DOUBLE PRECISION",
     "event_score": "DOUBLE PRECISION",
     "setup_score": "DOUBLE PRECISION",
     "avg_traded_value_20d": "DOUBLE PRECISION",
@@ -81,6 +88,17 @@ CANDIDATE_COLUMNS = {
     "watch_reasons": "TEXT",
     "rule_pass": "BOOLEAN",
     "load_ts": "TIMESTAMPTZ",
+}
+CONTEXT_METADATA_CANDIDATE_COLUMNS = {
+    "soft_failures_json",
+    "technical_setup_archetype",
+    "technical_setup_quality_json",
+    "regime_fit_weight_effective",
+}
+BASE_CANDIDATE_COLUMNS = {
+    column: sql_type
+    for column, sql_type in CANDIDATE_COLUMNS.items()
+    if column not in CONTEXT_METADATA_CANDIDATE_COLUMNS
 }
 REJECTION_COLUMNS = {
     "screener_date": "TIMESTAMPTZ",
@@ -159,7 +177,7 @@ RULE_ENGINE_SCHEMA_STATEMENTS = [
     """,
     *[
         f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
-        for column, sql_type in CANDIDATE_COLUMNS.items()
+        for column, sql_type in BASE_CANDIDATE_COLUMNS.items()
     ],
     f"""
     CREATE TABLE IF NOT EXISTS {REJECTIONS_TABLE} (
@@ -184,6 +202,18 @@ RULE_ENGINE_SCHEMA_STATEMENTS = [
         f"ALTER TABLE {REJECTIONS_TABLE} ADD COLUMN IF NOT EXISTS {column} {sql_type}"
         for column, sql_type in REJECTION_COLUMNS.items()
     ],
+]
+RULE_ENGINE_CONTEXT_METADATA_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS {column} {CANDIDATE_COLUMNS[column]}"
+    for column in [
+        "soft_failures_json",
+        "technical_setup_archetype",
+        "technical_setup_quality_json",
+        "regime_fit_weight_effective",
+    ]
+]
+RULE_ENGINE_TECHNICAL_ENTRY_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS technical_entry_confirmed BOOLEAN",
 ]
 
 DEFAULT_SCORING_WEIGHTS = {
@@ -264,6 +294,30 @@ def ensure_rule_output_tables() -> None:
         description="Create advisory rule candidate and rejection output tables.",
         metadata={"tables": [CANDIDATES_TABLE, REJECTIONS_TABLE], "workflow": "rule_engine_outputs"},
     )
+    apply_schema_migration(
+        migration_id=RULE_ENGINE_CONTEXT_METADATA_MIGRATION_ID,
+        statements=RULE_ENGINE_CONTEXT_METADATA_SCHEMA_STATEMENTS,
+        owner="advisory.rule_engine",
+        description="Add context and technical metadata columns to advisory rule candidate outputs.",
+        metadata={
+            "tables": [CANDIDATES_TABLE],
+            "workflow": "rule_engine_outputs",
+            "base_migration_id": RULE_ENGINE_SCHEMA_MIGRATION_ID,
+            "columns": list(RULE_ENGINE_CONTEXT_METADATA_SCHEMA_STATEMENTS),
+        },
+    )
+    apply_schema_migration(
+        migration_id=RULE_ENGINE_TECHNICAL_ENTRY_MIGRATION_ID,
+        statements=RULE_ENGINE_TECHNICAL_ENTRY_SCHEMA_STATEMENTS,
+        owner="advisory.rule_engine",
+        description="Add explicit technical entry confirmation flag to advisory rule candidate outputs.",
+        metadata={
+            "tables": [CANDIDATES_TABLE],
+            "workflow": "rule_engine_outputs",
+            "base_migration_id": RULE_ENGINE_SCHEMA_MIGRATION_ID,
+            "columns": ["technical_entry_confirmed"],
+        },
+    )
 
 
 DEFAULT_FRESHNESS_POLICY = {
@@ -275,6 +329,12 @@ DEFAULT_FRESHNESS_POLICY = {
 }
 DEFAULT_MAX_SNAPSHOT_REFRESH_AGE_DAYS = 7
 DEFAULT_MAX_INTRADAY_PREFETCH_AGE_DAYS = 14
+RULE_ENGINE_REGIME_LABEL_HARD_BLOCK_ENABLED_ENV = "RULE_ENGINE_REGIME_LABEL_HARD_BLOCK_ENABLED"
+RULE_ENGINE_OVERLAY_LABEL_HARD_BLOCK_ENABLED_ENV = "RULE_ENGINE_OVERLAY_LABEL_HARD_BLOCK_ENABLED"
+RULE_ENGINE_REGIME_FIT_WEIGHT_MULTIPLIER_ENV = "RULE_ENGINE_REGIME_FIT_WEIGHT_MULTIPLIER"
+RULE_ENGINE_REQUIRE_REGIME_CONTEXT_ENV = "RULE_ENGINE_REQUIRE_REGIME_CONTEXT"
+DEFAULT_REGIME_FIT_WEIGHT_MULTIPLIER = 0.35
+DIAGNOSTIC_REGIME_NAME = "UNKNOWN"
 
 
 def get_effective_dates(asof_date: pd.Timestamp | None = None) -> dict[str, pd.Timestamp | None]:
@@ -387,6 +447,23 @@ def load_regime(asof_date: pd.Timestamp) -> dict[str, Any] | None:
     if df.empty:
         return None
     return df.iloc[0].to_dict()
+
+
+def missing_regime_context(asof_date: pd.Timestamp) -> dict[str, Any]:
+    error = RuntimeError("no market-regime row available")
+    _record_rule_engine_fallback(
+        fallback_type="rule_engine_regime_context_missing",
+        source="advisory_market_regime",
+        reason="Rule engine continued with UNKNOWN diagnostic regime because no market-regime snapshot was available.",
+        error=error,
+        metadata={"asof_date": str(asof_date), "regime_name": DIAGNOSTIC_REGIME_NAME},
+    )
+    return {
+        "asof_date": None,
+        "regime_name": DIAGNOSTIC_REGIME_NAME,
+        "regime_context_status": "missing",
+        "regime_context_reason": "no market-regime snapshot available on or before screener date",
+    }
 
 
 def load_overlay(asof_date: pd.Timestamp, regime_name: str | None = None) -> dict[str, Any]:
@@ -535,26 +612,67 @@ def load_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
                 total_value,
                 dma_20,
                 dma_50,
+                dma_150,
                 dma_200,
+                dma_20_slope_20d_pct,
+                dma_50_slope_20d_pct,
+                dma_150_slope_20d_pct,
                 atr_20,
+                atr_pct,
                 atr_compression_pct,
                 bb_width,
+                bb_width_rank_252d,
                 dist_20d_high,
                 dist_50d_high,
                 dist_52w_high,
+                base_depth_20d_pct,
+                base_depth_60d_pct,
+                pivot_distance_20d_pct,
+                pivot_distance_60d_pct,
                 avg_traded_value_20d,
                 avg_traded_value_60d,
+                median_volume_20d,
+                median_volume_60d,
                 rs_vs_benchmark,
                 sector_peer_ret_20d,
                 sector_peer_count,
                 rs_vs_sector,
+                stock_ret_60d,
+                stock_ret_120d,
+                daily_range_pct,
+                range_contraction_20d_pct,
+                range_contraction_60d_pct,
+                range_contraction_ratio,
+                close_location_pct,
+                tight_close_upper_half_20d,
+                tight_close_upper_half_60d,
+                higher_high_count_20d,
+                higher_low_count_20d,
+                trend_persistence_20d,
+                trend_persistence_60d,
+                trend_persistence_120d,
+                breakout_day_volume_vs_20d,
+                up_volume_20d,
+                down_volume_20d,
+                up_down_volume_ratio_20d,
+                distribution_days_20d,
+                accumulation_days_20d,
+                pullback_volume_dryup_ratio_20d,
+                gap_pct,
+                gap_frequency_60d,
+                support_distance_20d_pct,
+                support_hold_rate_20d,
                 breakout_extension_pct,
+                volatility_contraction_flag,
                 pass_above_dma_20,
                 pass_above_dma_50,
+                pass_above_dma_150,
                 pass_above_dma_200,
                 pass_liquidity_20d,
                 pass_near_52w_high,
                 pass_breakout_extension,
+                pass_gap_behavior,
+                pass_trend_alignment,
                 load_ts
             FROM advisory_technical_daily
             WHERE asof_date <= %s
@@ -576,6 +694,25 @@ def load_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
     df["technical_snapshot_date"] = normalize_timestamp(df["technical_snapshot_date"])
     df["symbol"] = df["symbol"].astype("string").str.upper()
     return df
+
+
+def technical_entry_confirmed_from_evaluation(evaluation: dict[str, Any]) -> bool:
+    state = str(evaluation.get("technical_state") or "").strip().upper()
+    trigger = str(evaluation.get("technical_trigger_type") or "").strip()
+    return bool(state == "BUY_TRIGGERED" and trigger)
+
+
+def prefer_technical_feature_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Prefer latest technical features when screener rows carry stale metric names."""
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    tech_columns = [column for column in out.columns if str(column).endswith("_tech")]
+    for tech_column in tech_columns:
+        base_column = str(tech_column)[: -len("_tech")]
+        if base_column in out.columns:
+            out[base_column] = out[tech_column].combine_first(out[base_column])
+    return out.drop(columns=tech_columns, errors="ignore")
 
 
 def load_intraday(asof_date: pd.Timestamp) -> pd.DataFrame:
@@ -802,6 +939,50 @@ def regime_is_explicitly_blocked(regime_name: str, setup: dict[str, Any]) -> boo
     return str(regime_name or "").upper() in blocked
 
 
+def is_context_only_soft_failure(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    if text.startswith("regime:") and text.endswith("_not_preferred"):
+        return True
+    return text.endswith("_blocked_context_only") and (text.startswith("regime:") or text.startswith("overlay:"))
+
+
+def regime_label_hard_block_enabled() -> bool:
+    value = str(os.getenv(RULE_ENGINE_REGIME_LABEL_HARD_BLOCK_ENABLED_ENV, "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def overlay_label_hard_block_enabled() -> bool:
+    value = str(os.getenv(RULE_ENGINE_OVERLAY_LABEL_HARD_BLOCK_ENABLED_ENV, "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def require_regime_context() -> bool:
+    value = str(os.getenv(RULE_ENGINE_REQUIRE_REGIME_CONTEXT_ENV, "") or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def regime_fit_weight_multiplier() -> float:
+    raw = str(os.getenv(RULE_ENGINE_REGIME_FIT_WEIGHT_MULTIPLIER_ENV, str(DEFAULT_REGIME_FIT_WEIGHT_MULTIPLIER)) or "").strip()
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="advisory.rule_engine",
+            fallback_type="rule_engine_regime_fit_weight_multiplier_parse_failed",
+            source=RULE_ENGINE_REGIME_FIT_WEIGHT_MULTIPLIER_ENV,
+            severity="warn",
+            reason="Rule engine could not parse regime-fit weight multiplier and used the default bounded multiplier.",
+            error=exc,
+            metadata={"raw_value": raw, "default_multiplier": DEFAULT_REGIME_FIT_WEIGHT_MULTIPLIER},
+        )
+        return DEFAULT_REGIME_FIT_WEIGHT_MULTIPLIER
+    if value < 0:
+        return 0.0
+    if value > 1:
+        return 1.0
+    return value
+
+
 def component_age_days(candidate_asof_date: pd.Timestamp | None, source_asof_date: Any) -> int | None:
     if candidate_asof_date is None:
         return None
@@ -837,9 +1018,27 @@ def evaluate_freshness(
 
     regime_age = component_age_days(candidate_asof_date, row.get("regime_asof_date"))
     if regime_age is None:
-        rejections.append(build_rejection("missing_regime_snapshot", "regime snapshot missing", severity="hard"))
+        if require_regime_context():
+            rejections.append(build_rejection("missing_regime_snapshot", "regime snapshot missing", severity="hard"))
+        else:
+            rejections.append(
+                build_rejection(
+                    "missing_regime_snapshot_context_only",
+                    f"regime snapshot missing; hard block disabled by {RULE_ENGINE_REQUIRE_REGIME_CONTEXT_ENV}=false",
+                    severity="soft",
+                )
+            )
     elif regime_age > int(policy.get("regime_max_age_days", DEFAULT_FRESHNESS_POLICY["regime_max_age_days"])):
-        rejections.append(build_rejection("regime_snapshot_stale", f"regime_age_days={regime_age}", severity="hard"))
+        if require_regime_context():
+            rejections.append(build_rejection("regime_snapshot_stale", f"regime_age_days={regime_age}", severity="hard"))
+        else:
+            rejections.append(
+                build_rejection(
+                    "regime_snapshot_stale_context_only",
+                    f"regime_age_days={regime_age}; hard block disabled by {RULE_ENGINE_REQUIRE_REGIME_CONTEXT_ENV}=false",
+                    severity="soft",
+                )
+            )
 
     intraday_mode = str(setup.get("intraday_usage_mode") or "confirm_only").lower()
     intraday_age = component_age_days(candidate_asof_date, row.get("intraday_asof_date"))
@@ -896,7 +1095,7 @@ def snapshot_age_days(snapshot_date: Any, asof_date: Any) -> int | None:
     return int((asof_ts.normalize() - snapshot_ts.normalize()).days)
 
 
-def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[str, Any]) -> dict[str, float]:
+def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[str, Any]) -> dict[str, Any]:
     technical_engine_eval = evaluate_technical_pre_entry_state(
         row,
         thresholds=(setup.get("technical_thresholds") or setup.get("score_thresholds") or {}),
@@ -962,6 +1161,7 @@ def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[st
     regime_fit_score = compute_regime_fit_score(regime_name, setup)
     event_score = 0.5
     weights = {**DEFAULT_SCORING_WEIGHTS, **(setup.get("scoring_weights") or {})}
+    weights["regime_fit"] = float(weights.get("regime_fit", 0.0)) * regime_fit_weight_multiplier()
     total_weight = sum(float(value) for value in weights.values()) or 1.0
     setup_score = (
         (technical_score * float(weights["technical"]))
@@ -973,6 +1173,13 @@ def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[st
         "technical_state": str(technical_engine_eval["technical_state"]),
         "technical_trigger_type": technical_engine_eval.get("entry_trigger_type"),
         "technical_trigger_note": technical_engine_eval.get("entry_trigger_note"),
+        "technical_setup_archetype": technical_engine_eval.get("technical_setup_archetype"),
+        "technical_setup_quality_json": json.dumps(
+            technical_engine_eval.get("technical_setup_quality") or {},
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ),
         "technical_trend_score": round(float(technical_engine_eval["trend_score"]), 6),
         "technical_structure_score": round(float(technical_engine_eval["structure_score"]), 6),
         "technical_participation_score": round(float(technical_engine_eval["participation_score"]), 6),
@@ -981,6 +1188,7 @@ def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[st
         "technical_score": round(technical_score, 6),
         "fundamental_score": round(fundamental_score, 6),
         "regime_fit_score": round(regime_fit_score, 6),
+        "regime_fit_weight_effective": round(float(weights["regime_fit"]), 6),
         "event_score": round(event_score, 6),
         "setup_score": round(setup_score, 6),
     }
@@ -1203,11 +1411,31 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     soft_failures: list[str] = []
 
     if regime_is_explicitly_blocked(regime_name, setup):
-        rejections.append(build_rejection("regime_blocked", f"regime={regime_name}", severity="hard"))
+        if regime_label_hard_block_enabled():
+            rejections.append(build_rejection("regime_blocked", f"regime={regime_name}", severity="hard"))
+        else:
+            soft_failures.append(f"regime:{str(regime_name or '').lower()}_blocked_context_only")
+            rejections.append(
+                build_rejection(
+                    "regime_blocked_context_only",
+                    f"regime={regime_name}; hard block disabled by {RULE_ENGINE_REGIME_LABEL_HARD_BLOCK_ENABLED_ENV}=false",
+                    severity="soft",
+                )
+            )
     elif regime_name not in set(setup.get("allowed_regimes") or []):
         soft_failures.append(f"regime:{regime_name.lower()}_not_preferred")
     if overlay_is_explicitly_blocked(overlay_name, setup):
-        rejections.append(build_rejection("overlay_not_allowed", f"overlay={overlay_name}", severity="hard"))
+        if overlay_label_hard_block_enabled():
+            rejections.append(build_rejection("overlay_not_allowed", f"overlay={overlay_name}", severity="hard"))
+        else:
+            soft_failures.append(f"overlay:{str(overlay_name or 'NONE').lower()}_blocked_context_only")
+            rejections.append(
+                build_rejection(
+                    "overlay_blocked_context_only",
+                    f"overlay={overlay_name}; hard block disabled by {RULE_ENGINE_OVERLAY_LABEL_HARD_BLOCK_ENABLED_ENV}=false",
+                    severity="soft",
+                )
+            )
     elif not overlay_is_allowed(overlay_name, setup):
         soft_failures.append(f"overlay:{str(overlay_name or 'NONE').lower()}_not_preferred")
 
@@ -1291,7 +1519,7 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
 
     hard_rejections = [item for item in rejections if item["severity"] == "hard"]
     if hard_rejections:
-        return "REJECT", {**scores, "near_miss_flag": near_miss_flag}, hard_rejections
+        return "REJECT", {**scores, "near_miss_flag": near_miss_flag, "soft_failures": soft_failures}, hard_rejections
 
     technical_hard_reject = not bool(row.get("pass_liquidity_20d", True)) or technical_state == "REJECT"
     if technical_hard_reject:
@@ -1304,16 +1532,27 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
                 delta_to_pass=score_gap,
             )
         )
-        return "REJECT", {**scores, "near_miss_flag": near_miss_flag}, rejections
+        return "REJECT", {**scores, "near_miss_flag": near_miss_flag, "soft_failures": soft_failures}, rejections
 
     intraday_rule_failures = [value for value in soft_failures if value.startswith("intraday:")]
     non_intraday_soft_failures = [value for value in soft_failures if not value.startswith("intraday:")]
+    threshold_soft_failures = [value for value in non_intraday_soft_failures if not is_context_only_soft_failure(value)]
     candidate_state = map_technical_state_to_candidate_state(technical_state)
     watch_reason_detail = technical_trigger_note
     if candidate_state == "ABSTAIN":
-        if float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(non_intraday_soft_failures) <= 2:
-            candidate_state = "PASS_NOW"
-            watch_reason_detail = "aggregate setup score qualifies despite incomplete technical trigger context"
+        if float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(threshold_soft_failures) <= 2:
+            candidate_state = "WATCH_BREAKOUT"
+            watch_reason_detail = "aggregate setup score is strong, but technical trigger is not confirmed"
+            soft_failures.append("technical:trigger_not_confirmed")
+            rejections.append(
+                build_rejection(
+                    "technical_trigger_not_confirmed",
+                    f"technical_state={technical_state or 'UNKNOWN'} trigger={technical_trigger_type or 'NONE'}; aggregate score cannot create PASS_NOW without technical confirmation",
+                    severity="soft",
+                    is_near_miss=near_miss_flag,
+                    delta_to_pass=score_gap,
+                )
+            )
         elif float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
             candidate_state = "WATCH_BREAKOUT"
             watch_reason_detail = "aggregate setup score is strong enough to watch for a clean trigger"
@@ -1326,13 +1565,13 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     elif watch_pullback_extension_pct is not None and extension is not None and extension > watch_pullback_extension_pct:
         candidate_state = "WATCH_PULLBACK"
         watch_reason_detail = f"extended enough to wait for pullback at {extension:.2f}%"
-    elif candidate_state == "PASS_NOW" and float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(non_intraday_soft_failures) <= 2:
+    elif candidate_state == "PASS_NOW" and float(scores["setup_score"]) >= float(thresholds["pass_now"]) and len(threshold_soft_failures) <= 2:
         candidate_state = "PASS_NOW"
         watch_reason_detail = technical_trigger_note or "qualifies now with acceptable score and entry condition"
     elif candidate_state == "WATCH_BREAKOUT" and float(scores["setup_score"]) >= float(thresholds["watch_breakout"]):
         candidate_state = "WATCH_BREAKOUT"
-        watch_reason_detail = technical_trigger_note or "quality setup forming but not fully triggered"
-    elif candidate_state == "WATCH_EVENT" and float(scores["setup_score"]) >= float(thresholds["watch_event"]) and len(non_intraday_soft_failures) <= 2:
+        watch_reason_detail = technical_trigger_note or watch_reason_detail or "quality setup forming but not fully triggered"
+    elif candidate_state == "WATCH_EVENT" and float(scores["setup_score"]) >= float(thresholds["watch_event"]) and len(threshold_soft_failures) <= 2:
         candidate_state = "WATCH_EVENT"
         watch_reason_detail = technical_trigger_note or "candidate needs event confirmation before entry"
     elif near_miss_flag:
@@ -1378,7 +1617,7 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
                 delta_to_pass=score_gap,
             )
         )
-        return "ABSTAIN", {**scores, "near_miss_flag": near_miss_flag, "watch_reason_detail": watch_reason_detail}, rejections
+        return "ABSTAIN", {**scores, "near_miss_flag": near_miss_flag, "watch_reason_detail": watch_reason_detail, "soft_failures": soft_failures}, rejections
 
     if candidate_state == "REJECT":
         rejections.append(
@@ -1392,12 +1631,12 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
         )
         if len(soft_failures) == 1:
             rejections.append(build_rejection("single_rule_near_miss", soft_failures[0], severity="soft", is_near_miss=True, delta_to_pass=score_gap))
-        return "REJECT", {**scores, "near_miss_flag": near_miss_flag}, rejections
+        return "REJECT", {**scores, "near_miss_flag": near_miss_flag, "soft_failures": soft_failures}, rejections
 
     if candidate_state.startswith("WATCH_") and len(soft_failures) == 1 and watch_reason_detail:
         watch_reason_detail = f"{watch_reason_detail}; near miss on {soft_failures[0]}"
 
-    return candidate_state, {**scores, "near_miss_flag": near_miss_flag, "watch_reason_detail": watch_reason_detail}, rejections
+    return candidate_state, {**scores, "near_miss_flag": near_miss_flag, "watch_reason_detail": watch_reason_detail, "soft_failures": soft_failures}, rejections
 
 
 def run_rule_engine(
@@ -1417,7 +1656,15 @@ def run_rule_engine(
 
     regime = load_regime(screener_date)
     if regime is None:
-        return pd.DataFrame(), pd.DataFrame(), {"effective_date": str(screener_date), "screener_date": str(screener_date), "regime_name": None}
+        if require_regime_context():
+            return pd.DataFrame(), pd.DataFrame(), {
+                "effective_date": str(screener_date),
+                "screener_date": str(screener_date),
+                "regime_name": None,
+                "regime_context_status": "missing",
+                "regime_context_reason": f"required by {RULE_ENGINE_REQUIRE_REGIME_CONTEXT_ENV}=true",
+            }
+        regime = missing_regime_context(screener_date)
 
     setups = load_setup_registry(config_path)
     if setup_ids:
@@ -1436,6 +1683,8 @@ def run_rule_engine(
         "effective_date": str(screener_date),
         "screener_date": str(screener_date),
         "regime_name": regime.get("regime_name"),
+        "regime_context_status": regime.get("regime_context_status") or "available",
+        "regime_context_reason": regime.get("regime_context_reason"),
         "regime_snapshot_date": str(regime.get("asof_date")) if regime.get("asof_date") is not None else None,
         "technical_snapshot_date": str(technical["technical_snapshot_date"].max()) if not technical.empty and "technical_snapshot_date" in technical.columns else None,
         "intraday_snapshot_date": str(intraday["intraday_snapshot_date"].max()) if not intraday.empty and "intraday_snapshot_date" in intraday.columns else None,
@@ -1568,6 +1817,7 @@ def run_rule_engine(
             how="left",
             suffixes=("", "_tech"),
         )
+        merged = prefer_technical_feature_columns(merged)
         merged = merged.merge(
             fundamentals.drop_duplicates(subset=["symbol"], keep="last"),
             on=["symbol", "company_master_id"],
@@ -1607,9 +1857,13 @@ def run_rule_engine(
                         "rank": row.get("rank"),
                         "candidate_state": candidate_state,
                         "watch_reason_detail": evaluation.get("watch_reason_detail"),
+                        "soft_failures_json": json.dumps(evaluation.get("soft_failures") or []),
                         "technical_state": evaluation.get("technical_state"),
                         "technical_trigger_type": evaluation.get("technical_trigger_type"),
                         "technical_trigger_note": evaluation.get("technical_trigger_note"),
+                        "technical_entry_confirmed": technical_entry_confirmed_from_evaluation(evaluation),
+                        "technical_setup_archetype": evaluation.get("technical_setup_archetype"),
+                        "technical_setup_quality_json": evaluation.get("technical_setup_quality_json"),
                         "technical_trend_score": evaluation.get("technical_trend_score"),
                         "technical_structure_score": evaluation.get("technical_structure_score"),
                         "technical_participation_score": evaluation.get("technical_participation_score"),
@@ -1618,6 +1872,7 @@ def run_rule_engine(
                         "technical_score": evaluation["technical_score"],
                         "fundamental_score": evaluation["fundamental_score"],
                         "regime_fit_score": evaluation["regime_fit_score"],
+                        "regime_fit_weight_effective": evaluation.get("regime_fit_weight_effective"),
                         "event_score": evaluation["event_score"],
                         "setup_score": evaluation["setup_score"],
                         "avg_traded_value_20d": row.get("avg_traded_value_20d"),
@@ -1708,6 +1963,7 @@ def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, 
             "technical_tradability_score",
             "fundamental_score",
             "regime_fit_score",
+            "regime_fit_weight_effective",
             "event_score",
             "setup_score",
             "avg_traded_value_20d",
@@ -1731,6 +1987,7 @@ def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, 
             "intraday_opening_range_breakout_up",
             "intraday_prev_day_breakout_up",
             "intraday_failed_prev_day_breakout",
+            "technical_entry_confirmed",
             "near_miss_flag",
             "watch_enabled",
             "rule_pass",
@@ -1755,9 +2012,12 @@ def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, 
             "source_screener_list",
             "candidate_state",
             "watch_reason_detail",
+            "soft_failures_json",
             "technical_state",
             "technical_trigger_type",
             "technical_trigger_note",
+            "technical_setup_archetype",
+            "technical_setup_quality_json",
             "intraday_pattern_label",
             "entry_style",
             "entry_note",

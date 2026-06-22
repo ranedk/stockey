@@ -40,6 +40,7 @@ from advisory.event_meta_model import (
     score_events as score_event_model,
 )
 from advisory.event_policy import build_event_policy_actions, load_policy_inputs, persist_event_policy_actions
+from advisory.exchange_context_overlays import build_exchange_context_overlays, persist_exchange_context_overlays
 from advisory.exchange_events import build_exchange_events, persist_exchange_events
 from advisory.exchange_features import build_exchange_features, persist_exchange_features
 from advisory.fallback_telemetry import record_local_fallback_event
@@ -53,10 +54,16 @@ from advisory.llm_event_evaluator import DEFAULT_MODEL as DEFAULT_EVENT_MODEL
 from advisory.llm_event_evaluator import build_outputs as build_event_evaluations
 from advisory.llm_event_evaluator import persist_outputs as persist_event_evaluations
 from advisory.macro_features import build_macro_features, persist_macro_features
+from advisory.macro_context_overlays import build_macro_context_overlays, persist_macro_context_overlays
 from advisory.macro_snapshot import build_macro_snapshot, persist_macro_snapshot
 from advisory.market_context import build_market_context, persist_market_context
 from advisory.news_overlay_engine import build_overlay_state, persist_overlay_state
-from advisory.news_theme_engine import build_theme_recommendations, load_active_theme_screener_mapping
+from advisory.news_theme_engine import (
+    build_theme_context_overlays_from_recommendations,
+    build_theme_recommendations,
+    load_active_theme_screener_mapping,
+    persist_theme_context_overlays,
+)
 from advisory.news_watch import persist_news_events, run_news_watch
 from advisory.peer_sync import sync_peer_data
 from advisory.portfolio_engine import build_portfolio_orders, persist_portfolio_orders, PortfolioConfig
@@ -558,18 +565,36 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     if stage_enabled("macro_features", args.start_at, args.stop_at):
         stage_started = _start_stage("macro_features")
         macro_features_df = build_macro_features(from_date=asof_date, to_date=asof_date, rebuild=bool(args.rebuild))
+        macro_context_overlays_df, macro_context_overlay_meta = build_macro_context_overlays(
+            asof_date=asof_date,
+            features=macro_features_df if not macro_features_df.empty else None,
+        )
         if not args.dry_run:
             persist_macro_features(macro_features_df)
+            persist_macro_context_overlays(macro_context_overlays_df)
         summary["stages"]["macro_features"] = _json_ready(macro_features_df)
-        _finish_stage("macro_features", stage_started, f"rows={len(macro_features_df)}")
+        summary["stages"]["macro_features"]["context_overlays"] = {
+            "rows": int(len(macro_context_overlays_df)),
+            "meta": _json_ready(macro_context_overlay_meta),
+        }
+        _finish_stage("macro_features", stage_started, f"rows={len(macro_features_df)} overlays={len(macro_context_overlays_df)}")
 
     if stage_enabled("exchange_events", args.start_at, args.stop_at):
         stage_started = _start_stage("exchange_events")
         exchange_events_df = build_exchange_events(from_date=asof_date, to_date=asof_date)
+        exchange_context_overlays_df, exchange_context_overlay_meta = build_exchange_context_overlays(
+            asof_date=asof_date,
+            events=exchange_events_df,
+        )
         if not args.dry_run:
             persist_exchange_events(exchange_events_df)
+            persist_exchange_context_overlays(exchange_context_overlays_df)
         summary["stages"]["exchange_events"] = _json_ready(exchange_events_df)
-        _finish_stage("exchange_events", stage_started, f"rows={len(exchange_events_df)}")
+        summary["stages"]["exchange_events"]["context_overlays"] = {
+            "rows": int(len(exchange_context_overlays_df)),
+            "meta": _json_ready(exchange_context_overlay_meta),
+        }
+        _finish_stage("exchange_events", stage_started, f"rows={len(exchange_events_df)} overlays={len(exchange_context_overlays_df)}")
 
     if stage_enabled("exchange_features", args.start_at, args.stop_at):
         stage_started = _start_stage("exchange_features")
@@ -650,19 +675,28 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 if stage == "themes":
                     theme_payload = build_theme_recommendations(asof_date=asof_date)
                     theme_mapping = load_active_theme_screener_mapping(asof_date=asof_date)
+                    theme_overlays = build_theme_context_overlays_from_recommendations(
+                        asof_date=theme_payload.get("asof_date"),
+                        recommendations=theme_payload.get("recommendations") or [],
+                    )
+                    if not args.dry_run:
+                        persist_theme_context_overlays(theme_overlays)
                     payload = {
                         "meta": _json_ready(
                             {
                                 "asof_date": theme_payload.get("asof_date"),
                                 "news_count": theme_payload.get("news_count"),
                                 "error": theme_payload.get("error"),
+                                "context_overlay_count": len(theme_overlays),
+                                "context_overlay_authority_scope": "watchlist_pressure_only",
                             }
                         ),
                         "recommendations": _json_ready(theme_payload.get("recommendations") or []),
                         "active_mapping": _json_ready(theme_mapping),
+                        "context_overlays": _json_ready(theme_overlays),
                     }
-                    _finish_stage(stage, stage_started, f"active_themes={len(theme_payload.get('recommendations') or [])}")
-                    return stage, payload, f"active_themes={len(theme_payload.get('recommendations') or [])}"
+                    _finish_stage(stage, stage_started, f"active_themes={len(theme_payload.get('recommendations') or [])} overlays={len(theme_overlays)}")
+                    return stage, payload, f"active_themes={len(theme_payload.get('recommendations') or [])} overlays={len(theme_overlays)}"
                 raise ValueError(f"Unsupported parallel stage: {stage}")
 
             with ThreadPoolExecutor(max_workers=max(1, int(args.local_stage_workers)), thread_name_prefix="advisory-local") as pool:
@@ -769,18 +803,27 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         stage_started = _start_stage("themes")
         theme_payload = build_theme_recommendations(asof_date=asof_date)
         theme_mapping = load_active_theme_screener_mapping(asof_date=asof_date)
+        theme_overlays = build_theme_context_overlays_from_recommendations(
+            asof_date=theme_payload.get("asof_date"),
+            recommendations=theme_payload.get("recommendations") or [],
+        )
+        if not args.dry_run:
+            persist_theme_context_overlays(theme_overlays)
         summary["stages"]["themes"] = {
             "meta": _json_ready(
                 {
                     "asof_date": theme_payload.get("asof_date"),
                     "news_count": theme_payload.get("news_count"),
                     "error": theme_payload.get("error"),
+                    "context_overlay_count": len(theme_overlays),
+                    "context_overlay_authority_scope": "watchlist_pressure_only",
                 }
             ),
             "recommendations": _json_ready(theme_payload.get("recommendations") or []),
             "active_mapping": _json_ready(theme_mapping),
+            "context_overlays": _json_ready(theme_overlays),
         }
-        _finish_stage("themes", stage_started, f"active_themes={len(theme_payload.get('recommendations') or [])}")
+        _finish_stage("themes", stage_started, f"active_themes={len(theme_payload.get('recommendations') or [])} overlays={len(theme_overlays)}")
 
     candidates = pd.DataFrame()
     rejections = pd.DataFrame()
@@ -966,6 +1009,11 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
 
     if not args.skip_company_memory and stage_enabled("company_memory", args.start_at, args.stop_at):
         stage_started = _start_stage("company_memory")
+        company_memory_feature_gate = evaluate_stage_feature_gate(
+            "company_memory",
+            symbols or advisory_symbols or screener_symbols or None,
+            asof_date=asof_date,
+        )
         memory_df, memory_meta = build_company_memory_reviews(
             asof_date=asof_date,
             symbols=symbols,
@@ -979,6 +1027,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         summary["stages"]["company_memory"] = {
             "meta": _json_ready(memory_meta),
             "reviews": _json_ready(memory_df),
+            "feature_gate": _json_ready(company_memory_feature_gate),
         }
         _finish_stage("company_memory", stage_started, f"rows={len(memory_df)}")
 

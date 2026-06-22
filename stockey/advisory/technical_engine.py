@@ -255,6 +255,454 @@ def identify_entry_trigger(row: pd.Series, thresholds: dict[str, Any] | None = N
     return None, None
 
 
+def _trigger_blocker(
+    *,
+    code: str,
+    archetype: str,
+    metric: str,
+    current: Any,
+    operator: str,
+    threshold: Any,
+    description: str,
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "archetype": archetype,
+        "metric": metric,
+        "current": safe_float(current) if current is not None else None,
+        "operator": operator,
+        "threshold": safe_float(threshold) if threshold is not None else None,
+        "description": description,
+    }
+
+
+def _bool_trigger_blocker(*, code: str, archetype: str, metric: str, current: Any, description: str) -> dict[str, Any]:
+    return {
+        "code": code,
+        "archetype": archetype,
+        "metric": metric,
+        "current": bool(_bool(current)),
+        "operator": "eq",
+        "threshold": True,
+        "description": description,
+    }
+
+
+def diagnose_entry_trigger_blockers(row: pd.Series, thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Mirror entry-trigger rules and explain why confirmation is still blocked."""
+    cfg = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    trigger_type, trigger_note = identify_entry_trigger(row, thresholds=thresholds)
+    breakout_vol = safe_float(row.get("breakout_day_volume_vs_20d")) or 0.0
+    pivot_distance = safe_float(row.get("pivot_distance_20d_pct"))
+    support_distance = safe_float(row.get("support_distance_20d_pct")) or 99.0
+    support_hold = safe_float(row.get("support_hold_rate_20d")) or 0.0
+    dryup = safe_float(row.get("pullback_volume_dryup_ratio_20d")) or 9.0
+    close_location = safe_float(row.get("close_location_pct")) or 0.0
+    breakout_extension = safe_float(row.get("breakout_extension_pct")) or 99.0
+    dist_20d_high = safe_float(row.get("dist_20d_high")) or -99.0
+
+    by_archetype: dict[str, list[dict[str, Any]]] = {
+        "breakout": [],
+        "breakout_retest": [],
+        "trend_pullback": [],
+        "reclaim": [],
+    }
+
+    if breakout_vol < float(cfg["breakout_volume_min"]):
+        by_archetype["breakout"].append(
+            _trigger_blocker(
+                code="breakout_volume_below_min",
+                archetype="breakout",
+                metric="breakout_day_volume_vs_20d",
+                current=breakout_vol,
+                operator="gte",
+                threshold=cfg["breakout_volume_min"],
+                description="Breakout volume is below the configured confirmation threshold.",
+            )
+        )
+    if pivot_distance is None or pivot_distance > 0.5:
+        by_archetype["breakout"].append(
+            _trigger_blocker(
+                code="pivot_not_cleared",
+                archetype="breakout",
+                metric="pivot_distance_20d_pct",
+                current=pivot_distance,
+                operator="lte",
+                threshold=0.5,
+                description="Price has not cleared the pivot tightly enough for breakout confirmation.",
+            )
+        )
+    if close_location < 0.7:
+        by_archetype["breakout"].append(
+            _trigger_blocker(
+                code="close_not_strong_enough",
+                archetype="breakout",
+                metric="close_location_pct",
+                current=close_location,
+                operator="gte",
+                threshold=0.7,
+                description="Close location is not strong enough for breakout confirmation.",
+            )
+        )
+
+    if breakout_vol < 1.0:
+        by_archetype["breakout_retest"].append(
+            _trigger_blocker(
+                code="retest_volume_too_weak",
+                archetype="breakout_retest",
+                metric="breakout_day_volume_vs_20d",
+                current=breakout_vol,
+                operator="gte",
+                threshold=1.0,
+                description="Retest needs at least normal participation.",
+            )
+        )
+    if pivot_distance is None or abs(pivot_distance) > float(cfg["retest_distance_pct"]):
+        by_archetype["breakout_retest"].append(
+            _trigger_blocker(
+                code="not_near_retest_zone",
+                archetype="breakout_retest",
+                metric="pivot_distance_20d_pct",
+                current=pivot_distance,
+                operator="abs_lte",
+                threshold=cfg["retest_distance_pct"],
+                description="Price is not close enough to the pivot/retest zone.",
+            )
+        )
+    if support_hold < 0.45:
+        by_archetype["breakout_retest"].append(
+            _trigger_blocker(
+                code="support_hold_too_weak",
+                archetype="breakout_retest",
+                metric="support_hold_rate_20d",
+                current=support_hold,
+                operator="gte",
+                threshold=0.45,
+                description="Support has not been respected often enough.",
+            )
+        )
+    if dryup > 0.8:
+        by_archetype["breakout_retest"].append(
+            _trigger_blocker(
+                code="selling_volume_not_dry",
+                archetype="breakout_retest",
+                metric="pullback_volume_dryup_ratio_20d",
+                current=dryup,
+                operator="lte",
+                threshold=0.8,
+                description="Pullback/retest selling volume has not dried up enough.",
+            )
+        )
+
+    if not _bool(row.get("pass_trend_alignment")):
+        by_archetype["trend_pullback"].append(
+            _bool_trigger_blocker(
+                code="trend_alignment_missing",
+                archetype="trend_pullback",
+                metric="pass_trend_alignment",
+                current=row.get("pass_trend_alignment"),
+                description="Trend-pullback entries require aligned moving-average trend context.",
+            )
+        )
+    if support_distance > float(cfg["trend_add_on_pullback_distance_pct"]):
+        by_archetype["trend_pullback"].append(
+            _trigger_blocker(
+                code="too_far_from_support",
+                archetype="trend_pullback",
+                metric="support_distance_20d_pct",
+                current=support_distance,
+                operator="lte",
+                threshold=cfg["trend_add_on_pullback_distance_pct"],
+                description="Price is too far from support for a pullback entry.",
+            )
+        )
+    if dryup > 0.85:
+        by_archetype["trend_pullback"].append(
+            _trigger_blocker(
+                code="pullback_selling_volume_not_controlled",
+                archetype="trend_pullback",
+                metric="pullback_volume_dryup_ratio_20d",
+                current=dryup,
+                operator="lte",
+                threshold=0.85,
+                description="Pullback selling volume is not controlled enough.",
+            )
+        )
+    if close_location < 0.55:
+        by_archetype["trend_pullback"].append(
+            _trigger_blocker(
+                code="pullback_close_not_confirmed",
+                archetype="trend_pullback",
+                metric="close_location_pct",
+                current=close_location,
+                operator="gte",
+                threshold=0.55,
+                description="Close quality has not confirmed the pullback hold.",
+            )
+        )
+
+    if breakout_vol < 1.0:
+        by_archetype["reclaim"].append(
+            _trigger_blocker(
+                code="reclaim_volume_too_weak",
+                archetype="reclaim",
+                metric="breakout_day_volume_vs_20d",
+                current=breakout_vol,
+                operator="gte",
+                threshold=1.0,
+                description="Reclaim entries need at least normal participation.",
+            )
+        )
+    if not _bool(row.get("pass_above_dma_20")):
+        by_archetype["reclaim"].append(
+            _bool_trigger_blocker(
+                code="not_above_dma_20",
+                archetype="reclaim",
+                metric="pass_above_dma_20",
+                current=row.get("pass_above_dma_20"),
+                description="Reclaim entries require price above the short-term trend line.",
+            )
+        )
+    if close_location < 0.75:
+        by_archetype["reclaim"].append(
+            _trigger_blocker(
+                code="reclaim_close_not_strong_enough",
+                archetype="reclaim",
+                metric="close_location_pct",
+                current=close_location,
+                operator="gte",
+                threshold=0.75,
+                description="Close quality is not strong enough for a reclaim entry.",
+            )
+        )
+    if breakout_extension > 4.0:
+        by_archetype["reclaim"].append(
+            _trigger_blocker(
+                code="reclaim_too_extended",
+                archetype="reclaim",
+                metric="breakout_extension_pct",
+                current=breakout_extension,
+                operator="lte",
+                threshold=4.0,
+                description="Price is too extended for a low-risk reclaim entry.",
+            )
+        )
+    if dist_20d_high < -1.0:
+        by_archetype["reclaim"].append(
+            _trigger_blocker(
+                code="not_near_recent_high",
+                archetype="reclaim",
+                metric="dist_20d_high",
+                current=dist_20d_high,
+                operator="gte",
+                threshold=-1.0,
+                description="Price has not reclaimed close enough to the recent high.",
+            )
+        )
+
+    ranked = sorted(by_archetype.items(), key=lambda item: (len(item[1]), item[0]))
+    nearest_archetype, nearest_blockers = ranked[0]
+    return {
+        "schema_version": 1,
+        "status": "confirmed" if trigger_type else "blocked",
+        "confirmed_trigger_type": trigger_type,
+        "confirmed_trigger_note": trigger_note,
+        "nearest_trigger_type": trigger_type or nearest_archetype,
+        "nearest_trigger_blocker_count": 0 if trigger_type else len(nearest_blockers),
+        "nearest_trigger_blockers": [] if trigger_type else nearest_blockers,
+        "all_trigger_blockers": by_archetype,
+        "authority_scope": "technical_diagnostics_only",
+        "action_policy_effect": "explain_only_no_scoring_change",
+        "broker_execution_allowed": False,
+    }
+
+
+def diagnose_buy_readiness(
+    *,
+    score: dict[str, Any],
+    technical_reasons: list[str],
+    technical_state: str,
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Explain why a technically constructive row is not a BUY_TRIGGERED row."""
+    cfg = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
+    blockers: list[dict[str, Any]] = []
+    if not bool(score.get("hard_filter_pass")):
+        for reason in score.get("hard_filter_reasons") or []:
+            blockers.append(
+                {
+                    "code": str(reason),
+                    "category": "hard_filter",
+                    "description": "Hard technical/tradability filter failed.",
+                }
+            )
+    if not score.get("entry_trigger_type"):
+        blockers.append(
+            {
+                "code": "entry_trigger_missing",
+                "category": "trigger",
+                "description": "No breakout, retest, pullback, or reclaim trigger is confirmed.",
+            }
+        )
+    component_thresholds = {
+        "trend_score": ("trend_min", "trend_below_minimum"),
+        "structure_score": ("structure_min", "structure_below_minimum"),
+        "participation_score": ("participation_min", "participation_below_minimum"),
+        "relative_strength_score": ("relative_strength_min", "relative_strength_below_minimum"),
+        "tradability_score": ("tradability_min", "tradability_below_minimum"),
+    }
+    for metric, (threshold_key, code) in component_thresholds.items():
+        current = safe_float(score.get(metric))
+        threshold = safe_float(cfg.get(threshold_key))
+        if current is not None and threshold is not None and current < threshold:
+            blockers.append(
+                {
+                    "code": code,
+                    "category": "component_threshold",
+                    "metric": metric,
+                    "current": current,
+                    "operator": "gte",
+                    "threshold": threshold,
+                    "gap_to_threshold": round(threshold - current, 6),
+                    "description": f"{metric} is below the configured buy precondition.",
+                }
+            )
+    total = safe_float(score.get("technical_total_score"))
+    buy_min = safe_float(cfg.get("buy_total_min"))
+    if total is not None and buy_min is not None and total < buy_min:
+        blockers.append(
+            {
+                "code": "technical_total_below_buy_min",
+                "category": "total_score",
+                "metric": "technical_total_score",
+                "current": total,
+                "operator": "gte",
+                "threshold": buy_min,
+                "gap_to_threshold": round(buy_min - total, 6),
+                "description": "Total technical score is below the configured BUY_TRIGGERED threshold.",
+            }
+        )
+    for reason in technical_reasons:
+        if not any(item.get("code") == reason for item in blockers):
+            blockers.append(
+                {
+                    "code": str(reason),
+                    "category": "technical_reason",
+                    "description": "Technical engine emitted this reason while classifying the setup.",
+                }
+            )
+    status = "buy_triggered" if str(technical_state or "").upper() == "BUY_TRIGGERED" else "blocked"
+    return {
+        "schema_version": 1,
+        "status": status,
+        "technical_state": str(technical_state or "").upper() or None,
+        "blocker_count": 0 if status == "buy_triggered" else len(blockers),
+        "blockers": [] if status == "buy_triggered" else blockers,
+        "authority_scope": "technical_diagnostics_only",
+        "action_policy_effect": "explain_only_no_scoring_change",
+        "broker_execution_allowed": False,
+    }
+
+
+def classify_setup_archetype(
+    row: pd.Series,
+    *,
+    technical_state: str | None = None,
+    entry_trigger_type: str | None = None,
+    technical_total_score: float | None = None,
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    flags: list[str] = []
+    risks: list[str] = []
+    trigger = str(entry_trigger_type or "").strip().lower()
+    state = str(technical_state or "").strip().upper()
+    total_score = safe_float(technical_total_score)
+    pivot_distance = safe_float(row.get("pivot_distance_20d_pct"))
+    support_distance = safe_float(row.get("support_distance_20d_pct"))
+    range_ratio = safe_float(row.get("range_contraction_ratio"))
+    dryup = safe_float(row.get("pullback_volume_dryup_ratio_20d"))
+    breakout_vol = safe_float(row.get("breakout_day_volume_vs_20d"))
+    breakout_extension = safe_float(row.get("breakout_extension_pct"))
+    distribution = safe_float(row.get("distribution_days_20d")) or 0.0
+    accumulation = safe_float(row.get("accumulation_days_20d")) or 0.0
+    rs_benchmark = safe_float(row.get("rs_vs_benchmark"))
+    rs_sector = safe_float(row.get("rs_vs_sector"))
+    gap_frequency = safe_float(row.get("gap_frequency_60d"))
+    atr_pct = safe_float(row.get("atr_pct"))
+    base_depth = safe_float(row.get("base_depth_60d_pct"))
+
+    if _bool(row.get("volatility_contraction_flag")):
+        flags.append("volatility_compression")
+    if range_ratio is not None and range_ratio < 0.9:
+        flags.append("range_contraction")
+    if dryup is not None and dryup <= 0.8:
+        flags.append("pullback_volume_dryup")
+    if breakout_vol is not None and breakout_vol >= 1.8:
+        flags.append("breakout_volume_confirmation")
+    if accumulation >= distribution + 1:
+        flags.append("accumulation_outweighs_distribution")
+    if rs_benchmark is not None and rs_benchmark >= 0.03:
+        flags.append("benchmark_leadership")
+    if rs_sector is not None and rs_sector >= 0.0:
+        flags.append("sector_resilience")
+
+    if breakout_extension is not None and breakout_extension >= 10.0:
+        risks.append("extended_from_base_or_pivot")
+    if distribution >= 4:
+        risks.append("distribution_pressure")
+    if gap_frequency is not None and gap_frequency > DEFAULT_FILTERS["max_gap_frequency_60d"]:
+        risks.append("gap_frequency_risk")
+    if atr_pct is not None and atr_pct > DEFAULT_FILTERS["max_atr_pct"]:
+        risks.append("high_atr_noise")
+    if base_depth is not None and base_depth > DEFAULT_FILTERS["max_base_depth_60d_pct"]:
+        risks.append("loose_or_deep_base")
+
+    if trigger in {"breakout", "breakout_retest", "trend_pullback", "reclaim"}:
+        archetype = trigger
+        maturity = "triggered"
+    elif state == "NEAR_PIVOT":
+        archetype = "constructive_base_near_pivot"
+        maturity = "near_trigger"
+    elif state == "READY":
+        archetype = "constructive_base_ready"
+        maturity = "setup_ready"
+    elif state == "WATCHLIST":
+        archetype = "base_forming_watchlist"
+        maturity = "forming"
+    elif state in {"REJECT", "IGNORE"}:
+        archetype = "not_tradable_or_low_quality"
+        maturity = "invalid_or_low_quality"
+    elif support_distance is not None and support_distance <= DEFAULT_THRESHOLDS["trend_add_on_pullback_distance_pct"]:
+        archetype = "trend_pullback_watch"
+        maturity = "watch"
+    elif pivot_distance is not None and abs(pivot_distance) <= DEFAULT_THRESHOLDS["near_pivot_distance_pct"]:
+        archetype = "near_pivot_watch"
+        maturity = "watch"
+    else:
+        archetype = "unclassified_technical_setup"
+        maturity = "unknown"
+    trigger_diagnostics = diagnose_entry_trigger_blockers(row, thresholds=thresholds)
+
+    return {
+        "schema_version": 1,
+        "archetype": archetype,
+        "maturity": maturity,
+        "quality_flags": sorted(set(flags)),
+        "risk_flags": sorted(set(risks)),
+        "trigger_type": trigger or None,
+        "technical_state": state or None,
+        "technical_total_score": total_score,
+        "entry_trigger_status": trigger_diagnostics["status"],
+        "nearest_entry_trigger_type": trigger_diagnostics["nearest_trigger_type"],
+        "nearest_entry_trigger_blocker_count": trigger_diagnostics["nearest_trigger_blocker_count"],
+        "entry_trigger_blockers": trigger_diagnostics["nearest_trigger_blockers"],
+        "entry_trigger_diagnostics": trigger_diagnostics,
+        "authority_scope": "technical_evidence_only",
+        "action_policy_effect": "explain_only_no_scoring_change",
+        "broker_execution_allowed": False,
+    }
+
+
 def score_row(row: pd.Series, *, thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
     filter_result = evaluate_hard_filters(row, config=thresholds)
     trend_score = score_trend_regime(row)
@@ -267,6 +715,14 @@ def score_row(row: pd.Series, *, thresholds: dict[str, Any] | None = None) -> di
         4,
     )
     entry_type, trigger_note = identify_entry_trigger(row, thresholds=thresholds)
+    setup_quality = classify_setup_archetype(
+        row,
+        technical_state=None,
+        entry_trigger_type=entry_type,
+        technical_total_score=total_score,
+        thresholds=thresholds,
+    )
+    trigger_diagnostics = diagnose_entry_trigger_blockers(row, thresholds=thresholds)
     return {
         "hard_filter_pass": filter_result["passed"],
         "hard_filter_reasons": filter_result["reasons"],
@@ -278,6 +734,9 @@ def score_row(row: pd.Series, *, thresholds: dict[str, Any] | None = None) -> di
         "technical_total_score": total_score,
         "entry_trigger_type": entry_type,
         "entry_trigger_note": trigger_note,
+        "entry_trigger_diagnostics": trigger_diagnostics,
+        "technical_setup_archetype": setup_quality["archetype"],
+        "technical_setup_quality": setup_quality,
     }
 
 
@@ -314,10 +773,26 @@ def evaluate_pre_entry_state(row: pd.Series, *, thresholds: dict[str, Any] | Non
         else:
             state = "IGNORE"
 
+    setup_quality = classify_setup_archetype(
+        row,
+        technical_state=state,
+        entry_trigger_type=score.get("entry_trigger_type"),
+        technical_total_score=score.get("technical_total_score"),
+        thresholds=thresholds,
+    )
+    setup_quality["buy_readiness"] = diagnose_buy_readiness(
+        score=score,
+        technical_reasons=reasons,
+        technical_state=state,
+        thresholds=thresholds,
+    )
+
     return {
         **score,
         "technical_state": state,
         "technical_reasons": reasons,
+        "technical_setup_archetype": setup_quality["archetype"],
+        "technical_setup_quality": setup_quality,
         "conviction_bucket": (
             "HIGH_CONVICTION"
             if score["technical_total_score"] >= 85.0

@@ -6,6 +6,7 @@ import sys
 import pandas as pd
 
 from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.identity_issues import record_dhan_ohlcv_history_issue
 from data.dhanlive.client import DhanAPIError
 from data.dhanlive.ohlcv import sync_daily_ohlcv
 from data.sharpelydata.sharpely_data import sync_sharpely_data
@@ -68,6 +69,7 @@ def ensure_symbol_ohlcv(
             "dhan_ohlcv_daily",
             filters={"ticker": symbol, "asset_type": "stock", "exchange": "NSE"},
         )
+        latest_day = None
         from_date = None
         if latest is not None:
             latest_day = _normalize_db_day(latest)
@@ -93,15 +95,84 @@ def ensure_symbol_ohlcv(
             )
         except (DhanAPIError, ValueError) as exc:
             error_text = str(exc).lower()
+            missing_security_id = "no dhan security id mapped" in error_text
             if "no data present" in error_text:
-                results.append({"symbol": symbol, "action": "skip", "reason": "ohlcv_no_new_data"})
+                if latest_day is None:
+                    try:
+                        record_dhan_ohlcv_history_issue(
+                            symbol=symbol,
+                            requested_exchange="NSE",
+                            asset_type="stock",
+                            reason="ohlcv_no_new_data",
+                            error_text=str(exc),
+                            latest_date=None,
+                            context={
+                                "from_date": None if from_date is None else pd.Timestamp(from_date).isoformat(),
+                                "to_date": pd.Timestamp(target_day).isoformat(),
+                            },
+                        )
+                    except Exception as issue_exc:
+                        record_local_fallback_event(
+                            module="advisory.data_sync",
+                            source="advisory.identity_issues.record_dhan_ohlcv_history_issue",
+                            fallback_type="advisory_daily_ohlcv_history_issue_record_failed",
+                            severity="warn",
+                            symbol=symbol,
+                            reason="Daily OHLCV no-data issue could not be recorded for operator repair tracking.",
+                            error=issue_exc,
+                            metadata={
+                                "symbol": symbol,
+                                "exchange": "NSE",
+                                "asset_type": "stock",
+                            },
+                        )
+                results.append(
+                    {
+                        "symbol": symbol,
+                        "action": "skip",
+                        "reason": "ohlcv_no_new_data",
+                        "latest_date": None if latest_day is None else pd.Timestamp(latest_day).isoformat(),
+                    }
+                )
                 continue
+            reason = "dhan_daily_sync_failed_with_stale_history" if latest_day is not None else "dhan_daily_sync_failed_no_history"
+            if latest_day is None and not missing_security_id:
+                try:
+                    record_dhan_ohlcv_history_issue(
+                        symbol=symbol,
+                        requested_exchange="NSE",
+                        asset_type="stock",
+                        reason=reason,
+                        error_text=str(exc),
+                        latest_date=None,
+                        context={
+                            "from_date": None if from_date is None else pd.Timestamp(from_date).isoformat(),
+                            "to_date": pd.Timestamp(target_day).isoformat(),
+                        },
+                    )
+                except Exception as issue_exc:
+                    record_local_fallback_event(
+                        module="advisory.data_sync",
+                        source="advisory.identity_issues.record_dhan_ohlcv_history_issue",
+                        fallback_type="advisory_daily_ohlcv_history_issue_record_failed",
+                        severity="warn",
+                        symbol=symbol,
+                        reason="Daily OHLCV hard input blocker could not be recorded for operator repair tracking.",
+                        error=issue_exc,
+                        metadata={
+                            "symbol": symbol,
+                            "exchange": "NSE",
+                            "asset_type": "stock",
+                            "sync_reason": reason,
+                        },
+                    )
             result = {
                 "symbol": symbol,
                 "action": "issue",
-                "reason": "dhan_daily_sync_failed",
+                "reason": reason,
                 "error_type": exc.__class__.__name__,
                 "error": str(exc),
+                "latest_date": None if latest_day is None else pd.Timestamp(latest_day).isoformat(),
             }
             print(
                 f"[advisory.data_sync] daily OHLCV issue symbol={symbol} error_type={exc.__class__.__name__} error={exc}",
@@ -133,9 +204,15 @@ def ensure_advisory_symbol_inputs(
     symbols: list[str],
     *,
     to_date: datetime | pd.Timestamp | None = None,
+    include_fundamentals: bool = True,
+    include_ohlcv: bool = True,
 ) -> dict[str, object]:
     return {
         "symbols": sorted({str(value).upper() for value in symbols if value}),
-        "fundamentals": ensure_symbol_fundamentals(symbols, to_date=to_date),
-        "ohlcv": ensure_symbol_ohlcv(symbols, to_date=to_date),
+        "fundamentals": ensure_symbol_fundamentals(symbols, to_date=to_date) if include_fundamentals else [],
+        "ohlcv": ensure_symbol_ohlcv(symbols, to_date=to_date) if include_ohlcv else [],
+        "skipped": {
+            "fundamentals": not bool(include_fundamentals),
+            "ohlcv": not bool(include_ohlcv),
+        },
     }

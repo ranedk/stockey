@@ -291,6 +291,7 @@ def review_event_row(row: pd.Series) -> dict[str, Any]:
     score_impact = float(pd.to_numeric(row.get("score_impact"), errors="coerce") or 0.0)
     model_score = pd.to_numeric(row.get("event_meta_score"), errors="coerce")
     exchange_distribution_score = pd.to_numeric(row.get("exchange_distribution_score"), errors="coerce")
+    exchange_event_score = pd.to_numeric(row.get("exchange_event_score"), errors="coerce")
     insider_net_value_90d = pd.to_numeric(row.get("insider_net_value_90d"), errors="coerce")
     short_selling_event_count_20d = pd.to_numeric(row.get("short_selling_event_count_20d"), errors="coerce")
     reliability_score = _reliability_score(row.get("source_reliability"))
@@ -353,6 +354,9 @@ def review_event_row(row: pd.Series) -> dict[str, Any]:
     if pd.notna(exchange_distribution_score) and float(exchange_distribution_score) >= 0.35 and score_impact > 0:
         flags.append("exchange_distribution_contradicts_positive_event")
         penalties.append(0.18)
+    if pd.notna(exchange_event_score) and float(exchange_event_score) <= -0.35 and score_impact > 0:
+        flags.append("adverse_exchange_event_score_contradicts_positive_event")
+        penalties.append(0.16)
     if pd.notna(insider_net_value_90d) and float(insider_net_value_90d) < 0 and score_impact > 0:
         flags.append("recent_insider_net_selling")
         penalties.append(0.12)
@@ -386,6 +390,7 @@ def review_event_row(row: pd.Series) -> dict[str, Any]:
         "reliability_score": reliability_score,
         "materiality_score": materiality_score,
         "exchange_distribution_score": None if pd.isna(exchange_distribution_score) else float(exchange_distribution_score),
+        "exchange_event_score": None if pd.isna(exchange_event_score) else float(exchange_event_score),
         "insider_net_value_90d": None if pd.isna(insider_net_value_90d) else float(insider_net_value_90d),
         "short_selling_event_count_20d": None if pd.isna(short_selling_event_count_20d) else float(short_selling_event_count_20d),
     }

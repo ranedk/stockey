@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.event_evidence_store import ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE, BHAVCOPY_CONTEXT_OVERLAYS_TABLE
 from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df
 from utils.sync import parse_datetime_arg
@@ -227,6 +228,8 @@ def row_to_json_ready(row: dict[str, Any] | None) -> dict[str, Any] | None:
     for key, value in row.items():
         if isinstance(value, pd.Timestamp):
             out[key] = None if pd.isna(value) else value.isoformat()
+        elif isinstance(value, (dict, list)):
+            out[key] = value
         elif pd.isna(value):
             out[key] = None
         else:
@@ -367,6 +370,104 @@ def load_aggregated_event_decision(symbol: str, setup_id: str | None = None) -> 
     }
 
 
+def summarize_exchange_context_overlays(rows: pd.DataFrame) -> dict[str, Any] | None:
+    if rows.empty:
+        return None
+    df = rows.copy()
+    df["known_on"] = pd.to_datetime(df.get("known_on"), utc=True, errors="coerce")
+    df["asof_date"] = pd.to_datetime(df.get("asof_date"), utc=True, errors="coerce")
+    df["pressure_score"] = pd.to_numeric(df.get("pressure_score"), errors="coerce").fillna(0.0)
+    df["direction"] = df.get("direction", pd.Series(dtype="string")).astype("string").str.lower()
+    latest = df.sort_values(["known_on", "asof_date"], ascending=[False, False], kind="stable").iloc[0].to_dict()
+    direction_counts = {
+        str(key): int(value)
+        for key, value in df["direction"].value_counts(dropna=False).to_dict().items()
+        if str(key) and str(key).lower() != "<na>"
+    }
+    dominant_direction = max(direction_counts, key=direction_counts.get) if direction_counts else None
+    return {
+        "overlay_count": int(len(df)),
+        "latest_overlay_id": latest.get("overlay_id"),
+        "latest_known_on": latest.get("known_on"),
+        "latest_event_type": latest.get("event_type"),
+        "latest_direction": latest.get("direction"),
+        "latest_event_side": latest.get("event_side"),
+        "latest_pressure_score": latest.get("pressure_score"),
+        "dominant_direction": dominant_direction,
+        "direction_counts": direction_counts,
+        "max_abs_pressure_score": round(float(df["pressure_score"].abs().max()), 6),
+        "authority_scope": "watchlist_pressure_only",
+        "broker_execution_allowed": False,
+        "portfolio_authority": "none",
+    }
+
+
+def _first_present(row: dict[str, Any], columns: list[str]) -> Any:
+    for column in columns:
+        value = row.get(column)
+        try:
+            if value is None or pd.isna(value):
+                continue
+        except Exception as exc:
+            _record_symbol_trace_fallback(
+                fallback_type="symbol_trace_first_present_missing_check_failed",
+                source="symbol_trace_context_overlay_fields",
+                reason="Symbol trace could not evaluate a context-overlay field for missingness and used text fallback.",
+                error=exc,
+                metadata={"column": column, "value_type": type(value).__name__, "value_excerpt": str(value)[:200]},
+            )
+            if value is None:
+                continue
+        if str(value).strip():
+            return value
+    return None
+
+
+def summarize_watchlist_context_overlays(
+    rows: pd.DataFrame,
+    *,
+    source_family: str,
+    date_columns: list[str],
+    class_columns: list[str],
+) -> dict[str, Any] | None:
+    if rows.empty:
+        return None
+    df = rows.copy()
+    for column in date_columns:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["pressure_score"] = pd.to_numeric(df.get("pressure_score"), errors="coerce").fillna(0.0)
+    df["direction"] = df.get("direction", pd.Series(dtype="string")).astype("string").str.lower()
+    sort_columns = [column for column in date_columns if column in df.columns]
+    if sort_columns:
+        latest = df.sort_values(sort_columns, ascending=[False] * len(sort_columns), kind="stable").iloc[0].to_dict()
+    else:
+        latest = df.iloc[0].to_dict()
+    direction_counts = {
+        str(key): int(value)
+        for key, value in df["direction"].value_counts(dropna=False).to_dict().items()
+        if str(key) and str(key).lower() != "<na>"
+    }
+    dominant_direction = max(direction_counts, key=direction_counts.get) if direction_counts else None
+    latest_observed_at = _first_present(latest, date_columns)
+    return {
+        "source_family": source_family,
+        "overlay_count": int(len(df)),
+        "latest_overlay_id": latest.get("overlay_id"),
+        "latest_observed_at": latest_observed_at,
+        "latest_direction": latest.get("direction"),
+        "latest_context_class": _first_present(latest, class_columns),
+        "latest_pressure_score": latest.get("pressure_score"),
+        "latest_reason": latest.get("watch_reason_detail"),
+        "dominant_direction": dominant_direction,
+        "direction_counts": direction_counts,
+        "max_abs_pressure_score": round(float(df["pressure_score"].abs().max()), 6),
+        "authority_scope": latest.get("authority_scope") or "watchlist_pressure_only",
+        "broker_execution_allowed": False,
+        "portfolio_authority": "none",
+    }
+
+
 def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
     symbol_upper = symbol.upper()
     screener_rows = load_latest_screener_rows(symbol_upper, setup_id=setup_id)
@@ -377,6 +478,22 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
     watchlist_row = latest_single_row("advisory_watchlist", symbol=symbol_upper, setup_id=setup_id, date_column="asof_date")
     announcement_events = latest_rows("advisory_watch_events", symbol=symbol_upper, setup_id=setup_id, date_column="published_on", limit=10)
     news_events = latest_rows("advisory_news_events", symbol=symbol_upper, setup_id=setup_id, date_column="published_on", limit=10)
+    exchange_context_overlays = latest_rows("advisory_exchange_context_overlays", symbol=symbol_upper, setup_id=None, date_column="known_on", limit=10)
+    exchange_context_summary = summarize_exchange_context_overlays(exchange_context_overlays)
+    announcement_context_overlays = latest_rows(ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE, symbol=symbol_upper, setup_id=None, date_column="published_on", limit=10)
+    announcement_context_summary = summarize_watchlist_context_overlays(
+        announcement_context_overlays,
+        source_family="announcement_context",
+        date_columns=["published_on", "asof_date", "load_ts"],
+        class_columns=["event_class", "context_class"],
+    )
+    bhavcopy_context_overlays = latest_rows(BHAVCOPY_CONTEXT_OVERLAYS_TABLE, symbol=symbol_upper, setup_id=None, date_column="asof_date", limit=10)
+    bhavcopy_context_summary = summarize_watchlist_context_overlays(
+        bhavcopy_context_overlays,
+        source_family="bhavcopy_context",
+        date_columns=["asof_date", "load_ts"],
+        class_columns=["deal_pressure", "context_class"],
+    )
     event_eval = latest_single_row("advisory_event_evaluations", symbol=symbol_upper, setup_id=setup_id, date_column="published_on")
     aggregated_event = load_aggregated_event_decision(symbol_upper, setup_id=setup_id)
     allocation_row = latest_single_row("advisory_allocations", symbol=symbol_upper, setup_id=setup_id, date_column="published_on")
@@ -398,6 +515,9 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
         "on_watchlist": watchlist_row is not None,
         "announcement_event_count": int(len(announcement_events)),
         "news_event_count": int(len(news_events)),
+        "exchange_context_overlay_count": int(len(exchange_context_overlays)),
+        "announcement_context_overlay_count": int(len(announcement_context_overlays)),
+        "bhavcopy_context_overlay_count": int(len(bhavcopy_context_overlays)),
         "has_event_evaluation": event_eval is not None,
         "has_aggregated_event_decision": aggregated_event is not None,
         "has_allocation": allocation_row is not None,
@@ -434,6 +554,18 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
         "effective_investable_now": (aggregated_event or {}).get("effective_investable_now"),
         "effective_event_source": (aggregated_event or {}).get("effective_event_source"),
         "effective_raw_event_count": (aggregated_event or {}).get("raw_event_count"),
+        "latest_exchange_context_direction": (exchange_context_summary or {}).get("latest_direction"),
+        "latest_exchange_context_event_type": (exchange_context_summary or {}).get("latest_event_type"),
+        "latest_exchange_context_pressure_score": (exchange_context_summary or {}).get("latest_pressure_score"),
+        "exchange_context_authority_scope": (exchange_context_summary or {}).get("authority_scope"),
+        "latest_announcement_context_direction": (announcement_context_summary or {}).get("latest_direction"),
+        "latest_announcement_context_class": (announcement_context_summary or {}).get("latest_context_class"),
+        "latest_announcement_context_pressure_score": (announcement_context_summary or {}).get("latest_pressure_score"),
+        "announcement_context_authority_scope": (announcement_context_summary or {}).get("authority_scope"),
+        "latest_bhavcopy_context_direction": (bhavcopy_context_summary or {}).get("latest_direction"),
+        "latest_bhavcopy_context_class": (bhavcopy_context_summary or {}).get("latest_context_class"),
+        "latest_bhavcopy_context_pressure_score": (bhavcopy_context_summary or {}).get("latest_pressure_score"),
+        "bhavcopy_context_authority_scope": (bhavcopy_context_summary or {}).get("authority_scope"),
         "latest_allocation_status": (allocation_row or {}).get("allocation_status"),
         "latest_portfolio_status": (portfolio_row or {}).get("portfolio_status"),
         "latest_execution_status": (execution_row or {}).get("execution_status"),
@@ -462,6 +594,12 @@ def build_trace(symbol: str, *, setup_id: str | None = None) -> dict[str, Any]:
             "watchlist": row_to_json_ready(watchlist_row),
             "announcement_events": df_to_records(announcement_events, date_cols=["published_on", "asof_date"]),
             "news_events": df_to_records(news_events, date_cols=["published_on", "asof_date"]),
+            "exchange_context_overlays": df_to_records(exchange_context_overlays, date_cols=["known_on", "event_date", "asof_date", "load_ts"]),
+            "exchange_context_summary": row_to_json_ready(exchange_context_summary),
+            "announcement_context_overlays": df_to_records(announcement_context_overlays, date_cols=["published_on", "asof_date", "load_ts"]),
+            "announcement_context_summary": row_to_json_ready(announcement_context_summary),
+            "bhavcopy_context_overlays": df_to_records(bhavcopy_context_overlays, date_cols=["asof_date", "load_ts"]),
+            "bhavcopy_context_summary": row_to_json_ready(bhavcopy_context_summary),
             "event_evaluation": row_to_json_ready(event_eval),
             "aggregated_event_decision": row_to_json_ready(aggregated_event),
             "allocation": row_to_json_ready(allocation_row),
@@ -503,6 +641,18 @@ def format_text(trace: dict[str, Any]) -> str:
             f"- effective_investable_now: {trace['decision_summary'].get('effective_investable_now')}",
             f"- effective_event_source: {trace['decision_summary'].get('effective_event_source')}",
             f"- effective_raw_event_count: {trace['decision_summary'].get('effective_raw_event_count')}",
+            f"- latest_exchange_context_direction: {trace['decision_summary'].get('latest_exchange_context_direction')}",
+            f"- latest_exchange_context_event_type: {trace['decision_summary'].get('latest_exchange_context_event_type')}",
+            f"- latest_exchange_context_pressure_score: {trace['decision_summary'].get('latest_exchange_context_pressure_score')}",
+            f"- exchange_context_authority_scope: {trace['decision_summary'].get('exchange_context_authority_scope')}",
+            f"- latest_announcement_context_direction: {trace['decision_summary'].get('latest_announcement_context_direction')}",
+            f"- latest_announcement_context_class: {trace['decision_summary'].get('latest_announcement_context_class')}",
+            f"- latest_announcement_context_pressure_score: {trace['decision_summary'].get('latest_announcement_context_pressure_score')}",
+            f"- announcement_context_authority_scope: {trace['decision_summary'].get('announcement_context_authority_scope')}",
+            f"- latest_bhavcopy_context_direction: {trace['decision_summary'].get('latest_bhavcopy_context_direction')}",
+            f"- latest_bhavcopy_context_class: {trace['decision_summary'].get('latest_bhavcopy_context_class')}",
+            f"- latest_bhavcopy_context_pressure_score: {trace['decision_summary'].get('latest_bhavcopy_context_pressure_score')}",
+            f"- bhavcopy_context_authority_scope: {trace['decision_summary'].get('bhavcopy_context_authority_scope')}",
             f"- latest_allocation_status: {trace['decision_summary'].get('latest_allocation_status')}",
             f"- latest_portfolio_status: {trace['decision_summary'].get('latest_portfolio_status')}",
             f"- latest_execution_status: {trace['decision_summary'].get('latest_execution_status')}",

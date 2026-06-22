@@ -15,6 +15,7 @@ from utils.sync import parse_datetime_arg
 
 TABLE_NAME = "advisory_market_regime"
 DEFAULT_BENCHMARK_NAME = "NIFTY"
+BENCHMARK_LOOKBACK_BUFFER_DAYS = 260
 MACRO_FEATURES_TABLE = "advisory_macro_features_daily"
 REGIME_SCHEMA_MIGRATION_ID = "20260611_advisory_market_regime_base"
 REGIME_SCHEMA_STATEMENTS = [
@@ -444,10 +445,15 @@ def build_regime_snapshot(
     to_date: pd.Timestamp | None = None,
     benchmark_name: str = DEFAULT_BENCHMARK_NAME,
 ) -> pd.DataFrame:
+    benchmark_start_date = (
+        from_date - pd.Timedelta(days=BENCHMARK_LOOKBACK_BUFFER_DAYS)
+        if from_date is not None
+        else None
+    )
     macro = load_macro_history(start_date=from_date, to_date=to_date)
     benchmark = load_benchmark_history(
         benchmark_name=benchmark_name,
-        start_date=from_date,
+        start_date=benchmark_start_date,
         to_date=to_date,
     )
     if macro.empty or benchmark.empty:
@@ -456,6 +462,12 @@ def build_regime_snapshot(
     out = macro.merge(benchmark, left_on="asof_date", right_on="date", how="inner").drop(
         columns=["date"], errors="ignore"
     )
+    if from_date is not None:
+        out = out[out["asof_date"] >= from_date]
+    if to_date is not None:
+        out = out[out["asof_date"] <= to_date]
+    if out.empty:
+        return pd.DataFrame()
     labels = out.apply(classify_regime, axis=1)
     out["regime_name"] = [label for label, _ in labels]
     out["regime_notes"] = ["; ".join(notes) for _, notes in labels]

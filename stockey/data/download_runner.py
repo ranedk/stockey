@@ -46,6 +46,7 @@ PARSER_STEPS = [
     {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.benchmark_sync", "args": [], "purpose": "benchmark_sync"},
     {"module": "advisory.event_evidence_store", "args": [], "purpose": "compact_event_evidence"},
+    {"module": "advisory.context_overlay_refresh", "args": [], "purpose": "context_overlay_refresh"},
 ]
 
 DOWNLOAD_STEPS = [*DOWNLOADER_STEPS, *PARSER_STEPS]
@@ -70,6 +71,23 @@ def classify_run_status(*, status: str, module_name: str, error: str | None = No
     text = f"{module_name} {error or ''}".lower()
     if any(token in text for token in ["401", "403", "unauthorized", "forbidden", "token", "login", "auth", "credential"]):
         return "auth_unavailable"
+    if any(
+        token in text
+        for token in [
+            "no dhan security id mapped",
+            "no security id mapped",
+            "no match in dhan master",
+            "security id mapping",
+            "security_id mapping",
+            "reference mapping",
+            "company master mapping",
+            "company_master_id",
+            "identity mapping",
+            "missing symbol mapping",
+            "instrument mapping",
+        ]
+    ):
+        return "reference_mapping_missing"
     if any(token in text for token in ["no data", "empty", "not available for date", "no rows"]):
         return "no_data"
     if module_name in PARSER_MODULES or any(token in text for token in ["parser", "parse", "read_excel", "bad zip", "corrupt", "schema", "undefinedcolumn", "valueerror"]):
@@ -103,6 +121,47 @@ def _as_int(value: Any) -> int | None:
             metadata={"value": str(value)[:200]},
         )
         return None
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "y"}:
+            return True
+        if text in {"false", "0", "no", "n"}:
+            return False
+    return bool(value)
+
+
+def _classification_count(result: dict[str, Any], classification: str) -> int:
+    counts = result.get("classification_counts")
+    if not isinstance(counts, dict):
+        return 0
+    return _as_int(counts.get(classification)) or 0
+
+
+def _hard_failure_classification_count(result: dict[str, Any]) -> int:
+    counts = result.get("classification_counts")
+    if not isinstance(counts, dict):
+        return 0
+    hard_classes = {
+        "auth_unavailable",
+        "bad_file_retryable",
+        "failed",
+        "parse_failed",
+        "parser_bug",
+        "partial_failed",
+        "reference_mapping_missing",
+        "schema_changed",
+        "source_unavailable",
+    }
+    total = 0
+    for key, value in counts.items():
+        if str(key) in hard_classes:
+            total += _as_int(value) or 0
+    return total
 
 
 def _emptyish(value: Any) -> bool:
@@ -186,10 +245,35 @@ def _refine_success_classification(classification: str, result: dict[str, Any]) 
     rows = _as_int(_first_present(result, ["rows", "rows_written", "row_count"]))
     no_data_count = _as_int(_first_present(result, ["no_data_count", "empty_count", "empty_processed_count"])) or 0
     source_unavailable_count = _as_int(_first_present(result, ["source_unavailable_count", "source_unavailable"])) or 0
+    auth_unavailable_count = _as_int(_first_present(result, ["auth_unavailable_count", "auth_unavailable"])) or 0
+    parse_failed_count = _as_int(_first_present(result, ["parse_failed_count", "parse_failed"])) or 0
+    reference_mapping_missing_count = _as_int(_first_present(result, ["reference_mapping_missing_count"])) or 0
+    no_data_count = max(no_data_count, _classification_count(result, "no_data"))
+    source_unavailable_count = max(source_unavailable_count, _classification_count(result, "source_unavailable"))
+    auth_unavailable_count = max(auth_unavailable_count, _classification_count(result, "auth_unavailable"))
+    parse_failed_count = max(parse_failed_count, _classification_count(result, "parse_failed"))
+    reference_mapping_missing_count = max(reference_mapping_missing_count, _classification_count(result, "reference_mapping_missing"))
+    failed_unit_count = _as_int(_first_present(result, ["failed_symbol_count", "failed_count"])) or 0
+    hard_failure_count = max(
+        auth_unavailable_count,
+        source_unavailable_count,
+        parse_failed_count,
+        reference_mapping_missing_count,
+        failed_unit_count,
+        _hard_failure_classification_count(result),
+    )
     state_advanced = result.get("state_advanced")
     did_not_advance = state_advanced is False or str(state_advanced).lower() == "false"
+    if hard_failure_count > 0 and (rows or 0) > 0:
+        return "partial_failed"
+    if auth_unavailable_count > 0 and did_not_advance and rows == 0:
+        return "auth_unavailable"
+    if reference_mapping_missing_count > 0 and did_not_advance and rows == 0:
+        return "reference_mapping_missing"
     if source_unavailable_count > 0 and did_not_advance and rows == 0:
         return "source_unavailable"
+    if parse_failed_count > 0 and did_not_advance and rows == 0:
+        return "parse_failed"
     if no_data_count > 0 and rows == 0:
         return "no_data"
     if did_not_advance and rows == 0:
@@ -207,6 +291,8 @@ def build_run_state_result(result: dict[str, Any], *, step: dict[str, Any]) -> d
     classification = _refine_success_classification(classification, result)
     now = pd.Timestamp.utcnow()
     explicit_state_advanced = result.get("state_advanced")
+    result_rows = _first_present(result, ["rows", "rows_written", "row_count"])
+    result_row_count = _as_int(result_rows) or 0
     state = {
         "source": module_name,
         "module": module_name,
@@ -219,7 +305,7 @@ def build_run_state_result(result: dict[str, Any], *, step: dict[str, Any]) -> d
         "returncode": returncode,
         "from": result.get("from_date") or result.get("from_datetime"),
         "to": result.get("to_date") or result.get("to_datetime"),
-        "rows": result.get("rows") or result.get("rows_written") or result.get("row_count"),
+        "rows": result_rows,
         "rows_written": result.get("rows_written"),
         "rows_read": result.get("rows_read"),
         "skipped": bool(status in {"skipped", "skipped_dry_run"}),
@@ -233,7 +319,7 @@ def build_run_state_result(result: dict[str, Any], *, step: dict[str, Any]) -> d
         "fallback_used": bool(result.get("fallback_used", False)),
         "error_class": (error.split(":", 1)[0] if error and ":" in error else result.get("error_class")),
         "error": error,
-        "state_advanced": bool(explicit_state_advanced) if explicit_state_advanced is not None else bool(classification in {"ok", "no_data"}),
+        "state_advanced": _as_bool(explicit_state_advanced) if explicit_state_advanced is not None else bool(classification in {"ok", "no_data"} or result_row_count > 0),
         "updated_at": now.isoformat(),
         **_source_specific_run_state(result),
     }
@@ -284,6 +370,7 @@ def merge_module_run_state(result: dict[str, Any], module_state: dict[str, Any])
         "fallback_used",
         "state_advanced",
         "auth_unavailable_count",
+        "parse_failed_count",
         "reference_mapping_missing_count",
         "classification_counts",
         "error_count",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from datetime import timedelta
@@ -11,6 +12,13 @@ import pandas as pd
 from environs import Env
 
 from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.watchlist_builder import (
+    WATCHLIST_CONTEXT_OVERLAY_EXCLUDED_RELIABILITY_CLASSES,
+    load_context_family_reliability,
+)
+from advisory.event_evidence_store import ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE, BHAVCOPY_CONTEXT_OVERLAYS_TABLE
+from advisory.macro_context_overlays import MACRO_CONTEXT_OVERLAYS_TABLE
+from advisory.news_theme_engine import THEME_CONTEXT_OVERLAYS_TABLE, theme_sector_alias_values_sql
 from data.announcements.managed_pipeline import ManagedAnnouncementPipeline
 from utils.db import sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
@@ -24,8 +32,17 @@ EVENTS_TABLE = "advisory_watch_events"
 WATCH_OUTPUTS_SCHEMA_MIGRATION_ID = "20260611_advisory_announcement_watch_outputs_base"
 MARKET_CONTEXT_UNIVERSE_TABLE = "advisory_market_context_universe_daily"
 MARKET_CONTEXT_SETUP_ID = "MARKET_CONTEXT_TOP50"
+THEME_CONTEXT_SETUP_PREFIX = "THEME_CONTEXT"
+ANNOUNCEMENT_CONTEXT_SETUP_PREFIX = "ANNOUNCEMENT_CONTEXT"
+MACRO_CONTEXT_SETUP_PREFIX = "MACRO_CONTEXT"
+BHAVCOPY_CONTEXT_SETUP_PREFIX = "BHAVCOPY_CONTEXT"
 INITIAL_INGEST_LOOKBACK_DAYS = 3
 DEFAULT_MARKET_CONTEXT_WATCH_LIMIT = env.int("MARKET_CONTEXT_WATCH_LIMIT", default=50)
+DEFAULT_THEME_CONTEXT_WATCH_LIMIT = env.int("THEME_CONTEXT_WATCH_LIMIT", default=50)
+DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT = env.int("ANNOUNCEMENT_CONTEXT_WATCH_LIMIT", default=50)
+DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS = env.int("ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS", default=7)
+DEFAULT_MACRO_CONTEXT_WATCH_LIMIT = env.int("MACRO_CONTEXT_WATCH_LIMIT", default=50)
+DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT = env.int("BHAVCOPY_CONTEXT_WATCH_LIMIT", default=50)
 MATERIAL_EVENT_KEYWORDS = {
     "acquisition",
     "amalgamation",
@@ -87,6 +104,36 @@ MATERIAL_EVENT_KEYWORDS = {
     "tax demand",
     "termination",
     "upgrade",
+}
+STRONG_MATERIAL_EVENT_KEYWORDS = MATERIAL_EVENT_KEYWORDS - {
+    "board meeting",
+    "notice",
+    "results",
+}
+NON_MATERIAL_CONTEXT_PHRASES = {
+    "analyst meeting",
+    "closure of trading window",
+    "compliance certificate",
+    "copy of newspaper publication",
+    "duplicate share certificate",
+    "investor presentation",
+    "investor/analyst meet",
+    "intimation of analyst",
+    "intimation of board meeting",
+    "loss of share certificate",
+    "newspaper advertisement",
+    "newspaper publication",
+    "no material trading information",
+    "no material information",
+    "non material",
+    "non-material",
+    "not material",
+    "press release on newspaper publication",
+    "record date for dividend already declared",
+    "routine newspaper notice",
+    "secretarial compliance report",
+    "trading window closure",
+    "transcript of earnings call",
 }
 WATCHLIST_EXTRA_COLUMNS = {
     "setup_name": "TEXT",
@@ -283,6 +330,374 @@ def _table_exists(table_name: str) -> bool:
     return not df.empty
 
 
+def _table_columns(table_name: str) -> set[str]:
+    try:
+        df = sql_to_df(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            params=(table_name,),
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source=table_name,
+            fallback_type="announcement_watch_table_columns_lookup_failed",
+            severity="warn",
+            reason="Announcement watcher could not inspect optional source table columns and used compatibility mode.",
+            error=exc,
+            metadata={"table_name": table_name},
+        )
+        return set()
+    if df.empty or "column_name" not in df.columns:
+        return set()
+    return {str(value) for value in df["column_name"].dropna().tolist()}
+
+
+def _is_missing_scalar(value: object) -> bool:
+    return value is None or (pd.api.types.is_scalar(value) and pd.isna(value))
+
+
+def _context_family_from_monitor_source(value: object) -> str | None:
+    if _is_missing_scalar(value):
+        return None
+    text = str(value).strip().lower()
+    if text in {"theme_context", "announcement_context", "macro_context", "bhavcopy_context"}:
+        return text
+    return None
+
+
+def _parse_context_watch_reasons(value: object) -> list[dict[str, object]]:
+    if _is_missing_scalar(value):
+        return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        return [value]
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            fallback_type="announcement_watch_context_watch_reasons_parse_failed",
+            source="watch_reasons_json",
+            severity="warn",
+            reason="Announcement watcher could not parse context watch reasons and ignored the malformed context-class payload.",
+            error=exc,
+            metadata={"value_type": value.__class__.__name__},
+        )
+        return []
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    if isinstance(parsed, dict):
+        return [parsed]
+    return []
+
+
+def _context_class_from_row(row: pd.Series) -> str | None:
+    for column in ["context_class", "event_class", "theme_id", "macro_signal_id", "deal_pressure"]:
+        if column in row.index:
+            value = row.get(column)
+            if _is_missing_scalar(value):
+                continue
+            text = str(value).strip().upper()
+            if text and text not in {"<NA>", "NAN", "NONE"}:
+                return text
+    for column in ["watch_reasons_json", "watch_reasons"]:
+        if column not in row.index:
+            continue
+        for item in _parse_context_watch_reasons(row.get(column)):
+            for key in ["context_class", "class", "event_class", "theme_id", "macro_signal_id", "deal_pressure"]:
+                value = item.get(key)
+                text = str(value or "").strip().upper()
+                if text and text not in {"<NA>", "NAN", "NONE"}:
+                    return text
+    return None
+
+
+def _context_class_reliability_classification(family_row: dict[str, object] | None, context_class: str | None) -> str | None:
+    if not isinstance(family_row, dict) or not context_class:
+        return None
+    target_class = str(context_class).strip().upper()
+    for item in family_row.get("context_class_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("context_class") or "").strip().upper() != target_class:
+            continue
+        classification = str(item.get("classification") or "").strip()
+        return classification or None
+    return None
+
+
+def _sector_key_from_values(*values: object) -> str | None:
+    for value in values:
+        if pd.api.types.is_scalar(value) and pd.isna(value):
+            continue
+        text = str(value or "").strip()
+        if not text or text.upper() in {"<NA>", "NAN", "NONE"}:
+            continue
+        return "".join(ch for ch in text.upper() if ch.isalnum())
+    return None
+
+
+def _context_sector_values_from_row(row: pd.Series) -> tuple[object | None, object | None]:
+    sector_name_values: list[object] = []
+    sector_code_values: list[object] = []
+    for column in ["universe_sector_name", "overlay_sector_name", "sector_name"]:
+        if column in row.index:
+            sector_name_values.append(row.get(column))
+    for column in ["universe_sector_code", "overlay_sector_code", "sector_code"]:
+        if column in row.index:
+            sector_code_values.append(row.get(column))
+    for column in ["watch_reasons_json", "watch_reasons"]:
+        if column not in row.index:
+            continue
+        for item in _parse_context_watch_reasons(row.get(column)):
+            for key in ["universe_sector_name", "overlay_sector_name", "sector_name"]:
+                if key in item:
+                    sector_name_values.append(item.get(key))
+            for key in ["universe_sector_code", "overlay_sector_code", "sector_code"]:
+                if key in item:
+                    sector_code_values.append(item.get(key))
+    return (
+        next((value for value in sector_name_values if _sector_key_from_values(value)), None),
+        next((value for value in sector_code_values if _sector_key_from_values(value)), None),
+    )
+
+
+def _context_sector_reliability_classification(family_row: dict[str, object] | None, row: pd.Series) -> str | None:
+    if not isinstance(family_row, dict):
+        return None
+    sector_name, sector_code = _context_sector_values_from_row(row)
+    target_keys = {
+        key
+        for key in [
+            _sector_key_from_values(sector_code),
+            _sector_key_from_values(sector_name),
+        ]
+        if key
+    }
+    if not target_keys:
+        return None
+    for item in family_row.get("sector_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        item_keys = {
+            key
+            for key in [
+                _sector_key_from_values(item.get("sector_code")),
+                _sector_key_from_values(item.get("sector_name")),
+                _sector_key_from_values(item.get("sector_key")),
+            ]
+            if key
+        }
+        if not target_keys & item_keys:
+            continue
+        classification = str(item.get("classification") or "").strip()
+        return classification or None
+    return None
+
+
+def _reliability_families(reliability: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(reliability, dict):
+        return {}
+    families = reliability.get("families")
+    if isinstance(families, dict):
+        return families
+    if isinstance(families, list):
+        return {
+            str(item.get("source_family")): item
+            for item in families
+            if isinstance(item, dict) and item.get("source_family")
+        }
+    return {}
+
+
+def _runtime_contract_for_context_reliability(row: dict[str, Any] | None) -> dict[str, Any]:
+    from advisory.context_overlay_reliability_report import reliability_runtime_policy_contract
+
+    if not isinstance(row, dict):
+        return reliability_runtime_policy_contract(None)
+    contract = row.get("runtime_policy_contract")
+    if isinstance(contract, dict) and contract:
+        return contract
+    return reliability_runtime_policy_contract(row.get("classification"))
+
+
+def _runtime_contract_allows_context(
+    row: dict[str, Any] | None,
+    use_name: str,
+    *,
+    legacy_classification: str | None = None,
+) -> bool:
+    contract = _runtime_contract_for_context_reliability(row)
+    allowed = contract.get("allowed_runtime_uses")
+    if isinstance(allowed, dict) and use_name in allowed:
+        return bool(allowed.get(use_name))
+    classification = str((row or {}).get("classification") or legacy_classification or "").strip()
+    if use_name == "watch_priority":
+        return classification == "candidate_helpful"
+    if use_name == "de_risk_review":
+        return classification == "protective_candidate"
+    return False
+
+
+def _context_direction_from_row(row: pd.Series) -> str | None:
+    for column in ["direction", "context_direction"]:
+        if column in row.index:
+            text = str(row.get(column) or "").strip().lower()
+            if text in {"positive", "negative", "watch"}:
+                return text
+    for column in ["candidate_state", "current_state", "setup_id", "watch_status", "monitor_source"]:
+        if column not in row.index:
+            continue
+        text = str(row.get(column) or "").strip().lower()
+        if "negative" in text:
+            return "negative"
+        if "positive" in text:
+            return "positive"
+        if "watch" in text:
+            return "watch"
+    for column in ["watch_reasons_json", "watch_reasons"]:
+        if column not in row.index:
+            continue
+        for item in _parse_context_watch_reasons(row.get(column)):
+            text = str(item.get("direction") or item.get("context_direction") or "").strip().lower()
+            if text in {"positive", "negative", "watch"}:
+                return text
+    return None
+
+
+def _runtime_contract_blocks_context_target(row: pd.Series, family_row: dict[str, Any] | None) -> bool:
+    if not isinstance(family_row, dict) or not family_row:
+        return False
+    direction = _context_direction_from_row(row)
+    if direction in {"positive", "watch"}:
+        return not _runtime_contract_allows_context(
+            family_row,
+            "watch_priority",
+            legacy_classification=str(family_row.get("classification") or "").strip(),
+        )
+    if direction == "negative":
+        if _runtime_contract_allows_context(
+            family_row,
+            "de_risk_review",
+            legacy_classification=str(family_row.get("classification") or "").strip(),
+        ):
+            return False
+        class_row = None
+        target_class = row.get("_context_class")
+        if target_class:
+            target = str(target_class).strip().upper()
+            for item in family_row.get("context_class_diagnostics") or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("context_class") or "").strip().upper() == target:
+                    class_row = item
+                    break
+        return not _runtime_contract_allows_context(
+            class_row if isinstance(class_row, dict) else None,
+            "de_risk_review",
+            legacy_classification=str((class_row or {}).get("classification") or "").strip() if isinstance(class_row, dict) else None,
+        )
+    return False
+
+
+def _filter_context_targets_by_reliability(df: pd.DataFrame, *, asof_date: pd.Timestamp | None = None) -> pd.DataFrame:
+    if df.empty or "monitor_source" not in df.columns:
+        return df
+    families = {
+        family
+        for family in df["monitor_source"].map(_context_family_from_monitor_source).dropna().astype(str).tolist()
+        if family
+    }
+    if not families:
+        return df
+    try:
+        reliability = load_context_family_reliability(asof_date=asof_date)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source="advisory_context_overlay_reliability_summary",
+            fallback_type="announcement_watch_context_reliability_filter_failed",
+            severity="warn",
+            reason="Announcement/news watcher could not load context source-family reliability and kept context targets neutral.",
+            error=exc,
+            metadata={
+                "asof_date": None if asof_date is None else str(asof_date),
+                "families": sorted(families),
+            },
+        )
+        return df
+    family_rows = _reliability_families(reliability)
+    if not family_rows:
+        return df
+
+    out = df.copy()
+    out["_context_source_family"] = out["monitor_source"].map(_context_family_from_monitor_source)
+    out["_context_reliability_classification"] = out["_context_source_family"].map(
+        lambda family: (family_rows.get(str(family)) or {}).get("classification") if family else None
+    )
+    out["_context_class"] = out.apply(_context_class_from_row, axis=1)
+    out["_context_class_reliability_classification"] = out.apply(
+        lambda row: _context_class_reliability_classification(
+            family_rows.get(str(row.get("_context_source_family"))),
+            row.get("_context_class"),
+        ),
+        axis=1,
+    )
+    out["_context_sector_reliability_classification"] = out.apply(
+        lambda row: _context_sector_reliability_classification(
+            family_rows.get(str(row.get("_context_source_family"))),
+            row,
+        ),
+        axis=1,
+    )
+    mask_excluded = out["_context_reliability_classification"].astype("string").isin(
+        WATCHLIST_CONTEXT_OVERLAY_EXCLUDED_RELIABILITY_CLASSES
+    ) | out["_context_class_reliability_classification"].astype("string").isin(
+        WATCHLIST_CONTEXT_OVERLAY_EXCLUDED_RELIABILITY_CLASSES
+    ) | out["_context_sector_reliability_classification"].astype("string").isin(
+        WATCHLIST_CONTEXT_OVERLAY_EXCLUDED_RELIABILITY_CLASSES
+    )
+    mask_runtime_blocked = out.apply(
+        lambda row: _runtime_contract_blocks_context_target(
+            row,
+            family_rows.get(str(row.get("_context_source_family"))),
+        ),
+        axis=1,
+    )
+    mask_excluded = mask_excluded | mask_runtime_blocked
+    if not mask_excluded.any():
+        return out.drop(
+            columns=[
+                "_context_source_family",
+                "_context_reliability_classification",
+                "_context_class",
+                "_context_class_reliability_classification",
+                "_context_sector_reliability_classification",
+            ],
+            errors="ignore",
+        )
+    return (
+        out.loc[~mask_excluded]
+        .drop(
+            columns=[
+                "_context_source_family",
+                "_context_reliability_classification",
+                "_context_class",
+                "_context_class_reliability_classification",
+                "_context_sector_reliability_classification",
+            ],
+            errors="ignore",
+        )
+        .reset_index(drop=True)
+    )
+
+
 def load_market_context_watchlist(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -356,6 +771,644 @@ def load_market_context_watchlist(
     df["asof_date"] = normalize_timestamp(df["asof_date"])
     df["symbol"] = df["symbol"].astype("string").str.upper()
     df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    return _filter_context_targets_by_reliability(df, asof_date=effective_asof)
+
+
+def load_theme_context_watchlist(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    limit: int = DEFAULT_THEME_CONTEXT_WATCH_LIMIT,
+    last_checked_at: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if int(limit) <= 0 or not _table_exists(THEME_CONTEXT_OVERLAYS_TABLE) or not _table_exists(MARKET_CONTEXT_UNIVERSE_TABLE):
+        return pd.DataFrame()
+    effective_asof = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce").normalize()
+    symbol_clause = ""
+    params: dict[str, Any] = {
+        "asof_date": effective_asof,
+        "last_checked_at": last_checked_at,
+        "limit": int(limit),
+    }
+    if symbols:
+        symbol_clause = "AND UPPER(TRIM(u.symbol)) = ANY(%(symbols)s)"
+        params["symbols"] = [str(value).upper() for value in symbols]
+    try:
+        df = sql_to_df(
+            f"""
+            WITH theme_sector_alias(overlay_sector_key, universe_sector_code) AS (
+                VALUES
+                {theme_sector_alias_values_sql()}
+            ),
+            latest_overlays AS (
+                SELECT *
+                FROM {THEME_CONTEXT_OVERLAYS_TABLE}
+                WHERE asof_date = (
+                    SELECT MAX(asof_date)
+                    FROM {THEME_CONTEXT_OVERLAYS_TABLE}
+                    WHERE asof_date <= %(asof_date)s
+                )
+                  AND production_status = 'active'
+                  AND authority_scope = 'watchlist_pressure_only'
+                  AND direction IN ('positive', 'negative')
+                  AND NULLIF(TRIM(COALESCE(sector_name, sector_code, '')), '') IS NOT NULL
+            ),
+            latest_universe AS (
+                SELECT *
+                FROM {MARKET_CONTEXT_UNIVERSE_TABLE}
+                WHERE asof_date = (
+                    SELECT MAX(asof_date)
+                    FROM {MARKET_CONTEXT_UNIVERSE_TABLE}
+                    WHERE asof_date <= %(asof_date)s
+                )
+                  AND in_top_context = TRUE
+                  AND NULLIF(TRIM(symbol), '') IS NOT NULL
+                  AND NULLIF(TRIM(company_master_id), '') IS NOT NULL
+            ),
+            joined AS (
+                SELECT
+                    u.asof_date AS universe_asof_date,
+                    o.asof_date AS overlay_asof_date,
+                    UPPER(TRIM(u.symbol)) AS symbol,
+                    u.company_master_id,
+                    u.context_rank,
+                    u.sector_code AS universe_sector_code,
+                    u.sector_name AS universe_sector_name,
+                    u.technical_leadership_score,
+                    u.macro_sensitivity_tag,
+                    o.overlay_id,
+                    o.theme_id,
+                    o.theme_name,
+                    o.sector_name AS overlay_sector_name,
+                    o.sector_code AS overlay_sector_code,
+                    o.direction,
+                    o.pressure_score,
+                    o.theme_intensity,
+                    o.hit_score,
+                    o.holding_profile,
+                    o.risk_level,
+                    o.ideal_screener_logic,
+                    o.theme_reason,
+                    o.invalidation_signals_json,
+                    o.matched_sources_json,
+                    o.suggested_screeners_json,
+                    o.load_ts AS overlay_load_ts,
+                    u.load_ts AS universe_load_ts,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(u.symbol))
+                        ORDER BY
+                            o.pressure_score DESC NULLS LAST,
+                            CASE WHEN o.direction = 'positive' THEN 0 ELSE 1 END,
+                            u.context_rank ASC NULLS LAST,
+                            o.theme_id
+                    ) AS rn
+                FROM latest_universe u
+                JOIN latest_overlays o
+                  ON TRUE
+                LEFT JOIN theme_sector_alias tsa
+                  ON tsa.overlay_sector_key = regexp_replace(upper(coalesce(o.sector_name, o.sector_code, '')), '[^A-Z0-9]', '', 'g')
+                WHERE (
+                    regexp_replace(upper(coalesce(u.sector_name, '')), '[^A-Z0-9]', '', 'g') = regexp_replace(upper(coalesce(o.sector_name, '')), '[^A-Z0-9]', '', 'g')
+                    OR regexp_replace(upper(coalesce(u.sector_code, '')), '[^A-Z0-9]', '', 'g') = regexp_replace(upper(coalesce(o.sector_code, '')), '[^A-Z0-9]', '', 'g')
+                    OR upper(coalesce(u.sector_code, '')) = tsa.universe_sector_code
+                )
+                  {symbol_clause}
+            )
+            SELECT
+                overlay_asof_date AS asof_date,
+                (%(setup_prefix)s || '_' || theme_id || '_' || upper(direction))::text AS setup_id,
+                ('Theme context: ' || theme_name || ' / ' || direction)::text AS setup_name,
+                NULL::text AS regime_name,
+                symbol,
+                company_master_id,
+                NULL::text AS screener_slug,
+                context_rank::bigint AS rank,
+                ('THEME_CONTEXT_' || upper(direction))::text AS candidate_state,
+                ('THEME_CONTEXT_' || upper(direction))::text AS current_state,
+                CASE
+                    WHEN direction = 'positive' THEN 'Active news theme creates positive sector watchlist pressure; technical and liquidity confirmation still required.'
+                    ELSE 'Active news theme creates negative sector watchlist pressure; monitor for thesis invalidation, de-risking, or exit evidence.'
+                END::text AS watch_reason_detail,
+                NULL::text AS entry_style,
+                NULL::double precision AS attractive_price_low,
+                NULL::double precision AS attractive_price_high,
+                NULL::double precision AS invalidation_price,
+                NULL::text AS entry_note,
+                FALSE::boolean AS near_miss_flag,
+                NULL::text AS last_event_class,
+                NULL::text AS last_state_transition_hint,
+                NULL::double precision AS last_event_score_impact,
+                TRUE::boolean AS watch_enabled,
+                json_build_object(
+                    'source', 'news_theme_context_overlay',
+                    'overlay_id', overlay_id,
+                    'theme_id', theme_id,
+                    'theme_name', theme_name,
+                    'direction', direction,
+                    'pressure_score', pressure_score,
+                    'theme_intensity', theme_intensity,
+                    'hit_score', hit_score,
+                    'overlay_sector_name', overlay_sector_name,
+                    'overlay_sector_code', overlay_sector_code,
+                    'universe_sector_name', universe_sector_name,
+                    'universe_sector_code', universe_sector_code,
+                    'context_rank', context_rank,
+                    'technical_leadership_score', technical_leadership_score,
+                    'macro_sensitivity_tag', macro_sensitivity_tag,
+                    'holding_profile', holding_profile,
+                    'risk_level', risk_level,
+                    'ideal_screener_logic', ideal_screener_logic,
+                    'theme_reason', theme_reason,
+                    'invalidation_signals_json', invalidation_signals_json,
+                    'matched_sources_json', matched_sources_json,
+                    'suggested_screeners_json', suggested_screeners_json,
+                    'authority_scope', 'watchlist_pressure_only'
+                )::text AS watch_reasons_json,
+                'theme_context'::text AS watch_status,
+                overlay_asof_date AS state_updated_at,
+                overlay_asof_date AS watch_started_at,
+                %(last_checked_at)s::timestamptz AS last_checked_at,
+                NULL::timestamptz AS last_document_published_on,
+                GREATEST(overlay_load_ts, universe_load_ts) AS load_ts,
+                'theme_context'::text AS monitor_source
+            FROM joined
+            WHERE rn = 1
+            ORDER BY pressure_score DESC NULLS LAST, context_rank ASC NULLS LAST, symbol
+            LIMIT %(limit)s
+            """,
+            params={**params, "setup_prefix": THEME_CONTEXT_SETUP_PREFIX},
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source=THEME_CONTEXT_OVERLAYS_TABLE,
+            fallback_type="theme_context_watchlist_load_failed",
+            severity="warn",
+            reason="Announcement/news watcher skipped theme-context watch targets because overlay-to-universe mapping failed.",
+            error=exc,
+            metadata={
+                "asof_date": str(effective_asof),
+                "symbols_count": len(symbols or []),
+                "limit": int(limit),
+            },
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["asof_date", "state_updated_at", "watch_started_at", "last_checked_at", "last_document_published_on", "load_ts"]:
+        df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    return _filter_context_targets_by_reliability(df, asof_date=effective_asof)
+
+
+def load_announcement_context_watchlist(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    limit: int = DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT,
+    last_checked_at: pd.Timestamp | None = None,
+    lookback_days: int = DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    if int(limit) <= 0 or not _table_exists(ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE):
+        return pd.DataFrame()
+    available_columns = _table_columns(ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE)
+    taxonomy_filters: list[str] = []
+    if "announcement_storage_form" in available_columns:
+        taxonomy_filters.append("COALESCE(NULLIF(TRIM(announcement_storage_form), ''), 'compact_structured_event') <> 'archived_raw_reference_only'")
+    if "llm_review_ready" in available_columns:
+        taxonomy_filters.append("COALESCE(llm_review_ready, TRUE) IS TRUE")
+    optional_selects = {
+        "announcement_storage_form": "announcement_storage_form",
+        "llm_evidence_mode": "llm_evidence_mode",
+        "llm_review_ready": "llm_review_ready",
+        "raw_archive_required": "raw_archive_required",
+    }
+    taxonomy_json_fields = ",\n                    ".join(
+        f"'{key}', {expression if key in available_columns else 'NULL'}"
+        for key, expression in optional_selects.items()
+    )
+    taxonomy_where = "\n                  " + "\n                  ".join(f"AND {clause}" for clause in taxonomy_filters) if taxonomy_filters else ""
+    effective_asof = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    if pd.isna(effective_asof):
+        effective_asof = pd.Timestamp.utcnow()
+    effective_asof = effective_asof.normalize()
+    lookback_start = effective_asof - pd.Timedelta(days=max(1, int(lookback_days)))
+    symbol_clause = ""
+    params: dict[str, Any] = {
+        "asof_date": effective_asof,
+        "lookback_start": lookback_start,
+        "last_checked_at": last_checked_at,
+        "limit": int(limit),
+        "setup_prefix": ANNOUNCEMENT_CONTEXT_SETUP_PREFIX,
+        "source_table": ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE,
+        "taxonomy_filter_applied": bool(taxonomy_filters),
+        "archive_only_rows_excluded": "announcement_storage_form" in available_columns,
+    }
+    if symbols:
+        symbol_clause = "AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)"
+        params["symbols"] = [str(value).upper() for value in symbols]
+    try:
+        df = sql_to_df(
+            f"""
+            WITH recent_overlays AS (
+                SELECT *
+                FROM {ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE}
+                WHERE published_on >= %(lookback_start)s
+                  AND published_on < (%(asof_date)s + interval '1 day')
+                  AND production_status = 'active'
+                  AND authority_scope = 'watchlist_pressure_only'
+                  AND direction IN ('positive', 'negative', 'watch')
+                  AND NULLIF(TRIM(symbol), '') IS NOT NULL
+                  {taxonomy_where}
+                  {symbol_clause}
+            ),
+            ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(symbol))
+                        ORDER BY pressure_score DESC NULLS LAST, published_on DESC NULLS LAST, overlay_id
+                    ) AS rn
+                FROM recent_overlays
+            )
+            SELECT
+                asof_date,
+                (%(setup_prefix)s || '_' || upper(direction))::text AS setup_id,
+                ('Announcement context: ' || coalesce(event_class, direction))::text AS setup_name,
+                NULL::text AS regime_name,
+                UPPER(TRIM(symbol)) AS symbol,
+                company_master_id,
+                NULL::text AS screener_slug,
+                ROW_NUMBER() OVER (ORDER BY pressure_score DESC NULLS LAST, published_on DESC NULLS LAST, symbol)::bigint AS rank,
+                ('ANNOUNCEMENT_CONTEXT_' || upper(direction))::text AS candidate_state,
+                ('ANNOUNCEMENT_CONTEXT_' || upper(direction))::text AS current_state,
+                watch_reason_detail,
+                NULL::text AS entry_style,
+                NULL::double precision AS attractive_price_low,
+                NULL::double precision AS attractive_price_high,
+                NULL::double precision AS invalidation_price,
+                NULL::text AS entry_note,
+                FALSE::boolean AS near_miss_flag,
+                event_class AS last_event_class,
+                CASE
+                    WHEN direction = 'positive' THEN 'Official filing supports watchlist escalation only after technical confirmation.'
+                    WHEN direction = 'negative' THEN 'Official filing supports de-risk review only after lifecycle/risk confirmation.'
+                    ELSE 'Official filing needs follow-up evidence before escalation.'
+                END::text AS last_state_transition_hint,
+                pressure_score AS last_event_score_impact,
+                TRUE::boolean AS watch_enabled,
+                json_build_object(
+                    'source', 'announcement_context_overlay',
+                    'overlay_id', overlay_id,
+                    'evidence_id', evidence_id,
+                    'unique_id', unique_id,
+                    'event_class', event_class,
+                    'direction', direction,
+                    'pressure_score', pressure_score,
+                    'materiality', materiality,
+                    'surprise', surprise,
+                    'novelty', novelty,
+                    'contradiction', contradiction,
+                    'confidence', confidence,
+                    'verdict', verdict,
+                    'source_reliability', source_reliability,
+                    'compact_evidence_contract', json_build_object(
+                        'source_table', %(source_table)s,
+                        'taxonomy_filter_applied', %(taxonomy_filter_applied)s,
+                        'archive_only_rows_excluded', %(archive_only_rows_excluded)s,
+                        {taxonomy_json_fields}
+                    ),
+                    'matched_sources_json', matched_sources_json,
+                    'authority_scope', 'watchlist_pressure_only'
+                )::text AS watch_reasons_json,
+                'announcement_context'::text AS watch_status,
+                published_on AS state_updated_at,
+                published_on AS watch_started_at,
+                %(last_checked_at)s::timestamptz AS last_checked_at,
+                published_on AS last_document_published_on,
+                load_ts,
+                'announcement_context'::text AS monitor_source
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY pressure_score DESC NULLS LAST, published_on DESC NULLS LAST, symbol
+            LIMIT %(limit)s
+            """,
+            params=params,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source=ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE,
+            fallback_type="announcement_context_watchlist_load_failed",
+            severity="warn",
+            reason="Announcement/news watcher skipped announcement-context watch targets because official-filing overlay load failed.",
+            error=exc,
+            metadata={
+                "asof_date": str(effective_asof),
+                "lookback_days": int(lookback_days),
+                "symbols_count": len(symbols or []),
+                "limit": int(limit),
+            },
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["asof_date", "state_updated_at", "watch_started_at", "last_checked_at", "last_document_published_on", "load_ts"]:
+        df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    return _filter_context_targets_by_reliability(df, asof_date=effective_asof)
+
+
+def load_macro_context_watchlist(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    limit: int = DEFAULT_MACRO_CONTEXT_WATCH_LIMIT,
+    last_checked_at: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if int(limit) <= 0 or not _table_exists(MACRO_CONTEXT_OVERLAYS_TABLE) or not _table_exists(MARKET_CONTEXT_UNIVERSE_TABLE):
+        return pd.DataFrame()
+    effective_asof = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce").normalize()
+    symbol_clause = ""
+    params: dict[str, Any] = {
+        "asof_date": effective_asof,
+        "last_checked_at": last_checked_at,
+        "limit": int(limit),
+    }
+    if symbols:
+        symbol_clause = "AND UPPER(TRIM(u.symbol)) = ANY(%(symbols)s)"
+        params["symbols"] = [str(value).upper() for value in symbols]
+    try:
+        df = sql_to_df(
+            f"""
+            WITH latest_overlays AS (
+                SELECT *
+                FROM {MACRO_CONTEXT_OVERLAYS_TABLE}
+                WHERE asof_date = (
+                    SELECT MAX(asof_date)
+                    FROM {MACRO_CONTEXT_OVERLAYS_TABLE}
+                    WHERE asof_date <= %(asof_date)s
+                )
+                  AND production_status = 'active'
+                  AND authority_scope = 'watchlist_pressure_only'
+                  AND direction IN ('positive', 'negative', 'watch')
+                  AND NULLIF(TRIM(COALESCE(sector_name, sector_code, '')), '') IS NOT NULL
+            ),
+            latest_universe AS (
+                SELECT *
+                FROM {MARKET_CONTEXT_UNIVERSE_TABLE}
+                WHERE asof_date = (
+                    SELECT MAX(asof_date)
+                    FROM {MARKET_CONTEXT_UNIVERSE_TABLE}
+                    WHERE asof_date <= %(asof_date)s
+                )
+                  AND in_top_context = TRUE
+                  AND NULLIF(TRIM(symbol), '') IS NOT NULL
+                  AND NULLIF(TRIM(company_master_id), '') IS NOT NULL
+            ),
+            joined AS (
+                SELECT
+                    u.asof_date AS universe_asof_date,
+                    o.asof_date AS overlay_asof_date,
+                    UPPER(TRIM(u.symbol)) AS symbol,
+                    u.company_master_id,
+                    u.context_rank,
+                    u.sector_code AS universe_sector_code,
+                    u.sector_name AS universe_sector_name,
+                    u.technical_leadership_score,
+                    u.macro_sensitivity_tag,
+                    o.overlay_id,
+                    o.macro_signal_id,
+                    o.macro_signal_name,
+                    o.sector_name AS overlay_sector_name,
+                    o.sector_code AS overlay_sector_code,
+                    o.direction,
+                    o.pressure_score,
+                    o.macro_stress_score,
+                    o.macro_risk_state,
+                    o.trigger_reason,
+                    o.matched_sources_json,
+                    o.load_ts AS overlay_load_ts,
+                    u.load_ts AS universe_load_ts,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(u.symbol))
+                        ORDER BY
+                            o.pressure_score DESC NULLS LAST,
+                            CASE WHEN o.direction = 'negative' THEN 0 WHEN o.direction = 'positive' THEN 1 ELSE 2 END,
+                            u.context_rank ASC NULLS LAST,
+                            o.macro_signal_id
+                    ) AS rn
+                FROM latest_universe u
+                JOIN latest_overlays o
+                  ON regexp_replace(upper(coalesce(u.sector_name, '')), '[^A-Z0-9]', '', 'g') = regexp_replace(upper(coalesce(o.sector_name, '')), '[^A-Z0-9]', '', 'g')
+                  OR regexp_replace(upper(coalesce(u.sector_code, '')), '[^A-Z0-9]', '', 'g') = regexp_replace(upper(coalesce(o.sector_code, '')), '[^A-Z0-9]', '', 'g')
+                WHERE 1 = 1
+                  {symbol_clause}
+            )
+            SELECT
+                overlay_asof_date AS asof_date,
+                (%(setup_prefix)s || '_' || macro_signal_id || '_' || upper(direction))::text AS setup_id,
+                ('Macro context: ' || macro_signal_name || ' / ' || direction)::text AS setup_name,
+                NULL::text AS regime_name,
+                symbol,
+                company_master_id,
+                NULL::text AS screener_slug,
+                context_rank::bigint AS rank,
+                ('MACRO_CONTEXT_' || upper(direction))::text AS candidate_state,
+                ('MACRO_CONTEXT_' || upper(direction))::text AS current_state,
+                CASE
+                    WHEN direction = 'positive' THEN 'Macro context creates positive sector watch pressure; technical and liquidity confirmation still required.'
+                    WHEN direction = 'negative' THEN 'Macro context creates negative sector pressure; monitor for thesis invalidation, de-risking, or exit evidence.'
+                    ELSE 'Macro context creates watch-only sector pressure; inspect symbol evidence before escalation.'
+                END::text AS watch_reason_detail,
+                NULL::text AS entry_style,
+                NULL::double precision AS attractive_price_low,
+                NULL::double precision AS attractive_price_high,
+                NULL::double precision AS invalidation_price,
+                NULL::text AS entry_note,
+                FALSE::boolean AS near_miss_flag,
+                NULL::text AS last_event_class,
+                NULL::text AS last_state_transition_hint,
+                NULL::double precision AS last_event_score_impact,
+                TRUE::boolean AS watch_enabled,
+                json_build_object(
+                    'source', 'macro_context_overlay',
+                    'overlay_id', overlay_id,
+                    'macro_signal_id', macro_signal_id,
+                    'macro_signal_name', macro_signal_name,
+                    'direction', direction,
+                    'pressure_score', pressure_score,
+                    'macro_stress_score', macro_stress_score,
+                    'macro_risk_state', macro_risk_state,
+                    'overlay_sector_name', overlay_sector_name,
+                    'overlay_sector_code', overlay_sector_code,
+                    'universe_sector_name', universe_sector_name,
+                    'universe_sector_code', universe_sector_code,
+                    'context_rank', context_rank,
+                    'technical_leadership_score', technical_leadership_score,
+                    'macro_sensitivity_tag', macro_sensitivity_tag,
+                    'trigger_reason', trigger_reason,
+                    'matched_sources_json', matched_sources_json,
+                    'authority_scope', 'watchlist_pressure_only'
+                )::text AS watch_reasons_json,
+                'macro_context'::text AS watch_status,
+                overlay_asof_date AS state_updated_at,
+                overlay_asof_date AS watch_started_at,
+                %(last_checked_at)s::timestamptz AS last_checked_at,
+                NULL::timestamptz AS last_document_published_on,
+                GREATEST(overlay_load_ts, universe_load_ts) AS load_ts,
+                'macro_context'::text AS monitor_source
+            FROM joined
+            WHERE rn = 1
+            ORDER BY pressure_score DESC NULLS LAST, context_rank ASC NULLS LAST, symbol
+            LIMIT %(limit)s
+            """,
+            params={**params, "setup_prefix": MACRO_CONTEXT_SETUP_PREFIX},
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source=MACRO_CONTEXT_OVERLAYS_TABLE,
+            fallback_type="macro_context_watchlist_load_failed",
+            severity="warn",
+            reason="Announcement/news watcher skipped macro-context watch targets because overlay-to-universe mapping failed.",
+            error=exc,
+            metadata={
+                "asof_date": str(effective_asof),
+                "symbols_count": len(symbols or []),
+                "limit": int(limit),
+            },
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["asof_date", "state_updated_at", "watch_started_at", "last_checked_at", "last_document_published_on", "load_ts"]:
+        df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
+    return _filter_context_targets_by_reliability(df, asof_date=effective_asof)
+
+
+def load_bhavcopy_context_watchlist(
+    *,
+    asof_date: pd.Timestamp | None = None,
+    symbols: list[str] | None = None,
+    limit: int = DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT,
+    last_checked_at: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if int(limit) <= 0 or not _table_exists(BHAVCOPY_CONTEXT_OVERLAYS_TABLE):
+        return pd.DataFrame()
+    effective_asof = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce").normalize()
+    symbol_clause = ""
+    params: dict[str, Any] = {"asof_date": effective_asof, "last_checked_at": last_checked_at, "limit": int(limit)}
+    if symbols:
+        symbol_clause = "AND UPPER(TRIM(symbol)) = ANY(%(symbols)s)"
+        params["symbols"] = [str(value).upper() for value in symbols]
+    try:
+        df = sql_to_df(
+            f"""
+            WITH latest_overlays AS (
+                SELECT *
+                FROM {BHAVCOPY_CONTEXT_OVERLAYS_TABLE}
+                WHERE asof_date = (
+                    SELECT MAX(asof_date)
+                    FROM {BHAVCOPY_CONTEXT_OVERLAYS_TABLE}
+                    WHERE asof_date <= %(asof_date)s
+                )
+                  AND production_status = 'active'
+                  AND authority_scope = 'watchlist_pressure_only'
+                  AND NULLIF(TRIM(symbol), '') IS NOT NULL
+                  {symbol_clause}
+            ),
+            ranked AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(symbol))
+                        ORDER BY pressure_score DESC NULLS LAST, direction, overlay_id
+                    ) AS rn
+                FROM latest_overlays
+            )
+            SELECT
+                asof_date,
+                (%(setup_prefix)s || '_' || upper(direction))::text AS setup_id,
+                ('Bhavcopy context: ' || coalesce(deal_pressure, direction))::text AS setup_name,
+                NULL::text AS regime_name,
+                UPPER(TRIM(symbol)) AS symbol,
+                company_master_id,
+                NULL::text AS screener_slug,
+                ROW_NUMBER() OVER (ORDER BY pressure_score DESC NULLS LAST, symbol)::bigint AS rank,
+                ('BHAVCOPY_CONTEXT_' || upper(direction))::text AS candidate_state,
+                ('BHAVCOPY_CONTEXT_' || upper(direction))::text AS current_state,
+                watch_reason_detail,
+                NULL::text AS entry_style,
+                NULL::double precision AS attractive_price_low,
+                NULL::double precision AS attractive_price_high,
+                NULL::double precision AS invalidation_price,
+                NULL::text AS entry_note,
+                FALSE::boolean AS near_miss_flag,
+                NULL::text AS last_event_class,
+                NULL::text AS last_state_transition_hint,
+                NULL::double precision AS last_event_score_impact,
+                TRUE::boolean AS watch_enabled,
+                json_build_object(
+                    'source', 'bhavcopy_context_overlay',
+                    'overlay_id', overlay_id,
+                    'direction', direction,
+                    'pressure_score', pressure_score,
+                    'evidence_score', evidence_score,
+                    'deal_pressure', deal_pressure,
+                    'deal_net_value_inr', deal_net_value_inr,
+                    'short_selling_quantity', short_selling_quantity,
+                    'circuit_hit_count', circuit_hit_count,
+                    'turnover_value_inr', turnover_value_inr,
+                    'avg_turnover_value_20d', avg_turnover_value_20d,
+                    'matched_sources_json', matched_sources_json,
+                    'compact_evidence_contract', json_build_object(
+                        'source_table', %(source_table)s,
+                        'source_family', 'bhavcopy_context',
+                        'raw_bhavcopy_scan_allowed', false,
+                        'authority_scope', 'watchlist_pressure_only'
+                    ),
+                    'authority_scope', 'watchlist_pressure_only'
+                )::text AS watch_reasons_json,
+                'bhavcopy_context'::text AS watch_status,
+                asof_date AS state_updated_at,
+                asof_date AS watch_started_at,
+                %(last_checked_at)s::timestamptz AS last_checked_at,
+                NULL::timestamptz AS last_document_published_on,
+                load_ts,
+                'bhavcopy_context'::text AS monitor_source
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY pressure_score DESC NULLS LAST, symbol
+            LIMIT %(limit)s
+            """,
+            params={**params, "setup_prefix": BHAVCOPY_CONTEXT_SETUP_PREFIX, "source_table": BHAVCOPY_CONTEXT_OVERLAYS_TABLE},
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source=BHAVCOPY_CONTEXT_OVERLAYS_TABLE,
+            fallback_type="bhavcopy_context_watchlist_load_failed",
+            severity="warn",
+            reason="Announcement/news watcher skipped bhavcopy-context watch targets because compact evidence overlay load failed.",
+            error=exc,
+            metadata={"asof_date": str(effective_asof), "symbols_count": len(symbols or []), "limit": int(limit)},
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    for column in ["asof_date", "state_updated_at", "watch_started_at", "last_checked_at", "last_document_published_on", "load_ts"]:
+        df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    df["asof_date"] = normalize_timestamp(df["asof_date"])
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    df["rank"] = pd.to_numeric(df["rank"], errors="coerce")
     return df
 
 
@@ -386,7 +1439,19 @@ def is_material_context_event(row: pd.Series) -> bool:
         str(row.get(column) or "")
         for column in ["subject", "filed_under_category", "concise_summary_text", "categories_json"]
     ).lower()
-    return any(keyword in text for keyword in MATERIAL_EVENT_KEYWORDS)
+    def _has_keyword(keyword: str) -> bool:
+        normalized = str(keyword or "").strip().lower()
+        if not normalized:
+            return False
+        if " " in normalized:
+            return normalized in text
+        return re.search(rf"\b{re.escape(normalized)}\b", text) is not None
+
+    if any(phrase in text for phrase in NON_MATERIAL_CONTEXT_PHRASES):
+        return any(_has_keyword(keyword) for keyword in STRONG_MATERIAL_EVENT_KEYWORDS)
+    if "meeting" in text and not any(_has_keyword(keyword) for keyword in STRONG_MATERIAL_EVENT_KEYWORDS):
+        return False
+    return any(_has_keyword(keyword) for keyword in MATERIAL_EVENT_KEYWORDS)
 
 
 def load_documents_for_company(
@@ -450,10 +1515,12 @@ def build_event_rows(watch_row: pd.Series, docs: pd.DataFrame) -> pd.DataFrame:
             }
         )
     out = pd.DataFrame(rows)
-    market_mask = out["monitor_source"].astype("string").str.lower().eq("market_context")
-    if market_mask.any():
+    context_mask = out["monitor_source"].astype("string").str.lower().isin(
+        ["market_context", "theme_context", "announcement_context", "bhavcopy_context", "macro_context"]
+    )
+    if context_mask.any():
         material_mask = out.apply(is_material_context_event, axis=1)
-        out.loc[market_mask & ~material_mask, "event_status"] = "context_observed"
+        out.loc[context_mask & ~material_mask, "event_status"] = "context_observed"
     return out
 
 
@@ -516,6 +1583,20 @@ def run_announcement_ingest(
     include_market_context: bool = False,
     market_context_limit: int = DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
     market_context_last_checked_at: pd.Timestamp | None = None,
+    include_theme_context: bool = False,
+    theme_context_limit: int = DEFAULT_THEME_CONTEXT_WATCH_LIMIT,
+    theme_context_last_checked_at: pd.Timestamp | None = None,
+    include_announcement_context: bool = False,
+    announcement_context_limit: int = DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT,
+    announcement_context_last_checked_at: pd.Timestamp | None = None,
+    announcement_context_lookback_days: int = DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS,
+    include_macro_context: bool = False,
+    macro_context_limit: int = DEFAULT_MACRO_CONTEXT_WATCH_LIMIT,
+    macro_context_last_checked_at: pd.Timestamp | None = None,
+    include_bhavcopy_context: bool = False,
+    bhavcopy_context_limit: int = DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT,
+    bhavcopy_context_last_checked_at: pd.Timestamp | None = None,
+    max_ingest_targets: int | None = None,
 ) -> dict[str, object]:
     watchlist = load_watchlist(asof_date=asof_date, symbols=symbols, setup_ids=setup_ids)
     market_context_watchlist = (
@@ -528,6 +1609,51 @@ def run_announcement_ingest(
         if include_market_context
         else pd.DataFrame()
     )
+    theme_context_watchlist = (
+        load_theme_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=theme_context_limit,
+            last_checked_at=theme_context_last_checked_at,
+        )
+        if include_theme_context
+        else pd.DataFrame()
+    )
+    announcement_context_watchlist = (
+        load_announcement_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=announcement_context_limit,
+            last_checked_at=announcement_context_last_checked_at,
+            lookback_days=announcement_context_lookback_days,
+        )
+        if include_announcement_context
+        else pd.DataFrame()
+    )
+    macro_context_watchlist = (
+        load_macro_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=macro_context_limit,
+            last_checked_at=macro_context_last_checked_at,
+        )
+        if include_macro_context
+        else pd.DataFrame()
+    )
+    bhavcopy_context_watchlist = (
+        load_bhavcopy_context_watchlist(
+            asof_date=asof_date,
+            symbols=symbols,
+            limit=bhavcopy_context_limit,
+            last_checked_at=bhavcopy_context_last_checked_at,
+        )
+        if include_bhavcopy_context
+        else pd.DataFrame()
+    )
+    watchlist = merge_watch_targets(watchlist, announcement_context_watchlist)
+    watchlist = merge_watch_targets(watchlist, theme_context_watchlist)
+    watchlist = merge_watch_targets(watchlist, bhavcopy_context_watchlist)
+    watchlist = merge_watch_targets(watchlist, macro_context_watchlist)
     watchlist = merge_watch_targets(watchlist, market_context_watchlist)
     if watchlist.empty:
         return {
@@ -535,7 +1661,27 @@ def run_announcement_ingest(
             "effective_to": pd.to_datetime(to_date or pd.Timestamp.utcnow(), utc=True, errors="coerce"),
             "docs_by_company": {},
             "last_published_by_company": {},
-            "meta": {"watch_count": 0, "unique_ingest_targets": 0, "ingest_runs": []},
+            "meta": {
+                "watch_count": 0,
+                "unique_ingest_targets": 0,
+                "market_context_enabled": bool(include_market_context),
+                "market_context_limit": int(market_context_limit),
+                "market_context_watch_count": int(len(market_context_watchlist)),
+                "theme_context_enabled": bool(include_theme_context),
+                "theme_context_limit": int(theme_context_limit),
+                "theme_context_watch_count": int(len(theme_context_watchlist)),
+                "announcement_context_enabled": bool(include_announcement_context),
+                "announcement_context_limit": int(announcement_context_limit),
+                "announcement_context_watch_count": int(len(announcement_context_watchlist)),
+                "announcement_context_lookback_days": int(announcement_context_lookback_days),
+                "macro_context_enabled": bool(include_macro_context),
+                "macro_context_limit": int(macro_context_limit),
+                "macro_context_watch_count": int(len(macro_context_watchlist)),
+                "bhavcopy_context_enabled": bool(include_bhavcopy_context),
+                "bhavcopy_context_limit": int(bhavcopy_context_limit),
+                "bhavcopy_context_watch_count": int(len(bhavcopy_context_watchlist)),
+                "ingest_runs": [],
+            },
         }
 
     pipeline = ManagedAnnouncementPipeline()
@@ -545,11 +1691,47 @@ def run_announcement_ingest(
     ingest_runs: list[dict[str, object]] = []
     watchlist, unique_ingest_targets = _prepare_watchlist_for_ingest(watchlist, effective_to=effective_to)
     total_targets = int(len(unique_ingest_targets))
+    effective_max_ingest_targets = int(max_ingest_targets or 0)
+    skipped_ingest_target_count = 0
+    original_watch_count = int(len(watchlist))
+    if effective_max_ingest_targets > 0 and total_targets > effective_max_ingest_targets:
+        unique_ingest_targets = (
+            unique_ingest_targets
+            .sort_values(["published_from", "symbol"], ascending=[True, True], na_position="first")
+            .head(effective_max_ingest_targets)
+            .reset_index(drop=True)
+        )
+        def _target_key(company_master_id: object, symbol: object) -> tuple[str, str]:
+            company_text = "" if pd.isna(company_master_id) else str(company_master_id or "").strip()
+            symbol_text = "" if pd.isna(symbol) else str(symbol or "").strip().upper()
+            return company_text, symbol_text
+
+        selected_pairs = {
+            _target_key(row.company_master_id, row.symbol)
+            for row in unique_ingest_targets.itertuples(index=False)
+        }
+        watchlist = watchlist[
+            watchlist.apply(
+                lambda row: _target_key(row.get("company_master_id"), row.get("symbol")) in selected_pairs,
+                axis=1,
+            )
+        ].copy()
+        skipped_ingest_target_count = total_targets - int(len(unique_ingest_targets))
+        _emit_progress(
+            "[advisory.announcement_watch] ingest target cap applied "
+            f"max_ingest_targets={effective_max_ingest_targets} total_targets={total_targets} "
+            f"processed_targets={len(unique_ingest_targets)} skipped_targets={skipped_ingest_target_count}"
+        )
+    processed_targets = int(len(unique_ingest_targets))
     docs_by_company: dict[str, pd.DataFrame] = {}
     last_published_by_company: dict[str, pd.Timestamp | None] = {}
+    unresolved_ingest_target_count = 0
+    document_lookup_failed_count = 0
+    managed_ingest_failed_count = 0
 
     for position, target in enumerate(unique_ingest_targets.itertuples(index=False), start=1):
-        company_master_id = str(target.company_master_id or "")
+        raw_company_master_id = target.company_master_id
+        company_master_id = "" if pd.isna(raw_company_master_id) else str(raw_company_master_id or "").strip()
         symbol = str(target.symbol or "").upper()
         published_from = pd.to_datetime(target.published_from, utc=True, errors="coerce")
         published_to = effective_to
@@ -557,12 +1739,60 @@ def run_announcement_ingest(
         _emit_progress(
             f"[advisory.announcement_watch] ingest {position}/{total_targets} symbol={symbol} from={published_from.date()} to={published_to.date()} watch_rows={int(target.watch_rows)}"
         )
-        summary = pipeline.ingest_date_range(
-            ticker=symbol,
-            from_date=published_from.date(),
-            to_date=published_to.date(),
-            exchanges=["NSE"],
-        )
+        try:
+            summary = pipeline.ingest_date_range(
+                ticker=symbol,
+                from_date=published_from.date(),
+                to_date=published_to.date(),
+                exchanges=["NSE"],
+            )
+        except Exception as exc:
+            managed_ingest_failed_count += 1
+            issue = {
+                "ticker": symbol,
+                "issue_type": "announcement_managed_ingest_target_failed",
+                "severity": "warn",
+                "message": f"Announcement managed ingest failed before returning a summary: {type(exc).__name__}: {exc}",
+                "company_master_id": company_master_id,
+            }
+            ingest_runs.append(
+                {
+                    "symbol": symbol,
+                    "company_master_id": company_master_id,
+                    "requested": 0,
+                    "discovered": 0,
+                    "downloaded": 0,
+                    "ocred": 0,
+                    "categorized": 0,
+                    "parsed": 0,
+                    "skipped": 0,
+                    "failed": 1,
+                    "issue_count": 1,
+                    "issues": [issue],
+                    "elapsed_seconds": round(time.monotonic() - target_started, 4),
+                }
+            )
+            record_local_fallback_event(
+                module="advisory.announcement_watch",
+                fallback_type="announcement_watch_managed_ingest_target_failed",
+                source="data.announcements.managed_pipeline",
+                severity="warn",
+                symbol=symbol,
+                reason=(
+                    "Announcement watcher managed ingest failed for one target before returning a summary; "
+                    "the batch continues, but this symbol may use stale or missing announcement evidence."
+                ),
+                error=exc,
+                metadata={
+                    "company_master_id": company_master_id,
+                    "published_from": published_from.isoformat() if hasattr(published_from, "isoformat") else str(published_from),
+                    "published_to": published_to.isoformat() if hasattr(published_to, "isoformat") else str(published_to),
+                },
+            )
+            _emit_progress(
+                f"[advisory.announcement_watch] ingest failed symbol={symbol} error={type(exc).__name__}: {exc}"
+            )
+            continue
         ingest_runs.append(
             {
                 "symbol": symbol,
@@ -575,18 +1805,64 @@ def run_announcement_ingest(
                 "parsed": summary.parsed,
                 "skipped": summary.skipped,
                 "failed": summary.failed,
+                "issue_count": getattr(summary, "issue_count", 0),
+                "issues": getattr(summary, "issues", []),
                 "elapsed_seconds": round(time.monotonic() - target_started, 4),
             }
         )
+        if not company_master_id:
+            unresolved_ingest_target_count += 1
+            _emit_progress(
+                f"[advisory.announcement_watch] ingest skipped document lookup symbol={symbol} reason=missing_company_master_id"
+            )
+            continue
         _emit_progress(
             f"[advisory.announcement_watch] ingest done symbol={symbol} elapsed={time.monotonic() - target_started:.2f}s discovered={summary.discovered} parsed={summary.parsed} failed={summary.failed}"
         )
 
-        docs = load_documents_for_company(
-            company_master_id,
-            published_from=published_from,
-            published_to=published_to,
-        )
+        try:
+            docs = load_documents_for_company(
+                company_master_id,
+                published_from=published_from,
+                published_to=published_to,
+            )
+        except Exception as exc:
+            document_lookup_failed_count += 1
+            issue = {
+                "ticker": symbol,
+                "issue_type": "announcement_document_lookup_failed",
+                "severity": "warn",
+                "message": f"Announcement document history lookup failed: {type(exc).__name__}: {exc}",
+                "company_master_id": company_master_id,
+            }
+            ingest_runs[-1]["failed"] = int(ingest_runs[-1].get("failed") or 0) + 1
+            ingest_runs[-1]["issue_count"] = int(ingest_runs[-1].get("issue_count") or 0) + 1
+            issues = ingest_runs[-1].get("issues")
+            if not isinstance(issues, list):
+                issues = []
+                ingest_runs[-1]["issues"] = issues
+            issues.append(issue)
+            record_local_fallback_event(
+                module="advisory.announcement_watch",
+                fallback_type="announcement_watch_document_lookup_failed",
+                source="announcement_pipeline_documents",
+                severity="warn",
+                symbol=symbol,
+                reason=(
+                    "Announcement watcher could not load persisted document history for one target; "
+                    "the batch continues, but watch-event matching may miss fresh announcement evidence for this symbol."
+                ),
+                error=exc,
+                metadata={
+                    "company_master_id": company_master_id,
+                    "published_from": published_from.isoformat() if hasattr(published_from, "isoformat") else str(published_from),
+                    "published_to": published_to.isoformat() if hasattr(published_to, "isoformat") else str(published_to),
+                },
+            )
+            _emit_progress(
+                f"[advisory.announcement_watch] ingest document lookup failed symbol={symbol} error={type(exc).__name__}: {exc}"
+            )
+            continue
         docs_by_company[company_master_id] = docs
         last_published_by_company[company_master_id] = (
             docs["published_on"].max() if not docs.empty else None
@@ -599,12 +1875,34 @@ def run_announcement_ingest(
         "last_published_by_company": last_published_by_company,
         "meta": {
             "watch_count": int(len(watchlist)),
-            "unique_ingest_targets": total_targets,
+            "total_watch_count": int(original_watch_count),
+            "unique_ingest_targets": processed_targets,
+            "total_ingest_targets": total_targets,
+            "processed_ingest_targets": processed_targets,
+            "skipped_ingest_target_count": int(skipped_ingest_target_count),
+            "max_ingest_targets": int(effective_max_ingest_targets),
             "initial_lookback_days": INITIAL_INGEST_LOOKBACK_DAYS,
             "market_context_enabled": bool(include_market_context),
             "market_context_limit": int(market_context_limit),
             "market_context_watch_count": int(len(market_context_watchlist)),
+            "theme_context_enabled": bool(include_theme_context),
+            "theme_context_limit": int(theme_context_limit),
+            "theme_context_watch_count": int(len(theme_context_watchlist)),
+            "announcement_context_enabled": bool(include_announcement_context),
+            "announcement_context_limit": int(announcement_context_limit),
+            "announcement_context_watch_count": int(len(announcement_context_watchlist)),
+            "announcement_context_lookback_days": int(announcement_context_lookback_days),
+            "macro_context_enabled": bool(include_macro_context),
+            "macro_context_limit": int(macro_context_limit),
+            "macro_context_watch_count": int(len(macro_context_watchlist)),
+            "bhavcopy_context_enabled": bool(include_bhavcopy_context),
+            "bhavcopy_context_limit": int(bhavcopy_context_limit),
+            "bhavcopy_context_watch_count": int(len(bhavcopy_context_watchlist)),
             "capped_watch_rows": int(pd.Series(watchlist["published_from_capped"]).fillna(False).astype(bool).sum()),
+            "unresolved_ingest_target_count": int(unresolved_ingest_target_count),
+            "unresolved_watch_row_count": int(watchlist["company_master_id"].astype("string").fillna("").str.strip().eq("").sum()),
+            "document_lookup_failed_count": int(document_lookup_failed_count),
+            "managed_ingest_failed_count": int(managed_ingest_failed_count),
             "ingest_runs": ingest_runs,
         },
     }
@@ -719,6 +2017,20 @@ def run_announcement_watch(
     include_market_context: bool = False,
     market_context_limit: int = DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
     market_context_last_checked_at: pd.Timestamp | None = None,
+    include_theme_context: bool = False,
+    theme_context_limit: int = DEFAULT_THEME_CONTEXT_WATCH_LIMIT,
+    theme_context_last_checked_at: pd.Timestamp | None = None,
+    include_announcement_context: bool = False,
+    announcement_context_limit: int = DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT,
+    announcement_context_last_checked_at: pd.Timestamp | None = None,
+    announcement_context_lookback_days: int = DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS,
+    include_macro_context: bool = False,
+    macro_context_limit: int = DEFAULT_MACRO_CONTEXT_WATCH_LIMIT,
+    macro_context_last_checked_at: pd.Timestamp | None = None,
+    include_bhavcopy_context: bool = False,
+    bhavcopy_context_limit: int = DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT,
+    bhavcopy_context_last_checked_at: pd.Timestamp | None = None,
+    max_ingest_targets: int | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
     ingest_state = run_announcement_ingest(
         asof_date=asof_date,
@@ -728,6 +2040,20 @@ def run_announcement_watch(
         include_market_context=include_market_context,
         market_context_limit=market_context_limit,
         market_context_last_checked_at=market_context_last_checked_at,
+        include_theme_context=include_theme_context,
+        theme_context_limit=theme_context_limit,
+        theme_context_last_checked_at=theme_context_last_checked_at,
+        include_announcement_context=include_announcement_context,
+        announcement_context_limit=announcement_context_limit,
+        announcement_context_last_checked_at=announcement_context_last_checked_at,
+        announcement_context_lookback_days=announcement_context_lookback_days,
+        include_macro_context=include_macro_context,
+        macro_context_limit=macro_context_limit,
+        macro_context_last_checked_at=macro_context_last_checked_at,
+        include_bhavcopy_context=include_bhavcopy_context,
+        bhavcopy_context_limit=bhavcopy_context_limit,
+        bhavcopy_context_last_checked_at=bhavcopy_context_last_checked_at,
+        max_ingest_targets=max_ingest_targets,
     )
     watch_update_df, events_df, match_meta = build_watch_updates_from_ingest(ingest_state)
     meta = dict(ingest_state.get("meta") or {})
@@ -741,20 +2067,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbols", nargs="*", help="Optional symbols")
     parser.add_argument("--setup", dest="setup_ids", nargs="*", help="Optional setup ids")
     parser.add_argument("--to-date", type=parse_datetime_arg, help="End date in YYYY-MM-DD")
+    parser.add_argument("--max-ingest-targets", type=int, default=None, help="Maximum unique company/symbol ingest targets to process in this run. Skipped targets remain due for later runs.")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
 def summarize(watchlist_updates: pd.DataFrame, events: pd.DataFrame, meta: dict[str, object]) -> dict[str, object]:
+    ingest_runs = meta.get("ingest_runs", [])
+    ingest_rows = ingest_runs if isinstance(ingest_runs, list) else []
+    ingest_failed_count = sum(int(row.get("failed") or 0) for row in ingest_rows if isinstance(row, dict))
+    ingest_issue_count = sum(int(row.get("issue_count") or 0) for row in ingest_rows if isinstance(row, dict))
     return {
         "status": "ok",
         "watchlist_table": WATCHLIST_TABLE,
         "events_table": EVENTS_TABLE,
         "watch_count": meta.get("watch_count", 0),
+        "watch_update_count": int(len(watchlist_updates)),
         "event_count": int(len(events)),
         "triggered_event_count": meta.get("triggered_event_count", 0),
         "context_observed_count": meta.get("context_observed_count", 0),
-        "ingest_runs": meta.get("ingest_runs", []),
+        "unique_ingest_targets": meta.get("unique_ingest_targets", 0),
+        "total_ingest_targets": meta.get("total_ingest_targets", meta.get("unique_ingest_targets", 0)),
+        "processed_ingest_targets": meta.get("processed_ingest_targets", meta.get("unique_ingest_targets", 0)),
+        "skipped_ingest_target_count": meta.get("skipped_ingest_target_count", 0),
+        "max_ingest_targets": meta.get("max_ingest_targets", 0),
+        "unresolved_ingest_target_count": meta.get("unresolved_ingest_target_count", 0),
+        "unresolved_watch_row_count": meta.get("unresolved_watch_row_count", 0),
+        "managed_ingest_failed_count": meta.get("managed_ingest_failed_count", 0),
+        "document_lookup_failed_count": meta.get("document_lookup_failed_count", 0),
+        "ingest_failed_count": int(ingest_failed_count),
+        "ingest_issue_count": int(ingest_issue_count),
+        "ingest_runs": ingest_rows,
         "event_sample": events.head(10).to_dict(orient="records") if not events.empty else [],
     }
 
@@ -768,6 +2111,7 @@ def main() -> int:
         symbols=args.symbols,
         setup_ids=args.setup_ids,
         to_date=to_date,
+        max_ingest_targets=args.max_ingest_targets,
     )
     if not args.dry_run:
         persist_watch_outputs(watchlist_updates, events)

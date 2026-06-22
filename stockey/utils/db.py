@@ -548,6 +548,25 @@ def _upsert_to_db_once(
         temporary=True,
     )
 
+    def load_destination_column_types(cur) -> dict[str, str]:
+        schema_name, base_table_name = (
+            table_name.split(".", 1) if "." in table_name else ("public", table_name)
+        )
+        cur.execute(
+            """
+            SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod)
+            FROM pg_attribute a
+            JOIN pg_class t ON t.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            WHERE n.nspname = %s
+              AND t.relname = %s
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            """,
+            (schema_name, base_table_name),
+        )
+        return {str(name): str(pg_type) for name, pg_type in cur.fetchall()}
+
     def has_matching_unique_index(cur) -> bool:
         schema_name, base_table_name = (
             table_name.split(".", 1) if "." in table_name else ("public", table_name)
@@ -606,6 +625,7 @@ def _upsert_to_db_once(
                         sql.SQL(pandas_to_postgres_type(dtype)),
                     )
                 )
+            destination_column_types = load_destination_column_types(cur)
             cur.execute(create_temp_sql)
 
             # 2. COPY data into temp. Use a local temp file instead of keeping
@@ -643,16 +663,31 @@ def _upsert_to_db_once(
                 )
 
             # 4. UPSERT
+            select_expressions = []
+            for col in cols:
+                destination_type = destination_column_types.get(col)
+                if destination_type:
+                    select_expressions.append(
+                        sql.SQL("{}::{} AS {}").format(
+                            sql.Identifier(col),
+                            sql.SQL(destination_type),
+                            sql.Identifier(col),
+                        )
+                    )
+                else:
+                    select_expressions.append(sql.Identifier(col))
+
             insert_sql = sql.SQL(
                 """
                 INSERT INTO {dest} ({cols})
-                SELECT {cols} FROM {src}
+                SELECT {select_cols} FROM {src}
                 ON CONFLICT ({conflict_cols}) {on_conflict}
                 """
             ).format(
                 dest=full_table,
                 src=temp_table,
                 cols=sql.SQL(", ").join(col_identifiers),
+                select_cols=sql.SQL(", ").join(select_expressions),
                 conflict_cols=sql.SQL(", ").join(conflict_identifiers),
                 on_conflict=on_conflict,
             )

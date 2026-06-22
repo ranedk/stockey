@@ -32,6 +32,7 @@ class StageFeatureDependency:
     input_keys: tuple[str, ...]
     gate_effect: str
     block_positive_actions: bool = False
+    context_input_keys: tuple[str, ...] = ()
 
 
 FEATURE_INPUT_SPECS: tuple[FeatureInputSpec, ...] = (
@@ -43,6 +44,11 @@ FEATURE_INPUT_SPECS: tuple[FeatureInputSpec, ...] = (
     FeatureInputSpec("exchange_features", "Exchange Features", "advisory_exchange_features_daily", "asof_date", max_age_days=10, purpose="Corporate actions, deals, insider, short-selling, and exchange event features."),
     FeatureInputSpec("bhavcopy_evidence", "Bhavcopy Evidence", "advisory_bhavcopy_evidence_daily", "asof_date", max_age_days=10, purpose="Liquidity, circuit, participation, deal, short, and margin evidence."),
     FeatureInputSpec("announcement_evidence", "Announcement Evidence", "advisory_announcement_evidence", "published_on", max_age_days=30, purpose="Compact corporate announcement evidence available to LLM/event policy."),
+    FeatureInputSpec("announcement_context_overlay", "Announcement Context Overlay", "advisory_announcement_context_overlays", "published_on", max_age_days=30, purpose="Review-only direct announcement pressure used for watch/de-risk context."),
+    FeatureInputSpec("bhavcopy_context_overlay", "Bhavcopy Context Overlay", "advisory_bhavcopy_context_overlays", "asof_date", max_age_days=10, purpose="Review-only bhavcopy pressure used for watch/de-risk context."),
+    FeatureInputSpec("exchange_context_overlay", "Exchange Context Overlay", "advisory_exchange_context_overlays", "known_on", max_age_days=10, purpose="Review-only exchange-event pressure used for watch/de-risk context."),
+    FeatureInputSpec("news_theme_context_overlay", "News Theme Context Overlay", "advisory_news_theme_context_overlays", "asof_date", symbol_column=None, max_age_days=7, scope="global", purpose="Review-only sector/theme news pressure mapped into watch context."),
+    FeatureInputSpec("macro_context_overlay", "Macro Context Overlay", "advisory_macro_context_overlays", "asof_date", symbol_column=None, max_age_days=14, scope="global", purpose="Review-only macro pressure mapped into watch/de-risk context."),
     FeatureInputSpec("company_memory", "Company Memory Review", "advisory_company_memory_reviews", "review_date", max_age_days=14, purpose="LLM/deterministic company-memory review input; never final execution authority."),
 )
 FEATURE_INPUT_SPECS_BY_KEY = {spec.key: spec for spec in FEATURE_INPUT_SPECS}
@@ -72,6 +78,18 @@ STAGE_FEATURE_DEPENDENCIES: tuple[StageFeatureDependency, ...] = (
         input_keys=("daily_ohlcv", "technical_daily"),
         gate_effect="Positive broker-capable actions become MANUAL_REVIEW when required inputs are blocked; exits and risk-reduction rows remain visible.",
         block_positive_actions=True,
+    ),
+    StageFeatureDependency(
+        stage="company_memory",
+        input_keys=("daily_ohlcv", "technical_daily", "announcement_evidence", "bhavcopy_evidence"),
+        context_input_keys=(
+            "announcement_context_overlay",
+            "bhavcopy_context_overlay",
+            "exchange_context_overlay",
+            "news_theme_context_overlay",
+            "macro_context_overlay",
+        ),
+        gate_effect="Company-memory rows remain review-input only; required stale inputs lower confidence, while context-overlay inputs are reported as non-blocking evidence freshness.",
     ),
 )
 STAGE_FEATURE_DEPENDENCIES_BY_STAGE = {item.stage: item for item in STAGE_FEATURE_DEPENDENCIES}
@@ -336,6 +354,7 @@ def evaluate_stage_feature_gate(stage: str, symbols: list[str] | None, *, asof_d
             "symbols_checked": 0,
             "blocked_symbols": [],
             "required_input_keys": [],
+            "context_input_keys": [],
             "gate_effect": "No explicit feature dependency contract is configured for this stage.",
         }
     if not normalized_symbols:
@@ -346,13 +365,14 @@ def evaluate_stage_feature_gate(stage: str, symbols: list[str] | None, *, asof_d
             "symbols_checked": 0,
             "blocked_symbols": [],
             "required_input_keys": list(dependency.input_keys),
+            "context_input_keys": list(dependency.context_input_keys),
             "gate_effect": dependency.gate_effect,
             "block_positive_actions": dependency.block_positive_actions,
         }
     summaries: dict[str, dict[str, Any]] = {}
     blocked_symbols: list[str] = []
     for symbol in normalized_symbols:
-        symbol_summary = {"status": "ok", "counts": {}, "blockers": [], "required_inputs": []}
+        symbol_summary = {"status": "ok", "counts": {}, "blockers": [], "required_inputs": [], "context_inputs": []}
         for input_key in dependency.input_keys:
             spec = FEATURE_INPUT_SPECS_BY_KEY.get(input_key)
             if spec is None:
@@ -380,6 +400,33 @@ def evaluate_stage_feature_gate(stage: str, symbols: list[str] | None, *, asof_d
             symbol_summary["required_inputs"].append(compact)
             if status in {"missing", "stale", "error"}:
                 symbol_summary["blockers"].append(compact)
+        for input_key in dependency.context_input_keys:
+            spec = FEATURE_INPUT_SPECS_BY_KEY.get(input_key)
+            if spec is None:
+                compact = {
+                    "input_key": input_key,
+                    "label": input_key,
+                    "status": "error",
+                    "reason": "feature_input_spec_missing",
+                    "required": False,
+                    "blocking": False,
+                }
+            else:
+                row = evaluate_feature_input(spec, symbol=symbol, asof_date=asof_date)
+                compact = {
+                    "input_key": row.get("input_key"),
+                    "label": row.get("label"),
+                    "status": row.get("status"),
+                    "reason": row.get("reason"),
+                    "latest_at": row.get("latest_at"),
+                    "age_days": row.get("age_days"),
+                    "required": False,
+                    "blocking": False,
+                }
+            status = str(compact.get("status") or "unknown")
+            counts = symbol_summary["counts"]
+            counts[f"context_{status}"] = counts.get(f"context_{status}", 0) + 1
+            symbol_summary["context_inputs"].append(compact)
         if symbol_summary["blockers"]:
             symbol_summary["status"] = "blocked"
             blocked_symbols.append(symbol)
@@ -392,6 +439,7 @@ def evaluate_stage_feature_gate(stage: str, symbols: list[str] | None, *, asof_d
         "blocked_symbols": blocked_symbols,
         "blocked_count": len(blocked_symbols),
         "required_input_keys": list(dependency.input_keys),
+        "context_input_keys": list(dependency.context_input_keys),
         "gate_effect": dependency.gate_effect,
         "block_positive_actions": dependency.block_positive_actions,
         "symbols": summaries,

@@ -9,6 +9,11 @@ from environs import Env
 from pydantic import BaseModel, Field
 
 from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
+from advisory.event_evidence_store import ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE, BHAVCOPY_CONTEXT_OVERLAYS_TABLE
+from advisory.exchange_context_overlays import EXCHANGE_CONTEXT_OVERLAYS_TABLE
+from advisory.macro_context_overlays import MACRO_CONTEXT_OVERLAYS_TABLE
+from advisory.news_theme_engine import THEME_CONTEXT_OVERLAYS_TABLE
+from advisory.causal_event_memory import TABLE_NAME as CAUSAL_EVENT_MEMORY_TABLE
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.codex_cli import run_codex_structured
@@ -38,9 +43,18 @@ PROMPT_SCHEMA_VERSION = response_schema_version(PROMPT_ID)
 DEFAULT_MODEL = env("COMPANY_MEMORY_REVIEW_MODEL", default=env("CODEX_CLI_MODEL", default="gpt-5.4-mini"))
 DEFAULT_MAX_SYMBOLS = env.int("COMPANY_MEMORY_REVIEW_MAX_SYMBOLS", default=12)
 DEFAULT_LOOKBACK_DAYS = env.int("COMPANY_MEMORY_REVIEW_LOOKBACK_DAYS", default=180)
+DEFAULT_CONTEXT_OVERLAY_LOOKBACK_DAYS = env.int("COMPANY_MEMORY_CONTEXT_OVERLAY_LOOKBACK_DAYS", default=90)
+DEFAULT_CAUSAL_EVENT_MEMORY_LOOKBACK_DAYS = env.int("COMPANY_MEMORY_CAUSAL_EVENT_MEMORY_LOOKBACK_DAYS", default=90)
 LLM_ENABLED = env.bool("COMPANY_MEMORY_REVIEW_LLM_ENABLED", default=False)
 
 SIGNALS = {"BUY", "BUY_MORE", "HOLD", "WATCH", "SELL_PARTIAL", "SELL", "NO_ACTION"}
+CONTEXT_RELIABILITY_SUPPRESS_CLASSES = {
+    "hurts_or_no_lift",
+    "negative_after_cost",
+    "inconsistent_or_horizon_sensitive",
+    "needs_benchmark_attribution",
+    "benchmark_beta_not_overlay_alpha",
+}
 COMPANY_MEMORY_SCHEMA_STATEMENTS = [
     f"""
     CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -193,6 +207,32 @@ def table_exists(table_name: str) -> bool:
     return not df.empty
 
 
+def table_columns(table_name: str) -> set[str]:
+    try:
+        df = sql_to_df(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            params=(table_name,),
+            retries=2,
+            statement_timeout_ms=5000,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_source_columns_lookup_failed",
+            source=table_name,
+            severity="warn",
+            reason="Company-memory context could not inspect optional source columns and will use required columns only.",
+            error=exc,
+        )
+        return set()
+    return set(df["column_name"].astype(str).tolist()) if not df.empty and "column_name" in df.columns else set()
+
+
 def ensure_table() -> None:
     apply_schema_migration(
         migration_id=COMPANY_MEMORY_SCHEMA_MIGRATION_ID,
@@ -273,13 +313,18 @@ def _load_table_rows(
     asof_date: pd.Timestamp,
     date_column: str,
     columns: list[str],
+    optional_columns: list[str] | None = None,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
     limit: int = 8,
 ) -> pd.DataFrame:
     if not table_exists(table_name):
         return pd.DataFrame()
     start_date = asof_date - pd.Timedelta(days=max(1, int(lookback_days)))
-    column_sql = ", ".join(columns)
+    selected_columns = list(columns)
+    if optional_columns:
+        available = table_columns(table_name)
+        selected_columns.extend([column for column in optional_columns if column in available and column not in selected_columns])
+    column_sql = ", ".join(selected_columns)
     try:
         return sql_to_df(
             f"""
@@ -364,6 +409,771 @@ def _load_wait_signal_rows(
         return pd.DataFrame()
 
 
+def _load_company_context_overlay_rows(
+    table_name: str,
+    *,
+    source_name: str,
+    symbol: str,
+    asof_date: pd.Timestamp,
+    date_column: str,
+    class_column: str | None = None,
+    reason_column: str = "watch_reason_detail",
+    lookback_days: int = DEFAULT_CONTEXT_OVERLAY_LOOKBACK_DAYS,
+    limit: int = 8,
+) -> pd.DataFrame:
+    if not table_exists(table_name):
+        return pd.DataFrame()
+    available = table_columns(table_name)
+    required = {"symbol", date_column, "direction"}
+    if not required.issubset(available):
+        return pd.DataFrame()
+    selected = [
+        f"{date_column} AS observed_at",
+        "%(source_name)s::TEXT AS context_source",
+        "overlay_id",
+        "symbol",
+        "direction",
+    ]
+    if "pressure_score" in available:
+        selected.append("pressure_score")
+    if class_column and class_column in available:
+        selected.append(f"{class_column} AS context_class")
+    else:
+        selected.append("NULL::TEXT AS context_class")
+    if reason_column in available:
+        selected.append(f"{reason_column} AS context_reason")
+    else:
+        selected.append("NULL::TEXT AS context_reason")
+    for column in [
+        "authority_scope",
+        "production_status",
+        "matched_sources_json",
+        "source_reliability",
+        "confidence",
+        "materiality",
+        "evidence_score",
+        "deal_pressure",
+        "event_type",
+        "event_side",
+    ]:
+        if column in available and column not in selected:
+            selected.append(column)
+    start_date = asof_date - pd.Timedelta(days=max(1, int(lookback_days)))
+    production_filter = "AND LOWER(COALESCE(production_status, 'active')) = 'active'" if "production_status" in available else ""
+    pressure_order = "ABS(COALESCE(pressure_score, 0.0))" if "pressure_score" in available else "0.0"
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT {", ".join(selected)}
+            FROM {table_name}
+            WHERE UPPER(TRIM(symbol)) = %(symbol)s
+              AND {date_column} <= %(asof_date)s
+              AND {date_column} >= %(start_date)s
+              {production_filter}
+            ORDER BY {date_column} DESC, {pressure_order} DESC
+            LIMIT %(limit)s
+            """,
+            params={
+                "source_name": source_name,
+                "symbol": symbol.upper(),
+                "asof_date": asof_date,
+                "start_date": start_date,
+                "limit": max(1, int(limit)),
+            },
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_context_overlay_rows_load_failed",
+            source=table_name,
+            severity="warn",
+            symbol=symbol.upper(),
+            reason="Company-memory context skipped context-overlay rows because source loading failed.",
+            error=exc,
+            metadata={
+                "context_source": source_name,
+                "date_column": date_column,
+                "lookback_days": int(lookback_days),
+                "limit": max(1, int(limit)),
+            },
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["observed_at"] = pd.to_datetime(df["observed_at"], utc=True, errors="coerce")
+    if "pressure_score" in df.columns:
+        df["pressure_score"] = pd.to_numeric(df["pressure_score"], errors="coerce")
+    return df
+
+
+def _sector_code_from_context(symbol_context: dict[str, Any] | None) -> str | None:
+    context = symbol_context if isinstance(symbol_context, dict) else {}
+    for row in context.get("technical") or []:
+        if not isinstance(row, dict):
+            continue
+        text = _text(row.get("sector_code"))
+        if text:
+            return text.upper()
+    return None
+
+
+def _load_company_sector_context_overlay_rows(
+    table_name: str,
+    *,
+    source_name: str,
+    symbol: str,
+    sector_code: str | None,
+    asof_date: pd.Timestamp,
+    date_column: str = "asof_date",
+    class_column: str | None = None,
+    reason_column: str = "theme_reason",
+    lookback_days: int = DEFAULT_CONTEXT_OVERLAY_LOOKBACK_DAYS,
+    limit: int = 8,
+) -> pd.DataFrame:
+    if not sector_code or not table_exists(table_name):
+        return pd.DataFrame()
+    available = table_columns(table_name)
+    required = {"sector_code", date_column, "direction"}
+    if not required.issubset(available):
+        return pd.DataFrame()
+    selected = [
+        f"{date_column} AS observed_at",
+        "%(source_name)s::TEXT AS context_source",
+        "overlay_id",
+        "%(symbol)s::TEXT AS symbol",
+        "sector_code",
+        "sector_name" if "sector_name" in available else "NULL::TEXT AS sector_name",
+        "direction",
+    ]
+    if "pressure_score" in available:
+        selected.append("pressure_score")
+    if class_column and class_column in available:
+        selected.append(f"{class_column} AS context_class")
+    else:
+        selected.append("NULL::TEXT AS context_class")
+    if reason_column in available:
+        selected.append(f"{reason_column} AS context_reason")
+    elif "trigger_reason" in available:
+        selected.append("trigger_reason AS context_reason")
+    else:
+        selected.append("NULL::TEXT AS context_reason")
+    for column in [
+        "authority_scope",
+        "production_status",
+        "matched_sources_json",
+        "theme_intensity",
+        "macro_stress_score",
+        "macro_risk_state",
+        "risk_level",
+    ]:
+        if column in available and column not in selected:
+            selected.append(column)
+    start_date = asof_date - pd.Timedelta(days=max(1, int(lookback_days)))
+    production_filter = "AND LOWER(COALESCE(production_status, 'active')) = 'active'" if "production_status" in available else ""
+    pressure_order = "ABS(COALESCE(pressure_score, 0.0))" if "pressure_score" in available else "0.0"
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT {", ".join(selected)}
+            FROM {table_name}
+            WHERE UPPER(TRIM(sector_code)) = %(sector_code)s
+              AND {date_column} <= %(asof_date)s
+              AND {date_column} >= %(start_date)s
+              {production_filter}
+            ORDER BY {date_column} DESC, {pressure_order} DESC
+            LIMIT %(limit)s
+            """,
+            params={
+                "source_name": source_name,
+                "symbol": symbol.upper(),
+                "sector_code": sector_code.upper(),
+                "asof_date": asof_date,
+                "start_date": start_date,
+                "limit": max(1, int(limit)),
+            },
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_sector_context_overlay_rows_load_failed",
+            source=table_name,
+            severity="warn",
+            symbol=symbol.upper(),
+            reason="Company-memory context skipped sector-mapped context-overlay rows because source loading failed.",
+            error=exc,
+            metadata={
+                "context_source": source_name,
+                "sector_code": sector_code,
+                "date_column": date_column,
+                "lookback_days": int(lookback_days),
+                "limit": max(1, int(limit)),
+            },
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["observed_at"] = pd.to_datetime(df["observed_at"], utc=True, errors="coerce")
+    if "pressure_score" in df.columns:
+        df["pressure_score"] = pd.to_numeric(df["pressure_score"], errors="coerce")
+    return df
+
+
+def load_company_context_overlays(
+    *,
+    symbol: str,
+    asof_date: pd.Timestamp,
+    symbol_context: dict[str, Any] | None = None,
+    lookback_days: int = DEFAULT_CONTEXT_OVERLAY_LOOKBACK_DAYS,
+    limit_per_source: int = 8,
+) -> list[dict[str, Any]]:
+    symbol = symbol.strip().upper()
+    sector_code = _sector_code_from_context(symbol_context)
+    frames = [
+        _load_company_context_overlay_rows(
+            ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE,
+            source_name="announcement_context",
+            symbol=symbol,
+            asof_date=asof_date + pd.Timedelta(days=1),
+            date_column="published_on",
+            class_column="event_class",
+            lookback_days=lookback_days,
+            limit=limit_per_source,
+        ),
+        _load_company_context_overlay_rows(
+            EXCHANGE_CONTEXT_OVERLAYS_TABLE,
+            source_name="exchange_context",
+            symbol=symbol,
+            asof_date=asof_date,
+            date_column="asof_date",
+            class_column="event_type",
+            lookback_days=lookback_days,
+            limit=limit_per_source,
+        ),
+        _load_company_context_overlay_rows(
+            BHAVCOPY_CONTEXT_OVERLAYS_TABLE,
+            source_name="bhavcopy_context",
+            symbol=symbol,
+            asof_date=asof_date,
+            date_column="asof_date",
+            class_column="deal_pressure",
+            lookback_days=lookback_days,
+            limit=limit_per_source,
+        ),
+        _load_company_sector_context_overlay_rows(
+            THEME_CONTEXT_OVERLAYS_TABLE,
+            source_name="theme_context",
+            symbol=symbol,
+            sector_code=sector_code,
+            asof_date=asof_date,
+            class_column="theme_id",
+            reason_column="theme_reason",
+            lookback_days=lookback_days,
+            limit=limit_per_source,
+        ),
+        _load_company_sector_context_overlay_rows(
+            MACRO_CONTEXT_OVERLAYS_TABLE,
+            source_name="macro_context",
+            symbol=symbol,
+            sector_code=sector_code,
+            asof_date=asof_date,
+            class_column="macro_signal_id",
+            reason_column="trigger_reason",
+            lookback_days=lookback_days,
+            limit=limit_per_source,
+        ),
+    ]
+    frames = [frame for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if not frames:
+        return []
+    overlays = pd.concat(frames, ignore_index=True, sort=False)
+    if "pressure_score" in overlays.columns:
+        overlays = overlays.assign(_rank_pressure=overlays["pressure_score"].abs().fillna(0.0))
+    else:
+        overlays = overlays.assign(_rank_pressure=0.0)
+    overlays = overlays.sort_values(["observed_at", "_rank_pressure"], ascending=[False, False]).drop(columns=["_rank_pressure"], errors="ignore")
+    return _records(overlays, limit=max(1, int(limit_per_source) * 3))
+
+
+def _context_class_reliability(
+    source_family_reliability: dict[str, Any] | None,
+    source_family: Any,
+    context_class: Any,
+) -> dict[str, Any] | None:
+    families = _reliability_families(source_family_reliability)
+    family = str(source_family or "").strip()
+    target_class = str(context_class or "").strip().upper()
+    if not family or not target_class or target_class in {"<NA>", "NAN", "NONE"}:
+        return None
+    family_row = families.get(family)
+    if not isinstance(family_row, dict):
+        return None
+    for item in family_row.get("context_class_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("context_class") or "").strip().upper() != target_class:
+            continue
+        return {
+            **item,
+            "context_class": item.get("context_class") or target_class,
+            "source_family": family,
+            "authority_scope": "research_only",
+            "action_policy_effect": "annotation_only_no_trade_authority",
+            "broker_execution_allowed": False,
+        }
+    return None
+
+
+def _sector_key_from_values(*values: Any) -> str | None:
+    for value in values:
+        if pd.api.types.is_scalar(value) and pd.isna(value):
+            continue
+        text = str(value or "").strip()
+        if not text or text.upper() in {"<NA>", "NAN", "NONE"}:
+            continue
+        return "".join(ch for ch in text.upper() if ch.isalnum())
+    return None
+
+
+def _context_sector_reliability(
+    source_family_reliability: dict[str, Any] | None,
+    source_family: Any,
+    sector_name: Any,
+    sector_code: Any,
+) -> dict[str, Any] | None:
+    families = _reliability_families(source_family_reliability)
+    family = str(source_family or "").strip()
+    if not family:
+        return None
+    family_row = families.get(family)
+    if not isinstance(family_row, dict):
+        return None
+    target_keys = {
+        key
+        for key in [
+            _sector_key_from_values(sector_code),
+            _sector_key_from_values(sector_name),
+        ]
+        if key
+    }
+    if not target_keys:
+        return None
+    for item in family_row.get("sector_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        row_keys = {
+            key
+            for key in [
+                _sector_key_from_values(item.get("sector_code")),
+                _sector_key_from_values(item.get("sector_name")),
+                _sector_key_from_values(item.get("sector_key")),
+            ]
+            if key
+        }
+        if not target_keys & row_keys:
+            continue
+        return {
+            **item,
+            "source_family": family,
+            "authority_scope": "research_only",
+            "action_policy_effect": "annotation_only_no_trade_authority",
+            "broker_execution_allowed": False,
+        }
+    return None
+
+
+def _reliability_families(source_family_reliability: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(source_family_reliability, dict):
+        return {}
+    families = source_family_reliability.get("families")
+    if isinstance(families, dict):
+        return families
+    if isinstance(families, list):
+        return {
+            str(item.get("source_family")): item
+            for item in families
+            if isinstance(item, dict) and item.get("source_family")
+        }
+    return source_family_reliability
+
+
+def _runtime_contract_for_context_reliability(row: dict[str, Any] | None) -> dict[str, Any]:
+    from advisory.context_overlay_reliability_report import reliability_runtime_policy_contract
+
+    if not isinstance(row, dict):
+        return reliability_runtime_policy_contract(None)
+    contract = row.get("runtime_policy_contract")
+    if isinstance(contract, dict) and contract:
+        return contract
+    return reliability_runtime_policy_contract(row.get("classification"))
+
+
+def _runtime_contract_allows_context(
+    row: dict[str, Any] | None,
+    use_name: str,
+    *,
+    legacy_classification: str | None = None,
+) -> bool:
+    contract = _runtime_contract_for_context_reliability(row)
+    allowed = contract.get("allowed_runtime_uses")
+    if isinstance(allowed, dict) and use_name in allowed:
+        return bool(allowed.get(use_name))
+    classification = str((row or {}).get("classification") or legacy_classification or "").strip()
+    if use_name == "watch_priority":
+        return classification == "candidate_helpful"
+    if use_name == "de_risk_review":
+        return classification == "protective_candidate"
+    return False
+
+
+def _context_overlay_reliability_suppressed(item: dict[str, Any]) -> bool:
+    family_reliability = item.get("source_family_reliability") if isinstance(item.get("source_family_reliability"), dict) else {}
+    class_reliability = item.get("context_class_reliability") if isinstance(item.get("context_class_reliability"), dict) else {}
+    sector_reliability = item.get("context_sector_reliability") if isinstance(item.get("context_sector_reliability"), dict) else {}
+    family_classification = str(family_reliability.get("classification") or "").strip()
+    class_classification = str(class_reliability.get("classification") or "").strip()
+    sector_classification = str(sector_reliability.get("classification") or "").strip()
+    return (
+        family_classification in CONTEXT_RELIABILITY_SUPPRESS_CLASSES
+        or class_classification in CONTEXT_RELIABILITY_SUPPRESS_CLASSES
+        or sector_classification in CONTEXT_RELIABILITY_SUPPRESS_CLASSES
+    )
+
+
+def _context_overlay_runtime_effect_allowed(item: dict[str, Any], direction: str) -> bool:
+    family_reliability = item.get("source_family_reliability") if isinstance(item.get("source_family_reliability"), dict) else {}
+    class_reliability = item.get("context_class_reliability") if isinstance(item.get("context_class_reliability"), dict) else {}
+    if not family_reliability:
+        return True
+    if direction in {"positive", "watch"}:
+        return _runtime_contract_allows_context(
+            family_reliability,
+            "watch_priority",
+            legacy_classification=str(family_reliability.get("classification") or "").strip(),
+        )
+    if direction == "negative":
+        family_allows = _runtime_contract_allows_context(
+            family_reliability,
+            "de_risk_review",
+            legacy_classification=str(family_reliability.get("classification") or "").strip(),
+        )
+        class_allows = bool(
+            class_reliability
+            and _runtime_contract_allows_context(
+                class_reliability,
+                "de_risk_review",
+                legacy_classification=str(class_reliability.get("classification") or "").strip(),
+            )
+        )
+        return bool(family_allows or class_allows)
+    return True
+
+
+def load_company_context_overlay_reliability(asof_date: pd.Timestamp | None = None) -> dict[str, Any]:
+    try:
+        from advisory.context_overlay_reliability_report import load_persisted_reliability_report as load_persisted_context_reliability_report
+
+        reliability = load_persisted_context_reliability_report(asof_date=asof_date)
+        return reliability if isinstance(reliability, dict) else {}
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_context_overlay_reliability_load_failed",
+            source="advisory_context_overlay_reliability_summary",
+            severity="warn",
+            reason="Company-memory review could not load context-overlay reliability and treated missing reliability as neutral.",
+            error=exc,
+            metadata={"asof_date": None if asof_date is None else str(asof_date)},
+        )
+        return {}
+
+
+def summarize_company_context_overlays(
+    rows: list[dict[str, Any]],
+    *,
+    source_family_reliability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not rows:
+        return {
+            "schema_version": 1,
+            "authority_scope": "watchlist_pressure_only",
+            "action_policy_effect": "review_input_only_no_trade_authority",
+            "broker_execution_allowed": False,
+            "row_count": 0,
+            "positive_count": 0,
+            "negative_count": 0,
+            "watch_count": 0,
+            "effective_positive_count": 0,
+            "effective_negative_count": 0,
+            "effective_watch_count": 0,
+            "reliability_suppressed_count": 0,
+            "source_family_counts": {},
+            "top_overlays": [],
+            "top_suppressed_overlays": [],
+        }
+    frame = pd.DataFrame(rows)
+    directions = frame.get("direction", pd.Series(dtype="object")).astype("string").str.lower()
+    pressure = pd.to_numeric(frame.get("pressure_score"), errors="coerce").abs() if "pressure_score" in frame.columns else pd.Series([0.0] * len(frame))
+    ranked = frame.assign(_rank_pressure=pressure.fillna(0.0))
+    if "observed_at" in ranked.columns:
+        ranked["_rank_time"] = pd.to_datetime(ranked["observed_at"], utc=True, errors="coerce")
+        ranked = ranked.sort_values(["_rank_time", "_rank_pressure"], ascending=[False, False])
+    else:
+        ranked = ranked.sort_values("_rank_pressure", ascending=False)
+    top_overlays: list[dict[str, Any]] = []
+    top_suppressed_overlays: list[dict[str, Any]] = []
+    effective_counts = {"positive": 0, "negative": 0, "watch": 0}
+    for item in _records(ranked.drop(columns=["_rank_pressure", "_rank_time"], errors="ignore"), limit=8):
+        source = item.get("context_source")
+        family_reliability = None
+        if isinstance(source_family_reliability, dict):
+            families = _reliability_families(source_family_reliability)
+            family_reliability = families.get(str(source)) if isinstance(families, dict) and source is not None else None
+            if isinstance(family_reliability, dict) and "runtime_policy_contract" not in family_reliability:
+                from advisory.context_overlay_reliability_report import reliability_runtime_policy_contract
+
+                family_reliability = {
+                    **family_reliability,
+                    "runtime_policy_contract": reliability_runtime_policy_contract(family_reliability.get("classification")),
+                }
+        class_reliability = _context_class_reliability(source_family_reliability, source, item.get("context_class"))
+        sector_reliability = _context_sector_reliability(
+            source_family_reliability,
+            source,
+            item.get("sector_name"),
+            item.get("sector_code"),
+        )
+        compact = {
+            "observed_at": item.get("observed_at"),
+            "source": source,
+            "direction": item.get("direction"),
+            "class": item.get("context_class"),
+            "sector_code": item.get("sector_code"),
+            "sector_name": item.get("sector_name"),
+            "pressure_score": item.get("pressure_score"),
+            "reason": item.get("context_reason"),
+            "authority_scope": item.get("authority_scope") or "watchlist_pressure_only",
+            "broker_execution_allowed": False,
+            "source_family_reliability": family_reliability,
+            "context_class_reliability": class_reliability,
+            "context_sector_reliability": sector_reliability,
+        }
+        if _context_overlay_reliability_suppressed(compact):
+            compact["reliability_suppressed"] = True
+            top_suppressed_overlays.append(compact)
+            continue
+        direction = str(item.get("direction") or "").strip().lower()
+        if not _context_overlay_runtime_effect_allowed(compact, direction):
+            compact["reliability_suppressed"] = True
+            compact["runtime_policy_contract_suppressed"] = True
+            compact["runtime_policy_contract_suppression_reason"] = (
+                "watch_priority_not_allowed"
+                if direction in {"positive", "watch"}
+                else "de_risk_review_not_allowed"
+                if direction == "negative"
+                else "runtime_use_not_allowed"
+            )
+            top_suppressed_overlays.append(compact)
+            continue
+        if direction in effective_counts:
+            effective_counts[direction] += 1
+        top_overlays.append(compact)
+    return {
+        "schema_version": 1,
+        "authority_scope": "watchlist_pressure_only",
+        "action_policy_effect": "review_input_only_no_trade_authority",
+        "reliability_policy_effect": "annotation_only_no_trade_authority",
+        "portfolio_authority": "none",
+        "broker_execution_allowed": False,
+        "row_count": int(len(frame)),
+        "positive_count": int(directions.eq("positive").sum()),
+        "negative_count": int(directions.eq("negative").sum()),
+        "watch_count": int(directions.eq("watch").sum()),
+        "effective_positive_count": int(effective_counts["positive"]),
+        "effective_negative_count": int(effective_counts["negative"]),
+        "effective_watch_count": int(effective_counts["watch"]),
+        "reliability_suppressed_count": int(len(top_suppressed_overlays)),
+        "source_family_counts": frame.get("context_source", pd.Series(dtype="object")).dropna().astype(str).value_counts().to_dict(),
+        "max_pressure_score": None if pressure.dropna().empty else float(pressure.max()),
+        "top_overlays": top_overlays,
+        "top_suppressed_overlays": top_suppressed_overlays,
+    }
+
+
+def _filter_review_ready_announcement_evidence(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    if "announcement_storage_form" in out.columns:
+        out = out[out["announcement_storage_form"].astype("string").str.lower().ne("archived_raw_reference_only")].copy()
+    if "llm_review_ready" in out.columns:
+        out = out[out["llm_review_ready"].map(lambda value: str(value).strip().lower() not in {"0", "false", "f", "no", "n"})].copy()
+    return out
+
+
+def _latest_sector_code_from_context(context: dict[str, Any]) -> str | None:
+    for section in ("technical", "context_overlays"):
+        rows = context.get(section) or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sector_code = _text(row.get("sector_code"))
+            if sector_code:
+                return sector_code.strip().upper()
+    return None
+
+
+def load_company_causal_event_memory(
+    *,
+    symbol: str,
+    asof_date: pd.Timestamp,
+    symbol_context: dict[str, Any] | None = None,
+    lookback_days: int = DEFAULT_CAUSAL_EVENT_MEMORY_LOOKBACK_DAYS,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    symbol = symbol.strip().upper()
+    if not table_exists(CAUSAL_EVENT_MEMORY_TABLE):
+        return []
+    start_date = asof_date - pd.Timedelta(days=max(1, int(lookback_days)))
+    context = symbol_context or {}
+    sector_code = _latest_sector_code_from_context(context)
+    sector_clause = ""
+    params: dict[str, Any] = {
+        "symbol": symbol,
+        "asof_date": asof_date,
+        "start_date": start_date,
+        "limit": max(1, int(limit)),
+    }
+    if sector_code:
+        sector_clause = "OR (symbol IS NULL AND UPPER(TRIM(sector_code)) = %(sector_code)s)"
+        params["sector_code"] = sector_code
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date,
+                memory_id,
+                symbol,
+                sector_code,
+                sector_name,
+                context_source,
+                event_group,
+                event_type,
+                context_class,
+                direction,
+                event_state,
+                pressure_score,
+                decayed_pressure_score,
+                event_count,
+                first_seen_at,
+                last_seen_at,
+                expected_decay_days,
+                freshness_days,
+                contradiction_state,
+                source_refs_json,
+                source_summary_json,
+                authority_scope,
+                portfolio_authority,
+                broker_execution_allowed,
+                policy_effect
+            FROM {CAUSAL_EVENT_MEMORY_TABLE}
+            WHERE asof_date <= %(asof_date)s
+              AND asof_date >= %(start_date)s
+              AND (
+                  UPPER(TRIM(symbol)) = %(symbol)s
+                  {sector_clause}
+              )
+            ORDER BY asof_date DESC, decayed_pressure_score DESC NULLS LAST, pressure_score DESC NULLS LAST
+            LIMIT %(limit)s
+            """,
+            params=params,
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.company_memory_review",
+            fallback_type="company_memory_causal_event_memory_load_failed",
+            source=CAUSAL_EVENT_MEMORY_TABLE,
+            severity="warn",
+            symbol=symbol,
+            reason="Company-memory context skipped causal event memory rows because source loading failed.",
+            error=exc,
+            metadata={"lookback_days": int(lookback_days), "limit": max(1, int(limit)), "sector_code": sector_code},
+        )
+        return []
+    return _records(df, limit=limit)
+
+
+def summarize_company_causal_event_memory(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    frame = pd.DataFrame(rows or [])
+    if frame.empty:
+        return {
+            "schema_version": 1,
+            "authority_scope": "review_input_only",
+            "action_policy_effect": "memory_context_only_no_trade_authority",
+            "portfolio_authority": "none",
+            "broker_execution_allowed": False,
+            "row_count": 0,
+            "positive_count": 0,
+            "negative_count": 0,
+            "mixed_count": 0,
+            "contradiction_count": 0,
+            "top_memories": [],
+        }
+    directions = frame.get("direction", pd.Series(dtype="object")).astype("string").str.lower()
+    states = frame.get("event_state", pd.Series(dtype="object")).astype("string").str.lower()
+    contradictions = frame.get("contradiction_state", pd.Series(dtype="object")).astype("string").str.lower()
+    pressure = pd.to_numeric(frame.get("decayed_pressure_score", frame.get("pressure_score")), errors="coerce")
+    if "asof_date" not in frame.columns:
+        frame["asof_date"] = pd.NaT
+    sorted_frame = frame.assign(_sort_pressure=pressure.fillna(0.0)).sort_values(
+        ["asof_date", "_sort_pressure"],
+        ascending=[False, False],
+    )
+    top_memories: list[dict[str, Any]] = []
+    for row in sorted_frame.head(5).to_dict(orient="records"):
+        top_memories.append(
+            {
+                "asof_date": _json_ready(row.get("asof_date")),
+                "memory_id": _text(row.get("memory_id")),
+                "symbol": _text(row.get("symbol")),
+                "sector_code": _text(row.get("sector_code")),
+                "sector_name": _text(row.get("sector_name")),
+                "source": _text(row.get("context_source")),
+                "event_type": _text(row.get("event_type")),
+                "context_class": _text(row.get("context_class")),
+                "direction": _text(row.get("direction")),
+                "event_state": _text(row.get("event_state")),
+                "decayed_pressure_score": _num(row.get("decayed_pressure_score"), default=0.0),
+                "freshness_days": _num(row.get("freshness_days"), default=0.0),
+                "contradiction_state": _text(row.get("contradiction_state")),
+                "policy_effect": _text(row.get("policy_effect")) or "memory_only_no_trade_authority",
+            }
+        )
+    positive_mask = directions.eq("positive") | states.eq("positive_watch_pressure")
+    negative_mask = directions.eq("negative") | states.eq("negative_derisk_pressure")
+    mixed_mask = directions.eq("mixed") | states.eq("mixed_context")
+    return {
+        "schema_version": 1,
+        "authority_scope": "review_input_only",
+        "action_policy_effect": "memory_context_only_no_trade_authority",
+        "portfolio_authority": "none",
+        "broker_execution_allowed": False,
+        "row_count": int(len(frame)),
+        "positive_count": int(positive_mask.sum()),
+        "negative_count": int(negative_mask.sum()),
+        "mixed_count": int(mixed_mask.sum()),
+        "contradiction_count": int(contradictions.ne("none").sum()),
+        "source_family_counts": frame.get("context_source", pd.Series(dtype="object")).dropna().astype(str).value_counts().to_dict(),
+        "max_decayed_pressure_score": None if pressure.dropna().empty else float(pressure.max()),
+        "top_memories": top_memories,
+    }
+
+
 def load_company_memory_context(
     symbol: str,
     *,
@@ -420,7 +1230,7 @@ def load_company_memory_context(
             limit=5,
         )
     )
-    context["announcement_evidence"] = _records(
+    announcement_rows = _filter_review_ready_announcement_evidence(
         _load_table_rows(
             ANNOUNCEMENT_EVIDENCE_TABLE,
             symbol=symbol,
@@ -441,10 +1251,18 @@ def load_company_memory_context(
                 "what_happened",
                 "rationale",
             ],
+            optional_columns=[
+                "announcement_storage_form",
+                "announcement_storage_reason",
+                "llm_evidence_mode",
+                "llm_review_ready",
+                "raw_archive_required",
+            ],
             lookback_days=lookback_days,
             limit=8,
         )
     )
+    context["announcement_evidence"] = _records(announcement_rows)
     context["bhavcopy_evidence"] = _records(
         _load_table_rows(
             BHAVCOPY_EVIDENCE_TABLE,
@@ -521,6 +1339,26 @@ def load_company_memory_context(
             limit=8,
         )
     )
+    context["context_overlays"] = load_company_context_overlays(
+        symbol=symbol,
+        asof_date=asof_date,
+        symbol_context=context,
+        lookback_days=min(int(lookback_days), int(DEFAULT_CONTEXT_OVERLAY_LOOKBACK_DAYS)),
+        limit_per_source=8,
+    )
+    context["context_overlay_reliability"] = load_company_context_overlay_reliability(asof_date=asof_date)
+    context["context_overlay_summary"] = summarize_company_context_overlays(
+        context["context_overlays"],
+        source_family_reliability=context["context_overlay_reliability"],
+    )
+    context["causal_event_memory"] = load_company_causal_event_memory(
+        symbol=symbol,
+        asof_date=asof_date,
+        symbol_context=context,
+        lookback_days=min(int(lookback_days), int(DEFAULT_CAUSAL_EVENT_MEMORY_LOOKBACK_DAYS)),
+        limit=8,
+    )
+    context["causal_event_memory_summary"] = summarize_company_causal_event_memory(context["causal_event_memory"])
     context["evidence_source_contract"] = build_evidence_source_contract(context)
     return context
 
@@ -557,11 +1395,30 @@ def build_evidence_source_contract(context: dict[str, Any]) -> dict[str, Any]:
             "purpose": "operator_wait_condition_context",
             "required_for_confident_upgrade": False,
         },
+        "context_overlays": {
+            "source_table": ",".join(
+                [
+                    ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE,
+                    EXCHANGE_CONTEXT_OVERLAYS_TABLE,
+                    BHAVCOPY_CONTEXT_OVERLAYS_TABLE,
+                    THEME_CONTEXT_OVERLAYS_TABLE,
+                    MACRO_CONTEXT_OVERLAYS_TABLE,
+                ]
+            ),
+            "purpose": "review_only_context_pressure",
+            "required_for_confident_upgrade": False,
+        },
+        "causal_event_memory": {
+            "source_table": CAUSAL_EVENT_MEMORY_TABLE,
+            "purpose": "merged_event_state_context",
+            "required_for_confident_upgrade": False,
+        },
     }
     rows: list[dict[str, Any]] = []
     missing_required: list[str] = []
     for key, metadata in sources.items():
-        count = len(context.get(key) or [])
+        source_rows = context.get(key) or []
+        count = len(source_rows)
         status = "present" if count > 0 else "missing"
         row = {
             "source": key,
@@ -571,6 +1428,19 @@ def build_evidence_source_contract(context: dict[str, Any]) -> dict[str, Any]:
             "status": status,
             "required_for_confident_upgrade": bool(metadata["required_for_confident_upgrade"]),
         }
+        if key == "announcement_evidence":
+            storage_counts: dict[str, int] = {}
+            llm_ready_count = 0
+            for item in source_rows:
+                if not isinstance(item, dict):
+                    continue
+                storage_form = str(item.get("announcement_storage_form") or "unknown")
+                storage_counts[storage_form] = storage_counts.get(storage_form, 0) + 1
+                if str(item.get("llm_review_ready", True)).strip().lower() not in {"0", "false", "f", "no", "n"}:
+                    llm_ready_count += 1
+            row["storage_form_counts"] = storage_counts
+            row["llm_review_ready_count"] = int(llm_ready_count)
+            row["archive_only_rows_excluded"] = True
         rows.append(row)
         if status == "missing" and row["required_for_confident_upgrade"]:
             missing_required.append(key)
@@ -580,6 +1450,8 @@ def build_evidence_source_contract(context: dict[str, Any]) -> dict[str, Any]:
         "uses_compact_evidence": True,
         "raw_announcement_scan_allowed": False,
         "raw_bhavcopy_scan_allowed": False,
+        "context_overlay_policy_effect": "review_input_only_no_trade_authority",
+        "causal_event_memory_policy_effect": "memory_context_only_no_trade_authority",
         "sources": rows,
         "missing_required_sources": missing_required,
         "coverage_status": "complete" if not missing_required else "partial",
@@ -597,6 +1469,17 @@ def _has_positive_event(context: dict[str, Any]) -> bool:
     for row in context.get("event_policy") or []:
         if str(row.get("action_type") or "").upper() in {"BUY_WATCH", "NO_ACTION"} and _num(row.get("policy_score")) > 0:
             return True
+    overlay_summary = context.get("context_overlay_summary") if isinstance(context.get("context_overlay_summary"), dict) else {}
+    positive_count = int(overlay_summary.get("effective_positive_count", overlay_summary.get("positive_count") or 0) or 0)
+    negative_count = int(overlay_summary.get("effective_negative_count", overlay_summary.get("negative_count") or 0) or 0)
+    if positive_count > 0 and negative_count == 0:
+        return True
+    memory_summary = context.get("causal_event_memory_summary") if isinstance(context.get("causal_event_memory_summary"), dict) else {}
+    memory_positive = int(memory_summary.get("positive_count") or 0)
+    memory_negative = int(memory_summary.get("negative_count") or 0)
+    memory_mixed = int(memory_summary.get("mixed_count") or 0) + int(memory_summary.get("contradiction_count") or 0)
+    if memory_positive > 0 and memory_negative == 0 and memory_mixed == 0:
+        return True
     return False
 
 
@@ -607,6 +1490,12 @@ def _has_negative_event(context: dict[str, Any]) -> bool:
     for row in context.get("event_policy") or []:
         if str(row.get("action_type") or "").upper() in {"REDUCE_EXPOSURE_REVIEW"}:
             return True
+    overlay_summary = context.get("context_overlay_summary") if isinstance(context.get("context_overlay_summary"), dict) else {}
+    if int(overlay_summary.get("effective_negative_count", overlay_summary.get("negative_count") or 0) or 0) > 0:
+        return True
+    memory_summary = context.get("causal_event_memory_summary") if isinstance(context.get("causal_event_memory_summary"), dict) else {}
+    if int(memory_summary.get("negative_count") or 0) > 0:
+        return True
     return False
 
 
@@ -630,9 +1519,13 @@ def deterministic_review(context: dict[str, Any]) -> CompanyMemoryReview:
     wait_for: list[str] = []
     source_contract = context.get("evidence_source_contract") if isinstance(context.get("evidence_source_contract"), dict) else {}
     missing_required_sources = [str(item) for item in source_contract.get("missing_required_sources") or []]
+    overlay_summary = context.get("context_overlay_summary") if isinstance(context.get("context_overlay_summary"), dict) else {}
+    memory_summary = context.get("causal_event_memory_summary") if isinstance(context.get("causal_event_memory_summary"), dict) else {}
 
-    if action_code in {"SELL", "PARTIAL_SELL", "BUY", "BUY_MORE", "HOLD", "WATCH"}:
+    if action_code in {"SELL", "PARTIAL_SELL", "REDUCE_EXPOSURE_REVIEW", "BUY", "BUY_MORE", "HOLD", "WATCH"}:
         signal = "SELL_PARTIAL" if action_code == "PARTIAL_SELL" else action_code
+        if action_code == "REDUCE_EXPOSURE_REVIEW":
+            signal = "SELL_PARTIAL"
         evidence.append(f"latest consolidated action is {action_code}")
         confidence = 0.55
     if negative_event:
@@ -648,6 +1541,23 @@ def deterministic_review(context: dict[str, Any]) -> CompanyMemoryReview:
         evidence.append("technical score is constructive but not enough for an independent buy")
         wait_for.append("wait for confirmed breakout/retest or stronger event confirmation")
         confidence = max(confidence, 0.50)
+
+    if int(overlay_summary.get("effective_positive_count", overlay_summary.get("positive_count") or 0) or 0) > 0:
+        evidence.append("recent context-overlay pressure is positive or watch-supportive")
+    if int(overlay_summary.get("effective_negative_count", overlay_summary.get("negative_count") or 0) or 0) > 0:
+        risks.append("recent context-overlay pressure is negative and review-only")
+    if int(overlay_summary.get("reliability_suppressed_count") or 0) > 0:
+        risks.append("some context-overlay rows were ignored because family/class reliability is noisy or harmful")
+    if overlay_summary.get("row_count"):
+        evidence.append("company-memory review included review-only context overlays")
+    if int(memory_summary.get("positive_count") or 0) > 0:
+        evidence.append("causal event memory has current positive/watch event state")
+    if int(memory_summary.get("negative_count") or 0) > 0:
+        risks.append("causal event memory has current negative/de-risk event state")
+    if int(memory_summary.get("contradiction_count") or 0) > 0 or int(memory_summary.get("mixed_count") or 0) > 0:
+        risks.append("causal event memory contains mixed or contradictory event state")
+    if memory_summary.get("row_count"):
+        evidence.append("company-memory review included merged causal event memory")
 
     if deal_pressure == "distribution_or_pressure":
         risks.append("bhavcopy evidence shows distribution or short-selling pressure")

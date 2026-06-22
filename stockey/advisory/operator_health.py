@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -17,20 +18,57 @@ import pandas as pd
 import requests
 from environs import Env
 
+from advisory.action_evidence_provenance import build_action_evidence_provenance
+from advisory.action_transition_evaluator import DEFAULT_MIN_MATURED_ROWS as ACTION_TRANSITION_MIN_MATURED_ROWS
+from advisory.action_transition_evaluator import EVALUATIONS_TABLE as ACTION_TRANSITION_EVALUATIONS_TABLE
+from advisory.action_transition_evaluator import SUMMARY_TABLE as ACTION_TRANSITION_SUMMARY_TABLE
+from advisory.adversarial_review_evaluator import DEFAULT_MIN_MATURED_ROWS as ADVERSARIAL_REVIEW_MIN_MATURED_ROWS
+from advisory.adversarial_review_evaluator import EVALUATIONS_TABLE as ADVERSARIAL_REVIEW_EVALUATIONS_TABLE
+from advisory.adversarial_review_evaluator import SUMMARY_TABLE as ADVERSARIAL_REVIEW_SUMMARY_TABLE
+from advisory.causal_event_memory_evaluator import DEFAULT_MIN_MATURED_ROWS as CAUSAL_MEMORY_MIN_MATURED_ROWS
+from advisory.causal_event_memory_evaluator import EVALUATIONS_TABLE as CAUSAL_MEMORY_EVALUATIONS_TABLE
+from advisory.causal_event_memory_evaluator import SUMMARY_TABLE as CAUSAL_MEMORY_SUMMARY_TABLE
+from advisory.causal_event_provenance import build_causal_event_provenance
+from advisory.context_watch_evaluator import DEFAULT_MIN_MATURED_ROWS as CONTEXT_WATCH_MIN_MATURED_ROWS
+from advisory.context_watch_evaluator import EVALUATIONS_TABLE as CONTEXT_WATCH_EVALUATIONS_TABLE
+from advisory.context_watch_evaluator import SUMMARY_TABLE as CONTEXT_WATCH_SUMMARY_TABLE
 from advisory.performance_slowlog import summarize_slow_operations
 from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
 from advisory.operator_snapshot import SNAPSHOT_NAME, TABLE_NAME as OPERATOR_SNAPSHOT_TABLE
-from advisory.event_data_quality import build_event_data_quality_report
-from advisory.fallback_telemetry import record_local_fallback_event, summarize_fallback_events
+from advisory.event_data_quality import build_event_data_quality_health_summary, build_event_data_quality_report
+from advisory.event_policy_evaluator import DEFAULT_MIN_MATURED_ROWS as EVENT_POLICY_MIN_MATURED_ROWS
+from advisory.event_policy_evaluator import EVALUATIONS_TABLE as EVENT_POLICY_EVALUATIONS_TABLE
+from advisory.event_policy_evaluator import SUMMARY_TABLE as EVENT_POLICY_SUMMARY_TABLE
+from advisory.fallback_telemetry import read_local_fallback_events, record_local_fallback_event, summarize_fallback_events
 from advisory.feature_freshness import STAGE_FEATURE_DEPENDENCIES_BY_STAGE, evaluate_stage_feature_gate
 from advisory.identity_issues import IDENTITY_ISSUES_TABLE
+from advisory.llm_provenance_audit import build_llm_provenance_audit
+from advisory.macro_context_overlays import build_macro_context_overlays
+from advisory.news_theme_engine import build_theme_context_overlays
+from advisory.negative_pressure_evaluator import DEFAULT_MIN_MATURED_ROWS as NEGATIVE_PRESSURE_MIN_MATURED_ROWS
+from advisory.negative_pressure_evaluator import EVALUATIONS_TABLE as NEGATIVE_PRESSURE_EVALUATIONS_TABLE
+from advisory.negative_pressure_evaluator import SUMMARY_TABLE as NEGATIVE_PRESSURE_SUMMARY_TABLE
+from advisory.context_overlay_reliability_report import RELIABILITY_SUMMARY_TABLE as CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE
+from advisory.context_overlay_reliability_report import reliability_runtime_policy_contract
+from advisory.recommendation_diagnostics import current_context_gate_policy_snapshot
 from advisory.signal_quality_evaluator import EVALUATIONS_TABLE as SIGNAL_QUALITY_EVALUATIONS_TABLE
 from advisory.signal_quality_evaluator import SUMMARY_TABLE as SIGNAL_QUALITY_SUMMARY_TABLE
+from advisory.signal_quality_family_report import build_family_report as build_signal_quality_family_report
+from advisory.signal_quality_promotion import REVIEWS_TABLE as SIGNAL_QUALITY_PROMOTION_REVIEWS_TABLE
+from advisory.signal_quality_split_evaluator import DEFAULT_MIN_STABLE_WINDOWS as SIGNAL_QUALITY_SPLIT_MIN_STABLE_WINDOWS
+from advisory.signal_quality_split_evaluator import SPLIT_EVALUATIONS_TABLE as SIGNAL_QUALITY_SPLIT_EVALUATIONS_TABLE
+from advisory.signal_quality_split_evaluator import SPLIT_SUMMARY_TABLE as SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE
+from advisory.signal_quality_split_evaluator import build_split_stability_report
+from advisory.setup_registry import load_signal_quality_overlay_rules
 from advisory.superseded_failures import cleanup_superseded_failures
+from advisory.technical_threshold_calibration import DEFAULT_MIN_SIGNALS as TECHNICAL_THRESHOLD_MIN_SIGNALS
+from advisory.technical_threshold_calibration import EVALUATIONS_TABLE as TECHNICAL_THRESHOLD_EVALUATIONS_TABLE
+from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_THRESHOLD_SUMMARY_TABLE
+from advisory.ts_forecast_paper_portfolio import PAPER_TABLE as TS_FORECAST_PAPER_TABLE
 from scripts.advisory_stage_report import build_stage_report
 from scripts.api_performance_report import build_api_performance_report
 from data.screenerin.failure_log import FAILURES_TABLE as SCREENER_FAILURES_TABLE
-from utils.db import sql_to_df
+from utils.db import read_db_retry_telemetry_events, sql_to_df
 from utils.ingestion_state import classification_metadata as ingestion_classification_metadata
 from utils.ingestion_state import get_state_entries as get_ingestion_state_entries
 from utils.ingestion_state import summarize_state_entries as summarize_ingestion_state_entries
@@ -51,15 +89,54 @@ DEFAULT_OPERATOR_WEB_URL = "http://127.0.0.1:3000/"
 OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
 TRACE_SUMMARIES_TABLE = "advisory_trace_summaries"
 ACTION_RECOMMENDATIONS_TABLE = "advisory_action_recommendations"
+SIGNAL_REFRESH_ACTIONS_TABLE = "advisory_signal_refresh_actions"
 REBALANCE_TABLE = "advisory_rebalance_actions"
 LIFECYCLE_POLICY_CHANGES_TABLE = "advisory_lifecycle_policy_changes"
 COMPANY_MASTER_TABLE = "company_master"
+SIGNAL_QUALITY_OVERLAY_NEGATIVE_BLOCK_EFFECTS = {
+    "negative_context_blocks_positive_to_watch",
+    "trusted_negative_context_blocks_positive_to_watch",
+}
+SIGNAL_QUALITY_OVERLAY_POSITIVE_WATCH_EFFECTS = {
+    "positive_context_boosts_watch_priority",
+    "trusted_positive_context_boosts_watch_priority",
+}
+SIGNAL_QUALITY_OVERLAY_SUPPORTED_SPLIT_AXES = {
+    "context_class_direction",
+    "context_class",
+    "event_class",
+    "pressure_class",
+    "macro_signal",
+    "theme",
+    "rule_id",
+    "direction",
+}
+SIGNAL_QUALITY_OVERLAY_SUPPRESSED_CONTEXT_CLASS_RELIABILITY = {
+    "hurts_or_no_lift",
+    "negative_after_cost",
+    "inconsistent_or_horizon_sensitive",
+    "needs_benchmark_attribution",
+    "benchmark_beta_not_overlay_alpha",
+}
+CONTEXT_SIGNAL_REFRESH_SOURCE_PREFIXES = (
+    "announcement_context",
+    "bhavcopy_context",
+    "exchange_context",
+    "macro_context",
+    "theme_context",
+)
 BROKER_CAPABLE_ACTION_CODES = ("BUY", "BUY_MORE", "SELL", "PARTIAL_SELL")
 DHAN_TOKEN_EXPIRY_WARN_SECONDS = 6 * 60 * 60
 OPERATOR_HEALTH_FAST_WORKERS = env.int("OPERATOR_HEALTH_FAST_WORKERS", default=3)
+OPERATOR_HEALTH_FULL_WORKERS = env.int("OPERATOR_HEALTH_FULL_WORKERS", default=4)
+OPERATOR_HEALTH_FULL_PROCESS_ISOLATED = env.bool("OPERATOR_HEALTH_FULL_PROCESS_ISOLATED", default=True)
+OPERATOR_HEALTH_FULL_SECTION_TIMEOUT_SECONDS = env.float("OPERATOR_HEALTH_FULL_SECTION_TIMEOUT_SECONDS", default=30.0)
 OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS = env.int("OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS", default=30)
+OPERATOR_HEALTH_FEATURE_STAGE_GATES_TIMEOUT_SECONDS = env.float("OPERATOR_HEALTH_FEATURE_STAGE_GATES_TIMEOUT_SECONDS", default=20.0)
+OPERATOR_HEALTH_FEATURE_STAGE_GATE_SYMBOL_LIMIT = env.int("OPERATOR_HEALTH_FEATURE_STAGE_GATE_SYMBOL_LIMIT", default=5)
 API_LATENCY_PROBE_OUTPUT_FILE = Path(env.str("API_LATENCY_PROBE_OUTPUT_FILE", "logs/performance/latest_api_latency_probe.json"))
 API_LATENCY_PROBE_MAX_AGE_SECONDS = env.float("API_LATENCY_PROBE_MAX_AGE_SECONDS", default=24 * 60 * 60)
+RESEARCH_EVIDENCE_LOG_MAX_BYTES = env.int("RESEARCH_EVIDENCE_LOG_MAX_BYTES", default=2_000_000)
 SIGNAL_QUALITY_MAX_AGE_DAYS = env.float("SIGNAL_QUALITY_MAX_AGE_DAYS", default=14.0)
 SIGNAL_QUALITY_MIN_MATURED_ROWS = env.int("SIGNAL_QUALITY_MIN_MATURED_ROWS", default=30)
 SIGNAL_QUALITY_MIN_OVERLAY_ROWS = env.int("SIGNAL_QUALITY_MIN_OVERLAY_ROWS", default=10)
@@ -178,9 +255,11 @@ TABLE_FRESHNESS_CHECKS = [
     {"name": "event_policy", "table": "advisory_event_policy_actions", "column": "policy_at", "fallback_column": "load_ts", "max_age_days": 7},
     {"name": "market_context", "table": "advisory_market_context_summary_daily", "column": "asof_date", "max_age_days": 7},
     {"name": "ts_forecasts", "table": "advisory_ts_forecasts_daily", "column": "asof_date", "max_age_days": 7},
+    {"name": "ts_forecast_paper", "table": "advisory_ts_forecast_paper_portfolio", "column": "load_ts", "fallback_column": "asof_date", "max_age_days": 7},
     {"name": "sync_state", "table": "advisory_sync_state", "column": "updated_at", "max_age_days": 1},
     {"name": "operator_snapshot", "table": "advisory_operator_snapshots", "column": "generated_at", "max_age_days": 1},
     {"name": "signal_quality", "table": "advisory_signal_quality_eval_summary", "column": "evaluated_at", "max_age_days": 14},
+    {"name": "context_overlay_reliability", "table": "advisory_context_overlay_reliability_summary", "column": "evaluated_at", "max_age_days": 14},
 ]
 CRON_RECOVERY_OUTPUTS = {
     "all_advisory.log": [
@@ -574,6 +653,7 @@ def check_advisory_stage_report(log_dir: str | Path = DEFAULT_LOG_DIR) -> dict[s
 
     stage_count = int(report.get("stage_count") or 0)
     slow_stage_count = int(report.get("slow_stage_count") or 0)
+    degraded_stage_count = int(report.get("degraded_stage_count") or 0)
     report_status = str(report.get("status") or "missing")
     report_payload = dict(report)
     report_payload["report_status"] = report_payload.pop("status", report_status)
@@ -600,6 +680,9 @@ def check_advisory_stage_report(log_dir: str | Path = DEFAULT_LOG_DIR) -> dict[s
     elif slow_stage_count:
         status = "warn"
         message = "Latest advisory run has one or more over-budget stages."
+    elif degraded_stage_count:
+        status = "warn"
+        message = "Latest advisory run completed with degraded stage evidence."
 
     return _status(
         status,
@@ -607,6 +690,209 @@ def check_advisory_stage_report(log_dir: str | Path = DEFAULT_LOG_DIR) -> dict[s
         **report_payload,
         command=command,
         operations_command="advisory_stage_report",
+    )
+
+
+def _read_log_tail(path: Path, *, max_bytes: int) -> str:
+    if not path.exists():
+        return ""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - max(int(max_bytes), 0)))
+            data = handle.read()
+    except OSError as exc:
+        _record_health_local_fallback(
+            source=str(path),
+            fallback_type="operator_health_log_tail_read_failed",
+            reason="Operator Health could not read a cron log tail.",
+            error=exc,
+            severity="warn",
+            metadata={"path": str(path), "max_bytes": max_bytes},
+        )
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _candidate_json_objects_from_mixed_text(text: str, *, source: str, max_failures: int = 3) -> list[dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    objects: list[dict[str, Any]] = []
+    failures = 0
+    for idx, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError as exc:
+            if failures < max_failures:
+                _record_health_local_fallback(
+                    source=source,
+                    fallback_type="operator_health_candidate_json_parse_failed",
+                    reason="Operator Health skipped a non-JSON brace while scanning mixed cron log text.",
+                    error=exc,
+                    severity="warn",
+                    metadata={"offset": idx, "source": source},
+                )
+                failures += 1
+            continue
+        if isinstance(value, dict):
+            objects.append(value)
+    return objects
+
+
+def _extract_latest_research_evidence_payload(text: str, *, source: str) -> dict[str, Any]:
+    candidates = []
+    for payload in _candidate_json_objects_from_mixed_text(text, source=source):
+        evidence = payload.get("research_evidence")
+        if isinstance(evidence, dict) and isinstance(evidence.get("readiness_summary"), dict):
+            candidates.append(payload)
+    return candidates[-1] if candidates else {}
+
+
+def check_research_evidence_run_summary(log_dir: str | Path = DEFAULT_LOG_DIR) -> dict[str, Any]:
+    log_path = Path(log_dir) / "research_evidence.log"
+    command = "./all_research_evidence.sh"
+    health_command = "python -m advisory.operator_health --full --skip-dhan"
+    common = {
+        "log_path": str(log_path),
+        "command": command,
+        "health_command": health_command,
+        "broker_execution_allowed": False,
+        "policy_auto_promotion_allowed": False,
+        "portfolio_mutation_allowed": False,
+        "authority": "research_only_no_policy_or_broker_authority",
+        "operations_command": "run_research_evidence",
+    }
+    if not log_path.exists():
+        return _status(
+            "warn",
+            "Research evidence refresh log is missing.",
+            usable=False,
+            ready_for_research_review=False,
+            reasons=["missing_research_evidence_log"],
+            **common,
+        )
+
+    mtime = pd.Timestamp.fromtimestamp(log_path.stat().st_mtime, tz="UTC")
+    text = _read_log_tail(log_path, max_bytes=RESEARCH_EVIDENCE_LOG_MAX_BYTES)
+    if not text.strip():
+        return _status(
+            "warn",
+            "Research evidence refresh log is empty.",
+            usable=False,
+            ready_for_research_review=False,
+            reasons=["empty_research_evidence_log"],
+            latest_log_mtime=_json_ready(mtime),
+            **common,
+        )
+
+    payload = _extract_latest_research_evidence_payload(text, source=str(log_path))
+    if not payload:
+        return _status(
+            "warn",
+            "Research evidence refresh log does not contain a parseable readiness summary.",
+            usable=False,
+            ready_for_research_review=False,
+            reasons=["missing_research_evidence_readiness_summary"],
+            latest_log_mtime=_json_ready(mtime),
+            **common,
+        )
+
+    evidence = payload.get("research_evidence") if isinstance(payload.get("research_evidence"), dict) else {}
+    readiness = evidence.get("readiness_summary") if isinstance(evidence.get("readiness_summary"), dict) else {}
+    readiness_status = str(readiness.get("status") or "unknown")
+    payload_status = str(payload.get("status") or "unknown")
+    component_status = evidence.get("component_status") if isinstance(evidence.get("component_status"), list) else []
+    blocker_components = readiness.get("blocker_components") if isinstance(readiness.get("blocker_components"), list) else []
+    candidate_components = readiness.get("candidate_components") if isinstance(readiness.get("candidate_components"), list) else []
+    authority_violation_count = int(readiness.get("authority_violation_count") or 0)
+    authority_violation_components = (
+        readiness.get("authority_violation_components")
+        if isinstance(readiness.get("authority_violation_components"), list)
+        else []
+    )
+    active_component_count = int(readiness.get("active_component_count") or 0)
+    skipped_component_count = int(readiness.get("skipped_component_count") or 0)
+    candidate_component_count = int(readiness.get("candidate_component_count") or 0)
+    blocker_count = int(readiness.get("blocker_count") or len(blocker_components or []))
+    reasons: list[str] = []
+
+    if payload_status not in {"ok", "success", "unknown"}:
+        status = "error"
+        reasons.append("research_evidence_runner_failed")
+        message = "Research evidence refresh failed."
+        usable = False
+        ready_for_research_review = False
+    elif readiness_status == "candidate_evidence_available":
+        status = "ok"
+        message = "Research evidence refresh is available for research review."
+        usable = True
+        ready_for_research_review = True
+    elif readiness_status == "all_skipped":
+        status = "warn"
+        reasons.append("research_evidence_all_components_skipped")
+        message = "Research evidence refresh skipped every evidence component."
+        usable = False
+        ready_for_research_review = False
+    elif readiness_status == "not_ready":
+        status = "warn"
+        reasons.append("research_evidence_not_ready")
+        message = "Research evidence refresh ran, but evidence is not ready for review."
+        usable = False
+        ready_for_research_review = False
+    elif readiness_status == "monitor":
+        status = "warn"
+        reasons.append("research_evidence_monitor_only")
+        message = "Research evidence refresh produced monitor-only evidence."
+        usable = False
+        ready_for_research_review = False
+    elif readiness_status == "error":
+        status = "error"
+        reasons.append("research_evidence_readiness_error")
+        message = "Research evidence readiness summary reports an error."
+        usable = False
+        ready_for_research_review = False
+    else:
+        status = "warn"
+        reasons.append("unknown_research_evidence_readiness_status")
+        message = "Research evidence refresh has an unknown readiness status."
+        usable = False
+        ready_for_research_review = False
+
+    if (
+        bool(readiness.get("broker_execution_allowed"))
+        or bool(readiness.get("policy_auto_promotion_allowed"))
+        or bool(readiness.get("portfolio_mutation_allowed"))
+        or authority_violation_count > 0
+    ):
+        status = "error"
+        reasons.append("research_evidence_authority_boundary_violation")
+        message = "Research evidence readiness claims policy, portfolio, or broker authority; this violates the research-only contract."
+        usable = False
+        ready_for_research_review = False
+
+    return _status(
+        status,
+        message,
+        usable=usable,
+        ready_for_research_review=ready_for_research_review,
+        reasons=list(dict.fromkeys(reasons)),
+        latest_log_mtime=_json_ready(mtime),
+        payload_status=payload_status,
+        readiness_status=readiness_status,
+        active_component_count=active_component_count,
+        skipped_component_count=skipped_component_count,
+        candidate_component_count=candidate_component_count,
+        blocker_count=blocker_count,
+        candidate_components=candidate_components,
+        blocker_components=blocker_components[:10],
+        authority_violation_count=authority_violation_count,
+        authority_violation_components=authority_violation_components[:10],
+        component_count=len(component_status),
+        manual_review_rows_may_be_created=bool(evidence.get("manual_review_rows_may_be_created")),
+        manual_review_row_reason=evidence.get("manual_review_row_reason"),
+        **common,
     )
 
 
@@ -845,6 +1131,7 @@ def check_watcher_source_counters(max_age_minutes: int = 90) -> dict[str, Any]:
         stale_count = 0
         error_count = 0
         empty_count = 0
+        degraded_count = 0
         for source_name, short_name in expected_sources.items():
             row = latest.get(source_name)
             if not row:
@@ -883,12 +1170,25 @@ def check_watcher_source_counters(max_age_minutes: int = 90) -> dict[str, Any]:
                     "parsed_count",
                 )
             )
+            degraded_evidence_count = sum(
+                int(counters.get(key) or 0)
+                for key in (
+                    "ingest_issue_count",
+                    "unresolved_ingest_target_count",
+                    "unresolved_watch_row_count",
+                    "managed_ingest_failed_count",
+                    "document_lookup_failed_count",
+                )
+            ) if isinstance(counters, dict) else 0
             if has_error:
                 row_status = "error"
                 error_count += 1
             elif is_stale:
                 row_status = "warn"
                 stale_count += 1
+            elif degraded_evidence_count > 0:
+                row_status = "warn"
+                degraded_count += 1
             elif not counters:
                 row_status = "warn"
                 empty_count += 1
@@ -908,11 +1208,14 @@ def check_watcher_source_counters(max_age_minutes: int = 90) -> dict[str, Any]:
                     age_minutes=None if age_minutes is None else round(age_minutes, 2),
                     stale=is_stale,
                     produced_data=bool(produced),
+                    degraded_evidence_count=degraded_evidence_count,
+                    empty_reason=counters.get("empty_reason") if isinstance(counters, dict) else None,
+                    substeps=counters.get("substeps") if isinstance(counters, dict) else [],
                     error=row.get("error_text"),
                     counters=counters,
                 )
             )
-        status = "error" if error_count else "warn" if (stale_count or empty_count or missing_sources) else "ok"
+        status = "error" if error_count else "warn" if (stale_count or degraded_count or empty_count or missing_sources) else "ok"
         return _status(
             status,
             "Latest OHLCV/news/announcement watcher counters loaded.",
@@ -922,6 +1225,7 @@ def check_watcher_source_counters(max_age_minutes: int = 90) -> dict[str, Any]:
             missing_sources=missing_sources,
             stale_count=stale_count,
             error_count=error_count,
+            degraded_counter_count=degraded_count,
             empty_counter_count=empty_count,
             max_age_minutes=int(max_age_minutes),
         )
@@ -941,6 +1245,373 @@ def check_watcher_source_counters(max_age_minutes: int = 90) -> dict[str, Any]:
             rows=[],
             returned_count=0,
         )
+
+
+def check_signal_refresh_source_state(max_age_minutes: int = 90) -> dict[str, Any]:
+    from advisory.signal_refresh import CONTEXT_OVERLAY_SIGNAL_REFRESH_VERSION
+
+    expected_sources = {
+        "advisory:signal_refresh:context_overlays": "context_overlays",
+        "advisory:signal_refresh:causal_memory": "causal_memory",
+        "continuous_watch:action_refresh": "action_refresh",
+    }
+    try:
+        if not table_exists("advisory_sync_state"):
+            return _status(
+                "warn",
+                "Sync-state table does not exist yet; signal-refresh source state is unavailable.",
+                table="advisory_sync_state",
+                rows=[],
+                missing_sources=sorted(expected_sources),
+                stale_sources=[],
+                error_sources=[],
+            )
+        df = sql_to_df(
+            """
+            SELECT source_name, scope_key, status, error_text, updated_at, last_success_at, state_json
+            FROM advisory_sync_state
+            WHERE source_name = ANY(%s)
+            ORDER BY source_name, updated_at DESC NULLS LAST
+            """,
+            params=(list(expected_sources.keys()),),
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+        latest: dict[str, dict[str, Any]] = {}
+        for row in _records(df):
+            source_name = str(row.get("source_name") or "")
+            if source_name and source_name not in latest:
+                latest[source_name] = row
+
+        source_contract_audit = _audit_context_signal_refresh_source_contracts(max_age_minutes=max_age_minutes)
+        source_contract_issue_sources = (
+            ["advisory:signal_refresh:context_overlays"]
+            if int(source_contract_audit.get("malformed_source_contract_count") or 0) > 0
+            else []
+        )
+        now = pd.Timestamp.utcnow()
+        rows: list[dict[str, Any]] = []
+        missing_sources: list[str] = []
+        stale_sources: list[str] = []
+        error_sources: list[str] = []
+        unsafe_authority_sources: list[str] = []
+        algorithm_version_mismatch_sources: list[str] = []
+        stale_count = 0
+        error_count = 0
+        unsafe_authority_count = 0
+        algorithm_version_mismatch_count = 0
+        signal_row_total = 0
+        identity_policy_suppressed_target_rows_total = 0
+        identity_policy_suppressed_sources: dict[str, int] = {}
+        for source_name, short_name in expected_sources.items():
+            row = latest.get(source_name)
+            if not row:
+                missing_sources.append(source_name)
+                rows.append(
+                    _status(
+                        "warn",
+                        f"No signal-refresh sync-state row found for {short_name}.",
+                        source_name=source_name,
+                        signal_refresh_source=short_name,
+                        state={},
+                    )
+                )
+                continue
+            state = _json_dict(
+                row.get("state_json"),
+                source=f"{source_name}:state_json",
+                metadata={"source_name": source_name},
+            )
+            updated_at = pd.to_datetime(row.get("updated_at"), utc=True, errors="coerce")
+            last_success_at = pd.to_datetime(row.get("last_success_at"), utc=True, errors="coerce")
+            age_minutes = None if pd.isna(updated_at) else max((now - updated_at).total_seconds() / 60.0, 0.0)
+            status = str(row.get("status") or "").lower()
+            is_stale = age_minutes is not None and age_minutes > float(max_age_minutes)
+            has_error = status == "error" or bool(row.get("error_text"))
+            signal_rows = int(state.get("signal_rows") or state.get("candidate_count") or 0)
+            signal_row_total += signal_rows
+            authority_contract = state.get("authority_contract") if isinstance(state.get("authority_contract"), dict) else {}
+            broker_raw = state.get("broker_execution_allowed")
+            if broker_raw is None:
+                broker_raw = authority_contract.get("broker_execution_allowed")
+            portfolio_authority = str(state.get("portfolio_authority") or authority_contract.get("portfolio_authority") or "none").strip().lower()
+            broker_allowed = str(broker_raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+            full_advisory_required = state.get("full_advisory_required")
+            if full_advisory_required is None:
+                full_advisory_required = authority_contract.get("full_advisory_required")
+            full_advisory_required_bool = str(full_advisory_required).strip().lower() in {"1", "true", "yes", "y", "on"}
+            diagnostics = state.get("diagnostics") if isinstance(state.get("diagnostics"), dict) else {}
+            conversion_diagnostics = state.get("conversion_diagnostics") if isinstance(state.get("conversion_diagnostics"), dict) else {}
+            expected_algorithm_version = CONTEXT_OVERLAY_SIGNAL_REFRESH_VERSION if short_name == "context_overlays" else None
+            state_algorithm_version = (
+                str(state.get("context_overlay_signal_refresh_version") or "").strip()
+                if short_name == "context_overlays"
+                else ""
+            )
+            algorithm_version_matches = (
+                True
+                if short_name != "context_overlays"
+                else state_algorithm_version == CONTEXT_OVERLAY_SIGNAL_REFRESH_VERSION
+            )
+            identity_policy_suppressed_target_rows = 0
+            identity_policy_suppressed_source_counts: dict[str, int] = {}
+            if short_name == "context_overlays":
+                identity_policy_suppressed_target_rows = int(
+                    conversion_diagnostics.get("identity_policy_suppressed_target_rows") or 0
+                )
+                for source_row in conversion_diagnostics.get("sources") or []:
+                    if not isinstance(source_row, dict):
+                        continue
+                    count = int(source_row.get("identity_policy_suppressed_target_rows") or 0)
+                    if count <= 0:
+                        continue
+                    source = str(source_row.get("source") or "unknown").strip().lower() or "unknown"
+                    identity_policy_suppressed_source_counts[source] = identity_policy_suppressed_source_counts.get(source, 0) + count
+                    identity_policy_suppressed_sources[source] = identity_policy_suppressed_sources.get(source, 0) + count
+                identity_policy_suppressed_target_rows_total += identity_policy_suppressed_target_rows
+            unsafe_authority = bool(broker_allowed or portfolio_authority != "none" or not full_advisory_required_bool)
+            has_source_contract_issue = source_name in source_contract_issue_sources
+            if has_error:
+                row_status = "error"
+                error_count += 1
+                error_sources.append(source_name)
+            elif unsafe_authority:
+                row_status = "error"
+                unsafe_authority_count += 1
+                unsafe_authority_sources.append(source_name)
+            elif is_stale or has_source_contract_issue or not algorithm_version_matches:
+                row_status = "warn"
+                if is_stale:
+                    stale_count += 1
+                    stale_sources.append(source_name)
+                if not algorithm_version_matches:
+                    algorithm_version_mismatch_count += 1
+                    algorithm_version_mismatch_sources.append(source_name)
+            else:
+                row_status = "ok"
+            rows.append(
+                _status(
+                    row_status,
+                    "Latest review-only signal-refresh source state loaded.",
+                    source_name=source_name,
+                    signal_refresh_source=short_name,
+                    sync_status=row.get("status"),
+                    updated_at=_json_ready(updated_at),
+                    last_success_at=_json_ready(last_success_at),
+                    age_minutes=None if age_minutes is None else round(age_minutes, 2),
+                    stale=is_stale,
+                    target_rows=int(state.get("target_rows") or 0),
+                    signal_rows=signal_rows,
+                    affected_symbol_count=int(state.get("affected_symbol_count") or len(state.get("symbols") or [])),
+                    expected_algorithm_version=expected_algorithm_version,
+                    state_algorithm_version=state_algorithm_version or None,
+                    algorithm_version_matches=bool(algorithm_version_matches),
+                    identity_policy_suppressed_target_rows=(
+                        identity_policy_suppressed_target_rows
+                        if short_name == "context_overlays"
+                        else None
+                    ),
+                    identity_policy_suppressed_sources=(
+                        identity_policy_suppressed_source_counts
+                        if short_name == "context_overlays"
+                        else None
+                    ),
+                    source_contract_audit=(
+                        source_contract_audit
+                        if source_name == "advisory:signal_refresh:context_overlays"
+                        else None
+                    ),
+                    source_contract_audit_ok=(
+                        not has_source_contract_issue
+                        if source_name == "advisory:signal_refresh:context_overlays"
+                        else None
+                    ),
+                    authority_contract=authority_contract,
+                    authority_boundary_ok=not unsafe_authority,
+                    broker_execution_allowed=bool(broker_allowed),
+                    portfolio_authority=portfolio_authority,
+                    full_advisory_required=bool(full_advisory_required_bool),
+                    candidate_helpful_memory_rows=(
+                        int(diagnostics.get("candidate_helpful_memory_rows") or 0)
+                        if short_name == "causal_memory"
+                        else None
+                    ),
+                    harmful_or_no_lift_suppressed_memory_rows=(
+                        int(diagnostics.get("harmful_or_no_lift_suppressed_memory_rows") or 0)
+                        if short_name == "causal_memory"
+                        else None
+                    ),
+                    benchmark_beta_not_memory_alpha_suppressed_memory_rows=(
+                        int(diagnostics.get("benchmark_beta_not_memory_alpha_suppressed_memory_rows") or 0)
+                        if short_name == "causal_memory"
+                        else None
+                    ),
+                    needs_benchmark_attribution_suppressed_memory_rows=(
+                        int(diagnostics.get("needs_benchmark_attribution_suppressed_memory_rows") or 0)
+                        if short_name == "causal_memory"
+                        else None
+                    ),
+                    non_candidate_suppressed_memory_rows=(
+                        int(diagnostics.get("non_candidate_suppressed_memory_rows") or 0)
+                        if short_name == "causal_memory"
+                        else None
+                    ),
+                    causal_memory_suppression_policy=(
+                        diagnostics.get("suppression_policy")
+                        if short_name == "causal_memory"
+                        else None
+                    ),
+                    causal_memory_suppression_diagnostics_degraded=(
+                        bool(diagnostics.get("suppression_diagnostics_degraded"))
+                        if short_name == "causal_memory"
+                        else None
+                    ),
+                    error=row.get("error_text"),
+                    state=state,
+                )
+            )
+        status = (
+            "error"
+            if (error_count or unsafe_authority_count)
+            else "warn"
+            if (stale_count or missing_sources or source_contract_issue_sources or algorithm_version_mismatch_count)
+            else "ok"
+        )
+        return _status(
+            status,
+            "Latest review-only signal-refresh source state loaded.",
+            table="advisory_sync_state",
+            rows=rows,
+            returned_count=len(rows),
+            missing_sources=missing_sources,
+            stale_sources=stale_sources,
+            error_sources=error_sources,
+            unsafe_authority_sources=unsafe_authority_sources,
+            algorithm_version_mismatch_sources=algorithm_version_mismatch_sources,
+            source_contract_issue_sources=source_contract_issue_sources,
+            source_contract_audit=source_contract_audit,
+            stale_count=stale_count,
+            error_count=error_count,
+            unsafe_authority_count=unsafe_authority_count,
+            algorithm_version_mismatch_count=algorithm_version_mismatch_count,
+            malformed_source_contract_count=int(source_contract_audit.get("malformed_source_contract_count") or 0),
+            signal_row_total=signal_row_total,
+            identity_policy_suppressed_target_rows=identity_policy_suppressed_target_rows_total,
+            identity_policy_suppressed_sources=dict(sorted(identity_policy_suppressed_sources.items(), key=lambda item: (-item[1], item[0]))),
+            max_age_minutes=int(max_age_minutes),
+            broker_execution_allowed=False,
+            portfolio_authority="none",
+            full_advisory_required=True,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="advisory_sync_state",
+            fallback_type="operator_health_signal_refresh_source_state_failed",
+            reason="Operator Health could not inspect signal-refresh source state.",
+            error=exc,
+            metadata={"max_age_minutes": int(max_age_minutes)},
+        )
+        return _status(
+            "error",
+            "Signal-refresh source-state check failed.",
+            table="advisory_sync_state",
+            error=f"{type(exc).__name__}: {exc}",
+            rows=[],
+            returned_count=0,
+        )
+
+
+def _audit_context_signal_refresh_source_contracts(max_age_minutes: int = 90, *, limit: int = 100) -> dict[str, Any]:
+    try:
+        if not table_exists(SIGNAL_REFRESH_ACTIONS_TABLE):
+            return {
+                "status": "warn",
+                "message": "Signal-refresh actions table does not exist yet; source-contract audit is unavailable.",
+                "table": SIGNAL_REFRESH_ACTIONS_TABLE,
+                "checked_rows": 0,
+                "malformed_source_contract_count": 0,
+                "samples": [],
+            }
+        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(minutes=max(1, int(max_age_minutes)))
+        prefixes = list(CONTEXT_SIGNAL_REFRESH_SOURCE_PREFIXES)
+        df = sql_to_df(
+            f"""
+            SELECT refreshed_at, symbol, unique_id, signal_source, signal_action, action_payload_json
+            FROM {SIGNAL_REFRESH_ACTIONS_TABLE}
+            WHERE refreshed_at >= %s
+              AND (
+                LOWER(COALESCE(signal_source, '')) LIKE ANY(%s)
+              )
+            ORDER BY refreshed_at DESC
+            LIMIT %s
+            """,
+            params=(cutoff, [f"{prefix}%" for prefix in prefixes], max(1, int(limit))),
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+        malformed: list[dict[str, Any]] = []
+        checked = 0
+        for row in _records(df):
+            checked += 1
+            payload = _json_dict(
+                row.get("action_payload_json"),
+                source="signal_refresh_action_payload_json",
+                metadata={"symbol": row.get("symbol"), "signal_source": row.get("signal_source")},
+            )
+            source_contract = payload.get("source_contract") if isinstance(payload.get("source_contract"), dict) else {}
+            source_table = str(source_contract.get("source_table") or "").strip()
+            source_key = str(source_contract.get("source_key") or source_contract.get("context_overlay_id") or "").strip()
+            broker_allowed = str(source_contract.get("broker_execution_allowed")).strip().lower() in {"1", "true", "yes", "y", "on"}
+            issue_reasons: list[str] = []
+            if not source_contract:
+                issue_reasons.append("missing_source_contract")
+            if not source_table:
+                issue_reasons.append("missing_source_table")
+            if not source_key:
+                issue_reasons.append("missing_source_key")
+            if broker_allowed:
+                issue_reasons.append("source_contract_broker_authority_not_allowed")
+            if issue_reasons:
+                malformed.append(
+                    {
+                        "symbol": row.get("symbol"),
+                        "unique_id": row.get("unique_id"),
+                        "signal_source": row.get("signal_source"),
+                        "signal_action": row.get("signal_action"),
+                        "refreshed_at": _json_ready(pd.to_datetime(row.get("refreshed_at"), utc=True, errors="coerce")),
+                        "issue_reasons": issue_reasons,
+                    }
+                )
+        status = "warn" if malformed else "ok"
+        return {
+            "status": status,
+            "message": (
+                "Recent context-overlay signal-refresh rows have source contracts."
+                if not malformed
+                else "Recent context-overlay signal-refresh rows include malformed or missing source contracts."
+            ),
+            "table": SIGNAL_REFRESH_ACTIONS_TABLE,
+            "checked_rows": int(checked),
+            "malformed_source_contract_count": int(len(malformed)),
+            "samples": malformed[:10],
+        }
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=SIGNAL_REFRESH_ACTIONS_TABLE,
+            fallback_type="operator_health_signal_refresh_source_contract_audit_failed",
+            reason="Operator Health could not audit signal-refresh context source contracts.",
+            error=exc,
+            metadata={"max_age_minutes": int(max_age_minutes), "limit": int(limit)},
+        )
+        return {
+            "status": "warn",
+            "message": "Signal-refresh source-contract audit failed.",
+            "table": SIGNAL_REFRESH_ACTIONS_TABLE,
+            "checked_rows": 0,
+            "malformed_source_contract_count": 0,
+            "samples": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _download_runner_severity(row_status: str, classification: str) -> str:
@@ -2504,6 +3175,482 @@ def check_screener_failures(*, hours: int = 24, limit: int = 10) -> dict[str, An
     )
 
 
+def check_context_gate_policy() -> dict[str, Any]:
+    try:
+        snapshot = current_context_gate_policy_snapshot()
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="advisory.recommendation_diagnostics",
+            fallback_type="operator_health_context_gate_policy_check_failed",
+            reason="Operator Health could not inspect the current context/regime gate policy.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect context/regime gate policy.",
+            error=f"{type(exc).__name__}: {exc}",
+            broker_execution_allowed=False,
+            portfolio_authority="none",
+        )
+    exposure = snapshot.get("single_regime_hard_gate_exposure") if isinstance(snapshot.get("single_regime_hard_gate_exposure"), dict) else {}
+    active_single = list(exposure.get("active_single_regime_flags") or [])
+    active_context = list(exposure.get("active_context_hard_flags") or [])
+    if active_single:
+        status = "warn"
+        message = "A broad single-regime hard gate is enabled."
+        reasons = ["active_single_regime_hard_gate"]
+    else:
+        status = "ok"
+        message = "Broad regime labels are diagnostic/context-only by current env policy."
+        reasons = []
+    return _status(
+        status,
+        message,
+        reasons=reasons,
+        active_single_regime_flags=active_single,
+        active_context_hard_flags=active_context,
+        global_regime_label_blocks_buy=bool(exposure.get("global_regime_label_blocks_buy")),
+        policy_summary=snapshot.get("policy_summary") if isinstance(snapshot.get("policy_summary"), dict) else {},
+        env=snapshot.get("env") if isinstance(snapshot.get("env"), dict) else {},
+        operator_action=exposure.get("operator_action"),
+        command="python scripts/context_gate_policy_audit.py --fail-on-single-regime",
+        authority="read_only_env_policy_audit",
+        portfolio_authority="none",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_technical_threshold_evidence() -> dict[str, Any]:
+    command = "python -m advisory.technical_threshold_calibration --horizons 5 10 20"
+    promotion_command = (
+        "python -m advisory.technical_threshold_promotion "
+        "--setup-id EVENT_OPPORTUNITY_V1 --config-id <config_id> --dry-run"
+    )
+    if not table_exists(TECHNICAL_THRESHOLD_EVALUATIONS_TABLE) or not table_exists(TECHNICAL_THRESHOLD_SUMMARY_TABLE):
+        missing = [
+            table
+            for table in [TECHNICAL_THRESHOLD_EVALUATIONS_TABLE, TECHNICAL_THRESHOLD_SUMMARY_TABLE]
+            if not table_exists(table)
+        ]
+        return _status(
+            "warn",
+            "Technical-threshold calibration tables do not exist yet.",
+            usable=False,
+            ready_for_policy_review=False,
+            reasons=["missing_technical_threshold_evidence_tables"],
+            missing_tables=missing,
+            command=command,
+            promotion_review_command=promotion_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    summary_columns = table_columns(TECHNICAL_THRESHOLD_SUMMARY_TABLE)
+    required_columns = {
+        "best_config_id",
+        "best_eligible_count",
+        "best_avg_forward_return_after_cost",
+        "baseline_avg_forward_return_after_cost",
+        "recommendation",
+    }
+    missing_summary_columns = sorted(required_columns - summary_columns)
+    best_config_expr = "best_config_id" if "best_config_id" in summary_columns else "NULL::TEXT AS best_config_id"
+    best_eligible_expr = (
+        "best_eligible_count" if "best_eligible_count" in summary_columns else "NULL::BIGINT AS best_eligible_count"
+    )
+    best_return_expr = (
+        "best_avg_forward_return_after_cost"
+        if "best_avg_forward_return_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS best_avg_forward_return_after_cost"
+    )
+    baseline_return_expr = (
+        "baseline_avg_forward_return_after_cost"
+        if "baseline_avg_forward_return_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS baseline_avg_forward_return_after_cost"
+    )
+    best_hit_expr = (
+        "best_hit_rate_after_cost"
+        if "best_hit_rate_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS best_hit_rate_after_cost"
+    )
+    baseline_hit_expr = (
+        "baseline_hit_rate_after_cost"
+        if "baseline_hit_rate_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS baseline_hit_rate_after_cost"
+    )
+    recommendation_expr = "recommendation" if "recommendation" in summary_columns else "NULL::TEXT AS recommendation"
+    review_candidate_expr = (
+        "SUM(CASE WHEN recommendation = 'review_for_promotion' THEN 1 ELSE 0 END)"
+        if "recommendation" in summary_columns
+        else "0"
+    )
+    bounded_expr = (
+        "SUM(CASE WHEN recommendation = 'bounded_first_pass_only' THEN 1 ELSE 0 END)"
+        if "recommendation" in summary_columns
+        else "0"
+    )
+    enough_signals_expr = (
+        f"SUM(CASE WHEN best_eligible_count >= {int(TECHNICAL_THRESHOLD_MIN_SIGNALS)} THEN 1 ELSE 0 END)"
+        if "best_eligible_count" in summary_columns
+        else "0"
+    )
+    lift_expr = (
+        "SUM(CASE WHEN best_avg_forward_return_after_cost > baseline_avg_forward_return_after_cost THEN 1 ELSE 0 END)"
+        if {"best_avg_forward_return_after_cost", "baseline_avg_forward_return_after_cost"}.issubset(summary_columns)
+        else "0"
+    )
+    positive_return_expr = (
+        "SUM(CASE WHEN best_avg_forward_return_after_cost > 0 THEN 1 ELSE 0 END)"
+        if "best_avg_forward_return_after_cost" in summary_columns
+        else "0"
+    )
+    non_positive_return_expr = (
+        "SUM(CASE WHEN best_avg_forward_return_after_cost <= 0 THEN 1 ELSE 0 END)"
+        if "best_avg_forward_return_after_cost" in summary_columns
+        else "0"
+    )
+    no_lift_expr = (
+        "SUM(CASE WHEN best_avg_forward_return_after_cost <= baseline_avg_forward_return_after_cost THEN 1 ELSE 0 END)"
+        if {"best_avg_forward_return_after_cost", "baseline_avg_forward_return_after_cost"}.issubset(summary_columns)
+        else "0"
+    )
+    try:
+        eval_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                MAX(load_ts) AS latest_load_ts,
+                COUNT(*) AS evaluation_rows,
+                MAX(signal_count) AS max_matured_signal_count,
+                MAX(eligible_count) AS max_eligible_count,
+                SUM(CASE WHEN objective_score IS NOT NULL THEN 1 ELSE 0 END) AS objective_scored_rows,
+                COUNT(DISTINCT horizon_days) AS horizon_count
+            FROM {TECHNICAL_THRESHOLD_EVALUATIONS_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        summary_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                COUNT(*) AS summary_rows,
+                {review_candidate_expr} AS review_candidate_count,
+                {bounded_expr} AS bounded_first_pass_count,
+                {enough_signals_expr} AS sufficiently_matured_group_count,
+                {lift_expr} AS lift_over_baseline_count,
+                {positive_return_expr} AS positive_after_cost_count,
+                {non_positive_return_expr} AS non_positive_after_cost_count,
+                {no_lift_expr} AS no_lift_over_baseline_count
+            FROM {TECHNICAL_THRESHOLD_SUMMARY_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        groups = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                horizon_days,
+                {best_config_expr},
+                {best_eligible_expr},
+                {best_return_expr},
+                {baseline_return_expr},
+                {best_hit_expr},
+                {baseline_hit_expr},
+                {recommendation_expr}
+            FROM {TECHNICAL_THRESHOLD_SUMMARY_TABLE}
+            ORDER BY evaluated_at DESC, horizon_days
+            LIMIT 10
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=TECHNICAL_THRESHOLD_SUMMARY_TABLE,
+            fallback_type="operator_health_technical_threshold_evidence_failed",
+            reason="Operator Health could not inspect technical-threshold calibration evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect technical-threshold calibration evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            ready_for_policy_review=False,
+            command=command,
+            promotion_review_command=promotion_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    eval_row = eval_df.iloc[0] if not eval_df.empty else {}
+    summary_row = summary_df.iloc[0] if not summary_df.empty else {}
+    latest_eval = pd.to_datetime(eval_row.get("latest_evaluated_at"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    latest_load = pd.to_datetime(eval_row.get("latest_load_ts"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    evaluation_rows = int(eval_row.get("evaluation_rows") or 0) if len(eval_row) else 0
+    max_matured_signal_count = int(eval_row.get("max_matured_signal_count") or 0) if len(eval_row) else 0
+    max_eligible_count = int(eval_row.get("max_eligible_count") or 0) if len(eval_row) else 0
+    objective_scored_rows = int(eval_row.get("objective_scored_rows") or 0) if len(eval_row) else 0
+    horizon_count = int(eval_row.get("horizon_count") or 0) if len(eval_row) else 0
+    summary_rows = int(summary_row.get("summary_rows") or 0) if len(summary_row) else 0
+    review_candidate_count = int(summary_row.get("review_candidate_count") or 0) if len(summary_row) else 0
+    bounded_first_pass_count = int(summary_row.get("bounded_first_pass_count") or 0) if len(summary_row) else 0
+    sufficiently_matured_group_count = int(summary_row.get("sufficiently_matured_group_count") or 0) if len(summary_row) else 0
+    lift_over_baseline_count = int(summary_row.get("lift_over_baseline_count") or 0) if len(summary_row) else 0
+    positive_after_cost_count = int(summary_row.get("positive_after_cost_count") or 0) if len(summary_row) else 0
+    non_positive_after_cost_count = int(summary_row.get("non_positive_after_cost_count") or 0) if len(summary_row) else 0
+    no_lift_over_baseline_count = int(summary_row.get("no_lift_over_baseline_count") or 0) if len(summary_row) else 0
+    reasons: list[str] = []
+    if evaluation_rows <= 0 or summary_rows <= 0:
+        reasons.append("empty_technical_threshold_evidence")
+    if max_matured_signal_count < int(TECHNICAL_THRESHOLD_MIN_SIGNALS):
+        reasons.append("insufficient_matured_technical_threshold_signals")
+    if missing_summary_columns:
+        reasons.append("technical_threshold_evidence_schema_missing_summary_columns")
+    if bounded_first_pass_count > 0:
+        reasons.append("technical_threshold_evidence_bounded_first_pass_only")
+    if review_candidate_count <= 0:
+        reasons.append("no_technical_threshold_review_candidate")
+    if lift_over_baseline_count <= 0:
+        reasons.append("no_technical_threshold_lift_over_baseline")
+    if positive_after_cost_count <= 0:
+        reasons.append("no_positive_technical_threshold_after_cost_return")
+    if pd.isna(latest_eval):
+        reasons.append("missing_latest_technical_threshold_evaluated_at")
+        age_days = None
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_eval).total_seconds() / 86400.0, 0.0)
+        if age_days > 14:
+            reasons.append("stale_technical_threshold_evidence")
+    trigger_near_miss_research = _load_technical_threshold_near_miss_health(
+        latest_evaluated_at=latest_eval,
+        summary_columns=summary_columns,
+    )
+    status = "ok" if not reasons else "warn"
+    ready_for_policy_review = bool(
+        status == "ok"
+        and review_candidate_count > 0
+        and lift_over_baseline_count > 0
+        and positive_after_cost_count > 0
+        and max_matured_signal_count >= int(TECHNICAL_THRESHOLD_MIN_SIGNALS)
+    )
+    if status == "ok" and ready_for_policy_review:
+        message = "Technical-threshold calibration has after-cost lift over baseline and is ready for offline review."
+    elif missing_summary_columns:
+        message = "Technical-threshold calibration summary is missing required columns; rerun the calibration migration/output."
+    elif bounded_first_pass_count > 0:
+        message = "Technical-threshold calibration is only a bounded first pass; do not use it for threshold review."
+    elif lift_over_baseline_count <= 0:
+        message = "Technical-threshold calibration has not shown after-cost lift over the baseline threshold set."
+    elif positive_after_cost_count <= 0:
+        message = "Technical-threshold calibration has no positive after-cost candidate; do not review thresholds for promotion."
+    else:
+        message = "Technical-threshold calibration is missing, stale, or lacks enough matured after-cost evidence."
+    return _status(
+        status,
+        message,
+        usable=status == "ok",
+        ready_for_policy_review=ready_for_policy_review,
+        reasons=reasons,
+        evaluations_table=TECHNICAL_THRESHOLD_EVALUATIONS_TABLE,
+        summary_table=TECHNICAL_THRESHOLD_SUMMARY_TABLE,
+        latest_evaluated_at=_json_ready(latest_eval),
+        latest_load_ts=_json_ready(latest_load),
+        age_days=None if age_days is None else round(age_days, 3),
+        evaluation_rows=evaluation_rows,
+        summary_rows=summary_rows,
+        max_matured_signal_count=max_matured_signal_count,
+        max_eligible_count=max_eligible_count,
+        objective_scored_rows=objective_scored_rows,
+        horizon_count=horizon_count,
+        review_candidate_count=review_candidate_count,
+        bounded_first_pass_count=bounded_first_pass_count,
+        sufficiently_matured_group_count=sufficiently_matured_group_count,
+        lift_over_baseline_count=lift_over_baseline_count,
+        positive_after_cost_count=positive_after_cost_count,
+        non_positive_after_cost_count=non_positive_after_cost_count,
+        no_lift_over_baseline_count=no_lift_over_baseline_count,
+        missing_summary_columns=missing_summary_columns,
+        trigger_near_miss_research=trigger_near_miss_research,
+        trigger_near_miss_candidate_count=len(trigger_near_miss_research.get("top_relaxation_candidates") or []),
+        trigger_near_miss_do_not_relax_count=len(trigger_near_miss_research.get("top_do_not_relax") or []),
+        trigger_near_miss_needs_more_label_count=len(trigger_near_miss_research.get("needs_more_label_near_misses") or []),
+        min_matured_signals=int(TECHNICAL_THRESHOLD_MIN_SIGNALS),
+        groups=_records(groups),
+        command=command,
+        promotion_review_command=promotion_command,
+        authority="research_only_manual_review",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def _load_technical_threshold_near_miss_health(
+    *,
+    latest_evaluated_at: pd.Timestamp,
+    summary_columns: set[str],
+    min_signals: int = TECHNICAL_THRESHOLD_MIN_SIGNALS,
+    return_threshold: float = 0.03,
+    min_hit_rate: float = 0.5,
+) -> dict[str, Any]:
+    authority = {
+        "authority": "research_only_manual_review",
+        "broker_execution_allowed": False,
+        "policy_auto_promotion_allowed": False,
+    }
+    if "archetype_breakdown_json" not in summary_columns:
+        return {
+            "status": "missing_column",
+            **authority,
+            "near_miss_rows": 0,
+            "classification_counts": {},
+            "top_relaxation_candidates": [],
+            "top_do_not_relax": [],
+            "needs_more_label_near_misses": [],
+        }
+    if pd.isna(latest_evaluated_at):
+        return {
+            "status": "missing_latest_evaluated_at",
+            **authority,
+            "near_miss_rows": 0,
+            "classification_counts": {},
+            "top_relaxation_candidates": [],
+            "top_do_not_relax": [],
+            "needs_more_label_near_misses": [],
+        }
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT evaluated_at, horizon_days, archetype_breakdown_json
+            FROM {TECHNICAL_THRESHOLD_SUMMARY_TABLE}
+            WHERE evaluated_at = %(latest)s
+            ORDER BY horizon_days
+            """,
+            params={"latest": latest_evaluated_at},
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=TECHNICAL_THRESHOLD_SUMMARY_TABLE,
+            fallback_type="operator_health_technical_threshold_near_miss_load_failed",
+            reason="Operator Health could not load technical-threshold trigger near-miss evidence.",
+            error=exc,
+            metadata={"latest_evaluated_at": latest_evaluated_at.isoformat()},
+        )
+        return {
+            "status": "error",
+            **authority,
+            "error": f"{type(exc).__name__}: {exc}",
+            "near_miss_rows": 0,
+            "classification_counts": {},
+            "top_relaxation_candidates": [],
+            "top_do_not_relax": [],
+            "needs_more_label_near_misses": [],
+        }
+
+    buckets: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in _records(df):
+        payload = _json_dict(
+            row.get("archetype_breakdown_json"),
+            source=TECHNICAL_THRESHOLD_SUMMARY_TABLE,
+            fallback_type="operator_health_technical_threshold_near_miss_json_parse_failed",
+            metadata={"horizon_days": row.get("horizon_days"), "evaluated_at": row.get("evaluated_at")},
+        )
+        horizon = int(row.get("horizon_days") or payload.get("horizon_days") or 0)
+        for item in payload.get("trigger_near_miss_breakdown") or []:
+            if not isinstance(item, dict):
+                continue
+            key = (
+                str(item.get("near_miss_archetype") or "unknown"),
+                str(item.get("near_miss_blocker_key") or "none"),
+            )
+            bucket = buckets.setdefault(
+                key,
+                {
+                    "near_miss_archetype": key[0],
+                    "near_miss_blocker_key": key[1],
+                    "near_miss_blocker_codes": item.get("near_miss_blocker_codes")
+                    if isinstance(item.get("near_miss_blocker_codes"), list)
+                    else [],
+                    "horizons": [],
+                    "signal_count": 0,
+                    "_return_weighted_sum": 0.0,
+                    "_return_weight": 0,
+                    "_hit_weighted_sum": 0.0,
+                    "_hit_weight": 0,
+                    "sample_blockers": item.get("sample_blockers") if isinstance(item.get("sample_blockers"), list) else [],
+                },
+            )
+            if horizon and horizon not in bucket["horizons"]:
+                bucket["horizons"].append(horizon)
+            signal_count = int(item.get("signal_count") or 0)
+            bucket["signal_count"] += signal_count
+            avg_return = pd.to_numeric(item.get("avg_return_after_cost"), errors="coerce")
+            if not pd.isna(avg_return) and signal_count > 0:
+                bucket["_return_weighted_sum"] += float(avg_return) * signal_count
+                bucket["_return_weight"] += signal_count
+            hit_rate = pd.to_numeric(item.get("hit_rate_after_cost"), errors="coerce")
+            if not pd.isna(hit_rate) and signal_count > 0:
+                bucket["_hit_weighted_sum"] += float(hit_rate) * signal_count
+                bucket["_hit_weight"] += signal_count
+
+    rows: list[dict[str, Any]] = []
+    for bucket in buckets.values():
+        avg_return = None if int(bucket["_return_weight"]) == 0 else round(float(bucket["_return_weighted_sum"] / bucket["_return_weight"]), 6)
+        hit_rate = None if int(bucket["_hit_weight"]) == 0 else round(float(bucket["_hit_weighted_sum"] / bucket["_hit_weight"]), 6)
+        signal_count = int(bucket["signal_count"])
+        if signal_count < int(min_signals) or avg_return is None or hit_rate is None:
+            classification = "needs_more_matured_labels"
+        elif avg_return >= float(return_threshold) and hit_rate >= float(min_hit_rate):
+            classification = "potential_trigger_relaxation_candidate"
+        elif avg_return <= 0.0 or hit_rate < 0.4:
+            classification = "do_not_relax_negative_or_weak"
+        else:
+            classification = "mixed_or_marginal_requires_review"
+        rows.append(
+            {
+                "near_miss_archetype": bucket["near_miss_archetype"],
+                "near_miss_blocker_key": bucket["near_miss_blocker_key"],
+                "near_miss_blocker_codes": bucket["near_miss_blocker_codes"],
+                "horizons": sorted(bucket["horizons"]),
+                "signal_count": signal_count,
+                "avg_return_after_cost": avg_return,
+                "hit_rate_after_cost": hit_rate,
+                "classification": classification,
+                "sample_blockers": bucket["sample_blockers"],
+                **authority,
+            }
+        )
+    rows.sort(
+        key=lambda item: (
+            item["classification"] == "potential_trigger_relaxation_candidate",
+            int(item.get("signal_count") or 0),
+            float(item.get("avg_return_after_cost") or -999.0),
+        ),
+        reverse=True,
+    )
+    classification_counts = dict(pd.Series([item["classification"] for item in rows]).value_counts().to_dict()) if rows else {}
+    return {
+        "status": "ok" if rows else "no_near_miss_rows",
+        **authority,
+        "min_signals": int(min_signals),
+        "return_threshold": float(return_threshold),
+        "min_hit_rate": float(min_hit_rate),
+        "near_miss_rows": len(rows),
+        "classification_counts": classification_counts,
+        "top_relaxation_candidates": [item for item in rows if item["classification"] == "potential_trigger_relaxation_candidate"][:10],
+        "top_do_not_relax": [item for item in rows if item["classification"] == "do_not_relax_negative_or_weak"][:10],
+        "needs_more_label_near_misses": [item for item in rows if item["classification"] == "needs_more_matured_labels"][:10],
+        "mixed_or_marginal_near_misses": [item for item in rows if item["classification"] == "mixed_or_marginal_requires_review"][:10],
+    }
+
+
 def check_signal_quality() -> dict[str, Any]:
     if not table_exists(SIGNAL_QUALITY_SUMMARY_TABLE):
         return _status(
@@ -2585,15 +3732,47 @@ def check_signal_quality() -> dict[str, Any]:
             )
             coverage = pd.DataFrame()
 
+    promotion_reviews = _load_signal_quality_promotion_review_health(latest)
     now = pd.Timestamp.utcnow()
     age_days = float((now - latest).total_seconds() / 86400.0)
     matured = pd.to_numeric(summary.get("matured_count", pd.Series(dtype=float)), errors="coerce")
     max_matured = int(matured.max()) if not matured.dropna().empty else 0
+    empty_label_series = pd.Series([""] * len(summary), index=summary.index, dtype=object)
+    recommendations = (
+        summary.get("recommendation", empty_label_series)
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    classifications = (
+        summary.get("classification", empty_label_series)
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    benchmark_beta_rows = int(
+        (recommendations.eq("benchmark_beta_not_overlay_alpha") | classifications.eq("benchmark_beta_not_overlay_alpha")).sum()
+    )
+    needs_benchmark_rows = int(
+        (recommendations.eq("needs_benchmark_attribution") | classifications.eq("needs_benchmark_attribution")).sum()
+    )
+    benchmark_or_attribution_blocked_rows = benchmark_beta_rows + needs_benchmark_rows
     overlay_rows = 0
     if not coverage.empty:
         for column in ["event_policy_rows", "bhavcopy_rows", "company_memory_rows"]:
             if column in coverage.columns:
                 overlay_rows += int(pd.to_numeric(coverage[column], errors="coerce").fillna(0).max())
+    family_report = build_signal_quality_family_report(summary)
+    promotion_readiness = (
+        family_report.get("promotion_readiness")
+        if isinstance(family_report.get("promotion_readiness"), dict)
+        else {}
+    )
+    promotion_readiness_status = str(promotion_readiness.get("status") or "").strip()
+    candidate_helpful_families = promotion_readiness.get("candidate_helpful_families")
+    blocked_families = promotion_readiness.get("benchmark_or_attribution_blocked_families")
+    candidate_helpful_families = candidate_helpful_families if isinstance(candidate_helpful_families, list) else []
+    blocked_families = blocked_families if isinstance(blocked_families, list) else []
     reasons: list[str] = []
     if age_days > SIGNAL_QUALITY_MAX_AGE_DAYS:
         reasons.append("stale_signal_quality_run")
@@ -2601,6 +3780,14 @@ def check_signal_quality() -> dict[str, Any]:
         reasons.append("insufficient_matured_rows")
     if overlay_rows < SIGNAL_QUALITY_MIN_OVERLAY_ROWS:
         reasons.append("insufficient_overlay_coverage")
+    if benchmark_beta_rows > 0:
+        reasons.append("benchmark_beta_not_overlay_alpha")
+    if needs_benchmark_rows > 0:
+        reasons.append("needs_benchmark_attribution")
+    if promotion_readiness_status in {"blocked_by_benchmark_or_attribution", "blocked_by_horizon_instability"}:
+        reasons.append(promotion_readiness_status)
+    elif promotion_readiness_status in {"no_family_ready_for_review", "needs_more_matured_data", "no_family_evidence"}:
+        reasons.append("no_context_family_ready_for_review")
     status = "ok" if not reasons else "warn"
     return _status(
         status,
@@ -2615,9 +3802,2320 @@ def check_signal_quality() -> dict[str, Any]:
         min_matured_rows=SIGNAL_QUALITY_MIN_MATURED_ROWS,
         overlay_rows=overlay_rows,
         min_overlay_rows=SIGNAL_QUALITY_MIN_OVERLAY_ROWS,
+        benchmark_beta_not_overlay_alpha_count=benchmark_beta_rows,
+        needs_benchmark_attribution_count=needs_benchmark_rows,
+        benchmark_or_attribution_blocked_count=benchmark_or_attribution_blocked_rows,
+        promotion_readiness=promotion_readiness,
+        promotion_readiness_status=promotion_readiness_status,
+        candidate_helpful_family_count=int(len(candidate_helpful_families)),
+        benchmark_or_attribution_blocked_family_count=int(len(blocked_families)),
+        promotion_reviews=promotion_reviews,
+        promotion_review_sector_block_count=promotion_reviews.get("sector_block_count"),
+        promotion_review_runtime_block_count=promotion_reviews.get("runtime_block_count"),
+        promotion_review_harmful_class_block_count=promotion_reviews.get("harmful_class_block_count"),
         coverage=_records(coverage),
         summary=_records(summary.head(20)),
         command="python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20",
+        window_runner_command="python -m advisory.signal_quality_window_runner --horizons 5 10 20 --include-split-reports",
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def _load_signal_quality_promotion_review_health(latest_evaluated_at: pd.Timestamp) -> dict[str, Any]:
+    if not table_exists(SIGNAL_QUALITY_PROMOTION_REVIEWS_TABLE):
+        return {
+            "status": "missing_table",
+            "review_count": 0,
+            "sector_block_count": 0,
+            "runtime_block_count": 0,
+            "harmful_class_block_count": 0,
+            "sample_blocked_reviews": [],
+        }
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT reviewed_at, evaluated_at, horizon_days, variant, recommendation, coverage_json, llm_review_json
+            FROM {SIGNAL_QUALITY_PROMOTION_REVIEWS_TABLE}
+            WHERE evaluated_at = %(latest)s
+            ORDER BY reviewed_at DESC NULLS LAST
+            LIMIT 50
+            """,
+            params={"latest": latest_evaluated_at},
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=SIGNAL_QUALITY_PROMOTION_REVIEWS_TABLE,
+            fallback_type="operator_health_signal_quality_promotion_reviews_load_failed",
+            reason="Operator Health could not inspect persisted signal-quality promotion review blockers.",
+            error=exc,
+            metadata={"latest_evaluated_at": latest_evaluated_at.isoformat()},
+        )
+        return {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "review_count": 0,
+            "sector_block_count": 0,
+            "runtime_block_count": 0,
+            "harmful_class_block_count": 0,
+            "sample_blocked_reviews": [],
+        }
+    rows = _records(df)
+    sector_blocks: list[dict[str, Any]] = []
+    runtime_blocks: list[dict[str, Any]] = []
+    harmful_class_blocks: list[dict[str, Any]] = []
+    for row in rows:
+        coverage = _json_dict(
+            row.get("coverage_json"),
+            source=SIGNAL_QUALITY_PROMOTION_REVIEWS_TABLE,
+            metadata={"variant": row.get("variant"), "horizon_days": row.get("horizon_days")},
+        )
+        llm_review = _json_dict(
+            row.get("llm_review_json"),
+            source=SIGNAL_QUALITY_PROMOTION_REVIEWS_TABLE,
+            metadata={"variant": row.get("variant"), "horizon_days": row.get("horizon_days")},
+        )
+        record = {
+            "reviewed_at": row.get("reviewed_at"),
+            "evaluated_at": row.get("evaluated_at"),
+            "horizon_days": row.get("horizon_days"),
+            "variant": row.get("variant"),
+            "recommendation": row.get("recommendation"),
+            "reasons": llm_review.get("reasons") if isinstance(llm_review.get("reasons"), list) else [],
+            "source_family": coverage.get("fast_reliability_source_family") or coverage.get("context_variant_source_family"),
+            "authority": "research_only_manual_review",
+            "broker_execution_allowed": False,
+            "policy_auto_promotion_allowed": False,
+        }
+        if int(coverage.get("fast_reliability_harmful_sector_count") or 0) > 0:
+            sector_blocks.append(
+                {
+                    **record,
+                    "harmful_sector_count": int(coverage.get("fast_reliability_harmful_sector_count") or 0),
+                    "harmful_sectors": coverage.get("fast_reliability_harmful_sectors") or [],
+                }
+            )
+        if coverage.get("fast_reliability_watch_priority_allowed") is False:
+            runtime_blocks.append(
+                {
+                    **record,
+                    "runtime_policy_contract": coverage.get("fast_reliability_runtime_policy_contract"),
+                }
+            )
+        if int(coverage.get("fast_reliability_harmful_context_class_count") or 0) > 0:
+            harmful_class_blocks.append(
+                {
+                    **record,
+                    "harmful_context_class_count": int(coverage.get("fast_reliability_harmful_context_class_count") or 0),
+                    "harmful_context_classes": coverage.get("fast_reliability_harmful_context_classes") or [],
+                }
+            )
+    return {
+        "status": "ok",
+        "review_count": len(rows),
+        "sector_block_count": len(sector_blocks),
+        "runtime_block_count": len(runtime_blocks),
+        "harmful_class_block_count": len(harmful_class_blocks),
+        "sample_blocked_reviews": (sector_blocks + runtime_blocks + harmful_class_blocks)[:10],
+        "authority": "research_only_manual_review",
+        "broker_execution_allowed": False,
+        "policy_auto_promotion_allowed": False,
+    }
+
+
+def check_ts_forecast_paper_portfolio() -> dict[str, Any]:
+    command = "python -m advisory.ts_forecast_paper_portfolio --log-research-ledger"
+    if not table_exists(TS_FORECAST_PAPER_TABLE):
+        return _status(
+            "warn",
+            "TS forecast paper-portfolio evidence table does not exist yet.",
+            usable=False,
+            reasons=["missing_ts_forecast_paper_table"],
+            table=TS_FORECAST_PAPER_TABLE,
+            command=command,
+            promotion_check_endpoint="/api/research/ts-forecast-promotion-check",
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                MAX(load_ts) AS latest_load_ts,
+                MAX(asof_date) AS latest_asof_date,
+                COUNT(*) AS row_count,
+                SUM(CASE WHEN evaluation_status = 'matured' THEN 1 ELSE 0 END) AS matured_count,
+                SUM(CASE WHEN paper_decision = 'PAPER_BUY' THEN 1 ELSE 0 END) AS paper_buy_count,
+                COUNT(DISTINCT symbol) AS symbol_count,
+                COUNT(DISTINCT asof_date) AS asof_date_count
+            FROM {TS_FORECAST_PAPER_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=TS_FORECAST_PAPER_TABLE,
+            fallback_type="operator_health_ts_forecast_paper_check_failed",
+            reason="Operator Health could not inspect TS forecast paper-portfolio evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect TS forecast paper-portfolio evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            table=TS_FORECAST_PAPER_TABLE,
+            command=command,
+        )
+
+    row = df.iloc[0] if not df.empty else {}
+    latest_load_ts = pd.to_datetime(row.get("latest_load_ts"), utc=True, errors="coerce") if len(row) else pd.NaT
+    latest_asof_date = pd.to_datetime(row.get("latest_asof_date"), utc=True, errors="coerce") if len(row) else pd.NaT
+    row_count = int(row.get("row_count") or 0) if len(row) else 0
+    matured_count = int(row.get("matured_count") or 0) if len(row) else 0
+    paper_buy_count = int(row.get("paper_buy_count") or 0) if len(row) else 0
+    symbol_count = int(row.get("symbol_count") or 0) if len(row) else 0
+    asof_date_count = int(row.get("asof_date_count") or 0) if len(row) else 0
+    reasons: list[str] = []
+    if row_count <= 0:
+        reasons.append("empty_ts_forecast_paper_table")
+    if matured_count <= 0:
+        reasons.append("no_matured_paper_outcomes")
+    if pd.isna(latest_load_ts):
+        reasons.append("missing_latest_load_ts")
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_load_ts).total_seconds() / 86400.0, 0.0)
+        if age_days > 7:
+            reasons.append("stale_ts_forecast_paper_evidence")
+    status = "ok" if not reasons else "warn"
+    return _status(
+        status,
+        "TS forecast paper-portfolio evidence is available."
+        if status == "ok"
+        else "TS forecast paper-portfolio evidence is missing, stale, or not matured enough for promotion review.",
+        usable=status == "ok",
+        reasons=reasons,
+        table=TS_FORECAST_PAPER_TABLE,
+        latest_load_ts=_json_ready(latest_load_ts),
+        latest_asof_date=_json_ready(latest_asof_date),
+        age_days=None if pd.isna(latest_load_ts) else round(max((pd.Timestamp.utcnow() - latest_load_ts).total_seconds() / 86400.0, 0.0), 3),
+        row_count=row_count,
+        matured_count=matured_count,
+        paper_buy_count=paper_buy_count,
+        symbol_count=symbol_count,
+        asof_date_count=asof_date_count,
+        command=command,
+        promotion_check_command="python -m advisory.ts_forecast_promotion_check --format json",
+        promotion_check_endpoint="/api/research/ts-forecast-promotion-check",
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_llm_provenance_audit() -> dict[str, Any]:
+    command = "python -m advisory.llm_provenance_audit --lookback-days 30 --limit-per-table 100 --format text"
+    try:
+        payload = build_llm_provenance_audit(lookback_days=30, limit_per_table=100)
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="advisory.llm_provenance_audit",
+            fallback_type="operator_health_llm_provenance_audit_failed",
+            reason="Operator Health could not run the LLM provenance audit.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not run LLM provenance audit.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            command=command,
+            authority="audit_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+            repairs_metadata=False,
+        )
+
+    issue_count = int(payload.get("issue_table_count") or 0)
+    table_count = int(payload.get("table_count") or 0)
+    issue_rows = [
+        row
+        for row in (payload.get("tables") if isinstance(payload.get("tables"), list) else [])
+        if isinstance(row, dict) and str(row.get("status") or "ok") not in {"ok", "no_recent_rows"}
+    ]
+    status = "warn" if issue_count else "ok"
+    return _status(
+        status,
+        "LLM/Codex provenance audit is clean."
+        if status == "ok"
+        else "LLM/Codex provenance audit found missing prompt/schema/evidence/authority metadata.",
+        usable=status == "ok",
+        reasons=["llm_provenance_issues_found"] if issue_count else [],
+        issue_table_count=issue_count,
+        table_count=table_count,
+        lookback_days=int(payload.get("lookback_days") or 30),
+        limit_per_table=int(payload.get("limit_per_table") or 100),
+        issue_rows=issue_rows[:10],
+        command=command,
+        authority="audit_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+        repairs_metadata=False,
+    )
+
+
+def check_provenance_graph_dry_runs() -> dict[str, Any]:
+    commands = {
+        "action_evidence": "python -m advisory.action_evidence_provenance --dry-run --limit 250 --format text",
+        "causal_event": "python -m advisory.causal_event_provenance --dry-run --limit 250 --format text",
+    }
+    rows: list[dict[str, Any]] = []
+    reasons: list[str] = []
+    builders = [
+        ("action_evidence", build_action_evidence_provenance, "provenance_rows", {"limit": 250}),
+        ("causal_event", build_causal_event_provenance, "provenance_rows", {"limit": 250}),
+    ]
+    for key, builder, row_count_key, kwargs in builders:
+        try:
+            _frame, meta = builder(**kwargs)
+        except Exception as exc:
+            _record_health_local_fallback(
+                source=f"advisory.{key}_provenance",
+                fallback_type="operator_health_provenance_graph_dry_run_failed",
+                reason="Operator Health could not run a provenance graph dry-run builder.",
+                error=exc,
+                metadata={"graph": key, "command": commands[key]},
+            )
+            rows.append(
+                {
+                    "graph": key,
+                    "status": "error",
+                    "message": "Provenance dry run failed.",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "command": commands[key],
+                    "broker_execution_allowed": False,
+                    "policy_auto_promotion_allowed": False,
+                    "persisted": False,
+                }
+            )
+            reasons.append(f"{key}_dry_run_failed")
+            continue
+        provenance_rows = int(meta.get(row_count_key) or 0)
+        graph_status = "ok" if provenance_rows > 0 else "warn"
+        if graph_status != "ok":
+            reasons.append(f"{key}_no_provenance_rows")
+        rows.append(
+            {
+                "graph": key,
+                "status": graph_status,
+                "message": "Provenance dry run produced audit rows." if graph_status == "ok" else "Provenance dry run produced no audit rows.",
+                "command": commands[key],
+                "from_date": meta.get("from_date"),
+                "to_date": meta.get("to_date"),
+                "source_row_count": int(meta.get("action_rows") or meta.get("memory_rows") or 0),
+                "evaluation_rows": int(meta.get("evaluation_rows") or 0),
+                "provenance_rows": provenance_rows,
+                "table": meta.get("table"),
+                "authority_scope": meta.get("authority_scope") or "research_only",
+                "broker_execution_allowed": bool(meta.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(meta.get("policy_auto_promotion_allowed")),
+                "persisted": False,
+            }
+        )
+    error_count = sum(1 for row in rows if row.get("status") == "error")
+    warn_count = sum(1 for row in rows if row.get("status") == "warn")
+    status = "error" if error_count else "warn" if warn_count else "ok"
+    return _status(
+        status,
+        "Provenance graph dry runs are producing audit lineage."
+        if status == "ok"
+        else "One or more provenance graph dry runs are missing lineage rows or failed.",
+        usable=status == "ok",
+        reasons=reasons,
+        rows=rows,
+        row_count=len(rows),
+        error_count=error_count,
+        warn_count=warn_count,
+        commands=list(commands.values()),
+        authority="audit_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+        persists_rows=False,
+    )
+
+
+def check_causal_event_memory_evidence() -> dict[str, Any]:
+    command = "python -m advisory.causal_event_memory_evaluator --horizons 5 10 20 --format json"
+    if not table_exists(CAUSAL_MEMORY_EVALUATIONS_TABLE) or not table_exists(CAUSAL_MEMORY_SUMMARY_TABLE):
+        missing = [
+            table
+            for table in [CAUSAL_MEMORY_EVALUATIONS_TABLE, CAUSAL_MEMORY_SUMMARY_TABLE]
+            if not table_exists(table)
+        ]
+        return _status(
+            "warn",
+            "Causal event-memory evaluation tables do not exist yet.",
+            usable=False,
+            reasons=["missing_causal_event_memory_evidence_tables"],
+            missing_tables=missing,
+            command=command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+    try:
+        eval_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                MAX(load_ts) AS latest_load_ts,
+                COUNT(*) AS evaluation_rows,
+                SUM(CASE WHEN matured THEN 1 ELSE 0 END) AS matured_rows,
+                COUNT(DISTINCT symbol) AS symbol_count,
+                COUNT(DISTINCT horizon_days) AS horizon_count
+            FROM {CAUSAL_MEMORY_EVALUATIONS_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        summary_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                COUNT(*) AS summary_rows,
+                SUM(CASE WHEN classification = 'candidate_helpful' THEN 1 ELSE 0 END) AS candidate_group_count,
+                SUM(CASE WHEN classification = 'hurts_or_no_lift' THEN 1 ELSE 0 END) AS harmful_group_count,
+                SUM(CASE WHEN matured_count >= %s THEN 1 ELSE 0 END) AS sufficiently_matured_group_count
+            FROM {CAUSAL_MEMORY_SUMMARY_TABLE}
+            """,
+            params=(int(CAUSAL_MEMORY_MIN_MATURED_ROWS),),
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        groups = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                horizon_days,
+                context_source,
+                context_class,
+                event_type,
+                direction,
+                event_state,
+                sample_count,
+                matured_count,
+                symbol_count,
+                avg_forward_return_after_cost,
+                avg_excess_return_after_cost,
+                direction_hit_rate_after_cost,
+                excess_direction_hit_rate_after_cost,
+                classification,
+                recommendation,
+                broker_execution_allowed,
+                policy_auto_promotion_allowed
+            FROM {CAUSAL_MEMORY_SUMMARY_TABLE}
+            WHERE classification IN ('candidate_helpful', 'hurts_or_no_lift')
+            ORDER BY evaluated_at DESC, matured_count DESC, horizon_days, context_source, context_class
+            LIMIT 10
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=CAUSAL_MEMORY_SUMMARY_TABLE,
+            fallback_type="operator_health_causal_event_memory_evidence_failed",
+            reason="Operator Health could not inspect causal event-memory evaluation evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect causal event-memory evaluation evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            command=command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    eval_row = eval_df.iloc[0] if not eval_df.empty else {}
+    summary_row = summary_df.iloc[0] if not summary_df.empty else {}
+    latest_eval = pd.to_datetime(eval_row.get("latest_evaluated_at"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    latest_load = pd.to_datetime(eval_row.get("latest_load_ts"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    evaluation_rows = int(eval_row.get("evaluation_rows") or 0) if len(eval_row) else 0
+    matured_rows = int(eval_row.get("matured_rows") or 0) if len(eval_row) else 0
+    summary_rows = int(summary_row.get("summary_rows") or 0) if len(summary_row) else 0
+    candidate_group_count = int(summary_row.get("candidate_group_count") or 0) if len(summary_row) else 0
+    harmful_group_count = int(summary_row.get("harmful_group_count") or 0) if len(summary_row) else 0
+    sufficiently_matured_group_count = int(summary_row.get("sufficiently_matured_group_count") or 0) if len(summary_row) else 0
+    reasons: list[str] = []
+    if evaluation_rows <= 0 or summary_rows <= 0:
+        reasons.append("empty_causal_event_memory_evidence")
+    if matured_rows <= 0:
+        reasons.append("no_matured_causal_memory_labels")
+    if pd.isna(latest_eval):
+        reasons.append("missing_latest_causal_memory_evaluated_at")
+        age_days = None
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_eval).total_seconds() / 86400.0, 0.0)
+        if age_days > 7:
+            reasons.append("stale_causal_event_memory_evidence")
+    status = "ok" if not reasons else "warn"
+    ready_for_policy_review = bool(candidate_group_count > 0 and matured_rows >= int(CAUSAL_MEMORY_MIN_MATURED_ROWS))
+    if status == "ok" and ready_for_policy_review:
+        message = "Causal event-memory evaluation evidence has matured candidate groups for offline review."
+    elif status == "ok":
+        message = "Causal event-memory evaluation evidence is available, but no helpful candidate group is ready."
+    else:
+        message = "Causal event-memory evaluation evidence is missing, stale, or has no matured labels."
+    return _status(
+        status,
+        message,
+        usable=status == "ok",
+        ready_for_policy_review=ready_for_policy_review,
+        reasons=reasons,
+        evaluations_table=CAUSAL_MEMORY_EVALUATIONS_TABLE,
+        summary_table=CAUSAL_MEMORY_SUMMARY_TABLE,
+        latest_evaluated_at=_json_ready(latest_eval),
+        latest_load_ts=_json_ready(latest_load),
+        age_days=None if age_days is None else round(age_days, 3),
+        evaluation_rows=evaluation_rows,
+        matured_rows=matured_rows,
+        summary_rows=summary_rows,
+        candidate_group_count=candidate_group_count,
+        harmful_group_count=harmful_group_count,
+        sufficiently_matured_group_count=sufficiently_matured_group_count,
+        min_matured_rows=int(CAUSAL_MEMORY_MIN_MATURED_ROWS),
+        groups=_records(groups),
+        command=command,
+        config_preview_command=(
+            "python -m advisory.causal_event_memory_evaluator --horizons 5 10 20 "
+            "--generate-config-previews --include-suppression-config-previews --dry-run --format text"
+        ),
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_action_transition_evidence() -> dict[str, Any]:
+    command = "python -m advisory.action_transition_evaluator --horizons 5 10 20 --format json"
+    schema_command = "python -m advisory.action_transition_evaluator --ensure-schema-only"
+    if not table_exists(ACTION_TRANSITION_EVALUATIONS_TABLE) or not table_exists(ACTION_TRANSITION_SUMMARY_TABLE):
+        missing = [
+            table
+            for table in [ACTION_TRANSITION_EVALUATIONS_TABLE, ACTION_TRANSITION_SUMMARY_TABLE]
+            if not table_exists(table)
+        ]
+        return _status(
+            "warn",
+            "Action-transition evaluation tables do not exist yet.",
+            usable=False,
+            ready_for_policy_review=False,
+            reasons=["missing_action_transition_evidence_tables"],
+            missing_tables=missing,
+            command=command,
+            schema_command=schema_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+    try:
+        eval_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                MAX(load_ts) AS latest_load_ts,
+                COUNT(*) AS evaluation_rows,
+                SUM(CASE WHEN matured THEN 1 ELSE 0 END) AS matured_rows,
+                COUNT(DISTINCT symbol) AS symbol_count,
+                COUNT(DISTINCT horizon_days) AS horizon_count
+            FROM {ACTION_TRANSITION_EVALUATIONS_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        summary_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                COUNT(*) AS summary_rows,
+                SUM(CASE WHEN classification = 'candidate_stable_policy_signal' THEN 1 ELSE 0 END) AS candidate_group_count,
+                SUM(CASE WHEN classification = 'benchmark_beta_not_transition_alpha' THEN 1 ELSE 0 END) AS benchmark_beta_group_count,
+                SUM(CASE WHEN classification = 'needs_benchmark_attribution' THEN 1 ELSE 0 END) AS needs_benchmark_attribution_count,
+                SUM(CASE WHEN matured_count >= %s THEN 1 ELSE 0 END) AS sufficiently_matured_group_count
+            FROM {ACTION_TRANSITION_SUMMARY_TABLE}
+            """,
+            params=(int(ACTION_TRANSITION_MIN_MATURED_ROWS),),
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        groups = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                horizon_days,
+                group_type,
+                group_value,
+                sample_count,
+                matured_count,
+                direction_hit_rate_after_cost,
+                excess_direction_hit_rate_after_cost,
+                avg_directional_helpfulness_score,
+                avg_excess_directional_helpfulness_score,
+                avg_forward_return_after_cost,
+                avg_benchmark_forward_return,
+                avg_excess_forward_return_after_cost,
+                classification,
+                recommendation,
+                broker_execution_allowed,
+                policy_auto_promotion_allowed
+            FROM {ACTION_TRANSITION_SUMMARY_TABLE}
+            WHERE classification IN (
+                'candidate_stable_policy_signal',
+                'benchmark_beta_not_transition_alpha',
+                'needs_benchmark_attribution'
+            )
+            ORDER BY evaluated_at DESC, matured_count DESC, horizon_days, group_type, group_value
+            LIMIT 10
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=ACTION_TRANSITION_SUMMARY_TABLE,
+            fallback_type="operator_health_action_transition_evidence_failed",
+            reason="Operator Health could not inspect action-transition evaluation evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect action-transition evaluation evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            ready_for_policy_review=False,
+            command=command,
+            schema_command=schema_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    eval_row = eval_df.iloc[0] if not eval_df.empty else {}
+    summary_row = summary_df.iloc[0] if not summary_df.empty else {}
+    latest_eval = pd.to_datetime(eval_row.get("latest_evaluated_at"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    latest_load = pd.to_datetime(eval_row.get("latest_load_ts"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    evaluation_rows = int(eval_row.get("evaluation_rows") or 0) if len(eval_row) else 0
+    matured_rows = int(eval_row.get("matured_rows") or 0) if len(eval_row) else 0
+    summary_rows = int(summary_row.get("summary_rows") or 0) if len(summary_row) else 0
+    candidate_group_count = int(summary_row.get("candidate_group_count") or 0) if len(summary_row) else 0
+    benchmark_beta_group_count = int(summary_row.get("benchmark_beta_group_count") or 0) if len(summary_row) else 0
+    needs_benchmark_attribution_count = int(summary_row.get("needs_benchmark_attribution_count") or 0) if len(summary_row) else 0
+    sufficiently_matured_group_count = int(summary_row.get("sufficiently_matured_group_count") or 0) if len(summary_row) else 0
+    reasons: list[str] = []
+    if evaluation_rows <= 0 or summary_rows <= 0:
+        reasons.append("empty_action_transition_evidence")
+    if matured_rows <= 0:
+        reasons.append("no_matured_action_transition_labels")
+    if benchmark_beta_group_count > 0:
+        reasons.append("transition_evidence_benchmark_beta_only")
+    if needs_benchmark_attribution_count > 0:
+        reasons.append("transition_evidence_needs_benchmark_attribution")
+    if pd.isna(latest_eval):
+        reasons.append("missing_latest_action_transition_evaluated_at")
+        age_days = None
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_eval).total_seconds() / 86400.0, 0.0)
+        if age_days > 14:
+            reasons.append("stale_action_transition_evidence")
+    status = "ok" if not reasons else "warn"
+    ready_for_policy_review = bool(candidate_group_count > 0 and matured_rows >= int(ACTION_TRANSITION_MIN_MATURED_ROWS))
+    if status == "ok" and ready_for_policy_review:
+        message = "Action-transition evidence has candidate stable-policy groups for offline review."
+    elif benchmark_beta_group_count > 0:
+        message = "Action-transition evidence is raw-helpful but benchmark-beta-only; keep it research-only."
+    elif needs_benchmark_attribution_count > 0:
+        message = "Action-transition evidence needs benchmark attribution before policy review."
+    elif status == "ok":
+        message = "Action-transition evidence is available, but no stable helpful group is ready."
+    else:
+        message = "Action-transition evidence is missing, stale, or has no matured labels."
+    return _status(
+        status,
+        message,
+        usable=status == "ok",
+        ready_for_policy_review=ready_for_policy_review,
+        reasons=reasons,
+        evaluations_table=ACTION_TRANSITION_EVALUATIONS_TABLE,
+        summary_table=ACTION_TRANSITION_SUMMARY_TABLE,
+        latest_evaluated_at=_json_ready(latest_eval),
+        latest_load_ts=_json_ready(latest_load),
+        age_days=None if age_days is None else round(age_days, 3),
+        evaluation_rows=evaluation_rows,
+        matured_rows=matured_rows,
+        summary_rows=summary_rows,
+        candidate_group_count=candidate_group_count,
+        benchmark_beta_not_transition_alpha_count=benchmark_beta_group_count,
+        needs_benchmark_attribution_count=needs_benchmark_attribution_count,
+        sufficiently_matured_group_count=sufficiently_matured_group_count,
+        min_matured_rows=int(ACTION_TRANSITION_MIN_MATURED_ROWS),
+        groups=_records(groups),
+        command=command,
+        schema_command=schema_command,
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_event_policy_evidence() -> dict[str, Any]:
+    command = "python -m advisory.event_policy_evaluator --horizons 5 10 20"
+    schema_command = "python -m advisory.event_policy_evaluator --ensure-schema-only"
+    if not table_exists(EVENT_POLICY_EVALUATIONS_TABLE) or not table_exists(EVENT_POLICY_SUMMARY_TABLE):
+        missing = [
+            table
+            for table in [EVENT_POLICY_EVALUATIONS_TABLE, EVENT_POLICY_SUMMARY_TABLE]
+            if not table_exists(table)
+        ]
+        return _status(
+            "warn",
+            "Event-policy evaluation tables do not exist yet.",
+            usable=False,
+            ready_for_policy_review=False,
+            reasons=["missing_event_policy_evidence_tables"],
+            missing_tables=missing,
+            command=command,
+            schema_command=schema_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+    summary_columns = table_columns(EVENT_POLICY_SUMMARY_TABLE)
+    required_benchmark_columns = {
+        "avg_benchmark_forward_return",
+        "avg_excess_forward_return_after_cost",
+        "excess_hit_rate_after_cost",
+    }
+    missing_benchmark_columns = sorted(required_benchmark_columns - summary_columns)
+    avg_benchmark_expr = (
+        "avg_benchmark_forward_return"
+        if "avg_benchmark_forward_return" in summary_columns
+        else "NULL::DOUBLE PRECISION AS avg_benchmark_forward_return"
+    )
+    avg_excess_expr = (
+        "avg_excess_forward_return_after_cost"
+        if "avg_excess_forward_return_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS avg_excess_forward_return_after_cost"
+    )
+    excess_hit_expr = (
+        "excess_hit_rate_after_cost"
+        if "excess_hit_rate_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS excess_hit_rate_after_cost"
+    )
+    try:
+        eval_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                MAX(load_ts) AS latest_load_ts,
+                COUNT(*) AS evaluation_rows,
+                SUM(CASE WHEN matured THEN 1 ELSE 0 END) AS matured_rows,
+                COUNT(DISTINCT symbol) AS symbol_count,
+                COUNT(DISTINCT horizon_days) AS horizon_count
+            FROM {EVENT_POLICY_EVALUATIONS_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        summary_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                COUNT(*) AS summary_rows,
+                SUM(CASE WHEN recommendation = 'candidate_policy_strengthen' THEN 1 ELSE 0 END) AS candidate_strengthen_count,
+                SUM(CASE WHEN recommendation = 'candidate_policy_tighten_or_downgrade' THEN 1 ELSE 0 END) AS candidate_tighten_or_downgrade_count,
+                SUM(CASE WHEN recommendation = 'benchmark_beta_not_policy_alpha' THEN 1 ELSE 0 END) AS benchmark_beta_group_count,
+                SUM(CASE WHEN recommendation = 'needs_benchmark_attribution' THEN 1 ELSE 0 END) AS needs_benchmark_attribution_count,
+                SUM(CASE WHEN matured_count >= %s THEN 1 ELSE 0 END) AS sufficiently_matured_group_count
+            FROM {EVENT_POLICY_SUMMARY_TABLE}
+            """,
+            params=(int(EVENT_POLICY_MIN_MATURED_ROWS),),
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        groups = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                horizon_days,
+                group_type,
+                group_value,
+                sample_count,
+                matured_count,
+                avg_forward_return_after_cost,
+                {avg_benchmark_expr},
+                {avg_excess_expr},
+                hit_rate_after_cost,
+                {excess_hit_expr},
+                recommendation
+            FROM {EVENT_POLICY_SUMMARY_TABLE}
+            WHERE recommendation IN (
+                'candidate_policy_strengthen',
+                'candidate_policy_tighten_or_downgrade',
+                'benchmark_beta_not_policy_alpha',
+                'needs_benchmark_attribution'
+            )
+            ORDER BY evaluated_at DESC, matured_count DESC, horizon_days, group_type, group_value
+            LIMIT 10
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=EVENT_POLICY_SUMMARY_TABLE,
+            fallback_type="operator_health_event_policy_evidence_failed",
+            reason="Operator Health could not inspect event-policy evaluation evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect event-policy evaluation evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            ready_for_policy_review=False,
+            command=command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    eval_row = eval_df.iloc[0] if not eval_df.empty else {}
+    summary_row = summary_df.iloc[0] if not summary_df.empty else {}
+    latest_eval = pd.to_datetime(eval_row.get("latest_evaluated_at"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    latest_load = pd.to_datetime(eval_row.get("latest_load_ts"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    evaluation_rows = int(eval_row.get("evaluation_rows") or 0) if len(eval_row) else 0
+    matured_rows = int(eval_row.get("matured_rows") or 0) if len(eval_row) else 0
+    summary_rows = int(summary_row.get("summary_rows") or 0) if len(summary_row) else 0
+    candidate_strengthen_count = int(summary_row.get("candidate_strengthen_count") or 0) if len(summary_row) else 0
+    candidate_tighten_or_downgrade_count = int(summary_row.get("candidate_tighten_or_downgrade_count") or 0) if len(summary_row) else 0
+    benchmark_beta_group_count = int(summary_row.get("benchmark_beta_group_count") or 0) if len(summary_row) else 0
+    needs_benchmark_attribution_count = int(summary_row.get("needs_benchmark_attribution_count") or 0) if len(summary_row) else 0
+    sufficiently_matured_group_count = int(summary_row.get("sufficiently_matured_group_count") or 0) if len(summary_row) else 0
+    reasons: list[str] = []
+    if evaluation_rows <= 0 or summary_rows <= 0:
+        reasons.append("empty_event_policy_evidence")
+    if matured_rows <= 0:
+        reasons.append("no_matured_event_policy_labels")
+    if missing_benchmark_columns:
+        reasons.append("event_policy_evidence_schema_missing_benchmark_columns")
+    if benchmark_beta_group_count > 0:
+        reasons.append("event_policy_evidence_benchmark_beta_only")
+    if needs_benchmark_attribution_count > 0:
+        reasons.append("event_policy_evidence_needs_benchmark_attribution")
+    if pd.isna(latest_eval):
+        reasons.append("missing_latest_event_policy_evaluated_at")
+        age_days = None
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_eval).total_seconds() / 86400.0, 0.0)
+        if age_days > 14:
+            reasons.append("stale_event_policy_evidence")
+    status = "ok" if not reasons else "warn"
+    ready_for_policy_review = bool(
+        status == "ok"
+        and (candidate_strengthen_count + candidate_tighten_or_downgrade_count) > 0
+        and matured_rows >= int(EVENT_POLICY_MIN_MATURED_ROWS)
+    )
+    if status == "ok" and ready_for_policy_review:
+        message = "Event-policy evidence has benchmark-attributed candidate groups for offline review."
+    elif missing_benchmark_columns:
+        message = "Event-policy evidence summary is missing benchmark-attribution columns; rerun the evaluator migration/output."
+    elif benchmark_beta_group_count > 0:
+        message = "Event-policy evidence is raw-positive but benchmark-beta-only; keep policy influence research-only."
+    elif needs_benchmark_attribution_count > 0:
+        message = "Event-policy evidence needs benchmark attribution before policy review."
+    elif status == "ok":
+        message = "Event-policy evidence is available, but no benchmark-attributed candidate group is ready."
+    else:
+        message = "Event-policy evidence is missing, stale, or has no matured labels."
+    return _status(
+        status,
+        message,
+        usable=status == "ok",
+        ready_for_policy_review=ready_for_policy_review,
+        reasons=reasons,
+        evaluations_table=EVENT_POLICY_EVALUATIONS_TABLE,
+        summary_table=EVENT_POLICY_SUMMARY_TABLE,
+        latest_evaluated_at=_json_ready(latest_eval),
+        latest_load_ts=_json_ready(latest_load),
+        age_days=None if age_days is None else round(age_days, 3),
+        evaluation_rows=evaluation_rows,
+        matured_rows=matured_rows,
+        summary_rows=summary_rows,
+        candidate_strengthen_count=candidate_strengthen_count,
+        candidate_tighten_or_downgrade_count=candidate_tighten_or_downgrade_count,
+        benchmark_beta_not_policy_alpha_count=benchmark_beta_group_count,
+        needs_benchmark_attribution_count=needs_benchmark_attribution_count,
+        missing_benchmark_columns=missing_benchmark_columns,
+        sufficiently_matured_group_count=sufficiently_matured_group_count,
+        min_matured_rows=int(EVENT_POLICY_MIN_MATURED_ROWS),
+        groups=_records(groups),
+        command=command,
+        schema_command=schema_command,
+        promotion_review_command=(
+            "python -m advisory.event_policy_promotion --evaluated-at <timestamp> "
+            "--horizon-days <days> --group-type <group_type> --group-value <group_value> --dry-run"
+        ),
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_context_watch_evidence() -> dict[str, Any]:
+    command = "python -m advisory.context_watch_evaluator --horizons 5 10 20"
+    if not table_exists(CONTEXT_WATCH_EVALUATIONS_TABLE) or not table_exists(CONTEXT_WATCH_SUMMARY_TABLE):
+        missing = [
+            table
+            for table in [CONTEXT_WATCH_EVALUATIONS_TABLE, CONTEXT_WATCH_SUMMARY_TABLE]
+            if not table_exists(table)
+        ]
+        return _status(
+            "warn",
+            "Context-watch evaluation tables do not exist yet.",
+            usable=False,
+            ready_for_policy_review=False,
+            reasons=["missing_context_watch_evidence_tables"],
+            missing_tables=missing,
+            command=command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+    summary_columns = table_columns(CONTEXT_WATCH_SUMMARY_TABLE)
+    required_benchmark_columns = {
+        "avg_benchmark_forward_return",
+        "avg_excess_watch_return_after_cost",
+        "excess_opportunity_hit_rate_after_cost",
+        "negative_excess_after_cost_rate",
+    }
+    missing_benchmark_columns = sorted(required_benchmark_columns - summary_columns)
+    avg_benchmark_expr = (
+        "avg_benchmark_forward_return"
+        if "avg_benchmark_forward_return" in summary_columns
+        else "NULL::DOUBLE PRECISION AS avg_benchmark_forward_return"
+    )
+    avg_excess_expr = (
+        "avg_excess_watch_return_after_cost"
+        if "avg_excess_watch_return_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS avg_excess_watch_return_after_cost"
+    )
+    excess_hit_expr = (
+        "excess_opportunity_hit_rate_after_cost"
+        if "excess_opportunity_hit_rate_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS excess_opportunity_hit_rate_after_cost"
+    )
+    negative_excess_expr = (
+        "negative_excess_after_cost_rate"
+        if "negative_excess_after_cost_rate" in summary_columns
+        else "NULL::DOUBLE PRECISION AS negative_excess_after_cost_rate"
+    )
+    beta_only_expr = (
+        "SUM(CASE WHEN avg_watch_return_after_cost > 0 AND avg_excess_watch_return_after_cost <= 0 THEN 1 ELSE 0 END)"
+        if "avg_excess_watch_return_after_cost" in summary_columns
+        else "0"
+    )
+    try:
+        eval_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                MAX(load_ts) AS latest_load_ts,
+                COUNT(*) AS evaluation_rows,
+                SUM(CASE WHEN matured THEN 1 ELSE 0 END) AS matured_rows,
+                COUNT(DISTINCT symbol) AS symbol_count,
+                COUNT(DISTINCT horizon_days) AS horizon_count
+            FROM {CONTEXT_WATCH_EVALUATIONS_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        summary_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                COUNT(*) AS summary_rows,
+                SUM(CASE WHEN classification = 'opportunity_candidate' THEN 1 ELSE 0 END) AS opportunity_candidate_count,
+                SUM(CASE WHEN classification = 'harmful_watch_noise' THEN 1 ELSE 0 END) AS harmful_watch_noise_count,
+                SUM(CASE WHEN classification = 'mixed_or_weak' THEN 1 ELSE 0 END) AS mixed_or_weak_count,
+                SUM(CASE WHEN classification = 'needs_more_data' THEN 1 ELSE 0 END) AS needs_more_data_count,
+                {beta_only_expr} AS benchmark_beta_group_count,
+                SUM(CASE WHEN matured_count >= %s THEN 1 ELSE 0 END) AS sufficiently_matured_group_count
+            FROM {CONTEXT_WATCH_SUMMARY_TABLE}
+            """,
+            params=(int(CONTEXT_WATCH_MIN_MATURED_ROWS),),
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        groups = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                horizon_days,
+                signal_source,
+                effect_type,
+                source_context,
+                context_class,
+                context_candidate_state,
+                context_policy_effect,
+                watch_breakout_blocker,
+                sample_count,
+                matured_count,
+                avg_watch_return_after_cost,
+                {avg_benchmark_expr},
+                {avg_excess_expr},
+                opportunity_hit_rate_after_cost,
+                {excess_hit_expr},
+                negative_after_cost_rate,
+                {negative_excess_expr},
+                classification,
+                recommendation,
+                broker_execution_allowed,
+                policy_auto_promotion_allowed
+            FROM {CONTEXT_WATCH_SUMMARY_TABLE}
+            WHERE classification IN ('opportunity_candidate', 'harmful_watch_noise', 'mixed_or_weak', 'needs_more_data')
+            ORDER BY evaluated_at DESC, matured_count DESC, horizon_days, signal_source, source_context, context_class
+            LIMIT 10
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=CONTEXT_WATCH_SUMMARY_TABLE,
+            fallback_type="operator_health_context_watch_evidence_failed",
+            reason="Operator Health could not inspect context-watch evaluation evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect context-watch evaluation evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            ready_for_policy_review=False,
+            command=command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    eval_row = eval_df.iloc[0] if not eval_df.empty else {}
+    summary_row = summary_df.iloc[0] if not summary_df.empty else {}
+    latest_eval = pd.to_datetime(eval_row.get("latest_evaluated_at"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    latest_load = pd.to_datetime(eval_row.get("latest_load_ts"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    evaluation_rows = int(eval_row.get("evaluation_rows") or 0) if len(eval_row) else 0
+    matured_rows = int(eval_row.get("matured_rows") or 0) if len(eval_row) else 0
+    summary_rows = int(summary_row.get("summary_rows") or 0) if len(summary_row) else 0
+    opportunity_candidate_count = int(summary_row.get("opportunity_candidate_count") or 0) if len(summary_row) else 0
+    harmful_watch_noise_count = int(summary_row.get("harmful_watch_noise_count") or 0) if len(summary_row) else 0
+    mixed_or_weak_count = int(summary_row.get("mixed_or_weak_count") or 0) if len(summary_row) else 0
+    needs_more_data_count = int(summary_row.get("needs_more_data_count") or 0) if len(summary_row) else 0
+    benchmark_beta_group_count = int(summary_row.get("benchmark_beta_group_count") or 0) if len(summary_row) else 0
+    sufficiently_matured_group_count = int(summary_row.get("sufficiently_matured_group_count") or 0) if len(summary_row) else 0
+    reasons: list[str] = []
+    if evaluation_rows <= 0 or summary_rows <= 0:
+        reasons.append("empty_context_watch_evidence")
+    if matured_rows <= 0:
+        reasons.append("no_matured_context_watch_labels")
+    if missing_benchmark_columns:
+        reasons.append("context_watch_evidence_schema_missing_benchmark_columns")
+    if benchmark_beta_group_count > 0:
+        reasons.append("context_watch_evidence_benchmark_beta_only")
+    if pd.isna(latest_eval):
+        reasons.append("missing_latest_context_watch_evaluated_at")
+        age_days = None
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_eval).total_seconds() / 86400.0, 0.0)
+        if age_days > 14:
+            reasons.append("stale_context_watch_evidence")
+    status = "ok" if not reasons else "warn"
+    ready_for_policy_review = bool(status == "ok" and opportunity_candidate_count > 0 and matured_rows >= int(CONTEXT_WATCH_MIN_MATURED_ROWS))
+    if status == "ok" and ready_for_policy_review:
+        message = "Context-watch evidence has benchmark-attributed watch opportunity candidates for offline review."
+    elif missing_benchmark_columns:
+        message = "Context-watch evidence summary is missing benchmark-attribution columns; rerun the evaluator migration/output."
+    elif benchmark_beta_group_count > 0:
+        message = "Context-watch evidence has raw-positive but benchmark-beta-only groups; keep watch-priority influence research-only."
+    elif status == "ok":
+        message = "Context-watch evidence is available, but no benchmark-attributed watch opportunity is ready."
+    else:
+        message = "Context-watch evidence is missing, stale, or has no matured labels."
+    return _status(
+        status,
+        message,
+        usable=status == "ok",
+        ready_for_policy_review=ready_for_policy_review,
+        reasons=reasons,
+        evaluations_table=CONTEXT_WATCH_EVALUATIONS_TABLE,
+        summary_table=CONTEXT_WATCH_SUMMARY_TABLE,
+        latest_evaluated_at=_json_ready(latest_eval),
+        latest_load_ts=_json_ready(latest_load),
+        age_days=None if age_days is None else round(age_days, 3),
+        evaluation_rows=evaluation_rows,
+        matured_rows=matured_rows,
+        summary_rows=summary_rows,
+        opportunity_candidate_count=opportunity_candidate_count,
+        harmful_watch_noise_count=harmful_watch_noise_count,
+        mixed_or_weak_count=mixed_or_weak_count,
+        needs_more_data_count=needs_more_data_count,
+        benchmark_beta_not_watch_alpha_count=benchmark_beta_group_count,
+        missing_benchmark_columns=missing_benchmark_columns,
+        sufficiently_matured_group_count=sufficiently_matured_group_count,
+        min_matured_rows=int(CONTEXT_WATCH_MIN_MATURED_ROWS),
+        groups=_records(groups),
+        command=command,
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_negative_pressure_evidence() -> dict[str, Any]:
+    command = "python -m advisory.negative_pressure_evaluator --horizons 5 10 20"
+    if not table_exists(NEGATIVE_PRESSURE_EVALUATIONS_TABLE) or not table_exists(NEGATIVE_PRESSURE_SUMMARY_TABLE):
+        missing = [
+            table
+            for table in [NEGATIVE_PRESSURE_EVALUATIONS_TABLE, NEGATIVE_PRESSURE_SUMMARY_TABLE]
+            if not table_exists(table)
+        ]
+        return _status(
+            "warn",
+            "Negative-pressure evaluation tables do not exist yet.",
+            usable=False,
+            ready_for_policy_review=False,
+            reasons=["missing_negative_pressure_evidence_tables"],
+            missing_tables=missing,
+            command=command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+    summary_columns = table_columns(NEGATIVE_PRESSURE_SUMMARY_TABLE)
+    required_benchmark_columns = {
+        "avg_benchmark_forward_return",
+        "avg_excess_avoided_return_after_cost",
+        "excess_protective_hit_rate_after_cost",
+        "false_positive_excess_rate_after_cost",
+    }
+    missing_benchmark_columns = sorted(required_benchmark_columns - summary_columns)
+    avg_benchmark_expr = (
+        "avg_benchmark_forward_return"
+        if "avg_benchmark_forward_return" in summary_columns
+        else "NULL::DOUBLE PRECISION AS avg_benchmark_forward_return"
+    )
+    avg_excess_expr = (
+        "avg_excess_avoided_return_after_cost"
+        if "avg_excess_avoided_return_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS avg_excess_avoided_return_after_cost"
+    )
+    excess_hit_expr = (
+        "excess_protective_hit_rate_after_cost"
+        if "excess_protective_hit_rate_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS excess_protective_hit_rate_after_cost"
+    )
+    false_positive_excess_expr = (
+        "false_positive_excess_rate_after_cost"
+        if "false_positive_excess_rate_after_cost" in summary_columns
+        else "NULL::DOUBLE PRECISION AS false_positive_excess_rate_after_cost"
+    )
+    try:
+        eval_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                MAX(load_ts) AS latest_load_ts,
+                COUNT(*) AS evaluation_rows,
+                SUM(CASE WHEN matured THEN 1 ELSE 0 END) AS matured_rows,
+                COUNT(DISTINCT symbol) AS symbol_count,
+                COUNT(DISTINCT horizon_days) AS horizon_count
+            FROM {NEGATIVE_PRESSURE_EVALUATIONS_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        summary_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                COUNT(*) AS summary_rows,
+                SUM(CASE WHEN classification = 'protective_candidate' THEN 1 ELSE 0 END) AS protective_candidate_count,
+                SUM(CASE WHEN classification = 'benchmark_beta_not_derisk_alpha' THEN 1 ELSE 0 END) AS benchmark_beta_group_count,
+                SUM(CASE WHEN classification = 'harmful_false_positive_pressure' THEN 1 ELSE 0 END) AS harmful_false_positive_count,
+                SUM(CASE WHEN classification = 'mixed_or_weak' THEN 1 ELSE 0 END) AS mixed_or_weak_count,
+                SUM(CASE WHEN classification = 'needs_more_data' THEN 1 ELSE 0 END) AS needs_more_data_count,
+                SUM(CASE WHEN matured_count >= %s THEN 1 ELSE 0 END) AS sufficiently_matured_group_count
+            FROM {NEGATIVE_PRESSURE_SUMMARY_TABLE}
+            """,
+            params=(int(NEGATIVE_PRESSURE_MIN_MATURED_ROWS),),
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        groups = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                horizon_days,
+                signal_source,
+                effect_type,
+                source_context,
+                context_class,
+                sample_count,
+                matured_count,
+                avg_avoided_return_after_cost,
+                {avg_benchmark_expr},
+                {avg_excess_expr},
+                protective_hit_rate_after_cost,
+                {excess_hit_expr},
+                false_positive_rate_after_cost,
+                {false_positive_excess_expr},
+                classification,
+                recommendation,
+                broker_execution_allowed,
+                policy_auto_promotion_allowed
+            FROM {NEGATIVE_PRESSURE_SUMMARY_TABLE}
+            WHERE classification IN (
+                'protective_candidate',
+                'benchmark_beta_not_derisk_alpha',
+                'harmful_false_positive_pressure',
+                'mixed_or_weak',
+                'needs_more_data'
+            )
+            ORDER BY evaluated_at DESC, matured_count DESC, horizon_days, signal_source, source_context, context_class
+            LIMIT 10
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=NEGATIVE_PRESSURE_SUMMARY_TABLE,
+            fallback_type="operator_health_negative_pressure_evidence_failed",
+            reason="Operator Health could not inspect negative-pressure evaluation evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect negative-pressure evaluation evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            ready_for_policy_review=False,
+            command=command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    eval_row = eval_df.iloc[0] if not eval_df.empty else {}
+    summary_row = summary_df.iloc[0] if not summary_df.empty else {}
+    latest_eval = pd.to_datetime(eval_row.get("latest_evaluated_at"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    latest_load = pd.to_datetime(eval_row.get("latest_load_ts"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    evaluation_rows = int(eval_row.get("evaluation_rows") or 0) if len(eval_row) else 0
+    matured_rows = int(eval_row.get("matured_rows") or 0) if len(eval_row) else 0
+    summary_rows = int(summary_row.get("summary_rows") or 0) if len(summary_row) else 0
+    protective_candidate_count = int(summary_row.get("protective_candidate_count") or 0) if len(summary_row) else 0
+    benchmark_beta_group_count = int(summary_row.get("benchmark_beta_group_count") or 0) if len(summary_row) else 0
+    harmful_false_positive_count = int(summary_row.get("harmful_false_positive_count") or 0) if len(summary_row) else 0
+    mixed_or_weak_count = int(summary_row.get("mixed_or_weak_count") or 0) if len(summary_row) else 0
+    needs_more_data_count = int(summary_row.get("needs_more_data_count") or 0) if len(summary_row) else 0
+    sufficiently_matured_group_count = int(summary_row.get("sufficiently_matured_group_count") or 0) if len(summary_row) else 0
+    reasons: list[str] = []
+    if evaluation_rows <= 0 or summary_rows <= 0:
+        reasons.append("empty_negative_pressure_evidence")
+    if matured_rows <= 0:
+        reasons.append("no_matured_negative_pressure_labels")
+    if missing_benchmark_columns:
+        reasons.append("negative_pressure_evidence_schema_missing_benchmark_columns")
+    if benchmark_beta_group_count > 0:
+        reasons.append("negative_pressure_evidence_benchmark_beta_only")
+    if pd.isna(latest_eval):
+        reasons.append("missing_latest_negative_pressure_evaluated_at")
+        age_days = None
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_eval).total_seconds() / 86400.0, 0.0)
+        if age_days > 14:
+            reasons.append("stale_negative_pressure_evidence")
+    status = "ok" if not reasons else "warn"
+    ready_for_policy_review = bool(status == "ok" and protective_candidate_count > 0 and matured_rows >= int(NEGATIVE_PRESSURE_MIN_MATURED_ROWS))
+    if status == "ok" and ready_for_policy_review:
+        message = "Negative-pressure evidence has benchmark-attributed de-risk candidates for offline review."
+    elif missing_benchmark_columns:
+        message = "Negative-pressure evidence summary is missing benchmark-attribution columns; rerun the evaluator migration/output."
+    elif benchmark_beta_group_count > 0:
+        message = "Negative-pressure evidence is raw-protective but benchmark-beta-only; keep de-risk influence research-only."
+    elif status == "ok":
+        message = "Negative-pressure evidence is available, but no benchmark-attributed de-risk candidate is ready."
+    else:
+        message = "Negative-pressure evidence is missing, stale, or has no matured labels."
+    return _status(
+        status,
+        message,
+        usable=status == "ok",
+        ready_for_policy_review=ready_for_policy_review,
+        reasons=reasons,
+        evaluations_table=NEGATIVE_PRESSURE_EVALUATIONS_TABLE,
+        summary_table=NEGATIVE_PRESSURE_SUMMARY_TABLE,
+        latest_evaluated_at=_json_ready(latest_eval),
+        latest_load_ts=_json_ready(latest_load),
+        age_days=None if age_days is None else round(age_days, 3),
+        evaluation_rows=evaluation_rows,
+        matured_rows=matured_rows,
+        summary_rows=summary_rows,
+        protective_candidate_count=protective_candidate_count,
+        benchmark_beta_not_derisk_alpha_count=benchmark_beta_group_count,
+        harmful_false_positive_count=harmful_false_positive_count,
+        mixed_or_weak_count=mixed_or_weak_count,
+        needs_more_data_count=needs_more_data_count,
+        missing_benchmark_columns=missing_benchmark_columns,
+        sufficiently_matured_group_count=sufficiently_matured_group_count,
+        min_matured_rows=int(NEGATIVE_PRESSURE_MIN_MATURED_ROWS),
+        groups=_records(groups),
+        command=command,
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_adversarial_review_evidence() -> dict[str, Any]:
+    command = "python -m advisory.adversarial_review_evaluator --horizons 5 10 20"
+    schema_command = "python -m advisory.adversarial_review_evaluator --ensure-schema-only"
+    if not table_exists(ADVERSARIAL_REVIEW_EVALUATIONS_TABLE) or not table_exists(ADVERSARIAL_REVIEW_SUMMARY_TABLE):
+        missing = [
+            table
+            for table in [ADVERSARIAL_REVIEW_EVALUATIONS_TABLE, ADVERSARIAL_REVIEW_SUMMARY_TABLE]
+            if not table_exists(table)
+        ]
+        return _status(
+            "warn",
+            "Adversarial-review evaluation tables do not exist yet.",
+            usable=False,
+            ready_for_policy_review=False,
+            reasons=["missing_adversarial_review_evidence_tables"],
+            missing_tables=missing,
+            command=command,
+            schema_command=schema_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+    try:
+        eval_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                MAX(load_ts) AS latest_load_ts,
+                COUNT(*) AS evaluation_rows,
+                SUM(CASE WHEN matured THEN 1 ELSE 0 END) AS matured_rows,
+                COUNT(DISTINCT symbol) AS symbol_count,
+                COUNT(DISTINCT horizon_days) AS horizon_count
+            FROM {ADVERSARIAL_REVIEW_EVALUATIONS_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        summary_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                COUNT(*) AS summary_rows,
+                SUM(CASE WHEN recommendation = 'candidate_veto_policy_keep_or_tighten' THEN 1 ELSE 0 END) AS candidate_keep_or_tighten_count,
+                SUM(CASE WHEN recommendation = 'benchmark_beta_not_veto_alpha' THEN 1 ELSE 0 END) AS benchmark_beta_group_count,
+                SUM(CASE WHEN recommendation = 'needs_benchmark_attribution' THEN 1 ELSE 0 END) AS needs_benchmark_attribution_count,
+                SUM(CASE WHEN recommendation = 'candidate_veto_policy_relax_or_review_false_positives' THEN 1 ELSE 0 END) AS relax_or_false_positive_count,
+                SUM(CASE WHEN matured_count >= %s THEN 1 ELSE 0 END) AS sufficiently_matured_group_count
+            FROM {ADVERSARIAL_REVIEW_SUMMARY_TABLE}
+            """,
+            params=(int(ADVERSARIAL_REVIEW_MIN_MATURED_ROWS),),
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        groups = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                horizon_days,
+                group_type,
+                group_value,
+                sample_count,
+                matured_count,
+                avg_forward_return_after_cost,
+                avg_benchmark_forward_return,
+                avg_avoided_loss_return_after_cost,
+                avg_excess_avoided_loss_return_after_cost,
+                false_positive_rate,
+                excess_false_positive_rate,
+                recommendation
+            FROM {ADVERSARIAL_REVIEW_SUMMARY_TABLE}
+            WHERE recommendation IN (
+                'candidate_veto_policy_keep_or_tighten',
+                'benchmark_beta_not_veto_alpha',
+                'needs_benchmark_attribution',
+                'candidate_veto_policy_relax_or_review_false_positives'
+            )
+            ORDER BY evaluated_at DESC, matured_count DESC, horizon_days, group_type, group_value
+            LIMIT 10
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=ADVERSARIAL_REVIEW_SUMMARY_TABLE,
+            fallback_type="operator_health_adversarial_review_evidence_failed",
+            reason="Operator Health could not inspect adversarial-review evaluation evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect adversarial-review evaluation evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            ready_for_policy_review=False,
+            command=command,
+            schema_command=schema_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    eval_row = eval_df.iloc[0] if not eval_df.empty else {}
+    summary_row = summary_df.iloc[0] if not summary_df.empty else {}
+    latest_eval = pd.to_datetime(eval_row.get("latest_evaluated_at"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    latest_load = pd.to_datetime(eval_row.get("latest_load_ts"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    evaluation_rows = int(eval_row.get("evaluation_rows") or 0) if len(eval_row) else 0
+    matured_rows = int(eval_row.get("matured_rows") or 0) if len(eval_row) else 0
+    summary_rows = int(summary_row.get("summary_rows") or 0) if len(summary_row) else 0
+    candidate_keep_or_tighten_count = int(summary_row.get("candidate_keep_or_tighten_count") or 0) if len(summary_row) else 0
+    benchmark_beta_group_count = int(summary_row.get("benchmark_beta_group_count") or 0) if len(summary_row) else 0
+    needs_benchmark_attribution_count = int(summary_row.get("needs_benchmark_attribution_count") or 0) if len(summary_row) else 0
+    relax_or_false_positive_count = int(summary_row.get("relax_or_false_positive_count") or 0) if len(summary_row) else 0
+    sufficiently_matured_group_count = int(summary_row.get("sufficiently_matured_group_count") or 0) if len(summary_row) else 0
+    reasons: list[str] = []
+    if evaluation_rows <= 0 or summary_rows <= 0:
+        reasons.append("empty_adversarial_review_evidence")
+    if matured_rows <= 0:
+        reasons.append("no_matured_adversarial_review_labels")
+    if benchmark_beta_group_count > 0:
+        reasons.append("adversarial_review_evidence_benchmark_beta_only")
+    if needs_benchmark_attribution_count > 0:
+        reasons.append("adversarial_review_evidence_needs_benchmark_attribution")
+    if pd.isna(latest_eval):
+        reasons.append("missing_latest_adversarial_review_evaluated_at")
+        age_days = None
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_eval).total_seconds() / 86400.0, 0.0)
+        if age_days > 14:
+            reasons.append("stale_adversarial_review_evidence")
+    status = "ok" if not reasons else "warn"
+    ready_for_policy_review = bool(candidate_keep_or_tighten_count > 0 and matured_rows >= int(ADVERSARIAL_REVIEW_MIN_MATURED_ROWS))
+    if status == "ok" and ready_for_policy_review:
+        message = "Adversarial-review evidence has keep/tighten candidates for offline review."
+    elif benchmark_beta_group_count > 0:
+        message = "Adversarial-review evidence is raw-helpful but benchmark-beta-only; keep veto policy research-only."
+    elif needs_benchmark_attribution_count > 0:
+        message = "Adversarial-review evidence needs benchmark attribution before policy review."
+    elif status == "ok":
+        message = "Adversarial-review evidence is available, but no keep/tighten candidate is ready."
+    else:
+        message = "Adversarial-review evidence is missing, stale, or has no matured labels."
+    return _status(
+        status,
+        message,
+        usable=status == "ok",
+        ready_for_policy_review=ready_for_policy_review,
+        reasons=reasons,
+        evaluations_table=ADVERSARIAL_REVIEW_EVALUATIONS_TABLE,
+        summary_table=ADVERSARIAL_REVIEW_SUMMARY_TABLE,
+        latest_evaluated_at=_json_ready(latest_eval),
+        latest_load_ts=_json_ready(latest_load),
+        age_days=None if age_days is None else round(age_days, 3),
+        evaluation_rows=evaluation_rows,
+        matured_rows=matured_rows,
+        summary_rows=summary_rows,
+        candidate_keep_or_tighten_count=candidate_keep_or_tighten_count,
+        benchmark_beta_not_veto_alpha_count=benchmark_beta_group_count,
+        needs_benchmark_attribution_count=needs_benchmark_attribution_count,
+        relax_or_false_positive_count=relax_or_false_positive_count,
+        sufficiently_matured_group_count=sufficiently_matured_group_count,
+        min_matured_rows=int(ADVERSARIAL_REVIEW_MIN_MATURED_ROWS),
+        groups=_records(groups),
+        command=command,
+        schema_command=schema_command,
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_signal_quality_split_evidence() -> dict[str, Any]:
+    command = "python -m advisory.signal_quality_split_evaluator --stability-report --horizons 5 10 20 --format json"
+    schema_command = "python -m advisory.signal_quality_split_evaluator --ensure-schema-only"
+    if not table_exists(SIGNAL_QUALITY_SPLIT_EVALUATIONS_TABLE) or not table_exists(SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE):
+        missing = [
+            table
+            for table in [SIGNAL_QUALITY_SPLIT_EVALUATIONS_TABLE, SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE]
+            if not table_exists(table)
+        ]
+        return _status(
+            "warn",
+            "Signal-quality narrowed split evaluation tables do not exist yet.",
+            usable=False,
+            ready_for_policy_review=False,
+            reasons=["missing_signal_quality_split_evidence_tables"],
+            missing_tables=missing,
+            command=command,
+            schema_command=schema_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+    try:
+        eval_df = sql_to_df(
+            f"""
+            SELECT
+                MAX(evaluated_at) AS latest_evaluated_at,
+                MAX(load_ts) AS latest_load_ts,
+                COUNT(*) AS evaluation_rows,
+                SUM(CASE WHEN matured THEN 1 ELSE 0 END) AS matured_rows,
+                COUNT(DISTINCT symbol) AS symbol_count,
+                COUNT(DISTINCT horizon_days) AS horizon_count
+            FROM {SIGNAL_QUALITY_SPLIT_EVALUATIONS_TABLE}
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+        summary = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                source_evaluated_at,
+                horizon_days,
+                variant,
+                source_family,
+                split_axis,
+                split_value,
+                context_class,
+                direction,
+                sample_count,
+                selected_count,
+                matured_count,
+                symbol_count,
+                avg_forward_return_after_cost,
+                baseline_selected_count,
+                baseline_avg_forward_return_after_cost,
+                lift_vs_technical_only,
+                classification,
+                recommendation,
+                authority,
+                broker_execution_allowed,
+                policy_auto_promotion_allowed,
+                load_ts
+            FROM {SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE}
+            ORDER BY evaluated_at DESC, horizon_days, source_family, split_axis, split_value
+            LIMIT 1000
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE,
+            fallback_type="operator_health_signal_quality_split_evidence_failed",
+            reason="Operator Health could not inspect signal-quality narrowed split evidence.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not inspect signal-quality narrowed split evidence.",
+            error=f"{type(exc).__name__}: {exc}",
+            usable=False,
+            ready_for_policy_review=False,
+            command=command,
+            schema_command=schema_command,
+            authority="research_only",
+            broker_execution_allowed=False,
+            policy_auto_promotion_allowed=False,
+        )
+
+    eval_row = eval_df.iloc[0] if not eval_df.empty else {}
+    latest_eval = pd.to_datetime(eval_row.get("latest_evaluated_at"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    latest_load = pd.to_datetime(eval_row.get("latest_load_ts"), utc=True, errors="coerce") if len(eval_row) else pd.NaT
+    evaluation_rows = int(eval_row.get("evaluation_rows") or 0) if len(eval_row) else 0
+    matured_rows = int(eval_row.get("matured_rows") or 0) if len(eval_row) else 0
+    summary_rows = int(len(summary))
+    stability_report = build_split_stability_report(summary) if not summary.empty else build_split_stability_report(pd.DataFrame())
+    splits = stability_report.get("splits") if isinstance(stability_report.get("splits"), list) else []
+    baseline_unavailable_count = sum(int(row.get("baseline_unavailable_window_count") or 0) for row in splits if isinstance(row, dict))
+    stable_candidate_count = int(stability_report.get("stable_candidate_count") or 0)
+    harmful_negative_control_count = int(stability_report.get("harmful_negative_control_count") or 0)
+    unstable_or_horizon_sensitive_count = int(stability_report.get("unstable_or_horizon_sensitive_count") or 0)
+    reasons: list[str] = []
+    if evaluation_rows <= 0 or summary_rows <= 0:
+        reasons.append("empty_signal_quality_split_evidence")
+    if matured_rows <= 0:
+        reasons.append("no_matured_signal_quality_split_labels")
+    if baseline_unavailable_count > 0:
+        reasons.append("signal_quality_split_technical_baseline_unavailable")
+    if pd.isna(latest_eval):
+        reasons.append("missing_latest_signal_quality_split_evaluated_at")
+        age_days = None
+    else:
+        age_days = max((pd.Timestamp.utcnow() - latest_eval).total_seconds() / 86400.0, 0.0)
+        if age_days > 14:
+            reasons.append("stale_signal_quality_split_evidence")
+    status = "ok" if not reasons else "warn"
+    ready_for_policy_review = bool(stable_candidate_count > 0 and status == "ok")
+    if status == "ok" and ready_for_policy_review:
+        message = "Signal-quality narrowed split evidence has stable candidates for offline reviewed-rule work."
+    elif baseline_unavailable_count > 0:
+        message = "Signal-quality narrowed split evidence has incomplete technical-only baselines; keep splits research-only."
+    elif status == "ok":
+        message = "Signal-quality narrowed split evidence is available, but no stable candidate is ready."
+    else:
+        message = "Signal-quality narrowed split evidence is missing, stale, or has no matured labels."
+    return _status(
+        status,
+        message,
+        usable=status == "ok",
+        ready_for_policy_review=ready_for_policy_review,
+        reasons=reasons,
+        evaluations_table=SIGNAL_QUALITY_SPLIT_EVALUATIONS_TABLE,
+        summary_table=SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE,
+        latest_evaluated_at=_json_ready(latest_eval),
+        latest_load_ts=_json_ready(latest_load),
+        age_days=None if age_days is None else round(age_days, 3),
+        evaluation_rows=evaluation_rows,
+        matured_rows=matured_rows,
+        summary_rows=summary_rows,
+        split_count=int(stability_report.get("split_count") or 0),
+        stable_candidate_count=stable_candidate_count,
+        harmful_negative_control_count=harmful_negative_control_count,
+        unstable_or_horizon_sensitive_count=unstable_or_horizon_sensitive_count,
+        baseline_unavailable_window_count=baseline_unavailable_count,
+        min_stable_windows=int(SIGNAL_QUALITY_SPLIT_MIN_STABLE_WINDOWS),
+        splits=splits[:10],
+        command=command,
+        schema_command=schema_command,
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+    )
+
+
+def check_context_overlay_reliability() -> dict[str, Any]:
+    command = "python -m advisory.context_overlay_reliability_report --horizons 5 10 20 --format json"
+    if not table_exists(CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE):
+        return _status(
+            "warn",
+            "Context-overlay reliability report has not been persisted yet.",
+            usable=False,
+            reasons=["missing_reliability_table"],
+            command=command,
+        )
+    try:
+        latest_df = sql_to_df(
+            f"SELECT MAX(evaluated_at) AS latest_evaluated_at FROM {CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE}",
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE,
+            fallback_type="operator_health_context_overlay_reliability_summary_check_failed",
+            reason="Operator Health could not inspect context-overlay reliability freshness.",
+            error=exc,
+        )
+        return _status("error", "Could not inspect context-overlay reliability summary.", error=f"{type(exc).__name__}: {exc}", usable=False)
+
+    latest = pd.to_datetime(latest_df.iloc[0].get("latest_evaluated_at"), utc=True, errors="coerce") if not latest_df.empty else pd.NaT
+    if pd.isna(latest):
+        return _status(
+            "warn",
+            "Context-overlay reliability summary table has no evaluated rows.",
+            usable=False,
+            reasons=["empty_reliability_table"],
+            command=command,
+        )
+
+    try:
+        rows = sql_to_df(
+            f"""
+            SELECT *
+            FROM {CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE}
+            WHERE evaluated_at = %(latest)s
+            ORDER BY source_family
+            """,
+            params={"latest": latest},
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE,
+            fallback_type="operator_health_context_overlay_reliability_rows_load_failed",
+            reason="Operator Health could not load latest context-overlay reliability rows.",
+            error=exc,
+            metadata={"latest_evaluated_at": latest.isoformat()},
+        )
+        return _status("error", "Could not read latest context-overlay reliability rows.", error=f"{type(exc).__name__}: {exc}", usable=False)
+
+    now = pd.Timestamp.utcnow()
+    age_days = float((now - latest).total_seconds() / 86400.0)
+    matured = pd.to_numeric(rows.get("total_matured_count", pd.Series(dtype=float)), errors="coerce")
+    max_matured = int(matured.max()) if not matured.dropna().empty else 0
+    classifications = rows.get("classification", pd.Series(dtype=object)).astype("string").str.strip().str.lower() if not rows.empty else pd.Series(dtype="string")
+    reasons: list[str] = []
+    if age_days > SIGNAL_QUALITY_MAX_AGE_DAYS:
+        reasons.append("stale_context_overlay_reliability")
+    if max_matured < SIGNAL_QUALITY_MIN_MATURED_ROWS:
+        reasons.append("insufficient_matured_rows")
+    status = "ok" if not reasons else "warn"
+    return _status(
+        status,
+        "Latest context-overlay reliability report is usable for review-only context intake."
+        if status == "ok"
+        else "Latest context-overlay reliability report is missing, stale, or too sparse.",
+        usable=status == "ok",
+        reasons=reasons,
+        latest_evaluated_at=_json_ready(latest),
+        age_days=round(age_days, 3),
+        max_age_days=SIGNAL_QUALITY_MAX_AGE_DAYS,
+        family_count=int(len(rows)),
+        max_matured_rows=max_matured,
+        min_matured_rows=SIGNAL_QUALITY_MIN_MATURED_ROWS,
+        candidate_helpful_count=int(classifications.eq("candidate_helpful").sum()),
+        protective_candidate_count=int(classifications.eq("protective_candidate").sum()),
+        hurts_or_no_lift_count=int(classifications.isin(["hurts_or_no_lift", "negative_after_cost", "benchmark_beta_not_overlay_alpha"]).sum()),
+        inconsistent_or_horizon_sensitive_count=int(classifications.eq("inconsistent_or_horizon_sensitive").sum()),
+        needs_benchmark_attribution_count=int(classifications.eq("needs_benchmark_attribution").sum()),
+        benchmark_beta_not_overlay_alpha_count=int(classifications.eq("benchmark_beta_not_overlay_alpha").sum()),
+        suppressed_reliability_count=int(classifications.isin(SIGNAL_QUALITY_OVERLAY_SUPPRESSED_CONTEXT_CLASS_RELIABILITY).sum()),
+        suppressed_reliability_classes=sorted(SIGNAL_QUALITY_OVERLAY_SUPPRESSED_CONTEXT_CLASS_RELIABILITY),
+        authority="research_only",
+        broker_execution_allowed=False,
+        policy_auto_promotion_allowed=False,
+        rows=_records(rows.head(20)),
+        command=command,
+    )
+
+
+def check_macro_sector_alias_coverage() -> dict[str, Any]:
+    command = "python -m advisory.macro_context_overlays --dry-run --format json"
+    try:
+        overlays, meta = build_macro_context_overlays()
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="advisory.macro_context_overlays",
+            fallback_type="operator_health_macro_sector_alias_coverage_failed",
+            reason="Operator Health could not build macro context overlays for sector-alias coverage diagnostics.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Macro sector-alias coverage check failed.",
+            usable=False,
+            error=f"{type(exc).__name__}: {exc}",
+            command=command,
+        )
+
+    coverage = meta.get("sector_alias_coverage") if isinstance(meta, dict) else {}
+    if not isinstance(coverage, dict):
+        coverage = {}
+    unmapped = coverage.get("unmapped_sectors") if isinstance(coverage.get("unmapped_sectors"), list) else []
+    intentionally_broad = (
+        coverage.get("intentionally_broad_sectors")
+        if isinstance(coverage.get("intentionally_broad_sectors"), list)
+        else []
+    )
+    unmapped_count = int(coverage.get("unmapped_sector_count") or len(unmapped))
+    status = "ok" if unmapped_count <= 0 else "warn"
+    return _status(
+        status,
+        "Macro sector aliases cover the generated macro overlay sectors."
+        if status == "ok"
+        else "Some generated macro overlay sectors are not mapped to market-context universe sector codes.",
+        usable=status == "ok",
+        overlay_count=int(len(overlays)),
+        sector_count=int(coverage.get("sector_count") or 0),
+        mapped_sector_count=int(coverage.get("mapped_sector_count") or 0),
+        intentionally_broad_sector_count=int(coverage.get("intentionally_broad_sector_count") or len(intentionally_broad)),
+        unmapped_sector_count=unmapped_count,
+        unmapped_sectors=unmapped,
+        intentionally_broad_sectors=intentionally_broad,
+        authority_scope="diagnostic_only",
+        broker_execution_allowed=False,
+        command=command,
+        coverage=coverage,
+    )
+
+
+def check_theme_sector_alias_coverage() -> dict[str, Any]:
+    command = "python -m advisory.news_theme_engine build-overlays --dry-run --format json"
+    try:
+        overlays, meta = build_theme_context_overlays()
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="advisory.news_theme_engine",
+            fallback_type="operator_health_theme_sector_alias_coverage_failed",
+            reason="Operator Health could not build news-theme context overlays for sector-alias coverage diagnostics.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Theme sector-alias coverage check failed.",
+            usable=False,
+            error=f"{type(exc).__name__}: {exc}",
+            command=command,
+        )
+
+    coverage = meta.get("sector_alias_coverage") if isinstance(meta, dict) else {}
+    if not isinstance(coverage, dict):
+        coverage = {}
+    unmapped = coverage.get("unmapped_sectors") if isinstance(coverage.get("unmapped_sectors"), list) else []
+    intentionally_broad = (
+        coverage.get("intentionally_broad_sectors")
+        if isinstance(coverage.get("intentionally_broad_sectors"), list)
+        else []
+    )
+    unmapped_count = int(coverage.get("unmapped_sector_count") or len(unmapped))
+    status = "ok" if unmapped_count <= 0 else "warn"
+    return _status(
+        status,
+        "Theme sector aliases cover the generated news-theme overlay sectors."
+        if status == "ok"
+        else "Some generated news-theme overlay sectors are not mapped to market-context universe sector codes.",
+        usable=status == "ok",
+        overlay_count=int(len(overlays)),
+        sector_count=int(coverage.get("sector_count") or 0),
+        mapped_sector_count=int(coverage.get("mapped_sector_count") or 0),
+        intentionally_broad_sector_count=int(coverage.get("intentionally_broad_sector_count") or len(intentionally_broad)),
+        unmapped_sector_count=unmapped_count,
+        unmapped_sectors=unmapped,
+        intentionally_broad_sectors=intentionally_broad,
+        authority_scope="diagnostic_only",
+        broker_execution_allowed=False,
+        command=command,
+        coverage=coverage,
+    )
+
+
+def _signal_quality_rule_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.operator_health",
+            fallback_type="operator_health_signal_quality_rule_text_missing_check_failed",
+            source="signal_quality_overlay_rules",
+            severity="warn",
+            reason="Operator Health could not evaluate a signal-quality rule field for missingness and used string fallback.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_excerpt": str(value)[:200]},
+        )
+        pass
+    return str(value).strip().lower()
+
+
+def _signal_quality_split_value_tokens(value: Any) -> list[str]:
+    text = _signal_quality_rule_text(value)
+    if not text:
+        return []
+    return [part.strip() for part in text.split("|")]
+
+
+def _signal_quality_json_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            record_local_fallback_event(
+                module="advisory.operator_health",
+                fallback_type="operator_health_signal_quality_json_list_parse_failed",
+                source="signal_quality_overlay_rules",
+                severity="warn",
+                reason="Operator Health could not parse a signal-quality JSON list and used an empty list fallback.",
+                error=exc,
+                metadata={"value_excerpt": value[:500], "value_length": len(value)},
+            )
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _signal_quality_rule_context_class(rule: dict[str, Any]) -> str | None:
+    split_axis = _signal_quality_rule_text(rule.get("split_axis"))
+    split_tokens = _signal_quality_split_value_tokens(rule.get("split_value"))
+    rule_class = _signal_quality_rule_text(rule.get("context_class"))
+    if split_axis == "context_class_direction":
+        return split_tokens[0] if split_tokens else rule_class or None
+    if split_axis in {"context_class", "event_class", "pressure_class", "macro_signal", "theme", "rule_id"}:
+        return split_tokens[0] if split_tokens else rule_class or None
+    if not split_axis and rule_class:
+        return rule_class
+    return None
+
+
+def _signal_quality_context_class_reliability(
+    reliability: dict[str, Any] | None,
+    context_class: str | None,
+) -> dict[str, Any] | None:
+    target = _signal_quality_rule_text(context_class).upper()
+    if not reliability or not target:
+        return None
+    report = _signal_quality_reliability_report(reliability)
+    diagnostics = []
+    if isinstance(report, dict):
+        diagnostics = _signal_quality_json_list(report.get("context_class_diagnostics"))
+    if not diagnostics:
+        diagnostics = _signal_quality_json_list(reliability.get("context_class_diagnostics"))
+    for item in diagnostics:
+        if not isinstance(item, dict):
+            continue
+        if _signal_quality_rule_text(item.get("context_class")).upper() != target:
+            continue
+        return {
+            **item,
+            "context_class": item.get("context_class") or target,
+            "source_family": reliability.get("source_family"),
+            "authority_scope": "research_only",
+            "action_policy_effect": "annotation_only_no_ranking_change",
+            "broker_execution_allowed": False,
+        }
+    return None
+
+
+def _signal_quality_reliability_report(reliability: dict[str, Any] | None) -> dict[str, Any]:
+    if not reliability:
+        return {}
+    report = _json_dict(
+        reliability.get("report_json"),
+        source=CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE,
+        fallback_type="operator_health_context_reliability_report_json_parse_failed",
+        metadata={"source_family": reliability.get("source_family")},
+    )
+    if report:
+        return report
+    return reliability
+
+
+def _signal_quality_runtime_policy_contract(reliability: dict[str, Any] | None) -> dict[str, Any]:
+    report = _signal_quality_reliability_report(reliability)
+    contract = report.get("runtime_policy_contract") if isinstance(report, dict) else None
+    if isinstance(contract, dict):
+        return contract
+    classification = report.get("classification") if isinstance(report, dict) else None
+    if classification is None and reliability:
+        classification = reliability.get("classification")
+    return reliability_runtime_policy_contract(classification)
+
+
+def _signal_quality_runtime_contract_allows(reliability: dict[str, Any] | None, use_name: str) -> bool:
+    contract = _signal_quality_runtime_policy_contract(reliability)
+    allowed = contract.get("allowed_runtime_uses")
+    return isinstance(allowed, dict) and bool(allowed.get(use_name))
+
+
+def _signal_quality_rule_supported_effect(rule: dict[str, Any]) -> bool:
+    effect = _signal_quality_rule_text(rule.get("action_policy_effect"))
+    return effect in SIGNAL_QUALITY_OVERLAY_NEGATIVE_BLOCK_EFFECTS | SIGNAL_QUALITY_OVERLAY_POSITIVE_WATCH_EFFECTS
+
+
+def _signal_quality_rule_supported_split_scope(rule: dict[str, Any]) -> tuple[bool, str | None]:
+    split_axis = _signal_quality_rule_text(rule.get("split_axis"))
+    split_value = _signal_quality_rule_text(rule.get("split_value"))
+    if not split_axis:
+        return True, None
+    if split_axis not in SIGNAL_QUALITY_OVERLAY_SUPPORTED_SPLIT_AXES:
+        return False, "unsupported_split_axis"
+    if split_axis == "context_class_direction" and split_value and len(_signal_quality_split_value_tokens(split_value)) < 2:
+        return False, "invalid_context_class_direction_split_value"
+    return True, None
+
+
+def _signal_quality_rule_is_split_scoped(rule: dict[str, Any]) -> bool:
+    return bool(_signal_quality_rule_text(rule.get("split_axis")) or _signal_quality_rule_text(rule.get("split_value")))
+
+
+def _signal_quality_split_key_from_rule(rule: dict[str, Any]) -> tuple[str, int, str, str] | None:
+    source_family = _signal_quality_rule_text(rule.get("context_source_family"))
+    horizon = pd.to_numeric(rule.get("minimum_horizon_days") or rule.get("horizon_days"), errors="coerce")
+    split_axis = _signal_quality_rule_text(rule.get("split_axis"))
+    split_value = _signal_quality_rule_text(rule.get("split_value"))
+    if not source_family or pd.isna(horizon) or not split_axis or not split_value:
+        return None
+    return source_family, int(horizon), split_axis, split_value
+
+
+def _signal_quality_split_key_from_stability_row(row: dict[str, Any]) -> tuple[str, int, str, str] | None:
+    source_family = _signal_quality_rule_text(row.get("source_family"))
+    horizon = pd.to_numeric(row.get("horizon_days"), errors="coerce")
+    split_axis = _signal_quality_rule_text(row.get("split_axis"))
+    split_value = _signal_quality_rule_text(row.get("split_value"))
+    if not source_family or pd.isna(horizon) or not split_axis or not split_value:
+        return None
+    return source_family, int(horizon), split_axis, split_value
+
+
+def _load_signal_quality_split_stability_for_rules() -> tuple[str, dict[tuple[str, int, str, str], dict[str, Any]], str | None]:
+    if not table_exists(SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE):
+        return "missing", {}, "split_summary_table_missing"
+    try:
+        summary = sql_to_df(
+            f"""
+            SELECT
+                evaluated_at,
+                source_evaluated_at,
+                horizon_days,
+                variant,
+                source_family,
+                split_axis,
+                split_value,
+                context_class,
+                direction,
+                sample_count,
+                selected_count,
+                matured_count,
+                symbol_count,
+                avg_forward_return_after_cost,
+                baseline_selected_count,
+                baseline_avg_forward_return_after_cost,
+                lift_vs_technical_only,
+                classification,
+                recommendation,
+                authority,
+                broker_execution_allowed,
+                policy_auto_promotion_allowed,
+                load_ts
+            FROM {SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE}
+            ORDER BY evaluated_at DESC, horizon_days, source_family, split_axis, split_value
+            LIMIT 1000
+            """,
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=SIGNAL_QUALITY_SPLIT_SUMMARY_TABLE,
+            fallback_type="operator_health_signal_quality_overlay_rules_split_stability_load_failed",
+            reason="Operator Health could not load persisted narrowed split stability for trusted overlay-rule eligibility.",
+            error=exc,
+        )
+        return "error", {}, "split_stability_load_failed"
+    if summary.empty:
+        return "empty", {}, "split_summary_empty"
+    report = build_split_stability_report(summary)
+    split_rows = report.get("splits") if isinstance(report.get("splits"), list) else []
+    by_key: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+    for row in split_rows:
+        if not isinstance(row, dict):
+            continue
+        key = _signal_quality_split_key_from_stability_row(row)
+        if key is not None:
+            by_key[key] = row
+    return "ok", by_key, None
+
+
+def check_signal_quality_overlay_rules() -> dict[str, Any]:
+    try:
+        rules_payload = load_signal_quality_overlay_rules()
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="config/advisory_setups.yaml",
+            fallback_type="operator_health_signal_quality_overlay_rules_load_failed",
+            reason="Operator Health could not load signal-quality overlay rules.",
+            error=exc,
+        )
+        return _status(
+            "error",
+            "Could not load signal-quality overlay rules.",
+            error=f"{type(exc).__name__}: {exc}",
+            command="python -m advisory.operator_health --full --skip-dhan",
+        )
+
+    rules = rules_payload.get("rules") if isinstance(rules_payload, dict) else []
+    if not isinstance(rules, list):
+        rules = []
+    trusted_rules = [
+        rule
+        for rule in rules
+        if isinstance(rule, dict)
+        and rule.get("valid")
+        and str(rule.get("status") or "").strip().lower() == "trusted_overlay"
+    ]
+    split_scoped_trusted_rules = [rule for rule in trusted_rules if _signal_quality_rule_is_split_scoped(rule)]
+    reliability_by_family: dict[str, dict[str, Any]] = {}
+    reliability_status = "unavailable"
+    reliability_latest = None
+    if table_exists(CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE):
+        try:
+            latest_df = sql_to_df(
+                f"SELECT MAX(evaluated_at) AS latest_evaluated_at FROM {CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE}",
+                retries=3,
+                statement_timeout_ms=10000,
+            )
+            latest = pd.to_datetime(latest_df.iloc[0].get("latest_evaluated_at"), utc=True, errors="coerce") if not latest_df.empty else pd.NaT
+            if pd.notna(latest):
+                reliability_latest = latest
+                rows = sql_to_df(
+                    f"""
+                    SELECT *
+                    FROM {CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE}
+                    WHERE evaluated_at = %(latest)s
+                    """,
+                    params={"latest": latest},
+                    retries=3,
+                    statement_timeout_ms=10000,
+                )
+                reliability_by_family = {
+                    str(row.get("source_family") or "").strip().lower(): row
+                    for row in _records(rows)
+                    if str(row.get("source_family") or "").strip()
+                }
+                reliability_status = "ok" if reliability_by_family else "empty"
+            else:
+                reliability_status = "empty"
+        except Exception as exc:
+            _record_health_local_fallback(
+                source=CONTEXT_OVERLAY_RELIABILITY_SUMMARY_TABLE,
+                fallback_type="operator_health_signal_quality_overlay_rules_reliability_load_failed",
+                reason="Operator Health could not load context-overlay reliability for trusted rule eligibility.",
+                error=exc,
+            )
+            reliability_status = "error"
+    split_stability_status = "not_required"
+    split_stability_block_reason = None
+    split_stability_by_key: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+    if split_scoped_trusted_rules:
+        split_stability_status, split_stability_by_key, split_stability_block_reason = _load_signal_quality_split_stability_for_rules()
+    rows: list[dict[str, Any]] = []
+    eligible_count = 0
+    blocked_count = 0
+    for rule in trusted_rules:
+        source_family = str(rule.get("context_source_family") or "").strip().lower()
+        reliability = reliability_by_family.get(source_family) if source_family else None
+        reliability_classification = str((reliability or {}).get("classification") or "").strip().lower() or None
+        runtime_policy_contract = _signal_quality_runtime_policy_contract(reliability)
+        watch_priority_allowed = _signal_quality_runtime_contract_allows(reliability, "watch_priority")
+        stability_classification = str(rule.get("stability_classification") or "").strip() or None
+        supported_effect = _signal_quality_rule_supported_effect(rule)
+        supported_split_scope, split_scope_block_reason = _signal_quality_rule_supported_split_scope(rule)
+        split_key = _signal_quality_split_key_from_rule(rule)
+        matching_split_stability = split_stability_by_key.get(split_key) if split_key is not None else None
+        split_stability_supported = True
+        split_stability_reason = None
+        if _signal_quality_rule_is_split_scoped(rule):
+            split_stability_supported = False
+            if split_stability_status != "ok":
+                split_stability_reason = split_stability_block_reason or f"split_stability_{split_stability_status}"
+            elif split_key is None:
+                split_stability_reason = "split_rule_missing_match_fields"
+            elif not matching_split_stability:
+                split_stability_reason = "current_split_stability_missing"
+            elif int(matching_split_stability.get("baseline_unavailable_window_count") or 0) > 0:
+                split_stability_reason = "current_split_technical_baseline_unavailable"
+            elif str(matching_split_stability.get("classification") or "").strip() != "stable_candidate":
+                split_stability_reason = "current_split_stability_not_stable_candidate"
+            else:
+                split_stability_supported = True
+        rule_context_class = _signal_quality_rule_context_class(rule)
+        class_reliability = _signal_quality_context_class_reliability(reliability, rule_context_class)
+        class_reliability_classification = (
+            str((class_reliability or {}).get("classification") or "").strip().lower() or None
+        )
+        class_reliability_supported = class_reliability_classification not in SIGNAL_QUALITY_OVERLAY_SUPPRESSED_CONTEXT_CLASS_RELIABILITY
+        reasons: list[str] = []
+        if not watch_priority_allowed:
+            reasons.append("current_reliability_runtime_contract_disallows_watch_priority")
+        if stability_classification != "stable_candidate":
+            reasons.append("missing_stable_candidate_cross_window_evidence")
+        if not supported_effect:
+            reasons.append("unsupported_action_policy_effect")
+        if not supported_split_scope:
+            reasons.append(split_scope_block_reason or "unsupported_split_scope")
+        if not split_stability_supported:
+            reasons.append(split_stability_reason or "current_split_stability_not_supported")
+        if not class_reliability_supported:
+            reasons.append("context_class_reliability_suppressed")
+        eligible = not reasons
+        eligible_count += int(eligible)
+        blocked_count += int(not eligible)
+        rows.append(
+            {
+                "rule_id": rule.get("rule_id"),
+                "overlay": rule.get("overlay"),
+                "context_source_family": source_family or None,
+                "status": rule.get("status"),
+                "runtime_eligible_for_signal_quality_overlay_consumer": eligible,
+                "runtime_reliability_gate": "runtime_policy_contract_watch_priority_required",
+                "runtime_reliability_classification": reliability_classification,
+                "runtime_policy_contract": runtime_policy_contract,
+                "runtime_watch_priority_allowed": watch_priority_allowed,
+                "runtime_stability_gate": "stable_candidate_required",
+                "runtime_stability_classification": stability_classification,
+                "runtime_supported_effect_gate": "supported_review_only_effect_required",
+                "runtime_supported_effect": supported_effect,
+                "runtime_supported_split_scope_gate": "known_split_axis_or_broad_rule_required",
+                "runtime_supported_split_scope": supported_split_scope,
+                "runtime_split_scope_block_reason": split_scope_block_reason,
+                "runtime_current_split_stability_gate": "current_persisted_split_stability_required",
+                "runtime_current_split_stability_status": split_stability_status,
+                "runtime_current_split_stability_supported": split_stability_supported,
+                "runtime_current_split_stability_block_reason": split_stability_reason,
+                "runtime_current_split_stability": matching_split_stability,
+                "runtime_context_class_reliability_gate": "exact_context_class_not_harmful_required",
+                "runtime_context_class": rule_context_class,
+                "runtime_context_class_reliability": class_reliability,
+                "runtime_context_class_reliability_classification": class_reliability_classification,
+                "runtime_context_class_reliability_supported": class_reliability_supported,
+                "runtime_context_class_reliability_block_reason": (
+                    "context_class_reliability_suppressed" if not class_reliability_supported else None
+                ),
+                "blocked_reasons": reasons,
+                "action_policy_effect": rule.get("action_policy_effect"),
+                "broker_execution_allowed": False,
+                "policy_auto_promotion_allowed": False,
+            }
+        )
+
+    status = "ok"
+    reasons: list[str] = []
+    if (rules_payload.get("summary") or {}).get("issue_count"):
+        status = "warn"
+        reasons.append("config_rule_issues")
+    if trusted_rules and blocked_count:
+        status = "warn"
+        reasons.append("trusted_rules_not_runtime_eligible")
+    if trusted_rules and reliability_status in {"unavailable", "empty", "error"}:
+        status = "warn" if reliability_status != "error" else "error"
+        reasons.append(f"reliability_{reliability_status}")
+    if split_scoped_trusted_rules and split_stability_status in {"missing", "empty", "error"}:
+        status = "warn" if split_stability_status != "error" else "error"
+        reasons.append(f"split_stability_{split_stability_status}")
+    return _status(
+        status,
+        "Trusted signal-quality overlay rules are runtime-eligible under current evidence gates."
+        if status == "ok"
+        else "Some trusted signal-quality overlay rules are not runtime-eligible under current reliability/stability gates.",
+        reasons=reasons,
+        rule_count=int(len(rules)),
+        trusted_rule_count=int(len(trusted_rules)),
+        runtime_eligible_rule_count=int(eligible_count),
+        runtime_blocked_rule_count=int(blocked_count),
+        reliability_status=reliability_status,
+        reliability_latest_evaluated_at=_json_ready(reliability_latest),
+        split_scoped_trusted_rule_count=int(len(split_scoped_trusted_rules)),
+        split_stability_status=split_stability_status,
+        split_stability_block_reason=split_stability_block_reason,
+        operator_boundary={
+            "read_only": True,
+            "broker_execution_enabled": False,
+            "policy_auto_promotion_allowed": False,
+        },
+        rows=rows[:20],
+        command="python -m advisory.context_overlay_reliability_report --horizons 5 10 20 --format json",
+    )
+
+
+def _count_fallback_rows(rows: list[dict[str, Any]]) -> tuple[int, int, int, dict[str, int], dict[str, int]]:
+    active_count = len(rows)
+    error_count = sum(1 for row in rows if str(row.get("severity") or "").strip().lower() == "error")
+    warn_count = sum(1 for row in rows if str(row.get("severity") or "").strip().lower() == "warn")
+    counts_by_type: dict[str, int] = {}
+    counts_by_module: dict[str, int] = {}
+    for row in rows:
+        fallback_type = str(row.get("fallback_type") or "unknown")
+        module = str(row.get("module") or "unknown")
+        counts_by_type[fallback_type] = counts_by_type.get(fallback_type, 0) + 1
+        counts_by_module[module] = counts_by_module.get(module, 0) + 1
+    return active_count, error_count, warn_count, counts_by_type, counts_by_module
+
+
+def check_fallback_telemetry_compact(*, hours: int = 24, limit: int = 25) -> dict[str, Any]:
+    """Fast Health fallback telemetry from local spools only.
+
+    The DB-backed fallback table can be large and grouped scans are not suitable
+    for frequent Health polling on a small Postgres instance. This compact path
+    keeps urgent local fallback and DB-retry telemetry visible while pointing
+    operators to the deep command for the full persisted table summary.
+    """
+    window_hours = max(1, int(hours))
+    row_limit = max(1, int(limit))
+    errors: list[str] = []
+    try:
+        db_retry_rows = read_db_retry_telemetry_events(hours=window_hours, limit=row_limit)
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="utils.db",
+            fallback_type="operator_health_db_retry_spool_summary_failed",
+            reason="Operator Health could not read DB retry telemetry spool.",
+            error=exc,
+            metadata={"hours": window_hours, "limit": row_limit},
+        )
+        db_retry_rows = []
+        errors.append(f"{type(exc).__name__}: {exc}")
+    try:
+        local_rows = read_local_fallback_events(hours=window_hours, limit=row_limit)
+    except Exception as exc:
+        _record_health_local_fallback(
+            source="local_fallback_telemetry",
+            fallback_type="operator_health_local_fallback_spool_summary_failed",
+            reason="Operator Health could not read local fallback telemetry spool.",
+            error=exc,
+            metadata={"hours": window_hours, "limit": row_limit},
+        )
+        local_rows = []
+        errors.append(f"{type(exc).__name__}: {exc}")
+
+    rows = (db_retry_rows + local_rows)[:row_limit]
+    active_count, error_count, warn_count, counts_by_type, counts_by_module = _count_fallback_rows(rows)
+    nse_session_reset_count = int(counts_by_type.get("nse_session_reset") or 0)
+    nse_retry_count = int(counts_by_type.get("nse_retry") or 0)
+    status = "error" if errors or error_count else "warn" if active_count else "ok"
+    return _status(
+        status,
+        "Recent local fallback/degraded-path events found."
+        if active_count
+        else "No recent local fallback/degraded-path events; DB fallback table scan skipped for routine Health.",
+        compact_source="local_and_db_retry_spools",
+        db_table_scan_skipped=True,
+        deep_diagnostic_command="python -m advisory.operator_health --full --skip-dhan --format json",
+        window_hours=window_hours,
+        active_count=active_count,
+        error_count=error_count,
+        warn_count=warn_count,
+        counts_by_type=counts_by_type,
+        counts_by_module=counts_by_module,
+        db_retry_count=len(db_retry_rows),
+        db_retry_error_count=sum(1 for row in db_retry_rows if str(row.get("severity") or "").strip().lower() == "error"),
+        local_fallback_count=len(local_rows),
+        local_fallback_error_count=sum(1 for row in local_rows if str(row.get("severity") or "").strip().lower() == "error"),
+        nse_session_reset_count=nse_session_reset_count,
+        nse_retry_count=nse_retry_count,
+        nse_http_count=nse_session_reset_count + nse_retry_count,
+        errors=errors,
+        rows=rows,
     )
 
 
@@ -2658,7 +6156,7 @@ def check_feature_stage_gates(*, limit: int = FEATURE_STAGE_GATE_SYMBOL_LIMIT) -
             error=f"{type(exc).__name__}: {exc}",
             symbol_limit=int(limit),
         )
-    stages = ["rules", "risk", "portfolio", "lifecycle", "actions"]
+    stages = [stage for stage in ("rules", "risk", "portfolio", "lifecycle", "actions", "company_memory") if stage in STAGE_FEATURE_DEPENDENCIES_BY_STAGE]
     if not symbols:
         return _status(
             "warn",
@@ -2694,12 +6192,29 @@ def check_feature_stage_gates(*, limit: int = FEATURE_STAGE_GATE_SYMBOL_LIMIT) -
                     "blocked_count": len(symbols),
                     "blocked_symbols": symbols[:10],
                     "required_input_keys": list(dependency.input_keys),
+                    "context_input_keys": list(dependency.context_input_keys),
+                    "context_input_status_counts": {},
+                    "context_warning_count": 0,
                     "gate_effect": dependency.gate_effect,
                     "error": f"{type(exc).__name__}: {exc}",
                 }
             )
             continue
         blocked_symbols = [str(value).upper() for value in gate.get("blocked_symbols") or []]
+        context_counts: dict[str, int] = {}
+        for symbol_summary in (gate.get("symbols") or {}).values():
+            if not isinstance(symbol_summary, dict):
+                continue
+            for context_input in symbol_summary.get("context_inputs") or []:
+                if not isinstance(context_input, dict):
+                    continue
+                status = str(context_input.get("status") or "unknown").strip().lower() or "unknown"
+                context_counts[status] = context_counts.get(status, 0) + 1
+        context_warning_count = sum(
+            count
+            for status, count in context_counts.items()
+            if status in {"missing", "stale", "error", "intentionally_skipped"}
+        )
         rows.append(
             {
                 "stage": stage,
@@ -2708,6 +6223,9 @@ def check_feature_stage_gates(*, limit: int = FEATURE_STAGE_GATE_SYMBOL_LIMIT) -
                 "blocked_count": gate.get("blocked_count", len(blocked_symbols)),
                 "blocked_symbols": blocked_symbols[:10],
                 "required_input_keys": gate.get("required_input_keys"),
+                "context_input_keys": gate.get("context_input_keys"),
+                "context_input_status_counts": context_counts,
+                "context_warning_count": context_warning_count,
                 "gate_effect": gate.get("gate_effect"),
             }
         )
@@ -2725,6 +6243,242 @@ def check_feature_stage_gates(*, limit: int = FEATURE_STAGE_GATE_SYMBOL_LIMIT) -
         rows=rows,
         command="./complete_data.sh && ./all_advisory.sh",
     )
+
+
+def check_feature_stage_gates_snapshot(*, limit: int = OPERATOR_HEALTH_FEATURE_STAGE_GATE_SYMBOL_LIMIT) -> dict[str, Any]:
+    """Cheap Health summary from persisted decision-time freshness snapshots.
+
+    The deep `check_feature_stage_gates` path re-evaluates feature inputs against
+    source tables and can be expensive on small Postgres instances. Full Health
+    uses this snapshot path so the UI surfaces known blockers without scanning
+    OHLCV/technical tables on every health poll.
+    """
+    row_limit = max(1, int(limit))
+    try:
+        if not table_exists(ACTION_RECOMMENDATIONS_TABLE):
+            return _status(
+                "warn",
+                "No action recommendations table exists yet; feature stage-gate snapshots are unavailable.",
+                degraded=True,
+                compact_source="decision_time_snapshot",
+                live_recomputed=False,
+                symbol_limit=row_limit,
+                symbols_checked=0,
+                blocked_stage_count=0,
+                blocked_symbol_count=0,
+                rows=[],
+                command="./all_advisory.sh",
+            )
+        columns = table_columns(ACTION_RECOMMENDATIONS_TABLE)
+        if "feature_freshness_json" not in columns:
+            return _status(
+                "warn",
+                "Action recommendations do not contain persisted feature-freshness snapshots.",
+                degraded=True,
+                compact_source="decision_time_snapshot",
+                live_recomputed=False,
+                symbol_limit=row_limit,
+                symbols_checked=0,
+                blocked_stage_count=0,
+                blocked_symbol_count=0,
+                rows=[],
+                command="./all_advisory.sh",
+            )
+        df = sql_to_df(
+            f"""
+            SELECT
+                asof_date,
+                symbol,
+                action_code,
+                feature_freshness_json
+            FROM {ACTION_RECOMMENDATIONS_TABLE}
+            WHERE asof_date = (SELECT MAX(asof_date) FROM {ACTION_RECOMMENDATIONS_TABLE})
+              AND NULLIF(TRIM(symbol), '') IS NOT NULL
+            ORDER BY asof_date DESC NULLS LAST, symbol
+            LIMIT %s
+            """,
+            params=(row_limit,),
+            retries=2,
+            statement_timeout_ms=5000,
+        )
+    except Exception as exc:
+        _record_health_local_fallback(
+            source=ACTION_RECOMMENDATIONS_TABLE,
+            fallback_type="operator_health_feature_stage_gate_snapshot_load_failed",
+            reason="Operator Health could not load persisted feature stage-gate snapshots.",
+            error=exc,
+            metadata={"limit": row_limit},
+        )
+        return _status(
+            "error",
+            "Could not load persisted feature stage-gate snapshots.",
+            error=f"{type(exc).__name__}: {exc}",
+            compact_source="decision_time_snapshot",
+            live_recomputed=False,
+            symbol_limit=row_limit,
+            blocked_stage_count=None,
+            blocked_symbol_count=None,
+            rows=[],
+            command="./all_advisory.sh",
+        )
+
+    if df.empty:
+        return _status(
+            "warn",
+            "No latest action rows are available for feature stage-gate snapshots.",
+            compact_source="decision_time_snapshot",
+            live_recomputed=False,
+            symbol_limit=row_limit,
+            symbols_checked=0,
+            blocked_stage_count=0,
+            blocked_symbol_count=0,
+            rows=[],
+            command="./all_advisory.sh",
+        )
+
+    rows: list[dict[str, Any]] = []
+    blocked_symbols: set[str] = set()
+    malformed_count = 0
+    for row in _records(df):
+        symbol = str(row.get("symbol") or "").strip().upper()
+        contract = _json_dict(
+            row.get("feature_freshness_json"),
+            source=ACTION_RECOMMENDATIONS_TABLE,
+            fallback_type="operator_health_feature_stage_gate_snapshot_json_parse_failed",
+            metadata={"symbol": symbol, "asof_date": str(row.get("asof_date"))},
+        )
+        if not contract:
+            malformed_count += 1
+        status = str(contract.get("status") or "unknown").strip().lower()
+        blockers = contract.get("blockers") if isinstance(contract.get("blockers"), list) else []
+        required_inputs = contract.get("required_inputs") if isinstance(contract.get("required_inputs"), list) else []
+        if status == "blocked" or blockers:
+            blocked_symbols.add(symbol)
+        rows.append(
+            {
+                "stage": "actions",
+                "status": "blocked" if status == "blocked" or blockers else "ok" if status in {"ok", "fresh"} else status,
+                "symbol": symbol,
+                "action_code": row.get("action_code"),
+                "asof_date": row.get("asof_date"),
+                "blocked_count": 1 if status == "blocked" or blockers else 0,
+                "blocked_symbols": [symbol] if status == "blocked" or blockers else [],
+                "required_input_keys": [
+                    str(item.get("input_key"))
+                    for item in required_inputs
+                    if isinstance(item, dict) and item.get("input_key") is not None
+                ],
+                "blockers": blockers[:5],
+                "captured_at": contract.get("captured_at"),
+                "gate_effect": "Persisted decision-time feature freshness snapshot; run direct feature freshness diagnostics for live source-table detail.",
+            }
+        )
+
+    blocked_count = len(blocked_symbols)
+    status = "warn" if blocked_count or malformed_count else "ok"
+    message = "Persisted feature-freshness snapshots are clear."
+    if blocked_count:
+        message = "Persisted feature-freshness snapshots contain blocked action inputs."
+    elif malformed_count:
+        message = "Some persisted feature-freshness snapshots were missing or malformed."
+    return _status(
+        status,
+        message,
+        compact_source="decision_time_snapshot",
+        live_recomputed=False,
+        degraded=bool(malformed_count),
+        symbol_limit=row_limit,
+        symbols_checked=int(len(df)),
+        blocked_stage_count=1 if blocked_count else 0,
+        blocked_symbol_count=blocked_count,
+        malformed_snapshot_count=malformed_count,
+        rows=rows,
+        command="./complete_data.sh && ./all_advisory.sh",
+    )
+
+
+def check_feature_stage_gates_bounded(
+    *,
+    limit: int = FEATURE_STAGE_GATE_SYMBOL_LIMIT,
+    timeout_seconds: float = OPERATOR_HEALTH_FEATURE_STAGE_GATES_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    timeout = max(1.0, float(timeout_seconds))
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import json, sys; "
+            "from advisory.operator_health import check_feature_stage_gates; "
+            "print(json.dumps(check_feature_stage_gates(limit=int(sys.argv[1])), default=str))"
+        ),
+        str(int(limit)),
+    ]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        _record_health_local_fallback(
+            source="advisory.feature_freshness",
+            fallback_type="operator_health_feature_stage_gate_timeout",
+            reason="Operator Health feature stage-gate diagnostics exceeded the bounded full-health timeout.",
+            error=exc,
+            severity="warn",
+            metadata={"limit": int(limit), "timeout_seconds": timeout},
+        )
+        return _status(
+            "warn",
+            "Feature stage-gate diagnostics timed out and were skipped for this health run.",
+            timed_out=True,
+            degraded=True,
+            symbol_limit=int(limit),
+            timeout_seconds=timeout,
+            blocked_stage_count=None,
+            blocked_symbol_count=None,
+            rows=[],
+            command=f"FEATURE_STAGE_GATE_SYMBOL_LIMIT={max(1, min(5, int(limit)))} python -m advisory.operator_health --full --skip-dhan",
+        )
+    if proc.returncode:
+        error_text = (proc.stderr or proc.stdout or "").strip()
+        error = RuntimeError(error_text[:1000] or f"feature stage-gate subprocess failed with returncode={proc.returncode}")
+        _record_health_local_fallback(
+            source="advisory.feature_freshness",
+            fallback_type="operator_health_feature_stage_gate_subprocess_failed",
+            reason="Operator Health feature stage-gate subprocess failed.",
+            error=error,
+            severity="warn",
+            metadata={"limit": int(limit), "timeout_seconds": timeout, "returncode": proc.returncode},
+        )
+        return _status(
+            "error",
+            "Feature stage-gate diagnostics failed in subprocess.",
+            error=f"{type(error).__name__}: {error}",
+            symbol_limit=int(limit),
+            blocked_stage_count=None,
+            blocked_symbol_count=None,
+            rows=[],
+            command="./complete_data.sh && ./all_advisory.sh",
+        )
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        _record_health_local_fallback(
+            source="advisory.feature_freshness",
+            fallback_type="operator_health_feature_stage_gate_json_parse_failed",
+            reason="Operator Health could not parse feature stage-gate subprocess output.",
+            error=exc,
+            severity="warn",
+            metadata={"limit": int(limit), "stdout_length": len(proc.stdout or "")},
+        )
+        return _status(
+            "error",
+            "Feature stage-gate diagnostics returned invalid JSON.",
+            error=f"{type(exc).__name__}: {exc}",
+            symbol_limit=int(limit),
+            blocked_stage_count=None,
+            blocked_symbol_count=None,
+            rows=[],
+            command="./complete_data.sh && ./all_advisory.sh",
+        )
+    return payload if isinstance(payload, dict) else _status("error", "Feature stage-gate diagnostics returned a non-object payload.", symbol_limit=int(limit), rows=[])
 
 
 def _is_improving_stop_change(row: dict[str, Any]) -> bool:
@@ -2922,7 +6676,85 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
                 "missing_sources": watcher_counters.get("missing_sources"),
                 "stale_count": watcher_counters.get("stale_count"),
                 "error_count": watcher_counters.get("error_count"),
+                "degraded_counter_count": watcher_counters.get("degraded_counter_count"),
                 "empty_counter_count": watcher_counters.get("empty_counter_count"),
+            },
+        )
+
+    signal_refresh_state = sections.get("signal_refresh_source_state") if isinstance(sections.get("signal_refresh_source_state"), dict) else {}
+    if int(signal_refresh_state.get("identity_policy_suppressed_target_rows") or 0) > 0:
+        add(
+            status="warn",
+            title="Context-overlay identity/source mapping is suppressing targets",
+            reason=(
+                "Some review-only context-overlay watch/de-risk targets are suppressed because company-master, Dhan, or security identity mapping is unresolved. "
+                "Repair identity mapping before changing regime/context thresholds."
+            ),
+            commands=[
+                "python -m advisory.operator_health --check identity_issues --skip-dhan",
+                "python -m data.dhanlive.scrip_master",
+                "python -m advisory.identity_issues --format text",
+                "python -m advisory.signal_refresh --from-context-overlays --limit 50 --format text",
+                "python -m advisory.operator_health --check signal_refresh_source_state --skip-dhan",
+            ],
+            details={
+                "section": "signal_refresh_source_state",
+                "identity_policy_suppressed_target_rows": signal_refresh_state.get("identity_policy_suppressed_target_rows"),
+                "identity_policy_suppressed_sources": signal_refresh_state.get("identity_policy_suppressed_sources"),
+            },
+        )
+
+    if signal_refresh_state.get("status") in {"warn", "error"}:
+        unhealthy_signal_sources = {
+            str(source)
+            for key in (
+                "missing_sources",
+                "stale_sources",
+                "error_sources",
+                "unsafe_authority_sources",
+                "source_contract_issue_sources",
+                "algorithm_version_mismatch_sources",
+            )
+            for source in (signal_refresh_state.get(key) if isinstance(signal_refresh_state.get(key), list) else [])
+            if str(source or "").strip()
+        }
+        signal_refresh_commands: list[str] = []
+        if "advisory:signal_refresh:context_overlays" in unhealthy_signal_sources:
+            signal_refresh_commands.append("python -m advisory.signal_refresh --from-context-overlays --limit 50 --format text")
+        if "advisory:signal_refresh:causal_memory" in unhealthy_signal_sources:
+            signal_refresh_commands.append("python -m advisory.signal_refresh --from-causal-memory --limit 25 --format text")
+        if "continuous_watch:action_refresh" in unhealthy_signal_sources:
+            signal_refresh_commands.append("python -m advisory.recommendation_diagnostics --format text")
+        signal_refresh_commands.extend(["./all_watchers.sh", "python -m advisory.operator_health --full --skip-dhan"])
+        signal_refresh_commands = list(dict.fromkeys(signal_refresh_commands))
+        add(
+            status=str(signal_refresh_state.get("status") or "warn"),
+            title="Review-only signal-refresh source state is stale or incomplete",
+            reason=str(
+                signal_refresh_state.get("message")
+                or "Latest context-overlay, causal-memory, or bounded action-refresh sync-state rows are stale, missing, or failing."
+            ),
+            commands=signal_refresh_commands,
+            details={
+                "section": "signal_refresh_source_state",
+                "missing_sources": signal_refresh_state.get("missing_sources"),
+                "stale_sources": signal_refresh_state.get("stale_sources"),
+                "error_sources": signal_refresh_state.get("error_sources"),
+                "unsafe_authority_sources": signal_refresh_state.get("unsafe_authority_sources"),
+                "algorithm_version_mismatch_sources": signal_refresh_state.get("algorithm_version_mismatch_sources"),
+                "source_contract_issue_sources": signal_refresh_state.get("source_contract_issue_sources"),
+                "stale_count": signal_refresh_state.get("stale_count"),
+                "error_count": signal_refresh_state.get("error_count"),
+                "unsafe_authority_count": signal_refresh_state.get("unsafe_authority_count"),
+                "algorithm_version_mismatch_count": signal_refresh_state.get("algorithm_version_mismatch_count"),
+                "malformed_source_contract_count": signal_refresh_state.get("malformed_source_contract_count"),
+                "source_contract_audit": signal_refresh_state.get("source_contract_audit"),
+                "signal_row_total": signal_refresh_state.get("signal_row_total"),
+                "identity_policy_suppressed_target_rows": signal_refresh_state.get("identity_policy_suppressed_target_rows"),
+                "identity_policy_suppressed_sources": signal_refresh_state.get("identity_policy_suppressed_sources"),
+                "broker_execution_allowed": bool(signal_refresh_state.get("broker_execution_allowed")),
+                "portfolio_authority": signal_refresh_state.get("portfolio_authority") or "none",
+                "full_advisory_required": signal_refresh_state.get("full_advisory_required"),
             },
         )
 
@@ -3000,9 +6832,11 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
                 "log_path": advisory_stage_report.get("log_path"),
                 "stage_count": advisory_stage_report.get("stage_count"),
                 "slow_stage_count": advisory_stage_report.get("slow_stage_count"),
+                "degraded_stage_count": advisory_stage_report.get("degraded_stage_count"),
                 "operations_command": advisory_stage_report.get("operations_command"),
                 "operator_action": advisory_stage_report.get("operator_action"),
                 "ranked_stages": advisory_stage_report.get("ranked_stages"),
+                "stage_degradations": advisory_stage_report.get("stage_degradations"),
             },
         )
 
@@ -3063,19 +6897,571 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             },
         )
 
+    context_gate_policy = sections.get("context_gate_policy") if isinstance(sections.get("context_gate_policy"), dict) else {}
+    if context_gate_policy.get("status") in {"warn", "error"}:
+        add(
+            status=str(context_gate_policy.get("status") or "warn"),
+            title="Broad regime hard gate is active",
+            reason=str(
+                context_gate_policy.get("error")
+                or context_gate_policy.get("operator_action")
+                or context_gate_policy.get("message")
+                or "A broad single-regime hard gate is active."
+            ),
+            commands=[
+                str(context_gate_policy.get("command") or "python scripts/context_gate_policy_audit.py --fail-on-single-regime"),
+                "python -m advisory.recommendation_diagnostics --format text",
+                "python -m advisory.operator_health --skip-dhan",
+            ],
+            details={
+                "section": "context_gate_policy",
+                "reasons": context_gate_policy.get("reasons"),
+                "active_single_regime_flags": context_gate_policy.get("active_single_regime_flags"),
+                "active_context_hard_flags": context_gate_policy.get("active_context_hard_flags"),
+                "global_regime_label_blocks_buy": bool(context_gate_policy.get("global_regime_label_blocks_buy")),
+                "policy_summary": context_gate_policy.get("policy_summary"),
+                "broker_execution_allowed": bool(context_gate_policy.get("broker_execution_allowed")),
+                "portfolio_authority": context_gate_policy.get("portfolio_authority") or "none",
+            },
+        )
+
     signal_quality = sections.get("signal_quality") if isinstance(sections.get("signal_quality"), dict) else {}
     if signal_quality.get("status") in {"warn", "error"}:
         add(
             status=str(signal_quality.get("status") or "warn"),
             title="Signal-quality evidence is not usable for promotion",
             reason=str(signal_quality.get("error") or signal_quality.get("message") or "Signal-quality evaluator needs a fresher or better-covered run."),
-            commands=[str(signal_quality.get("command") or "python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20")],
+            commands=[
+                str(signal_quality.get("command") or "python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20"),
+                str(signal_quality.get("window_runner_command") or "python -m advisory.signal_quality_window_runner --horizons 5 10 20 --include-split-reports"),
+            ],
             details={
                 "section": "signal_quality",
                 "latest_evaluated_at": signal_quality.get("latest_evaluated_at"),
                 "reasons": signal_quality.get("reasons"),
                 "max_matured_rows": signal_quality.get("max_matured_rows"),
                 "overlay_rows": signal_quality.get("overlay_rows"),
+                "benchmark_beta_not_overlay_alpha_count": signal_quality.get("benchmark_beta_not_overlay_alpha_count"),
+                "needs_benchmark_attribution_count": signal_quality.get("needs_benchmark_attribution_count"),
+                "benchmark_or_attribution_blocked_count": signal_quality.get("benchmark_or_attribution_blocked_count"),
+                "promotion_readiness_status": signal_quality.get("promotion_readiness_status"),
+                "candidate_helpful_family_count": signal_quality.get("candidate_helpful_family_count"),
+                "benchmark_or_attribution_blocked_family_count": signal_quality.get("benchmark_or_attribution_blocked_family_count"),
+                "promotion_review_sector_block_count": signal_quality.get("promotion_review_sector_block_count"),
+                "promotion_review_runtime_block_count": signal_quality.get("promotion_review_runtime_block_count"),
+                "promotion_review_harmful_class_block_count": signal_quality.get("promotion_review_harmful_class_block_count"),
+                "promotion_reviews": signal_quality.get("promotion_reviews"),
+            },
+        )
+
+    technical_threshold_evidence = sections.get("technical_threshold_evidence") if isinstance(sections.get("technical_threshold_evidence"), dict) else {}
+    if technical_threshold_evidence.get("status") in {"warn", "error"}:
+        add(
+            status=str(technical_threshold_evidence.get("status") or "warn"),
+            title="Technical-threshold calibration evidence is not policy-ready",
+            reason=str(
+                technical_threshold_evidence.get("error")
+                or technical_threshold_evidence.get("message")
+                or "Technical threshold calibration needs fresh, matured, after-cost evidence with lift over baseline."
+            ),
+            commands=[
+                str(technical_threshold_evidence.get("command") or "python -m advisory.technical_threshold_calibration --horizons 5 10 20"),
+                str(technical_threshold_evidence.get("promotion_review_command") or "python -m advisory.technical_threshold_promotion --setup-id EVENT_OPPORTUNITY_V1 --config-id <config_id> --dry-run"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "technical_threshold_evidence",
+                "reasons": technical_threshold_evidence.get("reasons"),
+                "evaluation_rows": technical_threshold_evidence.get("evaluation_rows"),
+                "summary_rows": technical_threshold_evidence.get("summary_rows"),
+                "max_matured_signal_count": technical_threshold_evidence.get("max_matured_signal_count"),
+                "review_candidate_count": technical_threshold_evidence.get("review_candidate_count"),
+                "lift_over_baseline_count": technical_threshold_evidence.get("lift_over_baseline_count"),
+                "positive_after_cost_count": technical_threshold_evidence.get("positive_after_cost_count"),
+                "bounded_first_pass_count": technical_threshold_evidence.get("bounded_first_pass_count"),
+                "trigger_near_miss_candidate_count": technical_threshold_evidence.get("trigger_near_miss_candidate_count"),
+                "trigger_near_miss_do_not_relax_count": technical_threshold_evidence.get("trigger_near_miss_do_not_relax_count"),
+                "trigger_near_miss_needs_more_label_count": technical_threshold_evidence.get("trigger_near_miss_needs_more_label_count"),
+                "trigger_near_miss_research": technical_threshold_evidence.get("trigger_near_miss_research"),
+                "missing_summary_columns": technical_threshold_evidence.get("missing_summary_columns"),
+                "latest_evaluated_at": technical_threshold_evidence.get("latest_evaluated_at"),
+                "age_days": technical_threshold_evidence.get("age_days"),
+                "broker_execution_allowed": bool(technical_threshold_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(technical_threshold_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    research_evidence_summary = sections.get("research_evidence_run_summary") if isinstance(sections.get("research_evidence_run_summary"), dict) else {}
+    if research_evidence_summary.get("status") in {"warn", "error"}:
+        add(
+            status=str(research_evidence_summary.get("status") or "warn"),
+            title="Research evidence refresh is missing, failed, or not ready",
+            reason=str(
+                research_evidence_summary.get("error")
+                or research_evidence_summary.get("message")
+                or "The latest daily research-evidence wrapper did not produce a usable readiness summary."
+            ),
+            commands=[
+                str(research_evidence_summary.get("command") or "./all_research_evidence.sh"),
+                str(research_evidence_summary.get("health_command") or "python -m advisory.operator_health --full --skip-dhan"),
+            ],
+            details={
+                "section": "research_evidence_run_summary",
+                "reasons": research_evidence_summary.get("reasons"),
+                "log_path": research_evidence_summary.get("log_path"),
+                "readiness_status": research_evidence_summary.get("readiness_status"),
+                "payload_status": research_evidence_summary.get("payload_status"),
+                "active_component_count": research_evidence_summary.get("active_component_count"),
+                "candidate_component_count": research_evidence_summary.get("candidate_component_count"),
+                "blocker_count": research_evidence_summary.get("blocker_count"),
+                "blocker_components": research_evidence_summary.get("blocker_components"),
+                "authority_violation_count": research_evidence_summary.get("authority_violation_count"),
+                "authority_violation_components": research_evidence_summary.get("authority_violation_components"),
+                "broker_execution_allowed": bool(research_evidence_summary.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(research_evidence_summary.get("policy_auto_promotion_allowed")),
+                "portfolio_mutation_allowed": bool(research_evidence_summary.get("portfolio_mutation_allowed")),
+            },
+        )
+
+    ts_forecast_paper = sections.get("ts_forecast_paper") if isinstance(sections.get("ts_forecast_paper"), dict) else {}
+    if ts_forecast_paper.get("status") in {"warn", "error"}:
+        add(
+            status=str(ts_forecast_paper.get("status") or "warn"),
+            title="TS forecast paper-portfolio evidence is missing or not matured",
+            reason=str(
+                ts_forecast_paper.get("error")
+                or ts_forecast_paper.get("message")
+                or "TS forecast promotion checks need research-only paper-portfolio evidence before they can be reviewed."
+            ),
+            commands=[
+                str(ts_forecast_paper.get("command") or "python -m advisory.ts_forecast_paper_portfolio --log-research-ledger"),
+                str(ts_forecast_paper.get("promotion_check_command") or "python -m advisory.ts_forecast_promotion_check --format json"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "ts_forecast_paper",
+                "table": ts_forecast_paper.get("table"),
+                "reasons": ts_forecast_paper.get("reasons"),
+                "row_count": ts_forecast_paper.get("row_count"),
+                "matured_count": ts_forecast_paper.get("matured_count"),
+                "paper_buy_count": ts_forecast_paper.get("paper_buy_count"),
+                "symbol_count": ts_forecast_paper.get("symbol_count"),
+                "latest_load_ts": ts_forecast_paper.get("latest_load_ts"),
+                "latest_asof_date": ts_forecast_paper.get("latest_asof_date"),
+                "promotion_check_endpoint": ts_forecast_paper.get("promotion_check_endpoint"),
+                "broker_execution_allowed": bool(ts_forecast_paper.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(ts_forecast_paper.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    llm_provenance = sections.get("llm_provenance_audit") if isinstance(sections.get("llm_provenance_audit"), dict) else {}
+    if llm_provenance.get("status") in {"warn", "error"}:
+        add(
+            status=str(llm_provenance.get("status") or "warn"),
+            title="LLM provenance audit has open issues",
+            reason=str(
+                llm_provenance.get("error")
+                or llm_provenance.get("message")
+                or "Persisted LLM/Codex-derived rows are missing prompt/schema/evidence/authority metadata."
+            ),
+            commands=[
+                str(llm_provenance.get("command") or "python -m advisory.llm_provenance_audit --lookback-days 30 --limit-per-table 100 --format text"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "llm_provenance_audit",
+                "reasons": llm_provenance.get("reasons"),
+                "issue_table_count": llm_provenance.get("issue_table_count"),
+                "table_count": llm_provenance.get("table_count"),
+                "lookback_days": llm_provenance.get("lookback_days"),
+                "limit_per_table": llm_provenance.get("limit_per_table"),
+                "issue_rows": llm_provenance.get("issue_rows"),
+                "broker_execution_allowed": bool(llm_provenance.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(llm_provenance.get("policy_auto_promotion_allowed")),
+                "repairs_metadata": bool(llm_provenance.get("repairs_metadata")),
+            },
+        )
+
+    provenance_graphs = sections.get("provenance_graph_dry_runs") if isinstance(sections.get("provenance_graph_dry_runs"), dict) else {}
+    if provenance_graphs.get("status") in {"warn", "error"}:
+        add(
+            status=str(provenance_graphs.get("status") or "warn"),
+            title="Provenance graph dry runs are missing lineage",
+            reason=str(
+                provenance_graphs.get("error")
+                or provenance_graphs.get("message")
+                or "Action-evidence or causal-event provenance dry runs did not produce auditable lineage rows."
+            ),
+            commands=[
+                "python -m advisory.action_evidence_provenance --dry-run --limit 250 --format text",
+                "python -m advisory.causal_event_provenance --dry-run --limit 250 --format text",
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "provenance_graph_dry_runs",
+                "reasons": provenance_graphs.get("reasons"),
+                "row_count": provenance_graphs.get("row_count"),
+                "error_count": provenance_graphs.get("error_count"),
+                "warn_count": provenance_graphs.get("warn_count"),
+                "rows": provenance_graphs.get("rows"),
+                "broker_execution_allowed": bool(provenance_graphs.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(provenance_graphs.get("policy_auto_promotion_allowed")),
+                "persists_rows": bool(provenance_graphs.get("persists_rows")),
+            },
+        )
+
+    causal_memory = sections.get("causal_event_memory_evidence") if isinstance(sections.get("causal_event_memory_evidence"), dict) else {}
+    if causal_memory.get("status") in {"warn", "error"}:
+        add(
+            status=str(causal_memory.get("status") or "warn"),
+            title="Causal event-memory evidence is stale or unavailable",
+            reason=str(
+                causal_memory.get("error")
+                or causal_memory.get("message")
+                or "Persisted causal event-memory labels are missing, stale, or not mature enough for offline review."
+            ),
+            commands=[
+                str(causal_memory.get("command") or "python -m advisory.causal_event_memory_evaluator --horizons 5 10 20 --format json"),
+                str(
+                    causal_memory.get("config_preview_command")
+                    or "python -m advisory.causal_event_memory_evaluator --horizons 5 10 20 --generate-config-previews --include-suppression-config-previews --dry-run --format text"
+                ),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "causal_event_memory_evidence",
+                "reasons": causal_memory.get("reasons"),
+                "evaluation_rows": causal_memory.get("evaluation_rows"),
+                "matured_rows": causal_memory.get("matured_rows"),
+                "summary_rows": causal_memory.get("summary_rows"),
+                "candidate_group_count": causal_memory.get("candidate_group_count"),
+                "harmful_group_count": causal_memory.get("harmful_group_count"),
+                "latest_evaluated_at": causal_memory.get("latest_evaluated_at"),
+                "age_days": causal_memory.get("age_days"),
+                "broker_execution_allowed": bool(causal_memory.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(causal_memory.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    action_transition = sections.get("action_transition_evidence") if isinstance(sections.get("action_transition_evidence"), dict) else {}
+    if action_transition.get("status") in {"warn", "error"}:
+        add(
+            status=str(action_transition.get("status") or "warn"),
+            title="Action-transition evidence is not policy-ready",
+            reason=str(
+                action_transition.get("error")
+                or action_transition.get("message")
+                or "Persisted action-transition labels are missing, stale, benchmark-beta-only, or not mature enough for offline review."
+            ),
+            commands=[
+                *(
+                    [str(action_transition.get("schema_command"))]
+                    if action_transition.get("schema_command")
+                    and "missing_action_transition_evidence_tables" in (action_transition.get("reasons") or [])
+                    else []
+                ),
+                str(action_transition.get("command") or "python -m advisory.action_transition_evaluator --horizons 5 10 20 --format json"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "action_transition_evidence",
+                "reasons": action_transition.get("reasons"),
+                "schema_command": action_transition.get("schema_command"),
+                "evaluation_rows": action_transition.get("evaluation_rows"),
+                "matured_rows": action_transition.get("matured_rows"),
+                "summary_rows": action_transition.get("summary_rows"),
+                "candidate_group_count": action_transition.get("candidate_group_count"),
+                "benchmark_beta_not_transition_alpha_count": action_transition.get("benchmark_beta_not_transition_alpha_count"),
+                "needs_benchmark_attribution_count": action_transition.get("needs_benchmark_attribution_count"),
+                "latest_evaluated_at": action_transition.get("latest_evaluated_at"),
+                "age_days": action_transition.get("age_days"),
+                "broker_execution_allowed": bool(action_transition.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(action_transition.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    event_policy_evidence = sections.get("event_policy_evidence") if isinstance(sections.get("event_policy_evidence"), dict) else {}
+    if event_policy_evidence.get("status") in {"warn", "error"}:
+        add(
+            status=str(event_policy_evidence.get("status") or "warn"),
+            title="Event-policy evidence is not policy-ready",
+            reason=str(
+                event_policy_evidence.get("error")
+                or event_policy_evidence.get("message")
+                or "Persisted event-policy labels are missing, stale, benchmark-beta-only, or not mature enough for offline review."
+            ),
+            commands=[
+                *(
+                    [str(event_policy_evidence.get("schema_command"))]
+                    if event_policy_evidence.get("schema_command")
+                    and (
+                        "event_policy_evidence_schema_missing_benchmark_columns" in (event_policy_evidence.get("reasons") or [])
+                        or "missing_event_policy_evidence_tables" in (event_policy_evidence.get("reasons") or [])
+                    )
+                    else []
+                ),
+                str(event_policy_evidence.get("command") or "python -m advisory.event_policy_evaluator --horizons 5 10 20"),
+                str(event_policy_evidence.get("promotion_review_command") or "python -m advisory.event_policy_promotion --format json"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "event_policy_evidence",
+                "reasons": event_policy_evidence.get("reasons"),
+                "schema_command": event_policy_evidence.get("schema_command"),
+                "evaluation_rows": event_policy_evidence.get("evaluation_rows"),
+                "matured_rows": event_policy_evidence.get("matured_rows"),
+                "summary_rows": event_policy_evidence.get("summary_rows"),
+                "candidate_strengthen_count": event_policy_evidence.get("candidate_strengthen_count"),
+                "candidate_tighten_or_downgrade_count": event_policy_evidence.get("candidate_tighten_or_downgrade_count"),
+                "benchmark_beta_not_policy_alpha_count": event_policy_evidence.get("benchmark_beta_not_policy_alpha_count"),
+                "needs_benchmark_attribution_count": event_policy_evidence.get("needs_benchmark_attribution_count"),
+                "missing_benchmark_columns": event_policy_evidence.get("missing_benchmark_columns"),
+                "latest_evaluated_at": event_policy_evidence.get("latest_evaluated_at"),
+                "age_days": event_policy_evidence.get("age_days"),
+                "broker_execution_allowed": bool(event_policy_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(event_policy_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    context_watch_evidence = sections.get("context_watch_evidence") if isinstance(sections.get("context_watch_evidence"), dict) else {}
+    if context_watch_evidence.get("status") in {"warn", "error"}:
+        add(
+            status=str(context_watch_evidence.get("status") or "warn"),
+            title="Context-watch evidence is not policy-ready",
+            reason=str(
+                context_watch_evidence.get("error")
+                or context_watch_evidence.get("message")
+                or "Persisted context-watch labels are missing, stale, benchmark-beta-only, or not mature enough for offline review."
+            ),
+            commands=[
+                str(context_watch_evidence.get("command") or "python -m advisory.context_watch_evaluator --horizons 5 10 20"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "context_watch_evidence",
+                "reasons": context_watch_evidence.get("reasons"),
+                "evaluation_rows": context_watch_evidence.get("evaluation_rows"),
+                "matured_rows": context_watch_evidence.get("matured_rows"),
+                "summary_rows": context_watch_evidence.get("summary_rows"),
+                "opportunity_candidate_count": context_watch_evidence.get("opportunity_candidate_count"),
+                "harmful_watch_noise_count": context_watch_evidence.get("harmful_watch_noise_count"),
+                "benchmark_beta_not_watch_alpha_count": context_watch_evidence.get("benchmark_beta_not_watch_alpha_count"),
+                "missing_benchmark_columns": context_watch_evidence.get("missing_benchmark_columns"),
+                "latest_evaluated_at": context_watch_evidence.get("latest_evaluated_at"),
+                "age_days": context_watch_evidence.get("age_days"),
+                "broker_execution_allowed": bool(context_watch_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(context_watch_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    negative_pressure_evidence = sections.get("negative_pressure_evidence") if isinstance(sections.get("negative_pressure_evidence"), dict) else {}
+    if negative_pressure_evidence.get("status") in {"warn", "error"}:
+        add(
+            status=str(negative_pressure_evidence.get("status") or "warn"),
+            title="Negative-pressure evidence is not policy-ready",
+            reason=str(
+                negative_pressure_evidence.get("error")
+                or negative_pressure_evidence.get("message")
+                or "Persisted negative-pressure labels are missing, stale, benchmark-beta-only, or not mature enough for offline review."
+            ),
+            commands=[
+                str(negative_pressure_evidence.get("command") or "python -m advisory.negative_pressure_evaluator --horizons 5 10 20"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "negative_pressure_evidence",
+                "reasons": negative_pressure_evidence.get("reasons"),
+                "evaluation_rows": negative_pressure_evidence.get("evaluation_rows"),
+                "matured_rows": negative_pressure_evidence.get("matured_rows"),
+                "summary_rows": negative_pressure_evidence.get("summary_rows"),
+                "protective_candidate_count": negative_pressure_evidence.get("protective_candidate_count"),
+                "benchmark_beta_not_derisk_alpha_count": negative_pressure_evidence.get("benchmark_beta_not_derisk_alpha_count"),
+                "harmful_false_positive_count": negative_pressure_evidence.get("harmful_false_positive_count"),
+                "missing_benchmark_columns": negative_pressure_evidence.get("missing_benchmark_columns"),
+                "latest_evaluated_at": negative_pressure_evidence.get("latest_evaluated_at"),
+                "age_days": negative_pressure_evidence.get("age_days"),
+                "broker_execution_allowed": bool(negative_pressure_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(negative_pressure_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    adversarial_review_evidence = sections.get("adversarial_review_evidence") if isinstance(sections.get("adversarial_review_evidence"), dict) else {}
+    if adversarial_review_evidence.get("status") in {"warn", "error"}:
+        add(
+            status=str(adversarial_review_evidence.get("status") or "warn"),
+            title="Adversarial-review evidence is not policy-ready",
+            reason=str(
+                adversarial_review_evidence.get("error")
+                or adversarial_review_evidence.get("message")
+                or "Persisted adversarial-review labels are missing, stale, benchmark-beta-only, or not mature enough for offline review."
+            ),
+            commands=[
+                *(
+                    [str(adversarial_review_evidence.get("schema_command"))]
+                    if adversarial_review_evidence.get("schema_command")
+                    and "missing_adversarial_review_evidence_tables" in (adversarial_review_evidence.get("reasons") or [])
+                    else []
+                ),
+                str(adversarial_review_evidence.get("command") or "python -m advisory.adversarial_review_evaluator --horizons 5 10 20"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "adversarial_review_evidence",
+                "reasons": adversarial_review_evidence.get("reasons"),
+                "schema_command": adversarial_review_evidence.get("schema_command"),
+                "evaluation_rows": adversarial_review_evidence.get("evaluation_rows"),
+                "matured_rows": adversarial_review_evidence.get("matured_rows"),
+                "summary_rows": adversarial_review_evidence.get("summary_rows"),
+                "candidate_keep_or_tighten_count": adversarial_review_evidence.get("candidate_keep_or_tighten_count"),
+                "benchmark_beta_not_veto_alpha_count": adversarial_review_evidence.get("benchmark_beta_not_veto_alpha_count"),
+                "needs_benchmark_attribution_count": adversarial_review_evidence.get("needs_benchmark_attribution_count"),
+                "relax_or_false_positive_count": adversarial_review_evidence.get("relax_or_false_positive_count"),
+                "latest_evaluated_at": adversarial_review_evidence.get("latest_evaluated_at"),
+                "age_days": adversarial_review_evidence.get("age_days"),
+                "broker_execution_allowed": bool(adversarial_review_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(adversarial_review_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    signal_quality_split_evidence = sections.get("signal_quality_split_evidence") if isinstance(sections.get("signal_quality_split_evidence"), dict) else {}
+    if signal_quality_split_evidence.get("status") in {"warn", "error"}:
+        add(
+            status=str(signal_quality_split_evidence.get("status") or "warn"),
+            title="Signal-quality narrowed split evidence is not policy-ready",
+            reason=str(
+                signal_quality_split_evidence.get("error")
+                or signal_quality_split_evidence.get("message")
+                or "Persisted narrowed split evidence is missing, stale, under-baselined, or not mature enough for offline review."
+            ),
+            commands=[
+                *(
+                    [str(signal_quality_split_evidence.get("schema_command"))]
+                    if signal_quality_split_evidence.get("schema_command")
+                    and "missing_signal_quality_split_evidence_tables" in (signal_quality_split_evidence.get("reasons") or [])
+                    else []
+                ),
+                str(signal_quality_split_evidence.get("command") or "python -m advisory.signal_quality_split_evaluator --stability-report --horizons 5 10 20 --format json"),
+                "python -m advisory.model_training_runner --run-signal-quality-window-runner --include-signal-quality-split-reports --skip-s3-upload",
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "signal_quality_split_evidence",
+                "reasons": signal_quality_split_evidence.get("reasons"),
+                "schema_command": signal_quality_split_evidence.get("schema_command"),
+                "evaluation_rows": signal_quality_split_evidence.get("evaluation_rows"),
+                "matured_rows": signal_quality_split_evidence.get("matured_rows"),
+                "summary_rows": signal_quality_split_evidence.get("summary_rows"),
+                "split_count": signal_quality_split_evidence.get("split_count"),
+                "stable_candidate_count": signal_quality_split_evidence.get("stable_candidate_count"),
+                "harmful_negative_control_count": signal_quality_split_evidence.get("harmful_negative_control_count"),
+                "unstable_or_horizon_sensitive_count": signal_quality_split_evidence.get("unstable_or_horizon_sensitive_count"),
+                "baseline_unavailable_window_count": signal_quality_split_evidence.get("baseline_unavailable_window_count"),
+                "latest_evaluated_at": signal_quality_split_evidence.get("latest_evaluated_at"),
+                "age_days": signal_quality_split_evidence.get("age_days"),
+                "broker_execution_allowed": bool(signal_quality_split_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(signal_quality_split_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    context_overlay_reliability = sections.get("context_overlay_reliability") if isinstance(sections.get("context_overlay_reliability"), dict) else {}
+    if context_overlay_reliability.get("status") in {"warn", "error"}:
+        add(
+            status=str(context_overlay_reliability.get("status") or "warn"),
+            title="Context-overlay reliability evidence is stale or unavailable",
+            reason=str(
+                context_overlay_reliability.get("error")
+                or context_overlay_reliability.get("message")
+                or "Persisted context-overlay reliability evidence needs a fresher or better-covered run."
+            ),
+            commands=[
+                str(context_overlay_reliability.get("command") or "python -m advisory.context_overlay_reliability_report --horizons 5 10 20 --format json"),
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "context_overlay_reliability",
+                "latest_evaluated_at": context_overlay_reliability.get("latest_evaluated_at"),
+                "reasons": context_overlay_reliability.get("reasons"),
+                "family_count": context_overlay_reliability.get("family_count"),
+                "max_matured_rows": context_overlay_reliability.get("max_matured_rows"),
+                "candidate_helpful_count": context_overlay_reliability.get("candidate_helpful_count"),
+                "protective_candidate_count": context_overlay_reliability.get("protective_candidate_count"),
+                "needs_benchmark_attribution_count": context_overlay_reliability.get("needs_benchmark_attribution_count"),
+                "benchmark_beta_not_overlay_alpha_count": context_overlay_reliability.get("benchmark_beta_not_overlay_alpha_count"),
+                "suppressed_reliability_count": context_overlay_reliability.get("suppressed_reliability_count"),
+            },
+        )
+
+    macro_sector_alias_coverage = sections.get("macro_sector_alias_coverage") if isinstance(sections.get("macro_sector_alias_coverage"), dict) else {}
+    if macro_sector_alias_coverage.get("status") in {"warn", "error"}:
+        add(
+            status=str(macro_sector_alias_coverage.get("status") or "warn"),
+            title="Macro sector aliases need review",
+            reason=str(
+                macro_sector_alias_coverage.get("error")
+                or macro_sector_alias_coverage.get("message")
+                or "Generated macro overlay sectors are not fully mapped to market-context universe sector codes."
+            ),
+            commands=[
+                str(macro_sector_alias_coverage.get("command") or "python -m advisory.macro_context_overlays --dry-run --format json"),
+                "Update MACRO_SECTOR_CODE_ALIASES in advisory/macro_context_overlays.py after reviewing the sector mapping.",
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "macro_sector_alias_coverage",
+                "unmapped_sector_count": macro_sector_alias_coverage.get("unmapped_sector_count"),
+                "unmapped_sectors": macro_sector_alias_coverage.get("unmapped_sectors"),
+                "intentionally_broad_sector_count": macro_sector_alias_coverage.get("intentionally_broad_sector_count"),
+                "mapped_sector_count": macro_sector_alias_coverage.get("mapped_sector_count"),
+            },
+        )
+
+    theme_sector_alias_coverage = sections.get("theme_sector_alias_coverage") if isinstance(sections.get("theme_sector_alias_coverage"), dict) else {}
+    if theme_sector_alias_coverage.get("status") in {"warn", "error"}:
+        add(
+            status=str(theme_sector_alias_coverage.get("status") or "warn"),
+            title="Theme sector aliases need review",
+            reason=str(
+                theme_sector_alias_coverage.get("error")
+                or theme_sector_alias_coverage.get("message")
+                or "Generated news-theme overlay sectors are not fully mapped to market-context universe sector codes."
+            ),
+            commands=[
+                str(theme_sector_alias_coverage.get("command") or "python -m advisory.news_theme_engine build-overlays --dry-run --format json"),
+                "Update THEME_SECTOR_CODE_ALIASES in advisory/news_theme_engine.py after reviewing the sector mapping.",
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "theme_sector_alias_coverage",
+                "unmapped_sector_count": theme_sector_alias_coverage.get("unmapped_sector_count"),
+                "unmapped_sectors": theme_sector_alias_coverage.get("unmapped_sectors"),
+                "intentionally_broad_sector_count": theme_sector_alias_coverage.get("intentionally_broad_sector_count"),
+                "mapped_sector_count": theme_sector_alias_coverage.get("mapped_sector_count"),
+            },
+        )
+
+    signal_quality_overlay_rules = sections.get("signal_quality_overlay_rules") if isinstance(sections.get("signal_quality_overlay_rules"), dict) else {}
+    if signal_quality_overlay_rules.get("status") in {"warn", "error"}:
+        add(
+            status=str(signal_quality_overlay_rules.get("status") or "warn"),
+            title="Trusted signal-quality overlay rules are blocked by evidence gates",
+            reason=str(
+                signal_quality_overlay_rules.get("error")
+                or signal_quality_overlay_rules.get("message")
+                or "Trusted overlay rules are configured but not runtime-eligible under current reliability/stability gates."
+            ),
+            commands=[
+                "python -m advisory.context_overlay_reliability_report --horizons 5 10 20 --format json",
+                "python -m advisory.model_training_runner --run-signal-quality-window-runner --include-signal-quality-split-reports --skip-s3-upload",
+                "python -m advisory.operator_health --full --skip-dhan",
+            ],
+            details={
+                "section": "signal_quality_overlay_rules",
+                "trusted_rule_count": signal_quality_overlay_rules.get("trusted_rule_count"),
+                "runtime_eligible_rule_count": signal_quality_overlay_rules.get("runtime_eligible_rule_count"),
+                "runtime_blocked_rule_count": signal_quality_overlay_rules.get("runtime_blocked_rule_count"),
+                "reasons": signal_quality_overlay_rules.get("reasons"),
+                "reliability_status": signal_quality_overlay_rules.get("reliability_status"),
+                "reliability_latest_evaluated_at": signal_quality_overlay_rules.get("reliability_latest_evaluated_at"),
             },
         )
 
@@ -3209,6 +7595,10 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             + int(counts_by_type.get("event_evidence_bhavcopy_source_load_failed") or 0)
             + int(counts_by_type.get("event_evidence_announcement_source_load_failed") or 0)
         )
+        announcement_fetch_fallbacks = int(counts_by_type.get("announcement_managed_fetch_failed") or 0)
+        announcement_mapping_fallbacks = int(counts_by_type.get("announcement_company_master_mapping_missing") or 0)
+        announcement_document_lookup_fallbacks = int(counts_by_type.get("announcement_watch_document_lookup_failed") or 0)
+        announcement_watch_ingest_fallbacks = int(counts_by_type.get("announcement_watch_managed_ingest_target_failed") or 0)
         event_meta_model_fallbacks = (
             int(counts_by_type.get("event_meta_model_event_table_lookup_failed") or 0)
             + int(counts_by_type.get("event_meta_model_event_rows_load_failed") or 0)
@@ -3694,6 +8084,89 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
                     "event_evidence_max_date_lookup_failed": counts_by_type.get("event_evidence_max_date_lookup_failed"),
                     "event_evidence_bhavcopy_source_load_failed": counts_by_type.get("event_evidence_bhavcopy_source_load_failed"),
                     "event_evidence_announcement_source_load_failed": counts_by_type.get("event_evidence_announcement_source_load_failed"),
+                    "counts_by_type": fallback_telemetry.get("counts_by_type"),
+                    "counts_by_module": fallback_telemetry.get("counts_by_module"),
+                },
+            )
+        if announcement_mapping_fallbacks:
+            add(
+                status="warn",
+                title="Announcement ingest skipped symbols with missing company-master mappings",
+                reason=(
+                    f"Managed announcement ingestion skipped {announcement_mapping_fallbacks} ticker(s) in the last "
+                    f"{fallback_telemetry.get('window_hours') or 24} hours because no company-master mapping was found. "
+                    "Those symbols will not receive announcement evidence until identity/company-master mappings are repaired."
+                ),
+                commands=[
+                    "python -m data.dhanlive.scrip_master",
+                    "python -m advisory.identity_issues --limit 100",
+                    "python -m advisory.operator_health --full --skip-dhan",
+                    "./all_advisory.sh",
+                ],
+                details={
+                    "section": "fallback_telemetry",
+                    "announcement_company_master_mapping_missing": announcement_mapping_fallbacks,
+                    "counts_by_type": fallback_telemetry.get("counts_by_type"),
+                    "counts_by_module": fallback_telemetry.get("counts_by_module"),
+                },
+            )
+        if announcement_fetch_fallbacks:
+            add(
+                status="warn",
+                title="Announcement ingest source fetch failed for some symbols",
+                reason=(
+                    f"Managed announcement ingestion could not fetch source announcements {announcement_fetch_fallbacks} time(s) in the last "
+                    f"{fallback_telemetry.get('window_hours') or 24} hours. Advisory continues, but affected symbols may use stale or missing announcement evidence."
+                ),
+                commands=[
+                    "./all_watchers.sh",
+                    "./all_advisory.sh",
+                    "python -m advisory.event_data_quality --format json",
+                    "python -m advisory.operator_health --full --skip-dhan",
+                ],
+                details={
+                    "section": "fallback_telemetry",
+                    "announcement_managed_fetch_failed": announcement_fetch_fallbacks,
+                    "counts_by_type": fallback_telemetry.get("counts_by_type"),
+                    "counts_by_module": fallback_telemetry.get("counts_by_module"),
+                },
+            )
+        if announcement_document_lookup_fallbacks:
+            add(
+                status="warn",
+                title="Announcement watch document lookup failed for some symbols",
+                reason=(
+                    f"Announcement watcher could not load persisted document history {announcement_document_lookup_fallbacks} time(s) in the last "
+                    f"{fallback_telemetry.get('window_hours') or 24} hours. Advisory continues, but affected symbols may miss fresh announcement-event matching."
+                ),
+                commands=[
+                    "python -m advisory.event_data_quality --format json",
+                    "python -m advisory.operator_health --full --skip-dhan",
+                    "./all_advisory.sh",
+                ],
+                details={
+                    "section": "fallback_telemetry",
+                    "announcement_watch_document_lookup_failed": announcement_document_lookup_fallbacks,
+                    "counts_by_type": fallback_telemetry.get("counts_by_type"),
+                    "counts_by_module": fallback_telemetry.get("counts_by_module"),
+                },
+            )
+        if announcement_watch_ingest_fallbacks:
+            add(
+                status="warn",
+                title="Announcement watch managed ingest failed for some symbols",
+                reason=(
+                    f"Announcement watcher managed ingest failed before returning a summary {announcement_watch_ingest_fallbacks} time(s) in the last "
+                    f"{fallback_telemetry.get('window_hours') or 24} hours. Advisory continues, but affected symbols may have stale or missing announcement evidence."
+                ),
+                commands=[
+                    "python -m advisory.event_data_quality --format json",
+                    "python -m advisory.operator_health --full --skip-dhan",
+                    "./all_advisory.sh",
+                ],
+                details={
+                    "section": "fallback_telemetry",
+                    "announcement_watch_managed_ingest_target_failed": announcement_watch_ingest_fallbacks,
                     "counts_by_type": fallback_telemetry.get("counts_by_type"),
                     "counts_by_module": fallback_telemetry.get("counts_by_module"),
                 },
@@ -4264,7 +8737,10 @@ def build_fix_hints(sections: dict[str, Any]) -> list[dict[str, Any]]:
             "event_policy": "python -m advisory.event_policy_evaluator --horizons 5 10 20",
             "market_context": "./all_advisory.sh",
             "ts_forecasts": "python -m advisory.ts_forecast_workflow",
+            "ts_forecast_paper": "python -m advisory.ts_forecast_paper_portfolio --log-research-ledger",
             "sync_state": "./complete_data.sh",
+            "signal_quality": "python -m advisory.signal_quality_evaluator --from-date YYYY-MM-DD --to-date YYYY-MM-DD --horizons 5 10 20",
+            "context_overlay_reliability": "python -m advisory.context_overlay_reliability_report --horizons 5 10 20 --format json",
         }
         add(
             status=str(row.get("status") or "warn"),
@@ -4406,7 +8882,22 @@ TRUST_BLOCKER_SECTION_TITLES = {
     "event_data_quality": "Announcement/bhavcopy evidence readiness",
     "identity_issues": "Security identity readiness",
     "screener_failures": "Screener.in failure readiness",
+    "context_gate_policy": "Context/regime gate policy",
     "signal_quality": "Signal-quality evidence readiness",
+    "technical_threshold_evidence": "Technical-threshold calibration evidence readiness",
+    "research_evidence_run_summary": "Research evidence refresh readiness",
+    "ts_forecast_paper": "TS forecast paper evidence readiness",
+    "llm_provenance_audit": "LLM provenance audit readiness",
+    "provenance_graph_dry_runs": "Typed provenance graph readiness",
+    "causal_event_memory_evidence": "Causal event-memory evidence readiness",
+    "action_transition_evidence": "Action-transition evidence readiness",
+    "event_policy_evidence": "Event-policy evidence readiness",
+    "context_watch_evidence": "Context-watch evidence readiness",
+    "negative_pressure_evidence": "Negative-pressure evidence readiness",
+    "adversarial_review_evidence": "Adversarial-review evidence readiness",
+    "signal_quality_split_evidence": "Signal-quality narrowed split evidence readiness",
+    "context_overlay_reliability": "Context-overlay reliability readiness",
+    "signal_quality_overlay_rules": "Trusted signal-quality overlay rule eligibility",
     "feature_stage_gates": "Feature freshness stage gates",
     "fallback_telemetry": "Fallback telemetry",
     "trust_gate": "Advisory trust gate",
@@ -4426,11 +8917,43 @@ def _blocker_category(row: dict[str, Any]) -> str:
     title = str(row.get("title") or "").lower()
     if section in {"database", "operator_api", "frontend_runtime"} or "postgres" in title or "operator api" in title or "operator frontend" in title:
         return "runtime"
+    if section == "context_gate_policy" or "broad regime hard gate" in title:
+        return "advisory_trust"
     if section in {"dhan", "dhan_cache"} or kind.startswith("dhan") or "dhan" in title:
         return "broker_data"
     if section == "identity_issues" or "identity" in title:
         return "broker_data"
-    if section == "signal_quality" or "signal-quality" in title:
+    if section in {
+        "signal_quality",
+        "technical_threshold_evidence",
+        "research_evidence_run_summary",
+        "ts_forecast_paper",
+        "llm_provenance_audit",
+        "provenance_graph_dry_runs",
+        "causal_event_memory_evidence",
+        "action_transition_evidence",
+        "event_policy_evidence",
+        "context_watch_evidence",
+        "negative_pressure_evidence",
+        "adversarial_review_evidence",
+        "signal_quality_split_evidence",
+        "context_overlay_reliability",
+        "signal_quality_overlay_rules",
+    }:
+        return "research_evidence"
+    if (
+        "signal-quality" in title
+        or "technical-threshold" in title
+        or "research evidence refresh" in title
+        or "ts forecast paper" in title
+        or "llm provenance" in title
+        or "provenance graph" in title
+        or "causal event-memory" in title
+        or "action-transition" in title
+        or "adversarial-review" in title
+        or "narrowed split" in title
+        or "context-overlay reliability" in title
+    ):
         return "research_evidence"
     if section == "trust_gate":
         return "advisory_trust"
@@ -4488,6 +9011,8 @@ def _blocker_dedupe_key(row: dict[str, Any]) -> tuple[str, str]:
         return ("health_source", "slow_operations")
     if section == "advisory_stage_report" or "advisory stage timing" in title:
         return ("health_source", "advisory_stage_report")
+    if section == "research_evidence_run_summary" or "research evidence refresh" in title:
+        return ("health_source", "research_evidence_run_summary")
     if section:
         return (category, section)
     if kind:
@@ -4613,6 +9138,28 @@ def build_trust_gate(sections: dict[str, Any]) -> dict[str, Any]:
             },
         )
 
+    context_gate_policy = section("context_gate_policy")
+    if context_gate_policy.get("status") in {"warn", "error"}:
+        add_check(
+            "context_gate_policy",
+            str(context_gate_policy.get("status") or "warn"),
+            "Context/regime gate policy",
+            str(context_gate_policy.get("operator_action") or context_gate_policy.get("message") or "A broad single-regime hard gate is active."),
+            impact=(
+                "Missing BUY recommendations may be caused by a broad regime-label hard gate; verify env policy before tuning "
+                "technical thresholds or context-overlay rules."
+            ),
+            details={
+                "reasons": context_gate_policy.get("reasons"),
+                "active_single_regime_flags": context_gate_policy.get("active_single_regime_flags"),
+                "active_context_hard_flags": context_gate_policy.get("active_context_hard_flags"),
+                "global_regime_label_blocks_buy": bool(context_gate_policy.get("global_regime_label_blocks_buy")),
+                "policy_summary": context_gate_policy.get("policy_summary"),
+                "broker_execution_allowed": bool(context_gate_policy.get("broker_execution_allowed")),
+                "portfolio_authority": context_gate_policy.get("portfolio_authority") or "none",
+            },
+        )
+
     signal_quality = section("signal_quality")
     if signal_quality.get("status") in {"warn", "error"}:
         add_check(
@@ -4626,6 +9173,326 @@ def build_trust_gate(sections: dict[str, Any]) -> dict[str, Any]:
                 "latest_evaluated_at": signal_quality.get("latest_evaluated_at"),
                 "max_matured_rows": signal_quality.get("max_matured_rows"),
                 "overlay_rows": signal_quality.get("overlay_rows"),
+                "benchmark_beta_not_overlay_alpha_count": signal_quality.get("benchmark_beta_not_overlay_alpha_count"),
+                "needs_benchmark_attribution_count": signal_quality.get("needs_benchmark_attribution_count"),
+                "benchmark_or_attribution_blocked_count": signal_quality.get("benchmark_or_attribution_blocked_count"),
+                "promotion_readiness_status": signal_quality.get("promotion_readiness_status"),
+                "promotion_review_sector_block_count": signal_quality.get("promotion_review_sector_block_count"),
+                "promotion_review_runtime_block_count": signal_quality.get("promotion_review_runtime_block_count"),
+                "promotion_review_harmful_class_block_count": signal_quality.get("promotion_review_harmful_class_block_count"),
+            },
+        )
+
+    technical_threshold_evidence = section("technical_threshold_evidence")
+    if technical_threshold_evidence.get("status") in {"warn", "error"}:
+        add_check(
+            "technical_threshold_evidence",
+            str(technical_threshold_evidence.get("status") or "warn"),
+            "Technical-threshold calibration evidence readiness",
+            str(technical_threshold_evidence.get("message") or "Technical-threshold calibration is missing, stale, bounded, or lacks after-cost lift over baseline."),
+            impact=(
+                "Do not loosen or promote technical thresholds until calibration shows fresh matured after-cost evidence with lift over baseline."
+            ),
+            details={
+                "reasons": technical_threshold_evidence.get("reasons"),
+                "evaluation_rows": technical_threshold_evidence.get("evaluation_rows"),
+                "summary_rows": technical_threshold_evidence.get("summary_rows"),
+                "max_matured_signal_count": technical_threshold_evidence.get("max_matured_signal_count"),
+                "review_candidate_count": technical_threshold_evidence.get("review_candidate_count"),
+                "lift_over_baseline_count": technical_threshold_evidence.get("lift_over_baseline_count"),
+                "positive_after_cost_count": technical_threshold_evidence.get("positive_after_cost_count"),
+                "bounded_first_pass_count": technical_threshold_evidence.get("bounded_first_pass_count"),
+                "trigger_near_miss_candidate_count": technical_threshold_evidence.get("trigger_near_miss_candidate_count"),
+                "trigger_near_miss_do_not_relax_count": technical_threshold_evidence.get("trigger_near_miss_do_not_relax_count"),
+                "trigger_near_miss_needs_more_label_count": technical_threshold_evidence.get("trigger_near_miss_needs_more_label_count"),
+                "missing_summary_columns": technical_threshold_evidence.get("missing_summary_columns"),
+                "latest_evaluated_at": technical_threshold_evidence.get("latest_evaluated_at"),
+                "age_days": technical_threshold_evidence.get("age_days"),
+                "broker_execution_allowed": bool(technical_threshold_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(technical_threshold_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    research_evidence_summary = section("research_evidence_run_summary")
+    if research_evidence_summary.get("status") in {"warn", "error"}:
+        add_check(
+            "research_evidence_run_summary",
+            str(research_evidence_summary.get("status") or "warn"),
+            "Research evidence refresh readiness",
+            str(research_evidence_summary.get("message") or "The daily research-evidence wrapper is missing, failed, skipped, or not ready."),
+            impact=(
+                "Do not promote context, event, transition, or LLM-derived overlays until the consolidated research refresh is healthy."
+            ),
+            details={
+                "reasons": research_evidence_summary.get("reasons"),
+                "log_path": research_evidence_summary.get("log_path"),
+                "readiness_status": research_evidence_summary.get("readiness_status"),
+                "payload_status": research_evidence_summary.get("payload_status"),
+                "active_component_count": research_evidence_summary.get("active_component_count"),
+                "candidate_component_count": research_evidence_summary.get("candidate_component_count"),
+                "blocker_count": research_evidence_summary.get("blocker_count"),
+                "authority_violation_count": research_evidence_summary.get("authority_violation_count"),
+                "authority_violation_components": research_evidence_summary.get("authority_violation_components"),
+                "broker_execution_allowed": bool(research_evidence_summary.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(research_evidence_summary.get("policy_auto_promotion_allowed")),
+                "portfolio_mutation_allowed": bool(research_evidence_summary.get("portfolio_mutation_allowed")),
+            },
+        )
+
+    ts_forecast_paper = section("ts_forecast_paper")
+    if ts_forecast_paper.get("status") in {"warn", "error"}:
+        add_check(
+            "ts_forecast_paper",
+            str(ts_forecast_paper.get("status") or "warn"),
+            "TS forecast paper evidence readiness",
+            str(ts_forecast_paper.get("message") or "TS forecast paper-portfolio evidence is not usable for promotion review."),
+            impact="Do not promote TS forecast model rules or rely on TS forecast promotion checks until paper outcomes are available and matured.",
+            details={
+                "reasons": ts_forecast_paper.get("reasons"),
+                "latest_load_ts": ts_forecast_paper.get("latest_load_ts"),
+                "latest_asof_date": ts_forecast_paper.get("latest_asof_date"),
+                "row_count": ts_forecast_paper.get("row_count"),
+                "matured_count": ts_forecast_paper.get("matured_count"),
+                "paper_buy_count": ts_forecast_paper.get("paper_buy_count"),
+                "symbol_count": ts_forecast_paper.get("symbol_count"),
+                "broker_execution_allowed": bool(ts_forecast_paper.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(ts_forecast_paper.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    llm_provenance = section("llm_provenance_audit")
+    if llm_provenance.get("status") in {"warn", "error"}:
+        add_check(
+            "llm_provenance_audit",
+            str(llm_provenance.get("status") or "warn"),
+            "LLM provenance audit readiness",
+            str(llm_provenance.get("message") or "LLM/Codex provenance audit found prompt/schema/evidence/authority issues."),
+            impact="Treat affected LLM-derived signals as not production-auditable until prompt, schema, evidence, and authority metadata are repaired.",
+            details={
+                "reasons": llm_provenance.get("reasons"),
+                "issue_table_count": llm_provenance.get("issue_table_count"),
+                "table_count": llm_provenance.get("table_count"),
+                "lookback_days": llm_provenance.get("lookback_days"),
+                "issue_rows": llm_provenance.get("issue_rows"),
+                "broker_execution_allowed": bool(llm_provenance.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(llm_provenance.get("policy_auto_promotion_allowed")),
+                "repairs_metadata": bool(llm_provenance.get("repairs_metadata")),
+            },
+        )
+
+    provenance_graphs = section("provenance_graph_dry_runs")
+    if provenance_graphs.get("status") in {"warn", "error"}:
+        add_check(
+            "provenance_graph_dry_runs",
+            str(provenance_graphs.get("status") or "warn"),
+            "Typed provenance graph readiness",
+            str(provenance_graphs.get("message") or "Action-evidence or causal-event provenance dry runs are not producing complete audit lineage."),
+            impact="Treat affected action/context evidence as harder to audit until the provenance dry runs produce lineage rows.",
+            details={
+                "reasons": provenance_graphs.get("reasons"),
+                "row_count": provenance_graphs.get("row_count"),
+                "error_count": provenance_graphs.get("error_count"),
+                "warn_count": provenance_graphs.get("warn_count"),
+                "rows": provenance_graphs.get("rows"),
+                "broker_execution_allowed": bool(provenance_graphs.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(provenance_graphs.get("policy_auto_promotion_allowed")),
+                "persists_rows": bool(provenance_graphs.get("persists_rows")),
+            },
+        )
+
+    causal_memory = section("causal_event_memory_evidence")
+    if causal_memory.get("status") in {"warn", "error"}:
+        add_check(
+            "causal_event_memory_evidence",
+            str(causal_memory.get("status") or "warn"),
+            "Causal event-memory evidence readiness",
+            str(causal_memory.get("message") or "Causal event-memory evidence is missing, stale, or lacks matured labels."),
+            impact="Keep causal memory as explanation-only until point-in-time realized outcome labels are fresh and sufficiently matured.",
+            details={
+                "reasons": causal_memory.get("reasons"),
+                "evaluation_rows": causal_memory.get("evaluation_rows"),
+                "matured_rows": causal_memory.get("matured_rows"),
+                "summary_rows": causal_memory.get("summary_rows"),
+                "candidate_group_count": causal_memory.get("candidate_group_count"),
+                "harmful_group_count": causal_memory.get("harmful_group_count"),
+                "latest_evaluated_at": causal_memory.get("latest_evaluated_at"),
+                "age_days": causal_memory.get("age_days"),
+                "broker_execution_allowed": bool(causal_memory.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(causal_memory.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    action_transition = section("action_transition_evidence")
+    if action_transition.get("status") in {"warn", "error"}:
+        add_check(
+            "action_transition_evidence",
+            str(action_transition.get("status") or "warn"),
+            "Action-transition evidence readiness",
+            str(action_transition.get("message") or "Action-transition evidence is missing, stale, beta-only, or lacks matured labels."),
+            impact=(
+                "Keep transition-stability evidence research-only until point-in-time labels show both absolute and benchmark-excess usefulness."
+            ),
+            details={
+                "reasons": action_transition.get("reasons"),
+                "evaluation_rows": action_transition.get("evaluation_rows"),
+                "matured_rows": action_transition.get("matured_rows"),
+                "summary_rows": action_transition.get("summary_rows"),
+                "candidate_group_count": action_transition.get("candidate_group_count"),
+                "benchmark_beta_not_transition_alpha_count": action_transition.get("benchmark_beta_not_transition_alpha_count"),
+                "needs_benchmark_attribution_count": action_transition.get("needs_benchmark_attribution_count"),
+                "latest_evaluated_at": action_transition.get("latest_evaluated_at"),
+                "age_days": action_transition.get("age_days"),
+                "broker_execution_allowed": bool(action_transition.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(action_transition.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    event_policy_evidence = section("event_policy_evidence")
+    if event_policy_evidence.get("status") in {"warn", "error"}:
+        add_check(
+            "event_policy_evidence",
+            str(event_policy_evidence.get("status") or "warn"),
+            "Event-policy evidence readiness",
+            str(event_policy_evidence.get("message") or "Event-policy evidence is missing, stale, beta-only, or lacks matured labels."),
+            impact=(
+                "Keep event-policy LLM/classification influence research-only until point-in-time labels show both absolute and benchmark-excess usefulness."
+            ),
+            details={
+                "reasons": event_policy_evidence.get("reasons"),
+                "evaluation_rows": event_policy_evidence.get("evaluation_rows"),
+                "matured_rows": event_policy_evidence.get("matured_rows"),
+                "summary_rows": event_policy_evidence.get("summary_rows"),
+                "candidate_strengthen_count": event_policy_evidence.get("candidate_strengthen_count"),
+                "candidate_tighten_or_downgrade_count": event_policy_evidence.get("candidate_tighten_or_downgrade_count"),
+                "benchmark_beta_not_policy_alpha_count": event_policy_evidence.get("benchmark_beta_not_policy_alpha_count"),
+                "needs_benchmark_attribution_count": event_policy_evidence.get("needs_benchmark_attribution_count"),
+                "missing_benchmark_columns": event_policy_evidence.get("missing_benchmark_columns"),
+                "latest_evaluated_at": event_policy_evidence.get("latest_evaluated_at"),
+                "age_days": event_policy_evidence.get("age_days"),
+                "broker_execution_allowed": bool(event_policy_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(event_policy_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    context_watch_evidence = section("context_watch_evidence")
+    if context_watch_evidence.get("status") in {"warn", "error"}:
+        add_check(
+            "context_watch_evidence",
+            str(context_watch_evidence.get("status") or "warn"),
+            "Context-watch evidence readiness",
+            str(context_watch_evidence.get("message") or "Context-watch evidence is missing, stale, beta-only, or lacks matured labels."),
+            impact=(
+                "Keep context-overlay watch priority research-only until point-in-time labels show benchmark-excess opportunity value."
+            ),
+            details={
+                "reasons": context_watch_evidence.get("reasons"),
+                "evaluation_rows": context_watch_evidence.get("evaluation_rows"),
+                "matured_rows": context_watch_evidence.get("matured_rows"),
+                "summary_rows": context_watch_evidence.get("summary_rows"),
+                "opportunity_candidate_count": context_watch_evidence.get("opportunity_candidate_count"),
+                "harmful_watch_noise_count": context_watch_evidence.get("harmful_watch_noise_count"),
+                "benchmark_beta_not_watch_alpha_count": context_watch_evidence.get("benchmark_beta_not_watch_alpha_count"),
+                "missing_benchmark_columns": context_watch_evidence.get("missing_benchmark_columns"),
+                "latest_evaluated_at": context_watch_evidence.get("latest_evaluated_at"),
+                "age_days": context_watch_evidence.get("age_days"),
+                "broker_execution_allowed": bool(context_watch_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(context_watch_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    negative_pressure_evidence = section("negative_pressure_evidence")
+    if negative_pressure_evidence.get("status") in {"warn", "error"}:
+        add_check(
+            "negative_pressure_evidence",
+            str(negative_pressure_evidence.get("status") or "warn"),
+            "Negative-pressure evidence readiness",
+            str(negative_pressure_evidence.get("message") or "Negative-pressure evidence is missing, stale, beta-only, or lacks matured labels."),
+            impact=(
+                "Keep context-overlay de-risk pressure research-only until point-in-time labels show benchmark-excess protection."
+            ),
+            details={
+                "reasons": negative_pressure_evidence.get("reasons"),
+                "evaluation_rows": negative_pressure_evidence.get("evaluation_rows"),
+                "matured_rows": negative_pressure_evidence.get("matured_rows"),
+                "summary_rows": negative_pressure_evidence.get("summary_rows"),
+                "protective_candidate_count": negative_pressure_evidence.get("protective_candidate_count"),
+                "benchmark_beta_not_derisk_alpha_count": negative_pressure_evidence.get("benchmark_beta_not_derisk_alpha_count"),
+                "harmful_false_positive_count": negative_pressure_evidence.get("harmful_false_positive_count"),
+                "missing_benchmark_columns": negative_pressure_evidence.get("missing_benchmark_columns"),
+                "latest_evaluated_at": negative_pressure_evidence.get("latest_evaluated_at"),
+                "age_days": negative_pressure_evidence.get("age_days"),
+                "broker_execution_allowed": bool(negative_pressure_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(negative_pressure_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    adversarial_review_evidence = section("adversarial_review_evidence")
+    if adversarial_review_evidence.get("status") in {"warn", "error"}:
+        add_check(
+            "adversarial_review_evidence",
+            str(adversarial_review_evidence.get("status") or "warn"),
+            "Adversarial-review evidence readiness",
+            str(adversarial_review_evidence.get("message") or "Adversarial-review evidence is missing, stale, beta-only, or lacks matured labels."),
+            impact=(
+                "Keep adversarial veto/penalty policy research-only until point-in-time labels show benchmark-excess protection, not just broad-market beta."
+            ),
+            details={
+                "reasons": adversarial_review_evidence.get("reasons"),
+                "evaluation_rows": adversarial_review_evidence.get("evaluation_rows"),
+                "matured_rows": adversarial_review_evidence.get("matured_rows"),
+                "summary_rows": adversarial_review_evidence.get("summary_rows"),
+                "candidate_keep_or_tighten_count": adversarial_review_evidence.get("candidate_keep_or_tighten_count"),
+                "benchmark_beta_not_veto_alpha_count": adversarial_review_evidence.get("benchmark_beta_not_veto_alpha_count"),
+                "needs_benchmark_attribution_count": adversarial_review_evidence.get("needs_benchmark_attribution_count"),
+                "relax_or_false_positive_count": adversarial_review_evidence.get("relax_or_false_positive_count"),
+                "latest_evaluated_at": adversarial_review_evidence.get("latest_evaluated_at"),
+                "age_days": adversarial_review_evidence.get("age_days"),
+                "broker_execution_allowed": bool(adversarial_review_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(adversarial_review_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    signal_quality_split_evidence = section("signal_quality_split_evidence")
+    if signal_quality_split_evidence.get("status") in {"warn", "error"}:
+        add_check(
+            "signal_quality_split_evidence",
+            str(signal_quality_split_evidence.get("status") or "warn"),
+            "Signal-quality narrowed split evidence readiness",
+            str(signal_quality_split_evidence.get("message") or "Narrowed split evidence is missing, stale, under-baselined, or lacks matured labels."),
+            impact=(
+                "Do not promote broad source-family context rules until narrowed splits have complete technical-only baselines and stable evidence."
+            ),
+            details={
+                "reasons": signal_quality_split_evidence.get("reasons"),
+                "evaluation_rows": signal_quality_split_evidence.get("evaluation_rows"),
+                "matured_rows": signal_quality_split_evidence.get("matured_rows"),
+                "summary_rows": signal_quality_split_evidence.get("summary_rows"),
+                "split_count": signal_quality_split_evidence.get("split_count"),
+                "stable_candidate_count": signal_quality_split_evidence.get("stable_candidate_count"),
+                "harmful_negative_control_count": signal_quality_split_evidence.get("harmful_negative_control_count"),
+                "unstable_or_horizon_sensitive_count": signal_quality_split_evidence.get("unstable_or_horizon_sensitive_count"),
+                "baseline_unavailable_window_count": signal_quality_split_evidence.get("baseline_unavailable_window_count"),
+                "latest_evaluated_at": signal_quality_split_evidence.get("latest_evaluated_at"),
+                "age_days": signal_quality_split_evidence.get("age_days"),
+                "broker_execution_allowed": bool(signal_quality_split_evidence.get("broker_execution_allowed")),
+                "policy_auto_promotion_allowed": bool(signal_quality_split_evidence.get("policy_auto_promotion_allowed")),
+            },
+        )
+
+    signal_quality_overlay_rules = section("signal_quality_overlay_rules")
+    if signal_quality_overlay_rules.get("status") in {"warn", "error"}:
+        add_check(
+            "signal_quality_overlay_rules",
+            str(signal_quality_overlay_rules.get("status") or "warn"),
+            "Trusted signal-quality overlay rule eligibility",
+            str(signal_quality_overlay_rules.get("message") or "Trusted overlay rules are blocked by reliability/stability gates."),
+            impact="Configured trusted context rules may be annotation-only and should not be assumed to affect action policy.",
+            details={
+                "trusted_rule_count": signal_quality_overlay_rules.get("trusted_rule_count"),
+                "runtime_eligible_rule_count": signal_quality_overlay_rules.get("runtime_eligible_rule_count"),
+                "runtime_blocked_rule_count": signal_quality_overlay_rules.get("runtime_blocked_rule_count"),
+                "reasons": signal_quality_overlay_rules.get("reasons"),
+                "rows": signal_quality_overlay_rules.get("rows"),
             },
         )
 
@@ -4771,7 +9638,9 @@ def build_current_blockers(sections: dict[str, Any], fix_hints: list[dict[str, A
         "pipeline": 3,
         "broker_data": 4,
         "data_quality": 5,
-        "operations": 6,
+        "research_evidence": 6,
+        "advisory_trust": 7,
+        "operations": 8,
     }
     rows.sort(key=lambda row: (severity_rank.get(str(row.get("status")), 9), category_rank.get(str(row.get("category")), 9), str(row.get("title") or "")))
     rows = rows[: max(1, int(limit))]
@@ -4871,40 +9740,235 @@ def _run_health_checks(checks: dict[str, Any], *, workers: int) -> dict[str, Any
     return {name: out[name] for name in checks if name in out}
 
 
+def run_named_health_check(name: str, *, log_dir: str | Path = DEFAULT_LOG_DIR) -> Any:
+    normalized = str(name or "").strip()
+    if normalized == "database":
+        return check_database()
+    if normalized == "operator_api":
+        return check_operator_api()
+    if normalized == "operator_api_runtime":
+        return check_operator_api_runtime()
+    if normalized == "trace_summaries":
+        return check_trace_summaries()
+    if normalized == "slow_operations":
+        return check_slow_operations(limit=20)
+    if normalized == "api_latency_probe":
+        return check_api_latency_probe()
+    if normalized == "advisory_stage_report":
+        return check_advisory_stage_report(log_dir)
+    if normalized == "research_evidence_run_summary":
+        return check_research_evidence_run_summary(log_dir)
+    if normalized == "operator_snapshot":
+        return check_operator_snapshot()
+    if normalized == "event_data_quality":
+        return build_event_data_quality_health_summary(limit=20)
+    if normalized == "identity_issues":
+        return check_identity_issues(limit=10)
+    if normalized == "screener_failures":
+        return check_screener_failures(limit=10)
+    if normalized == "context_gate_policy":
+        return check_context_gate_policy()
+    if normalized == "signal_quality":
+        return check_signal_quality()
+    if normalized == "technical_threshold_evidence":
+        return check_technical_threshold_evidence()
+    if normalized == "ts_forecast_paper":
+        return check_ts_forecast_paper_portfolio()
+    if normalized == "llm_provenance_audit":
+        return check_llm_provenance_audit()
+    if normalized == "provenance_graph_dry_runs":
+        return check_provenance_graph_dry_runs()
+    if normalized == "causal_event_memory_evidence":
+        return check_causal_event_memory_evidence()
+    if normalized == "action_transition_evidence":
+        return check_action_transition_evidence()
+    if normalized == "event_policy_evidence":
+        return check_event_policy_evidence()
+    if normalized == "context_watch_evidence":
+        return check_context_watch_evidence()
+    if normalized == "negative_pressure_evidence":
+        return check_negative_pressure_evidence()
+    if normalized == "adversarial_review_evidence":
+        return check_adversarial_review_evidence()
+    if normalized == "signal_quality_split_evidence":
+        return check_signal_quality_split_evidence()
+    if normalized == "context_overlay_reliability":
+        return check_context_overlay_reliability()
+    if normalized == "macro_sector_alias_coverage":
+        return check_macro_sector_alias_coverage()
+    if normalized == "theme_sector_alias_coverage":
+        return check_theme_sector_alias_coverage()
+    if normalized == "signal_quality_overlay_rules":
+        return check_signal_quality_overlay_rules()
+    if normalized == "feature_stage_gates":
+        return check_feature_stage_gates_snapshot(limit=OPERATOR_HEALTH_FEATURE_STAGE_GATE_SYMBOL_LIMIT)
+    if normalized == "lifecycle_policy_audit":
+        return check_lifecycle_policy_change_audit()
+    if normalized == "fallback_telemetry":
+        return check_fallback_telemetry_compact(hours=24, limit=25)
+    if normalized == "table_freshness":
+        return check_table_freshness(include_counts=False)
+    if normalized == "sync_state_failures":
+        return check_sync_state_failures()
+    if normalized == "watcher_source_counters":
+        return check_watcher_source_counters()
+    if normalized == "signal_refresh_source_state":
+        return check_signal_refresh_source_state()
+    if normalized == "downloader_run_state":
+        return check_downloader_run_state()
+    if normalized == "ingestion_file_state":
+        return check_ingestion_file_state_failures()
+    if normalized == "schema_migrations":
+        return check_schema_migrations()
+    if normalized == "operator_api_errors":
+        return check_operator_api_errors()
+    if normalized == "redis":
+        return check_redis()
+    if normalized == "cron_logs":
+        return check_cron_logs(log_dir)
+    if normalized == "optional_dependencies":
+        return check_optional_dependencies()
+    if normalized == "frontend":
+        return check_frontend_dependencies()
+    if normalized == "frontend_runtime":
+        return check_frontend_runtime()
+    if normalized == "dhan_cache":
+        return check_dhan_cache()
+    raise ValueError(f"Unknown health check: {name}")
+
+
+def run_named_health_check_subprocess(
+    name: str,
+    *,
+    log_dir: str | Path = DEFAULT_LOG_DIR,
+    timeout_seconds: float = OPERATOR_HEALTH_FULL_SECTION_TIMEOUT_SECONDS,
+) -> Any:
+    timeout = max(1.0, float(timeout_seconds))
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import json, sys; "
+            "from advisory.operator_health import run_named_health_check; "
+            "payload = run_named_health_check(sys.argv[1], log_dir=sys.argv[2]); "
+            "print(json.dumps(payload, default=str))"
+        ),
+        str(name),
+        str(log_dir),
+    ]
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        _record_health_local_fallback(
+            source=str(name),
+            fallback_type="operator_health_section_timeout",
+            reason="Full Operator Health section exceeded its process-isolated timeout.",
+            error=exc,
+            severity="warn",
+            metadata={"check_name": str(name), "timeout_seconds": timeout},
+        )
+        return _status(
+            "warn",
+            "Full Health section timed out and was skipped for this payload.",
+            timed_out=True,
+            degraded=True,
+            timeout_seconds=timeout,
+            command=f"python -m advisory.operator_health --full --skip-dhan",
+        )
+    if proc.returncode:
+        error_text = (proc.stderr or proc.stdout or "").strip()
+        error = RuntimeError(error_text[:1000] or f"health section subprocess failed with returncode={proc.returncode}")
+        _record_health_local_fallback(
+            source=str(name),
+            fallback_type="operator_health_section_subprocess_failed",
+            reason="Full Operator Health section subprocess failed.",
+            error=error,
+            severity="warn",
+            metadata={"check_name": str(name), "timeout_seconds": timeout, "returncode": proc.returncode},
+        )
+        return _status("error", "Full Health section subprocess failed.", error=f"{type(error).__name__}: {error}", degraded=True)
+    output = (proc.stdout or "").strip()
+    if not output:
+        return _status("warn", "Full Health section returned no output.", degraded=True)
+    json_text = output.splitlines()[-1]
+    try:
+        payload = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        _record_health_local_fallback(
+            source=str(name),
+            fallback_type="operator_health_section_json_parse_failed",
+            reason="Full Operator Health could not parse section subprocess output.",
+            error=exc,
+            severity="warn",
+            metadata={"check_name": str(name), "stdout_length": len(output), "timeout_seconds": timeout},
+        )
+        return _status("error", "Full Health section returned invalid JSON.", error=f"{type(exc).__name__}: {exc}", degraded=True)
+    return payload
+
+
+def _full_health_checks(log_dir: str | Path) -> dict[str, Any]:
+    names = [
+        "database",
+        "operator_api",
+        "operator_api_runtime",
+        "trace_summaries",
+        "slow_operations",
+        "api_latency_probe",
+        "advisory_stage_report",
+        "research_evidence_run_summary",
+        "operator_snapshot",
+        "event_data_quality",
+        "identity_issues",
+        "screener_failures",
+        "context_gate_policy",
+        "signal_quality",
+        "technical_threshold_evidence",
+        "ts_forecast_paper",
+        "llm_provenance_audit",
+        "provenance_graph_dry_runs",
+        "causal_event_memory_evidence",
+        "action_transition_evidence",
+        "event_policy_evidence",
+        "context_watch_evidence",
+        "negative_pressure_evidence",
+        "adversarial_review_evidence",
+        "signal_quality_split_evidence",
+        "context_overlay_reliability",
+        "macro_sector_alias_coverage",
+        "theme_sector_alias_coverage",
+        "signal_quality_overlay_rules",
+        "feature_stage_gates",
+        "lifecycle_policy_audit",
+        "fallback_telemetry",
+        "table_freshness",
+        "sync_state_failures",
+        "watcher_source_counters",
+        "signal_refresh_source_state",
+        "downloader_run_state",
+        "ingestion_file_state",
+        "schema_migrations",
+        "operator_api_errors",
+        "redis",
+        "cron_logs",
+        "optional_dependencies",
+        "frontend",
+        "frontend_runtime",
+        "dhan_cache",
+    ]
+    if OPERATOR_HEALTH_FULL_PROCESS_ISOLATED:
+        return {
+            name: (lambda _name=name: run_named_health_check_subprocess(_name, log_dir=log_dir))
+            for name in names
+        }
+    return {name: (lambda _name=name: run_named_health_check(_name, log_dir=log_dir)) for name in names}
+
+
 def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan: bool = True, detail_level: str = "fast") -> dict[str, Any]:
     mode = "full" if str(detail_level or "").strip().lower() == "full" else "fast"
     full_mode = mode == "full"
     if full_mode:
-        sections: dict[str, Any] = {
-            "database": check_database(),
-            "operator_api": check_operator_api(),
-            "operator_api_runtime": check_operator_api_runtime(),
-            "trace_summaries": check_trace_summaries(),
-            "slow_operations": check_slow_operations(limit=20),
-            "api_latency_probe": check_api_latency_probe(),
-            "advisory_stage_report": check_advisory_stage_report(log_dir),
-            "operator_snapshot": check_operator_snapshot(),
-            "event_data_quality": build_event_data_quality_report(limit=20),
-            "identity_issues": check_identity_issues(limit=10),
-            "screener_failures": check_screener_failures(limit=10),
-            "signal_quality": check_signal_quality(),
-            "feature_stage_gates": check_feature_stage_gates(),
-            "lifecycle_policy_audit": check_lifecycle_policy_change_audit(),
-            "fallback_telemetry": summarize_fallback_events(hours=24, limit=25),
-            "table_freshness": check_table_freshness(include_counts=True),
-            "sync_state_failures": check_sync_state_failures(),
-            "watcher_source_counters": check_watcher_source_counters(),
-            "downloader_run_state": check_downloader_run_state(),
-            "ingestion_file_state": check_ingestion_file_state_failures(),
-            "schema_migrations": check_schema_migrations(),
-            "operator_api_errors": check_operator_api_errors(),
-            "redis": check_redis(),
-            "cron_logs": check_cron_logs(log_dir),
-            "optional_dependencies": check_optional_dependencies(),
-            "frontend": check_frontend_dependencies(),
-            "frontend_runtime": check_frontend_runtime(),
-            "dhan_cache": check_dhan_cache(),
-        }
+        full_checks = _full_health_checks(log_dir)
+        sections: dict[str, Any] = _run_health_checks(full_checks, workers=OPERATOR_HEALTH_FULL_WORKERS)
     else:
         fast_checks = {
             "database": check_database,
@@ -4913,7 +9977,9 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
             "slow_operations": lambda: check_slow_operations(limit=20),
             "api_latency_probe": check_api_latency_probe,
             "advisory_stage_report": lambda: check_advisory_stage_report(log_dir),
+            "research_evidence_run_summary": lambda: check_research_evidence_run_summary(log_dir),
             "operator_snapshot": check_operator_snapshot,
+            "context_gate_policy": check_context_gate_policy,
             "redis": check_redis,
             "optional_dependencies": check_optional_dependencies,
             "frontend": check_frontend_dependencies,
@@ -4936,6 +10002,76 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
             command="python -m advisory.operator_health --full --skip-dhan",
             reason="Signal-quality evidence checks inspect evaluation summary tables and are available in full health mode.",
         )
+        sections["technical_threshold_evidence"] = _deferred_section(
+            "Technical-threshold calibration evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Technical-threshold calibration checks inspect realized after-cost threshold evidence and are available in full health mode.",
+        )
+        sections["ts_forecast_paper"] = _deferred_section(
+            "TS forecast paper-portfolio evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="TS forecast paper-portfolio checks inspect research-only forecast paper outcomes and are available in full health mode.",
+        )
+        sections["llm_provenance_audit"] = _deferred_section(
+            "LLM provenance audit",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="LLM provenance checks inspect persisted LLM/Codex-derived rows for prompt/schema/evidence/authority metadata and are available in full health mode.",
+        )
+        sections["provenance_graph_dry_runs"] = _deferred_section(
+            "Typed provenance graph dry runs",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Typed provenance checks run action-evidence and causal-event provenance builders in dry-run mode and are available in full health mode.",
+        )
+        sections["causal_event_memory_evidence"] = _deferred_section(
+            "Causal event-memory evaluation evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Causal event-memory evidence checks inspect persisted point-in-time outcome labels and are available in full health mode.",
+        )
+        sections["action_transition_evidence"] = _deferred_section(
+            "Action-transition evaluation evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Action-transition evidence checks inspect persisted point-in-time transition labels and are available in full health mode.",
+        )
+        sections["event_policy_evidence"] = _deferred_section(
+            "Event-policy evaluation evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Event-policy evidence checks inspect persisted point-in-time LLM/classification policy labels and are available in full health mode.",
+        )
+        sections["context_watch_evidence"] = _deferred_section(
+            "Context-watch evaluation evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Context-watch evidence checks inspect persisted point-in-time watch-priority labels and are available in full health mode.",
+        )
+        sections["negative_pressure_evidence"] = _deferred_section(
+            "Negative-pressure evaluation evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Negative-pressure evidence checks inspect persisted point-in-time de-risk labels and are available in full health mode.",
+        )
+        sections["adversarial_review_evidence"] = _deferred_section(
+            "Adversarial-review evaluation evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Adversarial-review evidence checks inspect persisted point-in-time veto/penalty labels and are available in full health mode.",
+        )
+        sections["signal_quality_split_evidence"] = _deferred_section(
+            "Signal-quality narrowed split evidence",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Narrowed split evidence checks inspect persisted split labels, technical-only baselines, and stability classifications in full health mode.",
+        )
+        sections["signal_quality_overlay_rules"] = _deferred_section(
+            "Signal-quality overlay rule eligibility",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Trusted overlay-rule eligibility checks read config plus persisted reliability evidence and are available in full health mode.",
+        )
+        sections["macro_sector_alias_coverage"] = _deferred_section(
+            "Macro sector alias coverage",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Macro sector alias coverage builds current macro overlays and is available in full health mode.",
+        )
+        sections["theme_sector_alias_coverage"] = _deferred_section(
+            "Theme sector alias coverage",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Theme sector alias coverage builds current news-theme overlays and is available in full health mode.",
+        )
         sections["feature_stage_gates"] = _deferred_section(
             "Feature freshness stage gates",
             command="python -m advisory.operator_health --full --skip-dhan",
@@ -4957,6 +10093,11 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
             "Watcher source counters",
             command="python -m advisory.operator_health --full --skip-dhan",
             reason="Watcher source-counter checks read latest OHLCV/news/announcement sync-state rows and are available in full health mode.",
+        )
+        sections["signal_refresh_source_state"] = _deferred_section(
+            "Review-only signal-refresh source state",
+            command="python -m advisory.operator_health --full --skip-dhan",
+            reason="Signal-refresh state checks read context-overlay, causal-memory, and bounded action-refresh sync-state rows and are available in full health mode.",
         )
         sections["downloader_run_state"] = _deferred_section(
             "Downloader run state",
@@ -5032,6 +10173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
     parser.add_argument("--skip-dhan", action="store_true", help="Skip Dhan profile token validation.")
     parser.add_argument("--full", action="store_true", help="Run expensive deep diagnostics against source data tables and full cron logs.")
+    parser.add_argument("--check", help="Run one named health check, for example theme_sector_alias_coverage.")
     parser.add_argument("--format", choices=["json", "text"], default="json", help="Output format. Defaults to json for cron/API tooling.")
     return parser.parse_args()
 
@@ -5061,6 +10203,15 @@ def format_text(payload: dict[str, Any]) -> str:
 
 def main() -> int:
     args = parse_args()
+    if getattr(args, "check", None):
+        payload = run_named_health_check(str(args.check), log_dir=args.log_dir)
+        if args.format == "text":
+            print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        else:
+            print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        status = payload.get("status") if isinstance(payload, dict) else "ok"
+        return 0 if status in {"ok", "warn"} else 1
+
     payload = build_operator_health(log_dir=args.log_dir, include_dhan=not bool(args.skip_dhan), detail_level="full" if bool(args.full) else "fast")
     if args.format == "text":
         print(format_text(payload))

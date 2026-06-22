@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, time
 from typing import List, Optional, Sequence
 
@@ -9,6 +9,7 @@ import pytz
 
 from advisory.decision_trace import record_event_processing, safe_trace_call
 from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.identity_issues import record_company_master_mapping_issue
 
 from .db import load_company_master_targets
 from .models import Announcement
@@ -63,6 +64,49 @@ def _record_managed_ingest_fallback(
     )
 
 
+def _record_managed_ingest_unmapped_target(
+    *,
+    ticker: str,
+    exchanges: Optional[Sequence[str]],
+) -> None:
+    exchange_list = [str(exchange).upper() for exchange in exchanges or []]
+    record_local_fallback_event(
+        module="data.announcements.managed_pipeline",
+        fallback_type="announcement_company_master_mapping_missing",
+        source="announcement_managed_pipeline",
+        severity="warn",
+        symbol=ticker,
+        reason=(
+            "Announcement ingestion skipped this ticker because no company-master mapping was found. "
+            "The advisory batch continues, but announcements for this ticker are not available until the master mapping is fixed."
+        ),
+        error=ValueError(f"No company master mapping found for ticker: {ticker}"),
+        metadata={
+            "ticker": ticker,
+            "exchanges": exchange_list,
+        },
+    )
+    try:
+        record_company_master_mapping_issue(
+            symbol=ticker,
+            requested_exchange=exchange_list[0] if exchange_list else "NSE",
+            source="data.announcements.managed_pipeline",
+            error_text=f"No company master mapping found for ticker: {ticker}",
+            context={"exchanges": exchange_list, "ingest_stage": "managed_announcement_ingest"},
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="data.announcements.managed_pipeline",
+            fallback_type="announcement_company_master_mapping_issue_record_failed",
+            source="advisory_identity_issues",
+            severity="warn",
+            symbol=ticker,
+            reason="Managed announcement ingestion could not persist the missing company-master mapping issue; local fallback telemetry was already recorded.",
+            error=exc,
+            metadata={"ticker": ticker, "exchanges": exchange_list},
+        )
+
+
 def serialize_stage_payload(value: object) -> object:
     if hasattr(value, "model_dump"):
         return value.model_dump()  # type: ignore[attr-defined]
@@ -91,6 +135,8 @@ class IngestSummary:
     parsed: int = 0
     skipped: int = 0
     failed: int = 0
+    issue_count: int = 0
+    issues: list[dict[str, object]] = field(default_factory=list)
 
 
 class ManagedAnnouncementPipeline:
@@ -109,13 +155,62 @@ class ManagedAnnouncementPipeline:
         targets = list(load_company_master_targets(ticker=ticker, exchanges=exchanges))
         summary = IngestSummary(requested=len(targets))
         if not targets:
-            raise ValueError(f"No company master mapping found for ticker: {ticker}")
+            logger.warning("Skipping announcement ingest for unmapped ticker=%s exchanges=%s", ticker, exchanges)
+            _record_managed_ingest_unmapped_target(ticker=ticker, exchanges=exchanges)
+            summary.skipped += 1
+            summary.issue_count += 1
+            summary.issues.append(
+                {
+                    "ticker": str(ticker).upper(),
+                    "issue_type": "company_master_mapping_missing",
+                    "severity": "warn",
+                    "message": "No company master mapping found; announcement ingestion skipped for this ticker.",
+                    "exchanges": [str(exchange).upper() for exchange in exchanges or []],
+                }
+            )
+            return summary
 
         start_dt = self._date_start(from_date)
         end_dt = self._date_end(to_date)
+        try:
+            fetched_announcements = self.pipeline.fetch_announcements(targets, since=start_dt)
+        except Exception as exc:
+            logger.exception("Failed announcement fetch for ticker=%s", ticker)
+            exchange_list = [str(exchange).upper() for exchange in exchanges or []]
+            record_local_fallback_event(
+                module="data.announcements.managed_pipeline",
+                fallback_type="announcement_managed_fetch_failed",
+                source="announcement_managed_pipeline",
+                severity="warn",
+                symbol=ticker,
+                reason=(
+                    "Managed announcement ingestion could not fetch source announcements for this ticker; "
+                    "the advisory batch continues, but this ticker may use stale or missing announcement evidence."
+                ),
+                error=exc,
+                metadata={
+                    "ticker": ticker,
+                    "from_date": from_date.isoformat(),
+                    "to_date": to_date.isoformat(),
+                    "exchanges": exchange_list,
+                    "target_count": len(targets),
+                },
+            )
+            summary.failed += 1
+            summary.issue_count += 1
+            summary.issues.append(
+                {
+                    "ticker": str(ticker).upper(),
+                    "issue_type": "announcement_fetch_failed",
+                    "severity": "warn",
+                    "message": f"Announcement source fetch failed: {type(exc).__name__}: {exc}",
+                    "exchanges": exchange_list,
+                }
+            )
+            return summary
         announcements = [
             item
-            for item in self.pipeline.fetch_announcements(targets, since=start_dt)
+            for item in fetched_announcements
             if start_dt <= item.published_on <= end_dt
         ]
         summary.discovered = len(announcements)

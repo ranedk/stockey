@@ -250,9 +250,61 @@ def build_review_prompt(payload: dict[str, Any]) -> str:
     return (
         "Review this proposed swing-technical threshold promotion. "
         "You are not allowed to apply the change. Decide whether a human should promote, partially promote, reject, or wait for more data. "
-        "Focus on sample size, hit rate after costs, average return after costs, spread versus rejected rows, and whether the threshold changes are too loose or overfit.\n\n"
+        "Focus on sample size, hit rate after costs, average return after costs, spread versus rejected rows, setup-archetype outcome dispersion, and whether the threshold changes are too loose or overfit.\n\n"
         + json.dumps(payload, indent=2, ensure_ascii=False, default=str)
     )
+
+
+def extract_archetype_breakdown(summary: dict[str, Any]) -> dict[str, Any]:
+    payload = parse_jsonish(summary.get("archetype_breakdown_json"), {}, source="technical_threshold_archetype_breakdown_json")
+    if not isinstance(payload, dict):
+        return {}
+    breakdown = payload.get("breakdown")
+    if not isinstance(breakdown, list):
+        payload["breakdown"] = []
+    payload.setdefault("authority_scope", "research_only")
+    payload.setdefault("action_policy_effect", "no_live_policy_change")
+    payload.setdefault("broker_execution_allowed", False)
+    return payload
+
+
+def archetype_review_signals(archetype_breakdown: dict[str, Any]) -> dict[str, Any]:
+    rows = archetype_breakdown.get("breakdown") if isinstance(archetype_breakdown, dict) else []
+    if not isinstance(rows, list):
+        rows = []
+    selected_rows = []
+    weak_selected = []
+    strong_selected = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        selected_count = pd.to_numeric(row.get("selected_count"), errors="coerce")
+        avg_return = pd.to_numeric(row.get("avg_selected_return_after_cost"), errors="coerce")
+        hit_rate = pd.to_numeric(row.get("hit_rate_after_cost"), errors="coerce")
+        if pd.isna(selected_count) or int(selected_count) <= 0:
+            continue
+        item = {
+            "technical_setup_archetype": row.get("technical_setup_archetype"),
+            "selected_count": int(selected_count),
+            "avg_selected_return_after_cost": None if pd.isna(avg_return) else float(avg_return),
+            "hit_rate_after_cost": None if pd.isna(hit_rate) else float(hit_rate),
+        }
+        selected_rows.append(item)
+        if pd.notna(avg_return) and float(avg_return) <= 0:
+            weak_selected.append(item)
+        elif pd.notna(hit_rate) and float(hit_rate) < 0.40:
+            weak_selected.append(item)
+        elif pd.notna(avg_return) and pd.notna(hit_rate) and float(avg_return) > 0 and float(hit_rate) >= 0.45:
+            strong_selected.append(item)
+    return {
+        "selected_archetype_count": len(selected_rows),
+        "weak_selected_archetypes": weak_selected,
+        "strong_selected_archetypes": strong_selected,
+        "has_archetype_evidence": bool(rows),
+        "authority_scope": "research_only",
+        "action_policy_effect": "review_context_only_no_live_policy_change",
+        "broker_execution_allowed": False,
+    }
 
 
 def deterministic_review(payload: dict[str, Any], *, status: str = "disabled", error: str | None = None) -> TechnicalThresholdPromotionReview:
@@ -261,6 +313,8 @@ def deterministic_review(payload: dict[str, Any], *, status: str = "disabled", e
     eligible = 0 if pd.isna(eligible_raw) else int(eligible_raw)
     hit_rate = pd.to_numeric(evidence.get("hit_rate_after_cost"), errors="coerce")
     avg_return = pd.to_numeric(evidence.get("avg_forward_return_after_cost"), errors="coerce")
+    archetype_signals = payload.get("archetype_review_signals") if isinstance(payload.get("archetype_review_signals"), dict) else {}
+    weak_archetypes = archetype_signals.get("weak_selected_archetypes") if isinstance(archetype_signals.get("weak_selected_archetypes"), list) else []
     recommendation: Literal["promote", "promote_partially", "reject", "needs_more_data"] = "needs_more_data"
     reasons = []
     risks = []
@@ -273,8 +327,17 @@ def deterministic_review(payload: dict[str, Any], *, status: str = "disabled", e
     elif pd.notna(avg_return) and float(avg_return) <= 0:
         recommendation = "reject"
         reasons.append("Average return after costs is not positive.")
+    if weak_archetypes:
+        if recommendation == "promote_partially":
+            recommendation = "needs_more_data"
+        names = ", ".join(str(row.get("technical_setup_archetype") or "unknown") for row in weak_archetypes[:5])
+        reasons.append(f"At least one selected setup archetype has weak after-cost evidence: {names}.")
+        risks.append("Global threshold results may be hiding archetype-specific false positives.")
+    if not archetype_signals.get("has_archetype_evidence"):
+        risks.append("No setup-archetype breakdown was available for this calibration summary.")
     else:
-        reasons.append("Evidence is mixed and should be reviewed manually.")
+        if not reasons:
+            reasons.append("Evidence is mixed and should be reviewed manually.")
     if error:
         risks.append(f"LLM review unavailable: {error}")
     return TechnicalThresholdPromotionReview(
@@ -325,6 +388,10 @@ def generate_promotion_review(
         ]
     }
     summary = load_horizon_summary(int(calibration.get("horizon_days") or 0), calibration.get("evaluated_at"))
+    archetype_breakdown = extract_archetype_breakdown(summary)
+    archetype_signals = archetype_review_signals(archetype_breakdown)
+    evidence["archetype_breakdown"] = archetype_breakdown
+    evidence["archetype_review_signals"] = archetype_signals
     pending_patch = build_pending_patch(str(setup["setup_id"]), candidate_thresholds)
     payload = {
         "setup_id": setup["setup_id"],
@@ -333,6 +400,8 @@ def generate_promotion_review(
         "candidate_thresholds": candidate_thresholds,
         "calibration_evidence": evidence,
         "horizon_summary": summary,
+        "archetype_breakdown": archetype_breakdown,
+        "archetype_review_signals": archetype_signals,
         "pending_patch": pending_patch,
     }
     effective_model = model or DEFAULT_PROMOTION_REVIEW_MODEL
@@ -392,6 +461,8 @@ def generate_promotion_review(
         "candidate_thresholds": candidate_thresholds,
         "calibration_evidence": evidence,
         "horizon_summary": summary,
+        "archetype_breakdown": archetype_breakdown,
+        "archetype_review_signals": archetype_signals,
         "pending_patch": pending_patch,
         "llm_review": review.model_dump(),
         "prompt_id": PROMPT_ID,

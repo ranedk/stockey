@@ -123,9 +123,9 @@ For each match, the action planner creates:
 
 The default planner uses Codex through `utils.codex_cli`. If Codex is unavailable or disabled, the deterministic fallback still creates a conservative action plan and records the LLM status.
 
-The planner receives the latest `advisory_market_context_summary_daily` and matching symbol row from `advisory_market_context_universe_daily`. In weak breadth or risk-off regimes, positive playbook actions are downgraded to `BUY_WATCH`/manual review, and risk-reduction playbooks get higher urgency. Market context is evidence and a safety gate; it is not a standalone buy/sell rule.
+The planner receives the latest `advisory_market_context_summary_daily` and matching symbol row from `advisory_market_context_universe_daily`. Weak breadth is treated as sizing/caution evidence by default, while hard risk-off score or hard macro-risk can still downgrade positive playbook actions to `BUY_WATCH`/manual review and raise risk-reduction urgency. `HYPOTHESIS_MARKET_CONTEXT_REGIME_LABEL_HARD_BLOCK_ENABLED=true` restores global regime-label hard blocking, and `HYPOTHESIS_MARKET_CONTEXT_WEAK_BREADTH_HARD_BLOCK_ENABLED=true` restores weak-breadth hard blocking. Market context is evidence and a safety gate; it is not a standalone buy/sell rule.
 
-It does not auto-trade or auto-liquidate. `active_review` playbooks can be scanned and action-planned for review. Only `trusted_overlay` playbooks are allowed to become `advisory_action_recommendations` candidates, and even then only as `review_only` risk overlays such as `MANUAL_REVIEW` or `WATCH`; they do not create broker-executable orders directly.
+It does not auto-trade or auto-liquidate. `active_review` playbooks can be scanned and action-planned for review. Only `trusted_overlay` playbooks are allowed to become `advisory_action_recommendations` candidates, and even then only as `review_only` risk overlays such as `MANUAL_REVIEW` or `WATCH`; they do not create broker-executable orders directly. Positive `BUY_WATCH` playbook rows default to `WATCH` / watchlist-pressure evidence (`ACTION_PLAYBOOK_BUY_WATCH_AS_WATCH=true`) so they can support discovery without suppressing a confirmed technical `BUY` or `BUY_MORE`.
 
 ## Tables
 

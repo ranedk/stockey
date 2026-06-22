@@ -251,6 +251,72 @@ def _num(value: Any) -> float:
         return 0.0
 
 
+DEGRADED_STAGE_COUNTERS = {
+    "watch_ingest": [
+        "unresolved_ingest_target_count",
+        "unresolved_watch_row_count",
+        "managed_ingest_failed_count",
+        "document_lookup_failed_count",
+    ],
+    "watch_match": [
+        "unresolved_ingest_target_count",
+        "unresolved_watch_row_count",
+        "managed_ingest_failed_count",
+        "document_lookup_failed_count",
+    ],
+}
+
+
+def _stage_payload(summary: dict[str, Any], stage: str) -> dict[str, Any]:
+    stages = summary.get("stages") if isinstance(summary.get("stages"), dict) else {}
+    payload = stages.get(stage)
+    if not isinstance(payload, dict):
+        return {}
+    meta = payload.get("meta")
+    if isinstance(meta, dict):
+        return meta
+    return payload
+
+
+def _extract_stage_degradations(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for stage, counters in DEGRADED_STAGE_COUNTERS.items():
+        payload = _stage_payload(summary, stage)
+        if not payload:
+            continue
+        degraded_counts: dict[str, int] = {}
+        for counter in counters:
+            value = int(_num(payload.get(counter)))
+            if value > 0:
+                degraded_counts[counter] = value
+        ingest_runs = payload.get("ingest_runs") if isinstance(payload.get("ingest_runs"), list) else []
+        ingest_failed_count = sum(int(_num(row.get("failed"))) for row in ingest_runs if isinstance(row, dict))
+        ingest_issue_count = sum(int(_num(row.get("issue_count"))) for row in ingest_runs if isinstance(row, dict))
+        if ingest_failed_count > 0:
+            degraded_counts["ingest_failed_count"] = ingest_failed_count
+        if ingest_issue_count > 0:
+            degraded_counts["ingest_issue_count"] = ingest_issue_count
+        if not degraded_counts:
+            continue
+        rows.append(
+            {
+                "stage": stage,
+                "status": "warn",
+                "counts": degraded_counts,
+                "sample_issues": [
+                    {
+                        "symbol": row.get("symbol"),
+                        "issues": row.get("issues"),
+                    }
+                    for row in ingest_runs
+                    if isinstance(row, dict) and row.get("issues")
+                ][:5],
+                "operator_action": "Review announcement-watch degraded evidence counters before interpreting missing or stale event-driven signals.",
+            }
+        )
+    return rows
+
+
 def build_stage_report(
     *,
     log_path: str | Path = DEFAULT_LOG_PATH,
@@ -268,6 +334,7 @@ def build_stage_report(
     timing_rows = [row for row in timings if isinstance(row, dict)]
     ranked = sorted(timing_rows, key=lambda row: _num(row.get("elapsed_seconds")), reverse=True)
     slow = [row for row in timing_rows if row.get("over_budget")]
+    degradations = _extract_stage_degradations(summary) if summary else []
     bounded_limit = max(1, min(int(limit), 200))
     pipeline_status = str(summary.get("status") or "") if summary else ""
     status = pipeline_status if pipeline_status in {"failed", "running"} else "ok" if summary else "missing"
@@ -284,10 +351,15 @@ def build_stage_report(
         "asof_date": summary.get("asof_date") if summary else None,
         "stage_budget": summary.get("stage_budget") if summary else {},
         "slow_stages": slow,
+        "stage_degradations": degradations,
         "ranked_stages": ranked[:bounded_limit],
         "stage_count": len(timing_rows),
         "slow_stage_count": len(slow),
+        "degraded_stage_count": len(degradations),
         "operator_action": (
+            "Review degraded stage counters before trusting event-driven recommendations."
+            if degradations
+            else
             "Review slow stages and move external/source repair work to queues or add targeted query/index fixes."
             if slow
             else f"Latest advisory run failed in or near stage `{summary.get('failed_stage')}`; inspect the traceback below that stage marker."
@@ -320,6 +392,13 @@ def _format_text(report: dict[str, Any]) -> str:
         lines.append(
             f"{marker} stage={row.get('stage')} elapsed={row.get('elapsed_seconds')}s "
             f"budget={row.get('budget_seconds')}s detail={row.get('detail') or ''}"
+        )
+    degradations = report.get("stage_degradations") if isinstance(report.get("stage_degradations"), list) else []
+    for row in degradations:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"DEGRADED stage={row.get('stage')} counts={row.get('counts') or {}} action={row.get('operator_action') or ''}"
         )
     return "\n".join(lines)
 

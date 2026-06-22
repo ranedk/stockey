@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -11,8 +12,9 @@ import yaml
 
 from advisory.event_policy_promotion import DECISIONS_TABLE as EVENT_POLICY_DECISIONS_TABLE
 from advisory.fallback_telemetry import record_local_fallback_event
-from advisory.setup_registry import load_ts_forecast_review_rules
+from advisory.setup_registry import load_signal_quality_overlay_rules, load_ts_forecast_review_rules
 from advisory.signal_quality_promotion import DECISIONS_TABLE as SIGNAL_QUALITY_DECISIONS_TABLE
+from advisory.signal_quality_split_evaluator import SPLIT_DECISIONS_TABLE as SIGNAL_QUALITY_SPLIT_DECISIONS_TABLE
 from advisory.technical_threshold_promotion import DECISIONS_TABLE as TECHNICAL_DECISIONS_TABLE
 from advisory.ts_forecast_promotion import DECISIONS_TABLE as TS_FORECAST_DECISIONS_TABLE
 from utils.db import sql_to_df, upsert_to_db
@@ -25,7 +27,14 @@ PREVIEWS_TABLE = "advisory_config_change_previews"
 APPLICATIONS_TABLE = "advisory_config_change_applications"
 PREVIEWS_SCHEMA_MIGRATION_ID = "20260611_advisory_config_change_previews_base"
 APPLICATIONS_SCHEMA_MIGRATION_ID = "20260612_advisory_config_change_applications_base"
-ChangeSource = Literal["technical_threshold", "signal_quality_overlay", "event_policy_review_rule", "ts_forecast_review_rule"]
+ChangeSource = Literal[
+    "technical_threshold",
+    "signal_quality_overlay",
+    "signal_quality_split_overlay",
+    "causal_event_memory_rule",
+    "event_policy_review_rule",
+    "ts_forecast_review_rule",
+]
 ApplicationDecision = Literal["approved_to_apply", "marked_applied", "rejected", "needs_more_data"]
 PREVIEWS_SCHEMA_STATEMENTS = [
     f"""
@@ -290,8 +299,32 @@ def render_signal_quality_overlay_config(config_text: str, *, rule_suggestion: d
         "minimum_horizon_days": rule_suggestion.get("minimum_horizon_days"),
         "minimum_matured_rows": rule_suggestion.get("minimum_matured_rows"),
         "minimum_lift_vs_technical_only": rule_suggestion.get("minimum_lift_vs_technical_only"),
+        "context_source_family": rule_suggestion.get("context_source_family"),
+        "minimum_context_source_families": rule_suggestion.get("minimum_context_source_families"),
+        "minimum_context_family_selected_rows": rule_suggestion.get("minimum_context_family_selected_rows"),
+        "minimum_context_family_matured_rows": rule_suggestion.get("minimum_context_family_matured_rows"),
+        "minimum_context_family_symbols": rule_suggestion.get("minimum_context_family_symbols"),
+        "split_axis": rule_suggestion.get("split_axis"),
+        "split_value": rule_suggestion.get("split_value"),
+        "context_class": rule_suggestion.get("context_class"),
+        "direction": rule_suggestion.get("direction"),
+        "stability_classification": rule_suggestion.get("stability_classification") or rule_suggestion.get("classification"),
+        "minimum_windows": rule_suggestion.get("minimum_windows"),
+        "helpful_window_count": rule_suggestion.get("helpful_window_count"),
+        "harmful_window_count": rule_suggestion.get("harmful_window_count"),
+        "avg_lift_vs_technical_only": rule_suggestion.get("avg_lift_vs_technical_only"),
+        "causal_context_source": rule_suggestion.get("causal_context_source"),
+        "event_type": rule_suggestion.get("event_type"),
+        "event_state": rule_suggestion.get("event_state"),
+        "minimum_direction_hit_rate_after_cost": rule_suggestion.get("minimum_direction_hit_rate_after_cost"),
+        "minimum_avg_directional_helpfulness_score": rule_suggestion.get("minimum_avg_directional_helpfulness_score"),
+        "minimum_excess_direction_hit_rate_after_cost": rule_suggestion.get("minimum_excess_direction_hit_rate_after_cost"),
+        "minimum_avg_excess_directional_helpfulness_score": rule_suggestion.get("minimum_avg_excess_directional_helpfulness_score"),
+        "memory_policy_effect": rule_suggestion.get("memory_policy_effect"),
+        "action_policy_effect": rule_suggestion.get("action_policy_effect") or "review_input_only_no_live_policy",
         "authority": rule_suggestion.get("authority") or "review_input_only",
         "broker_execution_allowed": False,
+        "policy_auto_promotion_allowed": False,
         "status": "disabled_review_candidate",
     }
     rule = {key: value for key, value in rule.items() if value is not None}
@@ -307,6 +340,68 @@ def render_signal_quality_overlay_config(config_text: str, *, rule_suggestion: d
             return "\n".join(updated) + "\n"
     updated = lines + ["", "signal_quality_overlay_rules:"] + indented
     return "\n".join(updated) + "\n"
+
+
+def _slug(value: Any, *, default: str = "unknown") -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return text or default
+
+
+def causal_memory_rule_suggestion_from_group(group: dict[str, Any]) -> dict[str, Any]:
+    horizon_days = group.get("horizon_days")
+    if horizon_days is None:
+        raise ValueError("horizon_days is required for causal memory rule preview")
+    context_source = str(group.get("context_source") or "unknown").strip()
+    context_class = str(group.get("context_class") or "unknown").strip()
+    event_type = str(group.get("event_type") or "unknown").strip()
+    direction = str(group.get("direction") or "unknown").strip().lower()
+    event_state = str(group.get("event_state") or "unknown").strip()
+    classification = str(group.get("classification") or "candidate_helpful").strip()
+    if classification not in {"candidate_helpful", "hurts_or_no_lift", "benchmark_beta_not_memory_alpha"}:
+        raise ValueError(
+            "causal memory rule previews require classification=candidate_helpful, hurts_or_no_lift, or benchmark_beta_not_memory_alpha"
+        )
+    policy_effect = (
+        "review_only_low_weight_context_no_buy_sell_authority"
+        if classification == "candidate_helpful"
+        else "review_only_suppress_memory_context_no_sell_authority"
+    )
+    overlay_prefix = "causal_memory" if classification == "candidate_helpful" else "causal_memory_suppress"
+    overlay = overlay_prefix + "_" + "_".join(
+        [
+            _slug(context_source),
+            _slug(context_class),
+            _slug(event_type),
+            _slug(direction),
+            _slug(event_state),
+            f"h{int(horizon_days)}",
+        ]
+    )
+    split_value = "|".join([context_source, context_class, event_type, direction, event_state])
+    return {
+        "signal_quality_overlay": overlay,
+        "minimum_horizon_days": int(horizon_days),
+        "minimum_matured_rows": group.get("matured_count") or group.get("minimum_matured_rows"),
+        "context_source_family": "causal_event_memory",
+        "split_axis": "causal_context_source_class_type_direction_state",
+        "split_value": split_value,
+        "context_class": context_class,
+        "direction": direction,
+        "causal_context_source": context_source,
+        "event_type": event_type,
+        "event_state": event_state,
+        "stability_classification": classification or "candidate_helpful",
+        "minimum_direction_hit_rate_after_cost": group.get("direction_hit_rate_after_cost"),
+        "minimum_avg_directional_helpfulness_score": group.get("avg_directional_helpfulness_score"),
+        "minimum_excess_direction_hit_rate_after_cost": group.get("excess_direction_hit_rate_after_cost"),
+        "minimum_avg_excess_directional_helpfulness_score": group.get("avg_excess_directional_helpfulness_score"),
+        "memory_policy_effect": policy_effect,
+        "action_policy_effect": "review_input_only_no_live_policy",
+        "authority": "review_input_only",
+        "broker_execution_allowed": False,
+        "policy_auto_promotion_allowed": False,
+    }
 
 
 def render_event_policy_review_rule_config(config_text: str, *, rule_suggestion: dict[str, Any]) -> str:
@@ -393,6 +488,12 @@ def build_preview_from_patch(
 ) -> dict[str, Any]:
     config_text = config_path.read_text(encoding="utf-8")
     relative_path = str(config_path.relative_to(REPO_ROOT)) if config_path.is_relative_to(REPO_ROOT) else str(config_path)
+    operation = str(patch_payload.get("operation") or "").strip()
+    if source_type == "signal_quality_overlay" and operation == "review_trusted_context_rule_runtime_effects":
+        raise ValueError(
+            "technical_after_trusted_context_rules reviews existing trusted runtime rules only; "
+            "it must not generate a generic signal_quality_overlay_rules config diff."
+        )
     if source_type == "technical_threshold":
         updated_text = render_technical_threshold_config(
             config_text,
@@ -401,6 +502,35 @@ def build_preview_from_patch(
         )
     elif source_type == "signal_quality_overlay":
         suggestion = patch_payload.get("rule_suggestion") if isinstance(patch_payload.get("rule_suggestion"), dict) else {}
+        updated_text = render_signal_quality_overlay_config(config_text, rule_suggestion=suggestion)
+    elif source_type == "signal_quality_split_overlay":
+        suggestion = patch_payload.get("rule_suggestion") if isinstance(patch_payload.get("rule_suggestion"), dict) else {}
+        if not suggestion:
+            suggestion = {
+                "signal_quality_overlay": patch_payload.get("variant"),
+                "minimum_horizon_days": patch_payload.get("horizon_days"),
+                "minimum_matured_rows": patch_payload.get("minimum_matured_rows"),
+                "minimum_lift_vs_technical_only": patch_payload.get("minimum_lift_vs_technical_only"),
+                "context_source_family": patch_payload.get("source_family"),
+                "split_axis": patch_payload.get("split_axis"),
+                "split_value": patch_payload.get("split_value"),
+                "context_class": patch_payload.get("context_class"),
+                "direction": patch_payload.get("direction"),
+                "stability_classification": patch_payload.get("stability_classification") or patch_payload.get("classification"),
+                "minimum_windows": patch_payload.get("minimum_windows"),
+                "helpful_window_count": patch_payload.get("helpful_window_count"),
+                "harmful_window_count": patch_payload.get("harmful_window_count"),
+                "avg_lift_vs_technical_only": patch_payload.get("minimum_lift_vs_technical_only"),
+                "action_policy_effect": "review_input_only_no_live_policy",
+                "authority": patch_payload.get("authority") or "review_input_only",
+                "broker_execution_allowed": False,
+                "policy_auto_promotion_allowed": False,
+            }
+        updated_text = render_signal_quality_overlay_config(config_text, rule_suggestion=suggestion)
+    elif source_type == "causal_event_memory_rule":
+        suggestion = patch_payload.get("rule_suggestion") if isinstance(patch_payload.get("rule_suggestion"), dict) else {}
+        if not suggestion:
+            suggestion = causal_memory_rule_suggestion_from_group(patch_payload)
         updated_text = render_signal_quality_overlay_config(config_text, rule_suggestion=suggestion)
     elif source_type == "event_policy_review_rule":
         suggestion = patch_payload.get("rule_suggestion") if isinstance(patch_payload.get("rule_suggestion"), dict) else {}
@@ -499,13 +629,86 @@ def verify_preview_against_config(preview: dict[str, Any], *, config_path: Path 
     source_type = str(preview.get("source_type") or "").strip()
     patch_payload = preview.get("patch_payload") if isinstance(preview.get("patch_payload"), dict) else {}
     suggestion = patch_payload.get("rule_suggestion") if isinstance(patch_payload.get("rule_suggestion"), dict) else {}
+    if source_type in {"signal_quality_overlay", "signal_quality_split_overlay", "causal_event_memory_rule"}:
+        operation = str(patch_payload.get("operation") or "").strip()
+        if operation == "review_trusted_context_rule_runtime_effects":
+            return {
+                "status": "not_applicable_existing_runtime_rules_only",
+                "source_type": source_type,
+                "config_path": str(config_path),
+                "verified": False,
+                "operation": operation,
+                "overlay": str(suggestion.get("signal_quality_overlay") or suggestion.get("overlay") or "").strip() or None,
+                "operator_boundary": {
+                    "read_only": True,
+                    "broker_execution_enabled": False,
+                    "policy_auto_promotion_allowed": False,
+                    "config_patch_applicable": False,
+                },
+                "message": (
+                    "This signal-quality review evaluates existing trusted runtime-rule adjustments. "
+                    "No generic signal_quality_overlay_rules config patch should be applied or verified."
+                ),
+            }
+        overlay = str(suggestion.get("signal_quality_overlay") or suggestion.get("overlay") or "").strip()
+        horizon_days = suggestion.get("minimum_horizon_days") or suggestion.get("horizon_days")
+        context_source_family = str(suggestion.get("context_source_family") or "").strip().lower() or None
+        split_axis = str(suggestion.get("split_axis") or "").strip() or None
+        split_value = str(suggestion.get("split_value") or "").strip() or None
+        context_class = str(suggestion.get("context_class") or "").strip() or None
+        direction = str(suggestion.get("direction") or "").strip().lower() or None
+        if not overlay or horizon_days is None:
+            return {
+                "status": "invalid_preview_payload",
+                "source_type": source_type,
+                "config_path": str(config_path),
+                "verified": False,
+                "message": "Signal-quality preview payload is missing overlay or minimum_horizon_days.",
+            }
+        rules_payload = load_signal_quality_overlay_rules(str(config_path))
+        matches = [
+            rule
+            for rule in rules_payload.get("rules", [])
+            if str(rule.get("overlay") or "").strip() == overlay
+            and int(rule.get("minimum_horizon_days") or 0) == int(horizon_days)
+            and (not context_source_family or str(rule.get("context_source_family") or "").strip().lower() == context_source_family)
+            and (not split_axis or str(rule.get("split_axis") or "").strip() == split_axis)
+            and (not split_value or str(rule.get("split_value") or "").strip() == split_value)
+            and (not context_class or str(rule.get("context_class") or "").strip() == context_class)
+            and (not direction or str(rule.get("direction") or "").strip().lower() == direction)
+        ]
+        valid_matches = [rule for rule in matches if rule.get("valid")]
+        return {
+            "status": "verified" if valid_matches else "not_found_or_invalid",
+            "source_type": source_type,
+            "config_path": str(config_path),
+            "verified": bool(valid_matches),
+            "overlay": overlay,
+            "minimum_horizon_days": int(horizon_days),
+            "context_source_family": context_source_family,
+            "split_axis": split_axis,
+            "split_value": split_value,
+            "context_class": context_class,
+            "direction": direction,
+            "matched_count": len(matches),
+            "valid_matched_count": len(valid_matches),
+            "matched_rules": matches[:5],
+            "config_summary": rules_payload.get("summary") or {},
+            "issues": rules_payload.get("issues") or [],
+            "operator_boundary": rules_payload.get("operator_boundary") or {},
+            "message": (
+                "Matching valid signal-quality overlay review rule is present in config."
+                if valid_matches
+                else "Matching signal-quality overlay review rule is missing or invalid in config."
+            ),
+        }
     if source_type != "ts_forecast_review_rule":
         return {
             "status": "not_supported",
             "source_type": source_type,
             "config_path": str(config_path),
             "verified": False,
-            "message": "Automatic config verification is currently implemented only for TS forecast review rules.",
+            "message": "Automatic config verification is currently implemented only for TS forecast and signal-quality overlay review rules.",
         }
     model_name = str(suggestion.get("ts_forecast_model_name") or suggestion.get("model_name") or "").strip().lower()
     horizon_days = suggestion.get("ts_forecast_horizon_days") or suggestion.get("horizon_days")
@@ -777,6 +980,70 @@ def load_latest_approved_signal_quality_decision(
     return row
 
 
+def load_latest_approved_signal_quality_split_decision(
+    *,
+    horizon_days: int,
+    variant: str,
+    source_family: str,
+    split_axis: str,
+    split_value: str,
+    reviewed_at: Any | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "horizon_days": int(horizon_days),
+        "variant": str(variant),
+        "source_family": str(source_family),
+        "split_axis": str(split_axis),
+        "split_value": str(split_value),
+    }
+    reviewed_filter = ""
+    if reviewed_at:
+        parsed_reviewed = pd.to_datetime(reviewed_at, utc=True, errors="coerce")
+        if pd.isna(parsed_reviewed):
+            raise ValueError(f"Invalid reviewed_at: {reviewed_at}")
+        params["reviewed_at"] = parsed_reviewed
+        reviewed_filter = "AND reviewed_at = %(reviewed_at)s"
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT *
+            FROM {SIGNAL_QUALITY_SPLIT_DECISIONS_TABLE}
+            WHERE horizon_days = %(horizon_days)s
+              AND variant = %(variant)s
+              AND source_family = %(source_family)s
+              AND split_axis = %(split_axis)s
+              AND split_value = %(split_value)s
+              AND decision = 'approved'
+              {reviewed_filter}
+            ORDER BY decided_at DESC
+            LIMIT 1
+            """,
+            params=params,
+            retries=3,
+        )
+    except Exception as exc:
+        _record_config_change_fallback(
+            "config_change_signal_quality_split_decision_load_failed",
+            source=SIGNAL_QUALITY_SPLIT_DECISIONS_TABLE,
+            reason="Config-change preview could not load an approved signal-quality split overlay decision; preview generation failed closed.",
+            error=exc,
+            metadata={
+                "horizon_days": int(horizon_days),
+                "variant": variant,
+                "source_family": source_family,
+                "split_axis": split_axis,
+                "split_value": split_value,
+                "reviewed_at": str(reviewed_at) if reviewed_at else None,
+            },
+        )
+        raise
+    if df.empty:
+        raise ValueError(f"No approved signal-quality split decision found for {horizon_days}/{source_family}/{split_axis}/{split_value}/{variant}")
+    row = df.iloc[0].to_dict()
+    row["final_patch"] = parse_jsonish(row.get("final_patch_json"), {})
+    return row
+
+
 def load_latest_approved_event_policy_decision(
     *,
     evaluated_at: Any,
@@ -940,6 +1207,113 @@ def build_signal_quality_overlay_preview(
     return result
 
 
+def build_signal_quality_split_overlay_preview(
+    *,
+    horizon_days: int,
+    variant: str,
+    source_family: str,
+    split_axis: str,
+    split_value: str,
+    reviewed_at: Any | None = None,
+    persist: bool = True,
+) -> dict[str, Any]:
+    decision = load_latest_approved_signal_quality_split_decision(
+        horizon_days=horizon_days,
+        variant=variant,
+        source_family=source_family,
+        split_axis=split_axis,
+        split_value=split_value,
+        reviewed_at=reviewed_at,
+    )
+    source_key = f"{decision.get('reviewed_at')}:{horizon_days}:{source_family}:{split_axis}:{split_value}:{variant}"
+    result = build_preview_from_patch(
+        source_type="signal_quality_split_overlay",
+        source_key=source_key,
+        patch_payload=decision.get("final_patch") or {},
+        persist=persist,
+    )
+    result["decision"] = {
+        key: decision.get(key)
+        for key in [
+            "decided_at",
+            "reviewed_at",
+            "horizon_days",
+            "variant",
+            "source_family",
+            "split_axis",
+            "split_value",
+            "operator_id",
+            "decision_reason",
+        ]
+    }
+    return result
+
+
+def build_causal_event_memory_rule_preview(
+    *,
+    horizon_days: int,
+    context_source: str,
+    context_class: str,
+    event_type: str,
+    direction: str,
+    event_state: str,
+    matured_count: int | None = None,
+    direction_hit_rate_after_cost: float | None = None,
+    avg_directional_helpfulness_score: float | None = None,
+    excess_direction_hit_rate_after_cost: float | None = None,
+    avg_excess_directional_helpfulness_score: float | None = None,
+    classification: str = "candidate_helpful",
+    persist: bool = True,
+) -> dict[str, Any]:
+    normalized_classification = str(classification or "candidate_helpful").strip()
+    group = {
+        "horizon_days": int(horizon_days),
+        "context_source": context_source,
+        "context_class": context_class,
+        "event_type": event_type,
+        "direction": direction,
+        "event_state": event_state,
+        "matured_count": matured_count,
+        "direction_hit_rate_after_cost": direction_hit_rate_after_cost,
+        "avg_directional_helpfulness_score": avg_directional_helpfulness_score,
+        "excess_direction_hit_rate_after_cost": excess_direction_hit_rate_after_cost,
+        "avg_excess_directional_helpfulness_score": avg_excess_directional_helpfulness_score,
+        "classification": normalized_classification,
+    }
+    suggestion = causal_memory_rule_suggestion_from_group(group)
+    source_key = f"{horizon_days}:{context_source}:{context_class}:{event_type}:{direction}:{event_state}"
+    operation = (
+        "causal_event_memory_low_weight_review_rule"
+        if normalized_classification == "candidate_helpful"
+        else "causal_event_memory_suppression_review_rule"
+    )
+    result = build_preview_from_patch(
+        source_type="causal_event_memory_rule",
+        source_key=source_key,
+        patch_payload={
+            "operation": operation,
+            "rule_suggestion": suggestion,
+            "evidence_group": group,
+            "broker_execution_allowed": False,
+            "policy_auto_promotion_allowed": False,
+            "authority": "review_input_only",
+        },
+        persist=persist,
+    )
+    result["decision"] = {
+        "source": "causal_event_memory_evaluator",
+        "classification": normalized_classification,
+        "horizon_days": int(horizon_days),
+        "context_source": context_source,
+        "context_class": context_class,
+        "event_type": event_type,
+        "direction": direction,
+        "event_state": event_state,
+        "operator_boundary": "preview_only_no_runtime_consumer_no_broker_authority",
+    }
+    return result
+
+
 def build_event_policy_review_rule_preview(
     *,
     evaluated_at: Any,
@@ -1030,12 +1404,36 @@ def load_previews(limit: int = 25) -> list[dict[str, Any]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate reviewed config diffs from approved promotion decisions without applying them.")
-    parser.add_argument("--source-type", choices=["technical_threshold", "signal_quality_overlay", "event_policy_review_rule", "ts_forecast_review_rule"], required=True)
+    parser.add_argument(
+        "--source-type",
+        choices=[
+            "technical_threshold",
+            "signal_quality_overlay",
+            "signal_quality_split_overlay",
+            "causal_event_memory_rule",
+            "event_policy_review_rule",
+            "ts_forecast_review_rule",
+        ],
+        required=True,
+    )
     parser.add_argument("--setup-id")
     parser.add_argument("--config-id")
     parser.add_argument("--evaluated-at")
     parser.add_argument("--horizon-days", type=int)
     parser.add_argument("--variant")
+    parser.add_argument("--source-family")
+    parser.add_argument("--split-axis")
+    parser.add_argument("--split-value")
+    parser.add_argument("--context-source")
+    parser.add_argument("--context-class")
+    parser.add_argument("--event-type")
+    parser.add_argument("--event-state")
+    parser.add_argument("--direction")
+    parser.add_argument("--matured-count", type=int)
+    parser.add_argument("--direction-hit-rate-after-cost", type=float)
+    parser.add_argument("--avg-directional-helpfulness-score", type=float)
+    parser.add_argument("--excess-direction-hit-rate-after-cost", type=float)
+    parser.add_argument("--avg-excess-directional-helpfulness-score", type=float)
     parser.add_argument("--group-type")
     parser.add_argument("--group-value")
     parser.add_argument("--model-name")
@@ -1063,6 +1461,37 @@ def main() -> int:
             horizon_days=int(args.horizon_days),
             variant=args.variant,
             reviewed_at=args.reviewed_at,
+            persist=not bool(args.dry_run),
+        )
+    elif args.source_type == "signal_quality_split_overlay":
+        if args.horizon_days is None or not args.variant or not args.source_family or not args.split_axis or not args.split_value:
+            raise SystemExit("--horizon-days, --variant, --source-family, --split-axis, and --split-value are required for signal_quality_split_overlay")
+        result = build_signal_quality_split_overlay_preview(
+            horizon_days=int(args.horizon_days),
+            variant=args.variant,
+            source_family=args.source_family,
+            split_axis=args.split_axis,
+            split_value=args.split_value,
+            reviewed_at=args.reviewed_at,
+            persist=not bool(args.dry_run),
+        )
+    elif args.source_type == "causal_event_memory_rule":
+        if args.horizon_days is None or not args.context_source or not args.context_class or not args.event_type or not args.direction or not args.event_state:
+            raise SystemExit(
+                "--horizon-days, --context-source, --context-class, --event-type, --direction, and --event-state are required for causal_event_memory_rule"
+            )
+        result = build_causal_event_memory_rule_preview(
+            horizon_days=int(args.horizon_days),
+            context_source=args.context_source,
+            context_class=args.context_class,
+            event_type=args.event_type,
+            direction=args.direction,
+            event_state=args.event_state,
+            matured_count=args.matured_count,
+            direction_hit_rate_after_cost=args.direction_hit_rate_after_cost,
+            avg_directional_helpfulness_score=args.avg_directional_helpfulness_score,
+            excess_direction_hit_rate_after_cost=args.excess_direction_hit_rate_after_cost,
+            avg_excess_directional_helpfulness_score=args.avg_excess_directional_helpfulness_score,
             persist=not bool(args.dry_run),
         )
     elif args.source_type == "event_policy_review_rule":

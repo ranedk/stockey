@@ -20,7 +20,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_THEME_CONFIG = REPO_ROOT / "config" / "investment_themes.yaml"
 DEFAULT_LOOKBACK_LIMIT = 25
 THEME_SCREENERS_TABLE = "advisory_news_theme_screeners"
+THEME_CONTEXT_OVERLAYS_TABLE = "advisory_news_theme_context_overlays"
 NEWS_THEME_SCHEMA_MIGRATION_ID = "20260611_advisory_news_theme_screeners_base"
+NEWS_THEME_CONTEXT_OVERLAY_SCHEMA_MIGRATION_ID = "20260620_advisory_news_theme_context_overlays_base"
+THEME_SECTOR_CODE_ALIASES: dict[str, tuple[str, ...]] = {
+    "CAPITALGOODS": ("IN0702",),
+    "ENGINEERING": ("IN0702",),
+    "INDUSTRIALS": ("IN0702",),
+    "INFRASTRUCTURE": ("IN0701", "IN0702"),
+}
+THEME_SECTOR_INTENTIONALLY_BROAD_KEYS: set[str] = set()
 NEWS_THEME_SCHEMA_STATEMENTS = [
     f"""
     CREATE TABLE IF NOT EXISTS {THEME_SCREENERS_TABLE} (
@@ -32,6 +41,35 @@ NEWS_THEME_SCHEMA_STATEMENTS = [
         created_ts TIMESTAMPTZ NOT NULL,
         updated_ts TIMESTAMPTZ NOT NULL,
         UNIQUE (theme_id, screener_slug)
+    )
+    """,
+]
+NEWS_THEME_CONTEXT_OVERLAY_SCHEMA_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {THEME_CONTEXT_OVERLAYS_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        overlay_id TEXT NOT NULL,
+        theme_id TEXT NOT NULL,
+        theme_name TEXT,
+        sector_name TEXT,
+        sector_code TEXT,
+        direction TEXT NOT NULL,
+        pressure_score DOUBLE PRECISION,
+        theme_intensity DOUBLE PRECISION,
+        hit_score DOUBLE PRECISION,
+        holding_profile TEXT,
+        holding_period_min_days INTEGER,
+        holding_period_max_days INTEGER,
+        risk_level TEXT,
+        ideal_screener_logic TEXT,
+        theme_reason TEXT,
+        invalidation_signals_json TEXT,
+        matched_sources_json TEXT,
+        suggested_screeners_json TEXT,
+        authority_scope TEXT NOT NULL DEFAULT 'watchlist_pressure_only',
+        production_status TEXT NOT NULL DEFAULT 'active',
+        load_ts TIMESTAMPTZ NOT NULL,
+        UNIQUE (asof_date, overlay_id)
     )
     """,
 ]
@@ -59,6 +97,89 @@ def _string_list(value: Any, *, upper: bool = False, lower: bool = False) -> lis
             text = text.lower()
         out.append(text)
     return out
+
+
+def theme_sector_key(value: Any) -> str:
+    return "".join(char for char in str(value or "").upper() if char.isalnum())
+
+
+def theme_sector_alias_values_sql() -> str:
+    values: list[str] = []
+    for key, sector_codes in sorted(THEME_SECTOR_CODE_ALIASES.items()):
+        for sector_code in sector_codes:
+            values.append(f"('{key}', '{sector_code}')")
+    return ",\n                ".join(values) or "('NO_THEME_ALIAS', 'NO_SECTOR')"
+
+
+def summarize_theme_sector_alias_coverage(overlays: pd.DataFrame) -> dict[str, Any]:
+    if not isinstance(overlays, pd.DataFrame) or overlays.empty or "sector_name" not in overlays.columns:
+        return {
+            "status": "no_theme_overlay_sectors",
+            "sector_count": 0,
+            "mapped_sector_count": 0,
+            "intentionally_broad_sector_count": 0,
+            "unmapped_sector_count": 0,
+            "unmapped_sectors": [],
+            "authority_scope": "diagnostic_only",
+            "broker_execution_allowed": False,
+        }
+
+    sectors = sorted({str(value).strip() for value in overlays["sector_name"].dropna().tolist() if str(value).strip()})
+    mapped: list[dict[str, Any]] = []
+    broad: list[dict[str, Any]] = []
+    unmapped: list[str] = []
+    for sector in sectors:
+        key = theme_sector_key(sector)
+        if key in THEME_SECTOR_CODE_ALIASES:
+            mapped.append({"sector_name": sector, "sector_key": key, "sector_codes": list(THEME_SECTOR_CODE_ALIASES[key])})
+        elif key in THEME_SECTOR_INTENTIONALLY_BROAD_KEYS:
+            broad.append(
+                {
+                    "sector_name": sector,
+                    "sector_key": key,
+                    "reason": "Broad theme bucket is intentionally not mapped to sector-code targets until a narrower symbol/universe policy is reviewed.",
+                }
+            )
+        else:
+            unmapped.append(sector)
+
+    return {
+        "status": "ok" if not unmapped else "unmapped_theme_overlay_sectors",
+        "sector_count": int(len(sectors)),
+        "mapped_sector_count": int(len(mapped)),
+        "intentionally_broad_sector_count": int(len(broad)),
+        "unmapped_sector_count": int(len(unmapped)),
+        "mapped_sectors": mapped,
+        "intentionally_broad_sectors": broad,
+        "unmapped_sectors": unmapped,
+        "authority_scope": "diagnostic_only",
+        "broker_execution_allowed": False,
+    }
+
+
+def _json_dumps(value: Any) -> str:
+    return json.dumps(value if value is not None else [], ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _slug(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    out = []
+    previous_dash = False
+    for char in text:
+        if char.isalnum():
+            out.append(char)
+            previous_dash = False
+        elif not previous_dash:
+            out.append("-")
+            previous_dash = True
+    return "".join(out).strip("-") or "market"
+
+
+def _int_or_none(value: Any) -> int | None:
+    parsed = pd.to_numeric(value, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    return int(parsed)
 
 
 def _normalize_screener_templates(raw_templates: Any) -> list[dict[str, Any]]:
@@ -289,6 +410,111 @@ def ensure_theme_table() -> None:
     )
 
 
+def ensure_theme_context_overlay_table() -> None:
+    apply_schema_migration(
+        migration_id=NEWS_THEME_CONTEXT_OVERLAY_SCHEMA_MIGRATION_ID,
+        statements=NEWS_THEME_CONTEXT_OVERLAY_SCHEMA_STATEMENTS,
+        owner="advisory.news_theme_engine",
+        description="Create review-only news theme sector/context overlay table.",
+        metadata={"tables": [THEME_CONTEXT_OVERLAYS_TABLE], "workflow": "news_theme_context_overlays"},
+    )
+
+
+def build_theme_context_overlays_from_recommendations(
+    *,
+    asof_date: pd.Timestamp | None,
+    recommendations: list[dict[str, Any]],
+) -> pd.DataFrame:
+    resolved = pd.to_datetime(asof_date, utc=True, errors="coerce")
+    if pd.isna(resolved) or not recommendations:
+        return pd.DataFrame()
+    resolved = resolved.normalize()
+    load_ts = pd.Timestamp.utcnow()
+    rows: list[dict[str, Any]] = []
+    for item in recommendations:
+        theme_id = str(item.get("theme_id") or "").strip().upper()
+        if not theme_id:
+            continue
+        intensity = pd.to_numeric(item.get("theme_intensity"), errors="coerce")
+        hit_score = pd.to_numeric(item.get("hit_score"), errors="coerce")
+        intensity_float = 0.0 if pd.isna(intensity) else float(intensity)
+        hit_score_float = None if pd.isna(hit_score) else float(hit_score)
+        holding_period = item.get("holding_period_days") if isinstance(item.get("holding_period_days"), dict) else {}
+        sector_entries: list[tuple[str, str | None]] = []
+        positive_sectors = _string_list(item.get("positive_sectors"))
+        negative_sectors = _string_list(item.get("negative_sectors"))
+        sector_entries.extend(("positive", sector) for sector in positive_sectors)
+        sector_entries.extend(("negative", sector) for sector in negative_sectors)
+        if not sector_entries:
+            sector_entries.append(("market_theme", None))
+
+        for direction, sector_name in sector_entries:
+            sector_slug = _slug(sector_name)
+            overlay_id = f"{resolved.date()}:{theme_id}:{direction}:{sector_slug}"
+            rows.append(
+                {
+                    "asof_date": resolved,
+                    "overlay_id": overlay_id,
+                    "theme_id": theme_id,
+                    "theme_name": str(item.get("theme_name") or theme_id).strip(),
+                    "sector_name": sector_name,
+                    "sector_code": sector_slug.upper() if sector_name else None,
+                    "direction": direction,
+                    "pressure_score": round(abs(intensity_float), 6),
+                    "theme_intensity": round(intensity_float, 6),
+                    "hit_score": hit_score_float,
+                    "holding_profile": str(item.get("holding_profile") or "").strip(),
+                    "holding_period_min_days": _int_or_none(holding_period.get("min")),
+                    "holding_period_max_days": _int_or_none(holding_period.get("max")),
+                    "risk_level": str(item.get("risk_level") or "").strip(),
+                    "ideal_screener_logic": str(item.get("ideal_screener_logic") or "").strip(),
+                    "theme_reason": str(item.get("theme_reason") or "").strip()[:1000],
+                    "invalidation_signals_json": _json_dumps(item.get("invalidation_signals") or []),
+                    "matched_sources_json": _json_dumps(item.get("matched_sources") or []),
+                    "suggested_screeners_json": _json_dumps(item.get("suggested_screeners") or []),
+                    "authority_scope": "watchlist_pressure_only",
+                    "production_status": "active",
+                    "load_ts": load_ts,
+                }
+            )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["asof_date"] = pd.to_datetime(df["asof_date"], utc=True, errors="coerce")
+    df["load_ts"] = pd.to_datetime(df["load_ts"], utc=True, errors="coerce")
+    for column in ["pressure_score", "theme_intensity", "hit_score"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    for column in ["holding_period_min_days", "holding_period_max_days"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce").astype("Int64")
+    return df.drop_duplicates(subset=["asof_date", "overlay_id"], keep="last")
+
+
+def build_theme_context_overlays(*, asof_date: pd.Timestamp | None = None, config_path: str | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
+    payload = build_theme_recommendations(asof_date=asof_date, config_path=config_path)
+    overlays = build_theme_context_overlays_from_recommendations(
+        asof_date=payload.get("asof_date"),
+        recommendations=payload.get("recommendations") or [],
+    )
+    alias_coverage = summarize_theme_sector_alias_coverage(overlays)
+    meta = {
+        "asof_date": payload.get("asof_date"),
+        "news_count": payload.get("news_count"),
+        "active_theme_count": len(payload.get("recommendations") or []),
+        "overlay_count": int(len(overlays)),
+        "error": payload.get("error"),
+        "authority_scope": "watchlist_pressure_only",
+        "sector_alias_coverage": alias_coverage,
+    }
+    return overlays, meta
+
+
+def persist_theme_context_overlays(df: pd.DataFrame) -> None:
+    ensure_theme_context_overlay_table()
+    if df.empty:
+        return
+    upsert_to_db(df, THEME_CONTEXT_OVERLAYS_TABLE, unique_keys=["asof_date", "overlay_id"], timescaledb_column="asof_date")
+
+
 def register_theme_screener(*, theme_id: str, screener_url: str, screener_name: str | None = None) -> dict[str, Any]:
     ensure_theme_table()
     normalized_theme_id = str(theme_id or "").strip().upper()
@@ -442,6 +668,12 @@ def parse_args() -> argparse.Namespace:
     recommend.add_argument("--format", choices=["text", "json"], default="text")
     recommend.add_argument("--config", dest="config_path")
 
+    overlays = subparsers.add_parser("build-overlays", help="Build review-only sector/theme context overlays")
+    overlays.add_argument("--date", help="Asof date in YYYY-MM-DD")
+    overlays.add_argument("--format", choices=["text", "json"], default="json")
+    overlays.add_argument("--config", dest="config_path")
+    overlays.add_argument("--dry-run", action="store_true")
+
     register = subparsers.add_parser("register-url", help="Register a Screener.in URL against a theme")
     register.add_argument("--theme-id", required=True)
     register.add_argument("--url", required=True)
@@ -467,6 +699,23 @@ def main() -> int:
         return 0
 
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
+    if args.command == "build-overlays":
+        overlays, meta = build_theme_context_overlays(asof_date=asof_date, config_path=args.config_path)
+        if not args.dry_run:
+            persist_theme_context_overlays(overlays)
+        payload = {
+            "status": "ok",
+            "dry_run": bool(args.dry_run),
+            "table": THEME_CONTEXT_OVERLAYS_TABLE,
+            "meta": meta,
+            "rows": overlays.to_dict(orient="records"),
+        }
+        if args.format == "json":
+            print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        else:
+            print(f"Theme context overlays: {len(overlays)} rows | authority=watchlist_pressure_only")
+        return 0
+
     payload = build_theme_recommendations(asof_date=asof_date, config_path=args.config_path)
     if args.format == "json":
         print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))

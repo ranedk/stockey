@@ -152,6 +152,7 @@ Current schedule:
 - `17:30` weekdays: `./complete_data.sh` end-of-day catch-up before advisory
 - `18:55` weekdays: `./all_advisory_preflight.sh` validates/refreshes Dhan auth and runs compact operator smoke before advisory
 - `19:10` weekdays: `./all_advisory.sh`, after waiting for data catch-up and external worker locks to clear
+- `22:20` weekdays: `./all_research_evidence.sh` refreshes research-only context/event/action-transition evidence without event-model training or policy changes
 - `23:10` weekdays: `./all_event_policy_evaluator.sh` after costs
 - `04:20` Saturdays: `./all_technical_threshold_calibration.sh` after costs
 - `03:10` Sundays: weekly `./all_ml.sh` for event-model research training
@@ -181,6 +182,8 @@ Important constraint:
 - `all_watchers.sh` also self-locks with `/tmp/stockey_watchers.lock`, so manual and cron watcher runs cannot overlap
 - watcher source cursors live in `advisory_sync_state`; if a watcher tick is skipped because the previous run is still active, the next run resumes from the last successful cursor instead of only checking the last `10` minutes
 - downloader/parser runner state also lives in `advisory_sync_state` under `download_runner:<module>` source names; failed rows are visible in Operator Health with classifications such as `source_unavailable`, `auth_unavailable`, `parse_failed`, and `no_data`
+- review-only signal-refresh state also lives in `advisory_sync_state` under `advisory:signal_refresh:context_overlays`, `advisory:signal_refresh:causal_memory`, and `continuous_watch:action_refresh`; full Operator Health reports stale, missing, or error rows separately from raw OHLCV/news/announcement watcher counters, confirms these rows have no portfolio or broker authority, and emits source-specific repair commands before the broad `./all_watchers.sh` fallback
+- `all_watchers.sh` also runs `python -m advisory.watchlist_builder --setup CONTEXT_OVERLAY_WATCH --rebuild --skip-if-current` after wait-signal matching, date-pinned to the latest trading day by default. This persists durable context-overlay watchlist pressure from fresh news, announcements, bhavcopy, macro, and exchange context without creating BUY/SELL authority, portfolio rows, lifecycle rows, or broker orders. The skip guard reuses the context signal-refresh sync state written by the watcher context cycle, so frequent cron runs do not rewrite durable context-watch rows unless new context signal evidence is newer than the watchlist snapshot. Tune with `WATCHER_AUTO_LATEST_TRADING_DATE`, force a rewrite with `WATCHER_CONTEXT_WATCHLIST_FORCE=true`, and skip only for targeted debugging with `WATCHER_SKIP_CONTEXT_WATCHLIST_RECONCILE=true`.
 - the shell wrappers resolve Python automatically, so cron does not need `source .xstockey/bin/activate`
 
 ## Operator Health
@@ -225,14 +228,15 @@ Use the Nuxt `/recommendations` page when you want to manually build a clean pap
 
 The workflow is intentionally separate from the advisory model portfolio:
 
-- The page shows only action-capable rows: `BUY`, `BUY_MORE`, `SELL`, and `PARTIAL_SELL`.
+- The page shows only paper-action-capable rows: `BUY`, `BUY_MORE`, `SELL`, `PARTIAL_SELL`, and review-only `REDUCE_EXPOSURE_REVIEW`.
 - `WATCH`, `HOLD`, and `MANUAL_REVIEW` stay out of this page; use Watchlist or Manual Review for those.
 - Each row shows exactly one operator action button: `BUY`, `BUY_50%`, `SELL`, or `SELL_50%`.
-- The page is paper-portfolio-state aware. After a reset, only `BUY` rows are shown because there is no open paper position to sell. Once a symbol is open in the paper ledger, `BUY_MORE`, `SELL`, and `PARTIAL_SELL` rows for that symbol can appear.
+- The page is paper-portfolio-state aware. After a reset, only `BUY` rows are shown because there is no open paper position to sell. Once a symbol is open in the paper ledger, `BUY_MORE`, `SELL`, `PARTIAL_SELL`, and `REDUCE_EXPOSURE_REVIEW` rows for that symbol can appear.
 - `BUY` writes one paper-ledger entry for the symbol at the visible current/reference price.
 - `BUY_50%` records a paper add/half-entry action.
 - `SELL` closes the currently open paper position at the visible current/reference price.
 - `SELL_50%` records a partial-exit paper action without closing the position.
+- `REDUCE_EXPOSURE_REVIEW` maps to `SELL_50%` in the paper ledger only when the symbol is already open. It remains review-only de-risk pressure, not live broker authority.
 - `/paper-portfolio` shows only entry price, exit price, current price, and percentage gain/loss.
 - The paper ledger does not mutate `advisory_action_recommendations`, `advisory_portfolio_orders`, Dhan execution rows, or live broker orders.
 
@@ -253,7 +257,7 @@ python -m advisory.event_data_quality --format json
 python -m advisory.event_data_quality --format text
 ```
 
-This check is read-only. It does not change portfolio state or action authority. It reports whether source tables are fresh, announcement documents have parse/OCR/text coverage, exchange events are typed, corporate-action/earnings/deal features are visible, and raw tables are large enough that UI/LLM paths should use compact evidence caches instead of direct scans.
+This check is read-only. It does not change portfolio state or action authority. It reports whether source tables are fresh, announcement documents have parse/OCR/text coverage, compact announcement evidence is review-ready versus archive-only, compact bhavcopy evidence has broad/directional coverage, exchange events are typed, corporate-action/earnings/deal features are visible, and raw tables are large enough that UI/LLM paths should use compact evidence caches instead of direct scans.
 
 Compact event evidence is rebuilt by `complete_data.sh` through `advisory.event_evidence_store`. Run it directly for targeted repair:
 
@@ -278,7 +282,7 @@ Useful API/token env knobs:
 - `OPERATOR_WEB_HEALTH_URL`: frontend URL checked by operator health, default `http://127.0.0.1:3000/`
 - `OPERATOR_WEB_HEALTH_TIMEOUT_SECONDS`: frontend runtime health timeout, default `3`
 
-`python -m advisory.operator_health --skip-dhan` defaults to JSON for cron/API consumers. Use `--format text` for a short terminal summary, or `--format json` when piping into another script.
+`python -m advisory.operator_health --skip-dhan` defaults to JSON for cron/API consumers. Use `--format text` for a short terminal summary, or `--format json` when piping into another script. Use `--check <section_name>` to run one read-only section without the full Health payload, for example `python -m advisory.operator_health --check theme_sector_alias_coverage --skip-dhan`.
 
 Cron log health is run-aware. A traceback followed by a later success marker is shown as a warning with `latest_run_status=ok_after_historical_errors`; a traceback or failed status after the latest success marker remains an error. This prevents old failures from keeping the page red after a recovered run while still preserving historical errors for audit.
 
@@ -311,10 +315,15 @@ Current marker-enabled wrappers:
 - `all_ts_forecast_workflow.sh`
 - `all_ts_forecast_evaluator.sh`
 - `all_ts_forecast_paper_portfolio.sh`
+- `all_research_evidence.sh`
 - `all_event_policy_evaluator.sh`
 - `all_technical_threshold_calibration.sh`
 
 Most wrappers use `scripts/run_with_markers.sh`; `all_frontend.sh` emits markers internally so it can still clean up supervised API/Nuxt child processes on exit or interruption.
+
+Operator Health full mode now has a dedicated `ts_forecast_paper` section. If the research-only TS forecast paper-portfolio table is missing, empty, stale, or has no matured outcomes, Health shows a fix hint for `python -m advisory.ts_forecast_paper_portfolio --log-research-ledger` followed by `python -m advisory.ts_forecast_promotion_check --format json`. The same state is included in the Advisory Trust Gate and Current Blockers as `research_evidence`, so TS forecast promotion readiness is not confused with live advisory readiness. This is evidence generation only; it does not promote a forecast model, mutate recommendations, change portfolio state, or call the broker.
+
+Operator Health full mode also has a `technical_threshold_evidence` section. It checks the persisted technical-threshold calibration tables before any threshold-promotion review is trusted. Missing tables, stale/empty rows, bounded first-pass runs, missing summary columns, too few matured signals, no review candidate, no positive after-cost candidate, or no lift over the baseline threshold set all remain `research_evidence` blockers. A green check means the calibration is ready for offline/manual review only; it does not edit thresholds, mutate recommendations, change portfolio state, or call the broker.
 
 ## Database robustness knobs
 
@@ -420,6 +429,7 @@ Command:
 Default performance behavior:
 
 - runs `dhan_auth_preflight` first unless `ADVISORY_DHAN_PREFLIGHT=false`; this validates or refreshes Dhan auth before expensive advisory stages
+- runs bounded review-only context-overlay signal refresh only when the persisted sync state is not already current for the preview, then context-overlay watchlist reconciliation and causal-memory signal refresh before the long advisory reconciliation unless `ADVISORY_SKIP_PRE_SIGNAL_REFRESH=true`
 - runs independent local/DB feature stages with bounded threads
 - skips hidden rule-engine daily/intraday repair by default
 - expects data gaps to be handled by `complete_data.sh`, watchers, or the external task queue
@@ -434,11 +444,20 @@ ADVISORY_DISABLE_RULE_REPAIR=0 ./all_advisory.sh
 ADVISORY_STAGE_BUDGET_SECONDS=900 ./all_advisory.sh
 ADVISORY_STAGE_BUDGET_OVERRIDES=rules=1800,exchange_features=900 ./all_advisory.sh
 ADVISORY_DHAN_PREFLIGHT=false ./all_advisory.sh
+ADVISORY_SKIP_PRE_SIGNAL_REFRESH=true ./all_advisory.sh
+ADVISORY_SKIP_PRE_CONTEXT_WATCHLIST_RECONCILE=true ./all_advisory.sh
+ADVISORY_AUTO_LATEST_TRADING_DATE=false ./all_advisory.sh
 ```
 
 Use `ADVISORY_DISABLE_RULE_REPAIR=0` only when you deliberately want the advisory batch to repair missing Dhan/fundamental inputs inline. That can make the run much slower.
 
+By default, `all_advisory.sh` resolves the latest trading day from `dim_trading_days` with `python -m advisory.advisory_date --format date` and passes it to the advisory run as `--date`. This prevents weekend/holiday calendar drift where same-day advisory candidates are missing while the latest trading session already has rows. If you pass `./all_advisory.sh --date YYYY-MM-DD`, that explicit date wins. If trading-day resolution fails, the wrapper reports `step=resolve_advisory_date`; refresh trading-day data with `complete_data.sh`, pass an explicit `--date`, or set `ADVISORY_AUTO_LATEST_TRADING_DATE=false` only for targeted debugging.
+
 Use `ADVISORY_DHAN_PREFLIGHT=false` only for targeted dry-runs that do not need Dhan-backed price refresh. Normal advisory runs should keep the preflight enabled so an expired token fails or refreshes before the expensive pipeline starts. If this preflight fails, `all_advisory.sh` reports `step=dhan_auth_preflight`, prints `scripts/start_chrome_cdp.sh` as the first repair step when CDP may be unavailable, and then prints the auth refresh command instead of an old advisory stage report. `python -m data.dhanlive.auth_cli ensure --auto-login` returns structured JSON for refresh failures such as CDP/Chrome being unavailable, so cron logs should show `status=error`, `error_type`, `error`, and `operator_action` rather than a Python traceback. Related knobs are `ADVISORY_DHAN_PREFLIGHT_AUTO_LOGIN`, `ADVISORY_DHAN_PREFLIGHT_MIN_FRESH_MINUTES`, and `ADVISORY_DHAN_PREFLIGHT_SKIP_VALIDATE`.
+
+The pre-advisory refresh first runs `advisory.signal_refresh --from-context-overlays --skip-if-current`, then runs `advisory.watchlist_builder --setup CONTEXT_OVERLAY_WATCH --rebuild --skip-if-current`, and then, by default, runs `advisory.signal_refresh --from-causal-memory` before `advisory.master_pipeline`. The wrapper passes the resolved latest trading day, or the explicit `--date YYYY-MM-DD` you supplied, to signal refresh as `--asof-date YYYY-MM-DD` and to the watchlist builder as `--date YYYY-MM-DD`. Signal-refresh `--skip-if-current` performs a cheap sync-state/input-diagnostic precheck and skips target loading plus duplicate writes when source/watchlist/portfolio counts and the no-broker authority contract are already current. Watchlist-builder `--skip-if-current` skips only when same-date active `CONTEXT_OVERLAY_WATCH` rows exist, the upstream context signal-refresh sync state is `ok`, the sync as-of date matches, and the watchlist rows are at least as fresh as that signal-refresh run; missing or stale sync state rebuilds instead of silently trusting old rows. Signal-refresh rows are review-only Action Queue visibility with `portfolio_authority=none`, `broker_execution_allowed=false`, and `full_advisory_required=true`; context-watchlist reconciliation only persists `CONTEXT_OVERLAY_WATCH` rows and does not mutate portfolio, risk, lifecycle, action authority, or broker state. Tune with `ADVISORY_PRE_SIGNAL_REFRESH_LIMIT`, `ADVISORY_PRE_SIGNAL_REFRESH_FORCE`, `ADVISORY_PRE_CONTEXT_WATCHLIST_FORCE`, `ADVISORY_SKIP_PRE_CONTEXT_WATCHLIST_RECONCILE`, `ADVISORY_PRE_CAUSAL_MEMORY_REFRESH`, and `ADVISORY_PRE_CAUSAL_MEMORY_REFRESH_LIMIT`. Set `ADVISORY_PRE_SIGNAL_REFRESH_FORCE=true` only when you deliberately want to ignore current sync state and rewrite bounded context-overlay signal rows. Set `ADVISORY_PRE_CONTEXT_WATCHLIST_FORCE=true` only when you deliberately want to rewrite durable context-watch rows. If signal refresh fails, `all_advisory.sh` reports `step=pre_advisory_signal_refresh`; if context-watchlist reconciliation fails, it reports `step=pre_advisory_context_watchlist_reconcile` and prints the bounded watchlist-builder repair command. Set skip flags only for targeted debugging.
+
+Use `./all_context_to_entry_repair.sh` when `python -m advisory.recommendation_diagnostics --format text` says positive context pressure exists but `context_to_entry_pipeline.positive_context_entry_blocker` is `context_watchlist_reconcile_required`, `technical_feature_stale`, `technical_refresh_issue`, `technical_entry_confirmation_pending`, or `downstream_consolidation_or_transition_gate`. The wrapper runs only the bounded context-to-entry repair sequence: context-overlay signal refresh, `CONTEXT_OVERLAY_WATCH` reconciliation, targeted context-watch technical refresh, `advisory.pipeline --start-at rules --stop-at actions --skip-peer-sync --skip-intraday --skip-rule-snapshot-refresh --skip-intraday-prefetch --include-lifecycle`, Action Queue refresh, and diagnostics. The targeted technical refresh uses `advisory.recommendation_diagnostics --context-watch-technical-command-only` to select only active `CONTEXT_OVERLAY_WATCH` symbols and pin the refresh date to the latest Dhan-backed daily OHLCV date when Dhan lags the exchange calendar. It does not run downloads, full peer sync, full intraday refresh, live execution, or broker orders. The cron schedule runs it before `all_advisory.sh`, and the full advisory cron waits for `/tmp/stockey_context_to_entry_repair.lock` so the long run does not race stale context-watch repair. Tune with `CONTEXT_REPAIR_SIGNAL_REFRESH_LIMIT`, `CONTEXT_REPAIR_SIGNAL_REFRESH_FORCE`, `CONTEXT_REPAIR_WATCHLIST_FORCE`, `CONTEXT_REPAIR_SKIP_TECHNICAL_REFRESH`, `CONTEXT_REPAIR_SKIP_BOUNDED_ADVISORY`, `CONTEXT_REPAIR_SKIP_ACTION_REFRESH`, and `CONTEXT_REPAIR_SKIP_DIAGNOSTICS`.
 
 Use `./all_advisory_preflight.sh` before manual long advisory runs when you want to verify Dhan/CDP/token readiness and compact operator trust state without launching `advisory.master_pipeline`. It accepts the same Dhan preflight env knobs plus `ADVISORY_PREFLIGHT_SKIP_SMOKE=true` and `ADVISORY_PREFLIGHT_FIX_HINT_LIMIT`.
 
@@ -459,7 +478,43 @@ python scripts/advisory_stage_report.py --format json
 
 The same read-only report is also available from the Operations page as the audited `advisory_stage_report` command. Use the UI command when you want the run recorded in operator command history.
 
-Operator Health also checks this report. If the latest `all_advisory.log` has no parseable stage summary, if any stage is over budget, or if a failed/incomplete run only emitted stage markers before the traceback, Health emits a fix hint pointing to the CLI command and the audited Operations command. Failed marker-only runs should show the nearest failed stage, for example `intraday`, instead of a generic missing-summary warning.
+For missing-BUY or rising-market underparticipation triage, run:
+
+```sh
+python -m advisory.recommendation_diagnostics --format text
+```
+
+The same read-only report is available from the Operations page as the audited `recommendation_diagnostics` command and from `/api/research/recommendation-diagnostics`. It diagnoses stale candidate rows, technical-entry confirmation gaps, context-overlay conversion gaps, signal-quality benchmark-attribution blockers, downstream consolidation, market participation, and recommended bounded refresh commands. It also checks whether context-overlay signal refresh is already current for the preview; if it is, the bounded refresh command is suppressed and the next step is full advisory reconciliation. It does not mutate recommendations, portfolio rows, config, or broker orders.
+
+Before trusting macro/news/announcement/bhavcopy/exchange context overlays as anything stronger than watch/de-risk evidence, run the source-family validation reports:
+
+```sh
+python -m advisory.context_overlay_reliability_report --horizons 5 10 20 --format text
+python -m advisory.signal_quality_family_report --horizons 5 10 20 --format text
+python -m advisory.llm_provenance_audit --lookback-days 30 --limit-per-table 100 --format text
+python -m advisory.action_evidence_provenance --dry-run --limit 250 --format text
+python -m advisory.causal_event_provenance --dry-run --limit 250 --format text
+```
+
+The same reports are available from the Operations page as audited `context_overlay_reliability_report`, `signal_quality_family_report`, `llm_provenance_audit`, `action_evidence_provenance_dry_run`, and `causal_event_provenance_dry_run` commands. All are read-only from Operations. The context reports compare evidence against realised outcomes after costs and benchmark attribution; the LLM provenance audit checks prompt id/version, response schema, model, evidence, and authority metadata on persisted LLM/Codex-derived rows; the provenance dry runs show final-action-to-evidence lineage and source-to-memory-to-outcome lineage without persisting rows. They do not create promotion rows, repair metadata, change config, mutate recommendations, or call the broker.
+
+Operator Health full mode also runs the LLM provenance audit with the same bounded 30-day / 100-row-per-table defaults. Open provenance issues appear as `research_evidence` in fix hints, the Advisory Trust Gate, and Current Blockers. A warning means affected LLM-derived rows are not production-auditable until prompt/schema/evidence/authority metadata is repaired; it still does not repair rows or change policy by itself.
+
+Operator Health full mode also runs typed provenance graph builders in dry-run mode. Open `provenance_graph_dry_runs` warnings mean final action lineage or causal-memory source-to-outcome lineage is missing or failed to build. These warnings are `research_evidence` blockers only: the check does not persist provenance rows, change recommendations, change config, or call the broker.
+
+Operator Health full mode also checks persisted causal event-memory evaluation evidence. Open `causal_event_memory_evidence` warnings mean causal memory has not yet produced fresh matured point-in-time outcome labels, so causal memory must remain explanation-only. An `ok` status can still have `ready_for_policy_review=false`; that means labels exist but no helpful candidate group has proved enough lift for offline rule design. Any config preview remains dry-run/manual-review only.
+
+Operator Health full mode also checks persisted event-policy evaluation evidence. Open `event_policy_evidence` warnings mean event-policy LLM/classification outputs are missing outcome labels, stale, benchmark-unattributed, beta-only, or still on a pre-benchmark-attribution summary schema. A beta-only warning keeps event-policy influence research-only until `advisory.event_policy_evaluator` shows benchmark-excess usefulness, not just positive returns during an up-market. If Health reports missing benchmark columns, rerun the evaluator/migration before creating event-policy promotion reviews.
+
+Operator Health full mode also checks persisted context-watch and negative-pressure evaluation evidence. Open `context_watch_evidence` warnings mean review-only WATCH/context priority rows are missing labels, stale, beta-only, or not matured enough to justify any watch-priority policy review. Open `negative_pressure_evidence` warnings mean review-only de-risk pressure rows are missing labels, stale, beta-only, or not matured enough to justify any de-risk policy review. Both checks require benchmark-attributed matured labels; they do not create BUY, SELL, portfolio, or broker authority.
+
+Operator Health full mode also checks persisted adversarial-review evaluation evidence. Open `adversarial_review_evidence` warnings mean veto/penalty/manual-review rules are missing outcome labels, stale, benchmark-unattributed, or only useful because the benchmark fell. A beta-only warning keeps adversarial veto policy research-only until `advisory.adversarial_review_evaluator` shows benchmark-excess protection, not just raw avoided loss during broad selloffs.
+
+Operator Health full mode also checks persisted signal-quality narrowed split evidence. Open `signal_quality_split_evidence` warnings mean the split evaluator tables are missing, stale, unmatured, or have incomplete matching `technical_only` baselines. Under-baselined splits stay research-only and should block broad source-family promotion until `advisory.signal_quality_split_evaluator --stability-report` shows stable candidates with complete baselines.
+
+`./all_research_evidence.sh` and `advisory.research_evidence_runner` now emit a consolidated `research_evidence.readiness_summary`. Treat `candidate_evidence_available` as “inspect research candidates only”, `not_ready` as “collect more matured benchmark-attributed evidence”, and `all_skipped` as “the run did not execute evidence components.” Operator Health reads the latest `logs/cron/research_evidence.log` summary as `research_evidence_run_summary`; missing logs, failed runs, skipped runs, not-ready evidence, or authority-boundary violations appear as research-evidence fix hints, Trust Gate warnings, and Current Blockers. None of these states change live policy, portfolio rows, config, or broker behavior.
+
+Operator Health also checks advisory stage reports. If the latest `all_advisory.log` has no parseable stage summary, if any stage is over budget, or if a failed/incomplete run only emitted stage markers before the traceback, Health emits a fix hint pointing to the CLI command and the audited Operations command. Failed marker-only runs should show the nearest failed stage, for example `intraday`, instead of a generic missing-summary warning.
 
 `all_advisory.sh` also prints this stage report automatically when the wrapped advisory command fails. If Dhan automated login hits Playwright's sync API inside an existing asyncio loop, the auth layer retries the automated login in a subprocess before giving up; this avoids the historical intraday-stage crash where the traceback ended with `Playwright Sync API inside the asyncio loop`.
 
@@ -505,8 +560,9 @@ Use this table when deciding whether to run a full advisory pass, rely on watche
 | Flow | What starts it | What it reads | What it writes | What it can change | What it cannot do |
 | --- | --- | --- | --- | --- | --- |
 | Full advisory | `./all_advisory.sh` after fresh data, normally post-close | Screener universe, snapshots, event policy, adversarial review, risk, portfolio, lifecycle, action history | Current advisory tables including portfolio/order plans, lifecycle, consolidated action recommendations, execution previews, traces, and operator snapshot | Authoritative daily portfolio/action reconciliation and dry-run execution-plan state | Submit live broker orders without explicit live-execution gates |
-| Watchers | `./all_watchers.sh` cron or loop during market hours | Active watchlist names, open positions, recent OHLCV, news, announcements, wait signals, persisted watcher cursors | Watch alerts, fresh source rows, wait-signal matches, signal-refresh rows, trace summaries, operator snapshot | Fast operator visibility for fresh evidence and per-symbol action/evidence changes | Replace the full cross-sectional advisory, recompute authoritative portfolio allocation, or submit orders |
+| Watchers | `./all_watchers.sh` cron or loop during market hours | Active watchlist names, open positions, recent OHLCV, news, announcements, wait signals, context overlays, persisted watcher cursors | Watch alerts, fresh source rows, durable `CONTEXT_OVERLAY_WATCH` rows, wait-signal matches, signal-refresh rows, trace summaries, operator snapshot | Fast operator visibility for fresh evidence, context-watch intake, and per-symbol action/evidence changes | Replace the full cross-sectional advisory, recompute authoritative portfolio allocation, or submit orders |
 | Fast signal refresh | Watcher router or `python -m advisory.signal_refresh ...` | Latest consolidated action, lifecycle/rebalance rows, event-policy rows, matched wait signals for one symbol, and router price/news/announcement trigger context when available | `advisory_signal_refresh_actions`, trace rows, materialized trace summaries | Show whether a symbol-level signal changed, created a wait-match action, matched a review-only stop/entry watcher trigger, or only refreshed evidence, including previous action and action-changed trace fields | Run full allocation/risk sizing across the universe or mutate authoritative portfolio rows |
+| Fast action consolidation | `python -m advisory.action_recommender --date YYYY-MM-DD --format text` when `recommendation_diagnostics` prints an action-refresh command | Recent review-only signal-refresh rows plus existing advisory/action context | One consolidated `advisory_action_recommendations` row per affected symbol plus action-conflict/trace audit rows | Make fresh watcher/router/context evidence visible in the Action Queue as `WATCH`, `REDUCE_EXPOSURE_REVIEW`, `TIGHTEN_STOP`, or `MANUAL_REVIEW` without rerunning the long advisory pipeline | Create BUY/SELL broker authority, recompute risk sizing, mutate portfolio rows, or replace full advisory reconciliation |
 | Execution Approvals | `/execution-approvals` or `/api/execution/approvals` after dry-run execution previews exist | Latest `advisory_execution_orders` rows, execution safety contracts, audit-only approval decisions, broker order-state reads when reconciliation is requested, historical execution evidence rows when evidence review is requested, and current planned rows when live-submit preflight is requested | Optional audit rows in `advisory_execution_approval_decisions`; optional safety-contract update to `operator_approval_status=approved` after latest `approve_dry_run` audit; optional reconciliation/fill persistence through `/api/execution/reconcile` with `confirm=true`; optional evidence review rows in `advisory_execution_evidence_reviews`; optional live-allowance rows in `advisory_execution_live_allowance_reviews` | Show missing operator approval, broker reconciliation, live-evidence checklist, live-submission, and dry-run blockers; record review intent; mark operator approval status after reviewed audit; preview or persist broker reconciliation; mark evidence passed after enough reviewed cycles; set `live_submission_allowed=true` after all safety gates and exact phrase are satisfied; generate the read-only live-submit preflight token and manual CLI command | Bypass approval, bypass evidence checklist, submit orders from the UI/API, or treat reconciliation/evidence/live allowance/preflight as broker submission |
 | Regime Review | `python -m advisory.regime_overlay` creates proposals; `/regime-overlays` records decisions | Base market regime, market context, macro features, recent news, announcement-event counts, proposed rules | `advisory_regime_overlay_proposals` and `advisory_regime_overlay_decisions` | Approve a regime overlay for testing, promote it to a review-rule candidate, reject it, or request more evidence | Directly relax market gates, change sizing, create actions, mutate portfolio rows, or submit broker orders |
 | Wait signals | Playbook action plans, Manual Review `watch_for_event`, or `python -m advisory.wait_signals ...` | Typed wait conditions plus price/news/announcement evidence | `advisory_wait_signals` and `advisory_wait_signal_matches` | Record that a future condition is active, matched, expired, or closed | Trade, approve actions, or change portfolio state by itself |
@@ -516,6 +572,8 @@ Operator rule of thumb:
 
 - Use `./all_advisory.sh` when the question is "what is the authoritative current action/portfolio state?"
 - Use watcher and signal-refresh output when the question is "what changed intraday for a watched symbol?"
+- If `python -m advisory.recommendation_diagnostics --format text` prints a fast action-refresh command, run that `advisory.action_recommender` command for quick Action Queue visibility; still run `./all_advisory.sh` for authoritative portfolio/risk reconciliation when `full_advisory_rerun_recommended=true`.
+- `advisory.action_recommender` defaults to compact/log-safe samples. Use `--full-sample` only when you explicitly need raw `raw_context_json` and `recommendation_reason_json` payloads.
 - Use `/wait-signals` when the question is "which future evidence did we decide to wait for, and did it arrive?"
 - Use `/regime-overlays` when the question is "does this proposed macro/news regime layer deserve testing, rejection, or future rule implementation?"
 - Use `/manual-review` when the question is "what explicit operator decision should be recorded for this item?"
@@ -568,12 +626,14 @@ Use when:
 Command:
 
 ```sh
+./all_research_evidence.sh
 ./all_ml.sh
 ```
 
 Useful variants:
 
 ```sh
+./all_research_evidence.sh --skip-signal-quality --skip-causal-event-memory
 ./all_ml.sh --prep-only
 ./all_ml.sh --horizon-days 1
 ```
@@ -661,9 +721,12 @@ Important behavior:
 - OHLCV, news, and announcements use persisted cursors in `advisory_sync_state`, not cron wall-clock assumptions
 - OHLCV keeps a small overlap on every pull and does not advance `last_item_ts` when no fresh intraday candle was actually observed
 - OHLCV watcher catch-up is capped by `WATCHER_OHLCV_MAX_LOOKBACK_MINUTES` to avoid a stale cursor making every `10` minute cron run download days of 1-minute candles; `complete_data.sh` remains the broad catch-up path
+- Announcement watcher ingest/OCR is capped by `WATCHER_ANNOUNCEMENT_MAX_INGEST_TARGETS` on frequent watcher runs. Skipped targets are reported in source counters, are not marked checked, and remain due for later watcher runs or catch-up scripts.
 - Live price alerts use `WATCHER_ALERT_COOLDOWN_SECONDS` to suppress repeated alerts with the same setup/symbol/type/source/state fingerprint. The watcher publishes `alert_input_count`, `alert_persisted_count`, and `alert_suppressed_count`; if the dedupe lookup fails, it records fallback telemetry and persists alerts fail-open so evidence is not lost.
+- Context-overlay watchlist reconciliation is date-pinned by `WATCHER_AUTO_LATEST_TRADING_DATE=true` and runs under the same watcher lock. It writes only `CONTEXT_OVERLAY_WATCH` rows, skips duplicate rebuilds with `--skip-if-current`, can be force-rebuilt with `WATCHER_CONTEXT_WATCHLIST_FORCE=true`, and can be skipped with `WATCHER_SKIP_CONTEXT_WATCHLIST_RECONCILE=true` for debugging.
 - Each watcher cycle writes normalized `source_counters` into its result and `advisory_sync_state`: OHLCV reports symbols, sync results, latest-price rows, alert persisted/suppressed counts; news reports watch rows, RSS item count, matched/persisted event counts, triggered/context counts, and feed count; announcements report watch rows, unique ingest targets, ingest run/discovered/parsed/failed counts, matched/persisted event counts, and watch-update count.
-- Operator Health and the Health page show the latest watcher `source_counters`, including stale/missing/error status and a fix hint to rerun `./all_watchers.sh` when OHLCV/news/announcement watcher output is not healthy.
+- Operator Health and the Health page show the latest watcher `source_counters`, including stale/missing/error status and a fix hint to rerun `./all_watchers.sh` when OHLCV/news/announcement watcher output is not healthy. Full Operator Health also checks review-only signal-refresh sync state for context overlays, causal memory, and bounded action refresh, so data-arrival failures and signal-consumption failures are visible as separate operational issues.
+- When only signal-consumption state is stale, prefer the Health fix-hint order: `python -m advisory.signal_refresh --from-context-overlays --limit 50 --format text` for context overlays, `python -m advisory.signal_refresh --from-causal-memory --limit 25 --format text` for causal memory, and `python -m advisory.recommendation_diagnostics --format text` to get the exact bounded Action Queue refresh command. Use `./all_watchers.sh` when multiple watcher-derived states are stale or you want the normal one-shot market-hours loop.
 - if a run fails before cursor persistence, the next due run retries from the previous successful cursor
 - `complete_data.sh` or `all_downloaders.sh` remains the broad end-of-day catch-up path if a full day was missed
 - there is no default cap on how many symbols the router may reevaluate
@@ -694,14 +757,22 @@ Commands:
 python -m advisory.signal_refresh --symbol RELIANCE --reason manual --format text
 python -m advisory.signal_refresh --symbol RELIANCE --unique-id <event-id> --reason announcement --format json
 python -m advisory.signal_refresh --from-router --limit 25 --format text
+python -m advisory.signal_refresh --from-context-overlays --limit 50 --dry-run --format json
+python -m advisory.signal_refresh --from-causal-memory --limit 25 --dry-run --format json
 ```
 
 What it does:
 
 - reads the latest consolidated action, lifecycle/rebalance, and event-policy rows for the symbol
 - checks matched hypothesis Wait Signals for the symbol
+- checks positive/watch context overlays for review-only `WATCH` discovery rows and negative context overlays for existing watchlist/portfolio exposure when `--from-context-overlays` is used; `--from-theme-context` remains an older alias and also includes direct announcement/exchange/bhavcopy overlays
+- suppresses negative/de-risk context signals from source families that current reliability evidence classifies as `hurts_or_no_lift`, `negative_after_cost`, or `inconsistent_or_horizon_sensitive`; the command reports `reliability_suppressed_target_rows` and sample suppressed rows instead of silently dropping them
+- returns `diagnostics.empty_reason`, source table row counts/latest dates, and watchlist/portfolio freshness for `--from-context-overlays`, so a zero-row run distinguishes missing/empty overlay data from available overlays that simply did not match exposure
+- checks fresh symbol-scoped causal event-memory rows when `--from-causal-memory` is used; only exact `candidate_helpful` evaluator groups with clean contradiction state and enough decayed pressure can create review-only `WATCH` or `REDUCE_EXPOSURE_REVIEW` rows
+- reports causal-memory suppression diagnostics: `candidate_helpful_memory_rows`, `harmful_or_no_lift_suppressed_memory_rows`, `non_candidate_suppressed_memory_rows`, and `suppression_policy`. Harmful/no-lift and non-candidate groups are counted as suppressed evidence and cannot create watch/de-risk rows.
+- full Operator Health exposes the same causal-memory suppression counters from the latest `advisory:signal_refresh:causal_memory` sync-state row, so Health can explain a zero-row causal-memory refresh without running the CLI manually.
 - gives priority to exit/reduce lifecycle signals over stale buy/watch signals
-- uses watcher-router trigger context when available: stop/invalidation price alerts become review-only `REDUCE_EXPOSURE_REVIEW`, entry-zone/breakout alerts become review-only `WATCH`, and fresh news/announcement router context becomes `MANUAL_REVIEW` until event-policy/full advisory catches up
+- uses watcher-router trigger context when available: stop/invalidation price alerts become review-only `REDUCE_EXPOSURE_REVIEW`, entry-zone/breakout alerts become review-only `WATCH`, and fresh news/announcement router context becomes review-only `WATCH` evidence until event-policy/full advisory catches up
 - writes `advisory_signal_refresh_actions`
 - appends decision trace rows and refreshes materialized symbol/event trace summaries
 - does not run cross-sectional portfolio allocation or mutate the authoritative portfolio
@@ -900,6 +971,7 @@ python -m advisory.research_ledger --limit 20
 ```sh
 python -m advisory.event_router --dry-run
 python -m advisory.signal_refresh --from-router --limit 25 --dry-run --format text
+python -m advisory.signal_refresh --from-context-overlays --limit 50 --dry-run --format json
 ```
 
 ## Recommended daily order
@@ -909,8 +981,9 @@ python -m advisory.signal_refresh --from-router --limit 25 --dry-run --format te
 1. `./complete_data.sh`
 2. `./all_advisory.sh`
 3. inspect portfolio output and traces if something looks unusual
-4. optional research: `./all_ml.sh`
-5. optional research: `python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 20`
+4. optional research evidence refresh: `./all_research_evidence.sh`
+5. optional long-running research training: `./all_ml.sh`
+6. optional research: `python -m advisory.ts_forecast_features --symbols RELIANCE TCS --horizons 5 10 20`
 
 ### Live monitoring mode
 
@@ -929,6 +1002,7 @@ The continuous-watch stack publishes lightweight messages on these channels:
 - `stockey:continuous_watch:news`
 - `stockey:continuous_watch:announcements`
 - `stockey:continuous_watch:router`
+- `stockey:continuous_watch:causal_memory`
 - `stockey:continuous_watch:operator_frontend`
 - `stockey:continuous_watch:summary`
 

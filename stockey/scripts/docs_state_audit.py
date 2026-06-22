@@ -56,6 +56,7 @@ REQUIRED_COVERAGE = {
         ("Nuxt operator frontend", re.compile(r"\bNuxt\b.*\boperator frontend\b", re.IGNORECASE | re.DOTALL)),
         ("go-crond command", re.compile(r"\./go-crond\s+config/stockey\.generated\.crontab\s+--allow-unprivileged")),
         ("weekly all_ml", re.compile(r"\ball_ml\.sh\b.*\bweekly\b|\bweekly\b.*\ball_ml\.sh\b", re.IGNORECASE | re.DOTALL)),
+        ("daily research evidence", re.compile(r"\ball_research_evidence\.sh\b.*\bresearch[- ]only\b|\bresearch[- ]only\b.*\ball_research_evidence\.sh\b", re.IGNORECASE | re.DOTALL)),
         ("daily all_advisory", re.compile(r"\ball_advisory\.sh\b.*\bonce daily\b|\bonce daily\b.*\ball_advisory\.sh\b", re.IGNORECASE | re.DOTALL)),
     ],
     "todo.md": [
@@ -71,10 +72,24 @@ REQUIRED_COVERAGE = {
     "docs/operators_manual.md": [
         ("operator decision effects", re.compile(r"operator decision effects", re.IGNORECASE)),
         ("frontend replaces static dashboard", re.compile(r"Static `live_dashboard/` generation is deprecated|Nuxt operator frontend", re.IGNORECASE)),
+        ("research evidence cron", re.compile(r"22:20.*all_research_evidence\.sh|all_research_evidence\.sh.*22:20", re.IGNORECASE | re.DOTALL)),
     ],
     "docs/scripts.md": [
         ("script inventory", re.compile(r"Script Inventory", re.IGNORECASE)),
         ("env audit", re.compile(r"env_example_audit\.py")),
+        ("research evidence wrapper", re.compile(r"all_research_evidence\.sh.*advisory\.research_evidence_runner|advisory\.research_evidence_runner.*all_research_evidence\.sh", re.IGNORECASE | re.DOTALL)),
+    ],
+    "docs/index.md": [
+        ("research evidence operator path", re.compile(r"all_research_evidence\.sh.*lighter daily evidence-refresh path|lighter daily evidence-refresh path.*all_research_evidence\.sh", re.IGNORECASE | re.DOTALL)),
+    ],
+    "docs/tool_registry.json": [
+        ("research evidence operator command", re.compile(r'"name"\s*:\s*"run_research_evidence".*"command"\s*:\s*\[\s*"bash"\s*,\s*"all_research_evidence\.sh"\s*\]', re.IGNORECASE | re.DOTALL)),
+    ],
+    "config/stockey.crontab.template": [
+        ("research evidence scheduled template", re.compile(r"all_research_evidence\.sh.*research_evidence\.log|research_evidence\.log.*all_research_evidence\.sh", re.IGNORECASE)),
+    ],
+    "config/stockey.generated.crontab": [
+        ("research evidence scheduled generated", re.compile(r"all_research_evidence\.sh.*research_evidence\.log|research_evidence\.log.*all_research_evidence\.sh", re.IGNORECASE)),
     ],
 }
 

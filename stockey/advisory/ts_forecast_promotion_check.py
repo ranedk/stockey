@@ -19,6 +19,8 @@ DEFAULT_MIN_LIFT_VS_MOMENTUM = 0.005
 DEFAULT_MAX_EXIT_CONFLICT_RATE = 0.05
 DEFAULT_MIN_DISTINCT_DATES = 10
 DEFAULT_MIN_SYMBOLS = 20
+PAPER_PORTFOLIO_COMMAND = "python -m advisory.ts_forecast_paper_portfolio --log-research-ledger"
+PROMOTION_CHECK_COMMAND = "python -m advisory.ts_forecast_promotion_check --format json"
 
 
 def _json_default(value: Any) -> Any:
@@ -274,6 +276,24 @@ def _is_missing_table_error(exc: Exception) -> bool:
 
 def _build_unavailable_payload(*, args: argparse.Namespace, error: Exception) -> dict[str, Any]:
     scorecard = build_scorecard(groups=[], args=args)
+    reasons = ["missing_ts_forecast_paper_evidence"]
+    operator_next_steps = [
+        "Run the TS forecast paper-portfolio workflow after forecasts/evaluations exist.",
+        "Rerun the TS forecast promotion check only after the paper evidence table has rows.",
+        "Keep TS forecasts research-only until paper evidence beats the baseline gates.",
+    ]
+    recommended_commands = [
+        {
+            "command": PAPER_PORTFOLIO_COMMAND,
+            "purpose": "Create or refresh research-only TS forecast paper-portfolio evidence.",
+            "authority": "research_only_no_policy_or_broker_authority",
+        },
+        {
+            "command": PROMOTION_CHECK_COMMAND,
+            "purpose": "Recheck whether matured TS forecast paper evidence is ready for manual low-weight review.",
+            "authority": "read_only_no_policy_or_broker_authority",
+        },
+    ]
     scorecard.update(
         {
             "status": "evidence_unavailable",
@@ -289,6 +309,9 @@ def _build_unavailable_payload(*, args: argparse.Namespace, error: Exception) ->
         "decision": "hold_research_only",
         "ready_for_operator_review": False,
         "promotion_mode": "manual_low_weight_input_only",
+        "reasons": reasons,
+        "operator_next_steps": operator_next_steps,
+        "recommended_commands": recommended_commands,
         "scorecard": scorecard,
         "evidence": {
             "paper_table": PAPER_TABLE,
@@ -323,12 +346,41 @@ def build_promotion_check(args: argparse.Namespace) -> dict[str, Any]:
         raise
     groups = summarize_groups(evidence)
     scorecard = build_scorecard(groups=groups, args=args)
+    reasons: list[str] = []
+    operator_next_steps: list[str] = []
+    recommended_commands: list[dict[str, Any]] = []
+    if evidence.empty:
+        reasons.append("empty_ts_forecast_paper_evidence")
+        operator_next_steps.append("Run or rerun the TS forecast paper-portfolio workflow after forecasts have matured.")
+        recommended_commands.append(
+            {
+                "command": PAPER_PORTFOLIO_COMMAND,
+                "purpose": "Create or refresh research-only TS forecast paper-portfolio evidence.",
+                "authority": "research_only_no_policy_or_broker_authority",
+            }
+        )
+    elif scorecard["decision"] != "review_candidate":
+        reasons.append("ts_forecast_paper_gates_not_passed")
+        operator_next_steps.append("Keep TS forecasts research-only; inspect failed gates before considering any manual low-weight review.")
+        recommended_commands.append(
+            {
+                "command": PROMOTION_CHECK_COMMAND,
+                "purpose": "Inspect failed gates and evidence breadth for the TS forecast paper portfolio.",
+                "authority": "read_only_no_policy_or_broker_authority",
+            }
+        )
+    else:
+        reasons.append("ts_forecast_paper_gate_passed_manual_review_only")
+        operator_next_steps.append("Open a manual review if you want to consider TS forecasts as a low-weight research input.")
     return {
         "status": "ok",
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "decision": scorecard["decision"],
         "ready_for_operator_review": scorecard["ready_for_operator_review"],
         "promotion_mode": "manual_low_weight_input_only",
+        "reasons": reasons,
+        "operator_next_steps": operator_next_steps,
+        "recommended_commands": recommended_commands,
         "scorecard": scorecard,
         "evidence": {
             "paper_table": PAPER_TABLE,
@@ -349,11 +401,13 @@ def build_promotion_check(args: argparse.Namespace) -> dict[str, Any]:
 def format_text(payload: dict[str, Any]) -> str:
     scorecard = payload.get("scorecard") or {}
     best = scorecard.get("best_group") or {}
+    commands = payload.get("recommended_commands") if isinstance(payload.get("recommended_commands"), list) else []
     lines = [
         "TS Forecast Promotion Check",
         f"Decision: {payload.get('decision')}",
         f"Ready for operator review: {payload.get('ready_for_operator_review')}",
         f"Status: {scorecard.get('status')}",
+        f"Reasons: {', '.join(payload.get('reasons') or []) or 'none'}",
         "",
         "Best group:",
         f"- model/horizon: {best.get('model_name')}/{best.get('horizon_days')}d",
@@ -366,6 +420,12 @@ def format_text(payload: dict[str, Any]) -> str:
         "",
         f"Operator action: {scorecard.get('operator_action')}",
     ]
+    if commands:
+        lines.extend(["", "Recommended commands:"])
+        for command in commands:
+            if not isinstance(command, dict):
+                continue
+            lines.append(f"- {command.get('command')}: {command.get('purpose')}")
     return "\n".join(lines)
 
 

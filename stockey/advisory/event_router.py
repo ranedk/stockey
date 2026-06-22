@@ -359,6 +359,22 @@ def route_live_updates(
     )
     actions = execute_routing_plan(plan) if plan else pd.DataFrame()
     persist_actions(actions)
+    affected_symbols = sorted(
+        {
+            str(symbol or "").strip().upper()
+            for symbol in (
+                actions["symbol"].tolist() if not actions.empty and "symbol" in actions.columns else [item.get("symbol") for item in plan]
+            )
+            if str(symbol or "").strip()
+        }
+    )
+    if not actions.empty and "symbol" in actions.columns and "action_status" in actions.columns:
+        ok_actions = actions[actions["action_status"].astype("string").str.lower().eq("ok")]
+        action_refresh_symbols = sorted({str(symbol or "").strip().upper() for symbol in ok_actions["symbol"].tolist() if str(symbol or "").strip()})
+    elif actions.empty:
+        action_refresh_symbols = []
+    else:
+        action_refresh_symbols = affected_symbols
     candidates = [frame["load_ts"].max() for frame in (alerts, announcement_events, news_events) if not frame.empty and "load_ts" in frame.columns]
     last_item_ts = max(candidates) if candidates else pd.Timestamp.utcnow()
     persist_sync_state(
@@ -372,6 +388,10 @@ def route_live_updates(
             "news_rows": int(len(news_events)),
             "planned_actions": int(len(plan)),
             "executed_actions": int(len(actions)),
+            "affected_symbols": affected_symbols,
+            "affected_symbol_count": int(len(affected_symbols)),
+            "action_refresh_symbols": action_refresh_symbols,
+            "action_refresh_symbol_count": int(len(action_refresh_symbols)),
             "max_actions": None if max_actions is None else int(max_actions),
             "max_event_only_actions": None if max_event_only_actions is None else int(max_event_only_actions),
         },
@@ -384,6 +404,11 @@ def route_live_updates(
         "news_rows": int(len(news_events)),
         "planned_actions": int(len(plan)),
         "executed_actions": int(len(actions)),
+        "affected_symbols": affected_symbols,
+        "affected_symbol_count": int(len(affected_symbols)),
+        "action_refresh_symbols": action_refresh_symbols,
+        "action_refresh_symbol_count": int(len(action_refresh_symbols)),
+        "action_refresh_source": "event_router",
         "plan": plan,
         "action_sample": actions.head(10).to_dict(orient="records") if not actions.empty else [],
     }

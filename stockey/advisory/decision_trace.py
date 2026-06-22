@@ -31,7 +31,7 @@ ACTION_CONFLICT_RULES = [
         "rule_scope": "risk_management",
         "resolution_status": "resolved",
         "resolution_action": "keep_winner",
-        "reason": "Risk management actions such as SELL, PARTIAL_SELL, or TIGHTEN_STOP override entry/watch/manual signals.",
+        "reason": "Risk management actions such as SELL, PARTIAL_SELL, TIGHTEN_STOP, or REDUCE_EXPOSURE_REVIEW override entry/watch/manual signals.",
     },
     {
         "rule_id": "MARKET_GATE_MANUAL_BEATS_POSITIVE",
@@ -534,12 +534,13 @@ def classify_action_conflict(row: dict[str, Any], dynamic_rules: list[dict[str, 
     losing = str(row.get("losing_action_code") or "").strip().upper()
     winning_source = str(row.get("winning_source") or "").strip().lower()
     context_text = " ".join(str(row.get(key) or "") for key in ["lost_reason", "raw_context_json"]).lower()
-    exit_actions = {"SELL", "PARTIAL_SELL", "TIGHTEN_STOP", "EXIT", "REDUCE_EXPOSURE"}
+    exit_actions = {"SELL", "PARTIAL_SELL", "TIGHTEN_STOP", "EXIT", "REDUCE_EXPOSURE", "REDUCE_EXPOSURE_REVIEW"}
     low_priority_actions = {"WATCH", "HOLD", "MANUAL_REVIEW"}
+    entry_actions = {"BUY", "BUY_MORE"}
 
     if winning == losing and winning:
         rule = ACTION_CONFLICT_RULES_BY_ID["SAME_ACTION_DUPLICATE_COLLAPSE"]
-    elif winning in exit_actions and losing in low_priority_actions:
+    elif winning in exit_actions and losing in (low_priority_actions | entry_actions):
         rule = ACTION_CONFLICT_RULES_BY_ID["EXIT_BEATS_ENTRY_OR_WATCH"]
     elif winning == "MANUAL_REVIEW" and winning_source == "event_policy" and losing in {"BUY", "BUY_MORE"}:
         rule = ACTION_CONFLICT_RULES_BY_ID["EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY"]

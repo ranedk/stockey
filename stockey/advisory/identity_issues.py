@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from advisory.fallback_telemetry import record_local_fallback_event
+from utils.company_master import load_company_master_records
 from utils.db import db_session, execute_db_operation, sql_to_df
 from utils.schema_migrations import apply_schema_migration
 
@@ -199,6 +200,239 @@ def record_dhan_identity_issue(
     return row
 
 
+def record_dhan_ohlcv_history_issue(
+    *,
+    symbol: str,
+    requested_exchange: str = "NSE",
+    asset_type: str = "stock",
+    source: str = "advisory.data_sync.ensure_symbol_ohlcv",
+    reason: str = "dhan_daily_sync_failed_no_history",
+    error_text: str | None = None,
+    latest_date: str | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    symbol_text = (_text(symbol) or "").upper()
+    exchange_text = (_text(requested_exchange) or "NSE").upper()
+    asset_type_text = (_text(asset_type) or "stock").lower()
+    reason_text = _text(reason) or "dhan_daily_sync_failed_no_history"
+    issue_key = f"dhan_ohlcv_history_unavailable:{asset_type_text}:{exchange_text}:{symbol_text}"
+    suggested_action = (
+        f"Verify that {exchange_text}:{symbol_text} has active Dhan daily OHLCV history. "
+        "Refresh the Dhan scrip master/company master, test a small Dhan daily pull for the symbol, "
+        "and explicitly exclude the symbol from context-watch intake if Dhan has no usable history."
+    )
+    payload = {
+        "reason": reason_text,
+        "latest_date": latest_date,
+        **(context or {}),
+    }
+    row = {
+        "issue_key": issue_key,
+        "issue_type": "dhan_ohlcv_history_unavailable",
+        "symbol": symbol_text,
+        "requested_exchange": exchange_text,
+        "asset_type": asset_type_text,
+        "company_master_id": _text((context or {}).get("company_master_id")),
+        "source": source,
+        "error_text": error_text or reason_text,
+        "exchanges_tried_json": _json_dumps([exchange_text]),
+        "fallback_tried_json": _json_dumps([]),
+        "suggested_action": suggested_action,
+        "context_json": _json_dumps(payload),
+    }
+    ensure_identity_issues_table()
+
+    def _upsert_issue() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                INSERT INTO {IDENTITY_ISSUES_TABLE} (
+                    issue_key,
+                    first_seen_at,
+                    last_seen_at,
+                    status,
+                    issue_type,
+                    symbol,
+                    requested_exchange,
+                    asset_type,
+                    company_master_id,
+                    source,
+                    error_text,
+                    exchanges_tried_json,
+                    fallback_tried_json,
+                    suggested_action,
+                    context_json,
+                    attempt_count,
+                    resolution_error_text,
+                    resolution_context_json,
+                    resolved_at,
+                    load_ts
+                )
+                VALUES (
+                    %(issue_key)s,
+                    now(),
+                    now(),
+                    'open',
+                    %(issue_type)s,
+                    %(symbol)s,
+                    %(requested_exchange)s,
+                    %(asset_type)s,
+                    %(company_master_id)s,
+                    %(source)s,
+                    %(error_text)s,
+                    %(exchanges_tried_json)s,
+                    %(fallback_tried_json)s,
+                    %(suggested_action)s,
+                    %(context_json)s,
+                    1,
+                    NULL,
+                    NULL,
+                    NULL,
+                    now()
+                )
+                ON CONFLICT (issue_key) DO UPDATE SET
+                    last_seen_at = EXCLUDED.last_seen_at,
+                    status = 'open',
+                    attempt_count = COALESCE({IDENTITY_ISSUES_TABLE}.attempt_count, 0) + 1,
+                    symbol = EXCLUDED.symbol,
+                    requested_exchange = EXCLUDED.requested_exchange,
+                    asset_type = EXCLUDED.asset_type,
+                    company_master_id = EXCLUDED.company_master_id,
+                    source = EXCLUDED.source,
+                    error_text = EXCLUDED.error_text,
+                    exchanges_tried_json = EXCLUDED.exchanges_tried_json,
+                    fallback_tried_json = EXCLUDED.fallback_tried_json,
+                    suggested_action = EXCLUDED.suggested_action,
+                    context_json = EXCLUDED.context_json,
+                    resolution_error_text = NULL,
+                    resolution_context_json = NULL,
+                    resolved_at = NULL,
+                    load_ts = EXCLUDED.load_ts
+                """,
+                row,
+            )
+
+    execute_db_operation(
+        _upsert_issue,
+        operation_name="identity_issues:record_dhan_ohlcv_history_issue",
+    )
+    return row
+
+
+def record_company_master_mapping_issue(
+    *,
+    symbol: str,
+    requested_exchange: str = "NSE",
+    source: str = "data.announcements.managed_pipeline",
+    error_text: str | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    symbol_text = (_text(symbol) or "").upper()
+    exchange_text = (_text(requested_exchange) or "NSE").upper()
+    issue_key = f"company_master_mapping_missing:{exchange_text}:{symbol_text}"
+    suggested_action = (
+        f"Refresh company master inputs and verify {exchange_text}:{symbol_text} resolves to a company_master_id. "
+        "Run `python -m data.company_master`, refresh Dhan/Sharpely masters if needed, then rerun "
+        "`python -m advisory.identity_issues --apply --limit 100`."
+    )
+    payload = {
+        "reason": "company_master_mapping_missing",
+        "requested_exchange": exchange_text,
+        **(context or {}),
+    }
+    row = {
+        "issue_key": issue_key,
+        "issue_type": "company_master_mapping_missing",
+        "symbol": symbol_text,
+        "requested_exchange": exchange_text,
+        "asset_type": "stock",
+        "company_master_id": None,
+        "source": source,
+        "error_text": error_text or f"No company master mapping found for ticker: {symbol_text}",
+        "exchanges_tried_json": _json_dumps([exchange_text]),
+        "fallback_tried_json": _json_dumps([]),
+        "suggested_action": suggested_action,
+        "context_json": _json_dumps(payload),
+    }
+    ensure_identity_issues_table()
+
+    def _upsert_issue() -> None:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                INSERT INTO {IDENTITY_ISSUES_TABLE} (
+                    issue_key,
+                    first_seen_at,
+                    last_seen_at,
+                    status,
+                    issue_type,
+                    symbol,
+                    requested_exchange,
+                    asset_type,
+                    company_master_id,
+                    source,
+                    error_text,
+                    exchanges_tried_json,
+                    fallback_tried_json,
+                    suggested_action,
+                    context_json,
+                    attempt_count,
+                    resolution_error_text,
+                    resolution_context_json,
+                    resolved_at,
+                    load_ts
+                )
+                VALUES (
+                    %(issue_key)s,
+                    now(),
+                    now(),
+                    'open',
+                    %(issue_type)s,
+                    %(symbol)s,
+                    %(requested_exchange)s,
+                    %(asset_type)s,
+                    %(company_master_id)s,
+                    %(source)s,
+                    %(error_text)s,
+                    %(exchanges_tried_json)s,
+                    %(fallback_tried_json)s,
+                    %(suggested_action)s,
+                    %(context_json)s,
+                    1,
+                    NULL,
+                    NULL,
+                    NULL,
+                    now()
+                )
+                ON CONFLICT (issue_key) DO UPDATE SET
+                    last_seen_at = EXCLUDED.last_seen_at,
+                    status = 'open',
+                    attempt_count = COALESCE({IDENTITY_ISSUES_TABLE}.attempt_count, 0) + 1,
+                    symbol = EXCLUDED.symbol,
+                    requested_exchange = EXCLUDED.requested_exchange,
+                    asset_type = EXCLUDED.asset_type,
+                    company_master_id = EXCLUDED.company_master_id,
+                    source = EXCLUDED.source,
+                    error_text = EXCLUDED.error_text,
+                    exchanges_tried_json = EXCLUDED.exchanges_tried_json,
+                    fallback_tried_json = EXCLUDED.fallback_tried_json,
+                    suggested_action = EXCLUDED.suggested_action,
+                    context_json = EXCLUDED.context_json,
+                    resolution_error_text = NULL,
+                    resolution_context_json = NULL,
+                    resolved_at = NULL,
+                    load_ts = EXCLUDED.load_ts
+                """,
+                row,
+            )
+
+    execute_db_operation(
+        _upsert_issue,
+        operation_name="identity_issues:record_company_master_mapping_issue",
+    )
+    return row
+
+
 def mark_identity_issue_resolved(
     issue_key: str,
     *,
@@ -283,11 +517,131 @@ def load_open_identity_issues(*, limit: int = 100) -> pd.DataFrame:
 
 def _resolve_one_issue(row: dict[str, Any], *, apply: bool) -> dict[str, Any]:
     issue_key = _text(row.get("issue_key")) or ""
+    issue_type = _text(row.get("issue_type")) or "identity_issue"
     symbol = (_text(row.get("symbol")) or "").upper()
     requested_exchange = (_text(row.get("requested_exchange")) or "NSE").upper()
     asset_type = (_text(row.get("asset_type")) or "stock").lower()
     if not issue_key or not symbol:
         return {"issue_key": issue_key, "symbol": symbol, "status": "skipped", "reason": "missing_issue_key_or_symbol"}
+
+    if issue_type == "dhan_ohlcv_history_unavailable":
+        try:
+            latest = sql_to_df(
+                """
+                SELECT MAX(date) AS latest_date
+                FROM dhan_ohlcv_daily
+                WHERE UPPER(TRIM(ticker)) = %s
+                  AND UPPER(TRIM(exchange)) = %s
+                  AND LOWER(TRIM(asset_type)) = %s
+                """,
+                params=(symbol, requested_exchange, asset_type),
+                retries=3,
+            )
+            latest_date = pd.to_datetime(latest["latest_date"].iloc[0], utc=True, errors="coerce") if not latest.empty else pd.NaT
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            context = {"checked_symbol": symbol, "requested_exchange": requested_exchange, "asset_type": asset_type}
+            record_local_fallback_event(
+                module="advisory.identity_issues",
+                fallback_type="ohlcv_history_issue_resolution_failed",
+                source="dhan_ohlcv_daily",
+                severity="warn",
+                symbol=symbol or None,
+                reason="Open Dhan OHLCV history issue could not be checked and remains open.",
+                error=exc,
+                metadata={"issue_key": issue_key, "apply": bool(apply)},
+            )
+            if apply:
+                mark_identity_issue_resolution_failed(issue_key, error_text=error_text, resolution_context=context)
+            return {
+                "issue_key": issue_key,
+                "symbol": symbol,
+                "requested_exchange": requested_exchange,
+                "status": "still_open",
+                "error": error_text,
+                "applied": bool(apply),
+            }
+        if pd.isna(latest_date):
+            return {
+                "issue_key": issue_key,
+                "symbol": symbol,
+                "requested_exchange": requested_exchange,
+                "status": "still_open",
+                "reason": "dhan_daily_history_still_missing",
+                "suggested_action": "Repair Dhan OHLCV availability or explicitly exclude this symbol from context-watch intake.",
+                "applied": bool(apply),
+            }
+        context = {
+            "checked_symbol": symbol,
+            "requested_exchange": requested_exchange,
+            "asset_type": asset_type,
+            "latest_ohlcv_date": latest_date.isoformat(),
+        }
+        if apply:
+            mark_identity_issue_resolved(issue_key, resolution_context=context)
+        return {
+            "issue_key": issue_key,
+            "symbol": symbol,
+            "requested_exchange": requested_exchange,
+            "status": "resolved" if apply else "would_resolve",
+            "applied": bool(apply),
+            "latest_ohlcv_date": latest_date.isoformat(),
+        }
+
+    if issue_type == "company_master_mapping_missing":
+        try:
+            records = load_company_master_records(symbol, exchanges=[requested_exchange])
+        except Exception as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            context = {"checked_symbol": symbol, "requested_exchange": requested_exchange}
+            record_local_fallback_event(
+                module="advisory.identity_issues",
+                fallback_type="company_master_mapping_issue_resolution_failed",
+                source="company_master",
+                severity="warn",
+                symbol=symbol or None,
+                reason="Open company-master mapping issue could not be checked and remains open.",
+                error=exc,
+                metadata={"issue_key": issue_key, "apply": bool(apply)},
+            )
+            if apply:
+                mark_identity_issue_resolution_failed(issue_key, error_text=error_text, resolution_context=context)
+            return {
+                "issue_key": issue_key,
+                "symbol": symbol,
+                "requested_exchange": requested_exchange,
+                "status": "still_open",
+                "error": error_text,
+                "applied": bool(apply),
+            }
+        if records.empty:
+            return {
+                "issue_key": issue_key,
+                "symbol": symbol,
+                "requested_exchange": requested_exchange,
+                "status": "still_open",
+                "reason": "company_master_mapping_still_missing",
+                "suggested_action": "Refresh company master inputs and verify this ticker/exchange maps to a company_master_id.",
+                "applied": bool(apply),
+            }
+        first = records.iloc[0].to_dict()
+        context = {
+            "checked_symbol": symbol,
+            "requested_exchange": requested_exchange,
+            "company_master_id": _text(first.get("company_master_id")),
+            "matched_rows": int(len(records)),
+        }
+        if apply:
+            mark_identity_issue_resolved(issue_key, resolution_context=context)
+        return {
+            "issue_key": issue_key,
+            "symbol": symbol,
+            "requested_exchange": requested_exchange,
+            "status": "resolved" if apply else "would_resolve",
+            "applied": bool(apply),
+            "company_master_id": context["company_master_id"],
+            "matched_rows": context["matched_rows"],
+        }
 
     from data.dhanlive import dhan_db
 

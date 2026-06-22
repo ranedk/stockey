@@ -457,6 +457,26 @@ def _direction_sign(row: pd.Series) -> int:
     return 0
 
 
+def _point_in_time_feature_contract(*, feature_context_date: Any = None, anchor_date: Any = None) -> dict[str, Any]:
+    contract = {
+        "feature_context_date_rule": "Use only feature rows known on or before the event published_on date.",
+        "label_anchor_rule": "Use the first available close strictly after the event published_on date.",
+        "exchange_feature_context_rule": (
+            "Exchange/bhavcopy features are optional structured context joined by event-day context date, "
+            "not by future label anchor date."
+        ),
+        "exchange_feature_authority": "research_feature_only_no_portfolio_or_broker_authority",
+        "point_in_time_required": True,
+        "broker_execution_allowed": False,
+        "leakage_guard": "Features are joined on feature_context_date; forward returns are labels only.",
+    }
+    if feature_context_date is not None:
+        contract["feature_context_date"] = _json_default(feature_context_date)
+    if anchor_date is not None:
+        contract["anchor_date"] = _json_default(anchor_date)
+    return contract
+
+
 def _merge_event_context(
     events: pd.DataFrame,
     *,
@@ -564,13 +584,7 @@ def build_labeled_event_dataset(
             row["anchor_close"] = anchor["close"]
             row["feature_context_date"] = event_row["published_on"].normalize()
             row["point_in_time_contract_json"] = json.dumps(
-                {
-                    "feature_context_date_rule": "Use only feature rows known on or before the event published_on date.",
-                    "label_anchor_rule": "Use the first available close strictly after the event published_on date.",
-                    "feature_context_date": _json_default(row["feature_context_date"]),
-                    "anchor_date": _json_default(row["anchor_date"]),
-                    "leakage_guard": "Features are joined on feature_context_date; forward returns are labels only.",
-                },
+                _point_in_time_feature_contract(feature_context_date=row["feature_context_date"], anchor_date=row["anchor_date"]),
                 sort_keys=True,
                 ensure_ascii=False,
                 default=_json_default,
@@ -748,6 +762,9 @@ def build_event_model_research_controls(
             "method": "point_in_time_event_day_features_with_forward_return_labels",
             "feature_context_date_rule": "Training features are joined on event published_on date, not label anchor date.",
             "label_anchor_rule": "Forward-return labels use the first available close strictly after event published_on.",
+            "exchange_feature_context_rule": _point_in_time_feature_contract()["exchange_feature_context_rule"],
+            "exchange_feature_authority": _point_in_time_feature_contract()["exchange_feature_authority"],
+            "broker_execution_allowed": False,
             "split_rule": "Train/test split is chronological by published_on.",
         },
         "false_discovery_control": {

@@ -17,6 +17,7 @@ from utils.sync import parse_datetime_arg
 
 ALLOCATIONS_TABLE = "advisory_allocations"
 ALLOCATIONS_SCHEMA_MIGRATION_ID = "20260611_advisory_allocations_base"
+ALLOCATIONS_TECHNICAL_CONFIRMATION_MIGRATION_ID = "20260621_advisory_allocations_technical_confirmation"
 REVIEWS_TABLE = "advisory_event_reviews"
 MACRO_FEATURES_TABLE = "advisory_macro_features_daily"
 EXCHANGE_FEATURES_TABLE = "advisory_exchange_features_daily"
@@ -89,6 +90,15 @@ ALLOCATIONS_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS notes TEXT",
     f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS context_snapshot_json TEXT",
     f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS load_ts TIMESTAMPTZ",
+]
+ALLOCATIONS_TECHNICAL_CONFIRMATION_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS candidate_state TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS current_state TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS is_base_candidate_fallback BOOLEAN",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS technical_state TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS technical_trigger_type TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS technical_trigger_note TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS technical_entry_confirmed BOOLEAN",
 ]
 
 
@@ -247,6 +257,12 @@ def ensure_allocations_table() -> None:
         description="Create advisory risk allocation table.",
         statements=ALLOCATIONS_SCHEMA_STATEMENTS,
         metadata={"tables": [ALLOCATIONS_TABLE]},
+    )
+    apply_schema_migration(
+        migration_id=ALLOCATIONS_TECHNICAL_CONFIRMATION_MIGRATION_ID,
+        description="Add technical confirmation provenance to advisory risk allocation table.",
+        statements=ALLOCATIONS_TECHNICAL_CONFIRMATION_SCHEMA_STATEMENTS,
+        metadata={"tables": [ALLOCATIONS_TABLE], "depends_on": ALLOCATIONS_SCHEMA_MIGRATION_ID},
     )
 
 
@@ -523,7 +539,10 @@ def load_base_candidate_fallbacks(
             w.symbol,
             c.company_master_id,
             w.candidate_state,
-            w.current_state
+            w.current_state,
+            c.technical_state,
+            c.technical_trigger_type,
+            c.technical_trigger_note
         FROM advisory_watchlist w
         LEFT JOIN advisory_candidates c
           ON c.asof_date = w.asof_date
@@ -597,6 +616,9 @@ def load_base_candidate_fallbacks(
     rows: list[dict[str, Any]] = []
     for _, row in df.iterrows():
         current_state = str(row.get("current_state") or "").upper()
+        technical_state = str(row.get("technical_state") or "").strip().upper()
+        technical_trigger_type = str(row.get("technical_trigger_type") or "").strip().lower()
+        technical_entry_confirmed = current_state == "PASS_NOW" and technical_state == "BUY_TRIGGERED"
         rows.append(
             {
                 "published_on": row["published_on"],
@@ -608,7 +630,7 @@ def load_base_candidate_fallbacks(
                 "unique_id": row["unique_id"],
                 "evaluation_status": "completed",
                 "verdict": "continue",
-                "investable_now": current_state in {"PASS_NOW", "WATCH_BREAKOUT"},
+                "investable_now": technical_entry_confirmed,
                 "materiality": "low",
                 "setup_effect": "neutral",
                 "event_class": "BASE_CANDIDATE",
@@ -624,9 +646,29 @@ def load_base_candidate_fallbacks(
                 "current_state": current_state,
                 "watch_status": "active",
                 "is_base_candidate_fallback": True,
+                "technical_state": technical_state or None,
+                "technical_trigger_type": technical_trigger_type or None,
+                "technical_trigger_note": row.get("technical_trigger_note"),
+                "technical_entry_confirmed": technical_entry_confirmed,
             }
         )
     return pd.DataFrame(rows)
+
+
+def coalesce_watch_state_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize watch-state columns after merges with fallback/evaluation rows."""
+    if df.empty:
+        return df
+    out = df.copy()
+    for column in ["candidate_state", "current_state", "watch_status"]:
+        variants = [name for name in [column, f"{column}_x", f"{column}_y"] if name in out.columns]
+        if not variants:
+            continue
+        series = out[variants[0]]
+        for variant in variants[1:]:
+            series = series.combine_first(out[variant])
+        out[column] = series
+    return out
 
 
 def load_point_in_time_context(symbol: str, published_on: pd.Timestamp) -> dict[str, Any]:
@@ -993,6 +1035,7 @@ def build_allocations(
             on=["asof_date", "setup_id", "symbol"],
             how="left",
         )
+        evaluations = coalesce_watch_state_columns(evaluations)
 
     setup_profiles = get_setup_risk_profiles()
     rows: list[dict[str, Any]] = []
@@ -1008,6 +1051,13 @@ def build_allocations(
         evaluation_status = _clean_text(row.get("evaluation_status")).lower()
         investable_now = _safe_bool(row.get("investable_now"), False)
         current_state = _clean_text(row.get("current_state")).upper()
+        candidate_state = _clean_text(row.get("candidate_state")).upper()
+        technical_state = _clean_text(row.get("technical_state")).upper()
+        technical_trigger_type = _clean_text(row.get("technical_trigger_type")).lower()
+        technical_entry_confirmed = _safe_bool(
+            row.get("technical_entry_confirmed"),
+            current_state == "PASS_NOW" and technical_state == "BUY_TRIGGERED",
+        )
         event_class = _clean_text(row.get("event_class")).upper()
         state_transition_hint = _clean_text(row.get("state_transition_hint")).upper()
         score_impact_raw = pd.to_numeric(row.get("score_impact"), errors="coerce")
@@ -1024,12 +1074,21 @@ def build_allocations(
         notes: list[str] = []
         if is_base_candidate_fallback:
             notes.append("Allocation is based on base rule-engine state because no event evaluation was available.")
-            if current_state == "WATCH_BREAKOUT":
-                notes.append("Entry timing is still early; size remains conservative until confirmation improves.")
+            if not technical_entry_confirmed:
+                notes.append(
+                    "Base candidate is watch-only: portfolio allocation requires technical_state=BUY_TRIGGERED, "
+                    f"not candidate_state={candidate_state or current_state or 'UNKNOWN'} technical_state={technical_state or 'UNKNOWN'}."
+                )
+            elif technical_trigger_type:
+                notes.append(f"Technical entry trigger confirmed: {technical_trigger_type}.")
         if current_state == "ABSTAIN":
             allocation_status = "abstained"
             suggested_allocation_inr = 0.0
             notes.append("Explicit abstain: edge is too weak or too mixed to allocate capital.")
+        elif is_base_candidate_fallback and not technical_entry_confirmed:
+            allocation_status = "rejected"
+            suggested_allocation_inr = 0.0
+            notes.append("No allocation: base technical fallback has no confirmed buy trigger.")
         elif review_veto or review_action == "veto":
             allocation_status = "rejected"
             suggested_allocation_inr = 0.0
@@ -1164,6 +1223,13 @@ def build_allocations(
                 "materiality": row.get("materiality"),
                 "setup_effect": row.get("setup_effect"),
                 "event_class": row.get("event_class"),
+                "candidate_state": row.get("candidate_state"),
+                "current_state": row.get("current_state"),
+                "is_base_candidate_fallback": is_base_candidate_fallback,
+                "technical_state": row.get("technical_state"),
+                "technical_trigger_type": row.get("technical_trigger_type"),
+                "technical_trigger_note": row.get("technical_trigger_note"),
+                "technical_entry_confirmed": technical_entry_confirmed,
                 "state_transition_hint": row.get("state_transition_hint"),
                 "score_impact": row.get("score_impact"),
                 "confidence": row.get("confidence"),
@@ -1203,7 +1269,7 @@ def persist_allocations(df: pd.DataFrame) -> None:
             )
         )
         return normalized.astype(bool)
-    boolean_columns = ["investable_now", "review_veto"]
+    boolean_columns = ["investable_now", "review_veto", "is_base_candidate_fallback", "technical_entry_confirmed"]
     numeric_columns = [
         "score_impact",
         "confidence",

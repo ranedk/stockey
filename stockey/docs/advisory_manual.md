@@ -820,11 +820,14 @@ Typical technical columns:
 Technical-engine defaults are not promoted automatically. Use the calibration module to compare threshold grids against realized point-in-time forward returns from `dhan_ohlcv_daily`:
 
 ```sh
+python -m advisory.technical_threshold_calibration --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20 --max-configs 512 --progress-every 128
 python -m advisory.technical_threshold_calibration --dry-run --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
 python -m advisory.technical_threshold_calibration --from-date 2026-01-01 --to-date 2026-05-01 --horizons 5 10 20
 ```
 
-It writes `advisory_technical_threshold_evaluations` and `advisory_technical_threshold_eval_summary`. Treat these as research evidence only; update live setup thresholds manually after checking sample size, hit rate after costs, average return after costs, and spread versus rejected candidates.
+Use `--max-configs` for first-pass diagnosis when investigating missing BUYs; omit it for the full grid. Bounded runs are marked `bounded_first_pass_only` / `diagnostic_only_no_promotion` and are not eligible for threshold promotion. The command emits progress to stderr so long runs do not look stuck. Persisted full-grid runs write `advisory_technical_threshold_evaluations` and `advisory_technical_threshold_eval_summary`. Treat these as research evidence only; update live setup thresholds manually after checking sample size, hit rate after costs, average return after costs, and spread versus rejected candidates.
+
+The summary `archetype_breakdown_json` groups outcomes by setup type. New candidate rows should carry `technical_setup_archetype`; older rows are assigned a research-only effective bucket from `technical_trigger_type`, `candidate_state`, `technical_state`, and `setup_id`. Each breakdown row states whether the bucket was `explicit` or `inferred`. Inferred buckets are diagnostic labels only and do not change live scoring, portfolio policy, or broker behavior.
 
 Event-policy classes are evaluated separately, also as research-only evidence:
 

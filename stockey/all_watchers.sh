@@ -5,6 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="$("${SCRIPT_DIR}/scripts/resolve_python.sh")"
 WATCHER_LOCK_FILE="${STOCKEY_WATCHER_LOCK_FILE:-/tmp/stockey_watchers.lock}"
+WATCHER_CONTEXT_WATCHLIST_DATE_ARGS=()
 
 if [[ "${STOCKEY_WATCHER_LOCK_HELD:-0}" != "1" ]]; then
   WATCHER_LOCK_DIR="${WATCHER_LOCK_FILE}.d"
@@ -37,6 +38,26 @@ fi
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "all_watchers" "${PYTHON_BIN}" -m advisory.continuous_watch "$@"
 
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "wait_signals" "${PYTHON_BIN}" -m advisory.wait_signals --match --format text
+
+if [[ "${WATCHER_SKIP_CONTEXT_WATCHLIST_RECONCILE:-0}" == "1" || "${WATCHER_SKIP_CONTEXT_WATCHLIST_RECONCILE:-false}" == "true" ]]; then
+  echo "[all_watchers] context watchlist reconciliation skipped WATCHER_SKIP_CONTEXT_WATCHLIST_RECONCILE=${WATCHER_SKIP_CONTEXT_WATCHLIST_RECONCILE}"
+else
+  if [[ "${WATCHER_AUTO_LATEST_TRADING_DATE:-1}" != "0" && "${WATCHER_AUTO_LATEST_TRADING_DATE:-true}" != "false" ]]; then
+    watcher_resolved_date="$("${PYTHON_BIN}" -m advisory.advisory_date --format date)"
+    if [[ -n "${watcher_resolved_date}" ]]; then
+      WATCHER_CONTEXT_WATCHLIST_DATE_ARGS=(--date "${watcher_resolved_date}")
+      echo "[all_watchers] resolved context watchlist date ${watcher_resolved_date} using latest trading day"
+    else
+      echo "[all_watchers] failed to resolve latest trading-day context watchlist date" >&2
+      exit 1
+    fi
+  fi
+  WATCHER_CONTEXT_WATCHLIST_ARGS=("${WATCHER_CONTEXT_WATCHLIST_DATE_ARGS[@]}" --setup CONTEXT_OVERLAY_WATCH --rebuild)
+  if [[ "${WATCHER_CONTEXT_WATCHLIST_FORCE:-0}" != "1" && "${WATCHER_CONTEXT_WATCHLIST_FORCE:-false}" != "true" ]]; then
+    WATCHER_CONTEXT_WATCHLIST_ARGS+=(--skip-if-current)
+  fi
+  "${SCRIPT_DIR}/scripts/run_with_markers.sh" "watcher_context_watchlist_reconcile" "${PYTHON_BIN}" -m advisory.watchlist_builder "${WATCHER_CONTEXT_WATCHLIST_ARGS[@]}"
+fi
 
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "operator_snapshot" "${PYTHON_BIN}" -m advisory.operator_snapshot
 

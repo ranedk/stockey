@@ -164,6 +164,24 @@ def _load_from_cache(file_pattern: str, max_age_days: int = 10) -> str | None:
     return None
 
 
+def _load_latest_cache(file_pattern: str) -> tuple[str | None, Path | None]:
+    """Return newest cached text regardless of age for explicit stale-cache fallback."""
+    files = sorted(glob.glob(file_pattern), key=os.path.getmtime, reverse=True)
+    if not files:
+        return None, None
+    newest = Path(files[0])
+    try:
+        return newest.read_text(encoding="utf-8"), newest
+    except Exception as exc:
+        _record_http_cache_fallback(
+            fallback_type="http_stale_cache_read_failed",
+            reason="HTTP stale-cache fallback was unavailable because the newest cache file could not be read.",
+            error=exc,
+            cache_file=newest,
+        )
+        return None, newest
+
+
 def _save_to_cache(base_name: str, text: str) -> None:
     today = dt.datetime.now().strftime("%Y_%d_%m")
     fname = _CACHE_DIR / f"{base_name}__{today}.json"
@@ -200,7 +218,7 @@ def get_with_retries(
 
     # ---------- cache lookup -------------------------------------------------
     base_name, pattern = _build_cache_key(url)
-    cached_text = _load_from_cache(pattern, max_age_days)
+    cached_text = _load_from_cache(pattern, max_age_days) if from_cache else None
     if cached_text is not None:
         resp = requests.Response()
         resp._content = cached_text.encode()  # type: ignore[attr-defined]
@@ -208,6 +226,7 @@ def get_with_retries(
         resp.url = url
         resp.headers["X-Cache"] = "HIT"
         return resp
+    stale_cached_text, stale_cache_file = _load_latest_cache(pattern) if from_cache else (None, None)
 
     # ---------- network fetch with retry ------------------------------------
     session = requests.Session()
@@ -239,13 +258,39 @@ def get_with_retries(
         response.headers["X-Cache"] = "MISS"
         return response
     except requests.RequestException as e:
-        # Optional: fall back to *stale* cache if network fails completely
-        if cached_text:
+        # Optional: fall back to *stale* cache if network fails completely.
+        if stale_cached_text is not None:
+            _record_http_cache_fallback(
+                fallback_type="http_network_failed_stale_cache_used",
+                reason="HTTP request failed after retries; returning stale cached response and marking it explicitly.",
+                error=e,
+                cache_file=stale_cache_file,
+                metadata={
+                    "method": method,
+                    "host": urlparse(url).netloc,
+                    "path": urlparse(url).path,
+                    "timeout": timeout,
+                    "retries": retries,
+                },
+            )
             resp = requests.Response()
-            resp._content = cached_text.encode()  # type: ignore[attr-defined]
+            resp._content = stale_cached_text.encode()  # type: ignore[attr-defined]
             resp.status_code = 200
             resp.url = url
             resp.headers["X-Cache"] = "STALE"
             return resp
+        _record_http_cache_fallback(
+            fallback_type="http_network_failed_no_cache",
+            reason="HTTP request failed after retries and no cached response was available.",
+            error=e,
+            metadata={
+                "method": method,
+                "host": urlparse(url).netloc,
+                "path": urlparse(url).path,
+                "timeout": timeout,
+                "retries": retries,
+                "from_cache": from_cache,
+            },
+        )
         print(f"Request failed: {e}")
         raise

@@ -37,9 +37,16 @@ LOG_DIR={{LOG_DIR}}
 # not run the advisory pipeline or submit broker orders.
 55 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory_preflight.lock ./all_advisory_preflight.sh >> "$LOG_DIR/all_advisory_preflight.log" 2>&1
 
+# Bounded context-to-entry repair before the expensive full advisory run.
+# This refreshes review-only context signals, reconciles CONTEXT_OVERLAY_WATCH,
+# and runs rules-through-actions only, so positive context is not blocked by
+# stale watch rows before post-close advisory.
+00 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${CONTEXT_REPAIR_WAIT_FOR_DATA_TIMEOUT_SECONDS:-7200}" /tmp/stockey_complete_data.lock /tmp/stockey_download_queue.lock /tmp/stockey_external_workers.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_context_to_entry_repair.lock ./all_context_to_entry_repair.sh; } >> "$LOG_DIR/context_to_entry_repair.log" 2>&1
+
 # Portfolio/advisory run daily after market close. Wait for end-of-day data
-# catch-up and queued single-client workers before reconciling actions.
-10 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${ADVISORY_WAIT_FOR_DATA_TIMEOUT_SECONDS:-7200}" /tmp/stockey_complete_data.lock /tmp/stockey_download_queue.lock /tmp/stockey_external_workers.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh; } >> "$LOG_DIR/all_advisory.log" 2>&1
+# catch-up, queued single-client workers, and bounded context repair before
+# reconciling actions.
+10 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${ADVISORY_WAIT_FOR_DATA_TIMEOUT_SECONDS:-7200}" /tmp/stockey_complete_data.lock /tmp/stockey_download_queue.lock /tmp/stockey_external_workers.lock /tmp/stockey_context_to_entry_repair.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh; } >> "$LOG_DIR/all_advisory.log" 2>&1
 
 # Continuous one-shot watch during market hours on weekdays.
 # Internal sync state keeps news/announcements slower while OHLCV stays more frequent.
@@ -77,6 +84,11 @@ LOG_DIR={{LOG_DIR}}
 # Research-only TS forecast paper portfolio. Compares forecast-only decisions with naive momentum and advisory alignment.
 35 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_paper.lock ./all_ts_forecast_paper_portfolio.sh >> "$LOG_DIR/ts_forecast_paper_portfolio.log" 2>&1
 
+# Research-only evidence refresh. This matures context/event/action-transition
+# evidence daily without running event-model prep/training/scoring and without
+# changing policy, portfolio rows, config, or broker behavior.
+20 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_research_evidence.lock ./all_research_evidence.sh >> "$LOG_DIR/research_evidence.log" 2>&1
+
 # Research-only event-policy realized-return evaluation. Runs after the post-close advisory window.
 # It writes policy/action/class quality summaries only; it does not change thresholds or actions.
 10 23 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_event_policy_eval.lock ./all_event_policy_evaluator.sh >> "$LOG_DIR/event_policy_evaluator.log" 2>&1
@@ -86,8 +98,8 @@ LOG_DIR={{LOG_DIR}}
 20 04 * * 6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_technical_calibration.lock ./all_technical_threshold_calibration.sh >> "$LOG_DIR/technical_threshold_calibration.log" 2>&1
 
 # Weekly long-running research-only event-model prep/training.
-# It refreshes event-model evidence but does not change live policy automatically.
-10 03 * * 0 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh >> "$LOG_DIR/all_ml.log" 2>&1
+# It refreshes event-model evidence plus stable multi-window signal-quality evidence, but does not change live policy automatically.
+10 03 * * 0 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh --run-signal-quality-window-runner --include-signal-quality-split-reports >> "$LOG_DIR/all_ml.log" 2>&1
 
 # ---------------------------------------------------------------------------
 # Manual / catch-up / long-running scripts. Keep these commented unless you

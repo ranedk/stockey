@@ -12,7 +12,8 @@ from advisory.fallback_telemetry import record_fallback_event, record_local_fall
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.codex_cli import run_codex_structured
-from utils.db import sql_to_df, upsert_to_db
+from utils.company_master import map_company_master_ids
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
@@ -34,6 +35,18 @@ EVENT_POLICY_LLM_MANUAL_REVIEW_ENABLED = env.bool("EVENT_POLICY_LLM_MANUAL_REVIE
 EVENT_POLICY_LLM_MANUAL_REVIEW_MODEL = env("EVENT_POLICY_LLM_MANUAL_REVIEW_MODEL", default="codex")
 EVENT_POLICY_LLM_MANUAL_REVIEW_MAX_ROWS = env.int("EVENT_POLICY_LLM_MANUAL_REVIEW_MAX_ROWS", default=25)
 EVENT_POLICY_LLM_MANUAL_REVIEW_TIMEOUT_SECONDS = env.int("EVENT_POLICY_LLM_MANUAL_REVIEW_TIMEOUT_SECONDS", default=180)
+EVENT_POLICY_LLM_AUTHORITY_CONTRACT = {
+    "authority_scope": "event_policy_review_input_only",
+    "action_policy_effect": "classify_ambiguous_event_policy_rows_only",
+    "allowed_final_action_types": ["MANUAL_REVIEW", "NO_ACTION", "BUY_WATCH", "REDUCE_EXPOSURE_REVIEW"],
+    "portfolio_authority": "none",
+    "broker_execution_allowed": False,
+    "policy_auto_promotion_allowed": False,
+    "requires_downstream_policy_gate": True,
+    "requires_technical_confirmation_for_entry": True,
+    "requires_lifecycle_confirmation_for_exit_or_derisk": True,
+    "resolved_review_only_actions": ["NO_ACTION", "BUY_WATCH", "REDUCE_EXPOSURE_REVIEW"],
+}
 
 POSITIVE_CLASSES = {
     "ORDER_WIN",
@@ -144,7 +157,7 @@ EVENT_POLICY_ACTIONABILITY_SCHEMA_STATEMENTS = [
 
 
 class EventPolicyManualReview(BaseModel):
-    final_action_type: Literal["MANUAL_REVIEW", "NO_ACTION"]
+    final_action_type: Literal["MANUAL_REVIEW", "NO_ACTION", "BUY_WATCH", "REDUCE_EXPOSURE_REVIEW"]
     confidence: float = Field(ge=0.0, le=1.0)
     operator_summary: str = Field(min_length=10, max_length=800)
     possible_action: str = Field(min_length=5, max_length=400)
@@ -353,14 +366,98 @@ def _affected_market_scope(row: pd.Series) -> dict[str, Any]:
         scope_type = "sector"
     else:
         scope_type = "single_company_or_unknown"
+    validated_peers = _compact_text_list(
+        _first_nonempty(
+            row.get("validated_affected_peers_json"),
+            row.get("resolved_affected_peers_json"),
+            row.get("identity_validated_peers_json"),
+            tensor.get("validated_affected_peers"),
+            tensor.get("resolved_affected_peers"),
+        ),
+        max_items=12,
+        source="validated_affected_peers_json",
+    )
+    unresolved_peers = [peer for peer in peers if peer.upper() not in {value.upper() for value in validated_peers}]
+    identity_status = (
+        "not_applicable"
+        if not peers and not sectors
+        else "validated"
+        if peers and not unresolved_peers and validated_peers
+        else "requires_identity_validation"
+    )
     return {
         "scope_type": scope_type,
         "affected_sectors": sectors,
         "affected_peers": peers,
+        "validated_affected_peers": validated_peers,
+        "unresolved_affected_peers": unresolved_peers,
         "affected_sector_count": len(sectors),
         "affected_peer_count": len(peers),
+        "identity_validation": {
+            "status": identity_status,
+            "validated_peer_count": len(validated_peers),
+            "unresolved_peer_count": len(unresolved_peers),
+            "requires_company_master_resolution": bool(unresolved_peers),
+            "policy_effect": "context_only_until_resolved" if unresolved_peers else "identity_context_accepted",
+            "portfolio_authority": "none",
+            "broker_execution_allowed": False,
+            "note": (
+                "Affected peers came from structured extraction but are not marked as company-master/security-master validated."
+                if unresolved_peers
+                else "No unresolved affected peers are present."
+            ),
+        },
         "note": "Derived from structured event evaluation affected_sectors/affected_peers fields when available.",
     }
+
+
+def annotate_policy_input_peer_identity(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty or "affected_peers_json" not in rows.columns:
+        return rows
+    out = rows.copy()
+    row_peers: list[list[str]] = []
+    all_peers: list[str] = []
+    for value in out["affected_peers_json"].tolist():
+        peers = _compact_text_list(value, max_items=12, source="affected_peers_json")
+        row_peers.append(peers)
+        all_peers.extend(peers)
+    unique_peers = sorted({peer.upper() for peer in all_peers if _text(peer)})
+    if not unique_peers:
+        out["validated_affected_peers_json"] = "[]"
+        out["unresolved_affected_peers_json"] = "[]"
+        return out
+    try:
+        nse_ids = map_company_master_ids(unique_peers, exchange="NSE")
+        bse_ids = map_company_master_ids(unique_peers, exchange="BSE")
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.event_policy",
+            fallback_type="event_policy_affected_peer_identity_lookup_failed",
+            source="company_master",
+            severity="warn",
+            reason="Event-policy input peer identity validation failed; affected peers remain context-only until resolved.",
+            error=exc,
+            metadata={"peer_count": len(unique_peers), "peer_sample": unique_peers[:10]},
+        )
+        out["validated_affected_peers_json"] = "[]"
+        out["unresolved_affected_peers_json"] = out["affected_peers_json"].apply(
+            lambda value: json_dumps(_compact_text_list(value, max_items=12, source="affected_peers_json"))
+        )
+        return out
+    resolved: set[str] = set()
+    for peer, nse_id, bse_id in zip(unique_peers, nse_ids.tolist(), bse_ids.tolist(), strict=False):
+        if _text(nse_id) or _text(bse_id):
+            resolved.add(peer.upper())
+    validated_rows: list[str] = []
+    unresolved_rows: list[str] = []
+    for peers in row_peers:
+        validated = [peer for peer in peers if peer.upper() in resolved]
+        unresolved = [peer for peer in peers if peer.upper() not in resolved]
+        validated_rows.append(json_dumps(validated))
+        unresolved_rows.append(json_dumps(unresolved))
+    out["validated_affected_peers_json"] = validated_rows
+    out["unresolved_affected_peers_json"] = unresolved_rows
+    return out
 
 
 def _source_quality(row: pd.Series) -> dict[str, Any]:
@@ -458,6 +555,8 @@ def build_actionability_context(row: pd.Series, *, policy_class: str, action_typ
         next_evidence.append("Point-in-time price reaction is missing; refresh OHLCV/event evidence before deciding")
     if market_scope["affected_sector_count"] or market_scope["affected_peer_count"]:
         next_evidence.append("Check whether affected peers/sectors confirm or contradict the event thesis")
+    if market_scope.get("identity_validation", {}).get("requires_company_master_resolution"):
+        next_evidence.append("Resolve extracted affected peers through company/security masters before using peer context")
     return {
         "version": 1,
         "materiality": materiality,
@@ -652,7 +751,7 @@ def load_policy_inputs(
             LIMIT 1
         ) portfolio_ctx ON TRUE
         """
-    return sql_to_df(
+    df = sql_to_df(
         f"""
         SELECT
             e.published_on,
@@ -701,6 +800,7 @@ def load_policy_inputs(
         params=params or None,
         retries=3,
     )
+    return annotate_policy_input_peer_identity(df)
 
 
 def policy_class_for_event(row: pd.Series) -> str:
@@ -857,9 +957,13 @@ def _manual_review_prompt(policy_row: dict[str, Any]) -> str:
         "instruction": (
             "Review this event-policy MANUAL_REVIEW row. "
             "If manual review is unlikely to lead to a useful action, set final_action_type to NO_ACTION. "
-            "Otherwise keep MANUAL_REVIEW and provide exact operator notes, future events to wait for, and questions to answer. "
-            "Do not recommend immediate broker execution."
+            "If it is useful positive watchlist pressure but still needs technical/risk confirmation, set final_action_type to BUY_WATCH. "
+            "If it is useful negative/de-risk pressure but still needs portfolio/lifecycle confirmation, set final_action_type to REDUCE_EXPOSURE_REVIEW. "
+            "Keep MANUAL_REVIEW only when the event needs unresolved interpretation before even watch/de-risk classification. "
+            "Always provide exact operator notes, future events to wait for, and questions to answer. "
+            "Do not recommend immediate broker execution, sizing, or portfolio mutation."
         ),
+        "authority_contract": EVENT_POLICY_LLM_AUTHORITY_CONTRACT,
         "policy_row": policy_row,
     }
     return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
@@ -868,11 +972,17 @@ def _manual_review_prompt(policy_row: dict[str, Any]) -> str:
 def _deterministic_operator_notes(policy_row: dict[str, Any], *, status: str, error: str | None = None) -> dict[str, Any]:
     action_type = _text(policy_row.get("action_type"), "MANUAL_REVIEW").upper()
     policy_class = _text(policy_row.get("policy_class"), "OTHER")
-    actionability = json.loads(policy_row.get("actionability_json") or "{}")
+    actionability = _jsonish(policy_row.get("actionability_json"), source="event_policy_manual_review_actionability_json")
+    actionability = actionability if isinstance(actionability, dict) else {}
+    raw_context = _jsonish(policy_row.get("raw_context_json"), source="event_policy_manual_review_raw_context_json")
+    raw_context = raw_context if isinstance(raw_context, dict) else {}
     next_evidence = actionability.get("suggested_next_evidence") if isinstance(actionability, dict) else []
+    materiality = _text((actionability or {}).get("materiality") if isinstance(actionability, dict) else None, _text(policy_row.get("materiality"), "low")).lower()
+    confidence = _num(policy_row.get("confidence"))
+    score_impact = _num(raw_context.get("score_impact"), _num(policy_row.get("score_impact"), _num(policy_row.get("policy_score"))))
     notes = {
         "final_action_type": action_type,
-        "confidence": _num(policy_row.get("confidence")),
+        "confidence": confidence,
         "operator_summary": _text(policy_row.get("action_reason"), "Manual review required before this event can affect an action."),
         "possible_action": "Keep this as review-only evidence until follow-up data confirms materiality and market reaction.",
         "wait_for_events": list(next_evidence)[:5]
@@ -888,6 +998,7 @@ def _deterministic_operator_notes(policy_row: dict[str, Any], *, status: str, er
             "Does technical structure confirm or contradict the event?",
         ],
         "actionability": actionability,
+        "authority_contract": EVENT_POLICY_LLM_AUTHORITY_CONTRACT,
         "downgrade_reason": None,
         "rationale": "Deterministic fallback notes generated because LLM review was unavailable or disabled.",
         "status": status,
@@ -896,9 +1007,160 @@ def _deterministic_operator_notes(policy_row: dict[str, Any], *, status: str, er
         notes["final_action_type"] = "NO_ACTION"
         notes["possible_action"] = "No action unless a stronger related event appears."
         notes["downgrade_reason"] = "Low-action event class is not worth manual review by itself."
+    elif policy_class in POSITIVE_CLASSES:
+        if materiality == "low" or confidence < 0.45 or score_impact < 0.05:
+            notes["final_action_type"] = "NO_ACTION"
+            notes["possible_action"] = "Ignore until the positive event has stronger materiality, confidence, or price/volume confirmation."
+            notes["downgrade_reason"] = "Weak positive event evidence should not consume Manual Review or block technical candidates."
+        else:
+            notes["final_action_type"] = "BUY_WATCH"
+            notes["possible_action"] = "Treat as positive watchlist pressure only; require technical trigger, liquidity, stop, target, and risk checks before any entry."
+            notes["downgrade_reason"] = None
+            notes["operator_summary"] = (
+                "Positive event evidence is useful as watchlist pressure, but it is not strong enough to create broker-capable action."
+            )
+    elif policy_class in NEGATIVE_CLASSES:
+        if materiality == "low" and confidence < 0.45 and abs(score_impact) < 0.05:
+            notes["final_action_type"] = "NO_ACTION"
+            notes["possible_action"] = "Ignore until the negative event has stronger materiality, confidence, or price/volume confirmation."
+            notes["downgrade_reason"] = "Weak negative event evidence should not consume Manual Review or create de-risk pressure."
+        else:
+            notes["final_action_type"] = "REDUCE_EXPOSURE_REVIEW"
+            notes["possible_action"] = "Treat as review-only de-risk pressure; require portfolio exposure, lifecycle, stop, and event-freshness confirmation before any exit or reduction."
+            notes["downgrade_reason"] = None
+            notes["operator_summary"] = (
+                "Negative event evidence is useful as de-risk pressure, but it is not strong enough to create broker-capable exit."
+            )
     if error:
         notes["llm_error"] = error
     return notes
+
+
+def _apply_manual_review_notes(
+    policy_row: dict[str, Any],
+    *,
+    notes: dict[str, Any],
+    status: str,
+    effective_model: str,
+    error: str | None = None,
+) -> dict[str, Any]:
+    out = dict(policy_row)
+    final_action = str(notes.get("final_action_type") or out.get("action_type") or "MANUAL_REVIEW").upper()
+    notes["authority_contract"] = EVENT_POLICY_LLM_AUTHORITY_CONTRACT
+    if final_action in {"MANUAL_REVIEW", "NO_ACTION", "BUY_WATCH", "REDUCE_EXPOSURE_REVIEW"}:
+        out["action_type"] = final_action
+    if final_action == "NO_ACTION":
+        out["action_status"] = "llm_downgraded_no_action" if status == "ok" else "deterministic_downgraded_no_action"
+        downgrade_reason = _text(notes.get("downgrade_reason"))
+        if downgrade_reason:
+            out["action_reason"] = downgrade_reason
+    elif final_action == "BUY_WATCH":
+        out["action_status"] = "llm_reclassified_watch_overlay" if status == "ok" else "deterministic_reclassified_watch_overlay"
+        out["action_reason"] = _text(notes.get("operator_summary"), out.get("action_reason"))
+    elif final_action == "REDUCE_EXPOSURE_REVIEW":
+        out["action_status"] = "llm_reclassified_derisk_overlay" if status == "ok" else "deterministic_reclassified_derisk_overlay"
+        out["action_reason"] = _text(notes.get("operator_summary"), out.get("action_reason"))
+    elif final_action != "MANUAL_REVIEW":
+        out["action_status"] = "llm_reclassified_review" if status == "ok" else "deterministic_reclassified_review"
+        out["action_reason"] = _text(notes.get("operator_summary"), out.get("action_reason"))
+    else:
+        out["action_reason"] = _text(notes.get("operator_summary"), out.get("action_reason"))
+    out["operator_notes_json"] = json_dumps(notes)
+    out["llm_review_json"] = json_dumps(notes)
+    out["llm_prompt_id"] = PROMPT_ID
+    out["llm_prompt_version"] = PROMPT_VERSION
+    out["llm_prompt_schema_version"] = PROMPT_SCHEMA_VERSION
+    out["llm_review_status"] = status
+    out["llm_review_model"] = effective_model
+    out["llm_review_error"] = error
+    raw_context = _jsonish(out.get("raw_context_json"), source="event_policy_manual_review_output_raw_context_json")
+    raw_context = raw_context if isinstance(raw_context, dict) else {}
+    raw_context["operator_notes"] = notes
+    raw_context["authority_contract"] = EVENT_POLICY_LLM_AUTHORITY_CONTRACT
+    raw_context["prompt_contract"] = {
+        "prompt_id": PROMPT_ID,
+        "prompt_version": PROMPT_VERSION,
+        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+    }
+    out["raw_context_json"] = json_dumps(raw_context)
+    return out
+
+
+def repair_llm_provenance_metadata(*, dry_run: bool = True) -> dict[str, Any]:
+    """Backfill prompt metadata for legacy LLM-relevant event-policy rows.
+
+    This intentionally updates metadata only. It does not change actions,
+    scores, review notes, portfolio state, or broker eligibility.
+    """
+    ensure_tables()
+    where_clause = """
+        COALESCE(LOWER(TRIM(llm_review_status)), '') NOT IN ('', 'not_requested')
+        AND (
+            llm_prompt_id IS NULL OR TRIM(llm_prompt_id) = ''
+            OR llm_prompt_version IS NULL OR TRIM(llm_prompt_version) = ''
+            OR llm_prompt_schema_version IS NULL OR TRIM(llm_prompt_schema_version) = ''
+            OR llm_review_model IS NULL OR TRIM(llm_review_model) = ''
+        )
+    """
+    count_df = sql_to_df(
+        f"""
+        SELECT
+            COUNT(*) AS matched_rows,
+            COUNT(*) FILTER (WHERE llm_prompt_id IS NULL OR TRIM(llm_prompt_id) = '') AS missing_prompt_id,
+            COUNT(*) FILTER (WHERE llm_prompt_version IS NULL OR TRIM(llm_prompt_version) = '') AS missing_prompt_version,
+            COUNT(*) FILTER (WHERE llm_prompt_schema_version IS NULL OR TRIM(llm_prompt_schema_version) = '') AS missing_prompt_schema_version,
+            COUNT(*) FILTER (WHERE llm_review_model IS NULL OR TRIM(llm_review_model) = '') AS missing_model
+        FROM {TABLE_NAME}
+        WHERE {where_clause}
+        """
+    )
+    summary = count_df.iloc[0].to_dict() if not count_df.empty else {}
+    matched_rows = int(summary.get("matched_rows") or 0)
+    payload = {
+        "status": "dry_run" if dry_run else "applied",
+        "table": TABLE_NAME,
+        "dry_run": bool(dry_run),
+        "matched_rows": matched_rows,
+        "missing_prompt_id": int(summary.get("missing_prompt_id") or 0),
+        "missing_prompt_version": int(summary.get("missing_prompt_version") or 0),
+        "missing_prompt_schema_version": int(summary.get("missing_prompt_schema_version") or 0),
+        "missing_model": int(summary.get("missing_model") or 0),
+        "prompt_id": PROMPT_ID,
+        "prompt_version": PROMPT_VERSION,
+        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
+        "model_default": EVENT_POLICY_LLM_MANUAL_REVIEW_MODEL,
+        "policy_boundary": {
+            "metadata_only": True,
+            "action_policy_changed": False,
+            "broker_execution_allowed": False,
+            "policy_auto_promotion_allowed": False,
+        },
+    }
+    if dry_run or matched_rows == 0:
+        return payload
+
+    def _apply_repair() -> int:
+        with db_session() as (_, cur):
+            cur.execute(
+                f"""
+                UPDATE {TABLE_NAME}
+                SET
+                    llm_prompt_id = COALESCE(NULLIF(TRIM(llm_prompt_id), ''), %s),
+                    llm_prompt_version = COALESCE(NULLIF(TRIM(llm_prompt_version), ''), %s),
+                    llm_prompt_schema_version = COALESCE(NULLIF(TRIM(llm_prompt_schema_version), ''), %s),
+                    llm_review_model = COALESCE(NULLIF(TRIM(llm_review_model), ''), %s)
+                WHERE {where_clause}
+                """,
+                (PROMPT_ID, PROMPT_VERSION, PROMPT_SCHEMA_VERSION, EVENT_POLICY_LLM_MANUAL_REVIEW_MODEL),
+            )
+            return int(cur.rowcount or 0)
+
+    updated_rows = execute_db_operation(
+        _apply_repair,
+        operation_name="event_policy:repair_llm_provenance_metadata",
+    )
+    payload["updated_rows"] = int(updated_rows)
+    return payload
 
 
 def apply_llm_manual_review(policy_row: dict[str, Any], *, model: str | None = None, use_llm: bool = True) -> dict[str, Any]:
@@ -918,8 +1180,9 @@ def apply_llm_manual_review(policy_row: dict[str, Any], *, model: str | None = N
                 model=codex_model,
                 system_prompt=(
                     "You are a cautious Indian-equity event-policy reviewer. "
-                    "You decide whether a manual-review event is actionable enough to remain in the operator queue. "
-                    "You never submit trades and you never create broker-executable recommendations."
+                    "You decide whether a manual-review event should become no-action, review-only watch pressure, "
+                    "review-only de-risk pressure, or remain manual review. "
+                    "You never submit trades, size positions, mutate portfolios, or create broker-executable recommendations."
                 ),
                 max_attempts=2,
                 timeout_seconds=EVENT_POLICY_LLM_MANUAL_REVIEW_TIMEOUT_SECONDS,
@@ -944,37 +1207,19 @@ def apply_llm_manual_review(policy_row: dict[str, Any], *, model: str | None = N
                 metadata={"model": effective_model, "event_class": policy_row.get("policy_class") or policy_row.get("event_class")},
             )
 
-    out = dict(policy_row)
-    final_action = str(notes.get("final_action_type") or out.get("action_type") or "MANUAL_REVIEW").upper()
-    if final_action in {"MANUAL_REVIEW", "NO_ACTION"}:
-        out["action_type"] = final_action
-    if final_action == "NO_ACTION":
-        out["action_status"] = "llm_downgraded_no_action" if status == "ok" else out.get("action_status")
-        downgrade_reason = _text(notes.get("downgrade_reason"))
-        if downgrade_reason:
-            out["action_reason"] = downgrade_reason
-    elif final_action != "MANUAL_REVIEW":
-        out["action_status"] = "llm_reclassified_review"
-        out["action_reason"] = _text(notes.get("operator_summary"), out.get("action_reason"))
-    else:
-        out["action_reason"] = _text(notes.get("operator_summary"), out.get("action_reason"))
-    out["operator_notes_json"] = json_dumps(notes)
-    out["llm_review_json"] = json_dumps(notes)
-    out["llm_prompt_id"] = PROMPT_ID
-    out["llm_prompt_version"] = PROMPT_VERSION
-    out["llm_prompt_schema_version"] = PROMPT_SCHEMA_VERSION
-    out["llm_review_status"] = status
-    out["llm_review_model"] = effective_model
-    out["llm_review_error"] = error
-    raw_context = json.loads(out.get("raw_context_json") or "{}")
-    raw_context["operator_notes"] = notes
-    raw_context["prompt_contract"] = {
-        "prompt_id": PROMPT_ID,
-        "prompt_version": PROMPT_VERSION,
-        "prompt_schema_version": PROMPT_SCHEMA_VERSION,
-    }
-    out["raw_context_json"] = json_dumps(raw_context)
-    return out
+    return _apply_manual_review_notes(policy_row, notes=notes, status=status, effective_model=effective_model, error=error)
+
+
+def _manual_review_priority_key(policy_row: dict[str, Any]) -> tuple[int, int, float, float]:
+    actionability = _jsonish(policy_row.get("actionability_json"), source="event_policy_actionability_json")
+    actionability = actionability if isinstance(actionability, dict) else {}
+    review_priority = str(actionability.get("review_priority") or "").strip().lower()
+    priority_rank = {"high": 0, "medium": 1, "low": 2}.get(review_priority, 3)
+    materiality = str(actionability.get("materiality") or policy_row.get("source_verdict") or "").strip().lower()
+    materiality_rank = {"high": 0, "medium": 1, "low": 2}.get(materiality, 3)
+    score = abs(_num(policy_row.get("policy_score"), 0.0))
+    confidence = _num(policy_row.get("confidence"), 0.0)
+    return (priority_rank, materiality_rank, -score, 1.0 - confidence)
 
 
 def build_event_policy_actions(
@@ -991,12 +1236,24 @@ def build_event_policy_actions(
     max_rows = EVENT_POLICY_LLM_MANUAL_REVIEW_MAX_ROWS if llm_max_rows is None else max(0, int(llm_max_rows))
     reviewed_count = 0
     if effective_use_llm and max_rows > 0:
-        for idx, row in enumerate(policy_rows):
+        manual_indices = [
+            idx
+            for idx, row in enumerate(policy_rows)
+            if str(row.get("action_type") or "").upper() == "MANUAL_REVIEW"
+        ]
+        manual_indices.sort(key=lambda idx: _manual_review_priority_key(policy_rows[idx]))
+        for idx in manual_indices:
+            row = policy_rows[idx]
             if str(row.get("action_type") or "").upper() != "MANUAL_REVIEW":
                 continue
             if reviewed_count >= max_rows:
-                row["llm_review_status"] = "skipped_limit"
-                row["operator_notes_json"] = json_dumps(_deterministic_operator_notes(row, status="skipped_limit"))
+                policy_rows[idx] = _apply_manual_review_notes(
+                    row,
+                    notes=_deterministic_operator_notes(row, status="skipped_limit"),
+                    status="skipped_limit",
+                    effective_model=model or EVENT_POLICY_LLM_MANUAL_REVIEW_MODEL,
+                    error=None,
+                )
                 continue
             policy_rows[idx] = apply_llm_manual_review(row, model=model, use_llm=True)
             reviewed_count += 1
@@ -1038,12 +1295,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=None)
     parser.add_argument("--no-llm", action="store_true")
     parser.add_argument("--llm-max-rows", type=int, default=None)
+    parser.add_argument("--repair-llm-provenance", action="store_true", help="Backfill prompt metadata on legacy LLM-relevant event-policy rows.")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.repair_llm_provenance:
+        payload = repair_llm_provenance_metadata(dry_run=bool(args.dry_run))
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        return 0
     asof_date = pd.Timestamp(args.date, tz="UTC") if args.date else None
     events = load_policy_inputs(asof_date=asof_date, symbols=args.symbols, setup_ids=args.setup_ids)
     actions, meta = build_event_policy_actions(

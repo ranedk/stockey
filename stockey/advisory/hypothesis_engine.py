@@ -12,8 +12,15 @@ import yaml
 from environs import Env
 from pydantic import BaseModel, Field
 
+from advisory.event_evidence_store import ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE, BHAVCOPY_CONTEXT_OVERLAYS_TABLE
+from advisory.exchange_context_overlays import EXCHANGE_CONTEXT_OVERLAYS_TABLE
 from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
+from advisory.context_overlay_reliability_report import load_persisted_reliability_report as load_persisted_context_reliability_report
+from advisory.context_overlay_reliability_report import load_reliability_report as load_fast_context_reliability_report
+from advisory.context_overlay_reliability_report import reliability_runtime_policy_contract
+from advisory.macro_context_overlays import MACRO_CONTEXT_OVERLAYS_TABLE
 from advisory.market_context import load_latest_market_context
+from advisory.news_theme_engine import THEME_CONTEXT_OVERLAYS_TABLE
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.db import sql_to_df, upsert_to_db
@@ -146,9 +153,32 @@ PLAYBOOK_ACTION_PROMPT_ID = "playbook_action_plan"
 PLAYBOOK_ACTION_PROMPT_VERSION = registry_prompt_version(PLAYBOOK_ACTION_PROMPT_ID)
 PLAYBOOK_ACTION_PROMPT_SCHEMA_VERSION = response_schema_version(PLAYBOOK_ACTION_PROMPT_ID)
 WEAK_MARKET_BREADTH_THRESHOLD = 45.0
+HYPOTHESIS_MARKET_CONTEXT_RISK_OFF_SCORE_THRESHOLD = env.float("HYPOTHESIS_MARKET_CONTEXT_RISK_OFF_SCORE_THRESHOLD", default=0.60)
+HYPOTHESIS_MARKET_CONTEXT_REGIME_LABEL_HARD_BLOCK_ENABLED = env.bool("HYPOTHESIS_MARKET_CONTEXT_REGIME_LABEL_HARD_BLOCK_ENABLED", default=False)
+HYPOTHESIS_MARKET_CONTEXT_WEAK_BREADTH_HARD_BLOCK_ENABLED = env.bool("HYPOTHESIS_MARKET_CONTEXT_WEAK_BREADTH_HARD_BLOCK_ENABLED", default=False)
+HYPOTHESIS_MARKET_CONTEXT_SCORE_RISK_OFF_HARD_BLOCK_ENABLED = env.bool("HYPOTHESIS_MARKET_CONTEXT_SCORE_RISK_OFF_HARD_BLOCK_ENABLED", default=False)
+HYPOTHESIS_MARKET_CONTEXT_HIGH_MACRO_RISK_HARD_BLOCK_ENABLED = env.bool(
+    "HYPOTHESIS_MARKET_CONTEXT_HIGH_MACRO_RISK_HARD_BLOCK_ENABLED",
+    default=False,
+)
+HYPOTHESIS_MARKET_CONTEXT_SYMBOL_LEADERSHIP_OVERRIDE_ENABLED = env.bool("HYPOTHESIS_MARKET_CONTEXT_SYMBOL_LEADERSHIP_OVERRIDE_ENABLED", default=True)
+HYPOTHESIS_MARKET_CONTEXT_CONTEXT_OVERLAY_OVERRIDE_ENABLED = env.bool("HYPOTHESIS_MARKET_CONTEXT_CONTEXT_OVERLAY_OVERRIDE_ENABLED", default=True)
+HYPOTHESIS_MARKET_CONTEXT_CONTEXT_OVERLAY_SOFTENS_ANY_SYMBOL_ENABLED = env.bool(
+    "HYPOTHESIS_MARKET_CONTEXT_CONTEXT_OVERLAY_SOFTENS_ANY_SYMBOL_ENABLED",
+    default=True,
+)
+HYPOTHESIS_CONTEXT_OVERLAY_LOOKBACK_DAYS = env.int("HYPOTHESIS_CONTEXT_OVERLAY_LOOKBACK_DAYS", default=30)
 RISK_OFF_STATES = {"HIGH", "STRESS", "RISK_OFF", "DEFENSIVE"}
+SYSTEMIC_MACRO_HARD_RISK_STATES = {"STRESS", "CRASH", "HOSTILE", "SHOCK"}
 POSITIVE_PLAYBOOK_ACTIONS = {"BUY", "BUY_MORE", "BUY_WATCH", "WATCH_SYMBOLS", "ADD_TO_WATCHLIST"}
 NEGATIVE_PLAYBOOK_ACTIONS = {"REDUCE_EXPOSURE_REVIEW", "GO_CASH_REVIEW", "SHORT_RESEARCH_ONLY", "FULL_EXIT", "PARTIAL_EXIT"}
+CONTEXT_RELIABILITY_SUPPRESS_CLASSES = {
+    "hurts_or_no_lift",
+    "negative_after_cost",
+    "inconsistent_or_horizon_sensitive",
+    "needs_benchmark_attribution",
+    "benchmark_beta_not_overlay_alpha",
+}
 
 
 class PlaybookCheck(BaseModel):
@@ -187,6 +217,21 @@ def table_exists(table_name: str) -> bool:
         params=(table_name,),
     )
     return not df.empty
+
+
+def table_columns(table_name: str) -> set[str]:
+    df = sql_to_df(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = %s
+        """,
+        params=(table_name,),
+    )
+    if df.empty or "column_name" not in df.columns:
+        return set()
+    return {str(value) for value in df["column_name"].dropna().tolist()}
 
 
 def ensure_tables(*, force: bool = False) -> None:
@@ -283,6 +328,565 @@ def _clean_json_record(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _sector_key(value: Any) -> str:
+    if pd.api.types.is_scalar(value) and pd.isna(value):
+        return ""
+    text = str(value or "").strip()
+    if not text or text.upper() in {"<NA>", "NAN", "NONE"}:
+        return ""
+    return re.sub(r"[^A-Z0-9]+", "", text.upper())
+
+
+def _overlay_reason_expr(columns: set[str], *, table_alias: str = "o") -> str:
+    prefix = f"{table_alias}." if table_alias else ""
+    for column in ["trigger_reason", "theme_reason", "reason", "watch_reason_detail", "summary_text"]:
+        if column in columns:
+            return f"{prefix}{column}"
+    return "NULL::text"
+
+
+def _load_direct_playbook_context_overlay_rows(
+    *,
+    table_name: str,
+    source_name: str,
+    asof_date: pd.Timestamp,
+    symbol: str,
+    date_column: str,
+    class_column: str,
+) -> pd.DataFrame:
+    if not symbol or not table_exists(table_name):
+        return pd.DataFrame()
+    try:
+        columns = table_columns(table_name)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.hypothesis_engine",
+            fallback_type="hypothesis_context_overlay_columns_load_failed",
+            source=table_name,
+            severity="warn",
+            symbol=symbol,
+            reason="Hypothesis/playbook planning could not inspect context-overlay columns.",
+            error=exc,
+            metadata={"source_name": source_name},
+        )
+        return pd.DataFrame()
+    if not {date_column, "symbol", "direction"}.issubset(columns):
+        return pd.DataFrame()
+    from_date = asof_date - pd.Timedelta(days=max(0, int(HYPOTHESIS_CONTEXT_OVERLAY_LOOKBACK_DAYS)))
+    overlay_expr = "o.overlay_id" if "overlay_id" in columns else "NULL::text"
+    score_expr = "o.pressure_score" if "pressure_score" in columns else "NULL::double precision"
+    class_expr = f"o.{class_column}" if class_column in columns else "NULL::text"
+    reason_expr = _overlay_reason_expr(columns)
+    sector_name_expr = "o.sector_name" if "sector_name" in columns else "NULL::text"
+    sector_code_expr = "o.sector_code" if "sector_code" in columns else "NULL::text"
+    production_filter = "AND COALESCE(o.production_status, 'active') = 'active'" if "production_status" in columns else ""
+    authority_filter = (
+        "AND COALESCE(o.authority_scope, 'watchlist_pressure_only') = 'watchlist_pressure_only'"
+        if "authority_scope" in columns
+        else ""
+    )
+    try:
+        return sql_to_df(
+            f"""
+            SELECT
+                UPPER(TRIM(o.symbol)) AS symbol,
+                o.{date_column} AS context_asof_date,
+                %(source_name)s::text AS context_source,
+                {overlay_expr} AS overlay_id,
+                o.direction,
+                {score_expr} AS pressure_score,
+                {class_expr} AS context_class,
+                {reason_expr} AS reason,
+                {sector_name_expr} AS sector_name,
+                {sector_code_expr} AS sector_code
+            FROM {table_name} o
+            WHERE o.{date_column} >= %(from_date)s
+              AND o.{date_column} <= %(asof_date)s
+              AND UPPER(TRIM(o.symbol)) = %(symbol)s
+              {production_filter}
+              {authority_filter}
+            ORDER BY o.{date_column} DESC NULLS LAST, pressure_score DESC NULLS LAST
+            LIMIT 20
+            """,
+            params={"from_date": from_date, "asof_date": asof_date, "symbol": symbol, "source_name": source_name},
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.hypothesis_engine",
+            fallback_type="hypothesis_context_overlay_load_failed",
+            source=table_name,
+            severity="warn",
+            symbol=symbol,
+            reason="Hypothesis/playbook planning could not load direct context-overlay rows.",
+            error=exc,
+            metadata={"source_name": source_name, "lookback_days": HYPOTHESIS_CONTEXT_OVERLAY_LOOKBACK_DAYS},
+        )
+        return pd.DataFrame()
+
+
+def _load_sector_playbook_context_overlay_rows(
+    *,
+    table_name: str,
+    source_name: str,
+    asof_date: pd.Timestamp,
+    symbol_context: dict[str, Any],
+    class_column: str,
+    reason_column: str,
+) -> pd.DataFrame:
+    sector_keys = {_sector_key(symbol_context.get("sector_name")), _sector_key(symbol_context.get("sector_code"))}
+    sector_keys = {value for value in sector_keys if value}
+    if not sector_keys or not table_exists(table_name):
+        return pd.DataFrame()
+    try:
+        columns = table_columns(table_name)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.hypothesis_engine",
+            fallback_type="hypothesis_context_overlay_columns_load_failed",
+            source=table_name,
+            severity="warn",
+            reason="Hypothesis/playbook planning could not inspect sector context-overlay columns.",
+            error=exc,
+            metadata={"source_name": source_name, "sector_keys": sorted(sector_keys)},
+        )
+        return pd.DataFrame()
+    if not {"asof_date", "direction", "sector_name", "sector_code"}.issubset(columns):
+        return pd.DataFrame()
+    from_date = asof_date - pd.Timedelta(days=max(0, int(HYPOTHESIS_CONTEXT_OVERLAY_LOOKBACK_DAYS)))
+    overlay_expr = "o.overlay_id" if "overlay_id" in columns else "NULL::text"
+    score_expr = "o.pressure_score" if "pressure_score" in columns else "NULL::double precision"
+    class_expr = f"o.{class_column}" if class_column in columns else "NULL::text"
+    reason_expr = f"o.{reason_column}" if reason_column in columns else "NULL::text"
+    production_filter = "AND COALESCE(o.production_status, 'active') = 'active'" if "production_status" in columns else ""
+    authority_filter = (
+        "AND COALESCE(o.authority_scope, 'watchlist_pressure_only') = 'watchlist_pressure_only'"
+        if "authority_scope" in columns
+        else ""
+    )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                o.asof_date AS context_asof_date,
+                %(source_name)s::text AS context_source,
+                {overlay_expr} AS overlay_id,
+                o.direction,
+                {score_expr} AS pressure_score,
+                {class_expr} AS context_class,
+                {reason_expr} AS reason,
+                o.sector_name,
+                o.sector_code
+            FROM {table_name} o
+            WHERE o.asof_date >= %(from_date)s
+              AND o.asof_date <= %(asof_date)s
+              {production_filter}
+              {authority_filter}
+            ORDER BY o.asof_date DESC NULLS LAST, pressure_score DESC NULLS LAST
+            LIMIT 50
+            """,
+            params={"from_date": from_date, "asof_date": asof_date, "source_name": source_name},
+            retries=3,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.hypothesis_engine",
+            fallback_type="hypothesis_context_overlay_load_failed",
+            source=table_name,
+            severity="warn",
+            reason="Hypothesis/playbook planning could not load sector context-overlay rows.",
+            error=exc,
+            metadata={"source_name": source_name, "lookback_days": HYPOTHESIS_CONTEXT_OVERLAY_LOOKBACK_DAYS},
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    mask = df.apply(
+        lambda row: bool(_sector_key(row.get("sector_name")) in sector_keys or _sector_key(row.get("sector_code")) in sector_keys),
+        axis=1,
+    )
+    out = df[mask].copy()
+    out["symbol"] = str(symbol_context.get("symbol") or "").strip().upper() or None
+    return out
+
+
+def _compact_playbook_reliability_row(row: dict[str, Any]) -> dict[str, Any]:
+    contract = row.get("runtime_policy_contract") if isinstance(row.get("runtime_policy_contract"), dict) else None
+    out = {
+        "classification": row.get("classification"),
+        "total_selected_count": row.get("total_selected_count"),
+        "total_matured_count": row.get("total_matured_count"),
+        "watch_matured_count": row.get("watch_matured_count"),
+        "negative_pressure_matured_count": row.get("negative_pressure_matured_count"),
+        "avg_forward_return_after_cost": row.get("avg_forward_return_after_cost"),
+        "avg_hit_rate_after_cost": row.get("avg_hit_rate_after_cost"),
+        "context_class_diagnostics": row.get("context_class_diagnostics") or [],
+        "context_class_policy_effect": row.get("context_class_policy_effect"),
+        "sector_diagnostics": row.get("sector_diagnostics") or [],
+        "sector_policy_effect": row.get("sector_policy_effect"),
+        "runtime_policy_contract": contract or reliability_runtime_policy_contract(row.get("classification")),
+        "authority_scope": "research_only",
+        "action_policy_effect": "annotation_only_no_trade_authority",
+        "broker_execution_allowed": False,
+    }
+    return {key: value for key, value in out.items() if value not in (None, "", [], {})}
+
+
+def _load_playbook_context_reliability(asof_date: pd.Timestamp) -> dict[str, Any]:
+    for source_name, loader in [
+        ("persisted_context_overlay_reliability", load_persisted_context_reliability_report),
+        ("fast_context_overlay_reliability", load_fast_context_reliability_report),
+    ]:
+        try:
+            report = loader(asof_date=asof_date)
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.hypothesis_engine",
+                fallback_type="hypothesis_context_reliability_load_failed",
+                source=source_name,
+                severity="warn",
+                reason="Hypothesis/playbook planning could not load context-overlay reliability annotations.",
+                error=exc,
+                metadata={"asof_date": str(asof_date)},
+            )
+            continue
+        families = report.get("families") if isinstance(report, dict) else None
+        if not families:
+            continue
+        family_map = {
+            str(row.get("source_family")): _compact_playbook_reliability_row(row)
+            for row in families
+            if isinstance(row, dict) and row.get("source_family")
+        }
+        if family_map:
+            return {
+                "status": report.get("status"),
+                "evaluated_at": report.get("evaluated_at"),
+                "evidence_source": source_name,
+                "families": family_map,
+                "authority_scope": "research_only",
+                "action_policy_effect": "annotation_only_no_trade_authority",
+                "broker_execution_allowed": False,
+            }
+    return {}
+
+
+def _context_class_reliability_for_playbook_overlay(
+    reliability_by_family: dict[str, Any],
+    source_family: Any,
+    context_class: Any,
+) -> dict[str, Any] | None:
+    family = str(source_family or "").strip()
+    target_class = str(context_class or "").strip().upper()
+    if not family or not target_class or target_class in {"<NA>", "NAN", "NONE"}:
+        return None
+    family_row = reliability_by_family.get(family)
+    if not isinstance(family_row, dict):
+        return None
+    for item in family_row.get("context_class_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("context_class") or "").strip().upper() != target_class:
+            continue
+        out = {key: value for key, value in item.items() if value not in (None, "", [], {})}
+        out.setdefault("context_class", target_class)
+        out["source_family"] = family
+        out["authority_scope"] = "research_only"
+        out["action_policy_effect"] = "annotation_only_no_trade_authority"
+        out["broker_execution_allowed"] = False
+        return out
+    return None
+
+
+def _context_sector_reliability_for_playbook_overlay(
+    reliability_by_family: dict[str, Any],
+    source_family: Any,
+    sector_name: Any,
+    sector_code: Any,
+) -> dict[str, Any] | None:
+    family = str(source_family or "").strip()
+    if not family:
+        return None
+    target_keys = {
+        key
+        for key in [
+            _sector_key(sector_code),
+            _sector_key(sector_name),
+        ]
+        if key
+    }
+    if not target_keys:
+        return None
+    family_row = reliability_by_family.get(family)
+    if not isinstance(family_row, dict):
+        return None
+    for item in family_row.get("sector_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        row_keys = {
+            key
+            for key in [
+                _sector_key(item.get("sector_code")),
+                _sector_key(item.get("sector_name")),
+                _sector_key(item.get("sector_key")),
+            ]
+            if key
+        }
+        if not target_keys & row_keys:
+            continue
+        out = {key: value for key, value in item.items() if value not in (None, "", [], {})}
+        out["source_family"] = family
+        out["authority_scope"] = "research_only"
+        out["action_policy_effect"] = "annotation_only_no_trade_authority"
+        out["broker_execution_allowed"] = False
+        return out
+    return None
+
+
+def _runtime_contract_for_playbook_reliability(row: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return reliability_runtime_policy_contract(None)
+    contract = row.get("runtime_policy_contract")
+    if isinstance(contract, dict) and contract:
+        return contract
+    return reliability_runtime_policy_contract(row.get("classification"))
+
+
+def _runtime_contract_allows_playbook(row: dict[str, Any] | None, use_name: str, *, legacy_classification: str | None = None) -> bool:
+    contract = _runtime_contract_for_playbook_reliability(row)
+    allowed = contract.get("allowed_runtime_uses")
+    if isinstance(allowed, dict) and use_name in allowed:
+        return bool(allowed.get(use_name))
+    classification = str((row or {}).get("classification") or legacy_classification or "").strip()
+    if use_name == "watch_priority":
+        return classification == "candidate_helpful"
+    if use_name == "de_risk_review":
+        return classification == "protective_candidate"
+    return False
+
+
+def _playbook_overlay_reliability_suppressed(item: dict[str, Any]) -> bool:
+    family_reliability = item.get("source_family_reliability") if isinstance(item.get("source_family_reliability"), dict) else {}
+    class_reliability = item.get("context_class_reliability") if isinstance(item.get("context_class_reliability"), dict) else {}
+    sector_reliability = item.get("context_sector_reliability") if isinstance(item.get("context_sector_reliability"), dict) else {}
+    return any(
+        str(row.get("classification") or "").strip() in CONTEXT_RELIABILITY_SUPPRESS_CLASSES
+        for row in [family_reliability, class_reliability, sector_reliability]
+    )
+
+
+def _playbook_overlay_runtime_allowed(item: dict[str, Any]) -> bool:
+    direction = str(item.get("direction") or "").strip().lower()
+    family_reliability = item.get("source_family_reliability") if isinstance(item.get("source_family_reliability"), dict) else {}
+    class_reliability = item.get("context_class_reliability") if isinstance(item.get("context_class_reliability"), dict) else {}
+    if not family_reliability:
+        return True
+    if direction in {"positive", "watch"}:
+        return _runtime_contract_allows_playbook(
+            family_reliability,
+            "watch_priority",
+            legacy_classification=str(family_reliability.get("classification") or "").strip(),
+        )
+    if direction == "negative":
+        family_allows = _runtime_contract_allows_playbook(
+            family_reliability,
+            "de_risk_review",
+            legacy_classification=str(family_reliability.get("classification") or "").strip(),
+        )
+        class_allows = bool(
+            class_reliability
+            and _runtime_contract_allows_playbook(
+                class_reliability,
+                "de_risk_review",
+                legacy_classification=str(class_reliability.get("classification") or "").strip(),
+            )
+        )
+        return bool(family_allows or class_allows)
+    return True
+
+
+def summarize_playbook_context_overlays(
+    rows: pd.DataFrame,
+    *,
+    source_family_reliability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if rows.empty:
+        return {}
+    frame = rows.copy()
+    frame["context_asof_date"] = pd.to_datetime(frame["context_asof_date"], utc=True, errors="coerce")
+    frame["pressure_score"] = pd.to_numeric(frame.get("pressure_score"), errors="coerce")
+    frame["direction"] = frame["direction"].astype("string").str.strip().str.lower()
+    frame = frame.dropna(subset=["context_asof_date"])
+    if frame.empty:
+        return {}
+    ranked = frame.sort_values(["context_asof_date", "pressure_score"], ascending=[False, False], na_position="last")
+    directions = ranked["direction"]
+    reliability = source_family_reliability or {}
+    reliability_by_family = reliability.get("families", {}) if isinstance(reliability.get("families"), dict) else {}
+    top_overlays = []
+    top_suppressed_overlays = []
+    class_reliability_rows: list[dict[str, Any]] = []
+    sector_reliability_rows: list[dict[str, Any]] = []
+    effective_counts = {"positive": 0, "negative": 0, "watch": 0}
+    for item in ranked.head(8).to_dict(orient="records"):
+        source = item.get("context_source")
+        family_reliability = reliability_by_family.get(str(source)) if source else None
+        class_reliability = _context_class_reliability_for_playbook_overlay(
+            reliability_by_family,
+            source,
+            item.get("context_class"),
+        )
+        if class_reliability:
+            class_reliability_rows.append(class_reliability)
+        sector_reliability = _context_sector_reliability_for_playbook_overlay(
+            reliability_by_family,
+            source,
+            item.get("sector_name"),
+            item.get("sector_code"),
+        )
+        if sector_reliability:
+            sector_reliability_rows.append(sector_reliability)
+        compact = {
+            "source": source,
+            "overlay_id": item.get("overlay_id"),
+            "direction": item.get("direction"),
+            "pressure_score": None if pd.isna(item.get("pressure_score")) else float(item.get("pressure_score")),
+            "class": item.get("context_class"),
+            "sector_name": item.get("sector_name"),
+            "sector_code": item.get("sector_code"),
+            "reason": item.get("reason"),
+            "asof_date": None if pd.isna(item.get("context_asof_date")) else item.get("context_asof_date").isoformat(),
+            "source_family_reliability": family_reliability,
+            "context_class_reliability": class_reliability,
+            "context_sector_reliability": sector_reliability,
+            "broker_execution_allowed": False,
+        }
+        if _playbook_overlay_reliability_suppressed(compact):
+            compact["reliability_suppressed"] = True
+            top_suppressed_overlays.append(compact)
+            continue
+        if not _playbook_overlay_runtime_allowed(compact):
+            compact["reliability_suppressed"] = True
+            compact["runtime_policy_contract_suppressed"] = True
+            compact["runtime_policy_contract_suppression_reason"] = (
+                "watch_priority_not_allowed"
+                if str(item.get("direction") or "").strip().lower() in {"positive", "watch"}
+                else "de_risk_review_not_allowed"
+                if str(item.get("direction") or "").strip().lower() == "negative"
+                else "runtime_use_not_allowed"
+            )
+            top_suppressed_overlays.append(compact)
+            continue
+        direction = str(item.get("direction") or "").strip().lower()
+        if direction in effective_counts:
+            effective_counts[direction] += 1
+        top_overlays.append(compact)
+    class_reliability_counts: dict[str, int] = {}
+    for item in class_reliability_rows:
+        classification = str(item.get("classification") or "").strip()
+        if classification:
+            class_reliability_counts[classification] = class_reliability_counts.get(classification, 0) + 1
+    sector_reliability_counts: dict[str, int] = {}
+    for item in sector_reliability_rows:
+        classification = str(item.get("classification") or "").strip()
+        if classification:
+            sector_reliability_counts[classification] = sector_reliability_counts.get(classification, 0) + 1
+    return {
+        "schema_version": 1,
+        "authority_scope": "watchlist_pressure_only",
+        "action_policy_effect": "market_context_offset_only_no_trade_authority",
+        "source_family_reliability_policy_effect": "annotation_only_no_trade_authority",
+        "context_class_reliability_policy_effect": "annotation_only_no_trade_authority",
+        "portfolio_authority": "none",
+        "broker_execution_allowed": False,
+        "lookback_days": int(HYPOTHESIS_CONTEXT_OVERLAY_LOOKBACK_DAYS),
+        "overlay_count": int(len(ranked)),
+        "positive_count": int(directions.eq("positive").sum()),
+        "negative_count": int(directions.eq("negative").sum()),
+        "watch_count": int(directions.eq("watch").sum()),
+        "effective_positive_count": int(effective_counts["positive"]),
+        "effective_negative_count": int(effective_counts["negative"]),
+        "effective_watch_count": int(effective_counts["watch"]),
+        "reliability_suppressed_count": int(len(top_suppressed_overlays)),
+        "max_pressure_score": None if ranked["pressure_score"].dropna().empty else float(ranked["pressure_score"].abs().max()),
+        "source_family_counts": ranked["context_source"].dropna().astype(str).value_counts().to_dict(),
+        "source_family_reliability_status": reliability.get("status") if reliability else None,
+        "source_family_reliability_evaluated_at": reliability.get("evaluated_at") if reliability else None,
+        "source_family_reliability": {
+            source: reliability_by_family[source]
+            for source in ranked["context_source"].dropna().astype(str).unique().tolist()
+            if source in reliability_by_family
+        },
+        "context_class_reliability": class_reliability_rows,
+        "context_class_reliability_counts": class_reliability_counts,
+        "context_sector_reliability": sector_reliability_rows,
+        "context_sector_reliability_counts": sector_reliability_counts,
+        "top_overlays": top_overlays,
+        "top_suppressed_overlays": top_suppressed_overlays,
+    }
+
+
+def load_playbook_context_overlay_summary(
+    *,
+    symbol: str,
+    asof_date: pd.Timestamp,
+    symbol_context: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    frames = [
+        _load_direct_playbook_context_overlay_rows(
+            table_name=ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE,
+            source_name="announcement_context",
+            asof_date=asof_date,
+            symbol=normalized_symbol,
+            date_column="published_on",
+            class_column="event_class",
+        ),
+        _load_direct_playbook_context_overlay_rows(
+            table_name=EXCHANGE_CONTEXT_OVERLAYS_TABLE,
+            source_name="exchange_context",
+            asof_date=asof_date,
+            symbol=normalized_symbol,
+            date_column="asof_date",
+            class_column="event_type",
+        ),
+        _load_direct_playbook_context_overlay_rows(
+            table_name=BHAVCOPY_CONTEXT_OVERLAYS_TABLE,
+            source_name="bhavcopy_context",
+            asof_date=asof_date,
+            symbol=normalized_symbol,
+            date_column="asof_date",
+            class_column="deal_pressure",
+        ),
+        _load_sector_playbook_context_overlay_rows(
+            table_name=THEME_CONTEXT_OVERLAYS_TABLE,
+            source_name="theme_context",
+            asof_date=asof_date,
+            symbol_context={**(symbol_context or {}), "symbol": normalized_symbol},
+            class_column="theme_id",
+            reason_column="theme_reason",
+        ),
+        _load_sector_playbook_context_overlay_rows(
+            table_name=MACRO_CONTEXT_OVERLAYS_TABLE,
+            source_name="macro_context",
+            asof_date=asof_date,
+            symbol_context={**(symbol_context or {}), "symbol": normalized_symbol},
+            class_column="macro_signal_id",
+            reason_column="trigger_reason",
+        ),
+    ]
+    frames = [frame for frame in frames if isinstance(frame, pd.DataFrame) and not frame.empty]
+    if not frames:
+        return {}
+    reliability = _load_playbook_context_reliability(asof_date)
+    return summarize_playbook_context_overlays(
+        pd.concat(frames, ignore_index=True, sort=False),
+        source_family_reliability=reliability,
+    )
+
+
 def load_playbook_market_context(match: pd.Series) -> dict[str, Any]:
     published_on = pd.to_datetime(match.get("published_on") or pd.Timestamp.utcnow(), utc=True, errors="coerce")
     if pd.isna(published_on):
@@ -320,23 +924,113 @@ def load_playbook_market_context(match: pd.Series) -> dict[str, Any]:
             if str(row.get("symbol") or "").strip().upper() == symbol:
                 symbol_context = row
                 break
+    context_overlay_summary = load_playbook_context_overlay_summary(
+        symbol=symbol,
+        asof_date=published_on,
+        symbol_context=symbol_context if isinstance(symbol_context, dict) else {},
+    )
     return {
         "summary": _clean_json_record(summary) if isinstance(summary, dict) else {},
         "symbol_context": _clean_json_record(symbol_context) if isinstance(symbol_context, dict) else {},
+        "context_overlay_summary": context_overlay_summary,
     }
+
+
+def context_overlay_supports_positive_playbook(context_overlay_summary: Any) -> bool:
+    if not isinstance(context_overlay_summary, dict) or not context_overlay_summary:
+        return False
+    positive_count = int(context_overlay_summary.get("effective_positive_count", context_overlay_summary.get("positive_count") or 0) or 0)
+    negative_count = int(context_overlay_summary.get("effective_negative_count", context_overlay_summary.get("negative_count") or 0) or 0)
+    max_pressure = pd.to_numeric(context_overlay_summary.get("max_pressure_score"), errors="coerce")
+    if positive_count <= 0 or negative_count > 0:
+        return False
+    if pd.notna(max_pressure) and float(max_pressure) < 0.35:
+        return False
+    inspected_positive = False
+    for item in context_overlay_summary.get("top_overlays") or []:
+        if not isinstance(item, dict) or str(item.get("direction") or "").strip().lower() != "positive":
+            continue
+        inspected_positive = True
+        family_reliability = item.get("source_family_reliability") if isinstance(item.get("source_family_reliability"), dict) else {}
+        class_reliability = item.get("context_class_reliability") if isinstance(item.get("context_class_reliability"), dict) else {}
+        sector_reliability = item.get("context_sector_reliability") if isinstance(item.get("context_sector_reliability"), dict) else {}
+        family_classification = str(family_reliability.get("classification") or "").strip()
+        class_classification = str(class_reliability.get("classification") or "").strip()
+        sector_classification = str(sector_reliability.get("classification") or "").strip()
+        if family_reliability and not _runtime_contract_allows_playbook(
+            family_reliability,
+            "watch_priority",
+            legacy_classification=family_classification,
+        ):
+            continue
+        if family_classification in CONTEXT_RELIABILITY_SUPPRESS_CLASSES:
+            continue
+        if class_classification in CONTEXT_RELIABILITY_SUPPRESS_CLASSES:
+            continue
+        if sector_classification in CONTEXT_RELIABILITY_SUPPRESS_CLASSES:
+            continue
+        return True
+    return positive_count > 0 and not inspected_positive
 
 
 def market_context_adjustment(action_type: str, market_context: dict[str, Any]) -> dict[str, Any]:
     summary = market_context.get("summary") if isinstance(market_context, dict) else {}
     if not isinstance(summary, dict):
         summary = {}
+    symbol_context = market_context.get("symbol_context") if isinstance(market_context, dict) else {}
+    if not isinstance(symbol_context, dict):
+        symbol_context = {}
+    context_overlay_summary = market_context.get("context_overlay_summary") if isinstance(market_context, dict) else {}
     action = str(action_type or "").strip().upper()
     regime_name = str(summary.get("regime_name") or "").strip().upper()
     macro_risk_state = str(summary.get("macro_risk_state") or "").strip().upper()
     breadth = pd.to_numeric(summary.get("breadth_trend_alignment_pct"), errors="coerce")
     risk_off_score = pd.to_numeric(summary.get("risk_off_score"), errors="coerce")
+    rank_pct = pd.to_numeric(symbol_context.get("rank_pct"), errors="coerce")
+    rs_benchmark = pd.to_numeric(symbol_context.get("rs_vs_benchmark"), errors="coerce")
+    rs_sector = pd.to_numeric(symbol_context.get("rs_vs_sector"), errors="coerce")
+    symbol_leadership_override = bool(
+        HYPOTHESIS_MARKET_CONTEXT_SYMBOL_LEADERSHIP_OVERRIDE_ENABLED
+        and (
+            (not pd.isna(rank_pct) and float(rank_pct) <= 10.0)
+            or (
+                not pd.isna(rs_benchmark)
+                and float(rs_benchmark) > 0.0
+                and not pd.isna(rs_sector)
+                and float(rs_sector) > 0.0
+            )
+        )
+    )
+    context_overlay_positive_override = bool(
+        HYPOTHESIS_MARKET_CONTEXT_CONTEXT_OVERLAY_OVERRIDE_ENABLED
+        and (symbol_leadership_override or HYPOTHESIS_MARKET_CONTEXT_CONTEXT_OVERLAY_SOFTENS_ANY_SYMBOL_ENABLED)
+        and context_overlay_supports_positive_playbook(context_overlay_summary)
+    )
     weak_breadth = bool(not pd.isna(breadth) and float(breadth) < WEAK_MARKET_BREADTH_THRESHOLD)
-    risk_off = regime_name in RISK_OFF_STATES or macro_risk_state in RISK_OFF_STATES or bool(not pd.isna(risk_off_score) and float(risk_off_score) >= 0.60)
+    label_risk_off = bool(regime_name in RISK_OFF_STATES)
+    systemic_macro_hard_risk = bool(macro_risk_state in SYSTEMIC_MACRO_HARD_RISK_STATES or regime_name == "SHOCK")
+    high_macro_risk_hard_block = bool(
+        HYPOTHESIS_MARKET_CONTEXT_HIGH_MACRO_RISK_HARD_BLOCK_ENABLED
+        and macro_risk_state in RISK_OFF_STATES
+        and not systemic_macro_hard_risk
+    )
+    macro_hard_risk = bool(systemic_macro_hard_risk or high_macro_risk_hard_block)
+    score_risk_off = bool(not pd.isna(risk_off_score) and float(risk_off_score) >= HYPOTHESIS_MARKET_CONTEXT_RISK_OFF_SCORE_THRESHOLD)
+    weak_breadth_block = bool(
+        HYPOTHESIS_MARKET_CONTEXT_WEAK_BREADTH_HARD_BLOCK_ENABLED
+        and weak_breadth
+        and not symbol_leadership_override
+    )
+    score_risk_off_hard_block = bool(
+        HYPOTHESIS_MARKET_CONTEXT_SCORE_RISK_OFF_HARD_BLOCK_ENABLED
+        and score_risk_off
+        and not context_overlay_positive_override
+    )
+    risk_off = bool(
+        score_risk_off_hard_block
+        or macro_hard_risk
+        or (HYPOTHESIS_MARKET_CONTEXT_REGIME_LABEL_HARD_BLOCK_ENABLED and label_risk_off)
+    )
     adjusted_action = action
     adjustment = "none"
     reason = "Market context did not change the playbook action boundary."
@@ -344,15 +1038,16 @@ def market_context_adjustment(action_type: str, market_context: dict[str, Any]) 
     urgency_override: str | None = None
     confidence_delta = 0.0
 
-    if action in POSITIVE_PLAYBOOK_ACTIONS and (risk_off or weak_breadth):
+    if action in POSITIVE_PLAYBOOK_ACTIONS and (risk_off or weak_breadth_block):
         adjusted_action = "BUY_WATCH"
         adjustment = "positive_event_downgraded_by_market_context"
         production_allowed_override = False
         urgency_override = "normal"
         confidence_delta = -0.10
         reason = (
-            "Positive playbook evidence was downgraded to watch/manual review because broad market context is weak "
+            "Positive playbook evidence was downgraded to watch/manual review because broad market context is hard risk-off "
             f"(regime={regime_name or 'n/a'}, macro_risk={macro_risk_state or 'n/a'}, "
+            f"risk_off_score={None if pd.isna(risk_off_score) else round(float(risk_off_score), 3)}, "
             f"trend_breadth={None if pd.isna(breadth) else round(float(breadth), 2)}%)."
         )
     elif action in NEGATIVE_PLAYBOOK_ACTIONS and (risk_off or weak_breadth):
@@ -374,6 +1069,25 @@ def market_context_adjustment(action_type: str, market_context: dict[str, Any]) 
         "macro_risk_state": macro_risk_state or None,
         "breadth_trend_alignment_pct": None if pd.isna(breadth) else float(breadth),
         "risk_off_score": None if pd.isna(risk_off_score) else float(risk_off_score),
+        "label_risk_off": label_risk_off,
+        "score_risk_off": score_risk_off,
+        "score_risk_off_hard_block": score_risk_off_hard_block,
+        "score_risk_off_hard_block_enabled": HYPOTHESIS_MARKET_CONTEXT_SCORE_RISK_OFF_HARD_BLOCK_ENABLED,
+        "macro_hard_risk": macro_hard_risk,
+        "systemic_macro_hard_risk": systemic_macro_hard_risk,
+        "high_macro_risk_hard_block": high_macro_risk_hard_block,
+        "high_macro_risk_hard_block_enabled": HYPOTHESIS_MARKET_CONTEXT_HIGH_MACRO_RISK_HARD_BLOCK_ENABLED,
+        "weak_breadth": weak_breadth,
+        "weak_breadth_block": weak_breadth_block,
+        "regime_label_hard_block_enabled": HYPOTHESIS_MARKET_CONTEXT_REGIME_LABEL_HARD_BLOCK_ENABLED,
+        "weak_breadth_hard_block_enabled": HYPOTHESIS_MARKET_CONTEXT_WEAK_BREADTH_HARD_BLOCK_ENABLED,
+        "symbol_leadership_override": symbol_leadership_override,
+        "symbol_leadership_override_enabled": HYPOTHESIS_MARKET_CONTEXT_SYMBOL_LEADERSHIP_OVERRIDE_ENABLED,
+        "symbol_context": symbol_context,
+        "context_overlay_positive_override": context_overlay_positive_override,
+        "context_overlay_override_enabled": HYPOTHESIS_MARKET_CONTEXT_CONTEXT_OVERLAY_OVERRIDE_ENABLED,
+        "context_overlay_softens_any_symbol_enabled": HYPOTHESIS_MARKET_CONTEXT_CONTEXT_OVERLAY_SOFTENS_ANY_SYMBOL_ENABLED,
+        "context_overlay_summary": context_overlay_summary if isinstance(context_overlay_summary, dict) else {},
         "production_allowed_override": production_allowed_override,
         "urgency_override": urgency_override,
         "confidence_delta": confidence_delta,

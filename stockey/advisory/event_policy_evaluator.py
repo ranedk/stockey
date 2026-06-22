@@ -8,6 +8,7 @@ import pandas as pd
 
 from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
 from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.return_attribution import attach_benchmark_forward_returns, load_benchmark_history_for_attribution
 from advisory.technical_threshold_calibration import attach_forward_returns, load_price_history_for_returns
 from utils.db import sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
@@ -17,6 +18,7 @@ from utils.sync import parse_datetime_arg
 EVALUATIONS_TABLE = "advisory_event_policy_evaluations"
 SUMMARY_TABLE = "advisory_event_policy_eval_summary"
 EVENT_POLICY_EVAL_SCHEMA_MIGRATION_ID = "20260611_advisory_event_policy_evaluator_base"
+EVENT_POLICY_EVAL_BENCHMARK_SCHEMA_MIGRATION_ID = "20260622_advisory_event_policy_evaluator_benchmark_attribution"
 DEFAULT_HORIZONS = [5, 10, 20]
 DEFAULT_RETURN_THRESHOLD = 0.03
 DEFAULT_COST_BPS = 25.0
@@ -45,8 +47,16 @@ EVENT_POLICY_EVAL_SCHEMA_STATEMENTS = [
         entry_close DOUBLE PRECISION,
         exit_close DOUBLE PRECISION,
         forward_return DOUBLE PRECISION,
+        benchmark_name TEXT,
+        benchmark_entry_date TIMESTAMPTZ,
+        benchmark_exit_date TIMESTAMPTZ,
+        benchmark_entry_close DOUBLE PRECISION,
+        benchmark_exit_close DOUBLE PRECISION,
+        benchmark_forward_return DOUBLE PRECISION,
         forward_return_after_cost DOUBLE PRECISION,
+        excess_forward_return_after_cost DOUBLE PRECISION,
         hit_after_cost BOOLEAN,
+        excess_hit_after_cost BOOLEAN,
         matured BOOLEAN,
         raw_context_json TEXT,
         load_ts TIMESTAMPTZ,
@@ -63,9 +73,13 @@ EVENT_POLICY_EVAL_SCHEMA_STATEMENTS = [
         matured_count BIGINT,
         avg_forward_return DOUBLE PRECISION,
         median_forward_return DOUBLE PRECISION,
+        avg_benchmark_forward_return DOUBLE PRECISION,
         avg_forward_return_after_cost DOUBLE PRECISION,
+        avg_excess_forward_return_after_cost DOUBLE PRECISION,
         hit_rate_after_cost DOUBLE PRECISION,
+        excess_hit_rate_after_cost DOUBLE PRECISION,
         positive_return_rate DOUBLE PRECISION,
+        positive_excess_return_rate DOUBLE PRECISION,
         avg_policy_score DOUBLE PRECISION,
         avg_confidence DOUBLE PRECISION,
         sample_start TIMESTAMPTZ,
@@ -76,23 +90,54 @@ EVENT_POLICY_EVAL_SCHEMA_STATEMENTS = [
     )
     """,
 ]
+EVENT_POLICY_EVAL_BENCHMARK_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS benchmark_name TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS benchmark_entry_date TIMESTAMPTZ",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS benchmark_exit_date TIMESTAMPTZ",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS benchmark_entry_close DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS benchmark_exit_close DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS benchmark_forward_return DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS excess_forward_return_after_cost DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS excess_hit_after_cost BOOLEAN",
+    f"ALTER TABLE {SUMMARY_TABLE} ADD COLUMN IF NOT EXISTS avg_benchmark_forward_return DOUBLE PRECISION",
+    f"ALTER TABLE {SUMMARY_TABLE} ADD COLUMN IF NOT EXISTS avg_excess_forward_return_after_cost DOUBLE PRECISION",
+    f"ALTER TABLE {SUMMARY_TABLE} ADD COLUMN IF NOT EXISTS excess_hit_rate_after_cost DOUBLE PRECISION",
+    f"ALTER TABLE {SUMMARY_TABLE} ADD COLUMN IF NOT EXISTS positive_excess_return_rate DOUBLE PRECISION",
+]
 EVALUATION_NUMERIC_COLUMNS = [
     "policy_score",
     "confidence",
     "entry_close",
     "exit_close",
     "forward_return",
+    "benchmark_entry_close",
+    "benchmark_exit_close",
+    "benchmark_forward_return",
     "forward_return_after_cost",
+    "excess_forward_return_after_cost",
 ]
 EVALUATION_INT_COLUMNS = ["horizon_days"]
-EVALUATION_BOOL_COLUMNS = ["hit_after_cost", "matured"]
-EVALUATION_TS_COLUMNS = ["evaluated_at", "published_on", "asof_date", "entry_date", "exit_date", "load_ts"]
+EVALUATION_BOOL_COLUMNS = ["hit_after_cost", "excess_hit_after_cost", "matured"]
+EVALUATION_TS_COLUMNS = [
+    "evaluated_at",
+    "published_on",
+    "asof_date",
+    "entry_date",
+    "exit_date",
+    "benchmark_entry_date",
+    "benchmark_exit_date",
+    "load_ts",
+]
 SUMMARY_NUMERIC_COLUMNS = [
     "avg_forward_return",
     "median_forward_return",
+    "avg_benchmark_forward_return",
     "avg_forward_return_after_cost",
+    "avg_excess_forward_return_after_cost",
     "hit_rate_after_cost",
+    "excess_hit_rate_after_cost",
     "positive_return_rate",
+    "positive_excess_return_rate",
     "avg_policy_score",
     "avg_confidence",
 ]
@@ -160,12 +205,51 @@ def normalize_summary_frame(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _is_schema_checksum_mismatch(exc: Exception, migration_id: str) -> bool:
+    text = str(exc)
+    return "Migration checksum mismatch" in text and migration_id in text
+
+
+def _base_output_tables_exist() -> bool:
+    return bool(table_columns(EVALUATIONS_TABLE)) and bool(table_columns(SUMMARY_TABLE))
+
+
 def ensure_tables() -> None:
+    try:
+        apply_schema_migration(
+            migration_id=EVENT_POLICY_EVAL_SCHEMA_MIGRATION_ID,
+            description="Create event-policy evaluator output tables.",
+            statements=EVENT_POLICY_EVAL_SCHEMA_STATEMENTS,
+            metadata={"tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
+        )
+    except ValueError as exc:
+        if not _is_schema_checksum_mismatch(exc, EVENT_POLICY_EVAL_SCHEMA_MIGRATION_ID) or not _base_output_tables_exist():
+            raise
+        record_local_fallback_event(
+            module="advisory.event_policy_evaluator",
+            fallback_type="event_policy_evaluator_base_schema_checksum_mismatch_ignored",
+            source=EVENT_POLICY_EVAL_SCHEMA_MIGRATION_ID,
+            severity="warn",
+            reason=(
+                "Event-policy evaluator ignored historical base-migration checksum drift because output tables already exist; "
+                "continuing with additive benchmark-attribution migration."
+            ),
+            error=exc,
+            metadata={
+                "evaluations_table": EVALUATIONS_TABLE,
+                "summary_table": SUMMARY_TABLE,
+                "authority_scope": "research_only_schema_maintenance",
+            },
+        )
     apply_schema_migration(
-        migration_id=EVENT_POLICY_EVAL_SCHEMA_MIGRATION_ID,
-        description="Create event-policy evaluator output tables.",
-        statements=EVENT_POLICY_EVAL_SCHEMA_STATEMENTS,
-        metadata={"tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
+        migration_id=EVENT_POLICY_EVAL_BENCHMARK_SCHEMA_MIGRATION_ID,
+        description="Add benchmark-excess attribution columns to event-policy evaluator outputs.",
+        statements=EVENT_POLICY_EVAL_BENCHMARK_SCHEMA_STATEMENTS,
+        metadata={
+            "tables": [EVALUATIONS_TABLE, SUMMARY_TABLE],
+            "authority_scope": "research_only_benchmark_attribution",
+            "additive": True,
+        },
     )
 
 
@@ -392,14 +476,20 @@ def build_evaluation_rows(
     rows: list[dict[str, Any]] = []
     for _, row in dataset.iterrows():
         for horizon in horizons:
-            return_col = f"forward_return_h{int(horizon)}"
+            horizon = int(horizon)
+            return_col = f"forward_return_h{horizon}"
             forward_return = pd.to_numeric(row.get(return_col), errors="coerce")
             matured = bool(pd.notna(forward_return))
+            benchmark_forward_return = pd.to_numeric(row.get(f"benchmark_forward_return_h{horizon}"), errors="coerce")
+            has_benchmark = bool(pd.notna(benchmark_forward_return))
             after_cost = None if not matured else float(forward_return) - cost
+            excess_after_cost = None if not matured or not has_benchmark else float(forward_return) - float(benchmark_forward_return) - cost
+            benchmark_entry_date = pd.to_datetime(row.get(f"benchmark_entry_date_h{horizon}"), utc=True, errors="coerce")
+            benchmark_exit_date = pd.to_datetime(row.get(f"benchmark_exit_date_h{horizon}"), utc=True, errors="coerce")
             rows.append(
                 {
                     "evaluated_at": effective_evaluated_at,
-                    "horizon_days": int(horizon),
+                    "horizon_days": horizon,
                     "published_on": row.get("published_on"),
                     "asof_date": row.get("asof_date"),
                     "setup_id": row.get("setup_id"),
@@ -414,13 +504,21 @@ def build_evaluation_rows(
                     "confidence": row.get("confidence"),
                     "score_bucket": row.get("score_bucket"),
                     "confidence_bucket": row.get("confidence_bucket"),
-                    "entry_date": row.get(f"entry_date_h{int(horizon)}"),
-                    "exit_date": row.get(f"exit_date_h{int(horizon)}"),
-                    "entry_close": row.get(f"entry_close_h{int(horizon)}"),
-                    "exit_close": row.get(f"exit_close_h{int(horizon)}"),
+                    "entry_date": row.get(f"entry_date_h{horizon}"),
+                    "exit_date": row.get(f"exit_date_h{horizon}"),
+                    "entry_close": row.get(f"entry_close_h{horizon}"),
+                    "exit_close": row.get(f"exit_close_h{horizon}"),
                     "forward_return": None if not matured else float(forward_return),
+                    "benchmark_name": row.get("benchmark_name"),
+                    "benchmark_entry_date": None if pd.isna(benchmark_entry_date) else benchmark_entry_date,
+                    "benchmark_exit_date": None if pd.isna(benchmark_exit_date) else benchmark_exit_date,
+                    "benchmark_entry_close": row.get(f"benchmark_entry_close_h{horizon}"),
+                    "benchmark_exit_close": row.get(f"benchmark_exit_close_h{horizon}"),
+                    "benchmark_forward_return": None if not has_benchmark else float(benchmark_forward_return),
                     "forward_return_after_cost": after_cost,
+                    "excess_forward_return_after_cost": excess_after_cost,
                     "hit_after_cost": None if after_cost is None else bool(after_cost >= float(return_threshold)),
+                    "excess_hit_after_cost": None if excess_after_cost is None else bool(excess_after_cost >= float(return_threshold)),
                     "matured": matured,
                     "raw_context_json": row.get("raw_context_json"),
                     "load_ts": pd.Timestamp.utcnow(),
@@ -429,13 +527,37 @@ def build_evaluation_rows(
     return normalize_evaluation_frame(pd.DataFrame(rows))
 
 
-def _summary_recommendation(matured_count: int, avg_after_cost: float | None, hit_rate: float | None, min_rows: int) -> str:
+def _summary_recommendation(
+    matured_count: int,
+    avg_after_cost: float | None,
+    hit_rate: float | None,
+    avg_excess_after_cost: float | None,
+    excess_hit_rate: float | None,
+    min_rows: int,
+) -> str:
     if matured_count < int(min_rows):
         return "insufficient_matured_rows"
-    if avg_after_cost is not None and hit_rate is not None and avg_after_cost > 0.0 and hit_rate >= 0.50:
+    if avg_excess_after_cost is None or excess_hit_rate is None:
+        return "needs_benchmark_attribution"
+    if (
+        avg_after_cost is not None
+        and hit_rate is not None
+        and avg_after_cost > 0.0
+        and hit_rate >= 0.50
+        and avg_excess_after_cost > 0.0
+        and excess_hit_rate >= 0.50
+    ):
         return "candidate_policy_strengthen"
-    if avg_after_cost is not None and hit_rate is not None and avg_after_cost < 0.0 and hit_rate < 0.40:
+    if (
+        avg_after_cost is not None
+        and hit_rate is not None
+        and avg_after_cost < 0.0
+        and hit_rate < 0.40
+        and avg_excess_after_cost < 0.0
+    ):
         return "candidate_policy_tighten_or_downgrade"
+    if avg_after_cost is not None and avg_after_cost > 0.0 and avg_excess_after_cost <= 0.0:
+        return "benchmark_beta_not_policy_alpha"
     return "monitor"
 
 
@@ -489,10 +611,19 @@ def summarize_evaluations(
                 group_value = "|".join(str(value) for value in key_values)
                 matured = group[group["matured"].fillna(False).astype(bool)]
                 returns = pd.to_numeric(matured.get("forward_return"), errors="coerce").dropna()
+                benchmark_returns = pd.to_numeric(matured.get("benchmark_forward_return"), errors="coerce").dropna()
                 after_cost = pd.to_numeric(matured.get("forward_return_after_cost"), errors="coerce").dropna()
+                excess_after_cost = pd.to_numeric(matured.get("excess_forward_return_after_cost"), errors="coerce").dropna()
                 hit = matured["hit_after_cost"].dropna().astype(bool) if "hit_after_cost" in matured.columns else pd.Series(dtype=bool)
+                excess_hit = (
+                    matured["excess_hit_after_cost"].dropna().astype(bool)
+                    if "excess_hit_after_cost" in matured.columns
+                    else pd.Series(dtype=bool)
+                )
                 avg_after_cost = float(after_cost.mean()) if not after_cost.empty else None
                 hit_rate = float(hit.mean()) if not hit.empty else None
+                avg_excess_after_cost = float(excess_after_cost.mean()) if not excess_after_cost.empty else None
+                excess_hit_rate = float(excess_hit.mean()) if not excess_hit.empty else None
                 rows.append(
                     {
                         "evaluated_at": evaluated_at,
@@ -503,14 +634,27 @@ def summarize_evaluations(
                         "matured_count": int(len(matured)),
                         "avg_forward_return": float(returns.mean()) if not returns.empty else None,
                         "median_forward_return": float(returns.median()) if not returns.empty else None,
+                        "avg_benchmark_forward_return": float(benchmark_returns.mean()) if not benchmark_returns.empty else None,
                         "avg_forward_return_after_cost": avg_after_cost,
+                        "avg_excess_forward_return_after_cost": avg_excess_after_cost,
                         "hit_rate_after_cost": hit_rate,
+                        "excess_hit_rate_after_cost": excess_hit_rate,
                         "positive_return_rate": float(returns.gt(0).mean()) if not returns.empty else None,
+                        "positive_excess_return_rate": (
+                            float(excess_after_cost.gt(0).mean()) if not excess_after_cost.empty else None
+                        ),
                         "avg_policy_score": None if group["policy_score"].dropna().empty else float(group["policy_score"].mean()),
                         "avg_confidence": None if group["confidence"].dropna().empty else float(group["confidence"].mean()),
                         "sample_start": matured["asof_date"].min() if not matured.empty else pd.NaT,
                         "sample_end": matured["asof_date"].max() if not matured.empty else pd.NaT,
-                        "recommendation": _summary_recommendation(int(len(matured)), avg_after_cost, hit_rate, min_matured_rows),
+                        "recommendation": _summary_recommendation(
+                            int(len(matured)),
+                            avg_after_cost,
+                            hit_rate,
+                            avg_excess_after_cost,
+                            excess_hit_rate,
+                            min_matured_rows,
+                        ),
                         "load_ts": pd.Timestamp.utcnow(),
                     }
                 )
@@ -539,6 +683,8 @@ def evaluate_event_policies(
         to_date=price_end,
     )
     dataset = attach_forward_returns(signals, prices, horizons=effective_horizons)
+    benchmark = load_benchmark_history_for_attribution(from_date=price_start, to_date=price_end)
+    dataset = attach_benchmark_forward_returns(dataset, benchmark, horizons=effective_horizons)
     evaluated_at = pd.Timestamp.utcnow()
     evaluations = build_evaluation_rows(
         dataset,
@@ -551,6 +697,7 @@ def evaluate_event_policies(
     meta = {
         "signal_rows": int(len(signals)),
         "price_rows": int(len(prices)),
+        "benchmark_rows": int(len(benchmark)),
         "evaluation_rows": int(len(evaluations)),
         "matured_rows_by_horizon": {
             str(horizon): int(evaluations[(evaluations["horizon_days"] == int(horizon)) & (evaluations["matured"] == True)].shape[0])
@@ -563,6 +710,11 @@ def evaluate_event_policies(
         "point_in_time_return_contract": (
             json.loads(dataset["point_in_time_return_contract_json"].dropna().iloc[0])
             if "point_in_time_return_contract_json" in dataset.columns and dataset["point_in_time_return_contract_json"].notna().any()
+            else {}
+        ),
+        "benchmark_return_contract": (
+            json.loads(dataset["benchmark_return_contract_json"].dropna().iloc[0])
+            if "benchmark_return_contract_json" in dataset.columns and dataset["benchmark_return_contract_json"].notna().any()
             else {}
         ),
     }
@@ -599,11 +751,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS)
     parser.add_argument("--min-matured-rows", type=int, default=DEFAULT_MIN_MATURED_ROWS)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--ensure-schema-only",
+        action="store_true",
+        help="Apply additive evaluator schema migrations and exit without loading data or writing evaluation rows.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.ensure_schema_only:
+        ensure_tables()
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "mode": "ensure_schema_only",
+                    "evaluations_table": EVALUATIONS_TABLE,
+                    "summary_table": SUMMARY_TABLE,
+                    "broker_execution_allowed": False,
+                    "policy_auto_promotion_allowed": False,
+                    "authority": "research_only_schema_maintenance",
+                },
+                indent=2,
+                ensure_ascii=False,
+                default=str,
+            )
+        )
+        return 0
     evaluations, summary, meta = evaluate_event_policies(
         from_date=pd.Timestamp(args.from_date, tz="UTC") if args.from_date else None,
         to_date=pd.Timestamp(args.to_date, tz="UTC") if args.to_date else None,

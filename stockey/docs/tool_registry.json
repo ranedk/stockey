@@ -304,6 +304,23 @@
       ]
     },
     {
+      "name": "run_context_to_entry_repair",
+      "category": "orchestration",
+      "description": "Run the bounded context-to-entry repair chain before full advisory: review-only context signal refresh, CONTEXT_OVERLAY_WATCH reconciliation, rules-through-actions, Action Queue refresh, and diagnostics.",
+      "command": ["bash", "all_context_to_entry_repair.sh"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": [],
+          "description": "Run context-to-entry repair for the latest trading day."
+        },
+        {
+          "args": ["--date", "2026-06-19"],
+          "description": "Run context-to-entry repair for a specific advisory date."
+        }
+      ]
+    },
+    {
       "name": "route_live_updates",
       "category": "orchestration",
       "description": "Route fresh continuous-watch alerts and events into targeted symbol-level advisory reevaluation, including lifecycle-aware reruns for exit alerts.",
@@ -618,6 +635,23 @@
         {
           "args": ["--prep-only"],
           "description": "Run only the prep and readiness-check stage."
+        }
+      ]
+    },
+    {
+      "name": "run_research_evidence",
+      "category": "analysis",
+      "description": "Run the research-only evidence refresh for context, event, adversarial-review, action-transition, causal-memory, provenance, and reliability evidence without event-model training, live policy changes, portfolio mutation, config mutation, or broker behavior.",
+      "command": ["bash", "all_research_evidence.sh"],
+      "read_only": false,
+      "examples": [
+        {
+          "args": [],
+          "description": "Run the default daily research-evidence refresh with narrowed split reports enabled."
+        },
+        {
+          "args": ["--skip-signal-quality", "--skip-causal-event-memory"],
+          "description": "Run a scoped refresh that skips the heavier signal-quality and causal-memory steps."
         }
       ]
     },

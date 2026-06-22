@@ -36,6 +36,8 @@ def main() -> int:
             "parsed": summary.parsed,
             "skipped": summary.skipped,
             "failed": summary.failed,
+            "issue_count": summary.issue_count,
+            "issues": summary.issues,
         }
     )
     return 0

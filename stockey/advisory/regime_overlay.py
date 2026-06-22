@@ -176,8 +176,16 @@ def _json_ready(value: Any) -> Any:
     try:
         if pd.isna(value):
             return None
-    except (TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="advisory.regime_overlay",
+            fallback_type="regime_overlay_json_ready_missing_check_failed",
+            source="json_ready",
+            severity="warn",
+            reason="Regime overlay could not evaluate missingness for a JSON value and kept the original value.",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return value
 
 
@@ -194,8 +202,16 @@ def _text(value: Any) -> str:
     try:
         if pd.isna(value):
             return ""
-    except (TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as exc:
+        record_local_fallback_event(
+            module="advisory.regime_overlay",
+            fallback_type="regime_overlay_text_missing_check_failed",
+            source="text",
+            severity="warn",
+            reason="Regime overlay could not evaluate missingness for a text value and converted it with str().",
+            error=exc,
+            metadata={"value_type": type(value).__name__},
+        )
     return str(value)
 
 
@@ -221,6 +237,20 @@ def table_exists(table_name: str) -> bool:
         params=(schema_name, base_table_name),
     )
     return bool(df.iloc[0]["exists"]) if not df.empty else False
+
+
+def table_columns(table_name: str) -> set[str]:
+    schema_name, base_table_name = table_name.split(".", 1) if "." in table_name else ("public", table_name)
+    df = sql_to_df(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = %s AND table_name = %s
+        """,
+        params=(schema_name, base_table_name),
+        retries=2,
+    )
+    return set(df["column_name"].astype(str).tolist()) if not df.empty and "column_name" in df.columns else set()
 
 
 def ensure_table() -> None:
@@ -302,6 +332,13 @@ def _load_event_counts(asof_date: pd.Timestamp, lookback_days: int) -> dict[str,
         return {}
     start = asof_date - pd.Timedelta(days=lookback_days)
     end = asof_date + pd.Timedelta(days=1)
+    columns = table_columns(ANNOUNCEMENT_EVIDENCE_TABLE)
+    filters = []
+    if "announcement_storage_form" in columns:
+        filters.append("COALESCE(announcement_storage_form, '') <> 'archived_raw_reference_only'")
+    if "llm_review_ready" in columns:
+        filters.append("COALESCE(llm_review_ready, TRUE) IS TRUE")
+    taxonomy_filter_sql = f" AND {' AND '.join(filters)}" if filters else ""
     df = sql_to_df(
         f"""
         SELECT
@@ -313,6 +350,7 @@ def _load_event_counts(asof_date: pd.Timestamp, lookback_days: int) -> dict[str,
         FROM {ANNOUNCEMENT_EVIDENCE_TABLE}
         WHERE published_on >= %(start)s
           AND published_on < %(end)s
+          {taxonomy_filter_sql}
         GROUP BY 1, 2
         ORDER BY row_count DESC
         LIMIT 20
@@ -320,7 +358,17 @@ def _load_event_counts(asof_date: pd.Timestamp, lookback_days: int) -> dict[str,
         params={"start": start, "end": end},
         retries=3,
     )
-    return {"announcement_event_counts": [_json_ready(row) for row in df.to_dict(orient="records")]} if not df.empty else {}
+    if df.empty:
+        counts: list[dict[str, Any]] = []
+    else:
+        counts = [_json_ready(row) for row in df.to_dict(orient="records")]
+    payload: dict[str, Any] = {
+        "announcement_event_counts": counts,
+        "announcement_taxonomy_filter_applied": bool(filters),
+        "announcement_taxonomy_filter_columns": sorted(column for column in ["announcement_storage_form", "llm_review_ready"] if column in columns),
+        "archive_only_rows_excluded": "announcement_storage_form" in columns,
+    }
+    return payload if counts or filters else {}
 
 
 def load_regime_overlay_context(*, asof_date: Any = None, lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> dict[str, Any]:
@@ -586,7 +634,16 @@ def _json_loads(value: Any, default: Any) -> Any:
         return default
     try:
         return json.loads(text)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        record_local_fallback_event(
+            module="advisory.regime_overlay",
+            fallback_type="regime_overlay_json_parse_failed",
+            source="json_loads",
+            severity="warn",
+            reason="Regime overlay could not parse stored JSON and used the provided default.",
+            error=exc,
+            metadata={"value_type": type(value).__name__, "value_length": len(text), "value_excerpt": text[:240]},
+        )
         return default
 
 

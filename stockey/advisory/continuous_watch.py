@@ -11,10 +11,18 @@ from typing import Any
 import pandas as pd
 
 from advisory.announcement_watch import persist_watch_outputs, run_announcement_watch
+from advisory.announcement_watch import DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS
+from advisory.announcement_watch import DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT
 from advisory.announcement_watch import DEFAULT_MARKET_CONTEXT_WATCH_LIMIT
+from advisory.announcement_watch import DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT
+from advisory.announcement_watch import DEFAULT_MACRO_CONTEXT_WATCH_LIMIT
+from advisory.announcement_watch import WATCHLIST_CONTEXT_OVERLAY_EXCLUDED_RELIABILITY_CLASSES
+from advisory.announcement_watch import load_context_family_reliability
+from advisory.action_recommender import build_action_recommendations, persist_action_recommendations
 from advisory.event_router import route_live_updates
 from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.news_watch import persist_news_events, run_news_watch
+from advisory.signal_refresh import refresh_from_causal_memory, refresh_from_theme_context
 from advisory.sync_state import ensure_sync_state_table, load_sync_state, persist_sync_state, publish_bus_message
 from data.dhanlive.ohlcv import sync_many_intraday
 from utils.db import sql_to_df, upsert_to_db
@@ -22,9 +30,21 @@ from utils.schema_migrations import apply_schema_migration
 
 
 WATCHLIST_TABLE = "advisory_watchlist"
+EXCHANGE_CONTEXT_OVERLAYS_TABLE = "advisory_exchange_context_overlays"
+EXCHANGE_CONTEXT_SOURCE_FAMILY = "exchange_context"
 ALERTS_TABLE = "advisory_live_watch_alerts"
 ALERTS_SCHEMA_MIGRATION_ID = "20260611_advisory_live_watch_alerts_base"
 DEFAULT_ALERT_COOLDOWN_SECONDS = int(os.getenv("WATCHER_ALERT_COOLDOWN_SECONDS", "900"))
+WATCHER_EXCHANGE_CONTEXT_PRIORITY_ENABLED = os.getenv(
+    "WATCHER_EXCHANGE_CONTEXT_PRIORITY_ENABLED",
+    "true",
+).strip().lower() not in {"0", "false", "no"}
+WATCHER_EXCHANGE_CONTEXT_PRIORITY_LOOKBACK_DAYS = int(os.getenv("WATCHER_EXCHANGE_CONTEXT_PRIORITY_LOOKBACK_DAYS", "5"))
+WATCHER_ACTION_REFRESH_ENABLED = os.getenv("WATCHER_ACTION_REFRESH_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+WATCHER_ACTION_REFRESH_MAX_SYMBOLS = int(os.getenv("WATCHER_ACTION_REFRESH_MAX_SYMBOLS", "150"))
+WATCHER_CAUSAL_MEMORY_REFRESH_ENABLED = os.getenv("WATCHER_CAUSAL_MEMORY_REFRESH_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+WATCHER_CAUSAL_MEMORY_REFRESH_LIMIT = int(os.getenv("WATCHER_CAUSAL_MEMORY_REFRESH_LIMIT", "25"))
+WATCHER_ANNOUNCEMENT_MAX_INGEST_TARGETS = int(os.getenv("WATCHER_ANNOUNCEMENT_MAX_INGEST_TARGETS", "12"))
 
 ALERTS_SCHEMA_STATEMENTS = [
     f"""
@@ -63,6 +83,76 @@ def ensure_alerts_table() -> None:
         description="Create and normalize continuous-watch live alert table.",
         statements=ALERTS_SCHEMA_STATEMENTS,
         metadata={"module": "advisory.continuous_watch", "tables": [ALERTS_TABLE]},
+    )
+
+
+def _context_class_reliability_classification(family_row: dict[str, object] | None, context_class: object) -> str | None:
+    if not isinstance(family_row, dict):
+        return None
+    target_class = str(context_class or "").strip().upper()
+    if not target_class or target_class in {"<NA>", "NAN", "NONE"}:
+        return None
+    for item in family_row.get("context_class_diagnostics") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("context_class") or "").strip().upper() != target_class:
+            continue
+        classification = str(item.get("classification") or "").strip()
+        return classification or None
+    return None
+
+
+def _reliability_families(reliability: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(reliability, dict):
+        return {}
+    families = reliability.get("families")
+    if isinstance(families, dict):
+        return families
+    if isinstance(families, list):
+        return {
+            str(item.get("source_family")): item
+            for item in families
+            if isinstance(item, dict) and item.get("source_family")
+        }
+    return {}
+
+
+def _runtime_contract_for_context_reliability(row: dict[str, Any] | None) -> dict[str, Any]:
+    from advisory.context_overlay_reliability_report import reliability_runtime_policy_contract
+
+    if not isinstance(row, dict):
+        return reliability_runtime_policy_contract(None)
+    contract = row.get("runtime_policy_contract")
+    if isinstance(contract, dict) and contract:
+        return contract
+    return reliability_runtime_policy_contract(row.get("classification"))
+
+
+def _runtime_contract_allows_context(
+    row: dict[str, Any] | None,
+    use_name: str,
+    *,
+    legacy_classification: str | None = None,
+) -> bool:
+    contract = _runtime_contract_for_context_reliability(row)
+    allowed = contract.get("allowed_runtime_uses")
+    if isinstance(allowed, dict) and use_name in allowed:
+        return bool(allowed.get(use_name))
+    classification = str((row or {}).get("classification") or legacy_classification or "").strip()
+    if use_name == "watch_priority":
+        return classification == "candidate_helpful"
+    if use_name == "de_risk_review":
+        return classification == "protective_candidate"
+    return False
+
+
+def _runtime_contract_allows_exchange_priority(row: dict[str, Any] | None) -> bool:
+    if not isinstance(row, dict) or not row:
+        return True
+    classification = str(row.get("classification") or "").strip()
+    return bool(
+        _runtime_contract_allows_context(row, "watch_priority", legacy_classification=classification)
+        or _runtime_contract_allows_context(row, "de_risk_review", legacy_classification=classification)
     )
 
 
@@ -177,6 +267,149 @@ def load_open_positions(asof_date: pd.Timestamp | None = None) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def load_exchange_context_priorities(
+    symbols: list[str],
+    *,
+    asof_date: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if not WATCHER_EXCHANGE_CONTEXT_PRIORITY_ENABLED or not symbols:
+        return pd.DataFrame()
+    cutoff = pd.to_datetime(asof_date or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    if pd.isna(cutoff):
+        cutoff = pd.Timestamp.utcnow()
+    cutoff = cutoff.normalize()
+    from_date = cutoff - pd.Timedelta(days=max(1, int(WATCHER_EXCHANGE_CONTEXT_PRIORITY_LOOKBACK_DAYS)))
+    normalized_symbols = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+    if not normalized_symbols:
+        return pd.DataFrame()
+    family_row: dict[str, object] | None = None
+    reliability_classification: str | None = None
+    reliability_policy = "no_reliability_evidence_neutral"
+    try:
+        reliability = load_context_family_reliability(asof_date=cutoff)
+        family_rows = _reliability_families(reliability)
+        family_row = family_rows.get(EXCHANGE_CONTEXT_SOURCE_FAMILY) if isinstance(family_rows, dict) else None
+        if isinstance(family_row, dict):
+            reliability_classification = str(family_row.get("classification") or "").strip() or None
+            if reliability_classification in WATCHLIST_CONTEXT_OVERLAY_EXCLUDED_RELIABILITY_CLASSES:
+                return pd.DataFrame()
+            if not _runtime_contract_allows_exchange_priority(family_row):
+                return pd.DataFrame()
+            reliability_policy = (
+                "candidate_helpful_priority_allowed"
+                if _runtime_contract_allows_context(
+                    family_row,
+                    "watch_priority",
+                    legacy_classification=reliability_classification,
+                )
+                else "protective_candidate_priority_allowed"
+                if _runtime_contract_allows_context(
+                    family_row,
+                    "de_risk_review",
+                    legacy_classification=reliability_classification,
+                )
+                else "classification_neutral_priority_allowed"
+            )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.continuous_watch",
+            source="advisory_context_overlay_reliability_summary",
+            fallback_type="continuous_watch_exchange_context_reliability_load_failed",
+            severity="warn",
+            reason="Continuous watcher could not load exchange-context reliability and kept priority ordering neutral/allowed.",
+            error=exc,
+            metadata={
+                "asof_date": str(cutoff),
+                "source_family": EXCHANGE_CONTEXT_SOURCE_FAMILY,
+            },
+        )
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT
+                symbol,
+                UPPER(TRIM(COALESCE(event_type, 'UNSPECIFIED'))) AS exchange_context_class,
+                MAX(known_on) AS latest_exchange_context_known_on,
+                MAX(asof_date) AS latest_exchange_context_asof_date,
+                MAX(ABS(COALESCE(pressure_score, 0.0))) AS exchange_context_priority_score,
+                COUNT(*) AS exchange_context_event_count
+            FROM {EXCHANGE_CONTEXT_OVERLAYS_TABLE}
+            WHERE symbol = ANY(%(symbols)s)
+              AND COALESCE(production_status, 'active') = 'active'
+              AND COALESCE(authority_scope, 'watchlist_pressure_only') = 'watchlist_pressure_only'
+              AND COALESCE(known_on, asof_date) >= %(from_date)s
+              AND COALESCE(known_on, asof_date) <= %(cutoff)s + INTERVAL '1 day'
+            GROUP BY symbol, UPPER(TRIM(COALESCE(event_type, 'UNSPECIFIED')))
+            """,
+            params={"symbols": normalized_symbols, "from_date": from_date, "cutoff": cutoff},
+            retries=2,
+            statement_timeout_ms=10000,
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.continuous_watch",
+            source=EXCHANGE_CONTEXT_OVERLAYS_TABLE,
+            fallback_type="continuous_watch_exchange_context_priority_load_failed",
+            severity="warn",
+            reason="Continuous watcher could not load recent exchange-context overlay priority and kept normal watch ordering.",
+            error=exc,
+            metadata={
+                "asof_date": str(cutoff),
+                "from_date": str(from_date),
+                "symbols_count": len(normalized_symbols),
+            },
+        )
+        return pd.DataFrame()
+    if df.empty:
+        return df
+    df["symbol"] = df["symbol"].astype("string").str.upper()
+    if "exchange_context_class" not in df.columns:
+        df["exchange_context_class"] = "UNSPECIFIED"
+    df["exchange_context_class"] = df["exchange_context_class"].astype("string").str.strip().str.upper()
+    df.loc[df["exchange_context_class"].isin(["", "<NA>", "NAN", "NONE"]), "exchange_context_class"] = "UNSPECIFIED"
+    df["exchange_context_priority_score"] = pd.to_numeric(df["exchange_context_priority_score"], errors="coerce").fillna(0.0)
+    df["exchange_context_event_count"] = pd.to_numeric(df["exchange_context_event_count"], errors="coerce").fillna(0).astype("int64")
+    df["exchange_context_class_reliability_classification"] = df["exchange_context_class"].map(
+        lambda context_class: _context_class_reliability_classification(family_row, context_class)
+    )
+    excluded_class_mask = df["exchange_context_class_reliability_classification"].astype("string").isin(
+        WATCHLIST_CONTEXT_OVERLAY_EXCLUDED_RELIABILITY_CLASSES
+    )
+    if excluded_class_mask.any():
+        df = df.loc[~excluded_class_mask].copy()
+    if isinstance(family_row, dict) and not df.empty:
+        class_contract_blocked = []
+        for _, row in df.iterrows():
+            context_class = str(row.get("exchange_context_class") or "").strip().upper()
+            class_row = None
+            for item in family_row.get("context_class_diagnostics") or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("context_class") or "").strip().upper() == context_class:
+                    class_row = item
+                    break
+            class_contract_blocked.append(bool(class_row and not _runtime_contract_allows_exchange_priority(class_row)))
+        if any(class_contract_blocked):
+            df = df.loc[[not value for value in class_contract_blocked]].copy()
+    if df.empty:
+        return pd.DataFrame()
+    df = (
+        df.sort_values(
+            ["symbol", "exchange_context_priority_score", "exchange_context_event_count", "latest_exchange_context_known_on"],
+            ascending=[True, False, False, False],
+            na_position="last",
+            kind="stable",
+        )
+        .drop_duplicates(subset=["symbol"], keep="first")
+        .reset_index(drop=True)
+    )
+    df["exchange_context_reliability_classification"] = reliability_classification or pd.NA
+    df["exchange_context_priority_policy"] = reliability_policy
+    for column in ["latest_exchange_context_known_on", "latest_exchange_context_asof_date"]:
+        df[column] = pd.to_datetime(df[column], utc=True, errors="coerce")
+    return df
+
+
 def load_monitored_universe(asof_date: pd.Timestamp | None = None) -> pd.DataFrame:
     watchlist = load_active_watchlist(asof_date=asof_date)
     positions = load_open_positions(asof_date=asof_date)
@@ -205,12 +438,34 @@ def load_monitored_universe(asof_date: pd.Timestamp | None = None) -> pd.DataFra
     if "state_updated_at" not in out.columns:
         out["state_updated_at"] = pd.NaT
     out["state_updated_at"] = pd.to_datetime(out["state_updated_at"], utc=True, errors="coerce")
+    priority = load_exchange_context_priorities(out["symbol"].dropna().astype(str).str.upper().tolist(), asof_date=asof_date)
+    if not priority.empty:
+        out = out.merge(priority, on="symbol", how="left")
+    if "exchange_context_priority_score" not in out.columns:
+        out["exchange_context_priority_score"] = 0.0
+    out["exchange_context_priority_score"] = pd.to_numeric(out["exchange_context_priority_score"], errors="coerce").fillna(0.0)
+    if "exchange_context_event_count" not in out.columns:
+        out["exchange_context_event_count"] = 0
+    out["exchange_context_event_count"] = pd.to_numeric(out["exchange_context_event_count"], errors="coerce").fillna(0).astype("int64")
+    out["_exchange_context_priority_active"] = out["exchange_context_priority_score"] > 0
+    out["exchange_context_priority_reason"] = out["exchange_context_priority_score"].map(
+        lambda value: "fresh_exchange_event_activity" if float(value or 0.0) > 0 else "normal_watch_order"
+    )
     out = out.sort_values(
-        ["symbol", "monitor_source", "rank", "state_updated_at", "setup_id"],
-        ascending=[True, True, True, False, True],
+        [
+            "_exchange_context_priority_active",
+            "exchange_context_priority_score",
+            "exchange_context_event_count",
+            "symbol",
+            "monitor_source",
+            "rank",
+            "state_updated_at",
+            "setup_id",
+        ],
+        ascending=[False, False, False, True, True, True, False, True],
         kind="stable",
     )
-    return out.drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
+    return out.drop(columns=["_exchange_context_priority_active"], errors="ignore").drop_duplicates(subset=["symbol"], keep="first").reset_index(drop=True)
 
 
 def load_latest_intraday_prices(symbols: list[str], *, interval_minutes: int = 1) -> pd.DataFrame:
@@ -553,6 +808,161 @@ def _safe_count(value: Any) -> int:
         return 0
 
 
+def _watcher_substep(name: str, status: str, detail: str, **extra: Any) -> dict[str, Any]:
+    return {"name": name, "status": status, "detail": detail, **extra}
+
+
+def _watcher_empty_reason(source: str, counters: dict[str, Any]) -> tuple[str | None, list[dict[str, Any]]]:
+    source = str(source or "").lower()
+    substeps: list[dict[str, Any]] = []
+    if source == "ohlcv":
+        symbol_count = _safe_count(counters.get("symbol_count"))
+        latest_price_count = _safe_count(counters.get("latest_price_count"))
+        sync_failure_count = _safe_count(counters.get("sync_failure_count"))
+        alert_input_count = _safe_count(counters.get("alert_input_count"))
+        alert_persisted_count = _safe_count(counters.get("alert_persisted_count"))
+        alert_suppressed_count = _safe_count(counters.get("alert_suppressed_count"))
+        substeps.extend(
+            [
+                _watcher_substep("watchlist", "ok" if symbol_count else "empty", "Monitored symbols loaded.", count=symbol_count),
+                _watcher_substep(
+                    "dhan_intraday_sync",
+                    "warn" if sync_failure_count else "ok",
+                    "Intraday sync completed with source-level failures." if sync_failure_count else "Intraday sync completed without reported source failures.",
+                    failure_count=sync_failure_count,
+                    result_count=_safe_count(counters.get("sync_result_count")),
+                ),
+                _watcher_substep("latest_prices", "ok" if latest_price_count else "empty", "Latest intraday prices loaded.", count=latest_price_count),
+                _watcher_substep(
+                    "price_alerts",
+                    "ok" if alert_persisted_count else "empty",
+                    "Price alerts persisted." if alert_persisted_count else "No new price alerts persisted.",
+                    input_count=alert_input_count,
+                    persisted_count=alert_persisted_count,
+                    suppressed_count=alert_suppressed_count,
+                ),
+            ]
+        )
+        if symbol_count == 0:
+            return "no_watchlist_symbols", substeps
+        if latest_price_count == 0:
+            return "no_latest_intraday_prices", substeps
+        if alert_input_count == 0:
+            return "no_price_alerts_generated", substeps
+        if alert_persisted_count == 0 and alert_suppressed_count > 0:
+            return "alerts_suppressed_by_cooldown", substeps
+        if alert_persisted_count == 0:
+            return "no_price_alerts_persisted", substeps
+        return None, substeps
+    if source == "news":
+        watch_count = _safe_count(counters.get("watch_count"))
+        item_count = _safe_count(counters.get("news_item_count"))
+        matched_count = _safe_count(counters.get("matched_event_count"))
+        triggered_count = _safe_count(counters.get("triggered_event_count"))
+        observed_count = _safe_count(counters.get("context_observed_count"))
+        persisted_count = _safe_count(counters.get("persisted_event_count"))
+        substeps.extend(
+            [
+                _watcher_substep("watch_targets", "ok" if watch_count else "empty", "News watch targets loaded.", count=watch_count),
+                _watcher_substep("feed_items", "ok" if item_count else "empty", "News feed items loaded.", count=item_count),
+                _watcher_substep("symbol_match", "ok" if matched_count else "empty", "News items matched watched symbols.", count=matched_count),
+                _watcher_substep(
+                    "materiality",
+                    "ok" if triggered_count else "context_only" if observed_count else "empty",
+                    "News matches produced triggered events." if triggered_count else "News matches were context-only or non-material." if observed_count else "No material news matches.",
+                    triggered_count=triggered_count,
+                    context_observed_count=observed_count,
+                ),
+                _watcher_substep("persistence", "ok" if persisted_count else "empty", "News events persisted.", count=persisted_count),
+            ]
+        )
+        if watch_count == 0:
+            return "no_news_watch_targets", substeps
+        if item_count == 0:
+            return "no_news_feed_items", substeps
+        if matched_count == 0:
+            return "no_news_symbol_matches", substeps
+        if triggered_count == 0 and observed_count > 0:
+            return "context_observed_only", substeps
+        if persisted_count == 0:
+            return "no_news_events_persisted", substeps
+        return None, substeps
+    if source == "announcements":
+        watch_count = _safe_count(counters.get("watch_count"))
+        targets = _safe_count(counters.get("unique_ingest_targets"))
+        discovered = _safe_count(counters.get("discovered_count"))
+        parsed = _safe_count(counters.get("parsed_count"))
+        failed = _safe_count(counters.get("failed_count"))
+        issue_count = _safe_count(counters.get("ingest_issue_count"))
+        skipped_targets = _safe_count(counters.get("skipped_ingest_target_count"))
+        unresolved_targets = _safe_count(counters.get("unresolved_ingest_target_count"))
+        unresolved_watch_rows = _safe_count(counters.get("unresolved_watch_row_count"))
+        managed_ingest_failed = _safe_count(counters.get("managed_ingest_failed_count"))
+        document_lookup_failed = _safe_count(counters.get("document_lookup_failed_count"))
+        degraded_total = issue_count + unresolved_targets + unresolved_watch_rows + managed_ingest_failed + document_lookup_failed
+        match_count = _safe_count(counters.get("match_count"))
+        triggered_count = _safe_count(counters.get("triggered_event_count"))
+        observed_count = _safe_count(counters.get("context_observed_count"))
+        persisted_count = _safe_count(counters.get("persisted_event_count"))
+        substeps.extend(
+            [
+                _watcher_substep("watch_targets", "ok" if watch_count else "empty", "Announcement watch targets loaded.", count=watch_count),
+                _watcher_substep("ingest_targets", "ok" if targets else "empty", "Unique announcement ingest targets prepared.", count=targets),
+                _watcher_substep(
+                    "nse_ingest",
+                    "warn" if failed else "backlog" if skipped_targets else "ok" if discovered or parsed else "empty",
+                    "Announcement ingest had failed items." if failed else "Announcement ingest processed a bounded subset; skipped targets remain due." if skipped_targets else "Announcement ingest completed.",
+                    discovered_count=discovered,
+                    parsed_count=parsed,
+                    failed_count=failed,
+                    skipped_ingest_target_count=skipped_targets,
+                    total_ingest_targets=_safe_count(counters.get("total_ingest_targets")),
+                    processed_ingest_targets=_safe_count(counters.get("processed_ingest_targets")),
+                    max_ingest_targets=_safe_count(counters.get("max_ingest_targets")),
+                ),
+                _watcher_substep(
+                    "degraded_evidence",
+                    "warn" if degraded_total else "ok",
+                    "Announcement evidence was degraded by unresolved mappings or lookup/ingest issues."
+                    if degraded_total
+                    else "Announcement evidence had no reported degraded-ingest counters.",
+                    ingest_issue_count=issue_count,
+                    unresolved_ingest_target_count=unresolved_targets,
+                    unresolved_watch_row_count=unresolved_watch_rows,
+                    managed_ingest_failed_count=managed_ingest_failed,
+                    document_lookup_failed_count=document_lookup_failed,
+                ),
+                _watcher_substep("symbol_match", "ok" if match_count else "empty", "Announcements matched watched symbols.", count=match_count),
+                _watcher_substep(
+                    "materiality",
+                    "ok" if triggered_count else "context_only" if observed_count else "empty",
+                    "Announcement matches produced triggered events." if triggered_count else "Announcement matches were context-only or non-material." if observed_count else "No material announcement matches.",
+                    triggered_count=triggered_count,
+                    context_observed_count=observed_count,
+                ),
+                _watcher_substep("persistence", "ok" if persisted_count else "empty", "Announcement watch outputs persisted.", count=persisted_count),
+            ]
+        )
+        if watch_count == 0:
+            return "no_announcement_watch_targets", substeps
+        if targets == 0:
+            return "no_announcement_ingest_targets", substeps
+        if discovered == 0 and parsed == 0 and failed == 0:
+            return "no_announcements_discovered", substeps
+        if failed > 0 and parsed == 0:
+            return "announcement_ingest_failed", substeps
+        if degraded_total > 0 and match_count == 0:
+            return "announcement_evidence_degraded", substeps
+        if match_count == 0:
+            return "no_announcement_symbol_matches", substeps
+        if triggered_count == 0 and observed_count > 0:
+            return "context_observed_only", substeps
+        if persisted_count == 0:
+            return "no_announcement_events_persisted", substeps
+        return None, substeps
+    return None, substeps
+
+
 def watcher_source_counters(
     *,
     source: str,
@@ -589,6 +999,10 @@ def watcher_source_counters(
             {
                 "watch_count": _safe_count(meta.get("watch_count")),
                 "market_context_watch_count": _safe_count(meta.get("market_context_watch_count")),
+                "theme_context_watch_count": _safe_count(meta.get("theme_context_watch_count")),
+                "announcement_context_watch_count": _safe_count(meta.get("announcement_context_watch_count")),
+                "bhavcopy_context_watch_count": _safe_count(meta.get("bhavcopy_context_watch_count")),
+                "macro_context_watch_count": _safe_count(meta.get("macro_context_watch_count")),
                 "news_item_count": _safe_count(meta.get("news_item_count")),
                 "matched_event_count": _safe_count(meta.get("matched_event_count")),
                 "triggered_event_count": _safe_count(meta.get("triggered_event_count")),
@@ -602,6 +1016,7 @@ def watcher_source_counters(
         failed = sum(_safe_count(row.get("failed")) for row in ingest_runs if isinstance(row, dict))
         discovered = sum(_safe_count(row.get("discovered")) for row in ingest_runs if isinstance(row, dict))
         parsed = sum(_safe_count(row.get("parsed")) for row in ingest_runs if isinstance(row, dict))
+        issue_count = sum(_safe_count(row.get("issue_count")) for row in ingest_runs if isinstance(row, dict))
         counters.update(
             {
                 "watch_count": _safe_count(meta.get("watch_count")),
@@ -610,17 +1025,33 @@ def watcher_source_counters(
                 "discovered_count": discovered,
                 "parsed_count": parsed,
                 "failed_count": failed,
+                "ingest_issue_count": max(issue_count, _safe_count(meta.get("ingest_issue_count"))),
+                "total_ingest_targets": _safe_count(meta.get("total_ingest_targets") or meta.get("unique_ingest_targets")),
+                "processed_ingest_targets": _safe_count(meta.get("processed_ingest_targets") or meta.get("unique_ingest_targets")),
+                "skipped_ingest_target_count": _safe_count(meta.get("skipped_ingest_target_count")),
+                "max_ingest_targets": _safe_count(meta.get("max_ingest_targets")),
+                "unresolved_ingest_target_count": _safe_count(meta.get("unresolved_ingest_target_count")),
+                "unresolved_watch_row_count": _safe_count(meta.get("unresolved_watch_row_count")),
+                "managed_ingest_failed_count": _safe_count(meta.get("managed_ingest_failed_count")),
+                "document_lookup_failed_count": _safe_count(meta.get("document_lookup_failed_count")),
                 "match_count": _safe_count(meta.get("match_count")),
                 "triggered_event_count": _safe_count(meta.get("triggered_event_count")),
                 "context_observed_count": _safe_count(meta.get("context_observed_count")),
                 "watch_update_count": 0 if watch_updates is None else int(len(watch_updates)),
                 "persisted_event_count": 0 if events is None else int(len(events)),
                 "market_context_watch_count": _safe_count(meta.get("market_context_watch_count")),
+                "theme_context_watch_count": _safe_count(meta.get("theme_context_watch_count")),
+                "announcement_context_watch_count": _safe_count(meta.get("announcement_context_watch_count")),
+                "bhavcopy_context_watch_count": _safe_count(meta.get("bhavcopy_context_watch_count")),
+                "macro_context_watch_count": _safe_count(meta.get("macro_context_watch_count")),
                 "capped_watch_rows": _safe_count(meta.get("capped_watch_rows")),
             }
         )
     else:
         counters.update({key: _safe_count(value) for key, value in meta.items() if isinstance(value, (int, float))})
+    empty_reason, substeps = _watcher_empty_reason(source, counters)
+    counters["empty_reason"] = empty_reason
+    counters["substeps"] = substeps
     return counters
 
 
@@ -736,6 +1167,18 @@ def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90, max_loo
         include_market_context=True,
         market_context_limit=DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
         market_context_last_checked_at=published_from,
+        include_theme_context=True,
+        theme_context_last_checked_at=published_from,
+        include_announcement_context=True,
+        announcement_context_limit=DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT,
+        announcement_context_last_checked_at=published_from,
+        announcement_context_lookback_days=DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS,
+        include_macro_context=True,
+        macro_context_limit=DEFAULT_MACRO_CONTEXT_WATCH_LIMIT,
+        macro_context_last_checked_at=published_from,
+        include_bhavcopy_context=True,
+        bhavcopy_context_limit=DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT,
+        bhavcopy_context_last_checked_at=published_from,
     )
     persist_news_events(events)
     source_counters = watcher_source_counters(source="news", meta=meta, events=events)
@@ -769,7 +1212,13 @@ def run_news_cycle(*, interval_seconds: int, lookback_minutes: int = 90, max_loo
     return result
 
 
-def run_announcement_cycle(*, interval_seconds: int, initial_lookback_minutes: int = 720, max_lookback_minutes: int | None = None) -> dict[str, Any]:
+def run_announcement_cycle(
+    *,
+    interval_seconds: int,
+    initial_lookback_minutes: int = 720,
+    max_lookback_minutes: int | None = None,
+    max_ingest_targets: int | None = None,
+) -> dict[str, Any]:
     source_name = "continuous_watch:announcements"
     now = pd.Timestamp.utcnow()
     state = load_sync_state(source_name) or {}
@@ -793,6 +1242,19 @@ def run_announcement_cycle(*, interval_seconds: int, initial_lookback_minutes: i
         include_market_context=True,
         market_context_limit=DEFAULT_MARKET_CONTEXT_WATCH_LIMIT,
         market_context_last_checked_at=last_checked_at,
+        include_theme_context=True,
+        theme_context_last_checked_at=last_checked_at,
+        include_announcement_context=True,
+        announcement_context_limit=DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT,
+        announcement_context_last_checked_at=last_checked_at,
+        announcement_context_lookback_days=DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS,
+        include_macro_context=True,
+        macro_context_limit=DEFAULT_MACRO_CONTEXT_WATCH_LIMIT,
+        macro_context_last_checked_at=last_checked_at,
+        include_bhavcopy_context=True,
+        bhavcopy_context_limit=DEFAULT_BHAVCOPY_CONTEXT_WATCH_LIMIT,
+        bhavcopy_context_last_checked_at=last_checked_at,
+        max_ingest_targets=WATCHER_ANNOUNCEMENT_MAX_INGEST_TARGETS if max_ingest_targets is None else int(max_ingest_targets),
     )
     persist_watch_outputs(watch_updates, events)
     source_counters = watcher_source_counters(source="announcements", meta=meta, events=events, watch_updates=watch_updates)
@@ -809,6 +1271,8 @@ def run_announcement_cycle(*, interval_seconds: int, initial_lookback_minutes: i
             "replay_minutes": 15,
             "max_lookback_minutes": effective_max_lookback,
             "catchup_truncated": bool(catchup_truncated),
+            "max_ingest_targets": int(meta.get("max_ingest_targets") or 0),
+            "skipped_ingest_target_count": int(meta.get("skipped_ingest_target_count") or 0),
             "source_counters": source_counters,
         },
         status="ok",
@@ -820,6 +1284,8 @@ def run_announcement_cycle(*, interval_seconds: int, initial_lookback_minutes: i
         "requested_to": now.isoformat(),
         "catchup_truncated": bool(catchup_truncated),
         "max_lookback_minutes": effective_max_lookback,
+        "max_ingest_targets": int(meta.get("max_ingest_targets") or 0),
+        "skipped_ingest_target_count": int(meta.get("skipped_ingest_target_count") or 0),
         "source_counters": source_counters,
     }
     publish_bus_message("stockey:continuous_watch:announcements", {"published_at": pd.Timestamp.utcnow(), **result})
@@ -846,6 +1312,154 @@ def run_operator_frontend_cycle() -> dict[str, Any]:
     return result
 
 
+def run_theme_context_cycle(*, limit: int | None = None) -> dict[str, Any]:
+    effective_limit = int(limit or os.getenv("THEME_CONTEXT_DERISK_LIMIT", "50"))
+    _emit(f"[advisory.continuous_watch] theme_context start limit={effective_limit}")
+    result = refresh_from_theme_context(limit=effective_limit, dry_run=False)
+    try:
+        result["action_refresh"] = run_action_refresh_from_signal_result(result)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.continuous_watch",
+            fallback_type="continuous_watch_action_refresh_failed",
+            source="continuous_watch:action_refresh",
+            severity="warn",
+            reason="Context-overlay signal rows were refreshed, but bounded Action Queue refresh failed.",
+            error=exc,
+            metadata={"signal_rows": result.get("signal_rows"), "affected_symbol_count": result.get("affected_symbol_count")},
+        )
+        result["action_refresh"] = {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "signal_rows_persisted": result.get("signal_rows"),
+            "affected_symbol_count": result.get("affected_symbol_count"),
+            "broker_execution_allowed": False,
+            "portfolio_authority": "none",
+        }
+    publish_bus_message("stockey:continuous_watch:theme_context", {"published_at": pd.Timestamp.utcnow(), **result})
+    return result
+
+
+def run_causal_memory_cycle(*, limit: int | None = None) -> dict[str, Any]:
+    if not WATCHER_CAUSAL_MEMORY_REFRESH_ENABLED:
+        result = {
+            "status": "skipped",
+            "reason": "WATCHER_CAUSAL_MEMORY_REFRESH_ENABLED=false",
+            "broker_execution_allowed": False,
+            "portfolio_authority": "none",
+        }
+        publish_bus_message("stockey:continuous_watch:causal_memory", {"published_at": pd.Timestamp.utcnow(), **result})
+        return result
+    effective_limit = int(limit or WATCHER_CAUSAL_MEMORY_REFRESH_LIMIT)
+    _emit(f"[advisory.continuous_watch] causal_memory start limit={effective_limit}")
+    result = refresh_from_causal_memory(limit=effective_limit, dry_run=False)
+    try:
+        result["action_refresh"] = run_action_refresh_from_signal_result(result)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.continuous_watch",
+            fallback_type="continuous_watch_causal_memory_action_refresh_failed",
+            source="continuous_watch:causal_memory",
+            severity="warn",
+            reason="Causal-memory signal rows were refreshed, but bounded Action Queue refresh failed.",
+            error=exc,
+            metadata={"signal_rows": result.get("signal_rows"), "affected_symbol_count": result.get("affected_symbol_count")},
+        )
+        result["action_refresh"] = {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "signal_rows_persisted": result.get("signal_rows"),
+            "affected_symbol_count": result.get("affected_symbol_count"),
+            "broker_execution_allowed": False,
+            "portfolio_authority": "none",
+        }
+    publish_bus_message("stockey:continuous_watch:causal_memory", {"published_at": pd.Timestamp.utcnow(), **result})
+    return result
+
+
+def run_router_cycle() -> dict[str, Any]:
+    result = route_live_updates()
+    try:
+        result["action_refresh"] = run_action_refresh_from_signal_result(result)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.continuous_watch",
+            fallback_type="continuous_watch_router_action_refresh_failed",
+            source="continuous_watch:router",
+            severity="warn",
+            reason="Router signal rows were refreshed, but bounded Action Queue refresh failed.",
+            error=exc,
+            metadata={"executed_actions": result.get("executed_actions"), "affected_symbol_count": result.get("affected_symbol_count")},
+        )
+        result["action_refresh"] = {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "executed_actions": result.get("executed_actions"),
+            "affected_symbol_count": result.get("affected_symbol_count"),
+            "broker_execution_allowed": False,
+            "portfolio_authority": "none",
+        }
+    return result
+
+
+def run_action_refresh_from_signal_result(signal_result: dict[str, Any]) -> dict[str, Any]:
+    if not WATCHER_ACTION_REFRESH_ENABLED:
+        return {
+            "status": "skipped",
+            "reason": "WATCHER_ACTION_REFRESH_ENABLED=false",
+            "broker_execution_allowed": False,
+            "portfolio_authority": "none",
+        }
+    source_symbols = signal_result.get("action_refresh_symbols") if "action_refresh_symbols" in signal_result else signal_result.get("affected_symbols", [])
+    symbols = sorted(
+        {
+            str(symbol or "").strip().upper()
+            for symbol in (source_symbols or [])
+            if str(symbol or "").strip()
+        }
+    )
+    if not symbols:
+        return {
+            "status": "skipped",
+            "reason": "no_signal_refresh_symbols",
+            "broker_execution_allowed": False,
+            "portfolio_authority": "none",
+        }
+    if len(symbols) > WATCHER_ACTION_REFRESH_MAX_SYMBOLS:
+        symbols = symbols[:WATCHER_ACTION_REFRESH_MAX_SYMBOLS]
+        truncated = True
+    else:
+        truncated = False
+    asof_date = pd.Timestamp.utcnow().normalize()
+    _emit(f"[advisory.continuous_watch] action_refresh start symbols={len(symbols)} asof={asof_date.date()}")
+    refreshed = build_action_recommendations(asof_date=asof_date, symbols=symbols)
+    persist_action_recommendations(refreshed)
+    now = pd.Timestamp.utcnow()
+    result = {
+        "status": "ok",
+        "asof_date": asof_date.isoformat(),
+        "symbol_count": int(len(symbols)),
+        "symbols_truncated": bool(truncated),
+        "recommendation_rows": int(len(refreshed)),
+        "action_counts": refreshed["action_code"].value_counts().to_dict() if not refreshed.empty and "action_code" in refreshed.columns else {},
+        "source": signal_result.get("action_refresh_source") or "signal_refresh_context_overlays",
+        "full_advisory_required": True,
+        "broker_execution_allowed": False,
+        "portfolio_authority": "none",
+        "authority_scope": "review_input_only",
+    }
+    persist_sync_state(
+        source_name="continuous_watch:action_refresh",
+        last_success_at=now,
+        last_item_ts=now,
+        cursor_value=now.isoformat(),
+        state=result,
+        status="ok",
+    )
+    publish_bus_message("stockey:continuous_watch:action_refresh", {"published_at": now, **result})
+    return result
+
+
 def publish_lock_skipped_cycle(*, lock_file: str | None = None, lock_pid: str | None = None) -> dict[str, Any]:
     published_at = pd.Timestamp.utcnow()
     result = {
@@ -859,6 +1473,8 @@ def publish_lock_skipped_cycle(*, lock_file: str | None = None, lock_pid: str | 
         "announcements": result.copy(),
         "news": result.copy(),
         "router": result.copy(),
+        "theme_context": result.copy(),
+        "causal_memory": result.copy(),
         "operator_frontend": result.copy(),
         "wait_signals": result.copy(),
         "operator_snapshot": result.copy(),
@@ -881,23 +1497,28 @@ def run_once(
     announcement_interval_seconds: int,
     intraday_interval_minutes: int,
     ohlcv_max_lookback_minutes: int,
+    announcement_max_ingest_targets: int | None = None,
 ) -> dict[str, Any]:
     ensure_sync_state_table()
     ensure_alerts_table()
     summary: dict[str, Any] = {"status": "ok", "cycles": {}}
 
     def _run_cycle(source_name: str, cycle_name: str, func, **kwargs) -> dict[str, Any]:
-        try:
-            return func(**kwargs)
-        except Exception as exc:
+        def _record_cycle_error(exc: BaseException, *, interrupted: bool = False) -> dict[str, Any]:
+            fallback_type = "continuous_watch_cycle_interrupted" if interrupted else "continuous_watch_cycle_failed"
+            reason = (
+                "Continuous watcher cycle was interrupted; status was persisted as error before re-raising."
+                if interrupted
+                else "Continuous watcher cycle failed; status was persisted as error and later cycles may continue."
+            )
             error = f"{type(exc).__name__}: {exc}"
             _emit(f"[advisory.continuous_watch] {cycle_name} failed error={error}")
             record_local_fallback_event(
                 module="advisory.continuous_watch",
                 source=source_name,
-                fallback_type="continuous_watch_cycle_failed",
+                fallback_type=fallback_type,
                 severity="error",
-                reason="Continuous watcher cycle failed; status was persisted as error and later cycles may continue.",
+                reason=reason,
                 error=exc,
                 metadata={"cycle": cycle_name},
             )
@@ -905,14 +1526,22 @@ def run_once(
                 source_name=source_name,
                 status="error",
                 error_text=error,
-                state={"cycle": cycle_name, "error": error},
+                state={"cycle": cycle_name, "error": error, "interrupted": bool(interrupted)},
             )
             publish_bus_message(
                 f"stockey:continuous_watch:{cycle_name}",
-                {"published_at": pd.Timestamp.utcnow(), "status": "error", "error": error},
+                {"published_at": pd.Timestamp.utcnow(), "status": "error", "error": error, "interrupted": bool(interrupted)},
             )
             summary["status"] = "error"
-            return {"status": "error", "error": error}
+            return {"status": "error", "error": error, "interrupted": bool(interrupted)}
+
+        try:
+            return func(**kwargs)
+        except KeyboardInterrupt as exc:
+            _record_cycle_error(exc, interrupted=True)
+            raise
+        except Exception as exc:
+            return _record_cycle_error(exc)
 
     def _skip_cycle(cycle_name: str, reason: str) -> dict[str, Any]:
         result = {"status": "skipped", "reason": reason}
@@ -934,14 +1563,22 @@ def run_once(
     else:
         summary["cycles"]["ohlcv"] = _skip_cycle("ohlcv", "not_due")
     if _is_due("continuous_watch:announcements", announcement_interval_seconds):
-        summary["cycles"]["announcements"] = _run_cycle("continuous_watch:announcements", "announcements", run_announcement_cycle, interval_seconds=announcement_interval_seconds)
+        summary["cycles"]["announcements"] = _run_cycle(
+            "continuous_watch:announcements",
+            "announcements",
+            run_announcement_cycle,
+            interval_seconds=announcement_interval_seconds,
+            max_ingest_targets=announcement_max_ingest_targets,
+        )
     else:
         summary["cycles"]["announcements"] = _skip_cycle("announcements", "not_due")
     if _is_due("continuous_watch:news", news_interval_seconds):
         summary["cycles"]["news"] = _run_cycle("continuous_watch:news", "news", run_news_cycle, interval_seconds=news_interval_seconds)
     else:
         summary["cycles"]["news"] = _skip_cycle("news", "not_due")
-    summary["cycles"]["router"] = _run_cycle("continuous_watch:router", "router", route_live_updates)
+    summary["cycles"]["router"] = _run_cycle("continuous_watch:router", "router", run_router_cycle)
+    summary["cycles"]["theme_context"] = _run_cycle("continuous_watch:theme_context", "theme_context", run_theme_context_cycle)
+    summary["cycles"]["causal_memory"] = _run_cycle("continuous_watch:causal_memory", "causal_memory", run_causal_memory_cycle)
     summary["cycles"]["operator_frontend"] = _run_cycle("continuous_watch:operator_frontend", "operator_frontend", run_operator_frontend_cycle)
     publish_bus_message("stockey:continuous_watch:summary", {"published_at": pd.Timestamp.utcnow(), **summary})
     return summary
@@ -959,6 +1596,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--announcement-interval-seconds", type=int, default=1800)
     parser.add_argument("--intraday-interval-minutes", type=int, default=1)
     parser.add_argument("--ohlcv-max-lookback-minutes", type=int, default=int(os.getenv("WATCHER_OHLCV_MAX_LOOKBACK_MINUTES", "240")))
+    parser.add_argument("--announcement-max-ingest-targets", type=int, default=WATCHER_ANNOUNCEMENT_MAX_INGEST_TARGETS, help="Maximum unique announcement ingest targets per watcher run. Skipped targets remain due for later runs.")
     parser.add_argument("--output-dir", default=None, help="Deprecated; static dashboard generation has moved to the Nuxt operator frontend.")
     return parser.parse_args()
 
@@ -977,6 +1615,7 @@ def main() -> int:
             announcement_interval_seconds=int(args.announcement_interval_seconds),
             intraday_interval_minutes=int(args.intraday_interval_minutes),
             ohlcv_max_lookback_minutes=int(args.ohlcv_max_lookback_minutes),
+            announcement_max_ingest_targets=int(args.announcement_max_ingest_targets),
         )
         print(json.dumps(summary, indent=2, ensure_ascii=False, default=str))
         if not args.loop:
