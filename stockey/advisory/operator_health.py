@@ -181,6 +181,13 @@ DEGRADATION_PATTERNS = [
         "suggested_fix": "Check whether the symbol is suspended/newly listed, retry with BSE fallback, or reduce requested date window.",
     },
     {
+        "kind": "dhan_consent_limit_exceeded",
+        "severity": "error",
+        "pattern": re.compile(r"CONSENT_LIMIT_EXCEED", re.IGNORECASE),
+        "title": "Dhan consent limit exceeded",
+        "suggested_fix": "Dhan daily consent slot limit reached. Wait for the daily reset, then run python -m data.dhanlive.auth_cli refresh --clear-cache-first --auto-login after scripts/start_chrome_cdp.sh. Do not bypass with manual consent.",
+    },
+    {
         "kind": "dhan_auth_preflight_failed",
         "severity": "error",
         "pattern": re.compile(

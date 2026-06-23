@@ -2094,14 +2094,14 @@ def _filter_negative_context_targets_by_reliability(
                     "de_risk_review_allowed_by_runtime_contract": bool(derisk_allowed),
                     "overlay_id": item.get("overlay_id"),
                     "reason": (
-                        "Source-family runtime policy contract does not allow this context family to create de-risk review pressure."
-                        if family_row is not None and not derisk_allowed
-                        else
                         "Exact context-class reliability says this negative context is a false-positive or horizon-inconsistent de-risk signal."
                         if class_classification in CONTEXT_RELIABILITY_DERISK_SUPPRESS_CLASSES
                         else
                         "Sector reliability says this negative context is a false-positive or horizon-inconsistent de-risk signal for the matched sector."
                         if sector_classification in CONTEXT_RELIABILITY_DERISK_SUPPRESS_CLASSES
+                        else
+                        "Source-family runtime policy contract does not allow this context family to create de-risk review pressure."
+                        if family_row is not None and not derisk_allowed
                         else "Source-family reliability says this negative context is harmful, negative after cost, or horizon-inconsistent."
                     ),
                     "authority_scope": "review_input_only",

@@ -4174,6 +4174,16 @@ def _compact_ts_forecast_watch_rows(rows: list[dict[str, Any]], *, compact: bool
     return out
 
 
+def _compact_ts_forecast_summary_rows(rows: list[dict[str, Any]], *, compact: bool = True) -> list[dict[str, Any]]:
+    if not compact:
+        return rows
+    return [
+        _trim_home_value(row, max_text=260, max_list=6, max_depth=2)
+        for row in rows
+        if isinstance(row, dict)
+    ]
+
+
 def build_watchlist_payload(
     *,
     asof_date: str | None = None,
@@ -4212,7 +4222,7 @@ def build_watchlist_payload(
     ts_watch_recommendations = _compact_list_rows(raw_sections["ts_watch_recommendations"][:bounded_limit], compact=compact) if included["ts_watch_recommendations"] else []
     ts_forecast_watch = _compact_ts_forecast_watch_rows(raw_sections["ts_forecast_watch"][:bounded_limit], compact=compact) if included["ts_forecast_watch"] else []
     ts_forecast_eval_summary = _compact_list_rows(raw_sections["ts_forecast_eval_summary"][:bounded_limit], compact=compact) if included["ts_forecast_eval_summary"] else []
-    ts_forecast_paper_summary = _compact_list_rows(raw_sections["ts_forecast_paper_summary"][:bounded_limit], compact=compact) if included["ts_forecast_paper_summary"] else []
+    ts_forecast_paper_summary = _compact_ts_forecast_summary_rows(raw_sections["ts_forecast_paper_summary"][:bounded_limit], compact=compact) if included["ts_forecast_paper_summary"] else []
     return {
         "generated_at": payload.get("generated_at"),
         "api_schema": _operator_api_schema("/api/watchlist", schema_name="operator_watchlist"),
@@ -5128,11 +5138,26 @@ def _compact_action_reason_contract(value: Any) -> dict[str, Any] | None:
         return None
     evidence = reason.get("evidence") if isinstance(reason.get("evidence"), dict) else {}
     compact_evidence: dict[str, Any] = {}
-    for key in ["technical", "risk", "screener", "action_transition", "conflict_resolution", "company_memory"]:
-        if isinstance(evidence.get(key), dict) and evidence.get(key):
-            compact_evidence[key] = _trim_home_value(evidence[key], max_text=220, max_list=4, max_depth=2)
+    for key in ["technical", "risk", "screener", "action_transition", "conflict_resolution", "company_memory", "event", "macro_regime"]:
+        section = evidence.get(key)
+        if isinstance(section, dict) and section:
+            section_depth = 3 if key in {"conflict_resolution", "event", "macro_regime"} else 2
+            compact_evidence[key] = _trim_home_value(section, max_text=220, max_list=4, max_depth=section_depth)
+    event_section = compact_evidence.get("event")
+    if isinstance(event_section, dict) and event_section.get("action_status") is not None:
+        event_section["action_status"] = _display_reason_text(event_section.get("action_status")) or event_section.get("action_status")
+    macro_section = compact_evidence.get("macro_regime")
+    if isinstance(macro_section, dict) and macro_section.get("market_context_adjustment") is not None:
+        macro_section["market_context_adjustment"] = (
+            _display_reason_text(macro_section.get("market_context_adjustment")) or macro_section.get("market_context_adjustment")
+        )
+    missing_fields_raw = reason.get("missing_fields")
+    if isinstance(missing_fields_raw, list):
+        missing_fields = [_display_reason_text(item) or _text(item) for item in missing_fields_raw if _text(item)]
+    else:
+        missing_fields = _trim_home_value(missing_fields_raw, max_text=120, max_list=5, max_depth=1)
     out = {
-        "status": _text(reason.get("status")),
+        "status": _display_reason_text(reason.get("status")) or _text(reason.get("status")),
         "action_code": _text(reason.get("action_code")),
         "original_action_code": _text(reason.get("original_action_code") or reason.get("original_action")),
         "action_source": _text(reason.get("action_source")),
@@ -5140,7 +5165,7 @@ def _compact_action_reason_contract(value: Any) -> dict[str, Any] | None:
         "setup_id": _text(reason.get("setup_id")),
         "primary_reason": _trim_home_value(reason.get("primary_reason"), max_text=260, max_list=0, max_depth=1),
         "reason_detail": _trim_home_value(reason.get("reason_detail"), max_text=300, max_list=2, max_depth=1),
-        "missing_fields": _trim_home_value(reason.get("missing_fields"), max_text=120, max_list=5, max_depth=1),
+        "missing_fields": missing_fields,
         "evidence": compact_evidence,
     }
     return {key: val for key, val in out.items() if val not in (None, "", [], {})} or None

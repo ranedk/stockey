@@ -53,7 +53,7 @@ def build_run_state(
     return {
         "source": SYNC_SOURCE_NAME,
         "rows": int(rows_written),
-        "rows_read": int(rows_written),
+        "rows_read": 1,
         "rows_written": int(rows_written),
         "classification": classification,
         "status": "ok" if classification in {"ok", "no_data"} else "failed",

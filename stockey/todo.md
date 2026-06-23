@@ -2,317 +2,722 @@
 
 Updated: `2026-06-23`
 
-This is the single active planning document for Stockey. Treat this file as the
-priority-ordered backlog and current-state summary.
+This is the single active planning document for Stockey. It is the priority-ordered
+backlog and current-state summary. It was rebuilt from a deep code+log audit, so
+each task below is written to be picked up by an LLM agent working with a small
+context window: read only the named files, follow the steps, obey the authority
+guardrail, and run the listed validation.
 
-## Decision Rules
+## How To Use This File (LLM Task Contract)
 
-- Do not create BUY recommendations by weakening all rules globally.
-- Do not use one broad regime label as the sole BUY/SELL gate.
-- Prefer layered context: technical setup, market breadth, macro stress,
-  sector/symbol leadership, source-family overlays, exact event-class
-  reliability, and benchmark-excess evidence.
-- LLMs can extract, summarize, critique, and propose watch/de-risk plans.
-  Deterministic technical, risk, lifecycle, reason-contract, identity, and
-  execution gates own trade authority.
-- Context overlays, causal memory, event policy, and fast signal refresh are
-  review/watch/de-risk evidence until full advisory validates them.
-- Every fallback, stale source, degraded ingest, skipped symbol, source outage,
-  parser failure, and auth issue must be visible in logs, sync state, fallback
-  telemetry, Operator Health, or diagnostics.
-- Keep point-in-time discipline. Do not backdate recommendations or use future
-  data for features, labels, or portfolio assumptions.
+Each task is a self-contained card:
+
+- **Why** — the problem and evidence.
+- **Files** — the only files you need to open. Prefer `rg` to locate the exact
+  lines; line numbers are approximate and drift.
+- **Do** — concrete steps.
+- **Guardrail** — the authority/point-in-time boundary you must not break.
+- **Validate** — the smallest meaningful check + acceptance criterion.
+- **Confidence** — `verified` (audited against current source), or
+  `verify-first` (claim is plausible but you must confirm the code still behaves
+  this way before changing it; if the bug does not exist, record that and stop).
+
+Global rules for every task:
+
+- Do not weaken authority boundaries to make BUYs appear. Review-only rows keep
+  `portfolio_authority=none`, `broker_execution_allowed=false`,
+  `full_advisory_required=true` unless a full advisory/risk/lifecycle/action gate
+  upgrades them.
+- Do not use one broad regime label as the sole BUY/SELL gate. Prefer layered
+  context (breadth, macro stress, sector/symbol leadership, technical
+  confirmation, source-family + exact event-class reliability, benchmark-excess).
+- Every fallback, stale source, skipped symbol, parser failure, and auth issue
+  must stay visible (logs, sync state, fallback telemetry, Operator Health,
+  diagnostics). Never hide a source failure as empty data.
+- Keep point-in-time discipline. No future data, backdated portfolio, or
+  non-causal labels.
+- Add a narrow test for every behavioral change. Prefer bounded fixes over
+  refactors. Preserve unrelated dirty-worktree changes.
+
+Default validation (pick the smallest meaningful subset):
+
+```sh
+python -m py_compile <changed modules>
+pytest -q tests/test_advisory_regression.py::<specific_test>
+python scripts/docs_state_audit.py --strict
+python scripts/env_example_audit.py --strict
+git diff --check
+# UI/API changes:
+npm --prefix apps/operator-web run typecheck
+python scripts/api_performance_report.py --limit 20
+# cron/script changes:
+python scripts/cron_preflight.py
+```
 
 ## Primary Operator Commands
 
-- Downloaders only: `./all_downloaders.sh`
-- Queued downloader refresh: `./all_downloaders_queue.sh` then `./all_external_workers.sh`
-- Parsers only: `./all_parsers.sh`
 - Download + parse + compact/context refresh: `./complete_data.sh`
 - Continuous monitoring: `./all_watchers.sh --loop`
 - Context-to-entry repair: `./all_context_to_entry_repair.sh`
-- Advisory only: `./all_advisory.sh`
-- Fast advisory refresh: `./all_advisory.sh --fast`
-- Research evidence refresh: `./all_research_evidence.sh`
-- Optional ML/research training: `./all_ml.sh`
+- Authoritative advisory: `./all_advisory.sh` (fast: `--fast`)
+- Research evidence: `./all_research_evidence.sh`
+- Optional ML/research: `./all_ml.sh`
 - Frontend/API: `./all_frontend.sh`
-- Recommendation diagnostics: `python -m advisory.recommendation_diagnostics --format text`
+- Diagnostics: `python -m advisory.recommendation_diagnostics --format text`
 - Operator Health: `python -m advisory.operator_health --skip-dhan`
 
-Use `python -m advisory.pipeline` only for stage-level debugging and targeted
-reruns.
+Use `python -m advisory.pipeline` only for stage-level debugging.
 
-## P0 - Must Fix Before Trusting New Recommendations
+---
 
-1. **Verify current no-BUY state after a fresh advisory run.**
-   - Run `./all_context_to_entry_repair.sh`.
-   - Run `./all_advisory.sh --date <latest-trading-day>`.
-   - Run `python -m advisory.recommendation_diagnostics --asof-date <latest-trading-day> --format text`.
-   - Expected result: diagnostics must say whether missing BUY rows are caused
-     by candidate freshness, technical confirmation, context conversion,
-     downstream consolidation, or hard macro/context gates.
-   - Do not tune thresholds or context policy from stale candidate/action rows.
+## P0 - Active Failures Blocking Evidence Or Runs
 
-2. **Resolve BUY underparticipation using technical evidence.**
-   - Current evidence points to technical confirmation blockers, not broad
-     regime suppression: `technical_total_below_buy_min`,
-     `participation_below_minimum`, `entry_trigger_missing`,
-     `breakout_volume_below_min`, `pivot_not_cleared`, and weak close quality.
-   - Run bounded calibration first:
-     `python -m advisory.technical_threshold_calibration --dry-run --horizons 5 10 20 --max-configs 512 --progress-every 128`.
-   - Review blocker and near-miss outcomes before changing any production
-     threshold.
-   - Candidate relaxations must be archetype-specific, reviewed, and justified
-     by after-cost and benchmark-aware outcomes.
+These were found in `logs/fallback/` and `logs/cron/`. Fix these before tuning
+any policy: the evidence you would tune from is currently being corrupted or
+blocked.
 
-3. **Confirm technical threshold DB repair on live calibration.**
-   - Re-run technical-threshold calibration after the new Timescale repair
-     migration.
-   - Confirm no unique-index error occurs for
-     `advisory_technical_threshold_eval_summary`.
-   - If it fails, repair stale unique indexes that omit `evaluated_at`.
+> **Status (2026-06-23 implementation pass).** On verification, three of the five
+> were already fixed in the working tree and only flagged by stale Jun 19-21 logs:
+> - **P0.2 (migration checksum):** already fixed by commit `0cb4401`
+>   (`BASE_CANDIDATE_COLUMNS`). Live checksum matches the applied record
+>   (`793bc4…`, MATCH). No change made.
+> - **P0.4 (intraday unmapped Dhan id):** already guarded — current
+>   `ensure_intraday_history` wraps the per-symbol sync in
+>   `try/except (DhanAPIError, ValueError)` with fallback + `continue`. No change.
+> - **P0.3 (NSE `EGR` holiday):** the specific `EGR` key is already in the segment
+>   map. Implemented the defensive `.get` + `nse_holidays_unknown_segment`
+>   telemetry anyway so the *next* unknown NSE segment cannot crash the download.
+>
+> Implemented this pass: **P0.1** (incl. the sibling `_json_ready_record` with the
+> same latent bug), **P0.3** hardening, **P0.5** (`dhan_consent_limit_exceeded`
+> Operator Health pattern). 6 tests added/updated; 13 targeted tests green.
+>
+> **New finding → see [P0.6].** The advisory regression suite is currently RED on
+> this worktree: 16 pre-existing failures unrelated to these fixes.
 
-4. **Fix any active script failures that block evidence generation.**
-   - Re-check recent `logs/cron/*` after the next cron cycle.
-   - Known classes to watch: Dhan auth/CDP, Dhan identity mapping, NSE source
-     timeout, sync-state type mismatches, malformed JSON output from long
-     scripts, and Timescale unique-key errors.
-   - Failures should be recorded as source degradation, not hidden as no-data.
+### [P0.6] Triage 16 pre-existing advisory-regression failures  ✅ DONE (suite green: 2024 passed, 0 failed)
+- **Outcome (2026-06-23):** All 16 fixed. **7 genuine code regressions** from the WIP
+  commits — fix in production: conflict-precedence ordering (ADVERSARIAL_VETO must
+  beat MARKET_GATE) in `action_recommender.py`; `recent_events.py` `rows_read`
+  (single-fetch semantics); `signal_refresh.py` de-risk suppression reason
+  precedence; and four in `advisory/api/app.py` `_compact_action_reason_contract`
+  / watchlist payload (humanize `status`+`missing_fields`, surface
+  `event`/`macro_regime`/deep `conflict_resolution`, and a ts-forecast-aware
+  compaction so `model_name` survives). **9 stale tests** realigned to intended
+  WIP contracts (migration count, transition-gate `position_status`, unconditional
+  market-context annotation, `BUY_WATCH→WATCH`, expired date fixture, off-by-one
+  index, `skip_if_current` kwarg, internal `captured["query"]` typo, cosmetic
+  wording). No assertions weakened.
 
-## P1 - Investment Decision Quality
+- **Why:** `pytest tests/test_advisory_regression.py` reports **16 failed, 2008
+  passed** on the current worktree, and they fail with the P0 source edits stashed
+  too — so they predate this work (WIP commits `0cb4401`/`2e1f5d0`). A red
+  regression suite undermines trust in every other change. Examples:
+  `test_rule_engine_ensure_output_tables_uses_schema_registry`
+  (assertion `allocated` vs `rejected`), `test_recent_events_main_exports_runner_state`,
+  `test_risk_engine_falls_back_to_base_candidates_without_event_rows`,
+  `test_operator_api_splits_dashboard_payload`,
+  `test_action_recommender_bridges_event_policy_actions`,
+  `test_watchlist_builder_suppresses_context_overlay_hard_ohlcv_blockers`,
+  `test_signal_refresh_*`, `test_recommendation_diagnostics_labels_stale_pass_now_*`.
+- **Do:** Run the full list, group by root cause (several look like recent WIP
+  behavior changes that the tests were not updated for), and for each either fix
+  the code or update the test to the intended new contract. Treat any that reflect
+  a real behavior regression as its own P0.
+- **Guardrail:** Do not delete/weaken assertions to go green; confirm the intended
+  behavior first.
+- **Validate:** `pytest -q tests/test_advisory_regression.py` returns 0 failures.
+- **Confidence:** verified (reproduced on baseline).
 
-1. **Replace single-regime thinking with layered context everywhere.**
-   - Broad regime should remain diagnostic/annotation unless a narrow hard-risk
-     gate is explicitly justified.
-   - Recommendation diagnostics should continue to separate breadth, macro
-     stress, sector/symbol leadership, technical confirmation, source-family
-     overlays, and exact event-class reliability.
-   - Run `python scripts/context_gate_policy_audit.py --fail-on-single-regime`
-     after env/config changes.
+### [P0.1] Fix `pd.isna()` on non-scalar in action_recommender context builder  ✅ DONE
+- **Why:** `_json_context_value` runs `if pd.isna(value):` on values that can be
+  lists / dicts / numpy arrays, raising "truth value of an empty array is
+  ambiguous". The `except` swallows it and emits fallback type
+  `action_recommender_context_missing_check_failed` on every call — ~1,000 events
+  per 2,000 fallback-log lines (tens of thousands/day). It is non-fatal but
+  floods telemetry and hides real signals, violating "avoid silent fallback".
+- **Files:** `advisory/action_recommender.py` — `_json_context_value` (~line 1260,
+  the `pd.isna` at ~1264 and fallback emit at ~1269).
+- **Do:** Guard the scalar check exactly like the existing correct call sites in
+  the same file (lines ~516 and ~2493): `if pd.api.types.is_scalar(value) and
+  pd.isna(value):`. Non-scalars must return the value unchanged without entering
+  the isna branch and without emitting fallback telemetry.
+- **Guardrail:** Behavior-preserving for scalars; only stops the spurious
+  exception/fallback for containers.
+- **Validate:** `python -m py_compile advisory/action_recommender.py`; add a test
+  in `tests/test_advisory_regression.py` feeding `[]`, `[1,2]`, `np.array([])`,
+  `{}`, `None`, `np.nan`, `1.0` through `_json_context_value` asserting no
+  exception and correct passthrough/None. Acceptance: a fresh advisory run stops
+  accumulating `action_recommender_context_missing_check_failed`.
+- **Confidence:** verified.
 
-2. **Make context-to-entry reliable.**
-   - Fresh macro/news/announcement/bhavcopy/exchange/theme context should become
-     durable `CONTEXT_OVERLAY_WATCH` rows.
-   - Durable context-watch rows should carry technical confirmation plans and
-     point-in-time technical prechecks.
-   - Rows with hard OHLCV/technical-build issues must stay inactive/rejected
-     audit rows until data is repaired.
-   - Full advisory must be the only path that grants portfolio/risk/lifecycle
-     authority.
+### [P0.2] Resolve rule_engine migration checksum mismatch (blocks all_ml)  ✅ ALREADY FIXED (stale log)
+- **Why:** `all_ml.log` shows `Migration checksum mismatch for
+  20260611_advisory_rule_outputs_base`, which hard-fails `event_model_data_prep`
+  and any path calling `ensure_rule_output_tables()`. Root cause: an
+  already-applied migration's SQL was edited in place.
+- **Files:** `advisory/rule_engine.py` (`RULE_ENGINE_SCHEMA_MIGRATION_ID` ~line 29
+  and `RULE_ENGINE_SCHEMA_STATEMENTS`), `utils/schema_migrations.py` (~line 70).
+- **Do:** First `git log -p -- advisory/rule_engine.py | grep -A30
+  RULE_ENGINE_SCHEMA_STATEMENTS` to see what changed. Then EITHER (a) revert the
+  edited SQL to its applied form and add a NEW migration id for the intended
+  change, OR (b) if the live DB already matches the new SQL, add an explicit,
+  operator-gated re-baseline path in `schema_migrations` that records the new
+  checksum. Do NOT silently relax/skip checksum validation.
+- **Guardrail:** Migrations stay append-only; no silent checksum override.
+- **Validate:** `python -m advisory.event_model_data_prep --format json
+  --min-labeled-rows 20 --horizons 1` runs without the ValueError;
+  `python -m py_compile advisory/rule_engine.py utils/schema_migrations.py`.
+- **Confidence:** verify-first (confirm the mismatch still reproduces).
 
-3. **Build stronger sector/exact-class reliability.**
-   - Source-family aggregate labels are not enough.
-   - Use exact `context_class`, sector split, horizon, direction, and
-     benchmark-excess evidence before allowing a source to influence watch or
-     de-risk pressure.
-   - Suppress harmful/no-lift, negative-after-cost, horizon-inconsistent, and
-     benchmark-unattributed classes.
+### [P0.3] Make NSE holidays parser tolerant of unknown segment keys  ✅ DONE (hardened)
+- **Why:** `complete_data.log` shows `KeyError: 'EGR'` in
+  `download_holidays` — NSE now returns an Electronic Gold Receipts segment key
+  absent from the hardcoded `nse_product_info` map, aborting the holidays
+  download and degrading trading-calendar freshness.
+- **Files:** `data/nseindia/holidays.py` (`nse_product_info` map ~lines 34-100;
+  the lookup `nse_product_info[k]['name']` ~line 146).
+- **Do:** Replace the hard index with `nse_product_info.get(k, {}).get('name', k)`
+  and record a fallback telemetry event (`nse_holidays_unknown_segment`) listing
+  the unknown key, instead of raising. Optionally add the `EGR` entry too.
+- **Guardrail:** Unknown segments degrade visibly (telemetry), not silently.
+- **Validate:** `python -m py_compile data/nseindia/holidays.py`; unit test that a
+  product dict containing `EGR` parses without KeyError and emits one fallback.
+- **Confidence:** verified (from log).
 
-4. **Improve causal event memory as the core event layer.**
-   - Continue compact symbol/sector memory over announcements, exchange events,
-     bhavcopy, macro, and themes.
-   - Evaluate memory classes against forward return and benchmark-excess return.
-   - Design bounded deterministic consumers only for repeated helpful groups.
-   - Explicitly suppress harmful/no-lift, benchmark-beta-only, and
-     benchmark-unattributed classes.
+### [P0.4] Per-symbol skip + telemetry for unmapped Dhan security id  ✅ ALREADY FIXED (stale log)
+- **Why:** `all_advisory.log` shows `ValueError: No Dhan security id mapped for
+  NSE:HUIL` during intraday sync. One unmapped symbol (e.g. the HUL spinoff)
+  raises through `build_intraday_features` and can abort the batch.
+- **Files:** `data/dhanlive/dhan_db.py` (`resolve_dhan_identity` ~line 100),
+  `advisory/intraday_features.py` (intraday sync/build loop).
+- **Do:** In the intraday build loop, catch the unmapped-identity error per
+  symbol, record a fallback telemetry event + an `advisory_identity_issues` row
+  (`dhan_security_id_missing`), and continue with remaining symbols.
+- **Guardrail:** Missing identity becomes a visible identity issue, never a
+  hidden batch abort or silent drop.
+- **Validate:** `python -m py_compile` both files; test that one unmapped symbol
+  in a batch produces a telemetry/identity row and the other symbols still build.
+- **Confidence:** verified (from log).
 
-5. **Keep LLM decisioning bounded but useful.**
-   - LLMs should reduce Manual Review by classifying ambiguous evidence into
-     `NO_ACTION`, review-only `WATCH`, or review-only `REDUCE_EXPOSURE_REVIEW`
-     where possible.
-   - LLM output must carry no-portfolio/no-broker authority unless deterministic
-     gates later validate it.
-   - Prompt/skill contracts should remain inspectable in backend config, not
-     hidden in UI-only workflows.
+### [P0.5] Distinct operator message for Dhan CONSENT_LIMIT_EXCEED  ✅ DONE
+- **Why:** Dhan auth returns `CONSENT_LIMIT_EXCEED`, which fails
+  `dhan_auth_preflight` and aborts the entire advisory run. Hard-fail is the
+  intended design, but the generic auth-failure message hides that this is a
+  daily-consent-limit condition needing a specific operator action.
+- **Files:** `data/dhanlive/auth_cli.py`, `all_advisory_preflight.sh` (where the
+  preflight failure is surfaced), `advisory/operator_health.py`
+  (DEGRADATION_PATTERNS / fix hints).
+- **Do:** Detect `CONSENT_LIMIT_EXCEED` in the auth error and surface a distinct
+  message + fix hint ("Dhan consent limit exceeded — wait for daily reset or run
+  `auth_cli refresh --clear-cache-first --auto-login` after
+  `scripts/start_chrome_cdp.sh`"). Add a matching Operator Health pattern.
+- **Guardrail:** Still fail hard; do not add a hidden manual-consent fallback.
+- **Validate:** `python -m py_compile`; unit test mapping the error payload to the
+  distinct message/hint.
+- **Confidence:** verified (from log).
 
-6. **Clarify action authority and portfolio transition semantics.**
-   - Action Queue must distinguish review-only rows from executable rows.
-   - Recommendations page should show only the most recommended operator action
-     per symbol: buy, sell, buy_50%, sell_50%, watch, hold, or no action.
-   - Reset portfolio semantics should not create SELL recommendations for
-     positions that no longer exist.
-   - BUY-looking review-only signal-refresh rows should not appear as approved
-     executable BUYs.
+---
 
-7. **Validate action-transition stability before promoting it.**
-   - Continue action-transition evaluation against point-in-time forward returns
-     and NIFTY benchmark-excess movement.
-   - Keep unstable transition downgrades deterministic and conservative.
-   - Do not promote transition policy from raw helpful outcomes that are only
-     benchmark beta.
+## P1 - Decision Correctness And Authority Safety
 
-## P2 - Data, Evidence, And Source Reliability
+### [P1.1] Close review-only sanitization bypass for non-standard action codes
+- **Why:** `enforce_review_only_signal_boundaries` only sanitizes when the action
+  code is in `BROKER_CAPABLE_ACTIONS` or `execution_mode == "broker_order"`. A
+  review-only source emitting a non-broker `action_code` (e.g. `HOLD`) while still
+  carrying `transaction_type="BUY"` could slip a broker-capable transaction field
+  through.
+- **Files:** `advisory/action_recommender.py` —
+  `enforce_review_only_signal_boundaries` (~line 589-651).
+- **Do:** Make sanitization fire when `transaction_type in {"BUY","SELL"}` OR the
+  action is broker-capable OR `execution_mode == "broker_order"`. When a
+  review-only source carries any broker-capable field, force
+  `execution_mode="review_only"`, clear `transaction_type`, and downgrade the
+  action to `WATCH`/`REDUCE_EXPOSURE_REVIEW`. Record an audit note.
+- **Guardrail:** Review-only sources can never emit a broker-capable transaction.
+- **Validate:** Test: a review-only row with `action_code="HOLD",
+  transaction_type="BUY"` ends with `execution_mode="review_only"` and no
+  broker transaction. Assert no review-only-source row survives with
+  `transaction_type in {BUY,SELL}` and `execution_mode != review_only`.
+- **Confidence:** verify-first.
 
-1. **Keep announcement and document intelligence compact but complete.**
-   - Continue suppressing routine filings unless stronger material keywords are
-     present.
-   - Ensure material filings become compact structured/unstructured evidence
-     with source pointers and event class.
-   - Surface unresolved company mappings, OCR failures, source fetch failures,
-     document lookup failures, and ingest backlog in Operator Health.
+### [P1.2] Make non-existent-position SELL/TIGHTEN an execution precondition
+- **Why:** `position_state_missing_for_position_transition` is added to
+  `transition_blockers` (action_recommender ~line 4824), but the execution gate
+  (`_action_transition_block_reasons`, execution_engine ~line 1256) keys only off
+  `precondition_status`/`missing_preconditions`. So a SELL/TIGHTEN_STOP for a
+  position that no longer exists (e.g. after a portfolio reset) may not be
+  blocked at execution. Confirm whether the blocker reaches `missing_preconditions`.
+- **Files:** `advisory/action_recommender.py` (transition contract build around
+  ~4812-4860), `advisory/execution_engine.py`
+  (`_action_transition_block_reasons` ~1256, `_action_row_block_reasons` ~1536),
+  `advisory/position_lifecycle.py` (SELL/TIGHTEN emission).
+- **Do:** (1) Verify the gap. (2) If real, add
+  `position_state_missing_for_position_transition` to `missing_preconditions`
+  (or add a direct execution-row block) so broker submission is blocked. (3) In
+  `position_lifecycle`, skip emitting SELL/PARTIAL_SELL/TIGHTEN_STOP when the
+  current portfolio snapshot has no open quantity for the symbol.
+- **Guardrail:** Never submit a SELL for a position that does not exist; portfolio
+  reset must not generate phantom SELLs.
+- **Validate:** Test: a BUY_MORE/SELL with no open position → execution
+  `submit_blocked`. Test: portfolio-reset snapshot → no SELL rows emitted.
+- **Confidence:** verify-first.
 
-2. **Use bhavcopy and exchange data more directly.**
-   - Maintain compact accumulation, distribution, circuit risk, abnormal
-     turnover, short/off-market, insider, block/bulk, and corporate-action
-     evidence.
-   - Feed these as queryable context to LLM/company-memory/event-policy paths.
-   - Evaluate them by source family, event class, sector, and benchmark-excess
-     outcomes before runtime influence.
+### [P1.3] Corporate-action reconciliation for open positions (qty + cost basis)
+- **Why:** Splits/bonus/symbol changes are handled in OHLCV adjusted prices, but
+  open-position quantity and entry cost basis are not retroactively adjusted. A
+  1:2 split leaves stale quantity, corrupting P&L, sizing, and SELL quantity.
+  (Pairs with P2.9, the ingest side.)
+- **Files:** new `advisory/corporate_action_processor.py`;
+  `advisory/portfolio_engine.py` (holdings load), `advisory/position_lifecycle.py`
+  (entry/cost-basis math). Source: `nseindia_corporate_actions_normalized` and/or
+  Dhan corporate actions.
+- **Do:** Build a processor that, for each open position, finds splits/bonuses
+  between entry_date and asof_date and applies the cumulative price/volume factor
+  to quantity and cost basis, tagging the position
+  `adjusted_for_corporate_action` with the factor and source. Call it before
+  portfolio/lifecycle build. Record a fallback if the action lookup fails.
+- **Guardrail:** Point-in-time only — never compare pre/post-split prices without
+  the adjustment; record provenance of every adjustment.
+- **Validate:** Test: entry 100sh @ ₹500, 1:2 split → 200sh @ ₹250, P&L
+  unchanged; SELL uses adjusted quantity.
+- **Confidence:** verify-first (confirm portfolio math currently ignores splits).
 
-3. **Harden corporate actions handling.**
-   - Verify stock splits, bonus, symbol changes, and security master changes are
-     handled causally in OHLCV, labels, and portfolio history.
-   - Do not compare pre/post-split prices without adjustment or explicit event
-     context.
+### [P1.4] Audit trail for inferred vs explicit action authority
+- **Why:** `infer_action_authority_contract` (~line 7295) silently fills/overrides
+  `portfolio_authority`/`broker_execution_allowed`/`full_advisory_required` from
+  the action source. A downgrade of an explicit `broker_execution_allowed=true`
+  to `false` leaves no trace, and there is no count of inferred-vs-explicit rows.
+- **Files:** `advisory/action_recommender.py` (~7295-7323),
+  `advisory/recommendation_diagnostics.py` (`_row_diagnostics` ~3112).
+- **Do:** When authority is inferred or downgraded, write an
+  `authority_inference_log` entry into the row's `raw_context_json`
+  (`inferred_from`, `source_value`, `inferred_keys`, and any explicit→inferred
+  downgrade). Surface inferred-vs-explicit counts in diagnostics text output.
+- **Guardrail:** Audit-only; does not change ranking, portfolio, or broker state.
+- **Validate:** Test: a row with explicit `broker_execution_allowed=true` inferred
+  to `false` produces an audit entry; diagnostics report shows the count.
+- **Confidence:** verify-first.
 
-4. **Maintain identity issue visibility.**
-   - Dhan/security/company-master mapping failures should never silently drop
-     context or advisory candidates.
-   - Keep `advisory_identity_issues` and source-skip panels current.
-   - Prefer current Dhan master fallback for review-only symbol validation when
-     company master is stale, but keep that provenance visible.
+### [P1.5] Track context-overlay staleness and invalidate stale watch rows
+- **Why:** Context watch rows carry no `context_overlay_days_old`; stale evidence
+  (>14d) can persist as active `WATCH_BREAKOUT` pressure without refresh or
+  invalidation.
+- **Files:** `advisory/watchlist_builder.py`
+  (`load_context_overlay_watch_candidates` ~1792, context-watch row build
+  ~2088-2240; schema columns ~113-122).
+- **Do:** Compute `context_overlay_days_old = (asof - context_asof_date).days`,
+  persist it in `watch_reasons_json`. When age exceeds a configurable threshold
+  (default 14) and the row is not already `REJECT`, emit a `REJECT` audit row with
+  reason `suppress_context_stale_overlay_no_trade_authority`.
+- **Guardrail:** Watch-only/no-trade authority; a rejection is an audit row, not a
+  SELL.
+- **Validate:** Test: a 20-day-old overlay yields a stale `REJECT`; a fresh one
+  stays active.
+- **Confidence:** verify-first.
 
-5. **Preserve fallback telemetry quality.**
-   - Run `python scripts/fallback_telemetry_coverage_report.py --fail-on-silent`
-     after adding new source/API paths.
-   - Source/API errors should record fallback telemetry or re-raise with clear
-     operator context.
+### [P1.6] Hard gate low technical actionability on WATCH_BREAKOUT
+- **Why:** `_load_context_technical_actionability` scores readiness but is used
+  only for ranking. A `WATCH_BREAKOUT` row with very low actionability still
+  enters advisory as high-urgency context.
+- **Files:** `advisory/watchlist_builder.py`
+  (`_load_context_technical_actionability` ~269-361; promotion to
+  `WATCH_BREAKOUT` ~2088-2220).
+- **Do:** When `candidate_state == WATCH_BREAKOUT` and
+  `technical_actionability_score < threshold` (default 0.40), downgrade to
+  `WATCH_EVENT` (not REJECT) and record
+  `watch_breakout_priority_blocked=low_technical_actionability`.
+- **Guardrail:** Downgrade urgency only; never grant BUY authority. Missing
+  technical rows stay neutral, not auto-rejected.
+- **Validate:** Test: low-score breakout → `WATCH_EVENT` with blocker flag; high
+  score → unchanged.
+- **Confidence:** verify-first.
 
-6. **Keep `.env.example`, docs, and cron current.**
-   - Run `python scripts/env_example_audit.py --strict`.
-   - Run `python scripts/docs_state_audit.py --strict`.
-   - Run `python scripts/cron_preflight.py` before restarting `go-crond`.
+### [P1.7] Apply fresh negative-context suppression in signal refresh
+- **Why:** `watchlist_builder` writes negative-context suppression `REJECT` rows,
+  but `signal_refresh` positive-context loader does not consult them, so a fresh
+  negative overlay newer than the positive watch can still emit a `WATCH` signal.
+- **Files:** `advisory/signal_refresh.py` (positive context loader ~1649-1671 and
+  the negative loader `load_negative_context_overlay_suppression_candidates`),
+  `advisory/watchlist_builder.py` (suppression candidate query).
+- **Do:** In signal refresh, load suppression rows and exclude positive `WATCH`
+  signals for symbols whose newest negative context post-dates the positive
+  context; record the suppression reason in the run summary
+  (`policy_suppressed_target_rows`).
+- **Guardrail:** Suppression creates no SELL/portfolio authority; it only
+  withholds a review-only WATCH.
+- **Validate:** Test: same symbol with positive + newer negative context → no
+  WATCH signal, suppression counted.
+- **Confidence:** verify-first.
 
-## P3 - Research, Validation, And Promotion Discipline
+### [P1.8] Make "reliability unavailable" explicit instead of silently neutral
+- **Why:** `load_context_family_reliability` falls back persisted→fast→
+  signal-quality and finally returns `{}`; downstream treats empty as "no
+  restrictions" rather than "reliability unknown", so a row can pass intake when
+  required reliability evidence is simply missing.
+- **Files:** `advisory/watchlist_builder.py`
+  (`load_context_family_reliability` ~921-1089 and its consumers).
+- **Do:** Distinguish "evaluated as neutral" from "no evidence available". When no
+  evidence exists, tag the row `context_reliability_classification=unavailable`,
+  keep it as generic `WATCH_EVENT` (never `WATCH_BREAKOUT`), and surface an
+  `unavailable` count in the run summary / Operator Health.
+- **Guardrail:** Fail visible, not silently permissive; do not block explicit
+  watchlist/market-context targets.
+- **Validate:** Test: with all reliability sources empty, a positive overlay
+  becomes `WATCH_EVENT` tagged `unavailable`, not `WATCH_BREAKOUT`.
+- **Confidence:** verify-first.
 
-1. **Run research evidence refresh regularly.**
-   - Use `./all_research_evidence.sh` after post-close data catch-up.
-   - Keep event-policy, causal-memory, signal-quality, adversarial-review,
-     action-transition, context-watch, and negative-pressure evaluators current.
+### [P1.9] Candidate-state transition audit in watchlist builder
+- **Why:** Why a context row became `WATCH_BREAKOUT` vs `WATCH_EVENT` vs `REJECT`
+  is spread across many gates with no per-row record, making intake debugging
+  hard.
+- **Files:** `advisory/watchlist_builder.py` (row build/promotion ~2088-2240).
+- **Do:** Add a helper that records `{input_state, output_state, gates_passed,
+  gates_failed, promotion_reason, rejection_reason}` into `watch_reasons_json`.
+- **Guardrail:** Audit-only.
+- **Validate:** Test: accept, reject, and breakout-promotion rows each carry a
+  populated audit block.
+- **Confidence:** verify-first.
 
-2. **Treat optional ML as research until proven.**
-   - `./all_ml.sh` should not be part of live authority unless it repeatedly
-     improves after-cost, benchmark-aware outcomes.
-   - Fix noisy stdout / non-JSON child output if it breaks model training runner.
-   - Keep model artifacts, training summaries, and promotion checks auditable.
+---
 
-3. **Strengthen false-discovery controls.**
-   - Every threshold/config/source-family experiment should record configs,
-     dates, horizons, costs, data windows, and results in research evidence or
-     research ledger.
-   - Avoid acting on one good-looking sample.
-   - Prefer repeated windows, benchmark-excess checks, and negative controls.
+## P2 - Research/Evaluation Rigor And Source Visibility
 
-4. **Reviewed config diffs remain manual.**
-   - Technical threshold, signal-quality overlay, event-policy rule, and
-     causal-memory rule changes may generate reviewed diffs.
-   - Actual production config application remains manual until several clean
-     cycles prove the workflow.
+Policy review is only as trustworthy as the evidence. These close attribution and
+visibility gaps. All remain research-only / no auto-apply.
 
-5. **Keep TS forecasts experimental.**
-   - TS forecasts and paper portfolios are research-only.
-   - Promotion requires matured paper rows, after-cost returns, baseline
-     outperformance, breadth, advisory alignment checks, and manual review.
+### [P2.1] Benchmark-excess attribution in signal-quality split evaluator
+- **Why:** `signal_quality_split_evaluator` rows have only raw
+  `forward_return_after_cost`, no benchmark-excess columns, so split candidates
+  can be promoted on market beta.
+- **Files:** `advisory/signal_quality_split_evaluator.py` (table schema ~34; row
+  build ~466-510). Reuse `attach_benchmark_forward_returns` from
+  `advisory/signal_quality_evaluator.py`.
+- **Do:** Add `benchmark_name/entry_date/exit_date/forward_return`,
+  `excess_forward_return_after_cost`, `excess_hit_after_cost` to split eval rows
+  and `avg_excess_forward_return_after_cost` to the summary; require positive
+  excess before `candidate_split_helpful`.
+- **Guardrail:** research_only, `policy_auto_promotion_allowed=false`.
+- **Validate:** Run on a sample; assert excess fields populated and that a
+  beta-only split is not classified helpful.
+- **Confidence:** verified (schema lacks fields).
 
-## P4 - Performance And Operations
+### [P2.2] Complete after-cost + excess aggregation in event-policy evaluator
+- **Why:** `event_policy_evaluator` summary aggregation does not compute
+  `avg_forward_return_after_cost` / `avg_excess_forward_return_after_cost`
+  (schema exists but is unpopulated), so event-policy promotion can read raw beta.
+- **Files:** `advisory/event_policy_evaluator.py` (summary aggregation ~530-660).
+- **Do:** Compute after-cost average return and benchmark-excess average in the
+  summary; ensure hit-rate uses after-cost returns. Document `DEFAULT_COST_BPS`.
+- **Guardrail:** research_only.
+- **Validate:** Hand-check after-cost/excess on a small sample matches output.
+- **Confidence:** verified (aggregation incomplete).
 
-1. **Use evidence before optimizing.**
-   - Run `python scripts/api_performance_report.py --limit 20`.
-   - Prefer fresh probe rows over historical slowlog rows.
-   - Add snapshots, caching, pagination, or indexes only for proven slow paths.
+### [P2.3] Maturity / min-sample gating on event-policy & adversarial promotions
+- **Why:** `event_policy_promotion` (and adversarial promotion if present) lack a
+  `DEFAULT_MIN_MATURED_ROWS` gate; small samples can reach a promote recommendation.
+- **Files:** `advisory/event_policy_promotion.py`,
+  `advisory/adversarial_review_evaluator.py` (promotion path).
+- **Do:** Add `DEFAULT_MIN_MATURED_ROWS = 10` (mirror
+  `signal_quality_promotion.py`); below it, force `needs_more_data`.
+- **Guardrail:** research_only.
+- **Validate:** Test: a group with <10 matured rows → `needs_more_data`.
+- **Confidence:** verified.
 
-2. **Keep full advisory from becoming the only fast path.**
-   - Use bounded context refresh, context-watchlist reconciliation, targeted
-     technical refresh, and rules-through-actions reruns where appropriate.
-   - Do not rerun browser-bound downloads or expensive source ingest when the
-     blocker is already isolated downstream.
+### [P2.4] Multiple-testing / false-discovery control for promotions
+- **Why:** No FDR/Bonferroni correction across variants×horizons×families;
+  uncorrected, several false "candidate_helpful" rows appear by chance.
+- **Files:** new `advisory/multiple_testing_correction.py`; apply in
+  `advisory/signal_quality_promotion.py` (family candidate generation ~1072-1096)
+  and `advisory/signal_quality_split_evaluator.py` (stability classification).
+- **Do:** Implement Benjamini-Hochberg (`fdr_corrected(rows, p_or_confidence_field,
+  target_fdr=0.05)`) returning `fdr_adjusted_*` and `fdr_rejected_by_control`
+  flags; gate promotion recommendations on surviving correction.
+- **Guardrail:** research_only; correction only tightens, never loosens.
+- **Validate:** Unit test on synthetic p-values vs a reference BH implementation;
+  assert rejected rows cannot become promote recommendations.
+- **Confidence:** verified (absent).
 
-3. **Respect single-client external sources.**
-   - NSE, Dhan, and Screener should use serialized queues/workers where needed.
-   - Avoid aggressive parallel Chrome/browser sessions that trigger source
-     blocking.
+### [P2.5] Benchmark attribution (or explicit non-applicability) for TS forecast eval
+- **Why:** `ts_forecast_evaluator` has no benchmark schema; forecast quality is not
+  comparable to passive exposure.
+- **Files:** `advisory/ts_forecast_evaluator.py` (schema ~48-73, eval build).
+- **Do:** Either attach benchmark forward returns + excess fields, OR, if
+  forecasts are intentionally direction-only, document that explicitly in the
+  summary contract and in `docs/`.
+- **Guardrail:** research_only; TS forecasts stay experimental.
+- **Validate:** Sample run shows excess fields or a documented contract reason.
+- **Confidence:** verified (missing).
 
-4. **Continue hot/cold data management.**
-   - Use retention/archive/report-first scripts for trace, intraday, large
-     textual, and slowlog data.
-   - Keep frontend endpoints compact by default and put full payloads behind
-     explicit detail/debug flags.
+### [P2.6] Sector-concentration detector in promotions
+- **Why:** A "helpful" event-policy/negative-pressure group may derive all lift
+  from one sector.
+- **Files:** `advisory/event_policy_promotion.py`,
+  `advisory/negative_pressure_evaluator.py`.
+- **Do:** Add `_check_sector_concentration(group, max_pct=0.6)`; >0.6 adds a risk
+  note, >0.8 downgrades to `needs_more_data`.
+- **Guardrail:** research_only.
+- **Validate:** Test: a group 70% in one sector flags the risk; 85% blocks.
+- **Confidence:** verify-first.
+
+### [P2.7] Deterministic promotion review for TS forecasts
+- **Why:** `ts_forecast_promotion_check` appears to lack a deterministic review
+  (gates) parallel to signal-quality promotion.
+- **Files:** `advisory/ts_forecast_promotion_check.py`.
+- **Do:** If missing, add gates: direction accuracy ≥0.55, after-cost directional
+  return >0, ≥20 distinct symbols, stable across ≥2 non-overlapping windows;
+  persist review rows with `policy_auto_promotion_allowed=false`.
+- **Guardrail:** research_only; promotion creates review rows only.
+- **Validate:** Test: a model below 0.55 accuracy cannot recommend promote.
+- **Confidence:** verify-first (confirm it is a stub).
+
+### [P2.8] Assert + audit research-only boundary at trusted-overlay load
+- **Why:** `action_recommender` loads trusted signal-quality overlay rules; there
+  is no explicit assertion that every loaded rule has
+  `policy_auto_promotion_allowed=false`, and no audit when a rule transitions to
+  trusted.
+- **Files:** `advisory/action_recommender.py` (trusted-overlay loader ~3695-3707).
+- **Do:** Assert/skip any loaded rule with `policy_auto_promotion_allowed=true` or
+  `broker_execution_allowed=true` (with a visible fallback event), and audit-log
+  any rule that becomes runtime-eligible.
+- **Guardrail:** Fail-closed; a misconfigured rule must be ignored + logged, not
+  trusted.
+- **Validate:** Test: a rule with `policy_auto_promotion_allowed=true` is excluded
+  and logged.
+- **Confidence:** verify-first.
+
+### [P2.9] Corporate-action parse-failure telemetry + adjustment sanity bounds
+- **Why:** `adjusted_prices.py` returns `type="other"` / `price_factor=None` on
+  non-standard or compound subjects with no telemetry, and never validates that
+  cumulative factors are sane — a parse error can silently produce absurd
+  adjustment factors. (Ingest side of P1.3.)
+- **Files:** `data/nseindia/adjusted_prices.py` (parse ~13-87, cumulative build
+  ~158-220), `data/nseindia/corporate_actions.py`.
+- **Do:** When a split/bonus subject fails to yield a usable factor, record a
+  `corporate_action_parse_ambiguous` fallback. After building cumulative factors,
+  validate `0.01 ≤ factor ≤ 100` per symbol; outside that, record
+  `adjusted_price_factor_suspicious` and clamp.
+- **Guardrail:** Suspicious adjustments are visible, not silently applied.
+- **Validate:** Tests for a hand-split subject (telemetry, no crash) and a
+  malformed factor of 1000 (clamped + telemetry).
+- **Confidence:** verify-first.
+
+### [P2.10] macro_features main query must not fail silently
+- **Why:** `macro_features.load_macro_daily` wraps `table_exists` in try/except
+  but the main `sql_to_df` query has no fallback; a source outage raises raw to
+  the caller with no telemetry.
+- **Files:** `advisory/macro_features.py` (main load ~145-160).
+- **Do:** Wrap the main query; on error record `macro_features_load_failed`
+  fallback and re-raise with operator context (don't return empty silently).
+- **Guardrail:** Source failure visible, never empty-as-success.
+- **Validate:** Test: simulated query failure records the fallback and re-raises.
+- **Confidence:** verify-first.
+
+### [P2.11] Bounds check intraday features for sparse groups
+- **Why:** `intraday_features` indexes `.iloc[-last_60_bars]` without checking
+  group length; sparse symbols can silently pick the wrong bar.
+- **Files:** `advisory/intraday_features.py` (~480-520).
+- **Do:** Guard `len(group) >= last_60_bars`; otherwise record
+  `intraday_sparse_bars` telemetry and fall back to session open.
+- **Validate:** Test: a 30-bar group records telemetry and computes from open.
+- **Confidence:** verify-first.
+
+### [P2.12] Telemetry for partial company-master mapping
+- **Why:** `fundamental_snapshot` calls `map_company_master_ids` and silently
+  proceeds with the mapped subset; unmapped symbols vanish without record.
+- **Files:** `advisory/fundamental_snapshot.py` (~85-100).
+- **Do:** Log unmapped symbols as `company_master_mapping_partial` fallback and
+  write `advisory_identity_issues` rows with a suggested action.
+- **Guardrail:** Dropped candidates become visible identity issues.
+- **Validate:** Test: 2 of 10 unmapped → telemetry + 2 identity rows.
+- **Confidence:** verify-first.
+
+### [P2.13] Record Dhan NSE→BSE identity fallback as degraded
+- **Why:** `resolve_dhan_identity` falls back NSE→BSE but logs BSE success as a
+  clean resolution with no degradation signal.
+- **Files:** `data/dhanlive/dhan_db.py` (`resolve_dhan_identity` ~100),
+  `advisory/identity_issues.py` (~646-705).
+- **Do:** When BSE is used, record `dhan_identity_fallback_to_bse` telemetry and
+  mark resolution context `bse_fallback`.
+- **Validate:** Test: NSE miss + BSE hit → telemetry + `bse_fallback` context.
+- **Confidence:** verify-first.
+
+### [P2.14] Detect Dhan OHLCV continuity gaps
+- **Why:** `sync_daily_ohlcv` computes `from_date = latest+1` with no check for a
+  large gap after outages/holidays, so multi-day holes can pass unnoticed.
+- **Files:** `data/dhanlive/ohlcv.py` (`sync_daily_ohlcv` ~200+).
+- **Do:** After sync, if the trading-day gap (excluding weekends/holidays) exceeds
+  ~5 days, record `dhan_ohlcv_gap_detected` with `gap_days`.
+- **Validate:** Test: a 7-trading-day gap records telemetry; a weekend gap does not.
+- **Confidence:** verify-first.
+
+### [P2.15] Upstream data-lineage check in Operator Health
+- **Why:** Operator Health surfaces fallback events but not upstream
+  downloader/parser failures, so a failed download → skipped parser → stale
+  advisory chain is invisible until a downstream fallback happens.
+- **Files:** `advisory/operator_health.py` (add `check_upstream_lineage`).
+- **Do:** Scan recent `logs/cron/all_downloaders*.log`, `all_parsers.log`,
+  `all_external_workers.log` for non-zero exits in the last 24h, cross-reference
+  with sync-state `error_text`, and report broken chains with a fix hint.
+- **Guardrail:** Read-only; no behavior change.
+- **Validate:** Test/fixture: a failed bhavcopy download surfaces a stale-chain
+  warning.
+- **Confidence:** verify-first.
+
+---
+
+## P3 - Frontend Trust Surfacing
+
+Per the UI rule below, do these only because they expose backend truth or prevent
+operator mistakes — not polish.
+
+### [P3.1] Surface `why_not_executable` on action/recommendation rows
+- **Why:** Recommendations can render as executable BUYs even when blocked by
+  manual review, a market gate, or conflict resolution;
+  `operator_action_disabled_reason` only reflects portfolio applicability.
+- **Files:** `advisory/api/app.py` (action queue prep ~1789),
+  `advisory/operator_portfolio.py` (recommendations ~259-296),
+  `apps/operator-web/pages/recommendations.vue` (~65), `pages/index.vue`.
+- **Do:** Add `why_not_executable: str | None` derived from
+  `reason_contract_status != complete`, transition/market gates, and
+  `advisory_action_conflicts` losers. Disable the button and show the reason.
+- **Guardrail:** Never present review-only rows as approved executable BUYs.
+- **Validate:** `npm --prefix apps/operator-web run typecheck`; a manual-review
+  row shows the reason and a disabled action.
+- **Confidence:** verify-first.
+
+### [P3.2] Show feature-freshness blockers on action rows
+- **Why:** Symbol feature blockers render only on the symbol page, so the home /
+  recommendations pages can offer actions for symbols whose stage gates fail.
+- **Files:** `advisory/api/app.py` (`/api/actions`),
+  `apps/operator-web/pages/index.vue`, `pages/recommendations.vue`.
+- **Do:** Add opt-in `include_symbol_blockers=true`; attach `feature_blockers`
+  per row; disable the action and badge it when non-empty.
+- **Validate:** typecheck; a symbol with failing gates shows a "gates blocked"
+  badge and disabled action.
+- **Confidence:** verify-first.
+
+### [P3.3] Normalize `snapshot`/`snapshot_warning` across API response models
+- **Why:** Response models are inconsistent (some omit `snapshot`), risking
+  frontend crashes on `None`.
+- **Files:** `advisory/api/app.py` (response models ~326-1118).
+- **Do:** Add `snapshot: dict = Field(default_factory=dict)` and
+  `snapshot_warning: dict | None = None` to the base model; inherit everywhere.
+- **Validate:** typecheck; a response previously lacking `snapshot` now returns `{}`.
+- **Confidence:** verify-first.
+
+### [P3.4] Cache-first trace summary lookup
+- **Why:** `/api/symbols/{symbol}/trace/summary` rebuilds from `load_symbol_trace`
+  every call instead of reading `advisory_trace_summaries`.
+- **Files:** `advisory/api/app.py` (~11013), `advisory/trace_summary_store.py`
+  (~131-149).
+- **Do:** Add `load_summary(entity_type, entity_key)`; serve cached if <1h old;
+  rebuild+persist on miss.
+- **Validate:** `python scripts/api_performance_report.py --limit 20`; repeated
+  requests return cached results fast.
+- **Confidence:** verify-first.
+
+### [P3.5] Compact mode for heavy endpoints
+- **Why:** `/api/execution/approvals`, `/api/actions`, `/api/events` return large
+  payloads (full contracts/context) by default.
+- **Files:** `advisory/api/app.py` (those handlers).
+- **Do:** Add `compact=true`: omit `safety_contract`/`raw_context_json`, return
+  `blocker_count` + `readiness_summary` counts instead of full arrays; add
+  `total_count` to events.
+- **Validate:** api_performance_report shows reduced payloads; typecheck.
+- **Confidence:** verify-first.
+
+### [P3.6] Freshness tiers (fresh / aging / stale / critical)
+- **Why:** Freshness is binary; operators cannot tell "24h but ok" from "critical".
+- **Files:** `advisory/operator_snapshot.py` (~26, 80-92), `advisory/api/app.py`
+  (`_snapshot_payload`), `apps/operator-web/components/PayloadFreshnessStrip.vue`.
+- **Do:** Add `warning_age_seconds`; compute a 4-tier state; render 4 pill colors.
+- **Validate:** typecheck; an 18h snapshot (24h max) shows "aging".
+- **Confidence:** verify-first.
+
+### [P3.7] Contract-freshness check on execution approvals
+- **Why:** Readiness checks pass off a contract loaded at request time with no
+  staleness validation vs the execution row's evidence.
+- **Files:** `advisory/api/app.py` (`_execution_approval_row` ~1972-2010).
+- **Do:** Compute `contract_age_seconds`; if >1h add `contract_freshness_warning`;
+  render a banner before approval.
+- **Guardrail:** Reinforces that live approval needs fresh evidence.
+- **Validate:** typecheck; a >1h contract shows the warning.
+- **Confidence:** verify-first.
+
+### [P3.8] Require + validate operator id; audit execution decisions
+- **Why:** `operator_id` is recorded but not required/validated on approve/reject,
+  weakening the live-execution audit trail.
+- **Files:** `advisory/api/app.py` (decision endpoint ~2123-2220),
+  `apps/operator-web/pages/execution-approvals.vue` (~77-82).
+- **Do:** Validate `operator_id` against a known list (config/DB); 400 if
+  missing/invalid; persist `operator_id + decided_at + rationale`; add a
+  `/api/execution/decision-audit` read endpoint.
+- **Validate:** typecheck; missing operator id is rejected; decisions appear in
+  the audit endpoint.
+- **Confidence:** verify-first.
+
+---
+
+## P4 - Performance And Operations (evidence-first)
+
+1. Use `python scripts/api_performance_report.py --limit 20` and
+   `logs/performance/latest_api_latency_probe.json`; add snapshots/caching/
+   pagination/indexes only for proven slow paths (P3.4/P3.5 are the current
+   evidence-backed candidates).
+2. Keep bounded repair paths (`all_context_to_entry_repair.sh`, targeted
+   technical refresh, rules-through-actions) so full advisory is not the only
+   fast path.
+3. Respect single-client external sources: serialize NSE/Dhan/Screener via the
+   queue/workers; avoid parallel Chrome sessions that trigger blocking.
+4. Continue hot/cold retention for trace, intraday, large text, and slowlog data.
 
 ## P5 - UI Only When It Improves Trust
 
 Compatibility phrase for docs audit: Highest Priority: UI-First Operations.
 
-The UI is currently good enough. Do UI work only when it exposes critical
-backend truth or reduces operator mistakes.
-
-This keeps the previous UI-first operations priority but narrows it: operator
-UI work is priority work only when it makes backend state, action authority,
-staleness, source failure, or fix guidance safer to act on.
+The UI is good enough; do UI work only when it exposes critical backend truth or
+reduces operator mistakes (action authority, staleness, source failure, technical
+blockers, fix guidance). Avoid visual polish, ambiguous tags that hide backend
+state, and anything that turns review-only evidence into apparently executable
+recommendations.
 
 Nuxt operator frontend replaces the old static HTML dashboard path. The active
 operator surface is the Nuxt frontend backed by the FastAPI operator API.
 
-Allowed UI work:
+## Completed Foundations (preserve)
 
-- clearer action authority and stale-data badges
-- showing why a BUY/SELL is not executable
-- showing source degradation and fix hints
-- surfacing exact technical blockers and context source-family blockers
-- operator-safe reviewed-diff and research evidence visibility
-
-Avoid UI work:
-
-- visual polish without backend trust improvement
-- hiding complex backend state behind ambiguous tags
-- turning review-only evidence into apparently executable recommendations
-
-## Completed Foundations
-
-These are already implemented and should generally be preserved:
-
-- Dhan daily/intraday OHLCV and technical feature pipeline.
-- Screener.in production and ad hoc research queries.
-- Sharpely fundamentals and peer snapshots.
-- Macro, regime, announcement, bhavcopy, exchange-event, and theme/news context
-  overlays with review-only authority.
-- Context-watchlist and signal-refresh path with no-portfolio/no-broker
-  boundaries.
-- Technical setup explainability via `technical_setup_archetype` and
-  `technical_setup_quality_json`.
-- Recommendation diagnostics for stale candidates, no-BUY causes, technical
-  blockers, market/context attribution, and source-family attribution.
-- Technical threshold calibration with blocker and near-miss research.
-- Operator Health, fallback telemetry, source degradation, failed-symbol/source
-  skip visibility, and fix hints.
-- Reason contracts and single consolidated action recommendation path.
-- Event-policy, adversarial review, company-memory, causal-memory, hypothesis,
-  wait-signal, and playbook scaffolding.
-- Nuxt/FastAPI operator frontend, compact API paths, trace summaries, and
-  Operations tooling.
-- Research-only TS forecast, signal-quality, event-policy, causal-memory,
-  adversarial-review, and action-transition evaluators.
-- Cron wrappers, script groups, preflight checks, and current generated
-  go-crond flow.
+- Dhan daily/intraday OHLCV + technical features; Screener.in production/ad hoc;
+  Sharpely fundamentals/peers.
+- Macro, regime, announcement, bhavcopy, exchange-event, theme/news context
+  overlays with review-only authority; context-watchlist + signal-refresh path
+  with no-portfolio/no-broker boundaries.
+- Layered no-BUY diagnostics (breadth, macro stress, sector/symbol leadership,
+  technical confirmation, source-family + exact-class reliability,
+  benchmark-excess), context-to-entry funnel, and positive-context entry-blocker
+  attribution.
+- Technical setup explainability, technical threshold calibration (research-only),
+  reason contracts + single consolidated action path,
+  `reason_contract_status` producer + execution gate.
+- Event-policy, adversarial review, company-memory, causal-event-memory,
+  hypothesis, wait-signal, playbook scaffolding; identity validation; provenance
+  graphs (source→memory→outcome, final-action→evidence).
+- Research-only evaluators (signal-quality + splits, event-policy, causal-memory,
+  adversarial-review, action-transition, context-watch, negative-pressure, TS
+  forecast) with reviewed-diff (manual, disabled-by-default) promotion.
+- Operator Health, fallback telemetry, sync state, source-degradation visibility;
+  Nuxt/FastAPI operator frontend, compact API paths, trace summaries; cron
+  wrappers, preflight, generated go-crond flow.
 
 ## How To Pick The Next Slice
 
-Use this order:
+1. P0 active failures (scripts/diagnostics/health/advisory/API breakage).
+2. P1 decision correctness + authority safety.
+3. P2 research rigor + source/failure visibility that affects operator trust.
+4. P3 UI that surfaces critical backend state.
+5. P4 performance fixes backed by current probe/slowlog evidence.
 
-1. Bugs causing scripts, diagnostics, health, downloads, advisory, or API to
-   fail.
-2. Decision correctness: BUY underparticipation, action authority, stale
-   evidence, context-to-entry blockers, or portfolio transition errors.
-3. Failure/fallback visibility that affects operator trust.
-4. Research evidence needed before safe policy/config review.
-5. Performance fixes backed by current slowlog/probe evidence.
-6. UI changes only if they expose critical backend state.
-
-Every slice should include:
-
-- a narrow code change
-- a focused regression test or script validation
-- docs/todo update only if project state changes
-- `python -m py_compile <changed modules>`
-- focused `pytest` where practical
-- `python scripts/docs_state_audit.py --strict`
-- `git diff --check`
+Every slice: one narrow code change, a focused test or script validation, docs/
+todo update only if project state changes, `py_compile` of changed modules,
+focused `pytest`, `python scripts/docs_state_audit.py --strict`, and
+`git diff --check`.

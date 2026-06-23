@@ -143,7 +143,17 @@ def download_holidays(
         for k, v in data.items():
             df = pd.DataFrame(v)
             df['type'] = k
-            df['type_name'] = nse_product_info[k]['name']
+            segment_info = nse_product_info.get(k)
+            if segment_info is None:
+                record_local_fallback_event(
+                    module=SYNC_SOURCE_NAME,
+                    source=SYNC_SOURCE_NAME,
+                    fallback_type="nse_holidays_unknown_segment",
+                    severity="warn",
+                    reason="NSE holidays returned a product segment not in the local product map; using the raw segment key as its name.",
+                    metadata={"segment_key": str(k)},
+                )
+            df['type_name'] = (segment_info or {}).get('name', k)
             df = df.rename(columns={
                 'tradingDate': 'date',
                 'weekDay': 'weekday',

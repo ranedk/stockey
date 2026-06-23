@@ -1261,7 +1261,7 @@ def _json_context_value(value: Any) -> Any:
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
     try:
-        if pd.isna(value):
+        if pd.api.types.is_scalar(value) and pd.isna(value):
             return None
     except Exception as exc:
         record_local_fallback_event(
@@ -4074,16 +4074,6 @@ def conflict_precedence_for_row(
             "reason": "Review-only de-risk pressure is selected before entry/watch signals but remains non-executable.",
         }
     if (
-        "MARKET_GATE_MANUAL_BEATS_POSITIVE" in enabled_rules
-        and action == "MANUAL_REVIEW"
-        and ("market_context_adjustment" in context_text or "risk-off" in context_text or "risk_off" in context_text)
-    ):
-        return {
-            "score": 300,
-            "rule_id": "MARKET_GATE_MANUAL_BEATS_POSITIVE",
-            "reason": "Risk-off market context keeps positive actions in manual review.",
-        }
-    if (
         "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH" in enabled_rules
         and action == "MANUAL_REVIEW"
         and (
@@ -4098,6 +4088,16 @@ def conflict_precedence_for_row(
             "score": 350,
             "rule_id": "ADVERSARIAL_VETO_MANUAL_BEATS_POSITIVE_OR_WATCH",
             "reason": "Adversarial-review veto keeps the symbol in manual review ahead of buy/watch candidates.",
+        }
+    if (
+        "MARKET_GATE_MANUAL_BEATS_POSITIVE" in enabled_rules
+        and action == "MANUAL_REVIEW"
+        and ("market_context_adjustment" in context_text or "risk-off" in context_text or "risk_off" in context_text)
+    ):
+        return {
+            "score": 300,
+            "rule_id": "MARKET_GATE_MANUAL_BEATS_POSITIVE",
+            "reason": "Risk-off market context keeps positive actions in manual review.",
         }
     if (
         "EVENT_POLICY_REVIEW_BEATS_POSITIVE_ENTRY" in enabled_rules
@@ -4180,7 +4180,7 @@ def _json_ready_record(row: pd.Series | dict[str, Any]) -> dict[str, Any]:
             out[key] = value.isoformat()
             continue
         try:
-            if pd.isna(value):
+            if pd.api.types.is_scalar(value) and pd.isna(value):
                 out[key] = None
                 continue
         except Exception as exc:

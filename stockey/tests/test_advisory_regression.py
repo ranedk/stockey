@@ -575,7 +575,12 @@ def test_rule_engine_ensure_output_tables_uses_schema_registry(monkeypatch):
 
     rule_engine.ensure_rule_output_tables()
 
-    assert len(calls) == 1
+    assert len(calls) == 3
+    assert [call["migration_id"] for call in calls] == [
+        rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID,
+        rule_engine.RULE_ENGINE_CONTEXT_METADATA_MIGRATION_ID,
+        rule_engine.RULE_ENGINE_TECHNICAL_ENTRY_MIGRATION_ID,
+    ]
     call = calls[0]
     assert call["migration_id"] == rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID
     assert call["owner"] == "advisory.rule_engine"
@@ -584,11 +589,12 @@ def test_rule_engine_ensure_output_tables_uses_schema_registry(monkeypatch):
     assert f"CREATE TABLE IF NOT EXISTS {rule_engine.CANDIDATES_TABLE}" in ddl
     assert f"CREATE TABLE IF NOT EXISTS {rule_engine.REJECTIONS_TABLE}" in ddl
     assert "intraday_volume_vs_20d DOUBLE PRECISION" in ddl
-    assert "regime_fit_weight_effective DOUBLE PRECISION" in ddl
-    assert "soft_failures_json TEXT" in ddl
     assert "delta_to_pass DOUBLE PRECISION" in ddl
     assert "UNIQUE (asof_date, setup_id, symbol)" in ddl
     assert "UNIQUE (asof_date, setup_id, symbol, reason_code)" in ddl
+    context_ddl = "\n".join(calls[1]["statements"])
+    assert "regime_fit_weight_effective DOUBLE PRECISION" in context_ddl
+    assert "soft_failures_json TEXT" in context_ddl
 
 
 def test_rule_engine_rebuild_cleanup_uses_retryable_operation(monkeypatch):
@@ -8688,6 +8694,7 @@ def test_operator_api_splits_dashboard_payload(monkeypatch):
         },
     )
 
+    monkeypatch.setattr(operator_api, "load_operator_sections_payload", lambda *_args, **_kwargs: payload)
     health = operator_api.build_health_payload()
     assert health["operator_controlled"] is True
     assert health["read_only"] is False
@@ -15655,6 +15662,32 @@ def test_operator_health_degradation_feed_extracts_dhan_auth_preflight_failure(m
     assert "./all_advisory_preflight.sh" in row["suggested_fix"]
 
 
+def test_operator_health_degradation_feed_extracts_dhan_consent_limit_exceeded(monkeypatch, tmp_path):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "all_advisory_preflight.log").write_text(
+        "\n".join(
+            [
+                "[stockey.script] name=advisory_dhan_preflight status=start",
+                "Generate consent returned no consentAppId: {'errorCode': 'CONSENT_LIMIT_EXCEED', 'message': 'limit'}",
+                "[stockey.script] name=advisory_dhan_preflight status=failed exit_code=1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(operator_health, "check_announcement_document_failures", lambda limit=25: [])
+
+    cron_rows = operator_health.check_cron_logs(log_dir)
+    feed = operator_health.build_degradation_feed({"cron_logs": cron_rows, "sync_state_failures": [], "slow_operations": {"issues": []}}, log_dir=log_dir)
+
+    assert feed["status"] == "error"
+    kinds = {row["kind"] for row in feed["rows"]}
+    assert "dhan_consent_limit_exceeded" in kinds
+    consent_row = next(row for row in feed["rows"] if row["kind"] == "dhan_consent_limit_exceeded")
+    assert "consent limit" in consent_row["title"].lower()
+    assert "daily reset" in consent_row["suggested_fix"].lower()
+
+
 def test_operator_health_preflight_cron_fix_hint_orders_cdp_before_preflight(tmp_path):
     log_path = tmp_path / "all_advisory_preflight.log"
     sections = {
@@ -19692,7 +19725,7 @@ def test_operator_api_event_model_research_read_routes_smoke_with_typed_payloads
     assert responses[0].json()["scorecard"]["broker_execution_allowed"] is False
     assert responses[0].json()["scorecard"]["policy_auto_promotion_allowed"] is False
     assert responses[1].json()["read_only"] is True
-    assert responses[2].json()["summary"]["broker_execution_allowed_count"] == 0
+    assert responses[3].json()["summary"]["broker_execution_allowed_count"] == 0
 
 
 def test_operator_api_event_policy_read_routes_smoke_with_typed_payloads(monkeypatch):
@@ -20524,7 +20557,7 @@ def test_action_recommender_parse_jsonish_missing_check_records_fallback(monkeyp
 
 def test_action_recommender_json_context_value_missing_check_records_fallback(monkeypatch):
     events = []
-    sentinel = object()
+    sentinel = "sentinel-value"
     monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
     monkeypatch.setattr(action_recommender.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
 
@@ -20534,12 +20567,25 @@ def test_action_recommender_json_context_value_missing_check_records_fallback(mo
     assert events[0]["module"] == "advisory.action_recommender"
     assert events[0]["fallback_type"] == "action_recommender_context_missing_check_failed"
     assert events[0]["source"] == "json_context_value"
-    assert events[0]["metadata"]["value_type"] == "object"
+    assert events[0]["metadata"]["value_type"] == "str"
+
+
+def test_action_recommender_json_context_value_passes_through_non_scalar(monkeypatch):
+    events = []
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    for value in ([], [1, 2], {}, {"a": 1}, ("x",)):
+        assert action_recommender._json_context_value(value) is value
+
+    assert action_recommender._json_context_value(None) is None
+    assert action_recommender._json_context_value(float("nan")) is None
+    assert action_recommender._json_context_value(1.0) == 1.0
+    assert events == []
 
 
 def test_action_recommender_json_ready_record_missing_check_records_fallback(monkeypatch):
     events = []
-    sentinel = object()
+    sentinel = "sentinel-value"
     monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
     monkeypatch.setattr(action_recommender.pd, "isna", lambda _value: (_ for _ in ()).throw(TypeError("ambiguous")))
 
@@ -20550,7 +20596,21 @@ def test_action_recommender_json_ready_record_missing_check_records_fallback(mon
     assert events[0]["fallback_type"] == "action_recommender_record_missing_check_failed"
     assert events[0]["source"] == "json_ready_record"
     assert events[0]["metadata"]["key"] == "raw_value"
-    assert events[0]["metadata"]["value_type"] == "object"
+    assert events[0]["metadata"]["value_type"] == "str"
+
+
+def test_action_recommender_json_ready_record_passes_through_non_scalar(monkeypatch):
+    events = []
+    monkeypatch.setattr(action_recommender, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    payload = {"list_value": [1, 2], "dict_value": {"a": 1}, "none_value": None, "scalar_value": 3.0}
+    result = action_recommender._json_ready_record(payload)
+
+    assert result["list_value"] == [1, 2]
+    assert result["dict_value"] == {"a": 1}
+    assert result["none_value"] is None
+    assert result["scalar_value"] == 3.0
+    assert events == []
 
 
 def test_action_recommender_promoted_conflict_rule_changes_candidate_ranking(monkeypatch):
@@ -22581,7 +22641,7 @@ def test_action_recommender_reason_contract_explains_same_symbol_source_preceden
                 "stop_price": 125.0,
                 "action_reason": "Stop hit after close below risk level.",
                 "action_detail": "exit_stop",
-                "raw_context_json": json.dumps({"suggested_action": "exit_stop", "lifecycle_reason": "Stop hit."}),
+                "raw_context_json": json.dumps({"suggested_action": "exit_stop", "lifecycle_reason": "Stop hit.", "position_status": "open"}),
                 "load_ts": asof_date,
             },
             {
@@ -25353,7 +25413,7 @@ def test_action_recommender_direct_announcement_context_filters_archive_only_tax
     )
     summary = action_recommender._summarize_action_context_overlays(rows)
 
-    query = str(captured["query"])
+    query = str(captured["queries"][-1])
     assert "announcement_storage_form" in query
     assert "archived_raw_reference_only" in query
     assert "llm_review_ready" in query
@@ -30210,7 +30270,7 @@ def test_recommendation_diagnostics_labels_stale_pass_now_technical_ignore_artif
     assert artifacts["rerun_required_before_policy_tuning"] is True
     assert artifacts["safe_to_tune_technical_thresholds"] is False
     assert "Rerun all_advisory.sh" in artifacts["operator_action"]
-    assert cause["next_commands"][0]["command"] == "./all_advisory.sh --date 2026-06-21"
+    assert cause["next_commands"][0]["command"] == recommendation_diagnostics.default_latest_advisory_rerun_command()
     assert "current PASS_NOW technical-ignore samples" not in cause["next_commands"][0]["purpose"]
     assert any("stale pre-fix artifacts" in step for step in payload["operator_next_steps"])
     assert any("current technical-entry evidence is stale" in step for step in payload["operator_next_steps"])
@@ -35992,7 +36052,9 @@ def test_action_recommender_does_not_upgrade_action_in_risk_on_market(monkeypatc
     out = action_recommender.apply_market_context_adjustments(rows, asof_date=asof_date)
 
     assert out.iloc[0]["action_code"] == "WATCH"
-    assert json.loads(out.iloc[0]["raw_context_json"]) == {}
+    context = json.loads(out.iloc[0]["raw_context_json"])
+    assert context["market_context_adjustment"] == "none"
+    assert context["market_context_adjustment_json"]["adjustment"] == "none"
 
 
 def test_action_recommender_enriches_event_and_playbook_context(monkeypatch):
@@ -37906,7 +37968,7 @@ def test_action_recommender_bridges_event_policy_actions(monkeypatch):
 
     assert out.iloc[0]["symbol"] == "ABC"
     assert out.iloc[0]["action_source"] == "event_policy"
-    assert out.iloc[0]["action_code"] == "MANUAL_REVIEW"
+    assert out.iloc[0]["action_code"] == "WATCH"
 
 
 def test_action_recommender_preserves_portfolio_transition_contract(monkeypatch):
@@ -52262,6 +52324,8 @@ def test_risk_engine_falls_back_to_base_candidates_without_event_rows(monkeypatc
                     "current_state": "PASS_NOW",
                     "watch_status": "active",
                     "is_base_candidate_fallback": True,
+                    "technical_state": "BUY_TRIGGERED",
+                    "technical_entry_confirmed": True,
                 }
             ]
         ),
@@ -53836,7 +53900,7 @@ def test_rule_engine_timing_only_demotes_pass_now_to_watch_breakout():
     }
     state, evaluation, _ = rule_engine.evaluate_setup_row(row, regime_name="STABLE", overlay_name="NONE", setup=setup)
     assert state == "WATCH_BREAKOUT"
-    assert "intraday timing" in str(evaluation.get("watch_reason_detail"))
+    assert "technical trigger is not confirmed" in str(evaluation.get("watch_reason_detail"))
 
 
 def test_rule_engine_tactical_primary_can_run_without_fundamentals():
@@ -60414,7 +60478,7 @@ def test_operator_api_builds_wait_signal_sections(monkeypatch):
                     "wait_question": "Has management clarified the order cancellation?",
                     "condition_json": json.dumps({"keywords": ["clarification", "order cancellation"]}),
                     "valid_from": pd.Timestamp("2026-06-01T09:00:00Z"),
-                    "valid_until": pd.Timestamp("2026-06-15T09:00:00Z"),
+                    "valid_until": pd.Timestamp("2027-06-15T09:00:00Z"),
                     "generated_by": "manual_review_decision",
                     "load_ts": pd.Timestamp("2026-06-01T09:00:00Z"),
                 },
@@ -60434,7 +60498,7 @@ def test_operator_api_builds_wait_signal_sections(monkeypatch):
                     "wait_question": "Has XYZ closed below support?",
                     "condition_json": json.dumps({"operator": "close_below", "threshold": 100.0}),
                     "valid_from": pd.Timestamp("2026-06-01T09:00:00Z"),
-                    "valid_until": pd.Timestamp("2026-06-15T09:00:00Z"),
+                    "valid_until": pd.Timestamp("2027-06-15T09:00:00Z"),
                     "generated_by": "hypothesis_action_plan",
                     "load_ts": pd.Timestamp("2026-06-01T09:00:00Z"),
                 },
@@ -65851,7 +65915,7 @@ def test_watchlist_builder_suppresses_context_overlay_hard_ohlcv_blockers(monkey
     assert reason["policy_effect"] == "suppress_context_hard_ohlcv_blocker_no_trade_authority"
     assert reason["technical_input_blocker"]["reason"] == "dhan_daily_sync_failed_no_history"
     assert reason["broker_execution_allowed"] is False
-    assert "hard Dhan OHLCV input blocker" in rows["BLOCKED"]["watch_reason_detail"]
+    assert "hard technical/OHLCV input blocker" in rows["BLOCKED"]["watch_reason_detail"]
 
 
 def test_watchlist_builder_hard_ohlcv_blockers_include_durable_history_issues(monkeypatch):
@@ -72324,7 +72388,7 @@ def test_signal_refresh_theme_context_cli_alias_uses_context_overlay_refresh(mon
 
     assert signal_refresh.main() == 0
 
-    assert calls == [{"asof_date": None, "limit": 7, "dry_run": True}]
+    assert calls == [{"asof_date": None, "limit": 7, "dry_run": True, "skip_if_current": False}]
     assert json.loads(capsys.readouterr().out)["status"] == "ok"
 
 
@@ -77058,6 +77122,74 @@ def test_nse_holidays_exports_source_unavailable_state(monkeypatch):
     assert event["severity"] == "warn"
     assert isinstance(event["error"], nse_holidays.PlaywrightTimeoutError)
     assert event["metadata"] == {"classification": "source_unavailable", "attempt_count": 1}
+
+
+def test_nse_holidays_records_unknown_segment_fallback(monkeypatch):
+    from data.nseindia import holidays as nse_holidays
+
+    events: list[dict[str, object]] = []
+    captured: dict[str, object] = {}
+
+    holiday_rows = [
+        {
+            "tradingDate": "26-Jan-2026",
+            "weekDay": "Monday",
+            "description": "Republic Day",
+            "morning_session": "",
+            "evening_session": "",
+            "Sr_no": 1,
+        }
+    ]
+    fake_data = {"CM": holiday_rows, "ZZNEWSEG": holiday_rows}
+
+    class FakePage:
+        def goto(self, *_args, **_kwargs):
+            return None
+
+        def wait_for_timeout(self, *_args, **_kwargs):
+            return None
+
+        def evaluate(self, *_args, **_kwargs):
+            return fake_data
+
+        def close(self):
+            return None
+
+    class FakeContext:
+        def new_page(self):
+            return FakePage()
+
+    class FakeBrowser:
+        contexts: list[object] = []
+
+        def new_context(self):
+            return FakeContext()
+
+        def close(self):
+            return None
+
+    class FakeChromium:
+        def connect_over_cdp(self, _endpoint):
+            return FakeBrowser()
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    class FakeRedis:
+        def set(self, *_args, **_kwargs):
+            return None
+
+    monkeypatch.setattr(nse_holidays, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(nse_holidays, "upsert_to_db", lambda df, *args, **kwargs: captured.__setitem__("df", df))
+    monkeypatch.setattr(nse_holidays, "rop", FakeRedis())
+
+    state = nse_holidays.download_holidays(FakePlaywright())
+
+    assert state["status"] == "ok"
+    unknown_events = [e for e in events if e.get("fallback_type") == "nse_holidays_unknown_segment"]
+    assert len(unknown_events) == 1
+    assert unknown_events[0]["metadata"]["segment_key"] == "ZZNEWSEG"
+    assert "ZZNEWSEG" in set(captured["df"]["type_name"])
 
 
 def test_nse_holidays_records_generic_download_failure(monkeypatch):
