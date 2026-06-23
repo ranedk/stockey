@@ -45,6 +45,10 @@ WATCHLIST_CONTEXT_OVERLAY_RELIABILITY_PRIORITY_ENABLED = os.getenv(
 ).strip().lower() not in {"0", "false", "no"}
 WATCHLIST_CONTEXT_OVERLAY_HELPFUL_SCORE_MULTIPLIER = float(os.getenv("WATCHLIST_CONTEXT_OVERLAY_HELPFUL_SCORE_MULTIPLIER", "1.25"))
 WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_SCORE_THRESHOLD = float(os.getenv("WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_SCORE_THRESHOLD", "0.75"))
+# Backing-evidence freshness window for WATCH_BREAKOUT (reduced-screening-friction) urgency.
+# Older positive overlays still create WATCH_EVENT pressure, but stale evidence does not earn
+# breakout urgency. Intake is already hard-bounded by WATCHLIST_CONTEXT_OVERLAY_LOOKBACK_DAYS.
+WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS = int(os.getenv("WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS", "7"))
 WATCHLIST_CONTEXT_OVERLAY_NEGATIVE_SUPPRESSION_ENABLED = os.getenv(
     "WATCHLIST_CONTEXT_OVERLAY_NEGATIVE_SUPPRESSION_ENABLED",
     "true",
@@ -2083,12 +2087,24 @@ def load_context_overlay_watch_candidates(
             "watch_priority",
             legacy_classification=reliability_label,
         )
+        context_overlay_date = pd.to_datetime(item.get("context_asof_date"), utc=True, errors="coerce")
+        asof_for_age = pd.to_datetime(effective_asof, utc=True, errors="coerce")
+        context_overlay_days_old = (
+            int((asof_for_age.normalize() - context_overlay_date.normalize()).days)
+            if pd.notna(context_overlay_date) and pd.notna(asof_for_age)
+            else None
+        )
+        overlay_breakout_stale = (
+            context_overlay_days_old is not None
+            and context_overlay_days_old > int(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS)
+        )
         promoted_to_breakout_watch = bool(
             direction == "positive"
             and watch_priority_allowed
             and not context_class_blocks_breakout
             and not context_sector_blocks_breakout
             and not breakout_blocked
+            and not overlay_breakout_stale
             and score >= float(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_SCORE_THRESHOLD)
         )
         candidate_state = "WATCH_BREAKOUT" if promoted_to_breakout_watch else "WATCH_EVENT"
@@ -2143,6 +2159,12 @@ def load_context_overlay_watch_candidates(
                 if breakout_blocked
                 else ""
             )
+            + (
+                f" WATCH_BREAKOUT promotion blocked because backing context evidence is {context_overlay_days_old} days old "
+                f"(> {int(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS)}d fresh-breakout window); kept as watch-only."
+                if overlay_breakout_stale
+                else ""
+            )
             + f" Confirmation plan: {technical_confirmation_plan['operator_summary']}"
             + " This row can add the stock to watch, but it has no buy or broker authority."
         )
@@ -2179,6 +2201,9 @@ def load_context_overlay_watch_candidates(
                             "context_class": context_class or None,
                             "context_overlay_id": overlay_id,
                             "context_asof_date": str(item.get("context_asof_date")),
+                            "context_overlay_days_old": context_overlay_days_old,
+                            "context_overlay_breakout_stale": bool(overlay_breakout_stale),
+                            "context_overlay_breakout_max_age_days": int(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS),
                             "pressure_score": raw_score,
                             "watch_priority_score": score,
                             "reliability_score_multiplier": reliability_multiplier,

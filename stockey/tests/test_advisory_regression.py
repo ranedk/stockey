@@ -66347,6 +66347,63 @@ def test_watchlist_builder_uses_reliability_only_for_context_watch_priority(monk
     assert "breakout watch priority" in row["entry_note"]
     assert "no buy or broker authority" in row["watch_reason_detail"]
     assert "Confirmation plan:" in row["watch_reason_detail"]
+    fresh_reason = reason
+    assert fresh_reason["context_overlay_days_old"] == 0
+    assert fresh_reason["context_overlay_breakout_stale"] is False
+
+
+def test_watchlist_builder_demotes_stale_context_overlay_breakout_to_watch_event(monkeypatch):
+    asof_date = pd.Timestamp("2026-06-20T00:00:00Z")
+    stale_overlay_date = asof_date - pd.Timedelta(days=10)
+    _mock_context_overlay_identity_resolved(monkeypatch)
+
+    def fake_direct_loader(**kwargs):
+        source = kwargs["source_name"]
+        if source != "announcement_context":
+            return pd.DataFrame()
+        return pd.DataFrame(
+            [
+                {
+                    "asof_date": asof_date,
+                    "symbol": "ABC",
+                    "context_asof_date": stale_overlay_date,
+                    "context_source": source,
+                    "context_overlay_id": f"{source}-1",
+                    "direction": "positive",
+                    "pressure_score": 0.9,
+                    "context_class": "TEST",
+                    "context_reason": "test pressure",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(watchlist_builder, "_load_direct_context_overlay_watch_rows", fake_direct_loader)
+    monkeypatch.setattr(watchlist_builder, "_load_sector_context_overlay_watch_rows", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(watchlist_builder, "WATCHLIST_CONTEXT_OVERLAY_HELPFUL_SCORE_MULTIPLIER", 1.25)
+    monkeypatch.setattr(
+        watchlist_builder,
+        "load_context_family_reliability",
+        lambda **kwargs: {
+            "status": "ok",
+            "evaluated_at": pd.Timestamp("2026-06-19T00:00:00Z"),
+            "families": {"announcement_context": {"classification": "candidate_helpful"}},
+        },
+    )
+
+    df = watchlist_builder.load_context_overlay_watch_candidates(asof_date=asof_date)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    # high pressure + candidate_helpful reliability would normally promote to WATCH_BREAKOUT,
+    # but the backing overlay evidence is 10d old (> 7d fresh-breakout window) so it stays watch-only.
+    assert row["candidate_state"] == "WATCH_EVENT"
+    assert row["context_policy_effect"] == "watch_only_no_buy_authority"
+    reason = json.loads(row["watch_reasons"])[0]
+    assert reason["context_overlay_days_old"] == 10
+    assert reason["context_overlay_breakout_stale"] is True
+    assert reason["context_overlay_breakout_max_age_days"] == 7
+    assert reason["candidate_state"] == "WATCH_EVENT"
+    assert "fresh-breakout window" in row["watch_reason_detail"]
 
 
 def test_watchlist_builder_context_overlay_limit_uses_priority_not_symbol_order(monkeypatch):

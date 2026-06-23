@@ -340,7 +340,20 @@ blocked.
   to `false` produces an audit entry; diagnostics report shows the count.
 - **Confidence:** verify-first.
 
-### [P1.5] Track context-overlay staleness and invalidate stale watch rows
+### [P1.5] Track context-overlay staleness and invalidate stale watch rows  ✅ DONE (scope refined)
+- **Outcome (2026-06-23):** Verification showed the 14d intake lookback
+  (`WATCHLIST_CONTEXT_OVERLAY_LOOKBACK_DAYS`) already hard-bounds candidate age, so a
+  `>14d` hard-REJECT would be dead code in the normal same-day rebuild. Implemented the
+  genuinely useful pieces in `advisory/watchlist_builder.py`: persist
+  `context_overlay_days_old` in `watch_reasons` (transparency), and demote a positive row
+  from `WATCH_BREAKOUT` to `WATCH_EVENT` when backing evidence is older than
+  `WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS` (default 7) — recorded as
+  `context_overlay_breakout_stale` with a watch_reason note. Review-only either way; no
+  schema change, no buy/sell authority. Added `.env.example` entry and 1 test (+ extended
+  the fresh-breakout test to assert days_old=0).
+- **Note:** hard age-based REJECT is unnecessary in the same-day rebuild because intake
+  already excludes overlays older than the lookback; the only cross-asof-date lingering
+  risk is for consumers reading historical (non-current-asof) watch rows.
 - **Why:** Context watch rows carry no `context_overlay_days_old`; stale evidence
   (>14d) can persist as active `WATCH_BREAKOUT` pressure without refresh or
   invalidation.
