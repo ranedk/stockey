@@ -632,7 +632,13 @@ visibility gaps. All remain research-only / no auto-apply.
 - **Validate:** Hand-check after-cost/excess on a small sample matches output.
 - **Confidence:** verified (aggregation incomplete).
 
-### [P2.3] Maturity / min-sample gating on event-policy & adversarial promotions
+### [P2.3] Maturity / min-sample gating on event-policy & adversarial promotions  ✅ DONE (already gated; regression test added)
+- **Outcome (2026-06-23):** Both already gate on maturity. `event_policy_promotion.deterministic_review`
+  defaults to `needs_more_data` and every promote/tighten/reject path requires `matured_count >= 30`
+  (`event_policy_promotion.py:239-270`) — stricter than the audit's suggested 10 — plus a
+  benchmark-excess gate. `adversarial_review_evaluator` has `DEFAULT_MIN_MATURED_ROWS = 10` and
+  returns `insufficient_matured_rows` below it (`_summary_recommendation`:514). The `<30` event-policy
+  gate was untested (existing tests used 45/60), so added one lock-in test. No code change.
 - **Why:** `event_policy_promotion` (and adversarial promotion if present) lack a
   `DEFAULT_MIN_MATURED_ROWS` gate; small samples can reach a promote recommendation.
 - **Files:** `advisory/event_policy_promotion.py`,

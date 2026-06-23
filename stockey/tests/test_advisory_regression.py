@@ -64328,6 +64328,27 @@ def test_event_policy_promotion_tightens_weak_group():
     assert review.proposed_patch["mode"] == "manual_review_only"
 
 
+def test_event_policy_promotion_needs_more_data_below_min_matured():
+    # strong after-cost AND benchmark-excess returns, but too few matured rows to trust:
+    # the maturity gate must keep it at needs_more_data (no promote).
+    evidence = {
+        "evaluated_at": pd.Timestamp("2026-05-01T00:00:00Z"),
+        "horizon_days": 10,
+        "group_type": "policy_class",
+        "group_value": "ORDER_WIN",
+        "matured_count": 12,
+        "avg_forward_return_after_cost": 0.05,
+        "hit_rate_after_cost": 0.70,
+        "avg_excess_forward_return_after_cost": 0.04,
+        "excess_hit_rate_after_cost": 0.65,
+    }
+
+    review = event_policy_promotion.deterministic_review(evidence)
+
+    assert review.recommendation == "needs_more_data"
+    assert any("below 30 rows" in reason.lower() for reason in review.reasons)
+
+
 def test_event_policy_promotion_blocks_raw_positive_without_excess_attribution():
     evidence = {
         "evaluated_at": pd.Timestamp("2026-05-01T00:00:00Z"),
