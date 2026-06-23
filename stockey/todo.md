@@ -610,28 +610,43 @@ one step.**
 
 **Sub-tasks (phased, each verify-first, operator review per phase):**
 
-### [P-LLM-AUTH.1] Evidence-completeness + data-grounding decision contract  ✅ DONE
+### [P-LLM-AUTH.1] Evidence-completeness + data-grounding decision contract  ✅ DONE (revised 2026-06-23)
 - **Operator design (2026-06-23):** the LLM may decide, but only over the COMPLETE validated
   evidence packet with data-grounded reasons — never on one news / one announcement / one
   indicator. A competent analyst given the same complete data should reach the same call.
-- **Done:** added pure, additive `advisory/llm_decision_contract.py` (no DB, no LLM call, no live
-  consumer):
+- **Revised model (2026-06-23):** the original "cite >= 3 independent dimensions" rule was too
+  rigid — it conflated *number* of signals with *strength* of evidence. Replaced with a clean split
+  of **completeness** (did we LOOK at every dimension) from **sufficiency** (is the evidence strong
+  enough to act), and sufficiency is met by ANY of three paths, not a count:
+  1. **Valid Hypothesis match** — a validated/production investor playbook (the operator's
+     experience-encoded sufficiency rule, the PRD "Valid Hypothesis" concept) whose conditions are
+     met; can authorize a 1–2 dimension call. This is the primary path.
+  2. **Dominant single signal** — one cited dimension with strength >=
+     `LLM_DECISION_DOMINANT_SIGNAL_STRENGTH` (default 0.80), e.g. a revenue-material contract or a
+     confirmed breakout with strong participation.
+  3. **Aggregate corroboration** — summed cited strength >= `LLM_DECISION_AGGREGATE_SIGNAL_STRENGTH`
+     (default 1.50). When the packet carries no per-dimension strengths, a legacy count
+     (`LLM_DECISION_MIN_INDEPENDENT_CONFIRMATIONS`, default 3) approximates this.
+- **Done:** pure, additive `advisory/llm_decision_contract.py` (no DB, no LLM call, no live consumer):
   - `build_evidence_completeness` — required dimensions (technical_confirmation, risk,
-    market_context, sector_reliability, exact_class_reliability, benchmark_excess,
-    event_provenance) must be present + fresh.
-  - `evaluate_beta_guard` — a directional call resting on benchmark-beta/unattributed excess is
-    flagged `beta_only_support` (reuses the benchmark-excess classifications from P2.1-P2.7).
-  - `validate_decision_grounding` — a directional decision must cite benchmark-excess + >=
-    `LLM_DECISION_MIN_INDEPENDENT_CONFIRMATIONS` (default 3) independent dimensions; single-signal
-    calls fail.
-  - `build_llm_decision_contract` — assembles `meets_data_grounding_for_live` (the DATA bar) plus
-    an authority stamp: `broker_execution_allowed=False` always (no live bridge yet),
-    `live_authority_master_flag=LLM_DIRECT_AUTHORITY_ENABLED` (default OFF),
-    `eligible_for_live_authority = data bar AND master flag AND graduation_passed`.
-  - `.env.example`: `LLM_DIRECT_AUTHORITY_ENABLED=false`, `LLM_DECISION_MIN_INDEPENDENT_CONFIRMATIONS=3`. 5 tests.
-- **Next bricks consume this:** .2 fills the contract from a real evidence packet + LLM; soft-gate
-  override + deterministic sizing-as-bounds land in .4 (the live bridge), where the risk engine
-  sizes within caps and the execution-safety contract still runs.
+    market_context, sector_reliability, exact_class_reliability, benchmark_excess, event_provenance)
+    must be looked-at (present + fresh); a genuine gap fails completeness.
+  - `evaluate_beta_guard` — scoped to RETURN-based support: flags `beta_only_support` only when
+    benchmark-excess is a beta classification or explicitly negative. An event thesis making no
+    returns claim (`excess_positive` None) is NOT beta and is not auto-failed (the earlier bug).
+  - `evaluate_hypothesis_match` — validated/production playbook with conditions met = sufficient.
+  - `validate_decision_grounding` — completeness AND not-beta-only AND sufficiency (any path);
+    records `sufficiency_path`, `max_signal_strength`, `aggregate_signal_strength`, `hypothesis_match`.
+  - `build_llm_decision_contract` — `meets_data_grounding_for_live` (the DATA bar) plus the
+    authority stamp: `broker_execution_allowed=False` always, `live_authority_master_flag=
+    LLM_DIRECT_AUTHORITY_ENABLED` (default OFF), `eligible_for_live_authority = data bar AND master
+    flag AND graduation_passed`. (schema_version bumped to 2.)
+  - `.env.example`: `LLM_DIRECT_AUTHORITY_ENABLED=false`, `LLM_DECISION_DOMINANT_SIGNAL_STRENGTH=0.80`,
+    `LLM_DECISION_AGGREGATE_SIGNAL_STRENGTH=1.50`, `LLM_DECISION_MIN_INDEPENDENT_CONFIRMATIONS=3`.
+    9 tests (3 sufficiency paths + event-thesis-not-beta + originals).
+- **Next bricks consume this:** .4's packet loader populates per-dimension `strength` and the
+  `hypothesis_match` from `advisory_hypothesis_matches` (validated/production); .2 already sizes any
+  contract that meets the data bar; .5 is the live bridge.
 
 ### [P-LLM-AUTH.2] Deterministic risk / position-sizing bounds (the safety floor)  ✅ DONE
 - The seatbelt the operator chose. Added pure/additive `advisory/llm_decision_risk_bounds.py`

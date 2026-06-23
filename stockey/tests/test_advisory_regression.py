@@ -62796,8 +62796,90 @@ def test_llm_decision_contract_single_signal_is_not_grounded():
     )
     assert grounding["single_signal"] is True
     assert grounding["data_grounded"] is False
-    assert any("single_or_thin_signal" in reason for reason in grounding["grounding_failures"])
-    assert any("must_cite_benchmark_excess" in reason for reason in grounding["grounding_failures"])
+    assert grounding["sufficiency_path"] is None
+    assert any("insufficient_evidence_strength" in reason for reason in grounding["grounding_failures"])
+
+
+def test_llm_decision_contract_dominant_single_signal_is_grounded():
+    from advisory import llm_decision_contract
+
+    # One genuinely strong signal grounds a directional call without an artificial 3rd dimension.
+    packet = _llm_decision_full_packet(
+        technical_confirmation={"present": True, "fresh": True, "strength": 0.92},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(
+        action="BUY",
+        cited_dimensions=["technical_confirmation"],
+        packet=packet,
+    )
+    assert grounding["single_signal"] is True
+    assert grounding["max_signal_strength"] == 0.92
+    assert grounding["sufficiency_path"] == "dominant_single_signal"
+    assert grounding["data_grounded"] is True
+
+
+def test_llm_decision_contract_aggregate_strength_is_grounded():
+    from advisory import llm_decision_contract
+
+    # Several moderate signals whose summed strength clears the aggregate threshold.
+    packet = _llm_decision_full_packet(
+        technical_confirmation={"present": True, "fresh": True, "strength": 0.55},
+        event_provenance={"present": True, "fresh": True, "strength": 0.55},
+        sector_reliability={"present": True, "fresh": True, "strength": 0.55},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(
+        action="BUY",
+        cited_dimensions=["technical_confirmation", "event_provenance", "sector_reliability"],
+        packet=packet,
+    )
+    assert grounding["aggregate_signal_strength"] == 1.65
+    assert grounding["sufficiency_path"] == "aggregate_corroboration"
+    assert grounding["data_grounded"] is True
+
+
+def test_llm_decision_contract_valid_hypothesis_match_grounds_thin_call():
+    from advisory import llm_decision_contract
+
+    # A validated investor hypothesis (conditions met) authorizes a 1-dimension event call.
+    packet = _llm_decision_full_packet(
+        hypothesis_match={"status": "validated", "conditions_met": True, "hypothesis_id": "bull_large_order_v3"},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(
+        action="BUY",
+        cited_dimensions=["event_provenance"],
+        packet=packet,
+    )
+    assert grounding["sufficiency_path"] == "valid_hypothesis_match"
+    assert grounding["hypothesis_match"]["hypothesis_id"] == "bull_large_order_v3"
+    assert grounding["data_grounded"] is True
+    # An unvalidated (still-testing) hypothesis does NOT confer authority on its own.
+    testing = llm_decision_contract.validate_decision_grounding(
+        action="BUY",
+        cited_dimensions=["event_provenance"],
+        packet=_llm_decision_full_packet(hypothesis_match={"status": "testing", "conditions_met": True}),
+    )
+    assert testing["sufficiency_path"] is None
+    assert testing["data_grounded"] is False
+
+
+def test_llm_decision_contract_event_thesis_without_returns_claim_is_not_beta_blocked():
+    from advisory import llm_decision_contract
+
+    # Event-driven thesis: benchmark-excess looked at but makes no returns claim (excess_positive
+    # None). That is NOT market beta, so the beta guard must not block it.
+    packet = _llm_decision_full_packet(
+        benchmark_excess={"present": True, "fresh": True, "classification": "no_return_claim", "excess_positive": None},
+        event_provenance={"present": True, "fresh": True, "strength": 0.9},
+    )
+    guard = llm_decision_contract.evaluate_beta_guard(packet)
+    assert guard["benchmark_excess_present"] is True
+    assert guard["beta_only_support"] is False
+    grounding = llm_decision_contract.validate_decision_grounding(
+        action="BUY",
+        cited_dimensions=["event_provenance"],
+        packet=packet,
+    )
+    assert grounding["data_grounded"] is True
 
 
 def test_llm_decision_contract_incomplete_evidence_blocks_data_bar():
