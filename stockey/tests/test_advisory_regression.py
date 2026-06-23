@@ -23242,6 +23242,73 @@ def test_signal_refresh_context_overlay_result_reports_affected_symbols(monkeypa
     assert sync_states[0]["state"]["affected_symbol_count"] == 2
 
 
+def _positive_context_watch_target_frame():
+    return pd.DataFrame(
+        [
+            {
+                "symbol": "ABC",
+                "asof_date": pd.Timestamp("2026-06-20T00:00:00Z"),
+                "setup_score": 0.8,
+                "candidate_state": "WATCH_BREAKOUT",
+                "watch_enabled": True,
+                "context_source": "announcement_context",
+                "context_overlay_id": "announcement_context-1",
+                "context_policy_effect": "watch_breakout_priority_no_buy_authority",
+                "watch_reason_detail": "positive pressure",
+            },
+            {
+                "symbol": "XYZ",
+                "asof_date": pd.Timestamp("2026-06-20T00:00:00Z"),
+                "setup_score": 0.7,
+                "candidate_state": "WATCH_EVENT",
+                "watch_enabled": True,
+                "context_source": "exchange_context",
+                "context_overlay_id": "exchange_context-1",
+                "context_policy_effect": "watch_only_no_buy_authority",
+                "watch_reason_detail": "positive pressure",
+            },
+        ]
+    )
+
+
+def test_signal_refresh_suppresses_positive_watch_with_fresh_negative_context(monkeypatch):
+    monkeypatch.setattr(signal_refresh, "load_context_overlay_watch_candidates", lambda **kwargs: _positive_context_watch_target_frame())
+    monkeypatch.setattr(
+        signal_refresh,
+        "load_negative_context_overlay_suppression_candidates",
+        lambda **kwargs: pd.DataFrame(
+            [{"symbol": "ABC", "context_source": "announcement_context", "context_overlay_id": "neg-1"}]
+        ),
+    )
+
+    raw, kept, suppressed = signal_refresh.load_positive_context_overlay_watch_target_frames(
+        asof_date=pd.Timestamp("2026-06-20T00:00:00Z"), limit=50
+    )
+
+    kept_symbols = set(kept["symbol"]) if not kept.empty else set()
+    assert kept_symbols == {"XYZ"}
+    abc_suppressed = [row for row in suppressed if row["symbol"] == "ABC"]
+    assert abc_suppressed
+    assert "suppress_context_fresh_negative_overlay_no_buy_authority" in abc_suppressed[0]["suppression_reasons"]
+    assert abc_suppressed[0]["negative_context_source"] == "announcement_context"
+    assert abc_suppressed[0]["broker_execution_allowed"] is False
+
+
+def test_signal_refresh_keeps_positive_watch_without_fresh_negative_context(monkeypatch):
+    monkeypatch.setattr(signal_refresh, "load_context_overlay_watch_candidates", lambda **kwargs: _positive_context_watch_target_frame())
+    monkeypatch.setattr(signal_refresh, "load_negative_context_overlay_suppression_candidates", lambda **kwargs: pd.DataFrame())
+
+    raw, kept, suppressed = signal_refresh.load_positive_context_overlay_watch_target_frames(
+        asof_date=pd.Timestamp("2026-06-20T00:00:00Z"), limit=50
+    )
+
+    assert set(kept["symbol"]) == {"ABC", "XYZ"}
+    assert not any(
+        "suppress_context_fresh_negative_overlay_no_buy_authority" in (row.get("suppression_reasons") or [])
+        for row in suppressed
+    )
+
+
 def test_signal_refresh_negative_context_requires_explicit_derisk_runtime_contract():
     targets = pd.DataFrame(
         [
@@ -66404,6 +66471,64 @@ def test_watchlist_builder_demotes_stale_context_overlay_breakout_to_watch_event
     assert reason["context_overlay_breakout_max_age_days"] == 7
     assert reason["candidate_state"] == "WATCH_EVENT"
     assert "fresh-breakout window" in row["watch_reason_detail"]
+
+
+def test_watchlist_builder_demotes_low_technical_actionability_breakout_to_watch_event(monkeypatch):
+    asof_date = pd.Timestamp("2026-06-20T00:00:00Z")
+    _mock_context_overlay_identity_resolved(monkeypatch)
+
+    def fake_direct_loader(**kwargs):
+        source = kwargs["source_name"]
+        if source != "announcement_context":
+            return pd.DataFrame()
+        return pd.DataFrame(
+            [
+                {
+                    "asof_date": asof_date,
+                    "symbol": "ABC",
+                    "context_asof_date": asof_date,
+                    "context_source": source,
+                    "context_overlay_id": f"{source}-1",
+                    "direction": "positive",
+                    "pressure_score": 0.9,
+                    "context_class": "TEST",
+                    "context_reason": "test pressure",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(watchlist_builder, "_load_direct_context_overlay_watch_rows", fake_direct_loader)
+    monkeypatch.setattr(watchlist_builder, "_load_sector_context_overlay_watch_rows", lambda **kwargs: pd.DataFrame())
+    monkeypatch.setattr(watchlist_builder, "WATCHLIST_CONTEXT_OVERLAY_HELPFUL_SCORE_MULTIPLIER", 1.25)
+    # covered technical row but weak (base 0.25 < 0.40 breakout minimum)
+    monkeypatch.setattr(
+        watchlist_builder,
+        "_load_context_technical_actionability",
+        lambda **kwargs: {"ABC": {"technical_covered": True, "technical_actionability_score": 0.25}},
+    )
+    monkeypatch.setattr(
+        watchlist_builder,
+        "load_context_family_reliability",
+        lambda **kwargs: {
+            "status": "ok",
+            "evaluated_at": pd.Timestamp("2026-06-19T00:00:00Z"),
+            "families": {"announcement_context": {"classification": "candidate_helpful"}},
+        },
+    )
+
+    df = watchlist_builder.load_context_overlay_watch_candidates(asof_date=asof_date)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    # strong context pressure + candidate_helpful would normally promote to WATCH_BREAKOUT, but
+    # the symbol's technical setup is covered-but-weak (0.25 < 0.40) so it stays watch-only.
+    assert row["candidate_state"] == "WATCH_EVENT"
+    assert row["context_policy_effect"] == "watch_only_no_buy_authority"
+    reason = json.loads(row["watch_reasons"])[0]
+    assert reason["watch_breakout_low_technical_actionability_blocked"] is True
+    assert reason["watch_breakout_min_technical_actionability"] == 0.40
+    assert reason["context_overlay_breakout_stale"] is False
+    assert "breakout minimum" in row["watch_reason_detail"]
 
 
 def test_watchlist_builder_context_overlay_limit_uses_priority_not_symbol_order(monkeypatch):

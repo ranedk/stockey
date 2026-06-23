@@ -49,6 +49,10 @@ WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_SCORE_THRESHOLD = float(os.getenv("WATCHLIST_
 # Older positive overlays still create WATCH_EVENT pressure, but stale evidence does not earn
 # breakout urgency. Intake is already hard-bounded by WATCHLIST_CONTEXT_OVERLAY_LOOKBACK_DAYS.
 WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS = int(os.getenv("WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS", "7"))
+# Minimum point-in-time technical actionability score for WATCH_BREAKOUT (reduced-screening-
+# friction) urgency. Covered-but-weak technical setups stay as WATCH_EVENT; symbols with no
+# technical row stay neutral (not gated, not rejected).
+WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MIN_ACTIONABILITY = float(os.getenv("WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MIN_ACTIONABILITY", "0.40"))
 WATCHLIST_CONTEXT_OVERLAY_NEGATIVE_SUPPRESSION_ENABLED = os.getenv(
     "WATCHLIST_CONTEXT_OVERLAY_NEGATIVE_SUPPRESSION_ENABLED",
     "true",
@@ -2098,6 +2102,12 @@ def load_context_overlay_watch_candidates(
             context_overlay_days_old is not None
             and context_overlay_days_old > int(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS)
         )
+        technical_covered = bool(technical_hint.get("technical_covered")) if isinstance(technical_hint, dict) else False
+        low_technical_actionability_breakout_block = bool(
+            technical_covered
+            and not has_stale_ohlcv_blocker
+            and technical_score < float(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MIN_ACTIONABILITY)
+        )
         promoted_to_breakout_watch = bool(
             direction == "positive"
             and watch_priority_allowed
@@ -2105,6 +2115,7 @@ def load_context_overlay_watch_candidates(
             and not context_sector_blocks_breakout
             and not breakout_blocked
             and not overlay_breakout_stale
+            and not low_technical_actionability_breakout_block
             and score >= float(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_SCORE_THRESHOLD)
         )
         candidate_state = "WATCH_BREAKOUT" if promoted_to_breakout_watch else "WATCH_EVENT"
@@ -2165,6 +2176,12 @@ def load_context_overlay_watch_candidates(
                 if overlay_breakout_stale
                 else ""
             )
+            + (
+                f" WATCH_BREAKOUT promotion blocked because technical actionability score {round(technical_score, 4)} "
+                f"is below the {round(float(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MIN_ACTIONABILITY), 4)} breakout minimum; kept as watch-only."
+                if low_technical_actionability_breakout_block
+                else ""
+            )
             + f" Confirmation plan: {technical_confirmation_plan['operator_summary']}"
             + " This row can add the stock to watch, but it has no buy or broker authority."
         )
@@ -2204,6 +2221,8 @@ def load_context_overlay_watch_candidates(
                             "context_overlay_days_old": context_overlay_days_old,
                             "context_overlay_breakout_stale": bool(overlay_breakout_stale),
                             "context_overlay_breakout_max_age_days": int(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MAX_AGE_DAYS),
+                            "watch_breakout_low_technical_actionability_blocked": bool(low_technical_actionability_breakout_block),
+                            "watch_breakout_min_technical_actionability": float(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MIN_ACTIONABILITY),
                             "pressure_score": raw_score,
                             "watch_priority_score": score,
                             "reliability_score_multiplier": reliability_multiplier,

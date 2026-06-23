@@ -370,7 +370,15 @@ blocked.
   stays active.
 - **Confidence:** verify-first.
 
-### [P1.6] Hard gate low technical actionability on WATCH_BREAKOUT
+### [P1.6] Hard gate low technical actionability on WATCH_BREAKOUT  ✅ DONE
+- **Outcome (2026-06-23):** In `advisory/watchlist_builder.py`, a positive row is demoted
+  from `WATCH_BREAKOUT` to `WATCH_EVENT` when the symbol's point-in-time technical setup is
+  covered but weak (`technical_actionability_score < WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_MIN_ACTIONABILITY`,
+  default 0.40). Recorded as `watch_breakout_low_technical_actionability_blocked` with a
+  watch_reason note. Per the guardrail it is a DEMOTION (never REJECT), and it fires only
+  when technical is `technical_covered` and not already a stale-OHLCV blocker — symbols with
+  no technical row stay neutral. Review-only; no buy/sell authority. `.env.example` entry +
+  1 test added.
 - **Why:** `_load_context_technical_actionability` scores readiness but is used
   only for ranking. A `WATCH_BREAKOUT` row with very low actionability still
   enters advisory as high-urgency context.
@@ -387,7 +395,18 @@ blocked.
   score → unchanged.
 - **Confidence:** verify-first.
 
-### [P1.7] Apply fresh negative-context suppression in signal refresh
+### [P1.7] Apply fresh negative-context suppression in signal refresh  ✅ DONE
+- **Outcome (2026-06-23):** Confirmed the gap — signal_refresh's positive loader builds from
+  `load_context_overlay_watch_candidates`, which does NOT apply negative-context suppression
+  (that runs later in watchlist maintenance, line ~2422), so a fresh negative overlay could
+  still emit a review-only WATCH. Fixed in `advisory/signal_refresh.py`: added
+  `_negative_context_suppressed_symbols` (reuses the builder's reliability-gated
+  `load_negative_context_overlay_suppression_candidates`) and wired it into
+  `load_positive_context_overlay_watch_target_frames` so negative-suppressed symbols are
+  excluded BEFORE the limit and counted in `policy_suppressed_target_rows` with reason
+  `suppress_context_fresh_negative_overlay_no_buy_authority`. Fails open with telemetry if the
+  negative source is unavailable. Withholds a review-only WATCH only — no sell/portfolio/broker
+  authority. 2 tests added.
 - **Why:** `watchlist_builder` writes negative-context suppression `REJECT` rows,
   but `signal_refresh` positive-context loader does not consult them, so a fresh
   negative overlay newer than the positive watch can still emit a `WATCH` signal.

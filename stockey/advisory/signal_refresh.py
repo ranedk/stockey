@@ -26,6 +26,7 @@ from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, match_wait_signals
 from advisory.watchlist_builder import TABLE_NAME as WATCHLIST_TABLE
 from advisory.watchlist_builder import load_context_family_reliability
 from advisory.watchlist_builder import load_context_overlay_watch_candidates
+from advisory.watchlist_builder import load_negative_context_overlay_suppression_candidates
 from utils.db import sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 
@@ -1604,7 +1605,58 @@ def _positive_context_watch_suppression_reason(item: dict[str, Any]) -> list[str
     return reasons
 
 
-def _split_positive_context_overlay_watch_targets(raw: pd.DataFrame, *, limit: int) -> tuple[pd.DataFrame, pd.DataFrame, list[dict[str, Any]]]:
+def _negative_context_suppressed_symbols(frame: pd.DataFrame, *, asof_date: Any) -> dict[str, dict[str, Any]]:
+    """Symbols with fresh negative direct context that should withhold a review-only positive WATCH.
+
+    Reuses the watchlist builder's reliability-gated negative-suppression rule so fast signal
+    refresh stays consistent with the persisted watchlist instead of emitting a positive WATCH for
+    a symbol that just received fresh negative announcement/exchange/bhavcopy context. Suppression
+    withholds a review-only WATCH only; it grants no sell, portfolio, or broker authority. Fails
+    open (no suppression) with telemetry when the negative-context source is unavailable.
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty or "symbol" not in frame.columns or "candidate_state" not in frame.columns:
+        return {}
+    positive_mask = frame["candidate_state"].astype("string").str.strip().str.upper().isin(["WATCH_EVENT", "WATCH_BREAKOUT"])
+    symbols = sorted({
+        str(value).strip().upper()
+        for value in frame.loc[positive_mask, "symbol"].tolist()
+        if str(value or "").strip()
+    })
+    if not symbols:
+        return {}
+    try:
+        negative = load_negative_context_overlay_suppression_candidates(asof_date=asof_date, symbols=symbols)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.signal_refresh",
+            fallback_type="signal_refresh_negative_context_suppression_failed",
+            source="advisory_context_overlays",
+            severity="warn",
+            reason="Signal refresh could not load fresh negative context-overlay suppression; positive watch targets were not negative-suppressed this run.",
+            error=exc,
+            metadata={"symbol_count": len(symbols)},
+        )
+        return {}
+    if not isinstance(negative, pd.DataFrame) or negative.empty or "symbol" not in negative.columns:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for item in negative.to_dict(orient="records"):
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol or symbol in out:
+            continue
+        out[symbol] = {
+            "negative_context_source": _text(item.get("context_source")) or "context_overlay",
+            "negative_context_overlay_id": _text(item.get("context_overlay_id")),
+        }
+    return out
+
+
+def _split_positive_context_overlay_watch_targets(
+    raw: pd.DataFrame,
+    *,
+    limit: int,
+    negative_suppressed_symbols: dict[str, dict[str, Any]] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, list[dict[str, Any]]]:
     if not isinstance(raw, pd.DataFrame) or raw.empty:
         return pd.DataFrame(), pd.DataFrame(), []
     out = raw.copy()
@@ -1613,26 +1665,33 @@ def _split_positive_context_overlay_watch_targets(raw: pd.DataFrame, *, limit: i
     out = out.dropna(subset=["symbol"])
     if out.empty:
         return pd.DataFrame(), pd.DataFrame(), []
+    negative_suppressed_symbols = negative_suppressed_symbols or {}
     keep_mask: list[bool] = []
     suppressed: list[dict[str, Any]] = []
     for item in out.to_dict(orient="records"):
         reasons = _positive_context_watch_suppression_reason(item)
+        symbol_key = str(item.get("symbol") or "").strip().upper()
+        negative_hit = negative_suppressed_symbols.get(symbol_key)
+        if negative_hit:
+            reasons = list(reasons) + ["suppress_context_fresh_negative_overlay_no_buy_authority"]
         keep_mask.append(not reasons)
         if reasons:
-            suppressed.append(
-                {
-                    "symbol": _text(item.get("symbol")),
-                    "context_source": _text(item.get("context_source")) or "context_overlay",
-                    "context_overlay_id": _text(item.get("context_overlay_id")),
-                    "context_policy_effect": _text(item.get("context_policy_effect")),
-                    "candidate_state": _text(item.get("candidate_state")),
-                    "watch_enabled": item.get("watch_enabled"),
-                    "suppression_reasons": reasons,
-                    "watch_reason_detail": _text(item.get("watch_reason_detail")),
-                    "authority_scope": SIGNAL_REFRESH_AUTHORITY_CONTRACT["authority_scope"],
-                    "broker_execution_allowed": False,
-                }
-            )
+            entry = {
+                "symbol": _text(item.get("symbol")),
+                "context_source": _text(item.get("context_source")) or "context_overlay",
+                "context_overlay_id": _text(item.get("context_overlay_id")),
+                "context_policy_effect": _text(item.get("context_policy_effect")),
+                "candidate_state": _text(item.get("candidate_state")),
+                "watch_enabled": item.get("watch_enabled"),
+                "suppression_reasons": reasons,
+                "watch_reason_detail": _text(item.get("watch_reason_detail")),
+                "authority_scope": SIGNAL_REFRESH_AUTHORITY_CONTRACT["authority_scope"],
+                "broker_execution_allowed": False,
+            }
+            if negative_hit:
+                entry["negative_context_source"] = negative_hit.get("negative_context_source")
+                entry["negative_context_overlay_id"] = negative_hit.get("negative_context_overlay_id")
+            suppressed.append(entry)
     kept = out.loc[keep_mask].copy()
     if kept.empty:
         return out, pd.DataFrame(), suppressed
@@ -1663,7 +1722,12 @@ def load_positive_context_overlay_watch_target_frames(*, asof_date: Any = None, 
             metadata={"asof_date": str(effective_asof), "limit": int(limit)},
         )
         return pd.DataFrame(), pd.DataFrame(), []
-    return _split_positive_context_overlay_watch_targets(frame, limit=limit)
+    negative_suppressed = _negative_context_suppressed_symbols(
+        frame, asof_date=asof_date if asof_date is not None else effective_asof
+    )
+    return _split_positive_context_overlay_watch_targets(
+        frame, limit=limit, negative_suppressed_symbols=negative_suppressed
+    )
 
 
 def load_positive_context_overlay_watch_targets(*, asof_date: Any = None, limit: int = 50) -> pd.DataFrame:
