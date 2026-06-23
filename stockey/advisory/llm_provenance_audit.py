@@ -109,6 +109,19 @@ PROVENANCE_SPECS: tuple[ProvenanceSpec, ...] = (
         evidence_columns=("manual_revision_pointers_json", "recommendation_reason_json", "raw_context_json"),
         status_column="manual_revision_status",
     ),
+    ProvenanceSpec(
+        table_name="advisory_llm_decisions",
+        label="llm_decision_policy",
+        prompt_id="llm_decision_policy",
+        date_column="decided_at",
+        prompt_id_column="prompt_id",
+        prompt_version_column="prompt_version",
+        prompt_schema_column="prompt_schema_version",
+        model_column="llm_model",
+        evidence_columns=("evidence_packet_json", "decision_contract_json", "sizing_plan_json"),
+        authority_columns=("broker_execution_allowed",),
+        status_column="llm_status",
+    ),
 )
 
 

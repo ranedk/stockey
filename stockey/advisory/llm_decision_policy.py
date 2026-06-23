@@ -174,6 +174,7 @@ def decide(
         "schema_version": 1,
         "symbol": contract["symbol"],
         "asof_date": packet.get("asof_date") if isinstance(packet, dict) else None,
+        "evidence_packet": packet,
         "proposal": proposal.model_dump(),
         "contract": contract,
         "sizing": sizing,

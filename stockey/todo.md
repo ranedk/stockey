@@ -721,10 +721,25 @@ one step.**
     disabled, registry review-only).
 - **Next:** .4c persists the decide() result + feeds matured outcomes to the .3 monitor.
 
-#### [P-LLM-AUTH.4c] Decision persistence
-- `advisory_llm_decisions` via an append-only migration (`apply_schema_migration`) + `upsert_to_db`;
-  stamp prompt_id/version/schema/model + as-of date (register in `llm_provenance_audit.py`). Feed
-  matured rows to the .3 monitor.
+#### [P-LLM-AUTH.4c] Decision persistence  ✅ DONE
+- Added `advisory/llm_decision_store.py`: `advisory_llm_decisions` via an append-only migration
+  (`apply_schema_migration`, id `20260623_advisory_llm_decisions_base`); `persist_decisions(results,
+  decided_at=)` maps each `decide()` result -> row via the pure `build_decision_rows` and upserts
+  (unique key asof_date+symbol+decided_at, timescaledb_column decided_at). `broker_execution_allowed`
+  is forced False on every row (review-only). Stamps prompt_id/version/schema/model + asof + the full
+  evidence packet / contract / sizing JSON for provenance. `decide()` now also returns
+  `evidence_packet` so `event_class` and the packet are persisted.
+- Registered a `ProvenanceSpec` for `advisory_llm_decisions` in `advisory/llm_provenance_audit.py`
+  (date_column decided_at, authority_columns broker_execution_allowed -> audit flags any non-False).
+- `decisions_to_monitor_records` (pure) adapts persisted rows into the .3 monitor record shape,
+  attaching a realized outcome by (symbol, decided_at) when available; `build_decision_monitor_report`
+  runs the .3 monitor over them. Until an outcome is attached, a decision is `matured=False` and the
+  monitor treats it as not-yet-trustworthy (correct: no realized labels exist until .5).
+- **Realized-outcome attachment is deferred to .5/labeling** (the matured benchmark-excess a decision
+  is judged on). 4 tests. Full suite 2084 passed.
+
+**[P-LLM-AUTH].4 is COMPLETE** (.4a packet loader + .4b decision policy + .4c persistence). The
+decision engine runs end-to-end and review-only; only the live bridge (.5) remains in the epic.
 
 ### [P-LLM-AUTH.5] Live bridge behind the default-OFF master flag
 - Only when the master flag is ON: a grounded decision + its .2 risk bounds become a broker-capable

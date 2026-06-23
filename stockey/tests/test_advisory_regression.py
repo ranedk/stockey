@@ -63292,6 +63292,68 @@ def test_prompt_registry_includes_llm_decision_policy_review_only():
     assert row["broker_execution_allowed"] is False
 
 
+def test_llm_decision_store_builds_review_only_rows_with_provenance():
+    from advisory import llm_decision_policy as policy
+    from advisory import llm_decision_store as store
+
+    packet = _decision_packet()
+
+    def fake_llm(prompt, *, response_model, model, system_prompt):
+        return response_model(action="BUY", conviction=1.0, cited_dimensions=["technical_confirmation"], claims_hypothesis_match=True, rationale="ok")
+
+    result = policy.decide(packet, capital=1_000_000.0, price=100.0, atr=3.0, llm_caller=fake_llm)
+    rows = store.build_decision_rows([result], decided_at="2026-06-23T10:00:00Z")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["symbol"] == "ABC"
+    assert row["proposed_action"] == "BUY"
+    assert row["meets_data_grounding_for_live"] is True
+    assert row["event_class"] == "order_win"  # pulled from the stored evidence packet
+    assert row["broker_execution_allowed"] is False  # review-only regardless of decision
+    assert row["prompt_version"] == "LLM_DECISION_POLICY_V1"
+    assert row["prompt_id"] == "llm_decision_policy"
+
+
+def test_llm_decision_store_monitor_adapter_marks_unmatured_then_attaches_outcome():
+    from advisory import llm_decision_store as store
+
+    rows = [{
+        "symbol": "ABC", "decided_at": "2026-06-23T10:00:00Z",
+        "proposed_action": "BUY", "event_class": "order_win", "sufficiency_path": "valid_hypothesis_match",
+    }]
+    # No outcome yet -> matured False (monitor treats as not-yet-trustworthy).
+    unmatured = store.decisions_to_monitor_records(rows)
+    assert unmatured[0]["matured"] is False
+    assert unmatured[0]["realized_excess_after_cost"] is None
+    # Outcome attached by (symbol, decided_at).
+    matured = store.decisions_to_monitor_records(
+        rows,
+        outcomes_by_key={("ABC", "2026-06-23T10:00:00Z"): {"matured": True, "realized_excess_after_cost": 0.03, "resolved_beta_only": False}},
+    )
+    assert matured[0]["matured"] is True
+    assert matured[0]["realized_excess_after_cost"] == 0.03
+
+
+def test_llm_decision_store_monitor_report_under_baselined_without_outcomes():
+    from advisory import llm_decision_store as store
+
+    rows = [{"symbol": f"S{i}", "decided_at": f"2026-06-2{i % 9}", "sufficiency_path": "aggregate_corroboration"} for i in range(30)]
+    report = store.build_decision_monitor_report(rows)
+    # Decisions exist but none matured -> under-baselined info, no alerts, never blocks.
+    assert report["blocking"] is False
+    assert report["has_systematic_error"] is False
+    assert report["findings"][0]["kind"] == "llm_decisions_under_baselined"
+
+
+def test_llm_decision_provenance_spec_registered_review_only():
+    from advisory import llm_provenance_audit
+
+    spec = next(s for s in llm_provenance_audit.PROVENANCE_SPECS if s.table_name == "advisory_llm_decisions")
+    assert spec.prompt_id == "llm_decision_policy"
+    assert spec.date_column == "decided_at"
+    assert "broker_execution_allowed" in spec.authority_columns
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {
