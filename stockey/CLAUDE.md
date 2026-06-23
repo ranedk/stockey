@@ -9,12 +9,26 @@ polish or broad refactoring.
 
 ## Project Principles
 
-- Do not let an LLM directly decide trades or bypass deterministic gates.
+- LLM decision authority (operator decision, 2026-06-23): an LLM may take trade
+  decisions directly — including review outcomes and BUY/SELL/size — when it has
+  reviewed the evidence and recorded strong, provenance-backed reasons. The
+  deterministic technical, risk, lifecycle, action-consolidation, reason-contract,
+  identity, and execution gates are advisory guardrails: an LLM decision may
+  override a soft gate, but the override and its rationale must be recorded. This
+  replaces the former "LLM must never decide trades" rule. There is NO human
+  manual-review step; where review is needed the LLM performs it (see the
+  LLM-resolved-review and LLM-direct-authority epics in `todo.md`).
+- Non-negotiable engineering safety (kept regardless of who decides): every
+  LLM decision persists a typed evidence/provenance + reason contract; behavior
+  stays point-in-time (no future data / lookahead); a master enable flag gates
+  any live LLM→broker authority and DEFAULTS OFF (opt-in per deployment); and
+  LLM-decided actions graduate to live broker authority only after a measured
+  paper/shadow track record (after-cost, benchmark-excess, regime-robust). These
+  are reversibility/auditability guarantees, not authority limits.
 - Use LLMs for structured extraction, event interpretation, hypothesis/playbook
-  notes, company-memory summaries, adversarial review notes, and operator
-  explanations.
-- Trading authority must flow through deterministic technical, risk, lifecycle,
-  action-consolidation, reason-contract, identity, and execution-planning gates.
+  notes, company-memory summaries, adversarial review notes, operator
+  explanations, review resolution, and (when enabled and evidence-backed) trade
+  decisions.
 - A broad single regime label must not be the default explanation for no BUY
   recommendations. Prefer layered context: breadth, macro stress, sector/symbol
   leadership, technical confirmation, source-family overlays, and exact event
@@ -57,6 +71,12 @@ Main pipeline:
     from live authority.
 
 ## Important Authority Boundaries
+
+> Note (2026-06-23): these boundaries are the **default/current** behavior and remain
+> in force until the `[P-LLM-AUTH]` epic (see `todo.md`) builds and the operator enables
+> the default-OFF master flag. Per the updated Project Principles, an LLM may then take
+> trade decisions directly with recorded provenance/reasons, overriding these soft gates.
+> Until that flag is on, treat the boundaries below as binding.
 
 - `WATCH`, `BUY_WATCH`, `REDUCE_EXPOSURE_REVIEW`, `TIGHTEN_STOP`, and most
   signal-refresh rows are review-only unless explicitly upgraded by full

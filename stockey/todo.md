@@ -24,10 +24,16 @@ Each task is a self-contained card:
 
 Global rules for every task:
 
-- Do not weaken authority boundaries to make BUYs appear. Review-only rows keep
-  `portfolio_authority=none`, `broker_execution_allowed=false`,
-  `full_advisory_required=true` unless a full advisory/risk/lifecycle/action gate
-  upgrades them.
+- LLM decision authority (operator decision 2026-06-23, see CLAUDE.md): an LLM may
+  decide review outcomes and trades (incl. BUY/SELL/size) when it has reviewed the
+  evidence and recorded strong, provenance-backed reasons; the deterministic gates
+  are advisory guardrails an LLM decision may override with a recorded rationale.
+  No human manual-review step. STILL non-negotiable: typed evidence/provenance +
+  reason contract on every decision, point-in-time discipline, a default-OFF master
+  flag for any live LLM→broker authority, and paper/shadow graduation (after-cost +
+  benchmark-excess + regime-robust) before live. Until the [P-LLM-AUTH] epic builds
+  and enables that path, existing review-only rows keep `broker_execution_allowed=false`
+  by default — do not flip an existing module to live LLM authority ad hoc.
 - Do not use one broad regime label as the sole BUY/SELL gate. Prefer layered
   context (breadth, macro stress, sector/symbol leadership, technical
   confirmation, source-family + exact event-class reliability, benchmark-excess).
@@ -501,17 +507,18 @@ unresolved or low-confidence cases.
   automation is the Dhan/NSE/Screener data loaders (Playwright/CDP), not general research.
 
 **Hard guardrails (non-negotiable — these shape every sub-task).**
-- LLM never gets broker/trade authority. "Resolve the review" means choosing a review-only
-  outcome (`NO_ACTION` / `WATCH` / `REDUCE_EXPOSURE_REVIEW` / escalate), never `BUY`/`SELL`,
-  sizing, portfolio, or execution. Same boundary the event-policy reviewer already honors.
+- LLM resolves the review (operator decision 2026-06-23: LLM, never a human). For the review
+  queue the resolver chooses `NO_ACTION` / `WATCH` / `REDUCE_EXPOSURE_REVIEW` / hold. Direct
+  BUY/SELL/size by the LLM is governed by the separate [P-LLM-AUTH] epic (default-OFF master
+  flag + paper graduation); until that is enabled, review resolution stays review-only.
 - Every externally fetched fact (web search or other data point) is evidence with a typed
   provenance record (source URL/pointer, fetch time, query, prompt/schema version) and must
   resolve through identity validation before it can influence a symbol/peer/sector. No
   silent fallback: a failed/empty/low-confidence search is recorded and escalates, it does
   not silently pass.
-- Human fallback stays. Low-confidence, contradictory-evidence, or high-impact items still
-  escalate to a person; "manual review" becomes "LLM-resolved with human fallback", not
-  "human-only" and not "LLM auto-approves everything".
+- No human fallback (operator decision). Low-confidence / contradictory-evidence items do not
+  go to a person — the LLM escalates to a higher-rigor review pass (pull more evidence / web
+  search) or holds as `NO_ACTION`. "Manual review" becomes "LLM-resolved", not "human-only".
 - Point-in-time discipline holds for web evidence too: do not let a search surface
   post-dated information into a historical/as-of decision; stamp and bound by the item's
   asof date where the decision is point-in-time.
@@ -573,9 +580,62 @@ unresolved or low-confidence cases.
 
 **Open decisions for the operator (resolve before P1.10.3/P1.10.4 build):**
 - Which web-search/research provider, and cost/rate caps.
-- Confidence threshold for auto-resolve vs escalate, per source.
-- Which sources are "always escalate to a human" regardless (e.g. execution blockers,
-  identity-master repair).
+- Confidence threshold for auto-resolve vs escalate to a higher-rigor LLM pass, per source.
+- Which sources hold as `NO_ACTION` rather than auto-resolve (e.g. execution blockers,
+  identity-master repair) — escalation is to a stronger LLM review, never a human.
+
+---
+
+## P-LLM-AUTH - EPIC: LLM-direct trade decision authority (operator decision 2026-06-23)
+
+**Operator decision.** The owner chose to let the LLM take trade decisions directly (incl.
+BUY/SELL/size) when it has reviewed the evidence and has strong, provenance-backed reasons; the
+deterministic technical/risk/lifecycle/action gates become **advisory guardrails** an LLM
+decision may override with a recorded rationale (not hard blocks). This supersedes the former
+"LLM must never decide trades" rule (CLAUDE.md updated). No human in the loop.
+
+**Engineer's recorded dissent + retained safety (not authority limits — reversibility/audit only,
+removable by the operator):** the cited 2025-26 leakage-controlled benchmarks (StockBench,
+FINSABER, Profit Mirage) found capable LLM trading agents are run-to-run unstable and their
+apparent alpha is largely market beta. So this epic keeps: (a) a typed evidence/provenance +
+reason contract on every LLM decision (incl. which soft gates it overrode and why); (b)
+point-in-time discipline / no lookahead; (c) a **master enable flag that DEFAULTS OFF** for any
+live LLM→broker authority; (d) **paper/shadow graduation** — an LLM-decision policy runs in paper
+mode and must clear after-cost + benchmark-excess + regime-robust evidence over enough matured
+windows before its live flag can be turned on. Build is **phased; do not wire LLM→broker in one
+step.**
+
+**Sub-tasks (phased, each verify-first, operator review per phase):**
+
+### [P-LLM-AUTH.1] Soft-gate override contract
+- Make the deterministic gates emit advisory verdicts an LLM decision can override, and persist
+  the override + rationale + which gate + the gate's own verdict in the reason contract. No
+  behavior change yet (gates still block) — this just produces the override-capable contract +
+  audit. Files: `advisory/action_recommender.py` (reason contract / gate effects),
+  `advisory/risk_engine.py`, `advisory/execution_engine.py` (record, don't yet relax).
+
+### [P-LLM-AUTH.2] LLM decision policy in PAPER mode
+- An LLM decision policy that, from the same evidence the reviewer sees, emits BUY/SELL/size into
+  the **operator paper portfolio only** (reuse `advisory/operator_portfolio.py`), with full
+  provenance. Measure it like any other research signal: after-cost, benchmark-excess (now
+  available), regime split, exit-conflict. No live authority. Master flag defaults OFF.
+
+### [P-LLM-AUTH.3] Graduation gate
+- A deterministic promotion check (mirror `ts_forecast_promotion_check`) that decides whether an
+  LLM-decision policy has earned live eligibility: matured count, after-cost > 0, benchmark-excess
+  > 0, regime-robust, low exit-conflict, breadth. Output is eligibility evidence, not auto-enable.
+
+### [P-LLM-AUTH.4] Live bridge behind the master flag
+- Only when the master flag is ON and the policy passed graduation: let LLM decisions become
+  broker-capable actions through the existing execution safety contract / live-submit preflight
+  (`advisory/execution_engine.py`). Soft gates may be overridden with recorded rationale; the
+  execution-safety mechanics (dry-run, reconciliation, kill-switch) stay. Phase requires explicit
+  operator enablement.
+
+**Open decisions for the operator (before P-LLM-AUTH.3/.4):** the graduation thresholds; whether
+to keep the paper-first requirement or enable live sooner; per-policy enable scope; and whether to
+remove the retained safety items (a/b/c/d) above — currently kept by the engineer as deployment
+hygiene, but yours to drop.
 
 ---
 
@@ -743,28 +803,28 @@ visibility gaps. All remain research-only / no auto-apply.
   be promoted. 4 tests added/updated. research_only; no auto-apply; no live consumer.
 - **Note:** the P2.5 follow-on (gate TS promotion on benchmark-excess) is now closed here.
 
-### [P2.7E] EPIC — TS forecast "production path" (gated, review-only; do NOT bypass gates)
+### [P2.7E] EPIC — TS forecast "production path" (now governed by [P-LLM-AUTH])
 - **Operator intent (2026-06-23):** "make TS-forecast production ready and not just an
   independent/separate thing." Today TS forecasts have rigorous gated promotion but **no live
-  consumer** — they are a research silo by design.
-- **Hard boundary (non-negotiable):** TS forecasts must NEVER get direct broker/trade authority
-  or override exits (CLAUDE.md; FINSABER/StockBench evidence). "Production" here means the same
-  **bounded, review-only runtime bridge** that context overlays and causal memory already earned —
-  not bypassing deterministic gates.
+  consumer**.
+- **Updated stance (2026-06-23):** per the operator's LLM-authority decision, eligibility approval
+  is **LLM-resolved (no human manual review)**, and live authority is governed by the
+  [P-LLM-AUTH] epic's default-OFF master flag + paper graduation — not a separate boundary. TS
+  forecasts are one input the LLM decision policy (P-LLM-AUTH.2) can weigh; their own promotion
+  gates (P2.7, incl. benchmark-excess) decide live-eligibility evidence.
 - **Do (phased, each verify-first):**
   1. Build a `signal_refresh --from-ts-forecast` bridge (mirror `--from-causal-memory`) that emits
-     **review-only WATCH** rows ONLY for model/horizons that PASSED the promotion gates (matured
-     paper evidence, beats momentum AND benchmark-excess, breadth, low exit-conflict) AND have an
-     approved manual promotion decision. Rows carry `authority_scope=review_input_only`,
-     `portfolio_authority=none`, `broker_execution_allowed=false`, `full_advisory_required=true`.
-  2. Those WATCH rows then flow through the SAME technical/risk/lifecycle/action gates as every
-     other review-only source — no special path, no exit override.
-  3. Operator Health: surface "promoted TS model/horizon active as review-only watch input" with
-     provenance (which gates/thresholds it passed, approval id).
-  4. Keep a kill-switch env (default off) so the bridge is opt-in per the operator.
-- **Open decisions for the operator:** promotion thresholds for live-eligibility; whether to enable
-  the bridge at all; per-model approval workflow. **Do not relax the no-direct-authority boundary
-  without an explicit, separate decision.**
+     review-only WATCH rows for model/horizons that PASSED the promotion gates (matured paper
+     evidence, beats momentum AND benchmark-excess, breadth, low exit-conflict). Until the
+     P-LLM-AUTH master flag is on, rows stay `broker_execution_allowed=false`,
+     `full_advisory_required=true`.
+  2. Those rows flow through the same gates as every other source; live authority only via
+     P-LLM-AUTH.4 (master flag on + graduation passed).
+  3. Operator Health: surface "promoted TS model/horizon active as input" with provenance
+     (gates/thresholds passed, evidence).
+  4. Keep the P-LLM-AUTH master flag (default off) governing any live effect.
+- **Open decisions for the operator:** fold into [P-LLM-AUTH] open decisions (graduation
+  thresholds, whether/when to enable live).
 
 ### [P2.8] Assert + audit research-only boundary at trusted-overlay load
 - **Why:** `action_recommender` loads trusted signal-quality overlay rules; there
