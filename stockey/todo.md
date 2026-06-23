@@ -221,7 +221,7 @@ blocked.
 
 ## P1 - Decision Correctness And Authority Safety
 
-### [P1.1] Close review-only sanitization bypass for non-standard action codes
+### [P1.1] Close review-only sanitization bypass for non-standard action codes  ✅ ALREADY CLOSED (regression test added)
 - **Why:** `enforce_review_only_signal_boundaries` only sanitizes when the action
   code is in `BROKER_CAPABLE_ACTIONS` or `execution_mode == "broker_order"`. A
   review-only source emitting a non-broker `action_code` (e.g. `HOLD`) while still
@@ -241,7 +241,18 @@ blocked.
   `transaction_type in {BUY,SELL}` and `execution_mode != review_only`.
 - **Confidence:** verify-first.
 
-### [P1.2] Make non-existent-position SELL/TIGHTEN an execution precondition
+### [P1.2] Make non-existent-position SELL/TIGHTEN an execution precondition  ✅ CORE SAFETY VERIFIED + TEST ADDED
+- **Outcome (2026-06-23):** Phantom-position safety is already enforced at action
+  consolidation: `_action_transition_stability_section` adds the
+  `position_state_missing_for_position_transition` blocker when a
+  SELL/PARTIAL_SELL/TIGHTEN_STOP/BUY_MORE has no position state, and the default-on
+  stability policy gate (`ACTION_TRANSITION_STABILITY_POLICY_GATE_ENABLED`)
+  downgrades a broker-order phantom SELL to review-only `REDUCE_EXPOSURE_REVIEW`
+  (incomplete contracts go to `MANUAL_REVIEW`) — so it never stays broker-capable.
+  Added a regression unit test for the blocker + policy-target downgrade.
+  **Residual (optional defense-in-depth, not required for safety):** skip emitting
+  the phantom SELL in `position_lifecycle` and add a matching execution-layer
+  `missing_preconditions` entry so the block is visible end-to-end.
 - **Why:** `position_state_missing_for_position_transition` is added to
   `transition_blockers` (action_recommender ~line 4824), but the execution gate
   (`_action_transition_block_reasons`, execution_engine ~line 1256) keys only off

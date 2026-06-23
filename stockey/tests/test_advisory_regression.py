@@ -21779,6 +21779,29 @@ def test_action_recommender_reason_contract_downgrades_unstable_exit_to_derisk_r
     assert "review_only_source_cannot_directly_reverse_entry" in gate["transition_blockers"]
 
 
+def test_action_recommender_sell_for_missing_position_is_downgraded_to_derisk_review():
+    # Phantom-position guard: an exit/position transition (SELL) with no current
+    # position state must be flagged unstable and, for a broker-order candidate,
+    # downgraded to review-only de-risk pressure rather than staying broker-capable.
+    row = pd.Series({"action_source": "lifecycle", "action_code": "SELL"})
+    section = action_recommender._action_transition_stability_section(
+        row, {"technical_state": "HOLD"}, "SELL", missing_preconditions=[]
+    )
+    assert "position_state_missing_for_position_transition" in section["transition_blockers"]
+    assert section["stability_status"] == "unstable_requires_deterministic_confirmation"
+    assert section["broker_execution_allowed"] is False
+
+    contract = {
+        "evidence": {
+            "action_transition": {
+                "broker_order_candidate": True,
+                "transition_stability": section,
+            }
+        }
+    }
+    assert action_recommender._transition_stability_policy_target("SELL", contract) == "REDUCE_EXPOSURE_REVIEW"
+
+
 def test_action_recommender_reason_contract_marks_review_only_watch_transition_non_executable():
     asof_date = pd.Timestamp("2026-05-01T00:00:00Z")
     winners = pd.DataFrame(
@@ -23601,6 +23624,37 @@ def test_action_recommender_review_only_signal_source_cannot_emit_broker_buy():
     assert raw_context["broker_execution_allowed"] is False
     assert transition["broker_order_candidate"] is False
     assert transition["broker_execution_allowed"] is False
+
+
+def test_action_recommender_review_only_source_non_broker_action_with_broker_transaction_is_sanitized():
+    # Bypass guard: a review-only source emitting a non-broker action_code (HOLD)
+    # while still carrying transaction_type=BUY must be sanitized, not passed through.
+    df = pd.DataFrame(
+        [
+            {
+                "symbol": "TCS",
+                "action_code": "HOLD",
+                "action_source": "event_policy",
+                "transaction_type": "BUY",
+                "execution_mode": "",
+                "action_reason": "Buggy mapper kept a broker transaction on a non-broker action.",
+                "raw_context_json": json.dumps({"event_class": "ORDER_WIN"}),
+            }
+        ]
+    )
+
+    out = action_recommender.enforce_review_only_signal_boundaries(df)
+    row = out.iloc[0]
+    raw_context = json.loads(row["raw_context_json"])
+
+    assert row["action_code"] == "MANUAL_REVIEW"
+    assert row["transaction_type"] is None
+    assert row["execution_mode"] == "review_only"
+    assert raw_context["review_only_source_sanitized"] is True
+    assert raw_context["blocked_original_action_code"] == "HOLD"
+    assert raw_context["blocked_original_transaction_type"] == "BUY"
+    assert raw_context["broker_execution_allowed"] is False
+    assert raw_context["full_advisory_required"] is True
 
 
 def test_action_recommender_signal_refresh_router_manual_review_maps_to_watch(monkeypatch):
