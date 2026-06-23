@@ -62754,6 +62754,104 @@ def test_signal_quality_promotion_family_candidates_apply_fdr_control(monkeypatc
     assert survivor["sector_concentration"]["policy_effect"] == "attribution_only_no_promotion_block"
 
 
+def _llm_decision_full_packet(**overrides):
+    from advisory import llm_decision_contract
+
+    packet = {dimension: {"present": True, "fresh": True} for dimension in llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS}
+    packet["benchmark_excess"] = {"present": True, "fresh": True, "classification": "candidate_helpful", "excess_positive": True}
+    packet.update(overrides)
+    return packet
+
+
+def test_llm_decision_contract_grounded_directional_meets_data_bar_but_no_live_authority(monkeypatch):
+    from advisory import llm_decision_contract
+
+    monkeypatch.setattr(llm_decision_contract, "LLM_DIRECT_AUTHORITY_ENABLED", False)
+    packet = _llm_decision_full_packet()
+    contract = llm_decision_contract.build_llm_decision_contract(
+        symbol="abc",
+        proposed_action="BUY",
+        packet=packet,
+        cited_dimensions=list(llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS),
+        conviction=0.7,
+    )
+    assert contract["evidence_completeness"]["evidence_complete"] is True
+    assert contract["beta_guard"]["beta_only_support"] is False
+    assert contract["grounding"]["data_grounded"] is True
+    assert contract["meets_data_grounding_for_live"] is True
+    # data bar met, but master flag is OFF and no graduation -> no live authority, no broker
+    assert contract["broker_execution_allowed"] is False
+    assert contract["live_authority_master_flag"] is False
+    assert contract["eligible_for_live_authority"] is False
+
+
+def test_llm_decision_contract_single_signal_is_not_grounded():
+    from advisory import llm_decision_contract
+
+    packet = _llm_decision_full_packet()
+    grounding = llm_decision_contract.validate_decision_grounding(
+        action="BUY",
+        cited_dimensions=["technical_confirmation"],
+        packet=packet,
+    )
+    assert grounding["single_signal"] is True
+    assert grounding["data_grounded"] is False
+    assert any("single_or_thin_signal" in reason for reason in grounding["grounding_failures"])
+    assert any("must_cite_benchmark_excess" in reason for reason in grounding["grounding_failures"])
+
+
+def test_llm_decision_contract_incomplete_evidence_blocks_data_bar():
+    from advisory import llm_decision_contract
+
+    packet = _llm_decision_full_packet(risk={"present": False})
+    contract = llm_decision_contract.build_llm_decision_contract(
+        symbol="ABC",
+        proposed_action="BUY",
+        packet=packet,
+        cited_dimensions=list(llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS),
+    )
+    assert "risk" in contract["evidence_completeness"]["missing_dimensions"]
+    assert contract["evidence_completeness"]["evidence_complete"] is False
+    assert contract["meets_data_grounding_for_live"] is False
+
+
+def test_llm_decision_contract_beta_only_support_blocks_data_bar():
+    from advisory import llm_decision_contract
+
+    packet = _llm_decision_full_packet(
+        benchmark_excess={"present": True, "fresh": True, "classification": "benchmark_beta_not_overlay_alpha", "excess_positive": False}
+    )
+    contract = llm_decision_contract.build_llm_decision_contract(
+        symbol="ABC",
+        proposed_action="BUY",
+        packet=packet,
+        cited_dimensions=list(llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS),
+    )
+    assert contract["beta_guard"]["beta_only_support"] is True
+    assert contract["meets_data_grounding_for_live"] is False
+    assert any("beta_only_support" in reason for reason in contract["grounding"]["grounding_failures"])
+
+
+def test_llm_decision_contract_live_eligible_only_with_master_flag_and_graduation(monkeypatch):
+    from advisory import llm_decision_contract
+
+    monkeypatch.setattr(llm_decision_contract, "LLM_DIRECT_AUTHORITY_ENABLED", True)
+    packet = _llm_decision_full_packet()
+    cited = list(llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS)
+
+    not_graduated = llm_decision_contract.build_llm_decision_contract(
+        symbol="ABC", proposed_action="BUY", packet=packet, cited_dimensions=cited, graduation_passed=False
+    )
+    assert not_graduated["eligible_for_live_authority"] is False  # master flag on but not graduated
+
+    graduated = llm_decision_contract.build_llm_decision_contract(
+        symbol="ABC", proposed_action="BUY", packet=packet, cited_dimensions=cited, graduation_passed=True
+    )
+    assert graduated["eligible_for_live_authority"] is True
+    # even when live-eligible, .1 itself never sets broker_execution_allowed (no live bridge yet)
+    assert graduated["broker_execution_allowed"] is False
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {

@@ -607,12 +607,28 @@ step.**
 
 **Sub-tasks (phased, each verify-first, operator review per phase):**
 
-### [P-LLM-AUTH.1] Soft-gate override contract
-- Make the deterministic gates emit advisory verdicts an LLM decision can override, and persist
-  the override + rationale + which gate + the gate's own verdict in the reason contract. No
-  behavior change yet (gates still block) — this just produces the override-capable contract +
-  audit. Files: `advisory/action_recommender.py` (reason contract / gate effects),
-  `advisory/risk_engine.py`, `advisory/execution_engine.py` (record, don't yet relax).
+### [P-LLM-AUTH.1] Evidence-completeness + data-grounding decision contract  ✅ DONE
+- **Operator design (2026-06-23):** the LLM may decide, but only over the COMPLETE validated
+  evidence packet with data-grounded reasons — never on one news / one announcement / one
+  indicator. A competent analyst given the same complete data should reach the same call.
+- **Done:** added pure, additive `advisory/llm_decision_contract.py` (no DB, no LLM call, no live
+  consumer):
+  - `build_evidence_completeness` — required dimensions (technical_confirmation, risk,
+    market_context, sector_reliability, exact_class_reliability, benchmark_excess,
+    event_provenance) must be present + fresh.
+  - `evaluate_beta_guard` — a directional call resting on benchmark-beta/unattributed excess is
+    flagged `beta_only_support` (reuses the benchmark-excess classifications from P2.1-P2.7).
+  - `validate_decision_grounding` — a directional decision must cite benchmark-excess + >=
+    `LLM_DECISION_MIN_INDEPENDENT_CONFIRMATIONS` (default 3) independent dimensions; single-signal
+    calls fail.
+  - `build_llm_decision_contract` — assembles `meets_data_grounding_for_live` (the DATA bar) plus
+    an authority stamp: `broker_execution_allowed=False` always (no live bridge yet),
+    `live_authority_master_flag=LLM_DIRECT_AUTHORITY_ENABLED` (default OFF),
+    `eligible_for_live_authority = data bar AND master flag AND graduation_passed`.
+  - `.env.example`: `LLM_DIRECT_AUTHORITY_ENABLED=false`, `LLM_DECISION_MIN_INDEPENDENT_CONFIRMATIONS=3`. 5 tests.
+- **Next bricks consume this:** .2 fills the contract from a real evidence packet + LLM; soft-gate
+  override + deterministic sizing-as-bounds land in .4 (the live bridge), where the risk engine
+  sizes within caps and the execution-safety contract still runs.
 
 ### [P-LLM-AUTH.2] LLM decision policy in PAPER mode
 - An LLM decision policy that, from the same evidence the reviewer sees, emits BUY/SELL/size into
