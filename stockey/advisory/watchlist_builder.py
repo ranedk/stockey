@@ -725,6 +725,44 @@ def _runtime_contract_allows(row: dict[str, object] | None, use_name: str, *, le
     return False
 
 
+def _context_watch_candidate_state_audit(
+    *,
+    candidate_state: str,
+    direction: str,
+    score: float,
+    breakout_score_threshold: float,
+    watch_priority_allowed: bool,
+    context_class_blocks_breakout: bool,
+    context_sector_blocks_breakout: bool,
+    breakout_reliability_blocked: bool,
+    overlay_breakout_stale: bool,
+    low_technical_actionability: bool,
+) -> dict[str, object]:
+    """Consolidate the WATCH_BREAKOUT promotion gates into one explainable per-row audit.
+
+    Audit-only: it derives nothing new, it records which gates passed and which blocked breakout
+    urgency so intake debugging does not require reading scattered boolean flags. The row stays
+    review-only watch pressure with no portfolio or broker authority.
+    """
+    breakout_gate_results = {
+        "direction_positive": str(direction or "").strip().lower() == "positive",
+        "watch_priority_allowed": bool(watch_priority_allowed),
+        "exact_context_class_ok": not bool(context_class_blocks_breakout),
+        "sector_reliability_ok": not bool(context_sector_blocks_breakout),
+        "breakout_reliability_split_ok": not bool(breakout_reliability_blocked),
+        "overlay_evidence_fresh": not bool(overlay_breakout_stale),
+        "technical_actionability_ok": not bool(low_technical_actionability),
+        "score_meets_breakout_threshold": float(score) >= float(breakout_score_threshold),
+    }
+    breakout_blocked_by = sorted(name for name, ok in breakout_gate_results.items() if not ok)
+    return {
+        "output_state": str(candidate_state),
+        "promoted_to_breakout_watch": str(candidate_state).strip().upper() == "WATCH_BREAKOUT",
+        "breakout_gate_results": breakout_gate_results,
+        "breakout_blocked_by": breakout_blocked_by,
+    }
+
+
 def _context_reliability_priority_multiplier(family: str, reliability_by_family: dict[str, object]) -> tuple[str | None, float, str]:
     if not WATCHLIST_CONTEXT_OVERLAY_RELIABILITY_PRIORITY_ENABLED:
         return None, 1.0, "disabled"
@@ -2139,6 +2177,18 @@ def load_context_overlay_watch_candidates(
             and score >= float(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_SCORE_THRESHOLD)
         )
         candidate_state = "WATCH_BREAKOUT" if promoted_to_breakout_watch else "WATCH_EVENT"
+        candidate_state_audit = _context_watch_candidate_state_audit(
+            candidate_state=candidate_state,
+            direction=direction,
+            score=score,
+            breakout_score_threshold=float(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_SCORE_THRESHOLD),
+            watch_priority_allowed=watch_priority_allowed,
+            context_class_blocks_breakout=context_class_blocks_breakout,
+            context_sector_blocks_breakout=context_sector_blocks_breakout,
+            breakout_reliability_blocked=breakout_blocked,
+            overlay_breakout_stale=overlay_breakout_stale,
+            low_technical_actionability=low_technical_actionability_breakout_block,
+        )
         policy_effect = (
             "watch_breakout_priority_no_buy_authority"
             if promoted_to_breakout_watch
@@ -2261,6 +2311,7 @@ def load_context_overlay_watch_candidates(
                             "policy_effect": policy_effect,
                             "candidate_state": candidate_state,
                             "breakout_watch_threshold": float(WATCHLIST_CONTEXT_OVERLAY_BREAKOUT_SCORE_THRESHOLD),
+                            "candidate_state_audit": candidate_state_audit,
                             "reliability_classification": reliability_label or None,
                             "runtime_policy_contract": _runtime_policy_contract_for_reliability(
                                 reliability_row if isinstance(reliability_row, dict) else None

@@ -451,7 +451,19 @@ blocked.
   becomes `WATCH_EVENT` tagged `unavailable`, not `WATCH_BREAKOUT`.
 - **Confidence:** verify-first.
 
-### [P1.9] Candidate-state transition audit in watchlist builder
+### [P1.9] Candidate-state transition audit in watchlist builder  ✅ DONE
+- **Outcome (2026-06-23):** P1.5/P1.6/P1.8 had already scattered the individual breakout-gate
+  flags into `watch_reasons`; P1.9 consolidates them. Added `_context_watch_candidate_state_audit`
+  in `advisory/watchlist_builder.py`, recorded per positive context-watch row as
+  `watch_reasons.candidate_state_audit`: `output_state`, `promoted_to_breakout_watch`,
+  `breakout_gate_results` (direction/watch_priority/exact_class/sector/reliability_split/
+  overlay_fresh/technical_actionability/score_threshold), and `breakout_blocked_by` — so why a
+  row is WATCH_EVENT vs WATCH_BREAKOUT is one explainable field instead of scattered booleans.
+  Audit-only; derives nothing new; no authority change. 1 unit test + assertions wired into the
+  stale/low-technical/breakout integration tests.
+- **Note:** REJECT-row rejection reasons remain explicit via `context_policy_effect` +
+  `watch_reason_detail` (identity/OHLCV/class/stale/negative suppression), so the audit focused
+  on the positive WATCH_EVENT-vs-WATCH_BREAKOUT decision that previously required inference.
 - **Why:** Why a context row became `WATCH_BREAKOUT` vs `WATCH_EVENT` vs `REJECT`
   is spread across many gates with no per-row record, making intake debugging
   hard.

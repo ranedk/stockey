@@ -66418,6 +66418,42 @@ def test_watchlist_builder_uses_reliability_only_for_context_watch_priority(monk
     assert fresh_reason["context_overlay_days_old"] == 0
     assert fresh_reason["context_overlay_breakout_stale"] is False
     assert fresh_reason["context_reliability_status"] == "evaluated"
+    assert fresh_reason["candidate_state_audit"]["promoted_to_breakout_watch"] is True
+    assert fresh_reason["candidate_state_audit"]["breakout_blocked_by"] == []
+
+
+def test_context_watch_candidate_state_audit_lists_breakout_blockers():
+    blocked = watchlist_builder._context_watch_candidate_state_audit(
+        candidate_state="WATCH_EVENT",
+        direction="positive",
+        score=0.9,
+        breakout_score_threshold=0.75,
+        watch_priority_allowed=True,
+        context_class_blocks_breakout=False,
+        context_sector_blocks_breakout=False,
+        breakout_reliability_blocked=False,
+        overlay_breakout_stale=True,
+        low_technical_actionability=False,
+    )
+    assert blocked["output_state"] == "WATCH_EVENT"
+    assert blocked["promoted_to_breakout_watch"] is False
+    assert blocked["breakout_blocked_by"] == ["overlay_evidence_fresh"]
+    assert blocked["breakout_gate_results"]["overlay_evidence_fresh"] is False
+
+    promoted = watchlist_builder._context_watch_candidate_state_audit(
+        candidate_state="WATCH_BREAKOUT",
+        direction="positive",
+        score=0.9,
+        breakout_score_threshold=0.75,
+        watch_priority_allowed=True,
+        context_class_blocks_breakout=False,
+        context_sector_blocks_breakout=False,
+        breakout_reliability_blocked=False,
+        overlay_breakout_stale=False,
+        low_technical_actionability=False,
+    )
+    assert promoted["promoted_to_breakout_watch"] is True
+    assert promoted["breakout_blocked_by"] == []
 
 
 def test_watchlist_builder_flags_unavailable_context_reliability_without_breakout(monkeypatch):
@@ -66516,6 +66552,7 @@ def test_watchlist_builder_demotes_stale_context_overlay_breakout_to_watch_event
     assert reason["context_overlay_breakout_stale"] is True
     assert reason["context_overlay_breakout_max_age_days"] == 7
     assert reason["candidate_state"] == "WATCH_EVENT"
+    assert reason["candidate_state_audit"]["breakout_blocked_by"] == ["overlay_evidence_fresh"]
     assert "fresh-breakout window" in row["watch_reason_detail"]
 
 
@@ -66574,6 +66611,7 @@ def test_watchlist_builder_demotes_low_technical_actionability_breakout_to_watch
     assert reason["watch_breakout_low_technical_actionability_blocked"] is True
     assert reason["watch_breakout_min_technical_actionability"] == 0.40
     assert reason["context_overlay_breakout_stale"] is False
+    assert reason["candidate_state_audit"]["breakout_blocked_by"] == ["technical_actionability_ok"]
     assert "breakout minimum" in row["watch_reason_detail"]
 
 
