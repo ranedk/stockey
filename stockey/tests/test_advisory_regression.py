@@ -39441,12 +39441,16 @@ def test_ts_forecast_evaluator_ensure_tables_uses_schema_registry(monkeypatch):
 
     ts_forecast_evaluator.ensure_tables()
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0]["migration_id"] == ts_forecast_evaluator.TS_FORECAST_EVAL_SCHEMA_MIGRATION_ID
+    assert calls[1]["migration_id"] == ts_forecast_evaluator.TS_FORECAST_EVAL_BENCHMARK_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"]["tables"] == [ts_forecast_evaluator.EVALUATIONS_TABLE, ts_forecast_evaluator.SUMMARY_TABLE]
     assert any(ts_forecast_evaluator.EVALUATIONS_TABLE in statement for statement in calls[0]["statements"])
     assert any(ts_forecast_evaluator.SUMMARY_TABLE in statement for statement in calls[0]["statements"])
     assert any("direction_hit BOOLEAN" in statement for statement in calls[0]["statements"])
+    benchmark_ddl = "\n".join(calls[1]["statements"])
+    assert "excess_cost_adjusted_return DOUBLE PRECISION" in benchmark_ddl
+    assert "avg_excess_cost_adjusted_return DOUBLE PRECISION" in benchmark_ddl
 
 
 def test_ts_forecast_evaluator_records_forecast_load_failure(monkeypatch):
@@ -39546,6 +39550,55 @@ def test_ts_forecast_evaluator_scores_matured_rows_after_costs():
     assert len(summary) == 1
     assert int(summary.iloc[0]["row_count"]) == 1
     assert round(float(summary.iloc[0]["hit_rate"]), 4) == 1.0
+
+
+def test_ts_forecast_evaluator_attaches_benchmark_excess():
+    forecasts = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "naive_momentum_v1",
+                "forecast_horizon_days": 5,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "forecast_return": 0.05,
+            }
+        ]
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["ABC"] * 12,
+            "date": pd.date_range("2026-01-01", periods=12, freq="D", tz="UTC"),
+            "close": [100, 101, 102, 103, 104, 110, 111, 112, 113, 114, 115, 116],
+        }
+    )
+    benchmark_prices = pd.DataFrame(
+        {
+            "date": pd.date_range("2026-01-01", periods=12, freq="D", tz="UTC"),
+            "benchmark_close": [200, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210],
+        }
+    )
+
+    evaluations = ts_forecast_evaluator.build_forecast_evaluations(
+        forecasts=forecasts,
+        prices=prices,
+        cost_bps=25,
+        benchmark_prices=benchmark_prices,
+    )
+    evaluated = evaluations[evaluations["evaluation_status"].eq("evaluated")]
+    assert len(evaluated) == 1
+    row = evaluated.iloc[0]
+    benchmark_return = float(row["benchmark_forward_return"])
+    cost_adjusted = float(row["cost_adjusted_return"])
+    # benchmark return is attributed and excess is asset-after-cost minus the market move
+    assert benchmark_return > 0.0
+    assert round(float(row["excess_cost_adjusted_return"]), 10) == round(cost_adjusted - benchmark_return, 10)
+    # a forecast that merely matched the market would have ~zero excess; this one beat it
+    assert float(row["excess_cost_adjusted_return"]) < cost_adjusted
+
+    summary = ts_forecast_evaluator.build_evaluation_summary(evaluations, cost_bps=25)
+    assert summary.iloc[0]["avg_benchmark_forward_return"] is not None
+    assert summary.iloc[0]["avg_excess_cost_adjusted_return"] is not None
 
 
 def test_ts_forecast_evaluator_persist_casts_boolean_columns(monkeypatch):

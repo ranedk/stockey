@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.return_attribution import attach_benchmark_forward_returns, load_benchmark_history_for_attribution
 from advisory.ts_forecast_features import TABLE_NAME as FORECAST_TABLE
 from utils.db import sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
@@ -17,6 +18,7 @@ from utils.sync import parse_datetime_arg
 EVALUATIONS_TABLE = "advisory_ts_forecast_evaluations"
 SUMMARY_TABLE = "advisory_ts_forecast_eval_summary"
 TS_FORECAST_EVAL_SCHEMA_MIGRATION_ID = "20260611_advisory_ts_forecast_evaluator_base"
+TS_FORECAST_EVAL_BENCHMARK_SCHEMA_MIGRATION_ID = "20260623_advisory_ts_forecast_evaluator_benchmark_attribution"
 DEFAULT_COST_BPS = 25.0
 POINT_IN_TIME_RETURN_CONTRACT = {
     "entry_rule": "Use first available close strictly after forecast asof_date.",
@@ -96,6 +98,17 @@ TS_FORECAST_EVAL_SCHEMA_STATEMENTS = [
     """,
 ]
 
+# Benchmark-excess columns are added by a follow-on ALTER migration (not by editing the applied
+# CREATE TABLE statements) so the base migration checksum stays stable. direction_hit stays a
+# direction-accuracy metric (vs a coin flip), so it is intentionally not benchmark-attributed.
+TS_FORECAST_EVAL_BENCHMARK_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS benchmark_name TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS benchmark_forward_return DOUBLE PRECISION",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS excess_cost_adjusted_return DOUBLE PRECISION",
+    f"ALTER TABLE {SUMMARY_TABLE} ADD COLUMN IF NOT EXISTS avg_benchmark_forward_return DOUBLE PRECISION",
+    f"ALTER TABLE {SUMMARY_TABLE} ADD COLUMN IF NOT EXISTS avg_excess_cost_adjusted_return DOUBLE PRECISION",
+]
+
 EVALUATION_PERSIST_COLUMNS = [
     "asof_date",
     "symbol",
@@ -116,6 +129,9 @@ EVALUATION_PERSIST_COLUMNS = [
     "exit_price",
     "evaluation_status",
     "evaluation_detail",
+    "benchmark_name",
+    "benchmark_forward_return",
+    "excess_cost_adjusted_return",
     "load_ts",
 ]
 
@@ -161,6 +177,52 @@ def ensure_tables() -> None:
         statements=TS_FORECAST_EVAL_SCHEMA_STATEMENTS,
         metadata={"module": "advisory.ts_forecast_evaluator", "tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
     )
+    apply_schema_migration(
+        migration_id=TS_FORECAST_EVAL_BENCHMARK_SCHEMA_MIGRATION_ID,
+        description="Add benchmark-excess attribution columns to TS forecast evaluator outputs.",
+        statements=TS_FORECAST_EVAL_BENCHMARK_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.ts_forecast_evaluator", "tables": [EVALUATIONS_TABLE, SUMMARY_TABLE]},
+    )
+
+
+def _attach_benchmark_excess(
+    evaluations: pd.DataFrame,
+    *,
+    benchmark_prices: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Attach NIFTY benchmark-excess attribution to forecast evaluations (asset-vs-market, after cost).
+
+    excess_cost_adjusted_return = cost_adjusted_return - benchmark_forward_return over the same
+    forecast window. This keeps a forecast that merely rode the market from looking like alpha.
+    Attribution-only and research-only; it does not change forecasts, paper portfolio, or any
+    broker behavior. direction_hit stays unattributed (direction accuracy is vs a coin flip).
+    """
+    out = evaluations.copy()
+    out["benchmark_name"] = None
+    out["benchmark_forward_return"] = pd.NA
+    out["excess_cost_adjusted_return"] = pd.NA
+    if benchmark_prices is None or benchmark_prices.empty or out.empty:
+        return out
+    horizons = sorted({int(value) for value in pd.to_numeric(out["forecast_horizon_days"], errors="coerce").dropna().unique()})
+    if not horizons:
+        return out
+    attached = attach_benchmark_forward_returns(out, benchmark_prices, horizons=horizons)
+    benchmark_name = attached["benchmark_name"].iloc[0] if "benchmark_name" in attached.columns and len(attached) else None
+    benchmark_returns: list[float | None] = []
+    excess_returns: list[float | None] = []
+    for _, row in attached.iterrows():
+        horizon = pd.to_numeric(row.get("forecast_horizon_days"), errors="coerce")
+        benchmark_return = pd.to_numeric(row.get(f"benchmark_forward_return_h{int(horizon)}"), errors="coerce") if pd.notna(horizon) else None
+        cost_adjusted = pd.to_numeric(row.get("cost_adjusted_return"), errors="coerce")
+        benchmark_returns.append(None if benchmark_return is None or pd.isna(benchmark_return) else float(benchmark_return))
+        if benchmark_return is None or pd.isna(benchmark_return) or pd.isna(cost_adjusted):
+            excess_returns.append(None)
+        else:
+            excess_returns.append(float(cost_adjusted) - float(benchmark_return))
+    out["benchmark_name"] = benchmark_name
+    out["benchmark_forward_return"] = benchmark_returns
+    out["excess_cost_adjusted_return"] = excess_returns
+    return out
 
 
 def load_forecasts(
@@ -292,6 +354,7 @@ def build_forecast_evaluations(
     symbols: list[str] | None = None,
     model_names: list[str] | None = None,
     cost_bps: float = DEFAULT_COST_BPS,
+    benchmark_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     forecasts_df = forecasts if forecasts is not None else load_forecasts(
         from_date=from_date,
@@ -372,7 +435,22 @@ def build_forecast_evaluations(
                 "load_ts": now,
             }
         )
-    return pd.DataFrame(rows)
+    evaluations = pd.DataFrame(rows)
+    if evaluations.empty:
+        return evaluations
+    if benchmark_prices is None:
+        try:
+            benchmark_prices = load_benchmark_history_for_attribution(from_date=min_date, to_date=max_date)
+        except Exception as exc:
+            _record_ts_forecast_evaluator_fallback(
+                fallback_type="ts_forecast_evaluator_benchmark_history_load_failed",
+                source="benchmark_history",
+                reason="TS forecast evaluator could not load benchmark history; excess attribution is unavailable for this run.",
+                error=exc,
+                metadata={"from_date": str(min_date), "to_date": str(max_date)},
+            )
+            benchmark_prices = pd.DataFrame()
+    return _attach_benchmark_excess(evaluations, benchmark_prices=benchmark_prices)
 
 
 def build_evaluation_summary(
@@ -393,6 +471,8 @@ def build_evaluation_summary(
         model_name, horizon_days, action_hint = keys
         realized = pd.to_numeric(group["realized_return"], errors="coerce")
         adjusted = pd.to_numeric(group["cost_adjusted_return"], errors="coerce")
+        benchmark = pd.to_numeric(group.get("benchmark_forward_return", pd.Series(dtype=float)), errors="coerce")
+        excess = pd.to_numeric(group.get("excess_cost_adjusted_return", pd.Series(dtype=float)), errors="coerce")
         squared = pd.to_numeric(group["squared_error"], errors="coerce")
         hit = group["direction_hit"].astype("boolean")
         positive = group["positive_realized"].astype("boolean")
@@ -410,6 +490,8 @@ def build_evaluation_summary(
                 "avg_realized_return": float(realized.mean()) if len(realized.dropna()) else None,
                 "avg_cost_adjusted_return": float(adjusted.mean()) if len(adjusted.dropna()) else None,
                 "median_cost_adjusted_return": float(adjusted.median()) if len(adjusted.dropna()) else None,
+                "avg_benchmark_forward_return": float(benchmark.mean()) if len(benchmark.dropna()) else None,
+                "avg_excess_cost_adjusted_return": float(excess.mean()) if len(excess.dropna()) else None,
                 "avg_absolute_error": float(pd.to_numeric(group["absolute_error"], errors="coerce").mean()),
                 "rmse": float(np.sqrt(squared.mean())) if len(squared.dropna()) else None,
                 "sharpe_like": _annualized_sharpe(adjusted, int(horizon_days)),
@@ -439,13 +521,15 @@ def _prepare_evaluations_for_persist(evaluations: pd.DataFrame) -> pd.DataFrame:
         "squared_error",
         "entry_price",
         "exit_price",
+        "benchmark_forward_return",
+        "excess_cost_adjusted_return",
     ]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     for col in ["direction_hit", "positive_realized"]:
         if col in out.columns:
             out[col] = out[col].astype("boolean")
-    for col in ["symbol", "model_name", "action_hint", "evaluation_status", "evaluation_detail"]:
+    for col in ["symbol", "model_name", "action_hint", "evaluation_status", "evaluation_detail", "benchmark_name"]:
         if col in out.columns:
             out[col] = out[col].astype("string")
     out = out[[col for col in EVALUATION_PERSIST_COLUMNS if col in out.columns]].copy()
@@ -468,6 +552,8 @@ def _prepare_summary_for_persist(summary: pd.DataFrame) -> pd.DataFrame:
         "avg_realized_return",
         "avg_cost_adjusted_return",
         "median_cost_adjusted_return",
+        "avg_benchmark_forward_return",
+        "avg_excess_cost_adjusted_return",
         "avg_absolute_error",
         "rmse",
         "sharpe_like",

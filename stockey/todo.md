@@ -676,7 +676,19 @@ visibility gaps. All remain research-only / no auto-apply.
   assert rejected rows cannot become promote recommendations.
 - **Confidence:** verified (absent).
 
-### [P2.5] Benchmark attribution (or explicit non-applicability) for TS forecast eval
+### [P2.5] Benchmark attribution (or explicit non-applicability) for TS forecast eval  ✅ DONE (net-new)
+- **Outcome (2026-06-23):** Genuinely missing — the TS path compared only against a momentum
+  baseline (`ts_forecast_paper_portfolio` `lift_vs_momentum`), never against the market index, so
+  beta could pass as forecast value. Brought the evaluator in line with every other evaluator:
+  follow-on ALTER migration (`20260623_*_benchmark_attribution`) adds `benchmark_forward_return` +
+  `excess_cost_adjusted_return` (rows) and `avg_benchmark_forward_return` + `avg_excess_cost_adjusted_return`
+  (summary); `build_forecast_evaluations` loads NIFTY via `return_attribution.load_benchmark_history_for_attribution`
+  + `attach_benchmark_forward_returns` and computes `excess = cost_adjusted_return - benchmark_forward_return`
+  (asset-vs-market, after cost). `direction_hit` left unattributed by design (direction accuracy is
+  vs a coin flip). attribution-only/research-only; fails open with telemetry if benchmark history is
+  unavailable. 1 test added + schema-registry test updated.
+- **Note (future):** the paper-portfolio/promotion gate still uses momentum lift only; gating TS
+  promotion on benchmark-excess (now that the evaluator carries it) is a natural follow-on.
 - **Why:** `ts_forecast_evaluator` has no benchmark schema; forecast quality is not
   comparable to passive exposure.
 - **Files:** `advisory/ts_forecast_evaluator.py` (schema ~48-73, eval build).
