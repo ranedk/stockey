@@ -109,7 +109,7 @@ Cycle: {cycle}/{max_cycles}
 Repository: {REPO_ROOT}
 
 Read:
-- analysis.md
+- todo.md
 - docs/analysis_agent_board.md
 - relevant code/tests/docs for the next open slice
 
@@ -120,14 +120,14 @@ Required working mode:
 - If subagent tools are unavailable, do an explicit internal reviewer pass before finalizing.
 
 Task:
-1. Pick the next highest-priority bounded open slice from analysis.md and docs/analysis_agent_board.md.
+1. Pick the next highest-priority bounded open slice from todo.md and docs/analysis_agent_board.md.
 2. Implement only that slice.
 3. Run focused validation. Prefer:
    - python -m py_compile for changed Python modules
    - pytest -q tests/test_advisory_regression.py -k '<focused expression>'
    - npm --prefix apps/operator-web run typecheck if frontend changed
 4. Run a reviewer pass against the full local diff for regressions, stale docs, unsafe side effects, generated artifacts, lockfile drift, and missing tests.
-5. Update analysis.md and docs/analysis_agent_board.md.
+5. Update todo.md and docs/analysis_agent_board.md.
 6. Keep broker execution disabled unless explicitly requested by the human operator.
 7. Do not perform destructive DB/data operations.
 8. {safety_text} if the selected slice requires live broker execution, destructive DB cleanup, unclear production safety, credentials, or broad refactoring.
@@ -179,7 +179,7 @@ def has_safety_marker(text: str) -> str | None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run bounded Codex development cycles from analysis.md.")
+    parser = argparse.ArgumentParser(description="Run bounded Codex development cycles from todo.md.")
     parser.add_argument("--max-cycles", type=int, default=int(os.environ.get("ANALYSIS_AGENT_MAX_CYCLES", "1")))
     parser.add_argument("--hard-max-cycles", type=int, default=int(os.environ.get("ANALYSIS_AGENT_HARD_MAX_CYCLES", str(DEFAULT_HARD_MAX_CYCLES))))
     parser.add_argument("--max-files-per-cycle", type=int, default=int(os.environ.get("ANALYSIS_AGENT_MAX_FILES_PER_CYCLE", "20")))

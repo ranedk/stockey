@@ -55,14 +55,13 @@ Use these when a day was missed, data looks stale, or you explicitly want a broa
 | `./all_advisory_preflight.sh` | Dhan/CDP/token and compact smoke preflight before spending hours on `all_advisory.sh` |
 | `./all_ml.sh --run-signal-quality-window-runner --include-signal-quality-split-reports` | Long-running research/model-training flow; run manually when validating model quality, signal-quality overlays, source-family evidence, and split diagnostics, or rerun weekly in a dedicated research cron window |
 | `./all_advisory_codex.sh` | Debug/repair wrapper for advisory failures; use manually, not as normal cron |
-| `./all_analysis_codex.sh` | Manual bounded Codex development loop that picks the next `analysis.md` slice, implements it, validates it, and updates the board |
+| `./all_analysis_codex.sh` | Manual bounded Codex development loop that picks the next `todo.md` slice, implements it, validates it, and updates the board |
 
 Important docs:
 
 - `docs/operators_manual.md`: daily runbook and cron behavior.
 - `docs/scripts.md`: script and table inventory.
 - `docs/operator_app_prd.md`: operator frontend/API contract.
-- `analysis.md`: detailed engineering audit and implementation-gap tracker.
 - `todo.md`: current roadmap, including the long-term performance architecture backlog.
 
 Current architecture keeps LLM use bounded to extraction, review notes, hypothesis/playbook assistance, and manual-review context. Production action decisions are consolidated through deterministic policy, technical, risk, lifecycle, and reason-contract layers before any execution planning.

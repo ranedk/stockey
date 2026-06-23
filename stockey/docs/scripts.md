@@ -372,7 +372,7 @@ python -m data.dhanlive.auth_cli clear-cache
 | `complete_data.sh` | Combined ingestion, compact evidence, and context overlay refresh | Full download + parse catch-up/backfill plus `advisory.event_evidence_store` and `advisory.context_overlay_refresh`; useful end-of-day, after a missed day, or before a major rerun |
 | `all_ml.sh` | Event-model training orchestrator | Long-running research training plus signal-quality/source-family/adversarial-review evidence refresh; weekly cron passes `--run-signal-quality-window-runner --include-signal-quality-split-reports`, which preflights first and only persists multi-window review rows/split diagnostics when readiness passes |
 | `all_advisory_codex.sh` | Codex-supervised advisory orchestrator | Manual debug/repair wrapper that runs `all_advisory.sh`, captures logs, sends failure lines to Codex CLI, and reruns |
-| `all_analysis_codex.sh` | Codex analysis-development loop | Manual bounded loop that uses `analysis.md` and `docs/analysis_agent_board.md` to pick the next slice, implement it, validate it, and update docs |
+| `all_analysis_codex.sh` | Codex todo-development loop | Manual bounded loop that uses `todo.md` and `docs/analysis_agent_board.md` to pick the next slice, implement it, validate it, and update docs |
 
 Top-level operator scripts emit `[stockey.script]` start/end markers to stdout while preserving the wrapped command's exit code. Most call `scripts/run_with_markers.sh`; `all_frontend.sh` emits markers internally so it can supervise and clean up API/Nuxt child processes. The health parser uses these markers to classify the latest run as `ok`, `failed`, `interrupted_by_operator`, `restart_requested`, `ok_after_historical_errors`, or `recovered_after_manual_interrupt`.
 

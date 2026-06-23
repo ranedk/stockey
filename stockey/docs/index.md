@@ -374,8 +374,6 @@ The runner uses the invoking interpreter for downstream Python commands, so star
 
 Use [`todo.md`](../todo.md) as the maintained roadmap for current priorities, bottlenecks, and next implementation steps.
 
-Use [`analysis.md`](../analysis.md) as the detailed audit for implemented, partial, and open engineering gaps.
-
 Use [`docs/implementation.md`](implementation.md) as the current architecture summary for the live advisory stack.
 
 For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](advisory_manual.md). That is the practical runbook for:

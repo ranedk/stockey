@@ -536,7 +536,7 @@ Analysis-development loop:
 ANALYSIS_AGENT_MAX_CYCLES=1 ./all_analysis_codex.sh
 ```
 
-Use this when you want Codex CLI to continue development from `analysis.md`. The loop reads `analysis.md` and `docs/analysis_agent_board.md`, picks the next bounded slice, edits code/docs/tests, runs focused validation, and updates the board. It is manual-only and should not run from cron.
+Use this when you want Codex CLI to continue development from `todo.md`. The loop reads `todo.md` and `docs/analysis_agent_board.md`, picks the next bounded slice, edits code/docs/tests, runs focused validation, and updates the board. It is manual-only and should not run from cron.
 
 Operational guardrails:
 
@@ -550,7 +550,7 @@ Operational guardrails:
 - Prompts require Planner, Builder, Reviewer, and Integrator phases. If Codex CLI has subagent tools in that environment, it may use them for bounded planner/reviewer sidecars, but the wrapper still treats local post-checks as the source of truth.
 - Logs, prompts, stdout, and last Codex messages are written to `logs/analysis_agents/`.
 - It fails closed on Codex errors and is prompted to stop instead of editing broker execution, destructive DB/data cleanup, credential-dependent work, or unclear production-safety changes.
-- After each cycle, review `docs/analysis_agent_board.md`, `analysis.md`, `git diff`, and the validation lines before running another cycle.
+- After each cycle, review `docs/analysis_agent_board.md`, `todo.md`, `git diff`, and the validation lines before running another cycle.
 - Manual Review follow-up: open `/manual-review` and `/wait-signals` in the operator UI after cycles that touch Manual Review, wait signals, action policy, or health. Confirm new items are understandable and not duplicated before accepting the slice.
 
 ## Advisory, Watcher, Wait Signal, And Manual Review Boundaries

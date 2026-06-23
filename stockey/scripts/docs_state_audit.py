@@ -14,7 +14,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_DOC_PATHS = (
     "README.md",
-    "analysis.md",
     "todo.md",
     "docs",
     "apps/operator-web/README.md",
@@ -63,11 +62,6 @@ REQUIRED_COVERAGE = {
         ("current roadmap date", re.compile(r"Updated:\s*`2026-06-\d{2}`")),
         ("UI-first operations priority", re.compile(r"Highest Priority:\s*UI-First Operations", re.IGNORECASE)),
         ("Nuxt replaces static dashboard", re.compile(r"Nuxt operator frontend replaces the old static HTML dashboard path", re.IGNORECASE)),
-    ],
-    "analysis.md": [
-        ("analysis date", re.compile(r"Date:\s*2026-06-\d{2}")),
-        ("recommended next development order", re.compile(r"Recommended Next Development Order", re.IGNORECASE)),
-        ("confidence statement", re.compile(r"Immediate Confidence Statement", re.IGNORECASE)),
     ],
     "docs/operators_manual.md": [
         ("operator decision effects", re.compile(r"operator decision effects", re.IGNORECASE)),

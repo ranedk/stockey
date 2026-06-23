@@ -2,14 +2,14 @@
 
 Date: 2026-06-07
 
-Purpose: short-lived coordination board for the `analysis.md` development loop. This is not a backlog replacement. `analysis.md` remains the source of truth; this board tracks the current multi-agent cycle and handoffs.
+Purpose: short-lived coordination board for the `todo.md` development loop. This is not a backlog replacement. `todo.md` remains the source of truth; this board tracks the current multi-agent cycle and handoffs.
 
 ## Relay Model
 
-- Coordinator agent reads `analysis.md` and proposes the dependency-ordered queue.
+- Coordinator agent reads `todo.md` and proposes the dependency-ordered queue.
 - Builder agent gets one bounded slice at a time.
 - Reviewer agent audits the builder slice.
-- Main integrator applies/fixes changes in the real workspace, runs validation, updates `analysis.md`, and starts the next cycle.
+- Main integrator applies/fixes changes in the real workspace, runs validation, updates `todo.md`, and starts the next cycle.
 
 Agents do not rely on direct peer-to-peer chat. The main integrator relays relevant outputs between them.
 
@@ -27,7 +27,7 @@ Run multiple cycles only when you are watching:
 ANALYSIS_AGENT_MAX_CYCLES=3 ./all_analysis_codex.sh
 ```
 
-Logs and prompts are written to `logs/analysis_agents/`. After every cycle, review this board, `analysis.md`, `git diff`, and the validation output before accepting the changes.
+Logs and prompts are written to `logs/analysis_agents/`. After every cycle, review this board, `todo.md`, `git diff`, and the validation output before accepting the changes.
 
 Supervisor guardrails:
 
@@ -156,7 +156,7 @@ Acceptance criteria:
 - Builder: implemented typed wait-signal contracts and matcher routing.
 - Reviewer: found symbol-scoped market-wide matching, generic default-keyword matching, global match lookup, source-table drift, and price-summary readability issues.
 - Integrator: fixed reviewer findings in the main workspace.
-- Integrator: validated typed conditions and conservative signal-refresh escalation in the main workspace and updated `analysis.md`.
+- Integrator: validated typed conditions and conservative signal-refresh escalation in the main workspace and updated `todo.md`.
 - Integrator: added API-level coverage for every Manual Review dropdown decision.
 - Builder/Integrator: matched manual-review wait signals now carry explicit original-review provenance in evidence, Wait Signals API/UI rows, and Manual Review follow-up items.
 - Integrator: suppressed recovered/superseded event-processing and announcement-document failures from active Manual Review/Health without mutating data.
@@ -461,21 +461,21 @@ Acceptance criteria:
 - `pytest -q tests/test_advisory_regression.py -k 'operator_api_splits_dashboard_payload'` passed with 1 test.
 - `npm --prefix apps/operator-web run typecheck` passed.
 - `python -m py_compile advisory/signal_refresh.py advisory/api/app.py tests/test_advisory_regression.py`
-- `rg -n "Watcher trigger boundaries|intraday evidence/signal-refresh layer|document which events trigger only signal refresh" docs/operators_manual.md docs/scripts.md analysis.md docs/analysis_agent_board.md` passed.
-- `git diff --check -- docs/operators_manual.md docs/scripts.md analysis.md docs/analysis_agent_board.md` passed.
-- `rg -n "[ \t]+$" docs/operators_manual.md docs/scripts.md analysis.md docs/analysis_agent_board.md` found no trailing whitespace.
+- `rg -n "Watcher trigger boundaries|intraday evidence/signal-refresh layer|document which events trigger only signal refresh" docs/operators_manual.md docs/scripts.md todo.md docs/analysis_agent_board.md` passed.
+- `git diff --check -- docs/operators_manual.md docs/scripts.md todo.md docs/analysis_agent_board.md` passed.
+- `rg -n "[ \t]+$" docs/operators_manual.md docs/scripts.md todo.md docs/analysis_agent_board.md` found no trailing whitespace.
 - `pytest -q tests/test_advisory_regression.py -k 'signal_refresh or event_router_execute_uses_signal_refresh or compact_signal_refresh'` passed with 8 tests.
-- `git diff --check -- docs/operators_manual.md analysis.md docs/analysis_agent_board.md` passed.
-- `rg -n "Advisory, Watcher, Wait Signal, And Manual Review Boundaries|Document advisory/watch/signal/manual-review boundaries|document exact difference" docs/operators_manual.md analysis.md docs/analysis_agent_board.md` passed.
-- `rg -n "[ \t]+$" docs/operators_manual.md analysis.md docs/analysis_agent_board.md` found no trailing whitespace.
+- `git diff --check -- docs/operators_manual.md todo.md docs/analysis_agent_board.md` passed.
+- `rg -n "Advisory, Watcher, Wait Signal, And Manual Review Boundaries|Document advisory/watch/signal/manual-review boundaries|document exact difference" docs/operators_manual.md todo.md docs/analysis_agent_board.md` passed.
+- `rg -n "[ \t]+$" docs/operators_manual.md todo.md docs/analysis_agent_board.md` found no trailing whitespace.
 - `npm --prefix apps/operator-web run typecheck` passed.
-- `git diff --check -- docs/operators_manual.md analysis.md docs/analysis_agent_board.md` passed.
-- `rg -n "Manual Review decision effects|Document Manual Review operator decision effects|operator decision effects|reopened_wait_signal_matched" docs/operators_manual.md analysis.md docs/analysis_agent_board.md` passed.
-- `rg -n "[ \t]+$" docs/operators_manual.md analysis.md docs/analysis_agent_board.md` found no trailing whitespace.
+- `git diff --check -- docs/operators_manual.md todo.md docs/analysis_agent_board.md` passed.
+- `rg -n "Manual Review decision effects|Document Manual Review operator decision effects|operator decision effects|reopened_wait_signal_matched" docs/operators_manual.md todo.md docs/analysis_agent_board.md` passed.
+- `rg -n "[ \t]+$" docs/operators_manual.md todo.md docs/analysis_agent_board.md` found no trailing whitespace.
 - `python -m py_compile advisory/operator_health.py tests/test_advisory_regression.py` passed.
 - `pytest -q tests/test_advisory_regression.py -k 'operator_health_degradation_feed_groups_active_recovered_superseded or superseded_failure_cleanup'` passed with 3 tests.
 - `npm --prefix apps/operator-web run typecheck` passed.
-- `git diff --check -- advisory/operator_health.py apps/operator-web/pages/health.vue tests/test_advisory_regression.py docs/operators_manual.md docs/scripts.md analysis.md docs/analysis_agent_board.md` passed.
+- `git diff --check -- advisory/operator_health.py apps/operator-web/pages/health.vue tests/test_advisory_regression.py docs/operators_manual.md docs/scripts.md todo.md docs/analysis_agent_board.md` passed.
 - `bash -n all_superseded_cleanup_audit.sh` passed.
 - `python -m py_compile advisory/api/app.py tests/test_advisory_regression.py` passed.
 - `pytest -q tests/test_advisory_regression.py -k 'operator_api_lists_operator_commands or superseded_failure_cleanup'` passed with 3 tests.
@@ -488,7 +488,7 @@ Acceptance criteria:
 - `python -m py_compile advisory/continuous_watch.py tests/test_advisory_regression.py` passed.
 - `pytest -q tests/test_advisory_regression.py -k 'continuous_watch and (lock_skipped or skipped_due_cycles or records_failed_cycle or ohlcv_from_cursor)'` passed with 5 tests.
 - `bash -n all_watchers.sh` passed.
-- `git diff --check -- all_watchers.sh advisory/continuous_watch.py tests/test_advisory_regression.py analysis.md docs/analysis_agent_board.md` passed.
+- `git diff --check -- all_watchers.sh advisory/continuous_watch.py tests/test_advisory_regression.py todo.md docs/analysis_agent_board.md` passed.
 - `python -m py_compile tests/test_advisory_regression.py` passed.
 - `pytest -q tests/test_advisory_regression.py -k 'buy_sell_manual_watch_collision or reason_contract_matrix or same_symbol_source_precedence'` passed with 4 tests.
 - `python -m py_compile advisory/continuous_watch.py tests/test_advisory_regression.py` passed.
