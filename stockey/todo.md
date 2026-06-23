@@ -704,12 +704,22 @@ one step.**
     dimension, never a crash. 6 tests incl. a .1 integration (packet -> grounding paths).
 - **Next:** .4b consumes the packet -> LLM proposal -> .1 contract -> .2 sizing.
 
-#### [P-LLM-AUTH.4b] LLM decision policy
-- Build the prompt + `run_codex_structured` (Pydantic proposal: action, conviction, cited
-  dimensions, rationale, claimed hypothesis), feed through `build_llm_decision_contract` (.1) and
-  size with `bound_position_size` (.2). Deterministic WATCH fallback + `record_fallback_event` on
-  LLM failure; register in `advisory/prompt_registry.py` (authority_scope review_input_only,
-  broker_execution_allowed=False). LLM call injectable for tests.
+#### [P-LLM-AUTH.4b] LLM decision policy  ✅ DONE
+- Added `advisory/llm_decision_policy.py`: `decide(packet, capital, price, atr, exposures, ...)`
+  asks the LLM (`LlmDecisionProposal`: action, conviction, cited_dimensions, claims_hypothesis_match,
+  rationale) via `run_codex_structured`, then grades the proposal through `build_llm_decision_contract`
+  (.1) and sizes it with `bound_position_size` (.2). The LLM only proposes; the deterministic layers
+  decide grounding + size. The LLM's hypothesis claim never overrides the packet — .1 validates the
+  actual `hypothesis_match`.
+  - On any LLM failure: deterministic WATCH (conviction 0.2, no cited dims) + `record_fallback_event`
+    (`llm_decision_policy_failed`) — never a silent crash, never a default BUY. `use_llm=False`
+    yields a `disabled` WATCH. LLM call injectable (`llm_caller`) so it is tested without a model.
+  - Review-only: `broker_execution_allowed=False` always; result stamps prompt_id/version/schema/model
+    + as-of for provenance. Registered in `advisory/prompt_registry.py` as `llm_decision_policy`
+    (authority_scope review_input_only, broker_execution_allowed False). Env `LLM_DECISION_POLICY_MODEL`.
+    5 tests (grounded buy graded+sized+review-only, ungrounded not sized, failure->WATCH+telemetry,
+    disabled, registry review-only).
+- **Next:** .4c persists the decide() result + feeds matured outcomes to the .3 monitor.
 
 #### [P-LLM-AUTH.4c] Decision persistence
 - `advisory_llm_decisions` via an append-only migration (`apply_schema_migration`) + `upsert_to_db`;

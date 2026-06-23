@@ -63209,6 +63209,89 @@ def test_evidence_packet_loader_wiring_uses_injected_loaders():
     assert packet["benchmark_excess"]["excess_positive"] is True
 
 
+def _decision_packet(**overrides):
+    from advisory import llm_evidence_packet as ep
+
+    rows = _evidence_rows()
+    rows.update(overrides)
+    return ep.assemble_evidence_packet(**rows)
+
+
+def test_llm_decision_policy_grounded_buy_is_graded_and_sized_but_review_only():
+    from advisory import llm_decision_policy as policy
+
+    packet = _decision_packet()
+
+    def fake_llm(prompt, *, response_model, model, system_prompt):
+        return response_model(
+            action="BUY", conviction=1.0,
+            cited_dimensions=["technical_confirmation", "event_provenance"],
+            claims_hypothesis_match=True, rationale="Valid hypothesis matched; strong technical + event.",
+        )
+
+    result = policy.decide(packet, capital=1_000_000.0, price=100.0, atr=3.0, llm_caller=fake_llm)
+    assert result["llm_status"] == "ok"
+    assert result["meets_data_grounding_for_live"] is True
+    assert result["sufficiency_path"] == "valid_hypothesis_match"
+    assert result["sizing"]["allowed"] is True
+    assert result["sizing"]["position_inr"] == 50000.0
+    assert result["sizing"]["stop_price"] == 94.0
+    # review-only no matter what the LLM said
+    assert result["broker_execution_allowed"] is False
+    assert result["contract"]["broker_execution_allowed"] is False
+    assert result["prompt_version"] == "LLM_DECISION_POLICY_V1"
+
+
+def test_llm_decision_policy_ungrounded_proposal_is_not_sized():
+    from advisory import llm_decision_policy as policy
+
+    # Thin packet (risk dimension missing) -> incomplete -> not data-grounded -> not sized.
+    packet = _decision_packet(allocation_row=None)
+
+    def fake_llm(prompt, *, response_model, model, system_prompt):
+        return response_model(action="BUY", conviction=0.9, cited_dimensions=["technical_confirmation"], claims_hypothesis_match=False, rationale="x")
+
+    result = policy.decide(packet, capital=1_000_000.0, price=100.0, llm_caller=fake_llm)
+    assert result["meets_data_grounding_for_live"] is False
+    assert result["sizing"]["allowed"] is False
+    assert result["broker_execution_allowed"] is False
+
+
+def test_llm_decision_policy_llm_failure_degrades_to_watch_with_telemetry(monkeypatch):
+    from advisory import llm_decision_policy as policy
+    from advisory import fallback_telemetry
+
+    events = []
+    monkeypatch.setattr(fallback_telemetry, "record_fallback_event", lambda **kw: events.append(kw))
+    packet = _decision_packet()
+
+    def boom(prompt, *, response_model, model, system_prompt):
+        raise RuntimeError("model unavailable")
+
+    result = policy.decide(packet, capital=1_000_000.0, price=100.0, llm_caller=boom)
+    assert result["llm_status"] == "fallback_after_error"
+    assert result["proposal"]["action"] == "WATCH"  # never a default BUY on failure
+    assert result["sizing"]["allowed"] is False
+    assert events and events[0]["fallback_type"] == "llm_decision_policy_failed"
+
+
+def test_llm_decision_policy_disabled_uses_deterministic_watch():
+    from advisory import llm_decision_policy as policy
+
+    result = policy.decide(_decision_packet(), capital=1_000_000.0, price=100.0, use_llm=False)
+    assert result["llm_status"] == "disabled"
+    assert result["proposal"]["action"] == "WATCH"
+
+
+def test_prompt_registry_includes_llm_decision_policy_review_only():
+    from advisory import prompt_registry
+
+    contracts = {row["prompt_id"]: row for row in prompt_registry.build_prompt_registry_payload()["contracts"]}
+    row = contracts[prompt_registry.LLM_DECISION_POLICY_PROMPT_ID]
+    assert row["authority_scope"] == "review_input_only"
+    assert row["broker_execution_allowed"] is False
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {

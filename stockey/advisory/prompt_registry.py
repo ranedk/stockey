@@ -21,6 +21,7 @@ ANNOUNCEMENT_SUMMARY_PROMPT_ID = "announcement_summary"
 ANNOUNCEMENT_STRUCTURED_REPORT_PROMPT_ID = "announcement_structured_report"
 OCR_PDF_PAGE_PROMPT_ID = "ocr_pdf_page"
 REGIME_OVERLAY_PROPOSAL_PROMPT_ID = "regime_overlay_proposal"
+LLM_DECISION_POLICY_PROMPT_ID = "llm_decision_policy"
 
 
 @dataclass(frozen=True)
@@ -231,6 +232,28 @@ PROMPT_CONTRACTS: tuple[PromptContract, ...] = (
         notes=[
             "Creates proposed regimes/rules only; action consolidation must not consume them until explicitly promoted.",
             "Broker execution is never allowed from this prompt.",
+        ],
+    ),
+    PromptContract(
+        prompt_id=LLM_DECISION_POLICY_PROMPT_ID,
+        version="LLM_DECISION_POLICY_V1",
+        title="LLM-direct trade decision over the complete evidence packet",
+        owner_area="llm_direct_authority",
+        purpose="Given the complete point-in-time evidence packet, propose a trade action with conviction, the evidence dimensions cited, whether a valid hypothesis is matched, and a rationale.",
+        authority_scope="review_input_only",
+        provider="codex",
+        model_env_vars=["LLM_DECISION_POLICY_MODEL"],
+        response_schema="advisory.llm_decision_policy.LlmDecisionProposal",
+        prompt_source="advisory.llm_decision_policy.build_decision_prompt",
+        system_prompt_source="advisory.llm_decision_policy.SYSTEM_PROMPT",
+        input_evidence=["llm evidence packet (7 dimensions + hypothesis match)"],
+        output_tables=["advisory_llm_decisions"],
+        fallback_behavior="Deterministic WATCH (low conviction, no cited dimensions) is used when the LLM is disabled or fails; fallback telemetry is recorded.",
+        migration_status="caller_migrated",
+        broker_execution_allowed=False,
+        notes=[
+            "Proposal is graded by the deterministic .1 contract and sized by the .2 risk bounds; it is review-only.",
+            "Broker execution is gated by the default-OFF LLM_DIRECT_AUTHORITY_ENABLED master flag (.5), never by this prompt.",
         ],
     ),
 )
