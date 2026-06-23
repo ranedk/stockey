@@ -678,10 +678,43 @@ one step.**
     `_MIN_EXCESS_HIT_RATE=0.45`, `_MIN_MEAN_EXCESS=0.0`, `_BETA_TILT_RATE=0.50`. 5 tests.
 - **Wires into Operator Health in .4/.5** once the decision-policy logs real decision+outcome rows.
 
-### [P-LLM-AUTH.4] LLM decision policy over the complete evidence packet
+### [P-LLM-AUTH.4] LLM decision policy over the complete evidence packet  (sliced .4a/.4b/.4c)
 - Build the evidence-packet loader + the LLM call that fills the .1 contract from the real packet
   and is sized by .2. Produces grounded BUY/SELL + conviction with provenance. Until the master
   flag is on, output stays review-only.
+
+#### [P-LLM-AUTH.4a] Evidence-packet loader  ✅ DONE
+- Added `advisory/llm_evidence_packet.py` (mostly pure, DB loaders defensive). `assemble_evidence_packet`
+  turns point-in-time row dicts into the packet the .1 contract consumes: the 7 required dimensions
+  + `hypothesis_match`, each normalized to `{present, fresh, strength, classification, ...}`.
+  - Schema verified against the live DB first: no stored `technical_total_score` (derived technical
+    strength from the `pass_*` entry gates instead); `advisory_signal_quality_eval_summary` absent
+    (sector/exact-class/benchmark all sourced from `advisory_context_watch_eval_summary` at the
+    source_context / context_class grains).
+  - v1 strength formulas (tunable, pinned by tests): technical = fraction of entry `pass_*` gates
+    true; risk = conviction-bucket x risk-bucket discount (rejected/abstained -> absent); market =
+    `risk_on_score`; sector/exact-class = `excess_opportunity_hit_rate_after_cost` gated by a
+    helpful `classification` (else 0); benchmark = `classification` + sign of
+    `avg_excess_watch_return_after_cost` (feeds the beta guard); event = `confidence`.
+  - `hypothesis_match_dimension` -> the `{status, conditions_met, hypothesis_id}` dict .1 consumes;
+    only validated/production hypotheses, conditions_met from explicit decision_json or
+    match_score >= `LLM_DECISION_HYPOTHESIS_MIN_MATCH_SCORE` (0.5).
+  - `load_evidence_packet(symbol, asof_date, row_loader=, rows_loader=)` wires defensive point-in-time
+    SELECTs (injectable for tests); any missing table/column/row degrades to a `present=False`
+    dimension, never a crash. 6 tests incl. a .1 integration (packet -> grounding paths).
+- **Next:** .4b consumes the packet -> LLM proposal -> .1 contract -> .2 sizing.
+
+#### [P-LLM-AUTH.4b] LLM decision policy
+- Build the prompt + `run_codex_structured` (Pydantic proposal: action, conviction, cited
+  dimensions, rationale, claimed hypothesis), feed through `build_llm_decision_contract` (.1) and
+  size with `bound_position_size` (.2). Deterministic WATCH fallback + `record_fallback_event` on
+  LLM failure; register in `advisory/prompt_registry.py` (authority_scope review_input_only,
+  broker_execution_allowed=False). LLM call injectable for tests.
+
+#### [P-LLM-AUTH.4c] Decision persistence
+- `advisory_llm_decisions` via an append-only migration (`apply_schema_migration`) + `upsert_to_db`;
+  stamp prompt_id/version/schema/model + as-of date (register in `llm_provenance_audit.py`). Feed
+  matured rows to the .3 monitor.
 
 ### [P-LLM-AUTH.5] Live bridge behind the default-OFF master flag
 - Only when the master flag is ON: a grounded decision + its .2 risk bounds become a broker-capable

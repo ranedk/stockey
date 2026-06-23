@@ -63089,6 +63089,126 @@ def test_llm_decision_monitor_flags_misjudged_sufficiency_path():
     assert any("dominant_single_signal" in row["title"] for row in rows)
 
 
+def _evidence_rows(asof="2026-06-23"):
+    return dict(
+        symbol="ABC",
+        asof_date=asof,
+        technical_row={
+            "asof_date": asof, "rs_vs_benchmark": 1.2, "technical_state": "READY",
+            "pass_above_dma_50": True, "pass_above_dma_200": True, "pass_near_52w_high": True,
+            "pass_breakout_extension": True, "pass_liquidity_20d": True, "pass_trend_alignment": True,
+            "pass_gap_behavior": True,
+        },
+        allocation_row={
+            "asof_date": asof, "allocation_status": "allocated", "conviction_bucket": "high",
+            "risk_bucket": "low", "stop_price": 94.0, "invalidation_price": 90.0,
+            "event_class": "order_win", "confidence": 0.8, "setup_effect": "positive", "score_impact": 0.2,
+        },
+        market_row={"asof_date": asof, "risk_on_score": 0.7, "macro_risk_state": "RISK_ON", "regime_name": "constructive_trend", "macro_stress_score": 0.2},
+        sector_reliability_row={"classification": "candidate_helpful", "excess_opportunity_hit_rate_after_cost": 0.62, "matured_count": 30, "source_context": "announcement_context"},
+        exact_class_row={"classification": "candidate_helpful", "excess_opportunity_hit_rate_after_cost": 0.58, "matured_count": 24},
+        benchmark_row={"classification": "candidate_helpful", "avg_excess_watch_return_after_cost": 0.015},
+        hypothesis_rows=[{"status": "validated", "match_score": 0.8, "hypothesis_id": "bull_order_v1", "decision_json": {}}],
+    )
+
+
+def test_evidence_packet_assembles_normalized_dimensions():
+    from advisory import llm_evidence_packet as ep
+
+    packet = ep.assemble_evidence_packet(**_evidence_rows())
+    assert packet["technical_confirmation"]["strength"] == 1.0  # all 7 gates pass
+    assert packet["technical_confirmation"]["fresh"] is True
+    assert packet["risk"]["strength"] == 0.9  # high conviction * low-risk discount 1.0
+    assert packet["market_context"]["strength"] == 0.7
+    assert packet["sector_reliability"]["strength"] == 0.62
+    assert packet["exact_class_reliability"]["strength"] == 0.58
+    assert packet["benchmark_excess"]["excess_positive"] is True
+    assert packet["event_provenance"]["strength"] == 0.8
+    assert packet["event_provenance"]["event_class"] == "order_win"
+    assert packet["hypothesis_match"]["status"] == "validated"
+    assert packet["hypothesis_match"]["conditions_met"] is True
+
+
+def test_evidence_packet_feeds_decision_contract_grounding():
+    from advisory import llm_evidence_packet as ep
+    from advisory import llm_decision_contract as dc
+
+    packet = ep.assemble_evidence_packet(**_evidence_rows())
+    completeness = dc.build_evidence_completeness(packet)
+    assert completeness["evidence_complete"] is True
+    grounding = dc.validate_decision_grounding(
+        action="BUY",
+        cited_dimensions=["technical_confirmation", "event_provenance", "sector_reliability"],
+        packet=packet,
+    )
+    # A valid hypothesis is present, so it takes precedence as the sufficiency path.
+    assert grounding["sufficiency_path"] == "valid_hypothesis_match"
+    assert grounding["data_grounded"] is True
+    # Without the hypothesis, the strong technical gate (strength 1.0) grounds it on its own.
+    no_hyp = ep.assemble_evidence_packet(**{**_evidence_rows(), "hypothesis_rows": []})
+    dominant = dc.validate_decision_grounding(
+        action="BUY", cited_dimensions=["technical_confirmation"], packet=no_hyp,
+    )
+    assert dominant["sufficiency_path"] == "dominant_single_signal"
+    assert dominant["data_grounded"] is True
+
+
+def test_evidence_packet_non_helpful_reliability_yields_zero_strength():
+    from advisory import llm_evidence_packet as ep
+
+    dim = ep.sector_reliability_dimension(
+        {"classification": "benchmark_beta_not_overlay_alpha", "excess_opportunity_hit_rate_after_cost": 0.7, "matured_count": 30}
+    )
+    assert dim["present"] is True
+    assert dim["strength"] == 0.0  # not a helpful classification -> no positive strength
+
+
+def test_evidence_packet_missing_rows_degrade_to_absent_not_crash():
+    from advisory import llm_evidence_packet as ep
+
+    packet = ep.assemble_evidence_packet(symbol="ABC", asof_date="2026-06-23")
+    for dimension in ep.REQUIRED_DIMENSIONS:
+        assert packet[dimension]["present"] is False
+    assert packet["hypothesis_match"]["present"] is False
+
+
+def test_evidence_packet_rejected_allocation_marks_risk_absent():
+    from advisory import llm_evidence_packet as ep
+
+    dim = ep.risk_dimension({"asof_date": "2026-06-23", "allocation_status": "rejected", "conviction_bucket": "high", "risk_bucket": "low"}, "2026-06-23")
+    assert dim["present"] is False
+    assert dim["strength"] is None
+
+
+def test_evidence_packet_loader_wiring_uses_injected_loaders():
+    from advisory import llm_evidence_packet as ep
+
+    rows = _evidence_rows()
+
+    def fake_row(query, params):
+        if "advisory_technical_daily" in query:
+            return rows["technical_row"]
+        if "advisory_allocations" in query:
+            return rows["allocation_row"]
+        if "advisory_market_context_summary_daily" in query:
+            return rows["market_row"]
+        if "context_class=" in query:
+            # The eval-summary row carries both the class reliability and the after-cost excess.
+            return rows["exact_class_row"] | {"source_context": "announcement_context", "avg_excess_watch_return_after_cost": 0.015}
+        if "source_context=" in query:
+            return rows["sector_reliability_row"]
+        return None
+
+    def fake_rows(query, params):
+        return rows["hypothesis_rows"] if "advisory_hypothesis_matches" in query else []
+
+    packet = ep.load_evidence_packet("abc", "2026-06-23", row_loader=fake_row, rows_loader=fake_rows)
+    assert packet["symbol"] == "ABC"
+    assert packet["technical_confirmation"]["present"] is True
+    assert packet["hypothesis_match"]["hypothesis_id"] == "bull_order_v1"
+    assert packet["benchmark_excess"]["excess_positive"] is True
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {
