@@ -741,11 +741,38 @@ one step.**
 **[P-LLM-AUTH].4 is COMPLETE** (.4a packet loader + .4b decision policy + .4c persistence). The
 decision engine runs end-to-end and review-only; only the live bridge (.5) remains in the epic.
 
-### [P-LLM-AUTH.5] Live bridge behind the default-OFF master flag
-- Only when the master flag is ON: a grounded decision + its .2 risk bounds become a broker-capable
-  action through the existing execution-safety contract / live-submit preflight
-  (`advisory/execution_engine.py`); soft gates may be overridden with recorded rationale;
-  execution-safety mechanics (dry-run, reconciliation, kill-switch) stay; .3 monitoring runs.
+### [P-LLM-AUTH.5] Live bridge behind the default-OFF master flag  ✅ DONE (gated contract only)
+- Operator decision (2026-06-23): build the **gated contract only** — the bridge decides authority
+  and builds the broker-capable contract, but does NOT submit and does NOT auto-write into
+  `advisory_action_recommendations`. Wiring those contracts into the live execution table remains a
+  separate, explicitly-requested step; nothing in this commit can move capital even with both flags on.
+- Added pure/additive `advisory/llm_broker_bridge.py` — a TRANSLATION layer, not a submit path
+  (verified the existing execution-safety contract first):
+  - `evaluate_llm_broker_authority(result)` -> `broker_execution_allowed=True` ONLY when ALL hold:
+    `LLM_DIRECT_AUTHORITY_ENABLED` master flag on (recomputed at bridge time, default OFF) AND the
+    decision is data-grounded (.1) AND graduated (.3) AND sized (.2 `sizing.allowed` for entries)
+    AND llm_status ok AND the action is broker-capable. Every failing condition is recorded in
+    `blocked_reasons`.
+  - `build_broker_action_contract(result, decided_at, reference_price, soft_gate_overrides=)` ->
+    the `advisory_action_recommendations`-shaped row execution consumes: `execution_mode=broker_order`,
+    `approved_allocation_inr` from .2 sizing, `stop_price`, `full_advisory_required=False`, a COMPLETE
+    `reason_contract` embedding full LLM provenance/grounding/sizing + any recorded soft-gate-override
+    rationale (CLAUDE.md authority rule), and `broker_execution_allowed` from the gate.
+  - It NEVER calls `place_order`/`submit_live_orders`. Any real submission still requires the entire
+    unchanged execution-safety contract: a SECOND default-OFF flag `STOCKEY_LIVE_TRADING_ENABLED`,
+    the per-run confirmation token, operator approval, broker reconciliation, evidence checklist,
+    max-order-value, and the Dhan identity hard-fail in `apply_live_execution_safety()`. Two
+    independent default-OFF master flags must BOTH be on for any LLM capital movement — defense in depth.
+  - 5 tests (master-flag off blocks, default-OFF, all-gates-pass allows, ungraduated/ungrounded
+    blocks + incomplete reason contract, soft-gate-override recorded). No new env var. Full suite 2089.
+
+**[P-LLM-AUTH] EPIC COMPLETE** (.1 contract + .2 risk bounds + .3 monitoring + .4 decision engine +
+.5 gated broker bridge). The LLM can produce graduated, data-grounded, risk-bounded, provenance-stamped
+trade decisions and a broker-capable contract — all review-only and behind two default-OFF master flags.
+**Remaining explicit operator steps before any live trade:** (a) build the realized-outcome labeler so
+the .3 monitor has matured benchmark-excess to graduate on; (b) wire approved contracts into
+`advisory_action_recommendations` / execution (the deferred .5 injection step); (c) flip
+`LLM_DIRECT_AUTHORITY_ENABLED` + `STOCKEY_LIVE_TRADING_ENABLED` per deployment. Each is opt-in.
 
 **Open decisions for the operator (before .5):** the risk-bound caps (per-position / per-sector /
 total exposure %, stop ATR multiple, min conviction); whether/when to flip the master flag and at

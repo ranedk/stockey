@@ -63354,6 +63354,92 @@ def test_llm_decision_provenance_spec_registered_review_only():
     assert "broker_execution_allowed" in spec.authority_columns
 
 
+def _graduated_decision_result(graduation_passed=True):
+    """A decide()-shaped result whose contract is data-grounded and (optionally) graduated."""
+    from advisory import llm_decision_policy as policy
+
+    packet = _decision_packet()
+
+    def fake_llm(prompt, *, response_model, model, system_prompt):
+        return response_model(action="BUY", conviction=1.0, cited_dimensions=["technical_confirmation"], claims_hypothesis_match=True, rationale="strong")
+
+    result = policy.decide(packet, capital=1_000_000.0, price=100.0, atr=3.0, llm_caller=fake_llm)
+    # decide() never graduates on its own; simulate the .3 graduation outcome for the bridge test.
+    result["contract"]["graduation_passed"] = bool(graduation_passed)
+    return result
+
+
+def test_llm_broker_bridge_blocks_when_master_flag_off():
+    from advisory import llm_broker_bridge as bridge
+
+    result = _graduated_decision_result()
+    out = bridge.build_broker_action_contract(result, decided_at="2026-06-23T10:00:00Z", reference_price=100.0, master_flag_enabled=False)
+    assert out["broker_authority"]["broker_execution_allowed"] is False
+    assert "llm_direct_authority_master_flag_off" in out["broker_authority"]["blocked_reasons"]
+    assert out["action_contract"]["broker_execution_allowed"] is False
+    assert out["action_contract"]["authority_scope"] == "llm_decision_review_only"
+    assert out["action_contract"]["portfolio_authority"] == "none"
+
+
+def test_llm_broker_bridge_default_master_flag_is_off():
+    from advisory import llm_broker_bridge as bridge
+
+    # No override -> reads the module flag, which defaults OFF.
+    auth = bridge.evaluate_llm_broker_authority(_graduated_decision_result())
+    assert auth["master_flag_enabled"] is False
+    assert auth["broker_execution_allowed"] is False
+
+
+def test_llm_broker_bridge_allows_only_when_all_gates_pass():
+    from advisory import llm_broker_bridge as bridge
+
+    result = _graduated_decision_result(graduation_passed=True)
+    out = bridge.build_broker_action_contract(result, decided_at="2026-06-23T10:00:00Z", reference_price=100.0, master_flag_enabled=True)
+    auth = out["broker_authority"]
+    assert auth["broker_execution_allowed"] is True
+    assert auth["blocked_reasons"] == []
+    row = out["action_contract"]
+    assert row["broker_execution_allowed"] is True
+    assert row["transaction_type"] == "BUY"
+    assert row["execution_mode"] == "broker_order"
+    assert row["approved_allocation_inr"] == 50000.0  # from .2 sizing
+    assert row["stop_price"] == 94.0
+    assert row["reason_contract_status"] == "complete"
+    assert row["full_advisory_required"] is False
+    assert row["authority_scope"] == "llm_direct_broker"
+
+
+def test_llm_broker_bridge_blocks_ungraduated_and_ungrounded():
+    from advisory import llm_broker_bridge as bridge
+
+    not_graduated = bridge.evaluate_llm_broker_authority(_graduated_decision_result(graduation_passed=False), master_flag_enabled=True)
+    assert not_graduated["broker_execution_allowed"] is False
+    assert "decision_not_graduated" in not_graduated["blocked_reasons"]
+
+    # Ungrounded decision (risk dimension missing) -> not data-grounded, reason contract incomplete.
+    from advisory import llm_decision_policy as policy
+    packet = _decision_packet(allocation_row=None)
+    ungrounded = policy.decide(packet, capital=1_000_000.0, price=100.0, use_llm=False)
+    ungrounded["contract"]["graduation_passed"] = True
+    out = bridge.build_broker_action_contract(ungrounded, decided_at="2026-06-23T10:00:00Z", reference_price=100.0, master_flag_enabled=True)
+    assert out["broker_authority"]["broker_execution_allowed"] is False
+    assert "decision_not_data_grounded" in out["broker_authority"]["blocked_reasons"]
+    assert out["action_contract"]["reason_contract_status"] == "incomplete"
+
+
+def test_llm_broker_bridge_records_soft_gate_overrides():
+    from advisory import llm_broker_bridge as bridge
+
+    result = _graduated_decision_result()
+    overrides = [{"gate": "market_gate", "reason": "regime soft-off but event materiality dominates"}]
+    out = bridge.build_broker_action_contract(
+        result, decided_at="2026-06-23T10:00:00Z", reference_price=100.0, soft_gate_overrides=overrides, master_flag_enabled=True,
+    )
+    reason = json.loads(out["action_contract"]["recommendation_reason_json"])
+    assert reason["soft_gate_overrides"] == overrides
+    assert reason["source"] == "llm_direct_authority"
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {
