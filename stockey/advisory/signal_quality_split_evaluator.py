@@ -25,6 +25,7 @@ SPLIT_REVIEWS_TABLE = "advisory_signal_quality_split_promotion_reviews"
 SPLIT_DECISIONS_TABLE = "advisory_signal_quality_split_promotion_decisions"
 SPLIT_EVALUATOR_SCHEMA_MIGRATION_ID = "20260620_advisory_signal_quality_split_evaluator"
 SPLIT_REVIEW_SCHEMA_MIGRATION_ID = "20260620_advisory_signal_quality_split_promotion_reviews"
+SPLIT_EVALUATOR_BENCHMARK_SCHEMA_MIGRATION_ID = "20260623_advisory_signal_quality_split_evaluator_benchmark_excess"
 DEFAULT_MIN_MATURED_ROWS = 5
 DEFAULT_TOP_N = 10
 DEFAULT_MIN_STABLE_WINDOWS = 2
@@ -163,11 +164,19 @@ SPLIT_REVIEW_SCHEMA_STATEMENTS = [
 
 NUMERIC_COLUMNS = [
     "forward_return_after_cost",
+    "excess_forward_return_after_cost",
     "technical_only_forward_return_after_cost",
     "avg_forward_return_after_cost",
+    "avg_excess_forward_return_after_cost",
     "hit_rate_after_cost",
     "baseline_avg_forward_return_after_cost",
     "lift_vs_technical_only",
+]
+# Benchmark-excess attribution columns are added by a follow-on ALTER migration (not by editing
+# the already-applied CREATE TABLE statements) so the base migration checksum stays stable.
+SPLIT_EVALUATOR_BENCHMARK_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {SPLIT_EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS excess_forward_return_after_cost DOUBLE PRECISION",
+    f"ALTER TABLE {SPLIT_SUMMARY_TABLE} ADD COLUMN IF NOT EXISTS avg_excess_forward_return_after_cost DOUBLE PRECISION",
 ]
 INT_COLUMNS = [
     "horizon_days",
@@ -336,6 +345,16 @@ def ensure_tables() -> None:
             "policy_auto_promotion_allowed": False,
         },
     )
+    apply_schema_migration(
+        migration_id=SPLIT_EVALUATOR_BENCHMARK_SCHEMA_MIGRATION_ID,
+        description="Add benchmark-excess attribution columns to signal-quality split evaluator tables.",
+        statements=SPLIT_EVALUATOR_BENCHMARK_SCHEMA_STATEMENTS,
+        metadata={
+            "tables": [SPLIT_EVALUATIONS_TABLE, SPLIT_SUMMARY_TABLE],
+            "workflow": "signal_quality_split_evaluator",
+            "authority": "research_only",
+        },
+    )
 
 
 def _variants_for_specs(specs: list[dict[str, Any]]) -> list[str]:
@@ -401,6 +420,7 @@ def load_source_rows(
                 selected,
                 matured,
                 forward_return_after_cost,
+                excess_forward_return_after_cost,
                 hit_after_cost,
                 context_sources_json
             FROM {EVALUATIONS_TABLE}
@@ -517,6 +537,7 @@ def build_split_evaluation_rows(
                     "selected": selected,
                     "matured": bool(_boolish(row.get("matured")) and selected),
                     "forward_return_after_cost": row.get("forward_return_after_cost") if selected else None,
+                    "excess_forward_return_after_cost": row.get("excess_forward_return_after_cost") if selected else None,
                     "hit_after_cost": row.get("hit_after_cost") if selected else None,
                     "technical_only_selected": None if tech_row is None else _boolish(tech_row.get("selected")),
                     "technical_only_forward_return_after_cost": None if tech_row is None else tech_row.get("forward_return_after_cost"),
@@ -556,6 +577,13 @@ def classify_summary_row(row: dict[str, Any], *, min_matured_rows: int = DEFAULT
         return "negative_after_cost"
     if lift <= 0:
         return "no_lift_vs_technical_only"
+    # A split must beat the benchmark, not just be positive after costs and lift over technical.
+    # Raw up-market returns are not split alpha.
+    avg_excess = _number(row.get("avg_excess_forward_return_after_cost"))
+    if avg_excess is None:
+        return "needs_benchmark_attribution"
+    if avg_excess <= 0:
+        return "benchmark_beta_not_split_alpha"
     return "candidate_split_helpful"
 
 
@@ -586,6 +614,7 @@ def summarize_split_evaluations(
         selected = group[group["selected"].fillna(False).astype(bool)]
         matured = selected[selected["matured"].fillna(False).astype(bool)]
         returns = pd.to_numeric(matured.get("forward_return_after_cost"), errors="coerce").dropna()
+        excess_returns = pd.to_numeric(matured.get("excess_forward_return_after_cost", pd.Series(dtype=float)), errors="coerce").dropna()
         hits = matured.get("hit_after_cost", pd.Series(dtype=bool)).dropna().astype(bool)
         baseline = group[
             group["selected"].fillna(False).astype(bool)
@@ -595,6 +624,7 @@ def summarize_split_evaluations(
         ]
         baseline_returns = pd.to_numeric(baseline.get("technical_only_forward_return_after_cost"), errors="coerce").dropna()
         avg_return = None if returns.empty else float(returns.mean())
+        avg_excess = None if excess_returns.empty else float(excess_returns.mean())
         baseline_avg = None if baseline_returns.empty else float(baseline_returns.mean())
         summary_row = {
             "evaluated_at": evaluated_at,
@@ -611,6 +641,7 @@ def summarize_split_evaluations(
             "matured_count": int(len(matured)),
             "symbol_count": int(matured["symbol"].nunique()) if not matured.empty else 0,
             "avg_forward_return_after_cost": avg_return,
+            "avg_excess_forward_return_after_cost": avg_excess,
             "hit_rate_after_cost": None if hits.empty else float(hits.mean()),
             "baseline_selected_count": int(len(baseline)),
             "baseline_avg_forward_return_after_cost": baseline_avg,
@@ -631,10 +662,12 @@ def summarize_split_evaluations(
 def _recommendation_for_classification(classification: str) -> str:
     if classification == "candidate_split_helpful":
         return "run_rolling_window_validation_before_any_policy_influence"
-    if classification in {"negative_after_cost", "no_lift_vs_technical_only"}:
+    if classification in {"negative_after_cost", "no_lift_vs_technical_only", "benchmark_beta_not_split_alpha"}:
         return "track_as_negative_control_and_block_broad_family_promotion"
     if classification == "technical_baseline_unavailable":
         return "collect_matching_technical_only_baseline_before_split_review"
+    if classification == "needs_benchmark_attribution":
+        return "attach_benchmark_excess_attribution_before_split_review"
     return "collect_more_matured_labels"
 
 

@@ -79910,11 +79910,13 @@ def test_signal_quality_split_evaluator_uses_schema_registry(monkeypatch):
 
     signal_quality_split_evaluator.ensure_tables()
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     call = calls[0]
     review_call = calls[1]
+    benchmark_call = calls[2]
     assert call["migration_id"] == signal_quality_split_evaluator.SPLIT_EVALUATOR_SCHEMA_MIGRATION_ID
     assert review_call["migration_id"] == signal_quality_split_evaluator.SPLIT_REVIEW_SCHEMA_MIGRATION_ID
+    assert benchmark_call["migration_id"] == signal_quality_split_evaluator.SPLIT_EVALUATOR_BENCHMARK_SCHEMA_MIGRATION_ID
     assert call["metadata"]["authority"] == "research_only"
     assert review_call["metadata"]["authority"] == "manual_config_review_only"
     ddl = "\n".join(call["statements"] + review_call["statements"])
@@ -79923,6 +79925,9 @@ def test_signal_quality_split_evaluator_uses_schema_registry(monkeypatch):
     assert signal_quality_split_evaluator.SPLIT_REVIEWS_TABLE in ddl
     assert signal_quality_split_evaluator.SPLIT_DECISIONS_TABLE in ddl
     assert "broker_execution_allowed BOOLEAN" in ddl
+    benchmark_ddl = "\n".join(benchmark_call["statements"])
+    assert "excess_forward_return_after_cost DOUBLE PRECISION" in benchmark_ddl
+    assert "avg_excess_forward_return_after_cost DOUBLE PRECISION" in benchmark_ddl
 
 
 def test_signal_quality_split_evaluator_schema_only_cli_does_not_evaluate_or_persist(monkeypatch, capsys):
@@ -80007,6 +80012,7 @@ def test_signal_quality_split_evaluator_selects_matching_context_only():
                 "selected": True,
                 "matured": True,
                 "forward_return_after_cost": 0.07,
+                "excess_forward_return_after_cost": 0.06,
                 "hit_after_cost": True,
                 "context_sources_json": json.dumps(
                     [{"source": "announcement_context", "class": "ORDER_WIN", "direction": "positive"}]
@@ -80050,6 +80056,8 @@ def test_signal_quality_split_evaluator_selects_matching_context_only():
     assert bool(selected.iloc[0]["broker_execution_allowed"]) is False
     assert bool(selected.iloc[0]["policy_auto_promotion_allowed"]) is False
     assert "source_family_variant_selected_and_context_split_matches" in selected.iloc[0]["raw_context_json"]
+    # benchmark-excess attribution is carried through from the source evaluation rows
+    assert float(selected.iloc[0]["excess_forward_return_after_cost"]) == 0.06
 
 
 def test_signal_quality_split_evaluator_summary_is_research_only_with_lift():
@@ -80071,6 +80079,7 @@ def test_signal_quality_split_evaluator_summary_is_research_only_with_lift():
                 "selected": True,
                 "matured": True,
                 "forward_return_after_cost": 0.07,
+                "excess_forward_return_after_cost": 0.05,
                 "hit_after_cost": True,
                 "technical_only_selected": True,
                 "technical_only_forward_return_after_cost": 0.01,
@@ -80094,6 +80103,7 @@ def test_signal_quality_split_evaluator_summary_is_research_only_with_lift():
                 "selected": True,
                 "matured": True,
                 "forward_return_after_cost": 0.05,
+                "excess_forward_return_after_cost": 0.03,
                 "hit_after_cost": True,
                 "technical_only_selected": True,
                 "technical_only_forward_return_after_cost": 0.02,
@@ -80113,6 +80123,60 @@ def test_signal_quality_split_evaluator_summary_is_research_only_with_lift():
     assert bool(row["policy_auto_promotion_allowed"]) is False
     assert row["matured_count"] == 2
     assert round(row["lift_vs_technical_only"], 4) == 0.045
+    assert round(row["avg_excess_forward_return_after_cost"], 4) == 0.04
+
+
+def _split_eval_row_with(**overrides):
+    base = {
+        "evaluated_at": pd.Timestamp("2026-06-20T12:00:00Z"),
+        "source_evaluated_at": pd.Timestamp("2026-06-20T00:00:00Z"),
+        "horizon_days": 10,
+        "variant": "technical_plus_announcement_context_split_order_win_positive",
+        "source_family": "announcement_context",
+        "split_axis": "context_class_direction",
+        "split_value": "ORDER_WIN|positive",
+        "context_class": "ORDER_WIN",
+        "direction": "positive",
+        "asof_date": pd.Timestamp("2026-06-01T00:00:00Z"),
+        "setup_id": "S1",
+        "symbol": "ABC",
+        "selected": True,
+        "matured": True,
+        "forward_return_after_cost": 0.08,
+        "hit_after_cost": True,
+        "technical_only_selected": True,
+        "technical_only_forward_return_after_cost": 0.01,
+        "technical_only_hit_after_cost": True,
+        "broker_execution_allowed": False,
+        "policy_auto_promotion_allowed": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_signal_quality_split_evaluator_flags_benchmark_beta_not_alpha():
+    # positive after-cost return AND positive lift over technical, but it did not beat the
+    # benchmark -> beta, not split alpha; it must not become a candidate.
+    evaluations = pd.DataFrame([_split_eval_row_with(excess_forward_return_after_cost=-0.01)])
+
+    summary = signal_quality_split_evaluator.summarize_split_evaluations(evaluations, min_matured_rows=1)
+    row = summary.iloc[0].to_dict()
+
+    assert row["classification"] == "benchmark_beta_not_split_alpha"
+    assert row["recommendation"] == "track_as_negative_control_and_block_broad_family_promotion"
+    assert round(row["avg_excess_forward_return_after_cost"], 4) == -0.01
+
+
+def test_signal_quality_split_evaluator_requires_benchmark_attribution():
+    # positive return + lift but no benchmark-excess attribution -> cannot be confirmed as alpha
+    evaluations = pd.DataFrame([_split_eval_row_with()])  # no excess_forward_return_after_cost
+
+    summary = signal_quality_split_evaluator.summarize_split_evaluations(evaluations, min_matured_rows=1)
+    row = summary.iloc[0].to_dict()
+
+    assert row["classification"] == "needs_benchmark_attribution"
+    assert row["recommendation"] == "attach_benchmark_excess_attribution_before_split_review"
+    assert pd.isna(row["avg_excess_forward_return_after_cost"])
 
 
 def test_signal_quality_split_evaluator_summary_baseline_only_uses_selected_split_rows():
@@ -80134,6 +80198,7 @@ def test_signal_quality_split_evaluator_summary_baseline_only_uses_selected_spli
                 "selected": True,
                 "matured": True,
                 "forward_return_after_cost": 0.05,
+                "excess_forward_return_after_cost": 0.04,
                 "hit_after_cost": True,
                 "technical_only_selected": True,
                 "technical_only_forward_return_after_cost": 0.01,

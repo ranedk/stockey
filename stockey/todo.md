@@ -482,7 +482,17 @@ blocked.
 Policy review is only as trustworthy as the evidence. These close attribution and
 visibility gaps. All remain research-only / no auto-apply.
 
-### [P2.1] Benchmark-excess attribution in signal-quality split evaluator
+### [P2.1] Benchmark-excess attribution in signal-quality split evaluator  ✅ DONE
+- **Outcome (2026-06-23):** The split evaluator reads from `advisory_signal_quality_evaluations`,
+  which already carries `excess_forward_return_after_cost` (the main evaluator computes it), but
+  the split path never selected/carried/gated it. Added a follow-on ALTER migration
+  (`20260623_*_benchmark_excess`, not editing the applied CREATE TABLE), selected
+  `excess_forward_return_after_cost` in `load_source_rows`, carried it into split rows, aggregated
+  `avg_excess_forward_return_after_cost` in the summary, and gated `classify_summary_row`: a split
+  now needs positive benchmark-excess to be `candidate_split_helpful` — otherwise
+  `benchmark_beta_not_split_alpha` (excess<=0) or `needs_benchmark_attribution` (excess missing).
+  Downstream stability/promotion already treat non-helpful classifications as non-promotable.
+  research_only; no auto-apply. 2 tests added + fixtures updated for the benchmark-aware contract.
 - **Why:** `signal_quality_split_evaluator` rows have only raw
   `forward_return_after_cost`, no benchmark-excess columns, so split candidates
   can be promoted on market beta.
