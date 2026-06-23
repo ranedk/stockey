@@ -659,11 +659,24 @@ one step.**
   `MAX_TOTAL_EXPOSURE_PCT`=1.0, `STOP_ATR_MULT`=2.0). `broker_execution_allowed` always False here.
   5 tests; env documented. This is risk-of-ruin protection, not LLM distrust.
 
-### [P-LLM-AUTH.3] Live decision + outcome monitoring (systematic-error detector)
-- Log each LLM decision + its evidence packet + realized outcome + provenance; detect systematic
-  error patterns (e.g. repeated beta tilt, a consistently mis-judged event class) and surface via
-  Operator Health. Alerts/annotates; NEVER gates or blocks a decision. (This replaces paper
-  graduation — it catches repeatable mistakes live without pretending paper P&L is predictive.)
+### [P-LLM-AUTH.3] Live decision + outcome monitoring (systematic-error detector)  ✅ DONE
+- The other half of the safety floor (with .2's risk bounds): catches *repeatable* mistakes live
+  instead of pretending paper P&L is predictive. Added pure/additive
+  `advisory/llm_decision_monitor.py` (no DB, no LLM, no broker):
+  - `summarize_decision_outcomes` / `_aggregate` — matured-only, benchmark-EXCESS after cost
+    (never raw return): excess-hit-rate, mean excess, beta-resolved rate.
+  - `detect_systematic_errors` — overall alerts (`llm_decisions_low_excess_hit_rate`,
+    `_negative_mean_excess`, `_systematic_beta_tilt`) once matured >= MIN_MATURED, plus per-group
+    `_misjudged` flags for `event_class` and `sufficiency_path` (>= MIN_GROUP_MATURED). Thin groups
+    yield an `under_baselined` *info* note, not an alert.
+  - `build_llm_decision_monitor_report` — `blocking` is ALWAYS False (alert, never block);
+    `has_systematic_error`/`alert_count` summarize.
+  - `format_monitor_findings_for_operator_health` — maps findings into the Operator Health
+    degradation-row shape (alert->error, info dropped) so wiring is trivial once .4 logs real
+    decisions. No live consumer yet (no logged decisions exist until .4).
+  - `.env.example`: `LLM_DECISION_MONITOR_MIN_MATURED=20`, `_MIN_GROUP_MATURED=8`,
+    `_MIN_EXCESS_HIT_RATE=0.45`, `_MIN_MEAN_EXCESS=0.0`, `_BETA_TILT_RATE=0.50`. 5 tests.
+- **Wires into Operator Health in .4/.5** once the decision-policy logs real decision+outcome rows.
 
 ### [P-LLM-AUTH.4] LLM decision policy over the complete evidence packet
 - Build the evidence-packet loader + the LLM call that fills the .1 contract from the real packet

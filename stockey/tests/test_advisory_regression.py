@@ -63009,6 +63009,86 @@ def test_llm_decision_risk_bounds_exit_passes_through_unsized():
     assert plan["binding_constraint"] == "exit_not_capital_bounded"
 
 
+def _monitor_record(excess, *, matured=True, event_class="order_win", sufficiency_path="aggregate_corroboration", beta=False):
+    return {
+        "symbol": "ABC",
+        "matured": matured,
+        "proposed_action": "BUY",
+        "event_class": event_class,
+        "sufficiency_path": sufficiency_path,
+        "realized_excess_after_cost": excess,
+        "resolved_beta_only": beta,
+    }
+
+
+def test_llm_decision_monitor_under_baselined_returns_info_not_alert():
+    from advisory import llm_decision_monitor
+
+    report = llm_decision_monitor.build_llm_decision_monitor_report(
+        [_monitor_record(0.05) for _ in range(5)]
+    )
+    assert report["blocking"] is False
+    assert report["has_systematic_error"] is False
+    assert report["alert_count"] == 0
+    assert report["findings"][0]["kind"] == "llm_decisions_under_baselined"
+    assert report["findings"][0]["severity"] == "info"
+
+
+def test_llm_decision_monitor_healthy_decisions_produce_no_alerts():
+    from advisory import llm_decision_monitor
+
+    report = llm_decision_monitor.build_llm_decision_monitor_report(
+        [_monitor_record(0.04) for _ in range(24)]
+    )
+    assert report["summary"]["matured_count"] == 24
+    assert report["summary"]["excess_hit_rate"] == 1.0
+    assert report["has_systematic_error"] is False
+    assert report["alert_count"] == 0
+
+
+def test_llm_decision_monitor_flags_low_hit_rate_and_negative_excess():
+    from advisory import llm_decision_monitor
+
+    # 20 matured, all negative excess -> low hit rate AND negative mean excess, both alerts.
+    report = llm_decision_monitor.build_llm_decision_monitor_report(
+        [_monitor_record(-0.03) for _ in range(20)]
+    )
+    kinds = {f["kind"] for f in report["findings"] if f["severity"] == "alert"}
+    assert "llm_decisions_low_excess_hit_rate" in kinds
+    assert "llm_decisions_negative_mean_excess" in kinds
+    assert report["has_systematic_error"] is True
+    assert report["blocking"] is False  # never blocks
+
+
+def test_llm_decision_monitor_flags_systematic_beta_tilt():
+    from advisory import llm_decision_monitor
+
+    # Positive excess (so no hit-rate/mean alert) but most resolved as beta -> beta-tilt alert.
+    records = [_monitor_record(0.02, beta=(i < 15)) for i in range(20)]
+    report = llm_decision_monitor.build_llm_decision_monitor_report(records)
+    kinds = {f["kind"] for f in report["findings"] if f["severity"] == "alert"}
+    assert "llm_decisions_systematic_beta_tilt" in kinds
+    assert "llm_decisions_low_excess_hit_rate" not in kinds
+
+
+def test_llm_decision_monitor_flags_misjudged_sufficiency_path():
+    from advisory import llm_decision_monitor
+
+    # Overall healthy, but the dominant-single-signal path is systematically wrong.
+    good = [_monitor_record(0.05, sufficiency_path="aggregate_corroboration") for _ in range(20)]
+    bad = [_monitor_record(-0.04, sufficiency_path="dominant_single_signal") for _ in range(10)]
+    report = llm_decision_monitor.build_llm_decision_monitor_report(good + bad)
+    misjudged = [
+        f for f in report["findings"]
+        if f["kind"] == "llm_decision_sufficiency_path_misjudged" and f["key"] == "dominant_single_signal"
+    ]
+    assert misjudged and misjudged[0]["severity"] == "alert"
+    # Operator-health formatter drops info rows, maps alert -> error.
+    rows = llm_decision_monitor.format_monitor_findings_for_operator_health(report)
+    assert all(row["severity"] in {"error", "warn"} for row in rows)
+    assert any("dominant_single_signal" in row["title"] for row in rows)
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {
