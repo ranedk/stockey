@@ -39676,8 +39676,9 @@ def test_ts_forecast_paper_portfolio_ensure_table_uses_schema_registry(monkeypat
 
     ts_forecast_paper_portfolio.ensure_tables()
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0]["migration_id"] == ts_forecast_paper_portfolio.TS_FORECAST_PAPER_SCHEMA_MIGRATION_ID
+    assert calls[1]["migration_id"] == ts_forecast_paper_portfolio.TS_FORECAST_PAPER_BENCHMARK_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"] == {
         "module": "advisory.ts_forecast_paper_portfolio",
         "tables": [ts_forecast_paper_portfolio.PAPER_TABLE],
@@ -39685,6 +39686,8 @@ def test_ts_forecast_paper_portfolio_ensure_table_uses_schema_registry(monkeypat
     assert any(ts_forecast_paper_portfolio.PAPER_TABLE in statement for statement in calls[0]["statements"])
     assert any("paper_decision TEXT NOT NULL" in statement for statement in calls[0]["statements"])
     assert any("UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)" in statement for statement in calls[0]["statements"])
+    benchmark_ddl = "\n".join(calls[1]["statements"])
+    assert "excess_cost_adjusted_return DOUBLE PRECISION" in benchmark_ddl
 
 
 def test_ts_forecast_paper_portfolio_scores_forecast_only_against_baselines():
@@ -39757,6 +39760,95 @@ def test_ts_forecast_paper_portfolio_scores_forecast_only_against_baselines():
     buy_summary = summary[summary["paper_decision"].eq("PAPER_BUY")].iloc[0]
     assert int(buy_summary["evaluated_trades"]) == 1
     assert round(float(buy_summary["win_rate"]), 4) == 1.0
+
+
+def test_ts_forecast_paper_portfolio_attaches_benchmark_excess():
+    forecasts = pd.DataFrame(
+        [
+            {
+                "asof_date": pd.Timestamp("2026-01-01T00:00:00Z"),
+                "symbol": "ABC",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 5,
+                "action_hint": "EXPERIMENTAL_POSITIVE",
+                "forecast_return": 0.06,
+                "probability_positive": 0.70,
+                "signal_quality": 0.55,
+                "momentum_return_20d": 0.08,
+                "momentum_return_60d": 0.12,
+            }
+        ]
+    )
+    prices = pd.DataFrame(
+        {
+            "symbol": ["ABC"] * 6,
+            "date": pd.date_range("2026-01-01", periods=6, freq="D", tz="UTC"),
+            "close": [100, 101, 102, 103, 104, 112],
+        }
+    )
+    benchmark_prices = pd.DataFrame(
+        {
+            "date": pd.date_range("2026-01-01", periods=6, freq="D", tz="UTC"),
+            "benchmark_close": [200, 200, 201, 202, 203, 204],
+        }
+    )
+
+    rows = ts_forecast_paper_portfolio.build_paper_portfolio(
+        forecasts=forecasts,
+        prices=prices,
+        advisory_actions=pd.DataFrame(),
+        cost_bps=25,
+        benchmark_prices=benchmark_prices,
+    )
+    abc = rows[rows["symbol"].eq("ABC")].iloc[0]
+    assert abc["paper_decision"] == "PAPER_BUY"
+    benchmark_return = float(abc["benchmark_forward_return"])
+    cost_adjusted = float(abc["cost_adjusted_return"])
+    assert benchmark_return > 0.0
+    assert round(float(abc["excess_cost_adjusted_return"]), 10) == round(cost_adjusted - benchmark_return, 10)
+
+
+def test_ts_forecast_promotion_check_blocks_market_beta_without_excess():
+    dates = pd.date_range("2026-01-01", periods=60, freq="D", tz="UTC")
+    # strong vs momentum, positive after cost, broad — but it did NOT beat the market (excess <= 0)
+    evidence = pd.DataFrame(
+        [
+            {
+                "asof_date": dates[idx],
+                "symbol": f"SYM{idx:03d}",
+                "model_name": "timesfm_2p5_200m",
+                "forecast_horizon_days": 10,
+                "paper_decision": "PAPER_BUY",
+                "cost_adjusted_return": 0.02,
+                "baseline_cost_adjusted_return": 0.005,
+                "excess_cost_adjusted_return": -0.005,
+                "realized_return": 0.022,
+                "advisory_alignment": "ALIGNED_POSITIVE",
+                "load_ts": pd.Timestamp("2026-03-31T00:00:00Z"),
+            }
+            for idx in range(60)
+        ]
+    )
+    args = argparse.Namespace(
+        min_evaluated_trades=50,
+        min_win_rate=0.52,
+        min_avg_cost_adjusted_return=0.005,
+        min_lift_vs_momentum=0.002,
+        min_excess_cost_adjusted_return=0.0,
+        max_exit_conflict_rate=0.05,
+        min_distinct_dates=10,
+        min_symbols=20,
+    )
+
+    groups = ts_forecast_promotion_check.summarize_groups(evidence)
+    scorecard = ts_forecast_promotion_check.build_scorecard(groups=groups, args=args)
+    group = scorecard["groups"][0]
+
+    assert round(float(group["avg_excess_cost_adjusted_return"]), 4) == -0.005
+    # passes every other gate (beats momentum, positive after cost, broad) but rode the market
+    assert group["decision"] == "hold_research_only"
+    assert "excess_cost_adjusted_return" in group["failed_gates"]
+    assert group["failed_gates"] == ["excess_cost_adjusted_return"]
 
 
 def test_ts_forecast_paper_portfolio_persist_casts_numeric_columns(monkeypatch):
@@ -39892,6 +39984,7 @@ def test_ts_forecast_promotion_check_scores_groups_against_gates():
                 "paper_decision": "PAPER_BUY",
                 "cost_adjusted_return": 0.02 if idx < 40 else -0.01,
                 "baseline_cost_adjusted_return": 0.005,
+                "excess_cost_adjusted_return": 0.012 if idx < 40 else -0.004,
                 "realized_return": 0.022 if idx < 40 else -0.008,
                 "advisory_alignment": "ALIGNED_POSITIVE",
                 "load_ts": pd.Timestamp("2026-03-31T00:00:00Z"),

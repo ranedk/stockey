@@ -9,6 +9,7 @@ import pandas as pd
 from advisory.action_recommender import TABLE_NAME as ACTION_TABLE
 from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.research_ledger import finish_research_run, start_research_run
+from advisory.return_attribution import attach_benchmark_forward_returns, load_benchmark_history_for_attribution
 from advisory.ts_forecast_features import TABLE_NAME as FORECAST_TABLE
 from advisory.ts_forecast_evaluator import DEFAULT_COST_BPS, load_price_window
 from utils.db import sql_to_df, upsert_to_db
@@ -18,6 +19,7 @@ from utils.sync import parse_datetime_arg
 
 PAPER_TABLE = "advisory_ts_forecast_paper_portfolio"
 TS_FORECAST_PAPER_SCHEMA_MIGRATION_ID = "20260612_advisory_ts_forecast_paper_portfolio_base"
+TS_FORECAST_PAPER_BENCHMARK_SCHEMA_MIGRATION_ID = "20260623_advisory_ts_forecast_paper_portfolio_benchmark_attribution"
 DEFAULT_MIN_PROBABILITY_POSITIVE = 0.58
 DEFAULT_MIN_SIGNAL_QUALITY = 0.35
 DEFAULT_MIN_FORECAST_RETURN = 0.0
@@ -55,6 +57,15 @@ TS_FORECAST_PAPER_SCHEMA_STATEMENTS = [
         UNIQUE (asof_date, symbol, model_name, forecast_horizon_days)
     )
     """,
+]
+
+# Benchmark-excess columns are added by a follow-on ALTER migration (not by editing the applied
+# CREATE TABLE statements) so the base migration checksum stays stable. A promoted forecast must
+# beat the market after cost, not just a momentum baseline.
+TS_FORECAST_PAPER_BENCHMARK_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {PAPER_TABLE} ADD COLUMN IF NOT EXISTS benchmark_name TEXT",
+    f"ALTER TABLE {PAPER_TABLE} ADD COLUMN IF NOT EXISTS benchmark_forward_return DOUBLE PRECISION",
+    f"ALTER TABLE {PAPER_TABLE} ADD COLUMN IF NOT EXISTS excess_cost_adjusted_return DOUBLE PRECISION",
 ]
 
 
@@ -114,6 +125,52 @@ def ensure_tables() -> None:
         statements=TS_FORECAST_PAPER_SCHEMA_STATEMENTS,
         metadata={"module": "advisory.ts_forecast_paper_portfolio", "tables": [PAPER_TABLE]},
     )
+    apply_schema_migration(
+        migration_id=TS_FORECAST_PAPER_BENCHMARK_SCHEMA_MIGRATION_ID,
+        description="Add benchmark-excess attribution columns to TS forecast paper portfolio.",
+        statements=TS_FORECAST_PAPER_BENCHMARK_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.ts_forecast_paper_portfolio", "tables": [PAPER_TABLE]},
+    )
+
+
+def _attach_benchmark_excess(
+    rows_df: pd.DataFrame,
+    *,
+    benchmark_prices: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Attach NIFTY benchmark-excess to paper-portfolio rows (asset-vs-market, after cost).
+
+    excess_cost_adjusted_return = cost_adjusted_return - benchmark_forward_return over the same
+    forecast window, only for evaluated PAPER_BUY rows (where cost_adjusted_return is set). This
+    keeps a forecast that merely rode the market from looking like value. Attribution-only and
+    research-only; it grants no portfolio or broker authority.
+    """
+    out = rows_df.copy()
+    out["benchmark_name"] = None
+    out["benchmark_forward_return"] = pd.NA
+    out["excess_cost_adjusted_return"] = pd.NA
+    if benchmark_prices is None or benchmark_prices.empty or out.empty:
+        return out
+    horizons = sorted({int(value) for value in pd.to_numeric(out["forecast_horizon_days"], errors="coerce").dropna().unique()})
+    if not horizons:
+        return out
+    attached = attach_benchmark_forward_returns(out, benchmark_prices, horizons=horizons)
+    benchmark_name = attached["benchmark_name"].iloc[0] if "benchmark_name" in attached.columns and len(attached) else None
+    benchmark_returns: list[float | None] = []
+    excess_returns: list[float | None] = []
+    for _, row in attached.iterrows():
+        horizon = pd.to_numeric(row.get("forecast_horizon_days"), errors="coerce")
+        benchmark_return = pd.to_numeric(row.get(f"benchmark_forward_return_h{int(horizon)}"), errors="coerce") if pd.notna(horizon) else None
+        cost_adjusted = pd.to_numeric(row.get("cost_adjusted_return"), errors="coerce")
+        benchmark_returns.append(None if benchmark_return is None or pd.isna(benchmark_return) else float(benchmark_return))
+        if benchmark_return is None or pd.isna(benchmark_return) or pd.isna(cost_adjusted):
+            excess_returns.append(None)
+        else:
+            excess_returns.append(float(cost_adjusted) - float(benchmark_return))
+    out["benchmark_name"] = benchmark_name
+    out["benchmark_forward_return"] = benchmark_returns
+    out["excess_cost_adjusted_return"] = excess_returns
+    return out
 
 
 def load_forecast_candidates(
@@ -299,6 +356,7 @@ def build_paper_portfolio(
     min_probability_positive: float = DEFAULT_MIN_PROBABILITY_POSITIVE,
     min_signal_quality: float = DEFAULT_MIN_SIGNAL_QUALITY,
     min_forecast_return: float = DEFAULT_MIN_FORECAST_RETURN,
+    benchmark_prices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     forecast_df = forecasts if forecasts is not None else load_forecast_candidates(
         from_date=from_date,
@@ -411,7 +469,22 @@ def build_paper_portfolio(
                 "load_ts": now,
             }
         )
-    return pd.DataFrame(rows)
+    paper_rows = pd.DataFrame(rows)
+    if paper_rows.empty:
+        return paper_rows
+    if benchmark_prices is None:
+        try:
+            benchmark_prices = load_benchmark_history_for_attribution(from_date=min_date, to_date=max_date)
+        except Exception as exc:
+            _record_ts_paper_fallback(
+                fallback_type="ts_forecast_paper_benchmark_history_load_failed",
+                source="benchmark_history",
+                reason="TS forecast paper portfolio could not load benchmark history; excess attribution is unavailable for this run.",
+                error=exc,
+                metadata={"from_date": str(min_date), "to_date": str(max_date)},
+            )
+            benchmark_prices = pd.DataFrame()
+    return _attach_benchmark_excess(paper_rows, benchmark_prices=benchmark_prices)
 
 
 def build_summary(rows: pd.DataFrame, *, cost_bps: float = DEFAULT_COST_BPS) -> pd.DataFrame:
@@ -468,12 +541,15 @@ def _prepare_for_persist(df: pd.DataFrame) -> pd.DataFrame:
         "realized_return",
         "cost_adjusted_return",
         "baseline_cost_adjusted_return",
+        "benchmark_forward_return",
+        "excess_cost_adjusted_return",
     ]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     for col in [
         "symbol",
         "model_name",
+        "benchmark_name",
         "paper_decision",
         "paper_policy_version",
         "action_hint",

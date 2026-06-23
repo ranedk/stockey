@@ -728,16 +728,43 @@ visibility gaps. All remain research-only / no auto-apply.
 - **Validate:** Test: a group 70% in one sector flags the risk; 85% blocks.
 - **Confidence:** verify-first.
 
-### [P2.7] Deterministic promotion review for TS forecasts
+### [P2.7] Deterministic promotion review for TS forecasts  ✅ DONE (already rigorous; benchmark-excess gate added)
 - **Why:** `ts_forecast_promotion_check` appears to lack a deterministic review
   (gates) parallel to signal-quality promotion.
-- **Files:** `advisory/ts_forecast_promotion_check.py`.
-- **Do:** If missing, add gates: direction accuracy ≥0.55, after-cost directional
-  return >0, ≥20 distinct symbols, stable across ≥2 non-overlapping windows;
-  persist review rows with `policy_auto_promotion_allowed=false`.
-- **Guardrail:** research_only; promotion creates review rows only.
-- **Validate:** Test: a model below 0.55 accuracy cannot recommend promote.
-- **Confidence:** verify-first (confirm it is a stub).
+- **Outcome (2026-06-23):** NOT a stub — it already gates on evaluated_trades>=50,
+  win_rate>=0.52, avg_cost_adjusted_return>=1%, lift_vs_momentum>=0.5%,
+  exit_conflict_rate<=5%, >=10 dates, >=20 symbols, and persists
+  `manual_config_review_only` / `broker_execution_allowed=false` reviews. The real gap:
+  it beat *momentum* but not the *market*. Added NIFTY benchmark-excess to the TS paper
+  portfolio (`ts_forecast_paper_portfolio.py`, follow-on ALTER migration +
+  `_attach_benchmark_excess`, mirroring the P2.5 evaluator) and a
+  `min_excess_cost_adjusted_return` gate (default 0.0, fail-closed on missing/None) in
+  `ts_forecast_promotion_check.py`, so a forecast that merely rode the market can no longer
+  be promoted. 4 tests added/updated. research_only; no auto-apply; no live consumer.
+- **Note:** the P2.5 follow-on (gate TS promotion on benchmark-excess) is now closed here.
+
+### [P2.7E] EPIC — TS forecast "production path" (gated, review-only; do NOT bypass gates)
+- **Operator intent (2026-06-23):** "make TS-forecast production ready and not just an
+  independent/separate thing." Today TS forecasts have rigorous gated promotion but **no live
+  consumer** — they are a research silo by design.
+- **Hard boundary (non-negotiable):** TS forecasts must NEVER get direct broker/trade authority
+  or override exits (CLAUDE.md; FINSABER/StockBench evidence). "Production" here means the same
+  **bounded, review-only runtime bridge** that context overlays and causal memory already earned —
+  not bypassing deterministic gates.
+- **Do (phased, each verify-first):**
+  1. Build a `signal_refresh --from-ts-forecast` bridge (mirror `--from-causal-memory`) that emits
+     **review-only WATCH** rows ONLY for model/horizons that PASSED the promotion gates (matured
+     paper evidence, beats momentum AND benchmark-excess, breadth, low exit-conflict) AND have an
+     approved manual promotion decision. Rows carry `authority_scope=review_input_only`,
+     `portfolio_authority=none`, `broker_execution_allowed=false`, `full_advisory_required=true`.
+  2. Those WATCH rows then flow through the SAME technical/risk/lifecycle/action gates as every
+     other review-only source — no special path, no exit override.
+  3. Operator Health: surface "promoted TS model/horizon active as review-only watch input" with
+     provenance (which gates/thresholds it passed, approval id).
+  4. Keep a kill-switch env (default off) so the bridge is opt-in per the operator.
+- **Open decisions for the operator:** promotion thresholds for live-eligibility; whether to enable
+  the bridge at all; per-model approval workflow. **Do not relax the no-direct-authority boundary
+  without an explicit, separate decision.**
 
 ### [P2.8] Assert + audit research-only boundary at trusted-overlay load
 - **Why:** `action_recommender` loads trusted signal-quality overlay rules; there

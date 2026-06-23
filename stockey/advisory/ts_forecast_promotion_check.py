@@ -16,6 +16,8 @@ DEFAULT_MIN_EVALUATED_TRADES = 50
 DEFAULT_MIN_WIN_RATE = 0.52
 DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN = 0.01
 DEFAULT_MIN_LIFT_VS_MOMENTUM = 0.005
+# A promoted forecast must beat the market (NIFTY) after cost, not just the momentum baseline.
+DEFAULT_MIN_EXCESS_COST_ADJUSTED_RETURN = 0.0
 DEFAULT_MAX_EXIT_CONFLICT_RATE = 0.05
 DEFAULT_MIN_DISTINCT_DATES = 10
 DEFAULT_MIN_SYMBOLS = 20
@@ -115,6 +117,7 @@ def load_paper_evidence(
                 paper_decision,
                 cost_adjusted_return,
                 baseline_cost_adjusted_return,
+                excess_cost_adjusted_return,
                 realized_return,
                 advisory_alignment,
                 load_ts
@@ -144,8 +147,9 @@ def load_paper_evidence(
     df["symbol"] = df["symbol"].astype("string").str.strip().str.upper()
     df["model_name"] = df["model_name"].astype("string").str.strip().str.lower()
     df["forecast_horizon_days"] = pd.to_numeric(df["forecast_horizon_days"], errors="coerce")
-    for column in ["cost_adjusted_return", "baseline_cost_adjusted_return", "realized_return"]:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+    for column in ["cost_adjusted_return", "baseline_cost_adjusted_return", "excess_cost_adjusted_return", "realized_return"]:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
     return df.dropna(subset=["asof_date", "symbol", "model_name", "forecast_horizon_days", "cost_adjusted_return"])
 
 
@@ -157,8 +161,10 @@ def summarize_groups(evidence: pd.DataFrame) -> list[dict[str, Any]]:
         model_name, horizon = keys
         adjusted = pd.to_numeric(group["cost_adjusted_return"], errors="coerce").dropna()
         baseline = pd.to_numeric(group["baseline_cost_adjusted_return"], errors="coerce").dropna()
+        excess = pd.to_numeric(group.get("excess_cost_adjusted_return", pd.Series(dtype=float)), errors="coerce").dropna()
         avg_adjusted = _number(adjusted.mean()) if len(adjusted) else None
         avg_baseline = _number(baseline.mean()) if len(baseline) else None
+        avg_excess = _number(excess.mean()) if len(excess) else None
         lift = None
         if avg_adjusted is not None and avg_baseline is not None:
             lift = round(float(avg_adjusted - avg_baseline), 6)
@@ -175,6 +181,8 @@ def summarize_groups(evidence: pd.DataFrame) -> list[dict[str, Any]]:
                 "baseline_trade_count": int(len(baseline)),
                 "baseline_avg_cost_adjusted_return": avg_baseline,
                 "lift_vs_momentum": lift,
+                "avg_excess_cost_adjusted_return": avg_excess,
+                "excess_trade_count": int(len(excess)),
                 "exit_conflict_count": conflict_count,
                 "exit_conflict_rate": round(float(conflict_count / evaluated_trades), 6) if evaluated_trades else None,
                 "distinct_dates": int(group["asof_date"].nunique()),
@@ -193,6 +201,7 @@ def score_group(group: dict[str, Any], args: argparse.Namespace) -> dict[str, An
     _gate_gte("win_rate", group.get("win_rate"), args.min_win_rate, gates)
     _gate_gte("avg_cost_adjusted_return", group.get("avg_cost_adjusted_return"), args.min_avg_cost_adjusted_return, gates)
     _gate_gte("lift_vs_momentum", group.get("lift_vs_momentum"), args.min_lift_vs_momentum, gates)
+    _gate_gte("excess_cost_adjusted_return", group.get("avg_excess_cost_adjusted_return"), getattr(args, "min_excess_cost_adjusted_return", DEFAULT_MIN_EXCESS_COST_ADJUSTED_RETURN), gates)
     _gate_lte("exit_conflict_rate", group.get("exit_conflict_rate"), args.max_exit_conflict_rate, gates)
     _gate_gte("distinct_dates", group.get("distinct_dates"), args.min_distinct_dates, gates)
     _gate_gte("symbol_count", group.get("symbol_count"), args.min_symbols, gates)
@@ -260,6 +269,7 @@ def build_scorecard(
             "min_win_rate": float(args.min_win_rate),
             "min_avg_cost_adjusted_return": float(args.min_avg_cost_adjusted_return),
             "min_lift_vs_momentum": float(args.min_lift_vs_momentum),
+            "min_excess_cost_adjusted_return": float(getattr(args, "min_excess_cost_adjusted_return", DEFAULT_MIN_EXCESS_COST_ADJUSTED_RETURN)),
             "max_exit_conflict_rate": float(args.max_exit_conflict_rate),
             "min_distinct_dates": int(args.min_distinct_dates),
             "min_symbols": int(args.min_symbols),
@@ -440,6 +450,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-win-rate", type=float, default=DEFAULT_MIN_WIN_RATE)
     parser.add_argument("--min-avg-cost-adjusted-return", type=float, default=DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN)
     parser.add_argument("--min-lift-vs-momentum", type=float, default=DEFAULT_MIN_LIFT_VS_MOMENTUM)
+    parser.add_argument("--min-excess-cost-adjusted-return", type=float, default=DEFAULT_MIN_EXCESS_COST_ADJUSTED_RETURN)
     parser.add_argument("--max-exit-conflict-rate", type=float, default=DEFAULT_MAX_EXIT_CONFLICT_RATE)
     parser.add_argument("--min-distinct-dates", type=int, default=DEFAULT_MIN_DISTINCT_DATES)
     parser.add_argument("--min-symbols", type=int, default=DEFAULT_MIN_SYMBOLS)
