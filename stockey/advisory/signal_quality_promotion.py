@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from typing import Any, Literal
 
 import pandas as pd
@@ -11,6 +12,7 @@ from advisory.context_overlay_reliability_report import RELIABILITY_SUMMARY_TABL
 from advisory.context_overlay_reliability_report import reliability_runtime_policy_contract
 from advisory.context_overlay_reliability_report import load_persisted_reliability_report as load_persisted_context_reliability_report
 from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.multiple_testing import benjamini_hochberg, benjamini_hochberg_qvalues, binomial_right_tail_p_value
 from advisory.signal_quality_family_report import _is_missing_table_error as is_missing_family_report_table_error
 from advisory.signal_quality_family_report import build_family_report, build_unavailable_report, load_family_summary
 from advisory.signal_quality_family_report import family_report_authority_contract
@@ -26,6 +28,10 @@ from utils.schema_migrations import apply_schema_migration
 
 REVIEWS_TABLE = "advisory_signal_quality_promotion_reviews"
 DECISIONS_TABLE = "advisory_signal_quality_promotion_decisions"
+# False-discovery-rate ceiling for the family-candidate batch. Across many candidate
+# (source family x horizon) comparisons in one run, Benjamini-Hochberg keeps the expected
+# share of false promotions at or below this level. Research-only; no auto-apply.
+SIGNAL_QUALITY_PROMOTION_FDR_ALPHA = float(os.getenv("SIGNAL_QUALITY_PROMOTION_FDR_ALPHA", "0.10"))
 SIGNAL_QUALITY_PROMOTION_SCHEMA_MIGRATION_ID = "20260611_advisory_signal_quality_promotion_base"
 
 SIGNAL_QUALITY_PROMOTION_SCHEMA_STATEMENTS = [
@@ -1096,6 +1102,7 @@ def generate_family_candidate_reviews(
         }
     reviews: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
     for family in report.get("families") or []:
         if family.get("classification") != "candidate_helpful":
             continue
@@ -1146,13 +1153,57 @@ def generate_family_candidate_reviews(
                     }
                 )
                 continue
+            # Passed all deterministic gates; record as an FDR candidate before promoting.
+            matured_count = _safe_int(horizon.get("matured_count"))
+            excess_hit_rate = horizon.get("excess_hit_rate_after_cost")
+            excess_hits = (
+                None
+                if excess_hit_rate is None or matured_count <= 0
+                else int(round(float(excess_hit_rate) * matured_count))
+            )
+            candidates.append(
+                {
+                    "source_family": source_family,
+                    "horizon_days": horizon_days,
+                    "variant": variant,
+                    "matured_count": matured_count,
+                    "excess_hit_rate_after_cost": excess_hit_rate,
+                    "p_value": binomial_right_tail_p_value(excess_hits, matured_count) if excess_hits is not None else None,
+                }
+            )
+    # Benjamini-Hochberg FDR control across the whole candidate batch: when many
+    # family x horizon combos clear the deterministic gates together, a few can do so by chance.
+    # The null per candidate is "beating the benchmark after costs is a coin flip" (excess hit p=0.5).
+    p_values = [candidate["p_value"] for candidate in candidates]
+    rejected = benjamini_hochberg(p_values, alpha=SIGNAL_QUALITY_PROMOTION_FDR_ALPHA)
+    q_values = benjamini_hochberg_qvalues(p_values)
+    for index, candidate in enumerate(candidates):
+        if rejected[index]:
             reviews.append(
                 generate_promotion_review(
                     evaluated_at=report.get("evaluated_at") or evaluated_at,
-                    horizon_days=horizon_days,
-                    variant=variant,
+                    horizon_days=candidate["horizon_days"],
+                    variant=candidate["variant"],
                     persist=persist,
                 )
+            )
+        else:
+            skipped.append(
+                {
+                    "source_family": candidate["source_family"],
+                    "horizon_days": candidate["horizon_days"],
+                    "variant": candidate["variant"],
+                    "reason": (
+                        "blocked_by_multiple_testing_fdr_control"
+                        if candidate["p_value"] is not None
+                        else "blocked_by_missing_benchmark_excess_stats_for_fdr"
+                    ),
+                    "fdr_p_value": candidate["p_value"],
+                    "fdr_q_value": q_values[index],
+                    "fdr_alpha": float(SIGNAL_QUALITY_PROMOTION_FDR_ALPHA),
+                    "matured_count": candidate["matured_count"],
+                    "excess_hit_rate_after_cost": candidate["excess_hit_rate_after_cost"],
+                }
             )
     return {
         "status": "ok",
@@ -1166,7 +1217,10 @@ def generate_family_candidate_reviews(
         "skipped_count": len(skipped),
         "skipped": skipped,
         "reviews": reviews,
-        "note": "Generated promotion review rows only for source-family horizons classified as candidate_helpful and not blocked by harmful narrowed split negative controls. No config, action, portfolio, or broker behavior was changed.",
+        "fdr_alpha": float(SIGNAL_QUALITY_PROMOTION_FDR_ALPHA),
+        "fdr_candidate_count": len(candidates),
+        "fdr_survived_count": int(sum(1 for flag in rejected if flag)),
+        "note": "Generated promotion review rows only for source-family horizons classified as candidate_helpful, not blocked by harmful narrowed split negative controls, and surviving Benjamini-Hochberg FDR control across the candidate batch. No config, action, portfolio, or broker behavior was changed.",
     }
 
 

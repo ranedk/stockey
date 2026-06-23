@@ -649,7 +649,20 @@ visibility gaps. All remain research-only / no auto-apply.
 - **Validate:** Test: a group with <10 matured rows → `needs_more_data`.
 - **Confidence:** verified.
 
-### [P2.4] Multiple-testing / false-discovery control for promotions
+### [P2.4] Multiple-testing / false-discovery control for promotions  ✅ DONE (net-new)
+- **Outcome (2026-06-23):** No FDR/p-value/dispersion existed anywhere (confirmed net-new).
+  Added pure `advisory/multiple_testing.py` (`binomial_right_tail_p_value`, `benjamini_hochberg`,
+  `benjamini_hochberg_qvalues`) — dependency-free, no numpy/scipy. Wired Benjamini-Hochberg into
+  `signal_quality_promotion.generate_family_candidate_reviews`: across the candidate
+  (source family x horizon) batch, each candidate's null is 'beating the benchmark after costs is
+  a coin flip' (excess-hit p=0.5), giving a binomial p-value from the already-present
+  `excess_hit_rate_after_cost` + `matured_count` (no schema change). Only candidates surviving BH at
+  `SIGNAL_QUALITY_PROMOTION_FDR_ALPHA` (default 0.10) generate reviews; the rest are skipped with
+  `blocked_by_multiple_testing_fdr_control` (+ p/q values) or `blocked_by_missing_benchmark_excess_stats_for_fdr`
+  (fail-closed). research_only; no auto-apply. 4 tests added; one stale fixture (matured=12 marked
+  helpful) bumped to a statistically-significant sample.
+- **Note (future):** the proportion-based binomial p-value is intentionally simple; a magnitude-based
+  t-test would need per-group return std persisted in the evaluator summary (a follow-on if desired).
 - **Why:** No FDR/Bonferroni correction across variants×horizons×families;
   uncorrected, several false "candidate_helpful" rows appear by chance.
 - **Files:** new `advisory/multiple_testing_correction.py`; apply in

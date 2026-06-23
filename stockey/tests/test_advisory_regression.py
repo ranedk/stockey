@@ -62521,6 +62521,73 @@ def test_operator_api_records_technical_promotion_manual_decision(monkeypatch):
     assert called["operator_id"] == "tester"
 
 
+def test_multiple_testing_binomial_right_tail_p_value():
+    from advisory import multiple_testing
+
+    assert abs(multiple_testing.binomial_right_tail_p_value(10, 10) - (0.5 ** 10)) < 1e-12
+    assert multiple_testing.binomial_right_tail_p_value(0, 10) == 1.0
+    assert multiple_testing.binomial_right_tail_p_value(5, 10) > 0.5  # includes the mode
+    assert multiple_testing.binomial_right_tail_p_value(3, 0) is None
+
+
+def test_multiple_testing_benjamini_hochberg_controls_discoveries():
+    from advisory import multiple_testing
+
+    assert multiple_testing.benjamini_hochberg([0.001, 0.4, 0.6, 0.8], alpha=0.10) == [True, False, False, False]
+    assert multiple_testing.benjamini_hochberg([0.4, 0.5, 0.9], alpha=0.10) == [False, False, False]
+    assert multiple_testing.benjamini_hochberg([0.001, 0.002, 0.003], alpha=0.10) == [True, True, True]
+    assert multiple_testing.benjamini_hochberg([None, 0.001], alpha=0.10) == [False, True]
+    assert multiple_testing.benjamini_hochberg([]) == []
+
+
+def test_multiple_testing_qvalues_monotone_and_bounded():
+    from advisory import multiple_testing
+
+    q = multiple_testing.benjamini_hochberg_qvalues([0.001, 0.4, 0.6])
+    assert q[0] <= q[1] <= q[2]
+    assert all(0.0 <= value <= 1.0 for value in q)
+
+
+def test_signal_quality_promotion_family_candidates_apply_fdr_control(monkeypatch):
+    report = {
+        "evaluated_at": pd.Timestamp("2026-06-20T00:00:00Z"),
+        "families": [
+            {
+                "classification": "candidate_helpful",
+                "source_family": "announcement_context",
+                "horizons": [
+                    {"classification": "candidate_helpful", "variant": "v_a", "horizon_days": 5, "matured_count": 40, "excess_hit_rate_after_cost": 0.80},
+                    {"classification": "candidate_helpful", "variant": "v_b", "horizon_days": 10, "matured_count": 40, "excess_hit_rate_after_cost": 0.75},
+                    {"classification": "candidate_helpful", "variant": "v_c", "horizon_days": 20, "matured_count": 12, "excess_hit_rate_after_cost": 0.58},
+                ],
+            }
+        ],
+    }
+    monkeypatch.setattr(signal_quality_promotion, "load_family_summary", lambda **kwargs: pd.DataFrame([{"x": 1}]))
+    monkeypatch.setattr(signal_quality_promotion, "build_family_report", lambda rows: report)
+    monkeypatch.setattr(signal_quality_promotion, "load_persisted_fast_reliability_gate", lambda **kwargs: {"fast_reliability_blocks_broad_promotion": False})
+    monkeypatch.setattr(signal_quality_promotion, "load_split_negative_control_gate", lambda **kwargs: {"split_negative_control_blocks_broad_promotion": False})
+    generated: list[tuple[int, str]] = []
+
+    def fake_review(*, evaluated_at, horizon_days, variant, persist):
+        generated.append((horizon_days, variant))
+        return {"variant": variant, "horizon_days": horizon_days}
+
+    monkeypatch.setattr(signal_quality_promotion, "generate_promotion_review", fake_review)
+
+    result = signal_quality_promotion.generate_family_candidate_reviews(persist=False)
+
+    # strong excess-hit candidates survive BH; the weak small-sample one is FDR-rejected.
+    assert result["fdr_candidate_count"] == 3
+    assert result["fdr_survived_count"] == 2
+    assert result["review_count"] == 2
+    assert set(generated) == {(5, "v_a"), (10, "v_b")}
+    fdr_skipped = [row for row in result["skipped"] if row.get("reason") == "blocked_by_multiple_testing_fdr_control"]
+    assert len(fdr_skipped) == 1
+    assert fdr_skipped[0]["variant"] == "v_c"
+    assert fdr_skipped[0]["fdr_alpha"] == signal_quality_promotion.SIGNAL_QUALITY_PROMOTION_FDR_ALPHA
+
+
 def test_signal_quality_promotion_review_is_manual_only(monkeypatch):
     persisted = []
     monkeypatch.setattr(
@@ -63652,17 +63719,17 @@ def test_signal_quality_promotion_auto_family_candidates_generates_only_helpful_
                 "evaluated_at": pd.Timestamp("2026-06-20T00:00:00Z"),
                 "horizon_days": 5,
                 "variant": "technical_plus_announcement_context",
-                "sample_count": 100,
-                "selected_count": 14,
-                "matured_count": 12,
-                "selection_rate": 0.14,
+                "sample_count": 200,
+                "selected_count": 32,
+                "matured_count": 30,
+                "selection_rate": 0.16,
                     "avg_forward_return_after_cost": 0.035,
-                    "hit_rate_after_cost": 0.58,
-                    "positive_return_rate": 0.66,
+                    "hit_rate_after_cost": 0.80,
+                    "positive_return_rate": 0.80,
                     "avg_benchmark_forward_return": 0.012,
                     "avg_excess_forward_return_after_cost": 0.023,
-                    "excess_hit_rate_after_cost": 0.58,
-                    "positive_excess_return_rate": 0.66,
+                    "excess_hit_rate_after_cost": 0.80,
+                    "positive_excess_return_rate": 0.80,
                     "baseline_avg_forward_return_after_cost": 0.01,
                 "lift_vs_technical_only": 0.025,
                 "recommendation": "candidate_overlay_improves",
