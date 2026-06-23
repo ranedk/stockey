@@ -610,7 +610,18 @@ visibility gaps. All remain research-only / no auto-apply.
   beta-only split is not classified helpful.
 - **Confidence:** verified (schema lacks fields).
 
-### [P2.2] Complete after-cost + excess aggregation in event-policy evaluator
+### [P2.2] Complete after-cost + excess aggregation in event-policy evaluator  ✅ ALREADY DONE (audit finding was stale)
+- **Outcome (2026-06-23):** Verified already complete — the audit snapshot predated the
+  `20260622_advisory_event_policy_evaluator_benchmark_attribution` migration. The evaluator
+  computes per-row `forward_return_after_cost` + `excess_forward_return_after_cost` +
+  `hit_after_cost`/`excess_hit_after_cost` (`event_policy_evaluator.py:485-521`), and
+  `summarize_evaluations` (615-645) populates `avg_forward_return_after_cost`,
+  `avg_excess_forward_return_after_cost`, after-cost `hit_rate_after_cost`,
+  `excess_hit_rate_after_cost`, and `positive_excess_return_rate`. `_summary_recommendation`
+  (538-561) gates on benchmark-excess: `needs_benchmark_attribution` (excess missing),
+  `benchmark_beta_not_policy_alpha` (positive after-cost but excess<=0), and
+  `candidate_policy_strengthen` requires positive after-cost AND positive excess. Covered by
+  `test_event_policy_evaluator_builds_rows_and_summary` and siblings. No code change needed.
 - **Why:** `event_policy_evaluator` summary aggregation does not compute
   `avg_forward_return_after_cost` / `avg_excess_forward_return_after_cost`
   (schema exists but is unpopulated), so event-policy promotion can read raw beta.
