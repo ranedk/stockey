@@ -699,7 +699,25 @@ visibility gaps. All remain research-only / no auto-apply.
 - **Validate:** Sample run shows excess fields or a documented contract reason.
 - **Confidence:** verified (missing).
 
-### [P2.6] Sector-concentration detector in promotions
+### [P2.6] Sector-concentration detector in promotions  ✅ DONE (revised to attribution-only per operator)
+- **Operator steer (2026-06-23):** sector concentration is acceptable when a sector is genuinely
+  performing (and liquid enough to exit on sector bad news), so a hard concentration *block* would
+  be wrong. Two concepts were conflated: portfolio sector exposure (a risk-layer policy — see new
+  P-card below) vs research-evidence concentration (false-generalization risk). Stockey already
+  handles the latter the right way via benchmark-excess sector splits + (now) FDR.
+- **Outcome:** Implemented **A (attribution-only, no block)**. Added
+  `_sector_concentration_attribution` in `signal_quality_promotion.py`, sourced from the candidate's
+  `fast_reliability_family.sector_diagnostics`, and attached it to each family promotion review and
+  FDR-skip row as `sector_concentration` {dominant_sector, dominant_sector_matured_share,
+  sector_concentrated, note}. When share >=
+  `SIGNAL_QUALITY_PROMOTION_SECTOR_CONCENTRATION_NOTE_THRESHOLD` (0.60) the note routes the reviewer
+  to the benchmark-excess sector split (so a strong sector becomes a sector rule, not a discarded
+  one). `policy_effect=attribution_only_no_promotion_block` — never changes the recommendation.
+  3 tests added.
+- **Follow-on (separate layer): [P-RISK] portfolio sector-exposure + liquidity policy.** Capture the
+  operator's liquid-strong-sector intent where it belongs: position-sizing sector caps + exit-ability
+  + the existing de-risk/negative-pressure overlays for sector bad news. Risk/portfolio layer, not
+  research promotion.
 - **Why:** A "helpful" event-policy/negative-pressure group may derive all lift
   from one sector.
 - **Files:** `advisory/event_policy_promotion.py`,

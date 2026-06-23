@@ -32,6 +32,11 @@ DECISIONS_TABLE = "advisory_signal_quality_promotion_decisions"
 # (source family x horizon) comparisons in one run, Benjamini-Hochberg keeps the expected
 # share of false promotions at or below this level. Research-only; no auto-apply.
 SIGNAL_QUALITY_PROMOTION_FDR_ALPHA = float(os.getenv("SIGNAL_QUALITY_PROMOTION_FDR_ALPHA", "0.10"))
+# Dominant-sector matured share above which a candidate's edge is annotated as sector-concentrated.
+# This is attribution-only routing (validate via the sector split); it never blocks promotion.
+SIGNAL_QUALITY_PROMOTION_SECTOR_CONCENTRATION_NOTE_THRESHOLD = float(
+    os.getenv("SIGNAL_QUALITY_PROMOTION_SECTOR_CONCENTRATION_NOTE_THRESHOLD", "0.60")
+)
 SIGNAL_QUALITY_PROMOTION_SCHEMA_MIGRATION_ID = "20260611_advisory_signal_quality_promotion_base"
 
 SIGNAL_QUALITY_PROMOTION_SCHEMA_STATEMENTS = [
@@ -1075,6 +1080,53 @@ def generate_promotion_review(
     return result
 
 
+def _sector_concentration_attribution(family: Any) -> dict[str, Any]:
+    """Attribution-only: where does a candidate family's edge concentrate by sector?
+
+    A high dominant-sector matured share is a routing signal, not a blocker: validate the edge via
+    the existing benchmark-excess sector split so a genuinely strong, liquid sector becomes a
+    sector-specific rule rather than a discarded one. Portfolio-level sector exposure / liquidity is
+    a separate risk-layer policy. This never changes the promotion recommendation.
+    """
+    sectors = family.get("sector_diagnostics") if isinstance(family, dict) else None
+    sectors = sectors if isinstance(sectors, list) else []
+    matured = [
+        (str(item.get("sector_name") or item.get("sector_key") or "unknown"), _safe_int(item.get("total_matured_count")))
+        for item in sectors
+        if isinstance(item, dict)
+    ]
+    matured = [(name, count) for name, count in matured if count > 0]
+    total = sum(count for _, count in matured)
+    if not matured or total <= 0:
+        return {
+            "policy_effect": "attribution_only_no_promotion_block",
+            "sector_count": _safe_int((family or {}).get("sector_count")) if isinstance(family, dict) else 0,
+            "dominant_sector": None,
+            "dominant_sector_matured_share": None,
+            "sector_concentrated": False,
+            "note": "No sector matured-count breakdown available; cannot attribute sector concentration.",
+        }
+    dominant_sector, dominant_count = max(matured, key=lambda pair: pair[1])
+    share = round(dominant_count / total, 4)
+    concentrated = share >= SIGNAL_QUALITY_PROMOTION_SECTOR_CONCENTRATION_NOTE_THRESHOLD
+    note = (
+        f"Edge concentrates in {dominant_sector} ({share:.0%} of matured rows). Validate via the "
+        "benchmark-excess sector split before broad promotion; a genuinely strong sector becomes a "
+        "sector rule, not a discarded one. Attribution only; does not block promotion."
+        if concentrated
+        else f"Edge spread across {len(matured)} sectors (top {dominant_sector} {share:.0%})."
+    )
+    return {
+        "policy_effect": "attribution_only_no_promotion_block",
+        "sector_count": len(matured),
+        "helpful_sector_count": _safe_int(family.get("helpful_sector_count")) if isinstance(family, dict) else 0,
+        "dominant_sector": dominant_sector,
+        "dominant_sector_matured_share": share,
+        "sector_concentrated": bool(concentrated),
+        "note": note,
+    }
+
+
 def generate_family_candidate_reviews(
     *,
     evaluated_at: Any | None = None,
@@ -1169,6 +1221,7 @@ def generate_family_candidate_reviews(
                     "matured_count": matured_count,
                     "excess_hit_rate_after_cost": excess_hit_rate,
                     "p_value": binomial_right_tail_p_value(excess_hits, matured_count) if excess_hits is not None else None,
+                    "sector_concentration": _sector_concentration_attribution(fast_reliability_gate.get("fast_reliability_family")),
                 }
             )
     # Benjamini-Hochberg FDR control across the whole candidate batch: when many
@@ -1179,14 +1232,15 @@ def generate_family_candidate_reviews(
     q_values = benjamini_hochberg_qvalues(p_values)
     for index, candidate in enumerate(candidates):
         if rejected[index]:
-            reviews.append(
-                generate_promotion_review(
-                    evaluated_at=report.get("evaluated_at") or evaluated_at,
-                    horizon_days=candidate["horizon_days"],
-                    variant=candidate["variant"],
-                    persist=persist,
-                )
+            review = generate_promotion_review(
+                evaluated_at=report.get("evaluated_at") or evaluated_at,
+                horizon_days=candidate["horizon_days"],
+                variant=candidate["variant"],
+                persist=persist,
             )
+            if isinstance(review, dict):
+                review["sector_concentration"] = candidate["sector_concentration"]
+            reviews.append(review)
         else:
             skipped.append(
                 {
@@ -1203,6 +1257,7 @@ def generate_family_candidate_reviews(
                     "fdr_alpha": float(SIGNAL_QUALITY_PROMOTION_FDR_ALPHA),
                     "matured_count": candidate["matured_count"],
                     "excess_hit_rate_after_cost": candidate["excess_hit_rate_after_cost"],
+                    "sector_concentration": candidate["sector_concentration"],
                 }
             )
     return {

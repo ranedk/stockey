@@ -62618,7 +62618,22 @@ def test_signal_quality_promotion_family_candidates_apply_fdr_control(monkeypatc
     }
     monkeypatch.setattr(signal_quality_promotion, "load_family_summary", lambda **kwargs: pd.DataFrame([{"x": 1}]))
     monkeypatch.setattr(signal_quality_promotion, "build_family_report", lambda rows: report)
-    monkeypatch.setattr(signal_quality_promotion, "load_persisted_fast_reliability_gate", lambda **kwargs: {"fast_reliability_blocks_broad_promotion": False})
+    monkeypatch.setattr(
+        signal_quality_promotion,
+        "load_persisted_fast_reliability_gate",
+        lambda **kwargs: {
+            "fast_reliability_blocks_broad_promotion": False,
+            "fast_reliability_family": {
+                "sector_count": 3,
+                "helpful_sector_count": 1,
+                "sector_diagnostics": [
+                    {"sector_name": "Auto", "total_matured_count": 40, "classification": "candidate_helpful"},
+                    {"sector_name": "Pharma", "total_matured_count": 5, "classification": "monitor"},
+                    {"sector_name": "IT", "total_matured_count": 5, "classification": "monitor"},
+                ],
+            },
+        },
+    )
     monkeypatch.setattr(signal_quality_promotion, "load_split_negative_control_gate", lambda **kwargs: {"split_negative_control_blocks_broad_promotion": False})
     generated: list[tuple[int, str]] = []
 
@@ -62639,6 +62654,45 @@ def test_signal_quality_promotion_family_candidates_apply_fdr_control(monkeypatc
     assert len(fdr_skipped) == 1
     assert fdr_skipped[0]["variant"] == "v_c"
     assert fdr_skipped[0]["fdr_alpha"] == signal_quality_promotion.SIGNAL_QUALITY_PROMOTION_FDR_ALPHA
+    # sector-concentration is attribution-only: surfaced on reviews, never blocks promotion.
+    survivor = result["reviews"][0]
+    assert survivor["sector_concentration"]["dominant_sector"] == "Auto"
+    assert survivor["sector_concentration"]["sector_concentrated"] is True
+    assert survivor["sector_concentration"]["policy_effect"] == "attribution_only_no_promotion_block"
+
+
+def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
+    concentrated = signal_quality_promotion._sector_concentration_attribution(
+        {
+            "sector_count": 3,
+            "helpful_sector_count": 1,
+            "sector_diagnostics": [
+                {"sector_name": "Auto", "total_matured_count": 40, "classification": "candidate_helpful"},
+                {"sector_name": "Pharma", "total_matured_count": 5, "classification": "monitor"},
+                {"sector_name": "IT", "total_matured_count": 5, "classification": "monitor"},
+            ],
+        }
+    )
+    assert concentrated["dominant_sector"] == "Auto"
+    assert concentrated["dominant_sector_matured_share"] == 0.8
+    assert concentrated["sector_concentrated"] is True
+    assert concentrated["policy_effect"] == "attribution_only_no_promotion_block"
+    assert "sector split" in concentrated["note"].lower()
+
+    spread = signal_quality_promotion._sector_concentration_attribution(
+        {
+            "sector_diagnostics": [
+                {"sector_name": "Auto", "total_matured_count": 20, "classification": "candidate_helpful"},
+                {"sector_name": "Pharma", "total_matured_count": 18, "classification": "candidate_helpful"},
+                {"sector_name": "IT", "total_matured_count": 17, "classification": "candidate_helpful"},
+            ],
+        }
+    )
+    assert spread["sector_concentrated"] is False
+
+    empty = signal_quality_promotion._sector_concentration_attribution(None)
+    assert empty["dominant_sector"] is None
+    assert empty["sector_concentrated"] is False
 
 
 def test_signal_quality_promotion_review_is_manual_only(monkeypatch):
