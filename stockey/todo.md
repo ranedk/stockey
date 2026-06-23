@@ -600,10 +600,13 @@ FINSABER, Profit Mirage) found capable LLM trading agents are run-to-run unstabl
 apparent alpha is largely market beta. So this epic keeps: (a) a typed evidence/provenance +
 reason contract on every LLM decision (incl. which soft gates it overrode and why); (b)
 point-in-time discipline / no lookahead; (c) a **master enable flag that DEFAULTS OFF** for any
-live LLM→broker authority; (d) **paper/shadow graduation** — an LLM-decision policy runs in paper
-mode and must clear after-cost + benchmark-excess + regime-robust evidence over enough matured
-windows before its live flag can be turned on. Build is **phased; do not wire LLM→broker in one
-step.**
+live LLM→broker authority; (d) **deterministic risk bounds** — every live decision is sized
+within position / exposure / stop caps so no single call is catastrophic; (e) **outcome
+monitoring** — live decisions + outcomes + provenance are logged to detect systematic LLM error
+patterns (alert, never block). **Paper-first graduation is intentionally NOT used** (operator
+decision 2026-06-23: too many non-stationary dimensions for paper P&L to be informative; the floor
+is risk bounds + monitoring, not paper validation). Build is **phased; do not wire LLM→broker in
+one step.**
 
 **Sub-tasks (phased, each verify-first, operator review per phase):**
 
@@ -630,28 +633,38 @@ step.**
   override + deterministic sizing-as-bounds land in .4 (the live bridge), where the risk engine
   sizes within caps and the execution-safety contract still runs.
 
-### [P-LLM-AUTH.2] LLM decision policy in PAPER mode
-- An LLM decision policy that, from the same evidence the reviewer sees, emits BUY/SELL/size into
-  the **operator paper portfolio only** (reuse `advisory/operator_portfolio.py`), with full
-  provenance. Measure it like any other research signal: after-cost, benchmark-excess (now
-  available), regime split, exit-conflict. No live authority. Master flag defaults OFF.
+### [P-LLM-AUTH.2] Deterministic risk / position-sizing bounds (the safety floor)  ✅ DONE
+- The seatbelt the operator chose. Added pure/additive `advisory/llm_decision_risk_bounds.py`
+  (no LLM, no broker): `bound_position_size(contract, capital, price, conviction, atr, current
+  sector/total exposure, caps...)` -> bounded sizing plan. Only decisions that pass the .1 data bar
+  (`meets_data_grounding_for_live`) are sized; size = min(conviction-scaled position cap, sector
+  headroom, total headroom) with the binding constraint recorded; stop = price - ATR*mult; exits
+  pass through unsized (they reduce risk). Caps are env-tunable
+  (`LLM_DECISION_MAX_POSITION_PCT`=0.05, `MIN`=0.01, `MAX_SECTOR_EXPOSURE_PCT`=0.25,
+  `MAX_TOTAL_EXPOSURE_PCT`=1.0, `STOP_ATR_MULT`=2.0). `broker_execution_allowed` always False here.
+  5 tests; env documented. This is risk-of-ruin protection, not LLM distrust.
 
-### [P-LLM-AUTH.3] Graduation gate
-- A deterministic promotion check (mirror `ts_forecast_promotion_check`) that decides whether an
-  LLM-decision policy has earned live eligibility: matured count, after-cost > 0, benchmark-excess
-  > 0, regime-robust, low exit-conflict, breadth. Output is eligibility evidence, not auto-enable.
+### [P-LLM-AUTH.3] Live decision + outcome monitoring (systematic-error detector)
+- Log each LLM decision + its evidence packet + realized outcome + provenance; detect systematic
+  error patterns (e.g. repeated beta tilt, a consistently mis-judged event class) and surface via
+  Operator Health. Alerts/annotates; NEVER gates or blocks a decision. (This replaces paper
+  graduation — it catches repeatable mistakes live without pretending paper P&L is predictive.)
 
-### [P-LLM-AUTH.4] Live bridge behind the master flag
-- Only when the master flag is ON and the policy passed graduation: let LLM decisions become
-  broker-capable actions through the existing execution safety contract / live-submit preflight
-  (`advisory/execution_engine.py`). Soft gates may be overridden with recorded rationale; the
-  execution-safety mechanics (dry-run, reconciliation, kill-switch) stay. Phase requires explicit
-  operator enablement.
+### [P-LLM-AUTH.4] LLM decision policy over the complete evidence packet
+- Build the evidence-packet loader + the LLM call that fills the .1 contract from the real packet
+  and is sized by .2. Produces grounded BUY/SELL + conviction with provenance. Until the master
+  flag is on, output stays review-only.
 
-**Open decisions for the operator (before P-LLM-AUTH.3/.4):** the graduation thresholds; whether
-to keep the paper-first requirement or enable live sooner; per-policy enable scope; and whether to
-remove the retained safety items (a/b/c/d) above — currently kept by the engineer as deployment
-hygiene, but yours to drop.
+### [P-LLM-AUTH.5] Live bridge behind the default-OFF master flag
+- Only when the master flag is ON: a grounded decision + its .2 risk bounds become a broker-capable
+  action through the existing execution-safety contract / live-submit preflight
+  (`advisory/execution_engine.py`); soft gates may be overridden with recorded rationale;
+  execution-safety mechanics (dry-run, reconciliation, kill-switch) stay; .3 monitoring runs.
+
+**Open decisions for the operator (before .5):** the risk-bound caps (per-position / per-sector /
+total exposure %, stop ATR multiple, min conviction); whether/when to flip the master flag and at
+what capital sleeve; per-policy scope; and whether to drop any retained safety item (a–e) — kept by
+the engineer as survival/deployment hygiene, but yours to drop.
 
 ---
 

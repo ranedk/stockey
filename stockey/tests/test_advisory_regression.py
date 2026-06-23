@@ -62852,6 +62852,81 @@ def test_llm_decision_contract_live_eligible_only_with_master_flag_and_graduatio
     assert graduated["broker_execution_allowed"] is False
 
 
+def _grounded_buy_contract(action="BUY", conviction=1.0, **packet_overrides):
+    from advisory import llm_decision_contract
+
+    return llm_decision_contract.build_llm_decision_contract(
+        symbol="ABC",
+        proposed_action=action,
+        packet=_llm_decision_full_packet(**packet_overrides),
+        cited_dimensions=list(llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS),
+        conviction=conviction,
+    )
+
+
+def test_llm_decision_risk_bounds_caps_position_and_sets_stop():
+    from advisory import llm_decision_risk_bounds
+
+    contract = _grounded_buy_contract(conviction=1.0)
+    plan = llm_decision_risk_bounds.bound_position_size(
+        contract=contract, capital=1_000_000.0, price=100.0, conviction=1.0, atr=3.0,
+    )
+    assert plan["allowed"] is True
+    assert plan["position_inr"] == 50000.0  # 5% max-position cap at full conviction
+    assert plan["position_pct_of_capital"] == 0.05
+    assert plan["quantity"] == 500
+    assert plan["stop_price"] == 94.0  # 100 - 2*3
+    assert plan["binding_constraint"] == "conviction_position_cap"
+    assert plan["broker_execution_allowed"] is False
+
+
+def test_llm_decision_risk_bounds_sector_cap_binds():
+    from advisory import llm_decision_risk_bounds
+
+    contract = _grounded_buy_contract(conviction=1.0)
+    plan = llm_decision_risk_bounds.bound_position_size(
+        contract=contract, capital=1_000_000.0, price=100.0, conviction=1.0,
+        current_sector_exposure_inr=240_000.0,  # 10k of the 250k sector cap remains
+    )
+    assert plan["position_inr"] == 10000.0
+    assert plan["binding_constraint"] == "sector_exposure_cap"
+    assert plan["quantity"] == 100
+
+
+def test_llm_decision_risk_bounds_conviction_scales_size():
+    from advisory import llm_decision_risk_bounds
+
+    contract = _grounded_buy_contract(conviction=0.0)
+    plan = llm_decision_risk_bounds.bound_position_size(
+        contract=contract, capital=1_000_000.0, price=100.0, conviction=0.0,
+    )
+    assert plan["position_inr"] == 10000.0  # min-position 1% at zero conviction
+
+
+def test_llm_decision_risk_bounds_refuses_ungrounded_decision():
+    from advisory import llm_decision_risk_bounds
+
+    ungrounded = _grounded_buy_contract(conviction=1.0, risk={"present": False})
+    assert ungrounded["meets_data_grounding_for_live"] is False
+    plan = llm_decision_risk_bounds.bound_position_size(
+        contract=ungrounded, capital=1_000_000.0, price=100.0, conviction=1.0,
+    )
+    assert plan["allowed"] is False
+    assert plan["binding_constraint"] == "decision_not_data_grounded"
+    assert plan["position_inr"] == 0.0
+
+
+def test_llm_decision_risk_bounds_exit_passes_through_unsized():
+    from advisory import llm_decision_risk_bounds
+
+    contract = _grounded_buy_contract(action="SELL", conviction=0.8)
+    plan = llm_decision_risk_bounds.bound_position_size(
+        contract=contract, capital=1_000_000.0, price=100.0,
+    )
+    assert plan["allowed"] is True
+    assert plan["binding_constraint"] == "exit_not_capital_bounded"
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {

@@ -19,12 +19,16 @@ polish or broad refactoring.
   manual-review step; where review is needed the LLM performs it (see the
   LLM-resolved-review and LLM-direct-authority epics in `todo.md`).
 - Non-negotiable engineering safety (kept regardless of who decides): every
-  LLM decision persists a typed evidence/provenance + reason contract; behavior
-  stays point-in-time (no future data / lookahead); a master enable flag gates
-  any live LLM→broker authority and DEFAULTS OFF (opt-in per deployment); and
-  LLM-decided actions graduate to live broker authority only after a measured
-  paper/shadow track record (after-cost, benchmark-excess, regime-robust). These
-  are reversibility/auditability guarantees, not authority limits.
+  LLM decision persists a typed evidence/provenance + reason contract; the decision
+  rests on the COMPLETE validated evidence packet with data-grounded reasons (not a
+  single news/announcement/indicator); behavior stays point-in-time (no future data
+  / lookahead); a master enable flag gates any live LLM→broker authority and DEFAULTS
+  OFF (opt-in per deployment); every live decision is bounded by deterministic
+  position-sizing / exposure / stop limits so no single call is catastrophic; and
+  live decisions + outcomes + provenance are monitored to catch systematic errors
+  (alert, never block). Paper-first graduation is intentionally NOT used (operator
+  decision 2026-06-23: too many non-stationary dimensions for paper P&L to be
+  informative). These are survival/auditability guarantees, not authority limits.
 - Use LLMs for structured extraction, event interpretation, hypothesis/playbook
   notes, company-memory summaries, adversarial review notes, operator
   explanations, review resolution, and (when enabled and evidence-backed) trade
