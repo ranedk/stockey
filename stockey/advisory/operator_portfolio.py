@@ -15,6 +15,7 @@ from utils.schema_migrations import apply_schema_migration
 
 
 LEDGER_TABLE = "advisory_operator_portfolio_ledger"
+CORPORATE_ACTIONS_TABLE = "nseindia_corporate_actions_normalized"
 BROKER_ACTION_TO_OPERATOR_ACTION = {
     "BUY": "buy",
     "BUY_MORE": "buy_50%",
@@ -186,6 +187,121 @@ def _load_ledger() -> list[dict[str, Any]]:
     return df.to_dict(orient="records") if not df.empty else []
 
 
+def _load_corporate_action_price_factors(symbols: list[str]) -> tuple[dict[str, list[dict[str, Any]]], bool]:
+    """Load split/bonus price-adjustment factors per symbol for point-in-time entry-price adjustment.
+
+    Returns (factors_by_symbol, source_available). Each factor entry is
+    {"date": ex-date Timestamp, "action_type": str, "price_factor": float} where
+    price_factor = old_units/new_units (e.g. 0.5 for a 1:2 split). source_available is False
+    only when the source table cannot be read, so callers can flag unadjusted P&L instead of
+    silently trusting a mismatched price scale.
+    """
+    unique = sorted({_normalize_symbol(value) for value in symbols if _normalize_symbol(value)})
+    if not unique:
+        return {}, True
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT symbol, date, action_type, price_adjustment_factor
+            FROM {CORPORATE_ACTIONS_TABLE}
+            WHERE UPPER(TRIM(symbol)) = ANY(%s)
+              AND action_type IN ('split', 'bonus')
+              AND price_adjustment_factor IS NOT NULL
+              AND price_adjustment_factor <> 1.0
+            """,
+            (unique,),
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.operator_portfolio",
+            source=CORPORATE_ACTIONS_TABLE,
+            fallback_type="operator_portfolio_corporate_action_lookup_failed",
+            severity="warn",
+            reason="Operator paper-portfolio P&L could not load corporate-action factors; entry prices left unadjusted and flagged.",
+            error=exc,
+        )
+        return {}, False
+    out: dict[str, list[dict[str, Any]]] = {}
+    if df is None or df.empty:
+        return out, True
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+    df["price_adjustment_factor"] = pd.to_numeric(df["price_adjustment_factor"], errors="coerce")
+    for _, action_row in df.iterrows():
+        symbol = _normalize_symbol(action_row.get("symbol"))
+        factor = action_row.get("price_adjustment_factor")
+        ex_date = action_row.get("date")
+        if not symbol or pd.isna(factor) or float(factor) <= 0 or pd.isna(ex_date):
+            continue
+        out.setdefault(symbol, []).append(
+            {
+                "date": ex_date,
+                "action_type": str(action_row.get("action_type") or ""),
+                "price_factor": float(factor),
+            }
+        )
+    return out, True
+
+
+def _apply_corporate_action_adjustments(
+    positions: list[dict[str, Any]],
+    factors_by_symbol: dict[str, list[dict[str, Any]]],
+    *,
+    source_available: bool,
+    asof: pd.Timestamp,
+) -> None:
+    """Adjust frozen ledger entry prices onto the current/exit split-adjusted scale, then set P&L.
+
+    Operator ledger entry prices are recorded at the (pre-split) price paid, while current and
+    exit prices come from re-stated (post-split) OHLCV. Without this point-in-time adjustment a
+    1:2 split makes a flat position read ~-50%. This is paper-portfolio analytics only and has
+    no portfolio or broker authority. Splits/bonuses are applied only for ex-dates strictly after
+    entry and on or before the relevant cutoff (exit for closed, asof for open). When the source
+    is unavailable the status is recorded so unadjusted P&L stays visible rather than silently wrong.
+    """
+    asof_ts = pd.to_datetime(asof, utc=True, errors="coerce")
+    for row in positions:
+        entry = _to_float(row.get("entry_price"))
+        closed = row.get("status") == "closed"
+        basis = row.get("exit_price") if closed else row.get("current_price")
+        exit_or_current = _to_float(basis)
+        entry_at = pd.to_datetime(row.get("entry_at"), utc=True, errors="coerce")
+        cutoff = pd.to_datetime(row.get("exit_at"), utc=True, errors="coerce") if closed else asof_ts
+        if not source_available:
+            row["corporate_action_adjustment_status"] = "unavailable"
+        else:
+            actions = factors_by_symbol.get(_normalize_symbol(row.get("symbol"))) or []
+            applicable = [
+                action
+                for action in actions
+                if pd.notna(entry_at)
+                and pd.notna(action.get("date"))
+                and action["date"] > entry_at
+                and (pd.isna(cutoff) or action["date"] <= cutoff)
+            ]
+            factor = 1.0
+            for action in applicable:
+                factor *= float(action.get("price_factor") or 1.0)
+            if applicable and factor > 0 and factor != 1.0 and entry is not None:
+                row["entry_price_unadjusted"] = entry
+                entry = round(entry * factor, 6)
+                row["entry_price"] = entry
+                row["corporate_action_adjusted"] = True
+                row["corporate_action_price_factor"] = round(factor, 6)
+                row["corporate_action_events"] = [
+                    {
+                        "ex_date": action["date"].date().isoformat(),
+                        "action_type": action.get("action_type"),
+                        "price_factor": round(float(action.get("price_factor") or 1.0), 6),
+                    }
+                    for action in applicable
+                ]
+                row["corporate_action_adjustment_status"] = "adjusted"
+            else:
+                row["corporate_action_adjustment_status"] = "none"
+        row["pnl_pct"] = ((exit_or_current - entry) / entry * 100.0) if entry and exit_or_current else None
+
+
 def build_positions() -> list[dict[str, Any]]:
     rows = _load_ledger()
     positions: dict[str, dict[str, Any]] = {}
@@ -236,14 +352,18 @@ def build_positions() -> list[dict[str, Any]]:
     prices = load_current_prices([row["symbol"] for row in all_positions], max_age_seconds=None)
     for row in all_positions:
         current = prices.get(row["symbol"]) or {}
-        current_price = _to_float(current.get("price"))
-        row["current_price"] = current_price
+        row["current_price"] = _to_float(current.get("price"))
         row["current_price_asof"] = current.get("price_asof")
         row["current_price_source"] = current.get("price_source")
-        basis = row.get("exit_price") if row.get("status") == "closed" else current_price
-        entry = _to_float(row.get("entry_price"))
-        exit_or_current = _to_float(basis)
-        row["pnl_pct"] = ((exit_or_current - entry) / entry * 100.0) if entry and exit_or_current else None
+    ca_factors, ca_source_available = _load_corporate_action_price_factors(
+        [row["symbol"] for row in all_positions]
+    )
+    _apply_corporate_action_adjustments(
+        all_positions,
+        ca_factors,
+        source_available=ca_source_available,
+        asof=pd.Timestamp.utcnow(),
+    )
     all_positions.sort(key=lambda row: str(row.get("entry_at") or ""), reverse=True)
     return all_positions
 

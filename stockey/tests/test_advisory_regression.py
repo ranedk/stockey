@@ -79044,6 +79044,123 @@ def test_operator_portfolio_numeric_parse_failure_records_fallback(monkeypatch):
     assert events[0]["source"] == "operator_portfolio_price_fields"
 
 
+def test_operator_portfolio_corporate_action_split_adjusts_entry_and_pnl():
+    from advisory import operator_portfolio
+
+    positions = [
+        {
+            "symbol": "TCS",
+            "status": "open",
+            "entry_price": 500.0,
+            "entry_at": pd.Timestamp("2026-01-01T00:00:00Z"),
+            "current_price": 260.0,
+        }
+    ]
+    factors = {"TCS": [{"date": pd.Timestamp("2026-03-01T00:00:00Z"), "action_type": "split", "price_factor": 0.5}]}
+
+    operator_portfolio._apply_corporate_action_adjustments(
+        positions, factors, source_available=True, asof=pd.Timestamp("2026-06-01T00:00:00Z")
+    )
+    pos = positions[0]
+    assert pos["corporate_action_adjustment_status"] == "adjusted"
+    assert pos["corporate_action_adjusted"] is True
+    assert pos["entry_price_unadjusted"] == 500.0
+    assert pos["entry_price"] == 250.0
+    assert pos["corporate_action_price_factor"] == 0.5
+    assert pos["corporate_action_events"][0]["ex_date"] == "2026-03-01"
+    # current 260 vs split-adjusted entry 250 = +4% (not the bogus -48% from the raw scale)
+    assert pos["pnl_pct"] == pytest.approx(4.0)
+
+
+def test_operator_portfolio_corporate_action_pre_entry_split_not_applied():
+    from advisory import operator_portfolio
+
+    positions = [
+        {
+            "symbol": "TCS",
+            "status": "open",
+            "entry_price": 250.0,
+            "entry_at": pd.Timestamp("2026-04-01T00:00:00Z"),
+            "current_price": 260.0,
+        }
+    ]
+    factors = {"TCS": [{"date": pd.Timestamp("2026-03-01T00:00:00Z"), "action_type": "split", "price_factor": 0.5}]}
+
+    operator_portfolio._apply_corporate_action_adjustments(
+        positions, factors, source_available=True, asof=pd.Timestamp("2026-06-01T00:00:00Z")
+    )
+    pos = positions[0]
+    assert pos["corporate_action_adjustment_status"] == "none"
+    assert "entry_price_unadjusted" not in pos
+    assert pos["entry_price"] == 250.0
+    assert pos["pnl_pct"] == pytest.approx(4.0)
+
+
+def test_operator_portfolio_corporate_action_uses_exit_cutoff_for_closed_positions():
+    from advisory import operator_portfolio
+
+    positions = [
+        {
+            "symbol": "TCS",
+            "status": "closed",
+            "entry_price": 500.0,
+            "entry_at": pd.Timestamp("2026-01-01T00:00:00Z"),
+            "exit_at": pd.Timestamp("2026-02-01T00:00:00Z"),
+            "exit_price": 520.0,
+            "current_price": 260.0,
+        }
+    ]
+    factors = {"TCS": [{"date": pd.Timestamp("2026-03-01T00:00:00Z"), "action_type": "split", "price_factor": 0.5}]}
+
+    operator_portfolio._apply_corporate_action_adjustments(
+        positions, factors, source_available=True, asof=pd.Timestamp("2026-06-01T00:00:00Z")
+    )
+    pos = positions[0]
+    # split ex-date (Mar) is after the exit (Feb), so it must not adjust this closed trade
+    assert pos["corporate_action_adjustment_status"] == "none"
+    assert pos["entry_price"] == 500.0
+    assert pos["pnl_pct"] == pytest.approx(4.0)
+
+
+def test_operator_portfolio_corporate_action_source_unavailable_is_flagged():
+    from advisory import operator_portfolio
+
+    positions = [
+        {
+            "symbol": "TCS",
+            "status": "open",
+            "entry_price": 500.0,
+            "entry_at": pd.Timestamp("2026-01-01T00:00:00Z"),
+            "current_price": 260.0,
+        }
+    ]
+
+    operator_portfolio._apply_corporate_action_adjustments(
+        positions, {}, source_available=False, asof=pd.Timestamp("2026-06-01T00:00:00Z")
+    )
+    pos = positions[0]
+    assert pos["corporate_action_adjustment_status"] == "unavailable"
+    assert pos["entry_price"] == 500.0
+    assert "entry_price_unadjusted" not in pos
+    # unadjusted P&L is still computed but the mismatch risk is visibly flagged, not silent
+    assert pos["pnl_pct"] == pytest.approx(-48.0)
+
+
+def test_operator_portfolio_corporate_action_lookup_failure_records_fallback(monkeypatch):
+    from advisory import operator_portfolio
+
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(operator_portfolio, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(operator_portfolio, "sql_to_df", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("table missing")))
+
+    factors, available = operator_portfolio._load_corporate_action_price_factors(["TCS"])
+
+    assert factors == {}
+    assert available is False
+    assert events[0]["fallback_type"] == "operator_portfolio_corporate_action_lookup_failed"
+    assert events[0]["source"] == operator_portfolio.CORPORATE_ACTIONS_TABLE
+
+
 def test_operator_portfolio_maps_partial_actions_to_single_operator_button(monkeypatch):
     from advisory import operator_portfolio
 

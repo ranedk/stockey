@@ -274,7 +274,25 @@ blocked.
   `submit_blocked`. Test: portfolio-reset snapshot → no SELL rows emitted.
 - **Confidence:** verify-first.
 
-### [P1.3] Corporate-action reconciliation for open positions (qty + cost basis)
+### [P1.3] Corporate-action reconciliation for open positions (qty + cost basis)  ✅ DONE (operator P&L; scope corrected)
+- **Outcome (2026-06-23):** Investigation showed this system has **no share quantity /
+  cost basis** — positions are `entry_price` + percentage P&L — so the real risk is a
+  price-scale mismatch, not quantity math. **Definite bug fixed:** the operator paper
+  portfolio (`advisory/operator_portfolio.py`) compared a frozen pre-split ledger
+  `entry_price` against a re-stated post-split `current_price` (a 1:2 split read a flat
+  position as ~-48%). Added `_load_corporate_action_price_factors` (point-in-time
+  split/bonus factors from `nseindia_corporate_actions_normalized`) and
+  `_apply_corporate_action_adjustments`, which adjusts the entry price onto the
+  current/exit scale for ex-dates strictly after entry, tags provenance
+  (`entry_price_unadjusted`, `corporate_action_price_factor`, `corporate_action_events`,
+  `corporate_action_adjustment_status`), and records a fallback (status `unavailable`)
+  when the source can't be read so unadjusted P&L stays visible, never silently wrong.
+  Paper-analytics only; no portfolio/broker authority. 5 tests added.
+- **Residual (lifecycle, latent/self-healing):** `position_lifecycle` re-derives both
+  entry and current from `dhan_ohlcv_daily`, which gets a full re-backfill when a split
+  is detected (`data/dhanlive/ohlcv.py` `choose_daily_refresh_start`), so it is correct
+  except in the window between the corporate action and that re-backfill. Optional
+  follow-up: emit telemetry when an open position spans an unreconciled recent split.
 - **Why:** Splits/bonus/symbol changes are handled in OHLCV adjusted prices, but
   open-position quantity and entry cost basis are not retroactively adjusted. A
   1:2 split leaves stale quantity, corrupting P&L, sizing, and SELL quantity.
