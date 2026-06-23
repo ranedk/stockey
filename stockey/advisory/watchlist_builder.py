@@ -1870,6 +1870,19 @@ def load_context_overlay_watch_candidates(
     reliability = load_context_family_reliability(asof_date=effective_asof)
     reliability_by_family = reliability.get("families", {}) if isinstance(reliability.get("families"), dict) else {}
     reliability_evaluated_at = pd.to_datetime(reliability.get("evaluated_at"), utc=True, errors="coerce") if reliability else pd.NaT
+    # Distinguish "reliability source unavailable" (no evidence loaded at all) from "evaluated".
+    # Missing reliability already blocks WATCH_BREAKOUT (watch_priority requires candidate_helpful),
+    # but it must fail visibly rather than look like a silently-neutral pass.
+    reliability_source_available = bool(reliability)
+    if not reliability_source_available:
+        record_local_fallback_event(
+            module="advisory.watchlist_builder",
+            source="advisory_context_overlay_reliability",
+            fallback_type="watchlist_builder_context_reliability_unavailable",
+            severity="warn",
+            reason="Context-overlay reliability evidence is unavailable; context watch rows are built without reliability gating and cannot earn WATCH_BREAKOUT priority until evidence exists.",
+            metadata={"asof_date": str(effective_asof), "candidate_rows": int(len(frame))},
+        )
     negative_frame = _load_negative_direct_context_overlay_rows(asof_date=asof_date, symbols=symbols)
     if not negative_frame.empty:
         negative_by_symbol = {str(row.get("symbol")): row for row in negative_frame.to_dict(orient="records") if str(row.get("symbol") or "").strip()}
@@ -2075,6 +2088,13 @@ def load_context_overlay_watch_candidates(
         reliability_classification = item.get("_reliability_classification")
         reliability_label = "" if pd.isna(reliability_classification) else str(reliability_classification)
         reliability_row = reliability_by_family.get(source) if isinstance(reliability_by_family, dict) else None
+        context_reliability_status = (
+            "source_unavailable"
+            if not reliability_source_available
+            else "evaluated"
+            if isinstance(reliability_row, dict) and reliability_row
+            else "family_unevaluated"
+        )
         context_class_reliability = _context_class_reliability_classification(
             reliability_row if isinstance(reliability_row, dict) else None,
             context_class,
@@ -2227,6 +2247,7 @@ def load_context_overlay_watch_candidates(
                             "watch_priority_score": score,
                             "reliability_score_multiplier": reliability_multiplier,
                             "reliability_priority_reason": reliability_priority_reason,
+                            "context_reliability_status": context_reliability_status,
                             "technical_actionability_score": technical_score,
                             "technical_priority_bonus": technical_bonus,
                             "technical_actionability": _json_safe(technical_hint),

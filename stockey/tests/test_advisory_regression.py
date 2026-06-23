@@ -66417,6 +66417,52 @@ def test_watchlist_builder_uses_reliability_only_for_context_watch_priority(monk
     fresh_reason = reason
     assert fresh_reason["context_overlay_days_old"] == 0
     assert fresh_reason["context_overlay_breakout_stale"] is False
+    assert fresh_reason["context_reliability_status"] == "evaluated"
+
+
+def test_watchlist_builder_flags_unavailable_context_reliability_without_breakout(monkeypatch):
+    asof_date = pd.Timestamp("2026-06-20T00:00:00Z")
+    _mock_context_overlay_identity_resolved(monkeypatch)
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(watchlist_builder, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+
+    def fake_direct_loader(**kwargs):
+        source = kwargs["source_name"]
+        if source != "announcement_context":
+            return pd.DataFrame()
+        return pd.DataFrame(
+            [
+                {
+                    "asof_date": asof_date,
+                    "symbol": "ABC",
+                    "context_asof_date": asof_date,
+                    "context_source": source,
+                    "context_overlay_id": f"{source}-1",
+                    "direction": "positive",
+                    "pressure_score": 0.9,
+                    "context_class": "TEST",
+                    "context_reason": "test pressure",
+                }
+            ]
+        )
+
+    monkeypatch.setattr(watchlist_builder, "_load_direct_context_overlay_watch_rows", fake_direct_loader)
+    monkeypatch.setattr(watchlist_builder, "_load_sector_context_overlay_watch_rows", lambda **kwargs: pd.DataFrame())
+    # reliability evidence is entirely unavailable (no persisted/fast/signal-quality report)
+    monkeypatch.setattr(watchlist_builder, "load_context_family_reliability", lambda **kwargs: {})
+
+    df = watchlist_builder.load_context_overlay_watch_candidates(asof_date=asof_date)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    # missing reliability must stay neutral watch (never reduced-screening-friction breakout)
+    assert row["candidate_state"] == "WATCH_EVENT"
+    reason = json.loads(row["watch_reasons"])[0]
+    assert reason["context_reliability_status"] == "source_unavailable"
+    assert reason["watch_priority_allowed_by_runtime_contract"] is False
+    # unavailability is surfaced visibly via telemetry, not a silent neutral pass
+    unavailable_events = [e for e in events if e.get("fallback_type") == "watchlist_builder_context_reliability_unavailable"]
+    assert len(unavailable_events) == 1
 
 
 def test_watchlist_builder_demotes_stale_context_overlay_breakout_to_watch_event(monkeypatch):

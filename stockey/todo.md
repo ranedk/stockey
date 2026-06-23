@@ -423,7 +423,18 @@ blocked.
   WATCH signal, suppression counted.
 - **Confidence:** verify-first.
 
-### [P1.8] Make "reliability unavailable" explicit instead of silently neutral
+### [P1.8] Make "reliability unavailable" explicit instead of silently neutral  ✅ DONE (scope refined)
+- **Outcome (2026-06-23):** Verification showed the safety half is already enforced —
+  `_runtime_contract_allows(None, 'watch_priority')` returns False, so a no-reliability row
+  already cannot reach WATCH_BREAKOUT (stays WATCH_EVENT), and `_context_reliability_priority_multiplier`
+  already distinguishes `no_evidence_neutral` from `classification_neutral`. The real gap was
+  that a fully-FAILED reliability load (`load_context_family_reliability` -> {}) looked identical
+  to a silently-neutral pass. Fixed in `advisory/watchlist_builder.py`: derive
+  `reliability_source_available`, emit a one-per-run `watchlist_builder_context_reliability_unavailable`
+  fallback (visible in Operator Health) when no evidence loaded, and tag each context-watch row's
+  `watch_reasons.context_reliability_status` as `source_unavailable` / `family_unevaluated` /
+  `evaluated`. Does not block explicit watchlist/market-context targets; no authority change. 1 test
+  added (+ evaluated-case assertion).
 - **Why:** `load_context_family_reliability` falls back persisted→fast→
   signal-quality and finally returns `{}`; downstream treats empty as "no
   restrictions" rather than "reliability unknown", so a row can pass intake when
