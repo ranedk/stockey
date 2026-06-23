@@ -477,6 +477,108 @@ blocked.
 
 ---
 
+## P1.10 - LLM-Resolved Review (Epic): the LLM does the review, not a human
+
+**Operator intent (2026-06-23).** "I do not want manual review really. I want the LLM to
+do the review if need be. The LLM can web-search or use other data points to make a
+decision on items that need manual review." Items that today land in a human Manual Review
+queue should instead be resolved by a bounded LLM reviewer that can pull external evidence
+(web search and other data points), with a human only as the fallback for genuinely
+unresolved or low-confidence cases.
+
+**Current state (verified 2026-06-23 — this intent is NOT yet captured well).**
+- A narrow LLM reviewer exists for ONE source only: event-policy rows
+  (`advisory/event_policy.py:34` `EVENT_POLICY_LLM_MANUAL_REVIEW_ENABLED`, model `codex`,
+  capped by `EVENT_POLICY_LLM_MANUAL_REVIEW_MAX_ROWS=25`). It resolves ambiguous event rows
+  into `NO_ACTION` / `BUY_WATCH` / `REDUCE_EXPOSURE_REVIEW` / `MANUAL_REVIEW`
+  (`docs/advisory_manual.md:483`). This is the seed to generalize.
+- Every other manual-review source (action conflicts, execution blockers, identity issues,
+  threshold / signal-quality reviews, wait-signal follow-ups) is routed to a HUMAN. The PRD
+  (`docs/operator_app_prd.md:163-200`) is written operator-first ("copy must be written for
+  an operator", operator decisions in `advisory_manual_review_decisions`).
+- There is NO web-search / external-data capability anywhere in the codebase. The
+  event-policy reviewer decides only from the already-loaded source row. The only browser
+  automation is the Dhan/NSE/Screener data loaders (Playwright/CDP), not general research.
+
+**Hard guardrails (non-negotiable — these shape every sub-task).**
+- LLM never gets broker/trade authority. "Resolve the review" means choosing a review-only
+  outcome (`NO_ACTION` / `WATCH` / `REDUCE_EXPOSURE_REVIEW` / escalate), never `BUY`/`SELL`,
+  sizing, portfolio, or execution. Same boundary the event-policy reviewer already honors.
+- Every externally fetched fact (web search or other data point) is evidence with a typed
+  provenance record (source URL/pointer, fetch time, query, prompt/schema version) and must
+  resolve through identity validation before it can influence a symbol/peer/sector. No
+  silent fallback: a failed/empty/low-confidence search is recorded and escalates, it does
+  not silently pass.
+- Human fallback stays. Low-confidence, contradictory-evidence, or high-impact items still
+  escalate to a person; "manual review" becomes "LLM-resolved with human fallback", not
+  "human-only" and not "LLM auto-approves everything".
+- Point-in-time discipline holds for web evidence too: do not let a search surface
+  post-dated information into a historical/as-of decision; stamp and bound by the item's
+  asof date where the decision is point-in-time.
+
+**Sub-tasks (each bounded, verify-first, pick up later).**
+
+### [P1.10.1] Inventory and classify every Manual Review source
+- **Do:** Enumerate all sources that currently create Manual Review items
+  (`advisory/manual_review_state.py`, action-consolidation manual rows, identity issues,
+  execution blockers, threshold/signal-quality/event-policy reviews, wait-signal follow-ups).
+  For each, record: what decision it needs, what evidence is already loaded, whether external
+  research could help, and whether it is safe to auto-resolve vs always-escalate.
+- **Deliverable:** a short matrix (source -> needs-external-data? / auto-resolvable? /
+  always-escalate?) in `docs/` to drive the rest of the epic.
+- **Confidence:** verify-first.
+
+### [P1.10.2] Extract a reusable bounded LLM review-resolver contract
+- **Why:** Generalize the event-policy reviewer instead of copy-pasting per source.
+- **Files:** new `advisory/llm_review_resolver.py` (or extend `advisory/event_policy.py`'s
+  reviewer); reuse `advisory/prompts.py` / `advisory/prompt_registry.py` patterns.
+- **Do:** Define one resolver that takes a review item + its compact evidence, returns a
+  typed `{resolved_action, confidence, evidence_used, provenance, escalate_to_human}`
+  contract with the review-only authority boundary baked in. Persist prompt id/version +
+  response schema version (the existing provenance contract).
+- **Guardrail:** outputs review-only; confidence below a configurable threshold escalates.
+- **Confidence:** verify-first.
+
+### [P1.10.3] Add a web-search / external-data tool with provenance + identity validation
+- **Why:** This capability does not exist; it is the core of the operator's ask.
+- **Files:** new `advisory/external_research.py` (tool wrapper) + a typed evidence/provenance
+  table (mirror `advisory.action_evidence_provenance` / `llm_provenance_audit` conventions);
+  `.env.example` for the provider/key.
+- **Do:** Wrap a web-search/fetch provider behind one interface that returns
+  structured snippets with source URL, fetch timestamp, and query; record every call as
+  provenance; run extracted entities through the company/security master before they can
+  affect a symbol. Fail visible (telemetry + escalate), never silent.
+- **Open decision (ask operator):** which provider; rate/cost caps; allow-list of domains.
+- **Guardrail:** research/evidence only; no broker authority; point-in-time aware.
+- **Confidence:** verify-first.
+
+### [P1.10.4] Wire the resolver across the highest-value auto-resolvable sources
+- **Do:** Starting from the P1.10.1 matrix, route the safe sources through the resolver
+  (event-policy first as the proven case, then the next-safest), keeping human escalation for
+  the rest. Surface resolved-vs-escalated counts and the evidence/provenance in the existing
+  Manual Review / trace surfaces.
+- **Guardrail:** review-only outputs; unresolved/low-confidence still escalate; no source's
+  authority scope changes.
+- **Confidence:** verify-first.
+
+### [P1.10.5] Update the PRD and operator surfaces
+- **Why:** The PRD currently says human-only; it must describe "LLM-resolved with human
+  fallback".
+- **Files:** `docs/operator_app_prd.md` (Manual Review sections ~163-200),
+  `docs/advisory_manual.md`, and the Manual Review API/UI copy.
+- **Do:** Document the resolver contract, the evidence/provenance shown per resolved item,
+  the confidence/escalation policy, and that LLM resolution never mutates portfolio/broker
+  state. Keep `docs_state_audit --strict` green.
+- **Confidence:** verify-first.
+
+**Open decisions for the operator (resolve before P1.10.3/P1.10.4 build):**
+- Which web-search/research provider, and cost/rate caps.
+- Confidence threshold for auto-resolve vs escalate, per source.
+- Which sources are "always escalate to a human" regardless (e.g. execution blockers,
+  identity-master repair).
+
+---
+
 ## P2 - Research/Evaluation Rigor And Source Visibility
 
 Policy review is only as trustworthy as the evidence. These close attribution and
