@@ -312,7 +312,19 @@ blocked.
   unchanged; SELL uses adjusted quantity.
 - **Confidence:** verify-first (confirm portfolio math currently ignores splits).
 
-### [P1.4] Audit trail for inferred vs explicit action authority
+### [P1.4] Audit trail for inferred vs explicit action authority  ✅ DONE
+- **Outcome (2026-06-23):** The CLI authority path (`_authority_defaults_for_cli_row` /
+  `normalize_cli_authority_frame`) only *gap-fills* missing authority fields (it never
+  overrides explicit values), so the audit records inferred-vs-explicit rather than a
+  downgrade. Added non-mutating `_authority_inference_audit(df)` (mirrors the gap-fill:
+  a field is inferred when the row lacked an explicit value and a non-None default was
+  applied) and folded it into `build_cli_result`'s `authority_summary.authority_inference`
+  (`inferred_authority_rows`, `explicit_authority_rows`, `inferred_field_counts`,
+  `inferred_rows_by_source`); `format_cli_text` now prints an `Authority inference:` line.
+  Computed from the original frame (not the persisted/normalized one), so it adds no
+  persisted column and changes no ranking/portfolio/broker state. 2 tests added.
+- **Note:** no explicit→inferred *downgrade* path exists in this helper (explicit wins),
+  so the audit focuses on visibility of gap-filled authority rather than override alerts.
 - **Why:** `infer_action_authority_contract` (~line 7295) silently fills/overrides
   `portfolio_authority`/`broker_execution_allowed`/`full_advisory_required` from
   the action source. A downgrade of an explicit `broker_execution_allowed=true`

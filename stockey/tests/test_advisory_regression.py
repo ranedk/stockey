@@ -23448,6 +23448,49 @@ def test_action_recommender_cli_authority_infers_missing_columns_from_source():
     assert result["sample"][1]["full_advisory_required"] is False
 
 
+def test_action_recommender_authority_inference_audit_flags_inferred_vs_explicit():
+    df = pd.DataFrame(
+        [
+            {"symbol": "AAA", "action_code": "WATCH", "action_source": "signal_refresh"},
+            {
+                "symbol": "BBB",
+                "action_code": "WATCH",
+                "action_source": "watchlist",
+                "authority_scope": "watchlist_pressure_only",
+                "portfolio_authority": "none",
+                "broker_execution_allowed": False,
+                "full_advisory_required": True,
+            },
+        ]
+    )
+
+    audit = action_recommender._authority_inference_audit(df)
+
+    assert audit["row_count"] == 2
+    assert audit["inferred_authority_rows"] == 1
+    assert audit["explicit_authority_rows"] == 1
+    assert audit["inferred_field_counts"]["authority_scope"] == 1
+    assert audit["inferred_field_counts"]["broker_execution_allowed"] == 1
+    assert audit["inferred_rows_by_source"] == {"signal_refresh": 1}
+
+
+def test_action_recommender_build_cli_result_surfaces_authority_inference():
+    df = pd.DataFrame(
+        [
+            {"symbol": "AAA", "action_code": "WATCH", "action_source": "signal_refresh", "execution_mode": "review_only"},
+        ]
+    )
+
+    result = action_recommender.build_cli_result(df, dry_run=True)
+    inference = result["authority_summary"]["authority_inference"]
+
+    assert inference["inferred_authority_rows"] == 1
+    assert inference["explicit_authority_rows"] == 0
+    text = action_recommender.format_cli_text(result)
+    assert "Authority inference:" in text
+    assert "inferred_rows=1" in text
+
+
 def test_action_recommender_deferred_feature_freshness_blocks_positive_broker_action():
     df = pd.DataFrame(
         [

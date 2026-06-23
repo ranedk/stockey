@@ -7411,6 +7411,49 @@ def summarize_cli_authority(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+def _authority_inference_audit(df: pd.DataFrame) -> dict[str, Any]:
+    """Audit which reporting authority fields were inferred (filled) vs explicit on the source rows.
+
+    Mirrors normalize_cli_authority_frame's gap-fill: a field counts as inferred when the row
+    lacked an explicit value and a non-None default was applied. Audit-only; it changes no
+    ranking, portfolio, or broker state and only makes silent authority gap-filling visible.
+    """
+    fields = ["authority_scope", "portfolio_authority", "broker_execution_allowed", "full_advisory_required"]
+    row_count = int(len(df))
+    audit: dict[str, Any] = {
+        "row_count": row_count,
+        "inferred_authority_rows": 0,
+        "explicit_authority_rows": 0,
+        "inferred_field_counts": {field: 0 for field in fields},
+        "inferred_rows_by_source": {},
+    }
+    if row_count <= 0:
+        return audit
+    bool_fields = {"broker_execution_allowed", "full_advisory_required"}
+    for _, row in df.iterrows():
+        defaults = _authority_defaults_for_cli_row(row)
+        any_inferred = False
+        all_explicit = True
+        for field in fields:
+            if field in bool_fields:
+                explicit = field in df.columns and _boolish_or_none(row.get(field)) is not None
+            else:
+                explicit = field in df.columns and _text(row.get(field)) is not None
+            if explicit:
+                continue
+            all_explicit = False
+            if defaults.get(field) is not None:
+                any_inferred = True
+                audit["inferred_field_counts"][field] += 1
+        if any_inferred:
+            audit["inferred_authority_rows"] += 1
+            source = _text(row.get("action_source")) or "unknown"
+            audit["inferred_rows_by_source"][source] = audit["inferred_rows_by_source"].get(source, 0) + 1
+        if all_explicit:
+            audit["explicit_authority_rows"] += 1
+    return audit
+
+
 def build_cli_result(
     df: pd.DataFrame,
     *,
@@ -7419,13 +7462,15 @@ def build_cli_result(
     full_sample: bool = False,
 ) -> dict[str, Any]:
     display_df = normalize_cli_authority_frame(df)
+    authority_summary = summarize_cli_authority(display_df)
+    authority_summary["authority_inference"] = _authority_inference_audit(df)
     return {
         "status": "ok",
         "table": TABLE_NAME,
         "row_count": int(len(display_df)),
         "action_counts": display_df["action_code"].value_counts(dropna=False).to_dict() if not display_df.empty and "action_code" in display_df.columns else {},
         "action_source_counts": display_df["action_source"].value_counts(dropna=False).to_dict() if not display_df.empty and "action_source" in display_df.columns else {},
-        "authority_summary": summarize_cli_authority(display_df),
+        "authority_summary": authority_summary,
         "sample": _cli_sample(display_df, sample_limit=sample_limit, full_sample=full_sample),
         "sample_limit": int(sample_limit),
         "sample_mode": "full" if full_sample else "compact",
@@ -7515,6 +7560,14 @@ def format_cli_text(result: dict[str, Any]) -> str:
             lines.append(f"Portfolio authority: {authority.get('portfolio_authority_counts')}")
         if authority.get("execution_mode_counts"):
             lines.append(f"Execution modes: {authority.get('execution_mode_counts')}")
+        inference = authority.get("authority_inference") if isinstance(authority.get("authority_inference"), dict) else {}
+        if inference:
+            lines.append(
+                "Authority inference: "
+                f"inferred_rows={inference.get('inferred_authority_rows', 0)} "
+                f"explicit_rows={inference.get('explicit_authority_rows', 0)} "
+                f"inferred_fields={inference.get('inferred_field_counts', {})}"
+            )
     sync_state = result.get("action_refresh_sync") if isinstance(result.get("action_refresh_sync"), dict) else {}
     if sync_state:
         lines.append(
