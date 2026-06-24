@@ -649,14 +649,15 @@ one step.**
      (or formally disallow in authoring; doc already says event-driven only). The technical/screener
      layer is where these belong.
   2. **[SAFETY] Direction conflicts: 27 events fired BOTH a long and a reduce hypothesis** (e.g. one
-     BSE-tagged news hit ACQUISITION=long and DEBT_DEFAULT=reduce). `.4a hypothesis_match_dimension`
-     currently picks the highest match_score among trusted matches and IGNORES the conflict -> could
-     silently confer the wrong direction. -> Handle: when conflicting-direction trusted hypotheses
-     match a symbol, flag the conflict and withhold authority (don't pick by score). Highest priority.
-  3. **Market-scope hypotheses get symbol-attributed.** 0 matches had a null symbol -- macro
-     hypotheses (geopolitical 101, rate, crude) matched symbol-tagged news and inherited spurious
-     symbols (a war headline is not about the stock it was tagged to). -> Handle: market-scope matches
-     should aggregate to a market/regime signal; the symbol-keyed packet must not pull market-scope.
+     BSE-tagged news hit ACQUISITION=long and DEBT_DEFAULT=reduce). ✅ HANDLED: `hypothesis_match_dimension`
+     now detects when trusted hypotheses disagree on direction for a symbol and WITHHOLDS authority
+     (`conflict=True`, direction `conflicted`, conditions_met False); `.1` records
+     `hypothesis_direction_conflict` and grounds nothing on it. (Residual: the matcher still writes
+     both rows; only consumption is fixed.)
+  3. **Market-scope hypotheses get symbol-attributed.** ✅ HANDLED: the `.4a` per-symbol hypothesis
+     query now restricts to `h.trigger_scope='symbol'`, so macro/market hypotheses cannot leak into a
+     single name's grounding. (Residual: the matcher still attaches a symbol to market-scope matches
+     in the table -- harmless to grounding; aggregating market-scope to a regime signal is future work.)
   4. **Generic keywords -> high-volume noise.** ACQUISITION 107, GEOPOLITICAL 101 matched broad terms
      incl. SEBI takeover boilerplate. match_score (overlap ratio) does not capture relevance. ->
      Handle: raise min_terms, require multi-term/relevance, exclude boilerplate subjects.

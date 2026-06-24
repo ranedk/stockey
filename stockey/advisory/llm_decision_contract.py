@@ -213,7 +213,8 @@ def evaluate_hypothesis_match(
         return {"present": False, "is_valid_authority": False, "status": None, "hypothesis_id": None, "conditions_met": None, "direction": "unknown"}
     status = str(source.get("status") or "").strip().lower()
     conditions_met = source.get("conditions_met")
-    valid = status in VALID_HYPOTHESIS_STATUSES and bool(conditions_met)
+    conflict = bool(source.get("conflict"))
+    valid = status in VALID_HYPOTHESIS_STATUSES and bool(conditions_met) and not conflict
     return {
         "present": True,
         "is_valid_authority": bool(valid),
@@ -221,6 +222,7 @@ def evaluate_hypothesis_match(
         "hypothesis_id": source.get("hypothesis_id") or source.get("id"),
         "conditions_met": None if conditions_met is None else bool(conditions_met),
         "direction": str(source.get("direction") or "unknown").strip().lower(),
+        "conflict": conflict,
     }
 
 
@@ -332,6 +334,8 @@ def validate_decision_grounding(
             reasons.append(f"evidence_incomplete: missing {completeness['missing_dimensions']}")
         if contradicting:
             reasons.append(f"contradicting_evidence: {contradicting}")
+        if hypothesis.get("conflict"):
+            reasons.append("hypothesis_direction_conflict: trusted hypotheses disagree on direction for this symbol -- authority withheld")
         if hypothesis["is_valid_authority"] and not hypothesis_aligned:
             reasons.append(f"hypothesis_direction_mismatch: {hypothesis_direction} hypothesis vs {normalized_action}")
         if event_supportive and not corroborators and not hypothesis_path:

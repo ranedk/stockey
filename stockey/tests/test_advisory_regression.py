@@ -62920,6 +62920,46 @@ def test_llm_decision_contract_hypothesis_direction_must_match_action():
     assert sell["data_grounded"] is True
 
 
+def test_evidence_packet_hypothesis_conflict_withholds_authority():
+    from advisory import llm_evidence_packet as ep
+
+    # Constraint #2: two trusted hypotheses disagree on direction for the same symbol -> withhold.
+    dim = ep.hypothesis_match_dimension([
+        {"status": "trusted_overlay", "match_score": 0.9, "hypothesis_id": "acq", "expected_effect_json": {"market_direction": "positive"}},
+        {"status": "trusted_overlay", "match_score": 0.4, "hypothesis_id": "default", "expected_effect_json": {"market_direction": "negative"}},
+    ])
+    assert dim["conflict"] is True
+    assert dim["direction"] == "conflicted"
+    assert dim["conditions_met"] is False
+    assert sorted(dim["conflicting_directions"]) == ["long", "reduce"]
+
+
+def test_llm_decision_contract_hypothesis_conflict_blocks_and_is_recorded():
+    from advisory import llm_decision_contract
+
+    packet = _neutral_packet(hypothesis_match={"status": "trusted_overlay", "conditions_met": False, "hypothesis_id": "x", "direction": "conflicted", "conflict": True})
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["hypothesis_match"]["is_valid_authority"] is False
+    assert grounding["decision_mode"] is None
+    assert any("hypothesis_direction_conflict" in r for r in grounding["grounding_failures"])
+
+
+def test_evidence_packet_loader_excludes_market_scope_hypotheses():
+    from advisory import llm_evidence_packet as ep
+
+    # Constraint #3: the per-symbol hypothesis query must restrict to symbol-scope playbooks so a
+    # macro/market hypothesis cannot leak into a single name's grounding via a spurious symbol tag.
+    captured = {}
+
+    def fake_rows(query, params):
+        if "advisory_hypothesis_matches" in query:
+            captured["q"] = query
+        return []
+
+    ep.load_evidence_packet("ABC", "2026-06-24", row_loader=lambda q, p: None, rows_loader=fake_rows)
+    assert "trigger_scope='symbol'" in captured["q"]
+
+
 def test_evidence_packet_hypothesis_dimension_real_vocabulary_and_direction():
     from advisory import llm_evidence_packet as ep
 

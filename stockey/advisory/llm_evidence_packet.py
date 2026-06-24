@@ -384,10 +384,24 @@ def hypothesis_match_dimension(
     candidates = [r for r in (rows or []) if isinstance(r, dict)]
     valid = [r for r in candidates if str(r.get("status") or "").strip().lower() in HYPOTHESIS_AUTHORITY_STATUSES]
     if not valid:
-        return {"present": bool(candidates), "status": None, "conditions_met": None, "hypothesis_id": None, "direction": "unknown"}
+        return {"present": bool(candidates), "status": None, "conditions_met": None, "hypothesis_id": None, "direction": "unknown", "conflict": False}
     valid.sort(key=lambda r: (_num(r.get("match_score")) or 0.0), reverse=True)
     best = valid[0]
     score = _num(best.get("match_score"))
+    # Constraint #2: if trusted hypotheses disagree on direction for this symbol, WITHHOLD authority
+    # (do not silently pick the higher score). The disagreement is recorded for visibility.
+    directions = {_hypothesis_direction(r.get("expected_effect_json") or r.get("expected_effect")) for r in valid}
+    if "long" in directions and "reduce" in directions:
+        return {
+            "present": True,
+            "status": str(best.get("status")).strip().lower(),
+            "conditions_met": False,
+            "hypothesis_id": best.get("hypothesis_id"),
+            "match_score": score,
+            "direction": "conflicted",
+            "conflict": True,
+            "conflicting_directions": sorted(d for d in directions if d in {"long", "reduce"}),
+        }
     explicit = _as_bool(_as_dict(best.get("decision_json")).get("conditions_met"))
     conditions_met = explicit if explicit is not None else (score is not None and score >= float(min_score))
     return {
@@ -397,6 +411,7 @@ def hypothesis_match_dimension(
         "hypothesis_id": best.get("hypothesis_id"),
         "match_score": score,
         "direction": _hypothesis_direction(best.get("expected_effect_json") or best.get("expected_effect")),
+        "conflict": False,
     }
 
 
@@ -487,6 +502,9 @@ def load_evidence_packet(
         "JOIN advisory_hypotheses h ON h.hypothesis_id=m.hypothesis_id "
         "WHERE m.symbol=%(symbol)s AND m.published_on<=%(asof)s "
         "AND h.status IN ('trusted_overlay','production') "
+        # Constraint #3: only SYMBOL-scope hypotheses are a per-symbol thesis. Market-scope ones
+        # (macro/regime) must not leak into a single name's grounding via a spurious symbol tag.
+        "AND h.trigger_scope='symbol' "
         "ORDER BY m.matched_at DESC LIMIT 25",
         params,
     )
