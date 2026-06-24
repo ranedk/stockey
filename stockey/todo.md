@@ -1440,3 +1440,19 @@ focused `pytest`, `python scripts/docs_state_audit.py --strict`, and
 - 2 tests. Full suite 2123. **Phase 2 (the confidence score) is designed, not built** -- collapse
   correlated factors to one component vote, weight by validated edge, regime-switch reversion vs trend,
   and validate the COMBINATION before it grounds alpha.
+
+#### Price/factor model -- Phase 2 (confidence score) (2026-06-24)
+- `build_confidence_scores(frame)`: cross-sectional confidence (0..1) per (symbol, date). Each factor
+  percentile-ranked within its date's universe; ranks AVERAGED within an independent component (the
+  six correlated trend factors count ONCE); oriented by COMPONENT_ORIENTATION (liquidity negative =
+  size premium); combined by robust DEFAULT_COMPONENT_WEIGHTS (fundamentals 0.40 / trend 0.25 /
+  liquidity 0.15 / volume 0.10 / reversion 0.05 / volatility 0.05 -- fundamentals-led, unstable
+  components small, re-tunable). Transparent + re-tunable; not fit to the thin sample.
+- **Combination validation (the test that mattered):** confidence IC +0.080 BEAT every single
+  component (liquidity +0.070, volume +0.056, fundamental/trend +0.038). Confluence across INDEPENDENT
+  components adds real signal -- validated, not assumed. Caveats: thin 20-symbol sample, overlapping
+  windows, volatility component anti-predictive here (-0.10; low weight contains it).
+- **Not yet wired into the live decision path.** Next: feed `confidence` into the LLM packet
+  (technical_confirmation timing + a new fundamental dimension), and gate alpha through the same
+  contract -- only after the score earns edge on a wider universe (re-tune weights as deep-history
+  symbols accumulate). 1 test. Full suite 2125.

@@ -282,3 +282,66 @@ def factor_correlation(frame: Any) -> Any:
 
     present = [name for name in FACTORS if name in frame.columns]
     return frame[present].apply(pd.to_numeric, errors="coerce").corr(method="spearman")
+
+
+# --------------------------------------------------------------------------------------------------
+# Phase 2 -- the confidence score from INDEPENDENT, validated components.
+# --------------------------------------------------------------------------------------------------
+
+# Orientation per component: does a HIGH component score predict POSITIVE forward excess? Liquidity is
+# negative (the small-cap/size premium -- less-liquid names outperform). Validated/literature signs.
+COMPONENT_ORIENTATION: dict[str, float] = {
+    "trend": 1.0, "reversion": 1.0, "volatility": 1.0, "volume": 1.0, "liquidity": -1.0, "fundamental": 1.0,
+}
+
+# Robust default weights (NOT fit to the thin deep-history sample): fundamentals lead (strongest +
+# most consistent), trend is one modest vote, liquidity (size) matters, the unstable-sign components
+# (reversion, volatility) get small weight. Re-tune as the deep-history universe grows. Sum = 1.0.
+DEFAULT_COMPONENT_WEIGHTS: dict[str, float] = {
+    "fundamental": 0.40, "trend": 0.25, "liquidity": 0.15, "volume": 0.10, "reversion": 0.05, "volatility": 0.05,
+}
+
+
+def build_confidence_scores(
+    frame: Any,
+    *,
+    date_col: str = "asof_date",
+    weights: dict[str, float] | None = None,
+    orientation: dict[str, float] | None = None,
+) -> Any:
+    """Cross-sectional confidence score (0..1) per (symbol, date) from independent components.
+
+    Each factor is percentile-ranked within its date's universe; ranks are AVERAGED within a component
+    (so six correlated trend factors count once, not six), oriented by `orientation`, then combined by
+    `weights`. Transparent and re-tunable. Adds `score_<component>` columns and `confidence`.
+    """
+    import pandas as pd
+
+    weights = weights or DEFAULT_COMPONENT_WEIGHTS
+    orientation = orientation or COMPONENT_ORIENTATION
+    out = frame.copy()
+    by_component = factors_by_component()
+
+    component_scores: dict[str, Any] = {}
+    for component, names in by_component.items():
+        present = [name for name in names if name in out.columns]
+        if not present:
+            continue
+        ranks = [out.groupby(date_col)[name].rank(pct=True) for name in present]
+        score = pd.concat(ranks, axis=1).mean(axis=1, skipna=True)  # 0..1 average of factor percentiles
+        if orientation.get(component, 1.0) < 0:
+            score = 1.0 - score
+        out[f"score_{component}"] = score
+        component_scores[component] = score
+
+    numerator = None
+    total_weight = 0.0
+    for component, score in component_scores.items():
+        weight = float(weights.get(component, 0.0))
+        if weight == 0.0:
+            continue
+        contribution = score * weight
+        numerator = contribution if numerator is None else numerator + contribution
+        total_weight += weight
+    out["confidence"] = (numerator / total_weight) if (numerator is not None and total_weight > 0) else float("nan")
+    return out

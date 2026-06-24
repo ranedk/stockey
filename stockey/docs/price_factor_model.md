@@ -82,7 +82,23 @@ run, -0.063 on the deep-technical 1.2k-obs run). Therefore Phase 2 must use **ro
 component weights with shrinkage toward equal-weight / literature priors -- NOT precise weights fit
 to a 20-symbol sample.** Re-fit as more symbols accumulate deep history.
 
-## Phase 2 -- the confidence score (DESIGN)
+## Phase 2 -- the confidence score (BUILT)
+
+`advisory/price_factors.py::build_confidence_scores(frame)` produces a cross-sectional `confidence`
+(0..1) per (symbol, date): each factor is percentile-ranked within its date's universe, ranks are
+AVERAGED within a component (so the six correlated trend factors count once), oriented by
+`COMPONENT_ORIENTATION` (liquidity negative = size premium), and combined by robust
+`DEFAULT_COMPONENT_WEIGHTS` (fundamentals 0.40, trend 0.25, liquidity 0.15, volume 0.10, reversion
+0.05, volatility 0.05 -- fundamentals-led, unstable-sign components small; re-tunable).
+
+**Combination validation (the key test -- does confluence beat single factors?):** on the deep-history
+sample, `confidence` IC +0.080 BEAT every single component (liquidity +0.070, volume +0.056,
+fundamental +0.038, trend +0.038). So combining independent components adds real signal -- the
+confluence idea, validated rather than assumed. Caveats: thin 20-symbol sample, overlapping forward
+windows, and the volatility component was anti-predictive here (-0.10) -- its low weight contains the
+drag and confirms why unstable-sign components are down-weighted.
+
+## Phase 2 design principles
 
 Combine **validated, de-correlated components** into one confidence score:
 

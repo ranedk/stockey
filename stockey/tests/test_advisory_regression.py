@@ -63908,6 +63908,26 @@ def test_price_series_factors_from_raw_ohlcv():
     assert all(v is None for v in pf.compute_price_series_factors([1, 2, 3]).values())
 
 
+def test_build_confidence_scores_combines_components():
+    import pandas as pd
+    from advisory import price_factors as pf
+
+    frame = pd.DataFrame({
+        "asof_date": ["d"] * 4,
+        "symbol": ["A", "B", "C", "D"],
+        "earnings_growth": [0.1, 0.2, 0.3, 0.4],   # fundamental, higher = bullish
+        "momentum": [0.01, 0.02, 0.03, 0.04],       # trend
+        "liquidity": [1.0, 2.0, 3.0, 4.0],          # negative orientation (size premium)
+    })
+    out = pf.build_confidence_scores(frame).sort_values("symbol").reset_index(drop=True)
+    assert {"score_fundamental", "score_trend", "score_liquidity", "confidence"} <= set(out.columns)
+    # fundamental score rises with earnings growth
+    assert out["score_fundamental"].is_monotonic_increasing
+    # liquidity oriented NEGATIVE -> more liquid gets a LOWER score (small-cap premium)
+    assert out.sort_values("liquidity")["score_liquidity"].is_monotonic_decreasing
+    assert out["confidence"].between(0.0, 1.0).all()
+
+
 def test_price_factors_ic_report_ranks_signal():
     import numpy as np
     import pandas as pd
