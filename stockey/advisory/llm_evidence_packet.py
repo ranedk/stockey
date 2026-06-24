@@ -24,9 +24,16 @@ to a `present=False` dimension (visible, never a crash).
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from typing import Any, Callable
+
+# Canonical authoritative hypothesis statuses -- MUST mirror
+# advisory.hypothesis_engine.TRUSTED_OVERLAY_STATUSES. The engine normalizes authored statuses
+# (validated -> active_review, production -> trusted_overlay), so the real promoted/trusted status is
+# "trusted_overlay"; only these confer decision authority.
+HYPOTHESIS_AUTHORITY_STATUSES = {"trusted_overlay", "production"}
 
 # Reliability classifications that mean the family/class is a usable positive signal.
 HELPFUL_RELIABILITY_CLASSIFICATIONS = {
@@ -343,22 +350,45 @@ def event_provenance_dimension(row: dict[str, Any] | None, asof_date: Any) -> di
     return _verdict(dim, direction, confidence, {"setup_effect": setup_effect or None, "confidence": confidence_value})
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
+
+def _hypothesis_direction(expected_effect: Any) -> str:
+    """'long' | 'reduce' | 'unknown' from a hypothesis expected_effect (so a de-risk playbook does
+    not ground a BUY)."""
+    effect = _as_dict(expected_effect)
+    blob = " ".join(str(effect.get(key, "")) for key in ("effect", "market_direction", "action_bias", "direction")).lower()
+    long = any(token in blob for token in ("increase", "accumulate", "buy", "add", "positive", "long", "upside"))
+    reduce = any(token in blob for token in ("reduce", "exit", "sell", "trim", "derisk", "de-risk", "negative", "short", "downside", "avoid"))
+    if long and not reduce:
+        return "long"
+    if reduce and not long:
+        return "reduce"
+    return "unknown"
+
+
 def hypothesis_match_dimension(
     rows: list[dict[str, Any]] | None,
     *,
     min_score: float = HYPOTHESIS_CONDITIONS_MIN_SCORE,
 ) -> dict[str, Any]:
     candidates = [r for r in (rows or []) if isinstance(r, dict)]
-    valid = [r for r in candidates if str(r.get("status") or "").strip().lower() in {"validated", "production"}]
+    valid = [r for r in candidates if str(r.get("status") or "").strip().lower() in HYPOTHESIS_AUTHORITY_STATUSES]
     if not valid:
-        return {"present": bool(candidates), "status": None, "conditions_met": None, "hypothesis_id": None}
+        return {"present": bool(candidates), "status": None, "conditions_met": None, "hypothesis_id": None, "direction": "unknown"}
     valid.sort(key=lambda r: (_num(r.get("match_score")) or 0.0), reverse=True)
     best = valid[0]
     score = _num(best.get("match_score"))
-    explicit = None
-    decision = best.get("decision_json")
-    if isinstance(decision, dict):
-        explicit = _as_bool(decision.get("conditions_met"))
+    explicit = _as_bool(_as_dict(best.get("decision_json")).get("conditions_met"))
     conditions_met = explicit if explicit is not None else (score is not None and score >= float(min_score))
     return {
         "present": True,
@@ -366,6 +396,7 @@ def hypothesis_match_dimension(
         "conditions_met": bool(conditions_met),
         "hypothesis_id": best.get("hypothesis_id"),
         "match_score": score,
+        "direction": _hypothesis_direction(best.get("expected_effect_json") or best.get("expected_effect")),
     }
 
 
@@ -455,7 +486,7 @@ def load_evidence_packet(
         "SELECT m.*, h.status AS status FROM advisory_hypothesis_matches m "
         "JOIN advisory_hypotheses h ON h.hypothesis_id=m.hypothesis_id "
         "WHERE m.symbol=%(symbol)s AND m.published_on<=%(asof)s "
-        "AND h.status IN ('validated','production') "
+        "AND h.status IN ('trusted_overlay','production') "
         "ORDER BY m.matched_at DESC LIMIT 25",
         params,
     )

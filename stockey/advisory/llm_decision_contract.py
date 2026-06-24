@@ -85,8 +85,11 @@ REQUIRED_EVIDENCE_DIMENSIONS = (
 
 DIRECTIONAL_ACTIONS = {"BUY", "BUY_MORE", "SELL", "PARTIAL_SELL"}
 
-# Investor-playbook (Valid Hypothesis) statuses trusted to define sufficiency on their own.
-VALID_HYPOTHESIS_STATUSES = {"validated", "production"}
+# Investor-playbook statuses trusted to define sufficiency. MUST mirror the engine's canonical set
+# (advisory.hypothesis_engine.TRUSTED_OVERLAY_STATUSES): the engine normalizes authored statuses, so
+# the real promoted/trusted status is "trusted_overlay" -- NOT "validated" (that normalizes to
+# active_review, i.e. still testing) which would match nothing in stored data.
+VALID_HYPOTHESIS_STATUSES = {"trusted_overlay", "production"}
 
 # Benchmark-excess classifications that mean "market beta, not alpha": a directional decision
 # resting on them is not data-grounded for live authority.
@@ -207,7 +210,7 @@ def evaluate_hypothesis_match(
         packet.get("hypothesis_match") if isinstance(packet, dict) else None
     )
     if not isinstance(source, dict):
-        return {"present": False, "is_valid_authority": False, "status": None, "hypothesis_id": None, "conditions_met": None}
+        return {"present": False, "is_valid_authority": False, "status": None, "hypothesis_id": None, "conditions_met": None, "direction": "unknown"}
     status = str(source.get("status") or "").strip().lower()
     conditions_met = source.get("conditions_met")
     valid = status in VALID_HYPOTHESIS_STATUSES and bool(conditions_met)
@@ -217,7 +220,17 @@ def evaluate_hypothesis_match(
         "status": status or None,
         "hypothesis_id": source.get("hypothesis_id") or source.get("id"),
         "conditions_met": None if conditions_met is None else bool(conditions_met),
+        "direction": str(source.get("direction") or "unknown").strip().lower(),
     }
+
+
+def _hypothesis_aligns(direction: str, action: str) -> bool:
+    """A hypothesis grounds a decision only when its expected direction matches the action."""
+    if action in {"BUY", "BUY_MORE"}:
+        return direction == "long"
+    if action in {"SELL", "PARTIAL_SELL"}:
+        return direction == "reduce"
+    return False
 
 
 def _direction(packet: dict[str, Any], dimension: str) -> str:
@@ -276,7 +289,11 @@ def validate_decision_grounding(
     # signal, OR a valid hypothesis stands alone. A lone event is not enough for an alpha claim.
     event_supportive = _direction(packet, "event_provenance") == "supportive"
     corroborators = [d for d in ALPHA_THESIS_CORROBORATORS if _direction(packet, d) == "supportive"]
-    hypothesis_path = bool(hypothesis["is_valid_authority"])
+    # A valid hypothesis grounds only when its expected direction matches the action (a de-risk
+    # playbook does not authorize a BUY).
+    hypothesis_direction = str(hypothesis.get("direction") or "unknown")
+    hypothesis_aligned = bool(hypothesis["is_valid_authority"]) and _hypothesis_aligns(hypothesis_direction, normalized_action)
+    hypothesis_path = hypothesis_aligned
     has_thesis = hypothesis_path or (event_supportive and bool(corroborators))
     thesis_dimensions = ([d for d in THESIS_DIMENSIONS if _direction(packet, d) == "supportive"])
     technical_direction = _direction(packet, TIMING_DIMENSION)
@@ -315,6 +332,8 @@ def validate_decision_grounding(
             reasons.append(f"evidence_incomplete: missing {completeness['missing_dimensions']}")
         if contradicting:
             reasons.append(f"contradicting_evidence: {contradicting}")
+        if hypothesis["is_valid_authority"] and not hypothesis_aligned:
+            reasons.append(f"hypothesis_direction_mismatch: {hypothesis_direction} hypothesis vs {normalized_action}")
         if event_supportive and not corroborators and not hypothesis_path:
             reasons.append("uncorroborated_event_thesis: a lone supportive event needs a second non-technical signal or a valid hypothesis for alpha")
         if not has_thesis and not technical_supportive:
@@ -353,6 +372,8 @@ def validate_decision_grounding(
         "contradicting_dimensions": contradicting,
         "sufficiency_path": sufficiency_path,
         "hypothesis_match": hypothesis,
+        "hypothesis_direction": hypothesis_direction,
+        "hypothesis_aligned": hypothesis_aligned,
         "data_grounded": grounded,
         "grounding_failures": reasons,
     }

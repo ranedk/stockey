@@ -62890,19 +62890,49 @@ def test_llm_decision_contract_valid_hypothesis_match_grounds_thin_call():
 
     # A validated investor hypothesis (conditions met) grounds even with no confident corroboration.
     packet = _neutral_packet(
-        hypothesis_match={"status": "validated", "conditions_met": True, "hypothesis_id": "bull_large_order_v3"},
+        hypothesis_match={"status": "trusted_overlay", "conditions_met": True, "hypothesis_id": "bull_large_order_v3", "direction": "long"},
     )
     grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=["event_provenance"], packet=packet)
     assert grounding["sufficiency_path"] == "valid_hypothesis_match"
     assert grounding["hypothesis_match"]["hypothesis_id"] == "bull_large_order_v3"
     assert grounding["data_grounded"] is True
-    # An unvalidated (still-testing) hypothesis does NOT confer authority on its own.
+    # A still-testing (active_review-equivalent) hypothesis does NOT confer authority -- only
+    # trusted_overlay/production do (the engine normalizes 'validated' to active_review).
     testing = llm_decision_contract.validate_decision_grounding(
         action="BUY", cited_dimensions=["event_provenance"],
-        packet=_neutral_packet(hypothesis_match={"status": "testing", "conditions_met": True}),
+        packet=_neutral_packet(hypothesis_match={"status": "active_review", "conditions_met": True, "direction": "long"}),
     )
     assert testing["sufficiency_path"] is None
     assert testing["data_grounded"] is False
+
+
+def test_llm_decision_contract_hypothesis_direction_must_match_action():
+    from advisory import llm_decision_contract
+
+    # A reduce-exposure (de-risk) hypothesis must NOT ground a BUY...
+    derisk = _neutral_packet(hypothesis_match={"status": "trusted_overlay", "conditions_met": True, "hypothesis_id": "austerity_v1", "direction": "reduce"})
+    buy = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=derisk)
+    assert buy["decision_mode"] is None
+    assert any("hypothesis_direction_mismatch" in r for r in buy["grounding_failures"])
+    # ...but it DOES ground a SELL.
+    sell = llm_decision_contract.validate_decision_grounding(action="SELL", cited_dimensions=[], packet=derisk)
+    assert sell["sufficiency_path"] == "valid_hypothesis_match"
+    assert sell["data_grounded"] is True
+
+
+def test_evidence_packet_hypothesis_dimension_real_vocabulary_and_direction():
+    from advisory import llm_evidence_packet as ep
+
+    # Real authority status is trusted_overlay (not 'validated'); 'validated' normalizes to testing.
+    not_authority = ep.hypothesis_match_dimension([{"status": "validated", "match_score": 0.9, "hypothesis_id": "x"}])
+    assert not_authority["present"] is True and not_authority["status"] is None  # present but not authoritative
+    authority = ep.hypothesis_match_dimension([
+        {"status": "trusted_overlay", "match_score": 0.7, "hypothesis_id": "derisk_v1",
+         "expected_effect_json": {"effect": "reduce_exposure", "market_direction": "negative"}}
+    ])
+    assert authority["status"] == "trusted_overlay"
+    assert authority["conditions_met"] is True
+    assert authority["direction"] == "reduce"
 
 
 def test_llm_decision_contract_event_thesis_without_returns_claim_is_not_beta_blocked():
@@ -63232,7 +63262,7 @@ def _evidence_rows(asof="2026-06-23"):
         sector_reliability_row={"classification": "candidate_helpful", "excess_opportunity_hit_rate_after_cost": 0.62, "matured_count": 30, "source_context": "announcement_context"},
         exact_class_row={"classification": "candidate_helpful", "excess_opportunity_hit_rate_after_cost": 0.58, "matured_count": 24},
         benchmark_row={"classification": "candidate_helpful", "avg_excess_watch_return_after_cost": 0.015},
-        hypothesis_rows=[{"status": "validated", "match_score": 0.8, "hypothesis_id": "bull_order_v1", "decision_json": {}}],
+        hypothesis_rows=[{"status": "trusted_overlay", "match_score": 0.8, "hypothesis_id": "bull_order_v1", "decision_json": {}, "expected_effect_json": {"effect": "increase_exposure", "market_direction": "positive", "action_bias": "buy_watch"}}],
     )
 
 
@@ -63249,7 +63279,7 @@ def test_evidence_packet_assembles_normalized_dimensions():
     assert packet["benchmark_excess"]["excess_positive"] is True
     assert packet["event_provenance"]["strength"] == 0.8
     assert packet["event_provenance"]["event_class"] == "order_win"
-    assert packet["hypothesis_match"]["status"] == "validated"
+    assert packet["hypothesis_match"]["status"] == "trusted_overlay"
     assert packet["hypothesis_match"]["conditions_met"] is True
 
 

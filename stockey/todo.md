@@ -639,6 +639,28 @@ one step.**
   one number. A genuine calibrated strength remains possible later as a proper conditional research
   task, not a formula tweak.
 
+#### Hypothesis path wired to LLM-decision grounding (2026-06-24)
+- The hypothesis-alpha path was DEAD against real data (same vocabulary-bug class as market/event):
+  my `.1`/`.4a` filtered hypothesis status `{validated, production}`, but the engine NORMALIZES
+  authored statuses (`validated -> active_review`, `production -> trusted_overlay`), so the real
+  promoted/trusted status is `trusted_overlay` -- which my filter never matched. Aligned
+  `VALID_HYPOTHESIS_STATUSES` / `HYPOTHESIS_AUTHORITY_STATUSES` to `{trusted_overlay, production}`
+  (mirrors `hypothesis_engine.TRUSTED_OVERLAY_STATUSES` and `action_recommender`'s existing filter);
+  fixed the `.4a` loader query too. (Tables are currently empty -- fixed before hypotheses land.)
+- Added DIRECTION awareness: hypotheses carry an expected direction (the existing examples are
+  de-risk playbooks). `hypothesis_match_dimension` derives `direction` (long/reduce/unknown) from
+  `expected_effect_json`; grounding now only treats a hypothesis as authority when its direction
+  matches the action (`_hypothesis_aligns`): a reduce-exposure playbook grounds a SELL, not a BUY
+  (records `hypothesis_direction_mismatch`). 3 tests incl. real-vocabulary + direction-mismatch.
+- **Authoring is already supported:** `config/hypotheses.yaml` + `import_hypotheses_config` (CLI
+  `python -m advisory.hypothesis_engine --import-config`), the `/api/hypotheses` + `/preview` +
+  `/promotion-audit` endpoints, and matching via news/announcement keyword overlap. A hypothesis
+  must reach `trusted_overlay` (operator promotion after a forward-return promotion-audit) before it
+  grounds an LLM alpha decision. Full suite 2112.
+- **Note:** match_score is keyword-overlap (operator-judgment, not predictive); `conditions_met`
+  falls back to score >= `LLM_DECISION_HYPOTHESIS_MIN_MATCH_SCORE`. The real authority gate is the
+  trusted_overlay promotion (which DOES require forward-excess evidence via the promotion-audit).
+
 #### Red-team: too-permissive / too-restrictive edge fixes (2026-06-24)
 - A deep red-team of the selection logic found several edge errors; fixed in two commits after
   operator AskUserQuestion (regime = conviction/size factor; tighten both):
