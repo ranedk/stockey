@@ -658,13 +658,17 @@ one step.**
      query now restricts to `h.trigger_scope='symbol'`, so macro/market hypotheses cannot leak into a
      single name's grounding. (Residual: the matcher still attaches a symbol to market-scope matches
      in the table -- harmless to grounding; aggregating market-scope to a regime signal is future work.)
-  4. **Generic keywords -> high-volume noise.** ACQUISITION 107, GEOPOLITICAL 101 matched broad terms
-     incl. SEBI takeover boilerplate. match_score (overlap ratio) does not capture relevance. ->
-     Handle: raise min_terms, require multi-term/relevance, exclude boilerplate subjects.
-  5. **Keyword coverage is brittle.** Many legit event hypotheses got 0 matches from vocabulary
-     mismatch (GUIDANCE_RAISE/CUT, ANALYST_UP/DOWNGRADE, AUDITOR_RESIGNATION, INDEX_INCL/EXCL,
-     LITIGATION_FAVOURABLE). -> Handle: a keyword-coverage linter at import (warn if ~0 historical
-     hits), and/or replace raw keyword overlap with LLM/semantic event-class extraction.
+  4. **Generic keywords -> high-volume noise.** ✅ MOSTLY HANDLED: the matcher had two deterministic
+     bugs -- it used raw SUBSTRING matching ("war" matched "award"/"software"/"warrants": 165 vs 3
+     whole-word) and IGNORED `exclude_keywords` (normalize_terms drops them). Now word-boundary phrase
+     matching + excludes applied: raw matches 922 -> 664 (28%), worst offenders gutted (GEOPOLITICAL
+     169->3, ORDER_WIN 19->5, PRODUCT_LAUNCH 17->4). Residual: genuinely high-frequency terms
+     (ACQUISITION 191->183) and incidental real-phrase mentions (VEDL "rating upgrade" in an ED-search
+     story) still match -> needs relevance/min_terms + a semantic event-class layer (future).
+  5. **Keyword coverage is brittle.** ✅ HANDLED: added `hypothesis_coverage_report` + CLI
+     `--lint-coverage` -- reports every active hypothesis whose keywords have zero/low hits in recent
+     event text (caught all 8 price anomalies + mis-worded ANALYST/macro hypotheses). Author-time
+     linting replaces silent never-matching. Semantic event-class extraction remains the next frontier.
 - Compounding issue (seen earlier): news->symbol tagging is imperfect (Vedanta demerger -> BSE),
   which feeds 2/3/4. Cleanup: stress rows are `source='stress_test_knowledge_base'`, active_review
   (consume-nothing); purge with `DELETE FROM advisory_hypotheses WHERE source='stress_test_knowledge_base'`.

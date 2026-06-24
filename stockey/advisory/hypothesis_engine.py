@@ -2123,6 +2123,53 @@ def persist_action_plans(plans: pd.DataFrame) -> None:
     upsert_to_db(out, ACTION_PLANS_TABLE, unique_keys=["hypothesis_id", "source_table", "source_key"])
 
 
+def _phrase_regexes(terms: Any) -> list[tuple[str, "re.Pattern[str]"]]:
+    """Normalized (phrase, word-boundary regex) pairs. Word boundaries stop 'war' matching 'award'."""
+    out: list[tuple[str, "re.Pattern[str]"]] = []
+    seen: set[str] = set()
+    for term in terms or []:
+        phrase = normalize_text(term)
+        if not phrase or phrase in seen:
+            continue
+        seen.add(phrase)
+        out.append((phrase, re.compile(r"\b" + re.escape(phrase) + r"\b")))
+    return out
+
+
+def _exclude_phrases(trigger_patterns: Any) -> list[str]:
+    """exclude_keywords from a normalized trigger_patterns dict (normalize_terms drops these)."""
+    if not isinstance(trigger_patterns, dict):
+        return []
+    raw = trigger_patterns.get("exclude_keywords")
+    return list(raw) if isinstance(raw, list) else []
+
+
+def hypothesis_coverage_report(hypotheses: pd.DataFrame, events: pd.DataFrame, *, low_threshold: int = 3) -> list[dict[str, Any]]:
+    """Per-hypothesis count of events whose text contains an include term (word-boundary).
+
+    A keyword-coverage linter (constraint #5): flags hypotheses whose keywords never / rarely appear
+    in real event text, so authoring catches dead keywords instead of silently never matching.
+    """
+    evidence = [
+        normalize_text(" ".join(str(event.get(column) or "") for column in ["subject", "concise_summary_text"]))
+        for _, event in events.iterrows()
+    ]
+    reports: list[dict[str, Any]] = []
+    for _, hypothesis in hypotheses.iterrows():
+        trigger_patterns = parse_jsonish(hypothesis.get("trigger_patterns_json"), {}, source="trigger_patterns_json")
+        terms = normalize_terms(trigger_patterns) or normalize_terms(hypothesis.get("description"))
+        include_rx = _phrase_regexes(terms)
+        hits = sum(1 for text in evidence if any(rx.search(text) for _, rx in include_rx))
+        status = "zero" if hits == 0 else ("low" if hits < int(low_threshold) else "ok")
+        reports.append({
+            "hypothesis_id": hypothesis.get("hypothesis_id"),
+            "include_terms": [phrase for phrase, _ in include_rx],
+            "event_hits": hits,
+            "status": status,
+        })
+    return reports
+
+
 def build_matches(hypotheses: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     if hypotheses.empty or events.empty:
         return pd.DataFrame()
@@ -2135,6 +2182,12 @@ def build_matches(hypotheses: pd.DataFrame, events: pd.DataFrame) -> pd.DataFram
             terms = normalize_terms(hypothesis.get("description"))
         if not terms:
             continue
+        # Word-boundary phrase matching (so "war" no longer matches "award"/"software") and apply
+        # exclude_keywords, which normalize_terms drops -- both collapse a large share of false matches.
+        include_rx = _phrase_regexes(terms)
+        exclude_rx = [regex for _, regex in _phrase_regexes(_exclude_phrases(trigger_patterns))]
+        if not include_rx:
+            continue
         min_terms = int(parse_jsonish(hypothesis.get("decision_policy_json"), {}, source="decision_policy_json").get("min_terms", 1) or 1)
         for _, event in events.iterrows():
             evidence_text = " ".join(
@@ -2142,7 +2195,9 @@ def build_matches(hypotheses: pd.DataFrame, events: pd.DataFrame) -> pd.DataFram
                 for column in ["subject", "concise_summary_text"]
             ).strip()
             normalized_evidence = normalize_text(evidence_text)
-            matched_terms = [term for term in terms if term in normalized_evidence]
+            if any(regex.search(normalized_evidence) for regex in exclude_rx):
+                continue
+            matched_terms = [phrase for phrase, regex in include_rx if regex.search(normalized_evidence)]
             if len(matched_terms) < min_terms:
                 continue
             score = round(min(1.0, len(matched_terms) / max(len(terms), 1)), 4)
@@ -2297,12 +2352,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-llm", action="store_true", help="Use deterministic action-plan fallback instead of Codex.")
     parser.add_argument("--model", default=DEFAULT_PLAYBOOK_ACTION_MODEL, help="Action-plan model, e.g. codex, codex:gpt-5.4-mini, or off.")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--lint-coverage", action="store_true", help="Report keyword-coverage of active hypotheses against recent event text.")
+    parser.add_argument("--coverage-days", type=int, default=120, help="Lookback days for --lint-coverage.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.import_config:
+    if args.lint_coverage:
+        to_date = pd.Timestamp.utcnow()
+        from_date = to_date - pd.Timedelta(days=int(args.coverage_days))
+        events = load_source_events(from_date=from_date, to_date=to_date, sources=args.sources)
+        reports = hypothesis_coverage_report(load_hypotheses(include_inactive=False), events)
+        flagged = [r for r in reports if r["status"] != "ok"]
+        result = {
+            "status": "ok",
+            "coverage_window_days": int(args.coverage_days),
+            "event_count": int(len(events)),
+            "hypotheses_checked": len(reports),
+            "flagged_zero_or_low_coverage": flagged,
+        }
+    elif args.import_config:
         result = import_hypotheses_config(args.import_config, dry_run=bool(args.dry_run))
     elif args.run_scan:
         result = run_hypothesis_scan(

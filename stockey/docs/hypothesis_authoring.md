@@ -53,9 +53,10 @@ hypotheses:
 - **`trigger_scope`** — `symbol` for per-stock playbooks (order win, earnings beat); `market` for
   regime-level de-risk signals (austerity, macro stress). Market-scope hypotheses inform the regime,
   not a single name's alpha.
-- **`trigger_patterns.keywords.include` / `.exclude`** — the matcher does **keyword overlap** against
-  `subject + concise_summary_text` of news/announcement events. This is the single most important
-  field to get right (see Pointers).
+- **`trigger_patterns.keywords.include` / `.exclude`** — the matcher does **word-boundary phrase
+  matching** against `subject + concise_summary_text` of news/announcement events: an include phrase
+  must appear as whole words (so `war` does not match `award`/`software`), and an event containing any
+  **exclude** phrase is rejected. This is the single most important field to get right (see Pointers).
 - **`expected_effect`** — must encode **direction**. This now decides whether the hypothesis can ground
   a BUY vs a SELL: `increase_exposure` / `market_direction: positive` / a buy-ish `action_bias` ->
   **long** (grounds BUY/BUY_MORE); `reduce_exposure` / `market_direction: negative` / a reduce/exit
@@ -70,9 +71,10 @@ hypotheses:
 
 1. **Match the REAL vocabulary, not idealized words.** The announcement `subject` is an exchange
    *category* ("Scheme of Arrangement", "Record Date", "Disclosure under SEBI Takeover Regulations");
-   the substance is in `concise_summary_text`. Before trusting a keyword, measure how often it actually
-   appears (a few `... WHERE concise_summary_text ILIKE '%term%'` counts). A keyword that never appears
-   matches nothing; this is the most common authoring failure.
+   the substance is in `concise_summary_text`. A keyword that never appears matches nothing; this is
+   the most common authoring failure. **Run the coverage linter** before relying on a hypothesis:
+   `python -m advisory.hypothesis_engine --lint-coverage` reports every active hypothesis whose
+   keywords have zero / low hits in recent event text, so you fix dead keywords at authoring time.
 
 2. **Precision over recall.** A hypothesis that matches everything is worthless. Use specific include
    terms plus **exclude** terms to strip near-misses (e.g. an earnings-beat hypothesis must exclude

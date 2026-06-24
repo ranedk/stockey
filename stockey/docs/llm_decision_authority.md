@@ -148,8 +148,12 @@ in a constructive tape; hypotheses are what turn "ride the index" into "beat it"
 2. Direction conflicts among trusted hypotheses now withhold authority (handled). 
 3. Market-scope hypotheses no longer leak into a symbol's grounding (handled); the matcher still
    attaches a symbol to market-scope matches in the table (residual, harmless to grounding).
-4. Generic keywords produce match noise; overlap-ratio match_score does not capture relevance.
-5. Keyword coverage is brittle; a coverage linter and/or semantic event-class extraction would help.
+4. Generic-keyword noise: largely handled -- matching is now word-boundary phrase matching with
+   `exclude_keywords` applied (so "war" no longer matches "award"; cut raw matches ~28%, worst
+   offenders 80-98%). Residual: genuinely high-frequency terms (e.g. "acquisition") and incidental
+   real-phrase mentions still match; relevance/min_terms and a semantic event-class layer are future.
+5. Brittle keyword coverage: handled by a coverage linter (`hypothesis_coverage_report` /
+   `--lint-coverage`) that flags zero/low-coverage hypotheses at authoring time.
 6. Non-technical verdict signs and the bound thresholds are reasoned, not yet outcome-calibrated.
 
 ## Safety guarantees (kept regardless of who decides)

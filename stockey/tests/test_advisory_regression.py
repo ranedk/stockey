@@ -63835,6 +63835,47 @@ def test_hypothesis_persist_matches_dedups_conflict_keys(monkeypatch):
     assert len(k1) == 1 and float(k1.iloc[0]["match_score"]) == 0.8  # strongest kept
 
 
+def test_hypothesis_matcher_word_boundary_and_excludes():
+    import json
+    import pandas as pd
+    from advisory import hypothesis_engine as he
+
+    hyps = pd.DataFrame([{
+        "hypothesis_id": "H", "title": "t", "status": "active_review", "trigger_scope": "symbol",
+        "trigger_patterns_json": json.dumps({"keywords": ["war", "rating upgrade"], "exclude_keywords": ["downgrade"]}),
+        "expected_effect_json": json.dumps({"market_direction": "negative"}),
+        "decision_policy_json": json.dumps({"min_terms": 1}),
+        "description": "",
+    }])
+    ev = lambda key, txt: {"source_type": "news", "source_table": "t", "source_key": key, "published_on": "2026-06-01",
+                          "symbol": "A", "subject": "", "concise_summary_text": txt, "source_url": None}
+    events = pd.DataFrame([
+        ev("1", "company wins an award and a software deal"),     # 'war' only as substring of award/software
+        ev("2", "escalating war at the border"),                  # whole-word 'war'
+        ev("3", "rating upgrade but a downgrade followed"),       # excluded by 'downgrade'
+    ])
+    matches = he.build_matches(hyps, events)
+    keys = set(matches["source_key"]) if not matches.empty else set()
+    assert "1" not in keys   # word-boundary: award/software do NOT match 'war'
+    assert "2" in keys       # whole-word 'war' matches
+    assert "3" not in keys   # exclude_keyword 'downgrade' rejects the event (was previously ignored)
+
+
+def test_hypothesis_coverage_report_flags_dead_keywords():
+    import json
+    import pandas as pd
+    from advisory import hypothesis_engine as he
+
+    hyps = pd.DataFrame([
+        {"hypothesis_id": "LIVE", "trigger_patterns_json": json.dumps({"keywords": ["buyback"]}), "description": ""},
+        {"hypothesis_id": "DEAD", "trigger_patterns_json": json.dumps({"keywords": ["nonexistent zzz token"]}), "description": ""},
+    ])
+    events = pd.DataFrame([{"subject": "", "concise_summary_text": "board approved a share buyback"}])
+    rep = {r["hypothesis_id"]: r for r in he.hypothesis_coverage_report(hyps, events, low_threshold=1)}
+    assert rep["LIVE"]["status"] == "ok" and rep["LIVE"]["event_hits"] == 1
+    assert rep["DEAD"]["status"] == "zero" and rep["DEAD"]["event_hits"] == 0
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {
