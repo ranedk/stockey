@@ -15,28 +15,30 @@ It separates two questions that an earlier fixed "cite >= N dimensions" rule wro
 1. COMPLETENESS -- did we LOOK at every required dimension (regime, macro, sector, technical,
    event, benchmark)? A genuine data gap is recorded, not silently passed, so a decision is never
    made blind to a dimension that could contradict it.
-2. SUFFICIENCY -- is the evidence CONSISTENT and corroborated enough to act? This is NOT a magnitude
-   score and NOT a fixed count. Each packet dimension carries a structured VERDICT (direction
-   supportive / neutral / contradicting + confidence). A directional decision is grounded when:
-   - NO required dimension strongly CONTRADICTS the thesis (a confident `contradicting` verdict
-     vetoes -- e.g. a breakout in a name that is underperforming the benchmark), AND
-   - it matches a VALID HYPOTHESIS (a validated/production investor playbook whose conditions are
-     met -- the operator's experience-encoded sufficiency rule) OR has multi-dimension
-     CORROBORATION (>= min supportive, confident verdicts across distinct dimensions).
+2. SUFFICIENCY -- is the evidence consistent and corroborated enough to act, and in what MODE? The
+   dimensions are NOT a flat symmetric vote (operator design 2026-06-24): non-technical evidence is
+   the THESIS/filter, technicals are the TIMING, and benchmark-excess CLASSIFIES the mode rather than
+   blocking. Each dimension carries a structured VERDICT (direction supportive/neutral/contradicting
+   + confidence). A directional decision grounds in one of two modes, and is blocked by a confident
+   contradiction in any required dimension (a RISK_OFF tape, a weakening event, broken risk):
+   - ALPHA: there is a non-technical THESIS (a confidently supportive thesis dimension --
+     event/announcement/reliability -- OR a valid hypothesis), technical TIMING is not bad (not
+     played-out / not lagging), the regime is not contradicting, AND support is not market-beta-only.
+   - PARTICIPATION (beta): no thesis required, but the technical TREND is confidently supportive and
+     the regime is constructive (not contradicting). Labeled beta -- captures the market without
+     pretending to be alpha -- so the system can participate in a rally instead of sitting in cash.
    An earlier per-dimension magnitude score was removed: a calibration showed it had ~zero/negative
-   correlation with forward benchmark-excess, so it could not ground a decision. Verdicts encode
-   logical consistency (does the evidence support or contradict), which is sound regardless of a
-   feature's predictive power. Supportive/contradicting counts are taken over the PACKET's own
+   correlation with forward benchmark-excess. Verdicts encode logical consistency (support vs
+   contradict), which is sound regardless of predictive power; counts are taken over the PACKET's own
    verdicts (deterministic), so the LLM cannot ground a decision by choosing what to cite.
 
-The BETA guard stays but is scoped: it blocks only when directional support rests on return-based
-evidence that is market beta (excess-negative or explicitly unattributed). An event/hypothesis
-thesis that makes no returns claim (excess_positive is None) is not beta and is not auto-failed.
+The BETA guard no longer blocks -- it sets the mode. Beta-only support disqualifies ALPHA but still
+permits PARTICIPATION (so we don't refuse to invest just because we can't prove alpha). An event/
+hypothesis thesis that makes no returns claim (excess_positive is None) is not beta.
 
-`meets_data_grounding_for_live` is True only when the packet is complete, the decision is
-sufficiently grounded (no strong contradiction + hypothesis-or-corroboration), and support is not
-beta-only. That is the DATA bar -- separate from `live_authority_master_flag`
-(LLM_DIRECT_AUTHORITY_ENABLED) and from outcome-monitoring graduation.
+`meets_data_grounding_for_live` is True when the packet is complete and the decision grounds in
+either mode. `decision_mode` records which. This is the DATA bar -- separate from
+`live_authority_master_flag` (LLM_DIRECT_AUTHORITY_ENABLED) and from outcome-monitoring graduation.
 """
 
 from __future__ import annotations
@@ -49,14 +51,15 @@ from typing import Any
 # policy passed outcome-monitoring graduation ([P-LLM-AUTH].3/.4), neither of which exists yet.
 LLM_DIRECT_AUTHORITY_ENABLED = os.getenv("LLM_DIRECT_AUTHORITY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-# Minimum distinct dimensions whose verdict is supportive (and confident) required for the
-# corroboration path -- so a call cannot rest on one news / one announcement / one indicator. The
-# valid-hypothesis path bypasses this (the operator has encoded that those conditions suffice).
-DEFAULT_MIN_SUPPORTIVE_DIMENSIONS = int(os.getenv("LLM_DECISION_MIN_SUPPORTIVE_DIMENSIONS", "2"))
-
 # A verdict counts as decisive (supportive or contradicting) only at this confidence or above.
 _CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
 DECISIVE_CONFIDENCE = "medium"
+
+# Dimension ROLES (operator design 2026-06-24): non-technical evidence is the thesis/filter,
+# technicals are the timing, market context is the regime gate.
+THESIS_DIMENSIONS = ("event_provenance", "sector_reliability", "exact_class_reliability")
+TIMING_DIMENSION = "technical_confirmation"
+REGIME_DIMENSION = "market_context"
 
 # Evidence dimensions a decision must have LOOKED AT (completeness). Looking at a dimension and
 # finding it neutral/no-signal still counts as looked-at; a genuine data gap does not.
@@ -200,21 +203,28 @@ def evaluate_hypothesis_match(
     }
 
 
+def _direction(packet: dict[str, Any], dimension: str) -> str:
+    """Decisive direction of a present dimension's verdict, else 'neutral'."""
+    value = packet.get(dimension) if isinstance(packet, dict) else None
+    if not isinstance(value, dict) or not _dimension_available(packet, dimension) or not _decisive(value):
+        return "neutral"
+    direction = str(value.get("direction") or "").strip().lower()
+    return direction if direction in {"supportive", "contradicting"} else "neutral"
+
+
 def validate_decision_grounding(
     *,
     action: str,
     cited_dimensions: list[str] | None,
     packet: dict[str, Any],
     matched_hypothesis: dict[str, Any] | None = None,
-    min_supportive: int = DEFAULT_MIN_SUPPORTIVE_DIMENSIONS,
 ) -> dict[str, Any]:
-    """Is a proposed decision data-grounded -- complete, not beta-only, not contradicted, corroborated?
+    """Is a proposed decision grounded, and in what MODE (alpha vs market participation)?
 
-    A directional decision is grounded when the packet is complete, support is not beta-only, NO
-    required dimension confidently contradicts the thesis, AND (a valid hypothesis matches OR
-    >= min_supportive distinct dimensions confidently support it). Supportive/contradicting counts
-    come from the packet's own verdicts (deterministic) -- the LLM cannot ground a call by what it
-    cites. `cited_dimensions` is recorded for audit only.
+    Hierarchical, not a flat vote: non-technical dimensions are the thesis/filter, technicals are
+    the timing, market context is the regime gate, benchmark-excess classifies the mode. A confident
+    contradiction in any required dimension vetoes both modes. Counts come from the packet's verdicts
+    (deterministic); `cited_dimensions` is recorded for audit only.
     """
     normalized_action = str(action or "").strip().upper()
     completeness = build_evidence_completeness(packet)
@@ -228,42 +238,63 @@ def validate_decision_grounding(
     supportive = verdicts["supportive"]
     contradicting = verdicts["contradicting"]
 
+    thesis_dimensions = [d for d in THESIS_DIMENSIONS if _direction(packet, d) == "supportive"]
     hypothesis_path = bool(hypothesis["is_valid_authority"])
-    corroboration_path = len(supportive) >= int(min_supportive)
-    sufficient = hypothesis_path or corroboration_path
-    if hypothesis_path:
-        sufficiency_path = "valid_hypothesis_match"
-    elif corroboration_path:
-        sufficiency_path = "multi_dimension_corroboration"
+    has_thesis = bool(thesis_dimensions) or hypothesis_path
+    technical_direction = _direction(packet, TIMING_DIMENSION)
+    timing_ok = technical_direction != "contradicting"          # not played-out / not lagging
+    technical_supportive = technical_direction == "supportive"
+    regime_ok = _direction(packet, REGIME_DIMENSION) != "contradicting"
+    beta_only = bool(beta_guard["beta_only_support"])
+
+    base_ok = completeness["evidence_complete"] and not contradicting
+    alpha_ok = base_ok and has_thesis and timing_ok and regime_ok and not beta_only
+    participation_ok = base_ok and technical_supportive and regime_ok
+
+    if alpha_ok:
+        decision_mode = "alpha"
+        sufficiency_path = "valid_hypothesis_match" if hypothesis_path else "alpha_thesis_timing"
+    elif participation_ok:
+        decision_mode = "participation"
+        sufficiency_path = "market_participation"
     else:
+        decision_mode = None
         sufficiency_path = None
 
     reasons: list[str] = []
-    if directional:
+    if directional and decision_mode is None:
         if not completeness["evidence_complete"]:
             reasons.append(f"evidence_incomplete: missing {completeness['missing_dimensions']}")
-        if beta_guard["beta_only_support"]:
-            reasons.append(f"beta_only_support: benchmark-excess classification {beta_guard.get('classification')}")
         if contradicting:
             reasons.append(f"contradicting_evidence: {contradicting}")
-        if not sufficient:
-            reasons.append(
-                f"insufficient_corroboration: {len(supportive)} supportive dimensions "
-                f"(< {int(min_supportive)}) and no valid hypothesis match"
-            )
-    else:
-        # Non-directional (WATCH / NO_ACTION / HOLD / REDUCE_EXPOSURE_REVIEW): review-only, no bar.
-        pass
+        if not regime_ok:
+            reasons.append("regime_contradicts: market context is de-risk/stressed")
+        if not has_thesis and not technical_supportive:
+            reasons.append("no_thesis_and_no_participation_trend: needs a non-technical thesis or a supportive trend")
+        elif has_thesis and not timing_ok:
+            reasons.append("timing_contradicts: thesis present but technical timing is played-out/lagging")
+        elif not has_thesis and technical_supportive and not regime_ok:
+            reasons.append("participation_blocked_by_regime")
+        if has_thesis and timing_ok and regime_ok and beta_only and not technical_supportive:
+            reasons.append("alpha_blocked_beta_only_and_no_participation_trend")
 
-    grounded = not reasons
+    grounded = directional and decision_mode is not None
+    if not directional:
+        grounded = True  # non-directional (WATCH/NO_ACTION/...) is review-only, no bar
     return {
         "action": normalized_action,
         "directional": directional,
+        "decision_mode": decision_mode,
+        "is_beta_participation": decision_mode == "participation",
         "cited_dimensions": cited_unique,
+        "thesis_dimensions": thesis_dimensions,
+        "has_thesis": has_thesis,
+        "technical_direction": technical_direction,
+        "timing_ok": timing_ok,
+        "regime_ok": regime_ok,
+        "beta_only_support": beta_only,
         "supporting_dimensions": supportive,
         "contradicting_dimensions": contradicting,
-        "supportive_count": len(supportive),
-        "min_supportive_dimensions": int(min_supportive),
         "sufficiency_path": sufficiency_path,
         "hypothesis_match": hypothesis,
         "data_grounded": grounded,
@@ -281,14 +312,13 @@ def build_llm_decision_contract(
     conviction: float | None = None,
     rationale: str | None = None,
     graduation_passed: bool = False,
-    min_supportive: int = DEFAULT_MIN_SUPPORTIVE_DIMENSIONS,
 ) -> dict[str, Any]:
     """Assemble the full deterministic decision contract for an LLM-proposed action.
 
     Audit-only: `broker_execution_allowed` is always False here (no live bridge exists). The
-    contract records `meets_data_grounding_for_live` (the DATA bar), the master flag, and whether
-    outcome-monitoring graduation passed, so a future live bridge ([P-LLM-AUTH].5) has everything it
-    needs while nothing in .1 can move capital.
+    contract records `meets_data_grounding_for_live` (the DATA bar), `decision_mode` (alpha vs
+    market participation), the master flag, and whether outcome-monitoring graduation passed, so a
+    future live bridge ([P-LLM-AUTH].5) has everything it needs while nothing in .1 can move capital.
     """
     completeness = build_evidence_completeness(packet)
     beta_guard = evaluate_beta_guard(packet)
@@ -297,16 +327,13 @@ def build_llm_decision_contract(
         cited_dimensions=cited_dimensions,
         packet=packet,
         matched_hypothesis=matched_hypothesis,
-        min_supportive=min_supportive,
     )
-    meets_data_bar = bool(
-        grounding["data_grounded"]
-        and completeness["evidence_complete"]
-        and not beta_guard["beta_only_support"]
-    )
+    # Beta no longer blocks -- it sets the mode. The data bar is met when the decision grounds in
+    # either mode (alpha or participation) over a complete packet.
+    meets_data_bar = bool(grounding["data_grounded"] and completeness["evidence_complete"])
     live_eligible = bool(meets_data_bar and LLM_DIRECT_AUTHORITY_ENABLED and graduation_passed)
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "symbol": str(symbol or "").strip().upper(),
         "proposed_action": grounding["action"],
         "conviction": None if conviction is None else float(conviction),
@@ -314,6 +341,8 @@ def build_llm_decision_contract(
         "evidence_completeness": completeness,
         "beta_guard": beta_guard,
         "grounding": grounding,
+        "decision_mode": grounding["decision_mode"],
+        "is_beta_participation": grounding["is_beta_participation"],
         "sufficiency_path": grounding["sufficiency_path"],
         "hypothesis_match": grounding["hypothesis_match"],
         "meets_data_grounding_for_live": meets_data_bar,

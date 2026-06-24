@@ -62805,25 +62805,42 @@ def _neutral_packet(**overrides):
 def test_llm_decision_contract_neutral_evidence_is_not_grounded():
     from advisory import llm_decision_contract
 
-    # Everything looked at but nothing confidently supportive -> no corroboration -> not grounded.
+    # Everything looked at but no thesis and no supportive trend -> neither mode grounds.
     grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=_neutral_packet())
-    assert grounding["supportive_count"] == 0
+    assert grounding["decision_mode"] is None
     assert grounding["sufficiency_path"] is None
     assert grounding["data_grounded"] is False
-    assert any("insufficient_corroboration" in reason for reason in grounding["grounding_failures"])
+    assert any("no_thesis_and_no_participation_trend" in reason for reason in grounding["grounding_failures"])
 
 
-def test_llm_decision_contract_multi_dimension_corroboration_is_grounded():
+def test_llm_decision_contract_alpha_mode_needs_thesis_plus_timing():
     from advisory import llm_decision_contract
 
-    # Two confidently supportive dimensions, none contradicting -> grounded by corroboration.
+    # Non-technical thesis (event) supportive + technical timing ok + benchmark not beta -> ALPHA.
     packet = _neutral_packet(
-        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
-        event_provenance={"present": True, "fresh": True, "direction": "supportive", "confidence": "medium"},
+        event_provenance={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "medium"},
+        benchmark_excess={"present": True, "fresh": True, "excess_positive": True, "direction": "supportive", "confidence": "medium"},
     )
     grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
-    assert grounding["supporting_dimensions"] == ["technical_confirmation", "event_provenance"]
-    assert grounding["sufficiency_path"] == "multi_dimension_corroboration"
+    assert grounding["decision_mode"] == "alpha"
+    assert grounding["sufficiency_path"] == "alpha_thesis_timing"
+    assert grounding["has_thesis"] is True
+    assert grounding["data_grounded"] is True
+
+
+def test_llm_decision_contract_technical_only_grounds_participation_not_alpha():
+    from advisory import llm_decision_contract
+
+    # No non-technical thesis, but a supportive trend in a benign regime -> PARTICIPATION (beta).
+    packet = _neutral_packet(
+        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["has_thesis"] is False
+    assert grounding["decision_mode"] == "participation"
+    assert grounding["is_beta_participation"] is True
+    assert grounding["sufficiency_path"] == "market_participation"
     assert grounding["data_grounded"] is True
 
 
@@ -62904,11 +62921,13 @@ def test_llm_decision_contract_incomplete_evidence_blocks_data_bar():
     assert contract["meets_data_grounding_for_live"] is False
 
 
-def test_llm_decision_contract_beta_only_support_blocks_data_bar():
+def test_llm_decision_contract_beta_only_classifies_participation_does_not_block():
     from advisory import llm_decision_contract
 
+    # Beta-only benchmark support disqualifies ALPHA, but a supportive trend in a benign regime
+    # still grounds as PARTICIPATION -- beta classifies the mode, it does not block the trade.
     packet = _llm_decision_full_packet(
-        benchmark_excess={"present": True, "fresh": True, "classification": "benchmark_beta_not_overlay_alpha", "excess_positive": False}
+        benchmark_excess={"present": True, "fresh": True, "classification": "benchmark_beta_not_overlay_alpha", "excess_positive": False, "direction": "contradicting", "confidence": "low"}
     )
     contract = llm_decision_contract.build_llm_decision_contract(
         symbol="ABC",
@@ -62917,8 +62936,25 @@ def test_llm_decision_contract_beta_only_support_blocks_data_bar():
         cited_dimensions=list(llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS),
     )
     assert contract["beta_guard"]["beta_only_support"] is True
-    assert contract["meets_data_grounding_for_live"] is False
-    assert any("beta_only_support" in reason for reason in contract["grounding"]["grounding_failures"])
+    assert contract["decision_mode"] == "participation"
+    assert contract["is_beta_participation"] is True
+    assert contract["meets_data_grounding_for_live"] is True  # not blocked -- can still participate
+
+
+def test_llm_decision_contract_played_out_timing_blocks_alpha():
+    from advisory import llm_decision_contract
+
+    # Strong thesis but technical timing is contradicting (played-out / lagging) and no participation
+    # trend -> alpha blocked by timing, no participation either.
+    packet = _neutral_packet(
+        event_provenance={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+        technical_confirmation={"present": True, "fresh": True, "direction": "contradicting", "confidence": "high"},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["has_thesis"] is True
+    assert grounding["timing_ok"] is False
+    assert grounding["decision_mode"] is None
+    assert grounding["data_grounded"] is False
 
 
 def test_llm_decision_contract_live_eligible_only_with_master_flag_and_graduation(monkeypatch):
@@ -63151,14 +63187,15 @@ def test_evidence_packet_feeds_decision_contract_grounding():
     # A valid hypothesis is present, so it takes precedence as the sufficiency path.
     assert grounding["sufficiency_path"] == "valid_hypothesis_match"
     assert grounding["data_grounded"] is True
-    # Without the hypothesis, multiple confidently-supportive dimensions ground it by corroboration.
+    # Without the hypothesis: a supportive non-technical thesis + ok technical timing -> ALPHA mode.
     no_hyp = ep.assemble_evidence_packet(**{**_evidence_rows(), "hypothesis_rows": []})
-    corroborated = dc.validate_decision_grounding(
+    alpha = dc.validate_decision_grounding(
         action="BUY", cited_dimensions=["technical_confirmation"], packet=no_hyp,
     )
-    assert corroborated["sufficiency_path"] == "multi_dimension_corroboration"
-    assert corroborated["supportive_count"] >= 2
-    assert corroborated["data_grounded"] is True
+    assert alpha["decision_mode"] == "alpha"
+    assert alpha["sufficiency_path"] == "alpha_thesis_timing"
+    assert alpha["has_thesis"] is True
+    assert alpha["data_grounded"] is True
 
 
 def test_evidence_packet_technical_verdict_flags_underperformer_as_contradicting():

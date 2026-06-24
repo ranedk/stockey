@@ -167,7 +167,15 @@ def technical_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict[str,
         "rs_vs_benchmark": rs,
         "technical_state": row.get("technical_state"),
     }
-    return _verdict(dim, direction, confidence, {"rs_vs_benchmark": rs, "above_dma_50": above_50, "above_dma_200": above_200, "near_52w_high": near_high})
+    # Timing depth for the LLM to judge "already played out vs room to grow" (point-in-time fields;
+    # the deterministic verdict stays the consistency rail, the LLM weighs how extended the move is).
+    components = {
+        "rs_vs_benchmark": rs, "above_dma_50": above_50, "above_dma_200": above_200, "near_52w_high": near_high,
+        "breakout_extension_pct": _num(row.get("breakout_extension_pct")),
+        "dist_52w_high": _num(row.get("dist_52w_high")),
+        "stock_ret_60d": _num(row.get("stock_ret_60d")),
+    }
+    return _verdict(dim, direction, confidence, components)
 
 
 def risk_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict[str, Any]:

@@ -639,6 +639,32 @@ one step.**
   one number. A genuine calibrated strength remains possible later as a proper conditional research
   task, not a formula tweak.
 
+#### Hierarchical grounding: thesis -> timing -> mode (alpha vs participation) (2026-06-24)
+- Operator reframe (two decisions): (1) non-technical data should be the FILTER and technicals the
+  ENTRY/EXIT TIMING ("excellent quarter -> watchlist -> is it already played out or room to grow");
+  (2) beating the market must not mean refusing to invest -- not beating the benchmark shouldn't
+  leave us unable to even capture it. Both trace to `.1` treating the 7 dimensions as a flat,
+  symmetric vote. Restructured into roles + two grounding MODES:
+  - Dimension roles: THESIS = {event_provenance, sector_reliability, exact_class_reliability};
+    TIMING = technical_confirmation; REGIME = market_context; benchmark_excess = mode classifier.
+  - **ALPHA mode**: a confidently-supportive non-technical THESIS (or a valid hypothesis) + technical
+    timing not contradicting (not played-out/lagging) + regime not contradicting + NOT beta-only.
+  - **PARTICIPATION (beta) mode**: no thesis required, but a confidently-supportive technical TREND
+    in a constructive regime -- labeled beta, so the system can capture a rally instead of sitting in
+    cash. Chosen via AskUserQuestion: "classify don't block" + "thesis for alpha, technical-only for
+    participation".
+  - The beta guard NO LONGER blocks -- it sets the mode (beta-only disqualifies alpha, still allows
+    participation). A confident contradiction in any required dimension (RISK_OFF tape, weakening
+    event, broken risk) vetoes both modes. `meets_data_grounding_for_live` = grounds in either mode
+    over a complete packet; the contract records `decision_mode` / `is_beta_participation`
+    (schema_version 3). Removed `LLM_DECISION_MIN_SUPPORTIVE_DIMENSIONS` (the flat-count knob).
+  - Technical verdict stays the consistency rail; "played out vs room" is left to the LLM over
+    enriched timing `components` (breakout_extension_pct, dist_52w_high, stock_ret_60d) -- no
+    uncalibrated magic threshold. New tests: alpha-needs-thesis+timing, technical-only->participation,
+    beta-classifies-not-blocks, played-out-timing-blocks-alpha. Full suite 2104.
+- **Follow-ups:** size/manage PARTICIPATION positions as beta (currently same .2 bounds); the .3
+  monitor already splits outcomes by sufficiency_path, so alpha vs participation P&L stays separated.
+
 #### Verdict rigor applied to the other dimensions (2026-06-24)
 - Applying the same "check against real data" rigor to market/risk/event/reliability surfaced TWO
   correctness bugs (the synthetic tests used made-up category tokens that never occur):
