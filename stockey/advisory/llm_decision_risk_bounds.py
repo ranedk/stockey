@@ -52,6 +52,7 @@ def bound_position_size(
     max_total_exposure_pct: float | None = None,
     min_position_pct: float | None = None,
     stop_atr_mult: float | None = None,
+    size_multiplier: float = 1.0,
 ) -> dict[str, Any]:
     """Bound a (data-grounded) LLM entry decision to a survivable position size + stop.
 
@@ -118,7 +119,10 @@ def bound_position_size(
 
     effective_pct = min_position_pct + conviction_clamped * max(0.0, max_position_pct - min_position_pct)
     effective_pct = max(0.0, min(max_position_pct, effective_pct))
-    conviction_sized_inr = capital_value * effective_pct
+    # Regime headwind (or other caller-supplied) size penalty: a real thesis can trade into a weak
+    # tape, but smaller. Multiplier in [0, 1]; 1.0 is no penalty.
+    multiplier = max(0.0, min(1.0, float(size_multiplier)))
+    conviction_sized_inr = capital_value * effective_pct * multiplier
     sector_headroom = max(0.0, capital_value * max_sector_exposure_pct - max(0.0, _num(current_sector_exposure_inr) or 0.0))
     total_headroom = max(0.0, capital_value * max_total_exposure_pct - max(0.0, _num(current_total_exposure_inr) or 0.0))
 
@@ -130,6 +134,7 @@ def bound_position_size(
     binding_constraint = min(candidates, key=lambda key: candidates[key])
     position_inr = max(0.0, min(candidates.values()))
 
+    plan["size_multiplier"] = multiplier
     plan["binding_constraint"] = binding_constraint
     plan["position_inr"] = round(position_inr, 2)
     plan["position_pct_of_capital"] = round(position_inr / capital_value, 6)

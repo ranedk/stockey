@@ -218,14 +218,16 @@ def market_context_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict
     state = str(row.get("macro_risk_state") or "").strip().upper()
     regime = str(row.get("regime_name") or "").strip().upper()
 
-    # Veto-only dimension: a stressed / de-risk tape contradicts a long thesis; a benign tape is
-    # neutral (not a cheap corroborator). Sign is reasoned -- too few matured rows to calibrate yet.
-    if state == "STRESS" or regime in DERISK_REGIME_NAMES:
-        direction, confidence = "contradicting", "high"
-    elif state == "ELEVATED":
-        direction, confidence = "contradicting", "medium"
+    # Regime is a conviction/size FACTOR, not a blanket veto (a broad macro label must not be the
+    # sole trade gate -- CLAUDE.md). Only extreme STRESS hard-contradicts; ELEVATED / RISK_OFF is a
+    # headwind that shrinks alpha sizing and blocks beta participation, but does not veto a real
+    # idiosyncratic thesis. A benign tape is constructive.
+    if state == "STRESS":
+        regime_state, direction, confidence = "stress", "contradicting", "high"
+    elif state == "ELEVATED" or regime in DERISK_REGIME_NAMES:
+        regime_state, direction, confidence = "headwind", "neutral", "low"
     else:
-        direction, confidence = "neutral", "low"
+        regime_state, direction, confidence = "constructive", "neutral", "low"
 
     dim = {
         "present": True,
@@ -234,9 +236,11 @@ def market_context_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict
         "status": "ok",
         "classification": row.get("macro_risk_state"),
         "regime_name": row.get("regime_name"),
+        "regime_state": regime_state,
+        "regime_headwind": regime_state == "headwind",
         "macro_stress_score": _num(row.get("macro_stress_score")),
     }
-    return _verdict(dim, direction, confidence, {"macro_risk_state": state or None, "risk_on_score": risk_on})
+    return _verdict(dim, direction, confidence, {"macro_risk_state": state or None, "regime_name": regime or None, "risk_on_score": risk_on})
 
 
 def _reliability_dimension(row: dict[str, Any] | None) -> dict[str, Any]:

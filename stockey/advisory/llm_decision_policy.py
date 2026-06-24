@@ -168,6 +168,7 @@ def decide(
         atr=atr,
         current_total_exposure_inr=current_total_exposure_inr,
         current_sector_exposure_inr=current_sector_exposure_inr,
+        size_multiplier=contract.get("recommended_size_multiplier", 1.0),
     )
 
     return {

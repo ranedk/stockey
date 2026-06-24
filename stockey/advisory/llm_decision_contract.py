@@ -212,6 +212,23 @@ def _direction(packet: dict[str, Any], dimension: str) -> str:
     return direction if direction in {"supportive", "contradicting"} else "neutral"
 
 
+# Size penalty applied to an ALPHA decision taken into a regime headwind (a real thesis can trade,
+# but smaller). Participation is not allowed under a headwind at all.
+REGIME_HEADWIND_SIZE_MULTIPLIER = 0.5
+
+
+def _regime_state(packet: dict[str, Any]) -> str:
+    """'constructive' | 'headwind' | 'stress' | 'unknown' from the market_context dimension."""
+    market = packet.get(REGIME_DIMENSION) if isinstance(packet, dict) else None
+    if not isinstance(market, dict) or not _dimension_available(packet, REGIME_DIMENSION):
+        return "unknown"
+    state = str(market.get("regime_state") or "").strip().lower()
+    if state in {"constructive", "headwind", "stress"}:
+        return state
+    # Fallback for synthetic packets without an explicit regime_state.
+    return "stress" if _direction(packet, REGIME_DIMENSION) == "contradicting" else "constructive"
+
+
 def validate_decision_grounding(
     *,
     action: str,
@@ -244,12 +261,19 @@ def validate_decision_grounding(
     technical_direction = _direction(packet, TIMING_DIMENSION)
     timing_ok = technical_direction != "contradicting"          # not played-out / not lagging
     technical_supportive = technical_direction == "supportive"
-    regime_ok = _direction(packet, REGIME_DIMENSION) != "contradicting"
     beta_only = bool(beta_guard["beta_only_support"])
 
+    # Regime is a size factor, not a blanket veto: extreme stress hard-blocks (via the contradiction
+    # in `contradicting`), a headwind shrinks alpha sizing and forbids participation, constructive
+    # is clear. (`unknown` is treated as a headwind -- size down, no participation.)
+    regime_state = _regime_state(packet)
+    regime_constructive = regime_state == "constructive"
+    regime_headwind = regime_state in {"headwind", "unknown"}
+    size_multiplier = REGIME_HEADWIND_SIZE_MULTIPLIER if regime_headwind else 1.0
+
     base_ok = completeness["evidence_complete"] and not contradicting
-    alpha_ok = base_ok and has_thesis and timing_ok and regime_ok and not beta_only
-    participation_ok = base_ok and technical_supportive and regime_ok
+    alpha_ok = base_ok and has_thesis and timing_ok and not beta_only          # allowed into a headwind, sized down
+    participation_ok = base_ok and technical_supportive and regime_constructive  # beta only in a constructive tape
 
     if alpha_ok:
         decision_mode = "alpha"
@@ -267,16 +291,14 @@ def validate_decision_grounding(
             reasons.append(f"evidence_incomplete: missing {completeness['missing_dimensions']}")
         if contradicting:
             reasons.append(f"contradicting_evidence: {contradicting}")
-        if not regime_ok:
-            reasons.append("regime_contradicts: market context is de-risk/stressed")
         if not has_thesis and not technical_supportive:
             reasons.append("no_thesis_and_no_participation_trend: needs a non-technical thesis or a supportive trend")
         elif has_thesis and not timing_ok:
             reasons.append("timing_contradicts: thesis present but technical timing is played-out/lagging")
-        elif not has_thesis and technical_supportive and not regime_ok:
-            reasons.append("participation_blocked_by_regime")
-        if has_thesis and timing_ok and regime_ok and beta_only and not technical_supportive:
+        elif has_thesis and timing_ok and beta_only:
             reasons.append("alpha_blocked_beta_only_and_no_participation_trend")
+        elif not has_thesis and technical_supportive and not regime_constructive:
+            reasons.append(f"participation_blocked_by_regime: {regime_state}")
 
     grounded = directional and decision_mode is not None
     if not directional:
@@ -291,7 +313,9 @@ def validate_decision_grounding(
         "has_thesis": has_thesis,
         "technical_direction": technical_direction,
         "timing_ok": timing_ok,
-        "regime_ok": regime_ok,
+        "regime_state": regime_state,
+        "regime_headwind": regime_headwind,
+        "size_multiplier": size_multiplier,
         "beta_only_support": beta_only,
         "supporting_dimensions": supportive,
         "contradicting_dimensions": contradicting,
@@ -343,6 +367,8 @@ def build_llm_decision_contract(
         "grounding": grounding,
         "decision_mode": grounding["decision_mode"],
         "is_beta_participation": grounding["is_beta_participation"],
+        "regime_state": grounding["regime_state"],
+        "recommended_size_multiplier": grounding["size_multiplier"],
         "sufficiency_path": grounding["sufficiency_path"],
         "hypothesis_match": grounding["hypothesis_match"],
         "meets_data_grounding_for_live": meets_data_bar,

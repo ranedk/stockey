@@ -62941,6 +62941,58 @@ def test_llm_decision_contract_beta_only_classifies_participation_does_not_block
     assert contract["meets_data_grounding_for_live"] is True  # not blocked -- can still participate
 
 
+def test_llm_decision_contract_regime_headwind_sizes_down_alpha_not_blocks():
+    from advisory import llm_decision_contract
+
+    # A real thesis can still trade into a de-risk headwind, but sized down (not blanket-vetoed).
+    packet = _llm_decision_full_packet(
+        market_context={"present": True, "fresh": True, "direction": "neutral", "confidence": "low", "regime_state": "headwind", "regime_headwind": True},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["decision_mode"] == "alpha"  # thesis present -> still grounds
+    assert grounding["regime_headwind"] is True
+    assert grounding["size_multiplier"] == 0.5
+    contract = llm_decision_contract.build_llm_decision_contract(symbol="ABC", proposed_action="BUY", packet=packet)
+    assert contract["recommended_size_multiplier"] == 0.5
+
+
+def test_llm_decision_contract_regime_headwind_blocks_participation():
+    from advisory import llm_decision_contract
+
+    # Pure beta participation requires a constructive tape -> a headwind blocks it (no thesis).
+    packet = _neutral_packet(
+        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+        market_context={"present": True, "fresh": True, "direction": "neutral", "confidence": "low", "regime_state": "headwind", "regime_headwind": True},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["decision_mode"] is None
+    assert any("participation_blocked_by_regime" in r for r in grounding["grounding_failures"])
+
+
+def test_llm_decision_contract_extreme_stress_blocks_both_modes():
+    from advisory import llm_decision_contract
+
+    # Extreme stress is the one regime state that still hard-blocks everything.
+    packet = _llm_decision_full_packet(
+        market_context={"present": True, "fresh": True, "direction": "contradicting", "confidence": "high", "regime_state": "stress"},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["decision_mode"] is None
+    assert "market_context" in grounding["contradicting_dimensions"]
+
+
+def test_llm_decision_risk_bounds_regime_multiplier_shrinks_position():
+    from advisory import llm_decision_risk_bounds
+
+    contract = _grounded_buy_contract(conviction=1.0)
+    plan = llm_decision_risk_bounds.bound_position_size(
+        contract=contract, capital=1_000_000.0, price=100.0, conviction=1.0, atr=3.0, size_multiplier=0.5,
+    )
+    assert plan["allowed"] is True
+    assert plan["position_inr"] == 25000.0  # 50000 full cap * 0.5 headwind multiplier
+    assert plan["size_multiplier"] == 0.5
+
+
 def test_llm_decision_contract_played_out_timing_blocks_alpha():
     from advisory import llm_decision_contract
 
@@ -63240,14 +63292,17 @@ def test_evidence_packet_market_verdict_uses_real_state_vocabulary():
     from advisory import llm_evidence_packet as ep
 
     # Real macro_risk_state values are NORMAL / WATCH / ELEVATED / STRESS (not RISK_ON/RISK_OFF).
+    # Only extreme STRESS hard-contradicts; ELEVATED / RISK_OFF is a headwind (size factor, not veto).
     asof = "2026-06-18"
-    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "STRESS"}, asof)["direction"] == "contradicting"
-    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "ELEVATED"}, asof)["direction"] == "contradicting"
-    # A de-risk regime_name contradicts even when macro_risk_state reads NORMAL.
-    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "NORMAL", "regime_name": "RISK_OFF"}, asof)["direction"] == "contradicting"
-    # Benign tape is veto-only -> neutral, not a cheap corroborator.
-    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "NORMAL", "regime_name": "STABLE"}, asof)["direction"] == "neutral"
-    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "WATCH"}, asof)["direction"] == "neutral"
+    stress = ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "STRESS"}, asof)
+    assert stress["direction"] == "contradicting" and stress["regime_state"] == "stress"
+    elevated = ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "ELEVATED"}, asof)
+    assert elevated["direction"] == "neutral" and elevated["regime_state"] == "headwind"
+    riskoff = ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "NORMAL", "regime_name": "RISK_OFF"}, asof)
+    assert riskoff["regime_state"] == "headwind" and riskoff["regime_headwind"] is True
+    benign = ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "NORMAL", "regime_name": "STABLE"}, asof)
+    assert benign["regime_state"] == "constructive"
+    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "WATCH"}, asof)["regime_state"] == "constructive"
 
 
 def test_evidence_packet_event_verdict_uses_real_setup_effect_vocabulary():
