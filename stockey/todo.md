@@ -639,6 +639,30 @@ one step.**
   one number. A genuine calibrated strength remains possible later as a proper conditional research
   task, not a formula tweak.
 
+#### Red-team: too-permissive / too-restrictive edge fixes (2026-06-24)
+- A deep red-team of the selection logic found several edge errors; fixed in two commits after
+  operator AskUserQuestion (regime = conviction/size factor; tighten both):
+  - **Regime no longer blanket-vetoes** (was the broad-regime-as-sole-gate anti-pattern; the June
+    tape is RISK_OFF so it would have zeroed the book): only extreme STRESS hard-blocks; ELEVATED /
+    RISK_OFF is a `regime_headwind` that sizes alpha down (x0.5 via .2 `size_multiplier`) and blocks
+    beta participation. A real idiosyncratic thesis can still trade in a weak tape, smaller.
+  - **Technical re-derived for its TIMING role:** only a real downtrend (below 200DMA) or MATERIAL
+    underperformance (rs <= -0.08) contradicts; a mild lag in an uptrend is NEUTRAL ("quiet basing =
+    room to grow") -- fixing the inconsistency where the old rs<=-0.02 veto killed the very
+    pre-move setups the thesis->timing design wants to catch. "Played out vs room" is left to the LLM
+    over enriched timing components.
+  - **Completeness graceful-degradation:** CORE = {technical, market_context} must be present (never
+    decide blind to the chart or the tape); the rest are ENRICHING -- absence DEGRADES confidence
+    (`evidence_degraded`) but does not block, so sparse reliability/benchmark data can't silently veto
+    every candidate (the biggest restrictive bug).
+  - **Tightened permissiveness:** ALPHA now needs a CORROBORATED thesis (a supportive event AND a
+    second supportive non-technical signal, OR a valid hypothesis) -- a lone event is not enough;
+    PARTICIPATION is restricted to LIQUID names (pass_liquidity_20d) in a constructive tape, not a
+    thin momentum chase.
+- **Honest implication:** with reliability/benchmark data sparse today, corroborated ALPHA will
+  mostly come via a valid hypothesis until that data deepens -- intended discipline, not a bug.
+- Full suite 2110.
+
 #### Hierarchical grounding: thesis -> timing -> mode (alpha vs participation) (2026-06-24)
 - Operator reframe (two decisions): (1) non-technical data should be the FILTER and technicals the
   ENTRY/EXIT TIMING ("excellent quarter -> watchlist -> is it already played out or room to grow");

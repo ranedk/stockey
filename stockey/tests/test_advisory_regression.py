@@ -62763,6 +62763,8 @@ def _llm_decision_full_packet(**overrides):
         dimension: {"present": True, "fresh": True, "direction": "supportive", "confidence": "high"}
         for dimension in llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS
     }
+    packet["technical_confirmation"] = {"present": True, "fresh": True, "direction": "supportive", "confidence": "high", "liquid": True}
+    packet["market_context"] = {"present": True, "fresh": True, "direction": "neutral", "confidence": "low", "regime_state": "constructive"}
     packet["benchmark_excess"] = {"present": True, "fresh": True, "classification": "candidate_helpful", "excess_positive": True, "direction": "supportive", "confidence": "high"}
     packet.update(overrides)
     return packet
@@ -62832,9 +62834,9 @@ def test_llm_decision_contract_alpha_mode_needs_thesis_plus_timing():
 def test_llm_decision_contract_technical_only_grounds_participation_not_alpha():
     from advisory import llm_decision_contract
 
-    # No non-technical thesis, but a supportive trend in a benign regime -> PARTICIPATION (beta).
+    # No non-technical thesis, but a supportive LIQUID trend in a benign regime -> PARTICIPATION.
     packet = _neutral_packet(
-        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high", "liquid": True},
     )
     grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
     assert grounding["has_thesis"] is False
@@ -62842,6 +62844,18 @@ def test_llm_decision_contract_technical_only_grounds_participation_not_alpha():
     assert grounding["is_beta_participation"] is True
     assert grounding["sufficiency_path"] == "market_participation"
     assert grounding["data_grounded"] is True
+
+
+def test_llm_decision_contract_participation_requires_liquidity():
+    from advisory import llm_decision_contract
+
+    # Same supportive trend but ILLIQUID -> participation blocked (liquid leaders only).
+    packet = _neutral_packet(
+        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high", "liquid": False},
+    )
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["decision_mode"] is None
+    assert any("participation_blocked_illiquid" in r for r in grounding["grounding_failures"])
 
 
 def test_llm_decision_contract_confident_contradiction_vetoes_even_with_corroboration():
@@ -62909,16 +62923,30 @@ def test_llm_decision_contract_event_thesis_without_returns_claim_is_not_beta_bl
 def test_llm_decision_contract_incomplete_evidence_blocks_data_bar():
     from advisory import llm_decision_contract
 
-    packet = _llm_decision_full_packet(risk={"present": False})
+    # A missing CORE dimension (market_context = the regime) blocks: never decide blind to the tape.
+    packet = _llm_decision_full_packet(market_context={"present": False})
     contract = llm_decision_contract.build_llm_decision_contract(
         symbol="ABC",
         proposed_action="BUY",
         packet=packet,
         cited_dimensions=list(llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS),
     )
-    assert "risk" in contract["evidence_completeness"]["missing_dimensions"]
+    assert "market_context" in contract["evidence_completeness"]["core_missing_dimensions"]
     assert contract["evidence_completeness"]["evidence_complete"] is False
     assert contract["meets_data_grounding_for_live"] is False
+
+
+def test_llm_decision_contract_missing_enriching_dimension_degrades_not_blocks():
+    from advisory import llm_decision_contract
+
+    # A missing ENRICHING dimension (sparse reliability) degrades confidence but does NOT block --
+    # sparse data must not silently veto every candidate.
+    packet = _llm_decision_full_packet(sector_reliability={"present": False})
+    contract = llm_decision_contract.build_llm_decision_contract(symbol="ABC", proposed_action="BUY", packet=packet)
+    assert contract["evidence_completeness"]["evidence_complete"] is True
+    assert contract["evidence_completeness"]["degraded"] is True
+    assert "sector_reliability" in contract["evidence_completeness"]["degraded_dimensions"]
+    assert contract["meets_data_grounding_for_live"] is True  # still grounds (alpha via event+exact-class+benchmark)
 
 
 def test_llm_decision_contract_beta_only_classifies_participation_does_not_block():
@@ -62961,7 +62989,7 @@ def test_llm_decision_contract_regime_headwind_blocks_participation():
 
     # Pure beta participation requires a constructive tape -> a headwind blocks it (no thesis).
     packet = _neutral_packet(
-        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high", "liquid": True},
         market_context={"present": True, "fresh": True, "direction": "neutral", "confidence": "low", "regime_state": "headwind", "regime_headwind": True},
     )
     grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
@@ -62996,10 +63024,11 @@ def test_llm_decision_risk_bounds_regime_multiplier_shrinks_position():
 def test_llm_decision_contract_played_out_timing_blocks_alpha():
     from advisory import llm_decision_contract
 
-    # Strong thesis but technical timing is contradicting (played-out / lagging) and no participation
-    # trend -> alpha blocked by timing, no participation either.
+    # Corroborated thesis (event + benchmark) but technical timing is contradicting (played-out /
+    # lagging) and no participation trend -> alpha blocked by timing, no participation either.
     packet = _neutral_packet(
         event_provenance={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+        benchmark_excess={"present": True, "fresh": True, "excess_positive": True, "direction": "supportive", "confidence": "high"},
         technical_confirmation={"present": True, "fresh": True, "direction": "contradicting", "confidence": "high"},
     )
     grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
@@ -63083,7 +63112,7 @@ def test_llm_decision_risk_bounds_conviction_scales_size():
 def test_llm_decision_risk_bounds_refuses_ungrounded_decision():
     from advisory import llm_decision_risk_bounds
 
-    ungrounded = _grounded_buy_contract(conviction=1.0, risk={"present": False})
+    ungrounded = _grounded_buy_contract(conviction=1.0, market_context={"present": False})
     assert ungrounded["meets_data_grounding_for_live"] is False
     plan = llm_decision_risk_bounds.bound_position_size(
         contract=ungrounded, capital=1_000_000.0, price=100.0, conviction=1.0,
@@ -63250,20 +63279,20 @@ def test_evidence_packet_feeds_decision_contract_grounding():
     assert alpha["data_grounded"] is True
 
 
-def test_evidence_packet_technical_verdict_flags_underperformer_as_contradicting():
+def test_evidence_packet_technical_verdict_timing_role():
     from advisory import llm_evidence_packet as ep
 
-    # The NESTLEIND case: every breakout gate passes, but RS vs benchmark is negative (lagging the
-    # market). For an alpha thesis that is a CONTRADICTION, not strength.
-    dim = ep.technical_dimension(
-        {"asof_date": "2026-06-18", "rs_vs_benchmark": -0.035,
-         "pass_above_dma_50": True, "pass_above_dma_200": True, "pass_near_52w_high": True,
-         "pass_breakout_extension": True, "pass_liquidity_20d": True, "pass_trend_alignment": True, "pass_gap_behavior": True},
-        "2026-06-18",
-    )
-    assert dim["strength"] == 1.0  # descriptive gate-fraction still 1.0
-    assert dim["direction"] == "contradicting"  # but the verdict catches the underperformance
-    assert dim["confidence"] == "high"
+    base = {"pass_above_dma_50": True, "pass_above_dma_200": True, "pass_near_52w_high": True,
+            "pass_breakout_extension": True, "pass_liquidity_20d": True, "pass_trend_alignment": True, "pass_gap_behavior": True}
+    # As TIMING: a MATERIAL lag (or downtrend) contradicts...
+    material = ep.technical_dimension({"asof_date": "2026-06-18", "rs_vs_benchmark": -0.10, **base}, "2026-06-18")
+    assert material["direction"] == "contradicting"
+    downtrend = ep.technical_dimension({"asof_date": "2026-06-18", "rs_vs_benchmark": 0.03, **{**base, "pass_above_dma_200": False}}, "2026-06-18")
+    assert downtrend["direction"] == "contradicting"
+    # ...but a MILD lag while still in an uptrend is NEUTRAL (quiet basing = room to grow), not a veto.
+    mild = ep.technical_dimension({"asof_date": "2026-06-18", "rs_vs_benchmark": -0.035, **base}, "2026-06-18")
+    assert mild["direction"] == "neutral"
+    assert mild["liquid"] is True
 
 
 def test_evidence_packet_technical_verdict_supportive_when_outperforming_uptrend():
@@ -63407,8 +63436,8 @@ def test_llm_decision_policy_grounded_buy_is_graded_and_sized_but_review_only():
 def test_llm_decision_policy_ungrounded_proposal_is_not_sized():
     from advisory import llm_decision_policy as policy
 
-    # Thin packet (risk dimension missing) -> incomplete -> not data-grounded -> not sized.
-    packet = _decision_packet(allocation_row=None)
+    # Missing CORE dimension (no market context) -> incomplete -> not data-grounded -> not sized.
+    packet = _decision_packet(market_row=None)
 
     def fake_llm(prompt, *, response_model, model, system_prompt):
         return response_model(action="BUY", conviction=0.9, cited_dimensions=["technical_confirmation"], claims_hypothesis_match=False, rationale="x")
@@ -63578,10 +63607,14 @@ def test_llm_broker_bridge_blocks_ungraduated_and_ungrounded():
     assert not_graduated["broker_execution_allowed"] is False
     assert "decision_not_graduated" in not_graduated["blocked_reasons"]
 
-    # Ungrounded decision (risk dimension missing) -> not data-grounded, reason contract incomplete.
+    # Ungrounded directional decision (missing CORE market context) -> not data-grounded.
     from advisory import llm_decision_policy as policy
-    packet = _decision_packet(allocation_row=None)
-    ungrounded = policy.decide(packet, capital=1_000_000.0, price=100.0, use_llm=False)
+    packet = _decision_packet(market_row=None)
+
+    def buy_llm(prompt, *, response_model, model, system_prompt):
+        return response_model(action="BUY", conviction=0.9, cited_dimensions=["technical_confirmation"], claims_hypothesis_match=False, rationale="x")
+
+    ungrounded = policy.decide(packet, capital=1_000_000.0, price=100.0, llm_caller=buy_llm)
     ungrounded["contract"]["graduation_passed"] = True
     out = bridge.build_broker_action_contract(ungrounded, decided_at="2026-06-23T10:00:00Z", reference_price=100.0, master_flag_enabled=True)
     assert out["broker_authority"]["broker_execution_allowed"] is False

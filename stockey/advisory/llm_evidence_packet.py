@@ -53,9 +53,12 @@ CONTRADICTING_MARKET_STATES = {"STRESS", "ELEVATED"}
 # regime_name values that signal an active de-risk regime.
 DERISK_REGIME_NAMES = {"RISK_OFF"}
 
-# Relative strength below this (underperforming the benchmark) contradicts an ALPHA thesis even when
-# absolute trend gates pass. This is a logical-consistency rail, not a magnitude prediction.
-RS_CONTRADICTION_THRESHOLD = -0.02
+# Technicals are TIMING, not the thesis (operator design 2026-06-24): only a real downtrend (below
+# the 200DMA) or MATERIAL underperformance contradicts the timing. A mild relative lag while still in
+# an uptrend is "quiet basing" = acceptable timing / room to grow, NOT a contradiction -- exactly the
+# pre-move setups a thesis wants to catch. "Played out vs room" nuance is left to the LLM over the
+# enriched timing components.
+TECHNICAL_LAGGING_RS = -0.08
 
 # Technical entry gates whose pass/fail fraction is the DESCRIPTIVE technical strength (not used for
 # grounding -- see module docstring).
@@ -145,17 +148,18 @@ def technical_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict[str,
     above_50 = gates.get("pass_above_dma_50")
     above_200 = gates.get("pass_above_dma_200")
     near_high = gates.get("pass_near_52w_high")
+    liquid = gates.get("pass_liquidity_20d")
 
-    # Verdict encodes alpha-consistency: underperforming the benchmark or being below the 200DMA
-    # contradicts a long alpha thesis regardless of how many breakout gates pass.
-    if rs is not None and rs <= RS_CONTRADICTION_THRESHOLD:
-        direction, confidence = "contradicting", "high"
-    elif above_200 is False:
-        direction, confidence = "contradicting", "medium"
+    # Timing verdict: only a real downtrend or material underperformance is a contradiction. A mild
+    # lag in an uptrend is neutral (room to grow), not a veto.
+    if above_200 is False:
+        direction, confidence = "contradicting", "medium"            # downtrend
+    elif rs is not None and rs <= TECHNICAL_LAGGING_RS:
+        direction, confidence = "contradicting", "high"              # materially lagging
     elif rs is not None and rs > 0 and above_50 and above_200:
         direction, confidence = "supportive", ("high" if rs > 0.05 and near_high else "medium")
     else:
-        direction, confidence = "neutral", "low"
+        direction, confidence = "neutral", "low"                     # quiet basing / mild lag = ok timing
 
     dim = {
         "present": True,
@@ -165,12 +169,14 @@ def technical_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict[str,
         "gates_passed": sum(1 for value in known if value),
         "gates_total": len(known),
         "rs_vs_benchmark": rs,
+        "liquid": liquid,
         "technical_state": row.get("technical_state"),
     }
     # Timing depth for the LLM to judge "already played out vs room to grow" (point-in-time fields;
     # the deterministic verdict stays the consistency rail, the LLM weighs how extended the move is).
     components = {
         "rs_vs_benchmark": rs, "above_dma_50": above_50, "above_dma_200": above_200, "near_52w_high": near_high,
+        "liquid": liquid,
         "breakout_extension_pct": _num(row.get("breakout_extension_pct")),
         "dist_52w_high": _num(row.get("dist_52w_high")),
         "stock_ret_60d": _num(row.get("stock_ret_60d")),

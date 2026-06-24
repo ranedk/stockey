@@ -61,6 +61,16 @@ THESIS_DIMENSIONS = ("event_provenance", "sector_reliability", "exact_class_reli
 TIMING_DIMENSION = "technical_confirmation"
 REGIME_DIMENSION = "market_context"
 
+# CORE dimensions must be present for any grounding (you never decide blind to the timing or the
+# tape). The rest are ENRICHING -- their absence DEGRADES confidence but does not block, so sparse
+# reliability/benchmark data cannot silently veto every candidate.
+CORE_DIMENSIONS = ("technical_confirmation", "market_context")
+
+# An ALPHA thesis must be CORROBORATED, not a lone event: a supportive event needs a second
+# supportive non-technical signal (reliability / exact-class / benchmark-excess), OR a valid
+# hypothesis stands on its own (operator-curated). Tightening chosen via AskUserQuestion 2026-06-24.
+ALPHA_THESIS_CORROBORATORS = ("sector_reliability", "exact_class_reliability", "benchmark_excess")
+
 # Evidence dimensions a decision must have LOOKED AT (completeness). Looking at a dimension and
 # finding it neutral/no-signal still counts as looked-at; a genuine data gap does not.
 REQUIRED_EVIDENCE_DIMENSIONS = (
@@ -143,15 +153,22 @@ def build_evidence_completeness(
     packet: dict[str, Any],
     *,
     required: tuple[str, ...] = REQUIRED_EVIDENCE_DIMENSIONS,
+    core: tuple[str, ...] = CORE_DIMENSIONS,
 ) -> dict[str, Any]:
-    """Which required evidence dimensions were looked at (present+fresh), and is the packet complete?"""
+    """Which dimensions were looked at; complete iff all CORE present (enriching absence degrades)."""
     available = [dimension for dimension in required if _dimension_available(packet, dimension)]
     missing = [dimension for dimension in required if dimension not in available]
+    core_missing = [dimension for dimension in core if dimension not in available]
+    degraded_dimensions = [dimension for dimension in missing if dimension not in core]
     return {
         "required_dimensions": list(required),
+        "core_dimensions": list(core),
         "available_dimensions": available,
         "missing_dimensions": missing,
-        "evidence_complete": not missing,
+        "core_missing_dimensions": core_missing,
+        "degraded_dimensions": degraded_dimensions,
+        "degraded": bool(degraded_dimensions),
+        "evidence_complete": not core_missing,
     }
 
 
@@ -255,12 +272,18 @@ def validate_decision_grounding(
     supportive = verdicts["supportive"]
     contradicting = verdicts["contradicting"]
 
-    thesis_dimensions = [d for d in THESIS_DIMENSIONS if _direction(packet, d) == "supportive"]
+    # ALPHA thesis must be corroborated: a supportive event needs a second supportive non-technical
+    # signal, OR a valid hypothesis stands alone. A lone event is not enough for an alpha claim.
+    event_supportive = _direction(packet, "event_provenance") == "supportive"
+    corroborators = [d for d in ALPHA_THESIS_CORROBORATORS if _direction(packet, d) == "supportive"]
     hypothesis_path = bool(hypothesis["is_valid_authority"])
-    has_thesis = bool(thesis_dimensions) or hypothesis_path
+    has_thesis = hypothesis_path or (event_supportive and bool(corroborators))
+    thesis_dimensions = ([d for d in THESIS_DIMENSIONS if _direction(packet, d) == "supportive"])
     technical_direction = _direction(packet, TIMING_DIMENSION)
     timing_ok = technical_direction != "contradicting"          # not played-out / not lagging
     technical_supportive = technical_direction == "supportive"
+    technical_dim = packet.get(TIMING_DIMENSION) if isinstance(packet, dict) else None
+    liquid = bool(isinstance(technical_dim, dict) and technical_dim.get("liquid"))
     beta_only = bool(beta_guard["beta_only_support"])
 
     # Regime is a size factor, not a blanket veto: extreme stress hard-blocks (via the contradiction
@@ -273,7 +296,8 @@ def validate_decision_grounding(
 
     base_ok = completeness["evidence_complete"] and not contradicting
     alpha_ok = base_ok and has_thesis and timing_ok and not beta_only          # allowed into a headwind, sized down
-    participation_ok = base_ok and technical_supportive and regime_constructive  # beta only in a constructive tape
+    # Beta participation: liquid leaders only, in a constructive tape (not a thin momentum chase).
+    participation_ok = base_ok and technical_supportive and liquid and regime_constructive
 
     if alpha_ok:
         decision_mode = "alpha"
@@ -291,12 +315,16 @@ def validate_decision_grounding(
             reasons.append(f"evidence_incomplete: missing {completeness['missing_dimensions']}")
         if contradicting:
             reasons.append(f"contradicting_evidence: {contradicting}")
+        if event_supportive and not corroborators and not hypothesis_path:
+            reasons.append("uncorroborated_event_thesis: a lone supportive event needs a second non-technical signal or a valid hypothesis for alpha")
         if not has_thesis and not technical_supportive:
-            reasons.append("no_thesis_and_no_participation_trend: needs a non-technical thesis or a supportive trend")
+            reasons.append("no_thesis_and_no_participation_trend: needs a corroborated thesis or a supportive trend")
         elif has_thesis and not timing_ok:
             reasons.append("timing_contradicts: thesis present but technical timing is played-out/lagging")
         elif has_thesis and timing_ok and beta_only:
             reasons.append("alpha_blocked_beta_only_and_no_participation_trend")
+        elif not has_thesis and technical_supportive and not liquid:
+            reasons.append("participation_blocked_illiquid: beta participation is limited to liquid names")
         elif not has_thesis and technical_supportive and not regime_constructive:
             reasons.append(f"participation_blocked_by_regime: {regime_state}")
 
@@ -310,7 +338,11 @@ def validate_decision_grounding(
         "is_beta_participation": decision_mode == "participation",
         "cited_dimensions": cited_unique,
         "thesis_dimensions": thesis_dimensions,
+        "thesis_corroborators": corroborators,
         "has_thesis": has_thesis,
+        "evidence_degraded": completeness["degraded"],
+        "degraded_dimensions": completeness["degraded_dimensions"],
+        "liquid": liquid,
         "technical_direction": technical_direction,
         "timing_ok": timing_ok,
         "regime_state": regime_state,
