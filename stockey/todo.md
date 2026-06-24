@@ -1420,3 +1420,23 @@ Every slice: one narrow code change, a focused test or script validation, docs/
 todo update only if project state changes, `py_compile` of changed modules,
 focused `pytest`, `python scripts/docs_state_audit.py --strict`, and
 `git diff --check`.
+
+#### Price/factor model -- Phase 1 (factor signals + validation) (2026-06-24)
+- Operator decided to add price/factor patterns (momentum, trend, RS, mean-reversion, volatility,
+  52w-high, breakout, volume, liquidity, beta, + acceleration/quality/MTF-alignment/compression/
+  expansion/drawdown-recovery/price-efficiency/relative-volume) with an "independent factor"
+  confidence score. Built Phase 1; full design in `docs/price_factor_model.md`.
+- **The trap (proven on data):** Momentum/Trend Spearman ~0.83 (one signal, not two); trend family
+  0.4-0.7 correlated -> a naive count double-counts. So confidence must come from INDEPENDENT,
+  VALIDATED components, not a raw count.
+- `advisory/price_factors.py`: ~22 factors oriented bullish, tagged by independent component
+  (trend/reversion/volatility/volume/liquidity/fundamental); `compute_factors`, `factor_ic_report`
+  (cross-sectional Spearman IC -- no benchmark index needed, NIFTY history too shallow), `factor_correlation`.
+- **Phase 1 findings (forward 20d cross-sectional excess, ~22k obs 2018-2024):** fundamentals lead
+  (earnings_growth IC +0.089, low-leverage +0.074, revenue_growth +0.060); mean_reversion +0.053;
+  rel_strength +0.030; breakout NEGATIVE -0.048 (chasing extension hurts); liquidity NEGATIVE -0.081
+  (small-cap/size premium). Data-coverage limit: richer technical features (momentum returns,
+  persistence, ATR, volume) are NULL in deep history -- validate as data accumulates.
+- 2 tests. Full suite 2123. **Phase 2 (the confidence score) is designed, not built** -- collapse
+  correlated factors to one component vote, weight by validated edge, regime-switch reversion vs trend,
+  and validate the COMBINATION before it grounds alpha.

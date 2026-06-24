@@ -63861,6 +63861,49 @@ def test_hypothesis_matcher_word_boundary_and_excludes():
     assert "3" not in keys   # exclude_keyword 'downgrade' rejects the event (was previously ignored)
 
 
+def test_price_factors_compute_and_orientation():
+    from advisory import price_factors as pf
+
+    tech = {"stock_ret_60d": 0.12, "stock_ret_120d": 0.08, "pass_above_dma_50": True, "pass_above_dma_200": True,
+            "dma_50_slope_20d_pct": 1.5, "rs_vs_benchmark": 0.06, "dist_52w_high": -2.0, "atr_pct": 3.0,
+            "bb_width_rank_252d": 0.2, "dist_20d_high": -4.0, "trend_persistence_20d": 5, "trend_persistence_60d": 4,
+            "trend_persistence_120d": 3, "avg_traded_value_20d": 1e7}
+    fund = {"profit_after_tax_qoq_growth": 0.25, "net_debt_to_equity": 0.4, "free_cash_flow_to_equity": 0.1,
+            "total_revenue_qoq_growth": 0.15}
+    f = pf.compute_factors(tech, fund)
+    assert f["momentum"] == 0.12
+    assert round(f["momentum_acceleration"], 4) == round(2 * 0.12 - 0.08, 4)  # recent half vs older
+    assert f["trend_following"] == 1.0  # above 50 & 200 + positive slope
+    assert f["multi_timeframe_alignment"] == 1.0  # all 3 timeframes positive persistence
+    assert f["leverage"] == -0.4  # low debt oriented bullish (negated)
+    assert f["volatility"] == -3.0  # low vol oriented bullish (negated atr)
+    assert round(f["volatility_compression"], 4) == 0.8  # 1 - bb_width_rank
+    assert f["earnings_growth"] == 0.25
+    # missing rows -> all None, no crash
+    assert all(v is None for v in pf.compute_factors(None, None).values())
+
+
+def test_price_factors_ic_report_ranks_signal():
+    import numpy as np
+    import pandas as pd
+    from advisory import price_factors as pf
+
+    rng = np.random.RandomState(0)
+    n = 600
+    signal = rng.normal(size=n)
+    noise = rng.normal(size=n)
+    frame = pd.DataFrame({
+        "earnings_growth": signal,                      # correlated with forward excess
+        "liquidity": noise,                             # uncorrelated
+        "forward_excess": 0.5 * signal + rng.normal(scale=0.5, size=n),
+    })
+    rep = pf.factor_ic_report(frame)
+    assert rep.loc["earnings_growth", "spearman_ic"] > 0.4   # strong factor detected
+    assert abs(rep.loc["liquidity", "spearman_ic"]) < 0.15   # noise factor ~ 0
+    # a factor with no column present -> recorded as n=0, no crash
+    assert rep.loc["momentum", "n"] == 0
+
+
 def test_announcement_event_classifier_proximity():
     from advisory.announcement_event_classifier import (classify_announcement, CREDIT_RATING,
         WORK_ORDER_CONTRACT, ACQUISITION_OF_COMPANY, ACQUISITION_OF_PROPERTY, BUYBACK, IGNORE)
