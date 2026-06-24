@@ -122,6 +122,102 @@ FACTORS: dict[str, tuple[str, Callable[[dict[str, Any]], float | None]]] = {
 # over a window, not a single row (Phase 1b).
 
 
+# Factors computed directly from the raw OHLCV series (deep history) rather than from the
+# sparsely-backfilled pre-computed feature columns -- this closes the data-coverage gap.
+SERIES_FACTORS = (
+    "momentum", "momentum_acceleration", "trend_following", "trend_quality", "price_efficiency",
+    "multi_timeframe_alignment", "distance_from_52w_high", "mean_reversion", "drawdown_recovery",
+    "volatility", "volatility_compression", "volatility_expansion",
+    "volume_confirmation", "relative_volume", "up_down_volume_ratio",
+)
+
+
+def compute_price_series_factors(
+    closes: Any, highs: Any = None, lows: Any = None, volumes: Any = None,
+) -> dict[str, float | None]:
+    """Compute the technical factors point-in-time from a trailing OHLCV series (oldest..newest).
+
+    Uses only past data (the last element is the as-of day). Returns None for any factor whose window
+    is too short. This is the deep-history path -- the pre-computed feature columns are mostly NULL in
+    history, but adj_close/high/low/volume are fully populated.
+    """
+    import numpy as np
+
+    out: dict[str, float | None] = {name: None for name in SERIES_FACTORS}
+    c = np.asarray(list(closes), dtype=float)
+    c = c[np.isfinite(c)]
+    n = len(c)
+    if n < 21:
+        return out
+    rets = np.diff(c) / c[:-1]
+
+    def mom(k: int) -> float | None:
+        return (c[-1] / c[-1 - k] - 1.0) if n > k else None
+
+    mom20, mom60, mom120 = mom(20), mom(60), mom(120)
+    out["momentum"] = mom60
+    if mom60 is not None and mom120 is not None:
+        out["momentum_acceleration"] = 2.0 * mom60 - mom120
+
+    def sma(k: int) -> float | None:
+        return float(c[-k:].mean()) if n >= k else None
+
+    sma20, sma50, sma200 = sma(20), sma(50), sma(200)
+    tf = []
+    for s in (sma20, sma50, sma200):
+        if s is not None:
+            tf.append(1.0 if c[-1] > s else 0.0)
+    if n >= 70 and sma50 is not None:
+        tf.append(1.0 if sma50 > float(c[-70:-20].mean()) else 0.0)
+    out["trend_following"] = sum(tf) / len(tf) if tf else None
+    mtf = [1.0 if (m is not None and m > 0) else 0.0 for m in (mom20, mom60, mom120) if m is not None]
+    out["multi_timeframe_alignment"] = float(np.mean(mtf)) if mtf else None
+
+    def efficiency(k: int) -> float | None:
+        if n <= k:
+            return None
+        seg = c[-1 - k:]
+        path = float(np.abs(np.diff(seg)).sum())
+        return abs(seg[-1] - seg[0]) / path if path > 0 else None
+
+    out["trend_quality"] = efficiency(60)
+    out["price_efficiency"] = efficiency(120)
+    if n >= 252:
+        out["distance_from_52w_high"] = float(c[-1] / c[-252:].max() - 1.0)
+    if mom20 is not None and sma200 is not None:
+        out["mean_reversion"] = (-mom20) if c[-1] > sma200 else 0.0
+    if n >= 60:
+        lo, hi = float(c[-60:].min()), float(c[-60:].max())
+        out["drawdown_recovery"] = (c[-1] - lo) / (hi - lo) if hi > lo else None
+    if len(rets) >= 20:
+        out["volatility"] = -float(rets[-20:].std())
+    if n >= 40:
+        window = min(252, n - 19)
+        bw = []
+        for j in range(n - window, n):
+            if j - 19 < 0:
+                continue
+            seg = c[j - 19:j + 1]
+            mu = float(seg.mean())
+            bw.append(4.0 * float(seg.std()) / mu if mu > 0 else np.nan)
+        bw = np.asarray(bw, dtype=float)
+        if len(bw) >= 20 and np.isfinite(bw[-1]):
+            rank = float((bw < bw[-1]).mean())
+            out["volatility_expansion"] = rank
+            out["volatility_compression"] = 1.0 - rank
+    if volumes is not None:
+        v = np.asarray(list(volumes), dtype=float)
+        if len(v) == len(c) + 0 and len(rets) >= 20:
+            v20, r20 = v[-20:], rets[-20:]
+            upv, downv = float(v20[r20 > 0].sum()), float(v20[r20 < 0].sum())
+            total = upv + downv
+            out["volume_confirmation"] = (upv - downv) / total if total > 0 else None
+            out["up_down_volume_ratio"] = upv / downv if downv > 0 else None
+            base = float(v[-20:].mean())
+            out["relative_volume"] = float(v[-5:].mean()) / base if base > 0 else None
+    return out
+
+
 def compute_factors(technical_row: dict[str, Any] | None, fundamental_row: dict[str, Any] | None = None) -> dict[str, float | None]:
     """All factor values for one (symbol, as-of date) from its point-in-time rows (oriented bullish)."""
     merged: dict[str, Any] = {}

@@ -63883,6 +63883,31 @@ def test_price_factors_compute_and_orientation():
     assert all(v is None for v in pf.compute_factors(None, None).values())
 
 
+def test_price_series_factors_from_raw_ohlcv():
+    import numpy as np
+    from advisory import price_factors as pf
+
+    # Deep-history path: compute factors from the raw price series (the pre-computed columns are
+    # mostly NULL in history; adj_close/volume are not).
+    up = list(100 * np.exp(np.cumsum(np.full(300, 0.002))))
+    vol = list(np.full(300, 1000.0))
+    f = pf.compute_price_series_factors(up, volumes=vol)
+    assert f["momentum"] > 0
+    assert f["trend_following"] == 1.0
+    assert f["multi_timeframe_alignment"] == 1.0
+    assert round(f["distance_from_52w_high"], 3) == 0.0   # steady uptrend sits at its 52w high
+    assert f["drawdown_recovery"] == 1.0
+
+    down = list(100 * np.exp(np.cumsum(np.full(300, -0.002))))
+    g = pf.compute_price_series_factors(down)
+    assert g["momentum"] < 0
+    assert g["trend_following"] == 0.0
+    assert g["distance_from_52w_high"] < -0.2
+
+    # too-short series -> all None, no crash
+    assert all(v is None for v in pf.compute_price_series_factors([1, 2, 3]).values())
+
+
 def test_price_factors_ic_report_ranks_signal():
     import numpy as np
     import pandas as pd

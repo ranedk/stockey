@@ -63,9 +63,24 @@ hypothesis must earn a promotion-audit.
 - **Liquidity is negative** -- the small-cap/size premium (less-liquid names outperform).
 - **Chasing extended breakouts hurts** at 20d (extension mean-reverts).
 - **Trend factors are 0.4-0.7 correlated** -- they collapse to ~one vote, confirming the no-naive-count rule.
-- **Data-coverage limit:** the richer technical features (momentum returns, trend_persistence, ATR,
-  volume metrics) are NULL in deep history -- the feature builder added them recently -- so they can
-  only be validated as data accumulates. The validated set above is what has deep history today.
+### Data-coverage gap CLOSED (compute factors from raw OHLCV)
+
+The richer technical features (momentum returns, persistence, ATR, volume metrics) are NULL in deep
+history -- the feature builder added them recently. But adj_close/high/low/volume are 100% populated.
+So `compute_price_series_factors(closes, highs, lows, volumes)` computes the technical factors
+point-in-time directly from the raw trailing OHLCV series (the deep-history path), instead of reading
+the null pre-computed columns. A factor model should compute from price anyway.
+
+Re-validated with deep-history series-computed technicals (forward 20d cross-sectional excess):
+earnings_growth still leads (IC +0.110); momentum is now validatable and positive (+0.054); the
+trend family (relative_strength / 52w-distance / multi_timeframe / trend_following) is modestly
+positive AND **0.7-0.87 correlated -- one signal, not five**.
+
+**Caveat that shapes Phase 2:** the deep-history universe is thin (~20-29 symbols), so cross-sectional
+ICs are noisy and SOME SIGNS FLIP across samples (leverage was +0.074 on the older-feature 22k-obs
+run, -0.063 on the deep-technical 1.2k-obs run). Therefore Phase 2 must use **robust, sign-validated
+component weights with shrinkage toward equal-weight / literature priors -- NOT precise weights fit
+to a 20-symbol sample.** Re-fit as more symbols accumulate deep history.
 
 ## Phase 2 -- the confidence score (DESIGN)
 
