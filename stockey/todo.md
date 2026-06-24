@@ -639,6 +639,25 @@ one step.**
   one number. A genuine calibrated strength remains possible later as a proper conditional research
   task, not a formula tweak.
 
+#### Verdict rigor applied to the other dimensions (2026-06-24)
+- Applying the same "check against real data" rigor to market/risk/event/reliability surfaced TWO
+  correctness bugs (the synthetic tests used made-up category tokens that never occur):
+  - `market_context` keyed on `RISK_ON/RISK_OFF/STRESS/HIGH`, but `advisory_market_context_summary_daily`
+    actually stores `macro_risk_state` in {NORMAL, WATCH, ELEVATED, STRESS} with `regime_name` carrying
+    RISK_OFF. Fixed: STRESS or regime RISK_OFF -> contradicting/high; ELEVATED -> contradicting/medium;
+    NORMAL/WATCH -> neutral (veto-only: a benign tape is not a cheap corroborator). Verified on real
+    rows -- the June tape is a RISK_OFF regime, so market now correctly VETOES (was silently neutral).
+  - `event_provenance` keyed on `positive/negative`, but `setup_effect` is actually
+    {strengthens, weakens, neutral}. Fixed: strengthens -> supportive, weakens -> contradicting.
+    Verified on real allocation rows.
+- **Honest limit:** market/event/risk/reliability verdict SIGNS are reasoned + vocabulary-correct but
+  NOT outcome-calibrated -- the source tables are too new/sparse (market_context 16 rows/1mo;
+  allocations 3mo with a misaligned price grid -> only 1 matured joinable row). Only technical had the
+  deep 2013-2025 history to calibrate. Faking a calibration on 1 row was declined.
+- **TODO (when data accumulates):** once the labeler's `advisory_llm_decision_outcomes` (or deeper
+  allocation history) provides enough matured benchmark-excess, calibrate the non-technical verdict
+  signs the same way technical was (per-bucket forward excess, FDR-aware) and adjust any inverted sign.
+
 ### [P-LLM-AUTH.1-legacy] Evidence-completeness + data-grounding decision contract  ✅ superseded by the pivot above
 - **Operator design (2026-06-23):** the LLM may decide, but only over the COMPLETE validated
   evidence packet with data-grounded reasons — never on one news / one announcement / one

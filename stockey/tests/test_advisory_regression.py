@@ -63109,9 +63109,9 @@ def _evidence_rows(asof="2026-06-23"):
         allocation_row={
             "asof_date": asof, "allocation_status": "allocated", "conviction_bucket": "high",
             "risk_bucket": "low", "stop_price": 94.0, "invalidation_price": 90.0,
-            "event_class": "order_win", "confidence": 0.8, "setup_effect": "positive", "score_impact": 0.2,
+            "event_class": "order_win", "confidence": 0.8, "setup_effect": "strengthens", "score_impact": 0.2,
         },
-        market_row={"asof_date": asof, "risk_on_score": 0.7, "macro_risk_state": "RISK_ON", "regime_name": "constructive_trend", "macro_stress_score": 0.2},
+        market_row={"asof_date": asof, "risk_on_score": 0.7, "macro_risk_state": "NORMAL", "regime_name": "STABLE", "macro_stress_score": 0.2},
         sector_reliability_row={"classification": "candidate_helpful", "excess_opportunity_hit_rate_after_cost": 0.62, "matured_count": 30, "source_context": "announcement_context"},
         exact_class_row={"classification": "candidate_helpful", "excess_opportunity_hit_rate_after_cost": 0.58, "matured_count": 24},
         benchmark_row={"classification": "candidate_helpful", "avg_excess_watch_return_after_cost": 0.015},
@@ -63197,6 +63197,30 @@ def test_evidence_packet_reliability_negative_classification_contradicts():
     )
     assert dim["direction"] == "contradicting"
     assert dim["strength"] == 0.0
+
+
+def test_evidence_packet_market_verdict_uses_real_state_vocabulary():
+    from advisory import llm_evidence_packet as ep
+
+    # Real macro_risk_state values are NORMAL / WATCH / ELEVATED / STRESS (not RISK_ON/RISK_OFF).
+    asof = "2026-06-18"
+    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "STRESS"}, asof)["direction"] == "contradicting"
+    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "ELEVATED"}, asof)["direction"] == "contradicting"
+    # A de-risk regime_name contradicts even when macro_risk_state reads NORMAL.
+    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "NORMAL", "regime_name": "RISK_OFF"}, asof)["direction"] == "contradicting"
+    # Benign tape is veto-only -> neutral, not a cheap corroborator.
+    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "NORMAL", "regime_name": "STABLE"}, asof)["direction"] == "neutral"
+    assert ep.market_context_dimension({"asof_date": asof, "macro_risk_state": "WATCH"}, asof)["direction"] == "neutral"
+
+
+def test_evidence_packet_event_verdict_uses_real_setup_effect_vocabulary():
+    from advisory import llm_evidence_packet as ep
+
+    # Real setup_effect vocabulary is strengthens / weakens / neutral (not positive/negative).
+    asof = "2026-06-18"
+    assert ep.event_provenance_dimension({"asof_date": asof, "event_class": "order_win", "setup_effect": "strengthens", "confidence": 0.8}, asof)["direction"] == "supportive"
+    assert ep.event_provenance_dimension({"asof_date": asof, "event_class": "downgrade", "setup_effect": "weakens", "confidence": 0.8}, asof)["direction"] == "contradicting"
+    assert ep.event_provenance_dimension({"asof_date": asof, "event_class": "routine", "setup_effect": "neutral"}, asof)["direction"] == "neutral"
 
 
 def test_evidence_packet_non_helpful_reliability_yields_zero_strength():

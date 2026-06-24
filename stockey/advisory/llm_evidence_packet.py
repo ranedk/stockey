@@ -46,8 +46,12 @@ NEGATIVE_RELIABILITY_CLASSIFICATIONS = {
     "hurts_or_no_lift",
 }
 
-# Market-context states that contradict a long thesis.
-CONTRADICTING_MARKET_STATES = {"RISK_OFF", "STRESS", "HIGH"}
+# Market-context macro_risk_state values (real vocabulary: NORMAL / WATCH / ELEVATED / STRESS) that
+# contradict a long thesis. NORMAL/WATCH are treated as non-headwinds (neutral, veto-only dimension)
+# rather than cheap corroborators -- a benign market does not, on its own, support a name's alpha.
+CONTRADICTING_MARKET_STATES = {"STRESS", "ELEVATED"}
+# regime_name values that signal an active de-risk regime.
+DERISK_REGIME_NAMES = {"RISK_OFF"}
 
 # Relative strength below this (underperforming the benchmark) contradicts an ALPHA thesis even when
 # absolute trend gates pass. This is a logical-consistency rail, not a magnitude prediction.
@@ -204,11 +208,14 @@ def market_context_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict
         return _absent("missing")
     risk_on = _num(row.get("risk_on_score"))
     state = str(row.get("macro_risk_state") or "").strip().upper()
+    regime = str(row.get("regime_name") or "").strip().upper()
 
-    if state in CONTRADICTING_MARKET_STATES:
-        direction, confidence = "contradicting", ("high" if state in {"RISK_OFF", "HIGH"} else "medium")
-    elif state == "RISK_ON":
-        direction, confidence = "supportive", ("high" if (risk_on or 0) > 0.6 else "medium")
+    # Veto-only dimension: a stressed / de-risk tape contradicts a long thesis; a benign tape is
+    # neutral (not a cheap corroborator). Sign is reasoned -- too few matured rows to calibrate yet.
+    if state == "STRESS" or regime in DERISK_REGIME_NAMES:
+        direction, confidence = "contradicting", "high"
+    elif state == "ELEVATED":
+        direction, confidence = "contradicting", "medium"
     else:
         direction, confidence = "neutral", "low"
 
@@ -296,11 +303,12 @@ def event_provenance_dimension(row: dict[str, Any] | None, asof_date: Any) -> di
         return {"present": False, "fresh": False, "strength": None, "status": "no_event_class",
                 "direction": "neutral", "confidence": "low", "components": {}}
     confidence_value = _num(row.get("confidence"))
+    # Real setup_effect vocabulary: strengthens / weakens / neutral.
     setup_effect = str(row.get("setup_effect") or "").strip().lower()
 
-    if "negative" in setup_effect:
+    if setup_effect == "weakens":
         direction, confidence = "contradicting", ("high" if (confidence_value or 0) >= 0.6 else "medium")
-    elif "positive" in setup_effect:
+    elif setup_effect == "strengthens":
         direction, confidence = "supportive", ("high" if (confidence_value or 0) >= 0.6 else "medium")
     else:
         direction, confidence = "neutral", "low"
