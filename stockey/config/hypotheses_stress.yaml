@@ -1,0 +1,1274 @@
+# STRESS-TEST hypotheses (breadth over precision) to surface system constraints.
+# Generated; all active_review (ground nothing). Includes [price] anomalies that the
+# news-keyword matcher cannot express on purpose. See docs/hypothesis_authoring.md.
+hypotheses:
+- hypothesis_id: STRESS_GUIDANCE_RAISE
+  title: Guidance raised / outlook upgraded
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - raised guidance
+      - guidance raised
+      - outlook upgraded
+      - raises outlook
+      - upward revision in guidance
+      exclude:
+      - guidance cut
+      - lowered guidance
+  expected_effect: &id002
+    effect: increase_exposure
+    market_direction: positive
+    action_bias: buy_watch
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_GUIDANCE_CUT
+  title: Guidance cut / outlook lowered
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - guidance cut
+      - lowered guidance
+      - outlook lowered
+      - cuts outlook
+      - downward revision in guidance
+      exclude:
+      - raised guidance
+  expected_effect: &id001
+    effect: reduce_exposure
+    market_direction: negative
+    action_bias: reduce_exposure_review
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MARGIN_COMPRESSION
+  title: Margin compression / cost pressure
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - margin compression
+      - margin contraction
+      - margins fell
+      - cost pressure
+      - ebitda margin declined
+      exclude:
+      - margin expansion
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MONTHLY_SALES_BEAT
+  title: Monthly sales / volume beat
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - monthly sales
+      - monthly business update
+      - volume growth
+      - record dispatches
+      - highest ever sales
+      exclude:
+      - sales decline
+      - volume fell
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_SPECIAL_DIVIDEND
+  title: Special / sharply hiked dividend
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - special dividend
+      - dividend hike
+      - interim dividend
+      - highest ever dividend
+      exclude:
+      - dividend cut
+      - skips dividend
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_BONUS_ISSUE
+  title: Bonus issue
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - bonus issue
+      - bonus shares
+      - issue of bonus
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_STOCK_SPLIT
+  title: Stock split / sub-division
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - stock split
+      - sub-division of shares
+      - subdivision of equity
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_RIGHTS_ISSUE
+  title: Rights issue (dilution risk)
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - rights issue
+      - rights entitlement
+      exclude: []
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_QIP_DILUTION
+  title: QIP / preferential equity raise (dilution)
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - qip
+      - qualified institutional placement
+      - preferential allotment of equity
+      - preferential issue of shares
+      exclude:
+      - debenture
+      - warrants to promoter
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_OPEN_OFFER_TARGET
+  title: Open offer / being acquired (target)
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - open offer
+      - acquisition of controlling stake
+      - to acquire majority
+      - change in control
+      exclude:
+      - acquires
+      - to acquire stake in
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_ACQUISITION_ACQUIRER
+  title: Company makes an acquisition (acquirer)
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - acquisition
+      - to acquire
+      - acquires
+      - acquire stake in
+      - strategic acquisition
+      exclude:
+      - open offer received
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_ASSET_SALE_DELEVERAGE
+  title: Asset sale / divestment to deleverage
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - asset sale
+      - divestment
+      - stake sale
+      - monetisation
+      - sells subsidiary
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_SUBSIDIARY_IPO
+  title: Subsidiary IPO / listing value unlock
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - subsidiary ipo
+      - subsidiary listing
+      - ipo of subsidiary
+      - list subsidiary
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PLEDGE_INCREASE
+  title: Promoter pledge increase
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - increase in pledge
+      - shares pledged
+      - additional pledge
+      - encumbrance created
+      exclude:
+      - release of pledge
+      - pledge revoked
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PLEDGE_INVOCATION
+  title: Pledge invocation
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - invocation of pledge
+      - pledge invoked
+      - invocation of shares
+      exclude: []
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_BULK_DEAL_BUY
+  title: Marquee/institutional bulk-deal buying
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - bulk deal
+      - block deal
+      - acquired by
+      - fund acquired
+      - mutual fund bought
+      exclude:
+      - sold
+      - offloaded
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_FII_MF_BUYING
+  title: FII / MF stake increase
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - fii increased stake
+      - mutual fund increased
+      - institutional buying
+      - stake increased to
+      exclude:
+      - reduced stake
+      - stake cut
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_RATING_DOWNGRADE
+  title: Credit rating downgrade
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - rating downgrade
+      - rating downgraded
+      - credit rating downgraded
+      - outlook revised to negative
+      - under credit watch
+      exclude:
+      - rating upgrade
+      - upgraded
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_DEBT_REDUCTION
+  title: Debt reduction / deleveraging
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - debt reduction
+      - debt free
+      - reduced debt
+      - prepayment of debt
+      - deleveraging
+      exclude:
+      - debt restructuring
+      - default
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_DEBT_DEFAULT
+  title: Debt default / restructuring
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - default on
+      - debt restructuring
+      - failure to pay
+      - delay in repayment
+      - insolvency
+      exclude: []
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_AUDITOR_RESIGNATION
+  title: Auditor resignation / qualified opinion
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - auditor resignation
+      - auditor resigned
+      - qualified opinion
+      - adverse opinion
+      - auditor raised concern
+      exclude: []
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_FRAUD_IRREGULARITY
+  title: Fraud / accounting irregularity
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - fraud
+      - accounting irregularity
+      - misstatement
+      - siphoning
+      - forensic audit
+      exclude: []
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_LITIGATION_ADVERSE
+  title: Adverse litigation / large penalty
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - adverse order
+      - penalty imposed
+      - demand notice
+      - tax demand
+      - unfavourable ruling
+      exclude:
+      - favourable
+      - in favour
+      - relief granted
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_LITIGATION_FAVOURABLE
+  title: Favourable litigation resolution
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - favourable ruling
+      - in favour of the company
+      - relief granted
+      - case dismissed
+      - won the arbitration
+      exclude:
+      - adverse
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PLI_SCHEME_AWARD
+  title: PLI scheme / incentive award
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - pli scheme
+      - production linked incentive
+      - incentive approved
+      - scheme benefit
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_LONG_TERM_SUPPLY
+  title: Long-term supply / offtake agreement
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - long-term supply agreement
+      - offtake agreement
+      - multi-year contract
+      - supply agreement signed
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_NEW_PRODUCT_LAUNCH
+  title: Major new product launch
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - new product launch
+      - launches new
+      - unveils
+      - product launch
+      exclude:
+      - recall
+      - discontinued
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRODUCT_RECALL
+  title: Product recall / ban
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - product recall
+      - recall of
+      - product ban
+      - import alert
+      - usfda warning
+      exclude: []
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_INDEX_INCLUSION
+  title: Index inclusion (NIFTY/Sensex/MSCI)
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - index inclusion
+      - included in nifty
+      - added to sensex
+      - msci inclusion
+      - added to index
+      exclude:
+      - excluded
+      - removed from index
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_INDEX_EXCLUSION
+  title: Index exclusion
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - index exclusion
+      - excluded from
+      - removed from index
+      - dropped from nifty
+      exclude: []
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_ANALYST_UPGRADE
+  title: Analyst upgrade / target raised
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - analyst upgrade
+      - rating raised to buy
+      - target price raised
+      - upgraded to outperform
+      - brokerage upgrade
+      exclude:
+      - downgrade
+      - target cut
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_ANALYST_DOWNGRADE
+  title: Analyst downgrade / target cut
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - analyst downgrade
+      - downgraded to sell
+      - target price cut
+      - downgraded to underperform
+      exclude:
+      - upgrade
+  expected_effect: *id001
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MKT_RATE_CUT
+  title: Policy rate cut / dovish RBI
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: market
+  trigger_patterns:
+    keywords:
+      include:
+      - repo rate cut
+      - rate cut
+      - dovish
+      - rbi cuts
+      - monetary easing
+      exclude:
+      - rate hike
+      - hawkish
+  expected_effect: &id004
+    effect: increase_exposure
+    market_direction: positive
+    action_bias: buy_watch
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MKT_RATE_HIKE
+  title: Policy rate hike / hawkish RBI
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: market
+  trigger_patterns:
+    keywords:
+      include:
+      - repo rate hike
+      - rate hike
+      - hawkish
+      - rbi hikes
+      - monetary tightening
+      exclude:
+      - rate cut
+      - dovish
+  expected_effect: &id003
+    effect: reduce_exposure
+    market_direction: negative
+    action_bias: reduce_exposure_review
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MKT_CRUDE_SPIKE
+  title: Crude oil spike (import/inflation risk)
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: market
+  trigger_patterns:
+    keywords:
+      include:
+      - crude oil surges
+      - oil price spike
+      - brent jumps
+      - crude spikes
+      exclude:
+      - crude falls
+      - oil price drops
+  expected_effect: *id003
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MKT_INR_DEPRECIATION
+  title: Sharp INR depreciation
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: market
+  trigger_patterns:
+    keywords:
+      include:
+      - rupee depreciation
+      - rupee falls
+      - rupee hits record low
+      - inr weakens
+      exclude:
+      - rupee appreciates
+      - rupee strengthens
+  expected_effect: *id003
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MKT_GEOPOLITICAL_SHOCK
+  title: Geopolitical shock / conflict
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: market
+  trigger_patterns:
+    keywords:
+      include:
+      - war
+      - military conflict
+      - geopolitical tension
+      - border tension
+      - missile strike
+      exclude: []
+  expected_effect: *id003
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MKT_FII_OUTFLOW
+  title: FII outflow surge
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: market
+  trigger_patterns:
+    keywords:
+      include:
+      - fii outflow
+      - fpi selling
+      - foreign outflows
+      - fii sold
+      exclude:
+      - fii inflow
+      - fpi buying
+  expected_effect: *id003
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_MKT_BUDGET_CAPEX
+  title: Budget capex / infra push
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: market
+  trigger_patterns:
+    keywords:
+      include:
+      - budget capex
+      - infrastructure push
+      - capex outlay
+      - capital expenditure boost
+      exclude: []
+  expected_effect: *id004
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRICE_52W_HIGH_BREAKOUT
+  title: '[price] 52-week-high breakout momentum'
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - fiftytwo week high breakout signal token
+      - price breakout above pivot anomaly token
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRICE_GOLDEN_CROSS
+  title: '[price] Golden cross 50/200 DMA'
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - golden cross fifty two hundred dma anomaly token
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRICE_MOMENTUM_12_1
+  title: '[price] 12-1 cross-sectional momentum'
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - twelve minus one cross sectional momentum anomaly token
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRICE_LOW_VOL
+  title: '[price] Low-volatility anomaly'
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - low volatility anomaly factor token
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRICE_OVERSOLD_MEANREV
+  title: '[price] Oversold RSI mean reversion'
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - oversold rsi mean reversion anomaly token
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRICE_VALUE_LOWPE
+  title: '[price] Value low P/E'
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - low price to earnings value factor token
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRICE_QUALITY_ROE
+  title: '[price] Quality high ROE low debt'
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - high return on equity quality factor token
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25
+- hypothesis_id: STRESS_PRICE_VOLUME_BREAKOUT
+  title: '[price] Volume breakout'
+  source: stress_test_knowledge_base
+  status: active_review
+  trigger_scope: symbol
+  trigger_patterns:
+    keywords:
+      include:
+      - volume breakout above average anomaly token
+      exclude: []
+  expected_effect: *id002
+  holding_window:
+    horizons_days:
+    - 5
+    - 10
+    - 20
+  decision_policy:
+    min_terms: 1
+    confirmation_required: true
+  validation_protocol:
+    method: point_in_time_forward_return
+    benchmark: NIFTY
+    costs_bps: 25

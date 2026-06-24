@@ -639,6 +639,35 @@ one step.**
   one number. A genuine calibrated strength remains possible later as a proper conditional research
   task, not a formula tweak.
 
+#### Hypothesis stress test (47 breadth hypotheses) -> surfaced constraints (2026-06-24)
+- Generated `config/hypotheses_stress.yaml` (47 diverse investor hypotheses, breadth over precision,
+  all active_review -> ground nothing) and ran import -> scan over ~3mo real news/announcements:
+  61 hypotheses total, scan 9.5s, 922 matches. Constraints found (to HANDLE later, prioritized):
+  1. **Matcher is news-keyword-only; price/factor anomalies cannot be expressed.** All 8 deliberate
+     `[price]` anomalies (52w-high, golden-cross, 12-1 momentum, low-vol, value, quality, volume
+     breakout) got 0 matches. -> Handle: route price/factor hypotheses to a price-screen trigger
+     (or formally disallow in authoring; doc already says event-driven only). The technical/screener
+     layer is where these belong.
+  2. **[SAFETY] Direction conflicts: 27 events fired BOTH a long and a reduce hypothesis** (e.g. one
+     BSE-tagged news hit ACQUISITION=long and DEBT_DEFAULT=reduce). `.4a hypothesis_match_dimension`
+     currently picks the highest match_score among trusted matches and IGNORES the conflict -> could
+     silently confer the wrong direction. -> Handle: when conflicting-direction trusted hypotheses
+     match a symbol, flag the conflict and withhold authority (don't pick by score). Highest priority.
+  3. **Market-scope hypotheses get symbol-attributed.** 0 matches had a null symbol -- macro
+     hypotheses (geopolitical 101, rate, crude) matched symbol-tagged news and inherited spurious
+     symbols (a war headline is not about the stock it was tagged to). -> Handle: market-scope matches
+     should aggregate to a market/regime signal; the symbol-keyed packet must not pull market-scope.
+  4. **Generic keywords -> high-volume noise.** ACQUISITION 107, GEOPOLITICAL 101 matched broad terms
+     incl. SEBI takeover boilerplate. match_score (overlap ratio) does not capture relevance. ->
+     Handle: raise min_terms, require multi-term/relevance, exclude boilerplate subjects.
+  5. **Keyword coverage is brittle.** Many legit event hypotheses got 0 matches from vocabulary
+     mismatch (GUIDANCE_RAISE/CUT, ANALYST_UP/DOWNGRADE, AUDITOR_RESIGNATION, INDEX_INCL/EXCL,
+     LITIGATION_FAVOURABLE). -> Handle: a keyword-coverage linter at import (warn if ~0 historical
+     hits), and/or replace raw keyword overlap with LLM/semantic event-class extraction.
+- Compounding issue (seen earlier): news->symbol tagging is imperfect (Vedanta demerger -> BSE),
+  which feeds 2/3/4. Cleanup: stress rows are `source='stress_test_knowledge_base'`, active_review
+  (consume-nothing); purge with `DELETE FROM advisory_hypotheses WHERE source='stress_test_knowledge_base'`.
+
 #### Hypothesis authoring guide + seeded classics, run on real data (2026-06-24)
 - Wrote `docs/hypothesis_authoring.md` (the right way to author + pointers: match REAL exchange/news
   vocabulary, precision over recall with excludes, one mechanism each, direction must fit, stay
