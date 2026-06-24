@@ -63775,6 +63775,26 @@ def test_outcome_labeler_label_decisions_feeds_monitor_path():
     assert records[0]["realized_excess_after_cost"] > 0
 
 
+def test_hypothesis_persist_matches_dedups_conflict_keys(monkeypatch):
+    import pandas as pd
+    from advisory import hypothesis_engine
+
+    captured = {}
+    monkeypatch.setattr(hypothesis_engine, "ensure_tables", lambda: None)
+    monkeypatch.setattr(hypothesis_engine, "upsert_to_db", lambda df, table, unique_keys, **kw: captured.update(df=df))
+    base = {"matched_at": "2026-06-01", "published_on": "2026-06-01", "load_ts": "2026-06-01"}
+    frame = pd.DataFrame([
+        {"hypothesis_id": "H", "source_table": "t", "source_key": "k1", "match_score": 0.3, **base},
+        {"hypothesis_id": "H", "source_table": "t", "source_key": "k1", "match_score": 0.8, **base},  # dup conflict key
+        {"hypothesis_id": "H", "source_table": "t", "source_key": "k2", "match_score": 0.5, **base},
+    ])
+    hypothesis_engine.persist_matches(frame)
+    out = captured["df"]
+    assert len(out) == 2  # k1 collapsed -> no CardinalityViolation on conflict upsert
+    k1 = out[out["source_key"] == "k1"]
+    assert len(k1) == 1 and float(k1.iloc[0]["match_score"]) == 0.8  # strongest kept
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {

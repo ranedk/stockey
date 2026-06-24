@@ -639,6 +639,24 @@ one step.**
   one number. A genuine calibrated strength remains possible later as a proper conditional research
   task, not a formula tweak.
 
+#### Hypothesis authoring guide + seeded classics, run on real data (2026-06-24)
+- Wrote `docs/hypothesis_authoring.md` (the right way to author + pointers: match REAL exchange/news
+  vocabulary, precision over recall with excludes, one mechanism each, direction must fit, stay
+  point-in-time, event-driven only (not price anomalies), status discipline -> earn trusted_overlay).
+- Seeded 6 commonly-known event-driven classics into `config/hypotheses.yaml` (keywords calibrated to
+  measured hit-rates in real announcement text): EARNINGS_BEAT_DRIFT (PEAD), EARNINGS_MISS_DERISK,
+  BUYBACK_SIGNAL, CREDIT_RATING_UPGRADE, CAPACITY_EXPANSION_GROWTH, DEMERGER_VALUE_UNLOCK -- all
+  `active_review` (NOT promoted; ground nothing yet).
+- Ran the full path on ~3mo of real news/announcements: import -> scan -> matches -> promotion-audit.
+  Real matches (Bajaj buyback, Tenneco/CG Power capacity, Coal India value-unlock, Eicher "highest
+  ever"). Forward-excess vs NIFTY: EARNINGS_BEAT +1.4%/5d (67% hit), +2.3%/20d (PEAD shows up);
+  BUYBACK -1.4% (negative here); CAPACITY ~flat. The audit correctly separates "famous anomaly" from
+  "works here, now" -- none promotable yet (tiny samples + keyword false-positives, e.g. VEDL "rating
+  upgrade" was actually an ED-search story; Vedanta demerger mis-tagged to BSE).
+- Fixed a pre-existing engine bug surfaced by the run: `persist_matches` upserted without
+  de-duplicating the batch on the conflict key -> CardinalityViolation. Now collapses dup
+  (hypothesis_id, source_table, source_key) keeping the strongest score. Narrow test added. Suite 2113.
+
 #### Hypothesis path wired to LLM-decision grounding (2026-06-24)
 - The hypothesis-alpha path was DEAD against real data (same vocabulary-bug class as market/event):
   my `.1`/`.4a` filtered hypothesis status `{validated, production}`, but the engine NORMALIZES

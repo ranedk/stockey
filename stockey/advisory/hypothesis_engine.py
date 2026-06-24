@@ -2181,7 +2181,16 @@ def persist_matches(matches: pd.DataFrame) -> None:
     for column in ["matched_at", "published_on", "load_ts"]:
         out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
     out["match_score"] = pd.to_numeric(out["match_score"], errors="coerce")
-    upsert_to_db(out, MATCHES_TABLE, unique_keys=["hypothesis_id", "source_table", "source_key"])
+    # Collapse duplicate (hypothesis_id, source_table, source_key) rows within the batch (a source
+    # event can surface more than once) -- keep the strongest match -- before the conflict upsert,
+    # which otherwise raises CardinalityViolation ("cannot affect row a second time").
+    unique_keys = ["hypothesis_id", "source_table", "source_key"]
+    out = (
+        out.sort_values("match_score", ascending=False, na_position="last")
+        .drop_duplicates(subset=unique_keys, keep="first")
+        .reset_index(drop=True)
+    )
+    upsert_to_db(out, MATCHES_TABLE, unique_keys=unique_keys)
 
 
 def run_hypothesis_scan(

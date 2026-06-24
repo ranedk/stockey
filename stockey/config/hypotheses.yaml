@@ -299,3 +299,231 @@ hypotheses:
       benchmark: sector_index
       costs_bps: 35
     promotion_rule: Promote only when sale value, seller role, and recent price context are captured.
+
+  - hypothesis_id: EARNINGS_BEAT_DRIFT_V1
+    title: Post-earnings upside drift on a clear beat
+    description: >
+      A genuine earnings beat (record/standout profit, sharp margin expansion, profit jump) tends to
+      drift up over the following weeks as estimates are revised upward (post-earnings-announcement
+      drift). Must be a real beat, not merely "results announced"; exclude misses and losses.
+    source: common_investor_playbook
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - record profit
+          - highest ever
+          - profit jump
+          - profit surges
+          - margin expansion
+          - beat estimates
+          - surpass estimates
+          - strong set of numbers
+        exclude:
+          - profit decline
+          - net loss
+          - misses estimates
+          - weak results
+          - profit falls
+      source_reliability_min: medium
+    expected_effect:
+      effect: increase_exposure
+      market_direction: positive
+      action_bias: buy_watch
+    holding_window:
+      horizons_days: [5, 10, 20, 40]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: point_in_time_forward_return
+      benchmark: NIFTY
+      costs_bps: 25
+    promotion_rule: Promote to trusted_overlay only after a promotion-audit over >= 10 matured matches shows positive after-cost excess vs NIFTY.
+
+  - hypothesis_id: EARNINGS_MISS_DERISK_V1
+    title: Post-earnings downside drift on a clear miss
+    description: >
+      A clear earnings miss (profit decline, loss, sharp margin contraction) tends to drift down /
+      de-rate over the following weeks. The de-risk mirror of the beat-drift playbook.
+    source: common_investor_playbook
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - profit decline
+          - net loss
+          - misses estimates
+          - weak results
+          - margin contraction
+          - profit falls
+          - guidance cut
+        exclude:
+          - record profit
+          - highest ever
+          - beat estimates
+      source_reliability_min: medium
+    expected_effect:
+      effect: reduce_exposure
+      market_direction: negative
+      action_bias: reduce_exposure_review
+    holding_window:
+      horizons_days: [5, 10, 20]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: point_in_time_forward_return
+      benchmark: NIFTY
+      costs_bps: 25
+    promotion_rule: Promote only after a promotion-audit shows the de-rate persists after cost vs NIFTY.
+
+  - hypothesis_id: BUYBACK_SIGNAL_V1
+    title: Share buyback as an undervaluation/confidence signal
+    description: >
+      A board-approved share buyback (especially tender route, at a premium) signals management views
+      the stock as undervalued and supports the price. Check it is a real repurchase, not a routine note.
+    source: common_investor_playbook
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - buyback
+          - share buyback
+          - buy-back of equity shares
+          - repurchase
+          - tender offer buyback
+        exclude:
+          - debenture buyback
+          - bond buyback
+      source_reliability_min: medium
+    expected_effect:
+      effect: increase_exposure
+      market_direction: positive
+      action_bias: buy_watch
+    holding_window:
+      horizons_days: [5, 10, 20]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: point_in_time_forward_return
+      benchmark: NIFTY
+      costs_bps: 25
+    promotion_rule: Promote only after a promotion-audit over historical buybacks shows after-cost excess vs NIFTY.
+
+  - hypothesis_id: CREDIT_RATING_UPGRADE_V1
+    title: Credit rating upgrade as a de-risking/re-rating signal
+    description: >
+      A credit rating upgrade (or outlook revised to positive) lowers cost of capital and signals
+      improving fundamentals; historically associated with positive drift. Distinguish from downgrades.
+    source: common_investor_playbook
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - rating upgrade
+          - rating upgraded
+          - credit rating upgraded
+          - outlook revised to positive
+          - rating revised upward
+        exclude:
+          - rating downgrade
+          - downgraded
+          - outlook negative
+          - rating withdrawn
+      source_reliability_min: medium
+    expected_effect:
+      effect: increase_exposure
+      market_direction: positive
+      action_bias: buy_watch
+    holding_window:
+      horizons_days: [10, 20, 40]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: point_in_time_forward_return
+      benchmark: NIFTY
+      costs_bps: 25
+    promotion_rule: Promote only after a promotion-audit shows after-cost excess vs NIFTY on historical upgrades.
+
+  - hypothesis_id: CAPACITY_EXPANSION_GROWTH_V1
+    title: Material capacity expansion / capex as a growth runway signal
+    description: >
+      A material capacity expansion, greenfield/brownfield plant, or commissioning of new capacity
+      lengthens the growth runway and is often re-rated, especially in capital-goods/manufacturing.
+      Require a concrete capacity/capex action, not generic "growth plans".
+    source: common_investor_playbook
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - capacity expansion
+          - capacity addition
+          - greenfield
+          - brownfield
+          - new plant
+          - commissioning of
+          - debottlenecking
+        exclude:
+          - capacity utilisation fell
+          - shutdown
+          - plant closure
+      source_reliability_min: medium
+    expected_effect:
+      effect: increase_exposure
+      market_direction: positive
+      action_bias: buy_watch
+    holding_window:
+      horizons_days: [10, 20, 40]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: point_in_time_forward_return
+      benchmark: NIFTY
+      costs_bps: 25
+    promotion_rule: Promote only after a promotion-audit shows after-cost excess vs NIFTY on historical expansions.
+
+  - hypothesis_id: DEMERGER_VALUE_UNLOCK_V1
+    title: Demerger / scheme of arrangement as a value-unlock special situation
+    description: >
+      A demerger, hive-off, or subsidiary listing (scheme of arrangement) can unlock conglomerate
+      discount and re-rate the parts. A classic special-situation playbook; confirm it is a value-unlock
+      structure, not a routine internal restructuring.
+    source: common_investor_playbook
+    status: active_review
+    trigger_scope: symbol
+    trigger_patterns:
+      keywords:
+        include:
+          - demerger
+          - scheme of arrangement
+          - hive off
+          - hive-off
+          - subsidiary listing
+          - value unlock
+        exclude:
+          - merger of wholly owned subsidiary into parent
+          - amalgamation of dormant
+      source_reliability_min: medium
+    expected_effect:
+      effect: increase_exposure
+      market_direction: positive
+      action_bias: buy_watch
+    holding_window:
+      horizons_days: [20, 40, 60]
+    decision_policy:
+      min_terms: 1
+      confirmation_required: true
+    validation_protocol:
+      method: point_in_time_forward_return
+      benchmark: NIFTY
+      costs_bps: 25
+    promotion_rule: Promote only after a promotion-audit shows after-cost excess vs NIFTY on historical demergers.
