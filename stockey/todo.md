@@ -769,10 +769,30 @@ decision engine runs end-to-end and review-only; only the live bridge (.5) remai
 **[P-LLM-AUTH] EPIC COMPLETE** (.1 contract + .2 risk bounds + .3 monitoring + .4 decision engine +
 .5 gated broker bridge). The LLM can produce graduated, data-grounded, risk-bounded, provenance-stamped
 trade decisions and a broker-capable contract — all review-only and behind two default-OFF master flags.
-**Remaining explicit operator steps before any live trade:** (a) build the realized-outcome labeler so
-the .3 monitor has matured benchmark-excess to graduate on; (b) wire approved contracts into
-`advisory_action_recommendations` / execution (the deferred .5 injection step); (c) flip
-`LLM_DIRECT_AUTHORITY_ENABLED` + `STOCKEY_LIVE_TRADING_ENABLED` per deployment. Each is opt-in.
+**Remaining explicit operator steps before any live trade:** (a) ✅ DONE — realized-outcome labeler
+(below); (b) wire approved contracts into `advisory_action_recommendations` / execution (the deferred
+.5 injection step); (c) flip `LLM_DIRECT_AUTHORITY_ENABLED` + `STOCKEY_LIVE_TRADING_ENABLED` per
+deployment. Each is opt-in.
+
+### [P-LLM-AUTH] Realized-outcome labeler — closes the loop  ✅ DONE
+- Added `advisory/llm_decision_outcome_labeler.py` (pure compute + injectable DB loaders). The .3
+  monitor judges MATURED benchmark-excess after cost; nothing produced those labels, so every
+  decision read `matured=False`. This computes them point-in-time and makes graduation earnable.
+  - `compute_decision_outcome` — entry = first close STRICTLY AFTER the decision as-of date, exit =
+    horizon-th (mirrors `return_attribution`; no lookahead). Symbol forward return vs benchmark
+    forward return, net `cost_bps`, -> `realized_excess_after_cost`, `excess_hit`,
+    `resolved_beta_only` (made money but no alpha; entry-only). Entries = long alpha; exits = avoided
+    relative move. Immature (horizon not elapsed) -> `matured=False`.
+  - `evaluate_policy_graduation(monitor_report)` — the ONLY legitimate source of `graduation_passed`
+    (.1/.5): graduates a policy only with >= `LLM_DECISION_GRADUATION_MIN_MATURED` matured outcomes,
+    positive mean after-cost excess, and zero .3 systematic-error alerts. Never asserts confidence.
+  - `label_decisions(asof_date, ...)` loads directional decisions, labels each, returns
+    `outcomes_by_key` that feeds `llm_decision_store.decisions_to_monitor_records` -> the .3 monitor;
+    `persist_outcomes` writes `advisory_llm_decision_outcomes` (append-only migration
+    `20260624_*`). Env: `LLM_DECISION_OUTCOME_HORIZON_DAYS=20`, `_COST_BPS=25`,
+    `LLM_DECISION_GRADUATION_MIN_MATURED=20`. 7 tests. Full suite 2096 passed.
+- **The loop is now closed**: decide (.4) -> persist (.4c) -> label outcomes (here) -> monitor (.3)
+  -> graduate (here) -> the .5 bridge can grant authority. Live trade still needs steps (b) and (c).
 
 **Open decisions for the operator (before .5):** the risk-bound caps (per-position / per-sector /
 total exposure %, stop ATR multiple, min conviction); whether/when to flip the master flag and at

@@ -63440,6 +63440,116 @@ def test_llm_broker_bridge_records_soft_gate_overrides():
     assert reason["source"] == "llm_direct_authority"
 
 
+def _price_series(start="2026-01-01", n=40, start_price=100.0, daily=0.0):
+    import pandas as pd
+
+    dates = pd.bdate_range(start=start, periods=n)
+    return [{"date": d, "close": start_price * ((1.0 + daily) ** i)} for i, d in enumerate(dates)]
+
+
+def test_outcome_labeler_entry_alpha_positive_excess():
+    from advisory import llm_decision_outcome_labeler as labeler
+
+    # Symbol +1%/day, benchmark flat -> strong positive excess for a BUY.
+    out = labeler.compute_decision_outcome(
+        action="BUY", asof_date="2026-01-01", horizon_days=10,
+        symbol_series=_price_series(daily=0.01), benchmark_series=_price_series(daily=0.0),
+        cost_bps=25,
+    )
+    assert out["matured"] is True
+    assert out["realized_excess_after_cost"] > 0
+    assert out["excess_hit"] is True
+    assert out["resolved_beta_only"] is False
+
+
+def test_outcome_labeler_entry_resolved_beta_only():
+    from advisory import llm_decision_outcome_labeler as labeler
+
+    # Symbol +1%/day but benchmark +1.2%/day -> made money, did NOT beat benchmark -> beta-only.
+    out = labeler.compute_decision_outcome(
+        action="BUY", asof_date="2026-01-01", horizon_days=10,
+        symbol_series=_price_series(daily=0.01), benchmark_series=_price_series(daily=0.012),
+        cost_bps=25,
+    )
+    assert out["matured"] is True
+    assert out["realized_return_after_cost"] > 0  # absolute gain
+    assert out["realized_excess_after_cost"] <= 0  # but no alpha
+    assert out["resolved_beta_only"] is True
+
+
+def test_outcome_labeler_exit_scores_avoided_relative_move():
+    from advisory import llm_decision_outcome_labeler as labeler
+
+    # A SELL where the symbol then underperforms the benchmark is a GOOD sell (positive excess).
+    out = labeler.compute_decision_outcome(
+        action="SELL", asof_date="2026-01-01", horizon_days=10,
+        symbol_series=_price_series(daily=-0.01), benchmark_series=_price_series(daily=0.0),
+        cost_bps=25,
+    )
+    assert out["matured"] is True
+    assert out["realized_excess_after_cost"] > 0
+    assert out["resolved_beta_only"] is False  # beta-only is entry-only
+
+
+def test_outcome_labeler_immature_when_horizon_not_elapsed():
+    from advisory import llm_decision_outcome_labeler as labeler
+
+    out = labeler.compute_decision_outcome(
+        action="BUY", asof_date="2026-01-01", horizon_days=20,
+        symbol_series=_price_series(n=5), benchmark_series=_price_series(n=5), cost_bps=25,
+    )
+    assert out["matured"] is False
+    assert out["reason"] == "insufficient_forward_history"
+
+
+def test_outcome_labeler_no_lookahead_uses_only_strictly_after_closes():
+    from advisory import llm_decision_outcome_labeler as labeler
+
+    # Entry must be the first close STRICTLY AFTER asof; same-day close is not used.
+    series = [{"date": "2026-01-01", "close": 100.0}, {"date": "2026-01-02", "close": 110.0}, {"date": "2026-01-05", "close": 121.0}]
+    out = labeler.compute_decision_outcome(
+        action="BUY", asof_date="2026-01-01", horizon_days=2,
+        symbol_series=series, benchmark_series=_price_series(daily=0.0), cost_bps=0,
+    )
+    # entry=110 (2026-01-02, strictly after), exit=121 (horizon-th) -> +10%
+    assert round(out["symbol_forward_return"], 4) == 0.1
+
+
+def test_outcome_labeler_graduation_requires_matured_healthy_no_alerts():
+    from advisory import llm_decision_outcome_labeler as labeler
+
+    healthy = {"summary": {"matured_count": 25, "mean_excess_after_cost": 0.02}, "alert_count": 0}
+    assert labeler.evaluate_policy_graduation(healthy, min_matured=20)["graduated"] is True
+
+    too_few = {"summary": {"matured_count": 5, "mean_excess_after_cost": 0.02}, "alert_count": 0}
+    g = labeler.evaluate_policy_graduation(too_few, min_matured=20)
+    assert g["graduated"] is False and any("insufficient_matured" in r for r in g["blocked_reasons"])
+
+    with_alerts = {"summary": {"matured_count": 25, "mean_excess_after_cost": 0.02}, "alert_count": 2}
+    assert labeler.evaluate_policy_graduation(with_alerts, min_matured=20)["graduated"] is False
+
+
+def test_outcome_labeler_label_decisions_feeds_monitor_path():
+    from advisory import llm_decision_outcome_labeler as labeler
+    from advisory import llm_decision_store as store
+
+    decisions = [{"decided_at": "2026-01-01T10:00:00Z", "asof_date": "2026-01-01", "symbol": "ABC", "proposed_action": "BUY", "sufficiency_path": "valid_hypothesis_match"}]
+    result = labeler.label_decisions(
+        "2026-03-01",
+        horizon_days=10,
+        decisions_loader=lambda asof, h: decisions,
+        symbol_price_loader=lambda sym, f, t: _price_series(daily=0.01),
+        benchmark_loader=lambda f, t: _price_series(daily=0.0),
+    )
+    key = ("ABC", "2026-01-01T10:00:00Z")
+    assert result["outcomes_by_key"][key]["matured"] is True
+    # The labeled outcome flows through the .4c adapter -> .3 monitor as a matured record.
+    rows = [{"symbol": "ABC", "decided_at": "2026-01-01T10:00:00Z", "sufficiency_path": "valid_hypothesis_match"}]
+    records = store.decisions_to_monitor_records(rows, outcomes_by_key=result["outcomes_by_key"])
+    assert records[0]["matured"] is True
+    assert records[0]["realized_excess_after_cost"] > 0
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {
