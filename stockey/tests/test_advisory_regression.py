@@ -63861,6 +63861,67 @@ def test_hypothesis_matcher_word_boundary_and_excludes():
     assert "3" not in keys   # exclude_keyword 'downgrade' rejects the event (was previously ignored)
 
 
+def test_announcement_event_classifier_proximity():
+    from advisory.announcement_event_classifier import (classify_announcement, CREDIT_RATING,
+        WORK_ORDER_CONTRACT, ACQUISITION_OF_COMPANY, ACQUISITION_OF_PROPERTY, BUYBACK, IGNORE)
+
+    # Proximity/structural classification, not bare keyword presence.
+    assert CREDIT_RATING in classify_announcement("CRISIL has upgraded the long term rating to AA stable")
+    assert CREDIT_RATING not in classify_announcement("Vedanta shares fall after ED searches; a recent rating upgrade noted")
+    assert WORK_ORDER_CONTRACT in classify_announcement("Company has received a work order worth Rs 1200 crore from NHAI")
+    assert WORK_ORDER_CONTRACT not in classify_announcement("Notice of postal ballot in the usual order of business")
+    assert ACQUISITION_OF_COMPANY in classify_announcement("Intimation of acquisition of shares of XYZ Ltd")
+    assert ACQUISITION_OF_PROPERTY in classify_announcement("acquisition of land and property at the MIDC industrial area")
+    assert BUYBACK in classify_announcement("Board approved a buy-back of equity shares via tender route")
+    assert classify_announcement("Copy of Newspaper Publication of audited results") == {IGNORE}
+
+
+def test_hypothesis_matcher_event_class_gate():
+    import json
+    import pandas as pd
+    from advisory import hypothesis_engine as he
+
+    hyps = pd.DataFrame([{
+        "hypothesis_id": "H", "title": "t", "status": "active_review", "trigger_scope": "symbol",
+        "trigger_patterns_json": json.dumps({"keywords": ["rating"], "event_classes": ["CREDIT_RATING"]}),
+        "expected_effect_json": json.dumps({"market_direction": "positive"}),
+        "decision_policy_json": json.dumps({"min_terms": 1}), "description": "",
+    }])
+    ev = lambda key, txt: {"source_type": "news", "source_table": "t", "source_key": key, "published_on": "2026-06-01",
+                          "symbol": "A", "subject": "", "concise_summary_text": txt, "source_url": None}
+    events = pd.DataFrame([
+        ev("1", "CRISIL upgraded the long term rating of the company to AA"),  # classifies CREDIT_RATING
+        ev("2", "shares fell after ED searches; a rating upgrade was noted"),  # 'rating' keyword but NOT classified
+    ])
+    matches = he.build_matches(hyps, events)
+    keys = set(matches["source_key"]) if not matches.empty else set()
+    assert "1" in keys
+    assert "2" not in keys  # event-class relevance gate drops the incidental 'rating' mention
+
+
+def test_hypothesis_matcher_class_only_hypothesis():
+    import json
+    import pandas as pd
+    from advisory import hypothesis_engine as he
+
+    # A hypothesis with NO keywords but an event_classes gate matches on classification alone.
+    hyps = pd.DataFrame([{
+        "hypothesis_id": "H", "title": "t", "status": "active_review", "trigger_scope": "symbol",
+        "trigger_patterns_json": json.dumps({"event_classes": ["BUYBACK"]}),
+        "expected_effect_json": json.dumps({"market_direction": "positive"}),
+        "decision_policy_json": json.dumps({"min_terms": 1}), "description": "",
+    }])
+    events = pd.DataFrame([
+        {"source_type": "news", "source_table": "t", "source_key": "1", "published_on": "2026-06-01", "symbol": "A",
+         "subject": "", "concise_summary_text": "Board approved a buyback of equity shares", "source_url": None},
+        {"source_type": "news", "source_table": "t", "source_key": "2", "published_on": "2026-06-01", "symbol": "B",
+         "subject": "", "concise_summary_text": "Board approved a final dividend", "source_url": None},
+    ])
+    matches = he.build_matches(hyps, events)
+    keys = set(matches["source_key"]) if not matches.empty else set()
+    assert keys == {"1"}
+
+
 def test_hypothesis_coverage_report_flags_dead_keywords():
     import json
     import pandas as pd

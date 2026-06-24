@@ -57,6 +57,11 @@ hypotheses:
   matching** against `subject + concise_summary_text` of news/announcement events: an include phrase
   must appear as whole words (so `war` does not match `award`/`software`), and an event containing any
   **exclude** phrase is rejected. This is the single most important field to get right (see Pointers).
+- **`trigger_patterns.event_classes`** (optional, recommended) — a relevance gate: the event must
+  classify into one of these proximity-detected event classes (e.g. `[WORK_ORDER_CONTRACT]`,
+  `[CREDIT_RATING]`, `[BUYBACK]`, `[AMALGAMATION]`). This drops incidental keyword mentions ("rating
+  upgrade" inside an unrelated story) and cut 18-65% additional noise on real data. See
+  `docs/announcement_event_taxonomy.md` for the class list. Can be used with or without keywords.
 - **`expected_effect`** — must encode **direction**. This now decides whether the hypothesis can ground
   a BUY vs a SELL: `increase_exposure` / `market_direction: positive` / a buy-ish `action_bias` ->
   **long** (grounds BUY/BUY_MORE); `reduce_exposure` / `market_direction: negative` / a reduce/exit

@@ -664,7 +664,17 @@ one step.**
      matching + excludes applied: raw matches 922 -> 664 (28%), worst offenders gutted (GEOPOLITICAL
      169->3, ORDER_WIN 19->5, PRODUCT_LAUNCH 17->4). Residual: genuinely high-frequency terms
      (ACQUISITION 191->183) and incidental real-phrase mentions (VEDL "rating upgrade" in an ED-search
-     story) still match -> needs relevance/min_terms + a semantic event-class layer (future).
+     story) still match -> ✅ ALSO HANDLED by the event-class relevance gate below.
+  - **Event-class relevance gate (the #4 residual):** ported the operator's proximity/structural
+    announcement classifier into `advisory/announcement_event_classifier.py` (`classify_announcement`
+    -> event-class set: WORK_ORDER_CONTRACT, CREDIT_RATING, BUYBACK, AMALGAMATION, ...; IGNORE for
+    boilerplate). Hypotheses can declare `trigger_patterns.event_classes`; `build_matches` classifies
+    each event once and matches only when the event's classification intersects. On real data this cut
+    18-65% additional noise on top of word-boundary (ORDER_WIN 167->59, CREDIT_RATING 41->32) and
+    correctly drops the VEDL "rating upgrade"-in-ED-story false positive. Added event_classes to 3
+    seeded classics; taxonomy + future structured-extraction field schema (from operator gen_models)
+    in `docs/announcement_event_taxonomy.md`. Remaining LLM-per-event semantic layer is only needed
+    for ambiguous in-class context now.
   5. **Keyword coverage is brittle.** ✅ HANDLED: added `hypothesis_coverage_report` + CLI
      `--lint-coverage` -- reports every active hypothesis whose keywords have zero/low hits in recent
      event text (caught all 8 price anomalies + mis-worded ANALYST/macro hypotheses). Author-time

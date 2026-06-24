@@ -2144,6 +2144,20 @@ def _exclude_phrases(trigger_patterns: Any) -> list[str]:
     return list(raw) if isinstance(raw, list) else []
 
 
+def _declared_event_classes(trigger_patterns: Any) -> set[str]:
+    """event_classes a hypothesis triggers on (relevance gate, constraint #4). Empty = keyword-only."""
+    if not isinstance(trigger_patterns, dict):
+        return set()
+    raw = trigger_patterns.get("event_classes")
+    if not isinstance(raw, list):
+        return set()
+    return {str(item).strip().upper() for item in raw if str(item).strip()}
+
+
+def _event_text(event: Any) -> str:
+    return " ".join(str(event.get(column) or "") for column in ["subject", "concise_summary_text"])
+
+
 def hypothesis_coverage_report(hypotheses: pd.DataFrame, events: pd.DataFrame, *, low_threshold: int = 3) -> list[dict[str, Any]]:
     """Per-hypothesis count of events whose text contains an include term (word-boundary).
 
@@ -2173,34 +2187,42 @@ def hypothesis_coverage_report(hypotheses: pd.DataFrame, events: pd.DataFrame, *
 def build_matches(hypotheses: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
     if hypotheses.empty or events.empty:
         return pd.DataFrame()
+    from advisory.announcement_event_classifier import classify_announcement
+
     rows: list[dict[str, Any]] = []
     now = pd.Timestamp.utcnow()
+    # Classify each event ONCE (constraint #4 relevance gate): a hypothesis that declares
+    # event_classes only matches events whose proximity/structural classification intersects.
+    event_classes_cache = [classify_announcement(_event_text(event)) for _, event in events.iterrows()]
+    event_text_cache = [normalize_text(_event_text(event)) for _, event in events.iterrows()]
     for _, hypothesis in hypotheses.iterrows():
         trigger_patterns = parse_jsonish(hypothesis.get("trigger_patterns_json"), {}, source="trigger_patterns_json")
-        terms = normalize_terms(trigger_patterns)
-        if not terms:
-            terms = normalize_terms(hypothesis.get("description"))
-        if not terms:
-            continue
-        # Word-boundary phrase matching (so "war" no longer matches "award"/"software") and apply
-        # exclude_keywords, which normalize_terms drops -- both collapse a large share of false matches.
+        terms = normalize_terms(trigger_patterns) or normalize_terms(hypothesis.get("description"))
+        # Word-boundary phrase matching (so "war" no longer matches "award"/"software"), apply
+        # exclude_keywords (normalize_terms drops them), and an optional event-class relevance gate.
         include_rx = _phrase_regexes(terms)
         exclude_rx = [regex for _, regex in _phrase_regexes(_exclude_phrases(trigger_patterns))]
-        if not include_rx:
+        declared_classes = _declared_event_classes(trigger_patterns)
+        if not include_rx and not declared_classes:
             continue
         min_terms = int(parse_jsonish(hypothesis.get("decision_policy_json"), {}, source="decision_policy_json").get("min_terms", 1) or 1)
-        for _, event in events.iterrows():
-            evidence_text = " ".join(
-                str(event.get(column) or "")
-                for column in ["subject", "concise_summary_text"]
-            ).strip()
-            normalized_evidence = normalize_text(evidence_text)
+        for position, (_, event) in enumerate(events.iterrows()):
+            normalized_evidence = event_text_cache[position]
             if any(regex.search(normalized_evidence) for regex in exclude_rx):
                 continue
+            # Relevance gate: when event_classes are declared, the event must classify into one.
+            matched_classes: set[str] = set()
+            if declared_classes:
+                matched_classes = event_classes_cache[position] & declared_classes
+                if not matched_classes:
+                    continue
             matched_terms = [phrase for phrase, regex in include_rx if regex.search(normalized_evidence)]
-            if len(matched_terms) < min_terms:
+            if include_rx and len(matched_terms) < min_terms:
                 continue
-            score = round(min(1.0, len(matched_terms) / max(len(terms), 1)), 4)
+            if not include_rx:  # class-only hypothesis: record the matched classes as the evidence
+                matched_terms = sorted(matched_classes)
+            evidence_text = _event_text(event).strip()
+            score = round(min(1.0, len(matched_terms) / max(len(terms) or len(matched_terms), 1)), 4)
             action, reason, decision = decision_for_match(hypothesis, matched_terms, event)
             rows.append(
                 {
