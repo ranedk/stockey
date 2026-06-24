@@ -610,7 +610,36 @@ one step.**
 
 **Sub-tasks (phased, each verify-first, operator review per phase):**
 
-### [P-LLM-AUTH.1] Evidence-completeness + data-grounding decision contract  ✅ DONE (revised 2026-06-23)
+### [P-LLM-AUTH.1] Grounding pivot — verdicts + contradiction veto, not a magnitude score  ✅ DONE (2026-06-24)
+- **Calibration finding (2026-06-24):** ran the `.4a` gate-fraction strength against forward 20d
+  benchmark-excess over 3.6k matured stock-days. `corr(strength, excess) = -0.076`; the highest
+  strength bucket (.85-1.0) had the LOWEST mean excess and a SUB-50% hit rate. The scalar score is
+  not predictive and cannot ground a decision (NESTLEIND scored 1.0 while underperforming the
+  market). Tuning the threshold cannot fix a feature with ~zero correlation.
+- **Pivot (operator-approved):** replaced the per-dimension magnitude score with a structured
+  VERDICT — `direction` (supportive / neutral / contradicting) + `confidence` + `components` —
+  that encodes LOGICAL CONSISTENCY with the thesis, which is sound regardless of predictive power.
+  - `.4a` (`llm_evidence_packet`): each dimension now emits a verdict. Technical is `contradicting`
+    when RS vs benchmark is materially negative (underperforming) or below the 200DMA, even if every
+    breakout gate passes; `supportive` only when outperforming in an uptrend. Risk/market/reliability/
+    benchmark/event verdicts likewise encode support-vs-contradiction. `strength` is kept DESCRIPTIVE
+    (LLM prompt + audit) but grounds nothing. Verified on real names: NESTLEIND/COALINDIA/BAJAJ-AUTO
+    (gates pass but lagging) -> contradicting; CUMMINSIND/POLYCAB/CGPOWER (outperforming) -> supportive.
+  - `.1` (`llm_decision_contract`): sufficiency is now a RULE, not a sum — a directional decision is
+    grounded iff complete AND not beta-only AND NO required dimension confidently contradicts AND
+    (valid hypothesis OR >= `LLM_DECISION_MIN_SUPPORTIVE_DIMENSIONS` (2) confident supportive
+    dimensions). Supportive/contradicting counts come from the packet's verdicts (deterministic), so
+    the LLM cannot ground a call by choosing what to cite — it only influences action/conviction,
+    which is then gated. Removed the dominant-single-signal and aggregate-strength paths and the
+    `LLM_DECISION_DOMINANT_SIGNAL_STRENGTH` / `_AGGREGATE_SIGNAL_STRENGTH` /
+    `_MIN_INDEPENDENT_CONFIRMATIONS` knobs. New tests: contradiction veto, corroboration, confidence
+    gating, NESTLEIND case on real columns. Full suite 2100.
+- **Why this is better:** contradictions can VETO (a great chart can't bulldoze a bad fundamental or
+  an underperforming tape), and depth (`components`) flows to the LLM intact instead of collapsing to
+  one number. A genuine calibrated strength remains possible later as a proper conditional research
+  task, not a formula tweak.
+
+### [P-LLM-AUTH.1-legacy] Evidence-completeness + data-grounding decision contract  ✅ superseded by the pivot above
 - **Operator design (2026-06-23):** the LLM may decide, but only over the COMPLETE validated
   evidence packet with data-grounded reasons — never on one news / one announcement / one
   indicator. A competent analyst given the same complete data should reach the same call.

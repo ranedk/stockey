@@ -62757,8 +62757,13 @@ def test_signal_quality_promotion_family_candidates_apply_fdr_control(monkeypatc
 def _llm_decision_full_packet(**overrides):
     from advisory import llm_decision_contract
 
-    packet = {dimension: {"present": True, "fresh": True} for dimension in llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS}
-    packet["benchmark_excess"] = {"present": True, "fresh": True, "classification": "candidate_helpful", "excess_positive": True}
+    # Default: every required dimension present, fresh, and confidently SUPPORTIVE (no contradiction)
+    # -> grounded via multi-dimension corroboration.
+    packet = {
+        dimension: {"present": True, "fresh": True, "direction": "supportive", "confidence": "high"}
+        for dimension in llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS
+    }
+    packet["benchmark_excess"] = {"present": True, "fresh": True, "classification": "candidate_helpful", "excess_positive": True, "direction": "supportive", "confidence": "high"}
     packet.update(overrides)
     return packet
 
@@ -62785,78 +62790,85 @@ def test_llm_decision_contract_grounded_directional_meets_data_bar_but_no_live_a
     assert contract["eligible_for_live_authority"] is False
 
 
-def test_llm_decision_contract_single_signal_is_not_grounded():
+def _neutral_packet(**overrides):
     from advisory import llm_decision_contract
 
-    packet = _llm_decision_full_packet()
-    grounding = llm_decision_contract.validate_decision_grounding(
-        action="BUY",
-        cited_dimensions=["technical_confirmation"],
-        packet=packet,
-    )
-    assert grounding["single_signal"] is True
-    assert grounding["data_grounded"] is False
+    packet = {
+        dimension: {"present": True, "fresh": True, "direction": "neutral", "confidence": "low"}
+        for dimension in llm_decision_contract.REQUIRED_EVIDENCE_DIMENSIONS
+    }
+    packet["benchmark_excess"] = {"present": True, "fresh": True, "classification": "candidate_helpful", "excess_positive": True, "direction": "neutral", "confidence": "low"}
+    packet.update(overrides)
+    return packet
+
+
+def test_llm_decision_contract_neutral_evidence_is_not_grounded():
+    from advisory import llm_decision_contract
+
+    # Everything looked at but nothing confidently supportive -> no corroboration -> not grounded.
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=_neutral_packet())
+    assert grounding["supportive_count"] == 0
     assert grounding["sufficiency_path"] is None
-    assert any("insufficient_evidence_strength" in reason for reason in grounding["grounding_failures"])
+    assert grounding["data_grounded"] is False
+    assert any("insufficient_corroboration" in reason for reason in grounding["grounding_failures"])
 
 
-def test_llm_decision_contract_dominant_single_signal_is_grounded():
+def test_llm_decision_contract_multi_dimension_corroboration_is_grounded():
     from advisory import llm_decision_contract
 
-    # One genuinely strong signal grounds a directional call without an artificial 3rd dimension.
-    packet = _llm_decision_full_packet(
-        technical_confirmation={"present": True, "fresh": True, "strength": 0.92},
+    # Two confidently supportive dimensions, none contradicting -> grounded by corroboration.
+    packet = _neutral_packet(
+        technical_confirmation={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+        event_provenance={"present": True, "fresh": True, "direction": "supportive", "confidence": "medium"},
     )
-    grounding = llm_decision_contract.validate_decision_grounding(
-        action="BUY",
-        cited_dimensions=["technical_confirmation"],
-        packet=packet,
-    )
-    assert grounding["single_signal"] is True
-    assert grounding["max_signal_strength"] == 0.92
-    assert grounding["sufficiency_path"] == "dominant_single_signal"
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["supporting_dimensions"] == ["technical_confirmation", "event_provenance"]
+    assert grounding["sufficiency_path"] == "multi_dimension_corroboration"
     assert grounding["data_grounded"] is True
 
 
-def test_llm_decision_contract_aggregate_strength_is_grounded():
+def test_llm_decision_contract_confident_contradiction_vetoes_even_with_corroboration():
     from advisory import llm_decision_contract
 
-    # Several moderate signals whose summed strength clears the aggregate threshold.
+    # The NESTLEIND case: strong supportive signals, but one dimension confidently contradicts
+    # (e.g. underperforming the benchmark) -> blocked regardless of corroboration.
     packet = _llm_decision_full_packet(
-        technical_confirmation={"present": True, "fresh": True, "strength": 0.55},
-        event_provenance={"present": True, "fresh": True, "strength": 0.55},
-        sector_reliability={"present": True, "fresh": True, "strength": 0.55},
+        technical_confirmation={"present": True, "fresh": True, "direction": "contradicting", "confidence": "high"},
     )
-    grounding = llm_decision_contract.validate_decision_grounding(
-        action="BUY",
-        cited_dimensions=["technical_confirmation", "event_provenance", "sector_reliability"],
-        packet=packet,
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert "technical_confirmation" in grounding["contradicting_dimensions"]
+    assert grounding["data_grounded"] is False
+    assert any("contradicting_evidence" in reason for reason in grounding["grounding_failures"])
+
+
+def test_llm_decision_contract_low_confidence_verdicts_are_not_decisive():
+    from advisory import llm_decision_contract
+
+    # A low-confidence contradiction does NOT veto, and low-confidence support does NOT corroborate.
+    packet = _neutral_packet(
+        technical_confirmation={"present": True, "fresh": True, "direction": "contradicting", "confidence": "low"},
+        risk={"present": True, "fresh": True, "direction": "supportive", "confidence": "low"},
     )
-    assert grounding["aggregate_signal_strength"] == 1.65
-    assert grounding["sufficiency_path"] == "aggregate_corroboration"
-    assert grounding["data_grounded"] is True
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert grounding["contradicting_dimensions"] == []
+    assert grounding["supporting_dimensions"] == []
 
 
 def test_llm_decision_contract_valid_hypothesis_match_grounds_thin_call():
     from advisory import llm_decision_contract
 
-    # A validated investor hypothesis (conditions met) authorizes a 1-dimension event call.
-    packet = _llm_decision_full_packet(
+    # A validated investor hypothesis (conditions met) grounds even with no confident corroboration.
+    packet = _neutral_packet(
         hypothesis_match={"status": "validated", "conditions_met": True, "hypothesis_id": "bull_large_order_v3"},
     )
-    grounding = llm_decision_contract.validate_decision_grounding(
-        action="BUY",
-        cited_dimensions=["event_provenance"],
-        packet=packet,
-    )
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=["event_provenance"], packet=packet)
     assert grounding["sufficiency_path"] == "valid_hypothesis_match"
     assert grounding["hypothesis_match"]["hypothesis_id"] == "bull_large_order_v3"
     assert grounding["data_grounded"] is True
     # An unvalidated (still-testing) hypothesis does NOT confer authority on its own.
     testing = llm_decision_contract.validate_decision_grounding(
-        action="BUY",
-        cited_dimensions=["event_provenance"],
-        packet=_llm_decision_full_packet(hypothesis_match={"status": "testing", "conditions_met": True}),
+        action="BUY", cited_dimensions=["event_provenance"],
+        packet=_neutral_packet(hypothesis_match={"status": "testing", "conditions_met": True}),
     )
     assert testing["sufficiency_path"] is None
     assert testing["data_grounded"] is False
@@ -62866,19 +62878,14 @@ def test_llm_decision_contract_event_thesis_without_returns_claim_is_not_beta_bl
     from advisory import llm_decision_contract
 
     # Event-driven thesis: benchmark-excess looked at but makes no returns claim (excess_positive
-    # None). That is NOT market beta, so the beta guard must not block it.
+    # None) -> NOT market beta. Grounded via the other supportive dimensions.
     packet = _llm_decision_full_packet(
-        benchmark_excess={"present": True, "fresh": True, "classification": "no_return_claim", "excess_positive": None},
-        event_provenance={"present": True, "fresh": True, "strength": 0.9},
+        benchmark_excess={"present": True, "fresh": True, "classification": "no_return_claim", "excess_positive": None, "direction": "neutral", "confidence": "low"},
     )
     guard = llm_decision_contract.evaluate_beta_guard(packet)
     assert guard["benchmark_excess_present"] is True
     assert guard["beta_only_support"] is False
-    grounding = llm_decision_contract.validate_decision_grounding(
-        action="BUY",
-        cited_dimensions=["event_provenance"],
-        packet=packet,
-    )
+    grounding = llm_decision_contract.validate_decision_grounding(action="BUY", cited_dimensions=["event_provenance"], packet=packet)
     assert grounding["data_grounded"] is True
 
 
@@ -63076,17 +63083,17 @@ def test_llm_decision_monitor_flags_misjudged_sufficiency_path():
 
     # Overall healthy, but the dominant-single-signal path is systematically wrong.
     good = [_monitor_record(0.05, sufficiency_path="aggregate_corroboration") for _ in range(20)]
-    bad = [_monitor_record(-0.04, sufficiency_path="dominant_single_signal") for _ in range(10)]
+    bad = [_monitor_record(-0.04, sufficiency_path="multi_dimension_corroboration") for _ in range(10)]
     report = llm_decision_monitor.build_llm_decision_monitor_report(good + bad)
     misjudged = [
         f for f in report["findings"]
-        if f["kind"] == "llm_decision_sufficiency_path_misjudged" and f["key"] == "dominant_single_signal"
+        if f["kind"] == "llm_decision_sufficiency_path_misjudged" and f["key"] == "multi_dimension_corroboration"
     ]
     assert misjudged and misjudged[0]["severity"] == "alert"
     # Operator-health formatter drops info rows, maps alert -> error.
     rows = llm_decision_monitor.format_monitor_findings_for_operator_health(report)
     assert all(row["severity"] in {"error", "warn"} for row in rows)
-    assert any("dominant_single_signal" in row["title"] for row in rows)
+    assert any("multi_dimension_corroboration" in row["title"] for row in rows)
 
 
 def _evidence_rows(asof="2026-06-23"):
@@ -63094,7 +63101,7 @@ def _evidence_rows(asof="2026-06-23"):
         symbol="ABC",
         asof_date=asof,
         technical_row={
-            "asof_date": asof, "rs_vs_benchmark": 1.2, "technical_state": "READY",
+            "asof_date": asof, "rs_vs_benchmark": 0.08, "technical_state": "READY",
             "pass_above_dma_50": True, "pass_above_dma_200": True, "pass_near_52w_high": True,
             "pass_breakout_extension": True, "pass_liquidity_20d": True, "pass_trend_alignment": True,
             "pass_gap_behavior": True,
@@ -63144,13 +63151,52 @@ def test_evidence_packet_feeds_decision_contract_grounding():
     # A valid hypothesis is present, so it takes precedence as the sufficiency path.
     assert grounding["sufficiency_path"] == "valid_hypothesis_match"
     assert grounding["data_grounded"] is True
-    # Without the hypothesis, the strong technical gate (strength 1.0) grounds it on its own.
+    # Without the hypothesis, multiple confidently-supportive dimensions ground it by corroboration.
     no_hyp = ep.assemble_evidence_packet(**{**_evidence_rows(), "hypothesis_rows": []})
-    dominant = dc.validate_decision_grounding(
+    corroborated = dc.validate_decision_grounding(
         action="BUY", cited_dimensions=["technical_confirmation"], packet=no_hyp,
     )
-    assert dominant["sufficiency_path"] == "dominant_single_signal"
-    assert dominant["data_grounded"] is True
+    assert corroborated["sufficiency_path"] == "multi_dimension_corroboration"
+    assert corroborated["supportive_count"] >= 2
+    assert corroborated["data_grounded"] is True
+
+
+def test_evidence_packet_technical_verdict_flags_underperformer_as_contradicting():
+    from advisory import llm_evidence_packet as ep
+
+    # The NESTLEIND case: every breakout gate passes, but RS vs benchmark is negative (lagging the
+    # market). For an alpha thesis that is a CONTRADICTION, not strength.
+    dim = ep.technical_dimension(
+        {"asof_date": "2026-06-18", "rs_vs_benchmark": -0.035,
+         "pass_above_dma_50": True, "pass_above_dma_200": True, "pass_near_52w_high": True,
+         "pass_breakout_extension": True, "pass_liquidity_20d": True, "pass_trend_alignment": True, "pass_gap_behavior": True},
+        "2026-06-18",
+    )
+    assert dim["strength"] == 1.0  # descriptive gate-fraction still 1.0
+    assert dim["direction"] == "contradicting"  # but the verdict catches the underperformance
+    assert dim["confidence"] == "high"
+
+
+def test_evidence_packet_technical_verdict_supportive_when_outperforming_uptrend():
+    from advisory import llm_evidence_packet as ep
+
+    dim = ep.technical_dimension(
+        {"asof_date": "2026-06-18", "rs_vs_benchmark": 0.07,
+         "pass_above_dma_50": True, "pass_above_dma_200": True, "pass_near_52w_high": True},
+        "2026-06-18",
+    )
+    assert dim["direction"] == "supportive"
+    assert dim["confidence"] == "high"
+
+
+def test_evidence_packet_reliability_negative_classification_contradicts():
+    from advisory import llm_evidence_packet as ep
+
+    dim = ep.sector_reliability_dimension(
+        {"classification": "benchmark_beta_not_overlay_alpha", "excess_opportunity_hit_rate_after_cost": 0.7, "matured_count": 30}
+    )
+    assert dim["direction"] == "contradicting"
+    assert dim["strength"] == 0.0
 
 
 def test_evidence_packet_non_helpful_reliability_yields_zero_strength():

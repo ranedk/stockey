@@ -21,7 +21,7 @@ Record convention (lenient; missing fields are tolerated):
     {
       "symbol": str, "decided_at": iso8601, "matured": bool,
       "proposed_action": "BUY"|"SELL"|...,
-      "sufficiency_path": "valid_hypothesis_match"|"dominant_single_signal"|"aggregate_corroboration",
+      "sufficiency_path": "valid_hypothesis_match"|"multi_dimension_corroboration",
       "event_class": str|None, "sector": str|None,
       "realized_excess_after_cost": float|None,   # benchmark-excess return, AFTER cost
       "excess_hit": bool|None,                      # realized excess > 0 (derived if absent)

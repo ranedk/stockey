@@ -15,30 +15,32 @@ It separates two questions that an earlier fixed "cite >= N dimensions" rule wro
 1. COMPLETENESS -- did we LOOK at every required dimension (regime, macro, sector, technical,
    event, benchmark)? A genuine data gap is recorded, not silently passed, so a decision is never
    made blind to a dimension that could contradict it.
-2. SUFFICIENCY -- is the evidence STRONG enough to act? This is NOT a count. A decision is
-   sufficiently grounded if ANY of:
+2. SUFFICIENCY -- is the evidence CONSISTENT and corroborated enough to act? This is NOT a magnitude
+   score and NOT a fixed count. Each packet dimension carries a structured VERDICT (direction
+   supportive / neutral / contradicting + confidence). A directional decision is grounded when:
+   - NO required dimension strongly CONTRADICTS the thesis (a confident `contradicting` verdict
+     vetoes -- e.g. a breakout in a name that is underperforming the benchmark), AND
    - it matches a VALID HYPOTHESIS (a validated/production investor playbook whose conditions are
-     met) -- the operator's experience-encoded "these conditions are enough", which can authorize
-     a 1-2 dimension call;
-   - one DOMINANT signal is strong enough on its own (strength >= dominant threshold), e.g. a
-     contract worth a material share of revenue, or a confirmed breakout with strong participation;
-   - AGGREGATE corroboration: the summed strength of cited dimensions clears the aggregate
-     threshold (the old "multiple dimensions" case, strength-weighted -- not counted).
-   When the packet carries no per-dimension strengths, a legacy count fallback (>= N cited
-   dimensions) approximates aggregate corroboration so older callers keep working.
+     met -- the operator's experience-encoded sufficiency rule) OR has multi-dimension
+     CORROBORATION (>= min supportive, confident verdicts across distinct dimensions).
+   An earlier per-dimension magnitude score was removed: a calibration showed it had ~zero/negative
+   correlation with forward benchmark-excess, so it could not ground a decision. Verdicts encode
+   logical consistency (does the evidence support or contradict), which is sound regardless of a
+   feature's predictive power. Supportive/contradicting counts are taken over the PACKET's own
+   verdicts (deterministic), so the LLM cannot ground a decision by choosing what to cite.
 
 The BETA guard stays but is scoped: it blocks only when directional support rests on return-based
 evidence that is market beta (excess-negative or explicitly unattributed). An event/hypothesis
 thesis that makes no returns claim (excess_positive is None) is not beta and is not auto-failed.
 
 `meets_data_grounding_for_live` is True only when the packet is complete, the decision is
-sufficiently grounded, and support is not beta-only. That is the DATA bar -- separate from
-`live_authority_master_flag` (LLM_DIRECT_AUTHORITY_ENABLED) and from outcome-monitoring graduation.
+sufficiently grounded (no strong contradiction + hypothesis-or-corroboration), and support is not
+beta-only. That is the DATA bar -- separate from `live_authority_master_flag`
+(LLM_DIRECT_AUTHORITY_ENABLED) and from outcome-monitoring graduation.
 """
 
 from __future__ import annotations
 
-import math
 import os
 from typing import Any
 
@@ -47,18 +49,14 @@ from typing import Any
 # policy passed outcome-monitoring graduation ([P-LLM-AUTH].3/.4), neither of which exists yet.
 LLM_DIRECT_AUTHORITY_ENABLED = os.getenv("LLM_DIRECT_AUTHORITY_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-# Strength a SINGLE cited dimension must reach to ground a decision on its own (dominant-signal
-# path) -- so an unusually strong driver does not need an artificial 2nd/3rd dimension.
-DEFAULT_DOMINANT_SIGNAL_STRENGTH = float(os.getenv("LLM_DECISION_DOMINANT_SIGNAL_STRENGTH", "0.80"))
+# Minimum distinct dimensions whose verdict is supportive (and confident) required for the
+# corroboration path -- so a call cannot rest on one news / one announcement / one indicator. The
+# valid-hypothesis path bypasses this (the operator has encoded that those conditions suffice).
+DEFAULT_MIN_SUPPORTIVE_DIMENSIONS = int(os.getenv("LLM_DECISION_MIN_SUPPORTIVE_DIMENSIONS", "2"))
 
-# Summed strength of cited dimensions required for the aggregate-corroboration path (several
-# moderate signals together). Strength-weighted, not a count.
-DEFAULT_AGGREGATE_SIGNAL_STRENGTH = float(os.getenv("LLM_DECISION_AGGREGATE_SIGNAL_STRENGTH", "1.50"))
-
-# Legacy fallback ONLY when the packet carries no per-dimension strengths: minimum count of cited
-# independent dimensions that approximates aggregate corroboration so a call cannot rest on one
-# news / one announcement / one indicator.
-DEFAULT_MIN_INDEPENDENT_CONFIRMATIONS = int(os.getenv("LLM_DECISION_MIN_INDEPENDENT_CONFIRMATIONS", "3"))
+# A verdict counts as decisive (supportive or contradicting) only at this confidence or above.
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+DECISIVE_CONFIDENCE = "medium"
 
 # Evidence dimensions a decision must have LOOKED AT (completeness). Looking at a dimension and
 # finding it neutral/no-signal still counts as looked-at; a genuine data gap does not.
@@ -110,21 +108,32 @@ def _dimension_available(packet: dict[str, Any], dimension: str) -> bool:
     return bool(value)
 
 
-def _dimension_strength(packet: dict[str, Any], dimension: str) -> float | None:
-    """Per-dimension signal strength in [0, 1], or None when the packet carries no strength."""
-    value = packet.get(dimension) if isinstance(packet, dict) else None
-    if not isinstance(value, dict):
-        return None
-    raw = value.get("strength")
-    if raw is None:
-        return None
-    try:
-        strength = float(raw)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(strength):
-        return None
-    return max(0.0, min(1.0, strength))
+def _decisive(dimension: dict[str, Any]) -> bool:
+    """A verdict counts only at >= DECISIVE_CONFIDENCE (low-confidence verdicts are advisory)."""
+    rank = _CONFIDENCE_RANK.get(str(dimension.get("confidence") or "").strip().lower(), 0)
+    return rank >= _CONFIDENCE_RANK[DECISIVE_CONFIDENCE]
+
+
+def _classify_verdicts(packet: dict[str, Any], required: tuple[str, ...]) -> dict[str, list[str]]:
+    """Supportive / contradicting dimensions among the present required ones (deterministic).
+
+    Counts are taken over the PACKET's verdicts, not over what the LLM cited, so the LLM has no
+    leverage over grounding -- only over the proposed action/conviction, which is then gated.
+    """
+    supportive: list[str] = []
+    contradicting: list[str] = []
+    for dimension in required:
+        value = packet.get(dimension) if isinstance(packet, dict) else None
+        if not isinstance(value, dict) or not _dimension_available(packet, dimension):
+            continue
+        if not _decisive(value):
+            continue
+        direction = str(value.get("direction") or "").strip().lower()
+        if direction == "supportive":
+            supportive.append(dimension)
+        elif direction == "contradicting":
+            contradicting.append(dimension)
+    return {"supportive": supportive, "contradicting": contradicting}
 
 
 def build_evidence_completeness(
@@ -197,45 +206,35 @@ def validate_decision_grounding(
     cited_dimensions: list[str] | None,
     packet: dict[str, Any],
     matched_hypothesis: dict[str, Any] | None = None,
-    dominant_strength: float = DEFAULT_DOMINANT_SIGNAL_STRENGTH,
-    aggregate_strength: float = DEFAULT_AGGREGATE_SIGNAL_STRENGTH,
-    min_confirmations: int = DEFAULT_MIN_INDEPENDENT_CONFIRMATIONS,
+    min_supportive: int = DEFAULT_MIN_SUPPORTIVE_DIMENSIONS,
 ) -> dict[str, Any]:
-    """Is a proposed decision data-grounded -- complete, not beta-only, and sufficiently strong?
+    """Is a proposed decision data-grounded -- complete, not beta-only, not contradicted, corroborated?
 
-    Sufficiency (directional) is met by ANY of: a valid hypothesis match, one dominant cited signal
-    (strength >= dominant_strength), or aggregate cited strength >= aggregate_strength. When cited
-    dimensions carry no strength, a legacy count (>= min_confirmations) approximates aggregate
-    corroboration. There is no fixed dimension-count requirement.
+    A directional decision is grounded when the packet is complete, support is not beta-only, NO
+    required dimension confidently contradicts the thesis, AND (a valid hypothesis matches OR
+    >= min_supportive distinct dimensions confidently support it). Supportive/contradicting counts
+    come from the packet's own verdicts (deterministic) -- the LLM cannot ground a call by what it
+    cites. `cited_dimensions` is recorded for audit only.
     """
     normalized_action = str(action or "").strip().upper()
     completeness = build_evidence_completeness(packet)
     available = set(completeness["available_dimensions"])
-    cited = [dimension for dimension in (cited_dimensions or []) if dimension in available]
-    cited_unique = sorted(set(cited))
+    cited_unique = sorted({d for d in (cited_dimensions or []) if d in available})
     beta_guard = evaluate_beta_guard(packet)
     hypothesis = evaluate_hypothesis_match(packet, matched_hypothesis)
     directional = normalized_action in DIRECTIONAL_ACTIONS
 
-    strengths = {dimension: _dimension_strength(packet, dimension) for dimension in cited_unique}
-    scored = {dimension: value for dimension, value in strengths.items() if value is not None}
-    max_strength = max(scored.values()) if scored else None
-    total_strength = sum(scored.values()) if scored else 0.0
+    verdicts = _classify_verdicts(packet, REQUIRED_EVIDENCE_DIMENSIONS)
+    supportive = verdicts["supportive"]
+    contradicting = verdicts["contradicting"]
 
     hypothesis_path = bool(hypothesis["is_valid_authority"])
-    dominant_path = max_strength is not None and max_strength >= float(dominant_strength)
-    if scored:
-        aggregate_path = total_strength >= float(aggregate_strength)
-    else:
-        # No strengths in packet -> approximate aggregate corroboration by count.
-        aggregate_path = len(cited_unique) >= int(min_confirmations)
-    sufficient = hypothesis_path or dominant_path or aggregate_path
+    corroboration_path = len(supportive) >= int(min_supportive)
+    sufficient = hypothesis_path or corroboration_path
     if hypothesis_path:
         sufficiency_path = "valid_hypothesis_match"
-    elif dominant_path:
-        sufficiency_path = "dominant_single_signal"
-    elif aggregate_path:
-        sufficiency_path = "aggregate_corroboration"
+    elif corroboration_path:
+        sufficiency_path = "multi_dimension_corroboration"
     else:
         sufficiency_path = None
 
@@ -245,28 +244,26 @@ def validate_decision_grounding(
             reasons.append(f"evidence_incomplete: missing {completeness['missing_dimensions']}")
         if beta_guard["beta_only_support"]:
             reasons.append(f"beta_only_support: benchmark-excess classification {beta_guard.get('classification')}")
+        if contradicting:
+            reasons.append(f"contradicting_evidence: {contradicting}")
         if not sufficient:
             reasons.append(
-                "insufficient_evidence_strength: no valid hypothesis match, no dominant signal "
-                f"(max_strength={max_strength}), aggregate strength {round(total_strength, 4)} "
-                f"< {float(aggregate_strength)} and cited {len(cited_unique)} < {int(min_confirmations)}"
+                f"insufficient_corroboration: {len(supportive)} supportive dimensions "
+                f"(< {int(min_supportive)}) and no valid hypothesis match"
             )
     else:
-        # Non-directional (WATCH / NO_ACTION / HOLD / REDUCE_EXPOSURE_REVIEW): still not a
-        # zero-evidence call, but no completeness/beta/strength bar.
-        if len(cited_unique) < 1 and not hypothesis_path:
-            reasons.append("no_cited_evidence")
+        # Non-directional (WATCH / NO_ACTION / HOLD / REDUCE_EXPOSURE_REVIEW): review-only, no bar.
+        pass
 
     grounded = not reasons
     return {
         "action": normalized_action,
         "directional": directional,
         "cited_dimensions": cited_unique,
-        "independent_confirmation_count": len(cited_unique),
-        "min_independent_confirmations": int(min_confirmations),
-        "single_signal": len(cited_unique) <= 1,
-        "max_signal_strength": max_strength,
-        "aggregate_signal_strength": round(total_strength, 6) if scored else None,
+        "supporting_dimensions": supportive,
+        "contradicting_dimensions": contradicting,
+        "supportive_count": len(supportive),
+        "min_supportive_dimensions": int(min_supportive),
         "sufficiency_path": sufficiency_path,
         "hypothesis_match": hypothesis,
         "data_grounded": grounded,
@@ -284,9 +281,7 @@ def build_llm_decision_contract(
     conviction: float | None = None,
     rationale: str | None = None,
     graduation_passed: bool = False,
-    dominant_strength: float = DEFAULT_DOMINANT_SIGNAL_STRENGTH,
-    aggregate_strength: float = DEFAULT_AGGREGATE_SIGNAL_STRENGTH,
-    min_confirmations: int = DEFAULT_MIN_INDEPENDENT_CONFIRMATIONS,
+    min_supportive: int = DEFAULT_MIN_SUPPORTIVE_DIMENSIONS,
 ) -> dict[str, Any]:
     """Assemble the full deterministic decision contract for an LLM-proposed action.
 
@@ -302,9 +297,7 @@ def build_llm_decision_contract(
         cited_dimensions=cited_dimensions,
         packet=packet,
         matched_hypothesis=matched_hypothesis,
-        dominant_strength=dominant_strength,
-        aggregate_strength=aggregate_strength,
-        min_confirmations=min_confirmations,
+        min_supportive=min_supportive,
     )
     meets_data_bar = bool(
         grounding["data_grounded"]
