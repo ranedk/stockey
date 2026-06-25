@@ -1,5 +1,11 @@
 # Operator UI -- Review & Simplification Plan
 
+> **Status (2026-06-25):** the consolidation in this plan is now implemented -- unified per-symbol
+> state, the on-demand "why", lean/cached endpoints, and a 6-item navigation. See
+> [`docs/operator_ui.md`](operator_ui.md) for the shipped console. The remaining deferred steps are
+> slimming the legacy `/api/actions` heavy shape and deleting the legacy pages, both kept until proven
+> redundant in real use (additive guardrail).
+
 A grounded review of the Nuxt operator UI (`apps/operator-web`, 18 pages) and its FastAPI backend
 (`advisory/api/app.py`, ~73 endpoints), plus a plan to make it easier to understand and fast to load.
 The guiding rule: **a UI that has every fact but takes tens of minutes to load is worse than a lean

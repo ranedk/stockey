@@ -393,6 +393,7 @@ Start-here docs for the LLM decision system (the trade-decision authority subsys
 - multi-factor model + validation: [`docs/price_factor_model.md`](price_factor_model.md)
 - announcement event taxonomy: [`docs/announcement_event_taxonomy.md`](announcement_event_taxonomy.md)
 - operator UI review + simplification plan: [`docs/ui_simplification_plan.md`](ui_simplification_plan.md)
+- operator console (implemented redesign: unified per-symbol state, the "why", endpoints): [`docs/operator_ui.md`](operator_ui.md)
 
 Future operator UX and research design:
 
