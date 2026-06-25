@@ -50,6 +50,7 @@ export function useOperatorApi() {
     getScreenerFailures: (params: Record<string, unknown> = {}) => get<ScreenerFailuresPayload>(`/api/screeners/failures${query(params)}`),
     getManualReview: (limit = 100, params: Record<string, unknown> = {}) => get<ManualReviewPayload>(`/api/manual-review${query({ limit, include_raw: false, ...params })}`),
     getIdentityIssues: (params: Record<string, unknown> = {}) => get<IdentityIssuesPayload>(`/api/identity-issues${query(params)}`),
+    getLlmDecisions: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/llm-decisions${query(params)}`),
     previewIdentityIssueResolution: (body: Record<string, unknown> = {}) => post<IdentityIssueResolutionPayload>('/api/identity-issues/resolve-preview', body),
     applyIdentityIssueResolution: (body: Record<string, unknown>) => post<IdentityIssueResolutionPayload>('/api/identity-issues/resolve-apply', body),
     decideManualReview: (body: Record<string, unknown>) => post<ManualReviewDecisionResult>('/api/manual-review/decision', body),

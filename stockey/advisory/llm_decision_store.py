@@ -57,6 +57,17 @@ def ensure_tables() -> None:
         statements=SCHEMA_STATEMENTS,
         metadata={"tables": [DECISIONS_TABLE], "authority_scope": "llm_decision_review_only"},
     )
+    # Follow-on (append-only) migration: surface decision_mode / is_beta_participation as columns so
+    # the Decisions UI can show alpha-vs-participation without parsing decision_contract_json.
+    apply_schema_migration(
+        migration_id="20260625_advisory_llm_decisions_mode",
+        description="Add decision_mode / is_beta_participation columns to the LLM decisions table.",
+        statements=[
+            f"ALTER TABLE {DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS decision_mode TEXT",
+            f"ALTER TABLE {DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS is_beta_participation BOOLEAN",
+        ],
+        metadata={"tables": [DECISIONS_TABLE]},
+    )
 
 
 def _event_class_of(result: dict[str, Any]) -> Any:
@@ -78,6 +89,8 @@ def _decision_row(result: dict[str, Any], *, decided_at: Any) -> dict[str, Any]:
         "proposed_action": result.get("proposal", {}).get("action"),
         "conviction": result.get("proposal", {}).get("conviction"),
         "meets_data_grounding_for_live": bool(result.get("meets_data_grounding_for_live")),
+        "decision_mode": contract.get("decision_mode"),
+        "is_beta_participation": bool(contract.get("is_beta_participation")),
         "sufficiency_path": result.get("sufficiency_path"),
         "event_class": _event_class_of(result),
         "rationale": result.get("proposal", {}).get("rationale"),
