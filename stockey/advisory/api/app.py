@@ -4317,6 +4317,147 @@ def build_llm_decisions_payload(
     }
 
 
+# Unified per-symbol state resolver (UI redesign WI-2). A symbol is in EXACTLY one state so it never
+# appears in two lists. Precedence: an open tracked holding wins (HOLDING); otherwise a fresh actionable
+# signal (deterministic action and/or LLM decision) is a RECOMMENDATION; a closed holding with no fresh
+# signal is EXITED; everything else is NONE.
+_ACTION_DIRECTION = {
+    "BUY": 1, "BUY_WATCH": 1, "ACCUMULATE": 1, "ADD": 1, "ADD_EXPOSURE": 1,
+    "SELL": -1, "PARTIAL_SELL": -1, "REDUCE_EXPOSURE_REVIEW": -1, "TIGHTEN_STOP": -1, "EXIT": -1,
+}
+# Codes that do NOT by themselves make a symbol a fresh recommendation needing operator attention.
+_NON_ACTIONABLE_CODES = {"HOLD", "NO_ACTION", "NONE", ""}
+
+
+def _action_direction(code: Any) -> int:
+    """Map an action/decision verb to a long(+1)/de-risk(-1)/neutral(0) sign for agree-vs-conflict."""
+    return _ACTION_DIRECTION.get(str(code or "").strip().upper(), 0)
+
+
+def resolve_symbol_states(
+    recommendations: list[dict[str, Any]] | None,
+    llm_decisions: list[dict[str, Any]] | None,
+    holdings: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Collapse the three per-symbol sources into one row per symbol with a single `state`. Pure.
+
+    Inputs are already reduced to the latest row per symbol by the caller. Each output row carries the
+    deterministic action, the LLM action/mode/conviction, an agree/conflict flag, and any entry fields.
+    """
+    rec_by_symbol: dict[str, dict[str, Any]] = {}
+    for row in (recommendations or []):
+        sym = str(row.get("symbol") or "").strip().upper()
+        if sym:
+            rec_by_symbol[sym] = row
+    llm_by_symbol: dict[str, dict[str, Any]] = {}
+    for row in (llm_decisions or []):
+        sym = str(row.get("symbol") or "").strip().upper()
+        if sym:
+            llm_by_symbol[sym] = row
+    open_holding: dict[str, dict[str, Any]] = {}
+    exited_holding: dict[str, dict[str, Any]] = {}
+    for row in (holdings or []):
+        sym = str(row.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        if str(row.get("status") or "").strip().lower() == "open":
+            open_holding[sym] = row
+        else:
+            exited_holding.setdefault(sym, row)
+
+    symbols = set(rec_by_symbol) | set(llm_by_symbol) | set(open_holding) | set(exited_holding)
+    out: list[dict[str, Any]] = []
+    for sym in sorted(symbols):
+        rec = rec_by_symbol.get(sym) or {}
+        llm = llm_by_symbol.get(sym) or {}
+        det_action = rec.get("action_code")
+        llm_action = llm.get("proposed_action")
+        det_dir = _action_direction(det_action)
+        llm_dir = _action_direction(llm_action)
+        agree = bool(det_dir and llm_dir and det_dir == llm_dir)
+        conflict = bool(det_dir and llm_dir and det_dir != llm_dir)
+        det_actionable = bool(det_action) and str(det_action).strip().upper() not in _NON_ACTIONABLE_CODES
+        has_signal = det_actionable or bool(llm_action)
+
+        if sym in open_holding:
+            state = "HOLDING"
+        elif has_signal:
+            state = "RECOMMENDATION"
+        elif sym in exited_holding:
+            state = "EXITED"
+        else:
+            state = "NONE"
+
+        hold = open_holding.get(sym) or exited_holding.get(sym) or {}
+        out.append({
+            "symbol": sym,
+            "state": state,
+            "action": det_action,
+            "action_priority": rec.get("action_priority"),
+            "reference_price": rec.get("reference_price"),
+            "reason_contract_status": rec.get("reason_contract_status"),
+            "asof_date": rec.get("asof_date") or llm.get("asof_date"),
+            "llm_action": llm_action,
+            "llm_mode": llm.get("decision_mode"),
+            "llm_conviction": llm.get("conviction"),
+            "llm_grounded": llm.get("meets_data_grounding_for_live"),
+            "agree": agree,
+            "conflict": conflict,
+            "entry_price": hold.get("entry_price"),
+            "entry_date": hold.get("entry_date"),
+            "holding_status": hold.get("status"),
+            "source": hold.get("source"),
+        })
+    return out
+
+
+def _load_latest_recommendations_by_symbol() -> list[dict[str, Any]]:
+    """Latest action-recommendation row per symbol (most recent asof_date, then highest priority). Lean."""
+    if not _table_exists(ACTION_RECOMMENDATIONS_TABLE):
+        return []
+    return _records(sql_to_df(
+        f"""
+        SELECT DISTINCT ON (symbol)
+               symbol, action_code, action_priority, reference_price,
+               reason_contract_status, asof_date
+        FROM {ACTION_RECOMMENDATIONS_TABLE}
+        ORDER BY symbol, asof_date DESC NULLS LAST, action_priority DESC NULLS LAST
+        """,
+        retries=3,
+    ))
+
+
+def _load_latest_llm_decisions_by_symbol() -> list[dict[str, Any]]:
+    """Latest LLM decision row per symbol (most recent decided_at). Lean (no JSON blobs)."""
+    if not _table_exists(LLM_DECISIONS_TABLE):
+        return []
+    return _records(sql_to_df(
+        f"""
+        SELECT DISTINCT ON (symbol)
+               symbol, proposed_action, decision_mode, conviction,
+               meets_data_grounding_for_live, asof_date, decided_at
+        FROM {LLM_DECISIONS_TABLE}
+        ORDER BY symbol, decided_at DESC NULLS LAST
+        """,
+        retries=3,
+    ))
+
+
+def load_symbol_states() -> list[dict[str, Any]]:
+    """DB-backed wrapper around `resolve_symbol_states` (latest row per source). Review-only read."""
+    from advisory.operator_holdings import load_holdings
+
+    try:
+        holdings = load_holdings()
+    except Exception:
+        holdings = []
+    return resolve_symbol_states(
+        _load_latest_recommendations_by_symbol(),
+        _load_latest_llm_decisions_by_symbol(),
+        holdings,
+    )
+
+
 def build_market_context_payload(*, asof_date: str | None = None, limit: int = 50) -> dict[str, Any]:
     parsed_asof = _parse_asof_date(asof_date)
     payload = load_latest_market_context(parsed_asof, limit=max(0, int(limit)))

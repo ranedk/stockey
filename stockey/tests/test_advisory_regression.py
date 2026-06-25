@@ -82387,3 +82387,126 @@ def test_llm_provenance_audit_build_payload_handles_missing_table(monkeypatch):
     assert payload["issue_table_count"] == len(llm_provenance_audit.PROVENANCE_SPECS)
     assert {row["status"] for row in payload["tables"]} == {"missing_table"}
     assert payload["policy_boundary"]["broker_execution_allowed"] is False
+
+
+def test_operator_holdings_record_take_normalizes_and_is_review_only(monkeypatch):
+    import utils.db as db_utils
+    from advisory import operator_holdings
+
+    captured = {}
+    monkeypatch.setattr(operator_holdings, "ensure_tables", lambda: None)
+    monkeypatch.setattr(db_utils, "upsert_to_db", lambda frame, table, **kwargs: captured.update(
+        {"frame": frame, "table": table, "unique_keys": kwargs.get("unique_keys")}
+    ))
+
+    row = operator_holdings.record_take(
+        symbol="  tcs ", action="buy", entry_price="123.5", entry_date="2026-06-25", source="rec:42"
+    )
+
+    assert row["symbol"] == "TCS"
+    assert row["action"] == "BUY"
+    assert row["entry_price"] == 123.5
+    assert row["status"] == "open"
+    assert captured["table"] == operator_holdings.HOLDINGS_TABLE
+    assert captured["unique_keys"] == ["symbol", "entry_date"]
+    frame = captured["frame"]
+    assert list(frame["symbol"]) == ["TCS"]
+    # review-only monitoring: no broker/execution fields, no simulated pnl columns
+    assert not any(col in frame.columns for col in ("broker_execution_allowed", "pnl", "quantity"))
+
+
+def test_operator_holdings_record_take_requires_symbol_and_date(monkeypatch):
+    from advisory import operator_holdings
+
+    monkeypatch.setattr(operator_holdings, "ensure_tables", lambda: None)
+    with pytest.raises(ValueError):
+        operator_holdings.record_take(symbol="  ", entry_price=10.0, entry_date="2026-06-25")
+    with pytest.raises(ValueError):
+        operator_holdings.record_take(symbol="TCS", entry_price=10.0, entry_date="")
+
+
+def test_operator_holdings_record_exit_updates_open_only(monkeypatch):
+    import utils.db as db_utils
+    from advisory import operator_holdings
+
+    executed = {}
+
+    class _Cur:
+        rowcount = 1
+
+        def execute(self, sql, params):
+            executed["sql"] = sql
+            executed["params"] = params
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _fake_session(*args, **kwargs):
+        yield (None, _Cur())
+
+    monkeypatch.setattr(operator_holdings, "ensure_tables", lambda: None)
+    monkeypatch.setattr(db_utils, "db_session", _fake_session)
+    monkeypatch.setattr(db_utils, "execute_db_operation", lambda fn, **kwargs: fn())
+
+    updated = operator_holdings.record_exit(
+        symbol="tcs", entry_date="2026-06-25", exit_price=130.0, exit_date="2026-06-30"
+    )
+
+    assert updated == 1
+    assert "status = 'open'" in executed["sql"]
+    assert executed["params"]["symbol"] == "TCS"
+    assert executed["params"]["exit_price"] == 130.0
+
+
+def test_resolve_symbol_states_holding_wins_over_recommendation():
+    from advisory.api.app import resolve_symbol_states
+
+    rows = resolve_symbol_states(
+        recommendations=[
+            {"symbol": "TCS", "action_code": "WATCH", "reference_price": 100.0},
+            {"symbol": "INFY", "action_code": "BUY", "action_priority": 5},
+        ],
+        llm_decisions=[
+            {"symbol": "INFY", "proposed_action": "BUY", "decision_mode": "alpha", "conviction": 0.7},
+            {"symbol": "WIPRO", "proposed_action": "SELL", "decision_mode": "participation"},
+        ],
+        holdings=[
+            {"symbol": "TCS", "status": "open", "entry_price": 90.0, "entry_date": "2026-06-20"},
+            {"symbol": "HCLTECH", "status": "exited", "entry_date": "2026-05-01"},
+        ],
+    )
+    by_symbol = {r["symbol"]: r for r in rows}
+
+    # TCS has BOTH an open holding and a fresh WATCH rec -> holding wins, appears ONCE as HOLDING.
+    assert by_symbol["TCS"]["state"] == "HOLDING"
+    assert by_symbol["TCS"]["entry_price"] == 90.0
+    # INFY: deterministic BUY + LLM BUY -> RECOMMENDATION, agree=True.
+    assert by_symbol["INFY"]["state"] == "RECOMMENDATION"
+    assert by_symbol["INFY"]["agree"] is True
+    assert by_symbol["INFY"]["conflict"] is False
+    # WIPRO: only an LLM SELL decision -> still a RECOMMENDATION.
+    assert by_symbol["WIPRO"]["state"] == "RECOMMENDATION"
+    # HCLTECH: exited holding, no fresh signal -> EXITED.
+    assert by_symbol["HCLTECH"]["state"] == "EXITED"
+    # No symbol appears twice.
+    assert len(rows) == len(by_symbol)
+
+
+def test_resolve_symbol_states_detects_conflict_and_non_actionable():
+    from advisory.api.app import resolve_symbol_states
+
+    rows = resolve_symbol_states(
+        recommendations=[
+            {"symbol": "REL", "action_code": "BUY"},
+            {"symbol": "ITC", "action_code": "HOLD"},
+        ],
+        llm_decisions=[{"symbol": "REL", "proposed_action": "SELL"}],
+        holdings=[],
+    )
+    by_symbol = {r["symbol"]: r for r in rows}
+    # REL: deterministic BUY vs LLM SELL -> conflict.
+    assert by_symbol["REL"]["conflict"] is True
+    assert by_symbol["REL"]["agree"] is False
+    assert by_symbol["REL"]["state"] == "RECOMMENDATION"
+    # ITC: only a HOLD (non-actionable) and no holding -> NONE, not a recommendation.
+    assert by_symbol["ITC"]["state"] == "NONE"
