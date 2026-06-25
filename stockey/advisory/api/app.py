@@ -4256,6 +4256,67 @@ def build_watchlist_payload(
     }
 
 
+LLM_DECISIONS_TABLE = "advisory_llm_decisions"
+
+
+def build_llm_decisions_payload(
+    *, limit: int = 50, offset: int = 0, symbol: str | None = None, asof_date: str | None = None,
+) -> dict[str, Any]:
+    """Daily review-only LLM decisions (table `advisory_llm_decisions`).
+
+    Deliberately LEAN: bounded page, indexed `decided_at DESC`, and a projection that EXCLUDES the
+    large evidence/contract/sizing JSON blobs (fetch those per-row via a detail call), so the list
+    view loads fast. Every row is review-only (`broker_execution_allowed` is always False).
+    """
+    row_limit = _bounded_limit(limit, default=50, maximum=200)
+    row_offset = max(int(offset or 0), 0)
+    if not _table_exists(LLM_DECISIONS_TABLE):
+        return {"decisions": [], "summary": {"total": 0, "by_action": {}, "grounded_for_live": 0},
+                "page": {"total": 0, "returned": 0, "offset": row_offset, "limit": row_limit, "next_offset": None},
+                "review_only": True, "skipped": [{"source": LLM_DECISIONS_TABLE, "error": "missing_table"}]}
+    clauses: list[str] = []
+    filters: dict[str, Any] = {}
+    sym = _text(symbol)
+    if sym:
+        clauses.append("symbol = %(symbol)s")
+        filters["symbol"] = sym.upper()
+    day = _text(asof_date)
+    if day:
+        clauses.append("asof_date::date = %(asof_day)s")
+        filters["asof_day"] = day
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    rows = _records(sql_to_df(
+        f"""SELECT decided_at, asof_date, symbol, proposed_action, decision_mode, conviction,
+                   meets_data_grounding_for_live, sufficiency_path, broker_execution_allowed,
+                   llm_status, prompt_version, llm_model
+            FROM {LLM_DECISIONS_TABLE} {where}
+            ORDER BY decided_at DESC NULLS LAST LIMIT %(limit)s OFFSET %(offset)s""",
+        params={**filters, "limit": row_limit, "offset": row_offset}, retries=3,
+    ))
+    summary_df = sql_to_df(
+        f"""SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE meets_data_grounding_for_live) AS grounded
+            FROM {LLM_DECISIONS_TABLE} {where}""",
+        params=filters, retries=3,
+    )
+    by_action_df = sql_to_df(
+        f"SELECT proposed_action, COUNT(*) AS n FROM {LLM_DECISIONS_TABLE} {where} GROUP BY 1",
+        params=filters, retries=3,
+    )
+    total = int(summary_df.iloc[0]["total"]) if not summary_df.empty else 0
+    grounded = int(summary_df.iloc[0]["grounded"] or 0) if not summary_df.empty else 0
+    by_action = {str(r["proposed_action"]): int(r["n"]) for r in _records(by_action_df)}
+    next_offset = row_offset + row_limit if (row_offset + row_limit) < total else None
+    return {
+        "decisions": [_json_ready(row) for row in rows],
+        "summary": {"total": total, "by_action": by_action, "grounded_for_live": grounded},
+        "page": {"total": total, "returned": len(rows), "offset": row_offset, "limit": row_limit, "next_offset": next_offset},
+        "review_only": True,
+        "broker_execution_allowed_count": 0,
+    }
+
+
 def build_market_context_payload(*, asof_date: str | None = None, limit: int = 50) -> dict[str, Any]:
     parsed_asof = _parse_asof_date(asof_date)
     payload = load_latest_market_context(parsed_asof, limit=max(0, int(limit)))
@@ -11055,6 +11116,16 @@ def create_app():
     @app.get("/api/hypotheses", response_model=HypothesesResponse)
     def hypotheses(limit: int = Query(default=100, ge=0, le=500), offset: int = Query(default=0, ge=0)):
         return _guard(build_hypotheses_payload, route="/api/hypotheses", limit=limit, offset=offset)
+
+    @app.get("/api/llm-decisions")
+    def llm_decisions(
+        symbol: str | None = None,
+        asof_date: str | None = None,
+        limit: int = Query(default=50, ge=0, le=200),
+        offset: int = Query(default=0, ge=0),
+    ):
+        return _guard(build_llm_decisions_payload, route="/api/llm-decisions",
+                      symbol=symbol, asof_date=asof_date, limit=limit, offset=offset)
 
     @app.get("/api/wait-signals", response_model=WaitSignalsResponse)
     def wait_signals(limit: int = Query(default=100, ge=1, le=500), status: str | None = None, symbol: str | None = None):

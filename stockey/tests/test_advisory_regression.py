@@ -64141,6 +64141,34 @@ def test_hypothesis_coverage_report_flags_dead_keywords():
     assert rep["DEAD"]["status"] == "zero" and rep["DEAD"]["event_hits"] == 0
 
 
+def test_api_llm_decisions_payload_is_lean_and_review_only(monkeypatch):
+    import pandas as pd
+    from advisory.api import app as api
+
+    monkeypatch.setattr(api, "_table_exists", lambda table: True)
+
+    def fake_sql(query, params=None, **kwargs):
+        if "FILTER" in query:
+            return pd.DataFrame([{"total": 3, "grounded": 2}])
+        if "GROUP BY" in query:
+            return pd.DataFrame([{"proposed_action": "BUY", "n": 2}, {"proposed_action": "WATCH", "n": 1}])
+        return pd.DataFrame([{
+            "decided_at": "2026-06-23", "asof_date": "2026-06-23", "symbol": "ABC", "proposed_action": "BUY",
+            "decision_mode": "alpha", "conviction": 0.7, "meets_data_grounding_for_live": True,
+            "sufficiency_path": "alpha_thesis_timing", "broker_execution_allowed": False,
+            "llm_status": "ok", "prompt_version": "v1", "llm_model": "codex",
+        }])
+
+    monkeypatch.setattr(api, "sql_to_df", fake_sql)
+    out = api.build_llm_decisions_payload(limit=5)
+    assert out["review_only"] is True
+    assert out["summary"]["total"] == 3 and out["summary"]["grounded_for_live"] == 2
+    assert out["summary"]["by_action"] == {"BUY": 2, "WATCH": 1}
+    assert out["decisions"][0]["symbol"] == "ABC"
+    assert all(d["broker_execution_allowed"] is False for d in out["decisions"])
+    assert "evidence_packet_json" not in out["decisions"][0]  # lean list -- no heavy JSON blobs
+
+
 def test_signal_quality_promotion_sector_concentration_attribution_does_not_block():
     concentrated = signal_quality_promotion._sector_concentration_attribution(
         {

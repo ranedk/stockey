@@ -392,6 +392,7 @@ Start-here docs for the LLM decision system (the trade-decision authority subsys
 - authoring investor hypotheses: [`docs/hypothesis_authoring.md`](hypothesis_authoring.md)
 - multi-factor model + validation: [`docs/price_factor_model.md`](price_factor_model.md)
 - announcement event taxonomy: [`docs/announcement_event_taxonomy.md`](announcement_event_taxonomy.md)
+- operator UI review + simplification plan: [`docs/ui_simplification_plan.md`](ui_simplification_plan.md)
 
 Future operator UX and research design:
 
