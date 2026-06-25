@@ -142,5 +142,7 @@ first-class THESIS axis -- alpha needs >= 2 independent non-technical supports (
 event, or event + reliability), so a fundamentally strong name with a supporting catalyst grounds a
 corroborated thesis. The cross-sectional `confidence` SCORE itself (which needs the universe snapshot
 to percentile-rank) remains a research/ranking tool; the per-symbol `fundamental` verdict is what
-grounds. Technical factor enrichment of `technical_confirmation` (momentum/trend components from the
-series computation) is a natural follow-up.
+grounds. `technical_confirmation` is also enriched: `assemble_evidence_packet` accepts a trailing
+`price_closes`/`price_volumes` window and `compute_price_series_factors` adds momentum / trend /
+volatility / volume depth to its `components`; when the pre-computed columns are null (deep history)
+the timing verdict FALLS BACK to series momentum/trend, while a populated live row stays authoritative.

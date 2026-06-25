@@ -1488,3 +1488,12 @@ focused `pytest`, `python scripts/docs_state_audit.py --strict`, and
   series-computed momentum/trend components.
 - Documentation pass: `docs/llm_decision_authority.md` updated (fundamental dimension, generalised
   alpha rule, module map, Related-documents index); `docs/price_factor_model.md` wiring section added.
+
+#### Technical timing dimension enriched with series factors (2026-06-25)
+- Completed the price-factor wiring symmetrically: `assemble_evidence_packet` now accepts a trailing
+  `price_closes`/`price_volumes` window; `compute_price_series_factors` adds momentum / trend /
+  volatility / volume depth to `technical_confirmation`'s `components` (LLM weighs played-out vs room).
+  When the pre-computed feature columns are null (deep history), the timing verdict FALLS BACK to
+  series momentum/trend; a populated live row stays authoritative. `load_evidence_packet` loads the
+  trailing OHLCV window from advisory_technical_daily. 1 test. Full suite 2129. Both axes (fundamental
+  thesis + technical timing) now draw on the validated factor computation.

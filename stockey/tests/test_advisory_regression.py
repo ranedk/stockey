@@ -63387,6 +63387,31 @@ def test_evidence_packet_reliability_negative_classification_contradicts():
     assert dim["strength"] == 0.0
 
 
+def test_evidence_packet_technical_series_enrichment_and_fallback():
+    import numpy as np
+    from advisory import llm_evidence_packet as ep
+    from advisory.price_factors import compute_price_series_factors
+
+    asof = "2026-06-18"
+    # A live row (gates present) keeps its row-based verdict; series factors just add depth.
+    row = {"asof_date": asof, "rs_vs_benchmark": 0.07, "pass_above_dma_50": True, "pass_above_dma_200": True, "pass_near_52w_high": True}
+    sf = {"momentum": 0.12, "trend_following": 1.0, "volatility": -0.02}
+    dim = ep.technical_dimension(row, asof, series_factors=sf)
+    assert dim["direction"] == "supportive"            # row-based verdict preserved
+    assert dim["components"]["momentum"] == 0.12       # series depth added
+
+    # No row (deep-history / null columns): the verdict FALLS BACK to series factors.
+    up = compute_price_series_factors(list(100 * np.exp(np.cumsum(np.full(300, 0.002)))))
+    down = compute_price_series_factors(list(100 * np.exp(np.cumsum(np.full(300, -0.002)))))
+    assert ep.technical_dimension({}, asof, series_factors=up)["direction"] == "supportive"
+    assert ep.technical_dimension({}, asof, series_factors=down)["direction"] == "contradicting"
+
+    # assemble wires a price window into the technical dimension.
+    packet = ep.assemble_evidence_packet(symbol="ABC", asof_date=asof, technical_row=row,
+                                         price_closes=list(100 * np.exp(np.cumsum(np.full(300, 0.002)))))
+    assert packet["technical_confirmation"]["components"].get("momentum") is not None
+
+
 def test_evidence_packet_fundamental_verdict():
     from advisory import llm_evidence_packet as ep
 

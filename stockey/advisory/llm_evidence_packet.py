@@ -146,9 +146,11 @@ def _absent(reason: str) -> dict[str, Any]:
             "direction": "neutral", "confidence": "low", "components": {}}
 
 
-def technical_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict[str, Any]:
+def technical_dimension(row: dict[str, Any] | None, asof_date: Any, *, series_factors: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(row, dict) or not row:
-        return _absent("missing")
+        if not series_factors:
+            return _absent("missing")
+        row = {}
     gates = {gate: _as_bool(row.get(gate)) for gate in TECHNICAL_ENTRY_GATES}
     known = [value for value in gates.values() if value is not None]
     strength = (sum(1 for value in known if value) / len(known)) if known else None
@@ -168,6 +170,16 @@ def technical_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict[str,
         direction, confidence = "supportive", ("high" if rs > 0.05 and near_high else "medium")
     else:
         direction, confidence = "neutral", "low"                     # quiet basing / mild lag = ok timing
+
+    # Fallback to series-computed factors (deep history / when the pre-computed columns are null):
+    # only when the row-based inputs gave no decisive verdict, so the live row stays authoritative.
+    if direction == "neutral" and series_factors:
+        momentum = _num(series_factors.get("momentum"))
+        trend = _num(series_factors.get("trend_following"))
+        if (trend is not None and trend < 0.34) or (momentum is not None and momentum <= TECHNICAL_LAGGING_RS):
+            direction, confidence = "contradicting", "medium"
+        elif (momentum is not None and momentum > 0) and (trend is not None and trend >= 0.67):
+            direction, confidence = "supportive", "medium"
 
     dim = {
         "present": True,
@@ -189,6 +201,10 @@ def technical_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict[str,
         "dist_52w_high": _num(row.get("dist_52w_high")),
         "stock_ret_60d": _num(row.get("stock_ret_60d")),
     }
+    # Series-computed factor depth (momentum / trend / volatility / volume) for the LLM to weigh
+    # "played out vs room", computed from price when the pre-computed columns are sparse.
+    if series_factors:
+        components.update({key: value for key, value in series_factors.items() if value is not None})
     return _verdict(dim, direction, confidence, components)
 
 
@@ -470,13 +486,24 @@ def assemble_evidence_packet(
     event_row: dict[str, Any] | None = None,
     fundamental_row: dict[str, Any] | None = None,
     hypothesis_rows: list[dict[str, Any]] | None = None,
+    price_closes: Any = None,
+    price_volumes: Any = None,
 ) -> dict[str, Any]:
-    """Pure assembly: row dicts -> the packet consumed by `advisory/llm_decision_contract`."""
+    """Pure assembly: row dicts -> the packet consumed by `advisory/llm_decision_contract`.
+
+    A trailing `price_closes`/`price_volumes` window (oldest..newest) enriches the technical timing
+    dimension with series-computed factors (momentum / trend / volatility / volume).
+    """
+    series_factors = None
+    if price_closes is not None and len(list(price_closes)) >= 21:
+        from advisory.price_factors import compute_price_series_factors
+
+        series_factors = compute_price_series_factors(price_closes, volumes=price_volumes)
     event_source = event_row if event_row is not None else allocation_row
     return {
         "symbol": str(symbol or "").strip().upper(),
         "asof_date": str(asof_date)[:10] if asof_date is not None else None,
-        "technical_confirmation": technical_dimension(technical_row, asof_date),
+        "technical_confirmation": technical_dimension(technical_row, asof_date, series_factors=series_factors),
         "risk": risk_dimension(allocation_row, asof_date),
         "market_context": market_context_dimension(market_row, asof_date),
         "sector_reliability": sector_reliability_dimension(sector_reliability_row),
@@ -546,6 +573,15 @@ def load_evidence_packet(
         "ORDER BY asof_date DESC LIMIT 1",
         params,
     )
+    series_rows = rows_loader(
+        "SELECT asof_date, adj_close, volume FROM advisory_technical_daily "
+        "WHERE symbol=%(symbol)s AND asof_date<=%(asof)s AND adj_close IS NOT NULL "
+        "ORDER BY asof_date DESC LIMIT 320",
+        params,
+    )
+    series_rows = list(reversed(series_rows or []))  # chronological, oldest..newest
+    price_closes = [r.get("adj_close") for r in series_rows] or None
+    price_volumes = [r.get("volume") for r in series_rows] or None
     hypothesis_rows = rows_loader(
         "SELECT m.*, h.status AS status FROM advisory_hypothesis_matches m "
         "JOIN advisory_hypotheses h ON h.hypothesis_id=m.hypothesis_id "
@@ -588,4 +624,6 @@ def load_evidence_packet(
         event_row=allocation_row,
         fundamental_row=fundamental_row,
         hypothesis_rows=hypothesis_rows,
+        price_closes=price_closes,
+        price_volumes=price_volumes,
     )
