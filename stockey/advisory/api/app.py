@@ -4730,8 +4730,14 @@ def build_health_hub_payload(*, asof_date: str | None = None, error_limit: int =
     """One consolidated diagnostics hub (WI-7): data freshness + cron + API errors + LLM monitor.
 
     Each source is independently bounded (no unbounded scans); a degraded source is surfaced under
-    `skipped`, never silently dropped. Read-only.
+    `skipped`, never silently dropped. Read-only, so the result is briefly cached (WI-15) to keep the
+    multi-source fan-out off the hot path.
     """
+    cache_key = ("health_hub_payload", str(asof_date or ""), int(error_limit or 0))
+    now = time.monotonic()
+    cached = _PAYLOAD_CACHE.get(cache_key)
+    if cached and OPERATOR_API_PAYLOAD_CACHE_SECONDS > 0 and (now - cached[0]) <= OPERATOR_API_PAYLOAD_CACHE_SECONDS:
+        return cached[1]
     skipped: list[dict[str, Any]] = []
     try:
         data_health = build_data_health_payload(asof_date=asof_date)
@@ -4757,7 +4763,7 @@ def build_health_hub_payload(*, asof_date: str | None = None, error_limit: int =
         row for row in sync_state
         if isinstance(row, dict) and str(row.get("status") or row.get("freshness") or "").lower() in {"stale", "error", "degraded", "blocked"}
     ]
-    return {
+    payload = {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/health-hub", schema_name="operator_health_hub"),
         "data_health": {
@@ -4778,6 +4784,8 @@ def build_health_hub_payload(*, asof_date: str | None = None, error_limit: int =
         "skipped": skipped,
         "read_only": True,
     }
+    _PAYLOAD_CACHE[cache_key] = (now, payload)
+    return payload
 
 
 def build_workbench_payload(*, top_n: int = 8) -> dict[str, Any]:
