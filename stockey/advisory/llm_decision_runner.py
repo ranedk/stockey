@@ -65,6 +65,19 @@ def load_default_universe(asof_date: Any, *, limit: int = DEFAULT_UNIVERSE_LIMIT
     return [str(r.get("symbol")).upper() for r in rows if r.get("symbol")]
 
 
+def resolve_default_asof_date(*, row_loader: Callable[[str, dict[str, Any]], dict[str, Any] | None] = _first_row) -> str | None:
+    """The latest technical date in the DB -- the natural 'as of' for a daily review-only run.
+
+    Defaulting to this (rather than the wall-clock day) keeps the runner point-in-time and robust on
+    market holidays: it decides on the most recent advisory data, not on an empty future date.
+    """
+    row = row_loader("SELECT MAX(asof_date) AS asof FROM advisory_technical_daily", {})
+    if not isinstance(row, dict):
+        return None
+    value = row.get("asof")
+    return str(value)[:10] if value else None
+
+
 def _default_price_atr(symbol: str, asof_date: Any, *, row_loader: Callable[[str, dict[str, Any]], dict[str, Any] | None] = _first_row) -> tuple[float | None, float | None]:
     row = row_loader(
         "SELECT adj_close, atr_20 FROM advisory_technical_daily WHERE symbol=%(symbol)s AND asof_date<=%(asof)s "
@@ -133,17 +146,36 @@ def main() -> int:
     import json
 
     parser = argparse.ArgumentParser(description="Daily review-only LLM decision runner.")
-    parser.add_argument("--date", required=True, help="As-of trading date (YYYY-MM-DD).")
+    parser.add_argument("--date", default=None, help="As-of trading date (YYYY-MM-DD). Defaults to the latest advisory technical date.")
     parser.add_argument("--symbols", nargs="*", help="Symbols (default: the active universe).")
     parser.add_argument("--limit", type=int, default=DEFAULT_UNIVERSE_LIMIT)
     parser.add_argument("--capital", type=float, default=DEFAULT_CAPITAL_INR)
     parser.add_argument("--persist", action="store_true", help="Persist decisions to advisory_llm_decisions.")
     parser.add_argument("--no-llm", action="store_true", help="Deterministic WATCH fallback instead of the LLM.")
+    parser.add_argument("--label-outcomes", action="store_true",
+                        help="After persisting, mature decisions whose horizon elapsed into advisory_llm_decision_outcomes (feeds the .3 monitor).")
     parser.add_argument("--model", default=None)
     args = parser.parse_args()
-    symbols = args.symbols if args.symbols else load_default_universe(args.date, limit=args.limit)
-    summary = run_daily_decisions(args.date, symbols=symbols, capital=args.capital,
+
+    asof = args.date or resolve_default_asof_date()
+    if not asof:
+        print(json.dumps({"status": "no_asof_date",
+                          "error": "no advisory_technical_daily rows; run the advisory pipeline first"}, indent=2))
+        return 1
+
+    symbols = args.symbols if args.symbols else load_default_universe(asof, limit=args.limit)
+    summary = run_daily_decisions(asof, symbols=symbols, capital=args.capital,
                                   use_llm=not args.no_llm, persist=args.persist, model=args.model)
+
+    if args.label_outcomes:
+        from advisory.llm_decision_outcome_labeler import label_decisions, persist_outcomes
+
+        labeled = label_decisions(asof)
+        outcome_rows = labeled.get("outcomes") or []
+        summary["outcomes_labeled"] = len(outcome_rows)
+        summary["outcomes_matured"] = sum(1 for row in outcome_rows if row.get("matured"))
+        summary["outcomes_persisted"] = persist_outcomes(outcome_rows, labeled_at=asof) if args.persist else 0
+
     print(json.dumps(summary, indent=2, default=str))
     return 0
 

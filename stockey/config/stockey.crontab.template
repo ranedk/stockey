@@ -48,6 +48,13 @@ LOG_DIR={{LOG_DIR}}
 # reconciling actions.
 10 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${ADVISORY_WAIT_FOR_DATA_TIMEOUT_SECONDS:-7200}" /tmp/stockey_complete_data.lock /tmp/stockey_download_queue.lock /tmp/stockey_external_workers.lock /tmp/stockey_context_to_entry_repair.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh; } >> "$LOG_DIR/all_advisory.log" 2>&1
 
+# Daily review-only LLM decision cycle. After the post-close advisory run finishes (waits for its
+# lock), generate a graded/sized decision per symbol over the active universe, persist them to
+# advisory_llm_decisions, and mature any elapsed-horizon outcomes into advisory_llm_decision_outcomes
+# for the systematic-error monitor. Deterministic by default (no LLM API calls); set
+# LLM_DECISION_CRON_ARGS="" to opt a deployment into the LLM. Never moves capital (broker_execution_allowed=false).
+00 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${LLM_DECISIONS_WAIT_FOR_ADVISORY_TIMEOUT_SECONDS:-7200}" /tmp/stockey_advisory.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_llm_decisions.lock ./all_llm_decisions.sh; } >> "$LOG_DIR/llm_decisions.log" 2>&1
+
 # Continuous one-shot watch during market hours on weekdays.
 # Internal sync state keeps news/announcements slower while OHLCV stays more frequent.
 */10 09-15 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1

@@ -152,6 +152,7 @@ Current schedule:
 - `17:30` weekdays: `./complete_data.sh` end-of-day catch-up before advisory
 - `18:55` weekdays: `./all_advisory_preflight.sh` validates/refreshes Dhan auth and runs compact operator smoke before advisory
 - `19:10` weekdays: `./all_advisory.sh`, after waiting for data catch-up and external worker locks to clear
+- `22:00` weekdays: `./all_llm_decisions.sh`, after waiting for the advisory lock to clear; generates review-only graded/sized LLM decisions over the active universe and matures elapsed-horizon outcomes for the monitor. Deterministic by default (no LLM calls); never moves capital
 - `22:20` weekdays: `./all_research_evidence.sh` refreshes research-only context/event/action-transition evidence without event-model training or policy changes
 - `23:10` weekdays: `./all_event_policy_evaluator.sh` after costs
 - `04:20` Saturdays: `./all_technical_threshold_calibration.sh` after costs
@@ -315,6 +316,7 @@ Current marker-enabled wrappers:
 - `all_ts_forecast_workflow.sh`
 - `all_ts_forecast_evaluator.sh`
 - `all_ts_forecast_paper_portfolio.sh`
+- `all_llm_decisions.sh`
 - `all_research_evidence.sh`
 - `all_event_policy_evaluator.sh`
 - `all_technical_threshold_calibration.sh`

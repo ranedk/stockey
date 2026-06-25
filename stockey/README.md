@@ -37,6 +37,7 @@ These are safe to run from `config/stockey.generated.crontab` at regular interva
 | `./all_ts_forecast_workflow.sh` | research-only intraday schedule | Refreshes experimental TS forecast watch rows |
 | `./all_ts_forecast_evaluator.sh` | post-close research schedule | Evaluates matured TS forecasts after costs |
 | `./all_ts_forecast_paper_portfolio.sh` | post-close research schedule | Builds a research-only forecast paper portfolio and compares it with naive momentum/advisory alignment |
+| `./all_llm_decisions.sh` | post-advisory schedule | Generates review-only graded/sized LLM decisions per symbol over the active universe and matures elapsed-horizon outcomes for the monitor; deterministic by default, never moves capital (`broker_execution_allowed=false`) |
 | `./all_research_evidence.sh` | post-close research schedule | Refreshes context/event/action-transition research evidence without event-model prep/training/scoring, config mutation, portfolio mutation, or broker behavior |
 | `./all_event_policy_evaluator.sh` | post-close research schedule | Evaluates event-policy actions/classes after costs |
 | `./all_technical_threshold_calibration.sh` | weekly research schedule | Calibrates technical thresholds for manual review |

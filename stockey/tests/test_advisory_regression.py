@@ -63637,6 +63637,17 @@ def test_llm_decision_runner_batches_review_only_decisions():
     assert summary["persisted"] == 0
 
 
+def test_llm_decision_runner_resolves_default_asof_from_latest_technical_date():
+    from advisory import llm_decision_runner as runner
+
+    # Injected row loader stands in for the DB MAX(asof_date) lookup.
+    asof = runner.resolve_default_asof_date(row_loader=lambda q, p: {"asof": "2026-06-18T00:00:00+00:00"})
+    assert asof == "2026-06-18"
+    # No rows -> no default date (caller must surface "run advisory first").
+    assert runner.resolve_default_asof_date(row_loader=lambda q, p: None) is None
+    assert runner.resolve_default_asof_date(row_loader=lambda q, p: {"asof": None}) is None
+
+
 def test_llm_decision_runner_one_bad_symbol_does_not_abort_batch():
     from advisory import llm_decision_runner as runner
 

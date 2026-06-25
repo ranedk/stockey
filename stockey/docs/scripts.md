@@ -353,6 +353,7 @@ python -m data.dhanlive.auth_cli clear-cache
 | `all_ts_forecast_workflow.sh` | TS forecast workflow | Runs the research-only TS forecast watchlist refresh with configured model/max symbols and lifecycle markers |
 | `all_ts_forecast_evaluator.sh` | TS forecast evaluator | Evaluates matured TS forecast rows after costs with lifecycle markers |
 | `all_ts_forecast_paper_portfolio.sh` | TS forecast paper portfolio | Builds research-only forecast paper decisions with lifecycle markers |
+| `all_llm_decisions.sh` | LLM decision cycle | Daily post-advisory wrapper around `advisory.llm_decision_runner --persist --label-outcomes`; generates a review-only graded/sized decision per symbol over the active universe (auto-resolves the latest advisory technical date), persists to `advisory_llm_decisions`, and matures elapsed-horizon outcomes into `advisory_llm_decision_outcomes`. Deterministic by default (`LLM_DECISION_CRON_ARGS=--no-llm`); never moves capital (`broker_execution_allowed=false`) |
 | `all_research_evidence.sh` | Research evidence refresh | Daily post-close wrapper around `advisory.research_evidence_runner`; refreshes source-family, narrowed-split, context-watch, negative-pressure, adversarial-review, action-transition, causal-memory, provenance, and reliability evidence without event-model training, policy/config changes, portfolio mutation, or broker behavior |
 | `all_event_policy_evaluator.sh` | Event-policy evaluator | Evaluates event-policy outcomes after costs with lifecycle markers |
 | `all_technical_threshold_calibration.sh` | Technical threshold calibration | Runs weekly research-only technical threshold calibration with lifecycle markers |
@@ -435,12 +436,15 @@ Trace summary cache:
 - Check cleanup candidates: `python -m advisory.trace_summary_store --cleanup --keep-latest-per-entity 1 --older-than-days 14 --dry-run`
 - The Operations UI exposes these as safe audited commands; cache rebuild writes only `advisory_trace_summaries` and does not touch broker or recommendation state.
 - `advisory.ts_forecast_evaluator` at `18:20` and `21:20` on weekdays
+- `advisory.llm_decision_runner --persist --label-outcomes` through `all_llm_decisions.sh` at `22:00` on weekdays, after waiting for the post-close advisory lock to clear; review-only decision generation + outcome maturation, deterministic by default
 - `advisory.research_evidence_runner` through `all_research_evidence.sh` at `22:20` on weekdays
 - `advisory.event_policy_evaluator` at `23:10` on weekdays
 - `advisory.technical_threshold_calibration` at `04:20` on Saturdays
 - `all_ml.sh --run-signal-quality-window-runner --include-signal-quality-split-reports` at `03:10` on Sundays for research-only event-model prep/training plus preflight-gated stable multi-window signal-quality evidence and split diagnostics for unstable families
 
 Hypothesis scans default to Codex-backed action-plan notes. Set `HYPOTHESIS_CRON_ARGS=--no-llm` to keep that cron path deterministic only.
+
+The daily LLM decision cycle defaults to deterministic (`LLM_DECISION_CRON_ARGS=--no-llm`) so cron never makes LLM API calls. To opt a deployment into the LLM, set `LLM_DECISION_CRON_ARGS=""` and configure a model; decisions stay review-only regardless (`broker_execution_allowed=false`).
 
 Not scheduled by default:
 
