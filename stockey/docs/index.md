@@ -384,6 +384,15 @@ For day-to-day operation and maintenance, use [`docs/advisory_manual.md`](adviso
 - understanding stage ownership
 - debugging outputs and failures
 
+Start-here docs for the LLM decision system (the trade-decision authority subsystem):
+
+- conceptual overview for an investor: [`docs/investor_overview.md`](investor_overview.md)
+- developer onboarding + module map: [`docs/developer_onboarding.md`](developer_onboarding.md)
+- decision-subsystem architecture: [`docs/llm_decision_authority.md`](llm_decision_authority.md)
+- authoring investor hypotheses: [`docs/hypothesis_authoring.md`](hypothesis_authoring.md)
+- multi-factor model + validation: [`docs/price_factor_model.md`](price_factor_model.md)
+- announcement event taxonomy: [`docs/announcement_event_taxonomy.md`](announcement_event_taxonomy.md)
+
 Future operator UX and research design:
 
 - operator app and decision trace design: `docs/operator_app_prd.md`
