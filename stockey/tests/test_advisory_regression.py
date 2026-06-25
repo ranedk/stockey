@@ -63928,6 +63928,22 @@ def test_build_confidence_scores_combines_components():
     assert out["confidence"].between(0.0, 1.0).all()
 
 
+def test_confidence_scores_handle_missing_sparse_component():
+    import numpy as np
+    import pandas as pd
+    from advisory import price_factors as pf
+
+    # B has no fundamental data; it must still get a confidence from the present components (the
+    # weighting renormalises over present components -- no NaN propagation).
+    frame = pd.DataFrame({
+        "asof_date": ["d"] * 3, "symbol": ["A", "B", "C"],
+        "momentum": [0.01, 0.02, 0.03],
+        "earnings_growth": [0.1, np.nan, 0.3],
+    })
+    out = pf.build_confidence_scores(frame)
+    assert out["confidence"].notna().all()  # including B, which lacks fundamentals
+
+
 def test_price_factors_ic_report_ranks_signal():
     import numpy as np
     import pandas as pd

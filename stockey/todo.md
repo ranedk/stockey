@@ -1456,3 +1456,19 @@ focused `pytest`, `python scripts/docs_state_audit.py --strict`, and
   (technical_confirmation timing + a new fundamental dimension), and gate alpha through the same
   contract -- only after the score earns edge on a wider universe (re-tune weights as deep-history
   symbols accumulate). 1 test. Full suite 2125.
+
+#### Price/factor model -- widened validation universe (2026-06-25)
+- Widened from ~20 to 178 securities by validating over `dhan_ohlcv_daily` (544k rows, 2015-2026,
+  keyed by company_master_id) joined to fundamentals -- `scripts/validate_price_factors.py`
+  (reproducible, no DB writes; split/corp-action guard).
+- **Firmed-up findings:** fundamentals dominate consistently (earnings_growth IC +0.096); signs
+  STABILISED (leverage flipped back to +0.026 -- the earlier -0.063 was small-sample noise); trend
+  family modestly positive but 0.7-0.87 correlated (one signal); volatility/mean-reversion
+  consistently negative-to-flat; liquidity collapsed to ~0 on the wider (less small-cap-heavy) universe.
+- **Honest combination result (apples-to-apples, same rows):** on rows with technical AND fundamental
+  (839 obs) `confidence` IC +0.118 BEATS every single component (best single fundamental +0.059); on
+  technical-only rows it ~= the best single technical. So **confluence pays only across INDEPENDENT
+  axes (technical + fundamental)** -- exactly the thesis/timing split. Caught + fixed a real bug:
+  `build_confidence_scores` propagated NaN and silently restricted confidence to fundamental-having
+  rows; now renormalises over present components. Hand-tuning weights from single-factor ICs LOWERED
+  the combined IC (overfitting) -> kept robust round weights. 2 tests. Full suite 2126.

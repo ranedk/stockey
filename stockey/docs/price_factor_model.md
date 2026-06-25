@@ -91,12 +91,25 @@ AVERAGED within a component (so the six correlated trend factors count once), or
 `DEFAULT_COMPONENT_WEIGHTS` (fundamentals 0.40, trend 0.25, liquidity 0.15, volume 0.10, reversion
 0.05, volatility 0.05 -- fundamentals-led, unstable-sign components small; re-tunable).
 
-**Combination validation (the key test -- does confluence beat single factors?):** on the deep-history
-sample, `confidence` IC +0.080 BEAT every single component (liquidity +0.070, volume +0.056,
-fundamental +0.038, trend +0.038). So combining independent components adds real signal -- the
-confluence idea, validated rather than assumed. Caveats: thin 20-symbol sample, overlapping forward
-windows, and the volatility component was anti-predictive here (-0.10) -- its low weight contains the
-drag and confirms why unstable-sign components are down-weighted.
+**Combination validation -- wide universe (178 securities, 6.6k obs; `scripts/validate_price_factors.py`
+over dhan_ohlcv_daily joined to fundamentals).** Measured apples-to-apples (every metric on the SAME
+rows):
+- On rows with the FULL picture (technical AND fundamental, 839 obs): `confidence` IC **+0.118 beats
+  every single component** (liquidity +0.092, trend +0.075, volume +0.068, fundamental +0.059).
+- On technical-only rows (no fundamentals, 6.6k obs): `confidence` +0.035 ~= the best single technical
+  (trend +0.039) -- no real gain.
+
+So **confluence pays when it combines INDEPENDENT axes (technical AND fundamental); technical-only
+confluence adds little** (the technical factors are mostly one correlated trend signal). The
+fundamental axis is the crucial independent one -- which is exactly the thesis(non-technical) vs
+timing(technical) split the LLM decision contract already uses.
+
+Two findings from the widening that hardened the model:
+- `build_confidence_scores` now weights over the components PRESENT per row (renormalised), so a row
+  missing the sparse fundamental data still gets a confidence from the rest -- a NaN-propagation bug
+  had silently restricted `confidence` to fundamental-having rows and made an unfair comparison.
+- Hand-tuning component weights from single-factor ICs LOWERED the combined IC (the overfitting trap),
+  so the model keeps robust ROUND weights and earns trust from the combination IC, not from fitting.
 
 ## Phase 2 design principles
 

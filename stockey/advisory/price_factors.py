@@ -294,9 +294,11 @@ COMPONENT_ORIENTATION: dict[str, float] = {
     "trend": 1.0, "reversion": 1.0, "volatility": 1.0, "volume": 1.0, "liquidity": -1.0, "fundamental": 1.0,
 }
 
-# Robust default weights (NOT fit to the thin deep-history sample): fundamentals lead (strongest +
-# most consistent), trend is one modest vote, liquidity (size) matters, the unstable-sign components
-# (reversion, volatility) get small weight. Re-tune as the deep-history universe grows. Sum = 1.0.
+# Robust default weights: fundamentals lead (strongest + consistent across every sample), trend is one
+# modest vote, then volume/liquidity, with the consistently weak reversion/volatility kept small. These
+# are deliberately ROUND and NOT hand-fit to a single validation run -- on the wide universe, hand-
+# tuning component weights from single-factor ICs actually LOWERED the combined IC (the overfitting
+# trap), so the model keeps robust round weights and earns trust from the combination IC. Sum = 1.0.
 DEFAULT_COMPONENT_WEIGHTS: dict[str, float] = {
     "fundamental": 0.40, "trend": 0.25, "liquidity": 0.15, "volume": 0.10, "reversion": 0.05, "volatility": 0.05,
 }
@@ -334,14 +336,12 @@ def build_confidence_scores(
         out[f"score_{component}"] = score
         component_scores[component] = score
 
-    numerator = None
-    total_weight = 0.0
-    for component, score in component_scores.items():
-        weight = float(weights.get(component, 0.0))
-        if weight == 0.0:
-            continue
-        contribution = score * weight
-        numerator = contribution if numerator is None else numerator + contribution
-        total_weight += weight
-    out["confidence"] = (numerator / total_weight) if (numerator is not None and total_weight > 0) else float("nan")
+    # Weighted mean over the components PRESENT for each row (renormalised by present weight), so a
+    # row missing a sparse component (e.g. no fundamentals) still gets a confidence from the rest --
+    # rather than NaN propagating and silently restricting confidence to fundamental-having rows.
+    score_frame = pd.DataFrame(component_scores)
+    weight_series = pd.Series({component: float(weights.get(component, 0.0)) for component in score_frame.columns})
+    weighted = score_frame.mul(weight_series, axis=1).sum(axis=1, min_count=1)
+    present_weight = score_frame.notna().mul(weight_series, axis=1).sum(axis=1)
+    out["confidence"] = weighted / present_weight.where(present_weight > 0)
     return out
