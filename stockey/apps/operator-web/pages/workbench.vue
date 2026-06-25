@@ -37,6 +37,8 @@ function display(value: unknown) {
       </p>
     </header>
 
+    <RegimeBanner />
+
     <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">
       Could not load the workbench.
     </div>

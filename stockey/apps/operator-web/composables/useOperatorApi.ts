@@ -73,6 +73,7 @@ export function useOperatorApi() {
     getFeatureFreshness: (symbol: string, params: Record<string, unknown> = {}) => get<FeatureFreshnessPayload>(`/api/symbols/${encodeURIComponent(symbol)}/feature-freshness${query(params)}`),
     getHypotheses: (limit = 100, params: Record<string, unknown> = {}) => get<HypothesesPayload>(`/api/hypotheses${query({ limit, ...params })}`),
     getWaitSignals: (params: Record<string, unknown> = {}) => get<WaitSignalsPayload>(`/api/wait-signals${query(params)}`),
+    getMarketContext: (limit = 1) => get<Record<string, unknown>>(`/api/market-context?limit=${limit}`),
     createHypothesis: (body: Record<string, unknown>) => post<HypothesisCreateResult>('/api/hypotheses', body),
     updateHypothesis: (hypothesisId: string, body: Record<string, unknown>) => post<HypothesisCreateResult>(`/api/hypotheses/${encodeURIComponent(hypothesisId)}`, body),
     previewHypothesis: (body: Record<string, unknown>) => post<HypothesisPreviewResult>('/api/hypotheses/preview', body),

@@ -91,6 +91,8 @@ function goPrev() { offset.value = Math.max(0, offset.value - limit) }
       </p>
     </header>
 
+    <RegimeBanner />
+
     <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">
       Could not load recommendations. The API may be down, or none have been generated yet.
     </div>
