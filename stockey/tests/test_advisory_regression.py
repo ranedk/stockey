@@ -82568,3 +82568,27 @@ def test_build_position_take_and_exit_payload_validate_and_stay_review_only(monk
     assert exit_payload["status"] == "no_open_holding"
     with pytest.raises(ValueError):
         operator_api.build_position_exit_payload({"symbol": "TCS"})  # missing entry_date
+
+
+def test_resolve_symbol_states_neutral_llm_does_not_promote_non_actionable():
+    from advisory.api.app import resolve_symbol_states
+
+    rows = resolve_symbol_states(
+        recommendations=[
+            {"symbol": "HOLDONLY", "action_code": "HOLD"},
+            {"symbol": "NORECBUT", "action_code": None},
+        ],
+        # Both have only a NEUTRAL llm WATCH (e.g. the disabled-LLM deterministic fallback).
+        llm_decisions=[
+            {"symbol": "HOLDONLY", "proposed_action": "WATCH"},
+            {"symbol": "NORECBUT", "proposed_action": "WATCH"},
+            {"symbol": "REALBUY", "proposed_action": "BUY"},
+        ],
+        holdings=[],
+    )
+    by_symbol = {r["symbol"]: r for r in rows}
+    # Neutral LLM WATCH must NOT promote a HOLD/empty symbol into the queue.
+    assert by_symbol["HOLDONLY"]["state"] == "NONE"
+    assert by_symbol["NORECBUT"]["state"] == "NONE"
+    # A directional LLM call still surfaces a symbol on its own.
+    assert by_symbol["REALBUY"]["state"] == "RECOMMENDATION"

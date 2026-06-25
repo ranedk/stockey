@@ -27,6 +27,7 @@ const byAction = computed(() => asDict(summary.value.by_action))
 const skipped = computed(() => asList(data.value?.skipped))
 const reviewOnly = computed(() => data.value ? Boolean(data.value.review_only) : true)
 const nextOffset = computed(() => typeof page.value.next_offset === 'number' ? page.value.next_offset as number : null)
+const llmDisabled = computed(() => decisions.value.length > 0 && decisions.value.every((row) => String(row.llm_status) === 'disabled'))
 
 function asDict(value: unknown): Dict {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
@@ -67,6 +68,14 @@ function goPrev() { offset.value = Math.max(0, offset.value - limit) }
 
     <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">
       Could not load decisions. The API may be down, or no decisions have been generated yet.
+    </div>
+
+    <div v-if="llmDisabled" class="rounded-2xl border border-ink/15 bg-white/70 px-5 py-4 text-sm text-ink/65">
+      <span class="font-black text-ink/80">LLM direct authority is OFF</span> (master flag defaults off).
+      These rows are the <span class="font-semibold">deterministic review-only fallback</span> — every
+      decision shows <code class="rounded bg-ink/5 px-1.5 py-0.5">llm = disabled</code> and resolves to
+      <code class="rounded bg-ink/5 px-1.5 py-0.5">WATCH</code>. This is expected, not an error: enable
+      the flag and re-run with the LLM to get graded BUY/SELL/size proposals.
     </div>
 
     <div v-if="skipped.length" class="rounded-2xl border border-ink/15 bg-white/70 px-5 py-4 text-sm text-ink/60">

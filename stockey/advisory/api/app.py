@@ -4377,7 +4377,11 @@ def resolve_symbol_states(
         agree = bool(det_dir and llm_dir and det_dir == llm_dir)
         conflict = bool(det_dir and llm_dir and det_dir != llm_dir)
         det_actionable = bool(det_action) and str(det_action).strip().upper() not in _NON_ACTIONABLE_CODES
-        has_signal = det_actionable or bool(llm_action)
+        # The LLM-only path requires a DIRECTIONAL call (BUY/SELL family): a neutral LLM WATCH -- e.g.
+        # the deterministic fallback when LLM authority is off -- must not promote an otherwise
+        # non-actionable symbol into the queue. The deterministic action already covers WATCH.
+        llm_actionable = _action_direction(llm_action) != 0
+        has_signal = det_actionable or llm_actionable
 
         if sym in open_holding:
             state = "HOLDING"
@@ -4468,7 +4472,22 @@ def build_recommendations_unified_payload(
     """
     row_limit = _bounded_limit(limit, default=50, maximum=200)
     row_offset = max(int(offset or 0), 0)
-    states = [row for row in load_symbol_states() if row.get("state") == "RECOMMENDATION"]
+    all_recs = [row for row in load_symbol_states() if row.get("state") == "RECOMMENDATION"]
+
+    # Summary is computed over the FULL recommendation set (not the filtered view) so the by_action
+    # chips stay a stable navigation aid -- clicking one filters the list without hiding the others.
+    by_action: dict[str, int] = {}
+    agree_count = 0
+    conflict_count = 0
+    for row in all_recs:
+        key = str(row.get("action") or "UNKNOWN")
+        by_action[key] = by_action.get(key, 0) + 1
+        if row.get("agree"):
+            agree_count += 1
+        if row.get("conflict"):
+            conflict_count += 1
+
+    states = all_recs
     action_filter = _text(action)
     if action_filter:
         wanted = action_filter.strip().upper()
@@ -4484,23 +4503,13 @@ def build_recommendations_unified_payload(
         str(r.get("symbol") or ""),
     ))
     total = len(states)
-    by_action: dict[str, int] = {}
-    agree_count = 0
-    conflict_count = 0
-    for row in states:
-        key = str(row.get("action") or "UNKNOWN")
-        by_action[key] = by_action.get(key, 0) + 1
-        if row.get("agree"):
-            agree_count += 1
-        if row.get("conflict"):
-            conflict_count += 1
     page = states[row_offset:row_offset + row_limit]
     next_offset = row_offset + row_limit if (row_offset + row_limit) < total else None
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/recommendations-unified", schema_name="recommendations_unified"),
         "recommendations": [_json_ready(row) for row in page],
-        "summary": {"total": total, "by_action": by_action, "agree": agree_count, "conflict": conflict_count},
+        "summary": {"total": len(all_recs), "filtered": total, "by_action": by_action, "agree": agree_count, "conflict": conflict_count},
         "page": {"total": total, "returned": len(page), "offset": row_offset, "limit": row_limit, "next_offset": next_offset},
         "review_only": True,
         "broker_execution_allowed_count": 0,

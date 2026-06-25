@@ -44,6 +44,8 @@ function display(value: unknown) {
 }
 const visibleRows = computed(() => rows.value.filter((r) => !dismissed.value.has(String(r.symbol))))
 
+watch([actionFilter, onlyConflicts], () => { offset.value = 0 })
+
 async function take(row: Dict) {
   const symbol = String(row.symbol)
   busy.value = symbol
@@ -63,6 +65,11 @@ async function take(row: Dict) {
 }
 function dismiss(row: Dict) {
   dismissed.value = new Set([...dismissed.value, String(row.symbol)])
+}
+function toggleActionFilter(action: string) {
+  const current = actionFilter.value.trim().toUpperCase()
+  actionFilter.value = current === action.toUpperCase() ? '' : action
+  offset.value = 0
 }
 function agreeClass(row: Dict) {
   if (row.conflict) return 'border-rust/30 bg-rust/10 text-rust'
@@ -98,10 +105,14 @@ function goPrev() { offset.value = Math.max(0, offset.value - limit) }
       <span class="rounded-full border border-rust/25 bg-rust/10 px-4 py-1.5 text-sm font-black text-rust">
         {{ display(summary.conflict) }} conflict
       </span>
-      <span v-for="(count, action) in byAction" :key="action"
-            class="rounded-full border border-ink/10 bg-white/60 px-3 py-1.5 text-xs font-semibold text-ink/55">
+      <button v-for="(count, action) in byAction" :key="action"
+              class="rounded-full border px-3 py-1.5 text-xs font-semibold transition"
+              :class="actionFilter.trim().toUpperCase() === String(action).toUpperCase()
+                ? 'border-ink/40 bg-ink text-paper'
+                : 'border-ink/10 bg-white/60 text-ink/55 hover:bg-white'"
+              @click="toggleActionFilter(String(action))">
         {{ action }}: {{ display(count) }}
-      </span>
+      </button>
     </div>
 
     <div class="flex flex-wrap items-center gap-3">
