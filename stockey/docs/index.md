@@ -177,7 +177,7 @@ Use:
 - `python -m advisory.operator_health --skip-dhan` for a read-only local smoke test
 - `./all_advisory.sh` for the advisory and portfolio run
 
-The Operator home page and generated legacy dashboard show compact TS forecast paper-portfolio summaries. Treat those as validation evidence only; they do not approve action queue rows, portfolio rows, or Dhan execution.
+The research-only TS forecast paper-portfolio summaries are validation evidence only; they do not approve action queue rows, portfolio rows, or Dhan execution.
 - `./all_advisory.sh --fast` for a quicker lifecycle/action refresh when data is already current
 - `./all_watchers.sh --loop` for the lightweight live monitoring loop
 - `./all_frontend.sh` for the operator API + Nuxt frontend
@@ -187,12 +187,12 @@ Operator health:
 - `fix_hints` show the next concrete command for stale data, dependency problems, active cron failures, and recovered historical errors
 - API latency is checked through `OPERATOR_API_HEALTH_URL`, defaulting to the local FastAPI `/api/health` endpoint
 - Dhan cache metadata shows token cache age, expiry timestamp, and time left without triggering broker login
-- the Nuxt Data Health page filters rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`
+- the Nuxt Health hub (`/health-hub`) surfaces data freshness, cron/pipeline status, API errors, and the LLM systematic-error monitor in one place
 - manual `KeyboardInterrupt` is downgraded to recovered when mapped output tables have fresher rows than the interrupted log
 
 Operator trace inspection:
 
-- use the Nuxt Decision Trace page for readable symbol/event timelines
+- the per-symbol detail page (`/symbols/{symbol}`) and the per-symbol "why" drill-in surface readable evidence/decision context
 - use `python -m advisory.symbol_trace --symbol RELIANCE` for CLI symbol traces
 - use `python -m advisory.decision_trace --unique-id <event-id>` for CLI event traces
 
@@ -397,7 +397,7 @@ Start-here docs for the LLM decision system (the trade-decision authority subsys
 
 Future operator UX and research design:
 
-- operator app and decision trace design: `docs/operator_app_prd.md`
+- operator app and decision trace design (SUPERSEDED — historical; see `docs/operator_ui.md` for the current UI): `docs/operator_app_prd.md`
 - hypothesis research design: `docs/hypothesis_lab.md`
 
 For the short command-focused runbook, use [`docs/operators_manual.md`](operators_manual.md).

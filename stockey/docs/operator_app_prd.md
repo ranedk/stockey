@@ -1,5 +1,14 @@
 # Operator App PRD
 
+> **SUPERSEDED (2026-06-25) — historical design record.** This PRD describes the
+> earlier 18-page operator app, including pages that have since been removed
+> (Overview, the old Recommendations page, Paper Portfolio, Manual Review, Event
+> Inbox, Operator Journey, Execution Approvals, Decision Trace, Wait Signals, old
+> Data Health) and the **dropped paper-trading feature** (simulated entry/exit and
+> percentage P&L). It is kept only for design rationale. For the **current** UI —
+> the consolidated per-symbol model, the 5 primary pages, and the endpoints — see
+> [`docs/operator_ui.md`](operator_ui.md). Do not treat anything below as current.
+
 ## Objective
 
 Build a Nuxt operator app that explains what the advisory system is doing, not just what it finally recommends.

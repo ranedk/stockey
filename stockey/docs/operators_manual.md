@@ -219,35 +219,19 @@ Together these checks cover:
 - recent `logs/cron/*.log` tails for tracebacks, errors, failures, connection refusals, and timeouts
 - Poppler, Codex CLI, Node/npm, TimesFM, and frontend dependency presence
 
-The same data is exposed at `GET /api/health/details` and rendered in the Nuxt `Data Health` page. Warnings mean the system may still run with degraded functionality; errors mean a required dependency or recent cron run likely needs attention.
+The same data is exposed at `GET /api/health/details` and consolidated in the Nuxt Health hub (`/health-hub`). Warnings mean the system may still run with degraded functionality; errors mean a required dependency or recent cron run likely needs attention.
 
-The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, identity/action mapping gaps, Redis reachability, Postgres connectivity, event-evidence quality issues, Screener.in failures, and feature stage-gate blockers. The Nuxt `Data Health` page shows the hints near the top with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix. The page can filter health rows by `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
+The health payload also includes `fix_hints`. These are generated from stale tables, cron log errors, missing optional dependencies, Dhan token failures, identity/action mapping gaps, Redis reachability, Postgres connectivity, event-evidence quality issues, Screener.in failures, and feature stage-gate blockers. The Nuxt Health hub shows the hints with the command to run first, usually followed by `python -m advisory.operator_health --skip-dhan` to verify the fix.
 
-## Operator Paper Portfolio
+## Tracked Positions
 
-Use the Nuxt `/recommendations` page when you want to manually build a clean paper portfolio from the latest consolidated recommendations.
-
-The workflow is intentionally separate from the advisory model portfolio:
-
-- The page shows only paper-action-capable rows: `BUY`, `BUY_MORE`, `SELL`, `PARTIAL_SELL`, and review-only `REDUCE_EXPOSURE_REVIEW`.
-- `WATCH`, `HOLD`, and `MANUAL_REVIEW` stay out of this page; use Watchlist or Manual Review for those.
-- Each row shows exactly one operator action button: `BUY`, `BUY_50%`, `SELL`, or `SELL_50%`.
-- The page is paper-portfolio-state aware. After a reset, only `BUY` rows are shown because there is no open paper position to sell. Once a symbol is open in the paper ledger, `BUY_MORE`, `SELL`, `PARTIAL_SELL`, and `REDUCE_EXPOSURE_REVIEW` rows for that symbol can appear.
-- `BUY` writes one paper-ledger entry for the symbol at the visible current/reference price.
-- `BUY_50%` records a paper add/half-entry action.
-- `SELL` closes the currently open paper position at the visible current/reference price.
-- `SELL_50%` records a partial-exit paper action without closing the position.
-- `REDUCE_EXPOSURE_REVIEW` maps to `SELL_50%` in the paper ledger only when the symbol is already open. It remains review-only de-risk pressure, not live broker authority.
-- `/paper-portfolio` shows only entry price, exit price, current price, and percentage gain/loss.
-- The paper ledger does not mutate `advisory_action_recommendations`, `advisory_portfolio_orders`, Dhan execution rows, or live broker orders.
-
-Reset command:
-
-```sh
-python scripts/reset_operator_portfolio.py --confirm
-```
-
-This deletes only rows from `advisory_operator_portfolio_ledger`. It does not reset advisory history, recommendations, model output, execution approvals, or Dhan state. Use it when you want the operator paper portfolio to start from scratch while keeping the research/advisory database intact.
+Paper trading was dropped (operator decision 2026-06-23): there is no simulated
+P&L. The Nuxt **Positions** page (`/positions`, backed by
+`advisory/operator_holdings.py`) instead tracks recommendations the operator
+manually marked as taken -- entry price/date and the since-entry move for
+monitoring only. Taking a recommendation on the Recommendations page moves it into
+Positions; it never mutates `advisory_action_recommendations`, portfolio orders,
+or Dhan/broker state. See [`docs/operator_ui.md`](operator_ui.md).
 
 Dhan cache health also reports whether a non-interactive refresh path is ready. `auth_refresh_ready=false` with `auto_login_configured=true` usually means `CDP_ENDPOINT` is configured but Chrome remote debugging is not reachable; Health fix hints put `scripts/start_chrome_cdp.sh` before the Dhan refresh command in this case. Dhan auto-login is intentionally fail-hard when Chrome/CDP is unavailable. Run that Chrome CDP session first, then run `python -m data.dhanlive.auth_cli ensure --auto-login`, then rerun `all_advisory.sh`. If the Dhan page is reachable but slow between mobile, TOTP, PIN, and redirect steps, tune `DHAN_AUTO_LOGIN_STEP_TIMEOUT_MS`.
 
@@ -553,7 +537,7 @@ Operational guardrails:
 - Logs, prompts, stdout, and last Codex messages are written to `logs/analysis_agents/`.
 - It fails closed on Codex errors and is prompted to stop instead of editing broker execution, destructive DB/data cleanup, credential-dependent work, or unclear production-safety changes.
 - After each cycle, review `docs/analysis_agent_board.md`, `todo.md`, `git diff`, and the validation lines before running another cycle.
-- Manual Review follow-up: open `/manual-review` and `/wait-signals` in the operator UI after cycles that touch Manual Review, wait signals, action policy, or health. Confirm new items are understandable and not duplicated before accepting the slice.
+- Manual Review follow-up: query `/api/manual-review` and `/api/wait-signals` after cycles that touch Manual Review, wait signals, action policy, or health. Confirm new items are understandable and not duplicated before accepting the slice. (These no longer have dedicated UI pages; the endpoints remain.)
 
 ## Advisory, Watcher, Wait Signal, And Manual Review Boundaries
 
@@ -565,10 +549,10 @@ Use this table when deciding whether to run a full advisory pass, rely on watche
 | Watchers | `./all_watchers.sh` cron or loop during market hours | Active watchlist names, open positions, recent OHLCV, news, announcements, wait signals, context overlays, persisted watcher cursors | Watch alerts, fresh source rows, durable `CONTEXT_OVERLAY_WATCH` rows, wait-signal matches, signal-refresh rows, trace summaries, operator snapshot | Fast operator visibility for fresh evidence, context-watch intake, and per-symbol action/evidence changes | Replace the full cross-sectional advisory, recompute authoritative portfolio allocation, or submit orders |
 | Fast signal refresh | Watcher router or `python -m advisory.signal_refresh ...` | Latest consolidated action, lifecycle/rebalance rows, event-policy rows, matched wait signals for one symbol, and router price/news/announcement trigger context when available | `advisory_signal_refresh_actions`, trace rows, materialized trace summaries | Show whether a symbol-level signal changed, created a wait-match action, matched a review-only stop/entry watcher trigger, or only refreshed evidence, including previous action and action-changed trace fields | Run full allocation/risk sizing across the universe or mutate authoritative portfolio rows |
 | Fast action consolidation | `python -m advisory.action_recommender --date YYYY-MM-DD --format text` when `recommendation_diagnostics` prints an action-refresh command | Recent review-only signal-refresh rows plus existing advisory/action context | One consolidated `advisory_action_recommendations` row per affected symbol plus action-conflict/trace audit rows | Make fresh watcher/router/context evidence visible in the Action Queue as `WATCH`, `REDUCE_EXPOSURE_REVIEW`, `TIGHTEN_STOP`, or `MANUAL_REVIEW` without rerunning the long advisory pipeline | Create BUY/SELL broker authority, recompute risk sizing, mutate portfolio rows, or replace full advisory reconciliation |
-| Execution Approvals | `/execution-approvals` or `/api/execution/approvals` after dry-run execution previews exist | Latest `advisory_execution_orders` rows, execution safety contracts, audit-only approval decisions, broker order-state reads when reconciliation is requested, historical execution evidence rows when evidence review is requested, and current planned rows when live-submit preflight is requested | Optional audit rows in `advisory_execution_approval_decisions`; optional safety-contract update to `operator_approval_status=approved` after latest `approve_dry_run` audit; optional reconciliation/fill persistence through `/api/execution/reconcile` with `confirm=true`; optional evidence review rows in `advisory_execution_evidence_reviews`; optional live-allowance rows in `advisory_execution_live_allowance_reviews` | Show missing operator approval, broker reconciliation, live-evidence checklist, live-submission, and dry-run blockers; record review intent; mark operator approval status after reviewed audit; preview or persist broker reconciliation; mark evidence passed after enough reviewed cycles; set `live_submission_allowed=true` after all safety gates and exact phrase are satisfied; generate the read-only live-submit preflight token and manual CLI command | Bypass approval, bypass evidence checklist, submit orders from the UI/API, or treat reconciliation/evidence/live allowance/preflight as broker submission |
+| Execution Approvals | `/api/execution/approvals` after dry-run execution previews exist | Latest `advisory_execution_orders` rows, execution safety contracts, audit-only approval decisions, broker order-state reads when reconciliation is requested, historical execution evidence rows when evidence review is requested, and current planned rows when live-submit preflight is requested | Optional audit rows in `advisory_execution_approval_decisions`; optional safety-contract update to `operator_approval_status=approved` after latest `approve_dry_run` audit; optional reconciliation/fill persistence through `/api/execution/reconcile` with `confirm=true`; optional evidence review rows in `advisory_execution_evidence_reviews`; optional live-allowance rows in `advisory_execution_live_allowance_reviews` | Show missing operator approval, broker reconciliation, live-evidence checklist, live-submission, and dry-run blockers; record review intent; mark operator approval status after reviewed audit; preview or persist broker reconciliation; mark evidence passed after enough reviewed cycles; set `live_submission_allowed=true` after all safety gates and exact phrase are satisfied; generate the read-only live-submit preflight token and manual CLI command | Bypass approval, bypass evidence checklist, submit orders from the UI/API, or treat reconciliation/evidence/live allowance/preflight as broker submission |
 | Regime Review | `python -m advisory.regime_overlay` creates proposals; `/regime-overlays` records decisions | Base market regime, market context, macro features, recent news, announcement-event counts, proposed rules | `advisory_regime_overlay_proposals` and `advisory_regime_overlay_decisions` | Approve a regime overlay for testing, promote it to a review-rule candidate, reject it, or request more evidence | Directly relax market gates, change sizing, create actions, mutate portfolio rows, or submit broker orders |
 | Wait signals | Playbook action plans, Manual Review `watch_for_event`, or `python -m advisory.wait_signals ...` | Typed wait conditions plus price/news/announcement evidence | `advisory_wait_signals` and `advisory_wait_signal_matches` | Record that a future condition is active, matched, expired, or closed | Trade, approve actions, or change portfolio state by itself |
-| Manual Review | Operator decision in `/manual-review` or API decision endpoint | Active manual items, source row context, decision/effect table, optional wait-signal fields | `advisory_manual_review_decisions`; for `watch_for_event`, an active wait signal | Close or annotate a review item; create a watched condition; reopen matched Manual Review wait-signal follow-up work | Submit broker orders, directly mutate portfolio rows, or directly rewrite action recommendations |
+| Manual Review | Operator decision via the `/api/manual-review/decision` endpoint | Active manual items, source row context, decision/effect table, optional wait-signal fields | `advisory_manual_review_decisions`; for `watch_for_event`, an active wait signal | Close or annotate a review item; create a watched condition; reopen matched Manual Review wait-signal follow-up work | Submit broker orders, directly mutate portfolio rows, or directly rewrite action recommendations |
 
 Operator rule of thumb:
 
@@ -578,7 +562,7 @@ Operator rule of thumb:
 - `advisory.action_recommender` defaults to compact/log-safe samples. Use `--full-sample` only when you explicitly need raw `raw_context_json` and `recommendation_reason_json` payloads.
 - Use `/wait-signals` when the question is "which future evidence did we decide to wait for, and did it arrive?"
 - Use `/regime-overlays` when the question is "does this proposed macro/news regime layer deserve testing, rejection, or future rule implementation?"
-- Use `/manual-review` when the question is "what explicit operator decision should be recorded for this item?"
+- Use `/api/manual-review` when the question is "what explicit operator decision should be recorded for this item?"
 - If a matched wait signal looks actionable, review the evidence first, then run the relevant refresh/advisory flow. A wait match is evidence, not approval.
 
 Watcher trigger boundaries:
@@ -807,7 +791,7 @@ Behavior:
 - matches are written to `advisory_wait_signal_matches`
 - `./all_watchers.sh` runs a lightweight wait-signal match pass after each watcher cycle
 - signal refresh treats matched waits as evidence, not direct execution: negative waits can become `REDUCE_EXPOSURE_REVIEW`, positive waits become `WATCH`, and ambiguous waits become `MANUAL_REVIEW`
-- the Nuxt `/wait-signals` page shows active, matched, expired, and closed waits with source labels and latest evidence
+- the `/api/wait-signals` endpoint exposes active, matched, expired, and closed waits with source labels and latest evidence (no dedicated UI page)
 
 ### 6. Split refreshes
 
@@ -859,7 +843,7 @@ Manual Review is lane-filtered at the API boundary. `/api/manual-review` default
 
 Action Queue and Symbol Detail pages also show feature freshness. Consolidated action rows preserve the decision-time freshness snapshot, while the separate current panel shows present source state. The advisory pipeline also emits `feature_gate` summaries under `rules`, `risk`, `portfolio`, `lifecycle`, and `actions`, which tells you whether required `daily_ohlcv` / `technical_daily` inputs were blocked for the symbols being processed. Operator Health samples the latest action symbols and reports these stage gates in `feature_stage_gates`, fix hints, current blockers, and the trust gate. Symbol Detail shows `Stage Gate Effects`, which explains the concrete row-level impact when available: watch downgrade, review-only allocation, deferred capital, lifecycle warning, or final action downgrade. Blocked `rules` gates move immediate `PASS_NOW` candidates to `WATCH_EVENT`; blocked `risk` gates move automatic allocations to `review_manual`; blocked `portfolio` gates defer approved/trimmed capital; blocked lifecycle gates add warnings without suppressing exit/risk-reduction actions; blocked final `BUY` or `BUY_MORE` rows become `MANUAL_REVIEW`, review-only/no-broker-execution. Action consolidation also downgrades broker-capable winners to `MANUAL_REVIEW` when company/Dhan identity is missing; Health still reports active identity coverage gaps for visibility and repair. Execution dry-run previews add a final guard for older or non-standard broker-capable action rows: unresolved Dhan identity becomes `submit_blocked` with `broker_identity_status=failed` in the execution safety contract and an execution fallback telemetry row. The Action Queue execution section also shows the portfolio handoff boundary when present: `PLANNED_ENTRY` versus non-entry state, required entry evidence, broker-direct block status, and transition-contract issues. Each action-table order preview also carries `order_intent_lineage`, so an operator can trace the order back to the action row, reason-contract summary/status, risk sizing, stop/target levels, and approval/reconciliation gates before any live broker handoff. Live submission additionally needs an order-set-specific confirmation token, so a token from another same-day batch cannot approve a different symbol/quantity set.
 
-For cross-step debugging, use the Nuxt `/operator-journey` page. It is backed by the read-only `/api/operator-journey` endpoint and stitches manual-review decisions, wait signals, wait-signal matches, signal-refresh rows, action recommendations, portfolio rows, and execution previews into stage buckets plus a single newest-first timeline. Use filters such as `symbol`, `item_id`, or `unique_id` to narrow the journey.
+For cross-step debugging, query the read-only `/api/operator-journey` endpoint (the dedicated UI page was retired). It stitches manual-review decisions, wait signals, wait-signal matches, signal-refresh rows, action recommendations, portfolio rows, and execution previews into stage buckets plus a single newest-first timeline. Use filters such as `symbol`, `item_id`, or `unique_id` to narrow the journey.
 
 Slow API and snapshot operations are recorded under `logs/performance/`:
 
@@ -935,7 +919,7 @@ NUXT_PUBLIC_API_BASE=http://127.0.0.1:8765 npm run dev
 
 Static `live_dashboard/` generation is deprecated. The frontend reads current state directly from `advisory.api.app`, so cron no longer runs the legacy static dashboard generator.
 
-Use the Decision Trace page when you need to understand why a symbol changed action or why an event did not change the action. It reads normalized trace summaries from:
+Use the per-symbol detail page (`/symbols/{symbol}`), the per-symbol "why" drill-in, or the `/api/symbols/{symbol}/trace` endpoint when you need to understand why a symbol changed action or why an event did not change the action. They read normalized trace summaries from:
 
 ```sh
 python -m advisory.symbol_trace --symbol RELIANCE

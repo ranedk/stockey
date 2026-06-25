@@ -457,8 +457,7 @@ Operator health and logs:
 - `python -m advisory.operator_smoke` is the compact read-only preflight for DB/API/frontend/freshness/identity/signal-quality/cron trust. Use `python -m advisory.operator_health --skip-dhan` when you need the full detailed diagnostic payload.
 - Smoke output truncates long nested details and bounds visible fix hints/current blockers by default. Tune `OPERATOR_SMOKE_COMPACT_LIST_LIMIT` and `OPERATOR_SMOKE_COMPACT_STRING_CHARS` only if the Operations page needs more context.
 - It also checks local operator API latency and Dhan cached-token expiry metadata without initiating broker login.
-- `fix_hints` are emitted in the health payload and rendered at the top of the Nuxt Data Health page.
-- The Data Health page has filters for `All`, `Errors`, `Warnings`, `Recovered`, and `OK`.
+- `fix_hints` are emitted in the health payload and surfaced in the Nuxt Health hub (`/health-hub`).
 - Recovered manual interrupts are detected by comparing mapped output table timestamps against the interrupted log timestamp.
 
 Bootstrap note:
@@ -836,7 +835,7 @@ python -m advisory.decision_trace --unique-id <event-id>
 ./all_frontend.sh
 ```
 
-Use the Nuxt Decision Trace page for readable stage cards. The raw CLI commands are useful when debugging DB rows or API responses.
+Use the per-symbol detail page (`/symbols/{symbol}`) or the `/api/symbols/{symbol}/trace` endpoint for readable stage cards. The raw CLI commands are useful when debugging DB rows or API responses.
 
 Routing constraints:
 

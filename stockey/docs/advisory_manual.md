@@ -108,7 +108,7 @@ Trace inspection now has three operator paths:
 
 - `python -m advisory.symbol_trace --symbol RELIANCE`
 - `python -m advisory.decision_trace --unique-id <event-id>`
-- `./all_frontend.sh`, then open the Decision Trace page in the Nuxt app
+- `./all_frontend.sh`, then open the per-symbol detail page (`/symbols/{symbol}`) in the Nuxt app
 
 Decision Trace currently shows event evaluation, adversarial review, technical state, risk sizing, macro context, exchange-event context, portfolio allocation, lifecycle, rebalance, consolidated action conflicts, execution planning, execution safety, live submission, and reconciliation.
 
