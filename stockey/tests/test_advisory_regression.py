@@ -63613,6 +63613,46 @@ def test_prompt_registry_includes_llm_decision_policy_review_only():
     assert row["broker_execution_allowed"] is False
 
 
+def test_llm_decision_runner_batches_review_only_decisions():
+    from advisory import llm_decision_runner as runner
+
+    packet = _decision_packet()
+
+    def buy_llm(prompt, *, response_model, model, system_prompt):
+        return response_model(action="BUY", conviction=1.0, cited_dimensions=["technical_confirmation"], claims_hypothesis_match=True, rationale="ok")
+
+    summary = runner.run_daily_decisions(
+        "2026-06-23",
+        symbols=["ABC", "XYZ"],
+        capital=1_000_000.0,
+        llm_caller=buy_llm,
+        packet_loader=lambda sym, asof: packet,
+        price_atr_loader=lambda sym, asof: (100.0, 3.0),
+        persist=False,
+    )
+    assert summary["universe"] == 2 and summary["decisions"] == 2
+    assert summary["by_action"] == {"BUY": 2}
+    assert summary["grounded_for_live"] == 2
+    assert summary["broker_execution_allowed"] is False  # review-only, never trades
+    assert summary["persisted"] == 0
+
+
+def test_llm_decision_runner_one_bad_symbol_does_not_abort_batch():
+    from advisory import llm_decision_runner as runner
+
+    def loader(sym, asof):
+        if sym == "BAD":
+            raise RuntimeError("packet load failed")
+        return _decision_packet()
+
+    summary = runner.run_daily_decisions(
+        "2026-06-23", symbols=["BAD", "GOOD"], use_llm=False,
+        packet_loader=loader, price_atr_loader=lambda sym, asof: (100.0, 3.0),
+    )
+    assert summary["decisions"] == 1 and summary["error_count"] == 1
+    assert summary["errors"][0]["symbol"] == "BAD"
+
+
 def test_llm_decision_store_builds_review_only_rows_with_provenance():
     from advisory import llm_decision_policy as policy
     from advisory import llm_decision_store as store
