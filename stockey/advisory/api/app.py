@@ -49,10 +49,6 @@ from advisory.manual_review_state import (
     validate_decision,
 )
 from advisory.operator_health import build_operator_health, check_screener_failures
-from advisory.operator_portfolio import apply_operator_action as apply_operator_portfolio_action
-from advisory.operator_portfolio import build_portfolio_payload as build_operator_portfolio_state_payload
-from advisory.operator_portfolio import build_recommendations_payload as build_operator_portfolio_recommendations_payload
-from advisory.operator_portfolio import reset_operator_portfolio
 from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
 from advisory.operator_snapshot import load_operator_snapshot
 from advisory.operator_snapshot import load_operator_snapshot_sections
@@ -413,25 +409,6 @@ class OperatorPortfolioResponse(OperatorApiResponseModel):
     lifecycle: list[dict[str, Any]] = Field(default_factory=list)
     pagination: dict[str, Any] = Field(default_factory=dict)
     meta: dict[str, Any] = Field(default_factory=dict)
-
-
-class OperatorPaperPortfolioResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    status: str
-    recommendations: list[dict[str, Any]] = Field(default_factory=list)
-    positions: list[dict[str, Any]] = Field(default_factory=list)
-    open_positions: list[dict[str, Any]] = Field(default_factory=list)
-    closed_positions: list[dict[str, Any]] = Field(default_factory=list)
-    summary: dict[str, Any] = Field(default_factory=dict)
-
-
-class OperatorPaperPortfolioWriteResponse(OperatorApiResponseModel):
-    status: str
-    event: dict[str, Any] | None = None
-    portfolio: dict[str, Any] = Field(default_factory=dict)
-    boundary: dict[str, Any] = Field(default_factory=dict)
-    deleted_rows: int | None = None
-    table: str | None = None
 
 
 class OperatorWatchlistResponse(OperatorApiResponseModel):
@@ -11367,22 +11344,6 @@ def create_app():
     @app.get("/api/actions/detail", response_model=OperatorDetailResponse)
     def action_detail(symbol: str | None = None, unique_id: str | None = None, setup_id: str | None = None, asof_date: str | None = None):
         return _guard(build_action_detail_payload, route="/api/actions/detail", symbol=symbol, unique_id=unique_id, setup_id=setup_id, asof_date=asof_date)
-
-    @app.get("/api/operator-portfolio/recommendations", response_model=OperatorPaperPortfolioResponse)
-    def operator_portfolio_recommendations(limit: int = Query(default=100, ge=1, le=500), symbol: str | None = None):
-        return _guard(build_operator_portfolio_recommendations_payload, route="/api/operator-portfolio/recommendations", limit=limit, symbol=symbol)
-
-    @app.get("/api/operator-portfolio", response_model=OperatorPaperPortfolioResponse)
-    def operator_portfolio_state():
-        return _guard(build_operator_portfolio_state_payload, route="/api/operator-portfolio")
-
-    @app.post("/api/operator-portfolio/action", response_model=OperatorPaperPortfolioWriteResponse)
-    def operator_portfolio_action(payload: dict[str, Any] = Body(...)):
-        return _guard(apply_operator_portfolio_action, route="/api/operator-portfolio/action", **payload)
-
-    @app.post("/api/operator-portfolio/reset", response_model=OperatorPaperPortfolioWriteResponse)
-    def operator_portfolio_reset(payload: dict[str, Any] = Body(default_factory=dict)):
-        return _guard(reset_operator_portfolio, route="/api/operator-portfolio/reset", confirm=bool(payload.get("confirm")))
 
     @app.get("/api/action-conflict-rules", response_model=ActionConflictRulesResponse)
     def action_conflict_rules():
