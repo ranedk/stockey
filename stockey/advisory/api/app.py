@@ -22,32 +22,15 @@ from advisory.config_change_assistant import build_event_policy_review_rule_prev
 from advisory.cron_status import build_cron_status
 from advisory.current_prices import load_current_prices
 from advisory.decision_trace import ensure_trace_tables, load_event_trace, load_symbol_trace
-from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE
+from advisory.decision_trace import ACTION_CONFLICTS_TABLE, ACTION_CONFLICT_RULES_TABLE, MANUAL_REVIEW_DECISIONS_TABLE
 from advisory.event_model_artifact_store import build_artifact_manifest
 from advisory.event_model_promotion_check import build_promotion_check
 from advisory.feature_freshness import build_feature_freshness_contract, build_required_feature_freshness_summaries, evaluate_stage_feature_gate
 from advisory.hypothesis_engine import create_hypothesis, latest_promotion_audits, load_action_plans, load_hypotheses, load_matches, preview_hypothesis_payload, run_hypothesis_scan, run_promotion_audit, update_hypothesis
 from advisory.identity_issues import IDENTITY_ISSUES_TABLE, load_open_identity_issues, resolve_open_identity_issues
-from advisory.event_policy import TABLE_NAME as EVENT_POLICY_TABLE
-from advisory.event_policy_evaluator import SUMMARY_TABLE as EVENT_POLICY_EVAL_SUMMARY_TABLE
-from advisory.event_policy_promotion import generate_promotion_review as generate_event_policy_promotion_review
-from advisory.event_policy_promotion import load_promotion_reviews as load_event_policy_promotion_reviews
-from advisory.event_policy_promotion import record_manual_decision as record_event_policy_manual_decision
-from advisory.execution_engine import EXECUTION_TABLE, build_live_execution_confirmation_token, live_execution_row_freshness_blocker, load_recon_targets, persist_reconciliation, reconcile_live_orders
 from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.live_dashboard import DEFAULT_OUTPUT_DIR, build_live_dashboard_payload
 from advisory.market_context import load_latest_market_context
-from advisory.manual_review_state import (
-    ALLOWED_DECISIONS as MANUAL_REVIEW_ALLOWED_DECISIONS,
-    CLOSING_DECISIONS as MANUAL_REVIEW_CLOSING_DECISIONS,
-    MANUAL_REVIEW_DECISIONS_TABLE,
-    apply_decision_side_effects,
-    build_decision_row,
-    decision_effect_payload,
-    runtime_state_for_decision,
-    runtime_state_payload,
-    validate_decision,
-)
 from advisory.operator_health import build_operator_health, check_screener_failures
 from advisory.operator_snapshot import DEFAULT_MAX_AGE_SECONDS as OPERATOR_SNAPSHOT_MAX_AGE_SECONDS
 from advisory.operator_snapshot import load_operator_snapshot
@@ -57,7 +40,6 @@ from advisory.performance_slowlog import update_slow_issue_status
 from advisory.prompt_registry import build_prompt_registry_payload
 from advisory.recommendation_diagnostics import build_recommendation_diagnostics
 from advisory.regime_overlay import load_regime_overlay_decisions, load_regime_overlay_reviews, record_regime_overlay_decision
-from advisory.portfolio_engine import PORTFOLIO_TABLE
 from advisory.research_ledger import LEDGER_TABLE as RESEARCH_LEDGER_TABLE
 from advisory.research_ledger import list_runs as list_research_ledger_runs
 from advisory.screener_coverage import build_screener_coverage_payload
@@ -69,24 +51,12 @@ from advisory.signal_quality_promotion import load_promotion_reviews as load_sig
 from advisory.signal_quality_promotion import record_manual_decision as record_signal_quality_manual_decision
 from advisory.operator_smoke import build_operator_smoke
 from advisory.position_lifecycle import POLICY_CHANGES_TABLE as LIFECYCLE_POLICY_CHANGES_TABLE
-from advisory.setup_registry import load_ts_forecast_review_rules
 from advisory.superseded_failures import cleanup_superseded_failures
 from advisory.technical_threshold_calibration import EVALUATIONS_TABLE as TECHNICAL_CALIBRATION_EVALUATIONS_TABLE
 from advisory.technical_threshold_calibration import SUMMARY_TABLE as TECHNICAL_CALIBRATION_SUMMARY_TABLE
 from advisory.technical_threshold_promotion import generate_promotion_review, load_promotion_reviews, record_manual_decision
 from advisory.trace_summary_store import DEFAULT_LIMIT as TRACE_SUMMARY_DEFAULT_LIMIT
 from advisory.trace_summary_store import load_summary as load_materialized_trace_summary
-from advisory.ts_forecast_promotion_check import build_promotion_check as build_ts_forecast_promotion_check
-from advisory.ts_forecast_promotion_check import DEFAULT_MAX_EXIT_CONFLICT_RATE as TS_PROMOTION_DEFAULT_MAX_EXIT_CONFLICT_RATE
-from advisory.ts_forecast_promotion_check import DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN as TS_PROMOTION_DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN
-from advisory.ts_forecast_promotion_check import DEFAULT_MIN_DISTINCT_DATES as TS_PROMOTION_DEFAULT_MIN_DISTINCT_DATES
-from advisory.ts_forecast_promotion_check import DEFAULT_MIN_EVALUATED_TRADES as TS_PROMOTION_DEFAULT_MIN_EVALUATED_TRADES
-from advisory.ts_forecast_promotion_check import DEFAULT_MIN_LIFT_VS_MOMENTUM as TS_PROMOTION_DEFAULT_MIN_LIFT_VS_MOMENTUM
-from advisory.ts_forecast_promotion_check import DEFAULT_MIN_SYMBOLS as TS_PROMOTION_DEFAULT_MIN_SYMBOLS
-from advisory.ts_forecast_promotion_check import DEFAULT_MIN_WIN_RATE as TS_PROMOTION_DEFAULT_MIN_WIN_RATE
-from advisory.ts_forecast_promotion import generate_promotion_review as generate_ts_forecast_promotion_review
-from advisory.ts_forecast_promotion import load_promotion_reviews as load_ts_forecast_promotion_reviews
-from advisory.ts_forecast_promotion import record_manual_decision as record_ts_forecast_manual_decision
 from advisory.wait_signals import WAIT_SIGNAL_MATCHES_TABLE, WAIT_SIGNALS_TABLE, load_wait_signal_matches, load_wait_signals, match_wait_signals
 from data.screenerin.ad_hoc_query import build_raw_screen_url, companies_preview, fetch_ad_hoc_payload, slugify as screener_slugify
 from data.screenerin.query_validation import validate_screener_query
@@ -460,17 +430,6 @@ class RegimeOverlayDecisionResponse(OperatorApiResponseModel):
     note: str | None = None
 
 
-class OperatorEventsResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    asof_date: str | None = None
-    snapshot: dict[str, Any] = Field(default_factory=dict)
-    snapshot_warning: dict[str, Any] | None = None
-    events: list[dict[str, Any]] = Field(default_factory=list)
-    operator_feed: list[dict[str, Any]] = Field(default_factory=list)
-    alerts: list[dict[str, Any]] = Field(default_factory=list)
-    pagination: dict[str, Any] = Field(default_factory=dict)
-    meta: dict[str, Any] = Field(default_factory=dict)
 
 
 class SignalRefreshResponse(OperatorApiResponseModel):
@@ -481,15 +440,6 @@ class SignalRefreshResponse(OperatorApiResponseModel):
     meta: dict[str, Any] = Field(default_factory=dict)
 
 
-class OperatorJourneyResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    filters: dict[str, Any] = Field(default_factory=dict)
-    summary: dict[str, Any] = Field(default_factory=dict)
-    stages: dict[str, list[dict[str, Any]]] = Field(default_factory=dict)
-    timeline: list[dict[str, Any]] = Field(default_factory=list)
-    skipped_sources: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class OperatorHealthDetailsResponse(OperatorApiResponseModel):
@@ -611,27 +561,8 @@ class EventModelPromotionCheckResponse(OperatorApiResponseModel):
     notes: list[str] = Field(default_factory=list)
 
 
-class TsForecastPromotionCheckResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    decision: str | None = None
-    ready_for_operator_review: bool | None = None
-    promotion_mode: str | None = None
-    scorecard: dict[str, Any] = Field(default_factory=dict)
-    evidence: dict[str, Any] = Field(default_factory=dict)
-    notes: list[str] = Field(default_factory=list)
 
 
-class TsForecastReviewRulesResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    config_path: str | None = None
-    rules: list[dict[str, Any]] = Field(default_factory=list)
-    issues: list[dict[str, Any]] = Field(default_factory=list)
-    summary: dict[str, Any] = Field(default_factory=dict)
-    operator_boundary: dict[str, Any] = Field(default_factory=dict)
 
 
 class RecommendationDiagnosticsResponse(OperatorApiResponseModel):
@@ -674,12 +605,6 @@ class ResearchLedgerResponse(OperatorApiResponseModel):
     operator_boundary: dict[str, Any] = Field(default_factory=dict)
 
 
-class ManualReviewResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    summary: dict[str, Any] = Field(default_factory=dict)
-    items: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class IdentityIssuesResponse(OperatorApiResponseModel):
@@ -704,19 +629,6 @@ class IdentityIssueResolutionResponse(OperatorApiResponseModel):
     note: str | None = None
 
 
-class ManualReviewDecisionResponse(OperatorApiResponseModel):
-    status: str
-    api_schema: OperatorApiSchemaModel
-    decided_at: str | None = None
-    item_id: str
-    decision: str
-    closing_decision: bool
-    next_state: str | None = None
-    creates_wait_signal: bool | None = None
-    wait_signal: dict[str, Any] | None = None
-    manual_review_state: dict[str, Any] | None = None
-    decision_effect: dict[str, Any] | None = None
-    note: str | None = None
 
 
 class ActionConflictRulesResponse(OperatorApiResponseModel):
@@ -737,93 +649,18 @@ class ActionConflictRuleWriteResponse(OperatorApiResponseModel):
     note: str | None = None
 
 
-class ExecutionApprovalsResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    summary: dict[str, Any] = Field(default_factory=dict)
-    rows: list[dict[str, Any]] = Field(default_factory=list)
-    operator_boundary: dict[str, Any] = Field(default_factory=dict)
-    skipped: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class ExecutionApprovalDecisionResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    decision: dict[str, Any] = Field(default_factory=dict)
-    operator_boundary: dict[str, Any] = Field(default_factory=dict)
-    note: str | None = None
 
 
-class ExecutionApprovalContractUpdateResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    updated_row: dict[str, Any] = Field(default_factory=dict)
-    safety_contract: dict[str, Any] = Field(default_factory=dict)
-    operator_boundary: dict[str, Any] = Field(default_factory=dict)
-    note: str | None = None
 
 
-class ExecutionReconciliationRunResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    mode: str
-    dry_run: bool
-    summary: dict[str, Any] = Field(default_factory=dict)
-    orders: list[dict[str, Any]] = Field(default_factory=list)
-    fills: list[dict[str, Any]] = Field(default_factory=list)
-    targets: list[dict[str, Any]] = Field(default_factory=list)
-    operator_boundary: dict[str, Any] = Field(default_factory=dict)
-    note: str | None = None
 
 
-class ExecutionEvidenceReviewResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    mode: str
-    dry_run: bool
-    decision: str
-    review: dict[str, Any] = Field(default_factory=dict)
-    evidence: dict[str, Any] = Field(default_factory=dict)
-    updated_row: dict[str, Any] = Field(default_factory=dict)
-    safety_contract: dict[str, Any] = Field(default_factory=dict)
-    operator_boundary: dict[str, Any] = Field(default_factory=dict)
-    note: str | None = None
 
 
-class ExecutionLiveAllowanceResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    mode: str
-    dry_run: bool
-    decision: str
-    allowance: dict[str, Any] = Field(default_factory=dict)
-    blockers: list[str] = Field(default_factory=list)
-    updated_row: dict[str, Any] = Field(default_factory=dict)
-    safety_contract: dict[str, Any] = Field(default_factory=dict)
-    operator_boundary: dict[str, Any] = Field(default_factory=dict)
-    note: str | None = None
 
 
-class ExecutionLiveSubmitPreflightResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    decision: str
-    summary: dict[str, Any] = Field(default_factory=dict)
-    expected_live_token: str | None = None
-    cli_command_preview: str | None = None
-    env_required: dict[str, Any] = Field(default_factory=dict)
-    blockers: list[str] = Field(default_factory=list)
-    planned_orders: list[dict[str, Any]] = Field(default_factory=list)
-    skipped_orders: list[dict[str, Any]] = Field(default_factory=list)
-    operator_boundary: dict[str, Any] = Field(default_factory=dict)
-    note: str | None = None
 
 
 class WaitSignalsResponse(OperatorApiResponseModel):
@@ -867,19 +704,8 @@ class OperatorDetailResponse(OperatorApiResponseModel):
     policy_change_count: int = 0
 
 
-class EventDetailResponse(OperatorDetailResponse):
-    pass
 
 
-class EventTraceResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel | None = None
-    unique_id: str | None = None
-    processing: list[dict[str, Any]] = Field(default_factory=list)
-    traces: list[dict[str, Any]] = Field(default_factory=list)
-    steps: list[dict[str, Any]] = Field(default_factory=list)
-    action_conflicts: list[dict[str, Any]] = Field(default_factory=list)
-    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class TraceSummaryResponse(OperatorApiResponseModel):
@@ -929,20 +755,8 @@ class SignalQualityPromotionReviewsResponse(OperatorApiResponseModel):
     pagination: dict[str, Any] = Field(default_factory=dict)
 
 
-class EventPolicyPromotionReviewsResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    reviews: list[dict[str, Any]] = Field(default_factory=list)
-    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
-class TsForecastPromotionReviewsResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    reviews: list[dict[str, Any]] = Field(default_factory=list)
-    pagination: dict[str, Any] = Field(default_factory=dict)
 
 
 class PromotionReviewResponse(OperatorApiResponseModel):
@@ -1076,20 +890,8 @@ class ScreenerFailuresResponse(OperatorApiResponseModel):
     operator_boundary: dict[str, Any] = Field(default_factory=dict)
 
 
-class EventPolicyResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    asof_date: str | None = None
-    summary: dict[str, Any] = Field(default_factory=dict)
-    rows: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class EventPolicyEvaluationResponse(OperatorApiResponseModel):
-    generated_at: str | None = None
-    api_schema: OperatorApiSchemaModel
-    status: str
-    summary: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class HypothesesResponse(OperatorApiResponseModel):
@@ -1867,1190 +1669,58 @@ def _execution_approval_blockers(row: dict[str, Any], contract: dict[str, Any]) 
     return list(dict.fromkeys(blockers))
 
 
-def _execution_readiness_checks(row: dict[str, Any], contract: dict[str, Any]) -> list[dict[str, Any]]:
-    def check(key: str, label: str, passed: bool, detail: str, *, required: bool = True) -> dict[str, Any]:
-        return {
-            "key": key,
-            "label": label,
-            "status": "passed" if passed else ("blocked" if required else "not_required"),
-            "required": bool(required),
-            "passed": bool(passed),
-            "detail": detail,
-        }
-
-    status = str(row.get("execution_status") or "").strip().lower()
-    approval_status = str(contract.get("operator_approval_status") or "").strip().lower()
-    reconciliation_status = str(contract.get("broker_reconciliation_status") or "").strip().lower()
-    evidence_status = str(contract.get("live_evidence_status") or "").strip().lower()
-    post_allowance_status = str(contract.get("post_live_allowance_approval_status") or "").strip().lower()
-    evidence_runs = pd.to_numeric(contract.get("live_evidence_successful_runs"), errors="coerce")
-    evidence_min = pd.to_numeric(contract.get("live_evidence_min_successful_runs"), errors="coerce")
-    quantity = pd.to_numeric(row.get("quantity"), errors="coerce")
-    reference_price = pd.to_numeric(row.get("reference_price"), errors="coerce")
-    security_id = pd.to_numeric(row.get("security_id"), errors="coerce")
-    if pd.isna(evidence_runs):
-        evidence_runs = 0
-    if pd.isna(evidence_min):
-        evidence_min = 3
-    identity_required = bool(contract.get("broker_identity_required", True))
-    identity_resolved = bool(contract.get("broker_identity_resolved")) or pd.notna(security_id)
-    approval_required = bool(contract.get("operator_approval_required", True))
-    reconciliation_required = bool(contract.get("broker_reconciliation_required", True))
-    evidence_required = bool(contract.get("live_evidence_required", True))
-    post_allowance_required = bool(contract.get("post_live_allowance_approval_required", bool(contract.get("live_allowance_allowed_at"))))
-    return [
-        check("dry_run_row", "Dry-run execution row", status == "planned", f"Execution status is {status or 'missing'}."),
-        check("broker_identity", "Dhan/broker identity", (not identity_required) or identity_resolved, f"Identity status is {contract.get('broker_identity_status') or ('resolved' if identity_resolved else 'missing')}.", required=identity_required),
-        check("quantity", "Positive quantity", pd.notna(quantity) and float(quantity) > 0, f"Quantity is {row.get('quantity') or 'missing'}."),
-        check("reference_price", "Positive reference price", pd.notna(reference_price) and float(reference_price) > 0, f"Reference price is {row.get('reference_price') or 'missing'}."),
-        check("operator_approval", "Operator approval", (not approval_required) or approval_status in {"approved"}, f"Approval status is {approval_status or 'missing'}.", required=approval_required),
-        check("broker_reconciliation", "Broker reconciliation", (not reconciliation_required) or reconciliation_status in {"passed", "ok", "reconciled"}, f"Reconciliation status is {reconciliation_status or 'not_run'}.", required=reconciliation_required),
-        check("live_evidence", "Repeated dry-run evidence", (not evidence_required) or (evidence_status in {"passed", "ready", "approved"} and int(evidence_runs) >= int(evidence_min)), f"Evidence status is {evidence_status or 'missing'} with {int(evidence_runs)}/{int(evidence_min)} successful run(s).", required=evidence_required),
-        check("live_allowance", "Final live allowance", bool(contract.get("live_submission_allowed")), f"Live allowance is {bool(contract.get('live_submission_allowed'))}."),
-        check("post_live_allowance_approval", "Fresh approval after live allowance", (not post_allowance_required) or post_allowance_status in {"approved", "operator_approved"}, f"Post-allowance approval status is {post_allowance_status or 'missing'}.", required=post_allowance_required),
-    ]
 
 
-def _execution_approval_key(row: dict[str, Any]) -> str:
-    return ":".join(
-        [
-            _text(row.get("asof_date")) or "",
-            _text(row.get("published_on")) or "",
-            _text(row.get("setup_id")) or "",
-            (_text(row.get("symbol")) or "").upper(),
-            _text(row.get("unique_id")) or "",
-        ]
-    )
 
 
-def load_latest_execution_approval_decisions(*, limit: int = 1000) -> dict[str, dict[str, Any]]:
-    if not _table_exists(EXECUTION_APPROVAL_DECISIONS_TABLE):
-        return {}
-    df = sql_to_df(
-        f"""
-        SELECT DISTINCT ON (asof_date, published_on, setup_id, symbol, unique_id) *
-        FROM {EXECUTION_APPROVAL_DECISIONS_TABLE}
-        ORDER BY asof_date, published_on, setup_id, symbol, unique_id, decided_at DESC
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        retries=3,
-    )
-    out: dict[str, dict[str, Any]] = {}
-    for row in _records(df):
-        row["item_snapshot"] = _jsonish(row.get("item_snapshot_json"))
-        row["safety_contract"] = _jsonish(row.get("safety_contract_json"))
-        key = _execution_approval_key(row)
-        if key:
-            out[key] = row
-    return out
 
 
-def _execution_approval_row(row: dict[str, Any]) -> dict[str, Any]:
-    contract = _execution_safety_contract_from_row(row) or {
-        "operator_approval_required": True,
-        "operator_approval_status": "missing",
-        "broker_reconciliation_required": True,
-        "broker_reconciliation_status": "not_run",
-        "live_evidence_required": True,
-        "live_evidence_status": "missing",
-        "live_evidence_successful_runs": 0,
-        "live_evidence_min_successful_runs": 3,
-        "live_submission_allowed": False,
-        "source": "missing_execution_safety_contract",
-        "issues": ["Execution safety contract is missing."],
-    }
-    blockers = _execution_approval_blockers(row, contract)
-    readiness_checks = _execution_readiness_checks(row, contract)
-    return {
-        "asof_date": _ts(row.get("asof_date")),
-        "published_on": _ts(row.get("published_on")),
-        "setup_id": _text(row.get("setup_id")),
-        "symbol": _text(row.get("symbol")),
-        "unique_id": _text(row.get("unique_id")),
-        "correlation_id": _text(row.get("correlation_id")),
-        "transaction_type": _text(row.get("transaction_type")),
-        "quantity": _json_ready(row.get("quantity")),
-        "reference_price": _json_ready(row.get("reference_price")),
-        "estimated_order_value_inr": _json_ready(row.get("estimated_order_value_inr")),
-        "execution_status": _text(row.get("execution_status")),
-        "execution_reason": _text(row.get("execution_reason")),
-        "broker_order_status": _text(row.get("broker_order_status")),
-        "broker_order_id": _text(row.get("broker_order_id")),
-        "security_id": _json_ready(row.get("security_id")),
-        "reference_price_source": _text(row.get("reference_price_source")),
-        "reference_price_asof": _ts(row.get("reference_price_asof")),
-        "submitted_at": _ts(row.get("submitted_at")),
-        "broker_update_time": _ts(row.get("broker_update_time")),
-        "safety_contract": contract,
-        "blockers": blockers,
-        "readiness_checks": readiness_checks,
-        "readiness_summary": {
-            "required_count": sum(1 for item in readiness_checks if item.get("required")),
-            "passed_count": sum(1 for item in readiness_checks if item.get("required") and item.get("passed")),
-            "blocked_count": sum(1 for item in readiness_checks if item.get("required") and not item.get("passed")),
-        },
-        "approval_ready": not blockers and bool(contract.get("live_submission_allowed")),
-        "approval_key": _execution_approval_key(row),
-        "operator_action": (
-            "Review dry-run order, then keep blocked until an explicit approval-write workflow is implemented."
-            if blockers
-            else "Dry-run row has no visible blockers, but this endpoint is read-only and does not approve or submit orders."
-        ),
-    }
 
 
-def build_execution_approvals_payload(*, limit: int = 100, status: str | None = None) -> dict[str, Any]:
-    row_limit = _bounded_limit(limit, default=100, maximum=500)
-    skipped: list[dict[str, Any]] = []
-    if not _table_exists(EXECUTION_TABLE):
-        skipped.append({"source": EXECUTION_TABLE, "error": "missing_table"})
-        rows: list[dict[str, Any]] = []
-    else:
-        params: dict[str, Any] = {"limit": row_limit}
-        status_filter = _text(status)
-        status_clause = ""
-        if status_filter and status_filter.lower() != "all":
-            status_clause = "AND execution_status = %(status)s"
-            params["status"] = status_filter
-        df = sql_to_df(
-            f"""
-            SELECT *
-            FROM {EXECUTION_TABLE}
-            WHERE asof_date = (SELECT MAX(asof_date) FROM {EXECUTION_TABLE})
-              {status_clause}
-            ORDER BY
-                CASE execution_status
-                    WHEN 'planned' THEN 1
-                    WHEN 'submit_blocked' THEN 2
-                    WHEN 'submit_error' THEN 3
-                    WHEN 'reconcile_error' THEN 4
-                    ELSE 5
-                END,
-                published_on DESC NULLS LAST,
-                load_ts DESC NULLS LAST
-            LIMIT %(limit)s
-            """,
-            params=params,
-            retries=3,
-        )
-        rows = [_execution_approval_row(row) for row in _records(df)]
-    latest_decisions = load_latest_execution_approval_decisions(limit=max(row_limit * 5, 1000))
-    for row in rows:
-        latest_decision = latest_decisions.get(str(row.get("approval_key") or ""))
-        if latest_decision:
-            row["latest_operator_decision"] = _json_ready(latest_decision)
-    by_status: dict[str, int] = {}
-    blocked_count = 0
-    missing_approval_count = 0
-    missing_reconciliation_count = 0
-    live_allowed_count = 0
-    missing_evidence_count = 0
-    missing_post_live_allowance_approval_count = 0
-    for row in rows:
-        status_key = str(row.get("execution_status") or "unknown")
-        by_status[status_key] = by_status.get(status_key, 0) + 1
-        contract = row.get("safety_contract") if isinstance(row.get("safety_contract"), dict) else {}
-        if row.get("blockers"):
-            blocked_count += 1
-        if contract.get("operator_approval_required") and str(contract.get("operator_approval_status") or "").lower() != "approved":
-            missing_approval_count += 1
-        if contract.get("broker_reconciliation_required") and str(contract.get("broker_reconciliation_status") or "").lower() not in {"passed", "ok", "reconciled"}:
-            missing_reconciliation_count += 1
-        if contract.get("live_evidence_required", True) and str(contract.get("live_evidence_status") or "").lower() not in {"passed", "ready", "approved"}:
-            missing_evidence_count += 1
-        if contract.get("live_submission_allowed") is True:
-            live_allowed_count += 1
-        if (
-            contract.get("live_submission_allowed") is True
-            and bool(contract.get("post_live_allowance_approval_required", bool(contract.get("live_allowance_allowed_at"))))
-            and str(contract.get("post_live_allowance_approval_status") or "").strip().lower() not in {"approved", "operator_approved"}
-        ):
-            missing_post_live_allowance_approval_count += 1
-    source_warnings = _operator_source_warnings(rows, default_source=EXECUTION_TABLE, skipped=skipped)
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/execution/approvals", schema_name="execution_approvals", read_only=True),
-        "status": "ok",
-        "summary": {
-            "row_count": len(rows),
-            "by_status": by_status,
-            "blocked_count": blocked_count,
-            "missing_approval_count": missing_approval_count,
-            "missing_reconciliation_count": missing_reconciliation_count,
-            "missing_evidence_count": missing_evidence_count,
-            "live_allowed_count": live_allowed_count,
-            "missing_post_live_allowance_approval_count": missing_post_live_allowance_approval_count,
-            "filtered_status": _text(status) or "all",
-        },
-        "rows": rows,
-        "source_warnings": source_warnings,
-        "operator_boundary": {
-            "read_only": True,
-            "approves_execution": False,
-            "submits_broker_orders": False,
-            "mutates_execution_orders": False,
-            "requires_post_live_allowance_approval": True,
-            "note": "This endpoint is an execution approval workbench preview. It shows blockers but cannot approve or submit live orders. Live allowance still requires a fresh approval decision before live preflight or CLI submission can proceed.",
-        },
-        "skipped": skipped,
-    }
 
 
-def record_execution_approval_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    raw_decision = _text(payload.get("decision"))
-    decision = str(raw_decision or "").strip().lower()
-    if decision not in EXECUTION_APPROVAL_ALLOWED_DECISIONS:
-        raise ValueError(f"decision must be one of: {', '.join(sorted(EXECUTION_APPROVAL_ALLOWED_DECISIONS))}")
-    rationale = _text(payload.get("rationale"))
-    if not rationale:
-        raise ValueError("rationale is required")
-    item = payload.get("row") if isinstance(payload.get("row"), dict) else {}
-    contract = item.get("safety_contract") if isinstance(item.get("safety_contract"), dict) else {}
-    decided_at = pd.Timestamp.utcnow()
-    row_key = {
-        "asof_date": pd.to_datetime(payload.get("asof_date") or item.get("asof_date"), utc=True, errors="coerce"),
-        "published_on": pd.to_datetime(payload.get("published_on") or item.get("published_on"), utc=True, errors="coerce"),
-        "setup_id": _text(payload.get("setup_id")) or _text(item.get("setup_id")),
-        "symbol": (_text(payload.get("symbol")) or _text(item.get("symbol")) or "").upper(),
-        "unique_id": _text(payload.get("unique_id")) or _text(item.get("unique_id")),
-        "correlation_id": _text(payload.get("correlation_id")) or _text(item.get("correlation_id")),
-    }
-    missing = [key for key in ["asof_date", "published_on", "setup_id", "symbol", "unique_id"] if not _text(row_key.get(key))]
-    if missing:
-        raise ValueError(f"missing execution row identity fields: {', '.join(missing)}")
-    identity_payload = {key: _json_ready(value) for key, value in row_key.items()}
-    identity_payload["decision"] = decision
-    identity_payload["decided_at"] = decided_at.isoformat()
-    decision_id = "exec-approval:" + hashlib.sha256(json.dumps(identity_payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
-    decision_row = pd.DataFrame(
-        [
-            {
-                "decision_id": decision_id,
-                "decided_at": decided_at,
-                **row_key,
-                "decision": decision,
-                "operator_id": _text(payload.get("operator_id")),
-                "rationale": rationale,
-                "item_snapshot_json": json.dumps(_json_ready(item), ensure_ascii=False, default=str, sort_keys=True),
-                "safety_contract_json": json.dumps(_json_ready(contract), ensure_ascii=False, default=str, sort_keys=True),
-                "load_ts": decided_at,
-            }
-        ]
-    )
-    ensure_execution_approval_decisions_table()
-    upsert_to_db(
-        decision_row,
-        EXECUTION_APPROVAL_DECISIONS_TABLE,
-        unique_keys=["decision_id"],
-        timescaledb_column="decided_at",
-    )
-    decision_payload = _json_ready(decision_row.iloc[0].to_dict())
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/execution/approval-decision", schema_name="execution_approval_decision", read_only=False),
-        "status": "ok",
-        "decision": decision_payload,
-        "operator_boundary": {
-            "records_audit_only": True,
-            "mutates_execution_orders": False,
-            "updates_safety_contract": False,
-            "approves_live_submission": False,
-            "submits_broker_orders": False,
-        },
-        "note": "Execution approval decision recorded for audit only. Execution rows, safety contracts, reconciliation state, and broker orders were not changed.",
-    }
 
 
-def _execution_identity_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    item = payload.get("row") if isinstance(payload.get("row"), dict) else {}
-    return {
-        "asof_date": pd.to_datetime(payload.get("asof_date") or item.get("asof_date"), utc=True, errors="coerce"),
-        "published_on": pd.to_datetime(payload.get("published_on") or item.get("published_on"), utc=True, errors="coerce"),
-        "setup_id": _text(payload.get("setup_id")) or _text(item.get("setup_id")),
-        "symbol": (_text(payload.get("symbol")) or _text(item.get("symbol")) or "").upper(),
-        "unique_id": _text(payload.get("unique_id")) or _text(item.get("unique_id")),
-    }
 
 
-def _load_execution_row_for_update(identity: dict[str, Any]) -> dict[str, Any]:
-    if not _table_exists(EXECUTION_TABLE):
-        raise ValueError(f"{EXECUTION_TABLE} does not exist")
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {EXECUTION_TABLE}
-        WHERE asof_date = %(asof_date)s
-          AND published_on = %(published_on)s
-          AND setup_id = %(setup_id)s
-          AND symbol = %(symbol)s
-          AND unique_id = %(unique_id)s
-        ORDER BY load_ts DESC NULLS LAST
-        LIMIT 1
-        """,
-        params=identity,
-        retries=3,
-    )
-    rows = _records(df)
-    if not rows:
-        raise ValueError("execution row was not found for the supplied identity")
-    return rows[0]
 
 
-def _latest_execution_approval_decision_for_identity(identity: dict[str, Any]) -> dict[str, Any] | None:
-    if not _table_exists(EXECUTION_APPROVAL_DECISIONS_TABLE):
-        return None
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {EXECUTION_APPROVAL_DECISIONS_TABLE}
-        WHERE asof_date = %(asof_date)s
-          AND published_on = %(published_on)s
-          AND setup_id = %(setup_id)s
-          AND symbol = %(symbol)s
-          AND unique_id = %(unique_id)s
-        ORDER BY decided_at DESC
-        LIMIT 1
-        """,
-        params=identity,
-        retries=3,
-    )
-    rows = _records(df)
-    return rows[0] if rows else None
 
 
-def _approved_execution_safety_contract(existing_row: dict[str, Any], *, decision: dict[str, Any], rationale: str) -> tuple[dict[str, Any], str]:
-    contract = _execution_safety_contract_from_row(existing_row) or {
-        "source": "operator_approval_contract_update",
-        "operator_approval_required": True,
-        "operator_approval_status": "missing",
-        "broker_reconciliation_required": True,
-        "broker_reconciliation_status": "not_run",
-        "live_evidence_required": True,
-        "live_evidence_status": "missing",
-        "live_evidence_successful_runs": 0,
-        "live_evidence_min_successful_runs": 3,
-        "live_submission_allowed": False,
-        "issues": [],
-    }
-    updated_at = pd.Timestamp.utcnow().isoformat()
-    issues = [str(item) for item in contract.get("issues") or [] if str(item or "").strip()]
-    live_allowance_allowed_at = pd.to_datetime(contract.get("live_allowance_allowed_at"), utc=True, errors="coerce")
-    decision_decided_at = pd.to_datetime(decision.get("decided_at"), utc=True, errors="coerce")
-    has_live_allowance = pd.notna(live_allowance_allowed_at)
-    post_allowance_approved = bool(has_live_allowance and pd.notna(decision_decided_at) and decision_decided_at > live_allowance_allowed_at)
-    contract = {
-        **contract,
-        "source": "operator_approval_contract_update",
-        "operator_approval_status": "approved",
-        "operator_approval_source": "operator_audit_decision",
-        "operator_approval_decision_id": _text(decision.get("decision_id")),
-        "operator_approval_decided_at": _ts(decision.get("decided_at")),
-        "operator_approval_applied_at": updated_at,
-        "operator_approval_rationale": rationale,
-        "operator_approval_required": True,
-        "broker_reconciliation_required": bool(contract.get("broker_reconciliation_required", True)),
-        "broker_reconciliation_status": str(contract.get("broker_reconciliation_status") or "not_run"),
-        "live_evidence_required": bool(contract.get("live_evidence_required", True)),
-        "live_evidence_status": str(contract.get("live_evidence_status") or "missing"),
-        "live_evidence_successful_runs": _json_ready(contract.get("live_evidence_successful_runs") or 0),
-        "live_evidence_min_successful_runs": _json_ready(contract.get("live_evidence_min_successful_runs") or 3),
-        "post_live_allowance_approval_required": bool(has_live_allowance),
-        "post_live_allowance_approval_status": "approved" if post_allowance_approved else ("not_required" if not has_live_allowance else "missing"),
-        "post_live_allowance_approval_decision_id": _text(decision.get("decision_id")) if post_allowance_approved else None,
-        "post_live_allowance_approval_decided_at": _ts(decision.get("decided_at")) if post_allowance_approved else None,
-        "live_submission_allowed": bool(contract.get("live_submission_allowed")) if post_allowance_approved else False,
-        "issues": issues,
-    }
-    return contract, updated_at
 
 
-def apply_execution_approval_contract_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    if payload.get("confirm") is not True:
-        raise ValueError("confirm=true is required before updating the execution safety contract")
-    rationale = _text(payload.get("rationale"))
-    if not rationale:
-        raise ValueError("rationale is required")
-    identity = _execution_identity_from_payload(payload)
-    missing = [key for key in ["asof_date", "published_on", "setup_id", "symbol", "unique_id"] if not _text(identity.get(key))]
-    if missing:
-        raise ValueError(f"missing execution row identity fields: {', '.join(missing)}")
-    execution_row = _load_execution_row_for_update(identity)
-    latest_decision = _latest_execution_approval_decision_for_identity(identity)
-    if not latest_decision:
-        raise ValueError("an approve_dry_run audit decision is required before approval status can be updated")
-    if str(latest_decision.get("decision") or "").strip().lower() != "approve_dry_run":
-        raise ValueError(f"latest execution approval decision is {latest_decision.get('decision')}; approve_dry_run is required")
-    contract, updated_at = _approved_execution_safety_contract(execution_row, decision=latest_decision, rationale=rationale)
-    raw_broker = _jsonish(execution_row.get("raw_broker_json"))
-    if not isinstance(raw_broker, dict):
-        raw_broker = {}
-    raw_broker["execution_safety_contract"] = contract
-    safety_json = json.dumps(contract, ensure_ascii=False, default=str, sort_keys=True)
-    raw_json = json.dumps(_json_ready(raw_broker), ensure_ascii=False, default=str, sort_keys=True)
-
-    def operation() -> int:
-        with db_session() as (_, cur):
-            cur.execute(
-                f"""
-                UPDATE {EXECUTION_TABLE}
-                SET safety_checks_json = %(safety_checks_json)s,
-                    raw_broker_json = %(raw_broker_json)s,
-                    load_ts = %(load_ts)s
-                WHERE asof_date = %(asof_date)s
-                  AND published_on = %(published_on)s
-                  AND setup_id = %(setup_id)s
-                  AND symbol = %(symbol)s
-                  AND unique_id = %(unique_id)s
-                """,
-                {
-                    **identity,
-                    "safety_checks_json": safety_json,
-                    "raw_broker_json": raw_json,
-                    "load_ts": pd.Timestamp.utcnow(),
-                },
-            )
-            return int(cur.rowcount or 0)
-
-    updated_rows = execute_db_operation(operation, operation_name="operator_api:execution_approval_contract_update")
-    if updated_rows != 1:
-        raise RuntimeError(f"expected to update exactly one execution row, updated {updated_rows}")
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/execution/approval-contract-update", schema_name="execution_approval_contract_update", read_only=False),
-        "status": "ok",
-        "updated_row": {
-            **{key: _json_ready(value) for key, value in identity.items()},
-            "updated_rows": updated_rows,
-            "operator_approval_applied_at": updated_at,
-        },
-        "safety_contract": contract,
-        "operator_boundary": {
-            "mutates_execution_orders": True,
-            "updates_operator_approval_status": True,
-            "updates_reconciliation_status": False,
-            "live_submission_allowed": False,
-            "submits_broker_orders": False,
-            "requires_latest_decision": "approve_dry_run",
-        },
-        "note": "Execution safety contract marked operator-approved only. Reconciliation remains unchanged and live submission remains blocked until all live safety gates pass.",
-    }
 
 
-def _execution_reconciliation_filters_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    item = payload.get("row") if isinstance(payload.get("row"), dict) else {}
-    asof_value = payload.get("asof_date") or item.get("asof_date")
-    asof_date = pd.to_datetime(asof_value, utc=True, errors="coerce") if asof_value else None
-    symbols = payload.get("symbols")
-    if symbols is None and item.get("symbol"):
-        symbols = [item.get("symbol")]
-    if isinstance(symbols, str):
-        symbols = [symbols]
-    symbol_list = sorted({str(value or "").strip().upper() for value in (symbols or []) if str(value or "").strip()})
-    setup_ids = payload.get("setup_ids") or payload.get("setup")
-    if setup_ids is None and item.get("setup_id"):
-        setup_ids = [item.get("setup_id")]
-    if isinstance(setup_ids, str):
-        setup_ids = [setup_ids]
-    setup_list = sorted({str(value or "").strip().upper() for value in (setup_ids or []) if str(value or "").strip()})
-    return {
-        "asof_date": None if asof_date is None or pd.isna(asof_date) else asof_date.normalize(),
-        "symbols": symbol_list or None,
-        "setup_ids": setup_list or None,
-    }
 
 
-def run_execution_reconciliation_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    dry_run = payload.get("dry_run", True) is not False
-    apply_mode = payload.get("apply") is True or dry_run is False
-    if apply_mode and payload.get("confirm") is not True:
-        raise ValueError("confirm=true is required before persisting broker reconciliation results")
-    filters = _execution_reconciliation_filters_from_payload(payload)
-    target_df = load_recon_targets(**filters)
-    order_df = pd.DataFrame()
-    fills_df = pd.DataFrame()
-    if not target_df.empty:
-        order_df, fills_df = reconcile_live_orders(**filters)
-        if apply_mode:
-            persist_reconciliation(order_df, fills_df)
-    status_counts = order_df["execution_status"].value_counts(dropna=False).to_dict() if not order_df.empty and "execution_status" in order_df.columns else {}
-    mode = "apply" if apply_mode else "dry_run"
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/execution/reconcile", schema_name="execution_reconciliation_run", read_only=not apply_mode),
-        "status": "ok",
-        "mode": mode,
-        "dry_run": not apply_mode,
-        "summary": {
-            "target_count": int(len(target_df)),
-            "reconciled_count": int(len(order_df)),
-            "fill_count": int(len(fills_df)),
-            "status_counts": _json_ready(status_counts),
-            "filters": {
-                "asof_date": _ts(filters.get("asof_date")),
-                "symbols": filters.get("symbols") or [],
-                "setup_ids": filters.get("setup_ids") or [],
-            },
-        },
-        "targets": _json_ready(target_df.head(50).to_dict(orient="records")) if not target_df.empty else [],
-        "orders": _json_ready(order_df.head(50).to_dict(orient="records")) if not order_df.empty else [],
-        "fills": _json_ready(fills_df.head(50).to_dict(orient="records")) if not fills_df.empty else [],
-        "operator_boundary": {
-            "reads_broker_order_state": bool(not target_df.empty),
-            "persists_reconciliation": bool(apply_mode),
-            "updates_reconciliation_status": bool(apply_mode),
-            "updates_operator_approval_status": False,
-            "approves_live_submission": False,
-            "live_submission_allowed": False,
-            "submits_broker_orders": False,
-            "requires_confirm_for_apply": True,
-        },
-        "note": (
-            "Broker reconciliation persisted from broker order-state reads only. This did not approve live submission or submit orders."
-            if apply_mode
-            else "Dry-run broker reconciliation preview only. No execution rows, fills, approval state, live gate, or broker orders were changed."
-        ),
-    }
 
 
-def _execution_evidence_context(payload: dict[str, Any]) -> dict[str, Any]:
-    item = payload.get("row") if isinstance(payload.get("row"), dict) else {}
-    identity = _execution_identity_from_payload(payload)
-    transaction_type = (_text(payload.get("transaction_type")) or _text(item.get("transaction_type")) or "").upper()
-    return {
-        **identity,
-        "transaction_type": transaction_type or None,
-    }
 
 
-def _load_execution_evidence_rows(context: dict[str, Any], *, limit: int = 100) -> list[dict[str, Any]]:
-    if not _table_exists(EXECUTION_TABLE):
-        return []
-    params: dict[str, Any] = {
-        "symbol": context.get("symbol"),
-        "setup_id": context.get("setup_id"),
-        "asof_date": context.get("asof_date"),
-        "limit": max(1, min(int(limit), 500)),
-    }
-    transaction_clause = ""
-    if context.get("transaction_type"):
-        transaction_clause = "AND transaction_type = %(transaction_type)s"
-        params["transaction_type"] = context.get("transaction_type")
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {EXECUTION_TABLE}
-        WHERE symbol = %(symbol)s
-          AND setup_id = %(setup_id)s
-          AND asof_date <= %(asof_date)s
-          {transaction_clause}
-        ORDER BY asof_date DESC, published_on DESC NULLS LAST, load_ts DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params=params,
-        retries=3,
-    )
-    return _records(df)
 
 
-def _execution_evidence_row_summary(row: dict[str, Any]) -> dict[str, Any]:
-    contract = _execution_safety_contract_from_row(row) or {}
-    status = str(row.get("execution_status") or "").strip().lower()
-    approval_status = str(contract.get("operator_approval_status") or "").strip().lower()
-    reconciliation_status = str(contract.get("broker_reconciliation_status") or "").strip().lower()
-    live_mode = bool(row.get("live_mode")) if row.get("live_mode") is not None else False
-    error_like = any(token in status for token in ["error", "failed", "invalid"]) or "reconcile_error" == status
-    successful = (
-        approval_status in {"approved", "operator_approved"}
-        and reconciliation_status in {"passed", "ok", "reconciled"}
-        and not live_mode
-        and not error_like
-    )
-    return {
-        "asof_date": _ts(row.get("asof_date")),
-        "published_on": _ts(row.get("published_on")),
-        "setup_id": _text(row.get("setup_id")),
-        "symbol": _text(row.get("symbol")),
-        "unique_id": _text(row.get("unique_id")),
-        "transaction_type": _text(row.get("transaction_type")),
-        "execution_status": _text(row.get("execution_status")),
-        "operator_approval_status": contract.get("operator_approval_status") or "missing",
-        "broker_reconciliation_status": contract.get("broker_reconciliation_status") or "not_run",
-        "live_submission_allowed": bool(contract.get("live_submission_allowed")),
-        "live_mode": live_mode,
-        "successful_evidence": bool(successful),
-        "error_like": bool(error_like),
-    }
 
 
-def _build_execution_evidence_review(payload: dict[str, Any]) -> dict[str, Any]:
-    context = _execution_evidence_context(payload)
-    missing = [key for key in ["asof_date", "published_on", "setup_id", "symbol", "unique_id"] if not _text(context.get(key))]
-    if missing:
-        raise ValueError(f"missing execution row identity fields: {', '.join(missing)}")
-    required_runs = int(payload.get("required_runs") or EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS)
-    current_row = _load_execution_row_for_update({key: context[key] for key in ["asof_date", "published_on", "setup_id", "symbol", "unique_id"]})
-    current_contract = _execution_safety_contract_from_row(current_row) or {}
-    evidence_rows = [_execution_evidence_row_summary(row) for row in _load_execution_evidence_rows(context, limit=int(payload.get("limit") or 100))]
-    successful_dates = sorted({str(row.get("asof_date") or "") for row in evidence_rows if row.get("successful_evidence") and row.get("asof_date")})
-    failed_rows = [row for row in evidence_rows if row.get("error_like")]
-    current_approval = str(current_contract.get("operator_approval_status") or "").strip().lower()
-    current_reconciliation = str(current_contract.get("broker_reconciliation_status") or "").strip().lower()
-    blockers: list[str] = []
-    if current_approval not in {"approved", "operator_approved"}:
-        blockers.append(f"Current row operator approval is {current_contract.get('operator_approval_status') or 'missing'}.")
-    if current_reconciliation not in {"passed", "ok", "reconciled"}:
-        blockers.append(f"Current row broker reconciliation is {current_contract.get('broker_reconciliation_status') or 'not_run'}.")
-    if len(successful_dates) < required_runs:
-        blockers.append(f"Only {len(successful_dates)} successful evidence date(s); requires {required_runs}.")
-    if failed_rows:
-        blockers.append(f"{len(failed_rows)} evidence row(s) have execution or reconciliation errors.")
-    decision = "passed" if not blockers else "insufficient"
-    return {
-        "context": _json_ready(context),
-        "required_runs": required_runs,
-        "successful_runs": len(successful_dates),
-        "successful_dates": successful_dates,
-        "failed_runs": len(failed_rows),
-        "blockers": blockers,
-        "decision": decision,
-        "evidence_rows": evidence_rows[:50],
-        "current_contract": current_contract,
-        "current_row": current_row,
-    }
 
 
-def _write_execution_evidence_review(review: dict[str, Any], payload: dict[str, Any], *, applied: bool) -> dict[str, Any]:
-    reviewed_at = pd.Timestamp.utcnow()
-    context = review.get("context") if isinstance(review.get("context"), dict) else {}
-    review_basis = {
-        "context": context,
-        "decision": review.get("decision"),
-        "successful_runs": review.get("successful_runs"),
-        "required_runs": review.get("required_runs"),
-        "failed_runs": review.get("failed_runs"),
-        "reviewed_at": reviewed_at.isoformat(),
-        "applied": bool(applied),
-    }
-    review_id = "exec-evidence:" + hashlib.sha256(json.dumps(review_basis, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
-    item = payload.get("row") if isinstance(payload.get("row"), dict) else {}
-    audit_df = pd.DataFrame(
-        [
-            {
-                "review_id": review_id,
-                "reviewed_at": reviewed_at,
-                "asof_date": pd.to_datetime(context.get("asof_date"), utc=True, errors="coerce"),
-                "published_on": pd.to_datetime(context.get("published_on"), utc=True, errors="coerce"),
-                "setup_id": _text(context.get("setup_id")),
-                "symbol": _text(context.get("symbol")),
-                "unique_id": _text(context.get("unique_id")),
-                "transaction_type": _text(context.get("transaction_type")),
-                "mode": "apply" if applied else "preview",
-                "decision": _text(review.get("decision")),
-                "operator_id": _text(payload.get("operator_id")),
-                "rationale": _text(payload.get("rationale")),
-                "successful_runs": int(review.get("successful_runs") or 0),
-                "required_runs": int(review.get("required_runs") or 0),
-                "failed_runs": int(review.get("failed_runs") or 0),
-                "evidence_rows_json": json.dumps(_json_ready(review.get("evidence_rows") or []), ensure_ascii=False, default=str, sort_keys=True),
-                "item_snapshot_json": json.dumps(_json_ready(item), ensure_ascii=False, default=str, sort_keys=True),
-                "safety_contract_json": json.dumps(_json_ready(review.get("current_contract") or {}), ensure_ascii=False, default=str, sort_keys=True),
-                "applied": bool(applied),
-                "load_ts": reviewed_at,
-            }
-        ]
-    )
-    ensure_execution_evidence_reviews_table()
-    upsert_to_db(
-        audit_df,
-        EXECUTION_EVIDENCE_REVIEWS_TABLE,
-        unique_keys=["review_id"],
-        timescaledb_column="reviewed_at",
-    )
-    return _json_ready(audit_df.iloc[0].to_dict())
 
 
-def apply_execution_evidence_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    apply_mode = payload.get("apply") is True or payload.get("dry_run") is False
-    if apply_mode and payload.get("confirm") is not True:
-        raise ValueError("confirm=true is required before applying execution evidence status")
-    if apply_mode and not _text(payload.get("rationale")):
-        raise ValueError("rationale is required before applying execution evidence status")
-    review = _build_execution_evidence_review(payload)
-    if apply_mode and review["decision"] != "passed":
-        raise ValueError("execution evidence is insufficient: " + "; ".join(review.get("blockers") or []))
-    audit_row = _write_execution_evidence_review(review, payload, applied=True) if apply_mode else {}
-    updated_row: dict[str, Any] = {}
-    safety_contract: dict[str, Any] = {}
-    if apply_mode:
-        context = review["context"]
-        identity = {key: pd.to_datetime(context[key], utc=True, errors="coerce") if key in {"asof_date", "published_on"} else context[key] for key in ["asof_date", "published_on", "setup_id", "symbol", "unique_id"]}
-        current_row = review["current_row"]
-        contract = _execution_safety_contract_from_row(current_row) or {}
-        contract = {
-            **contract,
-            "source": "operator_evidence_review",
-            "live_evidence_required": True,
-            "live_evidence_status": "passed",
-            "live_evidence_successful_runs": int(review["successful_runs"]),
-            "live_evidence_min_successful_runs": int(review["required_runs"]),
-            "live_evidence_review_id": audit_row.get("review_id"),
-            "live_evidence_reviewed_at": audit_row.get("reviewed_at"),
-            "live_evidence_rationale": _text(payload.get("rationale")),
-            "live_submission_allowed": False,
-        }
-        raw_broker = _jsonish(current_row.get("raw_broker_json"))
-        if not isinstance(raw_broker, dict):
-            raw_broker = {}
-        raw_broker["execution_safety_contract"] = contract
-        safety_json = json.dumps(_json_ready(contract), ensure_ascii=False, default=str, sort_keys=True)
-        raw_json = json.dumps(_json_ready(raw_broker), ensure_ascii=False, default=str, sort_keys=True)
-
-        def operation() -> int:
-            with db_session() as (_, cur):
-                cur.execute(
-                    f"""
-                    UPDATE {EXECUTION_TABLE}
-                    SET safety_checks_json = %(safety_checks_json)s,
-                        raw_broker_json = %(raw_broker_json)s,
-                        load_ts = %(load_ts)s
-                    WHERE asof_date = %(asof_date)s
-                      AND published_on = %(published_on)s
-                      AND setup_id = %(setup_id)s
-                      AND symbol = %(symbol)s
-                      AND unique_id = %(unique_id)s
-                    """,
-                    {
-                        **identity,
-                        "safety_checks_json": safety_json,
-                        "raw_broker_json": raw_json,
-                        "load_ts": pd.Timestamp.utcnow(),
-                    },
-                )
-                return int(cur.rowcount or 0)
-
-        updated_rows = execute_db_operation(operation, operation_name="operator_api:execution_evidence_review_apply")
-        if updated_rows != 1:
-            raise RuntimeError(f"expected to update exactly one execution row, updated {updated_rows}")
-        updated_row = {**_json_ready(identity), "updated_rows": updated_rows, "live_evidence_review_id": audit_row.get("review_id")}
-        safety_contract = contract
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/execution/evidence-review", schema_name="execution_evidence_review", read_only=not apply_mode),
-        "status": "ok",
-        "mode": "apply" if apply_mode else "preview",
-        "dry_run": not apply_mode,
-        "decision": review["decision"],
-        "review": audit_row
-        or {
-            "mode": "preview",
-            "decision": review["decision"],
-            "successful_runs": review["successful_runs"],
-            "required_runs": review["required_runs"],
-            "failed_runs": review["failed_runs"],
-        },
-        "evidence": {
-            "required_runs": review["required_runs"],
-            "successful_runs": review["successful_runs"],
-            "successful_dates": review["successful_dates"],
-            "failed_runs": review["failed_runs"],
-            "blockers": review["blockers"],
-            "rows": review["evidence_rows"],
-        },
-        "updated_row": updated_row,
-        "safety_contract": safety_contract,
-        "operator_boundary": {
-            "records_audit": bool(apply_mode),
-            "mutates_execution_orders": bool(apply_mode),
-            "updates_live_evidence_status": bool(apply_mode),
-            "updates_operator_approval_status": False,
-            "updates_reconciliation_status": False,
-            "live_submission_allowed": False,
-            "submits_broker_orders": False,
-            "requires_confirm_for_apply": True,
-        },
-        "note": (
-            "Execution evidence marked passed for the current safety contract only. Live submission remains blocked until a separate live-submit workflow explicitly allows it."
-            if apply_mode
-            else "Execution evidence preview only. No execution rows, live gates, approval, reconciliation, or broker orders were changed."
-        ),
-    }
 
 
-def _live_allowance_confirmation_phrase(identity: dict[str, Any]) -> str:
-    symbol = str(identity.get("symbol") or "").upper()
-    setup_id = str(identity.get("setup_id") or "")
-    unique_id = str(identity.get("unique_id") or "")
-    return f"ALLOW LIVE {symbol} {setup_id} {unique_id}".strip()
 
 
-def _live_allowance_blockers(contract: dict[str, Any]) -> list[str]:
-    blockers: list[str] = []
-    approval_status = str(contract.get("operator_approval_status") or "").strip().lower()
-    reconciliation_status = str(contract.get("broker_reconciliation_status") or "").strip().lower()
-    evidence_status = str(contract.get("live_evidence_status") or "").strip().lower()
-    evidence_runs = pd.to_numeric(contract.get("live_evidence_successful_runs"), errors="coerce")
-    evidence_min = pd.to_numeric(contract.get("live_evidence_min_successful_runs"), errors="coerce")
-    if pd.isna(evidence_runs):
-        evidence_runs = 0
-    if pd.isna(evidence_min):
-        evidence_min = EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS
-    if approval_status not in {"approved", "operator_approved"}:
-        blockers.append(f"Operator approval is {contract.get('operator_approval_status') or 'missing'}.")
-    if reconciliation_status not in {"passed", "ok", "reconciled"}:
-        blockers.append(f"Broker reconciliation is {contract.get('broker_reconciliation_status') or 'not_run'}.")
-    if evidence_status not in {"passed", "ready", "approved"}:
-        blockers.append(f"Live evidence is {contract.get('live_evidence_status') or 'missing'}.")
-    if int(evidence_runs) < int(evidence_min):
-        blockers.append(f"Live evidence has {int(evidence_runs)} successful run(s); requires {int(evidence_min)}.")
-    return blockers
 
 
-def apply_execution_live_allowance_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    apply_mode = payload.get("apply") is True or payload.get("dry_run") is False
-    if apply_mode and payload.get("confirm") is not True:
-        raise ValueError("confirm=true is required before applying live allowance")
-    rationale = _text(payload.get("rationale"))
-    if apply_mode and not rationale:
-        raise ValueError("rationale is required before applying live allowance")
-    identity = _execution_identity_from_payload(payload)
-    missing = [key for key in ["asof_date", "published_on", "setup_id", "symbol", "unique_id"] if not _text(identity.get(key))]
-    if missing:
-        raise ValueError(f"missing execution row identity fields: {', '.join(missing)}")
-    execution_row = _load_execution_row_for_update(identity)
-    contract = _execution_safety_contract_from_row(execution_row) or {}
-    blockers = _live_allowance_blockers(contract)
-    expected_phrase = _live_allowance_confirmation_phrase(identity)
-    supplied_phrase = _text(payload.get("confirmation_phrase"))
-    if apply_mode and supplied_phrase != expected_phrase:
-        raise ValueError(f"confirmation_phrase must exactly match: {expected_phrase}")
-    if apply_mode and blockers:
-        raise ValueError("live allowance prerequisites are not met: " + "; ".join(blockers))
-
-    allowed_at = pd.Timestamp.utcnow()
-    item = payload.get("row") if isinstance(payload.get("row"), dict) else {}
-    transaction_type = _text(payload.get("transaction_type")) or _text(item.get("transaction_type")) or _text(execution_row.get("transaction_type"))
-    allowance_basis = {
-        **{key: _json_ready(value) for key, value in identity.items()},
-        "transaction_type": transaction_type,
-        "allowed_at": allowed_at.isoformat(),
-        "confirmation_phrase": supplied_phrase if apply_mode else expected_phrase,
-        "applied": bool(apply_mode),
-    }
-    allowance_id = "exec-live-allowance:" + hashlib.sha256(json.dumps(allowance_basis, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
-    audit_row: dict[str, Any] = {
-        "allowance_id": allowance_id,
-        "allowed_at": allowed_at,
-        **identity,
-        "transaction_type": transaction_type,
-        "operator_id": _text(payload.get("operator_id")),
-        "rationale": rationale,
-        "confirmation_phrase": supplied_phrase if apply_mode else expected_phrase,
-        "blocker_json": json.dumps(_json_ready(blockers), ensure_ascii=False, default=str, sort_keys=True),
-        "item_snapshot_json": json.dumps(_json_ready(item), ensure_ascii=False, default=str, sort_keys=True),
-        "safety_contract_json": json.dumps(_json_ready(contract), ensure_ascii=False, default=str, sort_keys=True),
-        "applied": bool(apply_mode),
-        "load_ts": allowed_at,
-    }
-    updated_row: dict[str, Any] = {}
-    safety_contract: dict[str, Any] = {}
-    if apply_mode:
-        ensure_execution_live_allowance_reviews_table()
-        audit_df = pd.DataFrame([audit_row])
-        upsert_to_db(
-            audit_df,
-            EXECUTION_LIVE_ALLOWANCE_REVIEWS_TABLE,
-            unique_keys=["allowance_id"],
-            timescaledb_column="allowed_at",
-        )
-        contract = {
-            **contract,
-            "source": "operator_live_allowance_review",
-            "live_submission_allowed": True,
-            "live_allowance_review_id": allowance_id,
-            "live_allowance_allowed_at": allowed_at.isoformat(),
-            "live_allowance_rationale": rationale,
-            "live_allowance_confirmation_phrase": supplied_phrase,
-            "post_live_allowance_approval_required": True,
-            "post_live_allowance_approval_status": "missing",
-            "post_live_allowance_approval_decision_id": None,
-            "post_live_allowance_approval_decided_at": None,
-        }
-        raw_broker = _jsonish(execution_row.get("raw_broker_json"))
-        if not isinstance(raw_broker, dict):
-            raw_broker = {}
-        raw_broker["execution_safety_contract"] = contract
-        safety_json = json.dumps(_json_ready(contract), ensure_ascii=False, default=str, sort_keys=True)
-        raw_json = json.dumps(_json_ready(raw_broker), ensure_ascii=False, default=str, sort_keys=True)
-
-        def operation() -> int:
-            with db_session() as (_, cur):
-                cur.execute(
-                    f"""
-                    UPDATE {EXECUTION_TABLE}
-                    SET safety_checks_json = %(safety_checks_json)s,
-                        raw_broker_json = %(raw_broker_json)s,
-                        load_ts = %(load_ts)s
-                    WHERE asof_date = %(asof_date)s
-                      AND published_on = %(published_on)s
-                      AND setup_id = %(setup_id)s
-                      AND symbol = %(symbol)s
-                      AND unique_id = %(unique_id)s
-                    """,
-                    {
-                        **identity,
-                        "safety_checks_json": safety_json,
-                        "raw_broker_json": raw_json,
-                        "load_ts": pd.Timestamp.utcnow(),
-                    },
-                )
-                return int(cur.rowcount or 0)
-
-        updated_rows = execute_db_operation(operation, operation_name="operator_api:execution_live_allowance_apply")
-        if updated_rows != 1:
-            raise RuntimeError(f"expected to update exactly one execution row, updated {updated_rows}")
-        updated_row = {**_json_ready(identity), "updated_rows": updated_rows, "live_allowance_review_id": allowance_id}
-        safety_contract = contract
-    decision = "ready" if not blockers else "blocked"
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/execution/live-allowance", schema_name="execution_live_allowance", read_only=not apply_mode),
-        "status": "ok",
-        "mode": "apply" if apply_mode else "preview",
-        "dry_run": not apply_mode,
-        "decision": decision,
-        "allowance": _json_ready(audit_row),
-        "blockers": blockers,
-        "updated_row": updated_row,
-        "safety_contract": safety_contract,
-        "operator_boundary": {
-            "records_audit": bool(apply_mode),
-            "mutates_execution_orders": bool(apply_mode),
-            "updates_live_submission_allowed": bool(apply_mode),
-            "updates_operator_approval_status": False,
-            "updates_reconciliation_status": False,
-            "updates_live_evidence_status": False,
-            "submits_broker_orders": False,
-            "requires_confirm_for_apply": True,
-            "expected_confirmation_phrase": expected_phrase,
-        },
-        "note": (
-            "Live allowance applied to the execution safety contract only. This did not submit broker orders; live submission still requires the separate per-run live confirmation token."
-            if apply_mode
-            else "Live allowance preview only. No execution rows, live gates, approval, reconciliation, evidence, or broker orders were changed."
-        ),
-    }
 
 
-def _execution_preflight_filters_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    item = payload.get("row") if isinstance(payload.get("row"), dict) else {}
-    asof_value = payload.get("asof_date") or item.get("asof_date")
-    asof_date = pd.to_datetime(asof_value, utc=True, errors="coerce") if asof_value else None
-    symbols = payload.get("symbols")
-    if symbols is None and item.get("symbol"):
-        symbols = [item.get("symbol")]
-    if isinstance(symbols, str):
-        symbols = [symbols]
-    setup_ids = payload.get("setup_ids") or payload.get("setup")
-    if setup_ids is None and item.get("setup_id"):
-        setup_ids = [item.get("setup_id")]
-    if isinstance(setup_ids, str):
-        setup_ids = [setup_ids]
-    return {
-        "asof_date": None if asof_date is None or pd.isna(asof_date) else asof_date.normalize(),
-        "symbols": sorted({str(value or "").strip().upper() for value in (symbols or []) if str(value or "").strip()}),
-        "setup_ids": sorted({str(value or "").strip().upper() for value in (setup_ids or []) if str(value or "").strip()}),
-    }
 
 
-def _load_execution_preflight_rows(filters: dict[str, Any], *, limit: int) -> pd.DataFrame:
-    if not _table_exists(EXECUTION_TABLE):
-        return pd.DataFrame()
-    clauses = []
-    params: dict[str, Any] = {"limit": max(1, min(int(limit), 500))}
-    if filters.get("asof_date") is not None:
-        clauses.append("asof_date = %(asof_date)s")
-        params["asof_date"] = filters["asof_date"]
-    else:
-        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {EXECUTION_TABLE})")
-    if filters.get("symbols"):
-        clauses.append("symbol = ANY(%(symbols)s)")
-        params["symbols"] = filters["symbols"]
-    if filters.get("setup_ids"):
-        clauses.append("setup_id = ANY(%(setup_ids)s)")
-        params["setup_ids"] = filters["setup_ids"]
-    return sql_to_df(
-        f"""
-        SELECT *
-        FROM {EXECUTION_TABLE}
-        WHERE {' AND '.join(clauses)}
-        ORDER BY
-            CASE execution_status
-                WHEN 'planned' THEN 1
-                WHEN 'submit_blocked' THEN 2
-                WHEN 'submit_error' THEN 3
-                WHEN 'reconcile_error' THEN 4
-                ELSE 5
-            END,
-            published_on DESC NULLS LAST,
-            load_ts DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params=params,
-        retries=3,
-    )
 
 
-def _live_submit_row_blockers(row: dict[str, Any], contract: dict[str, Any]) -> list[str]:
-    blockers = _execution_approval_blockers(row, contract)
-    status = str(row.get("execution_status") or "").strip().lower()
-    approval_status = str(contract.get("operator_approval_status") or "").strip().lower()
-    reconciliation_status = str(contract.get("broker_reconciliation_status") or "").strip().lower()
-    evidence_status = str(contract.get("live_evidence_status") or "").strip().lower()
-    evidence_runs = pd.to_numeric(contract.get("live_evidence_successful_runs"), errors="coerce")
-    evidence_min = pd.to_numeric(contract.get("live_evidence_min_successful_runs"), errors="coerce")
-    if pd.isna(evidence_runs):
-        evidence_runs = 0
-    if pd.isna(evidence_min):
-        evidence_min = EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS
-    if status != "planned":
-        blockers.append(f"Only planned rows can be live-submitted; current status is {status or 'missing'}.")
-    if approval_status not in {"approved", "operator_approved"}:
-        blockers.append(f"Operator approval is {contract.get('operator_approval_status') or 'missing'}.")
-    if reconciliation_status not in {"passed", "ok", "reconciled"}:
-        blockers.append(f"Broker reconciliation is {contract.get('broker_reconciliation_status') or 'not_run'}.")
-    if evidence_status not in {"passed", "ready", "approved"}:
-        blockers.append(f"Live evidence checklist is {contract.get('live_evidence_status') or 'missing'}.")
-    if int(evidence_runs) < int(evidence_min):
-        blockers.append(f"Live evidence has {int(evidence_runs)} successful run(s); requires {int(evidence_min)}.")
-    if not bool(contract.get("live_submission_allowed")):
-        blockers.append("Live submission is not allowed by the safety contract.")
-    if bool(contract.get("post_live_allowance_approval_required")) and str(contract.get("post_live_allowance_approval_status") or "").strip().lower() not in {"approved", "operator_approved"}:
-        allowed_at = contract.get("live_allowance_allowed_at")
-        blockers.append(
-            "Fresh operator approval after live allowance is required before live submission"
-            + (f"; live allowance was recorded at {allowed_at}." if allowed_at else ".")
-        )
-    freshness_blocker = live_execution_row_freshness_blocker(row)
-    if freshness_blocker:
-        blockers.append(freshness_blocker)
-    security_id = pd.to_numeric(row.get("security_id"), errors="coerce")
-    quantity = pd.to_numeric(row.get("quantity"), errors="coerce")
-    reference_price = pd.to_numeric(row.get("reference_price"), errors="coerce")
-    if pd.isna(security_id) or int(security_id) <= 0:
-        blockers.append("Missing broker security id.")
-    if pd.isna(quantity) or int(quantity) <= 0:
-        blockers.append("Quantity is missing or not positive.")
-    if pd.isna(reference_price) or float(reference_price) <= 0:
-        blockers.append("Reference price is missing or not positive.")
-    return list(dict.fromkeys(blockers))
 
 
-def _live_submit_command(filters: dict[str, Any], token: str | None) -> str | None:
-    if not token:
-        return None
-    parts = ["STOCKEY_LIVE_TRADING_ENABLED=true", "python", "-m", "advisory.execution_engine", "--live", "--include-existing"]
-    asof_date = filters.get("asof_date")
-    if asof_date is not None and pd.notna(asof_date):
-        parts.extend(["--date", pd.Timestamp(asof_date).date().isoformat()])
-    if filters.get("symbols"):
-        parts.append("--symbols")
-        parts.extend(filters["symbols"])
-    if filters.get("setup_ids"):
-        parts.append("--setup")
-        parts.extend(filters["setup_ids"])
-    parts.extend(["--live-confirmation", token])
-    return " ".join(str(part) for part in parts)
 
 
-def build_execution_live_submit_preflight_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    row_limit = _bounded_limit(payload.get("limit"), default=100, maximum=500)
-    filters = _execution_preflight_filters_from_payload(payload)
-    blockers: list[str] = []
-    skipped_orders: list[dict[str, Any]] = []
-    if not _table_exists(EXECUTION_TABLE):
-        blockers.append(f"{EXECUTION_TABLE} does not exist.")
-        df = pd.DataFrame()
-    else:
-        df = _load_execution_preflight_rows(filters, limit=row_limit)
-    rows = _records(df)
-    planned_candidates: list[dict[str, Any]] = []
-    for row in rows:
-        contract = _execution_safety_contract_from_row(row) or {
-            "operator_approval_required": True,
-            "operator_approval_status": "missing",
-            "broker_reconciliation_required": True,
-            "broker_reconciliation_status": "not_run",
-            "live_evidence_required": True,
-            "live_evidence_status": "missing",
-            "live_evidence_successful_runs": 0,
-            "live_evidence_min_successful_runs": EXECUTION_MIN_EVIDENCE_SUCCESSFUL_RUNS,
-            "live_submission_allowed": False,
-            "source": "missing_execution_safety_contract",
-            "issues": ["Execution safety contract is missing."],
-        }
-        row_blockers = _live_submit_row_blockers(row, contract)
-        item = _execution_approval_row(row)
-        item["live_submit_blockers"] = row_blockers
-        if row_blockers:
-            skipped_orders.append(item)
-        else:
-            planned_candidates.append(row)
-
-    planned_df = pd.DataFrame(planned_candidates)
-    expected_token = build_live_execution_confirmation_token(planned_df) if not planned_df.empty else None
-    if not rows:
-        blockers.append("No execution rows matched the preflight filters.")
-    if planned_df.empty:
-        blockers.append("No planned execution rows are eligible for live submission.")
-    live_env_enabled = os.getenv("STOCKEY_LIVE_TRADING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
-    blockers.extend([f"{item.get('symbol') or 'row'}: {reason}" for item in skipped_orders[:25] for reason in item.get("live_submit_blockers", [])])
-    blockers = list(dict.fromkeys(blockers))
-    command = _live_submit_command(filters, expected_token)
-    decision = "ready" if expected_token and not skipped_orders else "blocked"
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/execution/live-submit-preflight", schema_name="execution_live_submit_preflight", read_only=True),
-        "status": "ok",
-        "decision": decision,
-        "summary": {
-            "matched_rows": len(rows),
-            "eligible_planned_rows": int(len(planned_df)),
-            "skipped_rows": len(skipped_orders),
-            "filters": {
-                "asof_date": _ts(filters.get("asof_date")),
-                "symbols": filters.get("symbols") or [],
-                "setup_ids": filters.get("setup_ids") or [],
-            },
-        },
-        "expected_live_token": expected_token,
-        "cli_command_preview": command,
-        "env_required": {
-            "STOCKEY_LIVE_TRADING_ENABLED": "true",
-            "STOCKEY_EXECUTION_LIVE_RUN_CONFIRMATION": expected_token,
-            "current_api_process_live_env_enabled": live_env_enabled,
-        },
-        "blockers": blockers,
-        "planned_orders": _json_ready(planned_df.head(50).to_dict(orient="records")) if not planned_df.empty else [],
-        "skipped_orders": _json_ready(skipped_orders[:50]),
-        "operator_boundary": {
-            "read_only": True,
-            "records_audit": False,
-            "mutates_execution_orders": False,
-            "updates_operator_approval_status": False,
-            "updates_reconciliation_status": False,
-            "updates_live_evidence_status": False,
-            "updates_live_submission_allowed": False,
-            "submits_broker_orders": False,
-            "builds_manual_cli_command": bool(command),
-            "requires_manual_cli_execution": True,
-        },
-        "note": (
-            "Live submit preflight is ready. Copy the CLI command only after independently confirming the order set; this API route did not submit broker orders."
-            if decision == "ready"
-            else "Live submit preflight found blockers. This API route is read-only and did not submit broker orders."
-        ),
-    }
 
 
 def _load_latest_company_memory_reviews(symbols: list[str]) -> dict[str, dict[str, Any]]:
@@ -3820,210 +2490,12 @@ def build_signal_refresh_payload(
     }
 
 
-def _journey_filter_values(*, symbol: str | None, item_id: str | None, unique_id: str | None) -> dict[str, str]:
-    return {
-        "symbol": str(symbol or "").strip().upper(),
-        "item_id": str(item_id or "").strip(),
-        "unique_id": str(unique_id or "").strip(),
-    }
 
 
-def _journey_table_rows(
-    *,
-    table_name: str,
-    stage: str,
-    filters: dict[str, str],
-    limit: int,
-    timestamp_column: str,
-    supported_filters: dict[str, str],
-    order_by: str,
-    skipped_sources: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    if not _table_exists(table_name):
-        skipped_sources.append({"stage": stage, "source": table_name, "reason": "missing_table"})
-        return []
-    clauses = ["1 = 1"]
-    params: list[Any] = []
-    for filter_key, column_name in supported_filters.items():
-        value = filters.get(filter_key)
-        if not value:
-            continue
-        if filter_key == "symbol":
-            clauses.append(f"UPPER(TRIM({column_name})) = %s")
-            params.append(value)
-        else:
-            clauses.append(f"{column_name} = %s")
-            params.append(value)
-    try:
-        rows = sql_to_df(
-            f"""
-            SELECT *
-            FROM {table_name}
-            WHERE {' AND '.join(clauses)}
-            ORDER BY {order_by}
-            LIMIT %s
-            """,
-            params=tuple([*params, limit]),
-            retries=2,
-        )
-    except Exception as exc:
-        _record_operator_local_fallback(
-            source=table_name,
-            fallback_type="operator_journey_source_load_failed",
-            reason="Operator journey could not load a source table and will show the remaining stages.",
-            error=exc,
-            metadata={"stage": stage, "filters": filters},
-        )
-        skipped_sources.append({"stage": stage, "source": table_name, "reason": f"{type(exc).__name__}: {exc}"})
-        return []
-    out = _records(rows)
-    for row in out:
-        row["_journey_stage"] = stage
-        row["_journey_timestamp"] = _ts(row.get(timestamp_column) or row.get("load_ts"))
-        row["_journey_source_table"] = table_name
-    return [_json_ready(row) for row in out]
 
 
-def _journey_timeline_event(stage: str, row: dict[str, Any]) -> dict[str, Any]:
-    title_by_stage = {
-        "manual_decisions": "Manual-review decision",
-        "wait_signals": "Wait signal created",
-        "wait_signal_matches": "Wait signal matched",
-        "signal_refresh": "Signal refresh result",
-        "actions": "Action recommendation",
-        "portfolio": "Portfolio plan",
-        "execution": "Execution preview",
-    }
-    reason = (
-        row.get("rationale")
-        or row.get("wait_question")
-        or row.get("match_reason")
-        or row.get("action_reason")
-        or row.get("portfolio_reason")
-        or row.get("execution_reason")
-        or row.get("reason")
-    )
-    action = row.get("decision") or row.get("expected_action") or row.get("signal_action") or row.get("action_code") or row.get("portfolio_status") or row.get("execution_status")
-    return {
-        "stage": stage,
-        "title": title_by_stage.get(stage, stage.replace("_", " ").title()),
-        "timestamp": row.get("_journey_timestamp"),
-        "symbol": row.get("symbol"),
-        "unique_id": row.get("unique_id"),
-        "setup_id": row.get("setup_id"),
-        "action": action,
-        "reason": reason,
-        "source_table": row.get("_journey_source_table"),
-        "source_key": row.get("item_id") or row.get("signal_id") or row.get("refresh_id") or row.get("unique_id") or row.get("correlation_id"),
-    }
 
 
-def build_operator_journey_payload(
-    *,
-    symbol: str | None = None,
-    item_id: str | None = None,
-    unique_id: str | None = None,
-    limit: int = 25,
-) -> dict[str, Any]:
-    row_limit = _bounded_limit(limit, default=25, maximum=100)
-    filters = _journey_filter_values(symbol=symbol, item_id=item_id, unique_id=unique_id)
-    skipped_sources: list[dict[str, Any]] = []
-    stage_specs = [
-        {
-            "stage": "manual_decisions",
-            "table": MANUAL_REVIEW_DECISIONS_TABLE,
-            "timestamp": "decided_at",
-            "filters": {"symbol": "symbol", "item_id": "item_id", "unique_id": "unique_id"},
-            "order_by": "decided_at DESC NULLS LAST, load_ts DESC NULLS LAST",
-        },
-        {
-            "stage": "wait_signals",
-            "table": WAIT_SIGNALS_TABLE,
-            "timestamp": "created_at",
-            "filters": {"symbol": "symbol", "item_id": "source_key"},
-            "order_by": "created_at DESC NULLS LAST, load_ts DESC NULLS LAST",
-        },
-        {
-            "stage": "wait_signal_matches",
-            "table": WAIT_SIGNAL_MATCHES_TABLE,
-            "timestamp": "matched_at",
-            "filters": {"symbol": "symbol"},
-            "order_by": "matched_at DESC NULLS LAST, load_ts DESC NULLS LAST",
-        },
-        {
-            "stage": "signal_refresh",
-            "table": SIGNAL_REFRESH_TABLE,
-            "timestamp": "refreshed_at",
-            "filters": {"symbol": "symbol", "unique_id": "unique_id"},
-            "order_by": "refreshed_at DESC NULLS LAST, load_ts DESC NULLS LAST",
-        },
-        {
-            "stage": "actions",
-            "table": ACTION_RECOMMENDATIONS_TABLE,
-            "timestamp": "published_on",
-            "filters": {"symbol": "symbol", "unique_id": "unique_id"},
-            "order_by": "published_on DESC NULLS LAST, load_ts DESC NULLS LAST",
-        },
-        {
-            "stage": "portfolio",
-            "table": PORTFOLIO_TABLE,
-            "timestamp": "published_on",
-            "filters": {"symbol": "symbol", "unique_id": "unique_id"},
-            "order_by": "published_on DESC NULLS LAST, load_ts DESC NULLS LAST",
-        },
-        {
-            "stage": "execution",
-            "table": EXECUTION_TABLE,
-            "timestamp": "published_on",
-            "filters": {"symbol": "symbol", "unique_id": "unique_id"},
-            "order_by": "published_on DESC NULLS LAST, load_ts DESC NULLS LAST",
-        },
-    ]
-    stages: dict[str, list[dict[str, Any]]] = {}
-    for spec in stage_specs:
-        stages[spec["stage"]] = _journey_table_rows(
-            table_name=spec["table"],
-            stage=spec["stage"],
-            filters=filters,
-            limit=row_limit,
-            timestamp_column=spec["timestamp"],
-            supported_filters=spec["filters"],
-            order_by=spec["order_by"],
-            skipped_sources=skipped_sources,
-        )
-    timeline = [
-        _journey_timeline_event(stage, row)
-        for stage, rows in stages.items()
-        for row in rows
-    ]
-    timeline.sort(key=lambda row: str(row.get("timestamp") or ""), reverse=True)
-    summary = {
-        "stage_counts": {stage: len(rows) for stage, rows in stages.items()},
-        "timeline_count": len(timeline),
-        "skipped_source_count": len(skipped_sources),
-        "has_manual_decision": bool(stages.get("manual_decisions")),
-        "has_wait_signal": bool(stages.get("wait_signals")),
-        "has_wait_match": bool(stages.get("wait_signal_matches")),
-        "has_refreshed_action": bool(stages.get("signal_refresh") or stages.get("actions")),
-        "has_portfolio_or_execution_implication": bool(stages.get("portfolio") or stages.get("execution")),
-        "operator_boundary": {
-            "read_only": True,
-            "broker_execution_enabled": False,
-            "mutates_portfolio": False,
-            "mutates_action_recommendation": False,
-            "submits_order": False,
-        },
-    }
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/operator-journey", schema_name="operator_journey"),
-        "status": "ok",
-        "filters": {key: value for key, value in filters.items() if value},
-        "summary": summary,
-        "stages": stages,
-        "timeline": timeline[:row_limit],
-        "skipped_sources": skipped_sources,
-    }
 
 
 def build_portfolio_payload(
@@ -6057,22 +4529,8 @@ def ensure_operator_api_audit_tables() -> None:
     )
 
 
-def ensure_execution_approval_decisions_table() -> None:
-    apply_schema_migration(
-        migration_id=EXECUTION_APPROVAL_SCHEMA_MIGRATION_ID,
-        description="Create execution approval decision audit table.",
-        statements=EXECUTION_APPROVAL_SCHEMA_STATEMENTS,
-        metadata={"tables": [EXECUTION_APPROVAL_DECISIONS_TABLE]},
-    )
 
 
-def ensure_execution_evidence_reviews_table() -> None:
-    apply_schema_migration(
-        migration_id=EXECUTION_EVIDENCE_SCHEMA_MIGRATION_ID,
-        description="Create execution live-evidence review audit table.",
-        statements=EXECUTION_EVIDENCE_SCHEMA_STATEMENTS,
-        metadata={"tables": [EXECUTION_EVIDENCE_REVIEWS_TABLE]},
-    )
 
 
 def ensure_execution_live_allowance_reviews_table() -> None:
@@ -6548,139 +5006,16 @@ def build_signal_quality_promotion_review_decision_payload(payload: dict[str, An
     return result
 
 
-def build_event_policy_promotion_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    evaluated_at = payload.get("evaluated_at")
-    horizon_days = payload.get("horizon_days")
-    group_type = str(payload.get("group_type") or "").strip()
-    group_value = str(payload.get("group_value") or "").strip()
-    if not evaluated_at:
-        raise ValueError("evaluated_at is required")
-    if horizon_days is None or str(horizon_days).strip() == "":
-        raise ValueError("horizon_days is required")
-    if not group_type:
-        raise ValueError("group_type is required")
-    if not group_value:
-        raise ValueError("group_value is required")
-    result = generate_event_policy_promotion_review(
-        evaluated_at=evaluated_at,
-        horizon_days=int(horizon_days),
-        group_type=group_type,
-        group_value=group_value,
-        persist=True,
-    )
-    result["api_schema"] = _operator_api_schema("/api/event-policy/promotion-review", schema_name="event_policy_promotion_review")
-    return result
 
 
-def build_event_policy_promotion_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
-    reviews = load_event_policy_promotion_reviews(limit=limit)
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/event-policy/promotion-reviews", schema_name="event_policy_promotion_reviews"),
-        "status": "ok",
-        "reviews": reviews,
-        "pagination": {"reviews": _bounded_list_contract(reviews, limit=limit, default=25, maximum=100)},
-    }
 
 
-def build_event_policy_promotion_review_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    reviewed_at = payload.get("reviewed_at")
-    evaluated_at = payload.get("evaluated_at")
-    horizon_days = payload.get("horizon_days")
-    group_type = str(payload.get("group_type") or "").strip()
-    group_value = str(payload.get("group_value") or "").strip()
-    decision = str(payload.get("decision") or "").strip().lower()
-    if not reviewed_at:
-        raise ValueError("reviewed_at is required")
-    if not evaluated_at:
-        raise ValueError("evaluated_at is required")
-    if horizon_days is None or str(horizon_days).strip() == "":
-        raise ValueError("horizon_days is required")
-    if not group_type:
-        raise ValueError("group_type is required")
-    if not group_value:
-        raise ValueError("group_value is required")
-    if decision not in {"approved", "rejected", "needs_more_data"}:
-        raise ValueError("decision must be approved, rejected, or needs_more_data")
-    result = record_event_policy_manual_decision(
-        reviewed_at=reviewed_at,
-        evaluated_at=evaluated_at,
-        horizon_days=int(horizon_days),
-        group_type=group_type,
-        group_value=group_value,
-        decision=decision,  # type: ignore[arg-type]
-        operator_id=str(payload.get("operator_id") or "") or None,
-        decision_reason=str(payload.get("decision_reason") or "") or None,
-    )
-    result["api_schema"] = _operator_api_schema(
-        "/api/event-policy/promotion-review/decision",
-        schema_name="event_policy_promotion_decision",
-    )
-    return result
 
 
-def build_ts_forecast_promotion_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    model_name = str(payload.get("model_name") or "").strip()
-    horizon_days = payload.get("horizon_days")
-    if not model_name:
-        raise ValueError("model_name is required")
-    if horizon_days is None or str(horizon_days).strip() == "":
-        raise ValueError("horizon_days is required")
-    result = generate_ts_forecast_promotion_review(
-        model_name=model_name,
-        horizon_days=int(horizon_days),
-        from_date=payload.get("from_date"),
-        to_date=payload.get("to_date"),
-        persist=True,
-        allow_not_ready=bool(payload.get("allow_not_ready", False)),
-    )
-    result["api_schema"] = _operator_api_schema(
-        "/api/research/ts-forecast-promotion-review",
-        schema_name="ts_forecast_promotion_review",
-    )
-    return result
 
 
-def build_ts_forecast_promotion_reviews_payload(*, limit: int = 25) -> dict[str, Any]:
-    reviews = load_ts_forecast_promotion_reviews(limit=limit)
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema(
-            "/api/research/ts-forecast-promotion-reviews",
-            schema_name="ts_forecast_promotion_reviews",
-        ),
-        "status": "ok",
-        "reviews": reviews,
-        "pagination": {"reviews": _bounded_list_contract(reviews, limit=limit, default=25, maximum=100)},
-    }
 
 
-def build_ts_forecast_promotion_review_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    reviewed_at = payload.get("reviewed_at")
-    model_name = str(payload.get("model_name") or "").strip()
-    horizon_days = payload.get("horizon_days")
-    decision = str(payload.get("decision") or "").strip().lower()
-    if not reviewed_at:
-        raise ValueError("reviewed_at is required")
-    if not model_name:
-        raise ValueError("model_name is required")
-    if horizon_days is None or str(horizon_days).strip() == "":
-        raise ValueError("horizon_days is required")
-    if decision not in {"approved", "rejected", "needs_more_data"}:
-        raise ValueError("decision must be approved, rejected, or needs_more_data")
-    result = record_ts_forecast_manual_decision(
-        reviewed_at=reviewed_at,
-        model_name=model_name,
-        horizon_days=int(horizon_days),
-        decision=decision,  # type: ignore[arg-type]
-        operator_id=str(payload.get("operator_id") or "") or None,
-        decision_reason=str(payload.get("decision_reason") or "") or None,
-    )
-    result["api_schema"] = _operator_api_schema(
-        "/api/research/ts-forecast-promotion-review/decision",
-        schema_name="ts_forecast_promotion_decision",
-    )
-    return result
 
 
 def build_config_change_previews_payload(*, limit: int = 25) -> dict[str, Any]:
@@ -6762,46 +5097,8 @@ def build_signal_quality_config_change_preview_payload(payload: dict[str, Any]) 
     return result
 
 
-def build_event_policy_config_change_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    evaluated_at = payload.get("evaluated_at")
-    horizon_days = payload.get("horizon_days")
-    group_type = str(payload.get("group_type") or "").strip()
-    group_value = str(payload.get("group_value") or "").strip()
-    if not evaluated_at:
-        raise ValueError("evaluated_at is required")
-    if horizon_days is None or str(horizon_days).strip() == "":
-        raise ValueError("horizon_days is required")
-    if not group_type:
-        raise ValueError("group_type is required")
-    if not group_value:
-        raise ValueError("group_value is required")
-    result = build_event_policy_review_rule_preview(
-        evaluated_at=evaluated_at,
-        horizon_days=int(horizon_days),
-        group_type=group_type,
-        group_value=group_value,
-        reviewed_at=payload.get("reviewed_at"),
-        persist=bool(payload.get("persist", True)),
-    )
-    result["api_schema"] = _operator_api_schema("/api/config-change/event-policy-preview", schema_name="event_policy_config_change_preview")
-    return result
 
 
-def build_ts_forecast_config_change_preview_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    model_name = str(payload.get("model_name") or "").strip()
-    horizon_days = payload.get("horizon_days")
-    if not model_name:
-        raise ValueError("model_name is required")
-    if horizon_days is None or str(horizon_days).strip() == "":
-        raise ValueError("horizon_days is required")
-    result = build_ts_forecast_review_rule_preview(
-        model_name=model_name,
-        horizon_days=int(horizon_days),
-        reviewed_at=payload.get("reviewed_at"),
-        persist=bool(payload.get("persist", True)),
-    )
-    result["api_schema"] = _operator_api_schema("/api/config-change/ts-forecast-preview", schema_name="ts_forecast_config_change_preview")
-    return result
 
 
 def build_prompt_registry_api_payload(*, owner_area: str | None = None, authority_scope: str | None = None, limit: int = 100, offset: int = 0) -> dict[str, Any]:
@@ -6919,45 +5216,6 @@ def build_screener_failures_api_payload(*, hours: int = 24, limit: int = 25) -> 
     return out
 
 
-def build_events_payload(
-    *,
-    asof_date: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-    symbol: str | None = None,
-    status: str | None = None,
-    search: str | None = None,
-    compact: bool = False,
-) -> dict[str, Any]:
-    payload = load_operator_payload(asof_date=asof_date)
-    events = _filter_rows(payload.get("watch_events") or [], symbol=symbol, status=status, search=search)
-    operator_feed = _filter_rows(payload.get("operator_feed") or [], symbol=symbol, status=status, search=search)
-    alerts = _filter_rows(payload.get("alerts") or [], symbol=symbol, status=status, search=search)
-    event_page, event_meta = _page_rows(events, limit=limit, offset=offset)
-    operator_feed_pagination = _limited_pagination_contract(operator_feed, limit=limit, default=25)
-    alert_pagination = _limited_pagination_contract(alerts, limit=limit, default=25)
-    return {
-        "generated_at": payload.get("generated_at"),
-        "api_schema": _operator_api_schema("/api/events", schema_name="operator_events"),
-        "asof_date": payload.get("asof_date"),
-        "snapshot": _snapshot_payload(payload),
-        "snapshot_warning": _snapshot_warning_payload(payload),
-        "events": _compact_list_rows(event_page, compact=compact),
-        "operator_feed": _compact_list_rows(operator_feed[: _bounded_limit(limit, default=25)], compact=compact),
-        "alerts": _compact_list_rows(alerts[: _bounded_limit(limit, default=25)], compact=compact),
-        "pagination": {
-            "primary": "events",
-            "events": _pagination_contract(event_meta),
-            "operator_feed": operator_feed_pagination,
-            "alerts": alert_pagination,
-        },
-        "meta": {
-            "events": event_meta,
-            "operator_feed": {"total": len(operator_feed), "returned": operator_feed_pagination["returned_count"]},
-            "alerts": {"total": len(alerts), "returned": alert_pagination["returned_count"]},
-            "filters": {"symbol": symbol, "status": status, "search": search, "compact": compact},
-        },
-    }
 
 
 def build_action_detail_payload(*, symbol: str | None = None, unique_id: str | None = None, setup_id: str | None = None, asof_date: str | None = None) -> dict[str, Any]:
@@ -7015,10 +5273,6 @@ def build_portfolio_detail_payload(*, symbol: str, asof_date: str | None = None)
 
 
 
-def build_event_detail_payload(*, unique_id: str, asof_date: str | None = None) -> dict[str, Any]:
-    payload = load_operator_payload(asof_date=asof_date)
-    rows = [row for row in _payload_rows_by_kind(payload, "events") if str(row.get("unique_id") or "") == str(unique_id)]
-    return _detail_payload("events", rows, filters={"unique_id": unique_id, "asof_date": asof_date})
 
 
 _EVENT_POLICY_COMPACT_OMIT_KEYS = {
@@ -7031,144 +5285,12 @@ _EVENT_POLICY_COMPACT_OMIT_KEYS = {
 }
 
 
-def _compact_event_policy_row(row: dict[str, Any], *, include_raw: bool) -> dict[str, Any]:
-    if include_raw:
-        out = dict(row)
-        out["raw_included"] = True
-        return out
-    omitted = sorted(key for key in _EVENT_POLICY_COMPACT_OMIT_KEYS if key in row)
-    out = {key: value for key, value in row.items() if key not in _EVENT_POLICY_COMPACT_OMIT_KEYS}
-    out["raw_compacted"] = True
-    out["raw_omitted_keys_sample"] = omitted[:25]
-    out["raw_omitted_key_count"] = len(omitted)
-    return out
 
 
-def build_event_policy_payload(*, asof_date: str | None = None, action_type: str | None = None, limit: int = 100, include_raw: bool = False) -> dict[str, Any]:
-    if not _table_exists(EVENT_POLICY_TABLE):
-        return {
-            "generated_at": pd.Timestamp.utcnow().isoformat(),
-            "api_schema": _operator_api_schema("/api/event-policy", schema_name="event_policy"),
-            "status": "missing_table",
-            "summary": {"action_counts": {}, "policy_class_counts": {}},
-            "rows": [],
-        }
-    clauses = ["1 = 1"]
-    params: dict[str, Any] = {"limit": max(1, int(limit))}
-    parsed_asof = _parse_asof_date(asof_date)
-    if parsed_asof is not None:
-        clauses.append("asof_date = %(asof_date)s")
-        params["asof_date"] = parsed_asof
-    else:
-        clauses.append(f"asof_date = (SELECT MAX(asof_date) FROM {EVENT_POLICY_TABLE})")
-    normalized_action = str(action_type or "").strip().upper()
-    if normalized_action and normalized_action != "ALL":
-        clauses.append("action_type = %(action_type)s")
-        params["action_type"] = normalized_action
-    where_sql = " AND ".join(clauses)
-    rows = sql_to_df(
-        f"""
-        SELECT *
-        FROM {EVENT_POLICY_TABLE}
-        WHERE {where_sql}
-        ORDER BY
-            CASE action_type
-                WHEN 'REDUCE_EXPOSURE_REVIEW' THEN 1
-                WHEN 'BUY_WATCH' THEN 2
-                WHEN 'MANUAL_REVIEW' THEN 3
-                ELSE 4
-            END,
-            published_on DESC NULLS LAST,
-            ABS(policy_score) DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params=params,
-        retries=3,
-    )
-    summary_df = sql_to_df(
-        f"""
-        SELECT action_type, policy_class, count(*) AS row_count
-        FROM {EVENT_POLICY_TABLE}
-        WHERE {where_sql}
-        GROUP BY action_type, policy_class
-        """,
-        params={key: value for key, value in params.items() if key != "limit"},
-        retries=3,
-    )
-    records = _records(rows)
-    for row in records:
-        row["checks"] = _jsonish(row.get("checks_json"))
-        row["operator_notes"] = _jsonish(row.get("operator_notes_json"))
-        row["llm_review"] = _jsonish(row.get("llm_review_json"))
-        row["actionability"] = _jsonish(row.get("actionability_json"))
-        row["raw_context"] = _jsonish(row.get("raw_context_json"))
-    response_rows = [_compact_event_policy_row(row, include_raw=bool(include_raw)) for row in records]
-    action_counts: dict[str, int] = {}
-    policy_class_counts: dict[str, int] = {}
-    if not summary_df.empty:
-        for item in summary_df.to_dict(orient="records"):
-            count = int(item.get("row_count") or 0)
-            action_counts[str(item.get("action_type") or "UNKNOWN")] = action_counts.get(str(item.get("action_type") or "UNKNOWN"), 0) + count
-            policy_class_counts[str(item.get("policy_class") or "UNKNOWN")] = policy_class_counts.get(str(item.get("policy_class") or "UNKNOWN"), 0) + count
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/event-policy", schema_name="event_policy"),
-        "status": "ok",
-        "asof_date": asof_date,
-        "summary": {
-            "action_counts": action_counts,
-            "policy_class_counts": policy_class_counts,
-            "row_count": int(sum(action_counts.values())),
-            "compact": not bool(include_raw),
-            "raw_included": bool(include_raw),
-        },
-        "rows": response_rows,
-    }
 
 
-def build_event_policy_evaluation_payload(*, limit: int = 100) -> dict[str, Any]:
-    if not _table_exists(EVENT_POLICY_EVAL_SUMMARY_TABLE):
-        return {
-            "generated_at": pd.Timestamp.utcnow().isoformat(),
-            "api_schema": _operator_api_schema("/api/event-policy/evaluation", schema_name="event_policy_evaluation"),
-            "status": "missing_table",
-            "summary": [],
-        }
-    df = sql_to_df(
-        f"""
-        SELECT *
-        FROM {EVENT_POLICY_EVAL_SUMMARY_TABLE}
-        WHERE evaluated_at = (
-            SELECT MAX(evaluated_at)
-            FROM {EVENT_POLICY_EVAL_SUMMARY_TABLE}
-        )
-        ORDER BY
-            horizon_days,
-            CASE recommendation
-                WHEN 'candidate_policy_tighten_or_downgrade' THEN 1
-                WHEN 'candidate_policy_strengthen' THEN 2
-                WHEN 'monitor' THEN 3
-                ELSE 4
-            END,
-            matured_count DESC NULLS LAST,
-            avg_forward_return_after_cost DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        retries=3,
-    )
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/event-policy/evaluation", schema_name="event_policy_evaluation"),
-        "status": "ok",
-        "summary": _records(df),
-    }
 
 
-def build_event_trace_payload(unique_id: str) -> dict[str, Any]:
-    payload = load_event_trace(unique_id)
-    payload.setdefault("pagination", _trace_list_pagination(payload))
-    return payload
 
 
 def build_symbol_trace_payload(symbol: str, *, limit: int = 100) -> dict[str, Any]:
@@ -7723,20 +5845,6 @@ def _with_trace_summary_pagination(payload: dict[str, Any], *, limit: int | None
     return out
 
 
-def build_event_trace_summary_payload(unique_id: str) -> dict[str, Any]:
-    if OPERATOR_API_TRACE_SUMMARY_CACHE_ENABLED:
-        cached = load_materialized_trace_summary("event", unique_id, limit=TRACE_SUMMARY_DEFAULT_LIMIT)
-        if cached is not None:
-            return _with_trace_summary_pagination(cached, limit=TRACE_SUMMARY_DEFAULT_LIMIT)
-        record_operator_api_marker(
-            route="/api/events/{unique_id}/trace/summary",
-            operation="build_event_trace_summary_payload",
-            message="trace_summary_cache_miss:event",
-            context={"unique_id": unique_id},
-        )
-    summary = normalize_trace_payload(load_event_trace(unique_id))
-    summary["_trace_summary_cache"] = {"source": "live_fallback", "entity_type": "event", "entity_key": unique_id}
-    return _with_trace_summary_pagination(summary, limit=TRACE_SUMMARY_DEFAULT_LIMIT)
 
 
 def build_symbol_trace_summary_payload(symbol: str, *, limit: int = 100) -> dict[str, Any]:
@@ -8026,45 +6134,8 @@ def build_event_model_promotion_check_payload() -> dict[str, Any]:
     return payload
 
 
-def build_ts_forecast_promotion_check_payload(
-    *,
-    model_name: str | None = None,
-    horizon_days: int | None = None,
-    from_date: str | None = None,
-    to_date: str | None = None,
-) -> dict[str, Any]:
-    args = argparse.Namespace(
-        from_date=pd.to_datetime(from_date, utc=True, errors="coerce") if from_date else None,
-        to_date=pd.to_datetime(to_date, utc=True, errors="coerce") if to_date else None,
-        model_name=model_name,
-        horizon_days=horizon_days,
-        min_evaluated_trades=TS_PROMOTION_DEFAULT_MIN_EVALUATED_TRADES,
-        min_win_rate=TS_PROMOTION_DEFAULT_MIN_WIN_RATE,
-        min_avg_cost_adjusted_return=TS_PROMOTION_DEFAULT_MIN_AVG_COST_ADJUSTED_RETURN,
-        min_lift_vs_momentum=TS_PROMOTION_DEFAULT_MIN_LIFT_VS_MOMENTUM,
-        max_exit_conflict_rate=TS_PROMOTION_DEFAULT_MAX_EXIT_CONFLICT_RATE,
-        min_distinct_dates=TS_PROMOTION_DEFAULT_MIN_DISTINCT_DATES,
-        min_symbols=TS_PROMOTION_DEFAULT_MIN_SYMBOLS,
-    )
-    payload = build_ts_forecast_promotion_check(args)
-    payload["generated_at"] = pd.Timestamp.utcnow().isoformat()
-    payload["api_schema"] = _operator_api_schema(
-        "/api/research/ts-forecast-promotion-check",
-        schema_name="ts_forecast_promotion_check",
-    )
-    return payload
 
 
-def build_ts_forecast_review_rules_payload() -> dict[str, Any]:
-    payload = load_ts_forecast_review_rules()
-    payload["generated_at"] = pd.Timestamp.utcnow().isoformat()
-    payload["api_schema"] = _operator_api_schema(
-        "/api/research/ts-forecast-review-rules",
-        schema_name="ts_forecast_review_rules",
-    )
-    payload["api_schema"]["read_only"] = True
-    payload["api_schema"]["broker_execution_enabled"] = False
-    return payload
 
 
 def build_recommendation_diagnostics_payload(*, asof_date: str | None = None, limit: int = 500) -> dict[str, Any]:
@@ -8788,975 +6859,82 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
-def _manual_review_item(
-    *,
-    item_type: str,
-    severity: str,
-    status: str,
-    title: str,
-    reason: Any = None,
-    source_table: str,
-    source_key: Any = None,
-    row: dict[str, Any] | None = None,
-    symbol: Any = None,
-    unique_id: Any = None,
-    setup_id: Any = None,
-    asof_date: Any = None,
-    updated_at: Any = None,
-) -> dict[str, Any]:
-    raw = _json_ready(row or {})
-    symbol_text = _text(symbol if symbol is not None else raw.get("symbol"))
-    unique_id_text = _text(unique_id if unique_id is not None else raw.get("unique_id"))
-    setup_id_text = _text(setup_id if setup_id is not None else raw.get("setup_id"))
-    source_key_text = _text(source_key) or unique_id_text or symbol_text or setup_id_text or title
-    context = _manual_review_context(item_type=item_type, raw=raw, reason=reason)
-    operator_boundary = _manual_review_operator_boundary(item_type, context)
-    source_evidence = _manual_review_source_evidence(item_type=item_type, raw=raw, reason=reason)
-    return {
-        "item_id": f"{item_type}:{source_table}:{source_key_text}",
-        "item_type": item_type,
-        "review_lane": context["review_lane"],
-        "is_technical_issue": context["is_technical_issue"],
-        "operator_boundary": operator_boundary,
-        "decision_effects": operator_boundary["decision_effects"],
-        "source_evidence": source_evidence,
-        "operator_summary": context["operator_summary"],
-        "operator_questions": context["operator_questions"],
-        "wait_for_events": context["wait_for_events"],
-        "possible_action": context["possible_action"],
-        "suggested_decision": context["suggested_decision"],
-        "decision_hint": context["decision_hint"],
-        "severity": severity,
-        "status": status,
-        "title": title,
-        "reason": _text(reason) or "",
-        "source_table": source_table,
-        "source_key": source_key_text,
-        "symbol": symbol_text,
-        "unique_id": unique_id_text,
-        "setup_id": setup_id_text,
-        "asof_date": _ts(asof_date if asof_date is not None else raw.get("asof_date")),
-        "updated_at": _ts(updated_at if updated_at is not None else raw.get("updated_at") or raw.get("load_ts") or raw.get("created_at") or raw.get("reviewed_at")),
-        "raw": raw,
-    }
 
 
-def _manual_review_evidence_fact(label: str, value: Any) -> dict[str, Any] | None:
-    ready = _json_ready(value)
-    if ready is None or ready == "":
-        return None
-    return {"label": label, "value": ready}
 
 
-def _manual_review_source_evidence(*, item_type: str, raw: dict[str, Any], reason: Any = None) -> dict[str, Any]:
-    item_type_text = _text(item_type) or "manual_review"
-    facts: list[dict[str, Any]] = []
-
-    def add(label: str, value: Any) -> None:
-        fact = _manual_review_evidence_fact(label, value)
-        if fact is not None:
-            facts.append(fact)
-
-    headline = _text(reason) or _text(raw.get("action_reason")) or _text(raw.get("reason")) or _text(raw.get("last_error"))
-    source_kind = item_type_text
-    if item_type_text in {"event_policy_manual_review", "action_manual_review"} and (
-        item_type_text == "event_policy_manual_review" or (_text(raw.get("action_source")) or "").lower() == "event_policy"
-    ):
-        context = _extract_event_policy_context(raw)
-        source_kind = "event_policy"
-        headline = _text(context.get("detail")) or headline
-        add("Event class", context.get("event_label") or context.get("event_class"))
-        add("Source action", context.get("source_action"))
-        add("Materiality", context.get("materiality"))
-        add("Confidence", context.get("confidence"))
-        add("Policy score", context.get("policy_score"))
-        add("Published", context.get("published_on") or raw.get("published_on"))
-        add("Latest evaluation", raw.get("latest_evaluation_status"))
-    elif item_type_text == "action_conflict":
-        source_kind = "action_conflict"
-        headline = _text(raw.get("lost_reason")) or headline
-        add("Winner", raw.get("winning_action_code"))
-        add("Loser", raw.get("losing_action_code"))
-        add("Winning source", raw.get("winning_source"))
-        add("Losing source", raw.get("losing_source"))
-        add("Resolution status", raw.get("resolution_status"))
-        add("Manual resolution", raw.get("requires_manual_resolution"))
-    elif item_type_text == "execution_blocker":
-        source_kind = "execution_blocker"
-        add("Execution status", raw.get("execution_status"))
-        add("Action", raw.get("action_code"))
-        add("Transaction", raw.get("transaction_type"))
-        add("Mode", raw.get("execution_mode"))
-        add("Execution id", raw.get("execution_id"))
-    elif item_type_text == "event_processing_failure":
-        source_kind = "event_processing_failure"
-        add("Stage", raw.get("stage"))
-        add("Status", raw.get("status"))
-        add("Unique id", raw.get("unique_id"))
-        add("Completed", raw.get("completed_at") or raw.get("load_ts"))
-    elif item_type_text == "announcement_failure":
-        source_kind = "announcement_failure"
-        add("OCR status", raw.get("ocr_status"))
-        add("Parse status", raw.get("parse_status"))
-        add("Published", raw.get("published_on"))
-        add("Unique id", raw.get("unique_id"))
-    elif item_type_text == "identity_issue":
-        source_kind = "identity_issue"
-        add("Issue type", raw.get("issue_type"))
-        add("Requested exchange", raw.get("requested_exchange"))
-        add("Asset type", raw.get("asset_type"))
-        add("Attempt count", raw.get("attempt_count"))
-        add("Last seen", raw.get("last_seen_at"))
-    elif item_type_text == "threshold_review":
-        source_kind = "threshold_review"
-        add("Setup", raw.get("setup_id"))
-        add("Config", raw.get("config_id"))
-        add("Review status", raw.get("review_status"))
-        add("Reviewed", raw.get("reviewed_at"))
-    elif item_type_text == "wait_signal_followup":
-        source_kind = "wait_signal_followup"
-        followup = raw.get("wait_signal_followup") if isinstance(raw.get("wait_signal_followup"), dict) else {}
-        headline = _text(followup.get("evidence_summary")) or _text(followup.get("match_reason")) or headline
-        add("Original review item", followup.get("manual_review_item_id"))
-        add("Condition type", followup.get("condition_type"))
-        add("Waited for", followup.get("wait_question"))
-        add("Matched at", followup.get("matched_at"))
-    else:
-        source_kind = "action_review"
-        add("Action", raw.get("action_code") or raw.get("action_type"))
-        add("Action source", raw.get("action_source") or raw.get("source_action"))
-        add("Reason status", raw.get("reason_contract_status"))
-        add("Execution mode", raw.get("execution_mode"))
-
-    if not facts:
-        add("Source status", raw.get("status"))
-        add("Updated", raw.get("updated_at") or raw.get("load_ts"))
-    return {
-        "source_kind": source_kind,
-        "headline": headline,
-        "facts": facts[:8],
-        "compact": True,
-        "read_only": True,
-    }
 
 
-def _manual_review_context(*, item_type: str, raw: dict[str, Any], reason: Any = None) -> dict[str, Any]:
-    technical_types = {"event_processing_failure", "announcement_failure", "execution_blocker", "identity_issue"}
-    research_types = {"threshold_review"}
-    is_technical = item_type in technical_types
-    if is_technical:
-        lane = "technical_issue"
-        suggested = "mark_fixed"
-        hint = "Operational/data failure. Fix the pipeline or mark fixed after rerun confirms it is resolved."
-    elif item_type in research_types:
-        lane = "research_config"
-        suggested = "needs_more_data"
-        hint = "Research/config review. This does not affect portfolio unless a later code/config change is made."
-    else:
-        lane = "investment_review"
-        suggested = "watch_for_event"
-        hint = "Investment judgment review. Recording a decision annotates/closes this item only; it does not place trades or add portfolio rows."
-
-    notes = _manual_review_notes(raw)
-
-    questions = notes.get("operator_questions") if isinstance(notes, dict) else None
-    wait_for = notes.get("wait_for_events") if isinstance(notes, dict) else None
-    if not isinstance(questions, list):
-        questions = []
-    if not isinstance(wait_for, list):
-        wait_for = []
-
-    summary = None
-    possible_action = None
-    if isinstance(notes, dict):
-        summary = notes.get("operator_summary") or notes.get("revision_summary") or notes.get("rationale")
-        possible_action = notes.get("possible_action") or notes.get("final_action_type")
-    summary = _text(summary) or _text(raw.get("manual_revision_summary")) or _text(raw.get("action_detail")) or _text(reason)
-    possible_action = _text(possible_action)
-
-    action_source = (_text(raw.get("action_source")) or "").lower()
-    if item_type in {"action_manual_review", "event_policy_manual_review"} and action_source == "event_policy":
-        human = _event_policy_review_text(raw, fallback_reason=reason)
-        summary = human["operator_summary"]
-        possible_action = human["possible_action"]
-        if not questions:
-            questions = human["operator_questions"]
-        if not wait_for:
-            wait_for = human["wait_for_events"]
-    elif item_type == "event_policy_manual_review":
-        human = _event_policy_review_text(raw, fallback_reason=reason)
-        summary = human["operator_summary"]
-        possible_action = human["possible_action"]
-        if not questions:
-            questions = human["operator_questions"]
-        if not wait_for:
-            wait_for = human["wait_for_events"]
-    elif item_type == "wait_signal_followup":
-        followup = raw.get("wait_signal_followup") if isinstance(raw.get("wait_signal_followup"), dict) else {}
-        matched = _text(followup.get("evidence_summary")) or _text(followup.get("match_reason")) or _text(reason)
-        waited_for = _text(followup.get("wait_question"))
-        summary = f"A previously recorded wait condition has matched. Evidence: {matched}"
-        questions = [
-            "Does this matched evidence answer the original wait condition clearly?",
-            "Does the matched evidence strengthen, weaken, or invalidate the original thesis?",
-            "Should this become a new action candidate, stay on watch, or be closed as noise?",
-        ]
-        if waited_for:
-            questions.insert(0, f"Original wait condition: {waited_for}")
-        wait_for = [
-            "Additional confirmation from price, volume, announcement, or management clarification if the current match is weak",
-            "A fresh advisory or signal-refresh run if the matched evidence is actionable",
-        ]
-        possible_action = "Review the matched evidence and choose whether to close it, keep watching for more evidence, or run the relevant refresh/advisory flow. This item does not mutate portfolio/actions by itself."
-        suggested = "needs_more_data"
-        hint = "A wait signal fired. Decide whether the matched evidence is actionable; no portfolio, action, or broker state has changed."
-    elif item_type == "identity_issue":
-        summary = _text(raw.get("suggested_action")) or _text(reason)
-        questions = [
-            "Is this symbol still tradable and expected in the advisory universe?",
-            "Does company_master contain the right NSE/BSE ticker and Dhan security id?",
-            "After refreshing Dhan and company master data, does the failed downloader/advisory step rerun cleanly?",
-        ]
-        wait_for = [
-            "Fresh Dhan scrip master and company master sync",
-            "Successful rerun of the failed source without the same identity miss",
-        ]
-        possible_action = "Fix the identity mapping, rerun the failed source, then mark fixed only after the row no longer blocks ingestion/advisory."
-        suggested = "mark_fixed"
-        hint = "Identity/data failure. It blocks trusted advisory data for this symbol but does not submit orders or mutate portfolio state."
-
-    return {
-        "review_lane": lane,
-        "is_technical_issue": is_technical,
-        "operator_summary": summary,
-        "operator_questions": [_text(value) for value in questions if _text(value)],
-        "wait_for_events": [_text(value) for value in wait_for if _text(value)],
-        "possible_action": possible_action,
-        "suggested_decision": suggested,
-        "decision_hint": hint,
-    }
 
 
-def _manual_review_operator_boundary(item_type: str, context: dict[str, Any]) -> dict[str, Any]:
-    lane = _text(context.get("review_lane")) or "investment_review"
-    is_technical = bool(context.get("is_technical_issue"))
-    if lane == "technical_issue":
-        review_category = "technical_or_operational_issue"
-        primary_operator_task = "Fix the upstream data, parser, identity, API, or execution-planning issue; then mark fixed only after a rerun confirms recovery."
-    elif lane == "research_config":
-        review_category = "research_or_config_review"
-        primary_operator_task = "Review whether a later manual config/code change is justified. Saving this decision does not apply that change."
-    else:
-        review_category = "investment_judgment_review"
-        primary_operator_task = "Decide whether the evidence is actionable, should wait for a future signal, or should be closed as no action."
-    decision_effects = {
-        decision: decision_effect_payload(decision)
-        for decision in sorted(MANUAL_REVIEW_ALLOWED_DECISIONS)
-    }
-    return {
-        "review_category": review_category,
-        "review_lane": lane,
-        "is_technical_issue": is_technical,
-        "item_type": item_type,
-        "primary_operator_task": primary_operator_task,
-        "read_only_until_decision_saved": True,
-        "manual_review_decision_mutates_portfolio": False,
-        "manual_review_decision_mutates_action_recommendation": False,
-        "manual_review_decision_submits_order": False,
-        "manual_review_decision_can_create_wait_signal": True,
-        "safe_closing_decisions": sorted(MANUAL_REVIEW_CLOSING_DECISIONS),
-        "decision_effects": decision_effects,
-    }
 
 
-def _manual_review_notes(raw: dict[str, Any]) -> dict[str, Any]:
-    notes = _jsonish(raw.get("operator_notes_json"))
-    if isinstance(notes, dict):
-        return notes
-    notes = _jsonish(raw.get("llm_review_json"))
-    if isinstance(notes, dict):
-        return notes
-    raw_context = _jsonish(raw.get("raw_context_json"))
-    if isinstance(raw_context, dict) and isinstance(raw_context.get("operator_notes"), dict):
-        return raw_context["operator_notes"]
-    return {}
 
 
-def _manual_review_final_action(raw: dict[str, Any]) -> str:
-    notes = _manual_review_notes(raw)
-    return (_text(notes.get("final_action_type")) or "").upper() if notes else ""
 
 
 EVENT_POLICY_LLM_RESOLVED_ACTIONS = {"NO_ACTION", "BUY_WATCH", "REDUCE_EXPOSURE_REVIEW"}
 
 
-def _event_policy_llm_resolved_action(raw: dict[str, Any]) -> str:
-    final_action = _manual_review_final_action(raw)
-    return final_action if final_action in EVENT_POLICY_LLM_RESOLVED_ACTIONS else ""
 
 
-def _manual_review_detail(raw: dict[str, Any]) -> str:
-    reason_payload = _jsonish(raw.get("recommendation_reason_json"))
-    detail = ""
-    if isinstance(reason_payload, dict):
-        detail = _text(reason_payload.get("reason_detail")) or _text(reason_payload.get("primary_reason"))
-    return detail or _text(raw.get("action_detail")) or _text(raw.get("what_happened")) or _text(raw.get("summary"))
 
 
-def _human_label(value: Any) -> str:
-    text = (_text(value) or "").upper()
-    if not text:
-        return "event"
-    return EVENT_CLASS_LABELS.get(text, text.replace("_", " ").lower())
 
 
-def _action_boundary_for_source_action(value: Any) -> str:
-    action = (_text(value) or "").upper()
-    if action == "REDUCE_EXPOSURE_REVIEW":
-        return "Review risk first. This is not an automatic sell; reduce or exit only if the issue is material, fresh, and price/technical evidence confirms weakness."
-    if action == "BUY_WATCH":
-        return "Treat as watchlist evidence only. Do not buy unless price, volume, liquidity, and risk checks confirm the setup."
-    if action == "MANUAL_REVIEW":
-        return "Use judgment before changing the action. This row is review-only and will not place a trade by itself."
-    return "Review-only evidence. It does not place trades or change portfolio state by itself."
 
 
-def _extract_event_policy_context(raw: dict[str, Any]) -> dict[str, Any]:
-    reason_payload = _jsonish(raw.get("recommendation_reason_json"))
-    raw_context = _jsonish(raw.get("raw_context_json"))
-    policy_raw = raw_context.get("policy_raw_context") if isinstance(raw_context, dict) and isinstance(raw_context.get("policy_raw_context"), dict) else {}
-    evidence = reason_payload.get("evidence") if isinstance(reason_payload, dict) and isinstance(reason_payload.get("evidence"), dict) else {}
-    event_evidence = evidence.get("event") if isinstance(evidence.get("event"), dict) else {}
-    event_class = _text(raw.get("policy_class")) or _text(raw.get("event_class"))
-    if not event_class and isinstance(raw_context, dict):
-        event_class = _text(raw_context.get("policy_class")) or _text(raw_context.get("event_class"))
-    event_class = event_class or _text(policy_raw.get("policy_class")) or _text(event_evidence.get("event_class"))
-    source_action = _text(raw.get("source_action"))
-    if not source_action and isinstance(raw_context, dict):
-        source_action = _text(raw_context.get("final_source_action")) or _text(raw_context.get("action_type"))
-    raw_context_dict = raw_context if isinstance(raw_context, dict) else {}
-    return {
-        "event_class": event_class,
-        "event_label": _human_label(event_class),
-        "source_action": source_action,
-        "detail": _manual_review_detail(raw),
-        "policy_score": raw_context_dict.get("policy_score") if raw_context_dict.get("policy_score") is not None else raw.get("policy_score"),
-        "confidence": raw_context_dict.get("confidence") if raw_context_dict.get("confidence") is not None else raw.get("confidence"),
-        "materiality": raw_context_dict.get("materiality") if raw_context_dict.get("materiality") is not None else raw.get("materiality"),
-        "published_on": raw_context_dict.get("event_published_on") if raw_context_dict.get("event_published_on") is not None else raw.get("published_on"),
-    }
 
 
-def _event_policy_review_text(raw: dict[str, Any], fallback_reason: Any = None) -> dict[str, Any]:
-    context = _extract_event_policy_context(raw)
-    label = context["event_label"]
-    detail = _text(context.get("detail"))
-    fallback = _text(fallback_reason) or "The event may affect the current thesis."
-    summary = f"This is a {label} that needs a risk check before it affects the recommendation."
-    if detail:
-        summary = f"{summary} What happened: {detail}"
-    else:
-        summary = f"{summary} {fallback}"
-    questions = [
-        "Is the amount or issue material relative to revenue, profit, market cap, or current position size?",
-        "Does management say the impact is immaterial, disputed, already provided for, or likely to recur?",
-        "Has the stock reacted with abnormal price/volume weakness after the event?",
-        "If already holding, is the current stop or invalidation level still appropriate?",
-    ]
-    wait_for = [
-        "Company clarification, appeal outcome, or follow-up exchange filing",
-        "Price closing below support/invalidation with volume",
-        "Evidence that the issue is larger, recurring, or affects operations/cash flow",
-    ]
-    possible_action = _action_boundary_for_source_action(context.get("source_action"))
-    return {
-        "reason": summary,
-        "operator_summary": summary,
-        "possible_action": possible_action,
-        "operator_questions": questions,
-        "wait_for_events": wait_for,
-    }
 
 
-def _load_event_policy_no_action_unique_ids(skipped: list[dict[str, str]]) -> set[str]:
-    return _load_event_policy_llm_resolved_unique_ids(skipped, resolved_actions={"NO_ACTION"})
 
 
-def _load_event_policy_llm_resolved_unique_ids(
-    skipped: list[dict[str, str]],
-    *,
-    resolved_actions: set[str] | None = None,
-) -> set[str]:
-    table = EVENT_POLICY_TABLE
-    if not _table_exists(table):
-        return set()
-    allowed_actions = {(_text(value) or "").upper() for value in (resolved_actions or EVENT_POLICY_LLM_RESOLVED_ACTIONS)}
-    allowed_actions.discard("")
-    df = _safe_manual_query(
-        f"{table}:llm_resolved_notes",
-        f"""
-        SELECT unique_id, operator_notes_json, llm_review_json, raw_context_json
-        FROM {table}
-        WHERE asof_date = (SELECT MAX(asof_date) FROM {table})
-          AND unique_id IS NOT NULL
-          AND (
-            action_type = 'MANUAL_REVIEW'
-            OR action_status ILIKE '%%review%%'
-            OR action_status ILIKE '%%blocked%%'
-          )
-        """,
-        skipped=skipped,
-    )
-    out: set[str] = set()
-    for row in _records(df):
-        final_action = _manual_review_final_action(row)
-        if final_action and final_action in allowed_actions:
-            uid = _text(row.get("unique_id"))
-            if uid:
-                out.add(uid)
-    return out
 
 
-def _suppress_shadow_manual_review_items(items: list[dict[str, Any]], skipped: list[dict[str, str]]) -> list[dict[str, Any]]:
-    detailed_event_uids = {
-        _text(item.get("unique_id"))
-        for item in items
-        if item.get("item_type") == "event_policy_manual_review" and _text(item.get("unique_id"))
-    }
-    locally_resolved_event_present = any(
-        item.get("item_type") == "event_policy_manual_review"
-        and isinstance(item.get("raw"), dict)
-        and bool(_event_policy_llm_resolved_action(item["raw"]))
-        for item in items
-    )
-    llm_resolved_event_uids = _load_event_policy_llm_resolved_unique_ids(skipped)
-    superseded_event_uids = _load_superseded_event_policy_failure_unique_ids(skipped)
-    if not locally_resolved_event_present and not detailed_event_uids and not llm_resolved_event_uids and not superseded_event_uids:
-        return items
-    out: list[dict[str, Any]] = []
-    for item in items:
-        uid = _text(item.get("unique_id"))
-        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-        source = (_text(raw.get("action_source")) or "").lower() if isinstance(raw, dict) else ""
-        if item.get("item_type") == "event_policy_manual_review" and (
-            uid in llm_resolved_event_uids or _event_policy_llm_resolved_action(raw)
-        ):
-            continue
-        if item.get("item_type") == "event_policy_manual_review" and uid in superseded_event_uids:
-            continue
-        if item.get("item_type") == "action_manual_review" and source == "event_policy" and uid in (detailed_event_uids | llm_resolved_event_uids | superseded_event_uids):
-            continue
-        out.append(item)
-    return out
 
 
-def _safe_manual_query(source_name: str, query: str, *, params: dict[str, Any] | None = None, skipped: list[dict[str, str]]) -> pd.DataFrame:
-    try:
-        return sql_to_df(query, params=params or {}, retries=3)
-    except Exception as exc:
-        skipped.append({"source": source_name, "error": f"{type(exc).__name__}: {exc}"})
-        _record_operator_local_fallback(
-            source=source_name,
-            fallback_type="operator_api_manual_review_source_query_failed",
-            severity="error",
-            reason="Operator API could not load a Manual Review source table and omitted that source from the response.",
-            error=exc,
-            metadata={"params_keys": sorted((params or {}).keys())},
-        )
-        return pd.DataFrame()
 
 
 _SUCCESS_PROCESSING_STATUSES = {"ok", "success", "completed", "processed"}
 _RECOVERED_DOCUMENT_STATUSES = {"completed", "success", "ok", "processed", "skipped", "unavailable"}
 
 
-def _contains_llm_error_marker(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, dict):
-        return any(_contains_llm_error_marker(key) or _contains_llm_error_marker(item) for key, item in value.items())
-    if isinstance(value, (list, tuple, set)):
-        return any(_contains_llm_error_marker(item) for item in value)
-    return "llm_error" in str(value).strip().lower() or "automatic llm evaluation failed" in str(value).strip().lower()
 
 
-def _event_policy_llm_failure_superseded(row: dict[str, Any]) -> bool:
-    raw_context = _jsonish(row.get("raw_context_json"), source="event_policy_raw_context_json")
-    row_has_llm_failure = (
-        _contains_llm_error_marker(raw_context.get("source_trace") if isinstance(raw_context, dict) else raw_context)
-        or _contains_llm_error_marker(row.get("action_reason"))
-        or _contains_llm_error_marker(row.get("action_detail"))
-        or _contains_llm_error_marker(row.get("llm_review_error"))
-    )
-    if not row_has_llm_failure:
-        return False
-    latest_status = (_text(row.get("latest_evaluation_status")) or "").lower()
-    if latest_status not in _SUCCESS_PROCESSING_STATUSES:
-        return False
-    latest_trace = _jsonish(row.get("latest_evaluation_source_trace_json"), source="latest_evaluation_source_trace_json")
-    if _contains_llm_error_marker(latest_trace):
-        return False
-    row_asof = pd.to_datetime(row.get("asof_date"), utc=True, errors="coerce")
-    latest_asof = pd.to_datetime(row.get("latest_evaluation_asof_date"), utc=True, errors="coerce")
-    if not pd.isna(row_asof) and not pd.isna(latest_asof) and latest_asof < row_asof:
-        return False
-    return True
 
 
-def _load_superseded_event_policy_failure_unique_ids(skipped: list[dict[str, str]], *, limit: int = 5000) -> set[str]:
-    if not _table_exists(EVENT_POLICY_TABLE) or not _table_exists("advisory_event_evaluations"):
-        return set()
-    df = _safe_manual_query(
-        "event_policy_superseded_failure_check",
-        f"""
-        SELECT
-            p.unique_id,
-            p.symbol,
-            p.setup_id,
-            p.asof_date,
-            p.action_reason,
-            p.action_detail,
-            p.raw_context_json,
-            p.llm_review_error,
-            latest_eval.evaluation_status AS latest_evaluation_status,
-            latest_eval.source_trace_json AS latest_evaluation_source_trace_json,
-            latest_eval.asof_date AS latest_evaluation_asof_date
-        FROM {EVENT_POLICY_TABLE} p
-        LEFT JOIN LATERAL (
-            SELECT e.evaluation_status, e.source_trace_json, e.asof_date
-            FROM advisory_event_evaluations e
-            WHERE e.unique_id = p.unique_id
-              AND UPPER(TRIM(e.symbol)) = UPPER(TRIM(p.symbol))
-              AND UPPER(TRIM(e.setup_id)) = UPPER(TRIM(p.setup_id))
-            ORDER BY e.asof_date DESC NULLS LAST, e.published_on DESC NULLS LAST, e.load_ts DESC NULLS LAST
-            LIMIT 1
-        ) latest_eval ON TRUE
-        WHERE p.asof_date = (SELECT MAX(asof_date) FROM {EVENT_POLICY_TABLE})
-          AND (
-            p.action_type = 'MANUAL_REVIEW'
-            OR p.action_status ILIKE '%%review%%'
-            OR p.action_status ILIKE '%%blocked%%'
-          )
-        ORDER BY p.published_on DESC NULLS LAST, ABS(p.policy_score) DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        skipped=skipped,
-    )
-    return {
-        _text(row.get("unique_id")) or ""
-        for row in _records(df)
-        if _text(row.get("unique_id")) and _event_policy_llm_failure_superseded(row)
-    }
 
 
-def _processing_failure_is_superseded(row: dict[str, Any]) -> bool:
-    return bool(row.get("superseded_at") or (_text(row.get("superseded_by_status")) or "").lower() in _SUCCESS_PROCESSING_STATUSES)
 
 
-def _announcement_failure_is_active(row: dict[str, Any]) -> bool:
-    ocr_status = (_text(row.get("ocr_status")) or "").lower()
-    parse_status = (_text(row.get("parse_status")) or "").lower()
-    if ocr_status == "failed" or parse_status == "failed":
-        return True
-    if row.get("last_error") is None:
-        return False
-    return not (ocr_status in _RECOVERED_DOCUMENT_STATUSES and parse_status in _RECOVERED_DOCUMENT_STATUSES)
 
 
 def ensure_manual_review_decisions_table() -> None:
     ensure_operator_api_audit_tables()
 
 
-def load_latest_manual_review_decisions(*, limit: int = 1000) -> dict[str, dict[str, Any]]:
-    ensure_manual_review_decisions_table()
-    df = sql_to_df(
-        f"""
-        SELECT DISTINCT ON (item_id) *
-        FROM {MANUAL_REVIEW_DECISIONS_TABLE}
-        ORDER BY item_id, decided_at DESC
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        retries=3,
-    )
-    decisions: dict[str, dict[str, Any]] = {}
-    for row in _records(df):
-        item_id = _text(row.get("item_id"))
-        if not item_id:
-            continue
-        row["note"] = _jsonish(row.get("note_json"))
-        row["item_snapshot"] = _jsonish(row.get("item_snapshot_json"))
-        decisions[item_id] = row
-    return decisions
 
 
 MANUAL_REVIEW_ACTION_CODES = {"BUY", "BUY_MORE", "SELL", "PARTIAL_SELL", "TIGHTEN_STOP"}
 
 
-def _action_recommendation_requires_manual_review(row: dict[str, Any]) -> bool:
-    action_code = (_text(row.get("action_code")) or "").upper()
-    reason_status = (_text(row.get("reason_contract_status")) or "complete").lower()
-    execution_mode = (_text(row.get("execution_mode")) or "").lower()
-    if action_code == "MANUAL_REVIEW":
-        return True
-    if reason_status != "complete":
-        return True
-    return bool(execution_mode == "review_only" and action_code in MANUAL_REVIEW_ACTION_CODES)
 
 
-def _append_latest_action_review_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    table = ACTION_RECOMMENDATIONS_TABLE
-    if not _table_exists(table):
-        skipped.append({"source": table, "error": "missing_table"})
-        return
-    df = _safe_manual_query(
-        table,
-        f"""
-        SELECT *
-        FROM {table}
-        WHERE asof_date = (SELECT MAX(asof_date) FROM {table})
-          AND (
-            action_code = 'MANUAL_REVIEW'
-            OR reason_contract_status IS DISTINCT FROM 'complete'
-            OR (
-              execution_mode = 'review_only'
-              AND action_code IN ('BUY', 'BUY_MORE', 'SELL', 'PARTIAL_SELL', 'TIGHTEN_STOP')
-            )
-          )
-        ORDER BY
-            CASE action_code WHEN 'MANUAL_REVIEW' THEN 1 ELSE 2 END,
-            published_on DESC NULLS LAST,
-            load_ts DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        skipped=skipped,
-    )
-    for row in _records(df):
-        if not _action_recommendation_requires_manual_review(row):
-            continue
-        status = _text(row.get("action_code")) or "manual_review"
-        reason = row.get("action_reason") or row.get("reason") or row.get("reason_detail") or row.get("recommendation_reason")
-        if (_text(row.get("action_source")) or "").lower() == "event_policy":
-            reason = _event_policy_review_text(row, fallback_reason=reason)["reason"]
-        items.append(
-            _manual_review_item(
-                item_type="action_manual_review",
-                severity="review",
-                status=status,
-                title=f"{row.get('symbol') or 'Symbol'} event risk needs review" if (_text(row.get("action_source")) or "").lower() == "event_policy" else f"{row.get('symbol') or 'Symbol'} action needs review",
-                reason=reason,
-                source_table=table,
-                source_key=f"{row.get('asof_date')}:{row.get('symbol')}:{row.get('setup_id')}",
-                row=row,
-            )
-        )
 
 
-def _append_event_policy_review_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    table = EVENT_POLICY_TABLE
-    if not _table_exists(table):
-        skipped.append({"source": table, "error": "missing_table"})
-        return
-    if _table_exists("advisory_event_evaluations"):
-        evaluation_select = """
-            latest_eval.evaluation_status AS latest_evaluation_status,
-            latest_eval.source_trace_json AS latest_evaluation_source_trace_json,
-            latest_eval.asof_date AS latest_evaluation_asof_date
-        """
-        evaluation_join = """
-        LEFT JOIN LATERAL (
-            SELECT e.evaluation_status, e.source_trace_json, e.asof_date
-            FROM advisory_event_evaluations e
-            WHERE e.unique_id = p.unique_id
-              AND UPPER(TRIM(e.symbol)) = UPPER(TRIM(p.symbol))
-              AND UPPER(TRIM(e.setup_id)) = UPPER(TRIM(p.setup_id))
-            ORDER BY e.asof_date DESC NULLS LAST, e.published_on DESC NULLS LAST, e.load_ts DESC NULLS LAST
-            LIMIT 1
-        ) latest_eval ON TRUE
-        """
-    else:
-        evaluation_select = """
-            NULL::text AS latest_evaluation_status,
-            NULL::text AS latest_evaluation_source_trace_json,
-            NULL::timestamptz AS latest_evaluation_asof_date
-        """
-        evaluation_join = ""
-    df = _safe_manual_query(
-        table,
-        f"""
-        SELECT
-            p.*,
-            {evaluation_select}
-        FROM {table} p
-        {evaluation_join}
-        WHERE p.asof_date = (SELECT MAX(asof_date) FROM {table})
-          AND (
-            p.action_type = 'MANUAL_REVIEW'
-            OR p.action_status ILIKE '%%review%%'
-            OR p.action_status ILIKE '%%blocked%%'
-          )
-        ORDER BY p.published_on DESC NULLS LAST, ABS(p.policy_score) DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        skipped=skipped,
-    )
-    for row in _records(df):
-        if _event_policy_llm_resolved_action(row):
-            continue
-        if _event_policy_llm_failure_superseded(row):
-            continue
-        checks = _jsonish(row.get("checks_json"))
-        notes = _jsonish(row.get("operator_notes_json"))
-        reason = (
-            _text(notes.get("operator_summary")) if isinstance(notes, dict) else ""
-        ) or row.get("action_reason") or row.get("reason") or (checks.get("reason") if isinstance(checks, dict) else None)
-        detail = _manual_review_detail(row)
-        if detail and detail != _text(reason):
-            reason = f"{_text(reason)} Detail: {detail}" if _text(reason) else detail
-        reason = _event_policy_review_text(row, fallback_reason=reason)["reason"]
-        items.append(
-            _manual_review_item(
-                item_type="event_policy_manual_review",
-                severity="review",
-                status=_text(row.get("action_type")) or "MANUAL_REVIEW",
-                title=f"{row.get('symbol') or row.get('entity') or 'Event'} policy review",
-                reason=reason,
-                source_table=table,
-                source_key=row.get("unique_id") or row.get("event_id"),
-                row=row,
-            )
-        )
 
 
-def _append_action_conflict_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    table = ACTION_CONFLICTS_TABLE
-    if not _table_exists(table):
-        skipped.append({"source": table, "error": "missing_table"})
-        return
-    # Manual Review is an action-required queue. Resolved conflicts are audit-only
-    # and stay visible via decision traces, symbol pages, and conflict-rules views.
-    df = _safe_manual_query(
-        table,
-        f"""
-        SELECT *
-        FROM {table}
-        WHERE asof_date = (SELECT MAX(asof_date) FROM {table})
-          AND (
-            COALESCE(requires_manual_resolution, FALSE) = TRUE
-            OR COALESCE(resolution_status, '') IN ('unresolved', 'manual_required')
-          )
-        ORDER BY load_ts DESC NULLS LAST, asof_date DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        skipped=skipped,
-    )
-    for row in _records(df):
-        reason = row.get("lost_reason") or f"{row.get('winning_action_code')} won over {row.get('losing_action_code')}"
-        items.append(
-            _manual_review_item(
-                item_type="action_conflict",
-                severity="warning",
-                status=_text(row.get("resolution_status")) or "manual_required",
-                title=f"{row.get('symbol') or 'Symbol'} had conflicting action signals",
-                reason=reason,
-                source_table=table,
-                source_key=f"{row.get('asof_date')}:{row.get('symbol')}:{row.get('losing_setup_id')}:{row.get('losing_unique_id')}",
-                row=row,
-            )
-        )
 
 
-def _append_threshold_review_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    try:
-        reviews = load_promotion_reviews(limit=max(1, int(limit)))
-    except Exception as exc:
-        skipped.append({"source": "technical_threshold_promotion_reviews", "error": f"{type(exc).__name__}: {exc}"})
-        _record_operator_local_fallback(
-            source="technical_threshold_promotion_reviews",
-            fallback_type="operator_api_threshold_review_load_failed",
-            severity="error",
-            reason="Operator API could not load technical-threshold promotion reviews and omitted them from Manual Review.",
-            error=exc,
-            metadata={"limit": max(1, int(limit))},
-        )
-        return
-    for row in reviews:
-        if _text(row.get("manual_decision")):
-            continue
-        reason = row.get("review_status") or row.get("review_error") or "Threshold calibration needs operator decision before promotion."
-        items.append(
-            _manual_review_item(
-                item_type="threshold_review",
-                severity="review",
-                status=_text(row.get("review_status")) or "pending_operator_decision",
-                title=f"{row.get('setup_id') or 'Setup'} threshold review",
-                reason=reason,
-                source_table="technical_threshold_promotion_reviews",
-                source_key=f"{row.get('reviewed_at')}:{row.get('setup_id')}:{row.get('config_id')}",
-                row=row,
-                updated_at=row.get("reviewed_at"),
-            )
-        )
 
 
-def _append_execution_blocker_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    table = EXECUTION_TABLE
-    if not _table_exists(table):
-        skipped.append({"source": table, "error": "missing_table"})
-        return
-    df = _safe_manual_query(
-        table,
-        f"""
-        SELECT *
-        FROM {table}
-        WHERE asof_date = (SELECT MAX(asof_date) FROM {table})
-          AND execution_status IN ('submit_blocked', 'submit_error', 'reconcile_error', 'invalid_order')
-        ORDER BY published_on DESC NULLS LAST, submitted_at DESC NULLS LAST, load_ts DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        skipped=skipped,
-    )
-    for row in _records(df):
-        items.append(
-            _manual_review_item(
-                item_type="execution_blocker",
-                severity="error",
-                status=_text(row.get("execution_status")) or "execution_issue",
-                title=f"{row.get('symbol') or 'Order'} execution blocker",
-                reason=row.get("execution_reason") or row.get("error") or row.get("status_reason"),
-                source_table=table,
-                source_key=row.get("execution_id") or f"{row.get('asof_date')}:{row.get('symbol')}:{row.get('action_code')}",
-                row=row,
-            )
-        )
 
 
-def _append_processing_failure_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    table = "advisory_event_processing_runs"
-    if not _table_exists(table):
-        skipped.append({"source": table, "error": "missing_table"})
-        return
-    df = _safe_manual_query(
-        table,
-        f"""
-        SELECT failed.*
-        FROM {table} failed
-        WHERE (failed.status IN ('failed', 'error') OR failed.error IS NOT NULL)
-          AND NOT EXISTS (
-              SELECT 1
-              FROM {table} newer
-              WHERE newer.unique_id = failed.unique_id
-                AND newer.stage = failed.stage
-                AND newer.status IN ('ok', 'success', 'completed', 'processed')
-                AND COALESCE(newer.completed_at, newer.started_at, newer.load_ts) > COALESCE(failed.completed_at, failed.started_at, failed.load_ts)
-          )
-        ORDER BY COALESCE(failed.completed_at, failed.started_at, failed.load_ts) DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        skipped=skipped,
-    )
-    for row in _records(df):
-        if _processing_failure_is_superseded(row):
-            continue
-        items.append(
-            _manual_review_item(
-                item_type="event_processing_failure",
-                severity="error",
-                status=_text(row.get("status")) or "failed",
-                title=f"{row.get('stage') or 'Event processing'} failed",
-                reason=row.get("error") or row.get("reason"),
-                source_table=table,
-                source_key=row.get("run_id") or row.get("unique_id"),
-                row=row,
-            )
-        )
 
 
-def _append_announcement_failure_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    table = "announcement_pipeline_documents"
-    if not _table_exists(table):
-        skipped.append({"source": table, "error": "missing_table"})
-        return
-    df = _safe_manual_query(
-        table,
-        f"""
-        SELECT *
-        FROM {table}
-        WHERE ocr_status = 'failed'
-           OR parse_status = 'failed'
-           OR (
-                last_error IS NOT NULL
-                AND NOT (
-                    LOWER(COALESCE(ocr_status, '')) IN ('completed', 'success', 'ok', 'processed', 'skipped', 'unavailable')
-                    AND LOWER(COALESCE(parse_status, '')) IN ('completed', 'success', 'ok', 'processed', 'skipped', 'unavailable')
-                )
-           )
-        ORDER BY COALESCE(published_on, created_at, updated_at) DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        skipped=skipped,
-    )
-    for row in _records(df):
-        if not _announcement_failure_is_active(row):
-            continue
-        items.append(
-            _manual_review_item(
-                item_type="announcement_failure",
-                severity="warning",
-                status=_text(row.get("parse_status")) or _text(row.get("ocr_status")) or "failed",
-                title=f"{row.get('ticker') or row.get('symbol') or 'Announcement'} extraction issue",
-                reason=row.get("last_error") or row.get("ocr_error") or row.get("parse_error"),
-                source_table=table,
-                source_key=row.get("unique_id"),
-                row=row,
-                symbol=row.get("ticker") or row.get("symbol"),
-                updated_at=row.get("updated_at") or row.get("published_on"),
-            )
-        )
 
 
-def _append_identity_issue_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    if not _table_exists(IDENTITY_ISSUES_TABLE):
-        skipped.append({"source": IDENTITY_ISSUES_TABLE, "error": "missing_table"})
-        return
-    try:
-        df = load_open_identity_issues(limit=max(1, int(limit)))
-    except Exception as exc:
-        skipped.append({"source": IDENTITY_ISSUES_TABLE, "error": f"{type(exc).__name__}: {exc}"})
-        _record_operator_local_fallback(
-            source=IDENTITY_ISSUES_TABLE,
-            fallback_type="operator_api_identity_issues_load_failed",
-            severity="error",
-            reason="Operator API could not load identity issues and omitted them from Manual Review.",
-            error=exc,
-            metadata={"limit": max(1, int(limit))},
-        )
-        return
-    for row in _records(df):
-        symbol = row.get("symbol")
-        exchange = row.get("requested_exchange")
-        reason = row.get("error_text") or row.get("suggested_action") or "Unresolved identity issue."
-        items.append(
-            _manual_review_item(
-                item_type="identity_issue",
-                severity="error",
-                status=_text(row.get("status")) or "open",
-                title=f"{exchange or 'Exchange'}:{symbol or 'Symbol'} identity mapping issue",
-                reason=reason,
-                source_table=IDENTITY_ISSUES_TABLE,
-                source_key=row.get("issue_key"),
-                row=row,
-                symbol=symbol,
-                updated_at=row.get("last_seen_at") or row.get("load_ts"),
-            )
-        )
 
 
 def _identity_issue_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -9912,306 +7090,30 @@ def resolve_identity_issues_payload(*, payload: dict[str, Any] | None = None, ap
     }
 
 
-def _wait_signal_match_context(row: dict[str, Any]) -> dict[str, Any]:
-    evidence = _jsonish(row.get("evidence_json"))
-    wait_signal = evidence.get("wait_signal") if isinstance(evidence, dict) and isinstance(evidence.get("wait_signal"), dict) else {}
-    condition = _jsonish(row.get("condition_json"))
-    manual_review_item_id = (
-        _text(wait_signal.get("manual_review_item_id")) if isinstance(wait_signal, dict) else None
-    ) or (
-        _text(row.get("signal_source_key")) if _text(row.get("generated_by")) == "manual_review_decision" else None
-    )
-    return {
-        "signal_id": _text(row.get("signal_id")),
-        "manual_review_item_id": manual_review_item_id,
-        "manual_review_source_table": (
-            _text(wait_signal.get("manual_review_source_table")) if isinstance(wait_signal, dict) else None
-        ) or _text(row.get("signal_source_table")),
-        "manual_review_source_key": (
-            _text(wait_signal.get("manual_review_source_key")) if isinstance(wait_signal, dict) else None
-        ) or _text(row.get("signal_source_key")),
-        "wait_question": _text(row.get("wait_question")) or (_text(wait_signal.get("wait_question")) if isinstance(wait_signal, dict) else None),
-        "operator_summary": _text(row.get("operator_summary")) or (_text(wait_signal.get("operator_summary")) if isinstance(wait_signal, dict) else None),
-        "condition_type": (
-            _text(condition.get("condition_type")) if isinstance(condition, dict) else None
-        ) or _text(row.get("signal_type")),
-        "expected_action": _text(row.get("signal_expected_action")) or _text(row.get("expected_action")),
-        "matched_at": _ts(row.get("matched_at")),
-        "match_reason": _text(row.get("match_reason")),
-        "evidence_summary": _wait_signal_evidence_summary(row),
-        "match_source_table": _text(row.get("match_source_table")) or _text(row.get("source_table")),
-        "match_source_key": _text(row.get("match_source_key")) or _text(row.get("source_key")),
-        "observed_at": _ts(row.get("observed_at")),
-        "observed_value": _json_ready(row.get("observed_value")),
-        "threshold_value": _json_ready(row.get("threshold_value")),
-    }
 
 
-def _append_wait_signal_followup_items(items: list[dict[str, Any]], skipped: list[dict[str, str]], *, limit: int) -> None:
-    if not _table_exists(WAIT_SIGNALS_TABLE) or not _table_exists(WAIT_SIGNAL_MATCHES_TABLE):
-        skipped.append({"source": WAIT_SIGNALS_TABLE, "error": "missing_table"})
-        return
-    df = _safe_manual_query(
-        "matched_manual_review_wait_signals",
-        f"""
-        SELECT DISTINCT ON (m.signal_id)
-            m.matched_at,
-            m.signal_id,
-            m.hypothesis_id,
-            m.symbol,
-            m.signal_type,
-            m.expected_action,
-            m.match_status,
-            m.match_score,
-            m.source_table AS match_source_table,
-            m.source_key AS match_source_key,
-            m.observed_at,
-            m.observed_value,
-            m.threshold_value,
-            m.match_reason,
-            m.evidence_json,
-            s.created_at AS signal_created_at,
-            s.hypothesis_title,
-            s.source_table AS signal_source_table,
-            s.source_key AS signal_source_key,
-            s.symbol AS signal_symbol,
-            s.status AS signal_status,
-            s.priority,
-            s.expected_action AS signal_expected_action,
-            s.operator_summary,
-            s.wait_question,
-            s.condition_json,
-            s.valid_until,
-            s.generated_by
-        FROM {WAIT_SIGNAL_MATCHES_TABLE} m
-        JOIN {WAIT_SIGNALS_TABLE} s
-          ON s.signal_id = m.signal_id
-        WHERE s.generated_by = 'manual_review_decision'
-          AND COALESCE(m.match_status, 'matched') = 'matched'
-        ORDER BY m.signal_id, m.matched_at DESC NULLS LAST
-        LIMIT %(limit)s
-        """,
-        params={"limit": max(1, int(limit))},
-        skipped=skipped,
-    )
-    for row in _records(df):
-        context = _wait_signal_match_context(row)
-        manual_review_item_id = _text(context.get("manual_review_item_id"))
-        source_key = f"{row.get('signal_id')}:{row.get('match_source_table')}:{row.get('match_source_key')}"
-        title_symbol = _text(row.get("signal_symbol")) or _text(row.get("symbol")) or "Wait signal"
-        reason_bits = [
-            "A condition you asked the system to watch has matched fresh evidence.",
-            context.get("match_reason") or "",
-        ]
-        if context.get("wait_question"):
-            reason_bits.append(f"Original wait: {context.get('wait_question')}")
-        if manual_review_item_id:
-            reason_bits.append(f"Original Manual Review item: {manual_review_item_id}")
-        raw = dict(row)
-        raw["wait_signal_followup"] = context
-        items.append(
-            _manual_review_item(
-                item_type="wait_signal_followup",
-                severity="review",
-                status="matched_wait_signal",
-                title=f"{title_symbol} wait signal matched",
-                reason=" ".join(str(part).strip() for part in reason_bits if _text(part)),
-                source_table=WAIT_SIGNAL_MATCHES_TABLE,
-                source_key=source_key,
-                row=raw,
-                symbol=row.get("signal_symbol") or row.get("symbol"),
-                unique_id=row.get("match_source_key"),
-                updated_at=row.get("matched_at"),
-            )
-        )
 
 
-def _matched_manual_review_wait_item_ids(items: list[dict[str, Any]]) -> set[str]:
-    out: set[str] = set()
-    for item in items:
-        if item.get("item_type") != "wait_signal_followup":
-            continue
-        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-        followup = raw.get("wait_signal_followup") if isinstance(raw.get("wait_signal_followup"), dict) else {}
-        item_id = _text(followup.get("manual_review_item_id"))
-        if item_id:
-            out.add(item_id)
-    return out
 
 
-def _manual_review_wait_followup_original_item_id(item: dict[str, Any]) -> str | None:
-    if item.get("item_type") != "wait_signal_followup":
-        return None
-    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-    followup = raw.get("wait_signal_followup") if isinstance(raw.get("wait_signal_followup"), dict) else {}
-    return _text(followup.get("manual_review_item_id"))
 
 
-def _manual_review_canonical_dedupe_key(item: dict[str, Any]) -> str:
-    item_type = _text(item.get("item_type")) or "manual_review"
-    source_table = _text(item.get("source_table")) or ""
-    symbol = (_text(item.get("symbol")) or "").upper()
-    setup_id = _text(item.get("setup_id")) or ""
-    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-    if item_type == "action_manual_review":
-        return ":".join(
-            [
-                item_type,
-                source_table,
-                symbol,
-                setup_id,
-                (_text(raw.get("action_code")) or _text(item.get("status")) or "").upper(),
-                (_text(raw.get("action_source")) or "").lower(),
-            ]
-        )
-    if item_type == "action_conflict":
-        return ":".join(
-            [
-                item_type,
-                source_table,
-                symbol,
-                (_text(raw.get("winning_action_code")) or "").upper(),
-                (_text(raw.get("losing_action_code")) or "").upper(),
-                (_text(raw.get("resolution_status")) or _text(item.get("status")) or "").lower(),
-            ]
-        )
-    return str(item.get("item_id") or "")
 
 
-def _dedupe_manual_review_items(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    exact: dict[str, dict[str, Any]] = {}
-    for item in items:
-        item_id = str(item.get("item_id") or "")
-        if not item_id:
-            continue
-        existing = exact.get(item_id)
-        if not existing:
-            exact[item_id] = item
-            continue
-        existing_ts = str(existing.get("updated_at") or existing.get("asof_date") or "")
-        item_ts = str(item.get("updated_at") or item.get("asof_date") or "")
-        if item_ts >= existing_ts:
-            exact[item_id] = item
-
-    canonical: dict[str, dict[str, Any]] = {}
-    for item in exact.values():
-        key = _manual_review_canonical_dedupe_key(item)
-        if not key:
-            key = str(item.get("item_id") or "")
-        existing = canonical.get(key)
-        if not existing:
-            canonical[key] = item
-            continue
-        existing_ts = str(existing.get("updated_at") or existing.get("asof_date") or "")
-        item_ts = str(item.get("updated_at") or item.get("asof_date") or "")
-        if item_ts >= existing_ts:
-            canonical[key] = item
-    suppressed = max(0, len(items) - len(canonical))
-    return list(canonical.values()), suppressed
 
 
-def _manual_review_decision_canonical_key(decision: dict[str, Any]) -> str:
-    snapshot = decision.get("item_snapshot") if isinstance(decision.get("item_snapshot"), dict) else {}
-    if snapshot:
-        return _manual_review_canonical_dedupe_key(snapshot)
-    item = {
-        "item_id": decision.get("item_id"),
-        "item_type": decision.get("item_type"),
-        "source_table": decision.get("source_table"),
-        "source_key": decision.get("source_key"),
-        "symbol": decision.get("symbol"),
-        "unique_id": decision.get("unique_id"),
-        "setup_id": decision.get("setup_id"),
-    }
-    return _manual_review_canonical_dedupe_key(item)
 
 
-def _latest_manual_review_decisions_by_canonical_key(decisions: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    out: dict[str, dict[str, Any]] = {}
-    for decision in decisions.values():
-        key = _manual_review_decision_canonical_key(decision)
-        if not key:
-            continue
-        existing = out.get(key)
-        if not existing or str(decision.get("decided_at") or "") >= str(existing.get("decided_at") or ""):
-            out[key] = decision
-    return out
 
 
-def _latest_manual_review_decision_for_item(
-    item: dict[str, Any],
-    *,
-    latest_decisions: dict[str, dict[str, Any]],
-    latest_canonical_decisions: dict[str, dict[str, Any]],
-) -> dict[str, Any] | None:
-    item_id = str(item.get("item_id") or "")
-    if item_id and item_id in latest_decisions:
-        return latest_decisions[item_id]
-    canonical_key = _manual_review_canonical_dedupe_key(item)
-    if canonical_key:
-        return latest_canonical_decisions.get(canonical_key)
-    return None
 
 
-def _manual_review_scalar_ts(value: Any) -> pd.Timestamp | None:
-    if isinstance(value, (dict, list, tuple, set)):
-        return None
-    try:
-        parsed = pd.to_datetime(value, utc=True, errors="coerce")
-    except Exception as exc:
-        _record_operator_local_fallback(
-            source=MANUAL_REVIEW_DECISIONS_TABLE,
-            fallback_type="operator_api_manual_review_timestamp_parse_failed",
-            reason="manual review queue ignored a non-parseable source/decision timestamp while checking stale operator decisions",
-            error=exc,
-            severity="warn",
-            metadata={"value_type": type(value).__name__},
-        )
-        return None
-    if not isinstance(parsed, pd.Timestamp) or pd.isna(parsed):
-        return None
-    return pd.Timestamp(parsed)
 
 
-def _manual_review_item_updated_ts(item: dict[str, Any]) -> pd.Timestamp | None:
-    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-    candidates = [
-        item.get("updated_at"),
-        item.get("asof_date"),
-        raw.get("updated_at"),
-        raw.get("load_ts"),
-        raw.get("published_on"),
-        raw.get("created_at"),
-        raw.get("reviewed_at"),
-        raw.get("asof_date"),
-    ]
-    for value in candidates:
-        parsed = _manual_review_scalar_ts(value)
-        if parsed is not None:
-            return parsed
-    return None
 
 
-def _manual_review_decision_decided_ts(decision: dict[str, Any]) -> pd.Timestamp | None:
-    return _manual_review_scalar_ts(decision.get("decided_at"))
 
 
-def _manual_review_decision_stale_for_item(item: dict[str, Any], decision: dict[str, Any]) -> dict[str, Any] | None:
-    item_ts = _manual_review_item_updated_ts(item)
-    decision_ts = _manual_review_decision_decided_ts(decision)
-    if item_ts is None or decision_ts is None or item_ts <= decision_ts:
-        return None
-    return {
-        "state": "source_updated_after_operator_decision",
-        "active": True,
-        "closes_item": False,
-        "reopened_by_wait_signal": False,
-        "suppression_reason": None,
-        "decision_stale": True,
-        "source_updated_at": item_ts.isoformat(),
-        "decided_at": decision_ts.isoformat(),
-        "reason": "Source row changed after the operator decision; the item is active again for review.",
-    }
 
 
 _MANUAL_REVIEW_COMPACT_RAW_KEYS = {
@@ -10278,460 +7180,25 @@ _MANUAL_REVIEW_COMPACT_RAW_KEYS = {
 }
 
 
-def _compact_manual_review_raw_value(value: Any) -> Any:
-    ready = _json_ready(value)
-    if isinstance(ready, str) and len(ready) > 500:
-        return ready[:500] + "...[truncated]"
-    if isinstance(ready, list):
-        return [_compact_manual_review_raw_value(item) for item in ready[:8]]
-    if isinstance(ready, dict):
-        return {str(key): _compact_manual_review_raw_value(val) for key, val in list(ready.items())[:20]}
-    return ready
 
 
-def _compact_manual_review_latest_decision(value: Any) -> dict[str, Any]:
-    decision = value if isinstance(value, dict) else {}
-    keep_keys = {
-        "decision_id",
-        "item_id",
-        "decision",
-        "rationale",
-        "follow_up_event",
-        "operator_id",
-        "decided_at",
-        "source_table",
-        "source_key",
-        "symbol",
-        "unique_id",
-        "setup_id",
-        "decision_effect",
-        "manual_review_state",
-    }
-    return {
-        key: _compact_manual_review_raw_value(decision.get(key))
-        for key in keep_keys
-        if key in decision
-    }
 
 
-def _compact_manual_review_item(item: dict[str, Any], *, include_raw: bool) -> dict[str, Any]:
-    if include_raw:
-        return item
-    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
-    compact_raw: dict[str, Any] = {}
-    omitted_keys: list[str] = []
-    for key, value in raw.items():
-        if key in _MANUAL_REVIEW_COMPACT_RAW_KEYS:
-            compact_raw[key] = _compact_manual_review_raw_value(value)
-        else:
-            omitted_keys.append(str(key))
-    out = dict(item)
-    out["raw"] = compact_raw
-    if isinstance(out.get("latest_operator_decision"), dict):
-        out["latest_operator_decision"] = _compact_manual_review_latest_decision(out["latest_operator_decision"])
-    out["raw_compacted"] = True
-    out["raw_omitted_key_count"] = len(omitted_keys)
-    out["raw_omitted_keys_sample"] = sorted(omitted_keys)[:25]
-    return out
 
 
-def _manual_review_item_impact(row: dict[str, Any]) -> str:
-    item_type = (_text(row.get("item_type")) or "").lower()
-    lane = (_text(row.get("review_lane")) or "").lower()
-    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
-    action_code = (
-        _text(raw.get("action_code"))
-        or _text(raw.get("action_type"))
-        or _text(raw.get("source_action"))
-        or _text(row.get("status"))
-        or ""
-    ).upper()
-    if item_type == "execution_blocker":
-        return "execution_blocking"
-    if lane == "technical_issue" or bool(row.get("is_technical_issue")):
-        return "technical_or_operational"
-    if lane == "research_config":
-        return "research_or_config"
-    if item_type == "wait_signal_followup":
-        return "investment_followup"
-    if any(token in action_code for token in ("SELL", "EXIT", "REDUCE", "PARTIAL")):
-        return "investment_exit_or_risk"
-    return "investment_entry_or_watch"
 
 
-def _manual_review_visibility_lifecycle(row: dict[str, Any]) -> dict[str, Any]:
-    state = row.get("manual_review_state") if isinstance(row.get("manual_review_state"), dict) else {}
-    latest = row.get("latest_operator_decision") if isinstance(row.get("latest_operator_decision"), dict) else {}
-    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
-    followup = raw.get("wait_signal_followup") if isinstance(raw.get("wait_signal_followup"), dict) else {}
-    item_type = _text(row.get("item_type")) or "manual_review"
-    visibility_state = _text(state.get("state")) or "active_new"
-    active = bool(state.get("active", True))
-    if state.get("decision_stale"):
-        active_reason = "A previous operator decision exists, but newer source evidence arrived after that decision, so this item is active again."
-    elif item_type == "wait_signal_followup":
-        active_reason = "A Manual Review wait signal matched fresh evidence, so this follow-up is active for operator judgment."
-    elif latest:
-        active_reason = "The latest operator decision is non-closing, so this item remains active for follow-up."
-    else:
-        active_reason = "No closing operator decision exists for this current source row, so it is active operator work."
-    if not active:
-        active_reason = "This row is not active; it should be suppressed from the active Manual Review queue and kept only for audit/debug."
-    closing_decisions = sorted(MANUAL_REVIEW_CLOSING_DECISIONS)
-    non_closing_decisions = sorted(set(MANUAL_REVIEW_ALLOWED_DECISIONS) - set(MANUAL_REVIEW_CLOSING_DECISIONS))
-    boundary = row.get("operator_boundary") if isinstance(row.get("operator_boundary"), dict) else {}
-    return {
-        "schema_version": 1,
-        "active": active,
-        "visibility_state": visibility_state,
-        "active_reason": active_reason,
-        "is_reopened": bool(state.get("decision_stale") or item_type == "wait_signal_followup" or state.get("reopened_by_wait_signal")),
-        "reopened_reason": _text(state.get("reason")) or ("Wait signal matched fresh evidence." if item_type == "wait_signal_followup" else None),
-        "suppression_reason": _text(state.get("suppression_reason")),
-        "latest_decision": _text(latest.get("decision")),
-        "latest_decision_at": _ts(latest.get("decided_at")),
-        "source_updated_at": _text(state.get("source_updated_at")) or _ts(row.get("updated_at")),
-        "wait_signal_followup": {
-            "signal_id": _text(followup.get("signal_id")),
-            "manual_review_item_id": _text(followup.get("manual_review_item_id")),
-            "wait_question": _text(followup.get("wait_question")),
-            "matched_at": _text(followup.get("matched_at")),
-        } if followup else None,
-        "closing_decisions": closing_decisions,
-        "non_closing_decisions": non_closing_decisions,
-        "decision_boundary": (
-            "Closing decisions remove only this Manual Review item from the active queue. Non-closing decisions annotate or create a wait signal. "
-            "Manual Review decisions do not mutate portfolio rows, action recommendations, or broker orders."
-        ),
-        "mutates_portfolio": bool(boundary.get("manual_review_decision_mutates_portfolio")),
-        "mutates_action_recommendation": bool(boundary.get("manual_review_decision_mutates_action_recommendation")),
-        "submits_order": bool(boundary.get("manual_review_decision_submits_order")),
-    }
 
 
-def _manual_review_category_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    by_lane: dict[str, int] = {}
-    by_category: dict[str, int] = {}
-    by_impact: dict[str, int] = {}
-    for row in rows:
-        lane = _text(row.get("review_lane")) or "unknown"
-        boundary = row.get("operator_boundary") if isinstance(row.get("operator_boundary"), dict) else {}
-        category = _text(boundary.get("review_category")) or "unknown"
-        impact = _manual_review_item_impact(row)
-        by_lane[lane] = by_lane.get(lane, 0) + 1
-        by_category[category] = by_category.get(category, 0) + 1
-        by_impact[impact] = by_impact.get(impact, 0) + 1
-    return {
-        "by_review_lane": by_lane,
-        "by_review_category": by_category,
-        "by_item_impact": by_impact,
-        "plain_english": {
-            "investment_review": "Investment judgment: decide whether evidence is actionable, should wait, or should be closed as no action.",
-            "technical_issue": "Technical or operational issue: fix data, parser, identity, API, OCR, or execution-planning problems before trusting the row.",
-            "research_config": "Research/config review: review-only evidence for a later manual config or code change.",
-            "investment_judgment_review": "Operator judgment is required; saving a Manual Review decision does not trade or mutate portfolio rows.",
-            "technical_or_operational_issue": "Operational repair work; mark fixed only after the upstream issue is corrected or a rerun confirms recovery.",
-            "research_or_config_review": "Research or policy review; approval records intent but does not apply a config/code change.",
-            "execution_blocking": "Execution planning is blocked until repaired; Manual Review still cannot submit broker orders.",
-            "technical_or_operational": "Pipeline/data reliability work, not investment judgment.",
-            "research_or_config": "Review-only research/config work.",
-            "investment_followup": "A watched condition matched and needs follow-up judgment.",
-            "investment_exit_or_risk": "Potential exit or risk-management judgment.",
-            "investment_entry_or_watch": "Potential entry, add, hold, or watch judgment.",
-        },
-    }
 
 
-def _manual_review_lane_for_item(row: dict[str, Any]) -> str:
-    explicit = _text(row.get("review_lane"))
-    if explicit:
-        return explicit
-    item_type = _text(row.get("item_type"))
-    if item_type in {"event_processing_failure", "announcement_failure", "execution_blocker", "identity_issue"}:
-        return "technical_issue"
-    if item_type in {"threshold_review"}:
-        return "research_config"
-    return "investment_review"
 
 
 MANUAL_REVIEW_LANES = {"all", "investment_review", "technical_issue", "research_config"}
 
 
-def build_manual_review_payload(*, limit: int = 100, include_raw: bool = False, lane: str = "investment_review") -> dict[str, Any]:
-    requested_lane = _text(lane).lower() or "investment_review"
-    if requested_lane not in MANUAL_REVIEW_LANES:
-        raise ValueError(f"Unsupported manual review lane '{requested_lane}'. Expected one of: {', '.join(sorted(MANUAL_REVIEW_LANES))}")
-    items: list[dict[str, Any]] = []
-    skipped: list[dict[str, str]] = []
-    per_source_limit = max(1, int(limit))
-    _append_execution_blocker_items(items, skipped, limit=per_source_limit)
-    _append_latest_action_review_items(items, skipped, limit=per_source_limit)
-    _append_event_policy_review_items(items, skipped, limit=per_source_limit)
-    _append_action_conflict_items(items, skipped, limit=per_source_limit)
-    _append_threshold_review_items(items, skipped, limit=per_source_limit)
-    _append_wait_signal_followup_items(items, skipped, limit=per_source_limit)
-    _append_processing_failure_items(items, skipped, limit=per_source_limit)
-    _append_announcement_failure_items(items, skipped, limit=per_source_limit)
-    _append_identity_issue_items(items, skipped, limit=per_source_limit)
-    items = _suppress_shadow_manual_review_items(items, skipped)
-    items, duplicate_suppressed_count = _dedupe_manual_review_items(items)
-    latest_decisions: dict[str, dict[str, Any]] = {}
-    try:
-        latest_decisions = load_latest_manual_review_decisions(limit=max(per_source_limit * 5, 1000))
-    except Exception as exc:
-        _record_operator_local_fallback(
-            source=MANUAL_REVIEW_DECISIONS_TABLE,
-            fallback_type="operator_api_manual_review_decisions_load_failed",
-            reason="manual review queue could not load latest operator decisions",
-            error=exc,
-            severity="warn",
-            metadata={"limit": max(per_source_limit * 5, 1000)},
-        )
-        skipped.append({"source": MANUAL_REVIEW_DECISIONS_TABLE, "error": f"{type(exc).__name__}: {exc}"})
-    latest_canonical_decisions = _latest_manual_review_decisions_by_canonical_key(latest_decisions)
-    matched_wait_item_ids = _matched_manual_review_wait_item_ids(items)
-    active_items: list[dict[str, Any]] = []
-    closed_count = 0
-    annotated_count = 0
-    reopened_wait_count = 0
-    stale_operator_decision_count = 0
-    closed_original_wait_item_ids: set[str] = set()
-    for item in items:
-        item_id = str(item.get("item_id") or "")
-        original_wait_item_id = _manual_review_wait_followup_original_item_id(item)
-        if original_wait_item_id:
-            original_decision = latest_decisions.get(original_wait_item_id)
-            if original_decision:
-                try:
-                    original_state = runtime_state_for_decision(str(original_decision.get("decision") or ""), has_matched_wait_signal=True)
-                except ValueError as exc:
-                    _record_operator_local_fallback(
-                        source=MANUAL_REVIEW_DECISIONS_TABLE,
-                        fallback_type="operator_api_manual_review_invalid_decision_state",
-                        reason="manual review queue ignored an invalid original wait-signal decision state",
-                        error=exc,
-                        severity="warn",
-                        metadata={
-                            "item_id": item_id,
-                            "original_item_id": original_wait_item_id,
-                            "decision": str(original_decision.get("decision") or ""),
-                            "has_matched_wait_signal": True,
-                        },
-                    )
-                    original_state = None
-                if original_state is not None and original_state.closes_item:
-                    item["latest_operator_decision"] = _json_ready(original_decision)
-                    item["manual_review_state"] = {
-                        "state": original_state.state,
-                        "active": original_state.active,
-                        "closes_item": original_state.closes_item,
-                        "reopened_by_wait_signal": original_state.reopened_by_wait_signal,
-                        "suppression_reason": original_state.suppression_reason,
-                    }
-                    closed_original_wait_item_ids.add(original_wait_item_id)
-                    closed_count += 1
-                    continue
-        decision = _latest_manual_review_decision_for_item(
-            item,
-            latest_decisions=latest_decisions,
-            latest_canonical_decisions=latest_canonical_decisions,
-        )
-        if decision:
-            item["latest_operator_decision"] = _json_ready(decision)
-            stale_state = _manual_review_decision_stale_for_item(item, decision)
-            if stale_state is not None:
-                item["manual_review_state"] = stale_state
-                stale_operator_decision_count += 1
-                active_items.append(item)
-                continue
-            has_matched_wait_signal = item_id in matched_wait_item_ids
-            try:
-                runtime_state = runtime_state_for_decision(str(decision.get("decision") or ""), has_matched_wait_signal=has_matched_wait_signal)
-            except ValueError as exc:
-                _record_operator_local_fallback(
-                    source=MANUAL_REVIEW_DECISIONS_TABLE,
-                    fallback_type="operator_api_manual_review_invalid_decision_state",
-                    reason="manual review queue ignored an invalid operator decision state",
-                    error=exc,
-                    severity="warn",
-                    metadata={
-                        "item_id": item_id,
-                        "decision": str(decision.get("decision") or ""),
-                        "has_matched_wait_signal": bool(has_matched_wait_signal),
-                    },
-                )
-                runtime_state = None
-            if runtime_state is not None:
-                item["manual_review_state"] = {
-                    "state": runtime_state.state,
-                    "active": runtime_state.active,
-                    "closes_item": runtime_state.closes_item,
-                    "reopened_by_wait_signal": runtime_state.reopened_by_wait_signal,
-                    "suppression_reason": runtime_state.suppression_reason,
-                }
-                if runtime_state.reopened_by_wait_signal:
-                    reopened_wait_count += 1
-                    continue
-                if not runtime_state.active:
-                    if item_id not in closed_original_wait_item_ids:
-                        closed_count += 1
-                    continue
-            elif str(decision.get("decision") or "").strip().lower() in MANUAL_REVIEW_CLOSING_DECISIONS:
-                closed_count += 1
-                continue
-            annotated_count += 1
-        active_items.append(item)
-    all_active_items = active_items
-    all_active_items.sort(key=lambda row: row.get("updated_at") or row.get("asof_date") or "", reverse=True)
-    all_active_by_lane: dict[str, int] = {}
-    for row in all_active_items:
-        lane_key = _manual_review_lane_for_item(row)
-        row["review_lane"] = lane_key
-        all_active_by_lane[lane_key] = all_active_by_lane.get(lane_key, 0) + 1
-    if requested_lane == "all":
-        items = list(all_active_items)
-    else:
-        items = [row for row in all_active_items if _manual_review_lane_for_item(row) == requested_lane]
-    lane_filtered_out = max(0, len(all_active_items) - len(items))
-    trimmed = items[:per_source_limit]
-    by_type: dict[str, int] = {}
-    by_severity: dict[str, int] = {}
-    by_lane: dict[str, int] = {}
-    by_visibility_state: dict[str, int] = {}
-    for row in trimmed:
-        by_type[row["item_type"]] = by_type.get(row["item_type"], 0) + 1
-        by_severity[row["severity"]] = by_severity.get(row["severity"], 0) + 1
-        lane = _text(row.get("review_lane")) or "unknown"
-        by_lane[lane] = by_lane.get(lane, 0) + 1
-        row["item_impact"] = _manual_review_item_impact(row)
-        row["visibility_lifecycle"] = _manual_review_visibility_lifecycle(row)
-        visibility_state = _text(row["visibility_lifecycle"].get("visibility_state")) or "active_new"
-        by_visibility_state[visibility_state] = by_visibility_state.get(visibility_state, 0) + 1
-    category_summary = _manual_review_category_summary(trimmed)
-    source_warnings = _operator_source_warnings(trimmed, default_source="manual_review", source_field="source_table", skipped=skipped)
-    response_items = [_compact_manual_review_item(row, include_raw=bool(include_raw)) for row in trimmed]
-    payload_meta = _payload_size_meta(response_items)
-    queue_contract = {
-        "schema_version": 1,
-        "active_displayed_items": int(len(trimmed)),
-        "active_untrimmed_items": int(len(items)),
-        "lane": requested_lane,
-        "all_active_items": int(len(all_active_items)),
-        "lane_filtered_out": int(lane_filtered_out),
-        "all_active_by_lane": all_active_by_lane,
-        "limit": int(per_source_limit),
-        **payload_meta,
-        "closed_by_operator_suppressed": int(closed_count),
-        "annotated_active_items": int(annotated_count),
-        "reopened_by_wait_signal_suppressed": int(reopened_wait_count),
-        "stale_operator_decisions_reopened": int(stale_operator_decision_count),
-        "duplicate_suppressed": int(duplicate_suppressed_count),
-        "closed_rows_visible_in_queue": False,
-        "suppressed_rows_are_audit_only": True,
-        "manual_review_decisions_mutate_portfolio": False,
-        "manual_review_decisions_mutate_action_recommendation": False,
-        "manual_review_decisions_submit_order": False,
-        "operator_note": (
-            "Manual Review shows only active displayed items. Closed, duplicate, and matched-wait-suppressed rows remain audit/debug "
-            "history and should not be treated as active investment work."
-        ),
-    }
-    return {
-        "generated_at": pd.Timestamp.utcnow().isoformat(),
-        "api_schema": _operator_api_schema("/api/manual-review", schema_name="manual_review_queue"),
-        "status": "ok",
-        "source_warnings": source_warnings,
-        "summary": {
-            "total_items": len(trimmed),
-            "untrimmed_items": len(items),
-            "all_active_items": len(all_active_items),
-            "lane": requested_lane,
-            "lane_filtered_out": lane_filtered_out,
-            "all_active_by_lane": all_active_by_lane,
-            "closed_by_operator": closed_count,
-            "annotated_by_operator": annotated_count,
-            "reopened_by_wait_signal": reopened_wait_count,
-            "stale_operator_decision": stale_operator_decision_count,
-            "duplicate_suppressed": duplicate_suppressed_count,
-            "compact": not bool(include_raw),
-            "raw_included": bool(include_raw),
-            "payload": payload_meta,
-            "queue_contract": queue_contract,
-            "by_type": by_type,
-            "by_severity": by_severity,
-            "by_lane": by_lane,
-            "by_visibility_state": by_visibility_state,
-            **category_summary,
-            "skipped_sources": skipped,
-            "source_warnings": source_warnings,
-        },
-        "items": response_items,
-    }
 
 
-def record_manual_review_decision_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    item = payload.get("item")
-    if not isinstance(item, dict):
-        item = {}
-    item_id = _text(payload.get("item_id")) or _text(item.get("item_id"))
-    if not item_id:
-        raise ValueError("item_id is required")
-    decision = validate_decision(str(payload.get("decision") or ""))
-    rationale = _text(payload.get("rationale"))
-    if decision != "add_operator_note" and not rationale:
-        raise ValueError("rationale is required for this decision")
-    follow_up_event = _text(payload.get("follow_up_event"))
-    if decision == "watch_for_event" and not follow_up_event:
-        raise ValueError("follow_up_event is required when decision is watch_for_event")
-    decided_at = pd.Timestamp.utcnow()
-    note = payload.get("note") if isinstance(payload.get("note"), dict) else {}
-    merged_item = {
-        **item,
-        "item_type": _text(payload.get("item_type")) or _text(item.get("item_type")),
-        "source_table": _text(payload.get("source_table")) or _text(item.get("source_table")),
-        "source_key": _text(payload.get("source_key")) or _text(item.get("source_key")),
-        "symbol": _text(payload.get("symbol")) or _text(item.get("symbol")),
-        "unique_id": _text(payload.get("unique_id")) or _text(item.get("unique_id")),
-        "setup_id": _text(payload.get("setup_id")) or _text(item.get("setup_id")),
-    }
-    row = build_decision_row(
-        item_id=item_id,
-        item=merged_item,
-        decision=decision,
-        rationale=rationale,
-        follow_up_event=follow_up_event,
-        operator_id=_text(payload.get("operator_id")),
-        decided_at=decided_at,
-        note=note,
-    )
-    ensure_manual_review_decisions_table()
-    upsert_to_db(row, MANUAL_REVIEW_DECISIONS_TABLE, unique_keys=["item_id", "decided_at"], timescaledb_column="decided_at")
-    effects = apply_decision_side_effects(
-        item_id=item_id,
-        item=merged_item,
-        decision=decision,
-        rationale=rationale,
-        follow_up_event=follow_up_event,
-        decided_at=decided_at,
-        operator_id=_text(payload.get("operator_id")),
-    )
-    state_payload = runtime_state_payload(decision, has_matched_wait_signal=False)
-    effect_payload = decision_effect_payload(decision)
-    return {
-        "status": "ok",
-        "api_schema": _operator_api_schema("/api/manual-review/decision", schema_name="manual_review_decision_result"),
-        "decided_at": decided_at.isoformat(),
-        "item_id": item_id,
-        "decision": decision,
-        **effects,
-        "manual_review_state": state_payload,
-        "decision_effect": effect_payload,
-        "note": (
-            "Decision recorded and a wait signal was created. No broker or trading behavior was changed."
-            if effects.get("wait_signal")
-            else "Decision recorded only. No config, strategy, broker, or trading behavior was changed."
-        ),
-    }
 
 
 def build_hypotheses_payload(*, limit: int = 100, offset: int = 0) -> dict[str, Any]:
@@ -11209,41 +7676,10 @@ def create_app():
     def research_event_model_promotion_check():
         return _guard(build_event_model_promotion_check_payload, route="/api/research/event-model-promotion-check")
 
-    @app.get("/api/research/ts-forecast-promotion-check", response_model=TsForecastPromotionCheckResponse)
-    def research_ts_forecast_promotion_check(
-        model_name: str | None = None,
-        horizon_days: int | None = Query(default=None, ge=1, le=252),
-        from_date: str | None = None,
-        to_date: str | None = None,
-    ):
-        return _guard(
-            build_ts_forecast_promotion_check_payload,
-            route="/api/research/ts-forecast-promotion-check",
-            model_name=model_name,
-            horizon_days=horizon_days,
-            from_date=from_date,
-            to_date=to_date,
-        )
 
-    @app.post("/api/research/ts-forecast-promotion-review", response_model=PromotionReviewResponse)
-    def research_ts_forecast_promotion_review(payload: dict[str, Any]):
-        return _guard(build_ts_forecast_promotion_review_payload, route="/api/research/ts-forecast-promotion-review", payload=payload)
 
-    @app.get("/api/research/ts-forecast-promotion-reviews", response_model=TsForecastPromotionReviewsResponse)
-    def research_ts_forecast_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
-        return _guard(build_ts_forecast_promotion_reviews_payload, route="/api/research/ts-forecast-promotion-reviews", limit=limit)
 
-    @app.post("/api/research/ts-forecast-promotion-review/decision", response_model=PromotionDecisionResponse)
-    def research_ts_forecast_promotion_review_decision(payload: dict[str, Any]):
-        return _guard(
-            build_ts_forecast_promotion_review_decision_payload,
-            route="/api/research/ts-forecast-promotion-review/decision",
-            payload=payload,
-        )
 
-    @app.get("/api/research/ts-forecast-review-rules", response_model=TsForecastReviewRulesResponse)
-    def research_ts_forecast_review_rules():
-        return _guard(build_ts_forecast_review_rules_payload, route="/api/research/ts-forecast-review-rules")
 
     @app.get("/api/research/recommendation-diagnostics", response_model=RecommendationDiagnosticsResponse)
     def research_recommendation_diagnostics(
@@ -11281,13 +7717,6 @@ def create_app():
     def screener_failures(hours: int = Query(default=24, ge=1, le=168), limit: int = Query(default=25, ge=1, le=100)):
         return _guard(build_screener_failures_api_payload, route="/api/screeners/failures", hours=hours, limit=limit)
 
-    @app.get("/api/manual-review", response_model=ManualReviewResponse)
-    def manual_review(
-        limit: int = Query(default=100, ge=1, le=500),
-        include_raw: bool = Query(default=False),
-        lane: str = Query(default="investment_review", pattern="^(all|investment_review|technical_issue|research_config)$"),
-    ):
-        return _guard(build_manual_review_payload, route="/api/manual-review", limit=limit, include_raw=include_raw, lane=lane)
 
     @app.get("/api/identity-issues", response_model=IdentityIssuesResponse)
     def identity_issues(limit: int = Query(default=100, ge=1, le=500), symbol: str | None = None):
@@ -11301,9 +7730,6 @@ def create_app():
     def identity_issues_resolve_apply(payload: dict[str, Any] = Body(...)):
         return _guard(resolve_identity_issues_payload, route="/api/identity-issues/resolve-apply", payload=payload, apply=True)
 
-    @app.post("/api/manual-review/decision", response_model=ManualReviewDecisionResponse)
-    def manual_review_decision(payload: dict[str, Any] = Body(...)):
-        return _guard(record_manual_review_decision_payload, route="/api/manual-review/decision", payload=payload)
 
     @app.get("/api/summary", response_model=OperatorSummaryResponse)
     def summary(asof_date: str | None = None):
@@ -11368,42 +7794,13 @@ def create_app():
     ):
         return _guard(build_signal_refresh_payload, route="/api/signal-refresh", limit=limit, offset=offset, symbol=symbol, status=status, search=search, compact=compact)
 
-    @app.get("/api/execution/approvals", response_model=ExecutionApprovalsResponse)
-    def execution_approvals(limit: int = Query(default=100, ge=1, le=500), status: str | None = None):
-        return _guard(build_execution_approvals_payload, route="/api/execution/approvals", limit=limit, status=status)
 
-    @app.post("/api/execution/approval-decision", response_model=ExecutionApprovalDecisionResponse)
-    def execution_approval_decision(payload: dict[str, Any] = Body(...)):
-        return _guard(record_execution_approval_decision_payload, route="/api/execution/approval-decision", payload=payload)
 
-    @app.post("/api/execution/approval-contract-update", response_model=ExecutionApprovalContractUpdateResponse)
-    def execution_approval_contract_update(payload: dict[str, Any] = Body(...)):
-        return _guard(apply_execution_approval_contract_payload, route="/api/execution/approval-contract-update", payload=payload)
 
-    @app.post("/api/execution/reconcile", response_model=ExecutionReconciliationRunResponse)
-    def execution_reconcile(payload: dict[str, Any] = Body(default_factory=dict)):
-        return _guard(run_execution_reconciliation_payload, route="/api/execution/reconcile", payload=payload)
 
-    @app.post("/api/execution/evidence-review", response_model=ExecutionEvidenceReviewResponse)
-    def execution_evidence_review(payload: dict[str, Any] = Body(default_factory=dict)):
-        return _guard(apply_execution_evidence_review_payload, route="/api/execution/evidence-review", payload=payload)
 
-    @app.post("/api/execution/live-allowance", response_model=ExecutionLiveAllowanceResponse)
-    def execution_live_allowance(payload: dict[str, Any] = Body(default_factory=dict)):
-        return _guard(apply_execution_live_allowance_payload, route="/api/execution/live-allowance", payload=payload)
 
-    @app.post("/api/execution/live-submit-preflight", response_model=ExecutionLiveSubmitPreflightResponse)
-    def execution_live_submit_preflight(payload: dict[str, Any] = Body(default_factory=dict)):
-        return _guard(build_execution_live_submit_preflight_payload, route="/api/execution/live-submit-preflight", payload=payload)
 
-    @app.get("/api/operator-journey", response_model=OperatorJourneyResponse)
-    def operator_journey(
-        symbol: str | None = None,
-        item_id: str | None = None,
-        unique_id: str | None = None,
-        limit: int = Query(default=25, ge=1, le=100),
-    ):
-        return _guard(build_operator_journey_payload, route="/api/operator-journey", symbol=symbol, item_id=item_id, unique_id=unique_id, limit=limit)
 
     @app.get("/api/portfolio", response_model=OperatorPortfolioResponse)
     def portfolio(
@@ -11463,17 +7860,8 @@ def create_app():
     def signal_quality_promotion_review_decision(payload: dict[str, Any]):
         return _guard(build_signal_quality_promotion_review_decision_payload, route="/api/signal-quality/promotion-review/decision", payload=payload)
 
-    @app.post("/api/event-policy/promotion-review", response_model=PromotionReviewResponse)
-    def event_policy_promotion_review(payload: dict[str, Any]):
-        return _guard(build_event_policy_promotion_review_payload, route="/api/event-policy/promotion-review", payload=payload)
 
-    @app.get("/api/event-policy/promotion-reviews", response_model=EventPolicyPromotionReviewsResponse)
-    def event_policy_promotion_reviews(limit: int = Query(default=25, ge=1, le=100)):
-        return _guard(build_event_policy_promotion_reviews_payload, route="/api/event-policy/promotion-reviews", limit=limit)
 
-    @app.post("/api/event-policy/promotion-review/decision", response_model=PromotionDecisionResponse)
-    def event_policy_promotion_review_decision(payload: dict[str, Any]):
-        return _guard(build_event_policy_promotion_review_decision_payload, route="/api/event-policy/promotion-review/decision", payload=payload)
 
     @app.get("/api/config-change/previews", response_model=ConfigChangePreviewsResponse)
     def config_change_previews(limit: int = Query(default=25, ge=1, le=100)):
@@ -11495,13 +7883,7 @@ def create_app():
     def signal_quality_config_change_preview(payload: dict[str, Any]):
         return _guard(build_signal_quality_config_change_preview_payload, route="/api/config-change/signal-quality-preview", payload=payload)
 
-    @app.post("/api/config-change/event-policy-preview", response_model=ConfigChangePreviewResponse)
-    def event_policy_config_change_preview(payload: dict[str, Any]):
-        return _guard(build_event_policy_config_change_preview_payload, route="/api/config-change/event-policy-preview", payload=payload)
 
-    @app.post("/api/config-change/ts-forecast-preview", response_model=ConfigChangePreviewResponse)
-    def ts_forecast_config_change_preview(payload: dict[str, Any]):
-        return _guard(build_ts_forecast_config_change_preview_payload, route="/api/config-change/ts-forecast-preview", payload=payload)
 
     @app.post("/api/technical-calibration/promotion-review", response_model=PromotionReviewResponse)
     def technical_calibration_promotion_review(payload: dict[str, Any]):
@@ -11515,52 +7897,11 @@ def create_app():
     def technical_calibration_promotion_review_decision(payload: dict[str, Any]):
         return _guard(build_technical_threshold_review_decision_payload, route="/api/technical-calibration/promotion-review/decision", payload=payload)
 
-    @app.get("/api/events", response_model=OperatorEventsResponse)
-    def events(
-        asof_date: str | None = None,
-        limit: int = Query(default=50, ge=0, le=500),
-        offset: int = Query(default=0, ge=0),
-        symbol: str | None = None,
-        status: str | None = None,
-        search: str | None = None,
-        compact: bool = Query(default=False),
-    ):
-        return _guard(build_events_payload, route="/api/events", asof_date=asof_date, limit=limit, offset=offset, symbol=symbol, status=status, search=search, compact=compact)
 
-    @app.get("/api/events/{unique_id}/detail", response_model=EventDetailResponse)
-    def event_detail(unique_id: str, asof_date: str | None = None):
-        payload = _guard(build_event_detail_payload, route="/api/events/{unique_id}/detail", unique_id=unique_id, asof_date=asof_date)
-        return _with_operator_api_schema(
-            payload,
-            endpoint="/api/events/{unique_id}/detail",
-            schema_name="operator_event_detail",
-        )
 
-    @app.get("/api/event-policy", response_model=EventPolicyResponse)
-    def event_policy(asof_date: str | None = None, action_type: str | None = None, limit: int = Query(default=100, ge=1, le=500), include_raw: bool = Query(default=False)):
-        return _guard(build_event_policy_payload, route="/api/event-policy", asof_date=asof_date, action_type=action_type, limit=limit, include_raw=include_raw)
 
-    @app.get("/api/event-policy/evaluation", response_model=EventPolicyEvaluationResponse)
-    def event_policy_evaluation(limit: int = Query(default=100, ge=1, le=500)):
-        return _guard(build_event_policy_evaluation_payload, route="/api/event-policy/evaluation", limit=limit)
 
-    @app.get("/api/events/{unique_id}/trace", response_model=EventTraceResponse)
-    def event_trace(unique_id: str):
-        payload = _guard(build_event_trace_payload, route="/api/events/{unique_id}/trace", unique_id=unique_id)
-        return _with_operator_api_schema(
-            payload,
-            endpoint="/api/events/{unique_id}/trace",
-            schema_name="operator_event_trace",
-        )
 
-    @app.get("/api/events/{unique_id}/trace/summary", response_model=TraceSummaryResponse)
-    def event_trace_summary(unique_id: str):
-        payload = _guard(build_event_trace_summary_payload, route="/api/events/{unique_id}/trace/summary", unique_id=unique_id)
-        return _with_operator_api_schema(
-            payload,
-            endpoint="/api/events/{unique_id}/trace/summary",
-            schema_name="operator_event_trace_summary",
-        )
 
     @app.get("/api/symbols/{symbol}/trace", response_model=SymbolTraceResponse)
     def symbol_trace(symbol: str, limit: int = Query(default=100, ge=1, le=500)):
