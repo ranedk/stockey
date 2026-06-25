@@ -52,18 +52,6 @@ const runtimeLabel = computed(() => {
                 <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/action-conflict-rules">Conflict Rules</NuxtLink>
                 <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/identity-issues">Identity Issues</NuxtLink>
                 <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/operations">Operations</NuxtLink>
-                <div class="my-1 border-t border-ink/10"></div>
-                <p class="px-3 pt-1 text-[10px] font-black uppercase tracking-wide text-ink/35">Legacy (being retired)</p>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/">Overview</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/recommendations">Recommendations (old)</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/events">Event Inbox</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/manual-review">Manual Review</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/operator-journey">Operator Journey</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/execution-approvals">Execution Approvals</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/decision-trace">Decision Trace</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/wait-signals">Wait Signals</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/paper-portfolio">Paper Portfolio</NuxtLink>
-                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/health">Data Health</NuxtLink>
               </div>
             </details>
           </nav>

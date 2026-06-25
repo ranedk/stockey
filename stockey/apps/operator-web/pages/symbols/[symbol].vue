@@ -389,12 +389,9 @@ function companyMemoryReview(row: Dict) {
       <div>
         <h1 class="text-5xl font-black tracking-tight">{{ symbol }}</h1>
         <p class="mt-4 max-w-3xl text-lg leading-8 text-paper/70">
-          One read-only view for final action, recommendation evidence, live alerts, events, and decision trace.
+          One read-only view for final action, recommendation evidence, live alerts, and events.
         </p>
       </div>
-      <NuxtLink class="rounded-full bg-paper px-5 py-3 text-sm font-black text-ink" :to="`/decision-trace?symbol=${encodeURIComponent(symbol)}`">
-        Open full trace
-      </NuxtLink>
     </div>
   </section>
 
@@ -819,9 +816,6 @@ function companyMemoryReview(row: Dict) {
           <template #badge>
             <span class="rounded-full bg-ink px-3 py-1 text-xs font-bold text-paper">{{ row.source_type || row.alert_type || row.event_status || 'EVENT' }}</span>
           </template>
-          <NuxtLink v-if="row.unique_id" class="mt-4 inline-flex rounded-full bg-white px-4 py-2 text-sm font-bold text-ink" :to="`/decision-trace?unique_id=${encodeURIComponent(String(row.unique_id))}`">
-            Open event trace
-          </NuxtLink>
         </RecordCard>
         <p v-if="![...alertRows, ...eventRows].length" class="rounded-2xl bg-white/75 p-4 text-sm text-ink/60">No alerts or events in the current payload for this symbol.</p>
       </div>

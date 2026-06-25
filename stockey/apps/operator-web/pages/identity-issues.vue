@@ -110,12 +110,9 @@ async function applyResolution() {
           Open Dhan security mapping failures blocking clean advisory runs.
         </h1>
         <p class="mt-4 max-w-3xl text-sm leading-6 text-paper/65">
-          This page is read-only. Fix mappings and rerun the failed source, then use Manual Review only after the issue no longer blocks ingestion or advisory.
+          This page is read-only. Fix mappings and rerun the failed source so the issue no longer blocks ingestion or advisory.
         </p>
       </div>
-      <NuxtLink class="rounded-full bg-sun px-5 py-3 text-sm font-black text-ink shadow-soft" to="/manual-review">
-        Manual Review
-      </NuxtLink>
     </div>
 
     <div class="mt-6 grid gap-4 md:grid-cols-4">

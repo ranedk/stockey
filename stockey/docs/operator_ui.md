@@ -41,11 +41,13 @@ it does an LLM decision.
    filter, Exit action.
 4. **Decisions** (`/llm-decisions`) -- the LLM decision journal.
 5. **Health** (`/health-hub`) -- one diagnostics hub.
-6. **Research** (dropdown) -- low-frequency pages (Playbooks, Screeners, Signal Quality, Regime, Prompt
-   Registry, Technical Calibration, Conflict Rules, Identity Issues, Operations) plus the **legacy**
-   pages being retired (old Overview/Recommendations, Event Inbox, Manual Review, Operator Journey,
-   Execution Approvals, Decision Trace, Wait Signals, Paper Portfolio, Data Health). The legacy pages
-   still work; they back operator functions the new pages do not yet replace.
+6. **Research** (dropdown) -- low-frequency tools: Playbooks, Screeners, Signal Quality, Regime, Prompt
+   Registry, Technical Calibration, Conflict Rules, Identity Issues, Operations.
+
+Root (`/`) redirects to the Workbench. The retired pages (old Overview/Recommendations, Event Inbox,
+Manual Review, Operator Journey, Execution Approvals, Decision Trace, Wait Signals, Paper Portfolio,
+old Data Health) were removed -- their routes now 404. The per-symbol detail page (`/symbols/{symbol}`)
+remains, reachable from symbol links.
 
 The **"why"** is a drill-in panel (`components/DecisionWhy.vue`), reachable by clicking any symbol
 anywhere. It is the *only* place the heavy evidence tree loads.
