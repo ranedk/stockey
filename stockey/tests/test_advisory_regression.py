@@ -82510,3 +82510,61 @@ def test_resolve_symbol_states_detects_conflict_and_non_actionable():
     assert by_symbol["REL"]["state"] == "RECOMMENDATION"
     # ITC: only a HOLD (non-actionable) and no holding -> NONE, not a recommendation.
     assert by_symbol["ITC"]["state"] == "NONE"
+
+
+def test_build_recommendations_unified_filters_and_paginates(monkeypatch):
+    states = [
+        {"symbol": "INFY", "state": "RECOMMENDATION", "action": "BUY", "action_priority": 9, "agree": True, "conflict": False},
+        {"symbol": "TCS", "state": "RECOMMENDATION", "action": "WATCH", "action_priority": 2, "agree": False, "conflict": False},
+        {"symbol": "REL", "state": "RECOMMENDATION", "action": "SELL", "action_priority": 5, "agree": False, "conflict": True},
+        {"symbol": "HELD", "state": "HOLDING", "action": "BUY"},
+    ]
+    monkeypatch.setattr(operator_api, "load_symbol_states", lambda: states)
+
+    payload = operator_api.build_recommendations_unified_payload(limit=2, offset=0)
+    assert payload["review_only"] is True
+    assert payload["broker_execution_allowed_count"] == 0
+    # HOLDING excluded; only the 3 recommendations counted.
+    assert payload["summary"]["total"] == 3
+    assert payload["summary"]["conflict"] == 1
+    # BUY-side first (INFY), then de-risk (SELL/REL), neutral (WATCH/TCS) last; page limit honored.
+    symbols = [r["symbol"] for r in payload["recommendations"]]
+    assert symbols == ["INFY", "REL"]
+    assert payload["page"]["next_offset"] == 2
+
+    only_conf = operator_api.build_recommendations_unified_payload(limit=50, only_conflicts=True)
+    assert [r["symbol"] for r in only_conf["recommendations"]] == ["REL"]
+
+
+def test_build_positions_payload_computes_change_and_is_review_only(monkeypatch):
+    import advisory.operator_holdings as holdings_mod
+
+    monkeypatch.setattr(holdings_mod, "load_holdings", lambda **kwargs: [
+        {"symbol": "TCS", "status": "open", "entry_price": 100.0, "entry_date": "2026-06-20", "action": "BUY"},
+    ])
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda symbols: {"TCS": {"price": 110.0, "price_asof": "2026-06-25"}})
+
+    payload = operator_api.build_positions_payload(status="open")
+    assert payload["review_only"] is True
+    assert payload["summary"]["open"] == 1
+    pos = payload["positions"][0]
+    assert pos["current_price"] == 110.0
+    assert pos["change_pct_since_entry"] == 10.0
+
+
+def test_build_position_take_and_exit_payload_validate_and_stay_review_only(monkeypatch):
+    import advisory.operator_holdings as holdings_mod
+
+    monkeypatch.setattr(holdings_mod, "record_take", lambda **kwargs: {"symbol": kwargs["symbol"].upper(), **kwargs})
+    take = operator_api.build_position_take_payload({"symbol": "tcs", "entry_price": 100.0, "entry_date": "2026-06-25"})
+    assert take["status"] == "ok"
+    assert take["broker_execution_allowed"] is False
+
+    with pytest.raises(ValueError):
+        operator_api.build_position_take_payload({"entry_price": 100.0})
+
+    monkeypatch.setattr(holdings_mod, "record_exit", lambda **kwargs: 0)
+    exit_payload = operator_api.build_position_exit_payload({"symbol": "TCS", "entry_date": "2026-06-25"})
+    assert exit_payload["status"] == "no_open_holding"
+    with pytest.raises(ValueError):
+        operator_api.build_position_exit_payload({"symbol": "TCS"})  # missing entry_date

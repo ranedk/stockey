@@ -4458,6 +4458,362 @@ def load_symbol_states() -> list[dict[str, Any]]:
     )
 
 
+def build_recommendations_unified_payload(
+    *, limit: int = 50, offset: int = 0, action: str | None = None, only_conflicts: bool = False,
+) -> dict[str, Any]:
+    """Unified per-symbol RECOMMENDATION queue (WI-3): deterministic action + LLM decision in one row.
+
+    Lean: built from `resolve_symbol_states` (no evidence/contract blobs); the heavy "why" is the
+    on-demand `/api/symbol/{symbol}/why`. Review-only -- nothing here submits a broker order.
+    """
+    row_limit = _bounded_limit(limit, default=50, maximum=200)
+    row_offset = max(int(offset or 0), 0)
+    states = [row for row in load_symbol_states() if row.get("state") == "RECOMMENDATION"]
+    action_filter = _text(action)
+    if action_filter:
+        wanted = action_filter.strip().upper()
+        states = [row for row in states if str(row.get("action") or "").upper() == wanted]
+    if only_conflicts:
+        states = [row for row in states if row.get("conflict")]
+    # Most actionable first: directional (BUY/SELL) ahead of neutral (WATCH), BUY-side ahead of
+    # de-risk, then by deterministic priority.
+    states.sort(key=lambda r: (
+        -abs(_action_direction(r.get("action"))),
+        -_action_direction(r.get("action")),
+        -float(r.get("action_priority") or 0),
+        str(r.get("symbol") or ""),
+    ))
+    total = len(states)
+    by_action: dict[str, int] = {}
+    agree_count = 0
+    conflict_count = 0
+    for row in states:
+        key = str(row.get("action") or "UNKNOWN")
+        by_action[key] = by_action.get(key, 0) + 1
+        if row.get("agree"):
+            agree_count += 1
+        if row.get("conflict"):
+            conflict_count += 1
+    page = states[row_offset:row_offset + row_limit]
+    next_offset = row_offset + row_limit if (row_offset + row_limit) < total else None
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/recommendations-unified", schema_name="recommendations_unified"),
+        "recommendations": [_json_ready(row) for row in page],
+        "summary": {"total": total, "by_action": by_action, "agree": agree_count, "conflict": conflict_count},
+        "page": {"total": total, "returned": len(page), "offset": row_offset, "limit": row_limit, "next_offset": next_offset},
+        "review_only": True,
+        "broker_execution_allowed_count": 0,
+    }
+
+
+def build_positions_payload(*, status: str | None = "open", limit: int = 200) -> dict[str, Any]:
+    """Tracked holdings (WI-4): lean list, default open, enriched with the latest price. Review-only."""
+    from advisory.operator_holdings import load_holdings
+
+    row_limit = _bounded_limit(limit, default=200, maximum=500)
+    status_filter = _text(status)
+    holdings = load_holdings(status=(status_filter or None), limit=row_limit)
+    prices = _latest_ohlcv_prices([str(row.get("symbol") or "") for row in holdings])
+    out: list[dict[str, Any]] = []
+    open_count = 0
+    exited_count = 0
+    for row in holdings:
+        sym = str(row.get("symbol") or "").upper()
+        price_row = prices.get(sym) or {}
+        current_price = price_row.get("price")
+        entry_price = row.get("entry_price")
+        change_pct = None
+        if current_price is not None and entry_price not in (None, 0):
+            try:
+                change_pct = round((float(current_price) - float(entry_price)) / float(entry_price) * 100.0, 2)
+            except (TypeError, ValueError, ZeroDivisionError):
+                change_pct = None
+        if str(row.get("status") or "").lower() == "open":
+            open_count += 1
+        else:
+            exited_count += 1
+        out.append(_json_ready({
+            **row,
+            "current_price": current_price,
+            "price_asof": price_row.get("price_asof"),
+            "change_pct_since_entry": change_pct,
+        }))
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/positions", schema_name="operator_positions"),
+        "positions": out,
+        "summary": {"total": len(out), "open": open_count, "exited": exited_count},
+        "review_only": True,
+        "operator_note": "Holdings are operator-marked tracking for monitoring, not broker orders; no simulated P&L.",
+    }
+
+
+def build_position_take_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/positions/take -- mark a recommendation as taken -> tracked holding (WI-4)."""
+    from advisory.operator_holdings import record_take
+
+    symbol = str(payload.get("symbol") or "").strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    entry_date = payload.get("entry_date") or pd.Timestamp.utcnow().date().isoformat()
+    row = record_take(
+        symbol=symbol,
+        entry_price=payload.get("entry_price"),
+        entry_date=entry_date,
+        action=payload.get("action"),
+        source=payload.get("source"),
+        note=payload.get("note"),
+    )
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/positions/take", schema_name="operator_position_take"),
+        "status": "ok",
+        "holding": _json_ready(row),
+        "review_only": True,
+        "broker_execution_allowed": False,
+    }
+
+
+def build_position_exit_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/positions/exit -- close a tracked holding (WI-4)."""
+    from advisory.operator_holdings import record_exit
+
+    symbol = str(payload.get("symbol") or "").strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    entry_date = payload.get("entry_date")
+    if not entry_date:
+        raise ValueError("entry_date is required to identify the holding")
+    updated = record_exit(
+        symbol=symbol,
+        entry_date=entry_date,
+        exit_price=payload.get("exit_price"),
+        exit_date=payload.get("exit_date") or pd.Timestamp.utcnow().date().isoformat(),
+        note=payload.get("note"),
+    )
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/positions/exit", schema_name="operator_position_exit"),
+        "status": "ok" if updated else "no_open_holding",
+        "updated": int(updated),
+        "review_only": True,
+    }
+
+
+def _latest_recommendation_row(symbol: str) -> dict[str, Any]:
+    """Full latest deterministic recommendation row for one symbol (for the why detail)."""
+    if not _table_exists(ACTION_RECOMMENDATIONS_TABLE):
+        return {}
+    rows = _records(sql_to_df(
+        f"""
+        SELECT symbol, action_code, action_reason, action_detail, reason_contract_status,
+               recommendation_reason_json, reference_price, recommended_stop_price,
+               recommended_target_price, expected_horizon_days, feature_freshness_json, asof_date
+        FROM {ACTION_RECOMMENDATIONS_TABLE}
+        WHERE symbol = %(symbol)s
+        ORDER BY asof_date DESC NULLS LAST, action_priority DESC NULLS LAST
+        LIMIT 1
+        """,
+        params={"symbol": symbol.strip().upper()}, retries=2,
+    ))
+    return rows[0] if rows else {}
+
+
+def _latest_llm_decision_row(symbol: str) -> dict[str, Any]:
+    """Full latest LLM decision row for one symbol (for the why detail)."""
+    if not _table_exists(LLM_DECISIONS_TABLE):
+        return {}
+    rows = _records(sql_to_df(
+        f"""
+        SELECT symbol, asof_date, decided_at, proposed_action, decision_mode, conviction,
+               meets_data_grounding_for_live, sufficiency_path, rationale, decision_contract_json,
+               llm_status, llm_model, prompt_version
+        FROM {LLM_DECISIONS_TABLE}
+        WHERE symbol = %(symbol)s
+        ORDER BY decided_at DESC NULLS LAST
+        LIMIT 1
+        """,
+        params={"symbol": symbol.strip().upper()}, retries=2,
+    ))
+    return rows[0] if rows else {}
+
+
+def build_symbol_why_payload(symbol: str, *, asof_date: str | None = None) -> dict[str, Any]:
+    """The single heavy "why" detail for one symbol (WI-5): evidence verdicts + grounding + reasons.
+
+    This is the ONLY endpoint that loads the full evidence tree, fetched on demand when an operator
+    drills into a row. List endpoints stay lean. Review-only.
+    """
+    from advisory.llm_decision_contract import validate_decision_grounding
+    from advisory.llm_evidence_packet import load_evidence_packet
+
+    sym = str(symbol or "").strip().upper()
+    if not sym:
+        raise ValueError("symbol is required")
+    rec_row = _latest_recommendation_row(sym)
+    llm_row = _latest_llm_decision_row(sym)
+    asof = _text(asof_date) or str(rec_row.get("asof_date") or llm_row.get("asof_date") or "")[:10]
+
+    packet: dict[str, Any] = {}
+    packet_error: str | None = None
+    grounding: dict[str, Any] = {}
+    if asof:
+        try:
+            packet = load_evidence_packet(sym, asof)
+        except Exception as exc:  # surface, never silently swallow
+            packet_error = f"{type(exc).__name__}: {exc}"
+        if packet:
+            action = str(llm_row.get("proposed_action") or rec_row.get("action_code") or "").strip().upper()
+            try:
+                grounding = validate_decision_grounding(
+                    action=action, cited_dimensions=None, packet=packet, matched_hypothesis=None,
+                )
+            except Exception as exc:
+                grounding = {"error": f"{type(exc).__name__}: {exc}"}
+
+    reason_contract = None
+    raw_reason = rec_row.get("recommendation_reason_json")
+    if raw_reason:
+        try:
+            reason_contract = json.loads(raw_reason) if isinstance(raw_reason, str) else raw_reason
+        except (ValueError, TypeError):
+            reason_contract = None
+    decision_contract = None
+    raw_contract = llm_row.get("decision_contract_json")
+    if raw_contract:
+        try:
+            decision_contract = json.loads(raw_contract) if isinstance(raw_contract, str) else raw_contract
+        except (ValueError, TypeError):
+            decision_contract = None
+
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/symbol/{symbol}/why", schema_name="operator_symbol_why"),
+        "symbol": sym,
+        "asof_date": asof or None,
+        "evidence_packet": _json_ready(packet) if packet else None,
+        "evidence_packet_error": packet_error,
+        "grounding": _json_ready(grounding) if grounding else None,
+        "deterministic": {
+            "action_code": rec_row.get("action_code"),
+            "action_reason": rec_row.get("action_reason"),
+            "action_detail": rec_row.get("action_detail"),
+            "reason_contract_status": rec_row.get("reason_contract_status"),
+            "recommendation_reason": reason_contract,
+            "reference_price": rec_row.get("reference_price"),
+            "recommended_stop_price": rec_row.get("recommended_stop_price"),
+            "recommended_target_price": rec_row.get("recommended_target_price"),
+            "expected_horizon_days": rec_row.get("expected_horizon_days"),
+        },
+        "llm_decision": _json_ready({**llm_row, "decision_contract": decision_contract}) if llm_row else None,
+        "review_only": True,
+    }
+
+
+def _load_decision_monitor_records(*, limit: int = 500) -> list[dict[str, Any]]:
+    """Minimal rows for the .3 systematic-error monitor (WI-7). Bounded; no JSON blobs."""
+    if not _table_exists(LLM_DECISIONS_TABLE):
+        return []
+    return _records(sql_to_df(
+        f"""
+        SELECT symbol, decided_at, proposed_action, event_class, sufficiency_path
+        FROM {LLM_DECISIONS_TABLE}
+        ORDER BY decided_at DESC NULLS LAST
+        LIMIT %(limit)s
+        """,
+        params={"limit": max(1, int(limit))}, retries=2,
+    ))
+
+
+def build_health_hub_payload(*, asof_date: str | None = None, error_limit: int = 25) -> dict[str, Any]:
+    """One consolidated diagnostics hub (WI-7): data freshness + cron + API errors + LLM monitor.
+
+    Each source is independently bounded (no unbounded scans); a degraded source is surfaced under
+    `skipped`, never silently dropped. Read-only.
+    """
+    skipped: list[dict[str, Any]] = []
+    try:
+        data_health = build_data_health_payload(asof_date=asof_date)
+    except Exception as exc:
+        data_health = {}
+        skipped.append({"source": "data_health", "error": f"{type(exc).__name__}: {exc}"})
+    try:
+        api_errors = build_operator_api_errors_payload(limit=_bounded_limit(error_limit, default=25, maximum=100))
+    except Exception as exc:
+        api_errors = {"errors": [], "summary": {"total": 0}}
+        skipped.append({"source": "api_errors", "error": f"{type(exc).__name__}: {exc}"})
+
+    monitor: dict[str, Any] = {}
+    try:
+        from advisory.llm_decision_store import build_decision_monitor_report
+
+        monitor = build_decision_monitor_report(_load_decision_monitor_records())
+    except Exception as exc:
+        skipped.append({"source": "llm_decision_monitor", "error": f"{type(exc).__name__}: {exc}"})
+
+    sync_state = data_health.get("sync_state") or []
+    blocked = [
+        row for row in sync_state
+        if isinstance(row, dict) and str(row.get("status") or row.get("freshness") or "").lower() in {"stale", "error", "degraded", "blocked"}
+    ]
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/health-hub", schema_name="operator_health_hub"),
+        "data_health": {
+            "summary": data_health.get("summary") or {},
+            "snapshot": data_health.get("snapshot"),
+            "snapshot_warning": data_health.get("snapshot_warning"),
+            "sync_state": sync_state,
+            "cron_status": data_health.get("cron_status") or [],
+            "runtime_processes": data_health.get("runtime_processes") or [],
+        },
+        "blocked_on_data": {
+            "count": len(blocked),
+            "sources": blocked,
+            "note": "Sources whose sync-state is stale/degraded; symbols depending on them may be blocked.",
+        },
+        "api_errors": {"errors": api_errors.get("errors") or [], "summary": api_errors.get("summary") or {}},
+        "llm_monitor": monitor,
+        "skipped": skipped,
+        "read_only": True,
+    }
+
+
+def build_workbench_payload(*, top_n: int = 8) -> dict[str, Any]:
+    """The home screen (WI-6): one bounded call -> what needs me now.
+
+    Three sections from already-built pieces: the top unified recommendations, open holdings (with a
+    rough since-entry move), and the top health alerts. No full-snapshot fallback. Review-only.
+    """
+    n = _bounded_limit(top_n, default=8, maximum=25)
+    recommendations = build_recommendations_unified_payload(limit=n, offset=0)
+    positions = build_positions_payload(status="open", limit=n)
+    try:
+        hub = build_health_hub_payload(error_limit=5)
+        health_alerts = {
+            "blocked_on_data": hub.get("blocked_on_data", {}).get("count", 0),
+            "api_errors": (hub.get("api_errors", {}).get("summary", {}) or {}).get("total", 0),
+            "llm_monitor_alerts": hub.get("llm_monitor", {}).get("alerts") or hub.get("llm_monitor", {}).get("findings") or [],
+        }
+    except Exception as exc:
+        health_alerts = {"error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/workbench", schema_name="operator_workbench"),
+        "recommendations": {
+            "items": recommendations.get("recommendations") or [],
+            "summary": recommendations.get("summary") or {},
+        },
+        "holdings": {
+            "items": positions.get("positions") or [],
+            "summary": positions.get("summary") or {},
+        },
+        "health": health_alerts,
+        "review_only": True,
+    }
+
+
 def build_market_context_payload(*, asof_date: str | None = None, limit: int = 50) -> dict[str, Any]:
     parsed_asof = _parse_asof_date(asof_date)
     payload = load_latest_market_context(parsed_asof, limit=max(0, int(limit)))
@@ -11267,6 +11623,40 @@ def create_app():
     ):
         return _guard(build_llm_decisions_payload, route="/api/llm-decisions",
                       symbol=symbol, asof_date=asof_date, limit=limit, offset=offset)
+
+    @app.get("/api/recommendations-unified")
+    def recommendations_unified(
+        action: str | None = None,
+        only_conflicts: bool = False,
+        limit: int = Query(default=50, ge=0, le=200),
+        offset: int = Query(default=0, ge=0),
+    ):
+        return _guard(build_recommendations_unified_payload, route="/api/recommendations-unified",
+                      action=action, only_conflicts=only_conflicts, limit=limit, offset=offset)
+
+    @app.get("/api/positions")
+    def positions(status: str | None = "open", limit: int = Query(default=200, ge=0, le=500)):
+        return _guard(build_positions_payload, route="/api/positions", status=status, limit=limit)
+
+    @app.post("/api/positions/take")
+    def positions_take(payload: dict[str, Any] = Body(...)):
+        return _guard(build_position_take_payload, route="/api/positions/take", payload=payload)
+
+    @app.post("/api/positions/exit")
+    def positions_exit(payload: dict[str, Any] = Body(...)):
+        return _guard(build_position_exit_payload, route="/api/positions/exit", payload=payload)
+
+    @app.get("/api/symbol/{symbol}/why")
+    def symbol_why(symbol: str, asof_date: str | None = None):
+        return _guard(build_symbol_why_payload, route="/api/symbol/{symbol}/why", symbol=symbol, asof_date=asof_date)
+
+    @app.get("/api/workbench")
+    def workbench(top_n: int = Query(default=8, ge=1, le=25)):
+        return _guard(build_workbench_payload, route="/api/workbench", top_n=top_n)
+
+    @app.get("/api/health-hub")
+    def health_hub(asof_date: str | None = None, error_limit: int = Query(default=25, ge=0, le=100)):
+        return _guard(build_health_hub_payload, route="/api/health-hub", asof_date=asof_date, error_limit=error_limit)
 
     @app.get("/api/wait-signals", response_model=WaitSignalsResponse)
     def wait_signals(limit: int = Query(default=100, ge=1, le=500), status: str | None = None, symbol: str | None = None):
