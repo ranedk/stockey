@@ -9,33 +9,6 @@ export interface OperatorApiSchema {
   broker_execution_enabled: boolean
 }
 
-export interface OperatorSummary {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  asof_date?: string
-  snapshot?: Dict
-  snapshot_warning?: Dict | null
-  summary: Dict
-  runtime_processes: Dict[]
-  cron_status: Dict[]
-  sync_state: Dict[]
-}
-
-export interface OperatorHome {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  asof_date?: string
-  snapshot?: Dict
-  snapshot_warning?: Dict | null
-  summary: Dict
-  runtime_processes: Dict[]
-  cron_status: Dict[]
-  sync_state: Dict[]
-  top_action_recommendations: Dict[]
-  today_recommendations: Dict[]
-  ts_forecast_paper_summary?: Dict[]
-}
-
 export interface OperatorHealthDetails {
   generated_at?: string
   api_schema?: OperatorApiSchema
@@ -99,96 +72,6 @@ export interface OperatorSmokePayload {
   note?: string
 }
 
-export interface ExecutionApprovalsPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  summary: Dict
-  rows: Dict[]
-  operator_boundary: Dict
-  source_warnings?: Dict[]
-  skipped?: Dict[]
-}
-
-export interface ExecutionApprovalDecisionResult {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  decision: Dict
-  operator_boundary: Dict
-  note?: string
-}
-
-export interface ExecutionApprovalContractUpdateResult {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  updated_row: Dict
-  safety_contract: Dict
-  operator_boundary: Dict
-  note?: string
-}
-
-export interface ExecutionReconciliationRunResult {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  mode: string
-  dry_run: boolean
-  summary: Dict
-  orders: Dict[]
-  fills: Dict[]
-  targets: Dict[]
-  operator_boundary: Dict
-  note?: string
-}
-
-export interface ExecutionEvidenceReviewResult {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  mode: string
-  dry_run: boolean
-  decision: string
-  review: Dict
-  evidence: Dict
-  updated_row: Dict
-  safety_contract: Dict
-  operator_boundary: Dict
-  note?: string
-}
-
-export interface ExecutionLiveAllowanceResult {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  mode: string
-  dry_run: boolean
-  decision: string
-  allowance: Dict
-  blockers: string[]
-  updated_row: Dict
-  safety_contract: Dict
-  operator_boundary: Dict
-  note?: string
-}
-
-export interface ExecutionLiveSubmitPreflightResult {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  decision: string
-  summary: Dict
-  expected_live_token?: string | null
-  cli_command_preview?: string | null
-  env_required: Dict
-  blockers: string[]
-  planned_orders: Dict[]
-  skipped_orders: Dict[]
-  operator_boundary: Dict
-  note?: string
-}
-
 export interface CronLogsPayload {
   generated_at?: string
   api_schema?: OperatorApiSchema
@@ -223,28 +106,6 @@ export interface OperatorApiErrorsPayload {
   status: string
   summary: Dict
   errors: Dict[]
-}
-
-export interface IngestionStatePayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  filters: Dict
-  summary: Dict
-  operator_boundary: Dict
-}
-
-export interface SupersededCleanupPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  mode: string
-  dry_run: boolean
-  result: Dict
-  counts: Dict
-  operator_boundary: Dict
-  audit_run?: Dict | null
-  note?: string
 }
 
 export interface IdentityIssueResolutionPayload {
@@ -286,71 +147,6 @@ export interface EventModelPromotionCheckPayload {
   notes: string[]
 }
 
-export interface TsForecastPromotionCheckPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  decision?: string
-  ready_for_operator_review?: boolean
-  promotion_mode?: string
-  scorecard: Dict
-  evidence: Dict
-  notes?: string[]
-}
-
-export interface TsForecastReviewRulesPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  config_path?: string
-  rules: Dict[]
-  issues: Dict[]
-  summary: Dict
-  operator_boundary?: Dict
-}
-
-export interface TsForecastPromotionReviewResult {
-  status: string
-  api_schema?: OperatorApiSchema
-  reviewed_at?: string
-  model_name: string
-  horizon_days: number
-  evidence_from_date?: string
-  evidence_to_date?: string
-  promotion_check: Dict
-  group_evidence: Dict
-  pending_patch: Dict
-  llm_review: Dict
-  review_model?: string
-  review_status?: string
-  review_error?: string
-  applied?: boolean
-}
-
-export interface TsForecastPromotionReviewsPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  reviews: Dict[]
-  pagination?: Dict
-}
-
-export interface TsForecastPromotionDecisionResult {
-  status: string
-  api_schema?: OperatorApiSchema
-  decided_at?: string
-  reviewed_at?: string
-  model_name: string
-  horizon_days: number
-  decision: string
-  operator_id?: string
-  decision_reason?: string
-  final_patch: Dict
-  review?: Dict
-  applied: boolean
-  note?: string
-}
-
 export interface EventModelArtifactsPayload {
   generated_at?: string
   api_schema?: OperatorApiSchema
@@ -372,15 +168,6 @@ export interface ResearchLedgerPayload {
   operator_boundary?: Dict
 }
 
-export interface ManualReviewPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  summary: Dict
-  source_warnings?: Dict[]
-  items: Dict[]
-}
-
 export interface IdentityIssuesPayload {
   generated_at?: string
   api_schema?: OperatorApiSchema
@@ -389,21 +176,6 @@ export interface IdentityIssuesPayload {
   source_warnings?: Dict[]
   issues: Dict[]
   skipped?: Dict[]
-}
-
-export interface ManualReviewDecisionResult {
-  api_schema?: OperatorApiSchema
-  status: string
-  decided_at?: string
-  item_id: string
-  decision: string
-  closing_decision: boolean
-  next_state?: string
-  creates_wait_signal?: boolean
-  wait_signal?: Dict | null
-  manual_review_state?: Dict | null
-  decision_effect?: Dict | null
-  note?: string
 }
 
 export interface ActionConflictRulesPayload {
@@ -435,25 +207,6 @@ export interface OperatorActions {
   alerts: Dict[]
   pagination?: Dict
   meta?: Dict
-}
-
-export interface SignalRefreshPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  signals: Dict[]
-  meta?: Dict
-}
-
-export interface OperatorJourneyPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  filters: Dict
-  summary: Dict
-  stages: Record<string, Dict[]>
-  timeline: Dict[]
-  skipped_sources: Dict[]
 }
 
 export interface OperatorPortfolio {
@@ -494,30 +247,6 @@ export interface OperatorEvents {
   alerts: Dict[]
   pagination?: Dict
   meta?: Dict
-}
-
-export interface EventPolicyPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  asof_date?: string
-  summary: Dict
-  rows: Dict[]
-}
-
-export interface EventPolicyEvaluationPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  summary: Dict[]
-}
-
-export interface OperatorMarketContext {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  asof_date?: string
-  summary: Dict
-  top_universe: Dict[]
 }
 
 export interface RegimeOverlaysPayload {
@@ -605,48 +334,6 @@ export interface SignalQualityPromotionDecisionResult {
   note?: string
 }
 
-export interface EventPolicyPromotionReviewResult {
-  status: string
-  api_schema?: OperatorApiSchema
-  reviewed_at?: string
-  evaluated_at?: string
-  horizon_days?: number
-  group_type: string
-  group_value: string
-  event_policy_evidence: Dict
-  pending_patch: Dict
-  llm_review: Dict
-  review_model?: string
-  review_status?: string
-  review_error?: string
-}
-
-export interface EventPolicyPromotionReviewsPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  reviews: Dict[]
-  pagination?: Dict
-}
-
-export interface EventPolicyPromotionDecisionResult {
-  status: string
-  api_schema?: OperatorApiSchema
-  decided_at?: string
-  reviewed_at?: string
-  evaluated_at?: string
-  horizon_days?: number
-  group_type: string
-  group_value: string
-  decision: string
-  operator_id?: string
-  decision_reason?: string
-  final_patch: Dict
-  review?: Dict
-  applied: boolean
-  note?: string
-}
-
 export interface ConfigChangePreviewResult {
   status: string
   api_schema?: OperatorApiSchema
@@ -663,14 +350,6 @@ export interface ConfigChangePreviewResult {
   safety_checks?: string[]
   applied: boolean
   decision?: Dict
-}
-
-export interface ConfigChangePreviewsPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  previews: Dict[]
-  pagination?: Dict
 }
 
 export interface ConfigChangeApplicationResult {
@@ -792,36 +471,6 @@ export interface TechnicalPromotionDecisionResult {
   review?: Dict
   applied: boolean
   note?: string
-}
-
-export interface EventDetailPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  kind: string
-  filters: Dict
-  rows: Dict[]
-  row_count: number
-}
-
-export interface EventTrace {
-  api_schema?: OperatorApiSchema
-  unique_id: string
-  processing: Dict[]
-  traces: Dict[]
-  steps: Dict[]
-  action_conflicts?: Dict[]
-  pagination?: Dict
-}
-
-export interface SymbolTrace {
-  api_schema?: OperatorApiSchema
-  symbol: string
-  processing: Dict[]
-  traces: Dict[]
-  steps: Dict[]
-  action_conflicts: Dict[]
-  pagination?: Dict
 }
 
 export interface TraceStage {
@@ -946,13 +595,6 @@ export interface WaitSignalsPayload {
   signals: Dict[]
   matches: Dict[]
   match_result?: Dict | null
-}
-
-export interface WaitSignalMatchPayload {
-  generated_at?: string
-  api_schema?: OperatorApiSchema
-  status: string
-  match_result: Dict
 }
 
 export interface HypothesisCreateResult {
