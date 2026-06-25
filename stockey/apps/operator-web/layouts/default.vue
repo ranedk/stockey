@@ -34,26 +34,38 @@ const runtimeLabel = computed(() => {
             <span class="h-2 w-2 rounded-full" :class="liveTradingEnabled ? 'bg-rust' : liveTradingStatusKnown ? 'bg-moss' : 'bg-ink/35'"></span>
             <span>{{ liveTradingLabel }}</span>
           </div>
-          <nav class="flex flex-wrap justify-end gap-2 text-sm font-semibold">
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/">Overview</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/recommendations">Recommendations</NuxtLink>
+          <nav class="flex flex-wrap items-center justify-end gap-2 text-sm font-semibold">
+            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/workbench">Workbench</NuxtLink>
+            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/recommendations-unified">Recommendations</NuxtLink>
+            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/positions">Positions</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/llm-decisions">Decisions</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/paper-portfolio">Paper Portfolio</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/events">Event Inbox</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/manual-review">Manual Review</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/operator-journey">Operator Journey</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/execution-approvals">Execution Approvals</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/action-conflict-rules">Conflict Rules</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/decision-trace">Decision Trace</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/hypotheses">Playbooks</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/screeners">Screeners</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/wait-signals">Wait Signals</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/regime-overlays">Regime Review</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/signal-quality">Signal Quality</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/prompt-registry">Prompt Registry</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/identity-issues">Identity Issues</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/health">Data Health</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/operations">Operations</NuxtLink>
+            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/health-hub">Health</NuxtLink>
+            <details class="relative">
+              <summary class="cursor-pointer list-none rounded-full px-4 py-2 text-ink/65 hover:bg-white/70">Research ▾</summary>
+              <div class="absolute right-0 z-40 mt-2 flex w-56 flex-col gap-1 rounded-2xl border border-ink/10 bg-paper p-2 shadow-xl">
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/hypotheses">Playbooks</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/screeners">Screeners</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/signal-quality">Signal Quality</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/regime-overlays">Regime Review</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/prompt-registry">Prompt Registry</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/technical-calibration">Technical Calibration</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/action-conflict-rules">Conflict Rules</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/identity-issues">Identity Issues</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/operations">Operations</NuxtLink>
+                <div class="my-1 border-t border-ink/10"></div>
+                <p class="px-3 pt-1 text-[10px] font-black uppercase tracking-wide text-ink/35">Legacy (being retired)</p>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/">Overview</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/recommendations">Recommendations (old)</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/events">Event Inbox</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/manual-review">Manual Review</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/operator-journey">Operator Journey</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/execution-approvals">Execution Approvals</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/decision-trace">Decision Trace</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/wait-signals">Wait Signals</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/paper-portfolio">Paper Portfolio</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/50 hover:bg-white/70" to="/health">Data Health</NuxtLink>
+              </div>
+            </details>
           </nav>
         </div>
       </div>
