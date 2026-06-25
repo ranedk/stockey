@@ -50,6 +50,8 @@ Module map:
 | `advisory/llm_decision_monitor.py` | `.3` Systematic-error detector over matured outcomes; alerts, never blocks. |
 | `advisory/llm_decision_outcome_labeler.py` | Realized after-cost benchmark-excess labels + `evaluate_policy_graduation`. |
 | `advisory/llm_broker_bridge.py` | `.5` Gate + translate a graduated decision into a broker-capable action contract (no submit). |
+| `advisory/announcement_event_classifier.py` | Proximity event classifier (relevance gate for hypothesis matching). |
+| `advisory/price_factors.py` | Point-in-time price/fundamental factor signals + the confidence score (feeds the `fundamental` and timing dimensions). |
 
 ## Evidence packet (.4a) — verdicts, not scores
 
@@ -61,13 +63,18 @@ feature's predictive power.) `strength` is kept as a descriptive field for the L
 
 Dimension **roles** (the dimensions are not a flat vote):
 
-- **Thesis (the filter):** `event_provenance`, `sector_reliability`, `exact_class_reliability`, and a
-  matched **hypothesis**. Non-technical evidence is *why* a name is interesting.
+- **Thesis (the filter):** `event_provenance`, `fundamental`, `sector_reliability`,
+  `exact_class_reliability`, and a matched **hypothesis**. Non-technical evidence is *why* a name is
+  interesting. `fundamental` (earnings growth / leverage / cash, point-in-time from
+  `advisory_fundamentals_daily`) is the genuinely INDEPENDENT axis -- the price/factor validation
+  showed confluence beats single factors precisely when technical AND fundamental agree (earnings
+  growth is the strongest single factor). See `docs/price_factor_model.md`.
 - **Timing:** `technical_confirmation`. Technicals time the entry (room to grow vs played-out /
   lagging), they are not the thesis. Only a real downtrend or material underperformance contradicts;
   a mild lag in an uptrend is neutral (quiet basing = room).
 - **Regime gate:** `market_context`. A conviction/size factor, not a blanket veto.
 - **Mode classifier:** `benchmark_excess`. Classifies alpha vs beta; it does not block.
+- **Risk guardrail:** `risk`. A confident contradiction (broken risk profile) vetoes.
 
 Verdict signs are calibrated for technical; for the others they are reasoned + vocabulary-correct but
 not yet outcome-calibrated (the source tables are too sparse — see Constraints). The verdict
@@ -81,9 +88,10 @@ A directional decision is **data-grounded** when the packet is COMPLETE on its c
 does not block) and it grounds in one of two modes, with no confident contradiction in any required
 dimension:
 
-- **ALPHA** — a corroborated non-technical thesis (a supportive event AND a second supportive
-  non-technical signal, OR a valid hypothesis), technical timing not contradicting, support not
-  market-beta-only. Beating the market.
+- **ALPHA** — a CORROBORATED non-technical thesis: >= 2 confidently-supportive INDEPENDENT
+  non-technical dimensions (event / fundamental / sector / exact-class / benchmark -- e.g. fundamental
+  + event, or event + reliability) OR a valid hypothesis; plus technical timing not contradicting and
+  support not market-beta-only. A lone signal is not enough. Beating the market.
 - **PARTICIPATION (beta)** — no thesis required, but a supportive LIQUID trend in a constructive
   regime. Labeled beta so the system can capture a rally instead of sitting in cash; it does not
   pretend to be alpha.
@@ -132,6 +140,24 @@ ok, and the action is broker-capable. `build_broker_action_contract` then transl
 `advisory_action_recommendations`-shaped contract the existing execution engine consumes — it NEVER
 calls the broker and does NOT auto-write the execution table (gated-contract-only). Any real
 submission still requires `STOCKEY_LIVE_TRADING_ENABLED` + the execution engine's full safety contract.
+
+## Price/factor model (the fundamental + technical axes)
+
+`advisory/price_factors.py` computes ~22 point-in-time factors (momentum/trend/volume/volatility/
+liquidity + fundamental growth/leverage/cash), grouped by INDEPENDENT component, and a cross-sectional
+`confidence` score that averages percentile ranks within each component (so correlated trend factors
+count once) weighted robustly. Validated on 178 securities (`scripts/validate_price_factors.py`):
+fundamentals are the strongest single factor (earnings-growth IC ~+0.10), and confluence beats single
+factors ONLY across independent axes (technical AND fundamental). That finding is wired into the
+decision packet as the **`fundamental` dimension** (an independent thesis axis) -- a fundamentally
+strong name + a supporting event/reliability is a corroborated alpha thesis, exactly the technical+
+fundamental confluence the validation rewards. Full design + findings: `docs/price_factor_model.md`.
+
+## Related documents
+
+- `docs/price_factor_model.md` -- the multi-factor model (factors, validation, confidence score).
+- `docs/hypothesis_authoring.md` -- how to author investor hypotheses (the operator alpha channel).
+- `docs/announcement_event_taxonomy.md` -- the event-class taxonomy + extraction-field reference.
 
 ## Hypotheses
 

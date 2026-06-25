@@ -63387,6 +63387,41 @@ def test_evidence_packet_reliability_negative_classification_contradicts():
     assert dim["strength"] == 0.0
 
 
+def test_evidence_packet_fundamental_verdict():
+    from advisory import llm_evidence_packet as ep
+
+    asof = "2026-06-18"
+    # strong earnings growth, low debt -> supportive
+    good = ep.fundamental_dimension({"asof_date": asof, "profit_after_tax_qoq_growth": 0.25, "total_revenue_qoq_growth": 0.1, "net_debt_to_equity": 0.3}, asof)
+    assert good["direction"] == "supportive" and good["confidence"] == "high"
+    # earnings declining -> contradicting
+    bad = ep.fundamental_dimension({"asof_date": asof, "profit_after_tax_qoq_growth": -0.2, "net_debt_to_equity": 0.5}, asof)
+    assert bad["direction"] == "contradicting"
+    # growth but over-levered -> downgraded to neutral
+    levered = ep.fundamental_dimension({"asof_date": asof, "profit_after_tax_qoq_growth": 0.2, "net_debt_to_equity": 2.0}, asof)
+    assert levered["direction"] == "neutral"
+    # missing -> absent
+    assert ep.fundamental_dimension(None, asof)["present"] is False
+
+
+def test_llm_decision_contract_fundamental_is_a_thesis_axis():
+    from advisory import llm_decision_contract as dc
+
+    # Fundamental + event supportive = two independent non-technical supports -> ALPHA, no hypothesis.
+    packet = _neutral_packet(
+        fundamental={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+        event_provenance={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"},
+    )
+    g = dc.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=packet)
+    assert "fundamental" in g["thesis_supports"]
+    assert g["decision_mode"] == "alpha"
+    # Fundamental alone (one support) is NOT enough -> uncorroborated.
+    lone = _neutral_packet(fundamental={"present": True, "fresh": True, "direction": "supportive", "confidence": "high"})
+    g2 = dc.validate_decision_grounding(action="BUY", cited_dimensions=[], packet=lone)
+    assert g2["decision_mode"] is None
+    assert any("uncorroborated_thesis" in r for r in g2["grounding_failures"])
+
+
 def test_evidence_packet_market_verdict_uses_real_state_vocabulary():
     from advisory import llm_evidence_packet as ep
 

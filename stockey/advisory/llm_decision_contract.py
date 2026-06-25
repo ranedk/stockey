@@ -57,7 +57,7 @@ DECISIVE_CONFIDENCE = "medium"
 
 # Dimension ROLES (operator design 2026-06-24): non-technical evidence is the thesis/filter,
 # technicals are the timing, market context is the regime gate.
-THESIS_DIMENSIONS = ("event_provenance", "sector_reliability", "exact_class_reliability")
+THESIS_DIMENSIONS = ("event_provenance", "fundamental", "sector_reliability", "exact_class_reliability")
 TIMING_DIMENSION = "technical_confirmation"
 REGIME_DIMENSION = "market_context"
 
@@ -69,7 +69,12 @@ CORE_DIMENSIONS = ("technical_confirmation", "market_context")
 # An ALPHA thesis must be CORROBORATED, not a lone event: a supportive event needs a second
 # supportive non-technical signal (reliability / exact-class / benchmark-excess), OR a valid
 # hypothesis stands on its own (operator-curated). Tightening chosen via AskUserQuestion 2026-06-24.
-ALPHA_THESIS_CORROBORATORS = ("sector_reliability", "exact_class_reliability", "benchmark_excess")
+# Independent non-technical supports for a CORROBORATED alpha thesis. An alpha decision needs >= 2 of
+# these confidently supportive (e.g. fundamental + event, or event + reliability) OR a valid
+# hypothesis -- a lone signal is not enough. Fundamentals are the strongest INDEPENDENT axis
+# (validated: earnings-growth IC ~+0.10; technical+fundamental confluence beats single factors).
+THESIS_CORROBORATION_DIMENSIONS = ("event_provenance", "fundamental", "sector_reliability", "exact_class_reliability", "benchmark_excess")
+MIN_THESIS_SUPPORTS = 2
 
 # Evidence dimensions a decision must have LOOKED AT (completeness). Looking at a dimension and
 # finding it neutral/no-signal still counts as looked-at; a genuine data gap does not.
@@ -81,6 +86,7 @@ REQUIRED_EVIDENCE_DIMENSIONS = (
     "exact_class_reliability",
     "benchmark_excess",
     "event_provenance",
+    "fundamental",
 )
 
 DIRECTIONAL_ACTIONS = {"BUY", "BUY_MORE", "SELL", "PARTIAL_SELL"}
@@ -289,14 +295,16 @@ def validate_decision_grounding(
 
     # ALPHA thesis must be corroborated: a supportive event needs a second supportive non-technical
     # signal, OR a valid hypothesis stands alone. A lone event is not enough for an alpha claim.
-    event_supportive = _direction(packet, "event_provenance") == "supportive"
-    corroborators = [d for d in ALPHA_THESIS_CORROBORATORS if _direction(packet, d) == "supportive"]
+    # A corroborated thesis = >= MIN_THESIS_SUPPORTS confidently-supportive INDEPENDENT non-technical
+    # dimensions (event / fundamental / reliability / benchmark), so a lone signal can't ground alpha;
+    # fundamentals are now a first-class thesis axis (the validated independent one).
+    thesis_supports = [d for d in THESIS_CORROBORATION_DIMENSIONS if _direction(packet, d) == "supportive"]
     # A valid hypothesis grounds only when its expected direction matches the action (a de-risk
     # playbook does not authorize a BUY).
     hypothesis_direction = str(hypothesis.get("direction") or "unknown")
     hypothesis_aligned = bool(hypothesis["is_valid_authority"]) and _hypothesis_aligns(hypothesis_direction, normalized_action)
     hypothesis_path = hypothesis_aligned
-    has_thesis = hypothesis_path or (event_supportive and bool(corroborators))
+    has_thesis = hypothesis_path or len(thesis_supports) >= MIN_THESIS_SUPPORTS
     thesis_dimensions = ([d for d in THESIS_DIMENSIONS if _direction(packet, d) == "supportive"])
     technical_direction = _direction(packet, TIMING_DIMENSION)
     timing_ok = technical_direction != "contradicting"          # not played-out / not lagging
@@ -338,8 +346,8 @@ def validate_decision_grounding(
             reasons.append("hypothesis_direction_conflict: trusted hypotheses disagree on direction for this symbol -- authority withheld")
         if hypothesis["is_valid_authority"] and not hypothesis_aligned:
             reasons.append(f"hypothesis_direction_mismatch: {hypothesis_direction} hypothesis vs {normalized_action}")
-        if event_supportive and not corroborators and not hypothesis_path:
-            reasons.append("uncorroborated_event_thesis: a lone supportive event needs a second non-technical signal or a valid hypothesis for alpha")
+        if len(thesis_supports) == 1 and not hypothesis_path:
+            reasons.append(f"uncorroborated_thesis: only {thesis_supports} supportive; alpha needs >= {MIN_THESIS_SUPPORTS} independent non-technical signals or a valid hypothesis")
         if not has_thesis and not technical_supportive:
             reasons.append("no_thesis_and_no_participation_trend: needs a corroborated thesis or a supportive trend")
         elif has_thesis and not timing_ok:
@@ -361,7 +369,7 @@ def validate_decision_grounding(
         "is_beta_participation": decision_mode == "participation",
         "cited_dimensions": cited_unique,
         "thesis_dimensions": thesis_dimensions,
-        "thesis_corroborators": corroborators,
+        "thesis_supports": thesis_supports,
         "has_thesis": has_thesis,
         "evidence_degraded": completeness["degraded"],
         "degraded_dimensions": completeness["degraded_dimensions"],

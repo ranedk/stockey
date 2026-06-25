@@ -1472,3 +1472,19 @@ focused `pytest`, `python scripts/docs_state_audit.py --strict`, and
   `build_confidence_scores` propagated NaN and silently restricted confidence to fundamental-having
   rows; now renormalises over present components. Hand-tuning weights from single-factor ICs LOWERED
   the combined IC (overfitting) -> kept robust round weights. 2 tests. Full suite 2126.
+
+#### Factor model wired into the live decision packet (2026-06-25)
+- Added a `fundamental` dimension to the LLM evidence packet (`advisory/llm_evidence_packet.py`):
+  point-in-time verdict from earnings growth / leverage / cash, loaded as-of from
+  `advisory_fundamentals_daily`. This is the INDEPENDENT axis the price/factor validation showed makes
+  confluence pay (technical AND fundamental).
+- `.1` grounding now treats `fundamental` as a first-class THESIS axis: alpha needs >= 2 independent
+  non-technical supports (event / fundamental / sector / exact-class / benchmark) OR a valid
+  hypothesis -- so a fundamentally strong name + a supporting catalyst grounds a corroborated thesis
+  (generalised the old event-only corroboration; backward-compatible). `fundamental` is an enriching
+  required dimension (absence degrades, not blocks). 2 tests. Full suite 2128.
+- Cross-sectional `confidence` SCORE stays a research/ranking tool (needs the universe snapshot); the
+  per-symbol fundamental verdict is what grounds. Follow-up: enrich technical_confirmation with the
+  series-computed momentum/trend components.
+- Documentation pass: `docs/llm_decision_authority.md` updated (fundamental dimension, generalised
+  alpha rule, module map, Related-documents index); `docs/price_factor_model.md` wiring section added.

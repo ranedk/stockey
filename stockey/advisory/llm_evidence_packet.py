@@ -92,6 +92,7 @@ REQUIRED_DIMENSIONS = (
     "exact_class_reliability",
     "benchmark_excess",
     "event_provenance",
+    "fundamental",
 )
 
 
@@ -376,6 +377,47 @@ def _hypothesis_direction(expected_effect: Any) -> str:
     return "unknown"
 
 
+def fundamental_dimension(row: dict[str, Any] | None, asof_date: Any) -> dict[str, Any]:
+    """Fundamental verdict from point-in-time financials -- the INDEPENDENT axis the factor validation
+    showed is what makes technical+fundamental confluence pay (earnings growth is the strongest single
+    factor; leverage modifies). Anchored on earnings growth, with high leverage as a contradiction."""
+    if not isinstance(row, dict) or not row:
+        return _absent("missing")
+    growth = _num(row.get("profit_after_tax_qoq_growth"))
+    revenue_growth = _num(row.get("total_revenue_qoq_growth"))
+    net_debt_to_equity = _num(row.get("net_debt_to_equity"))
+    fcf_to_equity = _num(row.get("free_cash_flow_to_equity"))
+
+    high_leverage = net_debt_to_equity is not None and net_debt_to_equity > 3.0
+    if growth is not None and growth < 0:
+        direction, confidence = "contradicting", ("high" if growth < -0.10 else "medium")
+    elif high_leverage:
+        direction, confidence = "contradicting", "medium"
+    elif growth is not None and growth > 0 and (revenue_growth is None or revenue_growth >= 0):
+        # strong earnings growth + not over-levered is supportive; high leverage downgrades to neutral.
+        leveraged = net_debt_to_equity is not None and net_debt_to_equity > 1.5
+        direction = "supportive" if not leveraged else "neutral"
+        confidence = ("high" if (growth > 0.15 and not leveraged) else "medium") if direction == "supportive" else "low"
+    else:
+        direction, confidence = "neutral", "low"
+
+    strength = max(0.0, min(1.0, 0.5 + growth)) if growth is not None else None
+    dim = {
+        "present": True,
+        "fresh": True,  # fundamentals are as-of the latest filing, used point-in-time by the loader
+        "strength": strength,
+        "status": "ok",
+        "earnings_growth": growth,
+        "revenue_growth": revenue_growth,
+        "net_debt_to_equity": net_debt_to_equity,
+        "fcf_to_equity": fcf_to_equity,
+    }
+    return _verdict(dim, direction, confidence, {
+        "earnings_growth": growth, "revenue_growth": revenue_growth,
+        "net_debt_to_equity": net_debt_to_equity, "fcf_to_equity": fcf_to_equity,
+    })
+
+
 def hypothesis_match_dimension(
     rows: list[dict[str, Any]] | None,
     *,
@@ -426,6 +468,7 @@ def assemble_evidence_packet(
     exact_class_row: dict[str, Any] | None = None,
     benchmark_row: dict[str, Any] | None = None,
     event_row: dict[str, Any] | None = None,
+    fundamental_row: dict[str, Any] | None = None,
     hypothesis_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Pure assembly: row dicts -> the packet consumed by `advisory/llm_decision_contract`."""
@@ -440,6 +483,7 @@ def assemble_evidence_packet(
         "exact_class_reliability": exact_class_reliability_dimension(exact_class_row),
         "benchmark_excess": benchmark_excess_dimension(benchmark_row),
         "event_provenance": event_provenance_dimension(event_source, asof_date),
+        "fundamental": fundamental_dimension(fundamental_row, asof_date),
         "hypothesis_match": hypothesis_match_dimension(hypothesis_rows),
     }
 
@@ -497,6 +541,11 @@ def load_evidence_packet(
         "ORDER BY asof_date DESC LIMIT 1",
         params,
     )
+    fundamental_row = row_loader(
+        "SELECT * FROM advisory_fundamentals_daily WHERE symbol=%(symbol)s AND asof_date<=%(asof)s "
+        "ORDER BY asof_date DESC LIMIT 1",
+        params,
+    )
     hypothesis_rows = rows_loader(
         "SELECT m.*, h.status AS status FROM advisory_hypothesis_matches m "
         "JOIN advisory_hypotheses h ON h.hypothesis_id=m.hypothesis_id "
@@ -537,5 +586,6 @@ def load_evidence_packet(
         exact_class_row=exact_class_row,
         benchmark_row=benchmark_row,
         event_row=allocation_row,
+        fundamental_row=fundamental_row,
         hypothesis_rows=hypothesis_rows,
     )

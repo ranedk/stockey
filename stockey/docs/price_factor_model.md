@@ -131,3 +131,16 @@ Combine **validated, de-correlated components** into one confidence score:
 
 Like hypotheses, a factor / the combined score only grounds a live decision after it has earned edge
 on real, point-in-time data -- reputation never substitutes for the audit.
+
+## Wiring into the live decision path (DONE for the fundamental axis)
+
+The validated finding -- confluence pays across INDEPENDENT axes, and fundamentals are the strongest
+independent one -- is wired into the LLM decision packet (`advisory/llm_evidence_packet.py`) as the
+**`fundamental` dimension**: a point-in-time verdict from earnings growth / leverage / cash, loaded
+as-of from `advisory_fundamentals_daily`. The decision contract (`.1`) treats `fundamental` as a
+first-class THESIS axis -- alpha needs >= 2 independent non-technical supports (e.g. fundamental +
+event, or event + reliability), so a fundamentally strong name with a supporting catalyst grounds a
+corroborated thesis. The cross-sectional `confidence` SCORE itself (which needs the universe snapshot
+to percentile-rank) remains a research/ranking tool; the per-symbol `fundamental` verdict is what
+grounds. Technical factor enrichment of `technical_confirmation` (momentum/trend components from the
+series computation) is a natural follow-up.
