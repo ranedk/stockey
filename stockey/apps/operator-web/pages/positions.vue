@@ -14,6 +14,15 @@ const rows = computed(() => asList(data.value?.positions))
 const summary = computed(() => asDict(data.value?.summary))
 const whySymbol = ref<string | null>(null)
 const busy = ref<string | null>(null)
+const expanded = ref<Set<string>>(new Set())
+
+function rowKey(row: Dict) { return `${row.symbol}:${fmtDate(row.entry_date)}` }
+function toggleLog(row: Dict) {
+  const k = rowKey(row)
+  const next = new Set(expanded.value)
+  next.has(k) ? next.delete(k) : next.add(k)
+  expanded.value = next
+}
 
 function asDict(value: unknown): Dict {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
@@ -38,14 +47,17 @@ function changeClass(pct: unknown) {
   return 'text-ink/50'
 }
 
-async function exitPosition(row: Dict) {
+// One action handler for buy_more / reduce_exposure / hold / sell. % stays anchored to the original
+// entry server-side; sell also closes the holding.
+async function act(row: Dict, action: string) {
   const symbol = String(row.symbol)
-  busy.value = symbol
+  busy.value = rowKey(row)
   try {
-    await api.exitPosition({
+    await api.postPositionEvent({
       symbol,
       entry_date: fmtDate(row.entry_date),
-      exit_price: row.current_price
+      action,
+      price: row.current_price
     })
     await refresh()
   } catch {
@@ -54,6 +66,12 @@ async function exitPosition(row: Dict) {
     busy.value = null
   }
 }
+const ACTIONS = [
+  { key: 'buy_more', label: 'Buy more', cls: 'border-moss/30 bg-moss/10 text-moss hover:bg-moss/20' },
+  { key: 'reduce_exposure', label: 'Reduce', cls: 'border-sun/40 bg-sun/15 text-ink hover:bg-sun/25' },
+  { key: 'hold', label: 'Hold', cls: 'border-ink/15 bg-white/70 text-ink/55 hover:bg-white' },
+  { key: 'sell', label: 'Sell', cls: 'border-rust/30 bg-rust/10 text-rust hover:bg-rust/20' }
+]
 </script>
 
 <template>
@@ -99,24 +117,46 @@ async function exitPosition(row: Dict) {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="(row, idx) in rows" :key="idx" class="border-b border-ink/5 hover:bg-white/80">
-            <td class="px-4 py-3 font-black text-ink">
-              <button class="underline-offset-2 hover:underline" @click="whySymbol = String(row.symbol)">{{ display(row.symbol) }}</button>
-            </td>
-            <td class="px-4 py-3 font-semibold">{{ display(row.action) }}</td>
-            <td class="px-4 py-3 text-ink/70">{{ display(row.entry_price) }}</td>
-            <td class="px-4 py-3 text-ink/55">{{ fmtDate(row.entry_date) }}</td>
-            <td class="px-4 py-3 text-ink/70">{{ display(row.current_price) }}</td>
-            <td class="px-4 py-3" :class="changeClass(row.change_pct_since_entry)">
-              {{ typeof row.change_pct_since_entry === 'number' ? `${row.change_pct_since_entry > 0 ? '+' : ''}${row.change_pct_since_entry}%` : '-' }}
-            </td>
-            <td class="px-4 py-3 text-ink/55">{{ display(row.status) }}</td>
-            <td class="px-4 py-3 text-right">
-              <button v-if="String(row.status) === 'open'"
-                      class="rounded-full border border-rust/30 bg-rust/10 px-3 py-1.5 text-xs font-semibold text-rust hover:bg-rust/20 disabled:opacity-40"
-                      :disabled="busy === String(row.symbol)" @click="exitPosition(row)">Exit</button>
-            </td>
-          </tr>
+          <template v-for="(row, idx) in rows" :key="idx">
+            <tr class="border-b border-ink/5 hover:bg-white/80">
+              <td class="px-4 py-3 font-black text-ink">
+                <button class="underline-offset-2 hover:underline" @click="whySymbol = String(row.symbol)">{{ display(row.symbol) }}</button>
+              </td>
+              <td class="px-4 py-3 font-semibold">{{ display(row.action) }}</td>
+              <td class="px-4 py-3 text-ink/70">{{ display(row.entry_price) }}</td>
+              <td class="px-4 py-3 text-ink/55">{{ fmtDate(row.entry_date) }}</td>
+              <td class="px-4 py-3 text-ink/70">{{ display(row.current_price) }}</td>
+              <td class="px-4 py-3" :class="changeClass(row.change_pct_since_entry)">
+                {{ typeof row.change_pct_since_entry === 'number' ? `${row.change_pct_since_entry > 0 ? '+' : ''}${row.change_pct_since_entry}%` : '-' }}
+                <span v-if="asList(row.events).length" class="ml-1 text-[10px] font-semibold text-ink/40">· since original entry</span>
+              </td>
+              <td class="px-4 py-3 text-ink/55">
+                {{ display(row.status) }}
+                <button v-if="asList(row.events).length" class="ml-1 text-[10px] font-bold text-ink/40 hover:text-ink/70" @click="toggleLog(row)">
+                  log ({{ asList(row.events).length }})
+                </button>
+              </td>
+              <td class="px-4 py-3">
+                <div v-if="String(row.status) === 'open'" class="flex flex-wrap justify-end gap-1.5">
+                  <button v-for="a in ACTIONS" :key="a.key"
+                          class="rounded-full border px-2.5 py-1 text-xs font-semibold disabled:opacity-40" :class="a.cls"
+                          :disabled="busy === rowKey(row)" @click="act(row, a.key)">{{ a.label }}</button>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="expanded.has(rowKey(row))" class="border-b border-ink/5 bg-white/40">
+              <td colspan="8" class="px-4 py-3">
+                <div class="flex flex-col gap-1 text-xs text-ink/60">
+                  <div v-for="(e, ei) in asList(row.events)" :key="ei" class="flex gap-3">
+                    <span class="font-semibold text-ink/70">{{ display(e.action) }}</span>
+                    <span>@ {{ display(e.price) }}</span>
+                    <span class="text-ink/40">{{ String(e.event_at || '').slice(0, 16).replace('T', ' ') }}</span>
+                    <span v-if="e.note" class="text-ink/45">{{ display(e.note) }}</span>
+                  </div>
+                </div>
+              </td>
+            </tr>
+          </template>
           <tr v-if="!rows.length && !pending">
             <td colspan="8" class="px-4 py-8 text-center text-ink/40">No positions for this filter.</td>
           </tr>

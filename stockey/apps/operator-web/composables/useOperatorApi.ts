@@ -43,6 +43,7 @@ export function useOperatorApi() {
     getPositions: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/positions${query(params)}`),
     takePosition: (body: Record<string, unknown>) => post<Record<string, unknown>>('/api/positions/take', body),
     exitPosition: (body: Record<string, unknown>) => post<Record<string, unknown>>('/api/positions/exit', body),
+    postPositionEvent: (body: Record<string, unknown>) => post<Record<string, unknown>>('/api/positions/event', body),
     getSymbolWhy: (symbol: string, params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/symbol/${encodeURIComponent(symbol)}/why${query(params)}`),
     getWorkbench: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/workbench${query(params)}`),
     getHealthHub: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/health-hub${query(params)}`),

@@ -78262,3 +78262,51 @@ def test_symbol_why_hypothesis_extraction_and_driven_by():
     assert _driven_by({"thesis_supports": ["fundamental"]}, has_hypothesis=False) == "fundamental"
     assert _driven_by({"timing_ok": True}, has_hypothesis=False) == "technical"
     assert _driven_by({}, has_hypothesis=False) == "evidence"
+
+
+def test_operator_holdings_record_event_validates_and_is_append_only(monkeypatch):
+    import utils.db as db_utils
+    from advisory import operator_holdings
+
+    executed = {}
+
+    class _Cur:
+        def execute(self, sql, params):
+            executed["sql"] = sql
+            executed["params"] = params
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _fake_session(*args, **kwargs):
+        yield (None, _Cur())
+
+    monkeypatch.setattr(operator_holdings, "ensure_tables", lambda: None)
+    monkeypatch.setattr(db_utils, "db_session", _fake_session)
+    monkeypatch.setattr(db_utils, "execute_db_operation", lambda fn, **kwargs: fn())
+
+    row = operator_holdings.record_event(symbol="tcs", entry_date="2026-06-20", action="BUY_MORE", price=110.0)
+    assert row["action"] == "buy_more" and row["symbol"] == "TCS" and row["price"] == 110.0
+    assert "INSERT INTO" in executed["sql"]  # append-only, never an UPDATE of the parent entry
+    # unknown verbs are rejected
+    with pytest.raises(ValueError):
+        operator_holdings.record_event(symbol="TCS", entry_date="2026-06-20", action="frobnicate")
+
+
+def test_positions_payload_anchors_pct_to_original_entry(monkeypatch):
+    import advisory.operator_holdings as holdings_mod
+
+    # One holding (entry 100); the action log has a buy_more at 150 -- the % must stay vs 100, not re-average.
+    monkeypatch.setattr(holdings_mod, "load_holdings", lambda **kwargs: [
+        {"symbol": "TCS", "status": "open", "entry_price": 100.0, "entry_date": "2026-06-20", "action": "BUY"},
+    ])
+    monkeypatch.setattr(holdings_mod, "load_events", lambda **kwargs: [
+        {"symbol": "TCS", "entry_date": "2026-06-20", "action": "buy_more", "price": 150.0},
+        {"symbol": "TCS", "entry_date": "2026-06-20", "action": "buy", "price": 100.0},
+    ])
+    monkeypatch.setattr(operator_api, "_latest_ohlcv_prices", lambda symbols: {"TCS": {"price": 120.0}})
+
+    payload = operator_api.build_positions_payload(status="open")
+    pos = payload["positions"][0]
+    assert pos["change_pct_since_entry"] == 20.0  # (120-100)/100, anchored to ORIGINAL entry
+    assert [e["action"] for e in pos["events"]] == ["buy_more", "buy"]

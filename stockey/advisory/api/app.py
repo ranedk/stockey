@@ -2967,12 +2967,18 @@ def build_recommendations_unified_payload(
 
 def build_positions_payload(*, status: str | None = "open", limit: int = 200) -> dict[str, Any]:
     """Tracked holdings (WI-4): lean list, default open, enriched with the latest price. Review-only."""
-    from advisory.operator_holdings import load_holdings
+    from advisory.operator_holdings import load_events, load_holdings
 
     row_limit = _bounded_limit(limit, default=200, maximum=500)
     status_filter = _text(status)
     holdings = load_holdings(status=(status_filter or None), limit=row_limit)
-    prices = _latest_ohlcv_prices([str(row.get("symbol") or "") for row in holdings])
+    symbols = [str(row.get("symbol") or "") for row in holdings]
+    prices = _latest_ohlcv_prices(symbols)
+    # Action log per holding, keyed by (symbol, entry_date) so each position carries its own history.
+    events_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for ev in (load_events(symbols=symbols) if symbols else []):
+        key = (str(ev.get("symbol") or "").upper(), str(ev.get("entry_date") or "")[:10])
+        events_by_key.setdefault(key, []).append(_json_ready(ev))
     out: list[dict[str, Any]] = []
     open_count = 0
     exited_count = 0
@@ -2996,6 +3002,7 @@ def build_positions_payload(*, status: str | None = "open", limit: int = 200) ->
             "current_price": current_price,
             "price_asof": price_row.get("price_asof"),
             "change_pct_since_entry": change_pct,
+            "events": events_by_key.get((sym, str(row.get("entry_date") or "")[:10]), []),
         }))
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
@@ -3056,6 +3063,46 @@ def build_position_exit_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "status": "ok" if updated else "no_open_holding",
         "updated": int(updated),
         "review_only": True,
+    }
+
+
+def build_position_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/positions/event -- append an action (buy_more/reduce_exposure/hold/sell) to a holding's
+    log. % since-entry stays anchored to the original entry; `sell` also closes the holding. Review-only.
+    """
+    from advisory.operator_holdings import record_event, record_exit
+
+    symbol = str(payload.get("symbol") or "").strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    entry_date = payload.get("entry_date")
+    if not entry_date:
+        raise ValueError("entry_date is required to identify the holding")
+    action = str(payload.get("action") or "").strip().lower()
+    event = record_event(
+        symbol=symbol,
+        entry_date=entry_date,
+        action=action,
+        price=payload.get("price"),
+        quantity_delta_pct=payload.get("quantity_delta_pct"),
+        note=payload.get("note"),
+    )
+    closed = 0
+    if action == "sell":
+        closed = record_exit(
+            symbol=symbol, entry_date=entry_date,
+            exit_price=payload.get("price"),
+            exit_date=payload.get("exit_date") or pd.Timestamp.utcnow().date().isoformat(),
+            note=payload.get("note"),
+        )
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/positions/event", schema_name="operator_position_event"),
+        "status": "ok",
+        "event": _json_ready(event),
+        "closed_holding": bool(closed),
+        "review_only": True,
+        "broker_execution_allowed": False,
     }
 
 
@@ -8022,6 +8069,10 @@ def create_app():
     @app.post("/api/positions/exit")
     def positions_exit(payload: dict[str, Any] = Body(...)):
         return _guard(build_position_exit_payload, route="/api/positions/exit", payload=payload)
+
+    @app.post("/api/positions/event")
+    def positions_event(payload: dict[str, Any] = Body(...)):
+        return _guard(build_position_event_payload, route="/api/positions/event", payload=payload)
 
     @app.get("/api/symbol/{symbol}/why")
     def symbol_why(symbol: str, asof_date: str | None = None):
