@@ -31,26 +31,40 @@ since entry is shown for context, but there is **no simulated P&L** (paper tradi
 decision 2026-06-23). The realized-outcome labeler can mature a holding's benchmark-excess the same way
 it does an LLM decision.
 
-## Navigation (6 primary + a Research menu)
+## Navigation (UI v2)
+
+Primary: **Workbench · Recommendations · Watchlist · Positions · Health**, plus an **Insight** menu
+(Decisions, Scorecard) and a **Manage** menu (Playbooks, Prompts) and a **Research** menu.
 
 1. **Workbench** (`/workbench`) -- "what needs me now": top recommendations + tracked holdings + health
-   tiles, one screen.
-2. **Recommendations** (`/recommendations-unified`) -- the full unified per-symbol queue; row actions
-   Take / Dismiss; click a symbol for the "why".
-3. **Positions** (`/positions`) -- tracked holdings (entry / current / since-entry move), open|exited
-   filter, Exit action.
-4. **Decisions** (`/llm-decisions`) -- the LLM decision journal.
-5. **Health** (`/health-hub`) -- one diagnostics hub.
-6. **Research** (dropdown) -- low-frequency tools: Playbooks, Screeners, Signal Quality, Regime, Prompt
-   Registry, Technical Calibration, Conflict Rules, Identity Issues, Operations.
+   tiles, with a one-line **regime banner** (`components/RegimeBanner.vue`, over `/api/market-context`).
+2. **Recommendations** (`/recommendations-unified`) -- the unified per-symbol queue; Take / Dismiss; the
+   action-summary chips are clickable filters; regime banner on top; click a symbol for the "why".
+3. **Watchlist** (`/watchlist`) -- symbols on watch over `/api/wait-signals`: *why watching* +
+   *what we're waiting for* (the explicit wait condition) + status sections; hypothesis chip when
+   playbook-driven.
+4. **Positions** (`/positions`) -- tracked holdings with an **action log** (buy / buy_more /
+   reduce_exposure / hold / sell) and **% since the ORIGINAL entry** (buy_more/reduce never re-average
+   the basis); sell closes the holding.
+5. **Insight** -- **Decisions** (`/llm-decisions`, the LLM decision journal) and **Scorecard**
+   (`/scorecard`, the matured benchmark-excess track record, by event class / sufficiency path /
+   hypothesis).
+6. **Manage** -- **Playbooks** (`/hypotheses`, view/edit/add hypotheses) and **Prompts** (`/prompts`,
+   editable + versioned LLM prompts).
+7. **Health** (`/health-hub`) -- one diagnostics hub.
+8. **Research** (dropdown) -- Screeners, Signal Quality, Regime Review, Technical Calibration, Conflict
+   Rules, Identity Issues, Operations.
 
 Root (`/`) redirects to the Workbench. The retired pages (old Overview/Recommendations, Event Inbox,
-Manual Review, Operator Journey, Execution Approvals, Decision Trace, Wait Signals, Paper Portfolio,
-old Data Health) were removed -- their routes now 404. The per-symbol detail page (`/symbols/{symbol}`)
-remains, reachable from symbol links.
+Manual Review, Operator Journey, Execution Approvals, Decision Trace, the old Wait Signals page, Paper
+Portfolio, old Data Health, old read-only Prompt Registry) were removed -- their UI is gone and, where
+the operator decided "remove fully", the backend routes/builders/tests too (Phase 0). The per-symbol
+detail page (`/symbols/{symbol}`) remains, reachable from symbol links.
 
 The **"why"** is a drill-in panel (`components/DecisionWhy.vue`), reachable by clicking any symbol
-anywhere. It is the *only* place the heavy evidence tree loads.
+anywhere. It is the *only* place the heavy evidence tree loads, and it now names the driving
+**hypothesis** (linked to Playbooks) and tags the reason's nature (`driven_by` = hypothesis / event /
+fundamental / technical / evidence).
 
 ## Endpoints
 
@@ -58,9 +72,14 @@ anywhere. It is the *only* place the heavy evidence tree loads.
 |---|---|---|
 | `GET /api/recommendations-unified` | `build_recommendations_unified_payload` | lean per-symbol RECOMMENDATION rows + GROUP-BY summary (by_action, agree, conflict); paginated |
 | `GET /api/positions` | `build_positions_payload` | lean holdings (default open) + latest price + since-entry change |
-| `POST /api/positions/take` | `build_position_take_payload` | mark taken -> `advisory_operator_holdings` |
+| `POST /api/positions/take` | `build_position_take_payload` | mark taken -> `advisory_operator_holdings` (seeds first `buy` event) |
 | `POST /api/positions/exit` | `build_position_exit_payload` | close an open holding |
-| `GET /api/symbol/{symbol}/why` | `build_symbol_why_payload` | the heavy detail: evidence verdicts (`load_evidence_packet`) + grounding (`validate_decision_grounding`) + deterministic reason + LLM decision. On-demand only |
+| `POST /api/positions/event` | `build_position_event_payload` | append buy_more/reduce_exposure/hold/sell to `advisory_operator_holding_events`; sell also closes |
+| `GET /api/symbol/{symbol}/why` | `build_symbol_why_payload` | the heavy detail: evidence verdicts + grounding + deterministic reason + LLM decision + resolved `hypothesis` + `driven_by`. On-demand only |
+| `GET /api/scorecard` | `build_scorecard_payload` | matured benchmark-excess (outcomes JOIN decisions) overall + by event class / sufficiency path / hypothesis |
+| `GET /api/prompts` | `build_prompts_payload` | every LLM prompt + version history + active version + `wired` flag (`advisory_prompt_registry_versions`) |
+| `POST /api/prompts/{id}/versions` · `POST /api/prompts/{id}/activate` | `build_prompt_create_version_payload` / `build_prompt_activate_payload` | append-only new version / flip active version |
+| `GET /api/wait-signals` (Watchlist) · `GET /api/market-context` (regime banner) | `build_wait_signals_payload` / `build_market_context_payload` | existing endpoints surfaced by the new pages |
 | `GET /api/workbench` | `build_workbench_payload` | one bounded call: top recommendations + holdings + health tiles |
 | `GET /api/health-hub` | `build_health_hub_payload` | data freshness/sync + cron + API errors + LLM systematic-error monitor; each source bounded, degraded sources under `skipped`; 15s cached |
 
