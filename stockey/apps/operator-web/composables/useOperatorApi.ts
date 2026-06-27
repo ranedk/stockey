@@ -39,6 +39,7 @@ export function useOperatorApi() {
     getScreenerFailures: (params: Record<string, unknown> = {}) => get<ScreenerFailuresPayload>(`/api/screeners/failures${query(params)}`),
     getIdentityIssues: (params: Record<string, unknown> = {}) => get<IdentityIssuesPayload>(`/api/identity-issues${query(params)}`),
     getLlmDecisions: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/llm-decisions${query(params)}`),
+    getScorecard: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/scorecard${query(params)}`),
     getRecommendationsUnified: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/recommendations-unified${query(params)}`),
     getPositions: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/positions${query(params)}`),
     takePosition: (body: Record<string, unknown>) => post<Record<string, unknown>>('/api/positions/take', body),

@@ -68,6 +68,14 @@ def ensure_tables() -> None:
         ],
         metadata={"tables": [DECISIONS_TABLE]},
     )
+    # Follow-on (append-only): surface the driving hypothesis id as a column so the scorecard can
+    # group matured benchmark-excess by hypothesis without parsing decision_contract_json.
+    apply_schema_migration(
+        migration_id="20260627_advisory_llm_decisions_hypothesis",
+        description="Add hypothesis_id column to the LLM decisions table (scorecard by-hypothesis grouping).",
+        statements=[f"ALTER TABLE {DECISIONS_TABLE} ADD COLUMN IF NOT EXISTS hypothesis_id TEXT"],
+        metadata={"tables": [DECISIONS_TABLE]},
+    )
 
 
 def _event_class_of(result: dict[str, Any]) -> Any:
@@ -79,10 +87,16 @@ def _event_class_of(result: dict[str, Any]) -> Any:
     return None
 
 
+def _hypothesis_id_of(contract: dict[str, Any]) -> Any:
+    match = contract.get("hypothesis_match") if isinstance(contract, dict) else None
+    return match.get("hypothesis_id") if isinstance(match, dict) else None
+
+
 def _decision_row(result: dict[str, Any], *, decided_at: Any) -> dict[str, Any]:
     """Map a decide() result (+ its evidence packet) to a persistable row. Pure."""
     contract = result.get("contract") or {}
     return {
+        "hypothesis_id": _hypothesis_id_of(contract),
         "decided_at": decided_at,
         "asof_date": result.get("asof_date"),
         "symbol": result.get("symbol"),

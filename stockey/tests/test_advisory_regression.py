@@ -78310,3 +78310,23 @@ def test_positions_payload_anchors_pct_to_original_entry(monkeypatch):
     pos = payload["positions"][0]
     assert pos["change_pct_since_entry"] == 20.0  # (120-100)/100, anchored to ORIGINAL entry
     assert [e["action"] for e in pos["events"]] == ["buy_more", "buy"]
+
+
+def test_scorecard_group_aggregates_benchmark_excess():
+    from advisory.api.app import _scorecard_group
+
+    rows = [
+        {"event_class": "EARNINGS_BEAT", "excess_hit": True, "resolved_beta_only": False, "realized_excess_after_cost": 0.04},
+        {"event_class": "EARNINGS_BEAT", "excess_hit": False, "resolved_beta_only": True, "realized_excess_after_cost": -0.01},
+        {"event_class": None, "excess_hit": True, "resolved_beta_only": False, "realized_excess_after_cost": 0.02},
+    ]
+    by_class = _scorecard_group(rows, "event_class")
+    eb = next(g for g in by_class if g["group"] == "EARNINGS_BEAT")
+    assert eb["matured"] == 2
+    assert eb["excess_hit_rate"] == 0.5
+    assert eb["beta_only_rate"] == 0.5
+    assert eb["mean_excess_after_cost"] == 0.015  # (0.04 + -0.01) / 2
+    # null group falls back to "unattributed"
+    assert any(g["group"] == "unattributed" for g in by_class)
+    # ordered by matured desc
+    assert by_class[0]["matured"] >= by_class[-1]["matured"]

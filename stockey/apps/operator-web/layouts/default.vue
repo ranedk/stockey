@@ -39,7 +39,13 @@ const runtimeLabel = computed(() => {
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/recommendations-unified">Recommendations</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/watchlist">Watchlist</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/positions">Positions</NuxtLink>
-            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/llm-decisions">Decisions</NuxtLink>
+            <details class="relative">
+              <summary class="cursor-pointer list-none rounded-full px-4 py-2 text-ink/65 hover:bg-white/70">Insight ▾</summary>
+              <div class="absolute right-0 z-40 mt-2 flex w-44 flex-col gap-1 rounded-2xl border border-ink/10 bg-paper p-2 shadow-xl">
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/llm-decisions">Decisions</NuxtLink>
+                <NuxtLink class="rounded-xl px-3 py-2 text-ink/65 hover:bg-white/70" to="/scorecard">Scorecard</NuxtLink>
+              </div>
+            </details>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/health-hub">Health</NuxtLink>
             <details class="relative">
               <summary class="cursor-pointer list-none rounded-full px-4 py-2 text-ink/65 hover:bg-white/70">Research ▾</summary>

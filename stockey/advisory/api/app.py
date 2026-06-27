@@ -2706,6 +2706,88 @@ def build_watchlist_payload(
 
 
 LLM_DECISIONS_TABLE = "advisory_llm_decisions"
+LLM_DECISION_OUTCOMES_TABLE = "advisory_llm_decision_outcomes"
+
+
+def _scorecard_group(rows: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    """Aggregate matured benchmark-excess by a grouping key. Pure."""
+    groups: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        g = str(row.get(key) or "unattributed")
+        acc = groups.setdefault(g, {"group": g, "matured": 0, "excess_hits": 0,
+                                    "beta_only": 0, "excess_sum": 0.0})
+        acc["matured"] += 1
+        if row.get("excess_hit"):
+            acc["excess_hits"] += 1
+        if row.get("resolved_beta_only"):
+            acc["beta_only"] += 1
+        try:
+            acc["excess_sum"] += float(row.get("realized_excess_after_cost") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    out = []
+    for acc in groups.values():
+        n = acc["matured"] or 1
+        out.append({
+            "group": acc["group"],
+            "matured": acc["matured"],
+            "excess_hit_rate": round(acc["excess_hits"] / n, 3),
+            "mean_excess_after_cost": round(acc["excess_sum"] / n, 4),
+            "beta_only_rate": round(acc["beta_only"] / n, 3),
+        })
+    return sorted(out, key=lambda r: (-r["matured"], r["group"]))
+
+
+def build_scorecard_payload(*, limit: int = 2000) -> dict[str, Any]:
+    """Recommendation track record (UI v2 Phase 4): matured benchmark-excess of the system's decisions,
+    overall and sliced by event class / sufficiency path / hypothesis. Read-only.
+
+    Reads `advisory_llm_decision_outcomes` (the matured labels) JOINed to `advisory_llm_decisions` on
+    (symbol, decided_at) for the slicing dimensions. Only matured, directional outcomes count.
+    """
+    if not _table_exists(LLM_DECISION_OUTCOMES_TABLE) or not _table_exists(LLM_DECISIONS_TABLE):
+        return {"generated_at": pd.Timestamp.utcnow().isoformat(),
+                "api_schema": _operator_api_schema("/api/scorecard", schema_name="operator_scorecard"),
+                "summary": {"matured": 0}, "by_event_class": [], "by_sufficiency_path": [],
+                "by_hypothesis": [], "review_only": True,
+                "skipped": [{"source": LLM_DECISION_OUTCOMES_TABLE, "error": "missing_table"}]}
+    rows = _records(sql_to_df(
+        f"""
+        SELECT o.symbol, o.decided_at, o.matured, o.realized_excess_after_cost, o.excess_hit,
+               o.resolved_beta_only, o.action, d.event_class, d.sufficiency_path, d.hypothesis_id
+        FROM {LLM_DECISION_OUTCOMES_TABLE} o
+        LEFT JOIN {LLM_DECISIONS_TABLE} d ON d.symbol = o.symbol AND d.decided_at = o.decided_at
+        WHERE o.matured = TRUE
+        ORDER BY o.decided_at DESC NULLS LAST
+        LIMIT %(limit)s
+        """,
+        params={"limit": _bounded_limit(limit, default=2000, maximum=10000)}, retries=2,
+    ))
+    matured = len(rows)
+    hits = sum(1 for r in rows if r.get("excess_hit"))
+    beta_only = sum(1 for r in rows if r.get("resolved_beta_only"))
+    excess_sum = 0.0
+    for r in rows:
+        try:
+            excess_sum += float(r.get("realized_excess_after_cost") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    n = matured or 1
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/scorecard", schema_name="operator_scorecard"),
+        "summary": {
+            "matured": matured,
+            "excess_hit_rate": round(hits / n, 3),
+            "mean_excess_after_cost": round(excess_sum / n, 4),
+            "beta_only_rate": round(beta_only / n, 3),
+        },
+        "by_event_class": _scorecard_group(rows, "event_class"),
+        "by_sufficiency_path": _scorecard_group(rows, "sufficiency_path"),
+        "by_hypothesis": _scorecard_group(rows, "hypothesis_id"),
+        "review_only": True,
+        "operator_note": "Benchmark-excess after cost vs NIFTY for matured, directional decisions. The trust signal behind recommendations.",
+    }
 
 
 def build_llm_decisions_payload(
@@ -8047,6 +8129,10 @@ def create_app():
     ):
         return _guard(build_llm_decisions_payload, route="/api/llm-decisions",
                       symbol=symbol, asof_date=asof_date, limit=limit, offset=offset)
+
+    @app.get("/api/scorecard")
+    def scorecard(limit: int = Query(default=2000, ge=0, le=10000)):
+        return _guard(build_scorecard_payload, route="/api/scorecard", limit=limit)
 
     @app.get("/api/recommendations-unified")
     def recommendations_unified(
