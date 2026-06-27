@@ -39,6 +39,15 @@ watch(() => props.symbol, (sym) => { if (sym) load(sym) }, { immediate: true })
 
 const deterministic = computed(() => asDict(data.value?.deterministic))
 const grounding = computed(() => asDict(data.value?.grounding))
+const hypothesis = computed(() => asDict(data.value?.hypothesis))
+const drivenBy = computed(() => String(data.value?.driven_by || ''))
+const hasHypothesis = computed(() => Object.keys(hypothesis.value).length > 0)
+
+function drivenByClass(kind: string) {
+  if (kind === 'hypothesis') return 'border-moss/30 bg-moss/15 text-moss'
+  if (kind === 'event') return 'border-sun/40 bg-sun/15 text-ink'
+  return 'border-ink/15 bg-white/70 text-ink/60'
+}
 const llm = computed(() => asDict(data.value?.llm_decision))
 const packet = computed(() => asDict(data.value?.evidence_packet))
 const packetError = computed(() => data.value?.evidence_packet_error)
@@ -86,6 +95,27 @@ function dirClass(direction: unknown) {
       </div>
 
       <div v-else-if="data" class="mt-6 space-y-6">
+        <!-- What drives this decision (nature of the reason) + hypothesis link -->
+        <div class="flex flex-wrap items-center gap-2">
+          <span v-if="drivenBy" class="rounded-full border px-3 py-1 text-xs font-black uppercase tracking-wide" :class="drivenByClass(drivenBy)">
+            driven by {{ drivenBy }}
+          </span>
+        </div>
+        <section v-if="hasHypothesis" class="rounded-2xl border border-moss/25 bg-moss/5 p-5">
+          <h3 class="text-xs font-black uppercase tracking-wide text-moss/80">Hypothesis-driven</h3>
+          <div class="mt-2 flex flex-wrap items-center gap-3">
+            <NuxtLink :to="`/hypotheses?hypothesis_id=${encodeURIComponent(String(hypothesis.hypothesis_id || ''))}`"
+                      class="text-base font-black text-ink underline-offset-2 hover:underline">
+              {{ display(hypothesis.title || hypothesis.hypothesis_id) }}
+            </NuxtLink>
+            <span class="rounded-full border border-ink/15 bg-white/70 px-2.5 py-1 text-xs font-semibold">status: {{ display(hypothesis.status) }}</span>
+            <span v-if="hypothesis.match_status" class="rounded-full border border-ink/15 bg-white/70 px-2.5 py-1 text-xs text-ink/55">match: {{ display(hypothesis.match_status) }}</span>
+            <span v-if="hypothesis.direction" class="rounded-full border border-ink/15 bg-white/70 px-2.5 py-1 text-xs text-ink/55">{{ display(hypothesis.direction) }}</span>
+            <span v-if="hypothesis.match_score !== undefined && hypothesis.match_score !== null" class="text-xs text-ink/45">score {{ display(hypothesis.match_score) }}</span>
+          </div>
+          <p v-if="hypothesis.description" class="mt-2 text-sm text-ink/65">{{ display(hypothesis.description) }}</p>
+        </section>
+
         <!-- Grounding: mode + supports + guards -->
         <section class="rounded-2xl border border-ink/10 bg-white/60 p-5">
           <h3 class="text-xs font-black uppercase tracking-wide text-ink/45">Grounding</h3>

@@ -78242,3 +78242,23 @@ def test_resolve_symbol_states_neutral_llm_does_not_promote_non_actionable():
     assert by_symbol["NORECBUT"]["state"] == "NONE"
     # A directional LLM call still surfaces a symbol on its own.
     assert by_symbol["REALBUY"]["state"] == "RECOMMENDATION"
+
+
+def test_symbol_why_hypothesis_extraction_and_driven_by():
+    from advisory.api.app import _hypothesis_id_from_sources, _driven_by
+
+    # From the LLM packet's hypothesis_match dimension.
+    pkt = {"hypothesis_match": {"present": True, "hypothesis_id": "EARNINGS_BEAT_DRIFT_V1", "status": "production"}}
+    assert _hypothesis_id_from_sources(pkt, None) == "EARNINGS_BEAT_DRIFT_V1"
+    # From the deterministic reason's playbook section when the packet has none.
+    reason = {"evidence": {"playbook": {"hypothesis_id": "PROMOTER_BUYING_CONFIDENCE_V1"}}}
+    assert _hypothesis_id_from_sources({"hypothesis_match": {"hypothesis_id": None}}, reason) == "PROMOTER_BUYING_CONFIDENCE_V1"
+    # Neither present.
+    assert _hypothesis_id_from_sources({}, {"evidence": {"playbook": {}}}) is None
+
+    # driven_by classification.
+    assert _driven_by({"sufficiency_path": "valid_hypothesis_match"}, has_hypothesis=True) == "hypothesis"
+    assert _driven_by({"thesis_supports": ["event_provenance"]}, has_hypothesis=False) == "event"
+    assert _driven_by({"thesis_supports": ["fundamental"]}, has_hypothesis=False) == "fundamental"
+    assert _driven_by({"timing_ok": True}, has_hypothesis=False) == "technical"
+    assert _driven_by({}, has_hypothesis=False) == "evidence"

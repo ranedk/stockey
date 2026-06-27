@@ -3097,6 +3097,51 @@ def _latest_llm_decision_row(symbol: str) -> dict[str, Any]:
     return rows[0] if rows else {}
 
 
+def _resolve_hypothesis(hypothesis_id: Any) -> dict[str, Any] | None:
+    """Resolve a hypothesis id to its name/status/thesis so the 'why' can name and link it. Pure read."""
+    hid = str(hypothesis_id or "").strip()
+    if not hid or not _table_exists("advisory_hypotheses"):
+        return None
+    rows = _records(sql_to_df(
+        "SELECT hypothesis_id, title, status, description, holding_window_days "
+        "FROM advisory_hypotheses WHERE hypothesis_id = %(hid)s LIMIT 1",
+        params={"hid": hid}, retries=2,
+    ))
+    return rows[0] if rows else {"hypothesis_id": hid, "title": None, "status": "unknown"}
+
+
+def _hypothesis_id_from_sources(packet: dict[str, Any], reason_contract: Any) -> Any:
+    """Find the driving hypothesis id from the LLM packet's hypothesis_match or the deterministic
+    recommendation reason's playbook section (whichever is present)."""
+    match = packet.get("hypothesis_match") if isinstance(packet, dict) else None
+    if isinstance(match, dict) and match.get("hypothesis_id"):
+        return match.get("hypothesis_id")
+    if isinstance(reason_contract, dict):
+        # playbook evidence lives under evidence.playbook (or a top-level playbook section)
+        for container in (reason_contract.get("evidence"), reason_contract):
+            if isinstance(container, dict):
+                playbook = container.get("playbook")
+                if isinstance(playbook, dict) and playbook.get("hypothesis_id"):
+                    return playbook.get("hypothesis_id")
+    return None
+
+
+def _driven_by(grounding: dict[str, Any], has_hypothesis: bool) -> str:
+    """Classify what grounds the decision so the operator sees the *nature* of the reason."""
+    if not isinstance(grounding, dict):
+        return "evidence"
+    supports = [str(s).lower() for s in (grounding.get("thesis_supports") or [])]
+    if has_hypothesis and (grounding.get("sufficiency_path") == "valid_hypothesis_match" or grounding.get("hypothesis_aligned")):
+        return "hypothesis"
+    if any("event" in s for s in supports):
+        return "event"
+    if any("fundamental" in s for s in supports):
+        return "fundamental"
+    if grounding.get("timing_ok") or str(grounding.get("technical_direction") or "").lower() in {"up", "long", "bullish"}:
+        return "technical"
+    return "evidence"
+
+
 def build_symbol_why_payload(symbol: str, *, asof_date: str | None = None) -> dict[str, Any]:
     """The single heavy "why" detail for one symbol (WI-5): evidence verdicts + grounding + reasons.
 
@@ -3145,11 +3190,24 @@ def build_symbol_why_payload(symbol: str, *, asof_date: str | None = None) -> di
         except (ValueError, TypeError):
             decision_contract = None
 
+    hypothesis_id = _hypothesis_id_from_sources(packet, reason_contract)
+    hypothesis = _resolve_hypothesis(hypothesis_id) if hypothesis_id else None
+    if hypothesis is not None:
+        # carry the match facts (status/direction/score) from the packet dimension onto the block
+        match = packet.get("hypothesis_match") if isinstance(packet, dict) else None
+        if isinstance(match, dict):
+            hypothesis = {**hypothesis, "match_status": match.get("status"),
+                          "direction": match.get("direction"), "match_score": match.get("match_score"),
+                          "conditions_met": match.get("conditions_met"), "conflict": match.get("conflict")}
+    driven_by = _driven_by(grounding, has_hypothesis=bool(hypothesis))
+
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/symbol/{symbol}/why", schema_name="operator_symbol_why"),
         "symbol": sym,
         "asof_date": asof or None,
+        "driven_by": driven_by,
+        "hypothesis": _json_ready(hypothesis) if hypothesis else None,
         "evidence_packet": _json_ready(packet) if packet else None,
         "evidence_packet_error": packet_error,
         "grounding": _json_ready(grounding) if grounding else None,
