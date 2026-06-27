@@ -2790,6 +2790,81 @@ def build_scorecard_payload(*, limit: int = 2000) -> dict[str, Any]:
     }
 
 
+def build_prompts_payload() -> dict[str, Any]:
+    """Editable prompt registry (UI v2 Phase 5): every prompt grouped with its version history and the
+    active version. Seeds the baseline from prompt_registry on first read. Review-only."""
+    from advisory.prompt_store import load_versions, seed_baseline
+
+    try:
+        seed_baseline()
+    except Exception as exc:
+        return {"generated_at": pd.Timestamp.utcnow().isoformat(),
+                "api_schema": _operator_api_schema("/api/prompts", schema_name="operator_prompts"),
+                "prompts": [], "review_only": True,
+                "skipped": [{"source": "prompt_store", "error": f"{type(exc).__name__}: {exc}"}]}
+    versions = load_versions()
+    by_prompt: dict[str, dict[str, Any]] = {}
+    for v in versions:
+        pid = str(v.get("prompt_id"))
+        entry = by_prompt.setdefault(pid, {"prompt_id": pid, "title": v.get("title"),
+                                           "owner_area": v.get("owner_area"), "authority_scope": v.get("authority_scope"),
+                                           "active_version": None, "versions": []})
+        entry["versions"].append(_json_ready(v))
+        if v.get("active"):
+            entry["active_version"] = v.get("version")
+    # The decision prompt is the only executor wired to read the active version today.
+    wired = {"llm_decision_policy"}
+    prompts = []
+    for entry in by_prompt.values():
+        entry["wired"] = entry["prompt_id"] in wired
+        prompts.append(entry)
+    prompts.sort(key=lambda e: (not e["wired"], str(e["prompt_id"])))
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/prompts", schema_name="operator_prompts"),
+        "prompts": prompts,
+        "review_only": True,
+        "operator_note": "Editing creates a new version (never an overwrite). 'wired' prompts take effect when the LLM master flag is on; others are stored for adoption.",
+    }
+
+
+def build_prompt_create_version_payload(prompt_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/prompts/{prompt_id}/versions -- append a new prompt version (optionally activate it)."""
+    from advisory.prompt_store import create_version
+
+    result = create_version(
+        prompt_id=prompt_id,
+        system_prompt=payload.get("system_prompt"),
+        user_prompt_template=payload.get("user_prompt_template"),
+        title=payload.get("title"),
+        owner_area=payload.get("owner_area"),
+        authority_scope=payload.get("authority_scope"),
+        notes=payload.get("notes"),
+        created_by=payload.get("operator_id") or "operator",
+        activate=bool(payload.get("activate")),
+    )
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/prompts/{prompt_id}/versions", schema_name="operator_prompt_version"),
+        "status": "ok", "result": _json_ready(result), "review_only": True, "broker_execution_allowed": False,
+    }
+
+
+def build_prompt_activate_payload(prompt_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """POST /api/prompts/{prompt_id}/activate -- make one stored version the active one."""
+    from advisory.prompt_store import activate_version
+
+    version = payload.get("version")
+    if version is None:
+        raise ValueError("version is required")
+    updated = activate_version(prompt_id=prompt_id, version=int(version))
+    return {
+        "generated_at": pd.Timestamp.utcnow().isoformat(),
+        "api_schema": _operator_api_schema("/api/prompts/{prompt_id}/activate", schema_name="operator_prompt_activate"),
+        "status": "ok" if updated else "version_not_found", "updated": int(updated), "review_only": True,
+    }
+
+
 def build_llm_decisions_payload(
     *, limit: int = 50, offset: int = 0, symbol: str | None = None, asof_date: str | None = None,
 ) -> dict[str, Any]:
@@ -8133,6 +8208,20 @@ def create_app():
     @app.get("/api/scorecard")
     def scorecard(limit: int = Query(default=2000, ge=0, le=10000)):
         return _guard(build_scorecard_payload, route="/api/scorecard", limit=limit)
+
+    @app.get("/api/prompts")
+    def prompts():
+        return _guard(build_prompts_payload, route="/api/prompts")
+
+    @app.post("/api/prompts/{prompt_id}/versions")
+    def prompt_create_version(prompt_id: str, payload: dict[str, Any] = Body(default_factory=dict)):
+        return _guard(build_prompt_create_version_payload, route="/api/prompts/{prompt_id}/versions",
+                      prompt_id=prompt_id, payload=payload)
+
+    @app.post("/api/prompts/{prompt_id}/activate")
+    def prompt_activate(prompt_id: str, payload: dict[str, Any] = Body(...)):
+        return _guard(build_prompt_activate_payload, route="/api/prompts/{prompt_id}/activate",
+                      prompt_id=prompt_id, payload=payload)
 
     @app.get("/api/recommendations-unified")
     def recommendations_unified(

@@ -92,12 +92,29 @@ def _deterministic_watch(reason: str) -> LlmDecisionProposal:
     return LlmDecisionProposal(action="WATCH", conviction=0.2, cited_dimensions=[], claims_hypothesis_match=False, rationale=reason)
 
 
+def _active_system_prompt() -> str:
+    """The operator-edited active system prompt from the prompt store, or the hardcoded baseline.
+
+    Best-effort and review-only: any failure falls back to SYSTEM_PROMPT, and an edit only affects
+    behavior when the LLM master flag is on (otherwise the deterministic fallback runs).
+    """
+    try:
+        from advisory.prompt_store import resolve_active_prompt
+
+        active = resolve_active_prompt(PROMPT_ID)
+        body = (active or {}).get("system_prompt") if isinstance(active, dict) else None
+        return body if isinstance(body, str) and body.strip() else SYSTEM_PROMPT
+    except Exception:
+        return SYSTEM_PROMPT
+
+
 def _run_llm(prompt: str, *, model: str, llm_caller: Callable[..., LlmDecisionProposal] | None) -> LlmDecisionProposal:
+    system_prompt = _active_system_prompt()
     if llm_caller is not None:
-        return llm_caller(prompt, response_model=LlmDecisionProposal, model=model, system_prompt=SYSTEM_PROMPT)
+        return llm_caller(prompt, response_model=LlmDecisionProposal, model=model, system_prompt=system_prompt)
     from utils.codex_cli import run_codex_structured
 
-    return run_codex_structured(prompt, response_model=LlmDecisionProposal, model=model, system_prompt=SYSTEM_PROMPT, max_attempts=2)
+    return run_codex_structured(prompt, response_model=LlmDecisionProposal, model=model, system_prompt=system_prompt, max_attempts=2)
 
 
 def decide(

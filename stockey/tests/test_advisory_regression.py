@@ -78330,3 +78330,33 @@ def test_scorecard_group_aggregates_benchmark_excess():
     assert any(g["group"] == "unattributed" for g in by_class)
     # ordered by matured desc
     assert by_class[0]["matured"] >= by_class[-1]["matured"]
+
+
+def test_prompt_store_dotted_resolver_and_fallback(monkeypatch):
+    from advisory import prompt_store
+
+    # Resolves a module-level string constant; returns None for functions / bad paths.
+    assert prompt_store._resolve_dotted_str("advisory.llm_decision_policy.SYSTEM_PROMPT")
+    assert prompt_store._resolve_dotted_str("advisory.llm_decision_policy.decide") is None
+    assert prompt_store._resolve_dotted_str("nonexistent.module.attr") is None
+    assert prompt_store._resolve_dotted_str(None) is None
+
+    # resolve_active_prompt is resilient: any DB failure -> None (executor keeps its Python constant).
+    monkeypatch.setattr(prompt_store, "ensure_tables", lambda: None)
+    import utils.db as db_utils
+    monkeypatch.setattr(db_utils, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    assert prompt_store.resolve_active_prompt("llm_decision_policy") is None
+
+
+def test_llm_decision_policy_system_prompt_falls_back_to_constant(monkeypatch):
+    from advisory import llm_decision_policy as policy
+
+    # No active stored prompt -> the hardcoded SYSTEM_PROMPT is used.
+    monkeypatch.setattr("advisory.prompt_store.resolve_active_prompt", lambda pid: None)
+    assert policy._active_system_prompt() == policy.SYSTEM_PROMPT
+    # An active stored body overrides it.
+    monkeypatch.setattr("advisory.prompt_store.resolve_active_prompt", lambda pid: {"system_prompt": "EDITED"})
+    assert policy._active_system_prompt() == "EDITED"
+    # Empty/whitespace stored body falls back to the constant.
+    monkeypatch.setattr("advisory.prompt_store.resolve_active_prompt", lambda pid: {"system_prompt": "  "})
+    assert policy._active_system_prompt() == policy.SYSTEM_PROMPT
