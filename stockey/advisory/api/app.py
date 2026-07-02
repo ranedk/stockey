@@ -7760,9 +7760,13 @@ def create_app():
         raise RuntimeError("FastAPI is required for the operator API. Install requirements.txt first.") from exc
 
     app = FastAPI(title="Stockey Operator API", version="0.1.0")
+    # Origins of the operator web app. Defaults to the Nuxt dev server; override with
+    # OPERATOR_WEB_ORIGINS (comma-separated) when the frontend host/port changes.
+    _default_web_origins = "http://localhost:3035,http://127.0.0.1:3035"
+    _web_origins = [o.strip() for o in os.getenv("OPERATOR_WEB_ORIGINS", _default_web_origins).split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_origins=_web_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST"],
         allow_headers=["*"],
@@ -8314,7 +8318,7 @@ app = _create_module_app()
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the read-only Stockey operator API.")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--port", type=int, default=8085)
     args = parser.parse_args()
     if app is None:
         raise SystemExit("FastAPI is required for the operator API. Install requirements.txt first.")

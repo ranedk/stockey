@@ -83,9 +83,9 @@ env.read_env()
 DEFAULT_LOG_DIR = Path("logs/cron")
 DEFAULT_LOG_TAIL_LINES = 80
 DEFAULT_LOG_ANALYSIS_LINES = 5000
-DEFAULT_OPERATOR_API_URL = "http://127.0.0.1:8765/api/health"
-DEFAULT_OPERATOR_API_RUNTIME_URL = "http://127.0.0.1:8765/api/runtime"
-DEFAULT_OPERATOR_WEB_URL = "http://127.0.0.1:3000/"
+DEFAULT_OPERATOR_API_URL = "http://127.0.0.1:8085/api/health"
+DEFAULT_OPERATOR_API_RUNTIME_URL = "http://127.0.0.1:8085/api/runtime"
+DEFAULT_OPERATOR_WEB_URL = "http://127.0.0.1:3035/"
 OPERATOR_API_ERRORS_TABLE = "advisory_operator_api_errors"
 TRACE_SUMMARIES_TABLE = "advisory_trace_summaries"
 ACTION_RECOMMENDATIONS_TABLE = "advisory_action_recommendations"

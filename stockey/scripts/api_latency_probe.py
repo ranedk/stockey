@@ -18,7 +18,7 @@ from advisory.performance_slowlog import record_slow_operation
 env = Env()
 env.read_env()
 
-DEFAULT_BASE_URL = env.str("OPERATOR_API_BASE_URL", "http://127.0.0.1:8765")
+DEFAULT_BASE_URL = env.str("OPERATOR_API_BASE_URL", "http://127.0.0.1:8085")
 DEFAULT_ENDPOINTS = [
     "/api/health",
     "/api/home",

@@ -30,7 +30,7 @@ The repository has three primary runtime modes:
    - `./all_watchers.sh --loop`
 4. operator visibility
    - `./all_frontend.sh`
-   - `python -m advisory.api.app --host 127.0.0.1 --port 8765`
+   - `python -m advisory.api.app --host 127.0.0.1 --port 8085`
 
 ## Layer 1: Extraction
 

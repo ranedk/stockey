@@ -358,11 +358,11 @@ python -m data.dhanlive.auth_cli clear-cache
 | `all_event_policy_evaluator.sh` | Event-policy evaluator | Evaluates event-policy outcomes after costs with lifecycle markers |
 | `all_technical_threshold_calibration.sh` | Technical threshold calibration | Runs weekly research-only technical threshold calibration with lifecycle markers |
 
-`/api/manual-review` is intentionally compact by default. Use `include_raw=true` only for bounded debugging, for example `curl 'http://127.0.0.1:8765/api/manual-review?limit=5&include_raw=true'`, because full raw source rows can be much larger than the operator list needs.
+`/api/manual-review` is intentionally compact by default. Use `include_raw=true` only for bounded debugging, for example `curl 'http://127.0.0.1:8085/api/manual-review?limit=5&include_raw=true'`, because full raw source rows can be much larger than the operator list needs.
 
-`/api/health/details` is also compact by default. Use `compact=false` only for bounded debugging, for example `curl 'http://127.0.0.1:8765/api/health/details?mode=full&compact=false'`, because full health can include long tracebacks, log excerpts, and source-table diagnostic rows.
+`/api/health/details` is also compact by default. Use `compact=false` only for bounded debugging, for example `curl 'http://127.0.0.1:8085/api/health/details?mode=full&compact=false'`, because full health can include long tracebacks, log excerpts, and source-table diagnostic rows.
 
-`/api/event-policy` omits bulky raw JSON source columns by default while preserving parsed checks, operator notes, LLM review, and compact raw context. Use `include_raw=true` only for short debugging, for example `curl 'http://127.0.0.1:8765/api/event-policy?limit=5&include_raw=true'`.
+`/api/event-policy` omits bulky raw JSON source columns by default while preserving parsed checks, operator notes, LLM review, and compact raw context. Use `include_raw=true` only for short debugging, for example `curl 'http://127.0.0.1:8085/api/event-policy?limit=5&include_raw=true'`.
 
 ### Manual / catch-up / long-running scripts
 

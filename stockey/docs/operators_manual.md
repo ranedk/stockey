@@ -281,10 +281,10 @@ Operator-facing telemetry and log snippets are redacted before they are written 
 
 Useful API/token env knobs:
 
-- `OPERATOR_API_HEALTH_URL`: endpoint checked by operator health, default `http://127.0.0.1:8765/api/health`
-- `OPERATOR_API_RUNTIME_URL`: runtime metadata endpoint checked by operator health for stale API code, default `http://127.0.0.1:8765/api/runtime`
+- `OPERATOR_API_HEALTH_URL`: endpoint checked by operator health, default `http://127.0.0.1:8085/api/health`
+- `OPERATOR_API_RUNTIME_URL`: runtime metadata endpoint checked by operator health for stale API code, default `http://127.0.0.1:8085/api/runtime`
 - `OPERATOR_API_HEALTH_TIMEOUT_SECONDS`: API health timeout, default `3`
-- `OPERATOR_WEB_HEALTH_URL`: frontend URL checked by operator health, default `http://127.0.0.1:3000/`
+- `OPERATOR_WEB_HEALTH_URL`: frontend URL checked by operator health, default `http://127.0.0.1:3035/`
 - `OPERATOR_WEB_HEALTH_TIMEOUT_SECONDS`: frontend runtime health timeout, default `3`
 
 `python -m advisory.operator_health --skip-dhan` defaults to JSON for cron/API consumers. Use `--format text` for a short terminal summary, or `--format json` when piping into another script. Use `--check <section_name>` to run one read-only section without the full Health payload, for example `python -m advisory.operator_health --check theme_sector_alias_coverage --skip-dhan`.
@@ -835,7 +835,7 @@ Run the operator API and Nuxt app together with:
 ./all_frontend.sh
 ```
 
-This starts `advisory.api.app` on `127.0.0.1:8765` and Nuxt on `127.0.0.1:3000` by default. It loads `nvm use default` before running Node/npm, logs the resolved Node path/version, and installs frontend dependencies automatically if `apps/operator-web/node_modules` is missing.
+This starts `advisory.api.app` on `127.0.0.1:8085` and Nuxt on `127.0.0.1:3035` by default. It loads `nvm use default` before running Node/npm, logs the resolved Node path/version, and installs frontend dependencies automatically if `apps/operator-web/node_modules` is missing.
 
 The supervisor watches a lightweight source signature for the operator API and Nuxt app. With `OPERATOR_FRONTEND_RESTART_ON_CODE_CHANGE=true`, a long-running frontend process exits with a `[stockey.script] ... status=restart_requested` marker when relevant Python or Nuxt files change. The cron lock is released and the next `all_frontend.sh` cron tick starts a fresh API/frontend process, which prevents stale API code from serving fixed endpoints for hours. Use `OPERATOR_FRONTEND_CODE_CHECK_SECONDS=60` to tune the check interval.
 
@@ -931,10 +931,10 @@ OPERATOR_WEB_NPM_LEGACY_PEER_DEPS=true
 To run them separately:
 
 ```sh
-python -m advisory.api.app --host 127.0.0.1 --port 8765
+python -m advisory.api.app --host 127.0.0.1 --port 8085
 cd apps/operator-web
 npm install
-NUXT_PUBLIC_API_BASE=http://127.0.0.1:8765 npm run dev
+NUXT_PUBLIC_API_BASE=http://127.0.0.1:8085 npm run dev
 ```
 
 Static `live_dashboard/` generation is deprecated. The frontend reads current state directly from `advisory.api.app`, so cron no longer runs the legacy static dashboard generator.
@@ -995,7 +995,7 @@ python -m advisory.signal_refresh --from-context-overlays --limit 50 --dry-run -
 
 1. `./all_watchers.sh --loop`
 2. `./all_frontend.sh`
-3. open `http://127.0.0.1:3000`
+3. open `http://127.0.0.1:3035`
 4. inspect `advisory.event_router --dry-run` if routing volume looks suspicious
 5. inspect `python -m advisory.signal_refresh --from-router --limit 25 --dry-run --format text` if live signal rows look stale
 

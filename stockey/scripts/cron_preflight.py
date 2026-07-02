@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CRONTAB_PATH = REPO_ROOT / "config" / "stockey.generated.crontab"
 DEFAULT_LOG_DIR = REPO_ROOT / "logs" / "cron"
 DEFAULT_REQUIRED_ENV = ("STOCKEY_DIR", "LOG_DIR", "SHELL", "PATH")
-DEFAULT_PORTS = (("operator_api", "127.0.0.1", 8765), ("operator_web", "127.0.0.1", 3000))
+DEFAULT_PORTS = (("operator_api", "127.0.0.1", 8085), ("operator_web", "127.0.0.1", 3035))
 ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 SHELL_VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))")
 SCRIPT_TOKEN_RE = re.compile(r"(?P<quote>[\"']?)(?P<path>(?:\$STOCKEY_DIR/)?(?:\./)?[A-Za-z0-9_./-]+\.sh)(?P=quote)")

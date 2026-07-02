@@ -13869,9 +13869,9 @@ def test_operator_health_frontend_runtime_failure_records_fallback(monkeypatch):
 
     assert payload["status"] == "error"
     assert "not reachable" in payload["message"]
-    assert payload["url"] == "http://127.0.0.1:3000/"
+    assert payload["url"] == "http://127.0.0.1:3035/"
     assert events[0]["fallback_type"] == "operator_health_frontend_runtime_check_failed"
-    assert events[0]["source"] == "http://127.0.0.1:3000/"
+    assert events[0]["source"] == "http://127.0.0.1:3035/"
 
 
 def test_operator_health_api_runtime_flags_stale_code(monkeypatch):

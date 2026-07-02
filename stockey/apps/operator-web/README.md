@@ -13,7 +13,7 @@ The wrapper uses `nvm use default` by default, so cron gets the same Node runtim
 Or run the Python API first:
 
 ```sh
-python -m advisory.api.app --host 127.0.0.1 --port 8765
+python -m advisory.api.app --host 127.0.0.1 --port 8085
 ```
 
 Then run the frontend:
@@ -21,7 +21,7 @@ Then run the frontend:
 ```sh
 cd apps/operator-web
 npm install
-NUXT_PUBLIC_API_BASE=http://127.0.0.1:8765 npm run dev
+NUXT_PUBLIC_API_BASE=http://127.0.0.1:8085 npm run dev
 ```
 
 Current pages and work areas:
