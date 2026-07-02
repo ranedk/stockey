@@ -71,10 +71,13 @@ Cron startup:
 
 ```sh
 python builder.py
-./go-crond config/stockey.generated.crontab --allow-unprivileged
+python scripts/cron_preflight.py
+nohup ./go-crond config/stockey.generated.crontab --allow-unprivileged >> logs/cron/go-crond.log 2>&1 &
 ```
 
 The generated cron file is `go-crond`/system-crontab style and includes a username column. Use the Operations page or `python scripts/cron_preflight.py` before starting it after config changes.
+
+Starting `go-crond` only *schedules* jobs; it does not run them all immediately. Almost every job is weekday-bound (`* * 1-5`) — on a weekend only `all_frontend.sh` (every 5 min) runs until Monday; `all_ml.sh` is Sunday and technical calibration is Saturday. `go-crond` is foreground and unsupervised (run it under `nohup`/`tmux` or launchd; the crontab does not restart it), and the Dhan-backed jobs need the Chrome CDP session up. To run the full pipeline immediately instead of waiting for the schedule, run `./complete_data.sh && ./all_advisory_preflight.sh && ./all_context_to_entry_repair.sh && ./all_advisory.sh && ./all_llm_decisions.sh`. See `docs/operators_manual.md` -> "Running the schedule (operational reality)".
 
 Dhan and Screener browser-backed automation need a Chrome remote-debugging session when auto-login is required:
 

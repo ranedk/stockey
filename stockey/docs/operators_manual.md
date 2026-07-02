@@ -135,6 +135,26 @@ Important:
 - `go-crond` reads the generated file in system-crontab format in this setup, so each scheduled line includes the username field.
 - If that field is missing, `go-crond` will treat `cd` as the username and the jobs will not execute even though the runner starts.
 
+### Running the schedule (operational reality)
+
+Starting `go-crond` schedules the jobs; it does **not** run them all immediately. Keep these in mind:
+
+- **It is time-based and weekday-bound.** Almost every job runs Mon-Fri only (`* * 1-5`); `all_ml.sh` is Sunday `03:10` and `all_technical_threshold_calibration.sh` is Saturday `04:20`. If you start `go-crond` on a weekend, only `./all_frontend.sh` (every 5 min, all days) runs until Monday. Nothing "catches up" for a slot that already passed.
+- **`go-crond` is foreground and unsupervised.** The crontab does not restart `go-crond` itself, and there is no launchd/systemd unit by default. Run it under `nohup`/`tmux` (or a launchd agent) so it survives a closed terminal or reboot:
+  ```sh
+  nohup ./go-crond config/stockey.generated.crontab --allow-unprivileged >> logs/cron/go-crond.log 2>&1 &
+  ```
+- **Live Dhan data needs the Chrome CDP session.** The daily downloader/advisory jobs authenticate Dhan through Chrome remote debugging. Start it first and keep `CDP_ENDPOINT=http://localhost:9222`:
+  ```sh
+  scripts/start_chrome_cdp.sh
+  ```
+  Dhan auto-login is intentionally fail-hard when CDP/Chrome is unavailable (no silent manual-consent fallback), so those jobs fail rather than run stale. `./all_frontend.sh` keeps the operator API and Nuxt alive but does **not** keep `go-crond` or the Chrome CDP session alive.
+- **To run the full pipeline right now** (instead of waiting for the evening schedule), run the scripts manually in order:
+  ```sh
+  ./complete_data.sh && ./all_advisory_preflight.sh && ./all_context_to_entry_repair.sh && ./all_advisory.sh && ./all_llm_decisions.sh
+  ```
+- Re-run `python scripts/cron_preflight.py` (or Operations -> `Cron Preflight`) after any config change; it confirms the generated crontab parses, every referenced script exists and is executable, and Python resolves.
+
 Current schedule:
 
 - every `5` minutes: `./all_frontend.sh` under a lock, which keeps the operator API and Nuxt frontend running without duplicates and restarts after source-code changes
