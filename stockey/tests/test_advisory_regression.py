@@ -130,27 +130,33 @@ def test_ingestion_state_db_paths_use_retryable_operations(monkeypatch):
 
 
 def test_ingestion_state_runner_summarizes_statuses_and_classifications():
+    # Active vs stale is decided against wall-clock now (30-day window), so use relative dates --
+    # absolute dates would silently age out and flip an "active" failure to "stale_historical".
+    recent = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=1)
+    old = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=400)
+    old_key = f"bhavcopy/bhavcopy_{old.date()}.zip"
+    active_key = f"bhavcopy/bhavcopy_{recent.date()}.zip"
     rows = [
         {
             "source_prefix": "bhavcopy",
-            "object_key": "bhavcopy/bhavcopy_2026-01-01.zip",
+            "object_key": old_key,
             "status": "failed",
             "error_message": "classification=bad_file_retryable; bad zip",
-            "processed_at": pd.Timestamp("2026-01-02T00:00:00Z"),
+            "processed_at": old,
         },
         {
             "source_prefix": "indices",
-            "object_key": "indices/indices_2026-01-01.zip",
+            "object_key": f"indices/indices_{old.date()}.zip",
             "status": "empty_valid_source",
             "error_message": None,
-            "processed_at": pd.Timestamp("2026-01-02T00:00:00Z"),
+            "processed_at": old,
         },
         {
             "source_prefix": "bhavcopy",
-            "object_key": "bhavcopy/bhavcopy_2026-05-31.zip",
+            "object_key": active_key,
             "status": "failed",
             "error_message": "classification=schema_changed; missing columns",
-            "processed_at": pd.Timestamp("2026-06-01T00:00:00Z"),
+            "processed_at": recent,
         },
     ]
 
@@ -166,9 +172,9 @@ def test_ingestion_state_runner_summarizes_statuses_and_classifications():
     assert summary["failure_lifecycle_counts"] == {"active": 1, "not_failed": 1, "stale_historical": 1}
     assert summary["active_failure_count"] == 1
     assert summary["stale_historical_failure_count"] == 1
-    assert summary["active_failure_sample_rows"][0]["object_key"] == "bhavcopy/bhavcopy_2026-05-31.zip"
+    assert summary["active_failure_sample_rows"][0]["object_key"] == active_key
     assert summary["active_failure_sample_rows"][0]["classification_detail"]["label"] == "Schema changed"
-    assert summary["stale_historical_failure_sample_rows"][0]["object_key"] == "bhavcopy/bhavcopy_2026-01-01.zip"
+    assert summary["stale_historical_failure_sample_rows"][0]["object_key"] == old_key
     assert summary["enriched_sample_rows"][0]["classification_detail"]["label"] == "Retryable bad file"
     assert summary["sample_rows"] == rows[:1]
 
@@ -297,20 +303,24 @@ def test_operator_api_ingestion_state_payload_summarizes_rows(monkeypatch):
 
 
 def test_operator_health_ingestion_file_state_separates_active_and_stale_failures(monkeypatch):
+    # Active vs stale is decided against wall-clock now (OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS,
+    # default 30), so build the dates RELATIVE to now -- absolute dates would silently age out.
+    recent = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=1)
+    old = pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=400)
     rows = [
         {
             "source_prefix": "bhavcopy",
-            "object_key": "bhavcopy/bhavcopy_2026-01-01.zip",
+            "object_key": f"bhavcopy/bhavcopy_{old.date()}.zip",
             "status": "failed",
             "error_message": "classification=bad_file_retryable; old bad zip",
-            "processed_at": pd.Timestamp("2026-01-02T00:00:00Z"),
+            "processed_at": old,
         },
         {
             "source_prefix": "indices",
-            "object_key": "indices/indices_2026-06-01.zip",
+            "object_key": f"indices/indices_{recent.date()}.zip",
             "status": "failed",
             "error_message": "classification=parser_bug; new parser bug",
-            "processed_at": pd.Timestamp("2026-06-02T00:00:00Z"),
+            "processed_at": recent,
         },
     ]
 
