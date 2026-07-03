@@ -779,6 +779,43 @@ def test_event_evaluation_ensure_output_tables_applies_both_migrations(monkeypat
     ]
 
 
+def test_migration_drift_detection_flags_edited_migration(monkeypatch):
+    from advisory import migration_drift
+    from utils.schema_migrations import checksum_statements
+    import utils.db as udb
+
+    clean = ["CREATE TABLE a (x int)"]
+    edited = ["CREATE TABLE b (x int, y int)"]
+    monkeypatch.setattr(
+        migration_drift, "capture_code_migrations",
+        lambda: {"m_clean": clean, "m_drift": edited, "m_code_only": ["CREATE TABLE c (x int)"]},
+    )
+    ledger = pd.DataFrame(
+        [
+            {"migration_id": "m_clean", "checksum": checksum_statements(clean), "status": "applied"},
+            {"migration_id": "m_drift", "checksum": "a_stale_recorded_checksum", "status": "applied"},
+            {"migration_id": "m_db_only", "checksum": "x", "status": "applied"},
+        ]
+    )
+    monkeypatch.setattr(udb, "sql_to_df", lambda *a, **k: ledger)
+    drift = migration_drift.find_migration_drift()
+    # only the applied-and-edited migration is flagged; clean matches, code-only + db-only ignored
+    assert [row["migration_id"] for row in drift] == ["m_drift"]
+    assert drift[0]["code_checksum"] == checksum_statements(edited)
+
+
+def test_no_migration_drift_in_repo():
+    # Guard: no applied migration's DDL may be edited in place (append-only discipline).
+    # Empty ledger (fresh DB) trivially passes; a real ledger makes this a hard guard.
+    from advisory.migration_drift import capture_code_migrations, find_migration_drift
+
+    recorded = capture_code_migrations()
+    assert "20260611_advisory_event_evaluation_outputs_base" in recorded
+    assert len(recorded) > 50  # captures the bulk of the schema, not a trivial subset
+    drift = find_migration_drift()
+    assert drift == [], f"migration drift detected: {[row['migration_id'] for row in drift]}"
+
+
 def test_rule_engine_prefers_technical_metric_columns_over_screener_shadow_columns():
     frame = pd.DataFrame(
         [

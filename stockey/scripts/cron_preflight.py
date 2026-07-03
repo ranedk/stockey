@@ -129,6 +129,7 @@ def build_cron_preflight(
     required_env: tuple[str, ...] = DEFAULT_REQUIRED_ENV,
     check_ports: bool = True,
     resolve_python: bool = True,
+    check_migration_drift: bool = True,
     now: pd.Timestamp | None = None,
 ) -> dict[str, Any]:
     crontab = Path(crontab_path)
@@ -263,6 +264,38 @@ def build_cron_preflight(
             )
         )
 
+    if check_migration_drift:
+        try:
+            from advisory.migration_drift import find_migration_drift
+
+            drift = find_migration_drift()
+        except Exception as exc:
+            checks.append(
+                _status(
+                    "warn",
+                    "migration_drift",
+                    f"could not run the migration-drift audit: {type(exc).__name__}: {exc}",
+                )
+            )
+        else:
+            if drift:
+                checks.append(
+                    _status(
+                        "error",
+                        "migration_drift",
+                        f"{len(drift)} applied migration(s) have DDL edited after being applied; they will hard-fail the append-only guard on next run (split the change into a follow-on migration)",
+                        drifted=[row["migration_id"] for row in drift],
+                    )
+                )
+            else:
+                checks.append(
+                    _status(
+                        "ok",
+                        "migration_drift",
+                        "no applied migration has drifted from its recorded checksum",
+                    )
+                )
+
     status = _overall(checks)
     return {
         "status": status,
@@ -291,6 +324,8 @@ def _format_text(payload: dict[str, Any]) -> str:
             lines.append(f"  missing: {', '.join(map(str, check.get('missing') or []))}")
         if check.get("stale_count"):
             lines.append(f"  stale_locks: {check.get('stale_count')}")
+        if check.get("drifted"):
+            lines.append(f"  drifted: {', '.join(map(str, check.get('drifted') or []))}")
     if payload.get("next_command"):
         lines.append(f"next: {payload.get('next_command')}")
     return "\n".join(lines)
@@ -303,6 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stale-lock-seconds", type=int, default=cron_status.DEFAULT_STALE_LOCK_SECONDS)
     parser.add_argument("--skip-port-check", action="store_true")
     parser.add_argument("--skip-python-check", action="store_true")
+    parser.add_argument("--skip-migration-drift", action="store_true", help="Skip the migration-drift audit (imports advisory modules; ~5s).")
     parser.add_argument("--format", choices=["text", "json"], default="text")
     args = parser.parse_args(argv)
 
@@ -312,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
         stale_lock_seconds=args.stale_lock_seconds,
         check_ports=not args.skip_port_check,
         resolve_python=not args.skip_python_check,
+        check_migration_drift=not args.skip_migration_drift,
     )
     if args.format == "json":
         print(json.dumps(payload, indent=2, default=str))
