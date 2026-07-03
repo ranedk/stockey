@@ -738,6 +738,47 @@ def test_rule_engine_candidate_schema_persists_technical_entry_confirmed():
     ) is False
 
 
+def test_event_evaluation_base_migration_checksum_is_frozen():
+    # The base migration was applied to live DBs; appending new columns to its
+    # statement list retroactively changes its checksum and trips the append-only
+    # guard. New columns must go in a separate follow-on migration instead.
+    from advisory import llm_event_evaluator as evaluator
+    from utils.schema_migrations import checksum_statements
+
+    frozen_base_checksum = (
+        "12688fa980cee5179eada26fcdd0f8f02ae47f64b6f8229b1504fe16bd5ecefc"
+    )
+    assert (
+        checksum_statements(evaluator.EVENT_EVALUATION_SCHEMA_STATEMENTS)
+        == frozen_base_checksum
+    )
+    # The peer-resolution columns live in their own append-only migration.
+    for column in ("validated_affected_peers_json", "unresolved_affected_peers_json"):
+        assert not any(
+            column in stmt for stmt in evaluator.EVENT_EVALUATION_SCHEMA_STATEMENTS
+        )
+        assert any(
+            column in stmt
+            for stmt in evaluator.EVENT_EVALUATION_PEER_RESOLUTION_STATEMENTS
+        )
+
+
+def test_event_evaluation_ensure_output_tables_applies_both_migrations(monkeypatch):
+    from advisory import llm_event_evaluator as evaluator
+
+    calls = []
+    monkeypatch.setattr(
+        evaluator,
+        "apply_schema_migration",
+        lambda **kwargs: calls.append(kwargs.get("migration_id")) or {"status": "applied"},
+    )
+    evaluator.ensure_output_tables()
+    assert calls == [
+        evaluator.EVENT_EVALUATION_SCHEMA_MIGRATION_ID,
+        evaluator.EVENT_EVALUATION_PEER_RESOLUTION_MIGRATION_ID,
+    ]
+
+
 def test_rule_engine_prefers_technical_metric_columns_over_screener_shadow_columns():
     frame = pd.DataFrame(
         [
@@ -41561,12 +41602,15 @@ def test_llm_event_evaluator_ensure_output_tables_uses_schema_registry(monkeypat
 
     llm_event_evaluator.ensure_output_tables()
 
-    assert len(calls) == 1
+    # The immutable base migration is applied first, followed by the append-only
+    # peer-resolution follow-on migration (columns that were split out of the base).
+    assert len(calls) == 2
     assert calls[0]["migration_id"] == llm_event_evaluator.EVENT_EVALUATION_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"]["tables"] == [llm_event_evaluator.EVALUATIONS_TABLE, llm_event_evaluator.RISKS_TABLE]
     assert any(llm_event_evaluator.EVALUATIONS_TABLE in statement for statement in calls[0]["statements"])
     assert any(llm_event_evaluator.RISKS_TABLE in statement for statement in calls[0]["statements"])
     assert any("event_tensor_json" in statement for statement in calls[0]["statements"])
+    assert calls[1]["migration_id"] == llm_event_evaluator.EVENT_EVALUATION_PEER_RESOLUTION_MIGRATION_ID
 
 
 def test_llm_event_evaluator_delete_existing_risks_ensures_schema_before_delete(monkeypatch):

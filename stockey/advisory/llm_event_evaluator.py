@@ -118,10 +118,19 @@ EVENT_EVALUATION_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS source_reliability TEXT",
     f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_sectors_json TEXT",
     f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS affected_peers_json TEXT",
-    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS validated_affected_peers_json TEXT",
-    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS unresolved_affected_peers_json TEXT",
     f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS event_tensor_json TEXT",
     f"ALTER TABLE {RISKS_TABLE} ADD COLUMN IF NOT EXISTS event_source TEXT",
+]
+
+# Follow-on migration: peer-resolution columns were originally appended to the base
+# migration's statement list, which retroactively changed its checksum. They live in
+# their own append-only migration so the base migration stays immutable.
+EVENT_EVALUATION_PEER_RESOLUTION_MIGRATION_ID = (
+    "20260622_advisory_event_evaluation_affected_peer_resolution"
+)
+EVENT_EVALUATION_PEER_RESOLUTION_STATEMENTS = [
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS validated_affected_peers_json TEXT",
+    f"ALTER TABLE {EVALUATIONS_TABLE} ADD COLUMN IF NOT EXISTS unresolved_affected_peers_json TEXT",
 ]
 
 
@@ -1704,6 +1713,12 @@ def ensure_output_tables() -> None:
         description="Create and normalize event evaluation and event risk output tables.",
         statements=EVENT_EVALUATION_SCHEMA_STATEMENTS,
         metadata={"module": "advisory.llm_event_evaluator", "tables": [EVALUATIONS_TABLE, RISKS_TABLE]},
+    )
+    apply_schema_migration(
+        migration_id=EVENT_EVALUATION_PEER_RESOLUTION_MIGRATION_ID,
+        description="Add validated/unresolved affected-peer resolution columns to event evaluations.",
+        statements=EVENT_EVALUATION_PEER_RESOLUTION_STATEMENTS,
+        metadata={"module": "advisory.llm_event_evaluator", "tables": [EVALUATIONS_TABLE]},
     )
 
 
