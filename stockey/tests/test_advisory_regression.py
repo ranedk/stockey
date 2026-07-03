@@ -15458,6 +15458,127 @@ def test_pipeline_company_memory_stage_includes_context_feature_gate(monkeypatch
     assert summary["stages"]["company_memory"]["reviews"]["row_count"] == 1
 
 
+def test_resolve_resume_start_stage_returns_next_after_high_water(monkeypatch):
+    monkeypatch.setattr(pipeline, "_ensure_stage_checkpoint_table", lambda: None)
+    now = pd.Timestamp.utcnow()
+    df = pd.DataFrame(
+        [
+            {"stage": "screeners", "finished_at": now - pd.Timedelta(minutes=5)},
+            {"stage": "macro", "finished_at": now - pd.Timedelta(minutes=4)},
+            {"stage": "macro_features", "finished_at": now - pd.Timedelta(minutes=3)},
+        ]
+    )
+    monkeypatch.setattr(pipeline, "sql_to_df", lambda *a, **k: df)
+    assert (
+        pipeline.resolve_resume_start_stage(pd.Timestamp("2026-07-02T00:00:00Z"))
+        == "exchange_events"
+    )
+
+
+def test_resolve_resume_start_stage_ignores_stale_checkpoints(monkeypatch):
+    monkeypatch.setattr(pipeline, "_ensure_stage_checkpoint_table", lambda: None)
+    old = pd.Timestamp.utcnow() - pd.Timedelta(hours=48)
+    df = pd.DataFrame(
+        [{"stage": "screeners", "finished_at": old}, {"stage": "macro", "finished_at": old}]
+    )
+    monkeypatch.setattr(pipeline, "sql_to_df", lambda *a, **k: df)
+    assert (
+        pipeline.resolve_resume_start_stage(
+            pd.Timestamp("2026-07-02T00:00:00Z"), max_age_hours=18
+        )
+        is None
+    )
+
+
+def test_resolve_resume_start_stage_none_when_empty_or_all_complete(monkeypatch):
+    monkeypatch.setattr(pipeline, "_ensure_stage_checkpoint_table", lambda: None)
+    monkeypatch.setattr(pipeline, "sql_to_df", lambda *a, **k: pd.DataFrame(columns=["stage", "finished_at"]))
+    assert pipeline.resolve_resume_start_stage(pd.Timestamp("2026-07-02T00:00:00Z")) is None
+    assert pipeline.resolve_resume_start_stage(None) is None
+    now = pd.Timestamp.utcnow()
+    full = pd.DataFrame([{"stage": s, "finished_at": now} for s in pipeline.PIPELINE_STAGES])
+    monkeypatch.setattr(pipeline, "sql_to_df", lambda *a, **k: full)
+    # high-water == final stage -> nothing left to resume
+    assert pipeline.resolve_resume_start_stage(pd.Timestamp("2026-07-02T00:00:00Z")) is None
+
+
+def test_record_stage_checkpoint_upserts_and_is_nonfatal(monkeypatch):
+    monkeypatch.setattr(pipeline, "_ensure_stage_checkpoint_table", lambda: None)
+    captured: dict[str, object] = {}
+
+    def fake_upsert(df, table, unique_keys, timescaledb_column=None):
+        captured.update({"df": df, "table": table, "keys": unique_keys})
+
+    monkeypatch.setattr(pipeline, "upsert_to_db", fake_upsert)
+    pipeline.record_stage_checkpoint(
+        pd.Timestamp("2026-07-02T00:00:00Z"), "rules", run_id="r1", detail="candidates=5"
+    )
+    assert captured["table"] == pipeline.STAGE_CHECKPOINT_TABLE
+    assert captured["keys"] == ["asof_date", "stage"]
+    row = captured["df"].iloc[0]
+    assert row["stage"] == "rules" and row["status"] == "completed" and row["run_id"] == "r1"
+
+    # a None date is a no-op (nothing to key on)
+    captured.clear()
+    pipeline.record_stage_checkpoint(None, "rules")
+    assert "df" not in captured
+
+    # a write failure is swallowed and reported via fallback telemetry
+    events: list[dict[str, object]] = []
+
+    def boom(*_a, **_k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(pipeline, "upsert_to_db", boom)
+    monkeypatch.setattr(pipeline, "record_local_fallback_event", lambda **kw: events.append(kw))
+    pipeline.record_stage_checkpoint(pd.Timestamp("2026-07-02T00:00:00Z"), "rules")
+    assert events and events[0]["fallback_type"] == "advisory_stage_checkpoint_write_failed"
+
+
+def test_run_pipeline_resume_sets_start_at_from_checkpoint(monkeypatch):
+    monkeypatch.setattr(pipeline, "resolve_resume_start_stage", lambda asof_date, **k: "macro")
+    monkeypatch.setattr(
+        pipeline,
+        "build_macro_snapshot",
+        lambda **k: pd.DataFrame([{"asof_date": pd.Timestamp("2026-07-02T00:00:00Z"), "value": 1}]),
+    )
+    args = argparse.Namespace(
+        date=pd.Timestamp("2026-07-02T00:00:00Z"),
+        symbols=None, setup_ids=None,
+        start_at=None, stop_at="macro",
+        rebuild=False, dry_run=True, resume=True,
+        skip_peer_sync=True, include_watch=False, include_news=False,
+        include_lifecycle=False, include_execution=False,
+        live_execution=False, execution_reconcile=False,
+        stage_budget_seconds=0, stage_budget_overrides="",
+    )
+    summary = pipeline.run_pipeline(args)
+    assert args.start_at == "macro"
+    assert summary["resumed_from_stage"] == "macro"
+    assert "macro" in summary["stages"]
+
+
+def test_run_pipeline_resume_ignored_with_rebuild(monkeypatch):
+    calls: list[int] = []
+    monkeypatch.setattr(
+        pipeline, "resolve_resume_start_stage", lambda *a, **k: calls.append(1) or "macro"
+    )
+    monkeypatch.setattr(pipeline, "build_constituents", lambda **k: pd.DataFrame())
+    args = argparse.Namespace(
+        date=pd.Timestamp("2026-07-02T00:00:00Z"),
+        symbols=None, setup_ids=None,
+        start_at=None, stop_at="screeners",
+        rebuild=True, dry_run=True, resume=True,
+        skip_peer_sync=True, include_watch=False, include_news=False,
+        include_lifecycle=False, include_execution=False,
+        live_execution=False, execution_reconcile=False,
+        stage_budget_seconds=0, stage_budget_overrides="",
+    )
+    pipeline.run_pipeline(args)
+    assert args.start_at is None  # --rebuild bypasses resume entirely
+    assert calls == []  # resolve_resume_start_stage never consulted
+
+
 def test_pipeline_actions_stage_includes_feature_gate(monkeypatch):
     asof_date = pd.Timestamp("2026-06-10T00:00:00Z")
     captured = {}

@@ -108,6 +108,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-at", type=parse_stage, choices=PIPELINE_STAGES, help="Optional advisory stage to start from")
     parser.add_argument("--stop-at", type=parse_stage, choices=PIPELINE_STAGES, help="Optional advisory stage to stop after")
     parser.add_argument("--rebuild", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a partially completed run for this date: skip stages already checkpointed within the recency window (ADVISORY_RESUME_MAX_AGE_HOURS). Ignored with --rebuild or an explicit --start-at.",
+    )
     parser.add_argument("--skip-peer-sync", action="store_true")
     parser.add_argument("--skip-intraday", action="store_true", help="Skip intraday feature sync/build")
     parser.add_argument("--skip-rule-snapshot-refresh", action="store_true", help="Skip on-demand daily/fundamental repair inside the rule engine")

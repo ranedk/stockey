@@ -154,6 +154,7 @@ Starting `go-crond` schedules the jobs; it does **not** run them all immediately
   ./complete_data.sh && ./all_advisory_preflight.sh && ./all_context_to_entry_repair.sh && ./all_advisory.sh && ./all_llm_decisions.sh
   ```
 - Re-run `python scripts/cron_preflight.py` (or Operations -> `Cron Preflight`) after any config change; it confirms the generated crontab parses, every referenced script exists and is executable, and Python resolves.
+- **Resuming an interrupted advisory run.** `all_advisory.sh` records each completed stage per advisory date. If a long run is stopped or crashes partway, restart it with `ADVISORY_RESUME=1 ./all_advisory.sh` (or pass `--resume` to `python -m advisory.master_pipeline`) and it skips the stages already finished for that date, resuming at the first incomplete one. Resume only applies within `ADVISORY_RESUME_MAX_AGE_HOURS` (default `18`) and is ignored by `--rebuild` or an explicit `--start-at`. The scheduled evening run does **not** set `ADVISORY_RESUME`, so it always recomputes fresh.
 
 Current schedule:
 

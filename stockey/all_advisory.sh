@@ -100,6 +100,13 @@ if [[ "${ADVISORY_DISABLE_RULE_REPAIR:-1}" != "0" && "${ADVISORY_DISABLE_RULE_RE
   ADVISORY_ARGS+=(--skip-rule-snapshot-refresh --skip-intraday-prefetch)
 fi
 
+# Opt-in crash-safe resume: skip stages already completed for this advisory date.
+# Off by default so the scheduled EOD run always recomputes fresh; set ADVISORY_RESUME=1
+# when restarting an interrupted run. Ignored by the pipeline with --rebuild/--start-at.
+if [[ "${ADVISORY_RESUME:-0}" == "1" || "${ADVISORY_RESUME:-false}" == "true" ]]; then
+  ADVISORY_ARGS+=(--resume)
+fi
+
 if [[ "${ADVISORY_DHAN_PREFLIGHT:-1}" != "0" && "${ADVISORY_DHAN_PREFLIGHT:-true}" != "false" ]]; then
   advisory_failure_context="dhan_auth_preflight"
   DHAN_PREFLIGHT_ARGS=(ensure --min-fresh-minutes "${ADVISORY_DHAN_PREFLIGHT_MIN_FRESH_MINUTES:-30}")

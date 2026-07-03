@@ -81,6 +81,8 @@ from advisory.rule_engine import persist_rule_outputs, run_rule_engine
 from advisory.screener_parser import build_constituents, persist_constituents
 from advisory.technical_features import build_technical_features, persist_technical_features
 from advisory.watchlist_builder import build_watchlist, persist_watchlist
+from utils.db import sql_to_df, upsert_to_db
+from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
 
@@ -124,6 +126,28 @@ _ACTIVE_STAGE_BUDGET_SECONDS = DEFAULT_STAGE_BUDGET_SECONDS
 _ACTIVE_STAGE_BUDGET_OVERRIDES = DEFAULT_STAGE_BUDGET_OVERRIDES
 _STAGE_TIMINGS: list[dict[str, Any]] = []
 _STAGE_TIMINGS_LOCK = threading.Lock()
+
+STAGE_CHECKPOINT_TABLE = "advisory_pipeline_stage_runs"
+STAGE_CHECKPOINT_MIGRATION_ID = "20260703_advisory_pipeline_stage_runs_base"
+STAGE_CHECKPOINT_STATEMENTS = [
+    f"""
+    CREATE TABLE IF NOT EXISTS {STAGE_CHECKPOINT_TABLE} (
+        asof_date TIMESTAMPTZ NOT NULL,
+        stage TEXT NOT NULL,
+        status TEXT NOT NULL,
+        run_id TEXT,
+        detail TEXT,
+        finished_at TIMESTAMPTZ NOT NULL,
+        UNIQUE (asof_date, stage)
+    )
+    """,
+]
+DEFAULT_RESUME_MAX_AGE_HOURS = float(os.getenv("ADVISORY_RESUME_MAX_AGE_HOURS", "18"))
+_CHECKPOINT_TABLE_READY = False
+# Set by run_pipeline; read by _finish_stage (including parallel worker threads).
+_ACTIVE_CHECKPOINT_ASOF: pd.Timestamp | None = None
+_ACTIVE_RUN_ID: str | None = None
+_CHECKPOINT_RECORDING_ENABLED = False
 
 
 def _parse_stage_budget_overrides(value: Any) -> dict[str, float]:
@@ -194,6 +218,112 @@ def _stage_timing_summary() -> dict[str, Any]:
             "reporting_only": True,
         },
     }
+
+
+def _ensure_stage_checkpoint_table() -> None:
+    global _CHECKPOINT_TABLE_READY
+    if _CHECKPOINT_TABLE_READY:
+        return
+    apply_schema_migration(
+        migration_id=STAGE_CHECKPOINT_MIGRATION_ID,
+        description="Track advisory pipeline stage completion so --resume can skip finished stages after a crash/stop.",
+        statements=STAGE_CHECKPOINT_STATEMENTS,
+        metadata={"module": "advisory.pipeline", "tables": [STAGE_CHECKPOINT_TABLE]},
+    )
+    _CHECKPOINT_TABLE_READY = True
+
+
+def record_stage_checkpoint(
+    asof_date: Any,
+    stage: str,
+    *,
+    status: str = "completed",
+    run_id: str | None = None,
+    detail: str | None = None,
+) -> None:
+    """Best-effort per-(asof_date, stage) completion marker for crash-safe --resume.
+
+    A stage that crashes never reaches this call, so its absence is exactly what marks
+    the resume point. Failures here are non-fatal: the worst case is re-running a stage.
+    """
+    if asof_date is None:
+        return
+    try:
+        _ensure_stage_checkpoint_table()
+        row = pd.DataFrame(
+            [
+                {
+                    "asof_date": pd.to_datetime(asof_date, utc=True, errors="coerce"),
+                    "stage": str(stage),
+                    "status": str(status),
+                    "run_id": None if run_id is None else str(run_id),
+                    "detail": None if detail is None else str(detail)[:500],
+                    "finished_at": pd.Timestamp.utcnow(),
+                }
+            ]
+        )
+        upsert_to_db(
+            row,
+            STAGE_CHECKPOINT_TABLE,
+            unique_keys=["asof_date", "stage"],
+            timescaledb_column="asof_date",
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.pipeline",
+            source=STAGE_CHECKPOINT_TABLE,
+            fallback_type="advisory_stage_checkpoint_write_failed",
+            severity="warn",
+            reason="Advisory pipeline could not record a stage checkpoint; --resume may re-run this stage.",
+            error=exc,
+            metadata={"stage": str(stage)},
+        )
+
+
+def resolve_resume_start_stage(
+    asof_date: Any,
+    *,
+    max_age_hours: float | None = None,
+) -> str | None:
+    """Return the pipeline stage to start at to resume a partially completed run, or None.
+
+    Uses a high-water mark (the furthest completed stage in ``PIPELINE_STAGES`` order),
+    so it does not need to know which stages are flag-disabled: resuming at the next
+    stage lets each remaining stage re-apply its own gate via ``stage_enabled``. Only
+    checkpoints newer than the recency window count, so a stale partial run is ignored
+    (and the caller runs the full pipeline instead).
+    """
+    if asof_date is None:
+        return None
+    window = DEFAULT_RESUME_MAX_AGE_HOURS if max_age_hours is None else float(max_age_hours)
+    try:
+        _ensure_stage_checkpoint_table()
+        rows = sql_to_df(
+            f"""
+            SELECT stage, finished_at
+            FROM {STAGE_CHECKPOINT_TABLE}
+            WHERE asof_date = %s AND status = 'completed'
+            """,
+            params=(pd.to_datetime(asof_date, utc=True, errors="coerce"),),
+        )
+    except Exception:
+        return None
+    if rows is None or rows.empty:
+        return None
+    latest = pd.to_datetime(rows["finished_at"], utc=True, errors="coerce").max()
+    if pd.isna(latest):
+        return None
+    age_hours = (pd.Timestamp.utcnow() - latest).total_seconds() / 3600.0
+    if window > 0 and age_hours > window:
+        return None
+    completed = {str(value).strip() for value in rows["stage"].tolist() if str(value).strip()}
+    high_water = -1
+    for idx, stage in enumerate(PIPELINE_STAGES):
+        if stage in completed:
+            high_water = idx
+    if high_water < 0 or high_water >= len(PIPELINE_STAGES) - 1:
+        return None
+    return PIPELINE_STAGES[high_water + 1]
 
 
 def _json_ready(value: Any) -> Any:
@@ -369,6 +499,8 @@ def _finish_stage(stage: str, stage_state: tuple[float, threading.Event, threadi
     if timing.get("over_budget"):
         budget_suffix = f" over_budget=true budget={timing.get('budget_seconds')}s"
     _emit_progress(f"[advisory.pipeline] stage={stage} done elapsed={elapsed_seconds:.2f}s{suffix}{budget_suffix}")
+    if _CHECKPOINT_RECORDING_ENABLED and _ACTIVE_CHECKPOINT_ASOF is not None:
+        record_stage_checkpoint(_ACTIVE_CHECKPOINT_ASOF, stage, run_id=_ACTIVE_RUN_ID, detail=detail)
 
 
 def parse_stage(value: str | None) -> str | None:
@@ -470,6 +602,9 @@ def _normalize_utc_arg_timestamp(value: Any) -> pd.Timestamp | None:
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
     global _ACTIVE_STAGE_BUDGET_SECONDS, _ACTIVE_STAGE_BUDGET_OVERRIDES
+    global _ACTIVE_CHECKPOINT_ASOF, _ACTIVE_RUN_ID, _CHECKPOINT_RECORDING_ENABLED
+    if not hasattr(args, "resume"):
+        args.resume = False
     if not hasattr(args, "skip_intraday"):
         args.skip_intraday = False
     if not hasattr(args, "intraday_lookback_days"):
@@ -522,6 +657,26 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         "dry_run": bool(args.dry_run),
         "stages": {},
     }
+
+    # Crash-safe resume: record each completed stage so a restart can skip the finished
+    # prefix. Recording is disabled for dry runs and dateless runs (nothing to key on).
+    _ACTIVE_CHECKPOINT_ASOF = asof_date if (asof_date is not None and not bool(args.dry_run)) else None
+    _ACTIVE_RUN_ID = None if _ACTIVE_CHECKPOINT_ASOF is None else f"{asof_date.date().isoformat()}-{int(time.time())}"
+    _CHECKPOINT_RECORDING_ENABLED = _ACTIVE_CHECKPOINT_ASOF is not None
+    if (
+        bool(getattr(args, "resume", False))
+        and not bool(args.rebuild)
+        and asof_date is not None
+        and not getattr(args, "start_at", None)
+    ):
+        resume_start = resolve_resume_start_stage(asof_date)
+        if resume_start:
+            args.start_at = resume_start
+            summary["resumed_from_stage"] = resume_start
+            _emit_progress(
+                f"[advisory.pipeline] resume asof={asof_date.date()} start_at={resume_start} "
+                "(skipping checkpointed stages; pass --rebuild for a full run)"
+            )
 
     symbols = args.symbols
     setup_ids = args.setup_ids
