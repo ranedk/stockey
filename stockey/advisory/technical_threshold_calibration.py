@@ -106,7 +106,6 @@ TECHNICAL_THRESHOLD_SCHEMA_STATEMENTS = [
         baseline_signal_count BIGINT,
         baseline_avg_forward_return_after_cost DOUBLE PRECISION,
         baseline_hit_rate_after_cost DOUBLE PRECISION,
-        archetype_breakdown_json TEXT,
         recommendation TEXT,
         load_ts TIMESTAMPTZ,
         UNIQUE (evaluated_at, horizon_days)
