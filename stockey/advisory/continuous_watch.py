@@ -10,7 +10,7 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.announcement_watch import persist_watch_outputs, run_announcement_watch
+from advisory.announcement_watch import is_material_context_event, persist_watch_outputs, run_announcement_watch
 from advisory.announcement_watch import DEFAULT_ANNOUNCEMENT_CONTEXT_LOOKBACK_DAYS
 from advisory.announcement_watch import DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT
 from advisory.announcement_watch import DEFAULT_MARKET_CONTEXT_WATCH_LIMIT
@@ -45,6 +45,11 @@ WATCHER_ACTION_REFRESH_MAX_SYMBOLS = int(os.getenv("WATCHER_ACTION_REFRESH_MAX_S
 WATCHER_CAUSAL_MEMORY_REFRESH_ENABLED = os.getenv("WATCHER_CAUSAL_MEMORY_REFRESH_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
 WATCHER_CAUSAL_MEMORY_REFRESH_LIMIT = int(os.getenv("WATCHER_CAUSAL_MEMORY_REFRESH_LIMIT", "25"))
 WATCHER_ANNOUNCEMENT_MAX_INGEST_TARGETS = int(os.getenv("WATCHER_ANNOUNCEMENT_MAX_INGEST_TARGETS", "12"))
+# Review-only intraday alerts when a material exchange filing lands for a monitored
+# symbol, so the operator sees it within the day instead of only at EOD. Default on.
+WATCHER_ANNOUNCEMENT_ALERTS_ENABLED = os.getenv("WATCHER_ANNOUNCEMENT_ALERTS_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+WATCHER_ANNOUNCEMENT_ALERT_MAX = int(os.getenv("WATCHER_ANNOUNCEMENT_ALERT_MAX", "25"))
+WATCHER_ANNOUNCEMENT_ALERT_MAX_AGE_HOURS = int(os.getenv("WATCHER_ANNOUNCEMENT_ALERT_MAX_AGE_HOURS", "36"))
 
 ALERTS_SCHEMA_STATEMENTS = [
     f"""
@@ -609,6 +614,72 @@ def build_price_alerts(watchlist: pd.DataFrame, latest_prices: pd.DataFrame, *, 
     return pd.DataFrame(rows).drop_duplicates(subset=["symbol", "alert_type"], keep="last")
 
 
+def build_announcement_alerts(
+    events: pd.DataFrame,
+    *,
+    observed_at: pd.Timestamp | None = None,
+    max_alerts: int | None = None,
+    max_age_hours: int | None = None,
+) -> pd.DataFrame:
+    """Review-only alerts for material exchange filings surfaced by the intraday
+    announcement ingest.
+
+    A material filing on a monitored symbol becomes visible within the day instead of
+    only after the EOD `evaluate` stage. Materiality uses the deterministic pre-LLM
+    keyword signal (``is_material_context_event``). These alerts are informational
+    review signals only: they never confer BUY/SELL or broker authority.
+    """
+    if events is None or events.empty:
+        return pd.DataFrame()
+    observed = pd.to_datetime(observed_at or pd.Timestamp.utcnow(), utc=True, errors="coerce")
+    working = events.copy()
+    if "published_on" in working.columns:
+        working["published_on"] = pd.to_datetime(working["published_on"], utc=True, errors="coerce")
+        age_hours = int(max_age_hours if max_age_hours is not None else WATCHER_ANNOUNCEMENT_ALERT_MAX_AGE_HOURS)
+        if age_hours > 0:
+            cutoff = observed - pd.Timedelta(hours=age_hours)
+            working = working[working["published_on"].isna() | (working["published_on"] >= cutoff)]
+    if working.empty:
+        return pd.DataFrame()
+    material = working[working.apply(is_material_context_event, axis=1)].copy()
+    if material.empty:
+        return pd.DataFrame()
+    if "published_on" in material.columns:
+        material = material.sort_values("published_on", ascending=False, na_position="last")
+    subset = [column for column in ["symbol", "unique_id"] if column in material.columns]
+    if subset:
+        material = material.drop_duplicates(subset=subset, keep="first")
+    cap = int(max_alerts if max_alerts is not None else WATCHER_ANNOUNCEMENT_ALERT_MAX)
+    if cap > 0:
+        material = material.head(cap)
+    rows: list[dict[str, Any]] = []
+    for _, row in material.iterrows():
+        subject = str(row.get("subject") or "").strip()
+        category = str(row.get("filed_under_category") or "").strip()
+        published_on = pd.to_datetime(row.get("published_on"), utc=True, errors="coerce")
+        detail = " ".join(bit for bit in [subject, f"[{category}]" if category else ""] if bit)
+        reason = f"Material filing: {detail}" if detail else "Material exchange filing"
+        if not pd.isna(published_on):
+            reason = f"{reason} (filed {published_on.strftime('%Y-%m-%d %H:%M')} UTC)"
+        rows.append(
+            {
+                "observed_at": observed,
+                "asof_date": row.get("asof_date"),
+                "setup_id": row.get("setup_id"),
+                "symbol": str(row.get("symbol") or "").upper(),
+                "alert_type": "MATERIAL_ANNOUNCEMENT",
+                "alert_reason": reason[:500],
+                "monitor_source": str(row.get("monitor_source") or "announcement").lower(),
+                "current_state": str(row.get("event_status") or "REVIEW").upper(),
+                "alert_fingerprint_key": str(row.get("unique_id") or "").strip(),
+                "load_ts": pd.Timestamp.utcnow(),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
 def _alert_fingerprint(row: pd.Series | dict[str, Any]) -> str:
     get = row.get if isinstance(row, dict) else row.get
     parts = [
@@ -618,6 +689,12 @@ def _alert_fingerprint(row: pd.Series | dict[str, Any]) -> str:
         str(get("monitor_source") or "").strip().lower(),
         str(get("current_state") or "").strip().upper(),
     ]
+    # Optional per-item key (e.g. a specific filing's unique_id) so distinct events for
+    # the same symbol/alert_type each alert once instead of colliding on the cooldown.
+    # Absent for price alerts, keeping their fingerprint byte-identical to before.
+    extra = str(get("alert_fingerprint_key") or "").strip()
+    if extra:
+        parts.append(extra)
     return "|".join(parts)
 
 
@@ -670,6 +747,8 @@ def persist_alerts(df: pd.DataFrame, *, cooldown_seconds: int | None = None) -> 
         if column in out.columns:
             out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
     out["alert_fingerprint"] = out.apply(_alert_fingerprint, axis=1)
+    # Helper-only column used for fingerprinting; not a persisted alert column.
+    out = out.drop(columns=["alert_fingerprint_key"], errors="ignore")
     input_count = int(len(out))
     effective_cooldown = max(0, int(cooldown_seconds if cooldown_seconds is not None else DEFAULT_ALERT_COOLDOWN_SECONDS))
     recent_fingerprints: set[str] = set()
@@ -1257,6 +1336,10 @@ def run_announcement_cycle(
         max_ingest_targets=WATCHER_ANNOUNCEMENT_MAX_INGEST_TARGETS if max_ingest_targets is None else int(max_ingest_targets),
     )
     persist_watch_outputs(watch_updates, events)
+    announcement_alert_summary = {"input_count": 0, "persisted_count": 0, "suppressed_count": 0}
+    if WATCHER_ANNOUNCEMENT_ALERTS_ENABLED:
+        announcement_alerts = build_announcement_alerts(events, observed_at=now)
+        announcement_alert_summary = persist_alerts(announcement_alerts)
     source_counters = watcher_source_counters(source="announcements", meta=meta, events=events, watch_updates=watch_updates)
     last_item_ts = events["published_on"].max() if not events.empty else now
     persist_sync_state(
@@ -1287,6 +1370,7 @@ def run_announcement_cycle(
         "max_ingest_targets": int(meta.get("max_ingest_targets") or 0),
         "skipped_ingest_target_count": int(meta.get("skipped_ingest_target_count") or 0),
         "source_counters": source_counters,
+        "announcement_alerts": announcement_alert_summary,
     }
     publish_bus_message("stockey:continuous_watch:announcements", {"published_at": pd.Timestamp.utcnow(), **result})
     return result

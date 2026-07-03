@@ -3508,15 +3508,61 @@ def build_health_hub_payload(*, asof_date: str | None = None, error_limit: int =
     return payload
 
 
+LIVE_WATCH_ALERTS_TABLE = "advisory_live_watch_alerts"
+
+
+def _load_recent_live_alerts(*, limit: int = 12, since_hours: int = 36) -> list[dict[str, Any]]:
+    """Recent review-only intraday alerts (material filings + price triggers) from the
+    continuous watcher, newest first. Best-effort: returns [] on any failure."""
+    bounded = _bounded_limit(limit, default=12, maximum=50)
+    hours = max(1, int(since_hours))
+    try:
+        df = sql_to_df(
+            f"""
+            SELECT observed_at, symbol, setup_id, alert_type, alert_reason,
+                   monitor_source, current_state, last_price
+            FROM {LIVE_WATCH_ALERTS_TABLE}
+            WHERE observed_at >= now() - (%s * interval '1 hour')
+            ORDER BY observed_at DESC
+            LIMIT %s
+            """,
+            params=(int(hours), int(bounded)),
+        )
+    except Exception:
+        return []
+    if df is None or df.empty:
+        return []
+    items: list[dict[str, Any]] = []
+    for _, row in df.iterrows():
+        observed = pd.to_datetime(row.get("observed_at"), utc=True, errors="coerce")
+        price = pd.to_numeric(row.get("last_price"), errors="coerce")
+        items.append(
+            {
+                "observed_at": None if pd.isna(observed) else observed.isoformat(),
+                "symbol": str(row.get("symbol") or ""),
+                "setup_id": str(row.get("setup_id") or ""),
+                "alert_type": str(row.get("alert_type") or ""),
+                "alert_reason": str(row.get("alert_reason") or ""),
+                "monitor_source": str(row.get("monitor_source") or ""),
+                "current_state": str(row.get("current_state") or ""),
+                "last_price": None if pd.isna(price) else float(price),
+                "review_only": True,
+            }
+        )
+    return items
+
+
 def build_workbench_payload(*, top_n: int = 8) -> dict[str, Any]:
     """The home screen (WI-6): one bounded call -> what needs me now.
 
-    Three sections from already-built pieces: the top unified recommendations, open holdings (with a
-    rough since-entry move), and the top health alerts. No full-snapshot fallback. Review-only.
+    Sections from already-built pieces: the top unified recommendations, open holdings (with a
+    rough since-entry move), recent review-only intraday alerts (material filings + price
+    triggers), and the top health alerts. No full-snapshot fallback. Review-only.
     """
     n = _bounded_limit(top_n, default=8, maximum=25)
     recommendations = build_recommendations_unified_payload(limit=n, offset=0)
     positions = build_positions_payload(status="open", limit=n)
+    live_alerts = _load_recent_live_alerts(limit=max(n, 12), since_hours=36)
     try:
         hub = build_health_hub_payload(error_limit=5)
         health_alerts = {
@@ -3536,6 +3582,13 @@ def build_workbench_payload(*, top_n: int = 8) -> dict[str, Any]:
         "holdings": {
             "items": positions.get("positions") or [],
             "summary": positions.get("summary") or {},
+        },
+        "alerts": {
+            "items": live_alerts,
+            "total": len(live_alerts),
+            "material_announcement_count": sum(
+                1 for alert in live_alerts if alert.get("alert_type") == "MATERIAL_ANNOUNCEMENT"
+            ),
         },
         "health": health_alerts,
         "review_only": True,

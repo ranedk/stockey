@@ -19209,6 +19209,29 @@ def test_operator_api_audit_tables_use_schema_registry(monkeypatch):
     assert any("UNIQUE (item_id, decided_at)" in statement for statement in calls[0]["statements"])
 
 
+def test_workbench_recent_live_alerts_loader(monkeypatch):
+    df = pd.DataFrame(
+        [
+            {"observed_at": pd.Timestamp("2026-07-03T08:00:00Z"), "symbol": "ABC", "setup_id": "S1",
+             "alert_type": "MATERIAL_ANNOUNCEMENT", "alert_reason": "Material filing: acquisition",
+             "monitor_source": "watchlist", "current_state": "TRIGGERED", "last_price": None},
+            {"observed_at": pd.Timestamp("2026-07-03T07:00:00Z"), "symbol": "DEF", "setup_id": "S2",
+             "alert_type": "ENTRY_ZONE_HIT", "alert_reason": "in range",
+             "monitor_source": "watchlist", "current_state": "WATCH", "last_price": 100.0},
+        ]
+    )
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *a, **k: df)
+    items = operator_api._load_recent_live_alerts(limit=10, since_hours=36)
+    assert len(items) == 2
+    assert items[0]["alert_type"] == "MATERIAL_ANNOUNCEMENT"
+    assert items[0]["review_only"] is True
+    assert items[0]["last_price"] is None
+    assert items[1]["last_price"] == 100.0
+    # a lookup failure degrades to an empty list, never raises
+    monkeypatch.setattr(operator_api, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    assert operator_api._load_recent_live_alerts() == []
+
+
 def test_operator_api_legacy_ensure_helpers_share_audit_migration(monkeypatch):
     calls = []
 
@@ -66056,6 +66079,105 @@ def test_continuous_watch_persist_alerts_suppresses_recent_duplicates(monkeypatc
     assert writes == []
     assert published[0][0] == "stockey:continuous_watch:alerts"
     assert published[0][1]["suppressed_count"] == 1
+
+
+def test_continuous_watch_build_announcement_alerts_filters_material_and_dedups():
+    now = pd.Timestamp("2026-07-03T08:00:00Z")
+    events = pd.DataFrame(
+        [
+            {"symbol": "abc", "setup_id": "S1", "unique_id": "f1",
+             "subject": "Board approves acquisition of XYZ Ltd", "filed_under_category": "Acquisition",
+             "concise_summary_text": "", "categories_json": "[]",
+             "published_on": now - pd.Timedelta(hours=2), "monitor_source": "watchlist",
+             "event_status": "triggered", "asof_date": now.normalize()},
+            {"symbol": "abc", "setup_id": "S1", "unique_id": "f1",  # duplicate filing -> one alert
+             "subject": "Board approves acquisition of XYZ Ltd", "filed_under_category": "Acquisition",
+             "concise_summary_text": "", "categories_json": "[]",
+             "published_on": now - pd.Timedelta(hours=2), "monitor_source": "watchlist",
+             "event_status": "triggered", "asof_date": now.normalize()},
+            {"symbol": "def", "setup_id": "S2", "unique_id": "f2",  # non-material notice -> filtered
+             "subject": "Newspaper advertisement for record date", "filed_under_category": "Notices",
+             "concise_summary_text": "", "categories_json": "[]",
+             "published_on": now - pd.Timedelta(hours=1), "monitor_source": "announcement_context",
+             "event_status": "context_observed", "asof_date": now.normalize()},
+            {"symbol": "ghi", "setup_id": "S3", "unique_id": "f3",  # material but too old -> filtered
+             "subject": "Quarterly results", "filed_under_category": "Results",
+             "concise_summary_text": "results", "categories_json": "[]",
+             "published_on": now - pd.Timedelta(hours=200), "monitor_source": "watchlist",
+             "event_status": "triggered", "asof_date": now.normalize()},
+        ]
+    )
+    alerts = continuous_watch.build_announcement_alerts(events, observed_at=now, max_age_hours=36)
+    assert list(alerts["symbol"]) == ["ABC"]
+    assert list(alerts["alert_type"]) == ["MATERIAL_ANNOUNCEMENT"]
+    assert alerts.iloc[0]["alert_fingerprint_key"] == "f1"
+    assert "acquisition" in alerts.iloc[0]["alert_reason"].lower()
+    assert continuous_watch.build_announcement_alerts(pd.DataFrame()).empty
+
+
+def test_continuous_watch_alert_fingerprint_backward_compatible_and_per_filing():
+    price_fp = continuous_watch._alert_fingerprint(
+        {"setup_id": "S1", "symbol": "ABC", "alert_type": "ENTRY_ZONE_HIT",
+         "monitor_source": "watchlist", "current_state": "WATCH_BREAKOUT"}
+    )
+    assert price_fp == "S1|ABC|ENTRY_ZONE_HIT|watchlist|WATCH_BREAKOUT"  # unchanged: no trailing key
+    ann_fp = continuous_watch._alert_fingerprint(
+        {"setup_id": "S1", "symbol": "ABC", "alert_type": "MATERIAL_ANNOUNCEMENT",
+         "monitor_source": "watchlist", "current_state": "TRIGGERED", "alert_fingerprint_key": "f1"}
+    )
+    assert ann_fp.endswith("|f1")
+
+
+def test_continuous_watch_persist_alerts_drops_fingerprint_key_helper_column(monkeypatch):
+    writes: list[pd.DataFrame] = []
+    monkeypatch.setattr(continuous_watch, "ensure_alerts_table", lambda: None)
+    monkeypatch.setattr(continuous_watch, "upsert_to_db", lambda df, *a, **k: writes.append(df.copy()))
+    monkeypatch.setattr(continuous_watch, "publish_bus_message", lambda *a, **k: True)
+    alerts = pd.DataFrame(
+        [
+            {
+                "observed_at": pd.Timestamp("2026-07-03T08:00:00Z"),
+                "asof_date": pd.Timestamp("2026-07-03T00:00:00Z"),
+                "setup_id": "S1", "symbol": "ABC", "alert_type": "MATERIAL_ANNOUNCEMENT",
+                "alert_reason": "Material filing: X", "monitor_source": "watchlist",
+                "current_state": "TRIGGERED", "alert_fingerprint_key": "f1",
+                "load_ts": pd.Timestamp("2026-07-03T08:00:01Z"),
+            }
+        ]
+    )
+    summary = continuous_watch.persist_alerts(alerts, cooldown_seconds=0)
+    assert summary["persisted_count"] == 1
+    assert writes and "alert_fingerprint_key" not in writes[0].columns
+    assert writes[0].iloc[0]["alert_fingerprint"].endswith("|f1")
+
+
+def test_continuous_watch_announcement_cycle_emits_material_alerts(monkeypatch):
+    material_events = pd.DataFrame(
+        [
+            {"symbol": "abc", "setup_id": "S1", "unique_id": "f1",
+             "subject": "Board approves acquisition", "filed_under_category": "Acquisition",
+             "concise_summary_text": "", "categories_json": "[]",
+             "published_on": pd.Timestamp.utcnow() - pd.Timedelta(hours=1), "monitor_source": "watchlist",
+             "event_status": "triggered", "asof_date": pd.Timestamp.utcnow().normalize()},
+        ]
+    )
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(continuous_watch, "load_sync_state", lambda source_name: {"last_item_ts": pd.Timestamp.utcnow() - pd.Timedelta(hours=2)})
+    monkeypatch.setattr(continuous_watch, "run_announcement_watch", lambda **kwargs: (pd.DataFrame(), material_events, {"match_count": 1, "watch_count": 1}))
+    monkeypatch.setattr(continuous_watch, "persist_watch_outputs", lambda w, e: None)
+    monkeypatch.setattr(continuous_watch, "persist_sync_state", lambda **kwargs: None)
+    monkeypatch.setattr(continuous_watch, "publish_bus_message", lambda *a, **k: True)
+
+    def fake_persist_alerts(df, **kwargs):
+        captured["alerts"] = df.copy()
+        return {"input_count": int(len(df)), "persisted_count": int(len(df)), "suppressed_count": 0}
+
+    monkeypatch.setattr(continuous_watch, "persist_alerts", fake_persist_alerts)
+    result = continuous_watch.run_announcement_cycle(interval_seconds=1)
+    assert "announcement_alerts" in result
+    assert result["announcement_alerts"]["persisted_count"] == 1
+    assert not captured["alerts"].empty
+    assert captured["alerts"].iloc[0]["alert_type"] == "MATERIAL_ANNOUNCEMENT"
 
 
 def test_continuous_watch_persist_alerts_fail_open_when_dedupe_lookup_fails(monkeypatch):

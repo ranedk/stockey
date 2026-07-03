@@ -7,10 +7,19 @@ const { data, pending, error: loadError, refresh } = await useAsyncData('workben
 const recommendations = computed(() => asDict(data.value?.recommendations))
 const holdings = computed(() => asDict(data.value?.holdings))
 const health = computed(() => asDict(data.value?.health))
+const alerts = computed(() => asDict(data.value?.alerts))
 const recItems = computed(() => asList(recommendations.value.items))
 const holdItems = computed(() => asList(holdings.value.items))
+const alertItems = computed(() => asList(alerts.value.items))
 const recSummary = computed(() => asDict(recommendations.value.summary))
 const whySymbol = ref<string | null>(null)
+
+function alertTime(value: unknown): string {
+  if (typeof value !== 'string' || !value) return ''
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return ''
+  return parsed.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+}
 
 function asDict(value: unknown): Dict {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Dict : {}
@@ -78,6 +87,32 @@ function display(value: unknown) {
           </span>
         </div>
         <p v-if="!recItems.length && !pending" class="py-4 text-center text-sm text-ink/40">No open recommendations.</p>
+      </div>
+    </section>
+
+    <!-- Live alerts (intraday, review-only) -->
+    <section class="rounded-2xl border border-ink/10 bg-white/60 p-5">
+      <div class="flex items-center justify-between">
+        <h2 class="text-lg font-black tracking-tight text-ink">Live alerts
+          <span class="text-sm font-semibold text-ink/45">· intraday, review-only</span>
+        </h2>
+        <span v-if="Number(alerts.material_announcement_count) > 0" class="rounded-full border border-ink bg-ink px-2.5 py-0.5 text-xs font-black text-paper">
+          {{ display(alerts.material_announcement_count) }} material filing{{ Number(alerts.material_announcement_count) === 1 ? '' : 's' }}
+        </span>
+      </div>
+      <div class="mt-3 space-y-2">
+        <div v-for="(row, idx) in alertItems" :key="idx" class="flex items-center justify-between gap-3 rounded-xl border border-ink/5 bg-paper px-4 py-2.5">
+          <div class="flex min-w-0 items-center gap-3">
+            <button class="shrink-0 font-black text-ink underline-offset-2 hover:underline" @click="whySymbol = String(row.symbol)">{{ display(row.symbol) }}</button>
+            <span
+              class="shrink-0 rounded-full px-2 py-0.5 text-xs font-black"
+              :class="row.alert_type === 'MATERIAL_ANNOUNCEMENT' ? 'bg-ink text-paper' : 'border border-ink/15 text-ink/55'"
+            >{{ display(row.alert_type) }}</span>
+            <span class="truncate text-sm text-ink/60">{{ display(row.alert_reason) }}</span>
+          </div>
+          <span class="shrink-0 text-xs text-ink/40">{{ alertTime(row.observed_at) }}</span>
+        </div>
+        <p v-if="!alertItems.length && !pending" class="py-4 text-center text-sm text-ink/40">No live alerts in the last 36h.</p>
       </div>
     </section>
 
