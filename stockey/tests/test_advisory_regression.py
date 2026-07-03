@@ -41210,6 +41210,80 @@ def test_announcement_watch_caps_initial_ingest_lookback(monkeypatch):
     assert meta["initial_lookback_days"] == 3
 
 
+def test_prepare_watchlist_for_ingest_uses_durable_company_watermark():
+    effective_to = pd.Timestamp("2026-07-02T18:00:00Z")
+    watchlist = pd.DataFrame(
+        [
+            # null row watermark, but the company has a durable watermark -> incremental
+            {"asof_date": pd.Timestamp("2026-07-02T00:00:00Z"), "setup_id": "SETUP_A",
+             "symbol": "abc", "company_master_id": "cm-1", "last_checked_at": pd.NaT},
+            # no durable watermark at all -> initial lookback floor, capped
+            {"asof_date": pd.Timestamp("2026-07-02T00:00:00Z"), "setup_id": "SETUP_B",
+             "symbol": "xyz", "company_master_id": "cm-2", "last_checked_at": pd.NaT},
+            # stale row watermark, fresher durable watermark -> durable wins
+            {"asof_date": pd.Timestamp("2026-07-02T00:00:00Z"), "setup_id": "SETUP_C",
+             "symbol": "def", "company_master_id": "cm-3",
+             "last_checked_at": pd.Timestamp("2026-06-25T00:00:00Z")},
+            # fresher row watermark than durable -> row wins
+            {"asof_date": pd.Timestamp("2026-07-02T00:00:00Z"), "setup_id": "SETUP_D",
+             "symbol": "ghi", "company_master_id": "cm-4",
+             "last_checked_at": pd.Timestamp("2026-07-02T10:00:00Z")},
+        ]
+    )
+    watermarks = {
+        "cm-1": pd.Timestamp("2026-07-01T15:00:00Z"),
+        "cm-3": pd.Timestamp("2026-07-01T15:00:00Z"),
+        "cm-4": pd.Timestamp("2026-06-20T00:00:00Z"),
+    }
+    working, _ = announcement_watch._prepare_watchlist_for_ingest(
+        watchlist, effective_to=effective_to, company_watermarks=watermarks
+    )
+    by_symbol = working.set_index("symbol")
+    floor = (effective_to - pd.Timedelta(days=announcement_watch.INITIAL_INGEST_LOOKBACK_DAYS)).normalize()
+    # cm-1: from durable watermark - overlap, not the 3-day floor, not capped
+    assert by_symbol.loc["ABC", "published_from"] == pd.Timestamp("2026-06-30T15:00:00Z")
+    assert bool(by_symbol.loc["ABC", "published_from_capped"]) is False
+    # cm-2: no watermark -> initial floor, capped
+    assert by_symbol.loc["XYZ", "published_from"] == floor
+    assert bool(by_symbol.loc["XYZ", "published_from_capped"]) is True
+    # cm-3: durable beats stale row watermark
+    assert by_symbol.loc["DEF", "published_from"] == pd.Timestamp("2026-06-30T15:00:00Z")
+    # cm-4: fresher row watermark beats stale durable
+    assert by_symbol.loc["GHI", "published_from"] == pd.Timestamp("2026-07-01T10:00:00Z")
+
+
+def test_load_company_ingest_watermarks_folds_latest_signal(monkeypatch):
+    def fake_sql(query, params=None):
+        return pd.DataFrame(
+            [
+                {"company_master_id": "cm-1",
+                 "last_checked_at": pd.Timestamp("2026-07-01T09:00:00Z"),
+                 "last_document_published_on": pd.Timestamp("2026-07-02T09:00:00Z")},
+                {"company_master_id": "cm-2",
+                 "last_checked_at": pd.NaT,
+                 "last_document_published_on": pd.Timestamp("2026-06-30T09:00:00Z")},
+            ]
+        )
+
+    monkeypatch.setattr(announcement_watch, "sql_to_df", fake_sql)
+    out = announcement_watch.load_company_ingest_watermarks(["cm-1", "cm-2", "", None])
+    assert out["cm-1"] == pd.Timestamp("2026-07-02T09:00:00Z")  # max across both signals
+    assert out["cm-2"] == pd.Timestamp("2026-06-30T09:00:00Z")  # doc date when scan is null
+    assert announcement_watch.load_company_ingest_watermarks([]) == {}
+
+
+def test_load_company_ingest_watermarks_failure_is_nonfatal(monkeypatch):
+    events: list[dict[str, object]] = []
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(announcement_watch, "sql_to_df", boom)
+    monkeypatch.setattr(announcement_watch, "record_local_fallback_event", lambda **kw: events.append(kw))
+    assert announcement_watch.load_company_ingest_watermarks(["cm-1"]) == {}
+    assert events and events[0]["fallback_type"] == "announcement_ingest_watermark_load_failed"
+
+
 def test_announcement_watch_records_watchlist_load_fallback(monkeypatch):
     events: list[dict[str, object]] = []
 

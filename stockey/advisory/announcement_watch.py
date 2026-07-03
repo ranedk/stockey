@@ -37,6 +37,9 @@ ANNOUNCEMENT_CONTEXT_SETUP_PREFIX = "ANNOUNCEMENT_CONTEXT"
 MACRO_CONTEXT_SETUP_PREFIX = "MACRO_CONTEXT"
 BHAVCOPY_CONTEXT_SETUP_PREFIX = "BHAVCOPY_CONTEXT"
 INITIAL_INGEST_LOOKBACK_DAYS = 3
+# Overlap re-scanned before the durable watermark so a late/amended filing near the
+# last checkpoint is not skipped. Matches the historical `last_checked - 1 day` logic.
+INGEST_OVERLAP_DAYS = env.int("ANNOUNCEMENT_INGEST_OVERLAP_DAYS", default=1)
 DEFAULT_MARKET_CONTEXT_WATCH_LIMIT = env.int("MARKET_CONTEXT_WATCH_LIMIT", default=50)
 DEFAULT_THEME_CONTEXT_WATCH_LIMIT = env.int("THEME_CONTEXT_WATCH_LIMIT", default=50)
 DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT = env.int("ANNOUNCEMENT_CONTEXT_WATCH_LIMIT", default=50)
@@ -1542,10 +1545,76 @@ def persist_watch_outputs(watchlist_updates: pd.DataFrame, events: pd.DataFrame)
         )
 
 
+def load_company_ingest_watermarks(company_master_ids: Any) -> dict[str, pd.Timestamp]:
+    """Return a durable per-company "already ingested up to" watermark.
+
+    The per-asof-date watchlist rows reset ``last_checked_at`` every run (each new
+    advisory date builds fresh rows), so anchoring the incremental ingest window to
+    a single row makes almost every company fall back to the initial lookback floor
+    and re-discover/re-parse the same announcements daily. This looks up the freshest
+    prior checkpoint for each company across all asof-date rows (both the last scan
+    time and the newest announcement we already stored) so the window only covers the
+    delta. Best-effort: any failure yields an empty map and the caller falls back to
+    the initial lookback floor.
+    """
+    ids = sorted(
+        {
+            str(value).strip()
+            for value in (company_master_ids or [])
+            if value is not None and str(value).strip()
+        }
+    )
+    if not ids:
+        return {}
+    watermarks: dict[str, pd.Timestamp] = {}
+    try:
+        rows = sql_to_df(
+            f"""
+            SELECT company_master_id,
+                   MAX(last_checked_at) AS last_checked_at,
+                   MAX(last_document_published_on) AS last_document_published_on
+            FROM {WATCHLIST_TABLE}
+            WHERE company_master_id = ANY(%s)
+              AND (last_checked_at IS NOT NULL OR last_document_published_on IS NOT NULL)
+            GROUP BY company_master_id
+            """,
+            params=(ids,),
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.announcement_watch",
+            source=WATCHLIST_TABLE,
+            fallback_type="announcement_ingest_watermark_load_failed",
+            severity="warn",
+            reason=(
+                "Announcement watcher could not load durable per-company ingest watermarks and "
+                "fell back to the initial lookback floor, which may re-scan already-ingested announcements."
+            ),
+            error=exc,
+            metadata={"company_count": len(ids)},
+        )
+        return {}
+    if rows.empty:
+        return {}
+    for _, row in rows.iterrows():
+        key = str(row.get("company_master_id") or "").strip()
+        if not key:
+            continue
+        candidates = [
+            pd.to_datetime(row.get("last_checked_at"), utc=True, errors="coerce"),
+            pd.to_datetime(row.get("last_document_published_on"), utc=True, errors="coerce"),
+        ]
+        valid = [ts for ts in candidates if not pd.isna(ts)]
+        if valid:
+            watermarks[key] = max(valid)
+    return watermarks
+
+
 def _prepare_watchlist_for_ingest(
     watchlist: pd.DataFrame,
     *,
     effective_to: pd.Timestamp,
+    company_watermarks: dict[str, pd.Timestamp] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     working = watchlist.copy()
     working["company_master_id"] = working["company_master_id"].astype("string")
@@ -1553,14 +1622,20 @@ def _prepare_watchlist_for_ingest(
     working["published_from"] = pd.Series(pd.NaT, index=working.index, dtype="datetime64[ns, UTC]")
     working["published_from_capped"] = False
     default_floor = (effective_to - pd.Timedelta(days=INITIAL_INGEST_LOOKBACK_DAYS)).normalize()
+    if company_watermarks is None:
+        company_watermarks = load_company_ingest_watermarks(working["company_master_id"].tolist())
 
     for index, row in working.iterrows():
         last_checked = pd.to_datetime(row.get("last_checked_at"), utc=True, errors="coerce")
+        company_id = str(row.get("company_master_id") or "").strip()
+        durable = company_watermarks.get(company_id) if company_id else None
+        if durable is not None and (pd.isna(last_checked) or durable > last_checked):
+            last_checked = durable
         if pd.isna(last_checked):
             published_from = default_floor
             working.at[index, "published_from_capped"] = True
         else:
-            published_from = last_checked - pd.Timedelta(days=1)
+            published_from = last_checked - pd.Timedelta(days=INGEST_OVERLAP_DAYS)
         working.at[index, "published_from"] = published_from
 
     unique_ingest_targets = (
