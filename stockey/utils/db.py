@@ -495,6 +495,20 @@ def generate_postgres_schema(
     )
 
 
+def _dedupe_for_upsert(df: pd.DataFrame, unique_keys: List[str]) -> tuple[pd.DataFrame, int]:
+    """Collapse rows with duplicate conflict-key values, keeping the last (upsert semantics).
+
+    A single ``INSERT ... ON CONFLICT DO UPDATE`` cannot affect the same target row twice, so
+    an input frame with duplicate constrained values raises CardinalityViolation. Only dedupe
+    when every conflict column is present, so a genuinely malformed call still surfaces its own
+    error. Returns the (possibly reduced) frame and the number of rows dropped.
+    """
+    if not unique_keys or df.empty or not all(key in df.columns for key in unique_keys):
+        return df, 0
+    deduped = df.drop_duplicates(subset=list(unique_keys), keep="last")
+    return deduped, len(df) - len(deduped)
+
+
 def _upsert_to_db_once(
     df: pd.DataFrame,
     table_name: str,
@@ -627,6 +641,17 @@ def _upsert_to_db_once(
                 )
             destination_column_types = load_destination_column_types(cur)
             cur.execute(create_temp_sql)
+
+            # Collapse in-batch duplicates on the conflict key so a single
+            # INSERT ... ON CONFLICT DO UPDATE cannot target the same row twice
+            # (CardinalityViolation). Last row wins, matching upsert semantics.
+            df, dropped = _dedupe_for_upsert(df, unique_keys)
+            if dropped:
+                print(
+                    f"[utils.db] upsert_to_db:{table_name} collapsed {dropped} in-batch duplicate row(s) "
+                    f"on conflict key ({', '.join(unique_keys)}); kept last",
+                    file=sys.stderr,
+                )
 
             # 2. COPY data into temp. Use a local temp file instead of keeping
             # large CSV payloads in memory.

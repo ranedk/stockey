@@ -1381,6 +1381,34 @@ def test_portfolio_engine_defers_unconfirmed_base_technical_entry(monkeypatch):
     assert contract["technical_entry_confirmed"] is False
 
 
+def test_db_dedupe_for_upsert_keeps_last_on_conflict_keys():
+    import utils.db as udb
+
+    df = pd.DataFrame(
+        [
+            {"k": 1, "val": "first"},
+            {"k": 1, "val": "last"},   # duplicate conflict key -> collapses, last wins
+            {"k": 2, "val": "solo"},
+        ]
+    )
+    out, dropped = udb._dedupe_for_upsert(df, ["k"])
+    assert dropped == 1
+    assert list(out.sort_values("k")["val"]) == ["last", "solo"]
+
+    # no-op when there are no duplicates
+    unique = pd.DataFrame([{"k": 1, "val": "a"}, {"k": 2, "val": "b"}])
+    out2, dropped2 = udb._dedupe_for_upsert(unique, ["k"])
+    assert dropped2 == 0 and len(out2) == 2
+
+    # left untouched (no dedupe) when a conflict column is absent, so a malformed call still errors
+    partial = pd.DataFrame([{"k": 1}, {"k": 1}])
+    out3, dropped3 = udb._dedupe_for_upsert(partial, ["k", "missing_col"])
+    assert dropped3 == 0 and len(out3) == 2
+    # and with no unique_keys / empty frame
+    assert udb._dedupe_for_upsert(df, [])[1] == 0
+    assert udb._dedupe_for_upsert(pd.DataFrame(columns=["k"]), ["k"])[1] == 0
+
+
 def test_db_retry_wrapper_reconnects_on_transient_error(monkeypatch):
     calls = {"operation": 0, "dispose": 0}
 
