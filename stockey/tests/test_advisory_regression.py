@@ -67671,6 +67671,21 @@ def test_signal_refresh_records_router_action_lookup_fallback(monkeypatch):
     assert events[0]["source"] == signal_refresh.ROUTER_ACTIONS_TABLE
 
 
+def test_sector_key_handles_pd_na_columns():
+    # Nullable sector_code/sector_name columns contain pd.NA; `value or ""` used to raise
+    # "boolean value of NA is ambiguous". _sector_key must degrade to UNSPECIFIED / the name.
+    from advisory import negative_pressure_evaluator as npe
+    from advisory import context_watch_evaluator as cwe
+
+    for mod in (npe, cwe):
+        assert mod._na_safe_text(pd.NA) == ""
+        assert mod._na_safe_text(None) == ""
+        assert mod._na_safe_text("Banks") == "Banks"
+        assert mod._sector_key(pd.Series({"sector_code": pd.NA, "sector_name": pd.NA})) == "UNSPECIFIED"
+        assert mod._sector_key(pd.Series({"sector_code": pd.NA, "sector_name": "Metals"})) == "METALS"
+        assert mod._sector_key(pd.Series({"sector_code": "it", "sector_name": pd.NA})) == "IT"
+
+
 def test_negative_pressure_evaluator_loads_review_only_signal_rows(monkeypatch):
     captured: dict[str, object] = {}
 

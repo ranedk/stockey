@@ -584,11 +584,19 @@ def _summary_recommendation(classification: str) -> str:
     return "collect_more_matured_negative_pressure_labels"
 
 
+def _na_safe_text(value: Any) -> str:
+    # Nullable (pd.NA) columns raise "boolean value of NA is ambiguous" on `value or ""`,
+    # so coerce to text without any truthiness test on a possibly-NA scalar.
+    if value is None or pd.isna(value):
+        return ""
+    return str(value)
+
+
 def _sector_key(row: pd.Series) -> str:
-    sector_code = str(row.get("sector_code") or "").strip().upper()
+    sector_code = _na_safe_text(row.get("sector_code")).strip().upper()
     if sector_code and sector_code not in {"<NA>", "NAN", "NONE"}:
         return sector_code
-    sector_name = str(row.get("sector_name") or "").strip()
+    sector_name = _na_safe_text(row.get("sector_name")).strip()
     if sector_name and sector_name.upper() not in {"<NA>", "NAN", "NONE"}:
         return sector_name.upper()
     return "UNSPECIFIED"
