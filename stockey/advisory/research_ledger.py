@@ -11,7 +11,7 @@ from typing import Any
 import pandas as pd
 
 from advisory.fallback_telemetry import record_local_fallback_event
-from utils.db import sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 
@@ -182,23 +182,40 @@ def finish_research_run(
     error_text: str | None = None,
 ) -> None:
     ensure_tables()
-    now = pd.Timestamp.utcnow()
-    row = pd.DataFrame(
-        [
-            {
-                "research_run_id": str(research_run_id),
-                "status": str(status),
-                "data_snapshot_json": None if data_snapshot is None else _json_text(data_snapshot),
-                "result_metrics_json": None if result_metrics is None else _json_text(result_metrics),
-                "notes_json": None if notes is None else _json_text(notes),
-                "error_text": error_text,
-                "completed_ts": now,
-                "updated_ts": now,
-            }
-        ]
-    )
+    now = pd.Timestamp.utcnow().to_pydatetime()
+
+    # finish updates the row start_research_run created. upsert_to_db is INSERT ... ON
+    # CONFLICT, whose candidate row is checked against NOT NULL columns (run_type, entrypoint,
+    # config_hash, ...) before the conflict redirects to UPDATE -- so an insert-shaped finish
+    # row raises NotNullViolation. Update the started row directly instead.
+    def _update() -> None:
+        with db_session() as (_conn, cur):
+            cur.execute(
+                f"""
+                UPDATE {LEDGER_TABLE}
+                SET status = %s,
+                    data_snapshot_json = %s,
+                    result_metrics_json = %s,
+                    notes_json = %s,
+                    error_text = %s,
+                    completed_ts = %s,
+                    updated_ts = %s
+                WHERE research_run_id = %s
+                """,
+                (
+                    str(status),
+                    None if data_snapshot is None else _json_text(data_snapshot),
+                    None if result_metrics is None else _json_text(result_metrics),
+                    None if notes is None else _json_text(notes),
+                    error_text,
+                    now,
+                    now,
+                    str(research_run_id),
+                ),
+            )
+
     try:
-        upsert_to_db(row, LEDGER_TABLE, unique_keys=["research_run_id"])
+        execute_db_operation(_update, operation_name=f"research_ledger:finish:{LEDGER_TABLE}")
     except Exception as exc:
         _record_research_ledger_fallback(
             "research_ledger_finish_write_failed",

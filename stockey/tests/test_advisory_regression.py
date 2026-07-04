@@ -46047,6 +46047,37 @@ def test_recent_events_main_exports_runner_state(monkeypatch, capsys):
     assert persisted[-1]["status"] == "ok"
 
 
+def test_research_ledger_finish_updates_started_row_without_notnull_columns(monkeypatch):
+    # finish must UPDATE the started row, not INSERT ... ON CONFLICT: the insert candidate is
+    # checked against NOT NULL columns (run_type, entrypoint, config_hash, ...) before the
+    # conflict redirects, so an insert-shaped finish row raised NotNullViolation.
+    captured: dict[str, object] = {}
+
+    class FakeCur:
+        def execute(self, sql, params=None):
+            captured["sql"] = sql
+            captured["params"] = params
+
+    class FakeSession:
+        def __enter__(self):
+            return (None, FakeCur())
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(research_ledger, "ensure_tables", lambda: None)
+    monkeypatch.setattr(research_ledger, "db_session", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(research_ledger, "execute_db_operation", lambda op, *, operation_name=None: op())
+
+    research_ledger.finish_research_run("run-123", status="completed", error_text=None)
+
+    sql = str(captured["sql"])
+    assert "UPDATE" in sql and research_ledger.LEDGER_TABLE in sql
+    assert "run_type" not in sql  # never touches the NOT NULL started-run columns
+    assert captured["params"][0] == "completed"
+    assert captured["params"][-1] == "run-123"
+
+
 def test_research_ledger_ensure_tables_uses_schema_registry(monkeypatch):
     calls = []
 
@@ -46087,15 +46118,34 @@ def test_research_ledger_start_and_finish(monkeypatch):
     assert writes[0][1].iloc[0]["git_rev"] == "deadbeef"
     assert writes[0][1].iloc[0]["validation_protocol_json"]
 
+    # finish now issues a direct UPDATE of the started row (not an insert-shaped upsert)
+    finish_capture: dict[str, object] = {}
+
+    class _FakeCur:
+        def execute(self, sql, params=None):
+            finish_capture["sql"] = sql
+            finish_capture["params"] = params
+
+    class _FakeSession:
+        def __enter__(self):
+            return (None, _FakeCur())
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(research_ledger, "db_session", lambda *a, **k: _FakeSession())
+    monkeypatch.setattr(research_ledger, "execute_db_operation", lambda op, *, operation_name=None: op())
+
     research_ledger.finish_research_run(
         run_id,
         status="completed",
         data_snapshot={"asof_date": "2026-04-04"},
         result_metrics={"sharpe": 1.2},
     )
-    assert writes[1][0] == research_ledger.LEDGER_TABLE
-    assert writes[1][1].iloc[0]["research_run_id"] == run_id
-    assert writes[1][1].iloc[0]["status"] == "completed"
+    assert len(writes) == 1  # finish no longer upserts a row
+    assert "UPDATE" in str(finish_capture["sql"]) and research_ledger.LEDGER_TABLE in str(finish_capture["sql"])
+    assert finish_capture["params"][0] == "completed"
+    assert finish_capture["params"][-1] == run_id
 
 
 def test_research_ledger_git_rev_lookup_failure_records_fallback(monkeypatch):
