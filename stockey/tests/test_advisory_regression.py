@@ -21657,6 +21657,28 @@ def test_action_recommender_build_includes_signal_refresh_candidates(monkeypatch
     assert out.iloc[0]["action_code"] == "WATCH"
 
 
+def test_signal_refresh_lean_action_row_breaks_raw_context_recursion():
+    # A previous action row carries raw_context_json / action_payload(_json) that themselves
+    # embed a whole prior context. Embedding those compounds raw_context_json without bound
+    # across refreshes (the observed >1 GiB / Postgres OOM). They must be stripped before embed.
+    row = {
+        "symbol": "ABC",
+        "action_code": "WATCH",
+        "raw_context_json": "x" * 5000,
+        "action_payload_json": "y" * 4000,
+        "action_payload": {"nested": "z" * 3000},
+        "recommendation_reason_json": "{}",
+    }
+    lean = signal_refresh._lean_action_row(row)
+    for stripped in ("raw_context_json", "action_payload_json", "action_payload"):
+        assert stripped not in lean
+    assert lean["action_code"] == "WATCH" and lean["symbol"] == "ABC"
+    assert signal_refresh._lean_action_row(None) == {}
+    payload = signal_refresh._extract_action_payload(action=row, lifecycle=None, rebalance=None, events=[])
+    assert "raw_context_json" not in payload["action"]
+    assert "action_payload_json" not in payload["action"]
+
+
 def test_signal_refresh_context_overlay_result_reports_affected_symbols(monkeypatch):
     persisted = []
     sync_states = []

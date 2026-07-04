@@ -807,9 +807,24 @@ def _row_confidence(row: dict[str, Any] | None, *columns: str) -> float | None:
     return None
 
 
+# Keys on a previously-persisted action row that themselves carry an entire prior context
+# (raw_context_json / the serialized+parsed action payload). Embedding a previous action's
+# context inside the next action's context makes raw_context_json compound without bound
+# across refreshes (observed: hundreds of MB, eventually exceeding Postgres's 1 GiB field
+# cap and OOM-killing the server). Strip them before embedding so only scalar/summary fields
+# of the prior action are carried forward.
+_RECURSIVE_ACTION_CONTEXT_KEYS = ("raw_context_json", "action_payload_json", "action_payload")
+
+
+def _lean_action_row(row: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    return {key: value for key, value in row.items() if key not in _RECURSIVE_ACTION_CONTEXT_KEYS}
+
+
 def _extract_action_payload(*, action: dict[str, Any] | None, lifecycle: dict[str, Any] | None, rebalance: dict[str, Any] | None, events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "action": action or {},
+        "action": _lean_action_row(action),
         "lifecycle": lifecycle or {},
         "rebalance": rebalance or {},
         "event_policy": events,
@@ -2207,7 +2222,7 @@ def build_causal_memory_signal_rows(targets: pd.DataFrame, *, dry_run: bool = Fa
         )
         payload = {
             "causal_event_memory": item,
-            "previous_action": previous_action_row or {},
+            "previous_action": _lean_action_row(previous_action_row),
             "authority_contract": SIGNAL_REFRESH_AUTHORITY_CONTRACT,
             "memory_policy_effect": (
                 "review_only_de_risk_pressure_no_sell_authority"
@@ -2332,7 +2347,7 @@ def build_theme_context_signal_rows(targets: pd.DataFrame, *, dry_run: bool = Fa
         )
         payload = {
             context_source: item,
-            "previous_action": previous_action_row or {},
+            "previous_action": _lean_action_row(previous_action_row),
             "authority_contract": SIGNAL_REFRESH_AUTHORITY_CONTRACT,
             "source_table": MACRO_CONTEXT_OVERLAYS_TABLE if context_source == "macro_context" else THEME_CONTEXT_OVERLAYS_TABLE,
             "context_reliability_classification": reliability,
@@ -2453,7 +2468,7 @@ def build_positive_context_watch_signal_rows(targets: pd.DataFrame, *, dry_run: 
         )
         payload = {
             "context_watch": item,
-            "previous_action": previous_action_row or {},
+            "previous_action": _lean_action_row(previous_action_row),
             "authority_contract": SIGNAL_REFRESH_AUTHORITY_CONTRACT,
             "source_context": context_source,
             "context_reliability_classification": reliability,
@@ -2578,7 +2593,7 @@ def build_direct_context_signal_rows(targets: pd.DataFrame, *, dry_run: bool = F
         )
         payload = {
             "direct_context": item,
-            "previous_action": previous_action_row or {},
+            "previous_action": _lean_action_row(previous_action_row),
             "authority_contract": SIGNAL_REFRESH_AUTHORITY_CONTRACT,
             "source_context": context_source,
             "context_reliability_classification": reliability,
