@@ -513,6 +513,10 @@ def build_split_evaluation_rows(
         source_frame = frame[frame["variant"].astype(str).eq(source_variant)].copy()
         if source_frame.empty:
             continue
+        # One evaluation row per (horizon, asof, setup, symbol) per spec, matching the
+        # technical-only dedup above; without this a repeated source row yields duplicate
+        # rows on the persist unique key.
+        source_frame = source_frame.drop_duplicates(subset=key_cols, keep="last")
         variant = _variant_for_spec(spec)
         for _, row in source_frame.iterrows():
             key = tuple(row[col] for col in key_cols)
@@ -671,32 +675,35 @@ def _recommendation_for_classification(classification: str) -> str:
     return "collect_more_matured_labels"
 
 
+def _dedupe_on_keys(frame: pd.DataFrame, unique_keys: list[str]) -> pd.DataFrame:
+    # Postgres ON CONFLICT DO UPDATE rejects a command that targets the same row twice, so a
+    # frame must not carry duplicate constrained values. Keeping the last matches upsert semantics.
+    keys = [key for key in unique_keys if key in frame.columns]
+    if not keys:
+        return frame
+    return frame.drop_duplicates(subset=keys, keep="last")
+
+
 def persist_outputs(evaluations: pd.DataFrame, summary: pd.DataFrame) -> None:
     ensure_tables()
     evaluations = _normalize_frame(evaluations)
     summary = _normalize_frame(summary)
+    evaluations_keys = [
+        "evaluated_at",
+        "horizon_days",
+        "source_family",
+        "split_axis",
+        "split_value",
+        "asof_date",
+        "setup_id",
+        "symbol",
+        "variant",
+    ]
+    summary_keys = ["evaluated_at", "horizon_days", "source_family", "split_axis", "split_value", "variant"]
     if not evaluations.empty:
-        upsert_to_db(
-            evaluations,
-            SPLIT_EVALUATIONS_TABLE,
-            unique_keys=[
-                "evaluated_at",
-                "horizon_days",
-                "source_family",
-                "split_axis",
-                "split_value",
-                "asof_date",
-                "setup_id",
-                "symbol",
-                "variant",
-            ],
-        )
+        upsert_to_db(_dedupe_on_keys(evaluations, evaluations_keys), SPLIT_EVALUATIONS_TABLE, unique_keys=evaluations_keys)
     if not summary.empty:
-        upsert_to_db(
-            summary,
-            SPLIT_SUMMARY_TABLE,
-            unique_keys=["evaluated_at", "horizon_days", "source_family", "split_axis", "split_value", "variant"],
-        )
+        upsert_to_db(_dedupe_on_keys(summary, summary_keys), SPLIT_SUMMARY_TABLE, unique_keys=summary_keys)
 
 
 def load_split_summary_history(

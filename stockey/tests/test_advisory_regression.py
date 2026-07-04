@@ -54954,6 +54954,28 @@ def test_signal_quality_family_report_flags_positive_technical_baseline_without_
     assert "market_participation: technical_baseline_positive_but_no_context_family_ready" in text
 
 
+def test_signal_quality_split_persist_dedupes_duplicate_unique_keys(monkeypatch):
+    from advisory import signal_quality_split_evaluator as sqse
+
+    captured: dict[str, pd.DataFrame] = {}
+    monkeypatch.setattr(sqse, "ensure_tables", lambda: None)
+    monkeypatch.setattr(sqse, "_normalize_frame", lambda df: df)
+    monkeypatch.setattr(sqse, "upsert_to_db", lambda df, table, unique_keys: captured.__setitem__(table, df.copy()))
+
+    base = {
+        "evaluated_at": pd.Timestamp("2026-07-04T00:00:00Z"),
+        "horizon_days": 5, "source_family": "F", "split_axis": "a", "split_value": "v",
+        "asof_date": pd.Timestamp("2026-06-01T00:00:00Z"), "setup_id": "S", "symbol": "ABC",
+        "variant": "x",
+    }
+    # two rows with identical 9-key would trip ON CONFLICT DO UPDATE; must collapse to one (keep last)
+    evaluations = pd.DataFrame([{**base, "selected": True}, {**base, "selected": False}])
+    sqse.persist_outputs(evaluations, pd.DataFrame())
+    out = captured[sqse.SPLIT_EVALUATIONS_TABLE]
+    assert len(out) == 1
+    assert bool(out.iloc[0]["selected"]) is False  # keep="last"
+
+
 def test_signal_quality_split_report_ranks_context_class_direction_splits():
     rows = pd.DataFrame(
         [
