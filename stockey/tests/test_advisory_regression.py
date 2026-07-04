@@ -15112,6 +15112,31 @@ def test_operator_api_feature_freshness_payload_includes_current_stage_gates(mon
     assert any(row["stage"] == "company_memory" for row in payload["stage_gates"])
 
 
+def test_action_recommender_strips_heavy_recursive_context_keys():
+    from advisory import action_recommender as ar
+
+    # raw_context builders spread **row.to_dict() from tables that carry raw_context_json /
+    # action_payload_json; embedding those re-serializes a full prior context and compounds
+    # without bound (the >1 GiB / Postgres OOM). They must be stripped at every nesting level.
+    ctx = {
+        "symbol": "ABC",
+        "raw_context_json": "x" * 5000,           # top-level vector (from **row.to_dict())
+        "action_payload_json": "y" * 4000,        # serialized-payload vector
+        "signal_refresh": {
+            "action_payload": {"lean": "keep", "raw_context_json": "z" * 5000},  # nested vector
+            "trace_id": "t1",
+        },
+    }
+    out = ar._strip_heavy_context_keys(ctx)
+    assert out["symbol"] == "ABC"
+    assert "raw_context_json" not in out and "action_payload_json" not in out
+    assert out["signal_refresh"]["trace_id"] == "t1"
+    assert out["signal_refresh"]["action_payload"]["lean"] == "keep"
+    assert "raw_context_json" not in out["signal_refresh"]["action_payload"]  # stripped when nested too
+    # lists are walked as well
+    assert ar._strip_heavy_context_keys([{"raw_context_json": "q", "k": 1}]) == [{"k": 1}]
+
+
 def test_action_recommender_adds_decision_time_feature_freshness(monkeypatch):
     captured = []
 

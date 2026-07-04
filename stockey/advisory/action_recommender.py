@@ -525,6 +525,26 @@ def _boolish_or_none(value: Any) -> bool | None:
     return None
 
 
+# Serialized-context keys that themselves carry an entire prior context. Several raw_context
+# builders spread **row.to_dict() from source tables that hold these columns, so embedding them
+# re-serializes a full context into the new one -- the compounding that grew raw_context_json to
+# >1 GiB and OOM-killed Postgres. Strip them (recursively) before persisting; the structured
+# fields and any lean parsed payload are kept.
+_HEAVY_RECURSIVE_CONTEXT_KEYS = ("raw_context_json", "action_payload_json")
+
+
+def _strip_heavy_context_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_heavy_context_keys(item)
+            for key, item in value.items()
+            if key not in _HEAVY_RECURSIVE_CONTEXT_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_heavy_context_keys(item) for item in value]
+    return value
+
+
 def _build_record(
     *,
     asof_date: pd.Timestamp,
@@ -574,7 +594,7 @@ def _build_record(
         "invest_score_pct": _num(invest_score_pct),
         "action_reason": _text(action_reason),
         "action_detail": _text(action_detail),
-        "raw_context_json": json.dumps(raw_context or {}, ensure_ascii=False, default=str, sort_keys=True),
+        "raw_context_json": json.dumps(_strip_heavy_context_keys(raw_context or {}), ensure_ascii=False, default=str, sort_keys=True),
         "load_ts": pd.Timestamp.utcnow(),
     }
 
