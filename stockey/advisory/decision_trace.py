@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import uuid
 from typing import Any
 
@@ -177,6 +178,46 @@ TRACE_SCHEMA_STATEMENTS = [
 
 def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+
+
+# A single Postgres field cannot exceed 1 GiB; building a value near that size also spikes
+# server memory and can OOM-kill the instance. Trace payloads are audit context, not primary
+# data, so a runaway payload must be truncated to a marker rather than kill the write.
+TRACE_PAYLOAD_MAX_BYTES = int(os.getenv("ADVISORY_TRACE_PAYLOAD_MAX_BYTES", str(4 * 1024 * 1024)))
+
+
+def bounded_payload_json(
+    payload: Any,
+    *,
+    source: str = "trace_payload",
+    limit_bytes: int | None = None,
+    context: dict[str, Any] | None = None,
+) -> str:
+    """Serialize a trace payload, replacing it with a small truncated marker if it exceeds
+    the size cap. Prevents a single trace from producing a >1 GiB field / OOM-killing Postgres."""
+    limit = int(TRACE_PAYLOAD_MAX_BYTES if limit_bytes is None else limit_bytes)
+    text = json_dumps(payload or {})
+    if limit <= 0 or len(text) <= limit:
+        return text
+    original_len = len(text)
+    preview = text[:2000]
+    del text
+    record_local_fallback_event(
+        module="advisory.decision_trace",
+        source=source,
+        fallback_type="decision_trace_payload_truncated",
+        severity="warn",
+        reason="Decision trace payload exceeded the size cap and was truncated to a marker to avoid a >1 GiB field / DB OOM.",
+        metadata={"original_chars": original_len, "limit_bytes": limit, **(context or {})},
+    )
+    return json_dumps(
+        {
+            "_trace_payload_truncated": True,
+            "_original_chars": original_len,
+            "_limit_bytes": limit,
+            "_preview": preview,
+        }
+    )
 
 
 def stable_hash(value: Any) -> str:
@@ -400,7 +441,11 @@ def append_trace(
                 "final_reason": None if final_reason is None else str(final_reason),
                 "source_table": None if source_table is None else str(source_table),
                 "source_key": None if source_key is None else str(source_key),
-                "payload_json": json_dumps(payload or {}),
+                "payload_json": bounded_payload_json(
+                    payload,
+                    source="append_trace",
+                    context={"symbol": str(symbol).upper(), "trigger_type": trigger_type},
+                ),
                 "created_at": now,
                 "updated_at": now,
             }
@@ -436,7 +481,9 @@ def append_trace_step(
                 "reason": None if reason is None else str(reason),
                 "input_hash": stable_hash(input_payload) if input_payload is not None else None,
                 "output_hash": stable_hash(output_payload) if output_payload is not None else None,
-                "payload_json": json_dumps(payload or {}),
+                "payload_json": bounded_payload_json(
+                    payload, source="append_trace_step", context={"trace_id": trace_id, "stage": stage}
+                ),
                 "started_at": pd.to_datetime(started_at or now, utc=True, errors="coerce"),
                 "completed_at": pd.to_datetime(completed_at or now, utc=True, errors="coerce"),
                 "load_ts": now,
@@ -475,7 +522,9 @@ def record_event_processing(
                 "error": None if error is None else str(error),
                 "input_hash": stable_hash(input_payload) if input_payload is not None else None,
                 "output_hash": stable_hash(output_payload) if output_payload is not None else None,
-                "payload_json": json_dumps(payload or {}),
+                "payload_json": bounded_payload_json(
+                    payload, source="record_event_processing", context={"unique_id": str(unique_id), "stage": stage}
+                ),
                 "load_ts": now,
             }
         ]

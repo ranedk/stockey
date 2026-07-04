@@ -2126,6 +2126,28 @@ def test_action_conflict_resolution_updates_use_retryable_db_operation(monkeypat
     assert executed[0][1][1] == "BUY_OVER_SELL"
 
 
+def test_decision_trace_bounded_payload_json_truncates_oversized(monkeypatch):
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(decision_trace, "record_local_fallback_event", lambda **kw: events.append(kw))
+
+    # small payloads pass through byte-identical, no telemetry
+    small = {"a": 1, "b": "x"}
+    assert decision_trace.bounded_payload_json(small) == decision_trace.json_dumps(small)
+    assert events == []
+
+    # an oversized payload is replaced by a compact truncation marker (never a >1 GiB field)
+    out = decision_trace.bounded_payload_json(
+        {"blob": "x" * 50000}, limit_bytes=1000, source="unit", context={"symbol": "ABC"}
+    )
+    parsed = json.loads(out)
+    assert parsed["_trace_payload_truncated"] is True
+    assert parsed["_original_chars"] > 1000
+    assert len(out) < 5000
+    assert events and events[0]["fallback_type"] == "decision_trace_payload_truncated"
+    assert events[0]["metadata"]["symbol"] == "ABC"
+    assert events[0]["metadata"]["original_chars"] > 1000
+
+
 def test_action_conflict_classifies_same_action_duplicate_with_dedupe_rule():
     resolution = decision_trace.classify_action_conflict(
         {
