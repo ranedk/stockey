@@ -26,7 +26,7 @@ DEFAULT_ENDPOINTS = [
     "/api/actions?limit=25&compact=true",
     "/api/portfolio?limit=25&compact=true",
     "/api/watchlist?limit=25&compact=true",
-    "/api/events?limit=100",
+    "/api/workbench",
     "/api/data-health",
 ]
 DEFAULT_THRESHOLD_MS = env.float("API_LATENCY_PROBE_SLOW_MS", 750.0)
