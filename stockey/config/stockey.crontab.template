@@ -32,6 +32,13 @@ LOG_DIR={{LOG_DIR}}
 # portfolio/action reconciliation.
 30 17 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
 
+# Daily OHLCV coverage reconciliation before the advisory chain. Backfills any
+# universe symbol whose latest daily bar predates the last completed trading day
+# (e.g. after the scheduler was down during market hours), so freshness gates
+# never suppress buy authority because of silently stale bars. start_cron.sh
+# also runs this once at scheduler startup.
+45 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
+
 # Advisory readiness preflight before the expensive post-close reconciliation.
 # This validates/refreshes Dhan auth and runs compact operator smoke, but does
 # not run the advisory pipeline or submit broker orders.

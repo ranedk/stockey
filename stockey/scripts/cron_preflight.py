@@ -308,7 +308,7 @@ def build_cron_preflight(
         "jobs": jobs,
         "locks": lock_rows,
         "ports": ports,
-        "next_command": "./go-crond config/stockey.generated.crontab --allow-unprivileged" if status != "error" else "fix preflight errors before starting go-crond",
+        "next_command": "./start_cron.sh  # reconciles OHLCV coverage first, then starts go-crond" if status != "error" else "fix preflight errors before starting go-crond",
     }
 
 

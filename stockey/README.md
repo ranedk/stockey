@@ -72,8 +72,13 @@ Cron startup:
 ```sh
 python builder.py
 python scripts/cron_preflight.py
-nohup ./go-crond config/stockey.generated.crontab --allow-unprivileged >> logs/cron/go-crond.log 2>&1 &
+nohup ./start_cron.sh >> logs/cron/go-crond.log 2>&1 &
 ```
+
+`start_cron.sh` reconciles daily OHLCV universe coverage first (so a scheduler that was
+down during market hours never starts the day on stale bars), then execs the underlying
+runner (`./go-crond config/stockey.generated.crontab --allow-unprivileged`). Running that
+go-crond command directly also works but skips the startup reconciliation.
 
 The generated cron file is `go-crond`/system-crontab style and includes a username column. Use the Operations page or `python scripts/cron_preflight.py` before starting it after config changes.
 

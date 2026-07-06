@@ -1819,6 +1819,86 @@ def check_ingestion_file_state_failures(limit: int = 100) -> dict[str, Any]:
         )
 
 
+OPERATOR_HEALTH_OHLCV_COVERAGE_WARN_PCT = env.float("OPERATOR_HEALTH_OHLCV_COVERAGE_WARN_PCT", default=90.0)
+OPERATOR_HEALTH_OHLCV_COVERAGE_ERROR_PCT = env.float("OPERATOR_HEALTH_OHLCV_COVERAGE_ERROR_PCT", default=60.0)
+
+
+def check_daily_ohlcv_universe_coverage() -> dict[str, Any]:
+    """Daily-bar coverage for the advisory universe on the last completed trading day.
+
+    When the scheduler is down during market hours, universe daily OHLCV silently decays
+    (observed 106 -> 56 -> 1 tickers current) and the freshness gates then correctly
+    suppress all buy authority -- with nothing loudly saying why. This check makes that
+    failure a single visible line with the recovery commands.
+    """
+    fix_commands = [
+        "./all_ohlcv_reconcile.sh",
+        "./start_cron.sh  # keeps coverage fresh: reconciles at startup + watchers + 18:45 schedule",
+    ]
+    try:
+        from data.dhanlive.ohlcv_reconcile import (
+            expected_complete_trading_day,
+            find_stale_symbols,
+            load_universe_symbols,
+        )
+
+        expected = expected_complete_trading_day()
+        universe = load_universe_symbols()
+        if not universe:
+            return _status(
+                "warn",
+                "No advisory universe symbols found (screener constituents/watchlist/holdings empty); OHLCV coverage cannot be assessed.",
+                table="daily_ohlcv_universe_coverage",
+                expected_trading_day=expected.date().isoformat(),
+                universe_symbols=0,
+                commands=fix_commands,
+            )
+        stale = find_stale_symbols(universe, expected)
+        covered = len(universe) - len(stale)
+        coverage_pct = round(100.0 * covered / len(universe), 2)
+        if coverage_pct < OPERATOR_HEALTH_OHLCV_COVERAGE_ERROR_PCT:
+            severity = "error"
+            message = (
+                f"Daily OHLCV coverage collapsed: {covered}/{len(universe)} universe symbols "
+                f"({coverage_pct}%) have bars for the last completed trading day. Freshness gates "
+                "will suppress buy authority until bars are reconciled."
+            )
+        elif coverage_pct < OPERATOR_HEALTH_OHLCV_COVERAGE_WARN_PCT:
+            severity = "warn"
+            message = (
+                f"Daily OHLCV coverage degraded: {covered}/{len(universe)} universe symbols "
+                f"({coverage_pct}%) have bars for the last completed trading day."
+            )
+        else:
+            severity = "ok"
+            message = (
+                f"Daily OHLCV coverage healthy: {covered}/{len(universe)} universe symbols "
+                f"({coverage_pct}%) current through the last completed trading day."
+            )
+        return _status(
+            severity,
+            message,
+            table="daily_ohlcv_universe_coverage",
+            expected_trading_day=expected.date().isoformat(),
+            universe_symbols=len(universe),
+            covered_symbols=covered,
+            stale_symbols=len(stale),
+            coverage_pct=coverage_pct,
+            warn_below_pct=OPERATOR_HEALTH_OHLCV_COVERAGE_WARN_PCT,
+            error_below_pct=OPERATOR_HEALTH_OHLCV_COVERAGE_ERROR_PCT,
+            stale_sample=stale[:15],
+            commands=fix_commands if severity != "ok" else [],
+        )
+    except Exception as exc:
+        return _status(
+            "error",
+            "Daily OHLCV universe coverage check failed.",
+            table="daily_ohlcv_universe_coverage",
+            error=f"{type(exc).__name__}: {exc}",
+            commands=fix_commands,
+        )
+
+
 def check_schema_migrations(limit: int = 20) -> dict[str, Any]:
     try:
         if not table_exists(SCHEMA_MIGRATIONS_TABLE):
@@ -9825,6 +9905,8 @@ def run_named_health_check(name: str, *, log_dir: str | Path = DEFAULT_LOG_DIR) 
         return check_downloader_run_state()
     if normalized == "ingestion_file_state":
         return check_ingestion_file_state_failures()
+    if normalized == "ohlcv_universe_coverage":
+        return check_daily_ohlcv_universe_coverage()
     if normalized == "schema_migrations":
         return check_schema_migrations()
     if normalized == "operator_api_errors":
@@ -9953,6 +10035,7 @@ def _full_health_checks(log_dir: str | Path) -> dict[str, Any]:
         "signal_refresh_source_state",
         "downloader_run_state",
         "ingestion_file_state",
+        "ohlcv_universe_coverage",
         "schema_migrations",
         "operator_api_errors",
         "redis",
@@ -9987,6 +10070,7 @@ def build_operator_health(*, log_dir: str | Path = DEFAULT_LOG_DIR, include_dhan
             "research_evidence_run_summary": lambda: check_research_evidence_run_summary(log_dir),
             "operator_snapshot": check_operator_snapshot,
             "context_gate_policy": check_context_gate_policy,
+            "ohlcv_universe_coverage": check_daily_ohlcv_universe_coverage,
             "redis": check_redis,
             "optional_dependencies": check_optional_dependencies,
             "frontend": check_frontend_dependencies,

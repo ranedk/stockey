@@ -302,6 +302,100 @@ def test_operator_api_ingestion_state_payload_summarizes_rows(monkeypatch):
     assert payload["operator_boundary"]["mutates_state"] is False
 
 
+def test_ohlcv_reconcile_expected_day_steps_back_when_latest_is_today(monkeypatch):
+    from data.dhanlive import ohlcv_reconcile as orc
+
+    calls: list[object] = []
+
+    def fake_latest(value=None, **_kwargs):
+        calls.append(value)
+        # first call (for "now") says today IS a trading day; second call resolves the prior one
+        if len(calls) == 1:
+            return pd.Timestamp("2026-07-06", tz="UTC")
+        return pd.Timestamp("2026-07-03", tz="UTC")
+
+    monkeypatch.setattr(orc, "latest_trading_day_on_or_before", fake_latest)
+    monkeypatch.setattr(orc, "_market_calendar_date", lambda value=None, **k: pd.Timestamp("2026-07-06", tz="UTC"))
+    # bars for today only exist after the close -> expectation steps back to the prior trading day
+    assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-03"
+
+    # when the latest trading day is already in the past (weekend), it is used directly
+    monkeypatch.setattr(orc, "latest_trading_day_on_or_before", lambda value=None, **k: pd.Timestamp("2026-07-03", tz="UTC"))
+    monkeypatch.setattr(orc, "_market_calendar_date", lambda value=None, **k: pd.Timestamp("2026-07-05", tz="UTC"))
+    assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-03"
+
+
+def test_ohlcv_reconcile_find_stale_symbols(monkeypatch):
+    from data.dhanlive import ohlcv_reconcile as orc
+
+    coverage = pd.DataFrame(
+        [
+            {"symbol": "CURRENT", "max_date": pd.Timestamp("2026-07-03")},
+            {"symbol": "STALE", "max_date": pd.Timestamp("2026-07-01")},
+        ]
+    )
+    monkeypatch.setattr(orc, "sql_to_df", lambda *a, **k: coverage)
+    stale = orc.find_stale_symbols(["CURRENT", "STALE", "NEVER_SEEN"], pd.Timestamp("2026-07-03", tz="UTC"))
+    assert stale == ["STALE", "NEVER_SEEN"]
+    assert orc.find_stale_symbols([], pd.Timestamp("2026-07-03")) == []
+    # a coverage-lookup failure degrades to "sync everything", never hides staleness
+    monkeypatch.setattr(orc, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    assert orc.find_stale_symbols(["A", "B"], pd.Timestamp("2026-07-03")) == ["A", "B"]
+
+
+def test_ohlcv_reconcile_run_caps_symbols_and_counts_results(monkeypatch):
+    from data.dhanlive import ohlcv_reconcile as orc
+
+    monkeypatch.setattr(orc, "expected_complete_trading_day", lambda now=None: pd.Timestamp("2026-07-03", tz="UTC"))
+    monkeypatch.setattr(orc, "load_universe_symbols", lambda: ["A", "B", "C", "D"])
+    monkeypatch.setattr(orc, "find_stale_symbols", lambda universe, expected: ["A", "B", "C"])
+    synced: list[list[str]] = []
+
+    def fake_sync(tickers, **_kwargs):
+        synced.append(list(tickers))
+        return [{"ticker": t, "error": "boom" if t == "B" else None} for t in tickers]
+
+    monkeypatch.setattr(orc, "sync_many_daily", fake_sync)
+    summary = orc.run_reconcile(max_symbols=2)
+    assert synced == [["A", "B"]]  # capped at 2, cap logged
+    assert summary["stale_symbols"] == 3 and summary["skipped_over_cap"] == 1
+    assert summary["sync_attempted"] == 2 and summary["sync_succeeded"] == 1 and summary["sync_failed"] == 1
+    # dry run never syncs
+    synced.clear()
+    dry = orc.run_reconcile(dry_run=True)
+    assert synced == [] and dry["dry_run"] is True and dry["stale_sample"] == ["A", "B", "C"]
+
+
+def test_operator_health_ohlcv_universe_coverage_classifies(monkeypatch):
+    from data.dhanlive import ohlcv_reconcile as orc
+
+    monkeypatch.setattr(orc, "expected_complete_trading_day", lambda now=None: pd.Timestamp("2026-07-03", tz="UTC"))
+    universe = [f"S{i}" for i in range(10)]
+    monkeypatch.setattr(orc, "load_universe_symbols", lambda: universe)
+
+    # 100% coverage -> ok
+    monkeypatch.setattr(orc, "find_stale_symbols", lambda u, e: [])
+    payload = operator_health.check_daily_ohlcv_universe_coverage()
+    assert payload["status"] == "ok" and payload["coverage_pct"] == 100.0
+
+    # 80% -> warn (below 90 warn threshold)
+    monkeypatch.setattr(orc, "find_stale_symbols", lambda u, e: universe[:2])
+    payload = operator_health.check_daily_ohlcv_universe_coverage()
+    assert payload["status"] == "warn"
+
+    # 10% -> error, with recovery commands
+    monkeypatch.setattr(orc, "find_stale_symbols", lambda u, e: universe[:9])
+    payload = operator_health.check_daily_ohlcv_universe_coverage()
+    assert payload["status"] == "error"
+    assert any("all_ohlcv_reconcile" in cmd for cmd in payload["commands"])
+    assert payload["stale_sample"]
+
+    # empty universe -> warn, not crash
+    monkeypatch.setattr(orc, "load_universe_symbols", lambda: [])
+    payload = operator_health.check_daily_ohlcv_universe_coverage()
+    assert payload["status"] == "warn" and payload["universe_symbols"] == 0
+
+
 def test_operator_health_ingestion_file_state_separates_active_and_stale_failures(monkeypatch):
     # Active vs stale is decided against wall-clock now (OPERATOR_HEALTH_INGESTION_FAILURE_ACTIVE_DAYS,
     # default 30), so build the dates RELATIVE to now -- absolute dates would silently age out.
@@ -14786,7 +14880,9 @@ def test_cron_preflight_validates_generated_crontab(tmp_path, monkeypatch):
     assert payload["status"] == "ok"
     assert payload["job_count"] == 1
     assert any(row["check"] == "scripts" and row["status"] == "ok" for row in payload["checks"])
-    assert payload["next_command"].startswith("./go-crond")
+    # start_cron.sh is the supported start path: it reconciles OHLCV coverage first,
+    # then execs go-crond (which has no @reboot support).
+    assert payload["next_command"].startswith("./start_cron.sh")
 
 
 def test_cron_preflight_flags_missing_scripts_and_stale_locks(tmp_path, monkeypatch):

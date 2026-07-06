@@ -110,14 +110,23 @@ The same page shows read-only coverage metrics from `GET /api/screeners/coverage
 The repo now ships with a cron template at `config/stockey.crontab.template`.
 `python builder.py` renders the runnable file at `config/stockey.generated.crontab`.
 
-Recommended: run it with `go-crond`:
+Recommended: start it through `start_cron.sh`, which reconciles daily OHLCV coverage
+first (backfilling any universe symbol whose latest daily bar predates the last
+completed trading day — e.g. after the scheduler was down during market hours) and then
+starts `go-crond`. go-crond does not support `@reboot`, so the wrapper is what
+guarantees the catch-up happens at every scheduler start:
 
 ```sh
 mkdir -p /home/rane/code/stockey/logs/cron
 python builder.py
 python scripts/cron_preflight.py
-./go-crond config/stockey.generated.crontab --allow-unprivileged
+./start_cron.sh
 ```
+
+Starting `./go-crond config/stockey.generated.crontab --allow-unprivileged` directly
+still works but skips the startup OHLCV reconciliation (the 18:45 scheduled
+`all_ohlcv_reconcile.sh` entry and the Operator Health `ohlcv_universe_coverage` check
+still cover the gap later).
 
 If you install it with a normal per-user `crontab`, first remove the username column from every job line. The generated file is system-crontab/go-crond style.
 
@@ -142,8 +151,9 @@ Starting `go-crond` schedules the jobs; it does **not** run them all immediately
 - **It is time-based and weekday-bound.** Almost every job runs Mon-Fri only (`* * 1-5`); `all_ml.sh` is Sunday `03:10` and `all_technical_threshold_calibration.sh` is Saturday `04:20`. If you start `go-crond` on a weekend, only `./all_frontend.sh` (every 5 min, all days) runs until Monday. Nothing "catches up" for a slot that already passed.
 - **`go-crond` is foreground and unsupervised.** The crontab does not restart `go-crond` itself, and there is no launchd/systemd unit by default. Run it under `nohup`/`tmux` (or a launchd agent) so it survives a closed terminal or reboot:
   ```sh
-  nohup ./go-crond config/stockey.generated.crontab --allow-unprivileged >> logs/cron/go-crond.log 2>&1 &
+  nohup ./start_cron.sh >> logs/cron/go-crond.log 2>&1 &
   ```
+  (`start_cron.sh` runs the OHLCV coverage reconciliation first, then execs `go-crond`.)
 - **Live Dhan data needs the Chrome CDP session.** The daily downloader/advisory jobs authenticate Dhan through Chrome remote debugging. Start it first and keep `CDP_ENDPOINT=http://localhost:9222`:
   ```sh
   scripts/start_chrome_cdp.sh
