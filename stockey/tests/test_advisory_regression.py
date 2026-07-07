@@ -1475,6 +1475,8 @@ def test_build_constituents_includes_market_action_scan(monkeypatch):
     from advisory import hypothesis_screeners as _hs
     monkeypatch.setattr(_hs, "HYPOTHESIS_SCREENERS_ENABLED", False)
 
+    from advisory import screener_retention as _sret
+    monkeypatch.setattr(_sret, "apply_retention", lambda frame, **_k: frame)
     out = sp.build_constituents()
     assert len(out) == 1 and out.iloc[0]["screener_slug"] == mas.SCAN_SLUG
 
@@ -47415,6 +47417,96 @@ def test_news_overlay_engine_rebuild_cleanup_uses_retryable_operation(monkeypatc
     assert upserts == [(news_overlay_engine.TABLE_NAME, 1)]
 
 
+def _retention_prior_row(slug, ticker, date, raw=None):
+    return {"date": pd.Timestamp(date, tz="UTC"), "screener_slug": slug, "screener_name": "S",
+            "screener_url": None, "ticker": ticker, "exchange": "NSE", "company_master_id": f"cm-{ticker}",
+            "security_id": None, "instrument": None, "isin": None, "display_name": ticker,
+            "rank": 1, "raw_item_json": raw}
+
+
+def test_screener_retention_re_emits_and_expires(monkeypatch):
+    from advisory import screener_retention as sret
+
+    exits_written: list[pd.DataFrame] = []
+    prior = pd.DataFrame([
+        # scan member seen yesterday, admitted yesterday -> retained (window 10)
+        _retention_prior_row("market-action-scan-v1", "FRESHSCAN", "2026-07-06"),
+        # scan member admitted 12 days ago (carried admitted_date) -> window lapsed -> exit
+        _retention_prior_row("market-action-scan-v1", "OLDSCAN", "2026-07-06",
+                             raw=json.dumps({"retained": True, "admitted_date": "2026-06-25"})),
+        # quality-screen dropout 3 days ago -> retained under default 5d window
+        _retention_prior_row("sme-momentum-screen-v1", "QUALDROP", "2026-07-04"),
+        # member still present today -> untouched (no retained twin)
+        _retention_prior_row("sme-momentum-screen-v1", "STILLIN", "2026-07-06"),
+    ])
+    monkeypatch.setattr(sret, "sql_to_df", lambda *a, **k: prior.copy())
+    monkeypatch.setattr(sret, "ensure_exits_table", lambda: None)
+    monkeypatch.setattr(sret, "upsert_to_db", lambda df, *a, **k: exits_written.append(df.copy()))
+
+    today_frame = pd.DataFrame([
+        _retention_prior_row("sme-momentum-screen-v1", "STILLIN", "2026-07-07"),
+    ])
+    out = sret._apply_retention(today_frame, snapshot_date="2026-07-07")
+
+    retained = out[out["raw_item_json"].fillna("").str.contains('"retained": true')]
+    retained_tickers = set(retained["ticker"])
+    assert retained_tickers == {"FRESHSCAN", "QUALDROP"}
+    assert (pd.to_datetime(retained["date"], utc=True).dt.date.astype(str) == "2026-07-07").all()
+    fresh = json.loads(retained[retained["ticker"] == "FRESHSCAN"].iloc[0]["raw_item_json"])
+    assert fresh["admitted_date"] == "2026-07-06" and fresh["retention_window_days"] == 10
+    # STILLIN appears exactly once (today's own row, no twin)
+    assert int((out["ticker"] == "STILLIN").sum()) == 1
+    # OLDSCAN lapsed -> exit recorded, not re-emitted
+    assert "OLDSCAN" not in set(out["ticker"])
+    assert len(exits_written) == 1
+    exit_row = exits_written[0].iloc[0]
+    assert exit_row["symbol"] == "OLDSCAN" and exit_row["exit_reason"] == "retention_lapsed"
+    assert str(pd.Timestamp(exit_row["admitted_date"]).date()) == "2026-06-25"
+
+
+def test_screener_retention_bridges_older_dated_frame_rows(monkeypatch):
+    from advisory import screener_retention as sret
+
+    # fresh scan rows anchored to an OLDER bhavcopy date than the newest snapshot must get a
+    # retained twin at the target date, or the single-MAX-date universe read drops them.
+    monkeypatch.setattr(sret, "sql_to_df", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(sret, "ensure_exits_table", lambda: None)
+    monkeypatch.setattr(sret, "upsert_to_db", lambda *a, **k: None)
+    frame = pd.DataFrame([
+        _retention_prior_row("market-action-scan-v1", "BRIDGED", "2026-07-06"),
+        _retention_prior_row("quality-screen", "ATTARGET", "2026-07-07"),
+    ])
+    out = sret._apply_retention(frame, snapshot_date="2026-07-07")
+    bridged = out[(out["ticker"] == "BRIDGED")]
+    dates = sorted(pd.to_datetime(bridged["date"], utc=True).dt.date.astype(str))
+    assert dates == ["2026-07-06", "2026-07-07"]  # original + retained twin at target
+    twin = bridged[pd.to_datetime(bridged["date"], utc=True).dt.date.astype(str) == "2026-07-07"].iloc[0]
+    assert json.loads(twin["raw_item_json"])["retained"] is True
+
+    # failure degrades to unchanged frame (previous behavior), never raises
+    monkeypatch.setattr(sret, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    monkeypatch.setattr(sret, "record_local_fallback_event", lambda **k: None)
+    unchanged = sret.apply_retention(frame, snapshot_date="2026-07-07")
+    assert len(unchanged) == len(frame)
+
+
+def test_regret_ledger_enrolls_watch_exits(monkeypatch):
+    from advisory import regret_ledger as rl
+
+    def fake_sql(query, params=None):
+        if "FROM advisory_watch_exits" in query:
+            return pd.DataFrame([{"symbol": "OLDSCAN", "screener_slug": "market-action-scan-v1",
+                                  "exit_reason": "retention_lapsed"}])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(rl, "sql_to_df", fake_sql)
+    frame = rl.build_enrollment_rows(pd.Timestamp("2026-07-07", tz="UTC"))
+    exit_rows = frame[frame["stage"] == "watch_exit"]
+    assert len(exit_rows) == 1
+    assert exit_rows.iloc[0]["gate"] == "watch_exit:market-action-scan-v1"
+    assert exit_rows.iloc[0]["symbol"] == "OLDSCAN"
+
+
 def test_hypothesis_screeners_materialize_universe(monkeypatch):
     from advisory import hypothesis_screeners as hs
     from advisory import market_action_scan as mas
@@ -47561,6 +47653,8 @@ def test_build_constituents_includes_hypothesis_screeners(monkeypatch):
     monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", False)
     monkeypatch.setattr(hs, "HYPOTHESIS_SCREENERS_ENABLED", True)
     monkeypatch.setattr(hs, "safe_build_hypothesis_constituents", lambda **_k: hypo_frame.copy())
+    from advisory import screener_retention as _sret
+    monkeypatch.setattr(_sret, "apply_retention", lambda frame, **_k: frame)
     out = sp.build_constituents()
     assert len(out) == 1 and out.iloc[0]["screener_slug"] == "hypothesis-x-v1"
 

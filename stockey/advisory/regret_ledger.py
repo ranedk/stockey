@@ -180,6 +180,24 @@ def build_enrollment_rows(asof_date: pd.Timestamp) -> pd.DataFrame:
             metadata={"asof_date": str(asof_date)},
         )
 
+    try:
+        exits = sql_to_df(
+            """
+            SELECT symbol, screener_slug, exit_reason
+            FROM advisory_watch_exits WHERE asof_date = %s
+            """,
+            params=(asof_date,),
+        )
+        for row in exits.itertuples(index=False):
+            _add(row.symbol, "watch_exit", _text(row.screener_slug) or "unknown", detail=row.exit_reason)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.regret_ledger", source="advisory_watch_exits", severity="warn",
+            fallback_type="regret_ledger_watch_exits_load_failed",
+            reason="Regret ledger could not enroll watch exits for this date.", error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+
     if not rows:
         return pd.DataFrame()
     frame = pd.DataFrame(rows)

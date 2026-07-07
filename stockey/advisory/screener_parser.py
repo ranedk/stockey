@@ -294,8 +294,16 @@ def build_constituents(
             if not hypothesis_frame.empty:
                 frames.append(hypothesis_frame)
     if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+        combined = pd.DataFrame()
+    else:
+        combined = pd.concat(frames, ignore_index=True)
+    if screener_slug is None:
+        # Enter fast, exit slow: recently-admitted members of event-day sources are retained
+        # for their per-source window; lapsed members get a recorded exit (never silent).
+        from advisory.screener_retention import apply_retention
+
+        combined = apply_retention(combined, snapshot_date=snapshot_date)
+    return combined
 
 
 def persist_constituents(df: pd.DataFrame) -> None:
