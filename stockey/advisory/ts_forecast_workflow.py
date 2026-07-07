@@ -72,9 +72,41 @@ def _as_symbol_list(values: list[str] | None) -> list[str]:
 
 def _cap_symbols(symbols: list[str], *, max_symbols: int | None) -> list[str]:
     unique = sorted({str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()})
-    if max_symbols is None or int(max_symbols) <= 0:
+    if max_symbols is None or int(max_symbols) <= 0 or len(unique) <= int(max_symbols):
         return unique
-    return unique[: int(max_symbols)]
+    # Priority truncation, not alphabetical: watch-active-tier names first, then by
+    # cross-sectional RS percentile, alphabetical only as the final tiebreak. Best-effort --
+    # lookup failures degrade to the previous alphabetical order.
+    active_tier: set[str] = set()
+    try:
+        from utils.db import sql_to_df
+
+        tiers = sql_to_df(
+            "SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol FROM advisory_watchlist "
+            "WHERE asof_date = (SELECT MAX(asof_date) FROM advisory_watchlist) "
+            "AND COALESCE(watch_tier, 'active') = 'active' AND UPPER(TRIM(symbol)) = ANY(%s)",
+            params=(unique,),
+        )
+        if not tiers.empty:
+            active_tier = set(tiers["symbol"].dropna().tolist())
+    except Exception:
+        active_tier = set()
+    rs_map: dict[str, float] = {}
+    try:
+        from advisory.relative_strength import load_rs_percentiles
+
+        rs_map = load_rs_percentiles(unique)
+    except Exception:
+        rs_map = {}
+    ranked = sorted(
+        unique,
+        key=lambda symbol: (
+            0 if symbol in active_tier else 1,
+            -(rs_map.get(symbol) or 0.0),
+            symbol,
+        ),
+    )
+    return ranked[: int(max_symbols)]
 
 
 def _record_ts_workflow_fallback(

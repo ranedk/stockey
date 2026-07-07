@@ -92,6 +92,10 @@ const sectionCounts = computed(() => ({
               <button class="underline-offset-2 hover:underline" @click="whySymbol = String(row.symbol)">{{ display(row.symbol) }}</button>
               <span v-if="row.is_playbook_signal || row.hypothesis_id"
                     class="ml-2 rounded-full border border-moss/25 bg-moss/10 px-2 py-0.5 text-[10px] font-bold uppercase text-moss">hypothesis</span>
+              <span v-if="row.watch_tier === 'shelf'" :title="String(row.watch_tier_basis || 'shelf tier: daily bars, periodic ingest')"
+                    class="ml-2 rounded-full border border-ink/15 bg-ink/5 px-2 py-0.5 text-[10px] font-bold uppercase text-ink/50">shelf</span>
+              <span v-else-if="row.watch_tier === 'active'" :title="String(row.watch_tier_basis || '')"
+                    class="ml-2 rounded-full border border-amber-500/25 bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold uppercase text-amber-700">active</span>
             </td>
             <td class="px-4 py-3 text-ink/70">{{ whyWatching(row) }}</td>
             <td class="px-4 py-3 text-ink/70">{{ waitingFor(row) }}</td>

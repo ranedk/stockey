@@ -46595,7 +46595,9 @@ def test_watchlist_builder_ensure_table_uses_schema_registry(monkeypatch):
 
     watchlist_builder.ensure_watchlist_table()
 
-    assert len(calls) == 2
+    assert len(calls) == 3
+    assert calls[2]["migration_id"] == watchlist_builder.WATCH_TIER_MIGRATION_ID
+    assert any("watch_tier TEXT" in statement for statement in calls[2]["statements"])
     assert calls[0]["migration_id"] == watchlist_builder.WATCHLIST_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"]["tables"] == [watchlist_builder.TABLE_NAME]
     assert any(watchlist_builder.TABLE_NAME in statement for statement in calls[0]["statements"])
@@ -47507,6 +47509,90 @@ def test_regret_ledger_enrolls_watch_exits(monkeypatch):
     assert len(exit_rows) == 1
     assert exit_rows.iloc[0]["gate"] == "watch_exit:market-action-scan-v1"
     assert exit_rows.iloc[0]["symbol"] == "OLDSCAN"
+
+
+def _tier_row(symbol, state="WATCH_EVENT", rs=None, event_class=None, hint=None):
+    return {"symbol": symbol, "current_state": state, "rs_percentile": rs,
+            "last_event_class": event_class, "last_state_transition_hint": hint}
+
+
+def test_watch_tier_truth_table_and_overflow_cap(monkeypatch):
+    monkeypatch.setattr(watchlist_builder, "_open_holding_symbols", lambda: {"HELDCO"})
+    frame = pd.DataFrame([
+        _tier_row("NEARTRIG", state="PASS_NOW"),
+        _tier_row("BREAKOUT", state="WATCH_BREAKOUT"),
+        _tier_row("HELDCO"),
+        _tier_row("STRONGRS", rs=92.0),
+        _tier_row("EVENTHOT", event_class="ORDER_WIN"),
+        _tier_row("HINTED", hint="UPGRADE_TO_PASS_NOW"),
+        _tier_row("SLEEPY", rs=40.0),
+        _tier_row("NODATA"),
+    ])
+    out = watchlist_builder.assign_watch_tiers(frame.copy())
+    tiers = dict(zip(out["symbol"], out["watch_tier"]))
+    assert tiers == {"NEARTRIG": "active", "BREAKOUT": "active", "HELDCO": "active",
+                     "STRONGRS": "active", "EVENTHOT": "active", "HINTED": "active",
+                     "SLEEPY": "shelf", "NODATA": "shelf"}
+    basis = dict(zip(out["symbol"], out["watch_tier_basis"]))
+    assert basis["NEARTRIG"] == "near_trigger"
+    assert basis["HELDCO"] == "held_position"
+    assert basis["SLEEPY"] == "shelf_default"
+
+    # overflow: cap 2 -> held + highest-priority state keep slots, rest demoted visibly
+    monkeypatch.setattr(watchlist_builder, "ACTIVE_TIER_MAX", 2)
+    capped = watchlist_builder.assign_watch_tiers(frame.copy())
+    kept = set(capped.loc[capped["watch_tier"] == "active", "symbol"])
+    assert kept == {"HELDCO", "NEARTRIG"}  # held first, then PASS_NOW state priority
+    demoted = capped[capped["watch_tier_basis"] == "active_overflow"]
+    assert len(demoted) == 4
+
+
+def test_ohlcv_cycle_tier_gate(monkeypatch):
+    synced: list[list[str]] = []
+    universe = pd.DataFrame([
+        {"symbol": "ACTIVECO", "watch_tier": "active", "monitor_source": "watchlist"},
+        {"symbol": "SHELFCO", "watch_tier": "shelf", "monitor_source": "watchlist"},
+        {"symbol": "HELDCO", "watch_tier": "shelf", "monitor_source": "position"},
+        {"symbol": "LEGACYCO", "watch_tier": None, "monitor_source": "watchlist"},
+    ])
+    monkeypatch.setattr(continuous_watch, "load_monitored_universe", lambda **_k: universe.copy())
+    monkeypatch.setattr(continuous_watch, "load_sync_state", lambda *_a, **_k: {})
+    monkeypatch.setattr(continuous_watch, "persist_sync_state", lambda **_k: None)
+    monkeypatch.setattr(continuous_watch, "sync_many_intraday", lambda symbols, **_k: synced.append(list(symbols)) or [])
+    monkeypatch.setattr(continuous_watch, "build_price_alerts", lambda *_a, **_k: pd.DataFrame())
+    result = continuous_watch.run_ohlcv_cycle(interval_seconds=600)
+    assert synced, "sync_many_intraday not invoked"
+    # shelf watch row excluded; position + untiered (fail-open) + active retained
+    assert synced[0] == ["ACTIVECO", "HELDCO", "LEGACYCO"]
+
+
+def test_ingest_cap_prefers_active_tier(monkeypatch):
+    working = pd.DataFrame([
+        {"company_master_id": f"cm-{i}", "symbol": f"S{i}", "setup_id": "X",
+         "last_checked_at": pd.Timestamp("2026-07-01", tz="UTC"),
+         "watch_tier": "shelf" if i < 3 else "active"}
+        for i in range(6)
+    ])
+    monkeypatch.setattr(announcement_watch, "load_company_ingest_watermarks", lambda *a, **k: {})
+    prepared, targets = announcement_watch._prepare_watchlist_for_ingest(
+        working, effective_to=pd.Timestamp("2026-07-07", tz="UTC")
+    )
+    assert "tier_active" in targets.columns
+    tier_map = dict(zip(targets["symbol"], targets["tier_active"]))
+    assert tier_map["S0"] == False and tier_map["S5"] == True  # noqa: E712
+
+
+def test_ts_forecast_cap_orders_by_tier_and_rs(monkeypatch):
+    from advisory import ts_forecast_workflow as tsw
+
+    def fake_sql(query, params=None):
+        return pd.DataFrame([{"symbol": "ACTIVECO"}])
+
+    monkeypatch.setattr("utils.db.sql_to_df", fake_sql)
+    import advisory.relative_strength as rs_mod
+    monkeypatch.setattr(rs_mod, "load_rs_percentiles", lambda symbols, **_k: {"HIGHRS": 95.0, "MIDRS": 60.0})
+    out = tsw._cap_symbols(["ZLOWRS", "MIDRS", "HIGHRS", "ACTIVECO"], max_symbols=2)
+    assert out == ["ACTIVECO", "HIGHRS"]  # active tier first, then RS desc; alphabetical last
 
 
 def test_theme_screeners_emit_positive_universe_and_enforce_decay(monkeypatch):

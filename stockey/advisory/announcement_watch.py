@@ -40,6 +40,9 @@ INITIAL_INGEST_LOOKBACK_DAYS = 3
 # Overlap re-scanned before the durable watermark so a late/amended filing near the
 # last checkpoint is not skipped. Matches the historical `last_checked - 1 day` logic.
 INGEST_OVERLAP_DAYS = env.int("ANNOUNCEMENT_INGEST_OVERLAP_DAYS", default=1)
+# EOD full-ingest age gate for shelf-tier watch rows: shelf names still ingest, just at
+# most once per this many days; active tier ingests every run. Operational attention only.
+SHELF_INGEST_MAX_AGE_DAYS = env.int("SHELF_INGEST_MAX_AGE_DAYS", default=2)
 DEFAULT_MARKET_CONTEXT_WATCH_LIMIT = env.int("MARKET_CONTEXT_WATCH_LIMIT", default=50)
 DEFAULT_THEME_CONTEXT_WATCH_LIMIT = env.int("THEME_CONTEXT_WATCH_LIMIT", default=50)
 DEFAULT_ANNOUNCEMENT_CONTEXT_WATCH_LIMIT = env.int("ANNOUNCEMENT_CONTEXT_WATCH_LIMIT", default=50)
@@ -1638,11 +1641,16 @@ def _prepare_watchlist_for_ingest(
             published_from = last_checked - pd.Timedelta(days=INGEST_OVERLAP_DAYS)
         working.at[index, "published_from"] = published_from
 
+    if "watch_tier" not in working.columns:
+        working["watch_tier"] = pd.NA
+    # a target counts as active-tier when ANY of its watch rows is active or untiered (fail-open)
+    working["_tier_active"] = ~working["watch_tier"].astype("string").str.lower().eq("shelf")
     unique_ingest_targets = (
         working.groupby(["company_master_id", "symbol"], dropna=False, sort=True)
         .agg(
             published_from=("published_from", "min"),
             watch_rows=("setup_id", "count"),
+            tier_active=("_tier_active", "max"),
         )
         .reset_index()
     )
@@ -1769,10 +1777,37 @@ def run_announcement_ingest(
     effective_max_ingest_targets = int(max_ingest_targets or 0)
     skipped_ingest_target_count = 0
     original_watch_count = int(len(watchlist))
+    if effective_max_ingest_targets == 0 and total_targets > 0 and "tier_active" in unique_ingest_targets.columns:
+        # EOD full-ingest path: active-tier targets always ingest; shelf targets only when
+        # not checked within SHELF_INGEST_MAX_AGE_DAYS (published_from = last_checked -
+        # overlap, so recently-checked shelf targets have a recent published_from).
+        # Operational attention only -- every shelf name still ingests every ~N days.
+        shelf_recent_cutoff = effective_to - pd.Timedelta(days=SHELF_INGEST_MAX_AGE_DAYS) - pd.Timedelta(days=INGEST_OVERLAP_DAYS)
+        published_from_ts = pd.to_datetime(unique_ingest_targets["published_from"], utc=True, errors="coerce")
+        shelf_and_recent = (
+            ~unique_ingest_targets["tier_active"].fillna(True).astype(bool)
+            & published_from_ts.notna()
+            & (published_from_ts > shelf_recent_cutoff)
+        )
+        if bool(shelf_and_recent.any()):
+            skipped = int(shelf_and_recent.sum())
+            unique_ingest_targets = unique_ingest_targets[~shelf_and_recent].reset_index(drop=True)
+            _emit_progress(
+                "[advisory.announcement_watch] shelf-tier ingest age gate "
+                f"skipped={skipped} of {total_targets} targets (checked within {SHELF_INGEST_MAX_AGE_DAYS}d); "
+                f"remaining={len(unique_ingest_targets)}"
+            )
+            total_targets = int(len(unique_ingest_targets))
     if effective_max_ingest_targets > 0 and total_targets > effective_max_ingest_targets:
+        # Active tier wins the capped slots first; within a tier, longest-unchecked first.
+        tier_rank = (
+            ~unique_ingest_targets.get("tier_active", pd.Series(True, index=unique_ingest_targets.index)).fillna(True).astype(bool)
+        ).astype(int)
         unique_ingest_targets = (
             unique_ingest_targets
-            .sort_values(["published_from", "symbol"], ascending=[True, True], na_position="first")
+            .assign(_tier_rank=tier_rank)
+            .sort_values(["_tier_rank", "published_from", "symbol"], ascending=[True, True, True], na_position="first")
+            .drop(columns=["_tier_rank"])
             .head(effective_max_ingest_targets)
             .reset_index(drop=True)
         )

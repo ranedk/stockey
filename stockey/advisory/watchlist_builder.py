@@ -31,6 +31,16 @@ TECHNICAL_DAILY_TABLE = "advisory_technical_daily"
 TECHNICAL_REFRESH_STATUS_TABLE = "advisory_technical_feature_refresh_status"
 WATCHLIST_SCHEMA_MIGRATION_ID = "20260611_advisory_watchlist_base"
 WATCHLIST_CONTEXT_OVERLAY_SCHEMA_MIGRATION_ID = "20260622_advisory_watchlist_context_overlay_columns"
+WATCH_TIER_MIGRATION_ID = "20260708_advisory_watchlist_watch_tier"
+WATCH_TIER_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE advisory_watchlist ADD COLUMN IF NOT EXISTS watch_tier TEXT",
+    f"ALTER TABLE advisory_watchlist ADD COLUMN IF NOT EXISTS watch_tier_basis TEXT",
+]
+# Tier gates OPERATIONAL attention only (intraday sync cadence, ingest slots, evaluation
+# depth) -- never authority. A shelf name that triggers on daily bars still becomes a BUY.
+WATCH_TIER_RS_MIN = float(os.getenv("WATCH_TIER_RS_MIN", "80"))
+ACTIVE_TIER_MAX = int(os.getenv("ACTIVE_TIER_MAX", "60"))
+ACTIVE_TIER_STATES = {"PASS_NOW", "WATCH_BREAKOUT"}
 CONTEXT_OVERLAY_SETUP_ID = "CONTEXT_OVERLAY_WATCH"
 CONTEXT_OVERLAY_SETUP_NAME = "Layered Context Overlay Watch"
 CONTEXT_OVERLAY_SIGNAL_REFRESH_SYNC_SOURCE = "advisory:signal_refresh:context_overlays"
@@ -214,6 +224,12 @@ def ensure_watchlist_table() -> None:
         migration_id=WATCHLIST_CONTEXT_OVERLAY_SCHEMA_MIGRATION_ID,
         description="Add context-overlay provenance columns to advisory watchlist.",
         statements=WATCHLIST_CONTEXT_OVERLAY_SCHEMA_STATEMENTS,
+        metadata={"tables": [TABLE_NAME], "depends_on": WATCHLIST_SCHEMA_MIGRATION_ID},
+    )
+    apply_schema_migration(
+        migration_id=WATCH_TIER_MIGRATION_ID,
+        description="Add the operational attention tier (active/shelf) and its basis to the watchlist.",
+        statements=WATCH_TIER_SCHEMA_STATEMENTS,
         metadata={"tables": [TABLE_NAME], "depends_on": WATCHLIST_SCHEMA_MIGRATION_ID},
     )
 
@@ -2658,6 +2674,8 @@ def build_watchlist(
     for column in ["state_updated_at", "watch_started_at", "last_checked_at", "last_document_published_on", "load_ts"]:
         out[column] = pd.to_datetime(out[column], utc=True, errors="coerce")
 
+    out = assign_watch_tiers(out)
+
     ordered_cols = [
         "asof_date",
         "setup_id",
@@ -2699,9 +2717,73 @@ def build_watchlist(
         "context_reliability_classification",
         "context_class_reliability_classification",
         "context_reliability_evaluated_at",
+        "watch_tier",
+        "watch_tier_basis",
         "load_ts",
     ]
     return out[ordered_cols].drop_duplicates(subset=["asof_date", "setup_id", "symbol"], keep="last")
+
+
+def _open_holding_symbols() -> set[str]:
+    try:
+        frame = sql_to_df(
+            "SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol FROM advisory_operator_holdings "
+            "WHERE COALESCE(status, 'open') = 'open'"
+        )
+        return set(frame["symbol"].dropna().tolist()) if not frame.empty else set()
+    except Exception:
+        return set()
+
+
+def assign_watch_tiers(out: pd.DataFrame) -> pd.DataFrame:
+    """Operational attention tier: `active` rows get intraday sync, priority ingest slots,
+    and full EOD ingestion; `shelf` rows ride daily bars with periodic ingest. Deterministic
+    -- active if near trigger, held, market-wide strong (RS), or event-hot -- and bounded
+    (ACTIVE_TIER_MAX, ranked by state priority then RS; overflow demoted visibly).
+    Tier NEVER touches authority: a shelf name that triggers still becomes a BUY.
+    """
+    if out.empty:
+        out["watch_tier"] = pd.Series(dtype="string")
+        out["watch_tier_basis"] = pd.Series(dtype="string")
+        return out
+    state = out["current_state"].astype("string").str.upper().fillna("")
+    near_trigger = state.isin(ACTIVE_TIER_STATES)
+    held = out["symbol"].astype("string").str.upper().isin(_open_holding_symbols())
+    rs = pd.to_numeric(out["rs_percentile"], errors="coerce") if "rs_percentile" in out.columns else pd.Series(pd.NA, index=out.index)
+    strong_rs = rs.fillna(-1) >= WATCH_TIER_RS_MIN
+    event_hot = out["last_event_class"].notna() | out["last_state_transition_hint"].notna()
+
+    basis_parts = pd.DataFrame(
+        {
+            "near_trigger": near_trigger.map(lambda flag: "near_trigger" if flag else None),
+            "held": held.map(lambda flag: "held_position" if flag else None),
+            "rs": strong_rs.map(lambda flag: "strong_rs" if flag else None),
+            "event": event_hot.map(lambda flag: "event_hot" if flag else None),
+        }
+    )
+    basis = basis_parts.apply(lambda row: ",".join(part for part in row if part), axis=1)
+    active_mask = near_trigger | held | strong_rs | event_hot
+    out["watch_tier"] = pd.Series("shelf", index=out.index, dtype="string").where(~active_mask, "active")
+    out["watch_tier_basis"] = basis.where(active_mask, "shelf_default").astype("string")
+
+    active_count = int(active_mask.sum())
+    cap = max(1, ACTIVE_TIER_MAX)
+    if active_count > cap:
+        state_priority = state.map(lambda value: 3 if value == "PASS_NOW" else (2 if value == "WATCH_BREAKOUT" else 1))
+        rank_order = (
+            out.loc[active_mask]
+            .assign(_sp=state_priority.loc[active_mask], _rs=rs.loc[active_mask].fillna(-1), _held=held.loc[active_mask])
+            .sort_values(["_held", "_sp", "_rs"], ascending=[False, False, False], kind="stable")
+        )
+        overflow_index = rank_order.index[cap:]
+        out.loc[overflow_index, "watch_tier"] = "shelf"
+        out.loc[overflow_index, "watch_tier_basis"] = "active_overflow"
+        print(
+            f"[watchlist_builder] active tier capped: {active_count} qualified, {cap} kept, "
+            f"{len(overflow_index)} demoted to shelf (active_overflow)",
+            flush=True,
+        )
+    return out
 
 
 def persist_watchlist(df: pd.DataFrame, *, rebuild: bool = False, asof_date: pd.Timestamp | None = None) -> None:

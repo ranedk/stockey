@@ -4358,6 +4358,8 @@ COMPACT_LIST_FIELDS = {
     "unique_id",
     "setup_id",
     "setup_name",
+    "watch_tier",
+    "watch_tier_basis",
     "source_type",
     "event_type",
     "subject",

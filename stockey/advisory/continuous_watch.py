@@ -1146,7 +1146,20 @@ def run_ohlcv_cycle(
     if watchlist.empty:
         persist_sync_state(source_name=source_name, status="ok", state={"reason": "no_watchlist_symbols"}, last_success_at=pd.Timestamp.utcnow())
         return {"status": "ok", "symbol_count": 0, "sync_results": [], "alert_count": 0}
+    # Intraday sync = active tier + open positions only (operational attention, not
+    # authority). Shelf names ride daily bars via the nightly reconcile; rows without a
+    # tier (pre-tier builds) stay synced (fail-open to previous behavior).
+    total_universe = int(watchlist["symbol"].nunique())
+    if "watch_tier" in watchlist.columns:
+        tier = watchlist["watch_tier"].astype("string").str.lower()
+        is_position = watchlist.get("monitor_source", pd.Series("", index=watchlist.index)).astype("string").str.lower().eq("position")
+        watchlist = watchlist[tier.isna() | tier.ne("shelf") | is_position]
     symbols = sorted(watchlist["symbol"].dropna().astype(str).str.upper().unique().tolist())
+    if len(symbols) < total_universe:
+        _emit(
+            f"[advisory.continuous_watch] ohlcv tier gate: syncing {len(symbols)}/{total_universe} symbols "
+            "(active tier + positions); shelf rides daily bars"
+        )
     state = load_sync_state(source_name) or {}
     previous_cursor = pd.to_datetime(state.get("last_item_ts"), utc=True, errors="coerce")
     if pd.isna(previous_cursor):
