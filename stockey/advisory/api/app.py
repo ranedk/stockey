@@ -3612,11 +3612,19 @@ def build_workbench_payload(*, top_n: int = 8) -> dict[str, Any]:
 def build_market_context_payload(*, asof_date: str | None = None, limit: int = 50) -> dict[str, Any]:
     parsed_asof = _parse_asof_date(asof_date)
     payload = load_latest_market_context(parsed_asof, limit=max(0, int(limit)))
+    try:
+        from advisory.regime_admission_policy import resolve_active_policy
+
+        admission = resolve_active_policy(parsed_asof, record_if_missing=False)
+    except Exception:
+        admission = {}
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/market-context", schema_name="operator_market_context"),
         "asof_date": asof_date,
         "summary": payload.get("summary") or {},
+        "admission_state": admission.get("state"),
+        "admission_parameters": admission or None,
         "top_universe": payload.get("top_universe") or [],
     }
 

@@ -47406,6 +47406,132 @@ def test_news_overlay_engine_rebuild_cleanup_uses_retryable_operation(monkeypatc
     assert upserts == [(news_overlay_engine.TABLE_NAME, 1)]
 
 
+def test_regime_admission_raw_state_truth_table():
+    from advisory import regime_admission_policy as rap
+
+    risk_on_inputs = {"participation": "benchmark_uptrend", "breadth_above_dma50_pct": 62.0,
+                      "macro_risk_state": "NORMAL", "risk_off_flag": False}
+    assert rap.resolve_raw_state(risk_on_inputs) == rap.RISK_ON
+    # weak breadth blocks risk_on
+    assert rap.resolve_raw_state({**risk_on_inputs, "breadth_above_dma50_pct": 40.0}) == rap.NEUTRAL
+    # elevated macro blocks risk_on
+    assert rap.resolve_raw_state({**risk_on_inputs, "macro_risk_state": "ELEVATED"}) == rap.RISK_OFF
+    # risk_off precedence: downtrend or flag wins even with strong breadth
+    assert rap.resolve_raw_state({**risk_on_inputs, "participation": "benchmark_downtrend"}) == rap.RISK_OFF
+    assert rap.resolve_raw_state({**risk_on_inputs, "risk_off_flag": True}) == rap.RISK_OFF
+    # missing everything -> neutral
+    assert rap.resolve_raw_state({}) == rap.NEUTRAL
+
+
+def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
+    from advisory import regime_admission_policy as rap
+
+    writes: list[pd.DataFrame] = []
+    monkeypatch.setattr(rap, "ensure_table", lambda: None)
+    monkeypatch.setattr(rap, "upsert_to_db", lambda df, *a, **k: writes.append(df.copy()))
+    monkeypatch.setattr(rap, "resolve_inputs", lambda asof: {"participation": "benchmark_uptrend",
+                                                             "breadth_above_dma50_pct": 70.0,
+                                                             "macro_risk_state": "NORMAL",
+                                                             "risk_off_flag": False})
+
+    # day 2 of raw risk_on after neutral: no flip yet (confirm days = 3)
+    monkeypatch.setattr(rap, "_previous_policy_row",
+                        lambda asof: {"raw_state": "risk_on", "effective_state": "neutral", "consecutive_days": 1})
+    result = rap.resolve_and_record("2026-07-08")
+    assert result["raw_state"] == rap.RISK_ON and result["effective_state"] == rap.NEUTRAL
+    assert result["consecutive_days"] == 2
+
+    # day 3: flip confirmed
+    monkeypatch.setattr(rap, "_previous_policy_row",
+                        lambda asof: {"raw_state": "risk_on", "effective_state": "neutral", "consecutive_days": 2})
+    result = rap.resolve_and_record("2026-07-09")
+    assert result["effective_state"] == rap.RISK_ON and result["consecutive_days"] == 3
+    assert result["parameters"]["scan_limit"] == 50
+
+    # risk_off flips immediately regardless of streak (safety)
+    monkeypatch.setattr(rap, "resolve_inputs", lambda asof: {"participation": "benchmark_downtrend"})
+    monkeypatch.setattr(rap, "_previous_policy_row",
+                        lambda asof: {"raw_state": "risk_on", "effective_state": "risk_on", "consecutive_days": 9})
+    result = rap.resolve_and_record("2026-07-10")
+    assert result["raw_state"] == rap.RISK_OFF and result["effective_state"] == rap.RISK_OFF
+    assert result["consecutive_days"] == 1
+    assert result["parameters"]["market_cap_below_tolerance"] == 0.85
+    assert len(writes) == 3  # every decision recorded
+
+
+def test_regime_admission_resolve_active_policy_fails_open_to_neutral(monkeypatch):
+    from advisory import regime_admission_policy as rap
+
+    monkeypatch.setattr(rap, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(rap, "record_local_fallback_event", lambda **k: None)
+    params = rap.resolve_active_policy("2026-07-07")
+    # neutral == the previous hardcoded literals, byte for byte
+    assert params["state"] == rap.NEUTRAL
+    assert params["market_cap_below_tolerance"] == 0.70
+    assert params["market_cap_above_tolerance"] == 1.30
+    assert params["liquidity_floor_multiplier"] == 0.50
+    assert params["scan_limit"] == 30
+
+
+def test_rule_engine_admission_tolerances_flex_market_cap_band():
+    setup = {
+        "setup_id": "TEST",
+        "market_cap_min": 100.0,
+        "score_thresholds": {"pass_now": 0.68, "watch_breakout": 0.58, "watch_event": 0.48, "near_miss_gap": 0.05},
+    }
+    row = pd.Series(
+        {
+            "company_master_id": "nse:ABC",
+            "adj_close": 100.0,
+            "fundamentals_freshness_status": "fresh",
+            "market_cap": 60.0,   # below min*0.70=70 (neutral hard reject) but above min*0.50=50 (risk_on)
+            "avg_traded_value_20d": 1_000_000_000.0,
+            "breakout_extension_pct": 1.0,
+            "pass_above_dma_20": True,
+            "pass_above_dma_50": True,
+            "pass_above_dma_200": True,
+            "rs_vs_benchmark": 0.1,
+            "rs_vs_sector": 0.1,
+        }
+    )
+    # default (no admission dict) == neutral literals -> hard reject, detail names the policy
+    _, _, rejections = rule_engine.evaluate_setup_row(row, regime_name="STABLE", overlay_name="NONE", setup=setup)
+    below = [r for r in rejections if r["reason_code"] == "market_cap_below_min"]
+    assert below and "admission_state=neutral" in below[0]["reason_detail"]
+
+    # risk_on admission widens the band -> no hard reject (soft below_target instead)
+    risk_on = {"state": "risk_on", "market_cap_below_tolerance": 0.50,
+               "market_cap_above_tolerance": 1.60, "liquidity_floor_multiplier": 0.35}
+    _, details, rejections = rule_engine.evaluate_setup_row(
+        row, regime_name="STABLE", overlay_name="NONE", setup=setup, admission=risk_on)
+    assert all(r["reason_code"] != "market_cap_below_min" for r in rejections)
+    assert "market_cap:below_target" in details["soft_failures"]
+
+
+def test_market_action_scan_limit_resolves_from_admission_policy(monkeypatch):
+    from advisory import market_action_scan as mas
+    from advisory import regime_admission_policy as rap
+
+    calls = {"n": 0}
+
+    def fake_sql(query, params=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return pd.DataFrame([{"d": pd.Timestamp("2026-07-07")}])
+        return pd.DataFrame(
+            [
+                {"symbol": f"S{i}", "company_master_id": f"cm-{i}", "isin": f"INE{i}", "close": 100.0 + i,
+                 "breakout_pct": 5.0, "volume_multiple": 10.0 - i * 0.1, "volume": 1e6, "avg_turnover_inr": 9e7}
+                for i in range(20)
+            ]
+        )
+
+    monkeypatch.setattr(mas, "sql_to_df", fake_sql)
+    monkeypatch.setattr(rap, "resolve_active_policy", lambda *a, **k: {"state": "risk_off", "scan_limit": 4})
+    frame = mas.scan_market_action()  # no explicit limit -> policy decides
+    assert len(frame) == 4
+
+
 def test_rule_engine_resolves_overlay_screeners_and_softens_blocked_overlay_by_default(monkeypatch):
     monkeypatch.delenv(rule_engine.RULE_ENGINE_OVERLAY_LABEL_HARD_BLOCK_ENABLED_ENV, raising=False)
     setup = {

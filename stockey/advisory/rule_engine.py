@@ -1439,7 +1439,7 @@ def map_technical_state_to_candidate_state(technical_state: str | None) -> str:
     return "REJECT"
 
 
-def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, setup: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, setup: dict[str, Any], admission: dict[str, Any] | None = None) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     thresholds = {**DEFAULT_SCORE_THRESHOLDS, **(setup.get("score_thresholds") or {})}
     freshness_policy = get_freshness_policy(setup)
     intraday_usage_mode = get_intraday_usage_mode(setup)
@@ -1495,24 +1495,34 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     if pd.isna(row.get("fundamentals_freshness_status")) and fundamentals_required:
         rejections.append(build_rejection("missing_fundamental_snapshot", "fundamental snapshot missing for date", severity="hard"))
 
+    # Admission tolerances flex with the recorded regime admission state (top-of-funnel width
+    # only; entry confirmation and risk gates never flex). Neutral defaults reproduce the
+    # previous hardcoded literals exactly. The applied tolerance + state is recorded in the
+    # rejection detail so the regret ledger's gate rows carry the policy that produced them.
+    admission = admission or {}
+    admission_state = str(admission.get("state") or "neutral")
+    mcap_below_tolerance = float(admission.get("market_cap_below_tolerance") or 0.70)
+    mcap_above_tolerance = float(admission.get("market_cap_above_tolerance") or 1.30)
+    liquidity_floor_multiplier = float(admission.get("liquidity_floor_multiplier") or 0.50)
+
     market_cap = safe_float(row.get("market_cap"))
     market_cap_min = safe_float(setup.get("market_cap_min"))
     market_cap_max = safe_float(setup.get("market_cap_max"))
     if market_cap_min is not None:
-        if market_cap is None or market_cap < (market_cap_min * 0.70):
-            rejections.append(build_rejection("market_cap_below_min", f"market_cap={market_cap}", severity="hard"))
+        if market_cap is None or market_cap < (market_cap_min * mcap_below_tolerance):
+            rejections.append(build_rejection("market_cap_below_min", f"market_cap={market_cap} tolerance={mcap_below_tolerance} admission_state={admission_state}", severity="hard"))
         elif market_cap < market_cap_min:
             soft_failures.append("market_cap:below_target")
     if market_cap_max is not None:
-        if market_cap is None or market_cap > (market_cap_max * 1.30):
-            rejections.append(build_rejection("market_cap_above_max", f"market_cap={market_cap}", severity="hard"))
+        if market_cap is None or market_cap > (market_cap_max * mcap_above_tolerance):
+            rejections.append(build_rejection("market_cap_above_max", f"market_cap={market_cap} tolerance={mcap_above_tolerance} admission_state={admission_state}", severity="hard"))
         elif market_cap > market_cap_max:
             soft_failures.append("market_cap:above_target")
 
     traded_value = safe_float(row.get("avg_traded_value_20d"))
     min_liquidity = safe_float(setup.get("min_avg_traded_value_20d"))
-    if min_liquidity is not None and (traded_value is None or traded_value < (min_liquidity * 0.50)):
-        rejections.append(build_rejection("liquidity_far_below_min", f"avg_traded_value_20d={traded_value}", severity="hard"))
+    if min_liquidity is not None and (traded_value is None or traded_value < (min_liquidity * liquidity_floor_multiplier)):
+        rejections.append(build_rejection("liquidity_far_below_min", f"avg_traded_value_20d={traded_value} floor_multiplier={liquidity_floor_multiplier} admission_state={admission_state}", severity="hard"))
 
     extension = safe_float(row.get("breakout_extension_pct"))
     max_extension = safe_float(setup.get("max_breakout_extension_pct"))
@@ -1739,6 +1749,14 @@ def run_rule_engine(
     days_stale = _days_stale_from_today(screener_date)
     meta["days_stale_from_today"] = days_stale
 
+    # Regime admission policy: resolve ONCE per run (recorded daily row; fail-open to neutral =
+    # previous hardcoded tolerances). Flexes top-of-funnel admission width only.
+    from advisory.regime_admission_policy import resolve_active_policy as resolve_admission_policy
+
+    admission = resolve_admission_policy(screener_date)
+    meta["admission_state"] = admission.get("state")
+    meta["admission_parameters"] = dict(admission)
+
     setup_screeners: dict[str, list[str]] = {}
     setup_screener_modes: dict[str, str] = {}
     screener_frames = []
@@ -1870,7 +1888,7 @@ def run_rule_engine(
         merged["regime_snapshot_date"] = pd.to_datetime(regime.get("asof_date"), utc=True, errors="coerce")
 
         for _, row in merged.iterrows():
-            candidate_state, evaluation, rejections = evaluate_setup_row(row, regime_name=regime_name, overlay_name=overlay_name, setup=setup)
+            candidate_state, evaluation, rejections = evaluate_setup_row(row, regime_name=regime_name, overlay_name=overlay_name, setup=setup, admission=admission)
             if candidate_state != "REJECT":
                 entry_plan = build_entry_plan(row, candidate_state, evaluation.get("technical_trigger_type"))
                 candidate_rows.append(

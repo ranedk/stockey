@@ -104,6 +104,15 @@ def scan_market_action(*, asof_date: Any | None = None, limit: int | None = None
     )
     if rows.empty:
         return pd.DataFrame()
+    if limit is None:
+        # Daily cap flexes with the recorded regime admission state (risk_off 10 / neutral 30 /
+        # risk_on 50 by default); fail-open inside resolve_active_policy returns the neutral cap.
+        try:
+            from advisory.regime_admission_policy import resolve_active_policy
+
+            limit = int(resolve_active_policy(scan_date).get("scan_limit") or SCAN_LIMIT)
+        except Exception:
+            limit = None
     cap = int(SCAN_LIMIT if limit is None else limit)
     if cap > 0:
         rows = rows.head(cap)
