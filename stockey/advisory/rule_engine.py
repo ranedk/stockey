@@ -212,6 +212,30 @@ RULE_ENGINE_CONTEXT_METADATA_SCHEMA_STATEMENTS = [
         "regime_fit_weight_effective",
     ]
 ]
+RULE_ENGINE_TS_OVERRIDE_MIGRATION_ID = "20260707_advisory_rule_outputs_ts_forecast_override"
+RULE_ENGINE_TS_OVERRIDE_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS technical_override_source TEXT",
+    f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS technical_override_json TEXT",
+]
+
+# TS-forecast rescue (allow-gate): a candidate that fails deterministic technical
+# confirmation but carries a strong TimesFM forecast can be rescued to PASS_NOW with the
+# override recorded (same principle as recorded LLM soft-gate overrides). Intersecting a
+# model with the existing filters can only remove candidates; the rescue path is the only
+# way the model can ADD information. Thresholds are deliberately high, the daily rescue
+# count is capped, risk sizing applies a tighter cap for override-sourced rows, and the
+# rescued cohort matures through the normal outcome labeling so the gate keeps or loses
+# its power based on measured benchmark-excess evidence.
+TS_RESCUE_ENABLED = os.getenv("TS_FORECAST_RESCUE_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+TS_RESCUE_HORIZON_DAYS = int(os.getenv("TS_FORECAST_RESCUE_HORIZON_DAYS", "10"))
+TS_RESCUE_MIN_FORECAST_RETURN = float(os.getenv("TS_FORECAST_RESCUE_MIN_FORECAST_RETURN", "0.05"))
+TS_RESCUE_MIN_PROBABILITY = float(os.getenv("TS_FORECAST_RESCUE_MIN_PROBABILITY", "0.65"))
+TS_RESCUE_MIN_SIGNAL_QUALITY = float(os.getenv("TS_FORECAST_RESCUE_MIN_SIGNAL_QUALITY", "0.65"))
+TS_RESCUE_MAX_DOWNSIDE_P10 = float(os.getenv("TS_FORECAST_RESCUE_MAX_DOWNSIDE_P10", "-0.12"))
+TS_RESCUE_MAX_PER_DAY = int(os.getenv("TS_FORECAST_RESCUE_MAX_PER_DAY", "5"))
+TS_RESCUE_MAX_FORECAST_AGE_DAYS = int(os.getenv("TS_FORECAST_RESCUE_MAX_FORECAST_AGE_DAYS", "5"))
+TS_FORECASTS_TABLE = "advisory_ts_forecasts_daily"
+
 RULE_ENGINE_TECHNICAL_ENTRY_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS technical_entry_confirmed BOOLEAN",
 ]
@@ -316,6 +340,18 @@ def ensure_rule_output_tables() -> None:
             "workflow": "rule_engine_outputs",
             "base_migration_id": RULE_ENGINE_SCHEMA_MIGRATION_ID,
             "columns": ["technical_entry_confirmed"],
+        },
+    )
+    apply_schema_migration(
+        migration_id=RULE_ENGINE_TS_OVERRIDE_MIGRATION_ID,
+        statements=RULE_ENGINE_TS_OVERRIDE_SCHEMA_STATEMENTS,
+        owner="advisory.rule_engine",
+        description="Add recorded technical-override columns (TS-forecast rescue allow-gate) to rule candidate outputs.",
+        metadata={
+            "tables": [CANDIDATES_TABLE],
+            "workflow": "rule_engine_outputs",
+            "base_migration_id": RULE_ENGINE_SCHEMA_MIGRATION_ID,
+            "columns": ["technical_override_source", "technical_override_json"],
         },
     )
 
@@ -1928,7 +1964,138 @@ def run_rule_engine(
         candidates = candidates.sort_values(["setup_id", "setup_score", "technical_score", "fundamental_score", "symbol"], ascending=[True, False, False, False, True]).copy()
         candidates["rank"] = candidates.groupby("setup_id").cumcount() + 1
     rejections_df = pd.DataFrame(rejection_rows)
+    candidates, rescue_meta = apply_ts_forecast_rescue(candidates, asof_date=meta.get("effective_date"))
+    meta["ts_forecast_rescue"] = rescue_meta
     return candidates, rejections_df, meta
+
+
+def _load_rescue_forecasts(symbols: list[str], asof_date: Any | None) -> pd.DataFrame:
+    """Latest point-in-time TS forecast per symbol at the rescue horizon (asof <= rule date,
+    bounded age so a stale forecast can never rescue)."""
+    effective_asof = pd.to_datetime(asof_date, utc=True, errors="coerce")
+    if pd.isna(effective_asof):
+        effective_asof = pd.Timestamp.utcnow()
+    try:
+        return sql_to_df(
+            f"""
+            SELECT DISTINCT ON (symbol)
+                symbol, asof_date, model_name, model_version, forecast_horizon_days,
+                forecast_return, probability_positive, signal_quality,
+                downside_return_p10, upside_return_p90
+            FROM {TS_FORECASTS_TABLE}
+            WHERE forecast_horizon_days = %s
+              AND UPPER(TRIM(symbol)) = ANY(%s)
+              AND asof_date <= %s
+              AND asof_date > %s - interval '{int(TS_RESCUE_MAX_FORECAST_AGE_DAYS)} days'
+            ORDER BY symbol, asof_date DESC
+            """,
+            params=(int(TS_RESCUE_HORIZON_DAYS), symbols, effective_asof, effective_asof),
+        )
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.rule_engine",
+            source=TS_FORECASTS_TABLE,
+            fallback_type="ts_forecast_rescue_load_failed",
+            severity="warn",
+            reason="TS-forecast rescue lookup failed; rule outputs continue without the allow-gate.",
+            error=exc,
+            metadata={"horizon_days": TS_RESCUE_HORIZON_DAYS, "symbols": len(symbols)},
+        )
+        return pd.DataFrame()
+
+
+def apply_ts_forecast_rescue(candidates: pd.DataFrame, *, asof_date: Any | None = None) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Allow-gate: rescue technically-unconfirmed candidates with a strong TS forecast.
+
+    Rescued rows become PASS_NOW with `technical_override_source='ts_forecast'` and full
+    provenance recorded; `technical_entry_confirmed` stays False (honest). Downstream risk
+    sizing applies a tighter cap to override-sourced rows, and outcomes mature through the
+    normal labeling so the rescued cohort's benchmark-excess record decides the gate's fate.
+    """
+    meta: dict[str, Any] = {
+        "enabled": bool(TS_RESCUE_ENABLED),
+        "horizon_days": int(TS_RESCUE_HORIZON_DAYS),
+        "eligible": 0,
+        "rescued": 0,
+        "rescued_symbols": [],
+        "thresholds": {
+            "min_forecast_return": TS_RESCUE_MIN_FORECAST_RETURN,
+            "min_probability": TS_RESCUE_MIN_PROBABILITY,
+            "min_signal_quality": TS_RESCUE_MIN_SIGNAL_QUALITY,
+            "max_downside_p10": TS_RESCUE_MAX_DOWNSIDE_P10,
+            "max_per_day": TS_RESCUE_MAX_PER_DAY,
+        },
+    }
+    if not TS_RESCUE_ENABLED or candidates.empty or "candidate_state" not in candidates.columns:
+        return candidates, meta
+    eligible_states = {"WATCH_BREAKOUT", "WATCH_EVENT", "WATCH_PULLBACK", "ABSTAIN"}
+    eligible_mask = candidates["candidate_state"].astype("string").str.upper().isin(eligible_states)
+    meta["eligible"] = int(eligible_mask.sum())
+    if not eligible_mask.any():
+        return candidates, meta
+    symbols = sorted(
+        {str(value).strip().upper() for value in candidates.loc[eligible_mask, "symbol"].tolist() if str(value or "").strip()}
+    )
+    forecasts = _load_rescue_forecasts(symbols, asof_date)
+    if forecasts.empty:
+        return candidates, meta
+    strong = forecasts[
+        (pd.to_numeric(forecasts["forecast_return"], errors="coerce") >= TS_RESCUE_MIN_FORECAST_RETURN)
+        & (pd.to_numeric(forecasts["probability_positive"], errors="coerce") >= TS_RESCUE_MIN_PROBABILITY)
+        & (pd.to_numeric(forecasts["signal_quality"], errors="coerce") >= TS_RESCUE_MIN_SIGNAL_QUALITY)
+        & (pd.to_numeric(forecasts["downside_return_p10"], errors="coerce") >= TS_RESCUE_MAX_DOWNSIDE_P10)
+    ].copy()
+    if strong.empty:
+        return candidates, meta
+    strong = strong.sort_values("forecast_return", ascending=False)
+    out = candidates.copy()
+    if "technical_override_source" not in out.columns:
+        out["technical_override_source"] = None
+    if "technical_override_json" not in out.columns:
+        out["technical_override_json"] = None
+    rescued_symbols: list[str] = []
+    for forecast in strong.itertuples(index=False):
+        if len(rescued_symbols) >= max(0, int(TS_RESCUE_MAX_PER_DAY)):
+            break
+        symbol = str(forecast.symbol).strip().upper()
+        mask = eligible_mask & out["symbol"].astype("string").str.upper().eq(symbol)
+        if not mask.any():
+            continue
+        provenance = json.dumps(
+            {
+                "override_source": "ts_forecast",
+                "model_name": forecast.model_name,
+                "model_version": forecast.model_version,
+                "forecast_asof": str(forecast.asof_date),
+                "forecast_horizon_days": int(forecast.forecast_horizon_days),
+                "forecast_return": float(forecast.forecast_return),
+                "probability_positive": float(forecast.probability_positive),
+                "signal_quality": float(forecast.signal_quality),
+                "downside_return_p10": float(forecast.downside_return_p10),
+                "upside_return_p90": float(forecast.upside_return_p90),
+                "thresholds": meta["thresholds"],
+                "note": "Technical confirmation overridden by TS forecast; override recorded. Risk sizing applies the override allocation factor.",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        reason = (
+            f"TS-forecast rescue: {forecast.model_name} expects {float(forecast.forecast_return):+.1%} over "
+            f"{int(forecast.forecast_horizon_days)}d (p_pos={float(forecast.probability_positive):.2f}, "
+            f"quality={float(forecast.signal_quality):.2f}); technical trigger not confirmed -- override recorded"
+        )
+        out.loc[mask, "candidate_state"] = "PASS_NOW"
+        if "rule_pass" in out.columns:
+            out.loc[mask, "rule_pass"] = True
+        out.loc[mask, "technical_override_source"] = "ts_forecast"
+        out.loc[mask, "technical_override_json"] = provenance
+        if "watch_reason_detail" in out.columns:
+            out.loc[mask, "watch_reason_detail"] = reason
+        rescued_symbols.append(symbol)
+        print(f"[advisory.rule_engine] ts_forecast_rescue symbol={symbol} {reason}", flush=True)
+    meta["rescued"] = len(rescued_symbols)
+    meta["rescued_symbols"] = rescued_symbols
+    return out, meta
 
 
 def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, asof_date: pd.Timestamp | None, rebuild: bool = False) -> None:

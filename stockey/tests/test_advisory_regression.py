@@ -686,11 +686,12 @@ def test_rule_engine_ensure_output_tables_uses_schema_registry(monkeypatch):
 
     rule_engine.ensure_rule_output_tables()
 
-    assert len(calls) == 3
+    assert len(calls) == 4
     assert [call["migration_id"] for call in calls] == [
         rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID,
         rule_engine.RULE_ENGINE_CONTEXT_METADATA_MIGRATION_ID,
         rule_engine.RULE_ENGINE_TECHNICAL_ENTRY_MIGRATION_ID,
+        rule_engine.RULE_ENGINE_TS_OVERRIDE_MIGRATION_ID,
     ]
     call = calls[0]
     assert call["migration_id"] == rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID
@@ -1291,6 +1292,192 @@ def test_risk_engine_base_fallback_buy_triggered_can_allocate(monkeypatch):
     assert row["allocation_status"] == "allocated"
     assert row["suggested_allocation_inr"] > 0
     assert "Technical entry trigger confirmed: breakout." in row["notes"]
+
+
+def test_risk_engine_ts_override_allows_allocation_with_tighter_cap(monkeypatch):
+    # A recorded technical override (ts_forecast rescue) is an allow-gate: the unconfirmed
+    # entry is sized instead of rejected, but under the tighter override allocation factor.
+    asof_date = pd.Timestamp("2026-06-20T00:00:00Z")
+
+    def base_row(override: bool) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "published_on": pd.Timestamp("2026-06-20T09:30:00Z"),
+                    "asof_date": asof_date,
+                    "setup_id": "LARGECAP_BREAKOUT_POSITION_V1",
+                    "setup_name": "Largecap breakout",
+                    "symbol": "ABC",
+                    "company_master_id": "nse:ABC",
+                    "unique_id": "candidate:2026-06-20:LARGECAP_BREAKOUT_POSITION_V1:ABC",
+                    "evaluation_status": "completed",
+                    "verdict": "continue",
+                    "investable_now": False,
+                    "materiality": "low",
+                    "setup_effect": "neutral",
+                    "event_class": "BASE_CANDIDATE",
+                    "state_transition_hint": "NO_CHANGE",
+                    "score_impact": 0.0,
+                    "confidence": 0.60,
+                    "sentiment": "neutral",
+                    "governance_risk": "none",
+                    "balance_sheet_risk": "none",
+                    "execution_risk": "none",
+                    "review_action": "clear",
+                    "review_score": 0.0,
+                    "review_veto": False,
+                    "review_reason": None,
+                    "has_review_manual": False,
+                    "candidate_state": "PASS_NOW",
+                    "current_state": "PASS_NOW",
+                    "is_base_candidate_fallback": True,
+                    "technical_state": "NEAR_PIVOT",
+                    "technical_trigger_type": None,
+                    "technical_entry_confirmed": False,
+                    "technical_override_source": "ts_forecast" if override else None,
+                    "technical_override_json": '{"forecast_return": 0.08}' if override else None,
+                }
+            ]
+        )
+
+    context = {
+        "adj_close": 100.0,
+        "dma_20": 96.0,
+        "dma_50": 92.0,
+        "atr_20": 3.0,
+        "avg_traded_value_20d": 50_000_000.0,
+        "rs_vs_benchmark": 0.03,
+        "rs_vs_sector": 0.02,
+    }
+    monkeypatch.setattr(risk_engine, "load_event_evaluations", lambda **_kwargs: pd.DataFrame())
+    monkeypatch.setattr(risk_engine, "load_watch_states", lambda **_kwargs: pd.DataFrame())
+    monkeypatch.setattr(risk_engine, "load_point_in_time_context", lambda *_a, **_k: dict(context))
+
+    # without the override: rejected (no confirmed buy trigger)
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **_kwargs: base_row(False))
+    rejected = risk_engine.build_allocations(asof_date=asof_date).iloc[0]
+    assert rejected["allocation_status"] == "rejected"
+    assert rejected["suggested_allocation_inr"] == 0.0
+
+    # with the recorded override: allocated under the tighter cap, provenance persisted
+    monkeypatch.setattr(risk_engine, "load_base_candidate_fallbacks", lambda **_kwargs: base_row(True))
+    allowed = risk_engine.build_allocations(asof_date=asof_date).iloc[0]
+    assert allowed["allocation_status"] == "allocated"
+    assert allowed["suggested_allocation_inr"] > 0
+    assert allowed["technical_override_source"] == "ts_forecast"
+    assert "overridden by ts_forecast" in allowed["notes"].lower()
+    assert "override allocation cap applied" in allowed["notes"].lower()
+
+
+def test_rule_engine_ts_forecast_rescue_upgrades_unconfirmed_candidate(monkeypatch):
+    candidates = pd.DataFrame(
+        [
+            {"symbol": "AAA", "setup_id": "S1", "candidate_state": "WATCH_BREAKOUT",
+             "rule_pass": False, "watch_reason_detail": "quality setup forming"},
+            {"symbol": "BBB", "setup_id": "S1", "candidate_state": "PASS_NOW",
+             "rule_pass": True, "watch_reason_detail": "confirmed"},
+            {"symbol": "DDD", "setup_id": "S1", "candidate_state": "ABSTAIN",
+             "rule_pass": False, "watch_reason_detail": "weak edge"},
+        ]
+    )
+    forecasts = pd.DataFrame(
+        [
+            # strong forecast for AAA -> rescue; CCC is not a candidate -> ignored;
+            # DDD forecast is below the return threshold -> not rescued
+            {"symbol": "AAA", "asof_date": pd.Timestamp("2026-07-06", tz="UTC"), "model_name": "timesfm_2p5_200m",
+             "model_version": "2.5-200m", "forecast_horizon_days": 10, "forecast_return": 0.09,
+             "probability_positive": 0.80, "signal_quality": 0.75, "downside_return_p10": -0.05,
+             "upside_return_p90": 0.22},
+            {"symbol": "CCC", "asof_date": pd.Timestamp("2026-07-06", tz="UTC"), "model_name": "timesfm_2p5_200m",
+             "model_version": "2.5-200m", "forecast_horizon_days": 10, "forecast_return": 0.20,
+             "probability_positive": 0.90, "signal_quality": 0.90, "downside_return_p10": 0.01,
+             "upside_return_p90": 0.40},
+            {"symbol": "DDD", "asof_date": pd.Timestamp("2026-07-06", tz="UTC"), "model_name": "timesfm_2p5_200m",
+             "model_version": "2.5-200m", "forecast_horizon_days": 10, "forecast_return": 0.02,
+             "probability_positive": 0.80, "signal_quality": 0.80, "downside_return_p10": -0.03,
+             "upside_return_p90": 0.10},
+        ]
+    )
+    monkeypatch.setattr(rule_engine, "TS_RESCUE_ENABLED", True)
+    monkeypatch.setattr(rule_engine, "_load_rescue_forecasts", lambda symbols, asof: forecasts)
+
+    out, meta = rule_engine.apply_ts_forecast_rescue(candidates, asof_date=pd.Timestamp("2026-07-06", tz="UTC"))
+
+    assert meta["rescued"] == 1 and meta["rescued_symbols"] == ["AAA"]
+    rescued = out[out["symbol"] == "AAA"].iloc[0]
+    assert rescued["candidate_state"] == "PASS_NOW"
+    assert bool(rescued["rule_pass"]) is True
+    assert rescued["technical_override_source"] == "ts_forecast"
+    provenance = json.loads(rescued["technical_override_json"])
+    assert provenance["forecast_return"] == 0.09 and provenance["override_source"] == "ts_forecast"
+    assert "TS-forecast rescue" in rescued["watch_reason_detail"]
+    # already-confirmed and weak-forecast rows untouched
+    assert out[out["symbol"] == "BBB"].iloc[0]["technical_override_source"] is None
+    assert out[out["symbol"] == "DDD"].iloc[0]["candidate_state"] == "ABSTAIN"
+
+    # daily cap bounds the blast radius
+    monkeypatch.setattr(rule_engine, "TS_RESCUE_MAX_PER_DAY", 0)
+    capped, capped_meta = rule_engine.apply_ts_forecast_rescue(candidates, asof_date=pd.Timestamp("2026-07-06", tz="UTC"))
+    assert capped_meta["rescued"] == 0
+    assert (capped[capped["symbol"] == "AAA"]["candidate_state"] == "WATCH_BREAKOUT").all()
+
+    # disabled -> passthrough
+    monkeypatch.setattr(rule_engine, "TS_RESCUE_ENABLED", False)
+    same, disabled_meta = rule_engine.apply_ts_forecast_rescue(candidates)
+    assert disabled_meta["enabled"] is False and disabled_meta["rescued"] == 0
+
+
+def test_market_action_scan_builds_constituent_rows(monkeypatch):
+    from advisory import market_action_scan as mas
+
+    calls = {"n": 0}
+
+    def fake_sql(query, params=None):
+        calls["n"] += 1
+        if calls["n"] == 1:  # latest bhavcopy date lookup
+            return pd.DataFrame([{"d": pd.Timestamp("2026-07-06")}])
+        return pd.DataFrame(
+            [
+                {"symbol": "digitide", "company_master_id": "cm-1", "isin": "INE1", "close": 120.55,
+                 "breakout_pct": 17.93, "volume_multiple": 69.6, "volume": 5_000_000, "avg_turnover_inr": 8.6e7},
+                {"symbol": "WELCORP", "company_master_id": "cm-2", "isin": "INE2", "close": 1543.6,
+                 "breakout_pct": 1.43, "volume_multiple": 9.8, "volume": 2_000_000, "avg_turnover_inr": 3.1e9},
+            ]
+        )
+
+    monkeypatch.setattr(mas, "sql_to_df", fake_sql)
+    frame = mas.scan_market_action(limit=1)
+    assert len(frame) == 1  # cap applied
+    row = frame.iloc[0]
+    assert row["screener_slug"] == mas.SCAN_SLUG
+    assert row["ticker"] == "DIGITIDE" and row["exchange"] == "NSE" and row["rank"] == 1
+    meta = json.loads(row["raw_item_json"])
+    assert meta["breakout_pct"] == 17.93 and meta["volume_multiple"] == 69.6
+
+    # a scan failure degrades to empty via the safe wrapper, never raises
+    monkeypatch.setattr(mas, "scan_market_action", lambda **_k: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(mas, "record_local_fallback_event", lambda **_k: None)
+    assert mas.safe_scan_market_action().empty
+
+
+def test_build_constituents_includes_market_action_scan(monkeypatch):
+    from advisory import market_action_scan as mas
+    from advisory import screener_parser as sp
+
+    scan_frame = pd.DataFrame(
+        [{"date": pd.Timestamp("2026-07-06"), "screener_slug": mas.SCAN_SLUG, "ticker": "DIGITIDE",
+          "exchange": "NSE", "rank": 1, "last_price": 120.55}]
+    )
+    monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
+    monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", True)
+    monkeypatch.setattr(mas, "safe_scan_market_action", lambda **_k: scan_frame.copy())
+
+    out = sp.build_constituents()
+    assert len(out) == 1 and out.iloc[0]["screener_slug"] == mas.SCAN_SLUG
+
+    # targeted slug rebuilds exclude the scan
+    out_slug = sp.build_constituents(screener_slug="sme-momentum-screen-v1")
+    assert out_slug.empty
 
 
 def test_portfolio_engine_overlap_cap(monkeypatch):
@@ -50759,7 +50946,7 @@ def test_risk_engine_ensure_allocations_table_uses_schema_registry(monkeypatch):
 
     risk_engine.ensure_allocations_table()
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[0]["migration_id"] == risk_engine.ALLOCATIONS_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"]["tables"] == [risk_engine.ALLOCATIONS_TABLE]
     assert any(risk_engine.ALLOCATIONS_TABLE in statement for statement in calls[0]["statements"])
@@ -50770,6 +50957,8 @@ def test_risk_engine_ensure_allocations_table_uses_schema_registry(monkeypatch):
     assert calls[1]["metadata"]["depends_on"] == risk_engine.ALLOCATIONS_SCHEMA_MIGRATION_ID
     assert any("technical_state TEXT" in statement for statement in calls[1]["statements"])
     assert any("technical_entry_confirmed BOOLEAN" in statement for statement in calls[1]["statements"])
+    assert calls[2]["migration_id"] == risk_engine.ALLOCATIONS_TECHNICAL_OVERRIDE_MIGRATION_ID
+    assert any("technical_override_source TEXT" in statement for statement in calls[2]["statements"])
 
 
 def test_adversarial_review_ensure_output_table_uses_schema_registry(monkeypatch):

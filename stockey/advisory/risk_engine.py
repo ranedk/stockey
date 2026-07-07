@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -101,6 +102,12 @@ ALLOCATIONS_TECHNICAL_CONFIRMATION_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS technical_entry_confirmed BOOLEAN",
 ]
 
+ALLOCATIONS_TECHNICAL_OVERRIDE_MIGRATION_ID = "20260707_advisory_allocations_technical_override"
+ALLOCATIONS_TECHNICAL_OVERRIDE_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS technical_override_source TEXT",
+    f"ALTER TABLE {ALLOCATIONS_TABLE} ADD COLUMN IF NOT EXISTS technical_override_json TEXT",
+]
+
 
 @dataclass(frozen=True)
 class SetupRiskProfile:
@@ -164,6 +171,10 @@ CONVICTION_MULTIPLIER = {
     "medium": 0.70,
     "high": 1.00,
 }
+# Tighter deterministic cap for entries whose technical confirmation was overridden by a
+# recorded allow-gate (e.g. ts_forecast rescue): sizing is bounded so no single overridden
+# entry can be catastrophic, regardless of forecast strength.
+TECHNICAL_OVERRIDE_ALLOCATION_FACTOR = float(os.getenv("TECHNICAL_OVERRIDE_ALLOCATION_FACTOR", "0.50"))
 
 
 def _is_missing_value(value: Any) -> bool:
@@ -262,6 +273,12 @@ def ensure_allocations_table() -> None:
         migration_id=ALLOCATIONS_TECHNICAL_CONFIRMATION_MIGRATION_ID,
         description="Add technical confirmation provenance to advisory risk allocation table.",
         statements=ALLOCATIONS_TECHNICAL_CONFIRMATION_SCHEMA_STATEMENTS,
+        metadata={"tables": [ALLOCATIONS_TABLE], "depends_on": ALLOCATIONS_SCHEMA_MIGRATION_ID},
+    )
+    apply_schema_migration(
+        migration_id=ALLOCATIONS_TECHNICAL_OVERRIDE_MIGRATION_ID,
+        description="Add recorded technical-override provenance (allow-gate rescues) to risk allocations.",
+        statements=ALLOCATIONS_TECHNICAL_OVERRIDE_SCHEMA_STATEMENTS,
         metadata={"tables": [ALLOCATIONS_TABLE], "depends_on": ALLOCATIONS_SCHEMA_MIGRATION_ID},
     )
 
@@ -542,7 +559,9 @@ def load_base_candidate_fallbacks(
             w.current_state,
             c.technical_state,
             c.technical_trigger_type,
-            c.technical_trigger_note
+            c.technical_trigger_note,
+            c.technical_override_source,
+            c.technical_override_json
         FROM advisory_watchlist w
         LEFT JOIN advisory_candidates c
           ON c.asof_date = w.asof_date
@@ -650,6 +669,8 @@ def load_base_candidate_fallbacks(
                 "technical_trigger_type": technical_trigger_type or None,
                 "technical_trigger_note": row.get("technical_trigger_note"),
                 "technical_entry_confirmed": technical_entry_confirmed,
+                "technical_override_source": row.get("technical_override_source"),
+                "technical_override_json": row.get("technical_override_json"),
             }
         )
     return pd.DataFrame(rows)
@@ -1058,6 +1079,7 @@ def build_allocations(
             row.get("technical_entry_confirmed"),
             current_state == "PASS_NOW" and technical_state == "BUY_TRIGGERED",
         )
+        technical_override_source = _clean_text(row.get("technical_override_source")).lower()
         event_class = _clean_text(row.get("event_class")).upper()
         state_transition_hint = _clean_text(row.get("state_transition_hint")).upper()
         score_impact_raw = pd.to_numeric(row.get("score_impact"), errors="coerce")
@@ -1074,7 +1096,12 @@ def build_allocations(
         notes: list[str] = []
         if is_base_candidate_fallback:
             notes.append("Allocation is based on base rule-engine state because no event evaluation was available.")
-            if not technical_entry_confirmed:
+            if technical_override_source and not technical_entry_confirmed:
+                notes.append(
+                    f"Technical confirmation overridden by {technical_override_source} (override recorded on the candidate); "
+                    "allocation proceeds under the tighter override cap."
+                )
+            elif not technical_entry_confirmed:
                 notes.append(
                     "Base candidate is watch-only: portfolio allocation requires technical_state=BUY_TRIGGERED, "
                     f"not candidate_state={candidate_state or current_state or 'UNKNOWN'} technical_state={technical_state or 'UNKNOWN'}."
@@ -1085,7 +1112,7 @@ def build_allocations(
             allocation_status = "abstained"
             suggested_allocation_inr = 0.0
             notes.append("Explicit abstain: edge is too weak or too mixed to allocate capital.")
-        elif is_base_candidate_fallback and not technical_entry_confirmed:
+        elif is_base_candidate_fallback and not technical_entry_confirmed and not technical_override_source:
             allocation_status = "rejected"
             suggested_allocation_inr = 0.0
             notes.append("No allocation: base technical fallback has no confirmed buy trigger.")
@@ -1156,6 +1183,14 @@ def build_allocations(
             )
             if is_base_candidate_fallback and current_state == "WATCH_BREAKOUT":
                 suggested_allocation_inr = suggested_allocation_inr * 0.60
+            if technical_override_source and not technical_entry_confirmed:
+                # Deterministic survival bound for allow-gate rescues: no single overridden
+                # entry can size like a fully-confirmed one, regardless of forecast strength.
+                suggested_allocation_inr = suggested_allocation_inr * TECHNICAL_OVERRIDE_ALLOCATION_FACTOR
+                notes.append(
+                    f"Override allocation cap applied ({TECHNICAL_OVERRIDE_ALLOCATION_FACTOR:.0%}) because entry is "
+                    f"{technical_override_source}-overridden, not technically confirmed."
+                )
             event_multiplier = max(0.50, min(1.25, 1.0 + score_impact))
             if review_action == "penalize":
                 event_multiplier = event_multiplier * max(0.60, 1.0 + review_score)
@@ -1230,6 +1265,8 @@ def build_allocations(
                 "technical_trigger_type": row.get("technical_trigger_type"),
                 "technical_trigger_note": row.get("technical_trigger_note"),
                 "technical_entry_confirmed": technical_entry_confirmed,
+                "technical_override_source": technical_override_source or None,
+                "technical_override_json": row.get("technical_override_json"),
                 "state_transition_hint": row.get("state_transition_hint"),
                 "score_impact": row.get("score_impact"),
                 "confidence": row.get("confidence"),
