@@ -218,6 +218,11 @@ RULE_ENGINE_TS_OVERRIDE_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS technical_override_json TEXT",
 ]
 
+RULE_ENGINE_RS_PERCENTILE_MIGRATION_ID = "20260708_advisory_rule_outputs_rs_percentile"
+RULE_ENGINE_RS_PERCENTILE_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS rs_percentile DOUBLE PRECISION",
+]
+
 # TS-forecast rescue (allow-gate): a candidate that fails deterministic technical
 # confirmation but carries a strong TimesFM forecast can be rescued to PASS_NOW with the
 # override recorded (same principle as recorded LLM soft-gate overrides). Intersecting a
@@ -352,6 +357,18 @@ def ensure_rule_output_tables() -> None:
             "workflow": "rule_engine_outputs",
             "base_migration_id": RULE_ENGINE_SCHEMA_MIGRATION_ID,
             "columns": ["technical_override_source", "technical_override_json"],
+        },
+    )
+    apply_schema_migration(
+        migration_id=RULE_ENGINE_RS_PERCENTILE_MIGRATION_ID,
+        statements=RULE_ENGINE_RS_PERCENTILE_SCHEMA_STATEMENTS,
+        owner="advisory.rule_engine",
+        description="Add cross-sectional relative-strength percentile to rule candidate outputs.",
+        metadata={
+            "tables": [CANDIDATES_TABLE],
+            "workflow": "rule_engine_outputs",
+            "base_migration_id": RULE_ENGINE_SCHEMA_MIGRATION_ID,
+            "columns": ["rs_percentile"],
         },
     )
 
@@ -1757,6 +1774,13 @@ def run_rule_engine(
     meta["admission_state"] = admission.get("state")
     meta["admission_parameters"] = dict(admission)
 
+    # Cross-sectional RS percentiles: one batched point-in-time lookup per run; missing map
+    # (table empty / lookup failure) is neutral -- candidates simply carry no rank.
+    from advisory.relative_strength import load_rs_percentiles
+
+    rs_percentiles = load_rs_percentiles(asof_date=screener_date)
+    meta["rs_percentile_symbols"] = len(rs_percentiles)
+
     setup_screeners: dict[str, list[str]] = {}
     setup_screener_modes: dict[str, str] = {}
     screener_frames = []
@@ -1905,6 +1929,7 @@ def run_rule_engine(
                         "theme_ids": json.dumps(meta.get("active_theme_ids_by_setup", {}).get(setup["setup_id"], [])),
                         "symbol": row["symbol"],
                         "company_master_id": row["company_master_id"],
+                        "rs_percentile": rs_percentiles.get(str(row["symbol"] or "").strip().upper()),
                         "screener_slug": row.get("screener_slug"),
                         "source_screener_slug": row.get("source_screener_slug") or row.get("screener_slug"),
                         "source_screener_list": row.get("source_screener_list"),

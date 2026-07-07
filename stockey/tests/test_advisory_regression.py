@@ -686,12 +686,13 @@ def test_rule_engine_ensure_output_tables_uses_schema_registry(monkeypatch):
 
     rule_engine.ensure_rule_output_tables()
 
-    assert len(calls) == 4
+    assert len(calls) == 5
     assert [call["migration_id"] for call in calls] == [
         rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID,
         rule_engine.RULE_ENGINE_CONTEXT_METADATA_MIGRATION_ID,
         rule_engine.RULE_ENGINE_TECHNICAL_ENTRY_MIGRATION_ID,
         rule_engine.RULE_ENGINE_TS_OVERRIDE_MIGRATION_ID,
+        rule_engine.RULE_ENGINE_RS_PERCENTILE_MIGRATION_ID,
     ]
     call = calls[0]
     assert call["migration_id"] == rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID
@@ -1556,6 +1557,7 @@ def test_portfolio_engine_overlap_cap(monkeypatch):
         },
     )
 
+    monkeypatch.setattr(portfolio_engine, "load_rs_percentiles", lambda *a, **k: {})
     df = portfolio_engine.build_portfolio_orders(
         config=portfolio_engine.PortfolioConfig(
             capital_inr=120000.0,
@@ -1648,6 +1650,7 @@ def test_portfolio_engine_defers_unconfirmed_base_technical_entry(monkeypatch):
         lambda symbols: {symbol: (f"symbol:{symbol}", "symbol_only") for symbol in symbols},
     )
 
+    monkeypatch.setattr(portfolio_engine, "load_rs_percentiles", lambda *a, **k: {})
     df = portfolio_engine.build_portfolio_orders(
         config=portfolio_engine.PortfolioConfig(
             capital_inr=60000.0,
@@ -5028,6 +5031,7 @@ def test_portfolio_engine_keeps_only_highest_priority_symbol_owner(monkeypatch):
         },
     )
 
+    monkeypatch.setattr(portfolio_engine, "load_rs_percentiles", lambda *a, **k: {})
     df = portfolio_engine.build_portfolio_orders(
         config=portfolio_engine.PortfolioConfig(
             capital_inr=120000.0,
@@ -47406,6 +47410,68 @@ def test_news_overlay_engine_rebuild_cleanup_uses_retryable_operation(monkeypatc
     assert upserts == [(news_overlay_engine.TABLE_NAME, 1)]
 
 
+def test_relative_strength_percentiles_rank_and_filter():
+    from advisory import relative_strength as rs
+
+    panel = pd.DataFrame(
+        [
+            # strong: doubled over 63d, at its high
+            {"symbol": "STRONG", "c0": 200.0, "c63": 100.0, "c126": 90.0, "c252": 80.0,
+             "max_252": 200.0, "avg_turnover_inr": 5e7, "history_rows": 260},
+            # weak: halved, far from high
+            {"symbol": "WEAK", "c0": 50.0, "c63": 100.0, "c126": 110.0, "c252": 120.0,
+             "max_252": 130.0, "avg_turnover_inr": 5e7, "history_rows": 260},
+            # middling
+            {"symbol": "MID", "c0": 110.0, "c63": 100.0, "c126": 100.0, "c252": 100.0,
+             "max_252": 120.0, "avg_turnover_inr": 5e7, "history_rows": 260},
+            # young listing: only 63d history -> still ranked from available components
+            {"symbol": "YOUNG", "c0": 150.0, "c63": 100.0, "c126": None, "c252": None,
+             "max_252": 150.0, "avg_turnover_inr": 5e7, "history_rows": 80},
+            # illiquid: below turnover floor -> excluded from the rank universe
+            {"symbol": "ILLIQ", "c0": 300.0, "c63": 100.0, "c126": 90.0, "c252": 80.0,
+             "max_252": 300.0, "avg_turnover_inr": 1e5, "history_rows": 260},
+            # too little history -> excluded
+            {"symbol": "BABY", "c0": 120.0, "c63": None, "c126": None, "c252": None,
+             "max_252": 120.0, "avg_turnover_inr": 5e7, "history_rows": 10},
+        ]
+    )
+    out = rs.compute_rs_frame(panel, asof_date=pd.Timestamp("2026-07-06"))
+    symbols = set(out["symbol"])
+    assert symbols == {"STRONG", "WEAK", "MID", "YOUNG"}  # ILLIQ + BABY excluded
+    ranks = dict(zip(out["symbol"], out["rs_percentile"]))
+    assert ranks["STRONG"] > ranks["MID"] > ranks["WEAK"]
+    assert ranks["YOUNG"] > ranks["WEAK"]  # partial components still rank
+    assert (out["rank_universe_size"] == 4).all()
+    assert out["rs_percentile"].max() == 100.0
+
+
+def test_relative_strength_lookup_fails_open(monkeypatch):
+    from advisory import relative_strength as rs
+
+    monkeypatch.setattr(rs, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(rs, "record_local_fallback_event", lambda **k: None)
+    assert rs.load_rs_percentiles(["ABC"]) == {}
+
+
+def test_portfolio_priority_score_rs_term_decides_marginal_slot():
+    base = {
+        "confidence": 0.70,
+        "conviction_bucket": "medium",
+        "risk_bucket": "medium",
+        "suggested_allocation_inr": 50_000.0,
+        "score_impact": 0.0,
+        "state_transition_hint": "NO_CHANGE",
+        "allocation_pct_of_adv20d": 0.001,
+    }
+    weak = portfolio_engine.compute_priority_score(pd.Series({**base, "rs_percentile": 20.0}))
+    strong = portfolio_engine.compute_priority_score(pd.Series({**base, "rs_percentile": 95.0}))
+    missing = portfolio_engine.compute_priority_score(pd.Series({**base, "rs_percentile": None}))
+    no_field = portfolio_engine.compute_priority_score(pd.Series(base))
+    assert strong > weak  # market-wide stronger name wins the marginal slot
+    assert missing == no_field  # missing RS is neutral, never a penalty beyond absence
+    assert abs((strong - weak) - 0.75 * portfolio_engine.RS_PRIORITY_WEIGHT) < 1e-6
+
+
 def test_regime_admission_raw_state_truth_table():
     from advisory import regime_admission_policy as rap
 
@@ -66391,6 +66457,7 @@ def test_portfolio_engine_uses_setup_cap_override(monkeypatch):
         "get_single_position_cap_overrides",
         lambda: {},
     )
+    monkeypatch.setattr(portfolio_engine, "load_rs_percentiles", lambda *a, **k: {})
     df = portfolio_engine.build_portfolio_orders(
         config=portfolio_engine.PortfolioConfig(
             capital_inr=100000.0,

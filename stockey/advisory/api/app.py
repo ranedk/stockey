@@ -3116,10 +3116,21 @@ def build_recommendations_unified_payload(
         states = [row for row in states if row.get("conflict")]
     # Most actionable first: directional (BUY/SELL) ahead of neutral (WATCH), BUY-side ahead of
     # de-risk, then by deterministic priority.
+    # Attach cross-sectional RS (batched, best-effort) so the operator sees market-wide strength
+    # and equal-priority names order by it -- the selection layer surfaced in the queue.
+    try:
+        from advisory.relative_strength import load_rs_percentiles
+
+        rs_map = load_rs_percentiles([str(r.get("symbol") or "") for r in states])
+    except Exception:
+        rs_map = {}
+    for r in states:
+        r["rs_percentile"] = rs_map.get(str(r.get("symbol") or "").strip().upper())
     states.sort(key=lambda r: (
         -abs(_action_direction(r.get("action"))),
         -_action_direction(r.get("action")),
         -float(r.get("action_priority") or 0),
+        -float(r.get("rs_percentile") or 0),
         str(r.get("symbol") or ""),
     ))
     total = len(states)

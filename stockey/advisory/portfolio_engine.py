@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from advisory.decision_trace import append_trace, append_trace_step, safe_trace_call
 from advisory.fallback_telemetry import record_local_fallback_event
+from advisory.relative_strength import load_rs_percentiles
 from advisory.setup_registry import load_setup_registry
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.display_time import to_display_value
@@ -38,6 +40,9 @@ RISK_PENALTY = {
     "medium_high": 0.5,
     "high": 1.0,
 }
+# Weight of the cross-sectional RS percentile term in priority scoring ([0..1] * weight);
+# comparable in scale to conviction (1-3) and transition bonus (1.0) at the default.
+RS_PRIORITY_WEIGHT = float(os.getenv("RS_PRIORITY_WEIGHT", "1.0"))
 
 PORTFOLIO_SCHEMA_STATEMENTS = [
     f"""
@@ -420,7 +425,11 @@ def compute_priority_score(row: pd.Series) -> float:
         transition_bonus = 0.35
     elif transition_hint == "CUT_SCORE_ONLY":
         transition_bonus = -0.35
-    return round((confidence * 3.0) + conviction_score - risk_penalty - liquidity_penalty + (allocation_size / 100_000.0) + (score_impact * 2.0) + transition_bonus, 6)
+    # Cross-sectional RS: a bounded [0, RS_PRIORITY_WEIGHT] term so that, at the marginal
+    # max-positions slot, the market-wide stronger name wins. Missing RS is neutral (0).
+    rs_raw = pd.to_numeric(row.get("rs_percentile"), errors="coerce")
+    rs_term = 0.0 if pd.isna(rs_raw) else (max(0.0, min(100.0, float(rs_raw))) / 100.0) * RS_PRIORITY_WEIGHT
+    return round((confidence * 3.0) + conviction_score - risk_penalty - liquidity_penalty + (allocation_size / 100_000.0) + (score_impact * 2.0) + transition_bonus + rs_term, 6)
 
 
 def compute_invest_score_pct(row: pd.Series) -> float:
@@ -747,6 +756,17 @@ def build_portfolio_orders(
     overlap_map = build_overlap_map(working["symbol"].astype(str).tolist())
     working["overlap_group"] = working["symbol"].map(lambda s: overlap_map.get(str(s).upper(), (f"symbol:{s}", "symbol_only"))[0])
     working["overlap_reason"] = working["symbol"].map(lambda s: overlap_map.get(str(s).upper(), (f"symbol:{s}", "symbol_only"))[1])
+    # Cross-sectional RS as the selection layer for the max-positions slots: one batched
+    # point-in-time lookup, missing/failed = neutral. Ranking chooses among candidates for
+    # the marginal slot; it never blocks a candidate.
+    try:
+        rs_map = load_rs_percentiles(
+            working["symbol"].astype("string").str.upper().dropna().unique().tolist(),
+            asof_date=asof_date,
+        )
+    except Exception:
+        rs_map = {}
+    working["rs_percentile"] = working["symbol"].map(lambda s: rs_map.get(str(s or "").strip().upper()))
     working["priority_score"] = working.apply(compute_priority_score, axis=1)
     working["invest_score_pct"] = working.apply(compute_invest_score_pct, axis=1)
     working["requested_allocation_inr"] = pd.to_numeric(working["suggested_allocation_inr"], errors="coerce").fillna(0.0)
