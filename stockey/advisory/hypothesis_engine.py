@@ -34,6 +34,10 @@ MATCHES_TABLE = "advisory_hypothesis_matches"
 ACTION_PLANS_TABLE = "advisory_playbook_action_plans"
 PROMOTION_AUDITS_TABLE = "advisory_playbook_promotion_audits"
 HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID = "20260611_advisory_hypothesis_engine_base"
+HYPOTHESIS_UNIVERSE_MIGRATION_ID = "20260708_advisory_hypotheses_target_universe"
+HYPOTHESIS_UNIVERSE_SCHEMA_STATEMENTS = [
+    "ALTER TABLE advisory_hypotheses ADD COLUMN IF NOT EXISTS target_universe_json TEXT",
+]
 HYPOTHESIS_ENGINE_SCHEMA_STATEMENTS = [
     f"""
     CREATE TABLE IF NOT EXISTS {HYPOTHESES_TABLE} (
@@ -246,6 +250,12 @@ def ensure_tables(*, force: bool = False) -> None:
             "tables": [HYPOTHESES_TABLE, MATCHES_TABLE, ACTION_PLANS_TABLE, PROMOTION_AUDITS_TABLE],
             "authority_scope": "review_only_playbook_overlay",
         },
+    )
+    apply_schema_migration(
+        migration_id=HYPOTHESIS_UNIVERSE_MIGRATION_ID,
+        description="Add the operator-editable target universe (symbols/sectors/criteria) to hypotheses.",
+        statements=HYPOTHESIS_UNIVERSE_SCHEMA_STATEMENTS,
+        metadata={"tables": [HYPOTHESES_TABLE], "base_migration_id": HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID},
     )
     _TABLES_READY = True
 

@@ -1472,6 +1472,8 @@ def test_build_constituents_includes_market_action_scan(monkeypatch):
     monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
     monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", True)
     monkeypatch.setattr(mas, "safe_scan_market_action", lambda **_k: scan_frame.copy())
+    from advisory import hypothesis_screeners as _hs
+    monkeypatch.setattr(_hs, "HYPOTHESIS_SCREENERS_ENABLED", False)
 
     out = sp.build_constituents()
     assert len(out) == 1 and out.iloc[0]["screener_slug"] == mas.SCAN_SLUG
@@ -37609,7 +37611,9 @@ def test_hypothesis_engine_ensure_tables_uses_schema_registry(monkeypatch):
 
     hypothesis_engine.ensure_tables(force=True)
 
-    assert len(calls) == 1
+    assert len(calls) == 2
+    assert calls[1]["migration_id"] == hypothesis_engine.HYPOTHESIS_UNIVERSE_MIGRATION_ID
+    assert calls[1]["statements"] == hypothesis_engine.HYPOTHESIS_UNIVERSE_SCHEMA_STATEMENTS
     assert calls[0]["migration_id"] == hypothesis_engine.HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"] == {
         "tables": [
@@ -47408,6 +47412,62 @@ def test_news_overlay_engine_rebuild_cleanup_uses_retryable_operation(monkeypatc
     assert len(executed) == 1
     assert f"DELETE FROM {news_overlay_engine.TABLE_NAME}" in executed[0][0]
     assert upserts == [(news_overlay_engine.TABLE_NAME, 1)]
+
+
+def test_hypothesis_screeners_materialize_universe(monkeypatch):
+    from advisory import hypothesis_screeners as hs
+    from advisory import market_action_scan as mas
+
+    def fake_sql(query, params=None):
+        if "FROM advisory_hypotheses" in query:
+            return pd.DataFrame([
+                {"hypothesis_id": "PROMOTER_BUYING_V1", "title": "Promoter buying",
+                 "status": "active_review", "target_universe_json": None},
+                {"hypothesis_id": "EXPLICIT_UNI_V1", "title": "Explicit universe",
+                 "status": "trusted_overlay",
+                 "target_universe_json": json.dumps({"symbols": ["tcs", "INFY"]})},
+            ])
+        if "FROM advisory_hypothesis_matches" in query:
+            return pd.DataFrame([{"symbol": "RELIANCE", "n": 4}, {"symbol": "HDFCBANK", "n": 2}])
+        if "FROM nseindia_ohlcv" in query:
+            return pd.DataFrame([
+                {"symbol": s, "company_master_id": f"cm-{s}", "isin": f"INE-{s}"}
+                for s in ("RELIANCE", "HDFCBANK", "TCS", "INFY")
+            ])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(hs, "sql_to_df", fake_sql)
+    monkeypatch.setattr(mas, "_latest_bhavcopy_date", lambda asof=None: pd.Timestamp("2026-07-07"))
+    frame = hs.build_hypothesis_constituents()
+    by_slug = {slug: sorted(group["ticker"]) for slug, group in frame.groupby("screener_slug")}
+    # derived default = matched symbols; explicit target_universe_json wins when present
+    assert by_slug["hypothesis-promoter-buying-v1"] == ["HDFCBANK", "RELIANCE"]
+    assert by_slug["hypothesis-explicit-uni-v1"] == ["INFY", "TCS"]
+    row = frame[frame["ticker"] == "RELIANCE"].iloc[0]
+    assert row["company_master_id"] == "cm-RELIANCE"
+    assert json.loads(row["raw_item_json"])["hypothesis_id"] == "PROMOTER_BUYING_V1"
+
+    # failure degrades to empty via the safe wrapper
+    monkeypatch.setattr(hs, "build_hypothesis_constituents", lambda **_k: (_ for _ in ()).throw(RuntimeError("db")))
+    monkeypatch.setattr(hs, "record_local_fallback_event", lambda **_k: None)
+    assert hs.safe_build_hypothesis_constituents().empty
+
+
+def test_build_constituents_includes_hypothesis_screeners(monkeypatch):
+    from advisory import hypothesis_screeners as hs
+    from advisory import market_action_scan as mas
+    from advisory import screener_parser as sp
+
+    hypo_frame = pd.DataFrame(
+        [{"date": pd.Timestamp("2026-07-07"), "screener_slug": "hypothesis-x-v1", "ticker": "TCS",
+          "exchange": "NSE", "rank": 1}]
+    )
+    monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
+    monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", False)
+    monkeypatch.setattr(hs, "HYPOTHESIS_SCREENERS_ENABLED", True)
+    monkeypatch.setattr(hs, "safe_build_hypothesis_constituents", lambda **_k: hypo_frame.copy())
+    out = sp.build_constituents()
+    assert len(out) == 1 and out.iloc[0]["screener_slug"] == "hypothesis-x-v1"
 
 
 def test_relative_strength_percentiles_rank_and_filter():

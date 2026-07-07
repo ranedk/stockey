@@ -285,6 +285,14 @@ def build_constituents(
             scan_frame = safe_scan_market_action(asof_date=snapshot_date)
             if not scan_frame.empty:
                 frames.append(scan_frame)
+        # Hypothesis strategy instances: each active hypothesis's universe joins as its own
+        # screener source (hypothesis-<id>); paused/retired hypotheses stop emitting.
+        from advisory.hypothesis_screeners import HYPOTHESIS_SCREENERS_ENABLED, safe_build_hypothesis_constituents
+
+        if HYPOTHESIS_SCREENERS_ENABLED:
+            hypothesis_frame = safe_build_hypothesis_constituents(asof_date=snapshot_date)
+            if not hypothesis_frame.empty:
+                frames.append(hypothesis_frame)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
