@@ -74101,6 +74101,56 @@ def test_market_context_records_cache_load_fallbacks(monkeypatch):
     assert events[1]["metadata"]["limit"] == 3
 
 
+def test_fundamental_snapshot_yoy_growth_and_acceleration(monkeypatch):
+    universe = pd.DataFrame([{"company_master_id": "cm-1", "symbol": "ABC"}])
+    # 6 contiguous quarters: revenue grows so YoY at Q5 = 40/100 = 0.40, at Q6 = (168-110)/110
+    quarters = pd.date_range("2024-09-30", periods=6, freq="QE-DEC", tz="UTC")
+    revenue = [100.0, 110.0, 120.0, 130.0, 140.0, 168.0]
+    eps = [10.0, 11.0, 12.0, 13.0, 15.0, 17.6]
+    income_rows = [
+        {"company_master_id": "cm-1", "symbol": "ABC", "date": q, "period_length": "3 Months",
+         "total_revenue": r, "ebitda": r * 0.2, "profit_after_tax": r * 0.1,
+         "operating_profit": r * 0.15, "eps_diluted": e}
+        for q, r, e in zip(quarters, revenue, eps)
+    ]
+    # gappy company: 5 rows spanning 2.5 years -> shift(4) lag > 430d -> YoY must be nulled
+    gap_quarters = [pd.Timestamp(d, tz="UTC") for d in ("2023-03-31", "2023-06-30", "2024-06-30", "2025-06-30", "2025-09-30")]
+    income_rows += [
+        {"company_master_id": "cm-2", "symbol": "GAP", "date": q, "period_length": "3 Months",
+         "total_revenue": 50.0 + i, "ebitda": 10.0, "profit_after_tax": 5.0,
+         "operating_profit": 7.0, "eps_diluted": 2.0}
+        for i, q in enumerate(gap_quarters)
+    ]
+
+    def fake_sql(query, params=None):
+        # empty results still carry their SELECTed columns, like a real query would
+        if "FROM stmt_income" in query:
+            return pd.DataFrame(income_rows)
+        if "FROM stmt_balancesheet" in query:
+            return pd.DataFrame(columns=["company_master_id", "date", "total_shareholders_equity", "long_term_debt", "short_term_debt_and_cpltd", "net_debt"])
+        if "FROM stmt_cashflow" in query:
+            return pd.DataFrame(columns=["company_master_id", "date", "net_cash_from_operating_activities", "capital_expenditures_net", "free_cash_flow_to_equity"])
+        return pd.DataFrame(columns=["company_master_id", "statement_date", "reporting_date", "consolidated"])
+
+    monkeypatch.setattr(fundamental_snapshot, "sql_to_df", fake_sql)
+    out = fundamental_snapshot.load_statement_snapshot(
+        pd.DataFrame([{"company_master_id": "cm-1", "symbol": "ABC"},
+                      {"company_master_id": "cm-2", "symbol": "GAP"}])
+    )
+    abc = out[out["company_master_id"] == "cm-1"].sort_values("date")
+    # Q5 YoY: (140-100)/100 = 0.40 ; Q6 YoY: (168-110)/110 ~= 0.5273 ; accel = diff
+    assert abs(abc.iloc[4]["total_revenue_yoy_growth"] - 0.40) < 1e-9
+    assert abs(abc.iloc[5]["total_revenue_yoy_growth"] - (168 - 110) / 110) < 1e-9
+    assert abs(abc.iloc[5]["total_revenue_yoy_growth_accel"] - ((168 - 110) / 110 - 0.40)) < 1e-9
+    assert abs(abc.iloc[4]["eps_diluted_yoy_growth"] - 0.50) < 1e-9
+    assert abs(abc.iloc[1]["eps_diluted_qoq_growth"] - 0.10) < 1e-9
+    # first 4 quarters have no 1-year-back row -> YoY null
+    assert abc.iloc[:4]["total_revenue_yoy_growth"].isna().all()
+    # gappy history: shift(4) row is not ~1 year back -> YoY nulled, never silently wrong
+    gap = out[out["company_master_id"] == "cm-2"].sort_values("date")
+    assert gap["total_revenue_yoy_growth"].isna().all()
+
+
 def test_fundamental_snapshot_records_peer_membership_source_failure(monkeypatch):
     events = []
 

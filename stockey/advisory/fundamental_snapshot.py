@@ -365,13 +365,28 @@ def load_statement_snapshot(universe: pd.DataFrame) -> pd.DataFrame:
     merged = merged.drop(columns=["statement_date"], errors="ignore")
 
     merged = merged.sort_values(["company_master_id", "date"]).reset_index(drop=True)
-    for col in ["total_revenue", "ebitda", "profit_after_tax"]:
+    for col in ["total_revenue", "ebitda", "profit_after_tax", "eps_diluted"]:
         prev = merged.groupby("company_master_id")[col].shift(1)
         merged[f"{col}_qoq_growth"] = np.where(
             prev.replace(0, np.nan).notna(),
             (merged[col] - prev) / prev.abs().replace(0, np.nan),
             np.nan,
         )
+    # YoY (same quarter last year) is the primary growth read for seasonal Indian
+    # businesses -- QoQ alone is misleading there. Acceleration (the change in YoY
+    # growth vs the prior quarter) is the earnings-momentum signal screens and scoring
+    # care about most. shift(4) assumes contiguous quarters, so the 4-back row must
+    # actually be ~1 year old or the growth is nulled instead of silently wrong.
+    yoy_lag_days = (merged["date"] - merged.groupby("company_master_id")["date"].shift(4)).dt.days
+    for col in ["total_revenue", "ebitda", "profit_after_tax", "eps_diluted"]:
+        prev_yoy = merged.groupby("company_master_id")[col].shift(4)
+        valid_yoy = prev_yoy.replace(0, np.nan).notna() & yoy_lag_days.between(300, 430)
+        merged[f"{col}_yoy_growth"] = np.where(
+            valid_yoy,
+            (merged[col] - prev_yoy) / prev_yoy.abs().replace(0, np.nan),
+            np.nan,
+        )
+        merged[f"{col}_yoy_growth_accel"] = merged.groupby("company_master_id")[f"{col}_yoy_growth"].diff()
     debt_base = merged["total_shareholders_equity"].replace(0, np.nan).abs()
     merged["gross_debt"] = (
         merged["long_term_debt"].fillna(0) + merged["short_term_debt_and_cpltd"].fillna(0)
@@ -486,6 +501,9 @@ def attach_peer_relative_features(
         "total_revenue_qoq_growth",
         "ebitda_qoq_growth",
         "profit_after_tax_qoq_growth",
+        "total_revenue_yoy_growth",
+        "profit_after_tax_yoy_growth",
+        "eps_diluted_yoy_growth",
         "debt_to_equity",
         "net_debt_to_equity",
         "promoter_total",
