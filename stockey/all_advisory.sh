@@ -163,3 +163,12 @@ else
   advisory_failure_context="recommendation_diagnostics"
   "${SCRIPT_DIR}/scripts/run_with_markers.sh" "recommendation_diagnostics" "${PYTHON_BIN}" -m advisory.recommendation_diagnostics --format text
 fi
+
+# Automatic regret ledger: enroll today's gate-blocked would-be BUYs and mature earlier
+# ones with forward benchmark-excess, so every gate carries a measurable P&L. Read-only
+# research accounting; never blocks the run.
+if [[ "${ADVISORY_SKIP_REGRET_LEDGER:-0}" == "1" || "${ADVISORY_SKIP_REGRET_LEDGER:-false}" == "true" ]]; then
+  echo "[all_advisory] regret ledger skipped ADVISORY_SKIP_REGRET_LEDGER=${ADVISORY_SKIP_REGRET_LEDGER}"
+else
+  "${SCRIPT_DIR}/scripts/run_with_markers.sh" "regret_ledger" "${PYTHON_BIN}" -m advisory.regret_ledger --format text || echo "[all_advisory] regret ledger failed (non-fatal); rerun with: ${PYTHON_BIN} -m advisory.regret_ledger" >&2
+fi

@@ -2746,10 +2746,16 @@ def build_scorecard_payload(*, limit: int = 2000) -> dict[str, Any]:
     (symbol, decided_at) for the slicing dimensions. Only matured, directional outcomes count.
     """
     if not _table_exists(LLM_DECISION_OUTCOMES_TABLE) or not _table_exists(LLM_DECISIONS_TABLE):
+        try:
+            from advisory.regret_ledger import summarize as summarize_gate_regret
+
+            gate_regret = summarize_gate_regret(horizon=10)
+        except Exception as exc:
+            gate_regret = [{"error": f"{type(exc).__name__}: {exc}"}]
         return {"generated_at": pd.Timestamp.utcnow().isoformat(),
                 "api_schema": _operator_api_schema("/api/scorecard", schema_name="operator_scorecard"),
                 "summary": {"matured": 0}, "by_event_class": [], "by_sufficiency_path": [],
-                "by_hypothesis": [], "review_only": True,
+                "by_hypothesis": [], "gate_regret": gate_regret, "review_only": True,
                 "skipped": [{"source": LLM_DECISION_OUTCOMES_TABLE, "error": "missing_table"}]}
     rows = _records(sql_to_df(
         f"""
@@ -2773,6 +2779,12 @@ def build_scorecard_payload(*, limit: int = 2000) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
     n = matured or 1
+    try:
+        from advisory.regret_ledger import summarize as summarize_gate_regret
+
+        gate_regret = summarize_gate_regret(horizon=10)
+    except Exception as exc:
+        gate_regret = [{"error": f"{type(exc).__name__}: {exc}"}]
     return {
         "generated_at": pd.Timestamp.utcnow().isoformat(),
         "api_schema": _operator_api_schema("/api/scorecard", schema_name="operator_scorecard"),
@@ -2785,6 +2797,8 @@ def build_scorecard_payload(*, limit: int = 2000) -> dict[str, Any]:
         "by_event_class": _scorecard_group(rows, "event_class"),
         "by_sufficiency_path": _scorecard_group(rows, "sufficiency_path"),
         "by_hypothesis": _scorecard_group(rows, "hypothesis_id"),
+        "gate_regret": gate_regret,
+        "gate_regret_note": "What each gate's blocked would-be BUYs returned vs NIFTY after cost (10d). Positive avg = the gate blocks winners and costs alpha; negative = it earns its keep. Auto-enrolled and auto-labeled nightly.",
         "review_only": True,
         "operator_note": "Benchmark-excess after cost vs NIFTY for matured, directional decisions. The trust signal behind recommendations.",
     }

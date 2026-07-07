@@ -74101,6 +74101,96 @@ def test_market_context_records_cache_load_fallbacks(monkeypatch):
     assert events[1]["metadata"]["limit"] == 3
 
 
+def test_regret_ledger_enrollment_attributes_gates(monkeypatch):
+    from advisory import regret_ledger as rl
+
+    asof = pd.Timestamp("2026-07-06", tz="UTC")
+
+    def fake_sql(query, params=None):
+        if "FROM advisory_candidate_rejections" in query:
+            return pd.DataFrame([
+                {"symbol": "aaa", "reason_code": "liquidity_far_below_min", "reason_detail": "adv too small"},
+                {"symbol": "BBB", "reason_code": "market_cap_below_min", "reason_detail": "microcap"},
+            ])
+        if "FROM advisory_candidates" in query:
+            return pd.DataFrame([
+                {"symbol": "CCC", "candidate_state": "WATCH_BREAKOUT", "watch_reason_detail": "not triggered"},
+            ])
+        if "FROM advisory_allocations" in query:
+            return pd.DataFrame([
+                {"symbol": "DDD", "allocation_status": "review_manual", "candidate_state": "PASS_NOW", "notes": "llm review"},
+            ])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(rl, "sql_to_df", fake_sql)
+    frame = rl.build_enrollment_rows(asof)
+    gates = dict(zip(frame["symbol"], frame["gate"]))
+    assert gates["AAA"] == "rules:liquidity_far_below_min"
+    assert gates["BBB"] == "rules:market_cap_below_min"
+    assert gates["CCC"] == "candidates:state_watch_breakout"
+    assert gates["DDD"] == "risk:review_manual"
+    assert (frame["broker_execution_allowed"] == False).all()  # noqa: E712
+    assert not frame.duplicated(subset=["asof_date", "symbol", "stage", "gate"]).any()
+
+
+def test_regret_ledger_labels_forward_excess(monkeypatch):
+    from advisory import regret_ledger as rl
+
+    asof = pd.Timestamp("2026-06-20", tz="UTC")
+    # 12 trading rows: symbol +10% by t+5; benchmark +2% by t+5
+    dates = pd.date_range("2026-06-20", periods=12, freq="B", tz="UTC")
+    symbol_prices = pd.DataFrame({"symbol": "AAA", "date": dates, "close": [100.0 + 2 * i for i in range(12)]})
+    bench_prices = pd.DataFrame({"date": dates, "close": [100.0 + 0.4 * i for i in range(12)]})
+    pending = pd.DataFrame([{"asof_date": asof, "symbol": "AAA", "stage": "rules", "gate": "rules:x"}])
+
+    executed: list[tuple[str, tuple]] = []
+
+    class FakeCur:
+        def execute(self, sql, params=None):
+            executed.append((str(sql), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return (None, FakeCur())
+
+        def __exit__(self, *_a):
+            return False
+
+    monkeypatch.setattr(rl, "ensure_table", lambda: None)
+    monkeypatch.setattr(rl, "sql_to_df", lambda query, params=None: pending.copy() if rl.TABLE_NAME in query else pd.DataFrame())
+    monkeypatch.setattr(rl, "_load_price_series", lambda symbols, from_date: symbol_prices.copy())
+    monkeypatch.setattr(rl, "_load_benchmark_series", lambda from_date: bench_prices.copy())
+    monkeypatch.setattr(rl, "db_session", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(rl, "execute_db_operation", lambda op, *, operation_name=None: op())
+
+    result = rl.label_outcomes()
+    assert result == {"pending": 1, "updated": 1}
+    sql, params = executed[0]
+    assert "UPDATE" in sql and rl.TABLE_NAME in sql
+    # 5d: symbol 110/100-1 = 0.10 ; benchmark 102/100-1 = 0.02 ; excess = 0.08 - 25bps
+    sets = dict(zip([part.split(" = ")[0].strip() for part in sql.split("SET ")[1].split(" WHERE ")[0].split(", ")], params))
+    assert abs(sets["fwd_return_5d"] - 0.10) < 1e-9
+    assert abs(sets["benchmark_return_5d"] - 0.02) < 1e-9
+    assert abs(sets["excess_after_cost_5d"] - (0.08 - 0.0025)) < 1e-9
+    assert sets["matured_5d"] is True and sets["matured_10d"] is True
+    assert "matured_20d" not in sets  # only 11 forward rows -> 20d not matured yet
+
+
+def test_regret_ledger_summary_readings(monkeypatch):
+    from advisory import regret_ledger as rl
+
+    frame = pd.DataFrame([
+        {"gate": "rules:market_cap_below_min", "matured_count": 40, "avg_excess_after_cost": 0.031, "blocked_winner_rate": 0.66},
+        {"gate": "rules:technical_engine_reject", "matured_count": 30, "avg_excess_after_cost": -0.012, "blocked_winner_rate": 0.40},
+    ])
+    monkeypatch.setattr(rl, "ensure_table", lambda: None)
+    monkeypatch.setattr(rl, "sql_to_df", lambda *a, **k: frame)
+    out = rl.summarize(horizon=10)
+    assert out[0]["gate"] == "rules:market_cap_below_min" and out[0]["reading"] == "blocking_winners_costs_alpha"
+    assert out[1]["reading"] == "earning_its_keep"
+    assert out[0]["avg_excess_after_cost"] == 0.031
+
+
 def test_fundamental_snapshot_yoy_growth_and_acceleration(monkeypatch):
     universe = pd.DataFrame([{"company_master_id": "cm-1", "symbol": "ABC"}])
     # 6 contiguous quarters: revenue grows so YoY at Q5 = 40/100 = 0.40, at Q6 = (168-110)/110
