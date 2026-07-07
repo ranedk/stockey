@@ -525,10 +525,24 @@ unresolved or low-confidence cases.
 
 **Sub-tasks (each bounded, verify-first, pick up later).**
 
-### [P1.10.1] Inventory and classify every Manual Review source
+### [P1.10.1] Inventory and classify every Manual Review source  ✅ DONE
+- **Outcome (2026-07-05):** Added `docs/manual_review_resolution_inventory.md`, a
+  source matrix for the LLM-resolved review epic. It classifies event-policy rows,
+  playbook/hypothesis action plans, Manual Review wait-signal follow-ups,
+  unresolved action conflicts, market-gated positives, lifecycle/rebalance review
+  boundaries, incomplete reason contracts, execution blockers, identity issues,
+  technical/signal-quality/event-policy/TS-forecast promotion reviews, and
+  operational failures by decision needed, existing evidence, external-research
+  usefulness, auto-resolution suitability, and later resolver action. This was
+  documentation-only; no broker, portfolio, DB cleanup, credential, or runtime
+  behavior changed. The inventory also corrects the stale task hint that referenced
+  nonexistent `advisory/manual_review_state.py`; current sources are the API,
+  action-consolidation, wait-signal, identity, execution, event-policy, health,
+  and promotion-review modules named in the matrix.
 - **Do:** Enumerate all sources that currently create Manual Review items
-  (`advisory/manual_review_state.py`, action-consolidation manual rows, identity issues,
-  execution blockers, threshold/signal-quality/event-policy reviews, wait-signal follow-ups).
+  (action-consolidation manual rows, identity issues, execution blockers,
+  threshold/signal-quality/event-policy reviews, wait-signal follow-ups, and the
+  Operator API/Health surfaces that expose them).
   For each, record: what decision it needs, what evidence is already loaded, whether external
   research could help, and whether it is safe to auto-resolve vs always-escalate.
 - **Deliverable:** a short matrix (source -> needs-external-data? / auto-resolvable? /

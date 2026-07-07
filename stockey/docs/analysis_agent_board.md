@@ -41,16 +41,14 @@ Supervisor guardrails:
 
 Status: `integrated`
 
-Previous slice: `Rebalance SELL over risk-off market-gated portfolio BUY_MORE plus WATCH reason-contract source-precedence coverage`
-Current slice: `Adversarial-veto Manual Review over risk-off market-gated portfolio BUY_MORE plus WATCH reason-contract source-precedence coverage`
+Previous slice: `Adversarial-veto Manual Review over risk-off market-gated portfolio BUY_MORE plus WATCH reason-contract source-precedence coverage`
+Current slice: `Inventory and classify every Manual Review source for LLM-resolved review`
 
 Acceptance criteria:
 
-- A focused backend regression proves adversarial-veto event-policy `MANUAL_REVIEW` wins over a same-symbol risk-off market-gated portfolio `BUY_MORE` and watchlist `WATCH`.
-- The adversarial-veto winner remains review-only with no transaction type, explicit event veto evidence, and no broker execution authority.
-- Source-precedence evidence lists both losing candidates and preserves the losing portfolio add-on's market-gate context, including original `BUY_MORE`.
-- No broker execution behavior changes.
-- No cleanup command is executed and no DB rows are marked superseded.
+- A concise docs matrix lists current Manual Review source families and the decision each needs.
+- Each source family records existing evidence, whether external research could help, auto-resolution suitability, and later resolver action.
+- No broker execution behavior, runtime code, cleanup state, credentials, or DB rows are touched.
 
 ## Queue
 
@@ -149,6 +147,7 @@ Acceptance criteria:
 93. Event-policy Manual Review over market-adjusted portfolio BUY_MORE plus WATCH reason-contract source-precedence coverage. Integrated in cycle 1/3.
 94. Rebalance SELL over risk-off market-gated portfolio BUY_MORE plus WATCH reason-contract source-precedence coverage. Integrated in cycle 2/3.
 95. Adversarial-veto Manual Review over risk-off market-gated portfolio BUY_MORE plus WATCH reason-contract source-precedence coverage. Integrated in cycle 3/3.
+96. Inventory and classify every Manual Review source for LLM-resolved review. Integrated in cycle 1/1.
 
 ## Latest Agent Notes
 
@@ -262,10 +261,14 @@ Acceptance criteria:
 - Integrator: added rebalance SELL-over-risk-off market-gated BUY_MORE plus WATCH regression coverage, proving exit precedence remains broker-capable and losing source-precedence evidence preserves the blocked original add-on context.
 - Planner: confirmed the board's stale current rebalance slice was already integrated and recommended choosing another bounded action-source reason-contract permutation or read-only Operator API contract gap.
 - Integrator: added adversarial-veto Manual Review-over-risk-off market-gated BUY_MORE plus WATCH regression coverage, proving veto precedence remains review-only and losing source-precedence evidence preserves blocked original add-on context.
-- Next cycle after this: pick another bounded action-source reason-contract permutation, such as playbook exposure-review overlays against market-gated portfolio candidates, or a read-only Operator API contract gap; skip write routes that execute commands, mutate cleanup state, require credentials, or alter live broker behavior.
+- Planner: selected P1.10.1 as the next highest-priority bounded open slice after P0 and P1.1-P1.9 were already done/verified; the board's previous adversarial-veto slice was already integrated.
+- Integrator: added `docs/manual_review_resolution_inventory.md`, classifying Manual Review source families for the LLM-resolved review epic without changing runtime, broker, cleanup, credential, or DB behavior.
+- Next cycle after this: implement P1.10.2 by extracting a reusable bounded LLM review-resolver contract, starting with event-policy-compatible review-only inputs; stop before provider/web-search wiring, credentials, or live broker behavior.
 
 ## Validation Log
 
+- `python scripts/docs_state_audit.py --strict` passed for Manual Review source inventory docs.
+- `git diff --check` and `git diff --no-index --check /dev/null docs/manual_review_resolution_inventory.md; diff_status=$?; test $diff_status -le 1` passed for Manual Review source inventory docs.
 - `python -m py_compile advisory/action_recommender.py tests/test_advisory_regression.py` passed for adversarial-veto Manual Review over risk-off market-gated portfolio BUY_MORE plus WATCH reason-contract source-precedence coverage.
 - `pytest -q tests/test_advisory_regression.py -k 'adversarial_veto_beats_market_gated_buy_more_watch'` passed with 1 test.
 - `python -m py_compile advisory/action_recommender.py tests/test_advisory_regression.py` passed for rebalance SELL over risk-off market-gated portfolio BUY_MORE plus WATCH reason-contract source-precedence coverage.
