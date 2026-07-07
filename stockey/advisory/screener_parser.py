@@ -293,6 +293,14 @@ def build_constituents(
             hypothesis_frame = safe_build_hypothesis_constituents(asof_date=snapshot_date)
             if not hypothesis_frame.empty:
                 frames.append(hypothesis_frame)
+        # Theme screeners: active positive news themes admit their sector universe as
+        # theme-<id> sources; decayed themes stop emitting (lowest-conviction lane, capped).
+        from advisory.theme_screeners import THEME_SCREENERS_ENABLED, safe_build_theme_constituents
+
+        if THEME_SCREENERS_ENABLED:
+            theme_frame = safe_build_theme_constituents(asof_date=snapshot_date)
+            if not theme_frame.empty:
+                frames.append(theme_frame)
     if not frames:
         combined = pd.DataFrame()
     else:

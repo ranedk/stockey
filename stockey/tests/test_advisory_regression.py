@@ -1477,6 +1477,8 @@ def test_build_constituents_includes_market_action_scan(monkeypatch):
 
     from advisory import screener_retention as _sret
     monkeypatch.setattr(_sret, "apply_retention", lambda frame, **_k: frame)
+    from advisory import theme_screeners as _ts
+    monkeypatch.setattr(_ts, "THEME_SCREENERS_ENABLED", False)
     out = sp.build_constituents()
     assert len(out) == 1 and out.iloc[0]["screener_slug"] == mas.SCAN_SLUG
 
@@ -47507,6 +47509,87 @@ def test_regret_ledger_enrolls_watch_exits(monkeypatch):
     assert exit_rows.iloc[0]["symbol"] == "OLDSCAN"
 
 
+def test_theme_screeners_emit_positive_universe_and_enforce_decay(monkeypatch):
+    from advisory import market_action_scan as mas
+    from advisory import theme_screeners as ts
+
+    joined = pd.DataFrame([
+        {"theme_id": "DEFENSE_INDIGENISATION", "theme_name": "Defense indigenisation",
+         "overlay_asof_date": pd.Timestamp("2026-07-07", tz="UTC"), "pressure_score": 0.8,
+         "hit_score": 3.0, "overlay_sector_name": "defense", "symbol": "BEL",
+         "company_master_id": "cm-BEL", "context_rank": 1, "universe_sector_name": "IN0702",
+         "theme_rank": 1},
+        {"theme_id": "DEFENSE_INDIGENISATION", "theme_name": "Defense indigenisation",
+         "overlay_asof_date": pd.Timestamp("2026-07-07", tz="UTC"), "pressure_score": 0.8,
+         "hit_score": 3.0, "overlay_sector_name": "aerospace", "symbol": "HAL",
+         "company_master_id": "cm-HAL", "context_rank": 2, "universe_sector_name": "IN0702",
+         "theme_rank": 2},
+        # stale theme: overlay 30 days old vs max_active_days 21 -> skipped entirely
+        {"theme_id": "OLD_THEME", "theme_name": "Faded theme",
+         "overlay_asof_date": pd.Timestamp("2026-06-07", tz="UTC"), "pressure_score": 0.5,
+         "hit_score": 1.0, "overlay_sector_name": "banks", "symbol": "HDFCBANK",
+         "company_master_id": "cm-HDFC", "context_rank": 1, "universe_sector_name": "IN0501",
+         "theme_rank": 1},
+    ])
+    monkeypatch.setattr(ts, "_load_theme_symbols", lambda asof: joined.copy())
+    monkeypatch.setattr(ts, "_theme_max_active_days", lambda: {"DEFENSE_INDIGENISATION": 21, "OLD_THEME": 21})
+    monkeypatch.setattr(mas, "_latest_bhavcopy_date", lambda asof=None: pd.Timestamp("2026-07-07", tz="UTC"))
+    frame = ts.build_theme_constituents(asof_date="2026-07-07")
+    assert set(frame["screener_slug"]) == {"theme-defense-indigenisation"}
+    assert list(frame["ticker"]) == ["BEL", "HAL"]
+    raw = json.loads(frame.iloc[0]["raw_item_json"])
+    assert raw["theme_id"] == "DEFENSE_INDIGENISATION" and raw["pressure_score"] == 0.8
+    assert "HDFCBANK" not in set(frame["ticker"])  # decayed theme admits nothing
+
+    # failure degrades to empty via the safe wrapper
+    monkeypatch.setattr(ts, "build_theme_constituents", lambda **_k: (_ for _ in ()).throw(RuntimeError("db")))
+    monkeypatch.setattr(ts, "record_local_fallback_event", lambda **_k: None)
+    assert ts.safe_build_theme_constituents().empty
+
+
+def test_theme_sector_aliases_cover_all_yaml_sectors():
+    # every sector label used by a theme must resolve through the alias map -- otherwise the
+    # theme silently admits nothing (the universe carries raw NSE codes only).
+    import yaml
+    from advisory.news_theme_engine import THEME_SECTOR_CODE_ALIASES, theme_sector_key
+
+    config = yaml.safe_load(open("config/investment_themes.yaml"))
+    themes = config.get("themes") or config
+    labels: set[str] = set()
+    for theme in (themes if isinstance(themes, list) else themes.values()):
+        guidance = (theme.get("portfolio_guidance") or {}) if isinstance(theme, dict) else {}
+        for key in ("positive_sectors", "negative_sectors"):
+            for sector in guidance.get(key) or []:
+                labels.add(str(sector))
+    assert labels, "expected theme sector labels in investment_themes.yaml"
+    unmapped = sorted(
+        label for label in labels
+        if theme_sector_key(label) not in THEME_SECTOR_CODE_ALIASES
+    )
+    assert unmapped == [], f"theme sectors with no NSE code alias: {unmapped}"
+
+
+def test_build_constituents_includes_theme_screeners(monkeypatch):
+    from advisory import hypothesis_screeners as hs
+    from advisory import market_action_scan as mas
+    from advisory import screener_parser as sp
+    from advisory import screener_retention as sret
+    from advisory import theme_screeners as ts
+
+    theme_frame = pd.DataFrame(
+        [{"date": pd.Timestamp("2026-07-07"), "screener_slug": "theme-defense-indigenisation",
+          "ticker": "BEL", "exchange": "NSE", "rank": 1}]
+    )
+    monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
+    monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", False)
+    monkeypatch.setattr(hs, "HYPOTHESIS_SCREENERS_ENABLED", False)
+    monkeypatch.setattr(sret, "apply_retention", lambda frame, **_k: frame)
+    monkeypatch.setattr(ts, "THEME_SCREENERS_ENABLED", True)
+    monkeypatch.setattr(ts, "safe_build_theme_constituents", lambda **_k: theme_frame.copy())
+    out = sp.build_constituents()
+    assert len(out) == 1 and out.iloc[0]["screener_slug"] == "theme-defense-indigenisation"
+
+
 def test_hypothesis_screeners_materialize_universe(monkeypatch):
     from advisory import hypothesis_screeners as hs
     from advisory import market_action_scan as mas
@@ -47655,6 +47738,8 @@ def test_build_constituents_includes_hypothesis_screeners(monkeypatch):
     monkeypatch.setattr(hs, "safe_build_hypothesis_constituents", lambda **_k: hypo_frame.copy())
     from advisory import screener_retention as _sret
     monkeypatch.setattr(_sret, "apply_retention", lambda frame, **_k: frame)
+    from advisory import theme_screeners as _ts
+    monkeypatch.setattr(_ts, "THEME_SCREENERS_ENABLED", False)
     out = sp.build_constituents()
     assert len(out) == 1 and out.iloc[0]["screener_slug"] == "hypothesis-x-v1"
 

@@ -23,11 +23,59 @@ THEME_SCREENERS_TABLE = "advisory_news_theme_screeners"
 THEME_CONTEXT_OVERLAYS_TABLE = "advisory_news_theme_context_overlays"
 NEWS_THEME_SCHEMA_MIGRATION_ID = "20260611_advisory_news_theme_screeners_base"
 NEWS_THEME_CONTEXT_OVERLAY_SCHEMA_MIGRATION_ID = "20260620_advisory_news_theme_context_overlays_base"
+# NSE macro-sector codes verified empirically against master_sharpely_equity anchors
+# (IN0501 HDFC Bank/Bajaj Finance, IN0601 Sun Pharma/Apollo, IN0701 L&T, IN0702 BEL/HAL/
+# Siemens/Kaynes, IN0202 Dixon/Titan, IN0205 DLF, IN1101 NTPC, ...). Covers every sector
+# label used in config/investment_themes.yaml so theme->universe joins actually match.
 THEME_SECTOR_CODE_ALIASES: dict[str, tuple[str, ...]] = {
     "CAPITALGOODS": ("IN0702",),
     "ENGINEERING": ("IN0702",),
     "INDUSTRIALS": ("IN0702",),
     "INFRASTRUCTURE": ("IN0701", "IN0702"),
+    "AEROSPACE": ("IN0702",),
+    "DEFENSE": ("IN0702",),
+    "DEFENCE": ("IN0702",),
+    "CABLES": ("IN0702",),
+    "COMPONENTS": ("IN0702", "IN0202"),
+    "ELECTRONICS": ("IN0202", "IN0702"),
+    "EMS": ("IN0702", "IN0202"),
+    "COOLING": ("IN0202", "IN0702"),
+    "POWEREQUIPMENT": ("IN0702",),
+    "TRANSFORMERS": ("IN0702",),
+    "TRANSMISSION": ("IN1101", "IN0702"),
+    "POWER": ("IN1101", "IN1102"),
+    "STORAGE": ("IN0702", "IN0201"),
+    "EPC": ("IN0701",),
+    "CONSTRUCTION": ("IN0701",),
+    "BANKS": ("IN0501",),
+    "NBFC": ("IN0501",),
+    "GOLDFINANCE": ("IN0501",),
+    "FINANCIALSERVICES": ("IN0501",),
+    "GOLD": ("IN0202",),
+    "HOSPITALS": ("IN0601",),
+    "DIAGNOSTICS": ("IN0601",),
+    "HEALTHCARE": ("IN0601",),
+    "PHARMA": ("IN0601",),
+    "REALESTATE": ("IN0205",),
+    "REALTY": ("IN0205",),
+    "IT": ("IN0801",),
+    "TECHNOLOGY": ("IN0801",),
+    "AUTO": ("IN0201",),
+    "AUTOMOBILE": ("IN0201",),
+    "CHEMICALS": ("IN0101",),
+    "CEMENT": ("IN0102",),
+    "METALS": ("IN0103",),
+    "MINING": ("IN0103",),
+    "FMCG": ("IN0401",),
+    "OILGAS": ("IN0301",),
+    "ENERGY": ("IN0301",),
+    "TELECOM": ("IN1001",),
+    "LOGISTICS": ("IN0901",),
+    "PORTS": ("IN0901",),
+    "AVIATION": ("IN0901",),
+    "RETAIL": ("IN0206",),
+    "CONSUMERDURABLES": ("IN0202",),
+    "CONSUMERSERVICES": ("IN0206",),
 }
 THEME_SECTOR_INTENTIONALLY_BROAD_KEYS: set[str] = set()
 NEWS_THEME_SCHEMA_STATEMENTS = [
