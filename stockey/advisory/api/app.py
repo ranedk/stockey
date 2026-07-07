@@ -7829,6 +7829,21 @@ def preview_hypothesis_create_payload(payload: dict[str, Any]) -> dict[str, Any]
 
 
 def update_hypothesis_payload(hypothesis_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    # Retiring/pausing a thesis runs its lifecycle cascade (expire wait signals, review-only
+    # exit pressure for held universe symbols) instead of a bare status write.
+    from advisory.hypothesis_engine import RETIREMENT_STATUSES, normalize_playbook_status, retire_hypothesis
+
+    requested_status = normalize_playbook_status(str(payload.get("status") or ""))
+    if requested_status in RETIREMENT_STATUSES:
+        field_edits = {k: v for k, v in payload.items() if k not in {"status", "status_reason"}}
+        if field_edits:
+            update_hypothesis(hypothesis_id, field_edits)
+        cascade = retire_hypothesis(
+            hypothesis_id,
+            reason=str(payload.get("status_reason") or "operator status update"),
+            status=requested_status,
+        )
+        return {"status": "ok", "hypothesis_id": hypothesis_id, "cascade": cascade}
     row = update_hypothesis(hypothesis_id, payload)
     return {"status": "ok", "hypothesis": row}
 

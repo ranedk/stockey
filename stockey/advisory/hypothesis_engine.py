@@ -23,7 +23,7 @@ from advisory.market_context import load_latest_market_context
 from advisory.news_theme_engine import THEME_CONTEXT_OVERLAYS_TABLE
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
-from utils.db import sql_to_df, upsert_to_db
+from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 from utils.sync import parse_datetime_arg
 from utils.codex_cli import run_codex_structured
@@ -2340,6 +2340,137 @@ def attach_thesis_alignment(matches: pd.DataFrame) -> pd.DataFrame:
     out["thesis_alignment"] = alignments
     out["alignment_basis"] = bases
     return out
+
+
+RETIREMENT_STATUSES = {"retired", "paused"}
+
+
+def retire_hypothesis(hypothesis_id: str, *, reason: str, status: str = "retired") -> dict[str, Any]:
+    """Retire/pause a hypothesis WITH its lifecycle cascade (a thesis that dies takes its
+    machinery with it):
+
+    1. status + an audit entry appended to decision_policy_json.lifecycle_audit,
+    2. its open wait signals expire immediately,
+    3. universe symbols that are CURRENT OPEN operator holdings get a review-only
+       REDUCE_EXPOSURE_REVIEW signal-refresh row naming the dead thesis
+       (portfolio_authority=none, broker_execution_allowed=false, full advisory required).
+
+    The hypothesis screener stops emitting on the next constituents build (status filter),
+    so its watch symbols age out of the snapshot automatically.
+    """
+    ensure_tables()
+    normalized_id = str(hypothesis_id or "").strip()
+    normalized_status = normalize_playbook_status(status)
+    if normalized_status not in RETIREMENT_STATUSES:
+        raise ValueError(f"retire_hypothesis only accepts retired/paused, got: {status}")
+    existing = sql_to_df(
+        f"SELECT hypothesis_id, title, decision_policy_json, target_universe_json FROM {HYPOTHESES_TABLE} WHERE hypothesis_id = %s LIMIT 1",
+        params=(normalized_id,),
+    )
+    if existing.empty:
+        raise ValueError(f"Unknown hypothesis_id: {normalized_id}")
+    row = existing.iloc[0]
+    title = str(row.get("title") or normalized_id)
+    now = pd.Timestamp.utcnow()
+
+    policy = parse_jsonish(row.get("decision_policy_json"), {}, source="decision_policy_json")
+    if not isinstance(policy, dict):
+        policy = {}
+    audit = policy.get("lifecycle_audit")
+    audit = list(audit) if isinstance(audit, list) else []
+    audit.append({"at": now.isoformat(), "action": normalized_status, "reason": str(reason or "").strip()})
+    policy["lifecycle_audit"] = audit
+
+    expired_signals = 0
+
+    def _apply_status_and_expiry() -> None:
+        nonlocal expired_signals
+        with db_session() as (_conn, cur):
+            cur.execute(
+                f"UPDATE {HYPOTHESES_TABLE} SET status = %s, decision_policy_json = %s, updated_at = %s WHERE hypothesis_id = %s",
+                (normalized_status, json_dumps(policy), now.to_pydatetime(), normalized_id),
+            )
+            cur.execute(
+                "UPDATE advisory_wait_signals SET status = 'expired', valid_until = %s "
+                "WHERE hypothesis_id = %s AND LOWER(COALESCE(status, 'active')) NOT IN ('expired', 'matched')",
+                (now.to_pydatetime(), normalized_id),
+            )
+            expired_signals = int(cur.rowcount or 0)
+
+    execute_db_operation(_apply_status_and_expiry, operation_name="hypothesis_engine:retire_cascade")
+
+    # review-only exit pressure for held universe symbols
+    exit_review_symbols: list[str] = []
+    try:
+        from advisory.hypothesis_screeners import _universe_symbols
+
+        universe = _universe_symbols(normalized_id, row.get("target_universe_json"))
+        if universe:
+            held = sql_to_df(
+                "SELECT DISTINCT UPPER(TRIM(symbol)) AS symbol FROM advisory_operator_holdings "
+                "WHERE COALESCE(status, 'open') = 'open' AND UPPER(TRIM(symbol)) = ANY(%s)",
+                params=(universe,),
+            )
+            exit_review_symbols = sorted(held["symbol"].tolist()) if not held.empty else []
+        if exit_review_symbols:
+            from advisory.signal_refresh import (
+                SIGNAL_REFRESH_AUTHORITY_CONTRACT,
+                ensure_table as ensure_signal_refresh_table,
+                make_refresh_id,
+                persist_signal_rows,
+            )
+
+            ensure_signal_refresh_table()
+            signal_rows = []
+            for symbol in exit_review_symbols:
+                action_reason = (
+                    f"Hypothesis {normalized_status}: {title}. {str(reason or '').strip()} "
+                    "This holding entered the watch universe under that thesis; review exposure. "
+                    "Review-input only; full advisory remains authoritative."
+                )
+                signal_rows.append(
+                    {
+                        "refresh_id": make_refresh_id(refreshed_at=now, symbol=symbol, unique_id=normalized_id, reason=f"hypothesis_{normalized_status}"),
+                        "refreshed_at": now,
+                        "asof_date": now.normalize(),
+                        "symbol": symbol,
+                        "unique_id": f"hypothesis:{normalized_id}",
+                        "reason": f"hypothesis_{normalized_status}",
+                        "signal_action": "REDUCE_EXPOSURE_REVIEW",
+                        "signal_status": "exit_or_reduce",
+                        "signal_source": "hypothesis_lifecycle",
+                        "confidence": None,
+                        "action_reason": action_reason,
+                        "effect_type": "hypothesis_retired_derisk",
+                        "effect_summary": "The thesis behind this holding was retired; fast refresh created review-only de-risk pressure.",
+                        "previous_action": None,
+                        "action_changed": False,
+                        **SIGNAL_REFRESH_AUTHORITY_CONTRACT,
+                        "action_payload_json": json_dumps({"hypothesis_id": normalized_id, "title": title, "reason": reason, "lifecycle_status": normalized_status}),
+                        "trace_id": None,
+                        "dry_run": False,
+                        "load_ts": now,
+                    }
+                )
+            persist_signal_rows(signal_rows)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.hypothesis_engine",
+            source=HYPOTHESES_TABLE,
+            fallback_type="hypothesis_retire_exit_review_failed",
+            severity="warn",
+            reason="Hypothesis retirement completed but review-only exit signals for held symbols could not be created.",
+            error=exc,
+            metadata={"hypothesis_id": normalized_id, "status": normalized_status},
+        )
+    return {
+        "hypothesis_id": normalized_id,
+        "status": normalized_status,
+        "reason": str(reason or "").strip(),
+        "wait_signals_expired": expired_signals,
+        "exit_review_symbols": exit_review_symbols,
+        "broker_execution_allowed": False,
+    }
 
 
 def persist_matches(matches: pd.DataFrame) -> None:

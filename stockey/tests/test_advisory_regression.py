@@ -47454,6 +47454,69 @@ def test_hypothesis_screeners_materialize_universe(monkeypatch):
     assert hs.safe_build_hypothesis_constituents().empty
 
 
+def test_retire_hypothesis_cascade(monkeypatch):
+    executed: list[tuple[str, tuple]] = []
+    persisted_signals: list[dict[str, object]] = []
+
+    class FakeCur:
+        rowcount = 2  # two open wait signals expired
+
+        def execute(self, sql, params=None):
+            executed.append((str(sql), params))
+
+    class FakeSession:
+        def __enter__(self):
+            return (None, FakeCur())
+
+        def __exit__(self, *_a):
+            return False
+
+    def fake_sql(query, params=None):
+        if "FROM advisory_hypotheses" in query:
+            return pd.DataFrame([{"hypothesis_id": "H1", "title": "Promoter buying",
+                                  "decision_policy_json": "{}", "target_universe_json": None}])
+        if "FROM advisory_operator_holdings" in query:
+            return pd.DataFrame([{"symbol": "RELIANCE"}])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(hypothesis_engine, "ensure_tables", lambda **_k: None)
+    monkeypatch.setattr(hypothesis_engine, "sql_to_df", fake_sql)
+    monkeypatch.setattr(hypothesis_engine, "db_session", lambda *a, **k: FakeSession())
+    monkeypatch.setattr(hypothesis_engine, "execute_db_operation", lambda op, *, operation_name=None: op())
+    from advisory import hypothesis_screeners as hs
+    from advisory import signal_refresh as sr
+    monkeypatch.setattr(hs, "_universe_symbols", lambda hid, uni: ["RELIANCE", "TCS"])
+    monkeypatch.setattr(sr, "ensure_table", lambda: None)
+    monkeypatch.setattr(sr, "persist_signal_rows", lambda rows: persisted_signals.extend(rows))
+
+    result = hypothesis_engine.retire_hypothesis("H1", reason="thesis played out", status="retired")
+
+    assert result["status"] == "retired"
+    assert result["wait_signals_expired"] == 2
+    assert result["exit_review_symbols"] == ["RELIANCE"]  # held symbol only, TCS not held
+    assert result["broker_execution_allowed"] is False
+    # status write carries the audit trail
+    status_sql, status_params = executed[0]
+    assert "UPDATE advisory_hypotheses SET status" in status_sql
+    assert status_params[0] == "retired" and "thesis played out" in status_params[1]
+    # wait signals expired for this hypothesis only
+    expire_sql, expire_params = executed[1]
+    assert "advisory_wait_signals" in expire_sql and "expired" in expire_sql
+    assert expire_params[-1] == "H1"
+    # review-only exit pressure with the dead thesis named
+    assert len(persisted_signals) == 1
+    signal = persisted_signals[0]
+    assert signal["symbol"] == "RELIANCE"
+    assert signal["signal_action"] == "REDUCE_EXPOSURE_REVIEW"
+    assert signal["signal_source"] == "hypothesis_lifecycle"
+    assert signal["broker_execution_allowed"] is False
+    assert "Promoter buying" in signal["action_reason"]
+
+    # only retired/paused accepted
+    with pytest.raises(ValueError):
+        hypothesis_engine.retire_hypothesis("H1", reason="x", status="production")
+
+
 def test_hypothesis_thesis_alignment_truth_table(monkeypatch):
     # negative thesis (de-risk) SUPPORTED by negative event; positive thesis by positive;
     # opposite = contradicts; unevaluated or unknown-direction = neutral.
