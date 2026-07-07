@@ -7575,6 +7575,25 @@ def build_hypotheses_payload(*, limit: int = 100, offset: int = 0) -> dict[str, 
     all_hypotheses = load_hypotheses()
     hypothesis_rows = all_hypotheses.to_dict(orient="records") if not all_hypotheses.empty else []
     hypothesis_page, hypothesis_meta = _page_any_rows(hypothesis_rows, limit=row_limit, offset=row_offset, default=100, maximum=500)
+    # Running FOR/AGAINST evidence score per thesis (deterministic alignment grades on matches).
+    try:
+        tallies = sql_to_df(
+            """
+            SELECT hypothesis_id,
+                   COUNT(*) FILTER (WHERE thesis_alignment = 'supports') AS supports,
+                   COUNT(*) FILTER (WHERE thesis_alignment = 'contradicts') AS contradicts,
+                   COUNT(*) FILTER (WHERE COALESCE(thesis_alignment, 'neutral') = 'neutral') AS neutral
+            FROM advisory_hypothesis_matches GROUP BY hypothesis_id
+            """
+        )
+        tally_map = {
+            str(row.hypothesis_id): {"supports": int(row.supports), "contradicts": int(row.contradicts), "neutral": int(row.neutral)}
+            for row in tallies.itertuples(index=False)
+        } if not tallies.empty else {}
+    except Exception:
+        tally_map = {}
+    for row in hypothesis_page:
+        row["thesis_evidence"] = tally_map.get(str(row.get("hypothesis_id") or ""), {"supports": 0, "contradicts": 0, "neutral": 0})
     if hypothesis_page:
         matches = load_matches(limit=row_limit)
         action_plans = load_action_plans(limit=row_limit)

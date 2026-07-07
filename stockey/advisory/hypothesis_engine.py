@@ -38,6 +38,11 @@ HYPOTHESIS_UNIVERSE_MIGRATION_ID = "20260708_advisory_hypotheses_target_universe
 HYPOTHESIS_UNIVERSE_SCHEMA_STATEMENTS = [
     "ALTER TABLE advisory_hypotheses ADD COLUMN IF NOT EXISTS target_universe_json TEXT",
 ]
+HYPOTHESIS_ALIGNMENT_MIGRATION_ID = "20260708_advisory_hypothesis_matches_thesis_alignment"
+HYPOTHESIS_ALIGNMENT_SCHEMA_STATEMENTS = [
+    "ALTER TABLE advisory_hypothesis_matches ADD COLUMN IF NOT EXISTS thesis_alignment TEXT",
+    "ALTER TABLE advisory_hypothesis_matches ADD COLUMN IF NOT EXISTS alignment_basis TEXT",
+]
 HYPOTHESIS_ENGINE_SCHEMA_STATEMENTS = [
     f"""
     CREATE TABLE IF NOT EXISTS {HYPOTHESES_TABLE} (
@@ -256,6 +261,12 @@ def ensure_tables(*, force: bool = False) -> None:
         description="Add the operator-editable target universe (symbols/sectors/criteria) to hypotheses.",
         statements=HYPOTHESIS_UNIVERSE_SCHEMA_STATEMENTS,
         metadata={"tables": [HYPOTHESES_TABLE], "base_migration_id": HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID},
+    )
+    apply_schema_migration(
+        migration_id=HYPOTHESIS_ALIGNMENT_MIGRATION_ID,
+        description="Add deterministic thesis alignment (supports/contradicts/neutral) to hypothesis matches.",
+        statements=HYPOTHESIS_ALIGNMENT_SCHEMA_STATEMENTS,
+        metadata={"tables": [MATCHES_TABLE], "base_migration_id": HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID},
     )
     _TABLES_READY = True
 
@@ -2257,7 +2268,78 @@ def build_matches(hypotheses: pd.DataFrame, events: pd.DataFrame) -> pd.DataFram
                     "load_ts": now,
                 }
             )
-    return pd.DataFrame(rows)
+    return attach_thesis_alignment(pd.DataFrame(rows))
+
+
+_NEGATIVE_THESIS_ACTIONS = {"REDUCE_EXPOSURE_REVIEW", "SHORT_RESEARCH_ONLY", "GO_CASH_REVIEW"}
+_POSITIVE_EFFECT_HINTS = ("buy", "accumulate", "bullish", "positive", "upgrade", "growth", "rerat", "expansion", "beat", "confidence", "watch for entry")
+
+
+def _hypothesis_direction(suggested_action: Any, expected_effect_json: Any) -> int:
+    """+1 = thesis expects the name(s) to do well; -1 = expects harm/de-risk; 0 = unknown."""
+    action = str(suggested_action or "").upper().replace("_TESTING", "")
+    if action in _NEGATIVE_THESIS_ACTIONS:
+        return -1
+    effect = parse_jsonish(expected_effect_json, {}, source="expected_effect_json")
+    effect_text = normalize_text(" ".join(str(value) for value in effect.values())) if isinstance(effect, dict) else normalize_text(effect)
+    if any(hint in effect_text for hint in _POSITIVE_EFFECT_HINTS):
+        return 1
+    if "short" in effect_text or "down" in effect_text or "risk" in effect_text:
+        return -1
+    return 0
+
+
+def attach_thesis_alignment(matches: pd.DataFrame) -> pd.DataFrame:
+    """Deterministic v1 grade of each matched event FOR/AGAINST its owning thesis.
+
+    A thesis expecting harm (de-risk) is SUPPORTED by a negatively-evaluated event; a
+    positive thesis by a positive one. Uses the event's LLM evaluation sentiment when the
+    matched source has an advisory_event_evaluations row; otherwise neutral. No new LLM
+    surface -- this is arithmetic over already-recorded judgments.
+    """
+    if matches.empty:
+        return matches
+    out = matches.copy()
+    keys = sorted({str(value).strip() for value in out.get("source_key", pd.Series(dtype=str)).tolist() if str(value or "").strip()})
+    sentiment_map: dict[str, str] = {}
+    if keys:
+        try:
+            evaluations = sql_to_df(
+                """
+                SELECT DISTINCT ON (unique_id) unique_id, sentiment
+                FROM advisory_event_evaluations
+                WHERE unique_id = ANY(%s)
+                ORDER BY unique_id, evaluated_at DESC NULLS LAST
+                """,
+                params=(keys,),
+            )
+            if not evaluations.empty:
+                sentiment_map = {str(row.unique_id): str(row.sentiment or "").lower() for row in evaluations.itertuples(index=False)}
+        except Exception as exc:
+            record_local_fallback_event(
+                module="advisory.hypothesis_engine",
+                source="advisory_event_evaluations",
+                fallback_type="hypothesis_alignment_sentiment_load_failed",
+                severity="warn",
+                reason="Thesis-alignment grading could not load event sentiments; matches graded neutral.",
+                error=exc,
+                metadata={"match_count": int(len(out))},
+            )
+    alignments: list[str] = []
+    bases: list[str] = []
+    for row in out.itertuples(index=False):
+        hyp_dir = _hypothesis_direction(getattr(row, "suggested_action", None), getattr(row, "expected_effect_json", None))
+        sentiment = sentiment_map.get(str(getattr(row, "source_key", "") or "").strip(), "")
+        ev_dir = 1 if sentiment == "positive" else -1 if sentiment == "negative" else 0
+        if hyp_dir == 0 or ev_dir == 0:
+            alignments.append("neutral")
+            bases.append(f"hyp_dir={hyp_dir} event_sentiment={sentiment or 'unevaluated'}")
+            continue
+        alignments.append("supports" if hyp_dir == ev_dir else "contradicts")
+        bases.append(f"hyp_dir={hyp_dir} event_sentiment={sentiment}")
+    out["thesis_alignment"] = alignments
+    out["alignment_basis"] = bases
+    return out
 
 
 def persist_matches(matches: pd.DataFrame) -> None:

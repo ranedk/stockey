@@ -37611,9 +37611,10 @@ def test_hypothesis_engine_ensure_tables_uses_schema_registry(monkeypatch):
 
     hypothesis_engine.ensure_tables(force=True)
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert calls[1]["migration_id"] == hypothesis_engine.HYPOTHESIS_UNIVERSE_MIGRATION_ID
     assert calls[1]["statements"] == hypothesis_engine.HYPOTHESIS_UNIVERSE_SCHEMA_STATEMENTS
+    assert calls[2]["migration_id"] == hypothesis_engine.HYPOTHESIS_ALIGNMENT_MIGRATION_ID
     assert calls[0]["migration_id"] == hypothesis_engine.HYPOTHESIS_ENGINE_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"] == {
         "tables": [
@@ -47451,6 +47452,37 @@ def test_hypothesis_screeners_materialize_universe(monkeypatch):
     monkeypatch.setattr(hs, "build_hypothesis_constituents", lambda **_k: (_ for _ in ()).throw(RuntimeError("db")))
     monkeypatch.setattr(hs, "record_local_fallback_event", lambda **_k: None)
     assert hs.safe_build_hypothesis_constituents().empty
+
+
+def test_hypothesis_thesis_alignment_truth_table(monkeypatch):
+    # negative thesis (de-risk) SUPPORTED by negative event; positive thesis by positive;
+    # opposite = contradicts; unevaluated or unknown-direction = neutral.
+    matches = pd.DataFrame(
+        [
+            {"source_key": "ev-neg", "suggested_action": "REDUCE_EXPOSURE_REVIEW",
+             "expected_effect_json": '{"effect": "reduce exposure"}'},
+            {"source_key": "ev-pos", "suggested_action": "REDUCE_EXPOSURE_REVIEW",
+             "expected_effect_json": '{"effect": "reduce exposure"}'},
+            {"source_key": "ev-pos", "suggested_action": "MANUAL_REVIEW",
+             "expected_effect_json": '{"effect": "earnings beat drift accumulate"}'},
+            {"source_key": "ev-none", "suggested_action": "MANUAL_REVIEW",
+             "expected_effect_json": '{"effect": "manual_review"}'},
+        ]
+    )
+    sentiments = pd.DataFrame([
+        {"unique_id": "ev-neg", "sentiment": "negative"},
+        {"unique_id": "ev-pos", "sentiment": "positive"},
+    ])
+    monkeypatch.setattr(hypothesis_engine, "sql_to_df", lambda *a, **k: sentiments)
+    out = hypothesis_engine.attach_thesis_alignment(matches)
+    assert list(out["thesis_alignment"]) == ["supports", "contradicts", "supports", "neutral"]
+    assert "event_sentiment=unevaluated" in out.iloc[3]["alignment_basis"]
+
+    # sentiment lookup failure -> everything neutral, never raises
+    monkeypatch.setattr(hypothesis_engine, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    monkeypatch.setattr(hypothesis_engine, "record_local_fallback_event", lambda **k: None)
+    degraded = hypothesis_engine.attach_thesis_alignment(matches)
+    assert set(degraded["thesis_alignment"]) == {"neutral"}
 
 
 def test_build_constituents_includes_hypothesis_screeners(monkeypatch):
