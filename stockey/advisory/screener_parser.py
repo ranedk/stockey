@@ -270,10 +270,21 @@ def build_constituents(
     latest_only: bool = True,
 ) -> pd.DataFrame:
     snapshots = load_snapshots(screener_slug=screener_slug, snapshot_date=snapshot_date, latest_only=latest_only)
-    if snapshots.empty:
-        return pd.DataFrame()
-    frames = [normalize_snapshot_row(row) for _, row in snapshots.iterrows()]
-    frames = [frame for frame in frames if not frame.empty]
+    frames: list[pd.DataFrame] = []
+    if not snapshots.empty:
+        frames = [normalize_snapshot_row(row) for _, row in snapshots.iterrows()]
+        frames = [frame for frame in frames if not frame.empty]
+    # Action-first discovery lane: the whole-market breakout scan joins the universe as an
+    # ordinary constituents source (junk-eliminating filters only), so the downstream
+    # candidate/technical/risk/lifecycle gates still decide quality. A targeted
+    # screener_slug rebuild keeps the scan out of that slug's refresh.
+    if screener_slug is None:
+        from advisory.market_action_scan import MARKET_ACTION_SCAN_ENABLED, safe_scan_market_action
+
+        if MARKET_ACTION_SCAN_ENABLED:
+            scan_frame = safe_scan_market_action(asof_date=snapshot_date)
+            if not scan_frame.empty:
+                frames.append(scan_frame)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
