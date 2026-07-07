@@ -302,7 +302,7 @@ def test_operator_api_ingestion_state_payload_summarizes_rows(monkeypatch):
     assert payload["operator_boundary"]["mutates_state"] is False
 
 
-def test_ohlcv_reconcile_expected_day_steps_back_when_latest_is_today(monkeypatch):
+def test_ohlcv_reconcile_expected_day_is_trading_day_and_clock_aware(monkeypatch):
     from data.dhanlive import ohlcv_reconcile as orc
 
     calls: list[object] = []
@@ -316,12 +316,20 @@ def test_ohlcv_reconcile_expected_day_steps_back_when_latest_is_today(monkeypatc
 
     monkeypatch.setattr(orc, "latest_trading_day_on_or_before", fake_latest)
     monkeypatch.setattr(orc, "_market_calendar_date", lambda value=None, **k: pd.Timestamp("2026-07-06", tz="UTC"))
-    # bars for today only exist after the close -> expectation steps back to the prior trading day
+    # intraday on a trading day (10:00 IST): today's bars cannot exist yet -> prior trading day
+    monkeypatch.setattr(orc, "_ist_now", lambda now=None: pd.Timestamp("2026-07-06 10:00", tz="Asia/Kolkata"))
     assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-03"
+
+    # post-close (18:45 IST): today's bars ARE expected -> today (the 18:45 pre-advisory
+    # reconcile must pull today's bars before the 19:10 advisory)
+    calls.clear()
+    monkeypatch.setattr(orc, "_ist_now", lambda now=None: pd.Timestamp("2026-07-06 18:45", tz="Asia/Kolkata"))
+    assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-06"
 
     # when the latest trading day is already in the past (weekend), it is used directly
     monkeypatch.setattr(orc, "latest_trading_day_on_or_before", lambda value=None, **k: pd.Timestamp("2026-07-03", tz="UTC"))
     monkeypatch.setattr(orc, "_market_calendar_date", lambda value=None, **k: pd.Timestamp("2026-07-05", tz="UTC"))
+    monkeypatch.setattr(orc, "_ist_now", lambda now=None: pd.Timestamp("2026-07-05 10:00", tz="Asia/Kolkata"))
     assert orc.expected_complete_trading_day().date().isoformat() == "2026-07-03"
 
 

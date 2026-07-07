@@ -29,21 +29,39 @@ from utils.db import sql_to_df
 env = Env()
 
 DEFAULT_MAX_SYMBOLS = env.int("OHLCV_RECONCILE_MAX_SYMBOLS", default=400)
+# Union constituents over a snapshot window instead of only the newest snapshot: a
+# partial refresh (one screener updating on a weekend) must not collapse the universe
+# and silently exclude symbols from reconciliation.
+CONSTITUENTS_LOOKBACK_DAYS = env.int("OHLCV_RECONCILE_CONSTITUENTS_LOOKBACK_DAYS", default=7)
+# After this hour (IST) on a trading day, today's EOD bars are expected to exist, so the
+# pre-advisory reconcile (18:45) pulls TODAY's bars instead of stopping at yesterday.
+TODAY_COMPLETE_AFTER_HOUR_IST = env.int("OHLCV_RECONCILE_TODAY_COMPLETE_AFTER_HOUR_IST", default=18)
+MARKET_TIMEZONE = "Asia/Kolkata"
 CONSTITUENTS_TABLE = "advisory_screener_constituents"
 WATCHLIST_TABLE = "advisory_watchlist"
 HOLDINGS_TABLE = "advisory_operator_holdings"
 
 
+def _ist_now(now: Any | None = None) -> pd.Timestamp:
+    if now is None:
+        return pd.Timestamp.now(tz=MARKET_TIMEZONE)
+    ts = pd.Timestamp(now)
+    return ts.tz_convert(MARKET_TIMEZONE) if ts.tzinfo is not None else ts.tz_localize(MARKET_TIMEZONE)
+
+
 def expected_complete_trading_day(now: Any | None = None) -> pd.Timestamp:
     """The most recent trading day whose EOD bars should already exist.
 
-    Today's bars only land after the close, so while `latest trading day == today`
-    the expectation moves back one trading day. This keeps intraday runs (and the
-    paired health check) from flagging a gap that cannot exist yet.
+    Intraday on a trading day, today's bars cannot exist yet, so the expectation is the
+    previous trading day. After the post-close publish window (TODAY_COMPLETE_AFTER_HOUR_IST)
+    today's bars are expected -- this is what lets the 18:45 pre-advisory reconcile fetch
+    today's bars before the 19:10 advisory evaluates today's date.
     """
     latest = latest_trading_day_on_or_before(now)
     market_today = _market_calendar_date(now)
     if latest.date() >= market_today.date():
+        if _ist_now(now).hour >= TODAY_COMPLETE_AFTER_HOUR_IST:
+            return latest
         previous = market_today - pd.Timedelta(days=1)
         return latest_trading_day_on_or_before(previous)
     return latest
@@ -56,7 +74,7 @@ def load_universe_symbols() -> list[str]:
         (
             "constituents",
             f"SELECT DISTINCT ticker AS symbol FROM {CONSTITUENTS_TABLE} "
-            f"WHERE date = (SELECT MAX(date) FROM {CONSTITUENTS_TABLE})",
+            f"WHERE date >= (SELECT MAX(date) FROM {CONSTITUENTS_TABLE}) - interval '{int(CONSTITUENTS_LOOKBACK_DAYS)} days'",
         ),
         (
             "watchlist",
