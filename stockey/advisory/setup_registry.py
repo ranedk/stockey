@@ -52,6 +52,7 @@ def load_setup_registry(config_path: str | None = None) -> list[dict[str, Any]]:
                 "screener_slugs": screeners,
                 "screeners": screeners,
                 "screener_mode": str(setup.get("screener_mode") or "union").lower(),
+                "dynamic_sources": [str(value).strip().lower() for value in (setup.get("dynamic_sources") or []) if str(value or "").strip()],
                 "allowed_regimes": [str(value) for value in setup.get("allowed_regimes", [])],
                 "blocked_regimes": [str(value) for value in setup.get("blocked_regimes", [])],
                 "allowed_overlays": [str(value).upper() for value in setup.get("allowed_overlays", [])],

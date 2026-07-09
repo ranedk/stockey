@@ -560,6 +560,7 @@ def resolve_setup_screeners(
     overlay_name: str | None,
     *,
     theme_screener_mapping: dict[str, Any] | None = None,
+    dynamic_source_slugs: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], str, list[str]]:
     base_screeners = [str(value) for value in (setup.get("screeners") or setup.get("screener_slugs") or []) if value]
     if not base_screeners and setup.get("screener_slug"):
@@ -570,6 +571,14 @@ def resolve_setup_screeners(
         for value in ((theme_screener_mapping or {}).get("screener_slugs") or []):
             if value and str(value) not in base_screeners:
                 base_screeners.append(str(value))
+    # Dynamic constituents sources (market scan / hypothesis-<id> / theme-<id>) only reach
+    # evaluation when a setup declares them via `dynamic_sources` -- their slugs are per-id
+    # and cannot be listed statically in the YAML. Without this expansion, dynamically
+    # materialized constituents never enter the rule engine at all.
+    for source_kind in setup.get("dynamic_sources") or []:
+        for slug in (dynamic_source_slugs or {}).get(str(source_kind).lower(), []):
+            if slug and str(slug) not in base_screeners:
+                base_screeners.append(str(slug))
     overlay_cfg = (setup.get("overlay_screeners") or {}).get(str(overlay_name or "NONE").upper(), {})
     add = [str(value) for value in (overlay_cfg.get("add") or []) if value]
     remove = {str(value) for value in (overlay_cfg.get("remove") or []) if value}
@@ -578,6 +587,42 @@ def resolve_setup_screeners(
         if value not in active:
             active.append(value)
     return active, str(setup.get("screener_mode") or "union").lower(), theme_ids
+
+
+def load_dynamic_source_slugs(asof_date: pd.Timestamp | None) -> dict[str, list[str]]:
+    """The dynamic constituents slugs actually present at the screener date, grouped by
+    source kind, so setups can opt in via `dynamic_sources`. Best-effort: {} on failure."""
+    if asof_date is None:
+        return {}
+    try:
+        frame = sql_to_df(
+            """
+            SELECT DISTINCT screener_slug FROM advisory_screener_constituents
+            WHERE date = %s AND (
+                screener_slug = 'market-action-scan-v1'
+                OR screener_slug LIKE 'hypothesis-%%'
+                OR screener_slug LIKE 'theme-%%'
+            )
+            """,
+            params=(asof_date,),
+        )
+        slugs = sorted(str(value) for value in frame["screener_slug"].dropna().tolist()) if not frame.empty else []
+        return {
+            "market_scan": [slug for slug in slugs if slug == "market-action-scan-v1"],
+            "hypothesis": [slug for slug in slugs if slug.startswith("hypothesis-")],
+            "theme": [slug for slug in slugs if slug.startswith("theme-")],
+        }
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.rule_engine",
+            source="advisory_screener_constituents",
+            fallback_type="dynamic_source_slugs_load_failed",
+            severity="warn",
+            reason="Dynamic source slugs could not be loaded; setups evaluate static screeners only this run.",
+            error=exc,
+            metadata={"asof_date": str(asof_date)},
+        )
+        return {}
 
 
 def load_screener_universe(asof_date: pd.Timestamp, screener_slugs: list[str] | None, *, screener_mode: str = "union") -> pd.DataFrame:
@@ -1781,6 +1826,9 @@ def run_rule_engine(
     rs_percentiles = load_rs_percentiles(asof_date=screener_date)
     meta["rs_percentile_symbols"] = len(rs_percentiles)
 
+    dynamic_source_slugs = load_dynamic_source_slugs(screener_date)
+    meta["dynamic_source_slugs"] = {kind: len(slugs) for kind, slugs in dynamic_source_slugs.items()}
+
     setup_screeners: dict[str, list[str]] = {}
     setup_screener_modes: dict[str, str] = {}
     screener_frames = []
@@ -1789,6 +1837,7 @@ def run_rule_engine(
             setup,
             overlay_name,
             theme_screener_mapping=theme_screener_mapping,
+            dynamic_source_slugs=dynamic_source_slugs,
         )
         setup_screeners[setup["setup_id"].upper()] = active_screeners
         setup_screener_modes[setup["setup_id"].upper()] = screener_mode

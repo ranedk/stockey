@@ -7,6 +7,8 @@ setups:
       - sme-momentum-screen-v1
       - midcap-improver-screen-v1
     screener_mode: union
+    dynamic_sources:
+      - market_scan
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -107,6 +109,8 @@ setups:
       - midcap-improver-screen-v1
       - largecap-breakout-screen-v1
     screener_mode: union
+    dynamic_sources:
+      - market_scan
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -206,6 +210,8 @@ setups:
       - largecap-breakout-screen-v1
       - midcap-improver-screen-v1
     screener_mode: union
+    dynamic_sources:
+      - market_scan
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -400,6 +406,10 @@ setups:
     holding_horizon_note: 3 days to 8 weeks
     screeners: []
     screener_mode: union
+    dynamic_sources:
+      - market_scan
+      - hypothesis
+      - theme
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW

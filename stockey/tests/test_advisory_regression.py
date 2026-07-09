@@ -48070,6 +48070,48 @@ def test_market_action_scan_limit_resolves_from_admission_policy(monkeypatch):
     assert len(frame) == 4
 
 
+def test_resolve_setup_screeners_expands_dynamic_sources():
+    # regression: dynamically-materialized constituents (scan/hypothesis-<id>/theme-<id>)
+    # were invisible to the rule engine -- no setup's static screener list could name them,
+    # so 0 candidates ever came from those sources.
+    dynamic = {
+        "market_scan": ["market-action-scan-v1"],
+        "hypothesis": ["hypothesis-promoter-buying-v1", "hypothesis-earnings-beat-v1"],
+        "theme": ["theme-defense-indigenisation"],
+    }
+    setup = {
+        "setup_id": "TEST",
+        "screeners": ["static-screen"],
+        "dynamic_sources": ["market_scan", "hypothesis"],
+        "screener_mode": "union",
+    }
+    active, mode, _ = rule_engine.resolve_setup_screeners(setup, "NONE", dynamic_source_slugs=dynamic)
+    assert active == ["static-screen", "market-action-scan-v1",
+                      "hypothesis-promoter-buying-v1", "hypothesis-earnings-beat-v1"]
+    assert "theme-defense-indigenisation" not in active  # undeclared kind stays out
+
+    # no dynamic_sources declared -> unchanged
+    plain = {"setup_id": "PLAIN", "screeners": ["static-screen"], "screener_mode": "union"}
+    active, _, _ = rule_engine.resolve_setup_screeners(plain, "NONE", dynamic_source_slugs=dynamic)
+    assert active == ["static-screen"]
+
+
+def test_load_dynamic_source_slugs_groups_by_kind(monkeypatch):
+    frame = pd.DataFrame({"screener_slug": [
+        "market-action-scan-v1", "hypothesis-a-v1", "hypothesis-b-v1", "theme-defense",
+    ]})
+    monkeypatch.setattr(rule_engine, "sql_to_df", lambda *a, **k: frame)
+    out = rule_engine.load_dynamic_source_slugs(pd.Timestamp("2026-07-09", tz="UTC"))
+    assert out["market_scan"] == ["market-action-scan-v1"]
+    assert out["hypothesis"] == ["hypothesis-a-v1", "hypothesis-b-v1"]
+    assert out["theme"] == ["theme-defense"]
+    assert rule_engine.load_dynamic_source_slugs(None) == {}
+
+    monkeypatch.setattr(rule_engine, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    monkeypatch.setattr(rule_engine, "record_local_fallback_event", lambda **k: None)
+    assert rule_engine.load_dynamic_source_slugs(pd.Timestamp("2026-07-09", tz="UTC")) == {}
+
+
 def test_rule_engine_resolves_overlay_screeners_and_softens_blocked_overlay_by_default(monkeypatch):
     monkeypatch.delenv(rule_engine.RULE_ENGINE_OVERLAY_LABEL_HARD_BLOCK_ENABLED_ENV, raising=False)
     setup = {
