@@ -269,6 +269,7 @@ def main() -> int:
             start_at=args.start_at,
             stop_at=args.stop_at,
             rebuild=bool(args.rebuild),
+            resume=bool(getattr(args, "resume", False)),
             skip_peer_sync=bool(args.skip_peer_sync),
             skip_intraday=bool(args.skip_intraday),
             skip_rule_snapshot_refresh=bool(args.skip_rule_snapshot_refresh),

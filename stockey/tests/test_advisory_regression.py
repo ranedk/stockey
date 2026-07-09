@@ -47945,6 +47945,26 @@ def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
     assert len(writes) == 3  # every decision recorded
 
 
+def test_master_pipeline_forwards_resume_flag():
+    # regression: --resume was parsed by master_pipeline but dropped when constructing the
+    # pipeline args, so ADVISORY_RESUME=1 via all_advisory.sh silently never resumed.
+    import inspect
+    import sys
+
+    from advisory import master_pipeline
+
+    monkey_argv = ["master_pipeline", "--resume"]
+    old_argv = sys.argv
+    try:
+        sys.argv = monkey_argv
+        args = master_pipeline.parse_args()
+    finally:
+        sys.argv = old_argv
+    assert args.resume is True
+    source = inspect.getsource(master_pipeline)
+    assert 'resume=bool(getattr(args, "resume", False))' in source
+
+
 def test_regime_admission_resolve_records_new_day_despite_older_row(monkeypatch):
     # regression: an older recorded row must NOT satisfy a recording read -- that left
     # consecutive_days stuck at 1 forever, so hysteresis could never flip states.
