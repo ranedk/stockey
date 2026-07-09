@@ -18,6 +18,11 @@ LOG_DIR={{LOG_DIR}}
 # Recurring cron-managed jobs.
 # ---------------------------------------------------------------------------
 
+# Daily log rotation before the morning jobs: archive sizable logs as
+# logs/cron/archive/<name>.<YYYY-MM-DD>.log.gz (copy-then-truncate so long-running
+# processes keep their handles) and prune archives past LOG_ROTATE_KEEP_DAYS.
+50 06 * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_log_rotate.lock "$STOCKEY_DIR/scripts/rotate_logs.sh" >> "$LOG_DIR/rotate_logs.log" 2>&1
+
 # Daily broad raw download + parse safety net before market open on weekdays.
 # A second end-of-day complete_data.sh run below repairs anything intraday jobs missed before advisory.
 10 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
