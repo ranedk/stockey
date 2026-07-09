@@ -269,6 +269,21 @@ PY
 emit_script_marker "start"
 script_marker_started=1
 
+# Refuse to fight an already-healthy instance: if every component this run would start is
+# already serving on its port, exit cleanly (a second supervisor otherwise crash-loops on
+# EADDRINUSE every respawn -- e.g. a manual ./all_frontend.sh alongside the cron entry).
+already_healthy=1
+if [[ "${COMPONENT}" == "both" || "${COMPONENT}" == "api" ]]; then
+  health_check_url "http://${API_HOST}:${API_PORT}/api/health" || already_healthy=0
+fi
+if [[ "${COMPONENT}" == "both" || "${COMPONENT}" == "web" ]]; then
+  health_check_url "http://${WEB_HOST}:${WEB_PORT}/" || already_healthy=0
+fi
+if [[ "${already_healthy}" == "1" ]]; then
+  echo "[all_frontend] already_running: healthy instance detected on api=${API_HOST}:${API_PORT} web=${WEB_HOST}:${WEB_PORT}; exiting instead of competing"
+  exit 0
+fi
+
 echo "[all_frontend] mode=${COMPONENT}"
 if [[ "${COMPONENT}" == "both" || "${COMPONENT}" == "api" ]]; then
   start_api
