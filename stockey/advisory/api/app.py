@@ -1216,13 +1216,17 @@ def _git_output(args: list[str]) -> str | None:
 
 def _latest_source_mtime(root: Path = REPO_ROOT) -> tuple[float | None, str | None]:
     ignored_dirs = {
+        ".cache",
         ".git",
         ".mypy_cache",
         ".nuxt",
         ".output",
         ".pytest_cache",
         "__pycache__",
+        "chromedata",
         "data",
+        "http_cache",
+        "live_dashboard",
         "logs",
         "node_modules",
     }

@@ -47945,6 +47945,38 @@ def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
     assert len(writes) == 3  # every decision recorded
 
 
+def test_regime_admission_resolve_records_new_day_despite_older_row(monkeypatch):
+    # regression: an older recorded row must NOT satisfy a recording read -- that left
+    # consecutive_days stuck at 1 forever, so hysteresis could never flip states.
+    from advisory import regime_admission_policy as rap
+
+    recorded: list[str] = []
+    stale_row = pd.DataFrame([{
+        "asof_date": pd.Timestamp("2026-07-07", tz="UTC"),
+        "effective_state": "neutral",
+        "parameters_json": json.dumps(rap.admission_parameters("neutral")),
+    }])
+    monkeypatch.setattr(rap, "sql_to_df", lambda *a, **k: stale_row.copy())
+    monkeypatch.setattr(
+        rap, "resolve_and_record",
+        lambda parsed: recorded.append(str(parsed)) or {"parameters": rap.admission_parameters("neutral")},
+    )
+    rap.resolve_active_policy("2026-07-09")
+    assert recorded, "a new daily decision must be recorded when the latest row is older"
+
+    # same-day row satisfies the read without re-recording
+    recorded.clear()
+    same_day = stale_row.assign(asof_date=pd.Timestamp("2026-07-09", tz="UTC"))
+    monkeypatch.setattr(rap, "sql_to_df", lambda *a, **k: same_day.copy())
+    params = rap.resolve_active_policy("2026-07-09")
+    assert not recorded and params["state"] == "neutral"
+
+    # read-only callers still get the latest recorded decision for an older row
+    monkeypatch.setattr(rap, "sql_to_df", lambda *a, **k: stale_row.copy())
+    params = rap.resolve_active_policy("2026-07-09", record_if_missing=False)
+    assert not recorded and params["state"] == "neutral"
+
+
 def test_regime_admission_resolve_active_policy_fails_open_to_neutral(monkeypatch):
     from advisory import regime_admission_policy as rap
 

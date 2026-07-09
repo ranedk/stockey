@@ -264,16 +264,27 @@ def resolve_active_policy(asof_date: Any | None = None, *, record_if_missing: bo
             parsed = pd.Timestamp.utcnow()
         parsed = parsed.normalize()
         frame = sql_to_df(
-            f"SELECT effective_state, parameters_json FROM {TABLE_NAME} "
+            f"SELECT asof_date, effective_state, parameters_json FROM {TABLE_NAME} "
             "WHERE asof_date <= %s ORDER BY asof_date DESC LIMIT 1",
             params=(parsed,),
         )
+        recorded_parameters: dict[str, Any] | None = None
+        row_is_current = False
         if not frame.empty and str(frame.iloc[0].get("effective_state") or ""):
-            parameters = json.loads(frame.iloc[0].get("parameters_json") or "{}")
-            if parameters.get("state") in STATES:
-                return parameters
+            candidate = json.loads(frame.iloc[0].get("parameters_json") or "{}")
+            if candidate.get("state") in STATES:
+                recorded_parameters = candidate
+            row_date = pd.to_datetime(frame.iloc[0].get("asof_date"), utc=True, errors="coerce")
+            row_is_current = not pd.isna(row_date) and row_date.normalize() == parsed
+        # An OLDER row must not satisfy a recording read: without a fresh daily decision,
+        # consecutive_days stays stuck at its first value and hysteresis can never flip.
+        if recorded_parameters is not None and row_is_current:
+            return recorded_parameters
         if record_if_missing:
             return resolve_and_record(parsed)["parameters"]
+        if recorded_parameters is not None:
+            # read-only callers (API payload) may show the latest recorded decision
+            return recorded_parameters
     except Exception as exc:
         record_local_fallback_event(
             module="advisory.regime_admission_policy", source=TABLE_NAME, severity="warn",
