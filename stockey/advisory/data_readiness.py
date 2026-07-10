@@ -63,14 +63,15 @@ def check_bhavcopy(expected_day: pd.Timestamp) -> dict[str, Any]:
     rows = int(frame.iloc[0]["rows"] or 0) if not frame.empty else 0
     current = latest is not None and not pd.isna(latest) and latest.normalize() >= expected_day.normalize()
     status = "ok" if (current and rows >= BHAVCOPY_MIN_ROWS) else "error"
-    if status == "error" and latest is not None and not pd.isna(latest):
-        # Publication grace: NSE posts the day's bhavcopy ~18:30-19:00 IST. Between the
-        # 18:00 completeness boundary and the grace hour, being exactly one day behind is
-        # a warn (the --fix download usually lands it); after the grace hour it is real.
-        grace_hour = int(os.getenv("DATA_READINESS_BHAVCOPY_TODAY_AFTER_HOUR_IST", "20"))
-        ist_now = pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)
-        one_day_behind = (expected_day.normalize() - latest.normalize()).days <= 1
-        if one_day_behind and rows >= BHAVCOPY_MIN_ROWS and ist_now.hour < grace_hour:
+    if status == "error" and latest is not None and not pd.isna(latest) and rows >= BHAVCOPY_MIN_ROWS:
+        # Lag-based severity, not clock-based: NSE posts the day's file on ITS schedule
+        # (sometimes after 20:00), and a clock grace refused the delayed 19:59 run at
+        # 20:01. One day behind = warn (evening run proceeds on yesterday-complete data;
+        # the 22:30 catch-up + morning chain fetch the file). Two+ days = a frozen feed
+        # (the zero-byte incident class) and stays a hard error.
+        lag_days = int((expected_day.normalize() - latest.normalize()).days)
+        max_warn_lag = int(os.getenv("DATA_READINESS_BHAVCOPY_MAX_WARN_LAG_DAYS", "1"))
+        if lag_days <= max_warn_lag:
             status = "warn"
     return {
         "check": "bhavcopy_current", "status": status,

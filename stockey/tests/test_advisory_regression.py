@@ -47946,24 +47946,19 @@ def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
 
 
 def test_data_readiness_publication_grace(monkeypatch):
-    # Dhan/bhavcopy publish AFTER the 18:00 completeness boundary; between close and the
-    # grace hour the checks must not hard-error on "today missing" (that refused the
-    # nightly 19:10 advisory outright).
+    # Lag-based severity: NSE posts the day's bhavcopy on its own schedule, so one day
+    # behind is a warn (the evening run proceeds on yesterday-complete data); two+ days
+    # behind is a frozen feed and stays a hard error.
     from advisory import data_readiness as dr
 
-    # bhavcopy exactly one day behind + inside grace window -> warn, not error
     monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
         [{"latest": pd.Timestamp("2026-07-09", tz="UTC"), "rows": 2374}]))
-    frozen_ist_evening = pd.Timestamp("2026-07-10 13:40:00")  # 19:10 IST in UTC
-    monkeypatch.setattr(dr.pd.Timestamp, "utcnow", staticmethod(lambda: frozen_ist_evening))
-    result = dr.check_bhavcopy(pd.Timestamp("2026-07-10", tz="UTC"))
-    assert result["status"] == "warn"
-
-    # after the grace hour (21:30 IST) the same lag is a hard error
-    frozen_late = pd.Timestamp("2026-07-10 16:00:00")  # 21:30 IST in UTC
-    monkeypatch.setattr(dr.pd.Timestamp, "utcnow", staticmethod(lambda: frozen_late))
-    result = dr.check_bhavcopy(pd.Timestamp("2026-07-10", tz="UTC"))
-    assert result["status"] == "error"
+    assert dr.check_bhavcopy(pd.Timestamp("2026-07-10", tz="UTC"))["status"] == "warn"
+    assert dr.check_bhavcopy(pd.Timestamp("2026-07-11", tz="UTC"))["status"] == "error"
+    # thin latest day (placeholder-class) never soft-passes
+    monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
+        [{"latest": pd.Timestamp("2026-07-09", tz="UTC"), "rows": 3}]))
+    assert dr.check_bhavcopy(pd.Timestamp("2026-07-10", tz="UTC"))["status"] == "error"
 
 
 def test_data_readiness_checks_and_gate(monkeypatch):
@@ -47975,7 +47970,7 @@ def test_data_readiness_checks_and_gate(monkeypatch):
     monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
         [{"latest": pd.Timestamp("2026-07-09", tz="UTC"), "rows": 2374}]))
     assert dr.check_bhavcopy(expected)["status"] == "ok"
-    monkeypatch.setenv("DATA_READINESS_BHAVCOPY_TODAY_AFTER_HOUR_IST", "0")  # disable grace: deterministic
+    monkeypatch.setenv("DATA_READINESS_BHAVCOPY_MAX_WARN_LAG_DAYS", "0")  # disable lag grace: deterministic
     monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
         [{"latest": pd.Timestamp("2026-07-08", tz="UTC"), "rows": 2374}]))
     assert dr.check_bhavcopy(expected)["status"] == "error"
