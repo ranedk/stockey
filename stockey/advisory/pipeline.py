@@ -722,6 +722,24 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         advisory_symbols = symbols or screener_symbols
 
     advisory_symbols = symbols or screener_symbols
+    if not advisory_symbols:
+        # Screeners stage skipped (--start-at past it) and no explicit symbols: derive the
+        # universe from the latest stored constituents. Without this, downstream feature
+        # builders fall back to the static tracked-symbols file and dynamically-admitted
+        # symbols silently get no features.
+        try:
+            fallback = sql_to_df(
+                "SELECT DISTINCT UPPER(TRIM(ticker)) AS symbol FROM advisory_screener_constituents "
+                "WHERE date = (SELECT MAX(date) FROM advisory_screener_constituents WHERE date <= %s)",
+                params=(asof_date if asof_date is not None else pd.Timestamp.utcnow(),),
+            )
+            if not fallback.empty:
+                advisory_symbols = fallback["symbol"].dropna().tolist()
+                _emit_progress(
+                    f"[advisory.pipeline] screeners stage skipped; universe from stored constituents symbols={len(advisory_symbols)}"
+                )
+        except Exception:
+            pass
 
     if stage_enabled("macro", args.start_at, args.stop_at):
         stage_started = _start_stage("macro")
