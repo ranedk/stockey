@@ -47945,6 +47945,18 @@ def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
     assert len(writes) == 3  # every decision recorded
 
 
+def test_technical_build_catchup_window(monkeypatch):
+    # same-day EOD bars arrive staggered; the technicals stage must build a small window
+    # behind asof so newly-admitted symbols and late-publishing bars still get feature rows.
+    from advisory import pipeline as pl
+
+    asof = pd.Timestamp("2026-07-09", tz="UTC")
+    assert pl._technical_build_from(asof) == asof - pd.Timedelta(days=3)
+    monkeypatch.setenv("ADVISORY_TECHNICAL_BUILD_CATCHUP_DAYS", "0")
+    assert pl._technical_build_from(asof) == asof
+    assert pl._technical_build_from(None) is None
+
+
 def test_master_pipeline_forwards_resume_flag():
     # regression: --resume was parsed by master_pipeline but dropped when constructing the
     # pipeline args, so ADVISORY_RESUME=1 via all_advisory.sh silently never resumed.

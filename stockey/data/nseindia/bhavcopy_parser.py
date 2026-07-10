@@ -200,6 +200,30 @@ def run_parser() -> dict[str, object]:
             continue
         file_path = store.get_as_temp_file(key)
         emit(f"For: {key}")
+        # A zero-byte archive is a failed/placeholder download, never a valid empty day.
+        # Marking it processed would silently freeze the OHLCV feed at the prior date
+        # (observed 2026-07-10: an empty 07-09 zip halted bhavcopy, RS, and technicals).
+        try:
+            if os.path.getsize(file_path) == 0:
+                error_message = "classification=empty_download; zero-byte bhavcopy archive"
+                emit(f"❌ Zero-byte bhavcopy archive key={key}; marking failed for re-download")
+                record_local_fallback_event(
+                    module=SYNC_SOURCE_NAME,
+                    source=str(key),
+                    fallback_type="nse_bhavcopy_zero_byte_archive",
+                    severity="error",
+                    reason="Downloaded bhavcopy archive is zero bytes; marked failed so the next download retries instead of freezing the feed.",
+                    error=ValueError(error_message),
+                    metadata={"key": str(key), "source_prefix": SOURCE_PREFIX},
+                )
+                mark_failed(SOURCE_PREFIX, key, error_message)
+                summary["failed_count"] = int(summary["failed_count"]) + 1
+                classifications = dict(summary["failed_classifications"])
+                classifications["empty_download"] = int(classifications.get("empty_download", 0)) + 1
+                summary["failed_classifications"] = classifications
+                continue
+        except OSError:
+            pass
         try:
             parsed = unzip_and_process(file_path)
         except Exception as exc:

@@ -578,6 +578,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _technical_build_from(asof_date: pd.Timestamp | None) -> pd.Timestamp | None:
+    """Technicals build with a small catch-up window behind the asof date. Same-day EOD bars
+    arrive staggered (only a fraction of the universe has them at the evening build), and
+    newly-admitted symbols (scan/hypothesis/theme sources) have fresh price history but no
+    prior feature rows -- building only `asof` leaves both groups featureless. A few days of
+    catch-up keeps every universe symbol's latest-complete-day features present so the rule
+    engine's point-in-time merge finds a fresh row instead of hard-rejecting on
+    missing_technical_snapshot."""
+    if asof_date is None:
+        return None
+    catchup_days = int(os.getenv("ADVISORY_TECHNICAL_BUILD_CATCHUP_DAYS", "3"))
+    return asof_date - pd.Timedelta(days=max(0, catchup_days))
+
+
 def stage_enabled(stage: str, start_at: str | None, stop_at: str | None) -> bool:
     idx = PIPELINE_STAGES.index(stage)
     normalized_start = LEGACY_STAGE_ALIASES.get(start_at, (start_at, start_at))[0] if start_at is not None else None
@@ -792,7 +806,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
                 if stage == "technicals":
                     technical_df = build_technical_features(
                         symbols=advisory_symbols,
-                        from_date=asof_date,
+                        from_date=_technical_build_from(asof_date),
                         to_date=asof_date,
                         rebuild=bool(args.rebuild),
                     )
@@ -865,7 +879,7 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, Any]:
         stage_started = _start_stage("technicals")
         technical_df = build_technical_features(
             symbols=advisory_symbols,
-            from_date=asof_date,
+            from_date=_technical_build_from(asof_date),
             to_date=asof_date,
             rebuild=bool(args.rebuild),
         )
