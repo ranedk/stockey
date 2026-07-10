@@ -1567,24 +1567,41 @@ def evaluate_setup_row(row: pd.Series, *, regime_name: str, overlay_name: str, s
     mcap_above_tolerance = float(admission.get("market_cap_above_tolerance") or 1.30)
     liquidity_floor_multiplier = float(admission.get("liquidity_floor_multiplier") or 0.50)
 
+    # Unknown size data is NOT the same as failing the band: whole-market admissions
+    # (scan/hypothesis/theme) often lack a snapshot market cap, and hard-rejecting on
+    # absence gates by missing data rather than by evidence. Known-bad still hard-rejects;
+    # unknown becomes a visible soft failure (env-gated back to the old behavior).
+    unknown_size_hard = os.getenv("RULE_ENGINE_UNKNOWN_SIZE_HARD_REJECT", "false").strip().lower() in {"1", "true", "yes"}
+
     market_cap = safe_float(row.get("market_cap"))
     market_cap_min = safe_float(setup.get("market_cap_min"))
     market_cap_max = safe_float(setup.get("market_cap_max"))
-    if market_cap_min is not None:
-        if market_cap is None or market_cap < (market_cap_min * mcap_below_tolerance):
+    if (market_cap_min is not None or market_cap_max is not None) and market_cap is None:
+        if unknown_size_hard:
+            rejections.append(build_rejection("market_cap_below_min", f"market_cap=None admission_state={admission_state}", severity="hard"))
+        else:
+            soft_failures.append("market_cap:unknown")
+    if market_cap is not None and market_cap_min is not None:
+        if market_cap < (market_cap_min * mcap_below_tolerance):
             rejections.append(build_rejection("market_cap_below_min", f"market_cap={market_cap} tolerance={mcap_below_tolerance} admission_state={admission_state}", severity="hard"))
         elif market_cap < market_cap_min:
             soft_failures.append("market_cap:below_target")
-    if market_cap_max is not None:
-        if market_cap is None or market_cap > (market_cap_max * mcap_above_tolerance):
+    if market_cap is not None and market_cap_max is not None:
+        if market_cap > (market_cap_max * mcap_above_tolerance):
             rejections.append(build_rejection("market_cap_above_max", f"market_cap={market_cap} tolerance={mcap_above_tolerance} admission_state={admission_state}", severity="hard"))
         elif market_cap > market_cap_max:
             soft_failures.append("market_cap:above_target")
 
     traded_value = safe_float(row.get("avg_traded_value_20d"))
     min_liquidity = safe_float(setup.get("min_avg_traded_value_20d"))
-    if min_liquidity is not None and (traded_value is None or traded_value < (min_liquidity * liquidity_floor_multiplier)):
-        rejections.append(build_rejection("liquidity_far_below_min", f"avg_traded_value_20d={traded_value} floor_multiplier={liquidity_floor_multiplier} admission_state={admission_state}", severity="hard"))
+    if min_liquidity is not None:
+        if traded_value is None:
+            if unknown_size_hard:
+                rejections.append(build_rejection("liquidity_far_below_min", f"avg_traded_value_20d=None admission_state={admission_state}", severity="hard"))
+            else:
+                soft_failures.append("liquidity:unknown")
+        elif traded_value < (min_liquidity * liquidity_floor_multiplier):
+            rejections.append(build_rejection("liquidity_far_below_min", f"avg_traded_value_20d={traded_value} floor_multiplier={liquidity_floor_multiplier} admission_state={admission_state}", severity="hard"))
 
     extension = safe_float(row.get("breakout_extension_pct"))
     max_extension = safe_float(setup.get("max_breakout_extension_pct"))

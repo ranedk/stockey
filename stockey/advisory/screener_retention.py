@@ -118,6 +118,7 @@ def _apply_retention(frame: pd.DataFrame, *, snapshot_date: Any | None = None) -
         SELECT DISTINCT ON (screener_slug, ticker)
             date, screener_slug, screener_name, screener_url, ticker, exchange,
             company_master_id, security_id, instrument, isin, display_name, rank,
+            last_price, volume, market_cap, pe_ratio,
             raw_item_json
         FROM {CONSTITUENTS_TABLE}
         WHERE date < %(today)s AND date >= %(today)s - interval '{int(max_window) + 5} days'
@@ -142,7 +143,8 @@ def _apply_retention(frame: pd.DataFrame, *, snapshot_date: Any | None = None) -
         }
         prior_columns = [c for c in prior.columns] if not prior.empty else [
             "date", "screener_slug", "screener_name", "screener_url", "ticker", "exchange",
-            "company_master_id", "security_id", "instrument", "isin", "display_name", "rank", "raw_item_json",
+            "company_master_id", "security_id", "instrument", "isin", "display_name", "rank",
+            "last_price", "volume", "market_cap", "pe_ratio", "raw_item_json",
         ]
         frame_prior_rows = frame.loc[~at_target, [c for c in prior_columns if c in frame.columns]].copy()
     if not frame_prior_rows.empty:
@@ -153,6 +155,9 @@ def _apply_retention(frame: pd.DataFrame, *, snapshot_date: Any | None = None) -
         ).drop(columns=["_ticker_norm"])
     if prior.empty:
         return frame
+    for column in ("last_price", "volume", "market_cap", "pe_ratio", "security_id", "instrument", "isin", "display_name", "screener_name", "screener_url"):
+        if column not in prior.columns:
+            prior[column] = None
 
     now = pd.Timestamp.utcnow()
     retained_rows: list[dict[str, Any]] = []
@@ -193,6 +198,10 @@ def _apply_retention(frame: pd.DataFrame, *, snapshot_date: Any | None = None) -
                     "isin": row.isin,
                     "display_name": row.display_name,
                     "rank": row.rank,
+                    "last_price": row.last_price,
+                    "volume": row.volume,
+                    "market_cap": row.market_cap,
+                    "pe_ratio": row.pe_ratio,
                     "raw_item_json": json.dumps(raw, ensure_ascii=False),
                     "load_ts": now,
                 }

@@ -1540,7 +1540,7 @@ def build_outputs(
                 state_transition_hint="REVIEW_MANUAL",
                 score_impact=0.0,
                 confidence=0.0,
-                rationale=f"Automatic LLM evaluation failed: {exc}",
+                rationale=f"Automatic LLM evaluation failed: {exc}"[:1600],
                 source_trace=["llm_error"],
                 key_risks=[],
             )
