@@ -217,6 +217,13 @@ def run_parser() -> dict[str, object]:
                     metadata={"key": str(key), "source_prefix": SOURCE_PREFIX},
                 )
                 mark_failed(SOURCE_PREFIX, key, error_message)
+                # evict the empty object so the downloader treats the date as missing and
+                # re-fetches (mark_failed alone leaves "file exists" blocking the retry)
+                try:
+                    store.delete_file(key)
+                    emit(f"🗑️ Evicted zero-byte archive from store: {key}")
+                except Exception as evict_exc:
+                    emit(f"⚠️ Could not evict zero-byte archive {key}: {evict_exc}")
                 summary["failed_count"] = int(summary["failed_count"]) + 1
                 classifications = dict(summary["failed_classifications"])
                 classifications["empty_download"] = int(classifications.get("empty_download", 0)) + 1

@@ -99,6 +99,14 @@ def download_bhavcopy_for_date(
         file_path = f"bhavcopy_{formatted_date}.zip"
         download.save_as(file_path)
 
+        # A zero-byte download is a placeholder/failed fetch, never a valid day; storing it
+        # freezes the feed (the parser can only mark it failed, and "file exists" would stop
+        # future re-downloads). Refuse it so this date stays missing and retries.
+        if os.path.getsize(file_path) == 0:
+            os.remove(file_path)
+            print(f"❌ Zero-byte bhavcopy download for {formatted_date}; not stored, will retry")
+            return False
+
         store.save_file( file_path=file_path, prefix="bhavcopy")
         os.remove(file_path)
 

@@ -18,6 +18,11 @@ LOG_DIR={{LOG_DIR}}
 # Recurring cron-managed jobs.
 # ---------------------------------------------------------------------------
 
+# Late-night data catch-up: Dhan publishes EOD bars staggered (only a fraction of the
+# universe has them at the 18:45 reconcile), and a bad morning bhavcopy fetch must not
+# survive the night. Checks bhavcopy/Dhan coverage/RS and runs bounded fixes.
+30 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_readiness.lock ./all_data_readiness.sh >> "$LOG_DIR/data_readiness.log" 2>&1
+
 # Daily log rotation before the morning jobs: archive sizable logs as
 # logs/cron/archive/<name>.<YYYY-MM-DD>.log.gz (copy-then-truncate so long-running
 # processes keep their handles) and prune archives past LOG_ROTATE_KEEP_DAYS.

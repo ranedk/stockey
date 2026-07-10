@@ -47945,6 +47945,50 @@ def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
     assert len(writes) == 3  # every decision recorded
 
 
+def test_data_readiness_checks_and_gate(monkeypatch):
+    from advisory import data_readiness as dr
+
+    expected = pd.Timestamp("2026-07-09", tz="UTC")
+
+    # bhavcopy current + enough rows -> ok; stale -> error
+    monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
+        [{"latest": pd.Timestamp("2026-07-09", tz="UTC"), "rows": 2374}]))
+    assert dr.check_bhavcopy(expected)["status"] == "ok"
+    monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
+        [{"latest": pd.Timestamp("2026-07-08", tz="UTC"), "rows": 2374}]))
+    assert dr.check_bhavcopy(expected)["status"] == "error"
+
+    # dhan coverage bands: 94% ok, 75% warn, 30% error
+    import data.dhanlive.ohlcv_reconcile as recon
+    monkeypatch.setattr(recon, "load_universe_symbols", lambda: [f"S{i}" for i in range(100)])
+    for covered, want in [(94, "ok"), (75, "warn"), (30, "error")]:
+        monkeypatch.setattr(dr, "sql_to_df", lambda *a, _n=covered, **k: pd.DataFrame([{"n": _n}]))
+        result = dr.check_dhan_coverage(expected)
+        assert result["status"] == want, (covered, result)
+
+    # rs panel current vs lagging
+    monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
+        [{"rs_latest": pd.Timestamp("2026-07-09", tz="UTC"), "bhav_latest": pd.Timestamp("2026-07-09", tz="UTC")}]))
+    assert dr.check_rs_panel()["status"] == "ok"
+    monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
+        [{"rs_latest": pd.Timestamp("2026-07-07", tz="UTC"), "bhav_latest": pd.Timestamp("2026-07-09", tz="UTC")}]))
+    assert dr.check_rs_panel()["status"] == "warn"
+
+    # gate: --require exits 1 on hard error, 0 with bypass
+    monkeypatch.setattr(dr, "run_checks", lambda: [
+        {"check": "bhavcopy_current", "status": "error"},
+        {"check": "dhan_daily_coverage", "status": "ok"},
+    ])
+    monkeypatch.delenv("DATA_READINESS_BYPASS", raising=False)
+    assert dr.main(["--require"]) == 1
+    monkeypatch.setenv("DATA_READINESS_BYPASS", "true")
+    assert dr.main(["--require"]) == 0
+    # warn-only never blocks
+    monkeypatch.delenv("DATA_READINESS_BYPASS", raising=False)
+    monkeypatch.setattr(dr, "run_checks", lambda: [{"check": "rs_panel_current", "status": "warn"}])
+    assert dr.main(["--require"]) == 0
+
+
 def test_technical_build_catchup_window(monkeypatch):
     # same-day EOD bars arrive staggered; the technicals stage must build a small window
     # behind asof so newly-admitted symbols and late-publishing bars still get feature rows.

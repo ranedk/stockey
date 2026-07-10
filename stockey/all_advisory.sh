@@ -144,6 +144,14 @@ else
   fi
 fi
 
+# Data-readiness gate: a multi-hour run on a frozen/half-captured feed evaluates the
+# universe featureless and reads as "no signals". Refuses only on HARD errors
+# (missing bhavcopy day, Dhan coverage below floor); DATA_READINESS_BYPASS=true overrides.
+if [[ "${ADVISORY_SKIP_DATA_READINESS:-0}" != "1" && "${ADVISORY_SKIP_DATA_READINESS:-false}" != "true" ]]; then
+  advisory_failure_context="data_readiness_gate"
+  "${SCRIPT_DIR}/scripts/run_with_markers.sh" "advisory_data_readiness" "${PYTHON_BIN}" -m advisory.data_readiness --fix --require
+fi
+
 advisory_failure_context="all_advisory"
 "${SCRIPT_DIR}/scripts/run_with_markers.sh" "all_advisory" "${PYTHON_BIN}" -m advisory.master_pipeline "${ADVISORY_ARGS[@]}" "$@"
 

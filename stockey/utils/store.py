@@ -140,6 +140,13 @@ def get_as_temp_file(key: str) -> bytes:
     return tmp_file.name
 
 
+def delete_file(key: str) -> None:
+    """Delete an object from the store (used to evict corrupt/placeholder downloads so the
+    downloader treats the date as missing and re-fetches)."""
+    s3 = _get_client()
+    s3.delete_object(Bucket=AWS_BUCKET_NAME, Key=key)
+
+
 def list_files(prefix: str) -> Iterator[str]:
     """
     Lazily iterate over all S3 object keys that start with *prefix*.
