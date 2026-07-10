@@ -1842,7 +1842,14 @@ def check_daily_ohlcv_universe_coverage() -> dict[str, Any]:
             load_universe_symbols,
         )
 
-        expected = expected_complete_trading_day()
+        # Dhan publishes EOD bars staggered through the evening: right after the 18:00
+        # close, "today expected" reads ~0% covered and errored every nightly smoke. Until
+        # the publication grace hour, measure against the previous complete trading day.
+        grace_hour = int(os.getenv("OPERATOR_HEALTH_DHAN_TODAY_AFTER_HOUR_IST", "23"))
+        from data.dhanlive.ohlcv_reconcile import TODAY_COMPLETE_AFTER_HOUR_IST as _today_hour
+
+        shift_hours = max(0, grace_hour - int(_today_hour))
+        expected = expected_complete_trading_day(pd.Timestamp.utcnow() - pd.Timedelta(hours=shift_hours))
         universe = load_universe_symbols()
         if not universe:
             return _status(

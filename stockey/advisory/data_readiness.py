@@ -41,6 +41,19 @@ def _expected_day() -> pd.Timestamp:
     return expected_complete_trading_day()
 
 
+def _expected_dhan_day() -> pd.Timestamp:
+    """Dhan publishes EOD bars staggered through the evening; expecting TODAY's bars right
+    after the 18:00 close makes coverage read ~0% and would refuse the 19:10 advisory every
+    night. Shift the completeness boundary so today's bars are only EXPECTED after
+    DATA_READINESS_DHAN_TODAY_AFTER_HOUR_IST (default 23); before that, the previous
+    trading day is the standard."""
+    from data.dhanlive.ohlcv_reconcile import TODAY_COMPLETE_AFTER_HOUR_IST, expected_complete_trading_day
+
+    grace_hour = int(os.getenv("DATA_READINESS_DHAN_TODAY_AFTER_HOUR_IST", "23"))
+    shift_hours = max(0, grace_hour - int(TODAY_COMPLETE_AFTER_HOUR_IST))
+    return expected_complete_trading_day(pd.Timestamp.utcnow() - pd.Timedelta(hours=shift_hours))
+
+
 def check_bhavcopy(expected_day: pd.Timestamp) -> dict[str, Any]:
     frame = sql_to_df(
         "SELECT MAX(date) AS latest, COUNT(*) FILTER (WHERE date = (SELECT MAX(date) FROM nseindia_ohlcv WHERE series='EQ')) AS rows "
@@ -50,6 +63,15 @@ def check_bhavcopy(expected_day: pd.Timestamp) -> dict[str, Any]:
     rows = int(frame.iloc[0]["rows"] or 0) if not frame.empty else 0
     current = latest is not None and not pd.isna(latest) and latest.normalize() >= expected_day.normalize()
     status = "ok" if (current and rows >= BHAVCOPY_MIN_ROWS) else "error"
+    if status == "error" and latest is not None and not pd.isna(latest):
+        # Publication grace: NSE posts the day's bhavcopy ~18:30-19:00 IST. Between the
+        # 18:00 completeness boundary and the grace hour, being exactly one day behind is
+        # a warn (the --fix download usually lands it); after the grace hour it is real.
+        grace_hour = int(os.getenv("DATA_READINESS_BHAVCOPY_TODAY_AFTER_HOUR_IST", "20"))
+        ist_now = pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)
+        one_day_behind = (expected_day.normalize() - latest.normalize()).days <= 1
+        if one_day_behind and rows >= BHAVCOPY_MIN_ROWS and ist_now.hour < grace_hour:
+            status = "warn"
     return {
         "check": "bhavcopy_current", "status": status,
         "latest": None if latest is None or pd.isna(latest) else str(latest.date()),
@@ -116,7 +138,7 @@ def check_technicals(expected_day: pd.Timestamp) -> dict[str, Any]:
 def run_checks() -> list[dict[str, Any]]:
     expected_day = _expected_day()
     results = [check_bhavcopy(expected_day)]
-    results.append(check_dhan_coverage(expected_day))
+    results.append(check_dhan_coverage(_expected_dhan_day()))
     results.append(check_rs_panel())
     results.append(check_technicals(expected_day))
     return results
