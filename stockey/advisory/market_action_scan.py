@@ -35,6 +35,18 @@ SCAN_MIN_VOLUME_MULTIPLE = env.float("MARKET_ACTION_SCAN_MIN_VOLUME_MULTIPLE", d
 SCAN_MIN_BREAKOUT_PCT = env.float("MARKET_ACTION_SCAN_MIN_BREAKOUT_PCT", default=1.0)
 SCAN_MAX_CIRCUIT_HITS_20D = env.int("MARKET_ACTION_SCAN_MAX_CIRCUIT_HITS_20D", default=2)
 
+# Volume-surge sibling: catches the base-breakouts the new-high scan structurally misses
+# (measured 2026-07-10: 43 of 65 confirmed movers were below their 52w highs, 80% outside
+# our universe). A big single-day move on volume, explicitly NOT already at a 20d high, so
+# the two scans partition the mover population and the regret ledger grades each cleanly.
+SURGE_SLUG = "volume-surge-scan-v1"
+SURGE_NAME = "Volume surge scan (base-breakout momentum)"
+VOLUME_SURGE_SCAN_ENABLED = env.bool("VOLUME_SURGE_SCAN_ENABLED", default=True)
+SURGE_LIMIT = env.int("VOLUME_SURGE_SCAN_LIMIT", default=30)
+SURGE_MIN_CHANGE_PCT = env.float("VOLUME_SURGE_SCAN_MIN_CHANGE_PCT", default=4.0)
+SURGE_MIN_VOLUME_MULTIPLE = env.float("VOLUME_SURGE_SCAN_MIN_VOLUME_MULTIPLE", default=3.0)
+SURGE_MAX_DIST_BELOW_HIGH_PCT = env.float("VOLUME_SURGE_SCAN_MAX_DIST_BELOW_HIGH_PCT", default=25.0)
+
 OHLCV_TABLE = "nseindia_ohlcv"
 CIRCUIT_TABLE = "nseindia_circuit_hit"
 
@@ -65,6 +77,48 @@ def _scan_query() -> str:
       AND h.nprev >= 15
       AND h.close > h.max20 * (1 + %(min_breakout_pct)s / 100.0)
       AND h.volume >= %(min_volume_multiple)s * h.avgvol20
+      AND h.close >= %(min_price)s
+      AND h.avgvol20 * h.close >= %(min_turnover)s
+      AND COALESCE(c.hits, 0) <= %(max_circuit_hits)s
+    ORDER BY (h.volume / NULLIF(h.avgvol20, 0)) DESC
+    """
+
+
+def _surge_query() -> str:
+    return f"""
+    WITH hist AS (
+        SELECT symbol, company_master_id, isin, date, close, volume,
+               LAG(close)  OVER (PARTITION BY symbol ORDER BY date) AS prev_close,
+               MAX(close)  OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS max20,
+               MAX(close)  OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING) AS max252,
+               AVG(volume) OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS avgvol20,
+               COUNT(*)    OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS nprev
+        FROM {OHLCV_TABLE}
+        WHERE series = 'EQ' AND date >= %(scan_date)s - interval '400 days' AND date <= %(scan_date)s
+    ),
+    circuit AS (
+        SELECT symbol, COUNT(DISTINCT date) AS hits
+        FROM {CIRCUIT_TABLE}
+        WHERE date > %(scan_date)s - interval '20 days'
+        GROUP BY symbol
+    )
+    SELECT h.symbol, h.company_master_id, h.isin, h.close,
+           ((h.close / NULLIF(h.prev_close, 0) - 1) * 100)::float AS change_pct,
+           ((h.close / NULLIF(h.max252, 0)))::float AS proximity_52w_high,
+           (h.volume / NULLIF(h.avgvol20, 0))::float AS volume_multiple,
+           h.volume, (h.avgvol20 * h.close)::float AS avg_turnover_inr
+    FROM hist h
+    LEFT JOIN circuit c ON c.symbol = h.symbol
+    WHERE h.date = %(scan_date)s
+      AND h.nprev >= 15
+      AND h.prev_close IS NOT NULL
+      AND (h.close / NULLIF(h.prev_close, 0) - 1) * 100 >= %(min_change_pct)s
+      AND h.volume >= %(min_volume_multiple)s * h.avgvol20
+      -- explicitly NOT a fresh 20d high: those belong to the breakout scan
+      AND h.close <= h.max20
+      -- but still within striking distance of the 52w high (a base, not a falling knife)
+      AND h.max252 IS NOT NULL
+      AND h.close >= h.max252 * (1 - %(max_dist_below_high_pct)s / 100.0)
       AND h.close >= %(min_price)s
       AND h.avgvol20 * h.close >= %(min_turnover)s
       AND COALESCE(c.hits, 0) <= %(max_circuit_hits)s
@@ -167,6 +221,94 @@ def safe_scan_market_action(*, asof_date: Any | None = None, limit: int | None =
             fallback_type="market_action_scan_failed",
             severity="warn",
             reason="Whole-market action scan failed; constituents continue from Screener.in sources only.",
+            error=exc,
+            metadata={"asof_date": None if asof_date is None else str(asof_date)},
+        )
+        return pd.DataFrame()
+
+
+def scan_volume_surge(*, asof_date: Any | None = None, limit: int | None = None) -> pd.DataFrame:
+    """Base-breakout momentum: big single-day move on volume, not yet at a 20d high but
+    within striking distance of the 52w high. Junk-eliminating filters only; the downstream
+    candidate/technical/risk gates still decide quality."""
+    scan_date = _latest_bhavcopy_date(asof_date)
+    if scan_date is None:
+        return pd.DataFrame()
+    rows = sql_to_df(
+        _surge_query(),
+        params={
+            "scan_date": scan_date,
+            "min_change_pct": float(SURGE_MIN_CHANGE_PCT),
+            "min_volume_multiple": float(SURGE_MIN_VOLUME_MULTIPLE),
+            "max_dist_below_high_pct": float(SURGE_MAX_DIST_BELOW_HIGH_PCT),
+            "min_price": float(SCAN_MIN_PRICE),
+            "min_turnover": float(SCAN_MIN_TURNOVER_INR),
+            "max_circuit_hits": int(SCAN_MAX_CIRCUIT_HITS_20D),
+        },
+    )
+    if rows.empty:
+        return pd.DataFrame()
+    if limit is None:
+        try:
+            from advisory.regime_admission_policy import resolve_active_policy
+
+            limit = int(resolve_active_policy(scan_date).get("scan_limit") or SURGE_LIMIT)
+        except Exception:
+            limit = None
+    cap = int(SURGE_LIMIT if limit is None else limit)
+    if cap > 0:
+        rows = rows.head(cap)
+    now = pd.Timestamp.utcnow()
+    out = []
+    for rank, row in enumerate(rows.itertuples(index=False), start=1):
+        out.append(
+            {
+                "date": scan_date,
+                "screener_slug": SURGE_SLUG,
+                "screener_name": SURGE_NAME,
+                "screener_url": None,
+                "ticker": str(row.symbol).strip().upper(),
+                "exchange": "NSE",
+                "company_master_id": row.company_master_id,
+                "security_id": None,
+                "instrument": None,
+                "isin": row.isin,
+                "display_name": str(row.symbol).strip().upper(),
+                "rank": rank,
+                "last_price": float(row.close),
+                "volume": float(row.volume),
+                "raw_item_json": json.dumps(
+                    {
+                        "source": SURGE_SLUG,
+                        "change_pct": round(float(row.change_pct), 3),
+                        "volume_multiple": round(float(row.volume_multiple), 2),
+                        "proximity_52w_high": round(float(row.proximity_52w_high), 3),
+                        "avg_turnover_inr": round(float(row.avg_turnover_inr), 0),
+                        "junk_filters": {
+                            "min_price": SCAN_MIN_PRICE,
+                            "min_turnover_inr": SCAN_MIN_TURNOVER_INR,
+                            "max_circuit_hits_20d": SCAN_MAX_CIRCUIT_HITS_20D,
+                            "max_dist_below_high_pct": SURGE_MAX_DIST_BELOW_HIGH_PCT,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                "load_ts": now,
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def safe_scan_volume_surge(*, asof_date: Any | None = None, limit: int | None = None) -> pd.DataFrame:
+    try:
+        return scan_volume_surge(asof_date=asof_date, limit=limit)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.market_action_scan",
+            source=OHLCV_TABLE,
+            fallback_type="volume_surge_scan_failed",
+            severity="warn",
+            reason="Volume-surge scan failed; constituents continue without the base-breakout lane.",
             error=exc,
             metadata={"asof_date": None if asof_date is None else str(asof_date)},
         )

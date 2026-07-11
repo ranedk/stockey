@@ -47,11 +47,13 @@ WATCH_EXITS_SCHEMA_STATEMENTS = [
 
 RETENTION_DAYS_DEFAULT = int(os.getenv("SCREENER_RETENTION_DAYS_DEFAULT", "5"))
 RETENTION_DAYS_SCAN = int(os.getenv("SCREENER_RETENTION_DAYS_SCAN", "10"))
+# both whole-market scan lanes are single-day-triggered event sources -> the longer window
 SCAN_SLUG = "market-action-scan-v1"
+SCAN_SLUGS = {"market-action-scan-v1", "volume-surge-scan-v1"}
 
 
 def retention_days_for_slug(slug: str) -> int:
-    if str(slug or "").strip() == SCAN_SLUG:
+    if str(slug or "").strip() in SCAN_SLUGS:
         return max(0, RETENTION_DAYS_SCAN)
     return max(0, RETENTION_DAYS_DEFAULT)
 

@@ -179,7 +179,11 @@ def run_fixes(results: list[dict[str, Any]]) -> list[str]:
     """Bounded repairs in dependency order; returns the fixes executed."""
     executed: list[str] = []
     by_check = {r["check"]: r for r in results}
-    if by_check.get("bhavcopy_current", {}).get("status") == "error":
+    # Attempt the bhavcopy download on warn OR error: "warn" is the one-day-behind
+    # publication-grace state, and the download is cheap + idempotent (a no-op if NSE hasn't
+    # posted yet, lands the file the moment it has). Only acting on "error" left the current
+    # day silently uncaptured until it aged to two days stale (observed 2026-07-10).
+    if by_check.get("bhavcopy_current", {}).get("status") in {"warn", "error"}:
         _run_module("data.nseindia.bhavcopy_downloader")
         _run_module("data.nseindia.bhavcopy_parser")
         executed.append("bhavcopy_download_parse")

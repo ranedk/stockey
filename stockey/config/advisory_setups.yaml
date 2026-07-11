@@ -9,6 +9,7 @@ setups:
     screener_mode: union
     dynamic_sources:
       - market_scan
+      - volume_surge
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -111,6 +112,7 @@ setups:
     screener_mode: union
     dynamic_sources:
       - market_scan
+      - volume_surge
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -212,6 +214,7 @@ setups:
     screener_mode: union
     dynamic_sources:
       - market_scan
+      - volume_surge
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -408,6 +411,7 @@ setups:
     screener_mode: union
     dynamic_sources:
       - market_scan
+      - volume_surge
       - hypothesis
       - theme
     allowed_regimes:

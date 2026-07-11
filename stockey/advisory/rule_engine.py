@@ -600,6 +600,7 @@ def load_dynamic_source_slugs(asof_date: pd.Timestamp | None) -> dict[str, list[
             SELECT DISTINCT screener_slug FROM advisory_screener_constituents
             WHERE date = %s AND (
                 screener_slug = 'market-action-scan-v1'
+                OR screener_slug = 'volume-surge-scan-v1'
                 OR screener_slug LIKE 'hypothesis-%%'
                 OR screener_slug LIKE 'theme-%%'
             )
@@ -609,6 +610,7 @@ def load_dynamic_source_slugs(asof_date: pd.Timestamp | None) -> dict[str, list[
         slugs = sorted(str(value) for value in frame["screener_slug"].dropna().tolist()) if not frame.empty else []
         return {
             "market_scan": [slug for slug in slugs if slug == "market-action-scan-v1"],
+            "volume_surge": [slug for slug in slugs if slug == "volume-surge-scan-v1"],
             "hypothesis": [slug for slug in slugs if slug.startswith("hypothesis-")],
             "theme": [slug for slug in slugs if slug.startswith("theme-")],
         }

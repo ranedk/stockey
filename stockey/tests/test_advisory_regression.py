@@ -1471,6 +1471,7 @@ def test_build_constituents_includes_market_action_scan(monkeypatch):
     )
     monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
     monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", True)
+    monkeypatch.setattr(mas, "VOLUME_SURGE_SCAN_ENABLED", False)
     monkeypatch.setattr(mas, "safe_scan_market_action", lambda **_k: scan_frame.copy())
     from advisory import hypothesis_screeners as _hs
     monkeypatch.setattr(_hs, "HYPOTHESIS_SCREENERS_ENABLED", False)
@@ -47668,6 +47669,7 @@ def test_build_constituents_includes_theme_screeners(monkeypatch):
     )
     monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
     monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", False)
+    monkeypatch.setattr(mas, "VOLUME_SURGE_SCAN_ENABLED", False)
     monkeypatch.setattr(hs, "HYPOTHESIS_SCREENERS_ENABLED", False)
     monkeypatch.setattr(sret, "apply_retention", lambda frame, **_k: frame)
     monkeypatch.setattr(ts, "THEME_SCREENERS_ENABLED", True)
@@ -47820,6 +47822,7 @@ def test_build_constituents_includes_hypothesis_screeners(monkeypatch):
     )
     monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
     monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", False)
+    monkeypatch.setattr(mas, "VOLUME_SURGE_SCAN_ENABLED", False)
     monkeypatch.setattr(hs, "HYPOTHESIS_SCREENERS_ENABLED", True)
     monkeypatch.setattr(hs, "safe_build_hypothesis_constituents", lambda **_k: hypo_frame.copy())
     from advisory import screener_retention as _sret
@@ -48228,6 +48231,55 @@ def test_market_action_scan_limit_resolves_from_admission_policy(monkeypatch):
     monkeypatch.setattr(rap, "resolve_active_policy", lambda *a, **k: {"state": "risk_off", "scan_limit": 4})
     frame = mas.scan_market_action()  # no explicit limit -> policy decides
     assert len(frame) == 4
+
+
+def test_volume_surge_scan_partitions_from_breakout(monkeypatch):
+    # the surge scan must admit big-move-on-volume names that are NOT at a 20d high
+    # (base breakouts), partitioning cleanly from the new-high market_action scan.
+    from advisory import market_action_scan as mas
+
+    captured = {}
+    def fake_sql(query, params=None):
+        captured["query"] = query
+        return pd.DataFrame([
+            {"symbol": "MRPL", "company_master_id": "cm-MRPL", "isin": "INE-MRPL", "close": 250.0,
+             "change_pct": 8.6, "proximity_52w_high": 0.79, "volume_multiple": 7.6,
+             "volume": 5e6, "avg_turnover_inr": 9e8},
+        ])
+    monkeypatch.setattr(mas, "sql_to_df", fake_sql)
+    monkeypatch.setattr(mas, "_latest_bhavcopy_date", lambda asof=None: pd.Timestamp("2026-07-10"))
+    frame = mas.scan_volume_surge(asof_date="2026-07-10", limit=30)
+    assert list(frame["screener_slug"]) == ["volume-surge-scan-v1"]
+    assert frame.iloc[0]["ticker"] == "MRPL"
+    # query enforces the not-at-20d-high partition and the 52w-high proximity band
+    assert "close <= h.max20" in captured["query"]
+    assert "max_dist_below_high_pct" in captured["query"]
+    raw = json.loads(frame.iloc[0]["raw_item_json"])
+    assert raw["source"] == "volume-surge-scan-v1" and raw["change_pct"] == 8.6
+
+    # safe wrapper degrades to empty on failure
+    monkeypatch.setattr(mas, "scan_volume_surge", lambda **k: (_ for _ in ()).throw(RuntimeError("db")))
+    monkeypatch.setattr(mas, "record_local_fallback_event", lambda **k: None)
+    assert mas.safe_scan_volume_surge().empty
+
+
+def test_data_readiness_fix_downloads_bhavcopy_on_warn(monkeypatch):
+    # regression: the one-day-behind (warn) state must still trigger the bhavcopy download
+    # in --fix, or the current day stays uncaptured until it ages to a hard error.
+    from advisory import data_readiness as dr
+
+    ran = []
+    monkeypatch.setattr(dr, "_run_module", lambda m: ran.append(m) or True)
+    monkeypatch.setattr(dr, "build_relative_strength", lambda: None, raising=False)
+    import advisory.relative_strength as rs
+    monkeypatch.setattr(rs, "build_relative_strength", lambda **k: None)
+    executed = dr.run_fixes([
+        {"check": "bhavcopy_current", "status": "warn"},
+        {"check": "dhan_daily_coverage", "status": "ok"},
+        {"check": "rs_panel_current", "status": "ok"},
+    ])
+    assert "bhavcopy_download_parse" in executed
+    assert "data.nseindia.bhavcopy_downloader" in ran
 
 
 def test_resolve_setup_screeners_expands_dynamic_sources():
