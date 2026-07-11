@@ -47945,6 +47945,26 @@ def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
     assert len(writes) == 3  # every decision recorded
 
 
+def test_sharpely_v2_decrypt_roundtrip():
+    # the statements endpoint moved to AES-256-CBC "iv:ct"; the recovered key must
+    # round-trip what encryptAES produced (zero-padded UTF-8 key, PKCS7).
+    import base64
+    from Crypto.Cipher import AES
+    from Crypto.Util.Padding import pad
+    from data.sharpelydata import sharpely_utils as su
+
+    key = su._derive_key(su.SHARPELY_V2_AES_KEY)
+    assert len(key) == 32
+    plaintext = '{"statements": "{\\"inc_consol_interim\\": []}"}'
+    iv = b"0123456789abcdef"
+    ct = AES.new(key, AES.MODE_CBC, iv).encrypt(pad(plaintext.encode(), 16))
+    payload = base64.b64encode(iv).decode() + ":" + base64.b64encode(ct).decode()
+    assert su.decrypt_sharpely_v2(payload) == plaintext
+    import pytest
+    with pytest.raises(ValueError):
+        su.decrypt_sharpely_v2("not-encrypted")
+
+
 def test_screener_metrics_fill_missing_only(monkeypatch):
     from advisory import screener_metrics as sm
 

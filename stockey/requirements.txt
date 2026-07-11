@@ -30,3 +30,4 @@ TA-Lib==0.6.8
 scikit-learn==1.8.0
 xgboost==3.2.0
 pyotp==2.9.0
+pycryptodome==3.23.0

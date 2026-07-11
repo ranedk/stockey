@@ -84,11 +84,15 @@ def filter_by_date_range(df: pd.DataFrame, from_date: datetime | None, to_date: 
 
 
 def get_financial_statement(symbol: str, from_date: datetime | None = None, to_date: datetime | None = None) -> dict[str, object]:
-    resp = get_with_retries(
-        f"https://pyapiv2.mintbox.ai/api/core/getFinancialStatementsV2/ticker={symbol}",
-        headers=HEADERS,
-    ).json()
-    fin = json.loads(resp["statements"])
+    # 2026-07: the statements endpoint moved to /api/v2/core/ and now returns an
+    # AES-256-CBC "base64(iv):base64(ciphertext)" body (the old /api/core/ path 404s).
+    # Key is the sharpely web bundle's UTF-8 secret, zero-padded to 32 bytes.
+    response = get_with_retries(
+        f"https://pyapiv2.mintbox.ai/api/v2/core/getFinancialStatementsV2/ticker={symbol}",
+        headers=su.get_sharpely_v2_headers(),
+    )
+    resp = json.loads(su.decrypt_sharpely_v2(response.text))
+    fin = json.loads(resp["statements"]) if isinstance(resp["statements"], str) else resp["statements"]
 
     income_fccs = {
         "SREV": "gross_revenue",
