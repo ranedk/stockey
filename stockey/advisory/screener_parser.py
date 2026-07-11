@@ -311,6 +311,12 @@ def build_constituents(
         from advisory.screener_retention import apply_retention
 
         combined = apply_retention(combined, snapshot_date=snapshot_date)
+        # Dynamic/retained rows lack snapshot market caps; fill missing metrics from the
+        # weekly Sharpely snapshot so the rule engine's size bands evaluate real values
+        # instead of soft-flagging market_cap:unknown. Never overwrites present values.
+        from advisory.screener_metrics import attach_snapshot_metrics
+
+        combined = attach_snapshot_metrics(combined)
     return combined
 
 

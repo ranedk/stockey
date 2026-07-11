@@ -47945,6 +47945,44 @@ def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
     assert len(writes) == 3  # every decision recorded
 
 
+def test_screener_metrics_fill_missing_only(monkeypatch):
+    from advisory import screener_metrics as sm
+
+    monkeypatch.setattr(sm, "load_market_cap_map", lambda tickers=None: {
+        "TBZ": {"market_cap": 1523.7, "last_price": 220.0},
+        "STATICCO": {"market_cap": 999.0, "last_price": 1.0},
+    })
+    frame = pd.DataFrame([
+        {"ticker": "TBZ", "market_cap": None, "last_price": None},
+        {"ticker": "STATICCO", "market_cap": 555.0, "last_price": 100.0},  # present -> untouched
+        {"ticker": "NOMETRICS", "market_cap": None, "last_price": None},   # absent -> stays None
+    ])
+    out = sm.attach_snapshot_metrics(frame)
+    by = out.set_index("ticker")
+    assert by.loc["TBZ", "market_cap"] == 1523.7
+    assert by.loc["STATICCO", "market_cap"] == 555.0
+    assert pd.isna(by.loc["NOMETRICS", "market_cap"])
+
+    # lookup failure degrades to unchanged frame
+    monkeypatch.setattr(sm, "load_market_cap_map", lambda tickers=None: {})
+    out2 = sm.attach_snapshot_metrics(frame)
+    assert pd.isna(out2.set_index("ticker").loc["TBZ", "market_cap"])
+
+
+def test_fundamentals_refresh_targets_results_filers(monkeypatch):
+    from advisory import fundamentals_refresh as fr
+
+    captured = {}
+    monkeypatch.setattr(fr, "sql_to_df", lambda q, params=None: captured.update({"params": params}) or pd.DataFrame(
+        [{"symbol": "BEL"}, {"symbol": "LUPIN"}]))
+    symbols = fr.load_recent_results_symbols(3)
+    assert symbols == ["BEL", "LUPIN"]
+    assert "RESULTS_POSITIVE" in captured["params"][1]
+
+    summary = fr.refresh_from_recent_results(3, dry_run=True)
+    assert summary["symbol_count"] == 2 and summary["dry_run"] is True
+
+
 def test_http_cache_key_includes_request_body():
     # regression: URL-only cache keys replayed the first symbol's response for every
     # symbol on body-selected POSTs (getStocksColData) -- the sharpely_stock_meta/peers
