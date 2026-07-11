@@ -136,12 +136,34 @@ def check_technicals(expected_day: pd.Timestamp) -> dict[str, Any]:
     }
 
 
+def check_statements() -> dict[str, Any]:
+    """Quarterly fundamentals staleness (warn-only): flags when the newest statement period
+    is older than a results cycle -- catches a silently dead statements endpoint before a
+    whole earnings season is missed (the getFinancialStatementsV2 404s of 2026-07)."""
+    max_age_days = int(os.getenv("DATA_READINESS_STATEMENTS_MAX_AGE_DAYS", "130"))
+    try:
+        frame = sql_to_df("SELECT MAX(date) AS latest, COUNT(DISTINCT symbol) AS syms FROM stmt_income")
+        latest = pd.to_datetime(frame.iloc[0]["latest"], utc=True, errors="coerce") if not frame.empty else None
+        syms = int(frame.iloc[0]["syms"] or 0) if not frame.empty else 0
+    except Exception:
+        latest, syms = None, 0
+    age = None if latest is None or pd.isna(latest) else int((pd.Timestamp.utcnow() - latest).days)
+    status = "ok" if age is not None and age <= max_age_days else "warn"
+    return {
+        "check": "statements_quarterly", "status": status,
+        "latest_period": None if latest is None or pd.isna(latest) else str(latest.date()),
+        "age_days": age, "symbols": syms,
+        "note": "warn-only: quarterly cadence; investigate the Sharpely statements endpoint if this warns during results season",
+    }
+
+
 def run_checks() -> list[dict[str, Any]]:
     expected_day = _expected_day()
     results = [check_bhavcopy(expected_day)]
     results.append(check_dhan_coverage(_expected_dhan_day()))
     results.append(check_rs_panel())
     results.append(check_technicals(expected_day))
+    results.append(check_statements())
     return results
 
 

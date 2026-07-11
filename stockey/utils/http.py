@@ -2,6 +2,7 @@
 
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 import re
@@ -68,11 +69,16 @@ def _slugify(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text).strip("_") or "none"
 
 
-def _build_cache_key(url: str) -> tuple[str, str]:
+def _build_cache_key(url: str, json_data=None, data=None, params=None) -> tuple[str, str]:
     """
     Returns (base_name, file_pattern) where
       base_name  = endpoint & parameter values joined by '__'
       file_pattern = glob-ready pattern that matches any dated file for this base
+
+    The request BODY (json_data/data) and params are part of the key: a POST whose
+    payload selects the entity (e.g. Sharpely getStocksColData {"stocks": [...]})
+    previously collapsed to one URL-only key, so the first symbol's response was
+    replayed from cache for every symbol all day (the sharpely_stock_meta corruption).
     """
     p = urlparse(url)
     segments = [s for s in p.path.split("/") if s]
@@ -101,7 +107,16 @@ def _build_cache_key(url: str) -> tuple[str, str]:
     endpoint_slug = _slugify(endpoint)
     param_slugs = [_slugify(v) for v in param_vals] or ["noparam"]
 
-    base_name = "__".join([endpoint_slug] + param_slugs)
+    body_fragments: list[str] = []
+    for payload in (json_data, data, params):
+        if payload is None:
+            continue
+        try:
+            canonical = json.dumps(payload, sort_keys=True, default=str)
+        except Exception:
+            canonical = str(payload)
+        body_fragments.append(hashlib.sha1(canonical.encode()).hexdigest()[:10])
+    base_name = "__".join([endpoint_slug] + param_slugs + body_fragments)
     file_pattern = str(_CACHE_DIR / f"{base_name}__*.json")
     return base_name, file_pattern
 
@@ -217,7 +232,7 @@ def get_with_retries(
         raise ValueError("Only GET and POST allowed")
 
     # ---------- cache lookup -------------------------------------------------
-    base_name, pattern = _build_cache_key(url)
+    base_name, pattern = _build_cache_key(url, json_data=json_data, data=data, params=params)
     cached_text = _load_from_cache(pattern, max_age_days) if from_cache else None
     if cached_text is not None:
         resp = requests.Response()

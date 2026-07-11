@@ -615,8 +615,13 @@ def sync_sharpely_data(symbols: list[str], from_date: datetime | None = None, to
             )
             meta_max_ts = pd.Timestamp(meta_max_date).normalize() if meta_max_date is not None else None
             peers_max_ts = pd.Timestamp(peers_max_date).normalize() if peers_max_date is not None else None
-            need_meta_snapshot = meta_max_ts is None or meta_max_ts < snapshot_target
-            need_peers_snapshot = peers_max_ts is None or peers_max_ts < snapshot_target
+            # Meta/peers are slow-changing classification+valuation snapshots (sector codes,
+            # style boxes, peer groups); price/mcap freshness comes from the bhavcopy. A
+            # weekly snapshot is the default -- daily re-fetches were ~all API cost, no signal.
+            refresh_days = max(1, int(env.int("SHARPELY_SNAPSHOT_REFRESH_DAYS", 7)))
+            snapshot_floor = snapshot_target - pd.Timedelta(days=refresh_days - 1)
+            need_meta_snapshot = meta_max_ts is None or meta_max_ts < snapshot_floor
+            need_peers_snapshot = peers_max_ts is None or peers_max_ts < snapshot_floor
             cached_meta: dict | None = None
             if need_meta_snapshot or need_peers_snapshot:
                 meta_payload = get_stock_meta(symbol)

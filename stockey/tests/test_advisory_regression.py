@@ -47945,6 +47945,35 @@ def test_regime_admission_hysteresis_and_risk_off_fast_path(monkeypatch):
     assert len(writes) == 3  # every decision recorded
 
 
+def test_http_cache_key_includes_request_body():
+    # regression: URL-only cache keys replayed the first symbol's response for every
+    # symbol on body-selected POSTs (getStocksColData) -- the sharpely_stock_meta/peers
+    # corruption. Different bodies must produce different cache keys; same body, same key.
+    from utils.http import _build_cache_key
+
+    url = "https://pyapiv2.mintbox.ai/api/core/getStocksColData"
+    key_a, _ = _build_cache_key(url, json_data={"stocks": ["TARSONS"], "all_cols": True})
+    key_b, _ = _build_cache_key(url, json_data={"stocks": ["LICI"], "all_cols": True})
+    key_a2, _ = _build_cache_key(url, json_data={"all_cols": True, "stocks": ["TARSONS"]})
+    assert key_a != key_b
+    assert key_a == key_a2  # key order canonicalized
+    plain, _ = _build_cache_key(url)
+    assert plain != key_a and plain.endswith("noparam")
+
+
+def test_sharpely_snapshot_weekly_cadence(monkeypatch):
+    # meta/peers snapshots refresh weekly, not daily (classification data is slow-moving;
+    # bhavcopy owns daily price/mcap freshness).
+    import data.sharpelydata.sharpely_data as sd
+
+    calls = {"meta": 0}
+    monkeypatch.setattr(sd, "get_db_max_date", lambda table, **k: pd.Timestamp("2026-07-08"))
+    monkeypatch.setattr(sd, "get_stock_meta", lambda s: calls.__setitem__("meta", calls["meta"] + 1) or [])
+    summary = sd.sync_sharpely_data(["TESTCO"], to_date=pd.Timestamp("2026-07-10").to_pydatetime())
+    assert calls["meta"] == 0, "3-day-old snapshot must not refetch under weekly cadence"
+    assert summary["symbol_count"] == 1
+
+
 def test_data_readiness_publication_grace(monkeypatch):
     # Lag-based severity: NSE posts the day's bhavcopy on its own schedule, so one day
     # behind is a warn (the evening run proceeds on yesterday-complete data); two+ days
