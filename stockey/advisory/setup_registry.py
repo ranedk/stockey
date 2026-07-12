@@ -47,6 +47,7 @@ def load_setup_registry(config_path: str | None = None) -> list[dict[str, Any]]:
                 "setup_id": str(setup["setup_id"]),
                 "setup_name": str(setup.get("setup_name") or setup["setup_id"]),
                 "setup_family": str(setup.get("setup_family") or ""),
+                "entry_archetype": str(setup.get("entry_archetype") or "base_breakout").strip().lower(),
                 "holding_horizon_note": setup.get("holding_horizon_note"),
                 "screener_slug": screeners[0] if screeners else None,
                 "screener_slugs": screeners,

@@ -48308,6 +48308,43 @@ def test_missed_movers_classification():
     assert mm._classify({})[0] == "no_signal"
 
 
+def test_momentum_archetype_replaces_base_depth_with_trend_quality():
+    from advisory import technical_engine as te
+
+    # a runner: deep base (ran up), above rising DMA, higher lows, controlled extension
+    runner = pd.Series({
+        "avg_traded_value_20d": 5e8, "adj_close": 1400.0, "median_volume_20d": 5e5,
+        "base_depth_60d_pct": 55.0,  # DEEP base -> base_breakout hard-rejects
+        "breakout_extension_pct": 12.0, "higher_low_count_20d": 9, "support_hold_rate_20d": 0.6,
+        "pass_above_dma_50": True, "dma_50_slope_20d_pct": 3.0, "tight_close_upper_half_20d": 0.6,
+        "trend_persistence_60d": 0.7, "accumulation_days_20d": 5, "distribution_days_20d": 1,
+        "breakout_day_volume_vs_20d": 1.5,
+    })
+    base = te.evaluate_hard_filters(runner, archetype="base_breakout")
+    mom = te.evaluate_hard_filters(runner, archetype="momentum")
+    assert "base_too_deep" in base["reasons"]        # base-breakout rejects the runner
+    assert "base_too_deep" not in mom["reasons"]      # momentum does not
+    assert mom["passed"]                              # 12% extension is not parabolic
+
+    # a climactic blow-off: momentum's parabolic guard rejects it
+    blowoff = runner.copy(); blowoff["breakout_extension_pct"] = 55.0
+    assert "parabolic_extension" in te.evaluate_hard_filters(blowoff, archetype="momentum")["reasons"]
+
+    # momentum structure rewards the orderly trend; base structure penalizes the deep base
+    assert te.score_structure_momentum(runner) > te.score_structure_quality(runner)
+    # score_row routes by archetype
+    assert te.score_row(runner, archetype="momentum")["structure_score"] > te.score_row(runner, archetype="base_breakout")["structure_score"]
+
+
+def test_momentum_setup_registered_with_archetype():
+    from advisory.setup_registry import load_setup_registry
+    m = next((s for s in load_setup_registry() if s["setup_id"] == "MOMENTUM_CONTINUATION_V1"), None)
+    assert m is not None
+    assert m["entry_archetype"] == "momentum"
+    assert set(m["dynamic_sources"]) == {"momentum", "volume_surge"}
+    assert m["freshness_policy"]["fundamentals_required"] is False
+
+
 def test_momentum_trend_scan_emits_multi_day_leaders(monkeypatch):
     # the momentum scan catches sustained multi-day advances near 52w highs (the grind the
     # single-day breakout/surge scans miss).

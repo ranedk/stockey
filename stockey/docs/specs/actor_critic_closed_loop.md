@@ -135,6 +135,62 @@ the conditioned attribution sees the whole picture. `advisory_missed_movers_dail
 `(param_key, size_bucket, regime_state) → value` with resolution order
 `specific cell → size-only → regime-only → global default`, not flat params.
 
+## 3c. Conditional strategy allocation — the decision is a runtime policy, not a blanket choice
+
+The deepest operator insight (2026-07-12): the answer to "base-breakout vs momentum" or
+"how much to each" is **not a fixed value found by backtest** — a blanket backtest averages
+over regimes where the answer flips (momentum euphoria vs momentum crashes) and is actively
+misleading. The real question is **"under what conditions does each archetype work, and can
+we read those conditions at runtime?"** So we do not *select* a strategy; we run both and make
+the *mix* a runtime function of state.
+
+**Two runtime conditioners:**
+1. **Market regime / breadth (forward-looking):** is the environment hospitable to momentum
+   now (broad uptrend, healthy breadth, index trending)? Reuses the regime admission substrate.
+2. **Each archetype's own recent realized performance (self-correcting):** is this sleeve
+   actually paying *lately*? The regret ledger + per-lane grading are the input.
+
+**The whipsaw trap (non-negotiable guards).** Following the recently-working archetype is
+itself a momentum bet on strategies — you max momentum right before its crash, precisely when
+it has been working most. So the allocation policy requires: (a) **slow adaptation** (weeks-long
+performance lookback), (b) **floors and caps** (never 0/100 to one sleeve — always keep a
+base-breakout core), (c) a **regime veto over performance** (when breadth is collapsing, do NOT
+max momentum even if it has been working — the forward signal overrides the backward one, and
+that disagreement *is* the top).
+
+**Two phases:**
+- **Phase A — rule-based conditional allocation.** A transparent policy sets sleeve weights from
+  regime/breadth. Domain-guided, no overfitting, live immediately. Lives as its own layer that
+  *consumes* the regime admission state (kept separate: admission policy outputs admission
+  *width*; this outputs strategy *weighting*).
+- **Phase B — performance-following adaptation.** Once each sleeve has matured grades, the mix
+  also tilts toward the recently-working sleeve, under the three guards, with System 2 tuning
+  the conditioning.
+
+**Backtest reframe.** Do not backtest "which archetype wins" (the blanket, distrusted question).
+Backtest whether the **conditioning signal has predictive power** — "when breadth is high AND
+momentum has been working, does momentum keep working over the next N days?" The conditional is
+stationary enough to learn from even when the blanket answer is not.
+
+## 3d. The momentum-continuation entry archetype (the concrete enabler)
+
+The base-breakout engine cannot buy a stock that already ran (`base_too_deep` hard filter +
+tight-base `score_structure_quality`) — by design. Momentum needs a **replacement structure
+test, not a relaxation**: reward an *orderly* trend, penalize a *climactic* one.
+
+- New setup `MOMENTUM_CONTINUATION_V1`, `entry_archetype: momentum`, fed by the momentum +
+  surge scans (the extended-runner sources). A **distinct sleeve** so it is graded and
+  allocated separately (§3c, portfolio-level).
+- Archetype-aware evaluation in `advisory/technical_engine.py`:
+  - `evaluate_hard_filters`: for momentum, drop `base_too_deep` (a runner is *supposed* to have
+    a deep base) and add a `parabolic_extension` guard (reject blow-off / climactic verticality).
+  - `score_structure_quality`: momentum variant rewards higher-lows intact, above a rising DMA,
+    pullbacks that held, controlled (non-parabolic) extension — instead of a tight base.
+  - Triggers reuse the existing `trend_pullback` (pullback-resume) and a continuation-breakout
+    (break of a nearer, in-trend pivot) — the "both sub-triggers" decision.
+- Risk: portfolio-level sleeve cap (§3c), because momentum's failure mode is *correlated factor
+  unwind*, which per-trade sizing cannot see; per-trade stops still apply underneath.
+
 ## 4. Parameter taxonomy — what System 2 may touch
 
 - **Tier A — tunable (continuous, monotonic effect, well-measured).** Scan thresholds

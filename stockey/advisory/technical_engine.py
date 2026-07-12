@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pandas as pd
@@ -65,15 +66,24 @@ def _bool(value: Any) -> bool:
     return bool(value)
 
 
-def evaluate_hard_filters(row: pd.Series, config: dict[str, Any] | None = None) -> dict[str, Any]:
+MOMENTUM_ARCHETYPE = "momentum"
+# A momentum-continuation entry buys an already-run-up leader, so the base-breakout
+# `base_too_deep` filter is replaced by a `parabolic_extension` guard (reject climactic
+# blow-offs). Env-tunable; the actor/critic tunes these once the sleeve has matured grades.
+MOMENTUM_MAX_EXTENSION_PCT = float(os.getenv("MOMENTUM_ENTRY_MAX_EXTENSION_PCT", "40.0"))
+
+
+def evaluate_hard_filters(row: pd.Series, config: dict[str, Any] | None = None, *, archetype: str = "base_breakout") -> dict[str, Any]:
     cfg = {**DEFAULT_FILTERS, **(config or {})}
     failures: list[str] = []
+    is_momentum = str(archetype or "").strip().lower() == MOMENTUM_ARCHETYPE
     avg_traded_value = safe_float(row.get("avg_traded_value_20d"))
     price = safe_float(row.get("adj_close"))
     median_volume = safe_float(row.get("median_volume_20d"))
     atr_pct = safe_float(row.get("atr_pct"))
     gap_frequency = safe_float(row.get("gap_frequency_60d"))
     base_depth = safe_float(row.get("base_depth_60d_pct"))
+    extension = safe_float(row.get("breakout_extension_pct"))
 
     if avg_traded_value is None or avg_traded_value < float(cfg["min_avg_traded_value_20d"]):
         failures.append("low_liquidity")
@@ -85,8 +95,14 @@ def evaluate_hard_filters(row: pd.Series, config: dict[str, Any] | None = None) 
         failures.append("high_noise_atr")
     if gap_frequency is not None and gap_frequency > float(cfg["max_gap_frequency_60d"]):
         failures.append("excessive_gap_frequency")
-    if base_depth is not None and base_depth > float(cfg["max_base_depth_60d_pct"]):
-        failures.append("base_too_deep")
+    if is_momentum:
+        # a runner is SUPPOSED to have a deep base; reject only the climactic blow-off
+        max_ext = float(cfg.get("momentum_max_extension_pct", MOMENTUM_MAX_EXTENSION_PCT))
+        if extension is not None and extension > max_ext:
+            failures.append("parabolic_extension")
+    else:
+        if base_depth is not None and base_depth > float(cfg["max_base_depth_60d_pct"]):
+            failures.append("base_too_deep")
     if "pass_liquidity_20d" in row and not _bool(row.get("pass_liquidity_20d")):
         failures.append("liquidity_filter_failed")
     if "pass_gap_behavior" in row and not _bool(row.get("pass_gap_behavior")):
@@ -153,6 +169,65 @@ def score_structure_quality(row: pd.Series) -> float:
     if extension is not None and extension <= 8.0:
         score += 2.0
     return _clip_score(score, 30.0)
+
+
+def score_structure_momentum(row: pd.Series) -> float:
+    """Momentum-continuation structure: reward an ORDERLY trend (higher lows intact, above a
+    rising DMA, pullbacks that held, controlled non-parabolic extension) instead of a tight
+    base. A runner's deep base is a feature here, not a defect; verticality is the risk."""
+    score = 0.0
+    hl = safe_float(row.get("higher_low_count_20d")) or 0.0
+    support_hold = safe_float(row.get("support_hold_rate_20d")) or 0.0
+    extension = safe_float(row.get("breakout_extension_pct"))
+    dma50_slope = safe_float(row.get("dma_50_slope_20d_pct")) or -999.0
+    upper_half_20 = safe_float(row.get("tight_close_upper_half_20d")) or 0.0
+    persistence_60 = safe_float(row.get("trend_persistence_60d")) or 0.0
+
+    if _bool(row.get("pass_above_dma_50")) and dma50_slope > 0:
+        score += 7.0  # above a rising short MA = trend intact
+    if hl >= 8:
+        score += 6.0  # higher lows = orderly advance
+    elif hl >= 5:
+        score += 3.0
+    if support_hold >= 0.5:
+        score += 5.0  # pullbacks held support
+    # controlled extension: reward a live move, penalize the climactic top
+    if extension is not None and 0.0 <= extension <= 20.0:
+        score += 5.0
+    elif extension is not None and extension <= 30.0:
+        score += 2.0
+    score += min(3.0, persistence_60 * 3.0)  # sustained one-directional trend
+    if upper_half_20 >= 0.55:
+        score += 2.0
+    return _clip_score(score, 30.0)
+
+
+def score_participation_momentum(row: pd.Series) -> float:
+    """Momentum participation: a multi-day grind has no single breakout-day volume spike, so
+    weight the reliable NET-ACCUMULATION signal (accumulation vs distribution days over the
+    trend) instead. NaN-safe on the sparse up/down-volume features."""
+    score = 0.0
+    breakout_vol = safe_float(row.get("breakout_day_volume_vs_20d")) or 0.0
+    up_down_vol = safe_float(row.get("up_down_volume_ratio_20d"))
+    accumulation = safe_float(row.get("accumulation_days_20d")) or 0.0
+    distribution = safe_float(row.get("distribution_days_20d")) or 0.0
+    net_accum = accumulation - distribution
+    if net_accum >= 4:
+        score += 9.0
+    elif net_accum >= 2:
+        score += 6.0
+    elif net_accum >= 1:
+        score += 3.0
+    if up_down_vol is not None and up_down_vol >= 1.2:
+        score += 5.0
+    elif up_down_vol is not None and up_down_vol >= 1.0:
+        score += 3.0
+    if breakout_vol >= 1.4:
+        score += 4.0
+    elif breakout_vol >= 1.0:
+        score += 2.0
+    distribution_penalty = min(4.0, max(0.0, distribution - accumulation))
+    return _clip_score(score - distribution_penalty, 20.0)
 
 
 def score_participation(row: pd.Series) -> float:
@@ -703,11 +778,12 @@ def classify_setup_archetype(
     }
 
 
-def score_row(row: pd.Series, *, thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
-    filter_result = evaluate_hard_filters(row, config=thresholds)
+def score_row(row: pd.Series, *, thresholds: dict[str, Any] | None = None, archetype: str = "base_breakout") -> dict[str, Any]:
+    is_momentum = str(archetype or "").strip().lower() == MOMENTUM_ARCHETYPE
+    filter_result = evaluate_hard_filters(row, config=thresholds, archetype=archetype)
     trend_score = score_trend_regime(row)
-    structure_score = score_structure_quality(row)
-    participation_score = score_participation(row)
+    structure_score = score_structure_momentum(row) if is_momentum else score_structure_quality(row)
+    participation_score = score_participation_momentum(row) if is_momentum else score_participation(row)
     relative_strength_score = score_relative_strength(row)
     tradability_score = score_tradability(row)
     total_score = round(
@@ -740,9 +816,9 @@ def score_row(row: pd.Series, *, thresholds: dict[str, Any] | None = None) -> di
     }
 
 
-def evaluate_pre_entry_state(row: pd.Series, *, thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
+def evaluate_pre_entry_state(row: pd.Series, *, thresholds: dict[str, Any] | None = None, archetype: str = "base_breakout") -> dict[str, Any]:
     cfg = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
-    score = score_row(row, thresholds=thresholds)
+    score = score_row(row, thresholds=thresholds, archetype=archetype)
     reasons: list[str] = []
 
     if not score["hard_filter_pass"]:

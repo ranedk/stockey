@@ -406,6 +406,84 @@ setups:
       - PULLBACK_TO_20DMA
       - PULLBACK_TO_50DMA
 
+  - setup_id: MOMENTUM_CONTINUATION_V1
+    setup_name: Momentum continuation
+    setup_family: MOMENTUM_CONTINUATION
+    entry_archetype: momentum
+    holding_horizon_note: 1 week to 8 weeks
+    # A distinct momentum sleeve fed only by the extended-runner scans. It buys already-run-up
+    # leaders on an ORDERLY trend (the momentum archetype replaces base_too_deep with a
+    # parabolic-extension guard + orderly-trend structure score). Price-momentum thesis, so no
+    # hard fundamental requirement; the portfolio-level sleeve cap (Phase A conditional
+    # allocation) bounds correlated-momentum-unwind risk.
+    screeners: []
+    screener_mode: union
+    dynamic_sources:
+      - momentum
+      - volume_surge
+    allowed_regimes:
+      - BULL_RISK_ON
+      - BULL_NARROW
+      - STABLE
+    blocked_regimes:
+      - SHOCK
+      - RISK_OFF
+    allowed_overlays:
+      - NONE
+      - EVENT_CLUSTER
+    blocked_overlays:
+      - GEOPOLITICAL_RISK
+    market_cap_min: 5000
+    min_avg_traded_value_20d: 250000000
+    max_breakout_extension_pct: 40
+    watch_pullback_extension_pct: 12
+    min_dist_52w_high: -12
+    scoring_weights:
+      technical: 0.55
+      fundamental: 0.05
+      regime_fit: 0.25
+      event: 0.15
+    freshness_policy:
+      technical_max_age_days: 10
+      fundamentals_max_age_days: 400
+      regime_max_age_days: 15
+      intraday_max_age_days: 2
+      fundamentals_required: false
+    intraday_usage_mode: confirm_only
+    risk_profile:
+      base_risk_bucket: medium_high
+      max_allocation_inr: 75000
+      invalidation_anchor: dma_20
+    portfolio_cap_pct: 0.30
+    score_thresholds:
+      pass_now: 0.62
+      watch_breakout: 0.54
+      watch_pullback: 0.50
+      watch_event: 0.46
+      near_miss_gap: 0.05
+    regime_policy:
+      preferred:
+        - BULL_RISK_ON
+        - BULL_NARROW
+      acceptable:
+        - STABLE
+      avoid:
+        - RISK_OFF
+        - SHOCK
+    technical_rules:
+      - column: pass_above_dma_20
+        operator: eq
+        value: true
+      - column: pass_above_dma_50
+        operator: eq
+        value: true
+      - column: rs_vs_benchmark
+        operator: gte
+        value: 0.03
+    entry_styles:
+      - MOMENTUM_CONTINUATION_BREAKOUT
+      - PULLBACK_TO_20DMA
+
   - setup_id: EVENT_OPPORTUNITY_V1
     setup_name: Event opportunity
     setup_family: EVENT_OPPORTUNITY

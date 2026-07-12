@@ -1201,6 +1201,7 @@ def compute_component_scores(row: pd.Series, *, regime_name: str, setup: dict[st
     technical_engine_eval = evaluate_technical_pre_entry_state(
         row,
         thresholds=(setup.get("technical_thresholds") or setup.get("score_thresholds") or {}),
+        archetype=str(setup.get("entry_archetype") or "base_breakout"),
     )
     intraday_usage_mode = get_intraday_usage_mode(setup)
     technical_rule_defs = list(setup.get("technical_rules", []))
