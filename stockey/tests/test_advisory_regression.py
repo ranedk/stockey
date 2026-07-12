@@ -48368,6 +48368,26 @@ def test_volume_surge_scan_partitions_from_breakout(monkeypatch):
     assert mas.safe_scan_volume_surge().empty
 
 
+def test_data_readiness_benchmark_freshness(monkeypatch):
+    # a stale NIFTY benchmark zeroes rs_vs_benchmark for every name; the gate must flag it
+    # (lag>1 = error) and --fix must pull the indices.
+    from advisory import data_readiness as dr
+
+    monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
+        [{"bench_latest": pd.Timestamp("2026-07-08", tz="UTC"), "bhav_latest": pd.Timestamp("2026-07-10", tz="UTC")}]))
+    r = dr.check_benchmark()
+    assert r["status"] == "error" and r["lag_days"] == 2  # 2 days stale -> hard error
+    monkeypatch.setattr(dr, "sql_to_df", lambda *a, **k: pd.DataFrame(
+        [{"bench_latest": pd.Timestamp("2026-07-10", tz="UTC"), "bhav_latest": pd.Timestamp("2026-07-10", tz="UTC")}]))
+    assert dr.check_benchmark()["status"] == "ok"
+
+    ran = []
+    monkeypatch.setattr(dr, "_run_module", lambda m: ran.append(m) or True)
+    executed = dr.run_fixes([{"check": "benchmark_current", "status": "error"}])
+    assert "benchmark_indices" in executed
+    assert "data.nseindia.indices_downloader" in ran
+
+
 def test_data_readiness_fix_downloads_bhavcopy_on_warn(monkeypatch):
     # regression: the one-day-behind (warn) state must still trigger the bhavcopy download
     # in --fix, or the current day stays uncaptured until it ages to a hard error.

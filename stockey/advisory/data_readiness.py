@@ -102,6 +102,32 @@ def check_dhan_coverage(expected_day: pd.Timestamp) -> dict[str, Any]:
     }
 
 
+def check_benchmark() -> dict[str, Any]:
+    """NIFTY 50 benchmark freshness. A stale benchmark zeroes rs_vs_benchmark for every name
+    (verified 2026-07-09: benchmark stale at 07-08 -> 0/289 rs_vs_benchmark populated -> every
+    name under-scored ~5 RS points -> BUYs suppressed). Same-severity as bhavcopy: a hard error
+    when it lags the bhavcopy date, so the readiness --fix pulls the indices before advisory."""
+    frame = sql_to_df(
+        "SELECT (SELECT MAX(date) FROM nseindia_indices WHERE index_name ILIKE 'nifty 50') AS bench_latest, "
+        "(SELECT MAX(date) FROM nseindia_ohlcv WHERE series='EQ') AS bhav_latest"
+    )
+    bench = pd.to_datetime(frame.iloc[0]["bench_latest"], utc=True, errors="coerce") if not frame.empty else None
+    bhav = pd.to_datetime(frame.iloc[0]["bhav_latest"], utc=True, errors="coerce") if not frame.empty else None
+    if bench is None or pd.isna(bench) or bhav is None or pd.isna(bhav):
+        status = "error"
+        lag = None
+    else:
+        lag = int((bhav.normalize() - bench.normalize()).days)
+        status = "ok" if lag <= 0 else ("warn" if lag <= 1 else "error")
+    return {
+        "check": "benchmark_current", "status": status,
+        "benchmark_latest": None if bench is None or pd.isna(bench) else str(bench.date()),
+        "bhavcopy_latest": None if bhav is None or pd.isna(bhav) else str(bhav.date()),
+        "lag_days": lag,
+        "fix": "python -m data.nseindia.indices_downloader && python -m data.nseindia.indices_parser",
+    }
+
+
 def check_rs_panel() -> dict[str, Any]:
     frame = sql_to_df(
         "SELECT (SELECT MAX(date) FROM advisory_relative_strength_daily) AS rs_latest, "
@@ -161,6 +187,7 @@ def run_checks() -> list[dict[str, Any]]:
     expected_day = _expected_day()
     results = [check_bhavcopy(expected_day)]
     results.append(check_dhan_coverage(_expected_dhan_day()))
+    results.append(check_benchmark())
     results.append(check_rs_panel())
     results.append(check_technicals(expected_day))
     results.append(check_statements())
@@ -187,6 +214,10 @@ def run_fixes(results: list[dict[str, Any]]) -> list[str]:
         _run_module("data.nseindia.bhavcopy_downloader")
         _run_module("data.nseindia.bhavcopy_parser")
         executed.append("bhavcopy_download_parse")
+    if by_check.get("benchmark_current", {}).get("status") in {"warn", "error"}:
+        _run_module("data.nseindia.indices_downloader")
+        _run_module("data.nseindia.indices_parser")
+        executed.append("benchmark_indices")
     if by_check.get("dhan_daily_coverage", {}).get("status") in {"warn", "error"}:
         from data.dhanlive.ohlcv_reconcile import run_reconcile
 
