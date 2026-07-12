@@ -48308,6 +48308,31 @@ def test_missed_movers_classification():
     assert mm._classify({})[0] == "no_signal"
 
 
+def test_momentum_backtest_aggregation(monkeypatch):
+    from advisory import momentum_backtest as mb
+
+    picks = pd.DataFrame([
+        {"symbol": "A", "date": pd.Timestamp("2026-01-05"), "close": 100.0, "fwd5": 110.0, "fwd10": 115.0, "fwd20": 120.0},
+        {"symbol": "B", "date": pd.Timestamp("2026-01-05"), "close": 100.0, "fwd5": 95.0,  "fwd10": 90.0,  "fwd20": 85.0},
+    ])
+    bench = pd.DataFrame([
+        {"date": pd.Timestamp("2026-01-05"), "bench_close": 200.0, "bench_dma50": 190.0,  # favorable
+         "bench_fwd5": 202.0, "bench_fwd10": 204.0, "bench_fwd20": 206.0},
+    ])
+    monkeypatch.setattr(mb, "_load_momentum_picks", lambda: picks)
+    monkeypatch.setattr(mb, "_load_benchmark", lambda: bench)
+    monkeypatch.setattr(mb, "ensure_table", lambda: None)
+    monkeypatch.setattr(mb, "upsert_to_db", lambda *a, **k: None)
+    monkeypatch.setattr(mb, "SAMPLE_STEP_DAYS", 1)
+    out = mb.run_backtest(dry_run=True)
+    res10 = {r["regime"]: r for r in out["results"] if r["horizon_days"] == 10}
+    assert res10["all"]["picks"] == 2
+    assert res10["favorable"]["picks"] == 2   # benchmark above its DMA -> favorable
+    # A: +15% abs vs +2% bench = +13% excess (win); B: -10% vs +2% = -12% (loss)
+    assert res10["all"]["hit_rate"] == 0.5
+    assert res10["all"]["mean_abs_return_pct"] > 0  # (15-10)/2 minus cost
+
+
 def test_strategy_allocation_conditions_momentum_sleeve_by_regime(monkeypatch):
     from advisory import strategy_allocation_policy as sap
 
