@@ -48233,6 +48233,38 @@ def test_market_action_scan_limit_resolves_from_admission_policy(monkeypatch):
     assert len(frame) == 4
 
 
+def test_technical_price_history_bhavcopy_gapfill(monkeypatch):
+    # newly-admitted dynamic names have no Dhan daily bars on their admission day; the
+    # feature builder must gap-fill from the whole-market bhavcopy so features exist same-day.
+    from advisory import technical_features as tfmod
+
+    dhan = pd.DataFrame([
+        {"symbol": "OLDNAME", "series": "EQ", "security_id": 1, "isin": None,
+         "date": pd.Timestamp("2026-07-10"), "adj_open": 10, "adj_high": 11, "adj_low": 9,
+         "adj_close": 10.5, "volume": 1000, "total_value": 10500},
+    ])
+    bhav = pd.DataFrame([
+        {"symbol": "NEWNAME", "series": "EQ", "security_id": None, "isin": None,
+         "date": pd.Timestamp("2026-07-10"), "adj_open": 20, "adj_high": 22, "adj_low": 19,
+         "adj_close": 21.0, "volume": 5000, "total_value": 105000},
+        # a (symbol,date) dhan already has -> must NOT be duplicated from bhav
+        {"symbol": "OLDNAME", "series": "EQ", "security_id": None, "isin": None,
+         "date": pd.Timestamp("2026-07-10"), "adj_open": 10, "adj_high": 11, "adj_low": 9,
+         "adj_close": 99.9, "volume": 1, "total_value": 99},
+    ])
+    calls = {"n": 0}
+    def fake_sql(query, params=None):
+        calls["n"] += 1
+        return dhan.copy() if "dhan_ohlcv_daily" in query else bhav.copy()
+    monkeypatch.setattr(tfmod, "sql_to_df", fake_sql)
+    monkeypatch.setattr(tfmod, "_BHAVCOPY_TECHNICAL_FALLBACK_ENABLED", True)
+    out = tfmod.load_price_history(symbols=["OLDNAME", "NEWNAME"])
+    by = {(r.symbol, str(r.date.date())): r.adj_close for r in out.itertuples()}
+    assert by[("NEWNAME", "2026-07-10")] == 21.0    # gap-filled from bhavcopy
+    assert by[("OLDNAME", "2026-07-10")] == 10.5    # dhan kept, bhav duplicate dropped
+    assert len(out) == 2
+
+
 def test_volume_surge_scan_partitions_from_breakout(monkeypatch):
     # the surge scan must admit big-move-on-volume names that are NOT at a 20d high
     # (base breakouts), partitioning cleanly from the new-high market_action scan.

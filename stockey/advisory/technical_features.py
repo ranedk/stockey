@@ -13,10 +13,18 @@ from advisory.fallback_telemetry import record_local_fallback_event
 from advisory.peer_sync import sync_peer_data
 from features.tutils import get_max_date
 from utils.company_master import map_company_master_ids
+import os
+
 from utils.db import db_session, execute_db_operation, sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 from utils.sync import load_tracked_symbols, parse_datetime_arg
 
+
+# Gap-fill daily price history from the whole-market bhavcopy where Dhan daily is missing, so
+# newly-admitted dynamic names get features on their admission day (default on).
+_BHAVCOPY_TECHNICAL_FALLBACK_ENABLED = os.getenv(
+    "TECHNICAL_BHAVCOPY_FALLBACK_ENABLED", "true"
+).strip().lower() not in {"0", "false", "no"}
 
 TABLE_NAME = "advisory_technical_daily"
 REFRESH_STATUS_TABLE = "advisory_technical_feature_refresh_status"
@@ -252,6 +260,15 @@ def load_price_history(
         clauses.append("date <= %s")
         params.append(to_date)
 
+    # bhavcopy clauses (nseindia_ohlcv uses `symbol`, series='EQ', no security_id)
+    bhav_clauses = ["UPPER(TRIM(symbol)) = ANY(%s)", "series = 'EQ'"]
+    bhav_params: list[object] = [[str(s).strip().upper() for s in symbols]]
+    if start_date is not None:
+        bhav_clauses.append("date >= %s")
+        bhav_params.append(start_date)
+    if to_date is not None:
+        bhav_clauses.append("date <= %s")
+        bhav_params.append(to_date)
     try:
         df = sql_to_df(
             f"""
@@ -286,6 +303,54 @@ def load_price_history(
             },
         )
         raise
+    # Gap-fill from the whole-market bhavcopy: dhan_ohlcv_daily only covers already-synced
+    # universe symbols, so newly-admitted dynamic names (scan/surge/hypothesis/theme) have
+    # no Dhan bars on their admission day and can never get features in time. nseindia_ohlcv
+    # is complete for every NSE name the day it publishes; fill only the (symbol, date) pairs
+    # Dhan lacks (Dhan stays primary where present, preserving any adjustments).
+    if _BHAVCOPY_TECHNICAL_FALLBACK_ENABLED:
+        try:
+            bhav = sql_to_df(
+                f"""
+                SELECT
+                    UPPER(TRIM(symbol)) AS symbol, 'EQ' AS series,
+                    NULL::bigint AS security_id, NULL::text AS isin, date,
+                    open AS adj_open, high AS adj_high, low AS adj_low, close AS adj_close,
+                    volume, close * volume AS total_value
+                FROM nseindia_ohlcv
+                WHERE {' AND '.join(bhav_clauses)}
+                ORDER BY symbol, date
+                """,
+                params=tuple(bhav_params),
+            )
+        except Exception as exc:
+            _record_technical_features_fallback(
+                fallback_type="technical_features_bhavcopy_fallback_failed",
+                source="nseindia_ohlcv",
+                reason="Bhavcopy gap-fill for technical features failed; using Dhan coverage only.",
+                error=exc,
+                metadata={"symbol_count": len(symbols)},
+            )
+            bhav = pd.DataFrame()
+        if not bhav.empty:
+            if df.empty:
+                df = bhav
+            else:
+                have = set(
+                    zip(
+                        df["symbol"].astype("string").str.strip().str.upper(),
+                        pd.to_datetime(df["date"], errors="coerce").dt.normalize(),
+                    )
+                )
+                bkey = list(
+                    zip(
+                        bhav["symbol"].astype("string").str.strip().str.upper(),
+                        pd.to_datetime(bhav["date"], errors="coerce").dt.normalize(),
+                    )
+                )
+                fill = bhav[[k not in have for k in bkey]]
+                if not fill.empty:
+                    df = pd.concat([df, fill], ignore_index=True)
     if df.empty:
         return df
     df["date"] = normalize_timestamp(df["date"])
