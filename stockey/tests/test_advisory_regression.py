@@ -48308,6 +48308,23 @@ def test_missed_movers_classification():
     assert mm._classify({})[0] == "no_signal"
 
 
+def test_archetype_backtest_consistency_logic():
+    from advisory import archetype_backtest as ab
+    # same-sign edge across >=2 windows -> consistent; a sign flip -> inconsistent
+    consistent = [
+        {"archetype": "momentum", "window_label": "W1:x", "horizon_days": 10, "regime": "favorable", "mean_abs_return_pct": -1.0, "abs_win_rate": 0.4, "picks": 50},
+        {"archetype": "momentum", "window_label": "W1:x", "horizon_days": 10, "regime": "unfavorable", "mean_abs_return_pct": 2.0, "abs_win_rate": 0.6, "picks": 50},
+        {"archetype": "momentum", "window_label": "W2:y", "horizon_days": 10, "regime": "favorable", "mean_abs_return_pct": -0.5, "abs_win_rate": 0.4, "picks": 50},
+        {"archetype": "momentum", "window_label": "W2:y", "horizon_days": 10, "regime": "unfavorable", "mean_abs_return_pct": 1.5, "abs_win_rate": 0.6, "picks": 50},
+    ]
+    c = ab._consistency(consistent, "momentum", 10)
+    assert c["windows"] == 2 and c["consistent"]  # both edges negative
+    flipped = [dict(r) for r in consistent]
+    flipped[3]["mean_abs_return_pct"] = -5.0  # W2 unfavorable now worse than favorable -> edge sign flips
+    assert not ab._consistency(flipped, "momentum", 10)["consistent"]
+    assert set(ab.ARCHETYPE_FILTERS) == {"momentum", "breakout"}
+
+
 def test_momentum_backtest_aggregation(monkeypatch):
     from advisory import momentum_backtest as mb
 
