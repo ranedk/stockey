@@ -61,11 +61,18 @@ def get_v2_access_token() -> str:
     return resp["access_token"] if isinstance(resp, dict) else str(resp)
 
 
-def get_sharpely_v2_headers():
+# Cache the v2 token across a batch: fetching a fresh token per symbol both wastes the
+# token endpoint's quota and trips its rate limit (observed 403s mid-batch).
+_V2_TOKEN_CACHE: dict[str, str] = {}
+
+
+def get_sharpely_v2_headers(*, force_refresh: bool = False):
+    if force_refresh or "token" not in _V2_TOKEN_CACHE:
+        _V2_TOKEN_CACHE["token"] = get_v2_access_token()
     headers = get_dynamic_headers()
     headers.update(
         {
-            "Authorization": f"Bearer {get_v2_access_token()}",
+            "Authorization": f"Bearer {_V2_TOKEN_CACHE['token']}",
             "Origin": "https://sharpely.in",
             "Referer": "https://sharpely.in/",
         }

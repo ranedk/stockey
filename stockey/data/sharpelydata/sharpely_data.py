@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -15,6 +16,7 @@ from utils.sync import choose_from_date, get_db_max_date, load_tracked_symbols, 
 from . import sharpely_utils as su
 
 env = Env()
+_SHARPELY_V2_PACING_SECONDS = env.float("SHARPELY_V2_REQUEST_PACING_SECONDS", 3.0)
 env.read_env()
 HEADERS = su.get_sharpely_headers()
 SHARPELY_STOCK_META_TABLE = "sharpely_stock_meta"
@@ -87,10 +89,15 @@ def get_financial_statement(symbol: str, from_date: datetime | None = None, to_d
     # 2026-07: the statements endpoint moved to /api/v2/core/ and now returns an
     # AES-256-CBC "base64(iv):base64(ciphertext)" body (the old /api/core/ path 404s).
     # Key is the sharpely web bundle's UTF-8 secret, zero-padded to 32 bytes.
-    response = get_with_retries(
-        f"https://pyapiv2.mintbox.ai/api/v2/core/getFinancialStatementsV2/ticker={symbol}",
-        headers=su.get_sharpely_v2_headers(),
-    )
+    url = f"https://pyapiv2.mintbox.ai/api/v2/core/getFinancialStatementsV2/ticker={symbol}"
+    # The v2 statements endpoint rate-limits rapid successive calls (403 under batch load;
+    # verified that ~3s pacing clears it). Pace before each call, and on a 403 back off once.
+    time.sleep(_SHARPELY_V2_PACING_SECONDS)
+    try:
+        response = get_with_retries(url, headers=su.get_sharpely_v2_headers())
+    except Exception:
+        time.sleep(_SHARPELY_V2_PACING_SECONDS * 2)
+        response = get_with_retries(url, headers=su.get_sharpely_v2_headers(force_refresh=True))
     resp = json.loads(su.decrypt_sharpely_v2(response.text))
     fin = json.loads(resp["statements"]) if isinstance(resp["statements"], str) else resp["statements"]
 

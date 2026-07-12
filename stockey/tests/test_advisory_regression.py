@@ -47992,6 +47992,29 @@ def test_screener_metrics_fill_missing_only(monkeypatch):
     assert pd.isna(out2.set_index("ticker").loc["TBZ", "market_cap"])
 
 
+def test_fundamentals_refresh_includes_newly_admitted(monkeypatch):
+    # newly-admitted dynamic names lacking a fundamental snapshot must be fast-sourced
+    # alongside results filers (union, deduped, filers first).
+    from advisory import fundamentals_refresh as fr
+
+    def fake_sql(query, params=None):
+        if "advisory_event_evaluations" in query:
+            return pd.DataFrame([{"symbol": "BEL"}])
+        if "advisory_screener_constituents" in query:
+            # the query must scope to dynamic slugs and exclude names WITH a snapshot
+            assert "volume-surge-scan-v1" in query
+            assert "advisory_fundamentals_daily" in query
+            return pd.DataFrame([{"symbol": "MRPL"}, {"symbol": "BEL"}])  # BEL overlaps
+        return pd.DataFrame()
+
+    monkeypatch.setattr(fr, "sql_to_df", fake_sql)
+    summary = fr.refresh_from_recent_results(dry_run=True)
+    assert summary["results_filers"] == 1
+    assert summary["newly_admitted"] == 2
+    # BEL deduped (filer first), MRPL appended
+    assert summary["symbols"] == ["BEL", "MRPL"]
+
+
 def test_fundamentals_refresh_targets_results_filers(monkeypatch):
     from advisory import fundamentals_refresh as fr
 
