@@ -27,12 +27,13 @@ from utils.db import sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 
 TABLE_NAME = "advisory_archetype_backtest"
-MIGRATION_ID = "20260712_advisory_archetype_backtest_base"
+MIGRATION_ID = "20260712_advisory_archetype_backtest_v2"
 SCHEMA_STATEMENTS = [
     f"""
     CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
         run_date TIMESTAMPTZ NOT NULL,
         archetype TEXT NOT NULL,
+        regime_definition TEXT NOT NULL,
         window_label TEXT NOT NULL,
         horizon_days BIGINT NOT NULL,
         regime TEXT NOT NULL,
@@ -43,10 +44,19 @@ SCHEMA_STATEMENTS = [
         abs_win_rate DOUBLE PRECISION,
         expectancy_pct DOUBLE PRECISION,
         load_ts TIMESTAMPTZ,
-        UNIQUE (run_date, archetype, window_label, horizon_days, regime)
+        UNIQUE (run_date, archetype, regime_definition, window_label, horizon_days, regime)
     )
     """,
 ]
+
+# Alternative index-regime definitions -- if "deploy strength when weak" only holds under the
+# 50DMA level cut it is fragile; if it holds across level, longer-term level, and trend
+# direction, it is a robust deployment-timing signal.
+REGIME_DEFINITIONS = {
+    "above_50dma": lambda r: "favorable" if pd.notna(r["bench_dma50"]) and r["bench_close"] > r["bench_dma50"] else "unfavorable",
+    "above_200dma": lambda r: "favorable" if pd.notna(r["bench_dma200"]) and r["bench_close"] > r["bench_dma200"] else "unfavorable",
+    "dma50_rising": lambda r: "favorable" if pd.notna(r["bench_dma50_slope"]) and r["bench_dma50_slope"] > 0 else "unfavorable",
+}
 
 MIN_PRICE = float(os.getenv("MISSED_MOVERS_MIN_PRICE", "30.0"))
 MIN_TURNOVER = float(os.getenv("MARKET_ACTION_SCAN_MIN_TURNOVER_INR", "50000000"))
@@ -107,6 +117,7 @@ def _load_benchmark() -> pd.DataFrame:
         """
         SELECT date, close AS bench_close,
                AVG(close) OVER (ORDER BY date ROWS BETWEEN 50 PRECEDING AND 1 PRECEDING) AS bench_dma50,
+               AVG(close) OVER (ORDER BY date ROWS BETWEEN 200 PRECEDING AND 1 PRECEDING) AS bench_dma200,
                LEAD(close, 5)  OVER (ORDER BY date) AS bench_fwd5,
                LEAD(close, 10) OVER (ORDER BY date) AS bench_fwd10,
                LEAD(close, 20) OVER (ORDER BY date) AS bench_fwd20
@@ -137,6 +148,8 @@ def run_backtest(*, n_windows: int | None = None, dry_run: bool = False) -> dict
     if bench.empty:
         return {"results": []}
     bench["date"] = pd.to_datetime(bench["date"], utc=True, errors="coerce").dt.normalize()
+    bench = bench.sort_values("date").reset_index(drop=True)
+    bench["bench_dma50_slope"] = bench["bench_dma50"] - bench["bench_dma50"].shift(20)  # 20d trend of the 50DMA
     trading_days = sorted(bench["date"].dropna().unique())
     sampled = trading_days[::max(1, SAMPLE_STEP_DAYS)]
     # sequential, non-overlapping walk-forward windows over the sampled decision dates
@@ -154,43 +167,42 @@ def run_backtest(*, n_windows: int | None = None, dry_run: bool = False) -> dict
         df = picks.merge(bench, on="date", how="inner")
         if df.empty:
             continue
-        df["regime"] = df.apply(
-            lambda r: "favorable" if pd.notna(r["bench_dma50"]) and r["bench_close"] > r["bench_dma50"] else "unfavorable",
-            axis=1,
-        )
-        for wi in range(n_windows):
-            lo, hi = win_edges[wi], win_edges[wi + 1]
-            wdf = df[(df["date"] >= lo) & (df["date"] < hi)]
-            label = f"W{wi + 1}:{pd.Timestamp(lo).date()}"
-            for h in HORIZONS:
-                sub = wdf.dropna(subset=[f"fwd{h}", f"bench_fwd{h}"]).copy()
-                if sub.empty:
-                    continue
-                sub["abs_ret"] = sub[f"fwd{h}"] / sub["close"] - 1.0 - cost
-                sub["excess"] = sub["abs_ret"] - (sub[f"bench_fwd{h}"] / sub["bench_close"] - 1.0)
-                for regime in ("favorable", "unfavorable"):
-                    seg = sub[sub["regime"] == regime]
-                    if len(seg) < 10:  # too thin for a window/regime cell to be meaningful
+        for defn, fn in REGIME_DEFINITIONS.items():
+            df["regime"] = df.apply(fn, axis=1)
+            for wi in range(n_windows):
+                lo, hi = win_edges[wi], win_edges[wi + 1]
+                wdf = df[(df["date"] >= lo) & (df["date"] < hi)]
+                label = f"W{wi + 1}:{pd.Timestamp(lo).date()}"
+                for h in HORIZONS:
+                    sub = wdf.dropna(subset=[f"fwd{h}", f"bench_fwd{h}"]).copy()
+                    if sub.empty:
                         continue
-                    m = _segment_metrics(seg, h)
-                    rec = {"run_date": now.normalize(), "archetype": archetype, "window_label": label,
-                           "horizon_days": h, "regime": regime, **m, "load_ts": now}
-                    rows.append(rec)
-                    results.append({k: rec[k] for k in ("archetype", "window_label", "horizon_days", "regime", "picks", "mean_abs_return_pct", "abs_win_rate")})
+                    sub["abs_ret"] = sub[f"fwd{h}"] / sub["close"] - 1.0 - cost
+                    sub["excess"] = sub["abs_ret"] - (sub[f"bench_fwd{h}"] / sub["bench_close"] - 1.0)
+                    for regime in ("favorable", "unfavorable"):
+                        seg = sub[sub["regime"] == regime]
+                        if len(seg) < 10:  # too thin for a window/regime cell to be meaningful
+                            continue
+                        m = _segment_metrics(seg, h)
+                        rec = {"run_date": now.normalize(), "archetype": archetype, "regime_definition": defn,
+                               "window_label": label, "horizon_days": h, "regime": regime, **m, "load_ts": now}
+                        rows.append(rec)
+                        results.append({k: rec[k] for k in ("archetype", "regime_definition", "window_label", "horizon_days", "regime", "picks", "mean_abs_return_pct", "abs_win_rate")})
     if rows and not dry_run:
-        upsert_to_db(pd.DataFrame(rows), TABLE_NAME, unique_keys=["run_date", "archetype", "window_label", "horizon_days", "regime"], timescaledb_column="run_date")
+        upsert_to_db(pd.DataFrame(rows), TABLE_NAME, unique_keys=["run_date", "archetype", "regime_definition", "window_label", "horizon_days", "regime"], timescaledb_column="run_date")
     return {"n_windows": n_windows, "results": results}
 
 
-def _consistency(results: list[dict[str, Any]], archetype: str, horizon: int) -> dict[str, Any]:
+def _consistency(results: list[dict[str, Any]], archetype: str, horizon: int, regime_definition: str) -> dict[str, Any]:
     """Is the favorable-minus-unfavorable abs-return edge the same SIGN across all windows?"""
     by_win: dict[str, dict[str, float]] = {}
     for r in results:
-        if r["archetype"] == archetype and r["horizon_days"] == horizon:
+        if r["archetype"] == archetype and r["horizon_days"] == horizon and r.get("regime_definition") == regime_definition:
             by_win.setdefault(r["window_label"], {})[r["regime"]] = r["mean_abs_return_pct"]
     edges = {w: v.get("favorable", 0.0) - v.get("unfavorable", 0.0) for w, v in by_win.items() if "favorable" in v and "unfavorable" in v}
     signs = {(-1 if e < 0 else 1) for e in edges.values()}
-    return {"windows": len(edges), "edges": edges, "consistent": len(signs) == 1 and len(edges) >= 2}
+    return {"windows": len(edges), "edges": edges, "consistent": len(signs) == 1 and len(edges) >= 2,
+            "mean_edge": round(sum(edges.values()) / len(edges), 2) if edges else None}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -203,22 +215,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "json":
         print(json.dumps(out, indent=2, default=str))
         return 0
-    print(f"[archetype_backtest] windows={out['n_windows']}  (abs return %, per window x regime)")
+    print(f"[archetype_backtest] windows={out['n_windows']}  robustness of the 'buy strength when weak' edge")
+    print("  (fav-minus-unfav abs-return edge; NEGATIVE = strength does WORSE in favorable/strong markets)")
     for archetype in ARCHETYPE_FILTERS:
         print(f"\n  == {archetype} ==")
-        for r in sorted([x for x in out["results"] if x["archetype"] == archetype], key=lambda x: (x["window_label"], x["horizon_days"], x["regime"])):
-            print(f"    {r['window_label']:<18} {r['horizon_days']:>3}d {r['regime']:<12} n={r['picks']:>4} abs={r['mean_abs_return_pct']:>7.2f}% win={r['abs_win_rate']*100:>5.1f}%")
-        for h in HORIZONS:
-            c = _consistency(out["results"], archetype, h)
-            if c["windows"] >= 2:
-                verdict = "CONSISTENT" if c["consistent"] else "INCONSISTENT (one-window artifact risk)"
-                edges = ", ".join(f"{w.split(':')[0]}={e:+.1f}" for w, e in c["edges"].items())
-                print(f"    {horizon_line(h)} fav-minus-unfav edge across windows [{edges}] -> {verdict}")
+        print(f"    {'regime_definition':<16} {'horizon':>7} {'mean_edge':>10} {'verdict':>14}")
+        for defn in REGIME_DEFINITIONS:
+            for h in HORIZONS:
+                c = _consistency(out["results"], archetype, h, defn)
+                if c["windows"] >= 2:
+                    verdict = "CONSISTENT" if c["consistent"] else "inconsistent"
+                    print(f"    {defn:<16} {h:>6}d {c['mean_edge']:>+9.2f}% {verdict:>14}")
     return 0
-
-
-def horizon_line(h: int) -> str:
-    return f"{h:>3}d:"
 
 
 if __name__ == "__main__":

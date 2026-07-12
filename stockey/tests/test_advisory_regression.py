@@ -48311,18 +48311,20 @@ def test_missed_movers_classification():
 def test_archetype_backtest_consistency_logic():
     from advisory import archetype_backtest as ab
     # same-sign edge across >=2 windows -> consistent; a sign flip -> inconsistent
+    D = "above_50dma"
     consistent = [
-        {"archetype": "momentum", "window_label": "W1:x", "horizon_days": 10, "regime": "favorable", "mean_abs_return_pct": -1.0, "abs_win_rate": 0.4, "picks": 50},
-        {"archetype": "momentum", "window_label": "W1:x", "horizon_days": 10, "regime": "unfavorable", "mean_abs_return_pct": 2.0, "abs_win_rate": 0.6, "picks": 50},
-        {"archetype": "momentum", "window_label": "W2:y", "horizon_days": 10, "regime": "favorable", "mean_abs_return_pct": -0.5, "abs_win_rate": 0.4, "picks": 50},
-        {"archetype": "momentum", "window_label": "W2:y", "horizon_days": 10, "regime": "unfavorable", "mean_abs_return_pct": 1.5, "abs_win_rate": 0.6, "picks": 50},
+        {"archetype": "momentum", "regime_definition": D, "window_label": "W1:x", "horizon_days": 10, "regime": "favorable", "mean_abs_return_pct": -1.0, "abs_win_rate": 0.4, "picks": 50},
+        {"archetype": "momentum", "regime_definition": D, "window_label": "W1:x", "horizon_days": 10, "regime": "unfavorable", "mean_abs_return_pct": 2.0, "abs_win_rate": 0.6, "picks": 50},
+        {"archetype": "momentum", "regime_definition": D, "window_label": "W2:y", "horizon_days": 10, "regime": "favorable", "mean_abs_return_pct": -0.5, "abs_win_rate": 0.4, "picks": 50},
+        {"archetype": "momentum", "regime_definition": D, "window_label": "W2:y", "horizon_days": 10, "regime": "unfavorable", "mean_abs_return_pct": 1.5, "abs_win_rate": 0.6, "picks": 50},
     ]
-    c = ab._consistency(consistent, "momentum", 10)
+    c = ab._consistency(consistent, "momentum", 10, D)
     assert c["windows"] == 2 and c["consistent"]  # both edges negative
     flipped = [dict(r) for r in consistent]
     flipped[3]["mean_abs_return_pct"] = -5.0  # W2 unfavorable now worse than favorable -> edge sign flips
-    assert not ab._consistency(flipped, "momentum", 10)["consistent"]
+    assert not ab._consistency(flipped, "momentum", 10, D)["consistent"]
     assert set(ab.ARCHETYPE_FILTERS) == {"momentum", "breakout"}
+    assert set(ab.REGIME_DEFINITIONS) >= {"above_50dma", "above_200dma", "dma50_rising"}
 
 
 def test_momentum_backtest_aggregation(monkeypatch):
@@ -48353,7 +48355,13 @@ def test_momentum_backtest_aggregation(monkeypatch):
 def test_strategy_allocation_conditions_momentum_sleeve_by_regime(monkeypatch):
     from advisory import strategy_allocation_policy as sap
 
-    # the sleeve cap flexes with regime; risk_off starves momentum, risk_on leans in
+    # DEFAULT: the regime tilt is neutralized (OOS-confirmed backwards) -> flat across regimes
+    monkeypatch.setattr(sap, "MOMENTUM_SLEEVE_TILT_ENABLED", False)
+    assert sap._momentum_cap_for_state("risk_on") == sap._momentum_cap_for_state("risk_off")
+    assert sap._momentum_cap_for_state("risk_on") == sap.MOMENTUM_CAP_NEUTRAL
+
+    # when a (corrected) tilt is re-enabled the gradient applies again
+    monkeypatch.setattr(sap, "MOMENTUM_SLEEVE_TILT_ENABLED", True)
     assert sap._momentum_cap_for_state("risk_on") > sap._momentum_cap_for_state("neutral")
     assert sap._momentum_cap_for_state("neutral") > sap._momentum_cap_for_state("risk_off")
     assert sap._momentum_cap_for_state("garbage") == sap._momentum_cap_for_state("neutral")  # fail-safe

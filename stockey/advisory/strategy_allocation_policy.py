@@ -48,6 +48,12 @@ MOMENTUM_CAP_RISK_ON = float(os.getenv("MOMENTUM_SLEEVE_CAP_RISK_ON_PCT", "0.40"
 MOMENTUM_CAP_NEUTRAL = float(os.getenv("MOMENTUM_SLEEVE_CAP_NEUTRAL_PCT", "0.25"))
 MOMENTUM_CAP_RISK_OFF = float(os.getenv("MOMENTUM_SLEEVE_CAP_RISK_OFF_PCT", "0.10"))
 MOMENTUM_SLEEVE_MAX_PCT = float(os.getenv("MOMENTUM_SLEEVE_MAX_PCT", "0.50"))  # never dominate the book
+# The regime tilt is NEUTRALIZED (default OFF): the walk-forward backtest (2026-07-12) confirmed
+# out-of-sample that the original prior (lean into momentum in risk_on) was BACKWARDS, and that
+# the effect is shared across archetypes -- i.e. an index-regime-timing signal, not a
+# momentum-sleeve one. So the sleeve runs at a FLAT cap until the deployment-timing overlay is
+# designed on wider evidence. The env gradient stays wired for when a corrected tilt is enabled.
+MOMENTUM_SLEEVE_TILT_ENABLED = os.getenv("MOMENTUM_SLEEVE_TILT_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
 
 
 def ensure_table() -> None:
@@ -60,6 +66,9 @@ def ensure_table() -> None:
 
 
 def _momentum_cap_for_state(state: str) -> float:
+    if not MOMENTUM_SLEEVE_TILT_ENABLED:
+        # neutralized: flat cap regardless of regime (the tilt was OOS-confirmed backwards)
+        return max(0.0, min(float(MOMENTUM_CAP_NEUTRAL), MOMENTUM_SLEEVE_MAX_PCT))
     normalized = str(state or "").strip().lower()
     if normalized == "risk_on":
         cap = MOMENTUM_CAP_RISK_ON
