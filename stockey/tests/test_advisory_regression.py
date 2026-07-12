@@ -48308,6 +48308,23 @@ def test_missed_movers_classification():
     assert mm._classify({})[0] == "no_signal"
 
 
+def test_strategy_allocation_conditions_momentum_sleeve_by_regime(monkeypatch):
+    from advisory import strategy_allocation_policy as sap
+
+    # the sleeve cap flexes with regime; risk_off starves momentum, risk_on leans in
+    assert sap._momentum_cap_for_state("risk_on") > sap._momentum_cap_for_state("neutral")
+    assert sap._momentum_cap_for_state("neutral") > sap._momentum_cap_for_state("risk_off")
+    assert sap._momentum_cap_for_state("garbage") == sap._momentum_cap_for_state("neutral")  # fail-safe
+    # guard: never let momentum dominate the book, even if the env cap is set absurdly high
+    monkeypatch.setattr(sap, "MOMENTUM_CAP_RISK_ON", 0.95)
+    assert sap._momentum_cap_for_state("risk_on") <= sap.MOMENTUM_SLEEVE_MAX_PCT
+
+    # resolve fails open to the neutral cap, never to an unbounded sleeve
+    monkeypatch.setattr(sap, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    monkeypatch.setattr(sap, "record_local_fallback_event", lambda **k: None)
+    assert sap.resolve_momentum_sleeve_cap("2026-07-12") == sap._momentum_cap_for_state("neutral")
+
+
 def test_momentum_archetype_replaces_base_depth_with_trend_quality():
     from advisory import technical_engine as te
 

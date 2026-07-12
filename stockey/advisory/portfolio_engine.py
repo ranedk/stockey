@@ -794,6 +794,23 @@ def build_portfolio_orders(
 
     default_single_position_cap = float(config.capital_inr) * float(config.single_position_cap_pct)
     setup_cap_overrides = get_setup_cap_overrides()
+    # Conditional strategy allocation (Phase A): the momentum sleeve's cap is sized by market
+    # state (regime), not fixed -- momentum's correlated-unwind risk needs a portfolio-level
+    # bound that flexes with the environment. Fail-open to the setup's static cap.
+    try:
+        from advisory.strategy_allocation_policy import MOMENTUM_ARCHETYPE, resolve_momentum_sleeve_cap
+        from advisory.setup_registry import load_setup_registry
+
+        momentum_cap = resolve_momentum_sleeve_cap(asof_date)
+        momentum_setups = {
+            str(s.get("setup_id") or "").upper()
+            for s in load_setup_registry()
+            if str(s.get("entry_archetype") or "").strip().lower() == MOMENTUM_ARCHETYPE
+        }
+        for sid in momentum_setups:
+            setup_cap_overrides[sid] = float(momentum_cap)
+    except Exception:
+        pass
     single_position_cap_overrides = get_single_position_cap_overrides()
 
     for idx, (_, row) in enumerate(working.iterrows(), start=1):
