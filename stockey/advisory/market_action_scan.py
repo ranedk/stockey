@@ -47,6 +47,18 @@ SURGE_MIN_CHANGE_PCT = env.float("VOLUME_SURGE_SCAN_MIN_CHANGE_PCT", default=4.0
 SURGE_MIN_VOLUME_MULTIPLE = env.float("VOLUME_SURGE_SCAN_MIN_VOLUME_MULTIPLE", default=3.0)
 SURGE_MAX_DIST_BELOW_HIGH_PCT = env.float("VOLUME_SURGE_SCAN_MAX_DIST_BELOW_HIGH_PCT", default=25.0)
 
+# Multi-day momentum: the quiet grind to new highs the single-day breakout/surge scans miss
+# (measured 2026-07-10: the largest missed bucket -- 39 of 94 up-movers were multi-day moves
+# to new highs, ONMOBILE +44% / SUVEN +34%, never in the funnel). A sustained cumulative move
+# over N days, still trending (above DMA20), near the 52w high; not a single-day event.
+MOMENTUM_SLUG = "momentum-trend-scan-v1"
+MOMENTUM_NAME = "Momentum trend scan (multi-day grind to new highs)"
+MOMENTUM_SCAN_ENABLED = env.bool("MOMENTUM_SCAN_ENABLED", default=True)
+MOMENTUM_LIMIT = env.int("MOMENTUM_SCAN_LIMIT", default=30)
+MOMENTUM_LOOKBACK_DAYS = env.int("MOMENTUM_SCAN_LOOKBACK_DAYS", default=10)
+MOMENTUM_MIN_RETURN_PCT = env.float("MOMENTUM_SCAN_MIN_RETURN_PCT", default=15.0)
+MOMENTUM_MIN_52W_PROXIMITY = env.float("MOMENTUM_SCAN_MIN_52W_PROXIMITY", default=0.90)
+
 OHLCV_TABLE = "nseindia_ohlcv"
 CIRCUIT_TABLE = "nseindia_circuit_hit"
 
@@ -123,6 +135,49 @@ def _surge_query() -> str:
       AND h.avgvol20 * h.close >= %(min_turnover)s
       AND COALESCE(c.hits, 0) <= %(max_circuit_hits)s
     ORDER BY (h.volume / NULLIF(h.avgvol20, 0)) DESC
+    """
+
+
+def _momentum_query() -> str:
+    return f"""
+    WITH hist AS (
+        SELECT symbol, company_master_id, isin, date, close, volume,
+               MAX(close)  OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING) AS max252,
+               NTH_VALUE(close, %(lookback)s) OVER (
+                   PARTITION BY symbol ORDER BY date DESC ROWS BETWEEN CURRENT ROW AND %(lookback)s FOLLOWING
+               ) AS close_n_ago,
+               AVG(volume) OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS avgvol20,
+               AVG(close)  OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS dma20,
+               COUNT(*)    OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING) AS nprev
+        FROM {OHLCV_TABLE}
+        WHERE series = 'EQ' AND date >= %(scan_date)s - interval '400 days' AND date <= %(scan_date)s
+    ),
+    circuit AS (
+        SELECT symbol, COUNT(DISTINCT date) AS hits
+        FROM {CIRCUIT_TABLE}
+        WHERE date > %(scan_date)s - interval '20 days'
+        GROUP BY symbol
+    )
+    SELECT h.symbol, h.company_master_id, h.isin, h.close,
+           ((h.close / NULLIF(h.close_n_ago, 0) - 1) * 100)::float AS momentum_return_pct,
+           (h.close / NULLIF(h.max252, 0))::float AS proximity_52w_high,
+           h.close AS last_price, h.volume, (h.avgvol20 * h.close)::float AS avg_turnover_inr
+    FROM hist h
+    LEFT JOIN circuit c ON c.symbol = h.symbol
+    WHERE h.date = %(scan_date)s
+      AND h.nprev >= 60
+      AND h.close_n_ago IS NOT NULL
+      -- sustained N-day cumulative advance
+      AND (h.close / NULLIF(h.close_n_ago, 0) - 1) * 100 >= %(min_return_pct)s
+      -- still trending: above a rising short MA
+      AND h.close > h.dma20
+      -- near the 52w high (a trend leader, not a dead-cat bounce off the lows)
+      AND h.max252 IS NOT NULL
+      AND h.close >= h.max252 * %(min_52w_proximity)s
+      AND h.close >= %(min_price)s
+      AND h.avgvol20 * h.close >= %(min_turnover)s
+      AND COALESCE(c.hits, 0) <= %(max_circuit_hits)s
+    ORDER BY (h.close / NULLIF(h.close_n_ago, 0) - 1) DESC
     """
 
 
@@ -309,6 +364,93 @@ def safe_scan_volume_surge(*, asof_date: Any | None = None, limit: int | None = 
             fallback_type="volume_surge_scan_failed",
             severity="warn",
             reason="Volume-surge scan failed; constituents continue without the base-breakout lane.",
+            error=exc,
+            metadata={"asof_date": None if asof_date is None else str(asof_date)},
+        )
+        return pd.DataFrame()
+
+
+def scan_momentum_trend(*, asof_date: Any | None = None, limit: int | None = None) -> pd.DataFrame:
+    """Multi-day momentum leaders: sustained N-day advance, still above DMA20, near the 52w
+    high. Junk-eliminating filters only; downstream candidate/technical/risk gates decide."""
+    scan_date = _latest_bhavcopy_date(asof_date)
+    if scan_date is None:
+        return pd.DataFrame()
+    rows = sql_to_df(
+        _momentum_query(),
+        params={
+            "scan_date": scan_date,
+            "lookback": int(MOMENTUM_LOOKBACK_DAYS),
+            "min_return_pct": float(MOMENTUM_MIN_RETURN_PCT),
+            "min_52w_proximity": float(MOMENTUM_MIN_52W_PROXIMITY),
+            "min_price": float(SCAN_MIN_PRICE),
+            "min_turnover": float(SCAN_MIN_TURNOVER_INR),
+            "max_circuit_hits": int(SCAN_MAX_CIRCUIT_HITS_20D),
+        },
+    )
+    if rows.empty:
+        return pd.DataFrame()
+    if limit is None:
+        try:
+            from advisory.regime_admission_policy import resolve_active_policy
+
+            limit = int(resolve_active_policy(scan_date).get("scan_limit") or MOMENTUM_LIMIT)
+        except Exception:
+            limit = None
+    cap = int(MOMENTUM_LIMIT if limit is None else limit)
+    if cap > 0:
+        rows = rows.head(cap)
+    now = pd.Timestamp.utcnow()
+    out = []
+    for rank, row in enumerate(rows.itertuples(index=False), start=1):
+        out.append(
+            {
+                "date": scan_date,
+                "screener_slug": MOMENTUM_SLUG,
+                "screener_name": MOMENTUM_NAME,
+                "screener_url": None,
+                "ticker": str(row.symbol).strip().upper(),
+                "exchange": "NSE",
+                "company_master_id": row.company_master_id,
+                "security_id": None,
+                "instrument": None,
+                "isin": row.isin,
+                "display_name": str(row.symbol).strip().upper(),
+                "rank": rank,
+                "last_price": float(row.close),
+                "volume": float(row.volume),
+                "raw_item_json": json.dumps(
+                    {
+                        "source": MOMENTUM_SLUG,
+                        "momentum_return_pct": round(float(row.momentum_return_pct), 2),
+                        "lookback_days": int(MOMENTUM_LOOKBACK_DAYS),
+                        "proximity_52w_high": round(float(row.proximity_52w_high), 3),
+                        "avg_turnover_inr": round(float(row.avg_turnover_inr), 0),
+                        "junk_filters": {
+                            "min_price": SCAN_MIN_PRICE,
+                            "min_turnover_inr": SCAN_MIN_TURNOVER_INR,
+                            "max_circuit_hits_20d": SCAN_MAX_CIRCUIT_HITS_20D,
+                            "min_52w_proximity": MOMENTUM_MIN_52W_PROXIMITY,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                "load_ts": now,
+            }
+        )
+    return pd.DataFrame(out)
+
+
+def safe_scan_momentum_trend(*, asof_date: Any | None = None, limit: int | None = None) -> pd.DataFrame:
+    try:
+        return scan_momentum_trend(asof_date=asof_date, limit=limit)
+    except Exception as exc:
+        record_local_fallback_event(
+            module="advisory.market_action_scan",
+            source=OHLCV_TABLE,
+            fallback_type="momentum_trend_scan_failed",
+            severity="warn",
+            reason="Momentum-trend scan failed; constituents continue without the multi-day-momentum lane.",
             error=exc,
             metadata={"asof_date": None if asof_date is None else str(asof_date)},
         )

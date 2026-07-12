@@ -281,8 +281,10 @@ def build_constituents(
     if screener_slug is None:
         from advisory.market_action_scan import (
             MARKET_ACTION_SCAN_ENABLED,
+            MOMENTUM_SCAN_ENABLED,
             VOLUME_SURGE_SCAN_ENABLED,
             safe_scan_market_action,
+            safe_scan_momentum_trend,
             safe_scan_volume_surge,
         )
 
@@ -296,6 +298,11 @@ def build_constituents(
             surge_frame = safe_scan_volume_surge(asof_date=snapshot_date)
             if not surge_frame.empty:
                 frames.append(surge_frame)
+        # Multi-day momentum: the grind-to-new-highs population both single-day scans miss.
+        if MOMENTUM_SCAN_ENABLED:
+            momentum_frame = safe_scan_momentum_trend(asof_date=snapshot_date)
+            if not momentum_frame.empty:
+                frames.append(momentum_frame)
         # Hypothesis strategy instances: each active hypothesis's universe joins as its own
         # screener source (hypothesis-<id>); paused/retired hypotheses stop emitting.
         from advisory.hypothesis_screeners import HYPOTHESIS_SCREENERS_ENABLED, safe_build_hypothesis_constituents

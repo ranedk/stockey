@@ -10,6 +10,7 @@ setups:
     dynamic_sources:
       - market_scan
       - volume_surge
+      - momentum
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -113,6 +114,7 @@ setups:
     dynamic_sources:
       - market_scan
       - volume_surge
+      - momentum
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -215,6 +217,7 @@ setups:
     dynamic_sources:
       - market_scan
       - volume_surge
+      - momentum
     allowed_regimes:
       - BULL_RISK_ON
       - BULL_NARROW
@@ -412,6 +415,7 @@ setups:
     dynamic_sources:
       - market_scan
       - volume_surge
+      - momentum
       - hypothesis
       - theme
     allowed_regimes:

@@ -1472,6 +1472,7 @@ def test_build_constituents_includes_market_action_scan(monkeypatch):
     monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
     monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", True)
     monkeypatch.setattr(mas, "VOLUME_SURGE_SCAN_ENABLED", False)
+    monkeypatch.setattr(mas, "MOMENTUM_SCAN_ENABLED", False)
     monkeypatch.setattr(mas, "safe_scan_market_action", lambda **_k: scan_frame.copy())
     from advisory import hypothesis_screeners as _hs
     monkeypatch.setattr(_hs, "HYPOTHESIS_SCREENERS_ENABLED", False)
@@ -47670,6 +47671,7 @@ def test_build_constituents_includes_theme_screeners(monkeypatch):
     monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
     monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", False)
     monkeypatch.setattr(mas, "VOLUME_SURGE_SCAN_ENABLED", False)
+    monkeypatch.setattr(mas, "MOMENTUM_SCAN_ENABLED", False)
     monkeypatch.setattr(hs, "HYPOTHESIS_SCREENERS_ENABLED", False)
     monkeypatch.setattr(sret, "apply_retention", lambda frame, **_k: frame)
     monkeypatch.setattr(ts, "THEME_SCREENERS_ENABLED", True)
@@ -47823,6 +47825,7 @@ def test_build_constituents_includes_hypothesis_screeners(monkeypatch):
     monkeypatch.setattr(sp, "load_snapshots", lambda **_k: pd.DataFrame())
     monkeypatch.setattr(mas, "MARKET_ACTION_SCAN_ENABLED", False)
     monkeypatch.setattr(mas, "VOLUME_SURGE_SCAN_ENABLED", False)
+    monkeypatch.setattr(mas, "MOMENTUM_SCAN_ENABLED", False)
     monkeypatch.setattr(hs, "HYPOTHESIS_SCREENERS_ENABLED", True)
     monkeypatch.setattr(hs, "safe_build_hypothesis_constituents", lambda **_k: hypo_frame.copy())
     from advisory import screener_retention as _sret
@@ -48303,6 +48306,36 @@ def test_missed_movers_classification():
     assert mm._classify({"screeners": ["market-action-scan-v1"]})[0] == "admitted_not_candidate"
     # never in the funnel at all -> the new-signal bucket
     assert mm._classify({})[0] == "no_signal"
+
+
+def test_momentum_trend_scan_emits_multi_day_leaders(monkeypatch):
+    # the momentum scan catches sustained multi-day advances near 52w highs (the grind the
+    # single-day breakout/surge scans miss).
+    from advisory import market_action_scan as mas
+
+    captured = {}
+    def fake_sql(query, params=None):
+        captured["query"] = query
+        return pd.DataFrame([
+            {"symbol": "SUVEN", "company_master_id": "cm-SUVEN", "isin": "INE-SUVEN", "close": 1400.0,
+             "momentum_return_pct": 29.2, "proximity_52w_high": 1.03, "last_price": 1400.0,
+             "volume": 3e5, "avg_turnover_inr": 4e8},
+        ])
+    monkeypatch.setattr(mas, "sql_to_df", fake_sql)
+    monkeypatch.setattr(mas, "_latest_bhavcopy_date", lambda asof=None: pd.Timestamp("2026-07-10"))
+    frame = mas.scan_momentum_trend(asof_date="2026-07-10", limit=30)
+    assert list(frame["screener_slug"]) == ["momentum-trend-scan-v1"]
+    assert frame.iloc[0]["ticker"] == "SUVEN"
+    # query enforces the sustained N-day advance, DMA20 trend, and 52w proximity
+    assert "min_return_pct" in captured["query"]
+    assert "h.close > h.dma20" in captured["query"]
+    assert "min_52w_proximity" in captured["query"]
+    raw = json.loads(frame.iloc[0]["raw_item_json"])
+    assert raw["source"] == "momentum-trend-scan-v1" and raw["momentum_return_pct"] == 29.2
+
+    monkeypatch.setattr(mas, "scan_momentum_trend", lambda **k: (_ for _ in ()).throw(RuntimeError("db")))
+    monkeypatch.setattr(mas, "record_local_fallback_event", lambda **k: None)
+    assert mas.safe_scan_momentum_trend().empty
 
 
 def test_volume_surge_scan_partitions_from_breakout(monkeypatch):
