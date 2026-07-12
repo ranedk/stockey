@@ -48288,6 +48288,23 @@ def test_technical_price_history_bhavcopy_gapfill(monkeypatch):
     assert len(out) == 2
 
 
+def test_missed_movers_classification():
+    from advisory import missed_movers_analyzer as mm
+
+    # captured: reached BUY/PASS_NOW
+    assert mm._classify({"candidate_states": ["PASS_NOW"]})[0] == "captured"
+    assert mm._classify({"technical_states": ["BUY_TRIGGERED"]})[0] == "captured"
+    # watched but never triggered
+    assert mm._classify({"candidate_states": ["WATCH_BREAKOUT"]})[0] == "watched_not_triggered"
+    # seen but hard-rejected -> gate carried through
+    cls, _, gate = mm._classify({"top_rejection": "technical_engine_reject"})
+    assert cls == "blocked_by_gate" and gate == "technical_engine_reject"
+    # admitted to a screener but never a candidate
+    assert mm._classify({"screeners": ["market-action-scan-v1"]})[0] == "admitted_not_candidate"
+    # never in the funnel at all -> the new-signal bucket
+    assert mm._classify({})[0] == "no_signal"
+
+
 def test_volume_surge_scan_partitions_from_breakout(monkeypatch):
     # the surge scan must admit big-move-on-volume names that are NOT at a 20d high
     # (base breakouts), partitioning cleanly from the new-high market_action scan.

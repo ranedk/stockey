@@ -117,6 +117,11 @@ LOG_DIR={{LOG_DIR}}
 # It writes policy/action/class quality summaries only; it does not change thresholds or actions.
 10 23 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_event_policy_eval.lock ./all_event_policy_evaluator.sh >> "$LOG_DIR/event_policy_evaluator.log" 2>&1
 
+# Research-only missed-movers analyser. Classifies the day's big movers by their funnel
+# relationship (no_signal / blocked_by_gate / watched_not_triggered / captured) to guide
+# signal development. Writes advisory_missed_movers_daily only; never trades or changes config.
+20 23 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_missed_movers.lock ./all_missed_movers.sh >> "$LOG_DIR/missed_movers.log" 2>&1
+
 # Weekly research-only technical threshold calibration. This is deliberately not tied to live promotion.
 # Review the operator UI before manually changing config/advisory_setups.yaml.
 20 04 * * 6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_technical_calibration.lock ./all_technical_threshold_calibration.sh >> "$LOG_DIR/technical_threshold_calibration.log" 2>&1
