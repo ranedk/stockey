@@ -59,9 +59,12 @@ REQUIRED_COVERAGE = {
         ("daily all_advisory", re.compile(r"\ball_advisory\.sh\b.*\bonce daily\b|\bonce daily\b.*\ball_advisory\.sh\b", re.IGNORECASE | re.DOTALL)),
     ],
     "todo.md": [
-        ("current roadmap date", re.compile(r"Updated:\s*`2026-06-\d{2}`")),
-        ("UI-first operations priority", re.compile(r"Highest Priority:\s*UI-First Operations", re.IGNORECASE)),
-        ("Nuxt replaces static dashboard", re.compile(r"Nuxt operator frontend replaces the old static HTML dashboard path", re.IGNORECASE)),
+        # date regex widened from the hardcoded 2026-06 (broke on every update); the UI-first +
+        # Nuxt coverage requirements moved off todo.md when it was rewritten for the
+        # discovery-engine arc -- the Nuxt/static-dashboard fact stays enforced in
+        # docs/operators_manual.md, and todo.md now must reference the governing spec instead.
+        ("current roadmap date", re.compile(r"Updated:\s*`2026-\d{2}-\d{2}`")),
+        ("governing spec reference", re.compile(r"discovery_engine\.md", re.IGNORECASE)),
     ],
     "docs/operators_manual.md": [
         ("operator decision effects", re.compile(r"operator decision effects", re.IGNORECASE)),
