@@ -108,6 +108,13 @@ LOG_DIR={{LOG_DIR}}
 # Research-only TS forecast paper portfolio. Compares forecast-only decisions with naive momentum and advisory alignment.
 35 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_paper.lock ./all_ts_forecast_paper_portfolio.sh >> "$LOG_DIR/ts_forecast_paper_portfolio.log" 2>&1
 
+# Research-only split/bonus-adjusted price table (price-step derived; the paper loop reads adj_close from it).
+38 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
+
+# Research-only coherent paper decision loop. RS-selected, vol-sized, crash-floored decisions committed
+# and scored forward vs NIFTY. Bypasses the funnel; writes advisory_paper_decision_loop only, no action/broker.
+40 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_paper_decision_loop.lock ./all_paper_decision_loop.sh >> "$LOG_DIR/paper_decision_loop.log" 2>&1
+
 # Research-only evidence refresh. This matures context/event/action-transition
 # evidence daily without running event-model prep/training/scoring and without
 # changing policy, portfolio rows, config, or broker behavior.

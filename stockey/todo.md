@@ -15,14 +15,22 @@ open; use `rg`, line numbers drift), **Do** (steps), **Guardrail** (authority/po
 boundary), **Validate** (smallest check + acceptance), **Confidence** (`verified` /
 `verify-first`).
 
-Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`):
+Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`, esp. §8 — the 2026-07-13 review):
+- **Descriptive is well-powered; prescriptive is not.** The cross-section is broad (~2,700 names/day)
+  so *measuring* whether a sub-score predicts is sound; but re-fitting weights to claim next-period
+  improvement rests on only **~13 independent time blocks** (275 days ÷ 20d windows). Cross-sectional
+  breadth is NOT time-series power. Measure freely; re-weight almost never, and only if the adapted
+  weights beat frozen ones OOS (kill-switch, spec §8.1).
 - **Adaptive tracking, not convergent optimization.** Data is fixed (~13 months). Favor simple,
-  low-dimensional, robust methods (pooled cross-section, rank-IC, walk-forward). Seed intuition-
-  based rules; let the daily corrective run nudge them. Never "solved", always "current".
+  low-dimensional, robust methods (pooled cross-section, rank-IC, walk-forward); report IC via
+  block-bootstrap CIs, not point estimates (overlapping windows overstate significance).
 - **Robustness is the moat.** No discovered relationship earns a knob change without walk-forward
   + multi-definition robustness + enough matured labels + false-discovery control.
 - **Priors, not proofs.** Take market truths as ~90% priors; do not re-derive them; size positions
-  so the ~10% leaks are absorbed as portfolio risk.
+  so the ~10% leaks are absorbed as portfolio risk — and build the risk math that "absorbed" implies.
+- **Costs and the north-star are first-class.** Score every edge under a name-specific cost model
+  (not a flat 25bps), and against the one honest scorecard: net return vs buy-and-hold NIFTY after
+  costs. IC-drift is a warning light, never a portfolio driver (spec §8).
 - Review-only everywhere; `broker_execution_allowed=false`; master flags OFF; append-only
   migrations; typed evidence/provenance on every decision; point-in-time (no look-ahead).
 - Narrow tests per behavior; env/docs/cron-preflight/migration-drift audits green per commit.
@@ -43,6 +51,89 @@ Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`):
   outcome labeling, walk-forward multi-archetype backtest (`archetype_backtest.py`).
 - **Conditional allocation Phase A**: momentum sleeve cap — currently NEUTRALIZED (the regime
   tilt was OOS-confirmed backwards; `MOMENTUM_SLEEVE_TILT_ENABLED=false`).
+- **T0 invalidation gate SHIPPED (2026-07-13)**: name-specific cost model (`advisory/cost_model.py`:
+  statutory + turnover-spread + size-impact; median pick ~45bps vs the old flat 25), delist-honest
+  backtest (`archetype_backtest.py` now counts matured-but-gone picks instead of dropping them —
+  324 in the full run), and the north-star scorecard (`advisory/north_star.py`). **Finding: the raw
+  momentum+breakout lane, equal-weight, returned −9.24% net of cost over 13 months vs NIFTY −3.12%
+  — it TRAILS the index by ~6pts** (one −10% window, Sep 2025, dominates; 13 rebalances = wide error
+  bars per §8.1). Caveat: this is the *unfiltered lane population*, not the gated recommendation set.
+- **Gated north-star SHIPPED (2026-07-13, `north_star --source gated`)**: two findings. (1) STRUCTURAL:
+  the strict gated BUY set is **EMPTY** — zero PASS_NOW+entry-confirmed, zero BUY action codes, zero
+  broker-executable rows. The live funnel has recorded no buys, so there is literally nothing it
+  *would trade* to score (the §8.1/§8.5 "nothing to learn from" made concrete). (2) PROXY: scoring
+  the loosest proxy — PASS_NOW flags. **CORRECTED 2026-07-13 (funnel_invariants found the pollution):**
+  the first pass (n=320, "+0.6/+1.3/+4.3% excess, day-t up to 2.70, encouraging") was POLLUTED — 47% of
+  PASS_NOW rows are `research_only` RESEARCH_TRAINING label-harvesting rows (0.58 bar), not
+  recommendations. Excluding them (`north_star` now filters RESEARCH_TRAINING; honest set n=186 over 18
+  days): **5d −0.94%, 10d −0.35%, 20d +1.06% excess (day-t −0.48/0.45/0.68)** — the "gate beats NIFTY"
+  finding EVAPORATES; the honest recommendation set is ~neutral vs NIFTY. The +excess was research-row
+  artifact. (Exactly why the correctness net matters — see below.)
+- **WINNER-BACKWARD finding (2026-07-13) — the funnel fishes in the wrong pond.** Stopping the
+  circular funnel-output analysis and measuring against REALITY (actual +40%/60d moves in liquid
+  names, point-in-time features): the states our admission layer targets have NEGATIVE-to-zero
+  expected 60d return — *at-52w-high* mean −1.4%, *hot momentum (+30% already)* mean −3.2% with a
+  16.5% blow-up rate, *clean uptrend* mean 0.0%. The money was in the population the funnel EXCLUDES
+  by construction: *deep-below-52w-high* mean +9.7%, and *beaten-down + turning on RS* mean +12.4%
+  with the LOWEST blow-up rate (4.1%). Survivorship-stress-tested (fill delisted at −60%): +9.7%→
+  +7.8%, absolute edge survives. **BUT the kill-test (T0.5) then KILLED the tradeable version**: on
+  benchmark-EXCESS + walk-forward the reversal edge is INCONSISTENT (one window) and its beaten-down
+  absolute "+9.7%" was recovery-BETA, not repeatable alpha. On excess terms the *breakout* foil was
+  the more robust signal (consistent across windows+regimes) despite poor absolute return — the funnel
+  picks defensive RS names, so its weak absolute payoff is a market-TIMING problem, not stock-
+  selection. Net lesson: the market CYCLE dominates the archetype (feeds T0.75). Detail: spec §9.
+- **Funnel correctness net SHIPPED (Part A, 2026-07-13)** — the answer to "be sure the CODE is right,
+  not just the data" (the scale bug was found by luck). NEW `advisory/score_scales.py` (single source
+  of truth for 0-1 vs 0-100 score fields); NEW `scripts/funnel_invariants.py` audit — an impossible-gate
+  /dead-branch detector that statically catches the 0-1-vs-0-100 class + real-data range/cross-field
+  checks (in the CLAUDE.md validation checklist, `--strict`); golden-path reachability tests (ideal
+  candidate reaches BUY_TRIGGERED→PASS_NOW→technical_entry_confirmed; garbage does not; monotonic; and
+  the funnel ceiling is PASS_NOW, NOT a BUY); the confirmed `technical_score` 0-1-vs-0-100 bug fixed via
+  `to_100` in `company_memory_review` (capped review-only WATCH) + `action_recommender`; and a new
+  `confirmed_entry_exists_but_no_promotion_bridge` no-BUY cause in `recommendation_diagnostics`. Root
+  cause of no-BUYs proven ARCHITECTURAL: `action_recommender` emits BUY only from approved portfolio
+  rows (:6512) — no candidate→approved→BUY promotion bridge ([P-LLM-AUTH] unbuilt). **The audit already
+  surfaced a real warning to chase: 99 PASS_NOW rows are neither BUY_TRIGGERED nor override-sourced**
+  (a provenance gap). Part B (the paper decision loop) is the next pass on this verified ground.
+- **Coherent paper decision loop SHIPPED (Part B, 2026-07-13)** — the clean forward-tracked path that
+  finally generates real outcomes, built on the verified substrate. NEW `advisory/paper_decision_loop.py`
+  (+ table `advisory_paper_decision_loop`, migration): BYPASSES the funnel (no promotion bridge needed) —
+  SELECT on point-in-time RS computed from OHLCV (the persisted RS panel keeps only ~4 days; RS blends
+  whichever of 63/126/252d horizons exist), SIZE via `portfolio_risk.size_position` × crash-floor, COST
+  via `cost_model`, SCORE per-trade vs NIFTY (overlap-collapsed, §8.3). Research-only authority (writes one
+  table, never the action queue/broker; excludes research rows by construction). **Honest scorecard
+  (corrected 2026-07-13 after THREE data-bug fixes below): RS≥80 top-20 hold-20d over ~13mo → net +6.98%,
+  NIFTY −0.93%, excess +7.91% (bracket +5.28% to +7.91%), day-level t=3.67, 5% unscored.** Corrected
+  regime arc: Dec +17 / Jan −7.5 (the one real momentum-crush month) / Feb +2.3 / Mar +4 / Apr +15 /
+  May +12 / Jun −0.7. Stronger and MORE consistent than earlier contaminated reads. STILL not a proven
+  all-weather edge: one ~13mo (recovery-ish) regime, t overlap-inflated (§8.3), momentum's tail showed
+  in Jan. **Three data/methodology bugs found & fixed (each moved the scorecard):** (a) delist logic
+  fabricated −50% for any missing forward price → now `unscored_data_ends` (excluded+bracketed, never a
+  fake loss); (b) **EQ→BE series migration** — NSE T2T's high-momentum names when they run up, so an
+  EQ-only query lost them → panel now `series IN ('EQ','BE')`; (c) **unadjusted-price corporate actions**
+  — splits/bonuses (e.g. SILVER1's 10:1 → a fake −90%) counted as real losses; now a single-day
+  circuit-breach guard flags them `unscored_corporate_action`. My earlier "Jan-Feb brutal tail" was
+  substantially (c)'s silver-ETF split artifacts, not real momentum losses. **CRON-WIRED (2026-07-13):** `all_paper_decision_loop.sh` (runs the
+  module `--persist` via run_with_markers) + crontab entry (40 21 weekdays, post-close, lock+log);
+  generated crontab regenerated; cron_preflight/docs-audit/migration-drift clean. So forward outcomes now
+  accrue daily. Deferred (minor): research-ledger `start/finish_research_run` wrapper.
+- **Silent-data-bug HUNT round 2 (2026-07-13)** — prioritized hunt for the "code runs fine but numbers
+  are wrong from a hidden data assumption" class. FOUND & FIXED: (1) unadjusted corporate actions —
+  splits/bonuses (SILVER1 10:1 → fake −90%) counted as real returns; single-day circuit-breach guard
+  added to `paper_decision_loop` + `north_star`; (2) EQ→BE series migration (285 symbols) → `series IN
+  ('EQ','BE')` in both; (3) delist −50% fabrication → honest `unscored_*` (excluded+bracketed);
+  (4) benchmark-window misalignment (14% of picks had stock 20-row-exit ≠ NIFTY 20-row-exit) → NIFTY now
+  benchmarked over the stock's ACTUAL window. NEGATIVE results (increase trust): NO lookahead in feature
+  code (all LEAD is in outcomes), NO stale-latest bug (tables fresh), paper-loop returns match a
+  differential recompute exactly. NEW durable audit `scripts/price_data_sanity.py` institutionalizes the
+  hunt (CA steps, EQ→BE, cross-source mismatch, adjusted-table coverage, benchmark gaps). Paper-loop
+  final honest scorecard after all fixes: **net +6.98%, excess +8.09% vs NIFTY, day-t 3.81** (bracket
+  +5.5–8.1%) — still one regime / overlap-inflated / momentum-beta. Open data-health (fix at source):
+  NIFTY index missing 5 days incl. 4 in the March crash week; `nseindia_ohlcv_adjusted` covers only 2
+  symbols (unpopulated); `technical_features` bhavcopy gap-fill can mix adjusted-dhan + unadjusted-nse
+  for ~26 split names; `momentum_backtest` (older/superseded) still needs the guards. `archetype_backtest`
+  NOW FIXED (EQ+BE + CA guard; delisted 324→36) — and the "momentum-in-strong-markets is backwards" edge
+  SURVIVED the cleaning (still CONSISTENT under above_50dma), confirming it was not a data artifact.
 - **Data-layer robustness**: bhavcopy zero-byte guard + morning catch-up, benchmark freshness
   gate (stale NIFTY zeroed rs_vs_benchmark market-wide), Sharpely cache-poisoning fix + encrypted
   v2 endpoint reverse-engineered + fast-source fundamentals, technical-feature bhavcopy fallback,
@@ -50,50 +141,181 @@ Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`):
 
 Key learned facts (do not relitigate): entry-confirmation gate is VALIDATED (regret ledger:
 −2.86% forward excess on what it blocks); costly gates are admission/coverage; the "buy strength
-when weak" edge is fragile/definition-sensitive; regime is fragile and should be discovered
-(IC-drift), not imposed.
+when weak" edge is fragile/definition-sensitive; regime is fragile — IC-drift is a *diagnostic*
+(warning light), NOT an auto-driver (spec §8.2). 2026-07-13 review facts: ~13 independent time
+blocks cap all prescriptive re-fitting (§8.1); momentum picks median turnover ₹41.5cr / p25 ₹19cr
+so flat 25bps is optimistic (§8.4); data holds 171/2,166 non-survivors so survivorship bias is
+second-order (§8.4); there is no portfolio-level risk math yet and no net-vs-NIFTY north-star.
 
 ---
 
 ## Build Queue
 
-### T1 — Sub-score IC validation + slow adaptive reweighting  `[BUILD FIRST]`
+### T0.5 — Validate "beaten-down + RS-turning" archetype  `[DONE 2026-07-13 — VERDICT: NOT PROMOTED]`
 
-- **Why.** The scoring function is the heart of every decision and is entirely hand-weighted
-  (sub-score point allocations, the 78 buy bar, sub-score minimums). We have never measured whether
-  a high sub-score actually predicts a higher forward return. This single build pays triple:
-  reweights scoring from evidence, hands us the buy-bar knee, and its IC-drift is the *discovered
-  regime signal* that retires the fragile regime layer. See `docs/specs/discovery_engine.md` §3.
+> **Kill-test ran; the archetype FAILED it (spec §9).** 40d benchmark-excess walk-forward was
+> INCONSISTENT (W1 −6.2% / W2 +10.5% / W3 +2.0% — one window), and the regime attribution
+> self-contradicts (edge in a mostly-rising window, credited to weak-day decisions; ~13 blocks can't
+> disentangle). NO reversal lane built — it was the momentum prior inverted, and the harness caught
+> it. Key reconciliation: the beaten-down absolute "+9.7%" was recovery-BETA (one episode), not
+> repeatable alpha; on excess terms the breakout foil was the more robust (consistent) signal despite
+> poor absolute return. Real takeaway → the market CYCLE dominates the archetype (feeds T0.75).
+> Scratchpad harness kept; promote to `advisory/reversal_archetype.py` only if it re-validates on more
+> data. Below is the as-run kill-test spec.
+
+- **Why.** The winner-backward finding (Current State) said the funnel's admission philosophy looked
+  pointed the wrong way for this regime by *absolute* return: the highest expected-return, lowest-
+  blow-up state was *beaten-down (deep below 52w high) + turning up on relative strength* (+12.4% mean
+  60d, 4.1% blow-up). Before believing it — the mirror-image temptation of the momentum prior that
+  already burned us — try to KILL it. See `docs/specs/discovery_engine.md` §9.
+- **Files.** exploratory validation first (scratchpad script over `nseindia_ohlcv` + NIFTY); reuse
+  `advisory/archetype_backtest.py` walk-forward/regime/delist-honest patterns + `advisory/cost_model.py`.
+  Only promote to a real module (`advisory/reversal_archetype.py` + an `ARCHETYPE_FILTERS` entry) IF
+  it survives the kill-test.
+- **Do (the kill-test, in order — any failure demotes it to `regime_conditional` not `promote`).**
+  1. **Benchmark-EXCESS, not absolute.** Beaten-down = high beta; a +tape lifts it for free. Measure
+     forward 20/40/60d return MINUS NIFTY. Delist-honest (fill delisted at −60%, count them).
+  2. **Walk-forward sign-consistency** across ≥3 sequential non-overlapping windows (magnitude is
+     overlap-inflated; sign-consistency is the robust test).
+  3. **THE decisive test — regime split.** Tag each decision date by market state (NIFTY above/below
+     50DMA). If the excess exists only when the market is rising and vanishes/inverts when it is
+     weak, it is recovery-BETA, not alpha → do NOT promote as unconditional; at most a
+     regime-conditional lane. If it holds (even weaker) in the weak-market sub-window, it is real.
+  4. Foil: run the *breakout-at-high* archetype through the same harness as the negative control
+     (expect it to look bad, per the finding).
+  5. Breadth/tradability: enough liquid names/day to matter; median turnover of the admitted set.
+- **Guardrail.** Research/report-only. Do NOT wire a new lane into the live funnel until it survives
+  walk-forward + the regime split with benchmark-excess. No hardcoding "mean-reversion works" — that
+  is the momentum mistake inverted. Point-in-time; review-only.
+- **Validate.** Verdict is explicit: `promote` (survives regime split) / `regime_conditional` (only in
+  favorable) / `beta_not_alpha` / `needs_more_data`. Unit test the excess + delist-fill + regime-tag
+  math on a synthetic panel once/if promoted to a module.
+- **Confidence.** `verify-first` (the regime split is a genuine coin-flip; expect it may only survive
+  conditionally on this one recovery tape).
+
+### T0.75 — The cycle question (#2)  `[OPENED & RESOLVED 2026-07-13 — robustness, not timing]`
+
+> **Resolved (spec §10).** Empirical fact: NIFTY net −2.1% over the sample, worst DD −15.2%, **0**
+> 200DMA regime transitions — the whole "cycle" is ONE event (choppy grind → March-2026 −15% crash →
+> weak recovery). So cycle-TIMING is unlearnable (N=1 transition; a regime→archetype switcher would
+> memorize one anecdote) → §2/§5's demotion of fine-grained regime conditioning STANDS. A pre-committed
+> 50DMA cash floor on NIFTY cut maxDD −15.2%→−8.7% and vol 13%→6% but COST return (−2.1%→−4.4%,
+> whipsaw in chop) → a coarse floor is legitimate CAPITAL PROTECTION, never alpha. **Answer: go
+> cycle-ROBUST on 3 legs — (1) lean on the one cross-regime-consistent signal (RS/breakout on
+> benchmark-excess), (2) risk control does the heavy lifting → elevates T2, (3) a coarse conservative
+> crash floor.** The funnel's weakness is marginal selection edge in this data, not a re-philosophizable
+> error; leverage is not-losing (T2) + the robust signal, discovery engine stays slow research (§8.5).
+> (Operator: "do #1, pick #2 later" then "open the cycle question now", 2026-07-13.)
+
+### T0 — Invalidation gate: costs, capacity, survivorship, north-star  `[SHIPPED 2026-07-13]`
+
+> **Result recorded in Current State above** (both the raw lane AND the gated set are now scored).
+> The raw lane trails NIFTY; the gated set (PASS_NOW proxy) beats it but unproven; the strict gated
+> BUY set is empty. Remaining follow-up: calibrate the cost coefficients (`COST_*`) against real
+> fills, and re-score the gated set as more months accrue (the current window is one ~2.5mo regime).
+> Everything below is the as-built spec.
+
+
+- **Why.** Cheap to build, and it can kill or reshape everything downstream. Grounded facts (spec
+  §8.4): momentum picks median turnover ₹41.5cr / p25 ₹19cr → flat 25bps is optimistic and the
+  ~2-3%/10d edge may be a third-to-half eaten by real cost; the data holds 171/2,166 non-survivors
+  (survivorship second-order but the backtest silently drops picks that delist mid-window); and there
+  is **no net-vs-NIFTY scorecard** — the one metric that says whether any of this beats owning the
+  index. Do this before pointing the heavy machinery anywhere.
+- **Files.** `advisory/archetype_backtest.py` (cost model + delist-drop accounting); NEW
+  `advisory/cost_model.py` (name-specific spread + size-scaled impact from turnover); NEW north-star
+  reporter (reuse backtest forward-return SQL; benchmark = NIFTY).
+- **Do.**
+  1. **Name-specific cost model**: per-name round-trip cost from avg-daily turnover + price band
+     (spread proxy) + a size-scaled impact term for an assumed position size; replace the flat 25bps
+     everywhere the backtest scores an edge. Env for the assumed size.
+  2. **Survivorship honesty**: when a pick delists/suspends inside the forward window, do NOT silently
+     drop it — count and label it (worst-case fill or flat), and report how many picks it affects.
+  3. **North-star scorecard**: net portfolio return vs buy-and-hold NIFTY, after the name-specific
+     costs, over the full history and per walk-forward window. This is the top-line number.
+  4. Re-run the momentum/archetype edges under (1)+(2); report how much edge survives realistic cost.
+- **Guardrail.** Research/report-only; no authority, no knob changes. Point-in-time. If the edge does
+  not survive realistic cost, that is a finding to record, not a threshold to loosen.
+- **Validate.** Unit tests: cost rises as turnover falls / size rises; delist-drop is counted not
+  silently dropped; north-star matches a hand-checked toy portfolio. Live: edge-after-cost table +
+  net-vs-NIFTY per window. `pytest -q tests/test_advisory_regression.py -k cost_model`.
+- **Confidence.** `verify-first` (cost/impact calibration for Indian mid/small-caps needs a sanity check).
+
+### T1 — Sub-score IC *validation* (descriptive; prescriptive reweighting DEFERRED)
+
+- **Why.** The scoring function is the heart of every decision and is entirely hand-weighted, and we
+  have never measured whether a high sub-score predicts a higher forward return. The *descriptive*
+  measurement is well-powered cross-sectionally and is the genuine payoff; it also hands us the
+  buy-bar knee. The *prescriptive* auto-reweighting is deferred — it rests on only ~13 independent
+  time blocks (§8.1). See `docs/specs/discovery_engine.md` §3 + §8.1.
 - **Files.** NEW `advisory/subscore_ic.py`; `advisory/technical_engine.py` (the sub-score
   functions + `DEFAULT_THRESHOLDS`/weights); reuse `advisory/archetype_backtest.py` harness
-  patterns (walk-forward, forward-return SQL, regime tagging).
+  patterns (walk-forward, forward-return SQL, regime tagging) — now cost-aware after T0.
 - **Do.**
   1. For each sampled historical date, compute each sub-score (trend/structure/participation/RS/
      tradability) per name (point-in-time) and its forward 5/10/20d benchmark-excess.
   2. Metric = **rank-IC** (Spearman of sub-score vs realized forward excess), computed on the
-     **pooled cross-section** per archetype (NOT per-stock). Report each sub-score's IC + a
-     multi-weight fit's IC.
-  3. Fit IC-maximizing sub-score weights on the pooled cross-section, per archetype, with
-     **shrinkage** toward the current hand-set weights (data-frugality; do not overfit 13 months).
-  4. **Slow update**: the applied weights move a small bounded step toward the fit (not a jump);
-     env `SUBSCORE_IC_UPDATE_STEP`. Persist a daily row (weights + IC + drift).
-  5. **IC-drift alarm**: track aggregate IC vs its trailing baseline; a sharp collapse = regime
-     change → surface it (feeds the risk-off safety floor / de-risk signal). Per-stock residual =
+     **pooled cross-section** per archetype (NOT per-stock). Report each sub-score's IC with
+     **block-bootstrap confidence intervals** (overlapping windows overstate naive significance),
+     shrunk hard.
+  3. Buy-bar knee: report, per archetype, the score threshold where forward expectancy peaks
+     (research-only; do not auto-apply the bar).
+  4. **Prescriptive reweighting is DEFERRED.** Output the IC ranking as a report; a weight change is
+     at most a *single human-reviewed* reweighting, gated on the adapted weights beating frozen
+     hand-set weights OOS. NO daily auto-reweighter, NO `SUBSCORE_IC_UPDATE_STEP` live loop yet.
+  5. **IC-drift = warning light only.** Track aggregate IC vs trailing baseline and *surface* a
+     collapse as a diagnostic alert; it must NOT auto-drive de-risking (§8.2). Per-stock residual =
      secondary anomaly flag only.
-  6. Buy-bar knee: report, per archetype, the score threshold where forward expectancy peaks
-     (research-only; do not auto-apply the bar yet).
-- **Guardrail.** Research/propose-only first — do NOT auto-apply weights to live scoring until a
-  trust gate exists (T3). Walk-forward + robustness required before any weight is trusted. Point-in-
-  time: only pre-decision data in the fit; forward windows are the outcome. Deterministic risk
-  limits are never touched.
-- **Validate.** Unit tests: rank-IC math on a synthetic panel (known ordering); pooled-vs-per-stock
-  (per-stock refused/insufficient); shrinkage bounds; slow-step never jumps; drift alarm fires on a
-  synthetic IC collapse. Live: report each sub-score's IC over history + the fitted weights + the
+- **Guardrail.** Research/report-only. Do NOT auto-apply weights to live scoring. Point-in-time: only
+  pre-decision data in the measurement; forward windows are the outcome. Deterministic risk limits
+  never touched. IC-drift never drives portfolio action.
+- **Validate.** Unit tests: rank-IC math on a synthetic panel (known ordering); block-bootstrap CI
+  widens on autocorrelated input; pooled-vs-per-stock (per-stock refused/insufficient); drift alarm
+  fires (alert only) on a synthetic IC collapse. Live: each sub-score's IC + CIs over history + the
   buy-bar knee per archetype. `pytest -q tests/test_advisory_regression.py -k subscore_ic`.
-- **Confidence.** `verified` (design grounded in the shipped harness; sub-score functions confirmed
-  in `technical_engine.py`).
+- **Confidence.** `verified` (descriptive design grounded in the shipped harness; sub-score functions
+  confirmed in `technical_engine.py`).
 
-### T2 — Exit-as-scored-decision (design pass, then build)
+### T2 — Portfolio & risk layer (the asserted-but-unbuilt "absorb the leaks")  `[SHIPPED 2026-07-13 (report layer)]`
+
+> **Shipped as an advisory/report layer** (`advisory/portfolio_risk.py`, `python -m advisory.portfolio_risk`):
+> (1) volatility-targeted `size_position` — risks a fixed % of capital to a 2.5*ATR stop, clamped to
+> the hard `LLM_DECISION_MAX_POSITION_PCT` cap (volatile names auto-size down: 12% ATR -> 2.5% weight;
+> calm names bind on the 5% cap); (2) `book_metrics` — portfolio vol, effective-bets,
+> diversification-ratio, avg pairwise corr (catches "one bet wearing many tickers" that per-name caps
+> miss); (3) `crash_floor_multiplier` — pre-committed NIFTY<50DMA exposure cut (report: maxDD
+> -15%->-10%, vol 12%->8%, but costs return in chop — insurance, NOT alpha); plus `portfolio_heat`
+> (aggregate open risk vs `MAX_HEAT_PCT`) and `sector_exposure`. Tests + env + §11. Deferred follow-up:
+> the LIVE advisory hook into `portfolio_engine.py` (populate an advisory sized-weight field; do NOT
+> change execution) — held back deliberately since it touches live sizing (CLAUDE.md: don't mutate
+> broker behavior unprompted). Below is the as-built spec.
+
+
+- **Why.** DOUBLY confirmed by the momentum→reversal→cycle arc (spec §8.3 + §10): archetype selection
+  is fragile and cycle-timing is unlearnable (N=1 transition), so the real leverage is NOT-LOSING —
+  position sizing, cost-awareness, and not being over-deployed into the next March-style crash. The
+  spec says "size positions so the ~10% leaks are absorbed as portfolio risk" but there is no risk
+  math: no correlation structure, no strategy drawdown estimate, no sizing model, no crash floor. For
+  a personal account this dominates returns more than any entry-score decimal. Add a fourth item:
+  the coarse capital-protection floor (§10) — pre-committed, conservative, sold as risk not alpha
+  (on NIFTY it cut maxDD −15%→−9% / vol 13%→6% but cost return in chop; size it accordingly).
+- **Files.** NEW `advisory/portfolio_risk.py`; `advisory/portfolio_engine.py` (sizing hook);
+  reuse `advisory/archetype_backtest.py` for drawdown/vol measurement; T0's cost model.
+- **Do.**
+  1. Position sizing from volatility/ATR + a per-name risk budget; a hard cap so no single name is
+     catastrophic (ties to the existing deterministic position/exposure limits).
+  2. Correlation-aware exposure: estimate co-movement across held/candidate names (sector + return
+     correlation) so the book is not one bet wearing many tickers.
+  3. Strategy-level drawdown + volatility report over history (net of T0 costs), and a coarse
+     risk-off safety floor (spec §2) as a documented capital-protection rule.
+- **Guardrail.** Advisory sizing/report; the deterministic risk/stop/exposure gates remain the hard
+  floor and are never loosened by this layer — it can only be *more* conservative. Review-only rows.
+- **Validate.** Unit tests: sizing shrinks with volatility and respects the hard cap; correlation
+  estimate on a synthetic 2-name panel; drawdown math on a toy equity curve. Live: portfolio vol +
+  max-drawdown report net of cost. `pytest -q tests/test_advisory_regression.py -k portfolio_risk`.
+- **Confidence.** `verify-first` (sizing/correlation design + portfolio_engine integration points to confirm).
+
+### T3 — Exit-as-scored-decision (design pass, then build)
 
 - **Why.** Exits are the unmeasured half of the P&L. Frame: symmetric to entry — a reversal score
   from features that predict a forward drawdown, validated by the same harness, with an ATR/gap
@@ -115,16 +337,22 @@ when weak" edge is fragile/definition-sensitive; regime is fragile and should be
   reversal features + threshold logic + the disaster-stop floor.
 - **Confidence.** `verify-first` (needs the design pass; exit lifecycle integration points to confirm).
 
-### T3 — Daily discovery run + trust gate
+### T4 — Daily discovery run + trust gate  `[DEFERRED — see §8.1]`
 
-- **Why.** Wrap T1 (and later T2) into the self-correcting loop the operator asked for: a daily
+- **Why.** Wrap the descriptive engine into the self-correcting loop the operator asked for: a daily
   "what can we do better" run + knobs that self-adjust within guardrails. See
   `docs/specs/discovery_engine.md` §6 and `actor_critic_closed_loop.md` (Stage 1→3).
+- **DEFERRED (2026-07-13 review).** A daily multi-knob auto-tuner on ~13 independent time blocks
+  manufactures false winners faster than false-discovery control can catch them (§8.1). Build only
+  after more data exists OR T1's descriptive pass proves the signal-to-noise supports self-tuning,
+  AND T2's portfolio floor is in place. Until then the "daily run" is a **read-only report**, not an
+  applier; IC-drift stays a warning light (§8.2).
 - **Files.** NEW `advisory/discovery_run.py`; a governed-parameter store (from the actor/critic
   spec §5) so knobs are versioned/revertable; cron wrapper + entry.
 - **Do.**
-  1. Daily run: re-fit T1 (and T2) on recent data; emit a human-legible ranked report — which knobs,
-     moved how much, would improve OOS expectancy; which findings are robust vs fragile.
+  1. Daily run: re-run the T1 descriptive IC pass (and T3 exit metrics) on recent data; emit a
+     human-legible ranked report — which knobs, moved how much, would improve OOS expectancy; which
+     findings are robust vs fragile. Read-only until the deferral condition above is met.
   2. **Trust gate (first-class):** a knob moves only after walk-forward + multi-definition robustness
      + enough matured labels + **false-discovery control** (the danger of a daily multi-knob scan —
      correct for it), then a small bounded reversible step, monitored with auto-revert.
@@ -154,6 +382,79 @@ when weak" edge is fragile/definition-sensitive; regime is fragile and should be
 
 ## Deferred / Lower Priority
 
+- **[FIXED 2026-07-13 in the Part-A correctness net] technical_score scale mismatch (0-1 vs 0-100).**
+  `rule_engine.py:1217` persists `technical_score`/`setup_score` as 0-1; consumers compared them to
+  0-100 thresholds (dead branches; `conviction_score` persisted ~0). Fixed via `advisory/score_scales.py`
+  `to_100()` in `company_memory_review` (conviction scaled; branch capped review-only WATCH, never BUY)
+  and `action_recommender`; the 3 BUY-asserting tests moved to 0-1 + WATCH. `scripts/funnel_invariants.py`
+  now guards the class (impossible-gate detector). No longer open.
+- **[RESOLVED 2026-07-13] Provenance-gap warning → not a bug; corrected the audit + a real pollution
+  finding.** The flagged PASS_NOW-without-trigger rows are NOT a bug: `candidate_state=PASS_NOW` is set
+  by `setup_score >= the setup's OWN pass_now threshold` (per-setup: RESEARCH_TRAINING 0.58, EVENT 0.66,
+  DEFENSIVE 0.68, …), independent of BUY_TRIGGERED — so a PASS_NOW row legitimately carries
+  technical_state=IGNORE. (The earlier "PASS_NOW only from BUY_TRIGGERED" map was incomplete; the audit
+  check encoded it → false positive, now fixed.) REAL finding it surfaced: `EVENT_MODEL_TRAINING_V1` is
+  `research_only:True` and floods PASS_NOW (47%) for label harvesting; the audit now flags
+  `research_only_rows_in_pass_now_population`, and `north_star` excludes them (which overturned the
+  gated "+excess" finding — see Current State). **Research/live separator BUILT (2026-07-13):** typed
+  `research_only BOOLEAN` column on advisory_candidates (migration `20260713_advisory_rule_outputs_
+  research_only`, stamped from `setup.get('research_only')` at build, backfilled from the
+  RESEARCH_TRAINING family). `north_star` filters `research_only=FALSE`; `funnel_invariants` flags
+  leakage via the typed column (family fallback for pre-migration rows). `apply_ts_forecast_rescue`
+  (`rule_engine.py:2204`) IS honest (stamps override). Remaining nuance (not urgent): PASS_NOW still
+  overloads "aggregate-score-pass" vs "entry-confirmed" — that is by design (setup_score-driven).
+- **[DATA-SCOPE — surfaced 2026-07-13] EQ-only backtests silently drop EQ→BE series migrations.**
+  `archetype_backtest.py`, `north_star.py`, `momentum_backtest.py`, and the winner-backward queries all
+  filter `series='EQ'`, so any name NSE moves to the BE (Trade-to-Trade) surveillance segment loses its
+  forward bars — and that hits the RS/momentum leaders hardest (they get T2T'd *because* they ran up).
+  `paper_decision_loop` now uses `series IN ('EQ','BE')`; the other backtests should adopt the same
+  EQ+BE continuity so their forward-return coverage stops being biased against the exact winners. Not
+  urgent (research snapshots) but it modestly biased the earlier gated-north-star / archetype numbers.
+- **[PERMANENT SOLUTION BUILT 2026-07-14] Corporate-action price adjustment from the price series itself.**
+  Audit result: the recorded CA table is incomplete (misses ETF splits), `nseindia_ohlcv_adjusted` covers
+  only 2 symbols, and DHAN is adjusted but covers only 24/78 split names (misses SILVER1/ETFs) — so NO
+  external source is complete. But a split/bonus is ALWAYS a clean round-ratio single-day price step, and
+  that ratio IS the factor. NEW `advisory/price_adjustment.py` `adjust_frame()` derives a complete
+  cumulative back-adjustment from price steps alone (validated: SILVER1 fake −89.6% → true +4.4%);
+  universe: 57/78 CA steps auto-adjusted (`split_bonus`), 21 flagged `ambiguous` (possible data errors,
+  NOT adjusted — no silent rescaling). Tested. ROLLOUT REMAINING: (a) replace the exclude-only CA guards
+  in `paper_decision_loop`/`north_star`/`archetype_backtest` with adjustment via this module (so CA picks
+  are SCORED at their true return, not discarded); (b) a builder that populates the adjusted table for
+  consumers; (c) corroborate the 21 ambiguous with CA records/dhan/volume.
+- **[ROLLOUT DEPLOYED 2026-07-14] adjusted prices are now the source of truth for the live loop.** NEW
+  table `advisory_adjusted_ohlcv_daily` populated by `advisory.price_adjustment` (684k rows, 128 split/
+  bonus events auto-adjusted, 25 ambiguous flagged; migration `20260714_advisory_adjusted_ohlcv_daily`);
+  cron-wired `all_price_adjustment.sh` at 38 21 weekdays, BEFORE the paper loop (40 21). `paper_decision_
+  loop` now reads `adj_close` for returns/RS (turnover/ATR stay raw = split-invariant), scoring split
+  names at their TRUE return instead of excluding them (evaluated 496→509, unscored 5%→2%; excess
+  +8.09%→+7.30% t=3.57 — LOWER because the silver ETFs are now included at their real ~flat return, the
+  honest number). `price_data_sanity` adjusted-table warning resolved.
+- **[FOLLOW-UPS DONE 2026-07-14] adjusted prices rolled out to the research backtests + engine improved.**
+  `north_star` (gated) and `archetype_backtest` now read `adj_close` for returns/RS/trailing filters
+  (turnover/min-price on raw = split-invariant; `ambiguous` flag replaces the step-guard). The
+  "momentum-in-strong-markets is backwards" edge STILL HOLDS on adjusted prices (above_50dma CONSISTENT)
+  — robust, not an artifact. Ambiguous corroboration: 0/25 had CA records (table incomplete confirmed);
+  found the round-ratio set missed large ETF splits (LICMFGOLD/IVZINGOLD 100:1) → extended `_ROUND_IMPLIED`
+  to 100; rebuilt (split_bonus 128→132, ambiguous 25→21; the 21 are low-volume mid-range steps = likely
+  data errors, correctly left unadjusted). REMAINING (operator/documented, not code): (a) `technical_features`
+  bhavcopy gap-fill should read `adj_close`×`cum_adj_factor` for OHLC instead of mixing adjusted-dhan +
+  unadjusted-bhavcopy (live feature code, narrow ~26 names — deferred to avoid live risk); (b) NIFTY index
+  gap — CORRECTED: dhan DOES have the NIFTY 50 index (`ticker='NIFTY',instrument='INDEX'`, agrees with
+  nseindia exactly), so `archetype_backtest._load_benchmark` now UNION-gap-fills NIFTY from dhan (all 3
+  backtests import it). Dhan checked EXHAUSTIVELY: `dhan_ohlcv_daily` has only NIFTY (security_id 13,
+  IDX_I) covering Mar-20; `dhan_ohlcv_intraday` has NIFTY for Mar-23 only. `_load_benchmark` now
+  priority-coalesces nseindia_indices → dhan daily → dhan intraday-last-bar → filled Mar-20 + Mar-23
+  (gaps 5→3). The remaining 3 real trading days (Mar 24/25, Jul 9 — verified real: stocks moved) are
+  missing from ALL sources. **NSE re-fetch path**: `nseindia_indices` is populated by
+  `data.nseindia.indices_parser` (parses NSE daily `ind_close_DDMMYYYY.csv` files that
+  `data.download_runner --phase all` fetches). ROOT CAUSE FOUND: the original downloads for Mar 24/25/
+  Jul 9 wrote **0-byte archives** (transient NSE failures), which then blocked re-fetch (downloader skips
+  existing keys) and were marked processed-empty by the parser. **FIXED 2026-07-14 at source:** deleted
+  the 3 empty archives (`store.delete_file`), re-downloaded via `indices_downloader --backfill --from-date/
+  --to-date` (NSE served the real files), cleared the parser processed-state (`ingestion_state.clear_state`
+  + Redis `indices:parsed`), re-parsed → Mar 24=22912.4, 25=23306.5, Jul 9=23962.8 now in nseindia_indices.
+  `price_data_sanity` benchmark ERROR RESOLVED (status ok, 0 errors); paper-loop 26→27 decision-days,
+  529 trades, excess +7.61% t=3.63. The whole NIFTY gap (all 5 days) is closed.
 - Phase B conditional allocation (performance-following sleeve tilt) — only after T1's IC-drift +
   matured sleeve grades exist; the regime tilt stays neutralized until then.
 - Theme-screener suggested-query auto-execution (manual Screener.in registration stays).

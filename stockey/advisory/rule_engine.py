@@ -223,6 +223,17 @@ RULE_ENGINE_RS_PERCENTILE_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS rs_percentile DOUBLE PRECISION",
 ]
 
+# research_only separator: research/training setups (research_only=True, e.g. EVENT_MODEL_TRAINING_V1)
+# share the candidate table for label harvesting at a low pass_now bar and must NOT be counted as
+# recommendations by any consumer (north-star, diagnostics, live action). New rows are stamped from
+# setup.get('research_only'); historical rows are backfilled from the RESEARCH_TRAINING family (the sole
+# research_only setup to date). Idempotent backfill (guarded on NULL).
+RULE_ENGINE_RESEARCH_ONLY_MIGRATION_ID = "20260713_advisory_rule_outputs_research_only"
+RULE_ENGINE_RESEARCH_ONLY_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {CANDIDATES_TABLE} ADD COLUMN IF NOT EXISTS research_only BOOLEAN",
+    f"UPDATE {CANDIDATES_TABLE} SET research_only = (setup_family = 'RESEARCH_TRAINING') WHERE research_only IS NULL",
+]
+
 # TS-forecast rescue (allow-gate): a candidate that fails deterministic technical
 # confirmation but carries a strong TimesFM forecast can be rescued to PASS_NOW with the
 # override recorded (same principle as recorded LLM soft-gate overrides). Intersecting a
@@ -369,6 +380,18 @@ def ensure_rule_output_tables() -> None:
             "workflow": "rule_engine_outputs",
             "base_migration_id": RULE_ENGINE_SCHEMA_MIGRATION_ID,
             "columns": ["rs_percentile"],
+        },
+    )
+    apply_schema_migration(
+        migration_id=RULE_ENGINE_RESEARCH_ONLY_MIGRATION_ID,
+        statements=RULE_ENGINE_RESEARCH_ONLY_SCHEMA_STATEMENTS,
+        owner="advisory.rule_engine",
+        description="Add research_only separator to rule candidate outputs (exclude label-harvesting rows from recommendation consumers).",
+        metadata={
+            "tables": [CANDIDATES_TABLE],
+            "workflow": "rule_engine_outputs",
+            "base_migration_id": RULE_ENGINE_SCHEMA_MIGRATION_ID,
+            "columns": ["research_only"],
         },
     )
 
@@ -1993,6 +2016,7 @@ def run_rule_engine(
                         "setup_id": setup["setup_id"],
                         "setup_name": setup["setup_name"],
                         "setup_family": setup.get("setup_family"),
+                        "research_only": bool(setup.get("research_only")),
                         "holding_horizon_note": setup.get("holding_horizon_note"),
                         "regime_name": regime_name,
                         "base_regime": regime_name,
@@ -2272,6 +2296,7 @@ def persist_rule_outputs(candidates: pd.DataFrame, rejections: pd.DataFrame, *, 
             "near_miss_flag",
             "watch_enabled",
             "rule_pass",
+            "research_only",
         ]:
             if column in candidates.columns:
                 candidates[column] = candidates[column].map(

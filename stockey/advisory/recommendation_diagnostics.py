@@ -8745,6 +8745,30 @@ def classify_primary_no_buy_cause(
                 },
             ],
         }
+    _confirmed_now = int((upstream.get("technical_entry_readiness") or {}).get("confirmed_entry_candidate_count") or 0) if isinstance(upstream, dict) else 0
+    if _confirmed_now > 0:
+        # We fell through every specific diagnosis (lost-downstream, consolidation, freshness, context...)
+        # yet technically-confirmed entry candidates exist and produced no BUY. action_recommender emits
+        # BUY only from an already-approved portfolio row (advisory/action_recommender.py:6512): there is
+        # no promotion bridge candidate->approved->BUY (the human/[P-LLM-AUTH] step is unbuilt). Name the
+        # architectural gap explicitly instead of blaming a policy/threshold.
+        return {
+            "code": "confirmed_entry_exists_but_no_promotion_bridge",
+            "severity": "architectural_gap",
+            "operator_action": (
+                "Confirmed technical entry candidates exist but no BUY was produced: the funnel has no "
+                "promotion bridge candidate->approved->BUY (BUY is emitted only from approved portfolio "
+                "rows). Build the promotion/approval step ([P-LLM-AUTH]); this is not a policy/threshold gap."
+            ),
+            "evidence": {
+                "confirmed_entry_candidate_count": _confirmed_now,
+                "positive_recommendation_count": int(positive_count or 0),
+                "candidate_state_counts": upstream.get("candidate_state_counts", {}) if isinstance(upstream, dict) else {},
+                "technical_state_counts": upstream.get("technical_state_counts", {}) if isinstance(upstream, dict) else {},
+            },
+            "safe_to_tune_policy": False,
+            "next_commands": [],
+        }
     if int(action_counts.get("WATCH", 0)) > 0:
         return {
             "code": "watch_only_no_entry_trigger",

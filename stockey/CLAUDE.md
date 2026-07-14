@@ -176,6 +176,8 @@ python -m py_compile path/to/module.py
 pytest -q tests/test_advisory_regression.py::specific_test_name
 python scripts/docs_state_audit.py --strict
 python scripts/env_example_audit.py --strict
+python scripts/funnel_invariants.py --strict   # score-scale/dead-gate + funnel contracts (0 errors required)
+python scripts/price_data_sanity.py            # data-health: CA-splits/EQ-BE/cross-source/benchmark gaps (informational; data not code)
 git diff --check
 ```
 

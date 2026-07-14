@@ -686,13 +686,14 @@ def test_rule_engine_ensure_output_tables_uses_schema_registry(monkeypatch):
 
     rule_engine.ensure_rule_output_tables()
 
-    assert len(calls) == 5
+    assert len(calls) == 6
     assert [call["migration_id"] for call in calls] == [
         rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID,
         rule_engine.RULE_ENGINE_CONTEXT_METADATA_MIGRATION_ID,
         rule_engine.RULE_ENGINE_TECHNICAL_ENTRY_MIGRATION_ID,
         rule_engine.RULE_ENGINE_TS_OVERRIDE_MIGRATION_ID,
         rule_engine.RULE_ENGINE_RS_PERCENTILE_MIGRATION_ID,
+        rule_engine.RULE_ENGINE_RESEARCH_ONLY_MIGRATION_ID,
     ]
     call = calls[0]
     assert call["migration_id"] == rule_engine.RULE_ENGINE_SCHEMA_MIGRATION_ID
@@ -3907,6 +3908,116 @@ def test_indices_downloader_records_malformed_downloaded_member(monkeypatch):
     assert latest == datetime(2026, 6, 10)
     assert events[0]["fallback_type"] == "nse_indices_downloaded_member_parse_failed"
     assert events[0]["source"] == "bad-date"
+
+
+def test_indices_downloader_partition_empty_attempts_retry_vs_give_up():
+    today = datetime(2026, 7, 14)
+    first_seen = {
+        "2026-07-13": "2026-07-13",  # 1 day old -> retry
+        "2026-07-11": "2026-07-11",  # 3 days old, within window (4) -> retry
+        "2026-07-09": "2026-07-09",  # 5 days old, past window -> give up
+        "2026-07-01": "bad-iso",     # unparseable -> give up (do not retry forever)
+        "2026-07-12": "2026-07-12",  # but already downloaded -> neither
+    }
+    existing = {"2026-07-12"}
+
+    retry, give_up = indices_downloader.partition_empty_attempts(
+        first_seen, existing, today=today, window_days=4
+    )
+
+    assert retry == ["2026-07-11", "2026-07-13"]
+    assert give_up == ["2026-07-01", "2026-07-09"]
+
+
+def test_indices_downloader_empty_download_is_not_persisted_and_retries(monkeypatch, tmp_path):
+    """A 0-byte download must never be saved (it would look downloaded forever) and must be retried."""
+    saved: list[str] = []
+    monkeypatch.setattr(indices_downloader.store, "save_file", lambda **kw: saved.append(kw))
+
+    # Fake a Playwright download that first yields a 0-byte file, then a good one on retry.
+    sizes = iter([0, 0, 123])  # empty, empty, then real bytes
+
+    class _FakeDownload:
+        def save_as(self, path):
+            n = next(sizes)
+            with open(path, "wb") as fh:
+                fh.write(b"\x00" * n)
+
+    class _FakeCtx:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        @property
+        def value(self):
+            return _FakeDownload()
+
+    class _FakeLoc:
+        def click(self):
+            pass
+
+    class _FakePage:
+        def wait_for_timeout(self, *a):
+            pass
+
+        def goto(self, *a):
+            pass
+
+        def evaluate(self, *a):
+            pass
+
+        def get_by_role(self, *a, **k):
+            return _FakeLoc()
+
+        def expect_download(self, *a, **k):
+            return _FakeCtx()
+
+        def close(self):
+            pass
+
+    class _FakeBrowser:
+        contexts = []
+
+        def new_context(self):
+            class _C:
+                def new_page(self_inner):
+                    return _FakePage()
+
+            return _C()
+
+        def close(self):
+            pass
+
+    class _FakeChromium:
+        def connect_over_cdp(self, endpoint):
+            return _FakeBrowser()
+
+    class _FakePlaywright:
+        chromium = _FakeChromium()
+
+    class _FakeRedis:
+        def __init__(self):
+            self.members: set[str] = set()
+
+        def sadd(self, key, val):
+            self.members.add(val)
+
+    monkeypatch.chdir(tmp_path)
+    rop = _FakeRedis()
+
+    # single attempt returns "empty" on a 0-byte file, without persisting
+    status = indices_downloader.download_indices_for_date(_FakePlaywright(), "2026-07-14", "14-Jul-2026", rop)
+    assert status == "empty"
+    assert saved == []
+    assert rop.members == set()
+
+    # the wrapper retries the empty result and succeeds on the real file (3rd call here)
+    status = indices_downloader.download_with_empty_retries(_FakePlaywright(), "2026-07-14", "14-Jul-2026", rop)
+    assert status == "downloaded"
+    assert len(saved) == 1
+    assert rop.members == {"2026-07-14"}
 
 
 def test_indices_parser_only_considers_last_year_keys():
@@ -44173,6 +44284,24 @@ def test_bhavcopy_downloader_records_download_failure_fallback(monkeypatch):
 
 def test_indices_downloader_exports_failure_stop_run_state(monkeypatch):
     class FakeRedis:
+        def hgetall(self, key):
+            return {}
+
+        def smembers(self, key):
+            return set()
+
+        def hset(self, *a, **k):
+            return None
+
+        def hdel(self, *a, **k):
+            return None
+
+        def sadd(self, *a, **k):
+            return None
+
+        def srem(self, *a, **k):
+            return None
+
         def close(self):
             return None
 
@@ -44189,7 +44318,7 @@ def test_indices_downloader_exports_failure_stop_run_state(monkeypatch):
     monkeypatch.setattr(indices_downloader, "load_downloaded_dates_from_store", lambda: set())
     monkeypatch.setattr(indices_downloader, "latest_downloaded_date", lambda existing: None)
     monkeypatch.setattr(indices_downloader, "reverse_daterange", lambda start, end: dates)
-    monkeypatch.setattr(indices_downloader, "download_indices_for_date", lambda *args, **kwargs: False)
+    monkeypatch.setattr(indices_downloader, "download_indices_for_date", lambda *args, **kwargs: "error")
     monkeypatch.setattr(indices_downloader, "parse_datetime_arg", lambda value: indices_downloader.datetime.strptime(value, "%Y-%m-%d") if value else None)
     monkeypatch.setattr(sys, "argv", ["data.nseindia.indices_downloader", "--backfill", "--from-date", "2026-06-03", "--to-date", "2026-06-10"])
 
@@ -44251,7 +44380,7 @@ def test_indices_downloader_records_download_failure_fallback(monkeypatch):
         FakeRedis(),
     )
 
-    assert ok is False
+    assert ok == "error"
     assert len(events) == 1
     event = events[0]
     assert event["module"] == "data.nseindia.indices_downloader"
@@ -48325,6 +48454,339 @@ def test_archetype_backtest_consistency_logic():
     assert not ab._consistency(flipped, "momentum", 10, D)["consistent"]
     assert set(ab.ARCHETYPE_FILTERS) == {"momentum", "breakout"}
     assert set(ab.REGIME_DEFINITIONS) >= {"above_50dma", "above_200dma", "dma50_rising"}
+
+
+def test_cost_model_scales_with_turnover_and_size():
+    from advisory import cost_model as cm
+    import numpy as np
+    # thinner name -> higher round-trip cost; and a flat name-agnostic 25bps is NOT what we return
+    liquid = cm.round_trip_cost_fraction(500e7)   # ~500cr turnover
+    median = cm.round_trip_cost_fraction(41e7)    # ~median pick
+    thin = cm.round_trip_cost_fraction(19e7)      # ~p25 pick
+    assert liquid < median < thin
+    assert median > 25 / 10000.0  # the whole point: realistic cost exceeds the old flat 25bps
+    # bigger position -> more impact on the SAME name
+    assert cm.round_trip_cost_fraction(19e7, position_size_inr=5e6) > cm.round_trip_cost_fraction(19e7, position_size_inr=1e5)
+    # unknown / non-positive turnover -> most expensive, never cheapest (no free lunch on untradeable names)
+    arr = cm.round_trip_cost_fraction(np.array([500e7, np.nan, 0.0]))
+    assert arr[1] == arr[2] > arr[0]
+
+
+def test_archetype_backtest_counts_delistings_not_drops(monkeypatch):
+    from advisory import archetype_backtest as ab
+    dates = pd.bdate_range("2025-06-02", periods=60, tz="UTC").normalize()
+    bench = pd.DataFrame({
+        "date": dates, "bench_close": 200.0, "bench_dma50": 190.0, "bench_dma200": 190.0,
+        "bench_fwd5": 202.0, "bench_fwd10": 204.0, "bench_fwd20": 206.0,
+    })
+    # 12 momentum picks on the FIRST date (matures well inside the data); 2 of them delisted (no fwd)
+    picks = []
+    for i in range(12):
+        fwd = (None if i < 2 else 110.0)  # first two delisted: forward close absent but label SHOULD mature
+        picks.append({"symbol": f"D{i}" if i < 2 else f"L{i}", "date": dates[0], "close": 100.0,
+                      "avg_turnover_inr": 41e7, "fwd5": fwd, "fwd10": fwd, "fwd20": fwd})
+    # 11 momentum picks near the TAIL (horizon runs past the data) -> immature, must be EXCLUDED not filled
+    for i in range(11):
+        picks.append({"symbol": f"I{i}", "date": dates[58], "close": 100.0,
+                      "avg_turnover_inr": 41e7, "fwd5": None, "fwd10": None, "fwd20": None})
+    picks_df = pd.DataFrame(picks)
+
+    monkeypatch.setattr(ab, "_load_benchmark", lambda: bench)
+    monkeypatch.setattr(ab, "_load_picks", lambda archetype: picks_df.copy() if archetype == "momentum" else picks_df.iloc[0:0])
+    monkeypatch.setattr(ab, "ensure_table", lambda: None)
+    monkeypatch.setattr(ab, "SAMPLE_STEP_DAYS", 1)
+    monkeypatch.setattr(ab, "REGIME_DEFINITIONS", {"t": lambda r: "favorable"})
+    out = ab.run_backtest(n_windows=1, dry_run=True)
+
+    cell5 = [r for r in out["results"] if r["horizon_days"] == 5]
+    assert len(cell5) == 1
+    r = cell5[0]
+    assert r["picks"] == 12          # 12 matured picks kept (delisted INCLUDED, not silently dropped)
+    assert r["delisted"] == 2        # the two absent-forward names are flagged, not vanished
+    assert out["delisted_total"] >= 2
+    # the 11 tail picks are immature (no maturity date) -> excluded from every cell, never filled
+    assert all(rr["picks"] == 12 for rr in out["results"])
+    # delisted names dragged the mean down via the conservative fill (they were NOT dropped as if never picked)
+    assert r["mean_abs_return_pct"] < 10.0
+
+
+def test_north_star_matches_toy_portfolio(monkeypatch):
+    from advisory import north_star as ns
+    from advisory.cost_model import round_trip_cost_fraction
+    dates = pd.bdate_range("2025-06-02", periods=25, tz="UTC").normalize()
+    bench = pd.DataFrame({
+        "date": dates, "bench_close": 200.0, "bench_dma50": 190.0, "bench_dma200": 190.0,
+        "bench_fwd5": 200.0, "bench_fwd10": 200.0, "bench_fwd20": 200.0,  # NIFTY flat -> 0% each period
+    })
+    turnover = 1e11  # very liquid -> a known, small cost
+    picks = pd.DataFrame([
+        {"symbol": "A", "date": dates[0], "close": 100.0, "avg_turnover_inr": turnover, "fwd5": 110.0, "fwd10": 110.0, "fwd20": 110.0},
+        {"symbol": "B", "date": dates[0], "close": 100.0, "avg_turnover_inr": turnover, "fwd5": 90.0,  "fwd10": 90.0,  "fwd20": 90.0},
+    ])
+    monkeypatch.setattr(ns, "_load_benchmark", lambda: bench)
+    monkeypatch.setattr(ns, "_load_picks", lambda archetype: picks.copy() if archetype == "momentum" else picks.iloc[0:0])
+    out = ns.run_north_star(hold_days=5, n_windows=1)
+    o = out["overall"]
+    # rebalances at day 0,5,10,15 (day 20's +5 window runs past the data) -> 4 periods, 3 in cash
+    assert o["rebalances"] == 4 and o["cash_periods"] == 3
+    c = round_trip_cost_fraction(turnover)
+    # period 0: mean of (+10% - c, -10% - c) = -c; other periods flat -> overall == -c
+    # (reported strat_net_return_pct is rounded to 2 decimals, so compare at that precision)
+    assert abs(o["strat_net_return_pct"] / 100.0 - (-c)) < 1e-4
+    assert o["nifty_return_pct"] == 0.0
+    assert o["excess_pct"] == o["strat_net_return_pct"]  # since NIFTY is flat
+
+
+def test_north_star_gated_scorecard_and_overlap_collapse(monkeypatch):
+    from advisory import north_star as ns
+    dates = pd.bdate_range("2026-04-01", periods=30, tz="UTC").normalize()
+    bench = pd.DataFrame({
+        "date": dates, "bench_close": 200.0, "bench_dma50": 190.0, "bench_dma200": 190.0,
+        "bench_fwd5": 200.0, "bench_fwd10": 200.0, "bench_fwd20": 200.0,  # NIFTY flat -> excess == net
+    })
+    # 3 recommendations on day 0 and 2 on day 5 -> two decision days; liquid so cost is small/known
+    rows = []
+    for sym, fwd in [("A", 110.0), ("B", 105.0), ("C", 95.0)]:
+        rows.append({"symbol": sym, "date": dates[0], "close": 100.0, "avg_turnover_inr": 1e11, "fwd5": fwd, "fwd10": fwd, "fwd20": fwd, "ambiguous_ahead": 0})
+    for sym, fwd in [("D", 120.0), ("E", 108.0)]:
+        rows.append({"symbol": sym, "date": dates[5], "close": 100.0, "avg_turnover_inr": 1e11, "fwd5": fwd, "fwd10": fwd, "fwd20": fwd, "ambiguous_ahead": 0})
+    picks = pd.DataFrame(rows)
+    monkeypatch.setattr(ns, "_load_benchmark", lambda: bench)
+    monkeypatch.setattr(ns, "_load_gated_picks", lambda states=None: picks.copy())
+    out = ns.run_gated_scorecard()
+    r5 = out["horizons"][5]
+    assert out["n_recommendations"] == 5 and r5["trades"] == 5
+    # per-trade N is 5 but there are only TWO decision days -> the honest sample is 2, not 5
+    assert r5["decision_days"] == 2
+    assert r5["mean_excess_pct"] == r5["mean_net_pct"]  # NIFTY flat
+    assert r5["delisted"] == 0
+    # day-level t is computed from the 2 day-means, not the 5 trades (overlap not double-counted)
+    assert "day_level_t" in r5
+
+    # empty gated set -> the absence is reported, not a crash (the strict BUY set is empty in reality)
+    monkeypatch.setattr(ns, "_load_gated_picks", lambda states=None: picks.iloc[0:0])
+    empty = ns.run_gated_scorecard()
+    assert empty["n_recommendations"] == 0 and empty["horizons"] == {}
+
+
+def test_paper_decision_loop_selects_sizes_and_scores(monkeypatch):
+    from advisory import paper_decision_loop as pl
+    import numpy as np
+    dates = pd.bdate_range("2026-01-01", periods=40, tz="UTC").normalize()
+    bench = pd.DataFrame({"date": dates, "bench_close": 200.0, "bench_dma50": 190.0, "bench_dma200": 190.0,
+                          "bench_fwd5": 200.0, "bench_fwd10": 200.0, "bench_fwd20": 204.0})  # NIFTY +2% over the hold
+    # 4 names on day 0 with distinct RS (via trailing returns) and known forward outcomes
+    def _mk(sym, ret, fwd, atr=0.03, turn=1e9, ambiguous=0):
+        return {"symbol": sym, "date": dates[0], "close": 100.0, "avg_turnover_inr": turn, "atr_pct": atr,
+                "fwd": fwd, "ret63": ret, "ret126": ret, "ret252": ret, "ambiguous_ahead": ambiguous}
+    panel = pd.DataFrame([_mk("A", 0.40, 110.0), _mk("B", 0.30, 90.0), _mk("C", 0.20, 105.0), _mk("D", 0.10, 100.0)])
+    monkeypatch.setattr(pl, "SAMPLE_STEP_DAYS", 1)
+    monkeypatch.setattr(pl, "RS_MIN_PERCENTILE", 0.0)  # take all four to check mechanics
+    monkeypatch.setattr(pl, "MAX_NAMES", 10)
+    out = pl.run_paper_loop(hold_days=20, panel=panel.copy(), bench=bench.copy())
+    dec = out["decisions"].set_index("symbol")
+    assert len(dec) == 4
+    a = dec.loc["A"]
+    c = float(a["cost_fraction"])
+    assert abs(a["net_return"] - (0.10 - c)) < 1e-6           # +10% minus name cost
+    assert abs(a["excess_return"] - (a["net_return"] - 0.02)) < 1e-6  # minus NIFTY +2%
+    assert a["floor_multiplier"] == 1.0 and 0 < a["weight_pct"] <= 5.0 and not bool(a["broker_execution_allowed"])
+    # higher volatility -> smaller size (risk-targeted); RS_MIN filter keeps only the strongest
+    monkeypatch.setattr(pl, "RS_MIN_PERCENTILE", 90.0)
+    top = pl.run_paper_loop(hold_days=20, panel=panel.copy(), bench=bench.copy())["decisions"]
+    assert set(top["symbol"]) == {"A"}  # only the top-RS name clears the 90th-pct bar among 4
+
+
+def test_paper_decision_loop_handles_unscored_immature_and_corporate_actions(monkeypatch):
+    from advisory import paper_decision_loop as pl
+    import numpy as np
+    dates = pd.bdate_range("2026-01-01", periods=40, tz="UTC").normalize()
+    bench = pd.DataFrame({"date": dates, "bench_close": 200.0, "bench_dma50": 190.0, "bench_dma200": 190.0,
+                          "bench_fwd5": 200.0, "bench_fwd10": 200.0, "bench_fwd20": 200.0})
+    monkeypatch.setattr(pl, "SAMPLE_STEP_DAYS", 1)
+    monkeypatch.setattr(pl, "RS_MIN_PERCENTILE", 0.0)
+    monkeypatch.setattr(pl, "MAX_NAMES", 10)
+    row = lambda **kw: {"symbol": "X", "date": dates[0], "close": 100.0, "avg_turnover_inr": 1e9, "atr_pct": 0.03,
+                        "ret63": 0.3, "ret126": 0.3, "ret252": 0.3, "ambiguous_ahead": 0, **kw}
+    # matured window but no forward price (data ends before exit / delisting) -> UNSCORED, NOT a fake -50%
+    d = pl.run_paper_loop(hold_days=20, panel=pd.DataFrame([row(fwd=np.nan)]), bench=bench.copy())["decisions"]
+    assert len(d) == 1 and d.iloc[0]["evaluation_status"] == "unscored_data_ends" and pd.isna(d.iloc[0]["net_return"])
+    assert pl._summarize(d)["trades"] == 0 and pl._summarize(d)["unscored_data_ends"] == 1
+    # an `ambiguous` CA flag in the hold (a circuit-breaching step that did NOT snap -> probable data error;
+    # splits are already neutralised on adj_close) -> unscored_corporate_action, not scored on a bad price
+    ca = pl.run_paper_loop(hold_days=20, panel=pd.DataFrame([row(fwd=12.0, ambiguous_ahead=1)]), bench=bench.copy())["decisions"]
+    assert ca.iloc[0]["evaluation_status"] == "unscored_corporate_action" and pd.isna(ca.iloc[0]["net_return"])
+    assert pl._summarize(ca)["unscored_corporate_action"] == 1
+    # immature: decision on the last date (no forward window) -> excluded, not scored at all
+    immature = pd.DataFrame([{**row(fwd=np.nan), "date": dates[39]}])
+    assert pl.run_paper_loop(hold_days=20, panel=immature, bench=bench.copy())["decisions"].empty
+
+
+def test_no_buy_cause_names_promotion_bridge_gap():
+    from collections import Counter
+    from advisory import recommendation_diagnostics as rd
+    # confirmed technical entries exist, but no BUY -> the architectural promotion-bridge gap, not policy
+    cause = rd.classify_primary_no_buy_cause(
+        positive_count=0,
+        suppression_counts=Counter(),
+        upstream={
+            "technical_entry_readiness": {"confirmed_entry_candidate_count": 2, "diagnosis": "confirmed_entry_candidates_available"},
+            "candidate_state_counts": {"PASS_NOW": 2},
+            "technical_state_counts": {"BUY_TRIGGERED": 2},
+        },
+        action_counts=Counter({"WATCH": 1}),
+    )
+    assert cause["code"] == "confirmed_entry_exists_but_no_promotion_bridge"
+    assert cause["severity"] == "architectural_gap"
+    assert cause["evidence"]["confirmed_entry_candidate_count"] == 2
+    # no confirmed entries -> must NOT claim the bridge gap (falls through to watch-only/other)
+    other = rd.classify_primary_no_buy_cause(
+        positive_count=0, suppression_counts=Counter(),
+        upstream={"technical_entry_readiness": {"confirmed_entry_candidate_count": 0}},
+        action_counts=Counter({"WATCH": 1}),
+    )
+    assert other["code"] != "confirmed_entry_exists_but_no_promotion_bridge"
+
+
+def test_price_adjustment_derives_splits_from_price_steps():
+    from advisory import price_adjustment as pa
+    dates = pd.bdate_range("2026-01-01", periods=8, tz="UTC")
+    # a clean 1:10 split on day 4: 250 -> 25. Adjusted series must be smooth and the return real.
+    split = pd.DataFrame({"symbol": "S", "date": dates,
+                          "close": [240.0, 250.0, 245.0, 250.0, 25.0, 26.0, 27.0, 26.0]})
+    adj = pa.adjust_frame(split).sort_values("date").reset_index(drop=True)
+    assert (adj.loc[:3, "cum_adj_factor"] == 0.1).all() and (adj.loc[4:, "cum_adj_factor"] == 1.0).all()
+    assert adj.loc[4, "ca_flag"] == "split_bonus"
+    assert abs(adj.iloc[-1]["adj_close"] / adj.iloc[0]["adj_close"] - (26.0 / 24.0)) < 1e-9  # true return, not -90%
+    # a 1:1 bonus (price halves) snaps to factor 0.5
+    bonus = pd.DataFrame({"symbol": "B", "date": dates[:4], "close": [100.0, 102.0, 51.0, 52.0]})
+    ab = pa.adjust_frame(bonus).sort_values("date").reset_index(drop=True)
+    assert (ab.loc[:1, "cum_adj_factor"] == 0.5).all() and ab.loc[2, "ca_flag"] == "split_bonus"
+    # an ambiguous circuit-breaching step (not a round split/bonus ratio) is FLAGGED, never adjusted
+    weird = pd.DataFrame({"symbol": "W", "date": dates[:4], "close": [100.0, 100.0, 55.0, 56.0]})  # x0.55, no round match
+    aw = pa.adjust_frame(weird)
+    assert (aw["cum_adj_factor"] == 1.0).all() and (aw["ca_flag"] == "ambiguous").any()
+    # a normal series is untouched (all factors 1.0, adj_close == close)
+    calm = pd.DataFrame({"symbol": "C", "date": dates[:4], "close": [100.0, 103.0, 101.0, 104.0]})
+    ac = pa.adjust_frame(calm)
+    assert (ac["cum_adj_factor"] == 1.0).all() and (ac["adj_close"] == ac["close"]).all()
+
+
+def test_price_data_sanity_report_contract():
+    from scripts import price_data_sanity as pds
+    # the reporting contract: findings render, errors gate status, benchmark gaps are an error
+    report = {"status": "error", "db_status": "checked", "as_of": "2026-07-10", "errors": 1, "warnings": 2,
+              "findings": [pds.Finding("warning", "unadjusted_corporate_actions", "78 steps").as_dict(),
+                           pds.Finding("warning", "eq_to_be_migrations", "285 syms").as_dict(),
+                           pds.Finding("error", "benchmark_calendar_gaps", "5 days").as_dict()]}
+    text = pds.format_text_report(report)
+    assert "status: error" in text and "unadjusted_corporate_actions" in text and "benchmark_calendar_gaps" in text
+    # thresholds are the shared circuit-band convention (a split is a >35% single-day step)
+    assert pds.CA_STEP_LOW < 0.7 and pds.CA_STEP_HIGH > 1.3
+
+
+def test_funnel_invariants_catches_the_bug_class(tmp_path):
+    from scripts import funnel_invariants as fi
+    # 1. impossible-gate detector FIRES on a 0-1 field compared to a 0-100 threshold
+    adv = tmp_path / "advisory"
+    adv.mkdir()
+    (adv / "bad.py").write_text("x = 1\nif technical_score >= 78:\n    pass\n")
+    findings = fi.check_impossible_gates(repo_root=tmp_path)
+    assert any(f.code == "impossible_scale_gate" and "bad.py" in f.location for f in findings)
+    # ...and does NOT fire when the value was scaled via to_100() a few lines above
+    (adv / "good.py").write_text("technical_score = to_100(raw_frac)\n\nif technical_score >= 78:\n    pass\n")
+    locs = [f.location for f in fi.check_impossible_gates(repo_root=tmp_path)]
+    assert not any("good.py" in loc for loc in locs)
+    # 2. range check FIRES on a scale-corrupted score (0-1 field holding a 0-100 value)
+    row = {"candidate_state": "PASS_NOW", "technical_state": "BUY_TRIGGERED", "technical_entry_confirmed": True,
+           "technical_override_source": None, "technical_score": 82.0, "setup_score": 0.5, "fundamental_score": 0.5,
+           "regime_fit_score": 0.5, "event_score": 0.2, "technical_trend_score": 20, "technical_structure_score": 18,
+           "technical_participation_score": 10, "technical_relative_strength_score": 8, "technical_tradability_score": 6,
+           "rs_percentile": 80}
+    df = pd.DataFrame([row])
+    assert any(f.code == "score_out_of_range" and "technical_score" in f.location for f in fi.check_score_ranges(df))
+    # in-range row -> clean
+    good = dict(row); good["technical_score"] = 0.7
+    assert fi.check_score_ranges(pd.DataFrame([good])) == []
+    # 3. cross-field: technical_entry_confirmed=True but not BUY_TRIGGERED FIRES
+    bad = dict(good); bad["technical_state"] = "IGNORE"
+    assert any(f.code == "confirmed_without_buy_triggered" for f in fi.check_cross_field_consistency(pd.DataFrame([bad])))
+    # ...but PASS_NOW with technical_state=IGNORE is LEGAL (setup_score-driven), not flagged as a bug
+    legal_pass = {**good, "candidate_state": "PASS_NOW", "technical_state": "IGNORE",
+                  "technical_entry_confirmed": False, "setup_family": "EVENT_OPPORTUNITY"}
+    assert not any(f.severity == "error" for f in fi.check_cross_field_consistency(pd.DataFrame([legal_pass])))
+    # 4. research_only rows leaking into the PASS_NOW population are flagged via the typed column
+    research = {**legal_pass, "research_only": True}
+    assert any(f.code == "research_only_rows_in_pass_now_population" for f in fi.check_cross_field_consistency(pd.DataFrame([research])))
+
+
+def test_score_scales_registry_and_to_100():
+    from advisory import score_scales as ss
+    assert ss.is_unit_scale("technical_score") and ss.is_unit_scale("setup_score")
+    assert not ss.is_unit_scale("technical_total_score") and not ss.is_unit_scale("rs_percentile")
+    assert ss.to_100(0.85) == 85.0          # 0-1 scaled up
+    assert ss.to_100(82.0) == 82.0          # already 0-100 -> pass-through
+    assert ss.in_range("technical_score", 0.5) and not ss.in_range("technical_score", 78.0)
+    assert ss.in_range("technical_total_score", 78.0) and not ss.in_range("technical_total_score", 150.0)
+    # the impossible-gate class: every 0-1 field's max is below the 0-100 buy bar (can never clear it raw)
+    assert ss.BUY_BAR > 1.0
+    assert all(ss.SCORE_RANGES[name][1] <= 1.0 for name in ss.UNIT_SCALE_FIELDS)
+
+
+def test_company_memory_conviction_score_on_0_100_scale():
+    # conviction_score schema is ge=0 le=100; the 0-1 candidate score must be scaled up, not persisted ~0
+    ctx = {"symbol": "T", "actions": [{}], "candidates": [{"technical_score": 0.85, "setup_score": 0.40}],
+           "technical": [{"rs_vs_benchmark": 0.02}], "bhavcopy_evidence": [{"deal_pressure": "neutral"}]}
+    r = company_memory_review.deterministic_review(ctx)
+    assert 80.0 <= r.conviction_score <= 90.0     # scaled to 0-100 (was ~0.85 under the bug)
+    assert r.recommended_signal != "BUY"          # company-memory review never emits BUY
+
+
+def test_portfolio_risk_sizing_defers_to_caps_and_scales_with_vol():
+    from advisory import portfolio_risk as pr
+    cap = 1_000_000
+    calm = pr.size_position(cap, 0.02)     # low ATR -> binds on the per-name cap
+    vol = pr.size_position(cap, 0.12)      # high ATR -> binds on the risk budget, sized down
+    assert calm["capped_by"] == "position_cap" and calm["weight_pct"] == pr.MAX_POSITION_PCT * 100
+    assert vol["capped_by"] == "risk_budget" and vol["value_inr"] < calm["value_inr"]
+    # NEVER exceeds the hard cap, at any volatility (advisory layer only more conservative)
+    for a in (0.001, 0.02, 0.05, 0.2, 0.5):
+        assert pr.size_position(cap, a)["weight_pct"] <= pr.MAX_POSITION_PCT * 100 + 1e-9
+    # risk-budget-bound names all risk ~the same rupee amount to the stop
+    assert abs(vol["risk_pct"] - pr.RISK_BUDGET_PCT * 100) < 1e-6
+    # untradeable inputs -> zero, not a crash
+    assert pr.size_position(cap, 0.0)["value_inr"] == 0.0
+    assert pr.size_position(cap, float("nan"))["capped_by"] == "untradeable"
+
+
+def test_portfolio_risk_book_metrics_sees_hidden_correlation():
+    from advisory import portfolio_risk as pr
+    import numpy as np
+    idx = pd.date_range("2026-01-01", periods=40, freq="D")
+    a = np.tile([0.01, -0.02, 0.03, -0.01, 0.02], 8)
+    # perfectly correlated names -> diversification ratio ~1 (one bet wearing two tickers)
+    corr = pd.DataFrame({"A": a, "B": a}, index=idx)
+    mc = pr.book_metrics({"A": 1.0, "B": 1.0}, corr)
+    assert mc["effective_bets"] == 2.0 and abs(mc["diversification_ratio"] - 1.0) < 0.02
+    # orthogonal names -> diversification ratio > 1 (real diversification)
+    b = np.tile([0.02, 0.02, -0.02, -0.02, 0.0], 8)
+    div = pd.DataFrame({"A": a, "B": b}, index=idx)
+    md = pr.book_metrics({"A": 1.0, "B": 1.0}, div)
+    assert md["diversification_ratio"] > 1.05
+
+
+def test_portfolio_risk_crash_floor_and_heat():
+    from advisory import portfolio_risk as pr
+    import numpy as np
+    # index rises then falls below its MA -> multiplier drops to the floor on the weak days
+    up = pd.Series(np.concatenate([np.linspace(100, 130, 30), np.linspace(130, 90, 20)]))
+    mult = pr.crash_floor_multiplier(up, ma_days=10, floor_exposure=0.3)
+    assert mult.iloc[15] == 1.0            # still climbing, above MA
+    assert mult.iloc[-1] == 0.3            # well below MA -> floored
+    assert set(mult.unique()) <= {1.0, 0.3}
+    # heat = sum of per-position risk; a book can pass every per-name cap yet breach in aggregate
+    assert pr.portfolio_heat([0.75] * 5)["breaches_cap"] is False   # 3.75% < 6%
+    assert pr.portfolio_heat([0.75] * 12)["breaches_cap"] is True   # 9% > 6%
 
 
 def test_momentum_backtest_aggregation(monkeypatch):
@@ -54433,6 +54895,80 @@ def test_rule_engine_blocked_regime_is_context_only_by_default(monkeypatch):
     assert all(item["reason_code"] != "regime_blocked" for item in rejections)
 
 
+# ---- Golden-path reachability: the canary the funnel lacked. An IDEAL candidate must reach the
+# BUY-capable terminal state end-to-end; a scale/dead-branch/threshold bug makes it fail loudly here
+# (unlike piecewise tests that missed the technical_score scale bug). See discovery_engine.md.
+_GOLDEN_STATE_RANK = {"REJECT": 0, "ABSTAIN": 1, "WATCH_EVENT": 2, "WATCH_PULLBACK": 2, "WATCH_BREAKOUT": 3, "PASS_NOW": 4}
+
+
+def _golden_path_setup() -> dict[str, Any]:
+    return {
+        "allowed_regimes": ["STABLE"],
+        "blocked_regimes": [],
+        "allowed_overlays": ["NONE"],
+        "blocked_overlays": [],
+        "technical_rules": [],
+        "fundamental_rules": [],
+        "intraday_rules": [],
+        "score_thresholds": {"pass_now": 0.68, "watch_breakout": 0.58, "watch_event": 0.48, "abstain": 0.40, "near_miss_gap": 0.05},
+        "freshness_policy": {"technical_max_age_days": 10, "fundamentals_max_age_days": 180, "regime_max_age_days": 7, "intraday_max_age_days": 2, "fundamentals_required": True},
+        "min_avg_traded_value_20d": 100_000_000,
+        "max_breakout_extension_pct": 8,
+        "watch_pullback_extension_pct": 6,
+        "min_dist_52w_high": -20,
+    }
+
+
+def test_golden_path_ideal_candidate_reaches_buy_capable_state():
+    # Stage 1 -- technical engine reaches BUY_TRIGGERED (the only BUY-capable technical state)
+    tout = technical_engine.evaluate_pre_entry_state(_technical_engine_base_row())
+    assert tout["technical_state"] == "BUY_TRIGGERED"
+    assert tout["technical_total_score"] >= technical_engine.DEFAULT_THRESHOLDS["buy_total_min"]
+    assert tout["entry_trigger_type"] is not None
+
+    # Stage 2+3 -- rule engine reaches PASS_NOW AND technical_entry_confirmed=True, no hard rejections
+    state, evaluation, rejections = rule_engine.evaluate_setup_row(
+        _rule_engine_strong_candidate_row(), regime_name="STABLE", overlay_name="NONE", setup=_golden_path_setup())
+    assert state == "PASS_NOW"
+    assert rule_engine.technical_entry_confirmed_from_evaluation(evaluation) is True
+    assert evaluation["setup_score"] >= 0.68
+    assert all(item["severity"] != "hard" for item in rejections)
+
+
+def test_golden_path_garbage_candidate_is_not_confirmed():
+    row = _rule_engine_strong_candidate_row()
+    for key, value in {"pass_above_dma_50": False, "pass_above_dma_150": False, "pass_above_dma_200": False,
+                       "pass_trend_alignment": False, "breakout_day_volume_vs_20d": 0.5, "breakout_extension_pct": 0.0,
+                       "rs_vs_benchmark": -0.10, "rs_vs_sector": -0.08, "trend_persistence_60d": 0.1,
+                       "dist_52w_high": -45.0, "dma_50_slope_20d_pct": -3.0}.items():
+        row[key] = value
+    state, evaluation, _ = rule_engine.evaluate_setup_row(row, regime_name="STABLE", overlay_name="NONE", setup=_golden_path_setup())
+    assert state != "PASS_NOW"  # a degraded setup must not reach the confirmed-entry terminal
+    assert _GOLDEN_STATE_RANK[state] < _GOLDEN_STATE_RANK["PASS_NOW"]
+    assert rule_engine.technical_entry_confirmed_from_evaluation(evaluation) is False
+
+
+def test_golden_path_state_is_monotonic_in_quality():
+    setup = _golden_path_setup()
+    ideal = _rule_engine_strong_candidate_row()
+    weak = ideal.copy()
+    for key, value in {"breakout_extension_pct": 0.0, "breakout_day_volume_vs_20d": 0.5, "rs_vs_benchmark": -0.05}.items():
+        weak[key] = value
+    s_ideal = rule_engine.evaluate_setup_row(ideal, regime_name="STABLE", overlay_name="NONE", setup=setup)[0]
+    s_weak = rule_engine.evaluate_setup_row(weak, regime_name="STABLE", overlay_name="NONE", setup=setup)[0]
+    assert _GOLDEN_STATE_RANK[s_weak] <= _GOLDEN_STATE_RANK[s_ideal]  # degrading quality never improves the decision
+
+
+def test_golden_path_funnel_ceiling_is_pass_now_not_a_buy_action():
+    # Documents the architectural no-BUY cause: the funnel's best terminal for a FRESH candidate is
+    # PASS_NOW (a candidate_state), NOT a BUY action_code. action_recommender emits BUY only from an
+    # already-approved portfolio row (advisory/action_recommender.py:6512) -- there is no promotion
+    # bridge candidate->approved->BUY. This pins that fact so a silent wiring/breakage is caught.
+    assert rule_engine.map_technical_state_to_candidate_state("BUY_TRIGGERED") == "PASS_NOW"
+    assert "BUY" not in set(rule_engine.map_technical_state_to_candidate_state(s)
+                            for s in ("BUY_TRIGGERED", "READY", "NEAR_PIVOT", "WATCHLIST", "IGNORE"))
+
+
 def test_rule_engine_blocked_regime_can_still_be_hard_blocked_with_env(monkeypatch):
     monkeypatch.setenv(rule_engine.RULE_ENGINE_REGIME_LABEL_HARD_BLOCK_ENABLED_ENV, "true")
 
@@ -58872,7 +59408,7 @@ def test_company_memory_deterministic_review_is_review_input_only():
     context = {
         "symbol": "LUPIN",
         "technical": [{"rs_vs_benchmark": 0.08}],
-        "candidates": [{"technical_score": 82.0, "setup_score": 78.0}],
+        "candidates": [{"technical_score": 0.82, "setup_score": 0.78}],  # 0-1 production scale
         "announcement_evidence": [
             {
                 "direction": "positive",
@@ -58891,7 +59427,8 @@ def test_company_memory_deterministic_review_is_review_input_only():
 
     review = company_memory_review.deterministic_review(context)
 
-    assert review.recommended_signal == "BUY"
+    # company-memory review is review-only: strong technical + positive event caps at WATCH, never BUY
+    assert review.recommended_signal == "WATCH"
     assert review.confidence >= 0.65
     assert "Review input only" in review.deterministic_boundary
     assert any("technical score" in item for item in review.evidence_used)
@@ -59455,7 +59992,7 @@ def test_company_memory_deterministic_review_uses_context_overlay_pressure():
     context = {
         "symbol": "ABC",
         "technical": [{"rs_vs_benchmark": 0.03}],
-        "candidates": [{"technical_score": 81.0}],
+        "candidates": [{"technical_score": 0.81}],  # 0-1 production scale
         "announcement_evidence": [],
         "bhavcopy_evidence": [],
         "event_policy": [],
@@ -59476,7 +60013,8 @@ def test_company_memory_deterministic_review_uses_context_overlay_pressure():
 
     review = company_memory_review.deterministic_review(context)
 
-    assert review.recommended_signal == "BUY"
+    # review-only: caps at WATCH, never BUY, even with strong technical + positive overlay pressure
+    assert review.recommended_signal == "WATCH"
     assert any("context-overlay pressure" in item for item in review.evidence_used)
     assert context["evidence_source_contract"]["context_overlay_policy_effect"] == "review_input_only_no_trade_authority"
     assert "Review input only" in review.deterministic_boundary
@@ -59644,7 +60182,7 @@ def test_company_memory_deterministic_review_uses_causal_event_memory_context():
     context = {
         "symbol": "ABC",
         "technical": [{"rs_vs_benchmark": 0.03}],
-        "candidates": [{"technical_score": 82.0}],
+        "candidates": [{"technical_score": 0.82}],  # 0-1 production scale
         "announcement_evidence": [],
         "bhavcopy_evidence": [],
         "event_policy": [],
@@ -59675,7 +60213,8 @@ def test_company_memory_deterministic_review_uses_causal_event_memory_context():
 
     review = company_memory_review.deterministic_review(context)
 
-    assert review.recommended_signal == "BUY"
+    # review-only: caps at WATCH, never BUY
+    assert review.recommended_signal == "WATCH"
     assert any("causal event memory" in item for item in review.evidence_used)
     source_rows = {row["source"]: row for row in context["evidence_source_contract"]["sources"]}
     assert source_rows["causal_event_memory"]["row_count"] == 1

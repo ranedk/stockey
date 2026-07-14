@@ -14,6 +14,7 @@ from advisory.exchange_context_overlays import EXCHANGE_CONTEXT_OVERLAYS_TABLE
 from advisory.macro_context_overlays import MACRO_CONTEXT_OVERLAYS_TABLE
 from advisory.news_theme_engine import THEME_CONTEXT_OVERLAYS_TABLE
 from advisory.causal_event_memory import TABLE_NAME as CAUSAL_EVENT_MEMORY_TABLE
+from advisory.score_scales import to_100
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.codex_cli import run_codex_structured
@@ -1505,7 +1506,10 @@ def deterministic_review(context: dict[str, Any]) -> CompanyMemoryReview:
     latest_technical = (context.get("technical") or [{}])[0]
     latest_bhav = (context.get("bhavcopy_evidence") or [{}])[0]
     action_code = str(latest_action.get("action_code") or "").upper()
-    technical_score = max(_num(latest_candidate.get("technical_score")), _num(latest_candidate.get("setup_score")))
+    # candidate technical_score/setup_score are 0-1 (rule_engine normalizes technical_total_score/100);
+    # scale to the 0-100 conviction/threshold scale. to_100 passes >1 values through, so any caller that
+    # still supplies a 0-100 value is handled too. See advisory/score_scales.py.
+    technical_strength = to_100(max(_num(latest_candidate.get("technical_score")), _num(latest_candidate.get("setup_score"))))
     rs_benchmark = _num(latest_technical.get("rs_vs_benchmark"))
     deal_pressure = str(latest_bhav.get("deal_pressure") or "neutral")
     positive_event = _has_positive_event(context)
@@ -1513,7 +1517,7 @@ def deterministic_review(context: dict[str, Any]) -> CompanyMemoryReview:
 
     signal = "NO_ACTION"
     confidence = 0.35
-    conviction = max(0.0, min(100.0, technical_score))
+    conviction = max(0.0, min(100.0, technical_strength))
     evidence: list[str] = []
     risks: list[str] = []
     wait_for: list[str] = []
@@ -1532,11 +1536,15 @@ def deterministic_review(context: dict[str, Any]) -> CompanyMemoryReview:
         signal = "SELL_PARTIAL" if signal in {"BUY", "BUY_MORE", "HOLD"} else "WATCH"
         risks.append("recent negative event-policy or announcement evidence needs review")
         confidence = max(confidence, 0.60)
-    elif technical_score >= 78 and positive_event:
-        signal = "BUY" if signal in {"NO_ACTION", "WATCH", "HOLD"} else signal
+    elif technical_strength >= 78 and positive_event:
+        # Review-only: company-memory review is a watch/de-risk input, never a broker-capable BUY
+        # (authority boundary; action_recommender demotes any BUY from here anyway). A strong technical
+        # score is also the wrong-pond signal on its own (docs/specs/discovery_engine.md 9); with a
+        # catalyst it is at most a WATCH here.
+        signal = "WATCH" if signal in {"NO_ACTION", "HOLD"} else signal
         evidence.append("technical score is strong and recent event evidence is positive")
         confidence = max(confidence, 0.65)
-    elif technical_score >= 65:
+    elif technical_strength >= 65:
         signal = "WATCH" if signal == "NO_ACTION" else signal
         evidence.append("technical score is constructive but not enough for an independent buy")
         wait_for.append("wait for confirmed breakout/retest or stronger event confirmation")

@@ -13,6 +13,7 @@ from environs import Env
 from pydantic import BaseModel, Field
 
 from advisory.decision_trace import ACTION_CONFLICT_RULES_TABLE
+from advisory.score_scales import to_100
 from advisory.decision_trace import append_trace, append_trace_step, build_action_conflicts, persist_action_conflicts, safe_trace_call
 from advisory.event_evidence_store import ANNOUNCEMENT_CONTEXT_OVERLAYS_TABLE, ANNOUNCEMENT_EVIDENCE_TABLE, BHAVCOPY_CONTEXT_OVERLAYS_TABLE
 from advisory.exchange_context_overlays import EXCHANGE_CONTEXT_OVERLAYS_TABLE
@@ -3349,7 +3350,15 @@ def _build_multi_context_diagnostics(
         or technical_evidence.get("current_state")
         or ""
     ).strip().upper()
-    technical_score = _num(technical_evidence.get("technical_total_score") or technical_evidence.get("technical_score"))
+    # technical_total_score is 0-100; the candidate technical_score column is 0-1 (rule_engine normalizes
+    # total/100). Scale the fallback to 0-100 so the >= 70 comparison below is scale-correct. _num may
+    # return None (absent) -> keep None so the "constructive vs weak" branch is skipped, not miscalled.
+    _total = technical_evidence.get("technical_total_score")
+    if _total is not None:
+        technical_score = _num(_total)
+    else:
+        _frac = _num(technical_evidence.get("technical_score"))
+        technical_score = to_100(_frac) if _frac is not None else None
     technical_context = "unknown"
     if technical_state in {"BUY_TRIGGERED", "READY", "NEAR_PIVOT", "HOLD", "ADD_ON_PULLBACK"}:
         technical_context = "constructive"

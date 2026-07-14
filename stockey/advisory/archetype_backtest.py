@@ -23,6 +23,8 @@ from typing import Any
 
 import pandas as pd
 
+from advisory.cost_model import describe as describe_cost
+from advisory.cost_model import round_trip_cost_fraction
 from utils.db import sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 
@@ -61,8 +63,14 @@ REGIME_DEFINITIONS = {
 MIN_PRICE = float(os.getenv("MISSED_MOVERS_MIN_PRICE", "30.0"))
 MIN_TURNOVER = float(os.getenv("MARKET_ACTION_SCAN_MIN_TURNOVER_INR", "50000000"))
 SAMPLE_STEP_DAYS = int(os.getenv("MOMENTUM_BACKTEST_SAMPLE_STEP_DAYS", "5"))
-COST_BPS = float(os.getenv("MOMENTUM_BACKTEST_COST_BPS", "25"))
 N_WINDOWS = int(os.getenv("ARCHETYPE_BACKTEST_WINDOWS", "3"))
+# A pick whose forward label SHOULD have matured (its horizon date exists in the calendar) but has no
+# forward close = the name stopped trading (delist/halt). Silently dropping these biases the edge UP
+# (they are disproportionately losers). Include them at a conservative assumed return instead, and
+# count them. Not a wipeout prior (many are mergers/relistings); env-tunable.
+DELIST_RETURN = float(os.getenv("BACKTEST_DELIST_RETURN", "-0.5"))
+# NB: splits/bonuses handled by reading adj_close (advisory.price_adjustment); only `ambiguous` CA flags
+# (unsnappable steps = probable data errors) are excluded. No single-day-step guard needed.
 HORIZONS = (5, 10, 20)
 
 # Each archetype's admission filter (the WHERE fragment over the `eq` CTE columns below).
@@ -87,24 +95,33 @@ def _load_picks(archetype: str) -> pd.DataFrame:
     where = ARCHETYPE_FILTERS[archetype]
     return sql_to_df(
         f"""
-        WITH eq AS (
-            SELECT symbol, date, close, volume,
-                   LAG(close, 10) OVER w AS close_10ago,
-                   MAX(close)  OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS max20,
-                   AVG(close)  OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS dma20,
-                   MAX(close)  OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING) AS max252,
-                   AVG(volume) OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING) AS avgvol20,
-                   LEAD(close, 5)  OVER w AS fwd5,
-                   LEAD(close, 10) OVER w AS fwd10,
-                   LEAD(close, 20) OVER w AS fwd20,
-                   COUNT(*) OVER (PARTITION BY symbol ORDER BY date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING) AS nprev
-            FROM nseindia_ohlcv WHERE series = 'EQ'
-            WINDOW w AS (PARTITION BY symbol ORDER BY date)
+        WITH base AS (
+            -- adj_close (advisory.price_adjustment): splits/bonuses neutralised in BOTH the trailing
+            -- archetype filter (max252/dma20/close_10ago) AND the forward return. EQ+BE continuity;
+            -- turnover/min-price on raw price (split-invariant); `ambiguous` CA flag = probable data error.
+            SELECT o.symbol, o.date, a.adj_close AS close, o.close AS raw_close, o.volume,
+                   LAG(a.adj_close, 10) OVER w AS close_10ago,
+                   MAX(a.adj_close) OVER w20  AS max20,
+                   AVG(a.adj_close) OVER w20  AS dma20,
+                   MAX(a.adj_close) OVER w252 AS max252,
+                   AVG(o.volume)    OVER w20  AS avgvol20,
+                   LEAD(a.adj_close, 5)  OVER w AS fwd5,
+                   LEAD(a.adj_close, 10) OVER w AS fwd10,
+                   LEAD(a.adj_close, 20) OVER w AS fwd20,
+                   COUNT(*) OVER w252 AS nprev,
+                   MAX(CASE WHEN a.ca_flag = 'ambiguous' THEN 1 ELSE 0 END) OVER wfwd AS ambiguous_ahead
+            FROM nseindia_ohlcv o
+            JOIN advisory_adjusted_ohlcv_daily a ON a.symbol = o.symbol AND a.date = o.date
+            WHERE o.series IN ('EQ', 'BE')
+            WINDOW w AS (PARTITION BY o.symbol ORDER BY o.date),
+                   w20 AS (PARTITION BY o.symbol ORDER BY o.date ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING),
+                   w252 AS (PARTITION BY o.symbol ORDER BY o.date ROWS BETWEEN 252 PRECEDING AND 1 PRECEDING),
+                   wfwd AS (PARTITION BY o.symbol ORDER BY o.date ROWS BETWEEN 1 FOLLOWING AND 20 FOLLOWING)
         )
-        SELECT symbol, date, close, fwd5, fwd10, fwd20
-        FROM eq
+        SELECT symbol, date, close, avgvol20 * raw_close AS avg_turnover_inr, fwd5, fwd10, fwd20, ambiguous_ahead
+        FROM base
         WHERE close_10ago IS NOT NULL AND dma20 IS NOT NULL AND max20 IS NOT NULL AND max252 IS NOT NULL
-          AND nprev >= 60 AND close >= %(min_price)s AND avgvol20 * close >= %(min_turnover)s
+          AND nprev >= 60 AND raw_close >= %(min_price)s AND avgvol20 * raw_close >= %(min_turnover)s
           AND {where}
         ORDER BY date, symbol
         """,
@@ -115,13 +132,34 @@ def _load_picks(archetype: str) -> pd.DataFrame:
 def _load_benchmark() -> pd.DataFrame:
     return sql_to_df(
         """
-        SELECT date, close AS bench_close,
-               AVG(close) OVER (ORDER BY date ROWS BETWEEN 50 PRECEDING AND 1 PRECEDING) AS bench_dma50,
-               AVG(close) OVER (ORDER BY date ROWS BETWEEN 200 PRECEDING AND 1 PRECEDING) AS bench_dma200,
-               LEAD(close, 5)  OVER (ORDER BY date) AS bench_fwd5,
-               LEAD(close, 10) OVER (ORDER BY date) AS bench_fwd10,
-               LEAD(close, 20) OVER (ORDER BY date) AS bench_fwd20
-        FROM nseindia_indices WHERE index_name ILIKE 'nifty 50' ORDER BY date
+        -- NIFTY 50, priority-coalesced across sources by date (they agree exactly on overlaps): primary
+        -- nseindia_indices, then dhan's NIFTY INDEX daily, then dhan NIFTY intraday last-bar. nseindia is
+        -- missing some real trading days (the Mar-2026 crash week); the dhan sources fill some. Any day
+        -- still missing in ALL of them is a genuine data hole (needs an NSE `ind_close` re-fetch/parse).
+        WITH nse AS (
+            SELECT date::date AS d, close FROM nseindia_indices WHERE index_name ILIKE 'nifty 50'
+        ),
+        dhan_d AS (
+            SELECT date::date AS d, close FROM dhan_ohlcv_daily WHERE ticker = 'NIFTY' AND instrument = 'INDEX'
+        ),
+        dhan_i AS (
+            SELECT timestamp::date AS d, (array_agg(close ORDER BY timestamp DESC))[1] AS close
+            FROM dhan_ohlcv_intraday WHERE ticker = 'NIFTY' AND exchange_segment = 'IDX_I' GROUP BY 1
+        ),
+        combined AS (
+            SELECT d, close FROM nse
+            UNION ALL
+            SELECT d, close FROM dhan_d WHERE d NOT IN (SELECT d FROM nse)
+            UNION ALL
+            SELECT d, close FROM dhan_i WHERE d NOT IN (SELECT d FROM nse) AND d NOT IN (SELECT d FROM dhan_d)
+        )
+        SELECT d AS date, close AS bench_close,
+               AVG(close) OVER (ORDER BY d ROWS BETWEEN 50 PRECEDING AND 1 PRECEDING) AS bench_dma50,
+               AVG(close) OVER (ORDER BY d ROWS BETWEEN 200 PRECEDING AND 1 PRECEDING) AS bench_dma200,
+               LEAD(close, 5)  OVER (ORDER BY d) AS bench_fwd5,
+               LEAD(close, 10) OVER (ORDER BY d) AS bench_fwd10,
+               LEAD(close, 20) OVER (ORDER BY d) AS bench_fwd20
+        FROM combined ORDER BY d
         """
     )
 
@@ -138,6 +176,8 @@ def _segment_metrics(seg: pd.DataFrame, h: int) -> dict[str, Any]:
         "mean_abs_return_pct": round(float(seg["abs_ret"].mean()) * 100, 3),
         "abs_win_rate": round(float((seg["abs_ret"] > 0).mean()), 4),
         "expectancy_pct": round((hit * avg_win + (1 - hit) * avg_loss) * 100, 3),
+        "delisted": int(seg["_delisted"].sum()) if "_delisted" in seg else 0,
+        "mean_cost_pct": round(float(seg["cost"].mean()) * 100, 3) if "cost" in seg else 0.0,
     }
 
 
@@ -154,7 +194,11 @@ def run_backtest(*, n_windows: int | None = None, dry_run: bool = False) -> dict
     sampled = trading_days[::max(1, SAMPLE_STEP_DAYS)]
     # sequential, non-overlapping walk-forward windows over the sampled decision dates
     win_edges = [sampled[i * len(sampled) // n_windows] for i in range(n_windows)] + [sampled[-1] + pd.Timedelta(days=1)]
-    cost = COST_BPS / 10000.0
+    # maturity map: decision date -> the h-th trading day after it (NaT if it runs past our data). A
+    # missing forward close is a DELISTING only when the label should have matured; otherwise it is
+    # merely immature (correctly excluded, not a survivorship drop).
+    pos = {d: i for i, d in enumerate(trading_days)}
+    mat_map = {h: {d: (trading_days[i + h] if i + h < len(trading_days) else pd.NaT) for d, i in pos.items()} for h in HORIZONS}
     now = pd.Timestamp.utcnow()
     rows: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
@@ -174,10 +218,26 @@ def run_backtest(*, n_windows: int | None = None, dry_run: bool = False) -> dict
                 wdf = df[(df["date"] >= lo) & (df["date"] < hi)]
                 label = f"W{wi + 1}:{pd.Timestamp(lo).date()}"
                 for h in HORIZONS:
-                    sub = wdf.dropna(subset=[f"fwd{h}", f"bench_fwd{h}"]).copy()
+                    sub = wdf[wdf[f"bench_fwd{h}"].notna()].copy()  # benchmark forward must be mature
                     if sub.empty:
                         continue
-                    sub["abs_ret"] = sub[f"fwd{h}"] / sub["close"] - 1.0 - cost
+                    mat = sub["date"].map(mat_map[h])
+                    missing = sub[f"fwd{h}"].isna()
+                    # immature: no forward close AND the horizon runs past our data -> correctly excluded
+                    sub = sub[~(missing & mat.isna())].copy()
+                    if sub.empty:
+                        continue
+                    # splits/bonuses are already neutralised (returns on adj_close); drop only an
+                    # `ambiguous` CA flag in the forward window (unsnappable step = probable data error).
+                    if "ambiguous_ahead" in sub.columns:
+                        sub = sub[~sub["ambiguous_ahead"].fillna(0).astype(bool)].copy()
+                        if sub.empty:
+                            continue
+                    # any remaining missing forward close = matured-but-gone = delisting/halt
+                    sub["_delisted"] = sub[f"fwd{h}"].isna()
+                    sub["cost"] = round_trip_cost_fraction(sub["avg_turnover_inr"].to_numpy(dtype="float64"))
+                    raw_ret = (sub[f"fwd{h}"] / sub["close"] - 1.0).where(~sub["_delisted"], DELIST_RETURN)
+                    sub["abs_ret"] = raw_ret - sub["cost"]
                     sub["excess"] = sub["abs_ret"] - (sub[f"bench_fwd{h}"] / sub["bench_close"] - 1.0)
                     for regime in ("favorable", "unfavorable"):
                         seg = sub[sub["regime"] == regime]
@@ -185,12 +245,15 @@ def run_backtest(*, n_windows: int | None = None, dry_run: bool = False) -> dict
                             continue
                         m = _segment_metrics(seg, h)
                         rec = {"run_date": now.normalize(), "archetype": archetype, "regime_definition": defn,
-                               "window_label": label, "horizon_days": h, "regime": regime, **m, "load_ts": now}
+                               "window_label": label, "horizon_days": h, "regime": regime,
+                               **{k: v for k, v in m.items() if k not in ("delisted", "mean_cost_pct")}, "load_ts": now}
                         rows.append(rec)
-                        results.append({k: rec[k] for k in ("archetype", "regime_definition", "window_label", "horizon_days", "regime", "picks", "mean_abs_return_pct", "abs_win_rate")})
+                        results.append({**{k: rec[k] for k in ("archetype", "regime_definition", "window_label", "horizon_days", "regime", "picks", "mean_abs_return_pct", "abs_win_rate")},
+                                        "delisted": m["delisted"], "mean_cost_pct": m["mean_cost_pct"]})
     if rows and not dry_run:
         upsert_to_db(pd.DataFrame(rows), TABLE_NAME, unique_keys=["run_date", "archetype", "regime_definition", "window_label", "horizon_days", "regime"], timescaledb_column="run_date")
-    return {"n_windows": n_windows, "results": results}
+    return {"n_windows": n_windows, "results": results, "cost_model": describe_cost(),
+            "delisted_total": sum(r.get("delisted", 0) for r in results)}
 
 
 def _consistency(results: list[dict[str, Any]], archetype: str, horizon: int, regime_definition: str) -> dict[str, Any]:
@@ -215,7 +278,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.format == "json":
         print(json.dumps(out, indent=2, default=str))
         return 0
+    cm = out.get("cost_model", {})
     print(f"[archetype_backtest] windows={out['n_windows']}  robustness of the 'buy strength when weak' edge")
+    print(f"  cost=name-specific (statutory {cm.get('statutory_bps')}bps + turnover-spread + size-impact @ "
+          f"pos={cm.get('position_size_inr')}); delisted picks filled at {DELIST_RETURN:+.0%}, "
+          f"total={out.get('delisted_total', 0)}")
     print("  (fav-minus-unfav abs-return edge; NEGATIVE = strength does WORSE in favorable/strong markets)")
     for archetype in ARCHETYPE_FILTERS:
         print(f"\n  == {archetype} ==")
