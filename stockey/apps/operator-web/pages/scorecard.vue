@@ -45,9 +45,7 @@ function excessClass(value: unknown) {
       </p>
     </header>
 
-    <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">
-      Could not load the scorecard.
-    </div>
+    <ApiErrorBanner v-if="loadError" :error="loadError" title="Could not load the scorecard" />
     <p v-if="pending" class="text-sm text-ink/40">loading…</p>
 
     <div v-if="!matured && !pending" class="rounded-2xl border border-ink/15 bg-white/70 px-5 py-5 text-sm text-ink/65">

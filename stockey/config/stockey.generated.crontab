@@ -111,9 +111,25 @@ LOG_DIR=/Users/rane/code/stockey/logs/cron
 # Research-only split/bonus-adjusted price table (price-step derived; the paper loop reads adj_close from it).
 38 21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
 
+# Research-only market breadth (% of the liquid universe above its 50DMA) -- the richer market check the
+# breadth crash-floor + daily advisory read. Depends on adj_close; runs after the adjustment table.
+39 21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_market_breadth.lock ./all_market_breadth.sh >> "$LOG_DIR/market_breadth.log" 2>&1
+
 # Research-only coherent paper decision loop. RS-selected, vol-sized, crash-floored decisions committed
 # and scored forward vs NIFTY. Bypasses the funnel; writes advisory_paper_decision_loop only, no action/broker.
 40 21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_paper_decision_loop.lock ./all_paper_decision_loop.sh >> "$LOG_DIR/paper_decision_loop.log" 2>&1
+
+# Research-only regime-sized shadow ledger + data-selected floor config (max growth s.t. a ruin-guard).
+# Reads the paper-loop trades + breadth; writes advisory_regime_shadow_ledger / advisory_regime_floor_config.
+42 21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_regime_shadow_ledger.lock ./all_regime_shadow_ledger.sh >> "$LOG_DIR/regime_shadow_ledger.log" 2>&1
+
+# REVIEW-ONLY daily advisory: today's RS picks, regime-floored vol-target sizing, ATR stops, vs the current
+# breadth/floor context. portfolio_authority=none, no broker. Reads breadth + the selected floor config.
+43 21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_paper_advisory.lock ./all_paper_advisory.sh >> "$LOG_DIR/paper_advisory.log" 2>&1
+
+# REVIEW-ONLY always-on paper book: assumes every daily BUY was taken and manages it to EXIT (stop / 20-day
+# cap / momentum fade / data-gap). Writes advisory_paper_book + the operator book dashboard. No broker.
+44 21 * * 1-5 rane cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_paper_book.lock ./all_paper_book.sh >> "$LOG_DIR/paper_book.log" 2>&1
 
 # Research-only evidence refresh. This matures context/event/action-transition
 # evidence daily without running event-model prep/training/scoring and without

@@ -13,10 +13,11 @@ const liveTradingLabel = computed(() => {
   return liveTradingEnabled.value ? 'Live trading enabled' : 'Live trading disabled'
 })
 const liveTradingNote = computed(() => runtime.value?.live_trading_operator_note || 'Broker submission stays disabled unless explicitly enabled.')
-const runtimeLabel = computed(() => {
-  const rev = runtime.value?.git_rev ? String(runtime.value.git_rev).slice(0, 12) : 'unknown rev'
-  const path = runtime.value?.latest_source_path ? ` · ${runtime.value.latest_source_path}` : ''
-  return `API restart needed · ${rev}${path}`
+const runtimeLabel = computed(() => 'Operator API is running older code — restart it to serve current data')
+const runtimeDetail = computed(() => {
+  const rev = runtime.value?.git_rev ? String(runtime.value.git_rev).slice(0, 10) : 'unknown rev'
+  const path = runtime.value?.latest_source_path ? ` (${runtime.value.latest_source_path})` : ''
+  return `The API process started before the latest source change${path}. Expected after a code change; data may be stale until the API restarts. · rev ${rev}`
 })
 </script>
 
@@ -36,6 +37,7 @@ const runtimeLabel = computed(() => {
           </div>
           <nav class="flex flex-wrap items-center justify-end gap-2 text-sm font-semibold">
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/workbench">Workbench</NuxtLink>
+            <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/advisory">Advisory</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/recommendations-unified">Recommendations</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/watchlist">Watchlist</NuxtLink>
             <NuxtLink class="rounded-full px-4 py-2 text-ink/65 hover:bg-white/70" to="/positions">Positions</NuxtLink>
@@ -69,9 +71,9 @@ const runtimeLabel = computed(() => {
           </nav>
         </div>
       </div>
-      <div v-if="staleRuntime" class="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-rust/25 bg-rust/10 px-4 py-3 text-sm text-rust">
+      <div v-if="staleRuntime" class="mt-3 rounded-2xl border border-sun/45 bg-sun/10 px-4 py-3 text-sm text-ember">
         <p class="font-black">{{ runtimeLabel }}</p>
-        <p class="font-semibold text-rust/80">Running API process is older than source files on disk.</p>
+        <p class="mt-0.5 font-semibold text-ember/80">{{ runtimeDetail }}</p>
       </div>
     </header>
     <main class="mx-auto max-w-7xl px-6 pb-16">

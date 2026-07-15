@@ -85,9 +85,7 @@ const ACTIONS = [
       </p>
     </header>
 
-    <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">
-      Could not load positions.
-    </div>
+    <ApiErrorBanner v-if="loadError" :error="loadError" title="Could not load positions" />
 
     <div class="flex flex-wrap items-center gap-3">
       <span class="rounded-full border border-ink/15 bg-white/70 px-4 py-1.5 text-sm font-black text-ink/70">

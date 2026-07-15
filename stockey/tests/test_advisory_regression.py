@@ -955,7 +955,8 @@ def test_portfolio_engine_ensure_portfolio_table_uses_schema_registry(monkeypatc
 
     portfolio_engine.ensure_portfolio_table()
 
-    assert len(calls) == 1
+    # base schema migration + the separate advisory-sizing column migration (checksum-isolated)
+    assert len(calls) == 2
     assert calls[0]["migration_id"] == portfolio_engine.PORTFOLIO_SCHEMA_MIGRATION_ID
     assert calls[0]["metadata"]["tables"] == [portfolio_engine.PORTFOLIO_TABLE]
     assert any(portfolio_engine.PORTFOLIO_TABLE in statement for statement in calls[0]["statements"])
@@ -963,6 +964,11 @@ def test_portfolio_engine_ensure_portfolio_table_uses_schema_registry(monkeypatc
     assert any("exit_event_rules_json" in statement for statement in calls[0]["statements"])
     assert any("position_state" in statement for statement in calls[0]["statements"])
     assert any("state_transition_contract_json" in statement for statement in calls[0]["statements"])
+    # the advisory columns live in their OWN migration and never touch the execution/authority fields
+    assert calls[1]["migration_id"] == portfolio_engine.PORTFOLIO_ADVISORY_SIZING_MIGRATION_ID
+    assert any("advisory_sized_weight_pct" in s for s in calls[1]["statements"])
+    assert any("advisory_regime_exposure" in s for s in calls[1]["statements"])
+    assert not any("approved_allocation_inr" in s for s in calls[1]["statements"])
 
 
 def test_portfolio_engine_persist_cleanup_uses_retryable_operation(monkeypatch):
@@ -81072,3 +81078,378 @@ def test_llm_decision_policy_system_prompt_falls_back_to_constant(monkeypatch):
     # Empty/whitespace stored body falls back to the constant.
     monkeypatch.setattr("advisory.prompt_store.resolve_active_prompt", lambda pid: {"system_prompt": "  "})
     assert policy._active_system_prompt() == policy.SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------------------------------
+# advisory.subscore_ic -- pure IC/robustness/verdict helpers (T1 descriptive validation)
+# ---------------------------------------------------------------------------------------------------
+def _ic_cross_section(date, n, sign):
+    """One date's cross-section where excess is a monotone (sign) function of the score -> Spearman=sign."""
+    import numpy as np
+    rng = np.arange(n, dtype="float64")
+    return pd.DataFrame({"date": [date] * n, "s": rng, "excess": sign * rng * 0.001})
+
+
+def test_subscore_ic_daily_ic_recovers_known_ordering():
+    import numpy as np
+    from advisory import subscore_ic as sic
+    d1, d2 = pd.Timestamp("2026-01-05"), pd.Timestamp("2026-01-12")
+    pos = pd.concat([_ic_cross_section(d1, 30, +1), _ic_cross_section(d2, 30, +1)], ignore_index=True)
+    neg = pd.concat([_ic_cross_section(d1, 30, -1), _ic_cross_section(d2, 30, -1)], ignore_index=True)
+    ic_pos = sic.daily_ic(pos, "s")
+    ic_neg = sic.daily_ic(neg, "s")
+    assert len(ic_pos) == 2 and ic_pos.mean() > 0.99
+    assert len(ic_neg) == 2 and ic_neg.mean() < -0.99
+    # a date with too few names is dropped (min_names gate)
+    thin = _ic_cross_section(d1, 10, +1)
+    assert sic.daily_ic(thin, "s", min_names=20).empty
+
+
+def test_subscore_ic_block_bootstrap_ci_brackets_mean():
+    import numpy as np
+    from advisory import subscore_ic as sic
+    ic = pd.Series(np.linspace(0.02, 0.06, 40), index=pd.date_range("2026-01-01", periods=40, freq="5D"))
+    mean_ic, lo, hi = sic.block_bootstrap_ci(ic, n=300, block=4)
+    assert abs(mean_ic - float(ic.mean())) < 1e-9
+    assert lo <= mean_ic <= hi
+    # a too-short series returns the mean with NaN bounds, not a crash
+    short = pd.Series([0.03, 0.04])
+    m, l, h = sic.block_bootstrap_ci(short, n=50, block=4)
+    assert abs(m - 0.035) < 1e-9 and np.isnan(l) and np.isnan(h)
+
+
+def test_subscore_ic_regime_split_and_walkforward():
+    import numpy as np
+    from advisory import subscore_ic as sic
+    idx = pd.date_range("2026-01-01", periods=6, freq="5D")
+    ic = pd.Series([0.1, 0.1, -0.2, -0.2, 0.0, 0.0], index=idx)
+    fav = {idx[0], idx[1]}
+    fav_ic, unf_ic, fav_n, unf_n = sic.regime_split_ic(ic, fav)
+    assert fav_n == 2 and unf_n == 4
+    assert abs(fav_ic - 0.1) < 1e-9 and abs(unf_ic - (-0.1)) < 1e-9
+    # walk-forward: all-positive is consistent; a sign flip across windows is not
+    up = pd.Series(np.full(9, 0.05), index=pd.date_range("2026-01-01", periods=9, freq="5D"))
+    parts, consistent = sic.walkforward_signs(up)
+    assert consistent and len(parts) == 3 and all(p > 0 for p in parts)
+    flip = pd.Series([0.05] * 3 + [-0.05] * 3 + [0.05] * 3, index=pd.date_range("2026-01-01", periods=9, freq="5D"))
+    _, consistent2 = sic.walkforward_signs(flip)
+    assert not consistent2
+
+
+def test_subscore_ic_classify_verdict_maps_the_finding():
+    from advisory import subscore_ic as sic
+    # favorable-tape-only positive edge -> beta, not alpha (trend/structure_momentum shape)
+    assert sic.classify_verdict(significant=True, mean_ic=0.05, fav_ic=0.10, unf_ic=0.00,
+                                wf_consistent=True, n_dates=50) == "benchmark_beta_not_alpha"
+    # robustly inverted negative edge (participation_base shape) -> do_not_relax
+    assert sic.classify_verdict(significant=True, mean_ic=-0.03, fav_ic=-0.03, unf_ic=-0.02,
+                                wf_consistent=False, n_dates=50) == "do_not_relax"
+    # robust cross-regime positive edge that holds in the weak tape -> candidate
+    assert sic.classify_verdict(significant=True, mean_ic=0.05, fav_ic=0.06, unf_ic=0.05,
+                                wf_consistent=True, n_dates=50) == "candidate"
+    # not significant / too few blocks -> needs_more_data
+    assert sic.classify_verdict(significant=False, mean_ic=0.02, fav_ic=0.07, unf_ic=-0.03,
+                                wf_consistent=False, n_dates=50) == "needs_more_data"
+    assert sic.classify_verdict(significant=True, mean_ic=0.05, fav_ic=0.06, unf_ic=0.05,
+                                wf_consistent=True, n_dates=5) == "needs_more_data"
+
+
+def test_subscore_ic_attach_excess_delist_and_ambiguous():
+    import numpy as np
+    from advisory import subscore_ic as sic
+    d = pd.Timestamp("2026-02-02")
+    df = pd.DataFrame({
+        "date": [d, d, d],
+        "close": [100.0, 100.0, 100.0],
+        "fwd10": [110.0, np.nan, 130.0],   # normal, delisted (no fwd), ambiguous
+        "ambiguous_ahead": [0, 0, 1],
+    })
+    bench = pd.DataFrame({"date": [d], "bench_close": [200.0], "bench_dma50": [190.0], "bench_fwd10": [210.0]})
+    ex = sic.attach_excess(df, bench, 10).sort_values("close").reset_index(drop=True)
+    assert len(ex) == 2  # the ambiguous row is dropped
+    # normal row: 10% stock - 5% bench = +5% excess
+    normal = ex[ex["fwd10"] == 110.0].iloc[0]
+    assert abs(normal["excess"] - 0.05) < 1e-9
+    # delisted row: DELIST_RETURN (-0.5) - 5% bench
+    delisted = ex[ex["fwd10"].isna()].iloc[0]
+    assert abs(delisted["excess"] - (sic.DELIST_RETURN - 0.05)) < 1e-9
+
+
+# ---------------------------------------------------------------------------------------------------
+# advisory.regime_shadow_ledger -- pure book-math (T2 shadow ledger: does the regime floor help?)
+# ---------------------------------------------------------------------------------------------------
+def test_regime_shadow_ledger_book_returns_per_policy():
+    import numpy as np
+    from advisory import regime_shadow_ledger as rsl
+    d = pd.Timestamp("2026-03-02", tz="UTC")
+    trades = pd.DataFrame({
+        "asof_date": [d, d],
+        "symbol": ["A", "B"],
+        "weight_pct": [4.0, 2.0],
+        "floor_multiplier": [0.5, 0.5],
+        "net_return": [0.10, -0.05],
+        "benchmark_return": [0.02, 0.02],
+    })
+    eq = rsl.book_returns_by_date(trades, "equal_weight").iloc[0]
+    assert abs(eq["book_ret"] - 0.025) < 1e-9 and abs(eq["deployed"] - 1.0) < 1e-9
+    nf = rsl.book_returns_by_date(trades, "voltarget_nofloor").iloc[0]  # w=weight/floor/100 -> 0.08,0.04
+    assert abs(nf["book_ret"] - (0.08 * 0.10 + 0.04 * -0.05)) < 1e-9 and abs(nf["deployed"] - 0.12) < 1e-9
+    rg = rsl.book_returns_by_date(trades, "regime_sized").iloc[0]       # w=weight/100 -> 0.04,0.02
+    assert abs(rg["book_ret"] - (0.04 * 0.10 + 0.02 * -0.05)) < 1e-9 and abs(rg["deployed"] - 0.06) < 1e-9
+    nifty = rsl.book_returns_by_date(trades, "nifty_buy_hold").iloc[0]
+    assert abs(nifty["book_ret"] - 0.02) < 1e-9
+    # the floor de-risks: regime_sized deploys less and (here) earns less than the un-floored book
+    assert rg["deployed"] < nf["deployed"]
+
+
+def test_regime_shadow_ledger_overlap_and_nonoverlap_stats():
+    import numpy as np
+    from advisory import regime_shadow_ledger as rsl
+    book = pd.DataFrame({
+        "asof_date": pd.to_datetime(["2026-01-01", "2026-02-01", "2026-03-01"], utc=True),
+        "book_ret": [0.10, -0.20, 0.10],
+        "nifty_ret": [0.05, -0.05, 0.05],
+        "deployed": [1.0, 1.0, 1.0],
+    })
+    s = rsl.overlap_stats(book)
+    assert s["n_dates"] == 3
+    assert abs(s["mean_return_pct"] - 0.0) < 1e-6          # mean of +10,-20,+10 = 0
+    assert abs(s["worst_date_pct"] - (-20.0)) < 1e-6
+    assert s["pct_dates_positive"] == pytest.approx(66.7, abs=0.1)
+    # non-overlapping curve (dates ~30d apart, hold 20 -> all 3 kept): compound then maxDD
+    nc = rsl.nonoverlap_curve(book, hold_days=20)
+    assert nc["nonoverlap_points"] == 3
+    # equity: 1.1 -> 0.88 -> 0.968 ; peak 1.1 ; maxDD = 0.88/1.1 - 1 = -0.20
+    assert abs(nc["nonoverlap_maxdd_pct"] - (-20.0)) < 1e-6
+    assert abs(nc["nonoverlap_total_return_pct"] - (-3.2)) < 1e-6
+
+
+def test_regime_shadow_ledger_verdict_floor_tradeoff():
+    from advisory import regime_shadow_ledger as rsl
+    # floor cuts drawdown but costs return (the §10 insurance trade-off)
+    regime = {"n_dates": 60, "return_vol_ratio": 0.61, "mean_return_pct": 4.4, "nonoverlap_maxdd_pct": -10.7}
+    nofloor = {"n_dates": 60, "return_vol_ratio": 0.68, "mean_return_pct": 7.3, "nonoverlap_maxdd_pct": -21.7}
+    assert rsl.classify_verdict(regime, nofloor) == "floor_reduces_drawdown_costs_return"
+    # floor improves BOTH risk-adjusted return and drawdown
+    better = {"n_dates": 60, "return_vol_ratio": 0.90, "mean_return_pct": 6.0, "nonoverlap_maxdd_pct": -8.0}
+    assert rsl.classify_verdict(better, nofloor) == "floor_improves_riskadj"
+    # too little data
+    thin = {"n_dates": 5, "return_vol_ratio": 0.9, "mean_return_pct": 6.0, "nonoverlap_maxdd_pct": -8.0}
+    assert rsl.classify_verdict(thin, nofloor) == "needs_more_data"
+
+
+# ---------------------------------------------------------------------------------------------------
+# T2 advisory sizing: regime_exposure_multiplier + portfolio_engine advisory sized-weight (report-only)
+# ---------------------------------------------------------------------------------------------------
+def test_portfolio_risk_regime_exposure_multiplier():
+    from advisory.portfolio_risk import regime_exposure_multiplier, CRASH_FLOOR_EXPOSURE, NEUTRAL_EXPOSURE
+    assert regime_exposure_multiplier("risk_on") == 1.0
+    assert regime_exposure_multiplier("neutral") == NEUTRAL_EXPOSURE
+    assert regime_exposure_multiplier("RISK_OFF") == CRASH_FLOOR_EXPOSURE  # case-insensitive
+    # unknown / None fail OPEN to full exposure (the layer can only be more conservative, never less)
+    assert regime_exposure_multiplier("garbage") == 1.0
+    assert regime_exposure_multiplier(None) == 1.0
+
+
+def test_portfolio_engine_advisory_sized_weight_is_report_only():
+    import json
+    from advisory.portfolio_engine import _advisory_sized_weight_pct
+    # ATR 4% -> vol-target hits the 5% per-name cap; risk_off regime 0.3 -> 1.5% advisory weight
+    row = pd.Series({"context_snapshot_json": json.dumps({"atr_20": 4.0, "adj_close": 100.0})})
+    assert _advisory_sized_weight_pct(row, 1_000_000.0, 0.3) == pytest.approx(1.5, abs=1e-6)
+    # full exposure -> the uncapped-then-capped 5%
+    assert _advisory_sized_weight_pct(row, 1_000_000.0, 1.0) == pytest.approx(5.0, abs=1e-6)
+    # missing / malformed snapshot -> None (never fabricates a size)
+    assert _advisory_sized_weight_pct(pd.Series({"context_snapshot_json": None}), 1_000_000.0, 1.0) is None
+    assert _advisory_sized_weight_pct(pd.Series({"context_snapshot_json": "{not json"}), 1_000_000.0, 1.0) is None
+    assert _advisory_sized_weight_pct(
+        pd.Series({"context_snapshot_json": json.dumps({"atr_20": 4.0, "adj_close": 0.0})}), 1_000_000.0, 1.0) is None
+
+
+# ---------------------------------------------------------------------------------------------------
+# advisory.market_breadth + portfolio_risk.breadth_floor_multiplier (the richer market check)
+# ---------------------------------------------------------------------------------------------------
+def test_market_breadth_compute_counts_above_own_dma():
+    from advisory.market_breadth import compute_breadth
+    dates = pd.date_range("2026-01-01", periods=55, freq="B", tz="UTC")
+    shapes = {
+        "A": lambda i: 100 + i,                       # steadily rising -> above its trailing DMA
+        "B": lambda i: 200 - max(0, i - 40) * 3,      # flat then falling -> below DMA by the end
+        "C": lambda i: 150 + i * 0.5,                 # rising -> above
+    }
+    rows = [{"symbol": s, "date": d, "adj_close": f(i), "raw_close": f(i), "turnover": 1e8}
+            for s, f in shapes.items() for i, d in enumerate(dates)]
+    # an illiquid name must NOT count toward breadth
+    rows += [{"symbol": "D", "date": d, "adj_close": 100 + i, "raw_close": 100 + i, "turnover": 1e6}
+             for i, d in enumerate(dates)]
+    out = compute_breadth(pd.DataFrame(rows), min_price=30.0, min_turnover=5e7)
+    last = out.iloc[-1]
+    assert last["n_universe_50"] == 3                 # A,B,C liquid + have a 50DMA; D excluded (illiquid)
+    assert last["pct_above_50"] == pytest.approx(2 / 3, abs=1e-9)  # A,C above; B below
+    assert last["n_universe_200"] == 0                # 200DMA not defined in 55 days
+
+
+def test_portfolio_risk_breadth_floor_multiplier_uses_yesterday():
+    from advisory.portfolio_risk import breadth_floor_multiplier
+    br = pd.Series([0.60, 0.60, 0.40, 0.40, 0.70])
+    mult = breadth_floor_multiplier(br, healthy_pct=0.50, floor_exposure=0.30)
+    # decision uses YESTERDAY's breadth (no lookahead): day0 NaN->full; below only after a <0.5 prior day
+    assert list(mult) == [1.0, 1.0, 1.0, 0.30, 0.30]
+
+
+def test_regime_shadow_ledger_choose_config_objective():
+    from advisory import regime_shadow_ledger as rsl
+    scored = [
+        {"signal": "none", "threshold": None, "exposure": 1.0, "growth_pct": 50.0, "maxdd_pct": -22.0},
+        {"signal": "breadth", "threshold": 0.50, "exposure": 0.70, "growth_pct": 47.0, "maxdd_pct": -15.0},
+        {"signal": "breadth", "threshold": 0.50, "exposure": 0.30, "growth_pct": 40.0, "maxdd_pct": -7.0},
+    ]
+    # loose guard -> everything passes -> max compounded growth wins (no floor)
+    best, obj, n = rsl.choose_config(scored, -30.0)
+    assert best["signal"] == "none" and obj == "max_growth_within_ruin_guard" and n == 3
+    # -20% guard knocks out no-floor (-22) -> best passing by growth is the light breadth floor (47%, -15)
+    best, obj, n = rsl.choose_config(scored, -20.0)
+    assert best["exposure"] == 0.70 and best["growth_pct"] == 47.0 and n == 2
+    # tight guard nothing clears -> guard BINDS -> pick the shallowest drawdown (most protective), not growth
+    best, obj, n = rsl.choose_config(scored, -5.0)
+    assert best["maxdd_pct"] == -7.0 and obj == "ruin_guard_binds_min_drawdown" and n == 0
+
+
+def test_regime_shadow_ledger_book_from_floor_map_rescales():
+    from advisory import regime_shadow_ledger as rsl
+    d = pd.Timestamp("2026-03-02", tz="UTC")
+    trades = pd.DataFrame({
+        "asof_date": [d, d], "weight_pct": [4.0, 2.0], "floor_multiplier": [0.5, 0.5],
+        "net_return": [0.10, -0.05], "benchmark_return": [0.02, 0.02],
+    })
+    # un-floor -> vol-target weights 0.08/0.04; apply floor map 0.5 -> 0.04/0.02
+    b = rsl._book_from_floor_map(trades, {d: 0.5}).iloc[0]
+    assert abs(b["book_ret"] - (0.04 * 0.10 + 0.02 * -0.05)) < 1e-9
+    assert abs(b["deployed"] - 0.06) < 1e-9
+    # empty floor map -> full un-floored deployment
+    b2 = rsl._book_from_floor_map(trades, {}).iloc[0]
+    assert abs(b2["deployed"] - 0.12) < 1e-9
+
+
+def test_technical_engine_participation_base_neutralize_flag(monkeypatch):
+    from advisory import technical_engine as te
+    strong = pd.Series({"breakout_day_volume_vs_20d": 2.5, "up_down_volume_ratio_20d": 1.3,
+                        "accumulation_days_20d": 5, "distribution_days_20d": 1,
+                        "pullback_volume_dryup_ratio_20d": 0.6})
+    weak = pd.Series({"breakout_day_volume_vs_20d": 0.5, "accumulation_days_20d": 0, "distribution_days_20d": 5})
+    # DEFAULT-OFF: full scoring -> a strong row scores above the midpoint, a weak one below
+    monkeypatch.setattr(te, "NEUTRALIZE_PARTICIPATION_BASE", False)
+    assert te.score_participation(strong) > te._PARTICIPATION_NEUTRAL_VALUE
+    assert te.score_participation(weak) < te._PARTICIPATION_NEUTRAL_VALUE
+    # ENABLED: returns the neutral constant regardless of inputs (removes the counterproductive ranking)
+    monkeypatch.setattr(te, "NEUTRALIZE_PARTICIPATION_BASE", True)
+    assert te.score_participation(strong) == te._PARTICIPATION_NEUTRAL_VALUE
+    assert te.score_participation(weak) == te._PARTICIPATION_NEUTRAL_VALUE
+    # the momentum participation score is NOT gated by the flag (only base was inverted)
+    assert te.score_participation_momentum(strong) == 18.0
+
+
+def test_technical_engine_rs_percentile_swap_flag(monkeypatch):
+    from advisory import technical_engine as te
+    present = pd.Series({"rs_percentile": 80.0, "rs_vs_benchmark": 0.10, "stock_ret_60d": 0.2,
+                         "stock_ret_120d": 0.3, "dist_52w_high": -5})
+    absent = pd.Series({"rs_vs_benchmark": 0.10, "stock_ret_60d": 0.2, "stock_ret_120d": 0.3, "dist_52w_high": -5})
+    # DEFAULT-OFF: current buckets; rs_percentile is IGNORED (same score with or without it)
+    monkeypatch.setattr(te, "RS_USE_PERCENTILE", False)
+    base = te.score_relative_strength(present)
+    assert base == te.score_relative_strength(absent)
+    # ENABLED + rs_percentile present: cross-sectional rank mapped onto the 0-15 slot (80 -> 12.0)
+    monkeypatch.setattr(te, "RS_USE_PERCENTILE", True)
+    assert te.score_relative_strength(present) == pytest.approx(12.0, abs=1e-6)
+    # ENABLED + rs_percentile absent: falls back to the current buckets (never fabricates)
+    assert te.score_relative_strength(absent) == base
+    # capped at the 15 slot
+    assert te.score_relative_strength(pd.Series({"rs_percentile": 100.0})) == 15.0
+
+
+def test_paper_advisory_build_rows_sizes_and_stamps_review_only():
+    from advisory import paper_advisory as pa
+    picks = pd.DataFrame({
+        "symbol": ["A", "B"], "rs_percentile": [95.0, 88.0], "atr_pct": [0.04, 0.10],
+        "close": [100.0, 200.0], "avg_turnover_inr": [1e8, 6e7],
+    })
+    rows = pa.build_advisory_rows(picks, exposure=0.7, capital_inr=1_000_000,
+                                  asof_date=pd.Timestamp("2026-07-10", tz="UTC"), regime_signal="breadth")
+    assert len(rows) == 2
+    a, b = rows
+    # A (ATR 4%): vol-target hits the 5% cap; x0.7 regime exposure -> 3.5% advisory weight
+    assert a["vol_target_weight_pct"] == pytest.approx(5.0) and a["advisory_weight_pct"] == pytest.approx(3.5)
+    assert a["stop_price"] == pytest.approx(90.0)          # 100 * (1 - 2.5*0.04)
+    # B (ATR 10%): sizes DOWN to 3% (risk-budget binds), x0.7 -> 2.1%
+    assert b["vol_target_weight_pct"] == pytest.approx(3.0) and b["advisory_weight_pct"] == pytest.approx(2.1)
+    assert a["rank"] == 1 and b["rank"] == 2
+    # REVIEW-ONLY authority contract on every row -- never broker-capable from this surface
+    for r in rows:
+        assert r["portfolio_authority"] == "none"
+        assert r["broker_execution_allowed"] is False
+        assert r["full_advisory_required"] is True
+        assert r["authority_scope"] == "review_only"
+
+
+def test_paper_advisory_dashboard_renders_picks_track_and_authority():
+    from advisory import paper_advisory as pa
+    result = {"asof_date": "2026-07-10", "policy_version": "rs_v1", "capital_inr": 1_000_000,
+              "context": {"signal": "breadth", "breadth_pct_above_50": 0.7}, "exposure": 1.0,
+              "n_picks": 1, "book_deployment_pct": 5.0, "cash_pct": 95.0,
+              "picks": [{"rank": 1, "symbol": "ACME", "rs_percentile": 99.0, "advisory_weight_pct": 5.0,
+                         "entry_price": 100.0, "stop_price": 90.0, "atr_pct": 0.04, "cost_fraction": 0.004}]}
+    track = {"n_dates": 10, "n_trades": 50, "mean_excess_pct": 8.0, "pct_dates_beat_nifty": 80.0, "series": [1.0, -1.0, 2.0]}
+    html = pa.render_dashboard(result, track)
+    assert "ACME" in html and "99.0" in html                 # the pick renders
+    assert "Recent picks vs NIFTY" in html and "8.0%" in html  # track record shown
+    assert "Review only" in html and "no broker" in html.lower()  # authority banner
+    assert "<svg" in html                                     # sparkline present
+    # empty track record degrades gracefully, no crash
+    assert "no matured results yet" in pa.render_dashboard(result, {"n_dates": 0, "series": []})
+    # standalone wrapper yields a full document
+    doc = pa._standalone(html)
+    assert doc.startswith("<!doctype html>") and "</body></html>" in doc
+
+
+def test_paper_book_decide_action_exit_rules():
+    from advisory.paper_book import decide_action
+    base = dict(entry_price=100.0, stop_price=90.0, days_held=5, rs_now=90.0, missing_days=0,
+                hold_days=20, trim_rs=55.0, max_missing=3)
+    assert decide_action(mark=110.0, **base) == ("HOLD", "")                       # healthy -> hold
+    assert decide_action(mark=89.0, **base) == ("EXIT", "stop_hit")                # mark <= stop
+    assert decide_action(mark=110.0, **{**base, "days_held": 20}) == ("EXIT", "time_cap")
+    assert decide_action(mark=110.0, **{**base, "rs_now": 40.0}) == ("TRIM", "momentum_fade")
+    assert decide_action(mark=89.0, **{**base, "rs_now": 40.0}) == ("EXIT", "stop_hit")  # hard rule beats trim
+    # missing price: tolerated a few days, then exits as a data gap / delist
+    assert decide_action(mark=None, **base) == ("HOLD", "no_price_today")
+    assert decide_action(mark=None, **{**base, "missing_days": 2}) == ("EXIT", "data_gap_or_delisted")
+    # RS unknown (not in liquid panel) -> never trims on it
+    assert decide_action(mark=110.0, **{**base, "rs_now": None}) == ("HOLD", "")
+
+
+def test_operator_api_runtime_ignores_generated_reports(tmp_path):
+    import time
+    from advisory.api import app
+    (tmp_path / "app.py").write_text("x = 1")               # a real source file
+    time.sleep(0.02)
+    rep = tmp_path / "reports"; rep.mkdir()
+    (rep / "daily_book.html").write_text("<html></html>")   # generated, NEWER than the source file
+    mtime, path = app._latest_source_mtime(root=tmp_path)
+    # the newest file on disk is the generated report, but it must be ignored so it never trips
+    # the "API older than source -> restart needed" warning on every cron run
+    assert path == "app.py"
+
+
+def test_operator_api_daily_advisory_payload_is_review_only():
+    from advisory.api.app import build_daily_advisory_payload
+    p = build_daily_advisory_payload()
+    assert p["status"] in ("ok", "missing_table")
+    for key in ("picks", "book_open", "book_summary", "book_actions", "track_record",
+                "context", "freshness", "chain", "operator_boundary", "api_schema"):
+        assert key in p, key
+    assert isinstance(p["chain"], list)  # pipeline health (breadth -> advisory -> book)
+    b = p["operator_boundary"]                                  # the critical invariant: no broker leak
+    assert b["authority_scope"] == "review_only"
+    assert b["broker_execution_allowed"] is False
+    assert b["portfolio_authority"] == "none"
+    assert isinstance(p["picks"], list) and isinstance(p["book_open"], list)

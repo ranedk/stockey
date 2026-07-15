@@ -57,9 +57,7 @@ const sectionCounts = computed(() => ({
 
     <RegimeBanner />
 
-    <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">
-      Could not load the watchlist.
-    </div>
+    <ApiErrorBanner v-if="loadError" :error="loadError" title="Could not load the watchlist" />
     <div v-if="sourceWarnings.length" class="rounded-2xl border border-sun/30 bg-sun/10 px-5 py-4 text-sm text-ink/70">
       <span v-for="(w, i) in sourceWarnings" :key="i">{{ display(w.message) }}{{ i < sourceWarnings.length - 1 ? ' · ' : '' }}</span>
     </div>

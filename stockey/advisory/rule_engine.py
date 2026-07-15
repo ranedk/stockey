@@ -759,6 +759,7 @@ def load_technical(asof_date: pd.Timestamp) -> pd.DataFrame:
                 median_volume_20d,
                 median_volume_60d,
                 rs_vs_benchmark,
+                rs_percentile,
                 sector_peer_ret_20d,
                 sector_peer_count,
                 rs_vs_sector,

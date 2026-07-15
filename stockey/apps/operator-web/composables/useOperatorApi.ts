@@ -40,6 +40,7 @@ export function useOperatorApi() {
     getIdentityIssues: (params: Record<string, unknown> = {}) => get<IdentityIssuesPayload>(`/api/identity-issues${query(params)}`),
     getLlmDecisions: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/llm-decisions${query(params)}`),
     getScorecard: (params: Record<string, unknown> = {}) => get<Record<string, unknown>>(`/api/scorecard${query(params)}`),
+    getDailyAdvisory: () => get<Record<string, unknown>>('/api/advisory/daily'),
     getPrompts: () => get<Record<string, unknown>>('/api/prompts'),
     createPromptVersion: (promptId: string, body: Record<string, unknown>) => post<Record<string, unknown>>(`/api/prompts/${encodeURIComponent(promptId)}/versions`, body),
     activatePromptVersion: (promptId: string, body: Record<string, unknown>) => post<Record<string, unknown>>(`/api/prompts/${encodeURIComponent(promptId)}/activate`, body),

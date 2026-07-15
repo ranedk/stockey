@@ -2,7 +2,7 @@
 import type { ConfigChangeApplicationResult, ConfigChangeApplicationsPayload, ConfigChangePreviewResult, Dict, TechnicalPromotionReviewResult } from '~/types/api'
 
 const api = useOperatorApi()
-const { data, refresh } = await useAsyncData('technical-calibration', () => api.getTechnicalCalibration(12))
+const { data, pending, refresh, error: loadError } = await useAsyncData('technical-calibration', () => api.getTechnicalCalibration(12))
 const { data: reviewsData, refresh: refreshReviews } = await useAsyncData('technical-promotion-reviews', () => api.getTechnicalPromotionReviews(25))
 const { data: applicationsData, refresh: refreshApplications } = await useAsyncData<ConfigChangeApplicationsPayload>('config-change-applications-technical', () => api.getConfigChangeApplications(10))
 const reviewSetupId = ref('EVENT_OPPORTUNITY_V1')
@@ -211,6 +211,9 @@ async function recordConfigApplication() {
       </LinkButton>
     </div>
   </section>
+
+  <ApiErrorBanner v-if="loadError" :error="loadError" title="Could not load the calibration run" />
+  <p v-if="pending" class="mt-6 text-sm text-ink/40">loading…</p>
 
   <section class="mt-6 glass-panel rounded-3xl p-6">
     <div class="flex flex-wrap items-end gap-4">

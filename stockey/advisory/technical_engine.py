@@ -71,6 +71,20 @@ MOMENTUM_ARCHETYPE = "momentum"
 # `base_too_deep` filter is replaced by a `parabolic_extension` guard (reject climactic
 # blow-offs). Env-tunable; the actor/critic tunes these once the sleeve has matured grades.
 MOMENTUM_MAX_EXTENSION_PCT = float(os.getenv("MOMENTUM_ENTRY_MAX_EXTENSION_PCT", "40.0"))
+# T1 sub-score IC (2026-07-14) confirmed the BASE participation score (`score_participation`) has a
+# net-NEGATIVE rank-IC vs forward benchmark-excess -- it ranks the wrong way (high breakout-day volume =
+# exhaustion/fade, not continuation). Reviewed, DEFAULT-OFF opt-in to neutralise its counterproductive
+# differentiation by returning the cap midpoint (a constant -> zero cross-sectional information, scale
+# preserved). NOT auto-applied. Enabling shifts the score distribution, so the buy bar may need
+# recalibration; only the base archetype is affected (momentum participation was ~neutral, not inverted).
+NEUTRALIZE_PARTICIPATION_BASE = os.getenv("TECHNICAL_NEUTRALIZE_PARTICIPATION_BASE", "false").strip().lower() in ("1", "true", "yes", "on")
+_PARTICIPATION_NEUTRAL_VALUE = 10.0  # cap (20) midpoint
+# T1 sub-score IC (2026-07-14): the engine RS sub-score (20d rs_vs_benchmark + absolute 60/120d returns)
+# is out-predicted by the cross-sectional `rs_percentile` (60/120d return rank) -- the signal that drives
+# the paper loop's edge. Reviewed, DEFAULT-OFF opt-in: when enabled AND rs_percentile is on the row, score
+# RS as rs_percentile mapped onto the 0-15 slot; otherwise fall back to the current buckets. NOT auto-applied.
+RS_USE_PERCENTILE = os.getenv("TECHNICAL_RS_USE_PERCENTILE", "false").strip().lower() in ("1", "true", "yes", "on")
+RELATIVE_STRENGTH_CAP = 15.0
 
 
 def evaluate_hard_filters(row: pd.Series, config: dict[str, Any] | None = None, *, archetype: str = "base_breakout") -> dict[str, Any]:
@@ -231,6 +245,10 @@ def score_participation_momentum(row: pd.Series) -> float:
 
 
 def score_participation(row: pd.Series) -> float:
+    if NEUTRALIZE_PARTICIPATION_BASE:
+        # confirmed net-negative-IC sub-score -> return a constant so it adds no (counterproductive)
+        # cross-sectional ranking, without collapsing the 0-100 total scale (reviewed opt-in).
+        return _PARTICIPATION_NEUTRAL_VALUE
     score = 0.0
     breakout_vol = safe_float(row.get("breakout_day_volume_vs_20d")) or 0.0
     up_down_vol = safe_float(row.get("up_down_volume_ratio_20d")) or 0.0
@@ -257,6 +275,12 @@ def score_participation(row: pd.Series) -> float:
 
 
 def score_relative_strength(row: pd.Series) -> float:
+    if RS_USE_PERCENTILE:
+        rs_pct = safe_float(row.get("rs_percentile"))
+        if rs_pct is not None:
+            # cross-sectional RS rank (0-100) mapped onto the 0-15 slot -- the paper-loop signal (reviewed
+            # opt-in). Falls through to the current buckets when rs_percentile is absent on the row.
+            return _clip_score(rs_pct / 100.0 * RELATIVE_STRENGTH_CAP, RELATIVE_STRENGTH_CAP)
     score = 0.0
     rs_benchmark = safe_float(row.get("rs_vs_benchmark")) or 0.0
     rs_sector = safe_float(row.get("rs_vs_sector")) or 0.0

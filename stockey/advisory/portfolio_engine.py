@@ -124,6 +124,16 @@ PORTFOLIO_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS invest_score_pct DOUBLE PRECISION",
 ]
 
+# Advisory-only risk-layer sizing (T2): the vol-target x regime-exposure weight the risk layer WOULD
+# size this position at, alongside the engine's capital-cap `approved_allocation_inr`. Report/compare
+# only -- it does NOT drive execution, authority, or the approved allocation. Separate migration id so
+# the base schema migration's checksum is untouched (migration-drift audit).
+PORTFOLIO_ADVISORY_SIZING_MIGRATION_ID = "20260714_advisory_portfolio_advisory_sizing"
+PORTFOLIO_ADVISORY_SIZING_STATEMENTS = [
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS advisory_sized_weight_pct DOUBLE PRECISION",
+    f"ALTER TABLE {PORTFOLIO_TABLE} ADD COLUMN IF NOT EXISTS advisory_regime_exposure DOUBLE PRECISION",
+]
+
 
 @dataclass(frozen=True)
 class PortfolioConfig:
@@ -207,6 +217,12 @@ def ensure_portfolio_table() -> None:
         description="Create and normalize advisory portfolio order table.",
         statements=PORTFOLIO_SCHEMA_STATEMENTS,
         metadata={"module": "advisory.portfolio_engine", "tables": [PORTFOLIO_TABLE]},
+    )
+    apply_schema_migration(
+        migration_id=PORTFOLIO_ADVISORY_SIZING_MIGRATION_ID,
+        description="Advisory-only risk-layer sized-weight + regime-exposure columns (report/compare only).",
+        statements=PORTFOLIO_ADVISORY_SIZING_STATEMENTS,
+        metadata={"module": "advisory.portfolio_engine", "tables": [PORTFOLIO_TABLE], "authority": "advisory_only"},
     )
 
 
@@ -728,6 +744,22 @@ def derive_thesis_policy(row: pd.Series) -> dict[str, Any]:
     }
 
 
+def _advisory_sized_weight_pct(row: pd.Series, capital_inr: float, regime_exposure: float) -> float | None:
+    """Advisory (report-only) vol-target x regime-exposure weight the risk layer WOULD size this position
+    at -- ATR% read from the point-in-time context snapshot. None when ATR is unavailable. This NEVER
+    drives `approved_allocation_inr`, authority, or execution; it is surfaced for shadow comparison."""
+    try:
+        from advisory.portfolio_risk import size_position
+        snapshot = json.loads(row.get("context_snapshot_json") or "{}")
+        atr_20, adj_close = snapshot.get("atr_20"), snapshot.get("adj_close")
+        if not atr_20 or not adj_close or float(adj_close) <= 0:
+            return None
+        base = size_position(float(capital_inr), float(atr_20) / float(adj_close)).get("weight_pct")
+        return round(float(base) * float(regime_exposure), 3) if base is not None else None
+    except Exception:
+        return None
+
+
 def build_portfolio_orders(
     *,
     asof_date: pd.Timestamp | None = None,
@@ -813,6 +845,16 @@ def build_portfolio_orders(
         pass
     single_position_cap_overrides = get_single_position_cap_overrides()
 
+    # Advisory-only regime exposure (T2): pre-committed multiplier from the resolved 3-state market
+    # regime, used ONLY to populate the advisory sized-weight column. Fail-open to full exposure.
+    try:
+        from advisory.regime_admission_policy import resolve_active_policy
+        from advisory.portfolio_risk import regime_exposure_multiplier
+        advisory_regime_state = str((resolve_active_policy(asof_date, record_if_missing=False) or {}).get("state") or "neutral")
+        advisory_regime_exposure = regime_exposure_multiplier(advisory_regime_state)
+    except Exception:
+        advisory_regime_exposure = 1.0
+
     for idx, (_, row) in enumerate(working.iterrows(), start=1):
         setup_id = str(row["setup_id"]).upper()
         single_position_cap = float(config.capital_inr) * float(single_position_cap_overrides.get(setup_id, config.single_position_cap_pct))
@@ -878,6 +920,8 @@ def build_portfolio_orders(
                 "position_state": portfolio_position_state(status, approved),
                 "priority_score": row["priority_score"],
                 "invest_score_pct": row.get("invest_score_pct"),
+                "advisory_sized_weight_pct": _advisory_sized_weight_pct(row, config.capital_inr, advisory_regime_exposure),
+                "advisory_regime_exposure": advisory_regime_exposure,
                 "overlap_group": overlap_group,
                 "overlap_reason": overlap_reason,
                 "event_class": row.get("event_class"),
@@ -914,6 +958,8 @@ def persist_portfolio_orders(df: pd.DataFrame) -> None:
         "portfolio_capital_inr",
         "priority_score",
         "invest_score_pct",
+        "advisory_sized_weight_pct",
+        "advisory_regime_exposure",
         "score_impact",
         "requested_allocation_inr",
         "approved_allocation_inr",

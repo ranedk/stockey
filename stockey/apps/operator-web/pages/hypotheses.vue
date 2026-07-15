@@ -1,6 +1,6 @@
 <script setup lang="ts">
 const api = useOperatorApi()
-const { data, refresh } = await useAsyncData('hypotheses', () => api.getHypotheses(100))
+const { data, pending, refresh, error: loadError } = await useAsyncData('hypotheses', () => api.getHypotheses(100))
 
 const form = reactive({
   title: '',
@@ -444,6 +444,9 @@ function conditionSummary(row: Record<string, unknown>) {
       Add a playbook, scan news and announcements, then let the action planner decide what else to check and what safe operator action to consider. Trusted overlays can affect consolidated actions only as review-only signals.
     </p>
   </section>
+
+  <ApiErrorBanner v-if="loadError" :error="loadError" title="Could not load playbooks" />
+  <p v-if="pending" class="mt-6 text-sm text-ink/40">loading…</p>
 
   <p v-if="error" class="mt-6 rounded-3xl border border-ember/30 bg-ember/10 p-4 text-sm font-semibold text-ember">{{ error }}</p>
 

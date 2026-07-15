@@ -68,6 +68,15 @@ crash) — a capital-protection rule, allowed to be a simple documented rule, no
 
 ## 3. The scoring model — the heart, and the first build
 
+> **Measured 2026-07-14 (`advisory/subscore_ic.py`, T1 descriptive half).** The belief below is now
+> tested: on 13 months / 1,708 liquid names, NO sub-score has robust cross-regime selection alpha.
+> Every positive-IC component (trend, structure_momentum, rs, structure_base) is favorable-regime-only
+> (IC alive when NIFTY>50DMA, ~0 or inverted in a weak tape) → `benchmark_beta_not_alpha`; the scorer's
+> edge is rising-tape beta, not all-weather selection — an independent IC-side confirmation of §9/§10
+> (the cycle dominates the archetype). `participation_base` is robustly INVERTED (`do_not_relax`), and
+> the engine `rs` sub-score is NOT the `rs_percentile` that actually works (§9). This is why the loop
+> below stays DESCRIPTIVE: reweighting on ~13 blocks (§8.1) would fit rising-tape beta. See todo.md T1.
+
 Today the sub-scores (trend / structure / participation / RS / tradability), the 78 buy bar, and the
 sub-score minimums are all **hand-set arithmetic** — a belief about what predicts, never measured.
 

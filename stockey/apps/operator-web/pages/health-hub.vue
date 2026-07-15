@@ -39,9 +39,7 @@ function display(value: unknown) {
       </p>
     </header>
 
-    <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">
-      Could not load the health hub.
-    </div>
+    <ApiErrorBanner v-if="loadError" :error="loadError" title="Could not load the health hub" />
     <p v-if="pending" class="text-sm text-ink/40">loading…</p>
 
     <div v-if="skipped.length" class="rounded-2xl border border-rust/20 bg-rust/5 px-5 py-4 text-sm text-rust">

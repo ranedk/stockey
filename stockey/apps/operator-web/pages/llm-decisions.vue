@@ -66,9 +66,7 @@ function goPrev() { offset.value = Math.max(0, offset.value - limit) }
       </p>
     </header>
 
-    <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">
-      Could not load decisions. The API may be down, or no decisions have been generated yet.
-    </div>
+    <ApiErrorBanner v-if="loadError" :error="loadError" title="Could not load decisions" />
 
     <div v-if="llmDisabled" class="rounded-2xl border border-ink/15 bg-white/70 px-5 py-4 text-sm text-ink/65">
       <span class="font-black text-ink/80">LLM direct authority is OFF</span> (master flag defaults off).

@@ -78,7 +78,7 @@ async function addPrompt() {
       </p>
     </header>
 
-    <div v-if="loadError" class="rounded-2xl border border-rust/25 bg-rust/10 px-5 py-4 text-sm text-rust">Could not load prompts.</div>
+    <ApiErrorBanner v-if="loadError" :error="loadError" title="Could not load prompts" />
     <p v-if="pending" class="text-sm text-ink/40">loading…</p>
 
     <div class="flex justify-end">
@@ -91,6 +91,8 @@ async function addPrompt() {
       <button class="rounded-full border border-moss/30 bg-moss/10 px-4 py-2 text-sm font-semibold text-moss hover:bg-moss/20 disabled:opacity-40"
               :disabled="busy === '__new__' || !newId.trim()" @click="addPrompt">Create</button>
     </div>
+
+    <p v-if="!prompts.length && !pending" class="rounded-2xl border border-dashed border-black/15 bg-white/60 px-5 py-8 text-center text-sm text-ink/55">No prompts yet.</p>
 
     <div v-for="(p, idx) in prompts" :key="idx" class="rounded-2xl border border-ink/10 bg-white/60 p-5">
       <div class="flex flex-wrap items-center gap-3">

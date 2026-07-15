@@ -95,6 +95,65 @@ Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`, esp. §8 — t
   rows (:6512) — no candidate→approved→BUY promotion bridge ([P-LLM-AUTH] unbuilt). **The audit already
   surfaced a real warning to chase: 99 PASS_NOW rows are neither BUY_TRIGGERED nor override-sourced**
   (a provenance gap). Part B (the paper decision loop) is the next pass on this verified ground.
+- **Paper loop OPERATORIZED into a REVIEW-ONLY daily advisory (2026-07-14)** — the working edge, finally
+  surfaced. The paper loop's forward scorer SKIPS the latest (unmatured) date, so today's live picks were
+  never shown. NEW `advisory/paper_advisory.py` (+ table `advisory_daily_advisory`, migration, CLI) builds
+  the operator's daily advisory: today's RS>=80 picks, each vol-target sized × the DATA-SELECTED regime
+  floor (breadth @0.70 → currently full deployment since breadth 0.70 is healthy), ATR stop, name-specific
+  cost, + market context (breadth, deployment%, cash%). REVIEW-ONLY by contract: portfolio_authority=none,
+  broker_execution_allowed=false, full_advisory_required=true — no broker, no action queue. CRON-WIRED
+  (2026-07-14): the coherent daily chain price_adjustment(38) → market_breadth(39) → paper_decision_loop(40)
+  → regime_shadow_ledger(42, floor config) → paper_advisory(43); NEW wrappers all_market_breadth.sh /
+  all_regime_shadow_ledger.sh / all_paper_advisory.sh; crontab regenerated (28→31 jobs), cron_preflight +
+  migration-drift clean. Test: sizing (5% cap / high-ATR down-size) × exposure, ATR stop, review-only
+  authority stamped on every row. So the one measured edge now produces a daily operator decision.
+  **OPERATOR DASHBOARD (2026-07-14):** `paper_advisory` also renders a self-contained HTML dashboard on
+  each run (`reports/daily_advisory.html`, env `PAPER_ADVISORY_HTML_PATH`; gitignored) — today's picks with
+  size/stop/cost, market-health chips (breadth, deployment, the ×exposure dial), and a TRACK-RECORD panel
+  from matured paper-loop trades (currently +8.0% avg excess/rebalance, 79% of dates beat NIFTY, 63 matured
+  dates) with an up/down sparkline. Theme-aware, review-only badge. So the operator sees today's list next
+  to how recent picks actually did. Test: renders picks/track/authority + empty-track graceful + standalone wrap.
+- **ALWAYS-ON PAPER BOOK SHIPPED (2026-07-14) — the exit side; closes the entry-only gap.** The advisory only
+  emitted BUYs, so a paper-trader would never get a SELL. NEW `advisory/paper_book.py` (+ table
+  `advisory_paper_book`, migration; `advisory/paper_book_report.py` dashboard) assumes EVERY daily RS BUY was
+  taken and manages each to EXIT: pure `decide_action` → HOLD / TRIM / EXIT with reason — stop hit, 20-day
+  time cap, momentum fade (RS<`PAPER_BOOK_TRIM_RS`=55), or data-gap/delist (no price for `MAX_MISSING_DAYS`=3,
+  which deliberately SURFACES the always-trading edge cases). Dedup (no pyramiding a held symbol); marks/returns
+  on adj_close; realized + unrealized P&L and excess vs NIFTY over each name's actual window; CA-mid-hold flag.
+  `run_book` does daily-incremental or `--backfill-from` to populate. **Backfilled 2026-05-15→07-10: 30 open /
+  51 closed; textbook trend payoff — time_cap 41 exits +13.4% (excess +11.7%), stop_hit 10 exits −14.6%;
+  blended realized +7.9% (excess +6.7%, 65% win).** Operator book dashboard (`reports/daily_book.html`, env
+  `PAPER_BOOK_HTML_PATH`, gitignored): today's actions (exit/trim/buy with P&L), the open book with a per-name
+  signal + stop-distance + flags, realized track-record panel + sparkline. CRON-WIRED at 44 21 (after the
+  advisory); `all_paper_book.sh`; crontab regenerated (31→32 jobs), cron_preflight + migration-drift clean.
+  Review-only (portfolio_authority=none, no broker). Test: decide_action rule precedence (stop>time>trim, data-
+  gap tolerance, RS-unknown). So the system now gives entries AND exits — an always-trading paper model.
+- **ADVISORY WIRED INTO THE OPERATOR FRONTEND (2026-07-15).** The recommendations were only in standalone
+  HTML, so the operator (looking at operator-web) saw the funnel's ~no-BUYs. NEW read-only endpoint
+  `GET /api/advisory/daily` (`build_daily_advisory_payload`, reads advisory_daily_advisory + advisory_paper_book
+  persisted tables, computes the book view in pandas; review-only operator_boundary) + NEW page
+  `apps/operator-web/pages/advisory.vue` (top-nav "Advisory"): today's actions (exit/trim/buy with P&L),
+  today's picks (size/stop/cost), the open book with a per-name HOLD/TRIM/EXIT StatusPill + ⚑ flags, and the
+  realized-vs-NIFTY tiles. Matches existing conventions (useOperatorApi/useAsyncData, MetricTile/StatusPill/
+  SymbolLink, Tailwind palette). `npm run typecheck` green; payload contract test asserts review-only/no-broker.
+  **DAILY-HOME + FRESHNESS pass (2026-07-15):** payload gains a `freshness` block (asof vs latest market day,
+  is_current, generated_at, flagged) and a `chain` health list (breadth→advisory→book last-date/rows/current).
+  Advisory page now shows a Current/Behind pill, a stale-data banner + flagged-position warning (no silent
+  fallback), a 3-step pipeline-health strip (maintenance at a glance) linking to Operations, a track-record
+  sparkline vs NIFTY, and explicit empty states. Restart banner reworded/de-alarmed (amber, "API running
+  older code — restart to serve current data" + why) — the reports/ staleness false-positive is separately
+  fixed. typecheck green; contract test extended for freshness/chain.
+  **BROAD CONSISTENCY SWEEP (2026-07-15):** audited all 20 operator-web pages. Fixed the real gaps — 2 pages
+  silently swallowed load errors (`hypotheses.vue`, `technical-calibration.vue`: added `error`/`pending` +
+  ApiErrorBanner + loading), added a `prompts.vue` empty state, and unified error UX by swapping 7 hand-rolled
+  rust blocks (health-hub/scorecard/workbench/positions/llm-decisions/recommendations-unified/watchlist) that
+  discarded the real error → `ApiErrorBanner` (now shows the actual API message, a maintenance win). Result:
+  ApiErrorBanner adoption 8→18 pages, zero hand-rolled error blocks, every data page surfaces errors. Every
+  `<table>` was already `overflow-x-auto` (no mobile gaps). typecheck green; diff clean.
+- **FIXED (2026-07-15) operator-API false "restart needed" warning.** `_latest_source_mtime` (advisory/api/app.py)
+  scanned `.html` under the repo, so the `reports/*.html` dashboards (rewritten every cron run) were always
+  newer than the API process → the "Running API process is older than source files" banner reappeared after
+  every restart. Added `reports` to the ignored dirs (like `logs`/`data`/`live_dashboard`); regression test.
 - **Coherent paper decision loop SHIPPED (Part B, 2026-07-13)** — the clean forward-tracked path that
   finally generates real outcomes, built on the verified substrate. NEW `advisory/paper_decision_loop.py`
   (+ table `advisory_paper_decision_loop`, migration): BYPASSES the funnel (no promotion bridge needed) —
@@ -241,7 +300,34 @@ second-order (§8.4); there is no portfolio-level risk math yet and no net-vs-NI
   net-vs-NIFTY per window. `pytest -q tests/test_advisory_regression.py -k cost_model`.
 - **Confidence.** `verify-first` (cost/impact calibration for Indian mid/small-caps needs a sanity check).
 
-### T1 — Sub-score IC *validation* (descriptive; prescriptive reweighting DEFERRED)
+### T1 — Sub-score IC *validation* (descriptive; prescriptive reweighting DEFERRED)  `[SHIPPED 2026-07-14]`
+
+> **Result: no sub-score has robust cross-regime selection alpha.** NEW `advisory/subscore_ic.py`
+> (+ table `advisory_subscore_ic`, migration `20260714_advisory_subscore_ic`, CLI
+> `python -m advisory.subscore_ic`): regenerates the REAL persisted features over full history with the
+> REAL builder (`build_technical_features(rebuild=True)`, in-memory) and scores them with the REAL engine
+> functions, so the IC is of the ACTUAL sub-scores, not proxies. 1,708 liquid names, ~52k name-days, 55
+> dates, forward benchmark-EXCESS on adj_close (delist-honest, ambiguous-dropped), daily cross-sectional
+> rank-IC + block-bootstrap CIs, plus the two robustness gates that decide the verdict: the REGIME split
+> (NIFTY>50DMA vs weak tape) and walk-forward sign-consistency. **Findings (20d, consistent 5/10/20d):**
+> (1) EVERY positive-IC sub-score is favorable-regime-only and collapses to ~0 or inverts in a weak tape
+> — `trend` fav +0.099/unf +0.013, `structure_momentum` fav +0.096/unf +0.001, `rs` fav +0.072/unf
+> −0.029, `structure_base` fav +0.074/unf −0.031 → verdict `benchmark_beta_not_alpha` for the two
+> significant ones. The scorer's apparent edge is a rising-tape (beta/timing) phenomenon, NOT all-weather
+> selection — an INDEPENDENT confirmation, from the IC side, of the winner-backward + T0.75 cycle finding
+> (the market cycle dominates the archetype). (2) **`participation_base` is robustly INVERTED** — sig
+> negative IC (−0.015/−0.025/−0.027), negative in BOTH regimes → verdict `do_not_relax` (the base
+> distribution-day/breakout-volume score ranks the WRONG way; a concrete fixable defect). (3) the engine
+> `rs` sub-score (rs_vs_benchmark/sector) has NO robust edge and inverts in weak tape — distinct from the
+> standalone `rs_percentile` (63/126/252d cross-sectional rank) that drives the paper loop's +7-8% excess,
+> so the funnel's "RS" != the RS that works. (4) `tradability` has no return content (it is a liquidity
+> gate). NOTHING earns `candidate`. Caveats: small IC magnitudes / marginal CIs / ~13 blocks (the robust
+> result is the uniform fav>>unf ASYMMETRY, not any single IC); 252d-window features mature late in the
+> sample. Tests: rank-IC recovery / block-bootstrap / regime-split / walk-forward / verdict-mapping /
+> delist+ambiguous on synthetic panels. Strategic implication: entry-selection alpha is weak → the
+> leverage is not-losing (T2 risk layer), reinforcing the T0.75 resolution. **Prescriptive reweighting
+> stays DEFERRED** (report/verdict only; no scorer/threshold/authority change). Two defects recorded in
+> Deferred below. Below is the as-built spec.
 
 - **Why.** The scoring function is the heart of every decision and is entirely hand-weighted, and we
   have never measured whether a high sub-score predicts a higher forward return. The *descriptive*
@@ -276,7 +362,75 @@ second-order (§8.4); there is no portfolio-level risk math yet and no net-vs-NI
 - **Confidence.** `verified` (descriptive design grounded in the shipped harness; sub-score functions
   confirmed in `technical_engine.py`).
 
-### T2 — Portfolio & risk layer (the asserted-but-unbuilt "absorb the leaks")  `[SHIPPED 2026-07-13 (report layer)]`
+### T2 — Portfolio & risk layer (the asserted-but-unbuilt "absorb the leaks")  `[SHIPPED 2026-07-13; live hook + shadow ledger 2026-07-14]`
+
+> **Live hook + shadow ledger SHIPPED (2026-07-14), on the T1 evidence that entry-selection alpha is
+> weak (rising-tape beta) → the leverage is not-losing.** Two pieces, both advisory/research-only, zero
+> execution change: (1) `advisory/portfolio_engine.py` now populates two ADVISORY columns per planned
+> position — `advisory_sized_weight_pct` (vol-target `size_position` × the resolved 3-state regime
+> exposure) and `advisory_regime_exposure` (the multiplier) — next to `invest_score_pct`, via a separate
+> migration `20260714_advisory_portfolio_advisory_sizing` so the base-schema checksum is untouched. It
+> NEVER touches `approved_allocation_inr`, `position_state`, or the state-transition contract (execution
+> stays capital-cap-ladder + `broker_execution_allowed=false`). Regime exposure = new pre-committed
+> `portfolio_risk.regime_exposure_multiplier` (risk_on 1.0 / neutral 0.70 / risk_off 0.30; fail-open to
+> full). Low live signal NOW (the funnel produces ~no BUYs) — it is the plumbing so the sized-weight is
+> there when buys appear. (2) `advisory/regime_shadow_ledger.py` (+ table `advisory_regime_shadow_ledger`,
+> migration, CLI) — THE evidence engine: re-books the paper loop's RS pick stream (`advisory_paper_
+> decision_loop`, which persists vol-target `weight_pct` AND `floor_multiplier` separately) under three
+> sizing policies as pure analysis, vs buy-and-hold NIFTY, net of cost. **Result (1,320 evaluated trades,
+> 63 dates, 20d hold):** equal-weight mean +7.19%/hold (vol 10.96, non-overlap maxDD −22.5%); vol-target-
+> no-floor +7.30% (maxDD −21.7% — sizing alone adds ~nothing, picks are ATR-homogeneous); **regime_sized
+> (vol-target × crash floor) +4.36% (vol 7.19, maxDD −10.7%, avg deployment 53.8%)**; NIFTY −0.85%.
+> Verdict `floor_reduces_drawdown_costs_return`: **the floor roughly HALVES drawdown (−22%→−11%) and cuts
+> vol (11%→7%) but costs ~40% of the return** — it does NOT improve average risk-adjusted return (ret/vol
+> 0.61 vs 0.68), it is DRAWDOWN INSURANCE (exactly the §10 "insurance, not alpha", now measured on the
+> real book not just NIFTY). Whether the −22→−11 DD cut is worth ~3pts/hold of return is an operator
+> risk-preference call (for a personal account, usually yes). Caveats: non-overlap curve is only 10
+> points (thin), one regime (the March crash dominates the DD), overlap-inflated per §8.3. Tests: book
+> math per policy / overlap + non-overlap maxDD / verdict; regime multiplier; advisory sized-weight
+> report-only (None when ATR absent, never fabricates). Deferred: wire the LIVE portfolio_engine book
+> (when it has positions) into the ledger as a policy alongside the paper stream. Below is the
+> as-built spec.
+
+> **DATA-SELECTED floor (2026-07-14) — the operator sets an OBJECTIVE, not a threshold** ("I don't want to
+> take decisions as long as data takes it"). Honest boundary first: on this one recovery-tape sample,
+> maximising terminal WEALTH actually favours LIGHT/NO floor (no-floor compounded +49.8% vs breadth-floor
+> +40.9% — the one crash recovered, so full deployment won on growth; the floor only cut drawdown). So
+> "how much to insure against a crash the 13mo didn't contain" is the one irreducible preference. Resolved
+> by pre-committing ONE standard objective: **maximise compounded growth SUBJECT TO a coarse ruin-guard
+> (a wide max-drawdown cap, default −20%, env `SHADOW_LEDGER_RUIN_GUARD_MAXDD`) — "grow the account, never
+> risk ruin"**, not a return/DD tradeoff dial. NEW `select_floor_config` / `choose_config` in
+> `regime_shadow_ledger` (+ table `advisory_regime_floor_config`, migration) sweeps 13 configs
+> (none / nifty×exposure / breadth×threshold×exposure), scores each by non-overlap growth + maxDD, and
+> the objective picks: the −20% guard knocks out no-floor (−21.7% DD), and among survivors the data
+> chooses a **LIGHT breadth floor @ >=0.50, exposure 0.70** (growth +46.7%, maxDD −15.6%, 82% deployed,
+> 12/13 pass, robust) — a gentle trim, NOT the aggressive 0.30 floor. As worse tails accrue the SAME
+> objective tightens it automatically; if nothing clears the guard it flips to min-drawdown (most
+> protective). Descriptive/report-only; changes no live sizing. Tests: choose_config objective (loose
+> guard→max growth, −20→light floor, tight→min-DD binds) + book_from_floor_map rescale.
+
+> **BREADTH market check SHIPPED (2026-07-14) — the richer regime lever (operator: "NIFTY is too simple").**
+> NIFTY is cap-weighted, so a few megacaps mask the market most stocks live in. NEW `advisory/market_breadth.py`
+> (+ table `advisory_market_breadth_daily`, migration, CLI) computes % of the liquid universe above its own
+> 50DMA/200DMA over history from adj_close. **Divergence: NIFTY>50DMA and breadth>=50% AGREE only 67% of
+> days** — 54 narrow-rally days (NIFTY up, market narrow) + 37 hidden-strength days. NEW
+> `portfolio_risk.breadth_floor_multiplier` (sibling of crash_floor_multiplier, point-in-time shift(1),
+> pre-committed 0.50 line). **A breadth floor DOMINATES the NIFTY-50DMA floor on the paper book — robustly
+> across every threshold 0.40-0.60 (not a fitted cut):** at 0.50, regime_sized_breadth returns +5.17%/hold
+> vs the NIFTY floor's +4.36%, drawdown −6.9% vs −10.65%, ret/vol 0.738 vs 0.606 — same-or-better DD, more
+> return, best risk-adjusted, because breadth stays deployed on hidden-strength days and de-risks on narrow
+> rallies. Wired as the `regime_sized_breadth` policy in the shadow ledger (verdict
+> `breadth_floor_dominates_nifty`); NIFTY floor kept for comparison (operator: alongside, breadth preferred).
+> Threshold-FREE (breadth vs own MA) was worse → it is specifically the ~50% LEVEL that is the lever. Tests:
+> compute_breadth counts-above-own-DMA + liquidity filter; breadth_floor_multiplier uses-yesterday. Descriptive
+> measurement, no fitted knob. **T1 CONFIRM (negative, honest): breadth did NOT sharpen the sub-score SELECTION
+> IC split — NIFTY-50DMA is the equal-or-better conditioner there** (fav−unf 20d gaps WIDER under NIFTY:
+> trend .086 vs .076, rs .101 vs .058, structure_base .105 vs .001, structure_momentum .095 vs .065; the
+> "breadth-sharper" rows are all ~0/noise). So breadth and NIFTY do DIFFERENT jobs: breadth is the better
+> RISK/DEPLOYMENT lever (the floor — how much to be invested), NIFTY-50DMA is the better SELECTION-timing
+> conditioner (when stock-picking works). Correctly scoped: breadth wired only into the floor
+> (`portfolio_risk`/ledger); `subscore_ic`'s regime split stays on NIFTY (now validated as the right choice).
+> NOT a universal NIFTY replacement.
 
 > **Shipped as an advisory/report layer** (`advisory/portfolio_risk.py`, `python -m advisory.portfolio_risk`):
 > (1) volatility-targeted `size_position` — risks a fixed % of capital to a 2.5*ATR stop, clamped to
@@ -382,6 +536,38 @@ second-order (§8.4); there is no portfolio-level risk math yet and no net-vs-NI
 
 ## Deferred / Lower Priority
 
+- **[DEFECT DIAGNOSED + reviewed default-OFF fix wired 2026-07-14] `participation_base` sub-score is INVERTED.**
+  `score_participation` (base) has a significant NEGATIVE rank-IC vs forward excess (−0.015/−0.025/−0.027 at
+  5/10/20d), negative in both regimes — verdict `do_not_relax`. **Diagnosed (scratchpad, real subscore_ic
+  build):** the driver is the BREAKOUT-DAY VOLUME term — `breakout_day_volume_vs_20d` has fav-regime IC
+  **−0.111** (high breakout-day volume = climax/EXHAUSTION → fade, not continuation); two other terms also
+  look mis-signed (`distribution_days` +0.025, `pullback_dryup` +0.055, both opposite to how the score
+  treats them), and `up_down_volume_ratio_20d` is an all-NaN dead term. **Fix measured on the TOTAL score
+  (base archetype):** current IC +0.0375 → neutralize participation +0.0465 → invert +0.0557 (monotonic;
+  only invert is nominally significant). Just removing the breakout-vol REWARD barely helped (+0.0387) — to
+  capture the exhaustion insight you must PENALISE it, not merely stop rewarding. **BUT the gain is small,
+  CIs overlap, favorable-regime-only (~13 blocks) → below the bar for a live DEFAULT change (§8.1).** So
+  wired as a **reviewed, DEFAULT-OFF opt-in** (`TECHNICAL_NEUTRALIZE_PARTICIPATION_BASE=false`,
+  `advisory/technical_engine.py`): when enabled, `score_participation` returns the cap midpoint (constant →
+  zero counterproductive cross-sectional ranking, 0-100 scale preserved); default keeps current behavior,
+  momentum participation untouched (it was ~neutral, not inverted). Enabling shifts the score distribution
+  so the buy bar needs recalibration. Test: default-off unchanged / on→constant / momentum unaffected.
+  Not yet enabled anywhere — turn on only after more matured data clears walk-forward + FDR.
+- **[DIAGNOSED + plumbed + reviewed default-OFF fix wired 2026-07-14] the funnel's "RS" != the RS that works.**
+  The engine `score_relative_strength` leans on 20d `rs_vs_benchmark` (IC +0.007 = noise) so the sub-score
+  has no robust IC (fav +0.072 / unf −0.029). **Diagnosed (scratchpad):** the real RS signal is the
+  ~3-month (63d) CROSS-SECTIONAL momentum RANK — `r63_rank` IC +0.049 (fav +0.119 / unf −0.006, the least
+  regime-fragile RS variant), `rs_percentile` (63/126/252d blend) +0.042; the 12-month (252d) rank INVERTS
+  (−0.053, winners fade), so 60/120 is the improved blend. **Swapping rs_percentile into the RS slot lifts
+  the TOTAL score IC the most of any fix: +0.0375 → +0.0582** (fav +0.091 → +0.144). Same caveats (CIs
+  overlap, favorable-regime-only, ~13 blocks) → below the live-DEFAULT bar. **Plumbed + wired (operator:
+  flag + plumb):** `advisory/technical_features.py` now computes a cross-sectional `rs_percentile` (60/120d
+  rank per asof-date, point-in-time) as a persisted column (migration `20260714_advisory_technical_daily_
+  rs_percentile`; added to `ordered_cols` + `rule_engine.load_technical` SELECT); `score_relative_strength`
+  has a reviewed DEFAULT-OFF flag `TECHNICAL_RS_USE_PERCENTILE` that, when on AND rs_percentile present,
+  maps it onto the 0-15 slot, else falls back to the current buckets. Default unchanged; verified the column
+  populates 0-100 cross-sectionally. Test: flag off (ignored) / on→scaled / on+absent→fallback / capped.
+  Not enabled anywhere — turn on only after more matured data clears walk-forward + FDR.
 - **[FIXED 2026-07-13 in the Part-A correctness net] technical_score scale mismatch (0-1 vs 0-100).**
   `rule_engine.py:1217` persists `technical_score`/`setup_score` as 0-1; consumers compared them to
   0-100 thresholds (dead branches; `conviction_score` persisted ~0). Fixed via `advisory/score_scales.py`

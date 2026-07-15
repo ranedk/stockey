@@ -2,6 +2,11 @@
 
 Stockey is an Indian-equity advisory research and operator system.
 
+**New to the system?** Open `docs/stockey_overview.html` in a browser for a layered, plain-English
+explainer &mdash; pick a depth (Overview / How it works / The detail) and tap any term for its meaning.
+The one measured edge (RS-selected, risk-sized, breadth-floored) is surfaced as a **review-only daily
+advisory** via `python -m advisory.paper_advisory` (no broker; the funnel path still produces ~no BUYs).
+
 Core flow:
 
 1. `./complete_data.sh` downloads, parses, and refreshes compact/context evidence from raw data.

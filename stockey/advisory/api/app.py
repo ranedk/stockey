@@ -607,6 +607,22 @@ class ResearchLedgerResponse(OperatorApiResponseModel):
 
 
 
+class DailyAdvisoryResponse(OperatorApiResponseModel):
+    generated_at: str | None = None
+    api_schema: OperatorApiSchemaModel
+    status: str
+    asof_date: str | None = None
+    context: dict[str, Any] = Field(default_factory=dict)
+    freshness: dict[str, Any] = Field(default_factory=dict)
+    chain: list[dict[str, Any]] = Field(default_factory=list)
+    picks: list[dict[str, Any]] = Field(default_factory=list)
+    book_open: list[dict[str, Any]] = Field(default_factory=list)
+    book_summary: dict[str, Any] = Field(default_factory=dict)
+    book_actions: dict[str, Any] = Field(default_factory=dict)
+    track_record: dict[str, Any] = Field(default_factory=dict)
+    operator_boundary: dict[str, Any] = Field(default_factory=dict)
+
+
 class IdentityIssuesResponse(OperatorApiResponseModel):
     generated_at: str | None = None
     api_schema: OperatorApiSchemaModel
@@ -1229,6 +1245,7 @@ def _latest_source_mtime(root: Path = REPO_ROOT) -> tuple[float | None, str | No
         "live_dashboard",
         "logs",
         "node_modules",
+        "reports",
     }
     source_suffixes = {".css", ".html", ".js", ".json", ".py", ".sh", ".ts", ".vue", ".yaml", ".yml"}
     latest_mtime: float | None = None
@@ -6637,6 +6654,155 @@ def _research_ledger_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+DAILY_ADVISORY_TABLE = "advisory_daily_advisory"
+PAPER_BOOK_TABLE = "advisory_paper_book"
+MARKET_BREADTH_TABLE = "advisory_market_breadth_daily"
+
+
+def _daily_advisory_operator_boundary() -> dict[str, Any]:
+    return {
+        "authority_scope": "review_only",
+        "portfolio_authority": "none",
+        "broker_execution_allowed": False,
+        "full_advisory_required": True,
+        "operator_action": "Review today's picks and the managed paper book (assumes every BUY was taken, "
+                           "manages each to a stop / 20-day cap / momentum-fade exit). Research recommendations "
+                           "only -- no order is placed and no portfolio/broker state changes here.",
+    }
+
+
+def build_daily_advisory_payload() -> dict[str, Any]:
+    """Read-only view of the daily RS advisory + the always-on paper book (persisted tables; no recompute)."""
+    endpoint = "/api/advisory/daily"
+    schema = _operator_api_schema(endpoint, schema_name="daily_advisory")
+    now = pd.Timestamp.utcnow().isoformat()
+    boundary = _daily_advisory_operator_boundary()
+    if not _table_exists(DAILY_ADVISORY_TABLE):
+        return {"generated_at": now, "api_schema": schema, "status": "missing_table", "asof_date": None,
+                "context": {}, "freshness": {}, "chain": _advisory_chain_health(None), "picks": [],
+                "book_open": [], "book_summary": {}, "book_actions": {}, "track_record": {},
+                "operator_boundary": boundary}
+
+    picks_df = sql_to_df(
+        f"""SELECT rank, symbol, rs_percentile, advisory_weight_pct, entry_price, stop_price, atr_pct,
+                   cost_fraction, regime_signal, deployment_exposure
+            FROM {DAILY_ADVISORY_TABLE}
+            WHERE asof_date = (SELECT MAX(asof_date) FROM {DAILY_ADVISORY_TABLE})
+            ORDER BY rank""")
+    asof = None
+    context: dict[str, Any] = {}
+    if not picks_df.empty:
+        adf = sql_to_df(f"SELECT MAX(asof_date)::date AS d FROM {DAILY_ADVISORY_TABLE}")
+        asof = str(adf.iloc[0]["d"]) if not adf.empty else None
+        context = {
+            "deployment_exposure": float(picks_df.iloc[0]["deployment_exposure"]) if pd.notna(picks_df.iloc[0]["deployment_exposure"]) else None,
+            "regime_signal": str(picks_df.iloc[0]["regime_signal"]),
+            "book_deployment_pct": round(float(pd.to_numeric(picks_df["advisory_weight_pct"], errors="coerce").sum()), 2),
+            "n_picks": int(len(picks_df)),
+        }
+    if _table_exists(MARKET_BREADTH_TABLE):
+        try:
+            br = sql_to_df(f"SELECT pct_above_50 FROM {MARKET_BREADTH_TABLE} ORDER BY date DESC LIMIT 1")
+            if not br.empty and pd.notna(br.iloc[0]["pct_above_50"]):
+                context["breadth_pct_above_50"] = round(float(br.iloc[0]["pct_above_50"]), 3)
+        except Exception:
+            pass
+
+    book_open: list[dict[str, Any]] = []
+    book_summary: dict[str, Any] = {}
+    book_actions: dict[str, Any] = {}
+    track: dict[str, Any] = {}
+    if _table_exists(PAPER_BOOK_TABLE):
+        bk = sql_to_df(f"SELECT * FROM {PAPER_BOOK_TABLE}")
+        if not bk.empty:
+            for c in ("entry_date", "last_mark_date", "exit_date"):
+                bk[c] = pd.to_datetime(bk[c], utc=True, errors="coerce")
+            open_bk = bk[bk["status"] == "open"].copy()
+            closed = bk[bk["status"] == "exited"].copy()
+            open_view = open_bk.assign(entry_date=open_bk["entry_date"].dt.date.astype(str)).sort_values(
+                "unrealized_return_pct", ascending=False, na_position="last")
+            book_open = _records(open_view[["symbol", "entry_date", "days_held", "entry_price", "last_price",
+                                            "stop_price", "unrealized_return_pct", "entry_rs", "last_action",
+                                            "last_action_reason", "missing_days", "ca_flag"]])
+            ur = pd.to_numeric(open_bk["unrealized_return_pct"], errors="coerce")
+            rr = pd.to_numeric(closed["realized_return_pct"], errors="coerce")
+            rx = pd.to_numeric(closed["realized_excess_pct"], errors="coerce").dropna()
+            book_summary = {
+                "open": int(len(open_bk)), "closed": int(len(closed)),
+                "avg_unrealized_pct": round(float(ur.mean()), 2) if ur.notna().any() else None,
+                "avg_realized_pct": round(float(rr.mean()), 2) if rr.notna().any() else None,
+                "avg_realized_excess_pct": round(float(rx.mean()), 2) if len(rx) else None,
+                "win_rate_pct": round(float((rr.dropna() > 0).mean()) * 100, 0) if rr.notna().any() else None,
+                "flagged": int(((pd.to_numeric(open_bk["missing_days"], errors="coerce").fillna(0) > 0) | open_bk["ca_flag"].fillna(False)).sum()),
+            }
+            latest = pd.concat([bk["last_mark_date"], bk["exit_date"]]).max()
+            if pd.notna(latest):
+                ld = latest.date()
+                ex = closed[closed["exit_date"].dt.date == ld]
+                tw = open_bk[(open_bk["last_action"] == "TRIM") & (open_bk["last_mark_date"].dt.date == ld)]
+                bw = bk[bk["entry_date"].dt.date == ld]
+                book_actions = {
+                    "asof": str(ld),
+                    "exits": _records(ex[["symbol", "exit_reason", "realized_return_pct", "realized_excess_pct", "days_held"]]),
+                    "trims": _records(tw[["symbol", "last_action_reason", "unrealized_return_pct", "days_held"]]),
+                    "buys": _records(bw[["symbol", "entry_rs", "entry_price", "stop_price"]]),
+                }
+            ser = rr.dropna()
+            if len(ser):
+                track = {"n": int(len(ser)), "avg_return": round(float(ser.mean()), 2),
+                         "avg_excess": round(float(rx.mean()), 2) if len(rx) else None,
+                         "win": round(float((ser > 0).mean()) * 100, 0),
+                         "series": [round(float(v), 2) for v in ser.tolist()][-40:]}
+    latest_market = _latest_market_date()
+    generated_at = None
+    try:
+        gen = sql_to_df(f"SELECT MAX(load_ts) AS t FROM {DAILY_ADVISORY_TABLE}")
+        if not gen.empty and pd.notna(gen.iloc[0]["t"]):
+            generated_at = str(pd.Timestamp(gen.iloc[0]["t"]))
+    except Exception:
+        pass
+    freshness = {
+        "asof_date": asof, "latest_market_date": latest_market,
+        "is_current": bool(asof and latest_market and asof == latest_market),
+        "generated_at": generated_at, "flagged": int(book_summary.get("flagged") or 0),
+    }
+    return {"generated_at": now, "api_schema": schema, "status": "ok", "asof_date": asof, "context": context,
+            "freshness": freshness, "chain": _advisory_chain_health(latest_market), "picks": _records(picks_df),
+            "book_open": book_open, "book_summary": book_summary, "book_actions": book_actions,
+            "track_record": track, "operator_boundary": boundary}
+
+
+def _latest_market_date() -> str | None:
+    try:
+        r = sql_to_df("SELECT MAX(date)::date AS d FROM advisory_adjusted_ohlcv_daily")
+        return str(r.iloc[0]["d"]) if not r.empty and pd.notna(r.iloc[0]["d"]) else None
+    except Exception:
+        return None
+
+
+def _advisory_chain_health(latest_market: str | None) -> list[dict[str, Any]]:
+    """One-glance freshness of the advisory cron chain: did each step run and produce data for the latest
+    market day? (Row/last-date freshness is a cheap proxy for 'the chain ran clean'.)"""
+    steps = [
+        ("Market breadth", MARKET_BREADTH_TABLE, "date"),
+        ("Daily advisory", DAILY_ADVISORY_TABLE, "asof_date"),
+        ("Paper book", PAPER_BOOK_TABLE, "last_mark_date"),
+    ]
+    out: list[dict[str, Any]] = []
+    for label, table, datecol in steps:
+        if not _table_exists(table):
+            out.append({"step": label, "table": table, "last_date": None, "rows": 0, "current": False})
+            continue
+        try:
+            r = sql_to_df(f"SELECT MAX({datecol})::date AS d, COUNT(*) AS n FROM {table}")
+            last = str(r.iloc[0]["d"]) if pd.notna(r.iloc[0]["d"]) else None
+            out.append({"step": label, "table": table, "last_date": last, "rows": int(r.iloc[0]["n"]),
+                        "current": bool(latest_market and last == latest_market)})
+        except Exception:
+            out.append({"step": label, "table": table, "last_date": None, "rows": 0, "current": False})
+    return out
+
+
 def build_research_ledger_payload(*, limit: int = 25, offset: int = 0) -> dict[str, Any]:
     endpoint = "/api/research/ledger"
     row_limit = _bounded_limit(limit, default=25, maximum=100)
@@ -8092,6 +8258,10 @@ def create_app():
     @app.get("/api/research/ledger", response_model=ResearchLedgerResponse)
     def research_ledger(limit: int = Query(default=25, ge=1, le=100), offset: int = Query(default=0, ge=0)):
         return _guard(build_research_ledger_payload, route="/api/research/ledger", limit=limit, offset=offset)
+
+    @app.get("/api/advisory/daily", response_model=DailyAdvisoryResponse)
+    def advisory_daily():
+        return _guard(build_daily_advisory_payload, route="/api/advisory/daily")
 
     @app.get("/api/research/prompt-registry", response_model=PromptRegistryResponse)
     def research_prompt_registry(owner_area: str | None = None, authority_scope: str | None = None, limit: int = Query(default=100, ge=0, le=500), offset: int = Query(default=0, ge=0)):

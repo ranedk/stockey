@@ -68,6 +68,13 @@ TECHNICAL_REFRESH_STATUS_SCHEMA_STATEMENTS = [
 TECHNICAL_STOCK_RET_60D_SCHEMA_STATEMENTS = [
     f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS stock_ret_60d DOUBLE PRECISION",
 ]
+# Cross-sectional relative-strength percentile (T1 2026-07-14): the 60/120d cross-sectional return RANK
+# out-predicts the engine's 20d rs_vs_benchmark and is the signal that drives the paper loop's edge.
+# Persisted so score_relative_strength can consume it under a reviewed default-OFF flag. Own migration id.
+TECHNICAL_RS_PERCENTILE_SCHEMA_MIGRATION_ID = "20260714_advisory_technical_daily_rs_percentile"
+TECHNICAL_RS_PERCENTILE_SCHEMA_STATEMENTS = [
+    f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS rs_percentile DOUBLE PRECISION",
+]
 
 
 def _record_technical_features_fallback(
@@ -103,6 +110,12 @@ def ensure_technical_feature_schema() -> None:
         migration_id=TECHNICAL_STOCK_RET_60D_SCHEMA_MIGRATION_ID,
         description="Add persisted 60-day stock return for technical relative-strength scoring.",
         statements=TECHNICAL_STOCK_RET_60D_SCHEMA_STATEMENTS,
+        metadata={"module": "advisory.technical_features", "tables": [TABLE_NAME]},
+    )
+    apply_schema_migration(
+        migration_id=TECHNICAL_RS_PERCENTILE_SCHEMA_MIGRATION_ID,
+        description="Add cross-sectional RS percentile (60/120d rank) for the reviewed RS sub-score swap.",
+        statements=TECHNICAL_RS_PERCENTILE_SCHEMA_STATEMENTS,
         metadata={"module": "advisory.technical_features", "tables": [TABLE_NAME]},
     )
 
@@ -771,6 +784,19 @@ def build_technical_features(
     if effective_to is not None:
         out = out[out["asof_date"] <= effective_to]
 
+    # Cross-sectional relative-strength percentile: rank each name's 60d and 120d trailing return within
+    # its asof-date cross-section, blend, re-rank to 0-100. Point-in-time (trailing returns only; ranked
+    # against the same-day universe). T1 showed this out-predicts the engine's 20d rs_vs_benchmark; the
+    # 252d rank inverts, so 60/120 is the improved blend. Consumed by score_relative_strength iff its
+    # reviewed default-OFF flag is enabled (otherwise this is a diagnostic column only).
+    if not out.empty and "stock_ret_60d" in out.columns:
+        r60 = out.groupby("asof_date")["stock_ret_60d"].rank(pct=True)
+        r120 = out.groupby("asof_date")["stock_ret_120d"].rank(pct=True) if "stock_ret_120d" in out.columns else r60
+        blend = pd.concat([r60, r120], axis=1).mean(axis=1)
+        out["rs_percentile"] = blend.groupby(out["asof_date"]).rank(pct=True) * 100.0
+    else:
+        out["rs_percentile"] = np.nan
+
     ordered_cols = [
         "asof_date",
         "company_master_id",
@@ -812,6 +838,7 @@ def build_technical_features(
         "stock_ret_60d",
         "stock_ret_120d",
         "rs_vs_benchmark",
+        "rs_percentile",
         "sector_peer_ret_20d",
         "sector_peer_count",
         "rs_vs_sector",

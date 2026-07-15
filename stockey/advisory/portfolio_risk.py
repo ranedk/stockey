@@ -38,6 +38,7 @@ STOP_ATR_MULT = float(os.getenv("PORTFOLIO_RISK_STOP_ATR_MULT", "2.5"))     # st
 MAX_HEAT_PCT = float(os.getenv("PORTFOLIO_RISK_MAX_HEAT_PCT", "0.06"))      # sum of open per-position risk budgets
 CRASH_FLOOR_MA_DAYS = int(os.getenv("PORTFOLIO_RISK_CRASH_FLOOR_MA_DAYS", "50"))
 CRASH_FLOOR_EXPOSURE = float(os.getenv("PORTFOLIO_RISK_CRASH_FLOOR_EXPOSURE", "0.30"))
+NEUTRAL_EXPOSURE = float(os.getenv("PORTFOLIO_RISK_NEUTRAL_EXPOSURE", "0.70"))  # regime-label mid state
 TRADING_DAYS = 252
 
 
@@ -125,6 +126,30 @@ def crash_floor_multiplier(index_close: pd.Series, *, ma_days: int = CRASH_FLOOR
     ma = index_close.rolling(ma_days).mean()
     below = index_close.shift(1) < ma.shift(1)
     return pd.Series(np.where(below.fillna(False), floor_exposure, 1.0), index=index_close.index)
+
+
+BREADTH_HEALTHY_PCT = float(os.getenv("PORTFOLIO_RISK_BREADTH_HEALTHY_PCT", "0.50"))  # >= half above 50DMA
+
+
+def breadth_floor_multiplier(breadth_pct: pd.Series, *, healthy_pct: float = BREADTH_HEALTHY_PCT,
+                             floor_exposure: float = CRASH_FLOOR_EXPOSURE) -> pd.Series:
+    """Breadth sibling of crash_floor_multiplier: full exposure when >= healthy_pct of the liquid universe
+    is above its 50DMA, reduced when the market is narrow. Uses YESTERDAY's breadth (shift(1) -> no
+    lookahead into today's decision). Measured to DOMINATE the NIFTY-50DMA floor on this sample (same-or-
+    better drawdown, higher return) because a cap-weighted index misses narrow rallies / hidden strength."""
+    below = breadth_pct.shift(1) < healthy_pct
+    return pd.Series(np.where(below.fillna(False), floor_exposure, 1.0), index=breadth_pct.index)
+
+
+_REGIME_EXPOSURE = {"risk_on": 1.0, "neutral": NEUTRAL_EXPOSURE, "risk_off": CRASH_FLOOR_EXPOSURE}
+
+
+def regime_exposure_multiplier(state: str | None) -> float:
+    """Pre-committed (NOT fitted) exposure multiplier for the resolved 3-state market regime -- the
+    discrete sibling of crash_floor_multiplier, for callers that have a regime LABEL (risk_on / neutral
+    / risk_off) rather than the index series. risk_on=full, neutral=reduced, risk_off=floor. An unknown
+    state fails open to full exposure (this layer can only be MORE conservative, never less)."""
+    return _REGIME_EXPOSURE.get(str(state or "").strip().lower(), 1.0)
 
 
 def equity_stats(returns: pd.Series) -> dict[str, float]:
