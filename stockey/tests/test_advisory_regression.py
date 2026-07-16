@@ -81310,6 +81310,65 @@ def test_factor_graduation_weight_bounded_and_proposal_only():
 
 
 # ---------------------------------------------------------------------------------------------------
+# advisory.factor_tilt -- graduated-factor -> selection connection (no-op by default) + selection shadow
+# ---------------------------------------------------------------------------------------------------
+def _tilt_day():
+    # RS pool of 6 names all >= gate 80; a secondary factor F disagrees with RS ordering.
+    return pd.DataFrame({
+        "symbol": ["A", "B", "C", "D", "E", "F"],
+        "rs_percentile": [99.0, 95.0, 92.0, 88.0, 85.0, 82.0],
+        "factorX": [0.0, 0.0, 0.0, 9.0, 9.0, 9.0],   # favors the weaker-RS names
+    })
+
+
+def test_factor_tilt_no_op_when_no_active_weights():
+    from advisory import factor_tilt as ft
+    day = _tilt_day()
+    # identity: blended score equals the base column exactly
+    score = ft.blend_selection_score(day, base_col="rs_percentile", weights={})
+    assert list(score) == list(day["rs_percentile"])
+    # select_top with empty weights == pure-RS top-N (same names, RS-desc order)
+    picks = ft.select_top(day, base_col="rs_percentile", gate_col="rs_percentile", gate_min=80.0, n=3, weights={})
+    assert list(picks["symbol"]) == ["A", "B", "C"]
+    # a factor the panel does NOT carry is skipped -> still a no-op (fail-safe, not fail-loud)
+    picks2 = ft.select_top(day, base_col="rs_percentile", gate_col="rs_percentile", gate_min=80.0, n=3,
+                           weights={"not_a_column": 0.15})
+    assert list(picks2["symbol"]) == ["A", "B", "C"]
+
+
+def test_factor_tilt_bounded_reorders_within_pool_and_respects_gate():
+    from advisory import factor_tilt as ft
+    day = _tilt_day()
+    # a factor weight nudges the F-favored names up, but the blend is BOUNDED (base rank carries weight 1),
+    # so it refines rather than dominates: the top-RS name is retained, a weaker-RS name is pulled in.
+    picks = ft.select_top(day, base_col="rs_percentile", gate_col="rs_percentile", gate_min=80.0, n=3,
+                          weights={"factorX": 1.0})
+    sel = set(picks["symbol"])
+    assert sel != {"A", "B", "C"}          # tilt reordered the pool
+    assert "A" in sel and "D" in sel and "C" not in sel   # strongest kept; a factor-favored name promoted
+    # the RS floor still gates: a name below the gate can never be selected regardless of factor
+    day2 = pd.concat([day, pd.DataFrame({"symbol": ["Z"], "rs_percentile": [10.0], "factorX": [99.0]})],
+                     ignore_index=True)
+    picks2 = ft.select_top(day2, base_col="rs_percentile", gate_col="rs_percentile", gate_min=80.0, n=6,
+                           weights={"factorX": 1.0})
+    assert "Z" not in set(picks2["symbol"])
+
+
+def test_factor_tilt_selection_shadow_zero_effect_without_weights():
+    import numpy as np
+    from advisory import factor_tilt as ft
+    d = pd.Timestamp("2026-02-02", tz="UTC")
+    day = _tilt_day().assign(date=d, excess=[0.05, 0.04, 0.03, -0.01, -0.02, -0.03])
+    # no active weights -> tilt book == base book -> zero turnover, zero delta
+    res0 = ft.measure_selection_shadow(day, {}, gate_min=80.0, n=3)
+    assert res0["mean_names_changed_per_date"] == 0.0 and res0["tilt_minus_base"] == 0.0
+    # with a proposed weight the shadow MEASURES the (here negative) effect of chasing factorX
+    res1 = ft.measure_selection_shadow(day, {"factorX": 1.0}, gate_min=80.0, n=3)
+    assert res1["mean_names_changed_per_date"] > 0.0
+    assert res1["tilt_fwd_excess"] < res1["base_fwd_excess"]   # factorX would have hurt -> visible before it's live
+
+
+# ---------------------------------------------------------------------------------------------------
 # advisory.regime_shadow_ledger -- pure book-math (T2 shadow ledger: does the regime floor help?)
 # ---------------------------------------------------------------------------------------------------
 def test_regime_shadow_ledger_book_returns_per_policy():

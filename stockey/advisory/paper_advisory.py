@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 
 from advisory.cost_model import round_trip_cost_fraction
+from advisory.factor_tilt import load_active_weights, select_top
 from advisory.paper_decision_loop import (CAPITAL_INR, HOLD_DAYS, MAX_NAMES, POLICY_VERSION,
                                           RS_MIN_PERCENTILE, _load_panel, _rs_percentile)
 from advisory.portfolio_risk import (STOP_ATR_MULT, breadth_floor_multiplier, crash_floor_multiplier,
@@ -132,7 +133,12 @@ def build_daily_advisory(*, asof_date: pd.Timestamp | None = None, capital_inr: 
     if day.empty:
         return {"picks": [], "note": f"no panel rows for {latest.date()}"}
     day["rs_percentile"] = _rs_percentile(day)
-    picks = day[day["rs_percentile"] >= RS_MIN_PERCENTILE].sort_values("rs_percentile", ascending=False).head(MAX_NAMES)
+    # Selection is pure-RS top-N by default. If a factor has GRADUATED and the operator has opted in
+    # (FACTOR_GRADUATION_APPLY_ENABLED), its bounded weight refines the ordering within the RS pool only;
+    # otherwise load_active_weights returns {} and select_top is exactly the pure-RS selection below.
+    tilt_weights = load_active_weights(prefer="applied")
+    picks = select_top(day, base_col="rs_percentile", gate_col="rs_percentile",
+                       gate_min=RS_MIN_PERCENTILE, n=MAX_NAMES, weights=tilt_weights)
 
     exposure, context = current_exposure(latest)
     rows = build_advisory_rows(picks, exposure=exposure, capital_inr=capital_inr, asof_date=latest,
