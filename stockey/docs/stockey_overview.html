@@ -103,6 +103,27 @@
   .def[data-open="1"]{display:block;animation:rise .24s ease both;}
   .def b{font-family:var(--head);font-weight:650;font-size:.82rem;letter-spacing:.02em;}
 
+  /* ---- how-it-maps: flow row + two paths ---- */
+  .maprow{display:flex;flex-wrap:wrap;align-items:stretch;gap:.55rem;margin:1.1rem 0;}
+  .mapcell{flex:1 1 8.5rem;min-width:8.5rem;background:var(--raised);border:1px solid var(--line);
+    border-radius:12px;padding:.8rem .9rem;display:flex;flex-direction:column;gap:.2rem;}
+  .mapcell .mapq{font-family:var(--head);font-size:.64rem;font-weight:700;letter-spacing:.12em;
+    text-transform:uppercase;color:var(--accent);}
+  .mapcell b{font-family:var(--head);font-size:1.05rem;font-weight:640;}
+  .mapcell .mapd{font-size:.88rem;color:var(--muted);line-height:1.4;}
+  .maparrow{align-self:center;color:var(--accent);font-weight:700;font-size:1.15rem;}
+  .paths{display:grid;grid-template-columns:1fr;gap:.8rem;margin:1rem 0;}
+  @media(min-width:620px){.paths{grid-template-columns:1fr 1fr;}}
+  .pathcard{border-radius:12px;padding:.9rem 1rem;border:1px solid var(--line);}
+  .pathcard.weak{background:color-mix(in srgb,var(--warn) 8%,var(--surface));
+    border-color:color-mix(in srgb,var(--warn) 32%,var(--line));}
+  .pathcard.works{background:var(--accent-soft);border-color:color-mix(in srgb,var(--accent) 32%,var(--line));}
+  .pathcard .pathhead{font-family:var(--head);font-size:.68rem;font-weight:700;letter-spacing:.1em;
+    text-transform:uppercase;display:block;margin-bottom:.35rem;}
+  .pathcard.weak .pathhead{color:var(--warn);}
+  .pathcard.works .pathhead{color:var(--accent-ink);}
+  .pathcard p{margin:0;font-size:.93rem;}
+
   /* ---- footer pipeline ---- */
   .flow{margin-top:2rem;background:var(--raised);border:1px solid var(--line);border-radius:14px;
     padding:1.3rem 1.5rem;}
@@ -285,6 +306,40 @@
       <p>Written to a review-only table with an explicit no-broker stamp on <span class="num">every</span>
       row, refreshed by a small scheduled chain each evening after the close: clean prices &rarr; breadth &rarr;
       the momentum book &rarr; the floor setting &rarr; the advisory.</p>
+    </div>
+  </section>
+
+  <section class="card">
+    <span class="tag">The map</span>
+    <h2>Regime, technicals &amp; decisions &mdash; how they connect</h2>
+    <p class="lede">Three questions, in order: <span class="k">how much</span> to invest, <span class="k">which</span> names, and <span class="k">when</span> to get out.</p>
+    <div class="l2 layer">
+      <p>Read one day&rsquo;s call as a chain &mdash; each box answers one question and hands to the next:</p>
+      <div class="maprow">
+        <div class="mapcell"><span class="mapq">How much?</span><b>Regime</b><span class="mapd">Breadth &mdash; are most stocks healthy? Deploy fully, or pull back toward cash.</span></div>
+        <span class="maparrow">&rarr;</span>
+        <div class="mapcell"><span class="mapq">Which?</span><b>Technicals</b><span class="mapd">The part that works: relative strength &mdash; the strongest recent movers.</span></div>
+        <span class="maparrow">&rarr;</span>
+        <div class="mapcell"><span class="mapq">Do what?</span><b>Decision</b><span class="mapd">A review-only buy list, sized &amp; stopped; the book says when to exit.</span></div>
+      </div>
+      <p><b>Regime is the dial, not the picker</b> &mdash; it sets <em>how invested</em> you are, never <em>which</em> stocks. Relative strength picks the names; you approve; nothing trades on its own.</p>
+    </div>
+    <div class="l3 layer">
+      <span class="lbl">The detail &mdash; two paths, side by side</span>
+      <p>Two systems run in parallel, and they connect differently:</p>
+      <div class="paths">
+        <div class="pathcard weak">
+          <span class="pathhead">The elaborate funnel</span>
+          <p>A five-part technical score &rarr; &ldquo;confirmed entry&rdquo; &rarr; &hellip; and <b>stops there</b>. It makes almost no buys &mdash; the last step (turning a good entry into an actual BUY) was never built, and we
+          <button class="term" aria-expanded="false">measured its picking as weak</button><span class="def"><b>MEASURED WEAK</b> &mdash; a high technical score only led to higher returns when the whole market was already rising; in a weak tape it was ~0 or backwards. That&rsquo;s riding the market, not skill.</span>
+          anyway. This is the empty &ldquo;Recommendations&rdquo; screen.</p>
+        </div>
+        <div class="pathcard works">
+          <span class="pathhead">The working path</span>
+          <p>Breadth sizes the book &rarr; relative strength picks the names &rarr; the advisory &amp; the paper book produce the daily decision and manage every exit. This is the <b>Advisory</b> tab &mdash; the one actually earning its keep.</p>
+        </div>
+      </div>
+      <p>So today the fancy technical score is measured, flagged weak, and mostly on the sidelines; the real decisions come from <em>regime-sizing + relative strength</em>.</p>
     </div>
   </section>
 

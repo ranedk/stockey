@@ -43128,27 +43128,34 @@ def test_news_theme_engine_records_active_mapping_load_fallback(monkeypatch):
     assert events[0]["metadata"]["theme_ids"] == ["DEFENSE_INDIGENISATION"]
 
 
-def test_download_runner_stops_on_failure_when_continue_disabled(monkeypatch):
-    monkeypatch.setattr(
-        download_runner,
-        "DOWNLOAD_STEPS",
-        [
-            {"module": "mod.ok", "args": [], "purpose": "test"},
-            {"module": "mod.fail", "args": [], "purpose": "test"},
-            {"module": "mod.skip", "args": [], "purpose": "test"},
-        ],
-    )
+def test_download_runner_runs_all_and_fails_only_on_critical(monkeypatch):
+    # (2026-07-15 hardening) a failing source no longer aborts the pipeline; every step runs, and the
+    # overall status is 'failed' only when a CRITICAL market-data source fails -- non-critical failures
+    # are 'warning' so a flaky macro/fundamentals source can't skip the market downloaders or exit 1.
+    steps = [
+        {"module": "mod.macro", "args": [], "purpose": "macro"},          # non-critical, FAILS first
+        {"module": "mod.bhavcopy", "args": [], "purpose": "market_wide"},  # critical, ok
+        {"module": "mod.after", "args": [], "purpose": "news"},
+    ]
+    monkeypatch.setattr(download_runner, "_steps_for_phase", lambda phase: steps)
+    monkeypatch.setattr(download_runner, "install_resilient_redis", lambda: None)
 
     def fake_run(step: dict[str, object]) -> dict[str, object]:
-        if step["module"] == "mod.fail":
-            return {"module": step["module"], "status": "failed", "returncode": 1}
-        return {"module": step["module"], "status": "ok", "returncode": 0}
-
+        return {"module": step["module"], "status": "failed" if step["module"] == "mod.macro" else "ok", "returncode": 0}
     monkeypatch.setattr(download_runner, "run_download_module", fake_run)
 
     payload = download_runner.run_all_downloads(continue_on_error=False, dry_run=False)
-    assert payload["status"] == "failed"
-    assert [row["module"] for row in payload["results"]] == ["mod.ok", "mod.fail"]
+    assert [row["module"] for row in payload["results"]] == ["mod.macro", "mod.bhavcopy", "mod.after"]  # no abort
+    assert payload["status"] == "warning"  # only a non-critical source failed
+    assert payload["critical_failure"] is False and payload["noncritical_failure"] is True
+
+    # now make the CRITICAL market-data source fail -> failed (surfaced), but all steps still run
+    def fake_run_crit(step: dict[str, object]) -> dict[str, object]:
+        return {"module": step["module"], "status": "failed" if step["module"] == "mod.bhavcopy" else "ok"}
+    monkeypatch.setattr(download_runner, "run_download_module", fake_run_crit)
+    payload2 = download_runner.run_all_downloads(continue_on_error=False, dry_run=False)
+    assert payload2["status"] == "failed" and payload2["critical_failure"] is True
+    assert [row["module"] for row in payload2["results"]] == ["mod.macro", "mod.bhavcopy", "mod.after"]
 
 
 def test_download_runner_classifies_standard_run_statuses():
@@ -44203,8 +44210,10 @@ def test_bhavcopy_downloader_exports_retry_run_state(monkeypatch):
     calls = {"download": 0}
 
     def fake_download(playwright, formatted_date, display_date, rop):
+        # 2026-06-09 fails on EVERY attempt (incl. the in-run retries) so it stays a genuine failure;
+        # a transient one-attempt failure would now be rescued by download_bhavcopy_with_retries.
         calls["download"] += 1
-        return calls["download"] != 2
+        return formatted_date != "2026-06-09"
 
     monkeypatch.setattr(bhavcopy_downloader, "get_redis_client", lambda *args, **kwargs: FakeRedis())
     monkeypatch.setattr(bhavcopy_downloader, "sync_playwright", lambda: FakePlaywrightContext())
@@ -81176,6 +81185,131 @@ def test_subscore_ic_attach_excess_delist_and_ambiguous():
 
 
 # ---------------------------------------------------------------------------------------------------
+# advisory.factor_ic_sweep -- FDR + edge-drift monitor (the "confidence instrument")
+# ---------------------------------------------------------------------------------------------------
+def test_factor_ic_sweep_benjamini_hochberg_step_up():
+    from advisory import factor_ic_sweep as fis
+    # empty -> empty
+    assert fis.benjamini_hochberg([]) == []
+    # one clearly-significant p among nulls: at q=0.10, n=5, sorted rank1 threshold=0.02 -> 0.001 passes
+    sig = fis.benjamini_hochberg([0.001, 0.4, 0.6, 0.8, 0.9], q=0.10)
+    assert sig == [True, False, False, False, False]
+    # step-up: a larger p rides in if a higher-rank p clears its own threshold.
+    # n=4, q=0.5 -> thresholds .125/.25/.375/.5; p=[.10,.20,.30,.40] all <= thresh -> all True
+    assert fis.benjamini_hochberg([0.10, 0.20, 0.30, 0.40], q=0.5) == [True, True, True, True]
+    # nothing significant when every p is large
+    assert fis.benjamini_hochberg([0.5, 0.6, 0.7], q=0.10) == [False, False, False]
+    # NaN p-values are treated as 1.0 (never significant) and don't break ordering
+    assert fis.benjamini_hochberg([0.001, float("nan")], q=0.10)[0] is True
+
+
+def test_factor_ic_sweep_ic_p_value_and_drift_status():
+    import numpy as np
+    from advisory import factor_ic_sweep as fis
+    # degenerate inputs -> p=1.0 (no false significance)
+    assert fis.ic_p_value(0.05, 0.0, 10) == 1.0
+    assert fis.ic_p_value(float("nan"), 0.1, 10) == 1.0
+    assert fis.ic_p_value(0.05, 0.1, 1) == 1.0
+    # a strong t (mean 0.1, sd 0.1, n_eff 100 -> t=10) is highly significant
+    assert fis.ic_p_value(0.10, 0.10, 100) < 1e-6
+    # a weak t (mean 0.01, sd 0.2, n_eff 9 -> t=0.15) is not
+    assert fis.ic_p_value(0.01, 0.20, 9) > 0.5
+    # drift: holding / weakened / flipped / flat / unknown
+    assert fis.drift_status(0.05, 0.06) == "green"
+    assert fis.drift_status(0.02, 0.06) == "amber"      # same sign, decayed below half
+    assert fis.drift_status(-0.03, 0.06) == "red"       # sign flip
+    assert fis.drift_status(0.005, 0.004) == "flat"     # no full-sample edge to drift from
+    assert fis.drift_status(float("nan"), 0.06) == "unknown"
+
+
+def test_factor_ic_sweep_compute_records_fdr_gates_candidate():
+    import numpy as np
+    from advisory import factor_ic_sweep as fis
+    # Build a synthetic excess panel where one factor is a clean cross-regime predictor and one is noise.
+    rng = np.random.default_rng(7)
+    dates = pd.date_range("2025-06-02", periods=60, freq="5D", tz="UTC")
+    rows = []
+    for i, d in enumerate(dates):
+        n = 40
+        signal = rng.normal(size=n)
+        excess = 0.10 * signal + rng.normal(scale=0.02, size=n)   # strong, regime-independent edge
+        rows.append(pd.DataFrame({
+            "date": d, "symbol": [f"S{j}" for j in range(n)],
+            "rs_percentile": signal,                # aliased onto an in-use factor column
+            "dist_52w_high": rng.normal(size=n),    # pure noise
+            "excess": excess,
+            "bench_close": 100.0 + i, "bench_dma50": 100.0,        # all favorable (rising bench) -> exercises regime split
+        }))
+    ex = pd.concat(rows, ignore_index=True)
+    recs = fis.compute_records(ex, pd.DataFrame(), run_date=pd.Timestamp("2026-07-16"))
+    by = {r["factor"]: r for r in recs}
+    assert by["rs_percentile"]["mean_ic"] > 0.3           # the real signal is recovered
+    assert by["rs_percentile"]["fdr_significant"] is True
+    assert by["dist_52w_high"]["fdr_significant"] is False  # noise does not clear FDR
+    assert by["rs_percentile"]["in_use"] is True
+    assert by["rs_percentile"]["drift_status"] in {"green", "amber", "red", "flat", "unknown"}
+
+
+# ---------------------------------------------------------------------------------------------------
+# advisory.factor_graduation -- disciplined graduation state machine (bounded reversible, proposal-only)
+# ---------------------------------------------------------------------------------------------------
+def _grad_eligible_row():
+    return {"fdr_significant": True, "ci_excludes_zero": True, "wf_consistent": True,
+            "fav_ic": 0.06, "unf_ic": 0.04, "drift_status": "green", "n_dates": 40, "mean_ic": 0.05}
+
+
+def test_factor_graduation_eligibility_gates():
+    from advisory import factor_graduation as fg
+    ok, reasons = fg.evaluate_eligibility(_grad_eligible_row())
+    assert ok and reasons == []
+    # beta-not-alpha: unfavorable-regime IC not positive -> ineligible with the named reason
+    beta = {**_grad_eligible_row(), "unf_ic": -0.01}
+    ok, reasons = fg.evaluate_eligibility(beta)
+    assert not ok and "unf_ic<=0_beta_not_alpha" in reasons
+    # drift red and too-few matured dates each block eligibility
+    bad = {**_grad_eligible_row(), "drift_status": "red", "n_dates": 5}
+    ok, reasons = fg.evaluate_eligibility(bad)
+    assert not ok and "drift_red" in reasons and any(r.startswith("matured_dates<") for r in reasons)
+    # not FDR-significant blocks it (multiple-testing luck screened out)
+    ok, reasons = fg.evaluate_eligibility({**_grad_eligible_row(), "fdr_significant": False})
+    assert not ok and "not_fdr_significant" in reasons
+
+
+def test_factor_graduation_state_machine_promotes_and_auto_reverts():
+    from advisory import factor_graduation as fg
+    # accrue eligibility over K runs: observing -> graduating -> ... -> active
+    consec = 0
+    state = None
+    for i in range(fg.K_GRADUATE):
+        consec = fg.next_consecutive(consec, True)
+        state, why = fg.next_state(state, consecutive_eligible=consec, eligible_this_run=True)
+    assert state == fg.STATE_ACTIVE and "graduated" in why
+    assert consec == fg.K_GRADUATE
+    # a single non-eligible run (e.g. drift turned red -> not eligible) auto-reverts an active factor to 0
+    consec2 = fg.next_consecutive(consec, False)
+    reverted, why = fg.next_state(state, consecutive_eligible=consec2, eligible_this_run=False)
+    assert consec2 == 0 and reverted == fg.STATE_REVERTED and "auto-revert" in why
+    # before K runs it only graduates, never active
+    s, _ = fg.next_state(fg.STATE_OBSERVING, consecutive_eligible=1, eligible_this_run=True)
+    assert s == fg.STATE_GRADUATING
+    # a fresh non-eligible candidate just observes
+    s, _ = fg.next_state(None, consecutive_eligible=0, eligible_this_run=False)
+    assert s == fg.STATE_OBSERVING
+
+
+def test_factor_graduation_weight_bounded_and_proposal_only():
+    from advisory import factor_graduation as fg
+    # only an active factor earns weight; it is IC-scaled and hard-capped
+    assert fg.proposed_weight(fg.STATE_GRADUATING, 0.05) == 0.0
+    assert fg.proposed_weight(fg.STATE_ACTIVE, 0.05, cap=0.15, per_ic=2.0) == 0.10
+    assert fg.proposed_weight(fg.STATE_ACTIVE, 0.50, cap=0.15, per_ic=2.0) == 0.15   # capped
+    assert fg.proposed_weight(fg.STATE_ACTIVE, -0.02) == 0.0                          # never negative
+    # applied weight is gated by the default-OFF flag: proposal-only unless explicitly enabled
+    assert fg.applied_weight(0.10, apply_enabled=False) == 0.0
+    assert fg.applied_weight(0.10, apply_enabled=True) == 0.10
+
+
+# ---------------------------------------------------------------------------------------------------
 # advisory.regime_shadow_ledger -- pure book-math (T2 shadow ledger: does the regime floor help?)
 # ---------------------------------------------------------------------------------------------------
 def test_regime_shadow_ledger_book_returns_per_policy():
@@ -81453,3 +81587,50 @@ def test_operator_api_daily_advisory_payload_is_review_only():
     assert b["broker_execution_allowed"] is False
     assert b["portfolio_authority"] == "none"
     assert isinstance(p["picks"], list) and isinstance(p["book_open"], list)
+
+
+def test_download_runner_criticality_status_matrix():
+    from data.download_runner import _overall_download_status as s
+    assert s([("ok", True), ("ok", False)], continue_on_error=False) == "ok"
+    # a flaky NON-critical source (CPI SSL, sharpely) -> warning, NOT a failed run (was exit 1 daily)
+    assert s([("failed", False), ("ok", True)], continue_on_error=False) == "warning"
+    assert s([("source_unavailable", False), ("ok", True)], continue_on_error=False) == "warning"
+    # a CRITICAL (market-data: bhavcopy/indices/ohlcv) source failing -> failed, surfaced loudly
+    assert s([("failed", True)], continue_on_error=False) == "failed"
+    assert s([("failed", True), ("failed", False)], continue_on_error=False) == "failed"
+    # explicit continue_on_error never escalates to failed
+    assert s([("failed", True)], continue_on_error=True) == "warning"
+
+
+def test_download_runner_never_aborts_on_noncritical_failure(monkeypatch):
+    from data import download_runner as dr
+    steps = [
+        {"module": "data.mospi.cpi", "args": [], "purpose": "macro"},                     # non-critical, FAILS first
+        {"module": "data.nseindia.bhavcopy_downloader", "args": [], "purpose": "market_wide"},
+        {"module": "data.nseindia.indices_downloader", "args": [], "purpose": "market_wide"},
+    ]
+    monkeypatch.setattr(dr, "_steps_for_phase", lambda phase: steps)
+    monkeypatch.setattr(dr, "install_resilient_redis", lambda: None)
+    ran = []
+    def fake_run(step):
+        ran.append(step["module"])
+        return {"module": step["module"], "status": "failed" if "cpi" in step["module"] else "ok"}
+    monkeypatch.setattr(dr, "run_download_module", fake_run)
+    out = dr.run_all_downloads(phase="all")
+    # every step ran despite the early CPI failure -> the market downloaders are NOT skipped (the bug)
+    assert ran == [s["module"] for s in steps]
+    # a non-critical failure -> WARNING, not FAILED, so complete_data no longer exits 1 on a CPI outage
+    assert out["status"] == "warning"
+    assert out["noncritical_failure"] is True and out["critical_failure"] is False
+
+
+def test_bhavcopy_downloader_retries_within_run(monkeypatch):
+    from data.nseindia import bhavcopy_downloader as b
+    seq = iter([False, False, True]); calls = []
+    monkeypatch.setattr(b, "download_bhavcopy_for_date", lambda *a, **k: calls.append(1) or next(seq))
+    assert b.download_bhavcopy_with_retries(None, "2026-07-15", "15-Jul-2026", None) is True
+    assert len(calls) == 3                                      # failed twice, succeeded on the 3rd
+    calls.clear()
+    monkeypatch.setattr(b, "download_bhavcopy_for_date", lambda *a, **k: calls.append(1) or False)
+    assert b.download_bhavcopy_with_retries(None, "2026-07-15", "15-Jul-2026", None) is False
+    assert len(calls) == 3                                      # 1 + 2 retries then give up (candidate next run)

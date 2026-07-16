@@ -131,6 +131,17 @@ LOG_DIR={{LOG_DIR}}
 # cap / momentum fade / data-gap). Writes advisory_paper_book + the operator book dashboard. No broker.
 44 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_paper_book.lock ./all_paper_book.sh >> "$LOG_DIR/paper_book.log" 2>&1
 
+# RESEARCH-ONLY confidence instrument: FDR-gated factor-IC sweep + edge-drift monitor over the underused
+# point-in-time data. Faithful full-history feature rebuild (~heavy) -> weekly, Mondays only. Writes
+# advisory_factor_ic_sweep + per-factor verdicts; alerts on in-use-signal drift. No weight/threshold/broker change.
+46 21 * * 1 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_factor_ic_sweep.lock ./all_factor_ic_sweep.sh >> "$LOG_DIR/factor_ic_sweep.log" 2>&1
+
+# RESEARCH-ONLY graduation harness: reads the monitor snapshot and runs the disciplined state machine
+# (candidate earns a bounded reversible weight only after K consecutive eligible runs; auto-reverts on any
+# non-eligible run). Proposal-only unless FACTOR_GRADUATION_APPLY_ENABLED is opted in (defaults OFF). Runs
+# a few minutes after the sweep it depends on. Writes advisory_factor_graduation. No weight/broker change.
+52 21 * * 1 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_factor_graduation.lock ./all_factor_graduation.sh >> "$LOG_DIR/factor_graduation.log" 2>&1
+
 # Research-only evidence refresh. This matures context/event/action-transition
 # evidence daily without running event-model prep/training/scoring and without
 # changing policy, portfolio rows, config, or broker behavior.

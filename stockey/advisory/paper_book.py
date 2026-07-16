@@ -257,9 +257,11 @@ def _stop_mult() -> float:
 def summarize_book(positions: dict, asof) -> dict[str, Any]:
     open_pos = [p for p in positions.values() if p["status"] == "open"]
     closed = [p for p in positions.values() if p["status"] == "exited"]
-    unreal = [p["unrealized_return_pct"] for p in open_pos if p.get("unrealized_return_pct") is not None]
-    real = [p["realized_return_pct"] for p in closed if p.get("realized_return_pct") is not None]
-    real_ex = [p["realized_excess_pct"] for p in closed if p.get("realized_excess_pct") is not None]
+    # pd.notna excludes both None AND NaN -- values loaded back from the DB arrive as NaN, not None,
+    # which would otherwise poison np.mean (the "excess nan%" seen in the summary).
+    unreal = [p["unrealized_return_pct"] for p in open_pos if pd.notna(p.get("unrealized_return_pct"))]
+    real = [p["realized_return_pct"] for p in closed if pd.notna(p.get("realized_return_pct"))]
+    real_ex = [p["realized_excess_pct"] for p in closed if pd.notna(p.get("realized_excess_pct"))]
     return {
         "open": len(open_pos), "closed": len(closed),
         "avg_unrealized_pct": round(float(np.mean(unreal)), 2) if unreal else None,

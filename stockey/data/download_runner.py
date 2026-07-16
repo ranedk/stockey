@@ -53,6 +53,31 @@ DOWNLOAD_STEPS = [*DOWNLOADER_STEPS, *PARSER_STEPS]
 
 PARSER_MODULES = {str(step["module"]) for step in PARSER_STEPS}
 
+# The market-data path (OHLCV / bhavcopy / indices / benchmark). A failure HERE is a real pipeline
+# failure (the advisory chain goes stale). Everything else -- macro (CPI/WPI/RBI/FPI), fundamentals,
+# events, news -- is non-critical: a flaky external source (e.g. the MOSPI CPI API) must NOT abort the
+# run and must NOT skip the market downloaders ordered after it, nor flip the whole run to "failed".
+CRITICAL_PURPOSES = {"market_wide", "benchmark_sync", "dhan_ohlcv_precheck"}
+
+
+def _is_critical(step: dict[str, Any]) -> bool:
+    return str(step.get("purpose", "")) in CRITICAL_PURPOSES
+
+
+def _overall_download_status(outcomes: list[tuple[str, bool]], *, continue_on_error: bool) -> str:
+    """Decide the run's status from (per-step status, is_critical) pairs. A non-ok CRITICAL step ->
+    'failed' (exit 1); only non-critical failures -> 'warning' (exit 0, but visible). continue_on_error
+    forces at most 'warning' so an explicit best-effort run never reports 'failed'."""
+    critical_failed = any(status != "ok" and critical for status, critical in outcomes)
+    noncritical_failed = any(status != "ok" and not critical for status, critical in outcomes)
+    if continue_on_error:
+        return "warning" if (critical_failed or noncritical_failed) else "ok"
+    if critical_failed:
+        return "failed"
+    if noncritical_failed:
+        return "warning"
+    return "ok"
+
 
 def _step_phase(step: dict[str, Any]) -> str:
     module_name = str(step.get("module") or "")
@@ -617,20 +642,23 @@ def run_all_downloads(*, continue_on_error: bool = False, dry_run: bool = False,
         }
 
     results: list[dict[str, Any]] = []
-    status = "ok"
+    outcomes: list[tuple[str, bool]] = []
     for step in steps:
+        # Always run every step -- never abort the pipeline on a failure. A non-critical source (macro,
+        # fundamentals, news) failing must not skip the market downloaders/parsers ordered after it; a
+        # critical failure still surfaces via the overall status below (and each result is recorded).
         result = run_download_module(step)
         results.append(result)
-        if result["status"] != "ok":
-            status = "warning" if continue_on_error else "failed"
-            if not continue_on_error:
-                break
+        outcomes.append((str(result.get("status")), _is_critical(step)))
+    status = _overall_download_status(outcomes, continue_on_error=continue_on_error)
     return {
         "status": status,
         "phase": phase,
         "modules": [step["module"] for step in steps],
         "steps": steps,
         "results": results,
+        "critical_failure": any(s != "ok" and c for s, c in outcomes),
+        "noncritical_failure": any(s != "ok" and not c for s, c in outcomes),
     }
 
 

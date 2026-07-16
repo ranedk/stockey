@@ -197,6 +197,20 @@ Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`, esp. §8 — t
   gate (stale NIFTY zeroed rs_vs_benchmark market-wide), Sharpely cache-poisoning fix + encrypted
   v2 endpoint reverse-engineered + fast-source fundamentals, technical-feature bhavcopy fallback,
   data-readiness gate on all long jobs, daily log rotation.
+- **PIPELINE RESILIENCE HARDENING (2026-07-16).** 2-day health check found the advisory chain + paper-book
+  lifecycle all WORKING (exits/time-caps/stops firing, self-consistent), but market data was stuck at 07-14:
+  07-15 (a trading day, dhan had it) never ingested. Root cause: `data.download_runner.run_all_downloads`
+  used `continue_on_error=False` → the FIRST failing source `break`s and ABORTS the pipeline, and
+  `data.mospi.cpi` (SSL flake) + `sharpely_data` are ordered BEFORE `bhavcopy_downloader`/`indices_downloader`
+  → a flaky external macro source skipped the market downloaders AND flipped complete_data to exit 1 daily.
+  FIX: criticality-aware runner — `CRITICAL_PURPOSES = {market_wide, benchmark_sync, dhan_ohlcv_precheck}`;
+  now runs EVERY step (never aborts) and `_overall_download_status` reports `failed` only on a CRITICAL
+  failure, `warning` (exit 0, still visible) for non-critical. Plus `bhavcopy_downloader` gained an in-run
+  empty-retry wrapper (`download_bhavcopy_with_retries`, parity with the indices fix). Tests: criticality
+  matrix + never-aborts + bhavcopy retry; updated 2 tests that encoded the old stop-on-first-failure.
+  **07-15 RE-FETCHED** (the failure was transient): bhavcopy+indices re-downloaded → parsed → adjusted →
+  advisory chain advanced to 07-15 (breadth 0.681, 20 picks; book 30 open/64 closed, +4 buys/+4 time-cap
+  exits). Advisory is CURRENT again. So a flaky CPI/macro source can no longer stall the market feed.
 
 Key learned facts (do not relitigate): entry-confirmation gate is VALIDATED (regret ledger:
 −2.86% forward excess on what it blocks); costly gates are admission/coverage; the "buy strength

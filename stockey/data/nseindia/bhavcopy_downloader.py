@@ -22,6 +22,9 @@ REDIS_PORT = env("REDIS_PORT")
 CDP_ENDPOINT = env("CDP_ENDPOINT")
 REDIS_SET = "nse:downloaded"
 NSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS = max(env.int("NSE_BHAVCOPY_DOWNLOAD_LOOKBACK_DAYS", 365), 1)
+# An empty (0-byte) NSE response is a transient failure, not a real report. Retry it a few times in the
+# same run before giving up for this run (the date stays missing -> re-attempted on the next run too).
+NSE_BHAVCOPY_EMPTY_DOWNLOAD_RETRIES = max(env.int("NSE_BHAVCOPY_EMPTY_DOWNLOAD_RETRIES", 2), 0)
 SOURCE_PREFIX = "bhavcopy"
 SYNC_SOURCE_NAME = "data.nseindia.bhavcopy_downloader"
 STOCKEY_RUN_STATE: dict[str, object] = {}
@@ -139,6 +142,22 @@ def download_bhavcopy_for_date(
         browser.close()
 
 
+def download_bhavcopy_with_retries(
+    playwright,
+    formatted_date: str,
+    display_date: str,
+    rop: redis.Redis,
+) -> bool:
+    """Retry a failed bhavcopy download a few times within the same run (a transient empty/failure often
+    succeeds on a retry). The date also stays a candidate on the next run, so this only tightens the gap."""
+    for attempt in range(NSE_BHAVCOPY_EMPTY_DOWNLOAD_RETRIES + 1):
+        if download_bhavcopy_for_date(playwright, formatted_date, display_date, rop):
+            return True
+        if attempt < NSE_BHAVCOPY_EMPTY_DOWNLOAD_RETRIES:
+            print(f"   retrying bhavcopy {formatted_date} ({attempt + 1}/{NSE_BHAVCOPY_EMPTY_DOWNLOAD_RETRIES})")
+    return False
+
+
 def main() -> int:
     global STOCKEY_RUN_STATE
     rop = get_redis_client(REDIS_HOST, int(REDIS_PORT))
@@ -163,7 +182,7 @@ def main() -> int:
                 formatted_date = date_obj.strftime("%Y-%m-%d")  # 2025-06-19
                 display_date = date_obj.strftime("%d-%b-%Y")  # 19-Jun-2025
 
-                success = download_bhavcopy_for_date(
+                success = download_bhavcopy_with_retries(
                     p, formatted_date, display_date, rop
                 )
                 if success:

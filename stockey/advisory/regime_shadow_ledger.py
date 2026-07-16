@@ -339,6 +339,7 @@ def compute_ledger(trades: pd.DataFrame, *, run_date: pd.Timestamp, hold_days: i
         br_better = (br.get("mean_return_pct", 0) > nf.get("mean_return_pct", 0)
                      and (br.get("nonoverlap_maxdd_pct") or -99) >= (nf.get("nonoverlap_maxdd_pct") or -99))
         per_policy["regime_sized_breadth"]["_verdict"] = "breadth_floor_dominates_nifty" if br_better else "breadth_floor_not_better"
+    now = pd.Timestamp.utcnow()  # wall-clock run time (run_date is the data/maturity frontier, not "when it ran")
     records = []
     for policy, s in per_policy.items():
         records.append({
@@ -351,7 +352,7 @@ def compute_ledger(trades: pd.DataFrame, *, run_date: pd.Timestamp, hold_days: i
             "nonoverlap_points": s["nonoverlap_points"],
             "nonoverlap_total_return_pct": s["nonoverlap_total_return_pct"],
             "nonoverlap_maxdd_pct": s["nonoverlap_maxdd_pct"], "nonoverlap_vol_pct": s["nonoverlap_vol_pct"],
-            "verdict": (verdict if policy == "regime_sized" else s.get("_verdict", "")), "load_ts": run_date,
+            "verdict": (verdict if policy == "regime_sized" else s.get("_verdict", "")), "load_ts": now,
         })
     return records
 
@@ -379,7 +380,8 @@ def run_shadow_ledger(*, hold_days: int | None = None, dry_run: bool = False) ->
             "selected_signal": sel["signal"], "selected_threshold": sel["threshold"],
             "selected_exposure": sel["exposure"], "growth_pct": sel["growth_pct"], "maxdd_pct": sel["maxdd_pct"],
             "deploy_pct": sel["deploy_pct"], "n_passing": floor_selection["n_passing"],
-            "n_configs": floor_selection["n_configs"], "robust": floor_selection["robust"], "load_ts": run_date,
+            "n_configs": floor_selection["n_configs"], "robust": floor_selection["robust"],
+            "load_ts": pd.Timestamp.utcnow(),
         }]), FLOOR_CONFIG_TABLE, unique_keys=["run_date", "hold_days"], timescaledb_column="run_date")
     return {"records": records, "floor_selection": floor_selection, "hold_days": hold, "n_trades": int(len(trades))}
 
