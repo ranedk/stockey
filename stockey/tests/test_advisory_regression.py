@@ -81310,6 +81310,29 @@ def test_factor_graduation_weight_bounded_and_proposal_only():
 
 
 # ---------------------------------------------------------------------------------------------------
+# advisory.deployment_timing -- equity-curve math for the deployment-overlay research
+# ---------------------------------------------------------------------------------------------------
+def test_deployment_timing_curve_stats():
+    import numpy as np
+    from advisory import deployment_timing as dt
+    # exposure set the PRIOR day earns today: with full exposure the strat return == asset return.
+    ret = pd.Series([np.nan, 0.10, -0.05, 0.02])
+    full = pd.Series([1.0, 1.0, 1.0, 1.0])
+    s = dt.curve_stats(ret, full)
+    assert abs(s["deployed"] - 1.0) < 1e-9
+    # a drawdown is captured: returns +10% then -50% (fully deployed) -> equity 1.1 then 0.55, maxDD ~ -50%
+    ret2 = pd.Series([np.nan, 0.10, -0.50])
+    s2 = dt.curve_stats(ret2, pd.Series([1.0, 1.0, 1.0]))
+    assert abs(s2["maxDD"] - (0.55 / 1.10 - 1)) < 1e-9
+    # halving exposure halves participation in the same path -> shallower drawdown than full exposure
+    s3 = dt.curve_stats(ret2, pd.Series([0.5, 0.5, 0.5]))
+    assert s3["maxDD"] > s2["maxDD"]        # less negative = shallower
+    assert s3["deployed"] == 0.5
+    # empty after alignment -> empty dict (no crash)
+    assert dt.curve_stats(pd.Series([np.nan]), pd.Series([1.0])) == {}
+
+
+# ---------------------------------------------------------------------------------------------------
 # advisory.factor_tilt -- graduated-factor -> selection connection (no-op by default) + selection shadow
 # ---------------------------------------------------------------------------------------------------
 def _tilt_day():
