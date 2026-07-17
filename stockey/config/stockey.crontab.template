@@ -142,6 +142,11 @@ LOG_DIR={{LOG_DIR}}
 # a few minutes after the sweep it depends on. Writes advisory_factor_graduation. No weight/broker change.
 52 21 * * 1 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_factor_graduation.lock ./all_factor_graduation.sh >> "$LOG_DIR/factor_graduation.log" 2>&1
 
+# RESEARCH-ONLY selection shadow: pure-RS top-N vs the PROPOSED graduated tilt (forward-excess delta) so the
+# effect is visible BEFORE the apply flag is ever flipped. Cheap SQL short-circuit skips the heavy rebuild
+# until a factor is `active`; runs after graduation. Reads only -- no weight/threshold/broker change.
+56 21 * * 1 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_factor_tilt.lock ./all_factor_tilt.sh >> "$LOG_DIR/factor_tilt.log" 2>&1
+
 # Research-only evidence refresh. This matures context/event/action-transition
 # evidence daily without running event-model prep/training/scoring and without
 # changing policy, portfolio rows, config, or broker behavior.

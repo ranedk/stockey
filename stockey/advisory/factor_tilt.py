@@ -109,7 +109,13 @@ def measure_selection_shadow(ex: pd.DataFrame, weights: dict[str, float], *, bas
 
 
 def run_measurement() -> dict[str, Any]:
-    """Build the faithful factor panel and run the selection shadow with the PROPOSED graduated weights."""
+    """Run the selection shadow with the PROPOSED graduated weights. Short-circuits on a cheap SQL check --
+    an `active` factor is the only thing that produces a proposed weight, so with nothing active we skip the
+    ~100s panel rebuild entirely (the weekly cron stays near-free until there is something real to measure)."""
+    weights = load_active_weights(prefer="proposed")
+    if not weights:
+        return {"active_weights": {}, "skipped_rebuild": True,
+                "note": "no active graduated factors -- nothing to measure (skipped panel rebuild)"}
     from advisory import factor_ic_sweep as fis
     from advisory import subscore_ic as sic
     panel, bench = fis.build_factor_panel()
@@ -117,7 +123,6 @@ def run_measurement() -> dict[str, Any]:
         return {"note": "no panel"}
     ex = sic.attach_excess(panel, bench, fis.HORIZON)
     ex = fis.attach_derived(ex)
-    weights = load_active_weights(prefer="proposed")
     return measure_selection_shadow(ex, weights)
 
 
