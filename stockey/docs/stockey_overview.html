@@ -251,7 +251,11 @@
       <button class="term" aria-expanded="false">stop</button><span class="def"><b>STOP / ATR</b> &mdash; a pre-set exit price. Its distance is a few &ldquo;ATRs&rdquo; (Average True Range = a stock&rsquo;s typical daily swing), so jumpier stocks get wider stops and therefore smaller positions.</span>
       set a few ATRs away, capped at <span class="num">5%</span> a name. In testing, the crash floor cut
       the worst <button class="term" aria-expanded="false">drawdown</button><span class="def"><b>DRAWDOWN</b> &mdash; the biggest peak-to-trough drop in the account along the way. A &minus;20% drawdown means it fell a fifth from its high before recovering.</span>
-      roughly in half &mdash; it&rsquo;s insurance, not extra return.</p>
+      roughly in half &mdash; it&rsquo;s insurance, not extra return. Re-tested on five times more history
+      (<span class="num">2019&ndash;2026</span>, including the COVID crash) the simple floor cut the worst
+      drawdown from about <span class="num">&minus;38%</span> to <span class="num">&minus;12%</span> while
+      keeping the same return &mdash; and a machine-learning version that folded in volatility, foreign flows
+      and interest rates did <em>worse</em>. The plain rule is the ceiling.</p>
     </div>
   </section>
 
@@ -344,13 +348,41 @@
   </section>
 
   <section class="card">
+    <span class="tag">Self-adaptive</span>
+    <h2>Watching its own edge &mdash; and improving, carefully</h2>
+    <p class="lede">Every week it re-checks whether each signal still works &mdash; and only promotes a new one after it <span class="k">proves itself repeatedly</span>.</p>
+    <div class="l2 layer">
+      <p>A system that never adapts goes stale; one that adapts too eagerly fits noise and blows up. So it
+      re-measures each signal&rsquo;s real edge every week &mdash; a
+      <button class="term" aria-expanded="false">monitor</button><span class="def"><b>MONITOR</b> &mdash; a weekly job that re-scores every signal&rsquo;s actual predictive edge and lights it green / amber / red as that edge holds or fades.</span>
+      &mdash; and a
+      <button class="term" aria-expanded="false">graduation</button><span class="def"><b>GRADUATION</b> &mdash; a promotion gate: a new signal must clear a high bar for several weeks running before it earns any say, and is demoted automatically the moment it stops clearing it.</span>
+      gate only lets a new signal earn a say after it clears a high bar many weeks in a row. The moment its
+      edge breaks, it&rsquo;s demoted on its own. Nothing changes on a hunch.</p>
+    </div>
+    <div class="l3 layer">
+      <span class="lbl">The detail</span>
+      <p>To graduate, a signal must be positive in <em>both</em> rising and weak tape, survive
+      <button class="term" aria-expanded="false">false-discovery control</button><span class="def"><b>FALSE-DISCOVERY CONTROL</b> &mdash; when you test many signals at once, a few look good by pure luck. A correction (Benjamini-Hochberg) raises the bar so chance winners aren&rsquo;t mistaken for real ones.</span>
+      across every signal tested together, and show no
+      <button class="term" aria-expanded="false">drift</button><span class="def"><b>DRIFT</b> &mdash; a signal&rsquo;s recent edge fading against its long-run edge. A red drift light demotes it before the decay ever reaches the account.</span>
+      &mdash; for several consecutive weeks. Even then it earns only a <span class="num">small, capped</span>,
+      reversible weight; it stays <span class="num">OFF</span> from real decisions until you opt in; and it
+      can only re-order names <em>within</em> the strong-momentum pool &mdash; never override the risk floor.
+      Today <span class="num">nothing</span> has graduated: across four data families the honest verdict is
+      that no new edge clears the bar &mdash; which is exactly what the gate is for.</p>
+    </div>
+  </section>
+
+  <section class="card">
     <span class="tag">Discipline</span>
     <h2>How we keep ourselves honest</h2>
     <p class="lede">We assume we&rsquo;ll <span class="k">fool ourselves</span>, and design against it.</p>
     <div class="l2 layer">
       <p>Thirteen months isn&rsquo;t much history, so we resist tuning knobs to fit it. New ideas ship switched
-      <em>off</em> and only turn on once more evidence backs them. Every failure or fallback is made
-      visible rather than quietly swallowed.</p>
+      <em>off</em> and only turn on once more evidence backs them. We even threw machine learning at the one
+      place we have the most history &mdash; and a one-line rule still beat it, so we kept the rule. Every
+      failure or fallback is made visible rather than quietly swallowed.</p>
     </div>
     <div class="l3 layer">
       <span class="lbl">The detail</span>
@@ -369,7 +401,8 @@
       <span class="s">Measure the signal</span><span class="arrow">&rarr;</span>
       <span class="s">Lean on what works</span><span class="arrow">&rarr;</span>
       <span class="s">Let data set caution</span><span class="arrow">&rarr;</span>
-      <span class="s">Publish a review-only advisory</span>
+      <span class="s">Publish a review-only advisory</span><span class="arrow">&rarr;</span>
+      <span class="s">Re-check the edge weekly</span>
     </div>
   </div>
 

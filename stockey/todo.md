@@ -211,6 +211,45 @@ Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`, esp. §8 — t
   **07-15 RE-FETCHED** (the failure was transient): bhavcopy+indices re-downloaded → parsed → adjusted →
   advisory chain advanced to 07-15 (breadth 0.681, 20 picks; book 30 open/64 closed, +4 buys/+4 time-cap
   exits). Advisory is CURRENT again. So a flaky CPI/macro source can no longer stall the market feed.
+- **DEEP FACTOR RESEARCH — no selection alpha, confirmed across FOUR data families (2026-07-16).** Swept the
+  underused point-in-time data for cross-sectional 20d forward-excess selection alpha with block-bootstrap
+  CIs + regime split + walk-forward + Benjamini-Hochberg FDR: (1) fundamentals (`advisory_fundamentals_daily`
+  growth/quality/leverage/ownership) — thin/ragged (566 syms), no additive edge; (2) deal-flow (bulk/block/
+  short, full window) — ~0 IC; (3) 30 raw technical features (recomputed over 2847 syms) — **0 of 29 survive
+  FDR**; strongest (`dist_52w_high` IC 0.086) is favorable-regime beta; (4) sector-neutral RS is WORSE (0.007
+  vs 0.029) — Task C answered NO. Decision-relevant nuance: RS's *top quintile* earns +3.10% forward excess
+  in the UNFAVORABLE regime (defensive leadership) even though its whole-distribution IC is weak — so use RS
+  as a top-quintile selector (system already does), not a continuous tilt. A VCP composite has higher headline
+  IC but DEGRADES RS's top quintile. Scratchpad experiments; verdict recorded. So "make it less trivial" = the
+  triviality is close to the whole robust edge this data supports.
+- **DISCIPLINED SELF-ADAPTIVE LAYER SHIPPED (2026-07-16) — monitor → graduate → tilt, proposal-only.** Not a
+  knob-tuner (~13 blocks can't support prescriptive re-fitting, §8.1); a monitor-and-graduate loop that refuses
+  to promote luck or beta. NEW `advisory/factor_ic_sweep.py` (+ table `advisory_factor_ic_sweep`, migration,
+  weekly-Mon cron `all_factor_ic_sweep.sh`): faithful full-history feature rebuild, per-factor rank-IC + regime
+  split + walk-forward + **BH-FDR across the sweep** + **edge-drift** (recent-vs-full IC → green/amber/red) on
+  in-use signals. NEW `advisory/factor_graduation.py` (+ table `advisory_factor_graduation`, `all_factor_
+  graduation.sh`): auditable state machine observing→graduating→active only after K=4 consecutive eligible runs
+  (FDR-significant + CI excl 0 + walk-forward consistent + IC>0 in BOTH regimes + drift green + enough matured
+  dates); auto-reverts to `reverted` (weight→0) on any non-eligible run; an active factor earns a small,
+  IC-scaled, hard-capped, reversible weight — but PROPOSAL-ONLY: `applied_weight`=0 unless
+  `FACTOR_GRADUATION_APPLY_ENABLED` (DEFAULTS OFF). NEW `advisory/factor_tilt.py` (`all_factor_tilt.sh`): the
+  single connection from a graduated weight to live selection — `select_top`/`blend_selection_score` are IDENTITY
+  (pure-RS) with no active weights, tilt only refines ordering WITHIN the RS pool (never overrides the floor),
+  wired into `paper_advisory` (verified no-op: picks unchanged); + a SELECTION shadow (pure-RS vs proposed-tilt
+  top-N, forward-excess delta) that measures BEFORE the flag is flipped, short-circuiting the heavy rebuild until
+  a factor is active. Weekly Mon chain sweep(46)→graduation(52)→tilt-shadow(56). First run: all 29 candidates
+  `observing` with explicit gate reasons — nothing clears the bar (correct). 11 new tests; audits green. This is
+  the disciplined build of the deferred T4/§8.1 daily-discovery-run + trust-gate idea.
+- **DEPLOYMENT-TIMING model FAILS OOS — the simple trend/breadth floor is the ceiling (2026-07-16).** NEW
+  `advisory/deployment_timing.py` (report-only): can a low-capacity walk-forward logistic combining PIT market
+  state (NIFTY vs 50/200DMA, VIX level+chg, FPI equity 20d flow, gsec slope, INR) time deployment better than
+  the single floor? Tested on the well-powered axis (~43 independent 20d blocks, OOS 2019-2026 incl. COVID).
+  **Verdict `simple_floor_is_ceiling`:** the MODEL fails every pre-registered gate (OOS AUC=0.377 — worse than
+  random, worst CAGR 13%, maxDD as deep as always-deployed −38%, beats trend50 in only 1/3 walk-forward thirds);
+  adding VIX/FPI/yields DILUTED the one good signal (trend). But the SIMPLE floor is excellent: trend50/trend200
+  cut worst drawdown ~−38%→−12% while PRESERVING CAGR (Sharpe 0.84→1.03-1.08). Validates the deployment-axis
+  thesis on 5× longer history than breadth alone: the edge is NOT-LOSING, captured by a 1-parameter rule; more
+  features/fitting hurt on BOTH axes.
 
 Key learned facts (do not relitigate): entry-confirmation gate is VALIDATED (regret ledger:
 −2.86% forward excess on what it blocks); costly gates are admission/coverage; the "buy strength

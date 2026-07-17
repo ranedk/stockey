@@ -141,6 +141,16 @@ literature-informed design pass before build.
 
 ## 6. The daily discovery run + trust gate
 
+> **SHIPPED 2026-07-16 (weekly, disciplined form) — see todo.md Current State.** The trust gate below is
+> built as `advisory/factor_ic_sweep.py` (monitor: rank-IC + regime split + walk-forward + **BH-FDR** across
+> the sweep + edge-drift green/amber/red) → `advisory/factor_graduation.py` (state machine: a factor goes
+> `active` only after K=4 consecutive runs clearing FDR + CI-excl-0 + walk-forward + IC>0 in BOTH regimes +
+> drift-green + enough matured labels; **auto-reverts** to weight 0 on any non-eligible run) →
+> `advisory/factor_tilt.py` (a bounded, reversible, PROPOSAL-ONLY weight — `applied_weight`=0 unless
+> `FACTOR_GRADUATION_APPLY_ENABLED`, DEFAULTS OFF — that only refines ordering WITHIN the RS pool, with a
+> selection shadow measuring the effect first). Weekly, not daily (§8.1). First run: nothing graduates —
+> across four data families no new edge clears the bar. IC-drift is a warning light only (§8.2), as required.
+
 - **Daily run:** re-fit the IC-optimal scoring weights on recent data; report what moved, whether it
   is robust (walk-forward + multi-definition), and the IC-drift state — a human-legible "what can we
   do better" report.
