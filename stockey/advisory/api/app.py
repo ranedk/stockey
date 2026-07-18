@@ -6712,6 +6712,7 @@ def build_daily_advisory_payload() -> dict[str, Any]:
     book_summary: dict[str, Any] = {}
     book_actions: dict[str, Any] = {}
     track: dict[str, Any] = {}
+    book_marks: dict[str, dict[str, Any]] = {}   # symbol -> return-since-decision + current mark, from the open book
     if _table_exists(PAPER_BOOK_TABLE):
         bk = sql_to_df(f"SELECT * FROM {PAPER_BOOK_TABLE}")
         if not bk.empty:
@@ -6724,6 +6725,14 @@ def build_daily_advisory_payload() -> dict[str, Any]:
             book_open = _records(open_view[["symbol", "entry_date", "days_held", "entry_price", "last_price",
                                             "stop_price", "unrealized_return_pct", "entry_rs", "last_action",
                                             "last_action_reason", "missing_days", "ca_flag"]])
+            for _, br_ in open_bk.iterrows():
+                book_marks[str(br_["symbol"])] = {
+                    "entry_price": float(br_["entry_price"]) if pd.notna(br_["entry_price"]) else None,
+                    "current_price": float(br_["last_price"]) if pd.notna(br_["last_price"]) else None,
+                    "return_since_pct": round(float(br_["unrealized_return_pct"]), 2) if pd.notna(br_["unrealized_return_pct"]) else None,
+                    "decision_date": br_["entry_date"].date().isoformat() if pd.notna(br_["entry_date"]) else None,
+                    "days_held": int(br_["days_held"]) if pd.notna(br_["days_held"]) else None,
+                }
             ur = pd.to_numeric(open_bk["unrealized_return_pct"], errors="coerce")
             rr = pd.to_numeric(closed["realized_return_pct"], errors="coerce")
             rx = pd.to_numeric(closed["realized_excess_pct"], errors="coerce").dropna()
@@ -6753,6 +6762,41 @@ def build_daily_advisory_payload() -> dict[str, Any]:
                          "avg_excess": round(float(rx.mean()), 2) if len(rx) else None,
                          "win": round(float((ser > 0).mean()) * 100, 0),
                          "series": [round(float(v), 2) for v in ser.tolist()][-40:]}
+    # Enrich each pick with return-since-the-buy-decision + the current price. A pick already in the open
+    # book uses the book's authoritative entry/mark; a fresh pick (decided today, not yet in the book) uses
+    # the latest market price, so return-since is ~0 the day it is first recommended.
+    if not picks_df.empty:
+        sym_list = picks_df["symbol"].astype(str).tolist()
+        latest_px: dict[str, float] = {}
+        try:
+            lp = sql_to_df(
+                "SELECT DISTINCT ON (symbol) symbol, adj_close FROM advisory_adjusted_ohlcv_daily "
+                "WHERE symbol = ANY(%(s)s) ORDER BY symbol, date DESC", params={"s": sym_list})
+            latest_px = {str(s): float(p) for s, p in zip(lp["symbol"], lp["adj_close"]) if pd.notna(p)}
+        except Exception:
+            pass
+        ent, cur, ret, dec, held = [], [], [], [], []
+        for _, pr in picks_df.iterrows():
+            sym = str(pr["symbol"])
+            mk = book_marks.get(sym)
+            ep = float(pr["entry_price"]) if pd.notna(pr["entry_price"]) else None
+            if mk:
+                # held name: show the DECISION entry so entry -> current -> since are self-consistent
+                ent.append(mk["entry_price"] if mk["entry_price"] is not None else ep)
+                cur.append(mk["current_price"]); ret.append(mk["return_since_pct"])
+                dec.append(mk["decision_date"]); held.append(mk["days_held"])
+            else:
+                cp = latest_px.get(sym)
+                ent.append(ep)
+                cur.append(cp)
+                ret.append(round((cp / ep - 1) * 100, 2) if (cp and ep) else 0.0)
+                dec.append(asof); held.append(0)
+        picks_df["entry_price"] = ent
+        picks_df["current_price"] = cur
+        picks_df["return_since_pct"] = ret
+        picks_df["decision_date"] = dec
+        picks_df["days_held"] = held
+
     latest_market = _latest_market_date()
     generated_at = None
     try:

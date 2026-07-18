@@ -204,7 +204,7 @@ function reason(value: unknown): string {
     <!-- today's picks -->
     <div v-if="status === 'ok'" class="rounded-[2rem] border border-black/10 bg-white/80 p-5 shadow-soft">
       <h2 class="text-xl font-black tracking-tight text-ink">Today's picks</h2>
-      <p class="mt-1 text-sm text-ink/55">Weight is the share of the book per name (volatility-sized × the market-health dial, capped 5%). Stop is ~2.5× the stock's daily range below entry.</p>
+      <p class="mt-1 text-sm text-ink/55">Weight is the share of the book per name (volatility-sized × the market-health dial, capped 5%). Stop is ~2.5× the stock's daily range below entry. <span class="text-ink/45">Current is the latest price; Since entry is the return since this name was first recommended (held N days).</span></p>
       <div v-if="!picks.length" class="mt-3 text-sm text-ink/55">No picks for {{ asof }}.</div>
       <div v-else class="mt-3 overflow-x-auto">
         <table class="w-full text-sm">
@@ -212,7 +212,8 @@ function reason(value: unknown): string {
             <tr class="text-left text-xs font-black uppercase tracking-[0.12em] text-ink/45">
               <th class="py-2 pr-3">#</th><th class="py-2 pr-3">Symbol</th>
               <th class="py-2 pr-3 text-right">RS</th><th class="py-2 pr-3 text-right">Weight %</th>
-              <th class="py-2 pr-3 text-right">Entry</th><th class="py-2 pr-3 text-right">Stop</th>
+              <th class="py-2 pr-3 text-right">Entry</th><th class="py-2 pr-3 text-right">Current</th>
+              <th class="py-2 pr-3 text-right">Since entry</th><th class="py-2 pr-3 text-right">Stop</th>
               <th class="py-2 pr-3 text-right">ATR %</th><th class="py-2 text-right">Cost %</th>
             </tr>
           </thead>
@@ -223,6 +224,8 @@ function reason(value: unknown): string {
               <td class="py-2 pr-3 text-right">{{ num(row.rs_percentile, 1) }}</td>
               <td class="py-2 pr-3 text-right font-semibold text-moss">{{ num(row.advisory_weight_pct, 2) }}</td>
               <td class="py-2 pr-3 text-right">{{ num(row.entry_price, 2) }}</td>
+              <td class="py-2 pr-3 text-right">{{ num(row.current_price, 2) }}</td>
+              <td class="py-2 pr-3 text-right" :class="signClass(row.return_since_pct)">{{ signed(row.return_since_pct) }}<span v-if="typeof row.days_held === 'number' && row.days_held > 0" class="ml-1 text-xs text-ink/40">{{ row.days_held }}d</span></td>
               <td class="py-2 pr-3 text-right text-ink/70">{{ num(row.stop_price, 2) }}</td>
               <td class="py-2 pr-3 text-right text-ink/60">{{ num(typeof row.atr_pct === 'number' ? row.atr_pct * 100 : row.atr_pct, 1) }}</td>
               <td class="py-2 text-right text-ink/60">{{ num(typeof row.cost_fraction === 'number' ? row.cost_fraction * 100 : row.cost_fraction, 2) }}</td>
