@@ -81327,6 +81327,24 @@ def test_factor_graduation_weight_bounded_and_proposal_only():
 
 
 # ---------------------------------------------------------------------------------------------------
+# advisory.momentum_lab -- equity-curve stats for the Tier-1 momentum ablation
+# ---------------------------------------------------------------------------------------------------
+def test_momentum_lab_stats():
+    import numpy as np
+    from advisory import momentum_lab as ml
+    # a steady positive drift -> positive CAGR, ~no drawdown, final multiple > 1
+    r = pd.Series([0.001] * 300)
+    s = ml.stats(r, "steady")
+    assert s["cagr"] > 0 and s["final"] > 1.0 and s["maxdd"] > -1e-9
+    # inject a drawdown: up then a -30% shock -> maxDD captures it
+    r2 = pd.Series([0.001] * 150 + [-0.30] + [0.001] * 150)
+    s2 = ml.stats(r2, "shock")
+    assert s2["maxdd"] < -0.29
+    # too-short series returns None (guard)
+    assert ml.stats(pd.Series([0.01] * 10), "short") is None
+
+
+# ---------------------------------------------------------------------------------------------------
 # advisory.adaptive_ensemble -- the three mandatory backtest unit tests (spec s8.5)
 # ---------------------------------------------------------------------------------------------------
 def _ae_synth_weekly(n=140, seed=0, perfect=None):
