@@ -22,6 +22,7 @@ import pandas as pd
 
 from advisory.cost_model import round_trip_cost_fraction
 from advisory.factor_tilt import load_active_weights, select_top
+from advisory.strategy_registry import active_selector, recommend as registry_recommend
 from advisory.paper_decision_loop import (CAPITAL_INR, HOLD_DAYS, MAX_NAMES, POLICY_VERSION,
                                           RS_MIN_PERCENTILE, _load_panel, _rs_percentile)
 from advisory.portfolio_risk import (STOP_ATR_MULT, breadth_floor_multiplier, crash_floor_multiplier,
@@ -133,14 +134,27 @@ def build_daily_advisory(*, asof_date: pd.Timestamp | None = None, capital_inr: 
     if day.empty:
         return {"picks": [], "note": f"no panel rows for {latest.date()}"}
     day["rs_percentile"] = _rs_percentile(day)
-    # Selection is pure-RS top-N by default. If a factor has GRADUATED and the operator has opted in
-    # (FACTOR_GRADUATION_APPLY_ENABLED), its bounded weight refines the ordering within the RS pool only;
-    # otherwise load_active_weights returns {} and select_top is exactly the pure-RS selection below.
-    tilt_weights = load_active_weights(prefer="applied")
-    picks = select_top(day, base_col="rs_percentile", gate_col="rs_percentile",
-                       gate_min=RS_MIN_PERCENTILE, n=MAX_NAMES, weights=tilt_weights)
+    # Selection comes from the backtested strategy REGISTRY. If a selector has passed the multi-period
+    # robustness filter (status='enabled' in config/strategy_registry.json -- e.g. residual_momentum), the
+    # picks are its top-N; otherwise we fall back to the pure-RS baseline below. Any registry failure falls
+    # back too, so a research change can never break the live review-only advisory.
+    picks, selector_used = None, "raw_rs"
+    sel = active_selector()
+    if sel.status == "enabled":
+        try:
+            recs = registry_recommend(asof_date=latest, k=MAX_NAMES)
+            if not recs.empty:
+                picks, selector_used = recs, sel.name
+        except Exception:
+            picks = None
+    if picks is None:
+        # baseline: pure-RS top-N, optionally refined by a graduated factor tilt (default no-op)
+        tilt_weights = load_active_weights(prefer="applied")
+        picks = select_top(day, base_col="rs_percentile", gate_col="rs_percentile",
+                           gate_min=RS_MIN_PERCENTILE, n=MAX_NAMES, weights=tilt_weights)
 
     exposure, context = current_exposure(latest)
+    context["selector"] = selector_used
     rows = build_advisory_rows(picks, exposure=exposure, capital_inr=capital_inr, asof_date=latest,
                                regime_signal=str(context.get("signal", "none")))
     if rows and not dry_run:

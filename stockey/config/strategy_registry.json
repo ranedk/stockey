@@ -1,0 +1,120 @@
+{
+  "meta": {
+    "run_date": "2026-07-16",
+    "rebalance": 21,
+    "top_k": 30,
+    "folds": [
+      "2022-06-01..2023-10-13",
+      "2023-10-16..2025-02-24",
+      "2025-02-25..2026-07-16"
+    ],
+    "filter": "beats raw_rs baseline Sharpe robustly across folds"
+  },
+  "strategies": [
+    {
+      "name": "raw_rs",
+      "tier": "0",
+      "kind": "selector",
+      "status": "baseline",
+      "notes": "incumbent selector (current pipeline)",
+      "knobs": {
+        "lookbacks": [
+          63,
+          126,
+          252
+        ]
+      },
+      "verdict": {
+        "fold_delta_sharpe": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "decision": "incumbent",
+        "overall": {
+          "cagr": 0.45049414284247913,
+          "vol": 0.21263527459380083,
+          "sharpe": 1.5750398108986219,
+          "maxdd": -0.30018213895565327
+        }
+      }
+    },
+    {
+      "name": "voladj_momentum",
+      "tier": "1",
+      "kind": "selector",
+      "status": "parked",
+      "notes": "needs_more_data: not robust (folds ['-0.55', '+0.29', '+0.91'])",
+      "knobs": {
+        "lookbacks": [
+          126,
+          252
+        ],
+        "vol_adjust": true
+      },
+      "verdict": {
+        "fold_delta_sharpe": [
+          -0.552,
+          0.288,
+          0.915
+        ],
+        "decision": "needs_more_data: not robust (folds ['-0.55', '+0.29', '+0.91'])",
+        "overall": {
+          "cagr": 0.4810402718272,
+          "vol": 0.198276937874145,
+          "sharpe": 1.779316915819423,
+          "maxdd": -0.2827133694022975
+        }
+      }
+    },
+    {
+      "name": "residual_momentum",
+      "tier": "2",
+      "kind": "selector",
+      "status": "enabled",
+      "notes": "beats baseline in all 3 folds (mean +0.51 Sharpe)",
+      "knobs": {
+        "beta_window": 252,
+        "lookback": 252
+      },
+      "verdict": {
+        "fold_delta_sharpe": [
+          0.295,
+          0.654,
+          0.581
+        ],
+        "decision": "beats baseline in all 3 folds (mean +0.51 Sharpe)",
+        "overall": {
+          "cagr": 0.44181727794269454,
+          "vol": 0.1693972966473685,
+          "sharpe": 1.8925034053268477,
+          "maxdd": -0.27760951636105546
+        }
+      }
+    },
+    {
+      "name": "lowvol",
+      "tier": "2",
+      "kind": "selector",
+      "status": "parked",
+      "notes": "needs_more_data: not robust (folds ['-0.30', '-0.35', '-1.16'])",
+      "knobs": {
+        "vol_window": 252
+      },
+      "verdict": {
+        "fold_delta_sharpe": [
+          -0.298,
+          -0.35,
+          -1.163
+        ],
+        "decision": "needs_more_data: not robust (folds ['-0.30', '-0.35', '-1.16'])",
+        "overall": {
+          "cagr": 0.1609931163174796,
+          "vol": 0.10746305015044516,
+          "sharpe": 0.8849300013994468,
+          "maxdd": -0.1889987246501671
+        }
+      }
+    }
+  ]
+}

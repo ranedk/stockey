@@ -81327,6 +81327,51 @@ def test_factor_graduation_weight_bounded_and_proposal_only():
 
 
 # ---------------------------------------------------------------------------------------------------
+# advisory.strategy_registry / strategy_lab -- pluggable selectors + multi-period robustness filter
+# ---------------------------------------------------------------------------------------------------
+def test_strategy_registry_selectors_rank_as_designed():
+    from advisory import strategy_registry as sr
+    cs = pd.DataFrame({"ret63": [.1, .1], "ret126": [.2, .2], "ret252": [.3, .3],
+                       "vol252": [.2, .4], "resid_ret252": [.3, .1]}, index=["LOWVOL", "HIVOL"])
+    # vol-adjusted momentum prefers the SAME-return but LOWER-vol name
+    assert sr.score_voladj_momentum(cs)["LOWVOL"] > sr.score_voladj_momentum(cs)["HIVOL"]
+    # low-vol selector prefers the lower-vol name; residual momentum prefers higher residual
+    assert sr.score_lowvol(cs)["LOWVOL"] > sr.score_lowvol(cs)["HIVOL"]
+    assert sr.score_residual_momentum(cs)["LOWVOL"] > sr.score_residual_momentum(cs)["HIVOL"]
+
+
+def test_strategy_registry_active_selector(tmp_path):
+    import json
+    from advisory import strategy_registry as sr
+    cfg = tmp_path / "reg.json"
+    # nothing enabled -> falls back to the raw_rs baseline (never a parked strategy)
+    cfg.write_text(json.dumps({"strategies": [
+        {"name": "raw_rs", "tier": "0", "status": "baseline"},
+        {"name": "voladj_momentum", "tier": "1", "status": "parked"}]}))
+    assert sr.active_selector(str(cfg)).name == "raw_rs"
+    # an enabled selector is used (highest tier wins if several)
+    cfg.write_text(json.dumps({"strategies": [
+        {"name": "raw_rs", "tier": "0", "status": "baseline"},
+        {"name": "residual_momentum", "tier": "2", "status": "enabled"}]}))
+    sel = sr.active_selector(str(cfg))
+    assert sel.name == "residual_momentum" and sel.status == "enabled"
+
+
+def test_strategy_lab_robustness_filter():
+    from advisory import strategy_lab as sl
+    # beats baseline in every fold -> ENABLED (residual_momentum shape)
+    assert sl.decide_status([0.29, 0.65, 0.58])[0] == "enabled"
+    # robust-enough: beats 2/3 and never worse by >0.2 -> ENABLED
+    assert sl.decide_status([0.10, -0.10, 0.30])[0] == "enabled"
+    # one big loss (voladj shape: -0.55) -> PARKED (not robust)
+    assert sl.decide_status([-0.55, 0.29, 0.91])[0] == "parked"
+    # loses every fold (lowvol shape) -> PARKED
+    assert sl.decide_status([-0.30, -0.35, -1.16])[0] == "parked"
+    # too few folds -> PARKED (needs_more_data)
+    assert sl.decide_status([0.5])[0] == "parked"
+
+
+# ---------------------------------------------------------------------------------------------------
 # advisory.momentum_lab -- equity-curve stats for the Tier-1 momentum ablation
 # ---------------------------------------------------------------------------------------------------
 def test_momentum_lab_stats():

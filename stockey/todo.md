@@ -276,6 +276,23 @@ Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`, esp. §8 — t
   big/mid/small stocks x 2 holdout periods): 0/11 pass acceptance in BOTH periods -- the wins are period-luck;
   universal property is ~50-66% drawdown reduction (same not-losing thesis). See [[adaptive-ensemble-backtest]].
 
+- **RECOMMENDATION ENGINE now selects via a FILTERED STRATEGY REGISTRY (2026-07-19).** Rewrote the
+  review-only recommendation selection to be driven by backtested technical algorithms, filtered by a
+  multi-period robustness gate. NEW `advisory/strategy_registry.py` (pluggable selectors as pure
+  cross-section score fns: raw_rs baseline, voladj_momentum, residual_momentum, lowvol; state in
+  `config/strategy_registry.json`) + `advisory/strategy_lab.py` (evaluates each selector's top-30 monthly
+  book across 3 non-overlapping folds 2022-06..2026-07 after ~45bps cost; ENABLES only if it beats the
+  raw-RS incumbent Sharpe ROBUSTLY across folds, else PARKS it coded with notes='needs_more_data' -> re-run
+  re-tests when more data arrives; table `advisory_strategy_backtest`). RESULT: **residual_momentum ENABLED**
+  -- beat baseline in ALL 3 folds (+0.29/+0.65/+0.58 Sharpe; overall 1.89 vs 1.58); market-beta-adjusted
+  (idiosyncratic) momentum is stable across regimes, unlike raw/vol-adj momentum which are market-direction
+  dominated. voladj_momentum + lowvol PARKED (not robust across folds). WIRED into `advisory/paper_advisory`:
+  selection calls `strategy_registry.recommend()` when a selector is enabled, else falls back to raw-RS; any
+  registry failure also falls back, so a research change can never break the live advisory. Existing stack
+  unchanged (vol-target sizing, ATR stop, breadth floor, review-only authority: portfolio_authority=none,
+  broker_execution_allowed=false). Verified: advisory now leads with residual-momentum names (ATHERENERG/
+  UNIHEALTH/SENORES), not pure-RS descending. 5 new tests. See [[strategy-registry-recommendation-engine]].
+
 Key learned facts (do not relitigate): entry-confirmation gate is VALIDATED (regret ledger:
 −2.86% forward excess on what it blocks); costly gates are admission/coverage; the "buy strength
 when weak" edge is fragile/definition-sensitive; regime is fragile — IC-drift is a *diagnostic*
