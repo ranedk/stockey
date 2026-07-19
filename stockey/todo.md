@@ -251,6 +251,31 @@ Global rules (see `CLAUDE.md` + `docs/specs/discovery_engine.md`, esp. §8 — t
   thesis on 5× longer history than breadth alone: the edge is NOT-LOSING, captured by a 1-parameter rule; more
   features/fitting hurt on BOTH axes.
 
+- **ADAPTIVE INDICATOR-ENSEMBLE backtest SHIPPED (2026-07-18) -- adaptive-ensemble.md v0.1 implemented, NO-GO.**
+  NEW `advisory/adaptive_ensemble.py` + `config/adaptive_ensemble.json` (frozen), report-only. Long/flat weekly
+  NIFTY-50 strategy: 6 indicators (MACD-hist/ATR, ADX+DI, RSI, Bollinger %B, OBV slope, 12wk ROC) -> Hedge
+  online weights -> top-K consensus + agreement + conviction + vol filter; decision Fri close -> exec next open;
+  after costs. Reorganized to the DENSE window we hold (dhan NIFTY OHLCV complete only 2016-01..2021-07-16;
+  2022 & 2024 missing): burn-in 2016, Part A train 2017-01..2019-12, Part B holdout 2020-01..2021-07 (COVID).
+  RESULT (Part B, after cost): strategy CAGR 8.8%/Sharpe 0.35/**maxDD -6.4%**/Calmar 1.37 (in-market 30%) vs
+  benchmark CAGR 19.3%/Sharpe 0.58/**maxDD -36.1%**/Calmar 0.53. VERDICT NO-GO (fails criterion 1); winner
+  H=4/eta=2/theta=0.35 FRAGILE (>50% perturbation drop); M2 flags RSI/%B rho=0.89. Same thesis: strong
+  drawdown control (cut COVID DD -36%->-6%), not return. 3 mandatory unit tests (lookahead/cost/perfect-indicator)
+  pass. Research/report-only, no broker.
+
+- **NIFTY-index OHLCV gap ROOT-CAUSED + FIXED (2026-07-18).** The equity bhavcopy is contiguous but the NSE
+  INDICES downloader was leaving gaps (2025-09-04, 2026-03-20, 2026-03-23 -- real trading days the bhavcopy
+  captured). Cause: `data/nseindia/indices_downloader.py` permanently GAVE UP on a date after the NSE index
+  archive was empty for >4 days (a heuristic that wrongly assumes empty==holiday); during the Mar-2026 crash
+  week the index endpoint was down >4d on real trading days -> permanent gaps. FIX: self-heal to bhavcopy
+  parity -- `compute_confirmed_gaps`/`reconcile_gave_up`/`load_confirmed_gaps` treat any bhavcopy-recorded day
+  the index lacks as a CONFIRMED trading day, reinstate it if given-up, re-queue it, and NEVER permanently
+  abandon a confirmed trading day (persistent data-health alert instead). Detects all 3 real gaps; 8 downloader
+  tests green. NOTE: the separate HISTORICAL hole (index pre-2025-06 + dhan's 2021-07..2025-06) is a backfill
+  task, not a script gap -- the collectors didn't run then. Stock-scan research (adaptive_ensemble on 11
+  big/mid/small stocks x 2 holdout periods): 0/11 pass acceptance in BOTH periods -- the wins are period-luck;
+  universal property is ~50-66% drawdown reduction (same not-losing thesis). See [[adaptive-ensemble-backtest]].
+
 Key learned facts (do not relitigate): entry-confirmation gate is VALIDATED (regret ledger:
 −2.86% forward excess on what it blocks); costly gates are admission/coverage; the "buy strength
 when weak" edge is fragile/definition-sensitive; regime is fragile — IC-drift is a *diagnostic*

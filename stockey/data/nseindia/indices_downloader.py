@@ -14,6 +14,11 @@ from utils import store
 from utils.date import reverse_daterange
 from utils.sync import get_redis_client
 
+try:
+    from utils.db import sql_to_df
+except Exception:  # pragma: no cover - downloader must still run if the DB layer is unavailable
+    sql_to_df = None
+
 
 env = Env()
 env.read_env()
@@ -63,6 +68,40 @@ def partition_empty_attempts(
         else:
             retry.append(date_str)
     return sorted(set(retry)), sorted(set(give_up))
+
+
+def compute_confirmed_gaps(traded_days: set[str], index_days: set[str]) -> set[str]:
+    """Dates the equity bhavcopy proves the market traded but the index table is missing. Pure -- these are
+    CONFIRMED index gaps (a real trading day, not a holiday), so the downloader must never abandon them."""
+    return set(traded_days) - set(index_days)
+
+
+def reconcile_gave_up(confirmed: set[str], gave_up: set[str]) -> set[str]:
+    """Pure: given-up dates that are actually CONFIRMED trading days and must be reinstated for re-download
+    (a transient index-archive outage on a real trading day must never become a permanent gap)."""
+    return set(confirmed) & set(gave_up)
+
+
+def load_confirmed_gaps(*, lookback_days: int) -> set[str]:
+    """DB-backed: confirmed index gaps within the lookback (bhavcopy-traded days absent from the index table).
+    The equity bhavcopy (nseindia_ohlcv) is a different, more-reliable NSE endpoint than the indices archive,
+    so it is the ground truth for 'which days actually traded'. Fails soft to empty if the DB is unavailable."""
+    if sql_to_df is None:
+        return set()
+    try:
+        since = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+        traded = sql_to_df(
+            "SELECT DISTINCT date::date d FROM nseindia_ohlcv WHERE series IN ('EQ','BE') AND date >= %(s)s",
+            params={"s": since})
+        present = sql_to_df(
+            "SELECT DISTINCT date::date d FROM nseindia_indices WHERE index_name = 'Nifty 50' AND date >= %(s)s",
+            params={"s": since})
+    except Exception as exc:  # pragma: no cover - operational guard
+        print(f"   (indices gap reconciliation skipped: {exc})")
+        return set()
+    tset = {d.strftime("%Y-%m-%d") for d in traded["d"]}
+    pset = {d.strftime("%Y-%m-%d") for d in present["d"]}
+    return compute_confirmed_gaps(tset, pset)
 
 
 def extract_downloaded_date_from_key(key: str) -> str | None:
@@ -256,6 +295,34 @@ def main() -> int:
     retry_dates, give_up_dates = partition_empty_attempts(
         first_seen, existing_members, today=now, window_days=NSE_INDICES_EMPTY_RETRY_WINDOW_DAYS
     )
+
+    # Self-heal to bhavcopy parity: the equity bhavcopy is a different, more-reliable NSE endpoint, so any
+    # day it recorded that the index table lacks is a CONFIRMED trading day (not a holiday). A transient
+    # index-archive outage on a real trading day must never become a permanent gap -- so reinstate any
+    # confirmed gap that was given up, and refuse to newly give up a confirmed trading day.
+    confirmed_gaps = load_confirmed_gaps(lookback_days=NSE_INDICES_DOWNLOAD_LOOKBACK_DAYS)
+    reinstated_count = 0
+    for date_str in sorted(reconcile_gave_up(confirmed_gaps, gave_up)):
+        rop.srem(EMPTY_GAVEUP_SET, date_str)
+        gave_up.discard(date_str)
+        reinstated_count += 1
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME, source=f"indices:{date_str}",
+            fallback_type="nse_indices_confirmed_gap_reinstated", severity="warn",
+            reason=("Confirmed trading day (the equity bhavcopy has it) was missing from the index and had "
+                    "been given up; reinstating it for re-download so a transient index-archive outage cannot "
+                    "become a permanent gap."),
+            metadata={"formatted_date": date_str, "source_prefix": "indices"})
+    still_missing_confirmed = [d for d in give_up_dates if d in confirmed_gaps]
+    give_up_dates = [d for d in give_up_dates if d not in confirmed_gaps]
+    for date_str in still_missing_confirmed:
+        record_local_fallback_event(
+            module=SYNC_SOURCE_NAME, source=f"indices:{date_str}",
+            fallback_type="nse_indices_confirmed_gap_unfilled", severity="warn",
+            reason=("Confirmed trading day still missing from the index past the retry window; NOT giving up "
+                    "(a real trading day must not become a silent gap) -- it is re-attempted every run."),
+            metadata={"formatted_date": date_str, "source_prefix": "indices"})
+
     for date_str in give_up_dates:
         rop.sadd(EMPTY_GAVEUP_SET, date_str)
         rop.hdel(EMPTY_ATTEMPTS_HASH, date_str)
@@ -299,9 +366,11 @@ def main() -> int:
     # window would otherwise never revisit. An explicit --backfill is an operator override and may also
     # re-attempt gave-up dates; incremental runs skip gave-up dates so they stop retrying.
     retry_objs = [datetime.strptime(d, "%Y-%m-%d") for d in retry_dates]
+    # confirmed bhavcopy-proven gaps get re-queued too (they may pre-date the incremental leading edge)
+    confirmed_objs = [datetime.strptime(d, "%Y-%m-%d") for d in sorted(confirmed_gaps)]
     seen: set[str] = set()
     candidate_dates: list[datetime] = []
-    for date_obj in list(window_candidates) + retry_objs:
+    for date_obj in list(window_candidates) + retry_objs + confirmed_objs:
         key = date_obj.strftime("%Y-%m-%d")
         if key in seen or key in existing_members:
             continue
@@ -330,6 +399,8 @@ def main() -> int:
             "retry_count": 0,
             "empty_result_count": 0,
             "gave_up_count": gave_up_count,
+            "confirmed_gap_count": len(confirmed_gaps),
+            "reinstated_count": reinstated_count,
             "source_unavailable_count": 0,
             "fallback_used": bool(gave_up_count),
             "state_advanced": False,
@@ -401,6 +472,8 @@ def main() -> int:
         "retry_count": 0,
         "empty_result_count": empty_result_count,
         "gave_up_count": gave_up_count,
+        "confirmed_gap_count": len(confirmed_gaps),
+        "reinstated_count": reinstated_count,
         "downloaded_dates": downloaded_count,
         "source_unavailable_count": failed_attempt_count,
         "skipped_after_failure_stop": skipped_after_failure_stop,

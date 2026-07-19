@@ -3935,6 +3935,22 @@ def test_indices_downloader_partition_empty_attempts_retry_vs_give_up():
     assert give_up == ["2026-07-01", "2026-07-09"]
 
 
+def test_indices_downloader_confirmed_gap_reconciliation():
+    # the equity bhavcopy is the ground truth of which days actually traded; any such day missing from the
+    # index is a CONFIRMED gap (a real trading day) -- e.g. the Mar-2026 crash-week days the index endpoint
+    # dropped while the bhavcopy captured them.
+    traded = {"2026-03-19", "2026-03-20", "2026-03-23", "2026-03-24"}   # bhavcopy-recorded trading days
+    index_present = {"2026-03-19", "2026-03-24"}                        # index endpoint dropped 20th & 23rd
+    confirmed = indices_downloader.compute_confirmed_gaps(traded, index_present)
+    assert confirmed == {"2026-03-20", "2026-03-23"}
+    # a confirmed trading day that was wrongly given up must be reinstated for re-download...
+    gave_up = {"2026-03-20", "2026-03-23", "2020-05-01"}   # last is a genuine non-trading day, stays given up
+    assert indices_downloader.reconcile_gave_up(confirmed, gave_up) == {"2026-03-20", "2026-03-23"}
+    # ...and a genuine holiday (never in the bhavcopy) is never treated as a gap
+    assert indices_downloader.compute_confirmed_gaps(traded, traded) == set()
+    assert "2020-05-01" not in indices_downloader.reconcile_gave_up(confirmed, gave_up)
+
+
 def test_indices_downloader_empty_download_is_not_persisted_and_retries(monkeypatch, tmp_path):
     """A 0-byte download must never be saved (it would look downloaded forever) and must be retried."""
     saved: list[str] = []
@@ -44331,6 +44347,7 @@ def test_indices_downloader_exports_failure_stop_run_state(monkeypatch):
     monkeypatch.setattr(indices_downloader, "get_redis_client", lambda *args, **kwargs: FakeRedis())
     monkeypatch.setattr(indices_downloader, "sync_playwright", lambda: FakePlaywrightContext())
     monkeypatch.setattr(indices_downloader, "load_downloaded_dates_from_store", lambda: set())
+    monkeypatch.setattr(indices_downloader, "load_confirmed_gaps", lambda **kwargs: set())  # hermetic: no DB
     monkeypatch.setattr(indices_downloader, "latest_downloaded_date", lambda existing: None)
     monkeypatch.setattr(indices_downloader, "reverse_daterange", lambda start, end: dates)
     monkeypatch.setattr(indices_downloader, "download_indices_for_date", lambda *args, **kwargs: "error")
@@ -81307,6 +81324,64 @@ def test_factor_graduation_weight_bounded_and_proposal_only():
     # applied weight is gated by the default-OFF flag: proposal-only unless explicitly enabled
     assert fg.applied_weight(0.10, apply_enabled=False) == 0.0
     assert fg.applied_weight(0.10, apply_enabled=True) == 0.10
+
+
+# ---------------------------------------------------------------------------------------------------
+# advisory.adaptive_ensemble -- the three mandatory backtest unit tests (spec s8.5)
+# ---------------------------------------------------------------------------------------------------
+def _ae_synth_weekly(n=140, seed=0, perfect=None):
+    import numpy as np
+    from advisory import adaptive_ensemble as ae
+    rng = np.random.default_rng(seed)
+    dates = pd.date_range("2017-01-06", periods=n, freq="7D", tz="UTC")
+    cr = rng.normal(0.001, 0.02, n)
+    close = 100 * np.cumprod(1 + cr)
+    df = pd.DataFrame({"date": dates, "close": close, "next_open": close * (1 + rng.normal(0, 0.001, n)),
+                       "cr": cr, "vol_extreme": False})
+    for ind in ae.IND:
+        df[f"s_{ind}"] = rng.uniform(-1, 1, n)
+    if perfect:                                   # r_i[w]=s_i[w-1]*cr[w]>0 always  <=>  s_i[t]=sign(cr[t+1])
+        s = np.sign(np.roll(cr, -1)); s[-1] = 0.0
+        df[f"s_{perfect}"] = s
+    return df
+
+
+def test_adaptive_ensemble_no_lookahead():
+    import numpy as np
+    from advisory import adaptive_ensemble as ae
+    w = _ae_synth_weekly(seed=1)
+    p = ae.Params()
+    a = ae.run_backtest(w, p, rf_wk=0.0011, per_side=0.0015)
+    rng = np.random.default_rng(99)
+    w2 = w.copy(); w2["next_open"] = w2["next_open"] * rng.uniform(0.97, 1.03, len(w2))  # perturb FUTURE exec prices
+    b = ae.run_backtest(w2, p, rf_wk=0.0011, per_side=0.0015)
+    # decisions never peek at the execution price -> positions identical...
+    assert np.array_equal(a["pos"].to_numpy(), b["pos"].to_numpy())
+    # ...but the realized results DO change (spec: shift prices -> results change)
+    assert not np.allclose(a["strat_ret"].to_numpy(), b["strat_ret"].to_numpy())
+
+
+def test_adaptive_ensemble_costs_reduce_return():
+    from advisory import adaptive_ensemble as ae
+    w = _ae_synth_weekly(seed=2)
+    p = ae.Params(theta=0.05, rebalance_band=0.05)            # loosen so it actually trades
+    gross = ae.run_backtest(w, p, rf_wk=0.0011, per_side=0.0)
+    net = ae.run_backtest(w, p, rf_wk=0.0011, per_side=0.003)
+    trades = int((net["pos"].diff().abs() > 1e-9).sum())
+    assert trades > 0
+    assert net["strat_ret"].sum() < gross["strat_ret"].sum()   # net < gross
+
+
+def test_adaptive_ensemble_perfect_indicator_dominates():
+    from advisory import adaptive_ensemble as ae
+    H = 4.0
+    w = _ae_synth_weekly(n=160, seed=3, perfect="roc")
+    bt = ae.run_backtest(w, ae.Params(half_life_weeks=H), rf_wk=0.0011, per_side=0.0)
+    wcols = [f"w_{i}" for i in ae.IND]
+    after = bt.iloc[int(4 * H):]                              # within ~3-4 half-lives
+    avg = after[wcols].mean()
+    assert avg["w_roc"] == avg.max()                          # the perfect indicator's weight dominates
+    assert avg["w_roc"] > 1.5 / 6                             # and materially above equal-weight
 
 
 # ---------------------------------------------------------------------------------------------------
