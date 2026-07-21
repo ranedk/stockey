@@ -81805,6 +81805,24 @@ def test_paper_book_time_capped_name_is_not_rebought_same_day(monkeypatch):
     assert any(a["action"] == "BUY" and a["symbol"] == "FRESH" for a in actions)  # a different name still buys
 
 
+def test_paper_book_uses_active_selector_picks_when_provided(monkeypatch):
+    # the book must manage the ADVISORY's picks (active selector via picks_by_date), not re-derive raw RS
+    from advisory import paper_book as pb
+    d = pd.Timestamp("2026-07-17", tz="UTC")
+    monkeypatch.setattr(pb, "_rs_percentile", lambda day: pd.Series(90.0, index=day.index))
+    monkeypatch.setattr(pb, "_picks_for_date", lambda day: pd.DataFrame({
+        "symbol": ["RSONLY"], "close": [100.0], "atr_pct": [0.04], "rs_percentile": [99.0]}))
+    reg_picks = {d: pd.DataFrame({"symbol": ["REGPICK"], "close": [200.0], "atr_pct": [0.05], "rs_percentile": [80.0]})}
+    actions = pb._step_day(d, panel_day=pd.DataFrame({"symbol": ["X"]}), positions={}, marks={},
+                           bench_close={}, td_index={d: 0}, stop_atr_mult=2.5, picks_by_date=reg_picks)
+    bought = {a["symbol"] for a in actions if a["action"] == "BUY"}
+    assert bought == {"REGPICK"}          # used the registry (advisory) picks, not the raw-RS fallback
+    # with no registry picks for the date it falls back to the raw-RS panel (never breaks)
+    actions2 = pb._step_day(d, panel_day=pd.DataFrame({"symbol": ["X"]}), positions={}, marks={},
+                            bench_close={}, td_index={d: 0}, stop_atr_mult=2.5, picks_by_date={})
+    assert {a["symbol"] for a in actions2 if a["action"] == "BUY"} == {"RSONLY"}
+
+
 def test_operator_api_runtime_ignores_generated_reports(tmp_path):
     import time
     from advisory.api import app

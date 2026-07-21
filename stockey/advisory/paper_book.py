@@ -127,7 +127,8 @@ def _picks_for_date(day: pd.DataFrame) -> pd.DataFrame:
 # One trading day of book maintenance: mark + exit open positions, then ingest that day's new buys
 # ------------------------------------------------------------------------------------------------
 def _step_day(date: pd.Timestamp, *, panel_day: pd.DataFrame, positions: dict, marks: dict,
-              bench_close: dict, td_index: dict, stop_atr_mult: float) -> list[dict[str, Any]]:
+              bench_close: dict, td_index: dict, stop_atr_mult: float,
+              picks_by_date: dict | None = None) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
     rs_map = {}
     if not panel_day.empty:
@@ -173,7 +174,12 @@ def _step_day(date: pd.Timestamp, *, panel_day: pd.DataFrame, positions: dict, m
     #    (that is churn, and it shows the name in BOTH the Exit and Buy lists). It may re-enter a later day.
     blocked = {p["symbol"] for p in positions.values()
                if p["status"] == "open" or (p["status"] == "exited" and p.get("exit_date") == date)}
-    picks = _picks_for_date(panel_day) if not panel_day.empty else pd.DataFrame()
+    # buys mirror the advisory: the ACTIVE strategy-registry selector's picks for this date (residual_momentum),
+    # falling back to the raw-RS panel when the registry has no picks for the date or is disabled.
+    if picks_by_date is not None and date in picks_by_date:
+        picks = picks_by_date[date]
+    else:
+        picks = _picks_for_date(panel_day) if not panel_day.empty else pd.DataFrame()
     for p in picks.itertuples(index=False):
         if p.symbol in blocked:
             continue
@@ -227,11 +233,23 @@ def run_book(*, backfill_from: str | None = None, dry_run: bool = False) -> dict
     days = [d for d in trading_days if d >= start]
     marks = _load_marks(start - pd.Timedelta(days=5))
 
+    # The book manages exactly what the advisory recommends: the ACTIVE selector's picks (e.g.
+    # residual_momentum). Any failure falls back to the raw-RS panel per day, so a research change can never
+    # break the review-only book. Built once for the whole replay window.
+    picks_by_date = None
+    try:
+        from advisory import strategy_registry as _sr
+        if _sr.active_selector().status == "enabled":
+            picks_by_date = _sr.picks_by_date(_sr.build_panel(start="2021-01-01"), k=MAX_NAMES)
+    except Exception:
+        picks_by_date = None
+
     latest_actions: list[dict[str, Any]] = []
     for d in days:
         panel_day = panel[panel["date"] == d]
         latest_actions = _step_day(d, panel_day=panel_day, positions=positions, marks=marks,
-                                    bench_close=bench_close, td_index=td_index, stop_atr_mult=_stop_mult())
+                                    bench_close=bench_close, td_index=td_index, stop_atr_mult=_stop_mult(),
+                                    picks_by_date=picks_by_date)
 
     rows = []
     now = pd.Timestamp.utcnow()

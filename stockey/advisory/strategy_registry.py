@@ -150,6 +150,23 @@ def save_registry(strategies: list[Strategy], *, path: str = REGISTRY_CONFIG, me
         json.dump(payload, f, indent=2)
 
 
+def picks_by_date(panel: pd.DataFrame, *, k: int = 20, path: str = REGISTRY_CONFIG) -> dict:
+    """{date -> top-k picks DataFrame} for the ACTIVE selector across every date in the panel. Columns are
+    the book's buy-ingestion contract (symbol, close, atr_pct, rs_percentile). Lets advisory.paper_book
+    manage exactly the names the advisory recommends, instead of re-deriving raw RS."""
+    sel = active_selector(path)
+    liq = panel[panel["liquid"]].copy()
+    liq = liq[np.isfinite(liq["ret252"]) & np.isfinite(liq["vol252"])]
+    out: dict = {}
+    for d, cs in liq.groupby("date"):
+        c = cs.set_index("symbol")
+        c["rs_percentile"] = score_raw_rs(c).rank(pct=True) * 100.0
+        c["_score"] = sel.score(c)
+        top = c["_score"].dropna().nlargest(k)
+        out[d] = c.loc[top.index, ["close", "atr_pct", "rs_percentile"]].reset_index()
+    return out
+
+
 def active_selector(path: str = REGISTRY_CONFIG) -> Strategy:
     """The selector the live pipeline should use: the ENABLED one (highest tier if several), else the
     baseline raw_rs. Never returns a parked strategy -- parked ones are coded but not used."""
