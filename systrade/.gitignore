@@ -1,0 +1,8 @@
+.env
+*.log
+data/*.csv
+.cache/
+.DS_Store
+systrader
+/backtest
+/run
