@@ -168,11 +168,14 @@ def _step_day(date: pd.Timestamp, *, panel_day: pd.DataFrame, positions: dict, m
             actions.append({"action": "TRIM", "symbol": pos["symbol"], "reason": reason,
                             "return_pct": pos.get("unrealized_return_pct"), "days_held": days_held})
 
-    # 2) ingest today's new buys (dedup: skip symbols already open)
-    open_syms = {p["symbol"] for p in positions.values() if p["status"] == "open"}
+    # 2) ingest today's new buys. Dedup: skip a symbol already open (no pyramiding) AND a symbol EXITED
+    #    TODAY -- a name that hit its time-cap/stop today must not be exited and re-bought the same day
+    #    (that is churn, and it shows the name in BOTH the Exit and Buy lists). It may re-enter a later day.
+    blocked = {p["symbol"] for p in positions.values()
+               if p["status"] == "open" or (p["status"] == "exited" and p.get("exit_date") == date)}
     picks = _picks_for_date(panel_day) if not panel_day.empty else pd.DataFrame()
     for p in picks.itertuples(index=False):
-        if p.symbol in open_syms:
+        if p.symbol in blocked:
             continue
         entry = float(p.close)
         stop = round(entry * (1.0 - stop_atr_mult * float(p.atr_pct)), 4)
@@ -185,7 +188,7 @@ def _step_day(date: pd.Timestamp, *, panel_day: pd.DataFrame, positions: dict, m
             "exit_date": None, "exit_price": None, "exit_reason": None, "realized_return_pct": None,
             "realized_excess_pct": None, "ca_flag": False,
         }
-        open_syms.add(p.symbol)
+        blocked.add(p.symbol)
         actions.append({"action": "BUY", "symbol": p.symbol, "rs": round(float(p.rs_percentile), 2),
                         "entry_price": round(entry, 2), "stop_price": round(stop, 2)})
     return actions

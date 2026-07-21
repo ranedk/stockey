@@ -81781,6 +81781,30 @@ def test_paper_book_decide_action_exit_rules():
     assert decide_action(mark=110.0, **{**base, "rs_now": None}) == ("HOLD", "")
 
 
+def test_paper_book_time_capped_name_is_not_rebought_same_day(monkeypatch):
+    # regression: a position that hits its 20-day time-cap today must EXIT and NOT be re-bought the same day
+    # (that churn put UFBL in both the Exit and Buy lists). It may re-enter on a later day.
+    from advisory import paper_book as pb
+    d0 = pd.Timestamp("2026-06-18", tz="UTC")
+    d = pd.Timestamp("2026-07-17", tz="UTC")
+    monkeypatch.setattr(pb, "_rs_percentile", lambda day: pd.Series(90.0, index=day.index))
+    monkeypatch.setattr(pb, "_picks_for_date", lambda day: pd.DataFrame({
+        "symbol": ["UFBL", "FRESH"], "close": [738.8, 100.0], "atr_pct": [0.05, 0.04],
+        "rs_percentile": [99.0, 95.0]}))
+    positions = {("UFBL", d0, pb.POLICY_VERSION): {
+        "symbol": "UFBL", "entry_date": d0, "policy_version": pb.POLICY_VERSION, "entry_price": 600.0,
+        "stop_price": 540.0, "status": "open", "missing_days": 0, "last_price": 600.0, "ca_flag": False}}
+    actions = pb._step_day(d, panel_day=pd.DataFrame({"symbol": ["UFBL"]}), positions=positions,
+                           marks={("UFBL", d): (738.8, False)}, bench_close={d0: 200.0, d: 210.0},
+                           td_index={d0: 0, d: 20}, stop_atr_mult=2.5)
+    exited = [a for a in actions if a["action"] == "EXIT" and a["symbol"] == "UFBL"]
+    bought = [a for a in actions if a["action"] == "BUY" and a["symbol"] == "UFBL"]
+    assert exited and exited[0]["reason"] == "time_cap"      # it exits on the time cap...
+    assert not bought                                        # ...and is NOT re-bought the same day
+    assert not any(p["symbol"] == "UFBL" and p["status"] == "open" for p in positions.values())
+    assert any(a["action"] == "BUY" and a["symbol"] == "FRESH" for a in actions)  # a different name still buys
+
+
 def test_operator_api_runtime_ignores_generated_reports(tmp_path):
     import time
     from advisory.api import app
