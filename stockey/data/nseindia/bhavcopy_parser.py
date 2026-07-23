@@ -147,9 +147,21 @@ def _date_window_from_keys(keys: Iterable[str]) -> tuple[str | None, str | None]
     return min(dates), max(dates)
 
 
-def run_parser(*, backfill: bool = False) -> dict[str, object]:
+def run_parser(*, backfill: bool = False, from_date: str | None = None,
+               to_date: str | None = None) -> dict[str, object]:
+    lo = pd.Timestamp(from_date) if from_date else None
+    hi = pd.Timestamp(to_date) if to_date else None
+
+    def _in_range(key: str) -> bool:
+        if lo is None and hi is None:
+            return True
+        d = extract_bhavcopy_date_from_key(key)
+        if d is None:
+            return False
+        return (lo is None or d >= lo) and (hi is None or d <= hi)
+
     all_files = list(store.list_files("bhavcopy"))
-    files = [key for key in all_files if should_consider_key(key, backfill=backfill)]
+    files = [key for key in all_files if should_consider_key(key, backfill=backfill) and _in_range(key)]
     keyed_dates = {key: extract_bhavcopy_date_from_key(key) for key in files}
     processed_keys = load_completed_keys(SOURCE_PREFIX)
     parsed_dates = load_existing_ohlcv_dates(
@@ -944,8 +956,10 @@ def main() -> int:
     ap.add_argument("--backfill", action="store_true",
                     help="Ignore the parse lookback and re-parse every stored day whose OHLCV is missing "
                          "from nseindia_ohlcv (recovers the deep history already downloaded to the store).")
-    args, _ = ap.parse_known_args()          # tolerate a test/pytest argv; only --backfill is meaningful
-    STOCKEY_RUN_STATE = run_parser(backfill=args.backfill)
+    ap.add_argument("--from", dest="from_date", default=None, help="Only consider stored days >= this date (YYYY-MM-DD)")
+    ap.add_argument("--to", dest="to_date", default=None, help="Only consider stored days <= this date (YYYY-MM-DD)")
+    args, _ = ap.parse_known_args()          # tolerate a test/pytest argv
+    STOCKEY_RUN_STATE = run_parser(backfill=args.backfill, from_date=args.from_date, to_date=args.to_date)
     print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
     return 0
 
