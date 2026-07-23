@@ -3935,6 +3935,26 @@ def test_indices_downloader_partition_empty_attempts_retry_vs_give_up():
     assert give_up == ["2026-07-01", "2026-07-09"]
 
 
+def test_bhavcopy_history_parsers_and_split_detection():
+    from data.nseindia import bhavcopy_history as bh
+    oldcm = (b"SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP,TOTALTRADES,ISIN\n"
+             b"RELIANCE,EQ,100,110,95,105,105,98,1000,105000,02-JAN-2018,50,INE002A01018\n"
+             b"FIVEONE,EQ,20,21,19,20,20,100,500,10000,02-JAN-2018,10,INE123A01011\n")   # open 20 vs prevclose 100 = 5:1
+    df = bh.parse_oldcm(oldcm)
+    r = df[df["symbol"] == "RELIANCE"].iloc[0]
+    assert (r.open, r.close, r.previous_close, r.series, r["isin"]) == (100, 105, 98, "EQ", "INE002A01018")
+    assert str(r.date.date()) == "2018-01-02"
+    # UDiFF format maps to the same schema
+    udiff = (b"TradDt,TckrSymb,SctySrs,OpnPric,HghPric,LwPric,ClsPric,LastPric,PrvsClsgPric,TtlTradgVol,TtlTrfVal,TtlNbOfTxsExctd,ISIN\n"
+             b"2024-07-08,INFY,EQ,1500,1520,1490,1510,1510,1495,2000,3000000,100,INE009A01021\n")
+    u = bh.parse_udiff(udiff).iloc[0]
+    assert (u.symbol, u.open, u.close, u.series) == ("INFY", 1500, 1510, "EQ") and str(u.date.date()) == "2024-07-08"
+    # corporate-action detection: only the 5:1 name is flagged, with the right factor
+    ca = bh.split_factors(df)
+    assert set(ca["symbol"]) == {"FIVEONE"}
+    assert abs(float(ca.iloc[0]["adj_factor"]) - 0.20) < 1e-6      # open/prevclose = 20/100
+
+
 def test_indices_downloader_confirmed_gap_reconciliation():
     # the equity bhavcopy is the ground truth of which days actually traded; any such day missing from the
     # index is a CONFIRMED gap (a real trading day) -- e.g. the Mar-2026 crash-week days the index endpoint
