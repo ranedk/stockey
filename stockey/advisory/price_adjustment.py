@@ -47,8 +47,14 @@ def _snap_event_ratio(price_ratio: float) -> float | None:
 
 
 def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str = "date",
-                 close_col: str = "close") -> pd.DataFrame:
+                 close_col: str = "close", open_col: str = "open") -> pd.DataFrame:
     """Return df with `cum_adj_factor`, `adj_close`, and `ca_flag` per row.
+
+    CA detection uses the ex-date OVERNIGHT gap `open[t] / close[t-1]` -- the PURE split/bonus factor, since
+    the open trades at the already-adjusted level while the prior close is raw. That is cleaner than a
+    close-to-close step, which mixes in the ex-date's intraday move (e.g. IRCTC's 5:1: close/prev=0.221 fails
+    to snap, but open/prev=0.198 snaps to 1/5). Falls back to the close step where the open is missing, and
+    to close-only if the frame carries no `open` column (backward compatible).
 
     Back-adjustment: adj_close[t] = close[t] * (product of confirmed event ratios at dates > t), so
     pre-event prices are scaled down onto the post-event basis and the series is continuous. `ca_flag` is
@@ -58,8 +64,14 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
     if df.empty:
         return df.assign(cum_adj_factor=[], adj_close=[], ca_flag=[])
     out = df.sort_values([symbol_col, date_col]).copy()
-    prev = out.groupby(symbol_col)[close_col].shift(1)
-    price_ratio = (out[close_col] / prev.replace(0, np.nan)).to_numpy()
+    prev = out.groupby(symbol_col)[close_col].shift(1).replace(0, np.nan)
+    close_ratio = (out[close_col] / prev).to_numpy()
+    if open_col in out.columns:
+        open_ratio = (out[open_col] / prev).to_numpy()
+        valid_open = (out[open_col].to_numpy() > 0) & np.isfinite(open_ratio)
+        price_ratio = np.where(valid_open, open_ratio, close_ratio)   # overnight gap, else close step
+    else:
+        price_ratio = close_ratio
     breach = (price_ratio < CIRCUIT_STEP_LOW) | (price_ratio > CIRCUIT_STEP_HIGH)
 
     event_ratio = np.ones(len(out), dtype="float64")
@@ -123,7 +135,8 @@ def build_adjusted_ohlcv(*, dry_run: bool = False) -> dict[str, Any]:
     per symbol, so a T2T migration stays continuous). Returns a summary."""
     from utils.db import sql_to_df, upsert_to_db
     raw = sql_to_df(
-        "SELECT symbol, date, series, close FROM nseindia_ohlcv WHERE series IN ('EQ','BE') ORDER BY symbol, date"
+        "SELECT symbol, date, series, open, close FROM nseindia_ohlcv WHERE series IN ('EQ','BE') "
+        "ORDER BY symbol, date"
     )
     if raw.empty:
         return {"rows": 0}

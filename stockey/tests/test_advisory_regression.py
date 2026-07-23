@@ -48738,6 +48738,21 @@ def test_price_adjustment_derives_splits_from_price_steps():
     assert (ac["cum_adj_factor"] == 1.0).all() and (ac["adj_close"] == ac["close"]).all()
 
 
+def test_price_adjustment_open_gap_catches_split_with_intraday_move():
+    from advisory import price_adjustment as pa
+    dates = pd.bdate_range("2026-01-01", periods=3, tz="UTC")
+    # IRCTC-style 5:1 split with a +12% ex-date intraday move: close/prev=0.221 fails the 6% snap, but the
+    # OVERNIGHT gap open/prev=0.198 snaps cleanly to 1/5. The open-based detector must catch it.
+    df = pd.DataFrame({"symbol": "IRCTC", "date": dates,
+                       "open": [4068.0, 4250.0, 817.0], "close": [4189.0, 4130.0, 913.5]})
+    a = pa.adjust_frame(df).sort_values("date").reset_index(drop=True)
+    assert a.loc[2, "ca_flag"] == "split_bonus"
+    assert abs(a.loc[0, "cum_adj_factor"] - 0.2) < 1e-9 and abs(a.loc[1, "cum_adj_factor"] - 0.2) < 1e-9
+    # WITHOUT the open column it falls back to the close step, which misses this split (flags ambiguous)
+    a2 = pa.adjust_frame(df.drop(columns=["open"]))
+    assert (a2["ca_flag"] == "ambiguous").any() and (a2["cum_adj_factor"] == 1.0).all()
+
+
 def test_price_data_sanity_report_contract():
     from scripts import price_data_sanity as pds
     # the reporting contract: findings render, errors gate status, benchmark gaps are an error
