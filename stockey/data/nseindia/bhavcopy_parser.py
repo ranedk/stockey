@@ -1,4 +1,5 @@
 # bhavcopy download from S3 and parse
+import argparse
 import io
 import json
 import tempfile
@@ -61,11 +62,13 @@ def extract_bhavcopy_date_from_key(key: str) -> pd.Timestamp | None:
         return None
 
 
-def should_consider_key(key: str, *, today: datetime | None = None) -> bool:
-    today = today or datetime.today()
+def should_consider_key(key: str, *, today: datetime | None = None, backfill: bool = False) -> bool:
     file_date = extract_bhavcopy_date_from_key(key)
     if file_date is None:
         return False
+    if backfill:                    # backfill ignores the rolling lookback -> every stored day is considered
+        return True
+    today = today or datetime.today()
     cutoff = pd.Timestamp((today - timedelta(days=NSE_BHAVCOPY_PARSE_LOOKBACK_DAYS)).date())
     return file_date.normalize() >= cutoff
 
@@ -144,9 +147,9 @@ def _date_window_from_keys(keys: Iterable[str]) -> tuple[str | None, str | None]
     return min(dates), max(dates)
 
 
-def run_parser() -> dict[str, object]:
+def run_parser(*, backfill: bool = False) -> dict[str, object]:
     all_files = list(store.list_files("bhavcopy"))
-    files = [key for key in all_files if should_consider_key(key)]
+    files = [key for key in all_files if should_consider_key(key, backfill=backfill)]
     keyed_dates = {key: extract_bhavcopy_date_from_key(key) for key in files}
     processed_keys = load_completed_keys(SOURCE_PREFIX)
     parsed_dates = load_existing_ohlcv_dates(
@@ -187,12 +190,16 @@ def run_parser() -> dict[str, object]:
             emit(f"⚠️ Prior failure key={key} at={row.get('processed_at')} error={row.get('error_message')}")
 
     for key in files:
-        if key in processed_keys:
+        parsed_date = keyed_dates.get(key)
+        in_db = parsed_date is not None and parsed_date.strftime("%Y-%m-%d") in parsed_dates
+        # Default behavior is unchanged: skip anything marked processed. --backfill is the one exception --
+        # it re-parses a stored day whose OHLCV is NOT yet in the DB, recovering the deep history the rolling
+        # lookback (or a stale processed-marker) left unparsed.
+        if key in processed_keys and not (backfill and not in_db):
             emit(f"⏩ Already processed in DB state: {key}")
             summary["already_processed_count"] = int(summary["already_processed_count"]) + 1
             continue
-        parsed_date = keyed_dates.get(key)
-        if parsed_date is not None and parsed_date.strftime("%Y-%m-%d") in parsed_dates:
+        if in_db:
             emit(f"⏩ Already parsed in DB: {key}")
             mark_processed(SOURCE_PREFIX, key)
             processed_keys.add(key)
@@ -933,7 +940,12 @@ def unzip_and_process(zip_path):
 
 def main() -> int:
     global STOCKEY_RUN_STATE
-    STOCKEY_RUN_STATE = run_parser()
+    ap = argparse.ArgumentParser(description="Parse stored NSE bhavcopy archives into OHLCV + related tables.")
+    ap.add_argument("--backfill", action="store_true",
+                    help="Ignore the parse lookback and re-parse every stored day whose OHLCV is missing "
+                         "from nseindia_ohlcv (recovers the deep history already downloaded to the store).")
+    args, _ = ap.parse_known_args()          # tolerate a test/pytest argv; only --backfill is meaningful
+    STOCKEY_RUN_STATE = run_parser(backfill=args.backfill)
     print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
     return 0
 

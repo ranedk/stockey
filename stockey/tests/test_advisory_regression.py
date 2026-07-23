@@ -3574,7 +3574,7 @@ def test_bhavcopy_parser_skips_db_parsed_dates(monkeypatch):
         "list_files",
         lambda prefix: iter(["bhavcopy/bhavcopy_2015-01-16.zip", "bhavcopy/bhavcopy_2015-01-17.zip"]),
     )
-    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key, **kw: True)
     monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
@@ -3630,7 +3630,7 @@ def test_bhavcopy_parser_records_failed_key(monkeypatch):
         "list_files",
         lambda prefix: iter(["bhavcopy/bhavcopy_2015-01-16.zip"]),
     )
-    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key, **kw: True)
     monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(bhavcopy_parser, "load_existing_ohlcv_dates", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
@@ -3675,7 +3675,7 @@ def test_bhavcopy_parser_marks_empty_like_key_processed(monkeypatch):
         "list_files",
         lambda prefix: iter(["bhavcopy/bhavcopy_2015-10-18.zip"]),
     )
-    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key, **kw: True)
     monkeypatch.setattr(bhavcopy_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(bhavcopy_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(bhavcopy_parser, "load_existing_ohlcv_dates", lambda *_args, **_kwargs: set())
@@ -3713,7 +3713,7 @@ def test_bhavcopy_parser_treats_empty_valid_source_as_completed(monkeypatch):
         "list_files",
         lambda prefix: iter(["bhavcopy/bhavcopy_2015-10-18.zip"]),
     )
-    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(bhavcopy_parser, "should_consider_key", lambda key, **kw: True)
     monkeypatch.setattr(
         bhavcopy_parser,
         "get_processed_keys",
@@ -3933,6 +3933,20 @@ def test_indices_downloader_partition_empty_attempts_retry_vs_give_up():
 
     assert retry == ["2026-07-11", "2026-07-13"]
     assert give_up == ["2026-07-01", "2026-07-09"]
+
+
+def test_bhavcopy_parser_backfill_lifts_lookback():
+    # the deep history was downloaded to the store but never parsed because the 365-day lookback skipped it;
+    # --backfill must consider every stored day so it can be recovered.
+    from datetime import datetime
+    from data.nseindia import bhavcopy_parser as bp
+    t = datetime(2026, 7, 23)
+    old, recent, bad = "bhavcopy/bhavcopy_2018-01-03.zip", "bhavcopy/bhavcopy_2026-07-20.zip", "bhavcopy/xx.zip"
+    assert bp.should_consider_key(old, today=t) is False          # default: skipped (older than lookback)
+    assert bp.should_consider_key(recent, today=t) is True        # default: within lookback
+    assert bp.should_consider_key(old, today=t, backfill=True) is True    # backfill: considered
+    assert bp.should_consider_key(recent, today=t, backfill=True) is True
+    assert bp.should_consider_key(bad, today=t, backfill=True) is False   # non-date key never considered
 
 
 def test_bhavcopy_history_parsers_and_split_detection():
@@ -44620,7 +44634,7 @@ def test_bhavcopy_parser_main_exports_runner_state(monkeypatch, capsys):
     monkeypatch.setattr(
         bhavcopy_parser,
         "run_parser",
-        lambda: {
+        lambda **kw: {
             "source": "bhavcopy",
             "rows": 2,
             "rows_read": 3,
