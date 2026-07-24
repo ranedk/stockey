@@ -53,11 +53,13 @@ def extract_indices_date_from_key(key: str) -> str | None:
         return None
 
 
-def should_consider_key(key: str, *, today: datetime | None = None) -> bool:
-    today = today or datetime.today()
+def should_consider_key(key: str, *, today: datetime | None = None, backfill: bool = False) -> bool:
     file_date = extract_indices_date_from_key(key)
     if file_date is None:
         return False
+    if backfill:                    # backfill ignores the rolling lookback -> every stored index day considered
+        return True
+    today = today or datetime.today()
     cutoff = (today - timedelta(days=NSE_INDICES_PARSE_LOOKBACK_DAYS)).date()
     return datetime.strptime(file_date, "%Y-%m-%d").date() >= cutoff
 
@@ -220,9 +222,20 @@ def _date_window_from_keys(keys: list[str]) -> tuple[str | None, str | None]:
     return min(dates), max(dates)
 
 
-def run_parser() -> dict[str, object]:
+def run_parser(*, backfill: bool = False, from_date: str | None = None,
+               to_date: str | None = None, force: bool = False) -> dict[str, object]:
+    def _in_range(key: str) -> bool:
+        if from_date is None and to_date is None:
+            return True
+        fd = extract_indices_date_from_key(key)
+        if fd is None:
+            return False
+        d = datetime.strptime(fd, "%Y-%m-%d").date()
+        return ((from_date is None or d >= datetime.strptime(from_date, "%Y-%m-%d").date())
+                and (to_date is None or d <= datetime.strptime(to_date, "%Y-%m-%d").date()))
+
     all_files = list(store.list_files("indices"))
-    files = [key for key in all_files if should_consider_key(key)]
+    files = [key for key in all_files if should_consider_key(key, backfill=backfill) and _in_range(key)]
     parsed_files = load_completed_keys(SOURCE_PREFIX)
     failed_entries = {row["object_key"]: row for row in get_failed_entries(SOURCE_PREFIX)}
     from_date, to_date = _date_window_from_keys(files)
@@ -255,7 +268,7 @@ def run_parser() -> dict[str, object]:
             row = failed_entries[key]
             emit(f"⚠️ Prior failure key={key} at={row.get('processed_at')} error={row.get('error_message')}")
     for f in files:
-        if f in parsed_files:
+        if f in parsed_files and not force:          # --force re-parses stored index days already marked done
             emit(f"⏩ Already parsed in DB state: {f}")
             summary["already_processed_count"] = int(summary["already_processed_count"]) + 1
             continue
@@ -323,7 +336,15 @@ def run_parser() -> dict[str, object]:
 
 def main() -> int:
     global STOCKEY_RUN_STATE
-    STOCKEY_RUN_STATE = run_parser()
+    import argparse
+    ap = argparse.ArgumentParser(description="Parse stored NSE indices archives into nseindia_indices.")
+    ap.add_argument("--backfill", action="store_true", help="Ignore the parse lookback -> consider every stored index day")
+    ap.add_argument("--force", action="store_true", help="Re-parse stored index days already marked done (full history backfill)")
+    ap.add_argument("--from", dest="from_date", default=None, help="Only consider stored days >= this date (YYYY-MM-DD)")
+    ap.add_argument("--to", dest="to_date", default=None, help="Only consider stored days <= this date (YYYY-MM-DD)")
+    args, _ = ap.parse_known_args()
+    STOCKEY_RUN_STATE = run_parser(backfill=args.backfill, force=args.force,
+                                   from_date=args.from_date, to_date=args.to_date)
     print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
     return 0
 

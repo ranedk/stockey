@@ -4124,7 +4124,7 @@ def test_indices_parser_records_failed_key(monkeypatch):
     monkeypatch.setattr(indices_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(indices_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(indices_parser.store, "get_as_temp_file", lambda key: "/tmp/failing_indices.zip")
-    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key, **kw: True)
     monkeypatch.setattr(
         indices_parser,
         "unzip_and_process",
@@ -4165,7 +4165,7 @@ def test_indices_parser_marks_empty_valid_source_processed(monkeypatch):
     monkeypatch.setattr(indices_parser, "get_processed_keys", lambda *_args, **_kwargs: set())
     monkeypatch.setattr(indices_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(indices_parser.store, "get_as_temp_file", lambda key: "/tmp/empty_indices.zip")
-    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key, **kw: True)
     monkeypatch.setattr(indices_parser, "unzip_and_process", lambda path: {"status": indices_parser.EMPTY_VALID_STATUS, "rows": 0})
     monkeypatch.setattr(
         indices_parser,
@@ -4201,7 +4201,7 @@ def test_indices_parser_treats_empty_valid_source_as_completed(monkeypatch):
     )
     monkeypatch.setattr(indices_parser, "get_failed_entries", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(indices_parser.store, "get_as_temp_file", lambda key: (_ for _ in ()).throw(AssertionError("completed empty key should not be fetched")))
-    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key: True)
+    monkeypatch.setattr(indices_parser, "should_consider_key", lambda key, **kw: True)
 
     class DummyRedis:
         def sadd(self, *_args, **_kwargs):
@@ -44690,7 +44690,7 @@ def test_indices_parser_main_exports_runner_state(monkeypatch, capsys):
     monkeypatch.setattr(
         indices_parser,
         "run_parser",
-        lambda: {
+        lambda **kw: {
             "source": "indices",
             "rows": 1,
             "rows_read": 2,

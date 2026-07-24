@@ -148,7 +148,7 @@ def _date_window_from_keys(keys: Iterable[str]) -> tuple[str | None, str | None]
 
 
 def run_parser(*, backfill: bool = False, from_date: str | None = None,
-               to_date: str | None = None) -> dict[str, object]:
+               to_date: str | None = None, force: bool = False) -> dict[str, object]:
     lo = pd.Timestamp(from_date) if from_date else None
     hi = pd.Timestamp(to_date) if to_date else None
 
@@ -204,19 +204,21 @@ def run_parser(*, backfill: bool = False, from_date: str | None = None,
     for key in files:
         parsed_date = keyed_dates.get(key)
         in_db = parsed_date is not None and parsed_date.strftime("%Y-%m-%d") in parsed_dates
-        # Default behavior is unchanged: skip anything marked processed. --backfill is the one exception --
-        # it re-parses a stored day whose OHLCV is NOT yet in the DB, recovering the deep history the rolling
-        # lookback (or a stale processed-marker) left unparsed.
-        if key in processed_keys and not (backfill and not in_db):
-            emit(f"⏩ Already processed in DB state: {key}")
-            summary["already_processed_count"] = int(summary["already_processed_count"]) + 1
-            continue
-        if in_db:
-            emit(f"⏩ Already parsed in DB: {key}")
-            mark_processed(SOURCE_PREFIX, key)
-            processed_keys.add(key)
-            summary["already_parsed_db_count"] = int(summary["already_parsed_db_count"]) + 1
-            continue
+        # --force re-parses EVERY stored day in range regardless of skips -> re-runs the whole per-day zip so
+        # ALL numerical tables (mcap, delivery, volatility, circuit, ...) are backfilled, not just OHLCV.
+        if not force:
+            # Default behavior is unchanged: skip anything marked processed. --backfill re-parses a stored day
+            # whose OHLCV is NOT yet in the DB (deep history the lookback / a stale marker left unparsed).
+            if key in processed_keys and not (backfill and not in_db):
+                emit(f"⏩ Already processed in DB state: {key}")
+                summary["already_processed_count"] = int(summary["already_processed_count"]) + 1
+                continue
+            if in_db:
+                emit(f"⏩ Already parsed in DB: {key}")
+                mark_processed(SOURCE_PREFIX, key)
+                processed_keys.add(key)
+                summary["already_parsed_db_count"] = int(summary["already_parsed_db_count"]) + 1
+                continue
         file_path = store.get_as_temp_file(key)
         emit(f"For: {key}")
         # A zero-byte archive is a failed/placeholder download, never a valid empty day.
@@ -958,8 +960,12 @@ def main() -> int:
                          "from nseindia_ohlcv (recovers the deep history already downloaded to the store).")
     ap.add_argument("--from", dest="from_date", default=None, help="Only consider stored days >= this date (YYYY-MM-DD)")
     ap.add_argument("--to", dest="to_date", default=None, help="Only consider stored days <= this date (YYYY-MM-DD)")
+    ap.add_argument("--force", action="store_true",
+                    help="Re-parse every stored day in range regardless of skips -> backfills ALL numerical "
+                         "tables (mcap/volatility/circuit/...) for the deep history, not just OHLCV.")
     args, _ = ap.parse_known_args()          # tolerate a test/pytest argv
-    STOCKEY_RUN_STATE = run_parser(backfill=args.backfill, from_date=args.from_date, to_date=args.to_date)
+    STOCKEY_RUN_STATE = run_parser(backfill=args.backfill, from_date=args.from_date,
+                                   to_date=args.to_date, force=args.force)
     print(json.dumps({"status": "ok", **STOCKEY_RUN_STATE}, ensure_ascii=False, default=str), flush=True)
     return 0
 
