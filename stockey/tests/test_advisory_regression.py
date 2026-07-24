@@ -4073,6 +4073,54 @@ def test_legacy_archival_never_touches_protected_numerical_tables(monkeypatch):
     assert calls == ["nseindia_ohlcv"]
 
 
+def test_store_download_retries_transient_timeout(monkeypatch):
+    # A read timeout while streaming the S3 Body previously aborted the whole multi-hour backfill
+    # (2017-06-18). _download_bytes must retry the full get_object+read and self-heal.
+    import utils.store as store
+    from botocore.exceptions import ReadTimeoutError, ClientError
+
+    monkeypatch.setattr(store.time, "sleep", lambda *_a, **_k: None)  # no backoff delay in test
+
+    class _Body:
+        def read(self):
+            return b"PK\x03\x04ok"
+
+    state = {"n": 0}
+
+    class _FlakyClient:
+        def get_object(self, **_kw):
+            state["n"] += 1
+            if state["n"] < 3:
+                raise ReadTimeoutError(endpoint_url="s3", error="timed out")
+            return {"Body": _Body()}
+
+    monkeypatch.setattr(store, "_CLIENT", _FlakyClient())
+    assert store._download_bytes("bhavcopy/x.zip") == b"PK\x03\x04ok"
+    assert state["n"] == 3  # retried twice, succeeded on the third
+
+    # persistent timeout -> raises after exhausting attempts (caller records + skips the one key)
+    class _DeadClient:
+        def get_object(self, **_kw):
+            raise ReadTimeoutError(endpoint_url="s3", error="timed out")
+
+    monkeypatch.setattr(store, "_CLIENT", _DeadClient())
+    with pytest.raises(ReadTimeoutError):
+        store._download_bytes("bhavcopy/x.zip")
+
+    # a genuinely missing key (ClientError, not a transient network error) must fail fast, not retry
+    tries = {"n": 0}
+
+    class _MissingClient:
+        def get_object(self, **_kw):
+            tries["n"] += 1
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
+    monkeypatch.setattr(store, "_CLIENT", _MissingClient())
+    with pytest.raises(ClientError):
+        store._download_bytes("bhavcopy/missing.zip")
+    assert tries["n"] == 1  # not retried
+
+
 def test_indices_downloader_confirmed_gap_reconciliation():
     # the equity bhavcopy is the ground truth of which days actually traded; any such day missing from the
     # index is a CONFIRMED gap (a real trading day) -- e.g. the Mar-2026 crash-week days the index endpoint

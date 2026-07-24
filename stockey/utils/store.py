@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import mimetypes
 from pathlib import Path
 from typing import Union
@@ -8,6 +9,7 @@ from typing import Iterator
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError
 from environs import Env
 
 # ---------------------------------------------------------------------------
@@ -37,9 +39,37 @@ def _get_client() -> boto3.client:
             endpoint_url=AWS_S3_ENDPOINT_URL,
             aws_access_key_id=AWS_ACCESS_KEY_ID,
             aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            config=Config(signature_version="s3v4"),
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=15,
+                read_timeout=60,
+                retries={"max_attempts": 5, "mode": "standard"},
+            ),
         )
     return _CLIENT
+
+
+# botocore's client-level retries cover the initial request, but NOT a timeout that strikes while the
+# response body is streaming (Body.read()). A single such read timeout previously aborted the whole
+# multi-hour bhavcopy backfill (2017-06-18: "Read timed out"). Retry the full get_object+read on these
+# transient network/timeout errors so a blip self-heals instead of killing the run.
+_DOWNLOAD_MAX_ATTEMPTS = 5
+
+
+def _download_bytes(key: str) -> bytes:
+    """Download an object's bytes, retrying the full get_object+read on transient S3 errors."""
+    last_exc: Exception | None = None
+    for attempt in range(1, _DOWNLOAD_MAX_ATTEMPTS + 1):
+        try:
+            s3 = _get_client()
+            return s3.get_object(Bucket=AWS_BUCKET_NAME, Key=key)["Body"].read()
+        except (BotoCoreError, ConnectionError) as exc:  # ReadTimeout/ConnectTimeout/IncompleteRead are BotoCoreError subclasses; NoSuchKey (ClientError) is not caught and fails fast
+            last_exc = exc
+            if attempt == _DOWNLOAD_MAX_ATTEMPTS:
+                break
+            time.sleep(min(2 ** attempt, 30))
+    assert last_exc is not None
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -121,8 +151,7 @@ def save_file(
 
 def get_file_content(key: str) -> bytes:
     """ Download a file from S3 and return its content as bytes.  """
-    s3 = _get_client()
-    return s3.get_object(Bucket=AWS_BUCKET_NAME, Key=key)["Body"].read()
+    return _download_bytes(key)
 
 
 def get_file_handle(key: str) -> bytes:
@@ -133,10 +162,9 @@ def get_file_handle(key: str) -> bytes:
 
 def get_as_temp_file(key: str) -> bytes:
     """ Download a file from S3 and return its content as a temporary file. """
-    s3 = _get_client()
-    f = s3.get_object(Bucket=AWS_BUCKET_NAME, Key=key)["Body"]
+    content = _download_bytes(key)
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
-        tmp_file.write(f.read())
+        tmp_file.write(content)
     return tmp_file.name
 
 

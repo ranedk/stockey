@@ -219,7 +219,28 @@ def run_parser(*, backfill: bool = False, from_date: str | None = None,
                 processed_keys.add(key)
                 summary["already_parsed_db_count"] = int(summary["already_parsed_db_count"]) + 1
                 continue
-        file_path = store.get_as_temp_file(key)
+        try:
+            file_path = store.get_as_temp_file(key)
+        except Exception as exc:
+            # store.get_as_temp_file already retries transient S3 read timeouts; if it still fails, skip
+            # this one key (record it for retry) rather than aborting the whole multi-hour backfill.
+            error_message = f"classification=download_failed; {exc.__class__.__name__}: {exc}"
+            emit(f"❌ Failed to download bhavcopy key={key}: {error_message}")
+            record_local_fallback_event(
+                module=SYNC_SOURCE_NAME,
+                source=str(key),
+                fallback_type="nse_bhavcopy_download_failed",
+                severity="warn",
+                reason="Bhavcopy archive download failed after retries; marked failed for retry so the backfill continues.",
+                error=exc,
+                metadata={"key": str(key), "source_prefix": SOURCE_PREFIX},
+            )
+            mark_failed(SOURCE_PREFIX, key, error_message)
+            summary["failed_count"] = int(summary["failed_count"]) + 1
+            classifications = dict(summary["failed_classifications"])
+            classifications["download_failed"] = int(classifications.get("download_failed", 0)) + 1
+            summary["failed_classifications"] = classifications
+            continue
         emit(f"For: {key}")
         # A zero-byte archive is a failed/placeholder download, never a valid empty day.
         # Marking it processed would silently freeze the OHLCV feed at the prior date
