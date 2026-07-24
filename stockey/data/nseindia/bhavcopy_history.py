@@ -93,6 +93,68 @@ def split_factors(day_df: pd.DataFrame, *, threshold: float = 0.35) -> pd.DataFr
 # ------------------------------------------------------------------------------------------------
 # Fetch + collect
 # ------------------------------------------------------------------------------------------------
+def ohlcv_from_store_zip(raw: bytes) -> pd.DataFrame | None:
+    """Extract ONLY the OHLCV CSV from a stored 'all-reports' bhavcopy zip -- the nested cm*bhav.csv.zip (old)
+    or BhavCopy_NSE_CM*.zip (UDiFF). Skips the ~10 other reports the full parser handles, so a from-archive
+    OHLCV backfill is far faster than re-running the whole parser (no re-download, no per-file multi-table writes)."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        for name in z.namelist():
+            base = name.rsplit("/", 1)[-1]
+            low = base.lower()
+            if low.startswith("cm") and low.endswith("bhav.csv.zip"):
+                with zipfile.ZipFile(io.BytesIO(z.read(name))) as inner:
+                    return parse_oldcm(inner.read(inner.namelist()[0]))
+            if base.startswith("BhavCopy_NSE_CM") and low.endswith(".zip"):
+                with zipfile.ZipFile(io.BytesIO(z.read(name))) as inner:
+                    return parse_udiff(inner.read(inner.namelist()[0]))
+    return None
+
+
+def _store_key_date(key: str) -> pd.Timestamp | None:
+    import os
+    try:
+        return pd.Timestamp(pd.to_datetime(os.path.basename(key), format="bhavcopy_%Y-%m-%d.zip"))
+    except Exception:
+        return None
+
+
+def backfill_ohlcv_from_store(from_date: str, to_date: str, *, batch: int = 25, dry_run: bool = False) -> dict:
+    """Fill nseindia_ohlcv OHLCV straight from the ARCHIVE (the store's already-downloaded bhavcopy zips) --
+    no NSE re-download, no heavy multi-table parse. Skips days already in the DB; batches the writes."""
+    from utils import store
+    from utils.db import sql_to_df, upsert_to_db
+    lo, hi = pd.Timestamp(from_date), pd.Timestamp(to_date)
+    ex = sql_to_df("SELECT DISTINCT date::date d FROM nseindia_ohlcv WHERE date BETWEEN %(a)s AND %(b)s",
+                   params={"a": lo.date(), "b": hi.date()})
+    have = {pd.Timestamp(d) for d in ex["d"]} if not ex.empty else set()
+    keys = [(k, d) for k in store.list_files("bhavcopy")
+            if (d := _store_key_date(k)) is not None and lo <= d <= hi and d not in have]
+    keys.sort(key=lambda kd: kd[1])
+    buf: list[pd.DataFrame] = []
+    days = rows = 0
+
+    def _flush():
+        nonlocal buf, rows
+        if buf and not dry_run:
+            df = pd.concat(buf, ignore_index=True).drop_duplicates(["date", "symbol", "series"])
+            upsert_to_db(df[OUT_COLS], "nseindia_ohlcv", unique_keys=["date", "symbol", "series"])
+        buf = []
+
+    for key, _ in keys:
+        try:
+            df = ohlcv_from_store_zip(store.get_file_content(key))
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
+        df = df.dropna(subset=["symbol", "close"])
+        buf.append(df); days += 1; rows += len(df)
+        if len(buf) >= batch:
+            _flush()
+    _flush()
+    return {"days": days, "rows": rows, "range": f"{from_date}..{to_date}", "candidates": len(keys)}
+
+
 def _session() -> requests.Session:
     s = requests.Session(); s.headers.update(HEADERS)
     try:
@@ -142,11 +204,18 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Historical NSE bhavcopy collector (report-only backfill).")
     ap.add_argument("--from", dest="from_date", required=True)
     ap.add_argument("--to", dest="to_date", required=True)
-    ap.add_argument("--dry-run", action="store_true", help="download + parse but do not write to the DB")
-    ap.add_argument("--sleep", type=float, default=0.4, help="seconds between requests (be polite to NSE)")
+    ap.add_argument("--dry-run", action="store_true", help="parse but do not write to the DB")
+    ap.add_argument("--from-store", action="store_true",
+                    help="Fill OHLCV straight from the ARCHIVED store zips (fast, OHLCV-only, no NSE re-download)")
+    ap.add_argument("--batch", type=int, default=25, help="--from-store: days per DB write")
+    ap.add_argument("--sleep", type=float, default=0.4, help="download mode: seconds between NSE requests")
     args = ap.parse_args()
-    print(f"backfilling bhavcopy {args.from_date}..{args.to_date} (dry_run={args.dry_run})")
-    result = collect_range(args.from_date, args.to_date, dry_run=args.dry_run, sleep=args.sleep)
+    if args.from_store:
+        print(f"backfilling OHLCV from ARCHIVE {args.from_date}..{args.to_date} (dry_run={args.dry_run})", flush=True)
+        result = backfill_ohlcv_from_store(args.from_date, args.to_date, batch=args.batch, dry_run=args.dry_run)
+    else:
+        print(f"backfilling bhavcopy (download) {args.from_date}..{args.to_date} (dry_run={args.dry_run})", flush=True)
+        result = collect_range(args.from_date, args.to_date, dry_run=args.dry_run, sleep=args.sleep)
     print(result)
 
 

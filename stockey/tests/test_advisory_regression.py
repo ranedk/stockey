@@ -3949,6 +3949,28 @@ def test_bhavcopy_parser_backfill_lifts_lookback():
     assert bp.should_consider_key(bad, today=t, backfill=True) is False   # non-date key never considered
 
 
+def test_bhavcopy_history_extracts_ohlcv_from_store_zip():
+    import io, zipfile
+    from data.nseindia import bhavcopy_history as bh
+    cm_csv = (b"SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP,TOTALTRADES,ISIN\n"
+              b"RELIANCE,EQ,100,110,95,105,105,98,1000,105000,02-JAN-2018,50,INE002A01018\n")
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as z:
+        z.writestr("cm02JAN2018bhav.csv", cm_csv)
+    outer = io.BytesIO()
+    with zipfile.ZipFile(outer, "w") as z:                 # an 'all-reports' zip with the nested cm bhav zip
+        z.writestr("NSE_Market_Pulse.pdf", b"x")
+        z.writestr("cm02JAN2018bhav.csv.zip", inner.getvalue())
+    df = bh.ohlcv_from_store_zip(outer.getvalue())
+    assert df is not None and len(df) == 1
+    assert df.iloc[0]["symbol"] == "RELIANCE" and df.iloc[0]["close"] == 105
+    # a zip with no OHLCV report (e.g. a weekend/holiday download) -> None
+    empty = io.BytesIO()
+    with zipfile.ZipFile(empty, "w") as z:
+        z.writestr("shortselling.csv", b"x")
+    assert bh.ohlcv_from_store_zip(empty.getvalue()) is None
+
+
 def test_bhavcopy_history_parsers_and_split_detection():
     from data.nseindia import bhavcopy_history as bh
     oldcm = (b"SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP,TOTALTRADES,ISIN\n"
