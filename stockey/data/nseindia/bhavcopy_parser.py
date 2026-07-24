@@ -587,7 +587,10 @@ def parse_mto(path):
     emit("Processing MTO")
     parts = path.split("_")[-1].split(".")[0]
     for_date = pd.to_datetime(parts, format="%d%m%Y")
-    df = pd.read_csv(path, skiprows=4)
+    # header=None: the 4 skipped lines are preamble (title / "10,MTO" / trade-date / column-name row); the
+    # first "20,..." security row must be read as DATA, not consumed as the header (that silently dropped
+    # the first stock's delivery every day). Columns are assigned explicitly below.
+    df = pd.read_csv(path, skiprows=4, header=None)
     df = df.reset_index(drop=True)
     df.columns = [
         "record_type",
@@ -597,17 +600,51 @@ def parse_mto(path):
         "volume",
         "deliverable_volume",
         "deliverable_percent",
-    ]
+    ][: df.shape[1]]
     df["date"] = for_date
+    # keep only security rows (record_type == 20); drop the "90,..." grand-total trailer if present.
+    df = df[df["record_type"].astype(str).str.strip() == "20"]
     for c in ["volume", "deliverable_volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
     df["deliverable_percent"] = pd.to_numeric(
         df["deliverable_percent"], errors="coerce"
     )
+    df["symbol"] = df["symbol"].astype(str).str.strip()
+    df["series"] = df["series"].astype(str).str.strip()
     unique_keys = ["date", "symbol"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
     df = with_company_master(df)
     upsert_to_db(df, "nseindia_mto", unique_keys=unique_keys)
+    return df
+
+
+def parse_wk52(path):
+    emit("Processing 52WK")
+    parts = path.split("_")[-1].split(".")[0]
+    for_date = pd.to_datetime(parts, format="%d%m%Y")
+    # 2 disclaimer/effective-date lines precede the header row.
+    df = pd.read_csv(path, skiprows=2)
+    df = df.reset_index(drop=True)
+    df.columns = [
+        "symbol",
+        "series",
+        "adjusted_52_week_high",
+        "high_date",
+        "adjusted_52_week_low",
+        "low_date",
+    ][: len(df.columns)]
+    df["date"] = for_date
+    df["symbol"] = df["symbol"].astype(str).str.strip()
+    df["series"] = df["series"].astype(str).str.strip()
+    for c in ["adjusted_52_week_high", "adjusted_52_week_low"]:
+        df[c] = pd.to_numeric(df[c].astype(str).str.strip(), errors="coerce")
+    for c in ["high_date", "low_date"]:
+        df[c] = pd.to_datetime(df[c].astype(str).str.strip(), format="%d-%b-%Y", errors="coerce")
+    df = df[df["symbol"].notna() & (df["symbol"] != "") & (df["symbol"].str.lower() != "nan")]
+    unique_keys = ["date", "symbol"]
+    df = df.drop_duplicates(subset=unique_keys, keep="last")
+    df = with_company_master(df)
+    upsert_to_db(df, "nseindia_52wk", unique_keys=unique_keys)
     return df
 
 
@@ -841,9 +878,17 @@ def unzip_and_process(zip_path):
         for file_path in csqr_files:
             _run("csqr", file_path, parse_csqr)
 
-        mto_files = glob.glob(os.path.join(tmpdir, "**", "MTO_*.CSV"), recursive=True)
+        # NSE ships the security-wise delivery report as MTO_<ddmmyyyy>.DAT (not .CSV); the old .CSV glob
+        # never matched, so delivery was silently un-parsed despite the file being present since 2013.
+        mto_files = glob.glob(os.path.join(tmpdir, "**", "MTO_*.DAT"), recursive=True)
+        mto_files += glob.glob(os.path.join(tmpdir, "**", "MTO_*.CSV"), recursive=True)
         for file_path in mto_files:
             _run("mto", file_path, parse_mto)
+
+        # 52-week high/low (CM_52_wk_High_low_<ddmmyyyy>.csv) -- NSE started publishing this file in 2020.
+        wk52_files = glob.glob(os.path.join(tmpdir, "**", "CM_52_wk_High_low_*.csv"), recursive=True)
+        for file_path in wk52_files:
+            _run("wk52", file_path, parse_wk52)
 
         pe_files = glob.glob(os.path.join(tmpdir, "**", "PE_*.CSV"), recursive=True)
         for file_path in pe_files:

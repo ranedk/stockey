@@ -3991,6 +3991,88 @@ def test_bhavcopy_history_parsers_and_split_detection():
     assert abs(float(ca.iloc[0]["adj_factor"]) - 0.20) < 1e-6      # open/prevclose = 20/100
 
 
+def test_bhavcopy_parser_mto_dat_delivery(monkeypatch, tmp_path):
+    # NSE ships delivery as MTO_<ddmmyyyy>.DAT with 4 preamble lines, "20,..." security rows, and a
+    # "90,..." grand-total trailer. The parser must read the .DAT layout and drop the trailer.
+    captured: dict[str, object] = {}
+    path = tmp_path / "MTO_02012018.DAT"
+    path.write_text(
+        "Security Wise Delivery Position - Compulsory Rolling Settlement\n"
+        "10,MTO,02012018,723652832,0002021\n"
+        "Trade Date <02-JAN-2018>,Settlement Type <N>\n"
+        "Record Type,Sr No,Name of Security,Series,Quantity Traded,Deliverable Quantity,Percentage\n"
+        "20,1,RELIANCE,EQ,1000,600,60.00\n"
+        "20,2,TCS,EQ,500,250,50.00\n"
+        "90,MTO,02012018,1500,850\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df}))
+
+    frame = bhavcopy_parser.parse_mto(str(path))
+
+    assert captured["table"] == "nseindia_mto"
+    assert set(frame["symbol"]) == {"RELIANCE", "TCS"}          # the "90" trailer row is dropped
+    reliance = frame[frame["symbol"] == "RELIANCE"].iloc[0]
+    assert int(reliance["deliverable_volume"]) == 600
+    assert abs(float(reliance["deliverable_percent"]) - 60.0) < 1e-9
+    assert reliance["date"] == pd.Timestamp("2018-01-02")
+
+
+def test_bhavcopy_parser_wk52_high_low(monkeypatch, tmp_path):
+    # CM_52_wk_High_low_<ddmmyyyy>.csv -- 2 disclaimer/effective-date lines precede the header.
+    captured: dict[str, object] = {}
+    path = tmp_path / "CM_52_wk_High_low_02012018.csv"
+    path.write_text(
+        '"Disclaimer - adjusted for corporate actions"\n'
+        '"Effective for 02-Jan-2018"\n'
+        '"SYMBOL","SERIES","Adjusted 52_Week_High","52_Week_High_Date","Adjusted 52_Week_Low","52_Week_Low_DT"\n'
+        '"RELIANCE","EQ","    1200.50","18-JAN-2017","     900.25","23-AUG-2017"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df}))
+
+    frame = bhavcopy_parser.parse_wk52(str(path))
+
+    assert captured["table"] == "nseindia_52wk"
+    row = frame[frame["symbol"] == "RELIANCE"].iloc[0]
+    assert abs(float(row["adjusted_52_week_high"]) - 1200.50) < 1e-9
+    assert abs(float(row["adjusted_52_week_low"]) - 900.25) < 1e-9
+    assert row["high_date"] == pd.Timestamp("2017-01-18")
+    assert row["date"] == pd.Timestamp("2018-01-02")
+
+
+def test_legacy_archival_never_touches_protected_numerical_tables(monkeypatch):
+    # Operator decision: core numerical bhavcopy data must never be archived out of the live DB. The
+    # legacy-archival tool must skip every protected table by default, and only proceed under an
+    # explicit force override.
+    from scripts import archive_legacy_nse_tables as ala
+    from scripts.db_table_retention_report import PROTECTED_NUMERICAL_TABLES
+
+    assert {"nseindia_ohlcv", "nseindia_mto", "nseindia_52wk", "nseindia_indices"} <= PROTECTED_NUMERICAL_TABLES
+
+    calls: list[str] = []
+    monkeypatch.setattr(ala, "archive_table", lambda *, table_name, **kw: calls.append(table_name) or {"table_name": table_name, "deleted_rows": 0})
+
+    result = ala.run_archive(
+        tables=["nseindia_ohlcv", "nseindia_mto"], retention_days=365, cutoff="2020-01-01",
+        archive_s3=True, delete=True, execute=True, allow_delete_without_archive=True,
+        archive_prefix="x", max_chunks=1, exact_counts=False,
+    )
+    assert calls == []                                                  # archive_table never invoked
+    assert all(r["status"] == "protected_never_archived" for r in result["results"])
+    assert result["deleted_rows"] == 0
+
+    # explicit override lets it proceed (guard is a safety default, not a hard lock)
+    ala.run_archive(
+        tables=["nseindia_ohlcv"], retention_days=365, cutoff="2020-01-01",
+        archive_s3=True, delete=False, execute=False, allow_delete_without_archive=False,
+        archive_prefix="x", max_chunks=1, exact_counts=False, force_archive_protected=True,
+    )
+    assert calls == ["nseindia_ohlcv"]
+
+
 def test_indices_downloader_confirmed_gap_reconciliation():
     # the equity bhavcopy is the ground truth of which days actually traded; any such day missing from the
     # index is a CONFIRMED gap (a real trading day) -- e.g. the Mar-2026 crash-week days the index endpoint

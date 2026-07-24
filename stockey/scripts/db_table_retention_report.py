@@ -28,7 +28,15 @@ LEGACY_NSE_TABLES: dict[str, str] = {
     "nseindia_cat_turnover": "trade_date",
     "nseindia_events": "date",
     "nseindia_indices": "date",
+    "nseindia_mto": "date",
+    "nseindia_52wk": "date",
 }
+
+# Numerical bhavcopy-derived tables that are core research inputs and must NEVER be archived/deleted
+# out of the live DB (operator decision 2026-07: "all important data from bhavcopy must stay in the
+# system, never archived"). The legacy-archival tool refuses to touch these. They stay in
+# LEGACY_NSE_TABLES only so the retention *report* still shows their coverage.
+PROTECTED_NUMERICAL_TABLES: frozenset[str] = frozenset(LEGACY_NSE_TABLES)
 
 
 def _json_default(value: Any) -> str:

@@ -16,7 +16,11 @@ from psycopg2 import extensions
 from environs import Env
 from psycopg2 import sql
 
-from scripts.db_table_retention_report import DEFAULT_RETENTION_DAYS, LEGACY_NSE_TABLES
+from scripts.db_table_retention_report import (
+    DEFAULT_RETENTION_DAYS,
+    LEGACY_NSE_TABLES,
+    PROTECTED_NUMERICAL_TABLES,
+)
 from advisory.fallback_telemetry import record_local_fallback_event
 from utils.db import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER, qualified_identifier, sql_to_df
 from utils.store import save_file
@@ -335,6 +339,7 @@ def run_archive(
     archive_prefix: str,
     max_chunks: int | None,
     exact_counts: bool,
+    force_archive_protected: bool = False,
 ) -> dict[str, Any]:
     parsed_cutoff = _parse_cutoff(cutoff, retention_days)
     selected = tables or list(LEGACY_NSE_TABLES.keys())
@@ -344,6 +349,11 @@ def run_archive(
         if table not in LEGACY_NSE_TABLES:
             _log_progress("table_unknown", table=table)
             results.append({"table_name": table, "status": "unknown_table"})
+            continue
+        if table in PROTECTED_NUMERICAL_TABLES and not force_archive_protected:
+            # Core numerical bhavcopy data -- never archived out of the live DB (operator decision).
+            _log_progress("table_protected", table=table)
+            results.append({"table_name": table, "status": "protected_never_archived"})
             continue
         results.append(
             archive_table(
@@ -389,6 +399,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-chunks", type=int, default=None, help="Limit monthly chunks per table.")
     parser.add_argument("--exact-counts", action="store_true", help="Count each monthly chunk. Slow on large tables.")
     parser.add_argument("--execute", action="store_true", help="Actually archive/delete. Without this, dry-run only.")
+    parser.add_argument(
+        "--force-archive-protected",
+        action="store_true",
+        help="Override the never-archive guard on core numerical bhavcopy tables. Strongly discouraged.",
+    )
     args = parser.parse_args(argv)
     result = run_archive(
         tables=args.table,
@@ -401,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         archive_prefix=args.archive_prefix,
         max_chunks=args.max_chunks,
         exact_counts=bool(args.exact_counts),
+        force_archive_protected=bool(args.force_archive_protected),
     )
     print(json.dumps(result, indent=2, default=_json_default))
     return 0
