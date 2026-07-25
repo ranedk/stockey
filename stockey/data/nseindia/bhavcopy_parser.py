@@ -433,7 +433,12 @@ def parse_corporate_actions_bc(path):
             .str.strip()
             .replace({"": pd.NA, "-": pd.NA, "None": pd.NA, "null": pd.NA})
         )
-        df[col] = pd.to_datetime(s, format="%d/%m/%Y", errors="coerce")
+        # NSE switched the corporate-actions date format from DD/MM/YYYY to ISO YYYY-MM-DD in ~2025-10
+        # (alongside the filename lowercasing). Coalesce both so neither era's dates coerce to NaT --
+        # which would drop every row via the dropna below and silently zero out corporate actions.
+        parsed = pd.to_datetime(s, format="%d/%m/%Y", errors="coerce")
+        parsed = parsed.fillna(pd.to_datetime(s, format="%Y-%m-%d", errors="coerce"))
+        df[col] = parsed
 
     df = df.dropna(subset=["date", "symbol", "series", "subject"])
     unique_keys = ["date", "symbol", "series", "subject"]

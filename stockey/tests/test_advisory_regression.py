@@ -4145,6 +4145,27 @@ def test_bhavcopy_corporate_actions_bc_folds_embedded_comma(monkeypatch, tmp_pat
     assert set(frame["symbol"]) == {"RELIANCE", "TCS"}       # both rows survive
 
 
+def test_bhavcopy_corporate_actions_bc_parses_both_date_formats(monkeypatch, tmp_path):
+    # NSE switched the corporate-actions date format from DD/MM/YYYY to ISO YYYY-MM-DD in ~2025-10.
+    # Both eras must parse, else the ex-date coerces to NaT and dropna zeroes out the whole day.
+    captured: dict[str, object] = {}
+    path = tmp_path / "bc16032026.csv"
+    path.write_text(
+        "SERIES,SYMBOL,SECURITY,RECORD_DT,BC_STRT_DT,BC_END_DT,EX_DT,ND_STRT_DT,ND_END_DT,PURPOSE\n"
+        "EQ,OLDFMT,Old Ltd,02/09/2025,,,02/09/2025,,,DIV RS 14\n"     # legacy DD/MM/YYYY
+        "EQ,NEWFMT,New Ltd,2026-03-17,,,2026-03-17,,,INTEREST PAYMENT\n",  # ISO YYYY-MM-DD
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"df": df}))
+
+    frame = bhavcopy_parser.parse_corporate_actions_bc(str(path))
+
+    assert set(frame["symbol"]) == {"OLDFMT", "NEWFMT"}   # neither dropped
+    assert frame.set_index("symbol").loc["OLDFMT", "date"] == pd.Timestamp("2025-09-02")
+    assert frame.set_index("symbol").loc["NEWFMT", "date"] == pd.Timestamp("2026-03-17")
+
+
 def test_bhavcopy_ci_glob_survives_nse_case_change(tmp_path):
     # NSE lowercased the PR-zip report filenames in ~2025-10 (Bc->bc, MCAP->mcap). The case-sensitive
     # globs then silently dropped corporate actions + market cap for months. _ci_glob must match BOTH
