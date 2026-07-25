@@ -840,6 +840,24 @@ def parse_catg(path):
     return df
 
 
+def _ci_glob(root: str, prefix: str, suffix: str = ".csv") -> list[str]:
+    """Case-insensitive recursive match of basenames starting with `prefix` and ending with `suffix`.
+
+    NSE lowercased the PR-zip report filenames in ~2025-10 (Bc->bc, MCAP->mcap), so the old
+    case-sensitive `glob("Bc*.csv")` / `glob("MCAP*.csv")` silently stopped matching -- corporate
+    actions and market cap went missing for months while the run still reported success. Matching
+    case-insensitively survives NSE's casing changes.
+    """
+    p, s = prefix.lower(), suffix.lower()
+    matches: list[str] = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            low = name.lower()
+            if low.startswith(p) and low.endswith(s):
+                matches.append(os.path.join(dirpath, name))
+    return matches
+
+
 def is_empty_zip(path: str) -> bool:
     try:
         return os.path.getsize(path) == 0
@@ -1026,15 +1044,17 @@ def unzip_and_process(zip_path):
                     )
                     continue
 
-                bc_files = glob.glob(os.path.join(nested_tmpdir, "**", "Bc*.csv"), recursive=True)
+                # case-insensitive: NSE lowercased these PR-zip filenames in ~2025-10 (Bc->bc, MCAP->mcap),
+                # which silently dropped corporate actions + market cap under the old case-sensitive globs.
+                bc_files = _ci_glob(nested_tmpdir, "bc")
                 for file_path in bc_files:
                     _run("corporate_actions_bc", file_path, parse_corporate_actions_bc)
 
-                bh_files = glob.glob(os.path.join(nested_tmpdir, "**", "bh*.csv"), recursive=True)
+                bh_files = _ci_glob(nested_tmpdir, "bh")
                 for file_path in bh_files:
                     _run("circuit_hit", file_path, parse_circuit_hit)
 
-                mcap_files = glob.glob(os.path.join(nested_tmpdir, "**", "MCAP*.csv"), recursive=True)
+                mcap_files = _ci_glob(nested_tmpdir, "mcap")
                 for file_path in mcap_files:
                     _run("mcap", file_path, parse_mcap)
 

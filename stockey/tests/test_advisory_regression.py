@@ -4145,6 +4145,22 @@ def test_bhavcopy_corporate_actions_bc_folds_embedded_comma(monkeypatch, tmp_pat
     assert set(frame["symbol"]) == {"RELIANCE", "TCS"}       # both rows survive
 
 
+def test_bhavcopy_ci_glob_survives_nse_case_change(tmp_path):
+    # NSE lowercased the PR-zip report filenames in ~2025-10 (Bc->bc, MCAP->mcap). The case-sensitive
+    # globs then silently dropped corporate actions + market cap for months. _ci_glob must match BOTH
+    # cases and must not bleed into unrelated prefixes (pr/pd).
+    for name in ["Bc010925.csv", "bc01072026.csv", "MCAP01092025.csv", "mcap01072026.csv",
+                 "bh01072026.csv", "pr01072026.csv", "pd01072026.csv"]:
+        (tmp_path / name).write_text("x", encoding="utf-8")
+    import os as _os
+    bc = {_os.path.basename(p) for p in bhavcopy_parser._ci_glob(str(tmp_path), "bc")}
+    mcap = {_os.path.basename(p) for p in bhavcopy_parser._ci_glob(str(tmp_path), "mcap")}
+    bh = {_os.path.basename(p) for p in bhavcopy_parser._ci_glob(str(tmp_path), "bh")}
+    assert bc == {"Bc010925.csv", "bc01072026.csv"}          # both cases, not pr/pd
+    assert mcap == {"MCAP01092025.csv", "mcap01072026.csv"}
+    assert bh == {"bh01072026.csv"}
+
+
 def test_bhavcopy_soft_skips_unrecoverable_cat_turnover(monkeypatch, tmp_path):
     import zipfile
 
