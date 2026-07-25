@@ -48989,6 +48989,43 @@ def test_price_adjustment_open_gap_catches_split_with_intraday_move():
     assert (a2["ca_flag"] == "ambiguous").any() and (a2["cum_adj_factor"] == 1.0).all()
 
 
+def test_price_adjustment_ca_purpose_parser():
+    from advisory import price_adjustment as pa
+    f = lambda s: pa._factor_for_events(pa._events_from_subject(s))
+    assert f("BONUS 1:1") == 0.5                       # X:Y bonus -> Y/(X+Y)
+    assert f("BONUS 3:1") == 0.25
+    assert abs(f("BONUS 5:2") - 2 / 7) < 1e-9
+    assert f("FV SPLIT RS.10 TO RS.5") == 0.5          # split A->B -> B/A
+    assert abs(f("FVSPLT FRM RS 5 TO RE 1") - 0.2) < 1e-9
+    assert abs(f("BON 2:1/FVSPLT FRM RS 2 TO RE 1") - (1 / 3) * (1 / 2)) < 1e-9  # combined multiply
+    assert f("DIV - RS 5 PER SH") is None              # dividend is not a split/bonus
+
+
+def test_price_adjustment_declared_ca_fixes_missed_split():
+    import datetime as _dt
+    from advisory import price_adjustment as pa
+    # a 1:1 bonus whose ex-date ALSO fell ~7% -> overnight step 0.535 misses the round-ratio snap and is
+    # left 'ambiguous' (unadjusted). NSE's declared 1:1 bonus supplies the exact 0.5 and back-adjusts.
+    df = pd.DataFrame({
+        "symbol": ["X", "X", "X"],
+        "date": pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"], utc=True),
+        "open": [100.0, 53.5, 50.0], "close": [100.0, 50.0, 49.0],
+    })
+    a0 = pa.adjust_frame(df.copy())
+    assert (a0["ca_flag"] == "ambiguous").any() and (a0["cum_adj_factor"] == 1.0).all()  # unadjusted
+
+    decl = {("X", _dt.date(2024, 1, 2)): 0.5}
+    a1 = pa.adjust_frame(df.copy(), declared_ratios=decl).sort_values("date").reset_index(drop=True)
+    assert a1.loc[1, "ca_flag"] == "split_bonus_ca"
+    assert abs(a1.loc[0, "cum_adj_factor"] - 0.5) < 1e-9          # pre-event history rescaled
+    assert abs(a1.loc[0, "adj_close"] - 50.0) < 1e-9             # 100 * 0.5 onto post-event basis
+    # a declared CA with NO price step must NOT be applied (no double-adjust)
+    flat = pd.DataFrame({"symbol": ["Y", "Y"], "date": pd.to_datetime(["2024-01-01", "2024-01-02"], utc=True),
+                         "open": [100.0, 100.5], "close": [100.0, 101.0]})
+    a2 = pa.adjust_frame(flat, declared_ratios={("Y", _dt.date(2024, 1, 2)): 0.5})
+    assert (a2["cum_adj_factor"] == 1.0).all() and (a2["ca_flag"] == "").all()
+
+
 def test_price_data_sanity_report_contract():
     from scripts import price_data_sanity as pds
     # the reporting contract: findings render, errors gate status, benchmark gaps are an error

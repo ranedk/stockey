@@ -18,10 +18,70 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+# ---- declared corporate-action ratios (NSE Bc feed) -> confirm/supply the ratio the price-step heuristic
+# ---- misses. A step that breaches the circuit band but does not snap to a round ratio (e.g. a 1:1 bonus
+# ---- whose ex-date also moved a few %, or a 5:2 / 7:5 ratio absent from the round set) is left ambiguous
+# ---- and UNADJUSTED by the price-only path; cross-referencing NSE's declared split/bonus fixes exactly
+# ---- those. Bonus "X:Y" = X new shares per Y held -> price factor Y/(X+Y); FV split A->B -> factor B/A.
+_BONUS_RE = re.compile(r"BON(?:US)?\.?\s*(\d+)\s*:\s*(\d+)")
+_SPLIT_RE = re.compile(r"(?:F\.?\s*V\.?\s*)?(?:SPLI?T|SUB[\s-]*DIV)\D*?(\d+)\D+?TO\D*?(\d+)")
+
+
+def _events_from_subject(subject: str) -> set[tuple[str, int, int]]:
+    """Parse the canonical (kind, a, b) split/bonus events out of one Bc `subject` string. Splits on
+    '/', ';', '|' so a combined 'BONUS1:1/FVSPLIT 10 TO 5' yields both events."""
+    events: set[tuple[str, int, int]] = set()
+    for part in re.split(r"[/;|]", str(subject).upper()):
+        mb = _BONUS_RE.search(part)
+        if mb:
+            events.add(("bonus", int(mb.group(1)), int(mb.group(2))))
+        ms = _SPLIT_RE.search(part)
+        if ms:
+            events.add(("split", int(ms.group(1)), int(ms.group(2))))
+    return events
+
+
+def _factor_for_events(events: set[tuple[str, int, int]]) -> float | None:
+    """Combined price multiplier for a set of DISTINCT same-day events (duplicates already deduped by the
+    set). None if no split/bonus event was found."""
+    if not events:
+        return None
+    factor = 1.0
+    for kind, a, b in events:
+        if a <= 0 or b <= 0:
+            return None
+        factor *= (b / (a + b)) if kind == "bonus" else (b / a)
+    return factor
+
+
+def load_declared_ca_ratios() -> dict[tuple[str, Any], float]:
+    """Map (symbol, ex-date) -> declared split/bonus price factor from nseindia_corporate_actions_bc_raw.
+    Duplicate declarations (same event listed per series) dedupe; genuinely distinct same-day events
+    (a bonus AND a split) multiply. Only ratios that move the price >2% are kept (a real CA)."""
+    from utils.db import sql_to_df
+    df = sql_to_df(
+        "SELECT symbol, date, subject FROM nseindia_corporate_actions_bc_raw WHERE subject IS NOT NULL"
+    )
+    if df.empty:
+        return {}
+    dates = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.date
+    events_by_key: dict[tuple[str, Any], set[tuple[str, int, int]]] = {}
+    for sym, dt, subj in zip(df["symbol"], dates, df["subject"]):
+        if pd.isna(dt):
+            continue
+        events_by_key.setdefault((sym, dt), set()).update(_events_from_subject(subj))
+    ratios: dict[tuple[str, Any], float] = {}
+    for key, events in events_by_key.items():
+        f = _factor_for_events(events)
+        if f is not None and f > 0 and abs(f - 1.0) > 0.02:
+            ratios[key] = f
+    return ratios
 
 # a single-day close step beyond the widest Indian circuit band (~20%) is a CA or data artifact
 CIRCUIT_STEP_LOW = 0.65
@@ -47,7 +107,8 @@ def _snap_event_ratio(price_ratio: float) -> float | None:
 
 
 def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str = "date",
-                 close_col: str = "close", open_col: str = "open") -> pd.DataFrame:
+                 close_col: str = "close", open_col: str = "open",
+                 declared_ratios: dict[tuple[str, Any], float] | None = None) -> pd.DataFrame:
     """Return df with `cum_adj_factor`, `adj_close`, and `ca_flag` per row.
 
     CA detection uses the ex-date OVERNIGHT gap `open[t] / close[t-1]` -- the PURE split/bonus factor, since
@@ -56,10 +117,12 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
     to snap, but open/prev=0.198 snaps to 1/5). Falls back to the close step where the open is missing, and
     to close-only if the frame carries no `open` column (backward compatible).
 
-    Back-adjustment: adj_close[t] = close[t] * (product of confirmed event ratios at dates > t), so
-    pre-event prices are scaled down onto the post-event basis and the series is continuous. `ca_flag` is
-    'split_bonus' on a confirmed event day, 'ambiguous' on a circuit-breaching step that did not snap
-    (possible data error, NOT adjusted), else ''.
+    When `declared_ratios` (from NSE's Bc corporate-action feed, keyed by (symbol, ex-date)) is supplied, a
+    circuit-breaching step whose date matches a declared split/bonus uses that EXACT ratio -- fixing the
+    cases the price-only snap misses (a 1:1 bonus that also moved a few %, or ratios absent from the round
+    set). Only breaching rows consult it, so a declared CA with no price step is never applied (no
+    double-adjust). `ca_flag`: 'split_bonus_ca' (declared-confirmed), 'split_bonus' (price-snapped),
+    'ambiguous' (breach, neither -> possible data error, NOT adjusted), else ''.
     """
     if df.empty:
         return df.assign(cum_adj_factor=[], adj_close=[], ca_flag=[])
@@ -74,10 +137,27 @@ def adjust_frame(df: pd.DataFrame, *, symbol_col: str = "symbol", date_col: str 
         price_ratio = close_ratio
     breach = (price_ratio < CIRCUIT_STEP_LOW) | (price_ratio > CIRCUIT_STEP_HIGH)
 
+    # per-row declared-CA ratio, aligned to `out` (NaN where none) -- vectorized left-merge preserves order
+    if declared_ratios:
+        keys = pd.DataFrame({
+            "__sym": out[symbol_col].to_numpy(),
+            "__dt": pd.to_datetime(out[date_col], utc=True).dt.date.to_numpy(),
+        })
+        dr = pd.DataFrame([(s, d, f) for (s, d), f in declared_ratios.items()],
+                          columns=["__sym", "__dt", "__declared"])
+        declared_col = keys.merge(dr, on=["__sym", "__dt"], how="left", sort=False)["__declared"].to_numpy()
+    else:
+        declared_col = np.full(len(out), np.nan)
+
     event_ratio = np.ones(len(out), dtype="float64")
     ca_flag = np.array([""] * len(out), dtype=object)
-    # only circuit-breaching rows can be corporate actions -- snap just those (fast on the full universe)
+    # only circuit-breaching rows can be corporate actions -- resolve just those (fast on the full universe)
     for i in np.flatnonzero(np.nan_to_num(breach)):
+        declared = declared_col[i]
+        if np.isfinite(declared) and declared > 0:
+            event_ratio[i] = declared            # NSE-declared split/bonus -> exact, ground-truth ratio
+            ca_flag[i] = "split_bonus_ca"
+            continue
         snapped = _snap_event_ratio(float(price_ratio[i]))
         if snapped is None:
             ca_flag[i] = "ambiguous"          # possible data error -> do not adjust, flag for review
@@ -141,14 +221,17 @@ def build_adjusted_ohlcv(*, dry_run: bool = False) -> dict[str, Any]:
     if raw.empty:
         return {"rows": 0}
     raw["date"] = pd.to_datetime(raw["date"], utc=True, errors="coerce")
-    adj = adjust_frame(raw)  # per-symbol back-adjustment from price steps
+    declared_ratios = load_declared_ca_ratios()  # NSE Bc feed confirms/supplies ratios the price snap misses
+    adj = adjust_frame(raw, declared_ratios=declared_ratios)  # price-step + declared-CA back-adjustment
     now = pd.Timestamp.utcnow()
     out = adj[["symbol", "date", "series", "close", "adj_close", "cum_adj_factor", "ca_flag"]].copy()
     out["load_ts"] = now
     summary = {
         "rows": int(len(out)),
         "symbols": int(out["symbol"].nunique()),
+        "declared_ca_ratios_loaded": int(len(declared_ratios)),
         "split_bonus_events": int((out["ca_flag"] == "split_bonus").sum()),
+        "ca_confirmed_events": int((out["ca_flag"] == "split_bonus_ca").sum()),
         "ambiguous_flags": int((out["ca_flag"] == "ambiguous").sum()),
         "adjusted_rows": int((out["cum_adj_factor"] != 1.0).sum()),
     }
