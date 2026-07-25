@@ -4121,6 +4121,53 @@ def test_store_download_retries_transient_timeout(monkeypatch):
     assert tries["n"] == 1  # not retried
 
 
+def test_bhavcopy_corporate_actions_bc_folds_embedded_comma(monkeypatch, tmp_path):
+    # The trailing PURPOSE/subject column is free text with unquoted commas, so some rows carry >10
+    # comma fields. A plain read_csv raised "Expected 10 fields, saw 11" and lost the WHOLE day's
+    # corporate actions (8 backfill days). The parser must fold the overflow back into `subject`.
+    captured: dict[str, object] = {}
+    path = tmp_path / "Bc010101.csv"
+    path.write_text(
+        "SERIES,SYMBOL,SECURITY,RECORD_DATE,BC_START,BC_END,EX_DATE,ND_START,ND_END,PURPOSE\n"
+        "EQ,RELIANCE,Reliance Ltd,-,-,-,10/01/2019,-,-,DIVIDEND RS 5, SPECIAL\n"
+        "EQ,TCS,TCS Ltd,-,-,-,11/01/2019,-,-,BONUS 1:1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df}))
+
+    frame = bhavcopy_parser.parse_corporate_actions_bc(str(path))
+
+    assert captured["table"] == "nseindia_corporate_actions_bc_raw"
+    reliance = frame[frame["symbol"] == "RELIANCE"].iloc[0]
+    assert reliance["subject"] == "DIVIDEND RS 5, SPECIAL"   # embedded comma folded into one field
+    assert reliance["date"] == pd.Timestamp("2019-01-10")
+    assert set(frame["symbol"]) == {"RELIANCE", "TCS"}       # both rows survive
+
+
+def test_bhavcopy_soft_skips_unrecoverable_cat_turnover(monkeypatch, tmp_path):
+    import zipfile
+
+    # A corrupt-at-source cat_turnover .xls (NSE no longer serves a good copy) must NOT fail the whole
+    # day -- it is skipped visibly so the day's other tables are retained. A different cat_turnover
+    # error (e.g. a schema change) still fails hard.
+    events: list[dict[str, object]] = []
+    zip_path = tmp_path / "bhavcopy_2025-08-05.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("cat_turnover_050825.xls", "corrupt-ole-bytes")
+    monkeypatch.setattr(bhavcopy_parser, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    monkeypatch.setattr(
+        bhavcopy_parser, "parse_cat_turnover",
+        lambda path: (_ for _ in ()).throw(RuntimeError(f"Unable to read CAT Turnover workbook path={path}")),
+    )
+
+    # the corrupt cat_turnover is the only file -> the day completes (no RuntimeError raised)
+    result = bhavcopy_parser.unzip_and_process(str(zip_path))
+    assert result is not False
+    assert events and events[0]["fallback_type"] == "nse_bhavcopy_file_unrecoverable_skipped"
+    assert events[0]["severity"] == "warn"
+
+
 def test_indices_downloader_confirmed_gap_reconciliation():
     # the equity bhavcopy is the ground truth of which days actually traded; any such day missing from the
     # index is a CONFIRMED gap (a real trading day) -- e.g. the Mar-2026 crash-week days the index endpoint

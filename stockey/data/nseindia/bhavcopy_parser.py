@@ -396,8 +396,7 @@ def parse_circuit_hit(path):
 
 def parse_corporate_actions_bc(path):
     emit("Processing Corporate Actions BC")
-    df = pd.read_csv(path)
-    df.columns = [
+    cols = [
         "series",
         "symbol",
         "security_name",
@@ -409,6 +408,22 @@ def parse_corporate_actions_bc(path):
         "nd_end_date",
         "subject",
     ]
+    # The trailing `subject` (PURPOSE) column is free text with unquoted commas, so some rows carry
+    # >10 comma-separated fields (e.g. "DIVIDEND RS 5, SPECIAL"). A plain read_csv raised
+    # "Expected 10 fields, saw 11" and lost the WHOLE day's corporate actions. Split with maxsplit so
+    # the overflow folds back into `subject` and every record survives.
+    records = []
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        next(fh, None)  # discard header row
+        for raw in fh:
+            line = raw.rstrip("\r\n")
+            if not line.strip():
+                continue
+            parts = line.split(",", len(cols) - 1)
+            if len(parts) < len(cols):
+                parts = parts + [""] * (len(cols) - len(parts))
+            records.append(parts)
+    df = pd.DataFrame(records, columns=cols)
     df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
 
     for col in ["record_date", "bc_start_date", "bc_end_date", "date", "nd_start_date", "nd_end_date"]:
@@ -859,18 +874,28 @@ def unzip_and_process(zip_path):
 
         failures: list[str] = []
 
-        def _run(label: str, file_path: str, parser) -> None:
+        def _run(label: str, file_path: str, parser, *, soft_error_substrings: tuple[str, ...] = ()) -> None:
             try:
                 parser(file_path)
             except Exception as exc:
-                failures.append(f"{label}:{os.path.basename(file_path)}:{exc.__class__.__name__}:{exc}")
-                emit(f"❌ Failed {label} file={file_path}: {exc.__class__.__name__}: {exc}")
+                # A minor, occasionally corrupt-at-source file (e.g. a truncated cat_turnover .xls NSE
+                # itself no longer serves) should NOT fail the whole day and trap it in permanent retry --
+                # the day's important numerical data (OHLCV, delivery, ...) parsed fine. Downgrade only the
+                # KNOWN corruption signature to a visible warning; any other error still fails hard so a
+                # real schema/parser regression is still caught.
+                soft = any(s in str(exc) for s in soft_error_substrings)
+                emit(f"{'⚠️ Skipped (corrupt source)' if soft else '❌ Failed'} {label} file={file_path}: {exc.__class__.__name__}: {exc}")
                 record_local_fallback_event(
                     module=SYNC_SOURCE_NAME,
                     source=str(file_path),
-                    fallback_type="nse_bhavcopy_file_parse_failed",
+                    fallback_type="nse_bhavcopy_file_unrecoverable_skipped" if soft else "nse_bhavcopy_file_parse_failed",
                     severity="warn",
-                    reason="A file inside the bhavcopy archive failed to parse; the parent archive will be marked failed for retry/review.",
+                    reason=(
+                        "A minor bhavcopy file is corrupt at source and unrecoverable; skipped visibly so the day's "
+                        "other tables are retained instead of the whole archive being marked failed."
+                        if soft else
+                        "A file inside the bhavcopy archive failed to parse; the parent archive will be marked failed for retry/review."
+                    ),
                     error=exc,
                     metadata={
                         "label": str(label),
@@ -878,6 +903,8 @@ def unzip_and_process(zip_path):
                         "filename": os.path.basename(file_path),
                     },
                 )
+                if not soft:
+                    failures.append(f"{label}:{os.path.basename(file_path)}:{exc.__class__.__name__}:{exc}")
 
         catg_files = glob.glob(os.path.join(tmpdir, "**", "C_CATG_*.T*"), recursive=True)
         for file_path in catg_files:
@@ -889,7 +916,8 @@ def unzip_and_process(zip_path):
 
         cat_turnover_files = glob.glob(os.path.join(tmpdir, "**", "cat_turnover_*.xls"), recursive=True)
         for file_path in cat_turnover_files:
-            _run("cat_turnover", file_path, parse_cat_turnover)
+            _run("cat_turnover", file_path, parse_cat_turnover,
+                 soft_error_substrings=("Unable to read CAT Turnover workbook",))
 
         cmvolt_files = glob.glob(os.path.join(tmpdir, "**", "CMVOLT_*.CSV"), recursive=True)
         for file_path in cmvolt_files:
