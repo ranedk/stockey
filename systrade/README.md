@@ -58,12 +58,48 @@ go run ./cmd/run -config config.json -data ./data
   forecasts capped ±20, inertia 10%, cost drag printed against the 0.13 SR
   speed limit, t-stat judged against the ledger's Bonferroni bar.
 
+## Data & broker layer
+
+- **Local DB**: postgres `systrade` (user/pass `systrade`), tables mirrored
+  1:1 from the stockey project so the DBs can be merged later. Sync:
+  `./scripts/sync_from_stockey.sh` (remote 172.26.39.7, falls back to local;
+  full-refresh for small tables, incremental on `date` for the big ones).
+- **Primary equity history**: `advisory_adjusted_ohlcv_daily` — CA-adjusted
+  closes, 2013+, ~3,950 symbols incl. delisted (survivorship-honest). Use
+  `Store.AdjustedCloses`; raw `dhan_ohlcv_daily` (2015+) is fallback only.
+  `nseindia_indices` has index OHLCV + PE/PB/div yield (carry inputs).
+  `master_dhan_instruments` has lot sizes/security ids.
+- **Backfilled series**: `systrader_ohlcv_daily` (our table, never stockey's)
+  holds ETFs, index spot, and futures fetched via `cmd/dhan backfill`.
+  CAUTION: Dhan futures "history" is an unadjusted continuous splice, not
+  per-contract data — read `docs/data_notes.md` before using it.
+- **Dhan auth**: stockey owns the browser login (Chrome CDP + Playwright +
+  TOTP); systrader reuses its token cache (`DHAN_TOKEN_CACHE`). If expired:
+  run stockey's `python -m data.dhanlive.web_login`.
+- **Order safety**: `PlaceOrder` is a dry run unless `LIVE_ORDERS=yes`.
+- Config: copy `.env.example` → `.env` (never commit `.env`).
+
+```bash
+./scripts/sync_from_stockey.sh                 # refresh local data
+go run ./cmd/backtest -tickers RELIANCE,TCS    # real-data backtest
+go run ./cmd/dhan funds|holdings|positions     # broker smoke tests
+go run ./cmd/dhan backfill                     # fill systrader_ohlcv_daily (incremental)
+go run ./cmd/dhan hist -sec 14428 -seg NSE_EQ -inst EQUITY -from 2016-01-01
+```
+
 ## Status
 
 - [x] Framework core + tests + synthetic demo
-- [ ] Real OHLCV ingestion (blocked on open questions B5–B7)
-- [ ] Futures stitching (Panama) + carry series construction
+- [x] Postgres data layer (systrade mirror of stockey + sync script)
+- [x] Real-data backtests from `dhan_ohlcv_daily` (`-tickers` flag)
+- [x] Dhan client: token reuse, funds/holdings/positions/historical, guarded orders
+- [x] Backfill ETF/index/futures history via Dhan API (`cmd/dhan backfill` →
+      `systrader_ohlcv_daily`; futures caveat in `docs/data_notes.md`)
+- [x] Corporate-action price adjustment (`advisory_adjusted_ohlcv_daily` →
+      `Store.AdjustedCloses`; backtests prefer adjusted, raw is labelled)
+- [ ] Futures stitching (Panama over Dhan slot splices, roll = expiry calendar)
+      + carry from position-1/position-2 basis (splice-safe, see data_notes)
 - [ ] Matched-control baseline harness; bootstrap weight estimation
 - [ ] Handcrafting helper (correlation grouping → weights + FDM/IDM)
 - [ ] Instrument universe finalization (blocked on capital, A1)
-- [ ] Paper-trade mode; later: broker API execution
+- [ ] Paper-trade mode; later: live execution via Dhan orders API

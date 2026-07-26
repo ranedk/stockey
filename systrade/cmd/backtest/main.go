@@ -1,22 +1,111 @@
-// Command backtest runs the full pipeline. With no arguments it runs a
-// SYNTHETIC demo (random data, seeded) purely to exercise the machinery —
-// its performance numbers are meaningless by construction and the report
-// says so. Real usage arrives with real data: see cmd/run and docs/.
+// Command backtest runs the full pipeline.
+//
+//	backtest                          synthetic demo (harness check only)
+//	backtest -tickers RELIANCE,TCS    real data from the systrade database
+//
+// Real runs use cash-equity economics (block = 1 share, LongOnly) until
+// futures metadata is wired up. Carry is skipped automatically when no carry
+// series exists (the combiner renormalizes weights over available rules).
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/ranedk/systrader/internal/backtest"
 	"github.com/ranedk/systrader/internal/core"
 	"github.com/ranedk/systrader/internal/data"
 	"github.com/ranedk/systrader/internal/rules"
+	"github.com/ranedk/systrader/internal/store"
 )
 
 func main() {
+	tickers := flag.String("tickers", "", "comma-separated tickers from systrade db (empty = synthetic demo)")
+	capital := flag.Float64("capital", 5_000_000, "trading capital")
+	volTarget := flag.Float64("voltarget", 0.20, "annual volatility target (fraction)")
+	flag.Parse()
+	if *tickers != "" {
+		runReal(strings.Split(*tickers, ","), *capital, *volTarget)
+		return
+	}
+	runSynthetic()
+}
+
+func runReal(tickers []string, capital, volTarget float64) {
+	ctx := context.Background()
+	st, err := store.Open(ctx)
+	if err != nil {
+		panic(err)
+	}
+	defer st.Close()
+
+	var instruments []*data.Instrument
+	weights := map[string]float64{}
+	for _, tk := range tickers {
+		tk = strings.TrimSpace(tk)
+		// Adjusted closes first (splits/bonuses corrected, 2013+, delisted
+		// included); raw dhan series only as a fallback for names the
+		// adjusted table lacks (ETFs etc.) — raw returns lie at CA dates.
+		prices, err := st.AdjustedCloses(ctx, tk)
+		src := "adjusted"
+		if err != nil {
+			prices, err = st.DailyCloses(ctx, tk)
+			src = "dhan RAW (beware corporate actions)"
+		}
+		if err != nil {
+			fmt.Printf("skip %s: %v\n", tk, err)
+			continue
+		}
+		instruments = append(instruments, &data.Instrument{
+			Meta: data.Meta{Symbol: tk, PointValue: 1, Block: 1, LongOnly: true,
+				// cash-equity cost model: ~5bps spread+impact, ₹0 brokerage
+				// (delivery), 0.1% STT+charges per side
+				SpreadPoints: 0, FeePerBlock: 0, PercentValueFee: 0.0012},
+			Prices: prices,
+		})
+		fmt.Printf("%s: %d bars (%s → %s) [%s]\n", tk, prices.Len(),
+			prices.Times[0].Format("2006-01-02"), prices.Times[prices.Len()-1].Format("2006-01-02"), src)
+	}
+	if len(instruments) == 0 {
+		panic("no instruments loaded")
+	}
+	for _, in := range instruments {
+		weights[in.Meta.Symbol] = 1.0 / float64(len(instruments))
+	}
+	idm := math.Min(math.Sqrt(float64(len(instruments))), 2.5) // rough; handcraft later
+
+	cfg := backtest.Config{
+		Capital: capital, VolTargetPct: volTarget, Compounding: true,
+		Rules: []backtest.RuleSpec{
+			{Rule: rules.EWMAC{Fast: 16}, Weight: 0.42}, // carry absent → trend-only,
+			{Rule: rules.EWMAC{Fast: 32}, Weight: 0.16}, // Table-8 within-group weights
+			{Rule: rules.EWMAC{Fast: 64}, Weight: 0.42},
+		},
+		FDM:               1.1, // three correlated EWMAC variations only
+		InstrumentWeights: weights,
+		IDM:               idm,
+	}
+	res, err := backtest.Run(cfg, instruments)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("\n=== REAL DATA (cash-equity economics, long-only) ===")
+	fmt.Println(res.Metrics.Report(2))
+	fmt.Println()
+	for _, in := range instruments {
+		ir := res.Instruments[in.Meta.Symbol]
+		fmt.Printf("%-12s turnover=%.1f/yr  avg|pos|=%.0f  costs=₹%.0f\n",
+			in.Meta.Symbol, ir.Turnover, ir.AvgAbsPos, ir.CostCash)
+	}
+	fmt.Printf("\nEnd capital: ₹%.0f (started ₹%.0f)\n", res.EndCapital, capital)
+}
+
+func runSynthetic() {
 	rng := rand.New(rand.NewSource(42))
 	days := tradingDays(time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC), 2500)
 

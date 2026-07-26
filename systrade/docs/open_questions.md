@@ -28,19 +28,28 @@ Answer inline under each question (edit this file directly). Defaults in
 
 ## B. Broker, execution & data
 
-5. **[blocking] Which broker(s)?** Zerodha (Kite Connect), Upstox, Fyers,
-   Dhan, IBKR India…? Determines API for later automation and actual fee
-   schedule for the cost model.
+5. ~~Which broker?~~ **ANSWERED: Dhan** (client 1106536894), auth reused from
+   stockey's CDP login, client in `internal/broker/dhan`. Remaining: confirm
+   the actual fee schedule to encode in the cost model (delivery/F&O/MCX).
    > 
 
-6. **[blocking] Daily OHLCV source?** You mentioned you'll provide access —
-   which source (broker API historicals, NSE bhavcopy archive, a vendor)?
-   Does it include: (a) delisted stocks, (b) futures continuous/contract-wise
-   prices, (c) both near and next-month contracts (needed for carry), (d) MCX?
+6. ~~Daily OHLCV source?~~ **ANSWERED: stockey → systrade mirror** (stocks) +
+   **`systrader_ohlcv_daily` Dhan backfill** (ETFs, index spot, futures, MCX —
+   2026-07-24). Remaining sub-questions:
+   (a) ~~delisted stocks?~~ **ANSWERED 2026-07-26: yes** —
+   `advisory_adjusted_ohlcv_daily` (now primary, CA-adjusted, 2013+) carries
+   1,201 symbols whose last bar predates 2026; universe is survivorship-honest.
+   (b/c/d) futures near+next & MCX: backfilled, BUT Dhan serves continuous
+   slot-splices, not per-contract series — carry is usable now, EWMAC needs
+   Panama first (`docs/data_notes.md`). True contract-wise history would need
+   NSE/MCX bhavcopy archives if we ever want exact roll-date basis.
    > 
 
-7. How far back does the history go? <10 years materially weakens what we can
-   claim statistically (Ch 3 tables).
+7. History depth: **improved 2026-07-26** — adjusted equity series now spans
+   2013-07→present (13yrs) for the older names; `dhan_ohlcv_daily` (2015-11+)
+   is fallback. Still worth asking: NSE bhavcopy back to ~2000 for the
+   longest-lived symbols? Per Ch-3 tables, 13yrs supports slow-rule claims
+   but t-stats on anything fast remain weak.
    > 
 
 8. Execution mode for v1: you place orders manually from a daily report, or
