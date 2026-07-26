@@ -49049,6 +49049,24 @@ def test_rbi_currency_parse_rate_rows():
     assert parse_rate_rows([["junk"], ["x"]]).empty
 
 
+def test_corporate_action_events_parsers():
+    from data.nseindia.corporate_action_events import parse_dividend, classify_capital_change
+    # dividend amount + type from the real Bc PURPOSE formats
+    assert parse_dividend("DIV - RS 2 PER SH") == {"dividend_amount": 2.0, "dividend_type": "final"}
+    assert parse_dividend("AGM/DIV-RS 1.50 PER SHARE")["dividend_amount"] == 1.5
+    assert parse_dividend("INTERIM DIVIDEND") == {"dividend_amount": None, "dividend_type": "interim"}
+    assert parse_dividend("INTDIV - RE 1 PER SH") == {"dividend_amount": 1.0, "dividend_type": "interim"}
+    assert parse_dividend("SPECIAL DIVIDEND RS 5 PER SH") == {"dividend_amount": 5.0, "dividend_type": "special"}
+    assert parse_dividend("BONUS 1:1") is None                      # not a dividend
+    assert parse_dividend("SUB-DIVISION FV RS 10 TO RE 1") is None  # subdivision = split, not a dividend
+    # capital change: type + price factor, and dividends are excluded
+    bonus = classify_capital_change("BONUS 1:1")
+    assert bonus["event_type"] == "bonus" and abs(bonus["price_factor"] - 0.5) < 1e-9
+    assert classify_capital_change("FVSPLT FRM RS 10 TO RE 1")["event_type"] == "split"
+    assert classify_capital_change("BON 2:1/FVSPLT FRM RS 2 TO RE 1")["event_type"] == "bonus+split"
+    assert classify_capital_change("DIV - RS 2 PER SH") is None
+
+
 def test_price_data_sanity_report_contract():
     from scripts import price_data_sanity as pds
     # the reporting contract: findings render, errors gate status, benchmark gaps are an error
