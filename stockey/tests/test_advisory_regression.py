@@ -49026,6 +49026,29 @@ def test_price_adjustment_declared_ca_fixes_missed_split():
     assert (a2["cum_adj_factor"] == 1.0).all() and (a2["ca_flag"] == "").all()
 
 
+def test_rbi_currency_parse_rate_rows():
+    from data.rbi.download_currency_rates import parse_rate_rows
+    # current RBI header carries unit suffixes + EUR/JPY + new AED/IDR -- the old fixed ["USD","GBP","EURO",
+    # "YEN"] list corrupted this. Map by the leading currency CODE instead.
+    rows = [
+        ["Date", "USD (INR / 1 USD)", "GBP (INR / 1 GBP)", "EUR (INR / 1 EUR)",
+         "JPY (INR / 100 JPY)", "AED (INR / 1 AED)", "IDR (INR / 10000 IDR)"],
+        ["15/07/2026", "96.2219", "129.0746", "110.0798", "59.3300", "26.1980", "53.2577"],
+        ["14/07/2026", "96.1138", "128.3750", "109.4557", "59.2000", "26.1688", "53.0831"],
+    ]
+    df = parse_rate_rows(rows)
+    assert list(df.columns) == ["date", "usd", "gbp", "eur", "jpy", "aed", "idr"]
+    assert df.iloc[0]["date"] == pd.Timestamp("2026-07-15")
+    assert abs(df.iloc[0]["usd"] - 96.2219) < 1e-6 and abs(df.iloc[0]["jpy"] - 59.33) < 1e-6
+    # legacy EURO/YEN labels (pre-suffix era) must still map to eur/jpy
+    legacy = parse_rate_rows([["Date", "USD", "GBP", "EURO", "YEN"],
+                              ["01/02/2015", "62.5", "95.1", "70.2", "0.52"]])
+    assert list(legacy.columns) == ["date", "usd", "gbp", "eur", "jpy"]
+    assert abs(legacy.iloc[0]["eur"] - 70.2) < 1e-6
+    # a table with no recognizable header yields an empty frame (never a corrupt one)
+    assert parse_rate_rows([["junk"], ["x"]]).empty
+
+
 def test_price_data_sanity_report_contract():
     from scripts import price_data_sanity as pds
     # the reporting contract: findings render, errors gate status, benchmark gaps are an error
