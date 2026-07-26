@@ -385,8 +385,60 @@ def run_macro_sync() -> dict[str, object]:
     return state
 
 
+def backfill_fred_series(series: Dict[str, str], start: date, end: date | None = None,
+                         *, resample: str | None = "D", dry_run: bool = False) -> dict:
+    """Fetch specific FRED series from `start` (bypassing the incremental latest-date logic) and upsert
+    into macro_usa. The daily incremental only ever pulls recent dates, so a column added later -- e.g.
+    inr_usd_spot / DEXINUS -- never gets its deep history; this fills it. Only the requested columns are
+    written, so other macro_usa columns are untouched on conflict.
+    """
+    end = end or date.today()
+    frames, failed = [], []
+    for series_id, friendly in series.items():
+        print(f"Backfilling FRED series {series_id} -> {friendly} ({start}..{end})", flush=True)
+        try:
+            data = _fetch_single_fred_series(series_id, start=start, end=end)
+        except Exception as exc:
+            failed.append(series_id)
+            print(f"FRED backfill failed for {series_id}: {exc}", flush=True)
+            continue
+        if data is None:
+            failed.append(series_id)
+            continue
+        frames.append(data.rename(friendly))
+    if not frames:
+        return {"status": "no_data", "failed": failed}
+    df = pd.concat(frames, axis=1).sort_index()
+    if resample:
+        df = df.resample(resample).last().ffill()
+    df = df.reset_index()
+    df.columns = ["date" if str(c).lower() in {"date", "observation_date"} else str(c) for c in df.columns]
+    usa_cols = [c for c in df.columns if c not in {"date", "india_gdp"}]
+    if usa_cols and not dry_run:
+        upsert_to_db(df[["date", *usa_cols]], "macro_usa", unique_keys=["date"], timescaledb_column="date")
+    return {"status": "ok" if not failed else "partial", "rows": int(len(df)), "columns": usa_cols,
+            "from_date": df["date"].min().date().isoformat(), "to_date": df["date"].max().date().isoformat(),
+            "failed": sorted(failed)}
+
+
 def main() -> int:
     global STOCKEY_RUN_STATE
+    import argparse
+    ap = argparse.ArgumentParser(description="Sync core US/India macro series from FRED into macro_usa.")
+    ap.add_argument("--backfill", metavar="SERIES_ID", action="append", default=[],
+                    help="Backfill one FRED series id (e.g. DEXINUS) from --from, bypassing the incremental logic. Repeatable.")
+    ap.add_argument("--from", dest="from_date", default="2014-01-01", help="--backfill start date (default 2014-01-01)")
+    args = ap.parse_args()
+    if args.backfill:
+        unknown = [s for s in args.backfill if s.upper() not in {k.upper() for k in __FRED_SERIES}]
+        if unknown:
+            print(json.dumps({"status": "error", "unknown_series": unknown,
+                              "known": sorted(__FRED_SERIES)}, default=str), flush=True)
+            return 1
+        series = {k: v for k, v in __FRED_SERIES.items() if k.upper() in {s.upper() for s in args.backfill}}
+        result = backfill_fred_series(series, start=date.fromisoformat(args.from_date))
+        print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
+        return 0
     STOCKEY_RUN_STATE = run_macro_sync()
     status = str(STOCKEY_RUN_STATE.get("status") or "ok")
     print(
