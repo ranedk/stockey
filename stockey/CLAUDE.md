@@ -219,3 +219,30 @@ python scripts/docs_state_audit.py --strict
   operator-trust issue.
 - Do not assume latest rows are current; use trading-day-aware diagnostics and
   sync-state contracts.
+
+## Boundary with systrader (2026-07-27)
+
+Stockey is becoming a pure DATA PLATFORM; all research/TA/selection authority
+is migrating to the `systrader` project (`~/Downloads/books/systrader`, Go,
+Carver-framework). Read before any structural work:
+
+- `DATA_CONTRACT.md` (repo root; canonical copy in systrader) — table API,
+  load rule (cloud DB is small: never point heavy reads at it), auth, tick plan.
+- `docs/ADVISORY_SPLIT.md` — which advisory modules move to `data/`
+  (`price_adjustment.py` FIRST — it produces systrader's primary price
+  table), which are ops, which get archived. Includes special handling:
+  export `research_ledger`/`multiple_testing` records to systrader's LEDGER
+  before archiving; `config/adaptive_ensemble.json` params are contaminated.
+
+Cross-session protocol with systrader's Claude session:
+- Decisions affecting the other project go into these repo docs (the
+  inter-session API), never only into session memory.
+- Either session MAY read the other's memory for context, READ-ONLY
+  (systrader's: `~/.claude/projects/-Users-rane-Downloads-books/memory/`;
+  this project's: `~/.claude/projects/-Users-rane-code-stockey/memory/`).
+  Never write to the other session's memory.
+- Research findings here that touch shared NSE data must be exportable as
+  trial counts — systrader's multiple-testing bar depends on knowing every
+  experiment this data has been asked (its LEDGER already imports the
+  adaptive-ensemble NO-GO, the factor-sweep null, and the deployment-timing
+  result; the 2020-01→2021-07 ensemble holdout is recorded as burned there).
