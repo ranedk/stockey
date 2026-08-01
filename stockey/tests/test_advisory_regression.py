@@ -4043,6 +4043,44 @@ def test_bhavcopy_parser_wk52_high_low(monkeypatch, tmp_path):
     assert row["date"] == pd.Timestamp("2018-01-02")
 
 
+def test_bhavcopy_parser_var1_dedupes_same_day_entries(monkeypatch, tmp_path):
+    # NSE republishes VAR1 several times a day as separately entry-numbered files. Storing every
+    # numbered file as its own row grew nseindia_var1 to 209M rows for no informational gain (the
+    # only consumer already collapses to MAX per day). parse_var1 must combine all of a day's
+    # files into ONE column-wise-MAX row per (for_date, series, symbol, isin) -- matching that
+    # consumer's aggregation exactly -- and RELIANCE's genuinely-revised margin (up in entry 2)
+    # must not be shadowed by the unchanged TCS row.
+    header_cols = "RecordType,Symbol,Series,ISIN,SecVaR,IdxVaR,VaRMargin,ELR,AdhocMargin,ApplicableMargin\n"
+    entry1 = tmp_path / "C_VAR1_02012018_1.DAT"
+    entry1.write_text(
+        "01,02012018,X,Y\n" + header_cols +          # 4 comma-fields -> entry_number defaults to 1
+        "1,RELIANCE,EQ,INE002A01018,3.5,4.0,7.5,1.0,0,8.5\n"
+        "1,TCS,EQ,INE467B01029,3.0,4.0,7.0,1.0,0,8.0\n",
+        encoding="utf-8",
+    )
+    entry2 = tmp_path / "C_VAR1_02012018_2.DAT"
+    entry2.write_text(
+        "01,02012018,X,2,Y\n" + header_cols +         # 5 comma-fields -> entry_number = parts[3] = 2
+        "1,RELIANCE,EQ,INE002A01018,4.0,4.0,8.0,1.0,0,9.0\n"     # margin genuinely revised up
+        "1,TCS,EQ,INE467B01029,3.0,4.0,7.0,1.0,0,8.0\n",         # unchanged republish
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(bhavcopy_parser, "with_company_master", lambda frame: frame)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(bhavcopy_parser, "upsert_to_db", lambda df, table, **kw: captured.update({"table": table, "df": df, "unique_keys": kw.get("unique_keys")}))
+
+    frame = bhavcopy_parser.parse_var1([str(entry1), str(entry2)])
+
+    assert captured["table"] == "nseindia_var1"
+    assert captured["unique_keys"] == ["for_date", "series", "symbol", "isin"]
+    assert len(frame) == 2                                              # one row per symbol, not per entry
+    reliance = frame[frame["symbol"] == "RELIANCE"].iloc[0]
+    assert abs(float(reliance["applicable_margin"]) - 9.0) < 1e-9        # kept the higher, revised value
+    assert int(reliance["entry_number"]) == 2                           # provenance: highest contributing entry
+    tcs = frame[frame["symbol"] == "TCS"].iloc[0]
+    assert abs(float(tcs["applicable_margin"]) - 8.0) < 1e-9             # unchanged across entries
+
+
 def test_legacy_archival_never_touches_protected_numerical_tables(monkeypatch):
     # Operator decision: core numerical bhavcopy data must never be archived out of the live DB. The
     # legacy-archival tool must skip every protected table by default, and only proceed under an

@@ -749,15 +749,23 @@ def parse_cmvolt(path):
     return df
 
 
-def parse_var1(path):
-    emit("Processing VAR1")
+VAR1_MARGIN_COLUMNS = [
+    "security_var",
+    "index_var",
+    "var_margin",
+    "extreme_loss_rate",
+    "adhoc_margin",
+    "applicable_margin",
+]
+
+
+def _read_var1_file(path: str) -> pd.DataFrame:
+    """Parse one NSE C_VAR1 file into a raw per-entry frame (one row per symbol/series/isin as
+    published in this specific numbered file)."""
     with open(path) as f:
         parts = f.readline().strip().split(",")
         for_date = datetime.strptime(parts[1], "%d%m%Y").date()
-        if len(parts) == 4:
-            entry_number = 1
-        else:
-            entry_number = int(parts[3])
+        entry_number = 1 if len(parts) == 4 else int(parts[3])
 
     df = pd.read_csv(path, skiprows=1)
     df.columns = [
@@ -773,19 +781,41 @@ def parse_var1(path):
         "applicable_margin",
     ]
     df = df.drop(columns="record_type")
-    for c in [
-        "security_var",
-        "index_var",
-        "var_margin",
-        "extreme_loss_rate",
-        "adhoc_margin",
-        "applicable_margin",
-    ]:
+    for c in VAR1_MARGIN_COLUMNS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     df["for_date"] = pd.to_datetime(for_date)
     df["entry_number"] = entry_number
-    unique_keys = ["for_date", "entry_number", "series", "symbol", "isin"]
+    return df
+
+
+def parse_var1(paths: str | Iterable[str]):
+    """Parse one day's NSE C_VAR1 file(s) into `nseindia_var1`, one row per (for_date, series,
+    symbol, isin).
+
+    NSE republishes VaR margin several times a day as separately entry-numbered files
+    (C_VAR1_ddmmyyyy_1.DAT, _2.DAT, ...); most republishes carry unchanged values, but real
+    intraday margin recalculation does happen for a meaningful share of symbols (~22% of
+    symbol/days in a spot-check). Storing every numbered file as its own row (keyed on
+    entry_number) is what grew this table to 209M rows / 52GB for no informational gain: the
+    only consumer (advisory/event_evidence_store.py) already collapses to
+    `max(...) GROUP BY (date, symbol)`. Reducing to one column-wise-MAX row per
+    (for_date, series, symbol, isin) here, at ingestion, matches that consumer's aggregation
+    exactly -- zero change to any value it reads -- while cutting stored rows ~6x.
+    `entry_number` is kept as the highest entry_number that contributed, for provenance only;
+    it is no longer part of the row identity.
+    """
+    emit("Processing VAR1")
+    paths = [paths] if isinstance(paths, str) else list(paths)
+    frames = [_read_var1_file(p) for p in paths]
+    df = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
+
+    group_keys = ["for_date", "series", "symbol", "isin"]
+    agg = {c: "max" for c in VAR1_MARGIN_COLUMNS}
+    agg["entry_number"] = "max"
+    df = df.groupby(group_keys, as_index=False).agg(agg)
+
+    unique_keys = ["for_date", "series", "symbol", "isin"]
     df = df.drop_duplicates(subset=unique_keys, keep="last")
     df = with_company_master(df)
     upsert_to_db(df, "nseindia_var1", unique_keys=unique_keys)
@@ -934,8 +964,11 @@ def unzip_and_process(zip_path):
             _run("catg", file_path, parse_catg)
 
         var1_files = glob.glob(os.path.join(tmpdir, "**", "C_VAR1_*_*.DAT"), recursive=True)
-        for file_path in var1_files:
-            _run("var1", file_path, parse_var1)
+        if var1_files:
+            # NSE republishes VAR1 several times a day as separately entry-numbered files;
+            # parse_var1 combines all of a day's files into one deduped upsert (see its docstring).
+            var1_label = f"{len(var1_files)} files: " + ", ".join(sorted(os.path.basename(p) for p in var1_files))
+            _run("var1", var1_label, lambda _label: parse_var1(var1_files))
 
         cat_turnover_files = glob.glob(os.path.join(tmpdir, "**", "cat_turnover_*.xls"), recursive=True)
         for file_path in cat_turnover_files:
