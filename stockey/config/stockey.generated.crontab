@@ -3,14 +3,14 @@ PATH=/opt/homebrew/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/
 CRON_TZ=Asia/Kolkata
 MAILTO=""
 
-STOCKEY_DIR=/Users/rane/code/stockey
-LOG_DIR=/Users/rane/code/stockey/logs/cron
+STOCKEY_DIR=/Users/rane/code/trading/stockey
+LOG_DIR=/Users/rane/code/trading/stockey/logs/cron
 
 # Create log directory once before enabling the crontab:
-#   mkdir -p /Users/rane/code/stockey/logs/cron
+#   mkdir -p /Users/rane/code/trading/stockey/logs/cron
 #
 # Run with go-crond:
-#   ./go-crond /Users/rane/code/stockey/config/stockey.generated.crontab --allow-unprivileged
+#   ./go-crond /Users/rane/code/trading/stockey/config/stockey.generated.crontab --allow-unprivileged
 #
 # This file includes a username field. Remove that field before installing into a normal per-user crontab.
 
