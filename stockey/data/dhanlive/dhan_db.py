@@ -1,8 +1,8 @@
 import pandas as pd
 from environs import Env
 
-from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
-from advisory.identity_issues import record_dhan_identity_issue
+from utils.fallback_telemetry import record_fallback_event, record_local_fallback_event
+from utils.identity_issues import record_dhan_identity_issue
 from utils.db import get_sql, sql_to_df
 from utils.company_master import load_company_master_records
 

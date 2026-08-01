@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import redis
 from environs import Env
 from playwright.sync_api import sync_playwright
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.ingestion_state import get_failed_entries
 from utils import store
 from utils.date import reverse_daterange

@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import pandas as pd
 import requests
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import force_refresh_access_token, get_access_token
 from environs import Env
 

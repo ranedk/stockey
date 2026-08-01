@@ -9,7 +9,7 @@ import redis
 import requests
 from environs import Env
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import upsert_to_db
 from utils.http import get_dynamic_headers
 from utils.date import daterange

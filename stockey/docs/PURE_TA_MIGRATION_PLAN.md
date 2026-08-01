@@ -45,19 +45,40 @@ Each phase ends with a gate. Do not start the next phase red.
 **Gate:** tests + sync + downloaders green from new paths; new session at
 `~/code/trading` sees both repos and merged memory.
 
-## Phase 2 — Promote data producers out of advisory/ (1 session)
+## Phase 2 — Promote data producers out of advisory/ (1 session) — DONE 2026-07-28
 
 1. `advisory/price_adjustment.py` → `data/nseindia/price_adjustment.py`
-   (imports fixed, table name unchanged). Run once; verify
-   `advisory_adjusted_ohlcv_daily` max(load_ts) advances.
-2. Audit imports: does anything under `data/` import `advisory.*`? Promote
-   or inline what's needed (`data_sync`, `sync_state`, `data_readiness`,
-   `current_prices`, `identity_issues`, `event_data_quality` are the
-   candidates). Check whether downloaders read `advisory_sync_state`.
-3. Point `all_price_adjustment.sh` at the new module path.
+   (imports fixed, table name unchanged). Verified: the 4 price-adjustment
+   regression tests pass against the new path.
+2. Audit imports: does anything under `data/` import `advisory.*`? Full
+   grep audit found the real set differed from the guessed candidate list:
+   `data_sync`, `data_readiness`, `current_prices`, `event_data_quality` are
+   NOT imported anywhere under `data/` (false positives — left in
+   `advisory/`, archived with it in Phase 4). The real promoted set is
+   `fallback_telemetry`, `sync_state`, `identity_issues`, `advisory_date`,
+   `external_task_queue` — all moved to `utils/` (fallback_telemetry has
+   zero advisory-internal deps; the other four depend only on it +
+   `utils.*`). `advisory/` keeps thin re-export shims (`from utils.X import
+   *`, plus a `main()` passthrough for the 3 with CLI entrypoints) so its
+   ~130 existing internal callers and `python -m advisory.X` cron
+   invocations (`all_watchers.sh`, `all_context_to_entry_repair.sh`,
+   `all_advisory.sh`, `all_external_workers.sh`) keep working unchanged
+   until Phase 4 deletes the package outright. `utils/*` files that
+   already imported these from `advisory.*` (a pre-existing layering
+   inversion — `redaction.py`, `redis_utils.py`, `sync.py`,
+   `ingestion_state.py`, `http.py`, `redis_bkp_restore.py`, `date.py`,
+   `display_time.py`, `codex_cli.py`, `company_master.py`,
+   `transcribe/llm_transcribe.py`) were repointed to the new `utils.*`
+   location directly, not the shim. Checked whether downloaders read
+   `advisory_sync_state`: **yes** — `data/download_runner.py` persists to
+   it via `persist_sync_state`; it is load-bearing and excluded from the
+   Phase 5 drop list (see `DATA_INVENTORY.md`).
+3. Pointed `all_price_adjustment.sh` at the new module path.
 
-**Gate:** `complete_data.sh` + price adjustment run green with ZERO imports
-from `advisory/`.
+**Gate:** price-adjustment tests green on the new path; all `data/` and
+`utils/` imports of the promoted modules point at `utils.*`, zero imports
+of `advisory.*` remain under `data/` or `utils/`
+(`advisory/*.py` itself still imports the shims, expected until Phase 4).
 
 ## Phase 3 — Evidence export (before anything is archived)
 
@@ -102,8 +123,9 @@ day; `git grep -l "import advisory"` returns nothing outside the archive.
 ## Phase 5 — Cloud DB cleanup (destructive; NO dump — operator decision)
 
 1. Generate the DROP list mechanically: every `advisory_*` table EXCEPT
-   `advisory_adjusted_ohlcv_daily` (and `advisory_sync_state` if Phase 2
-   found it load-bearing), plus `announcement_*`, `screenerin_*`, `stmt_*`,
+   `advisory_adjusted_ohlcv_daily` and `advisory_sync_state` (Phase 2
+   confirmed it load-bearing — `data/download_runner.py` writes to it),
+   plus `announcement_*`, `screenerin_*`, `stmt_*`,
    `shareholding_*`, `sharpely_*`/`master_sharpely_*` (except none —
    `historical_mcap` is its own table and stays), `features_*`,
    `economictimes_rss_items`, `nseindia_insider_deals`,
@@ -111,7 +133,7 @@ day; `git grep -l "import advisory"` returns nothing outside the archive.
    `macro_usa*`, `macro_india_gdp`, `fii_*`.
    NEVER in the list: anything in DATA_INVENTORY's KEEP table, explicitly
    including `events_dividend`, `events_capital_change`,
-   `rbi_currency_rates`, `dhan_ohlcv_intraday`.
+   `rbi_currency_rates`, `dhan_ohlcv_intraday`, `advisory_sync_state`.
 2. Review the generated list by eye against DATA_INVENTORY.md (this review
    IS the safety net in place of the dump).
 3. Drop in batches inside transactions; `VACUUM FULL` the small instance

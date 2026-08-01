@@ -23,7 +23,7 @@ from .categorize import report_category_map
 from .models import Announcement, CompanyMasterTarget, ParsedReport
 from .prompts import CATEGORY_PROMPTS, REPORT_PROMPTS
 from .schemas import DOCUMENT_PYDANTIC_MAP, MODEL_TYPE_MAP
-from advisory.fallback_telemetry import record_fallback_event, record_local_fallback_event
+from utils.fallback_telemetry import record_fallback_event, record_local_fallback_event
 from advisory.prompt_registry import prompt_version as registry_prompt_version
 from advisory.prompt_registry import response_schema_version
 from utils.http import get_dynamic_headers

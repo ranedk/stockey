@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from psycopg2.extras import Json
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from data.screenerin.auth import ensure_authenticated_requests_session
 from data.screenerin.failure_log import record_screener_failure
 from utils.db import db_session, execute_db_operation, sql_to_df

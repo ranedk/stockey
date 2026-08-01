@@ -8,8 +8,8 @@ import redis
 import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
-from advisory.fallback_telemetry import record_local_fallback_event
-from advisory.sync_state import persist_sync_state
+from utils.fallback_telemetry import record_local_fallback_event
+from utils.sync_state import persist_sync_state
 from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db
 from utils.sync import get_redis_client

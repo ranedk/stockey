@@ -75,7 +75,7 @@ def _redact_url(match: re.Match[str]) -> str:
     try:
         parts = urlsplit(url)
     except Exception as exc:
-        from advisory.fallback_telemetry import record_local_fallback_event
+        from utils.fallback_telemetry import record_local_fallback_event
 
         record_local_fallback_event(
             module="utils.redaction",
@@ -137,7 +137,7 @@ def redact_json_text(value: Any) -> str:
         try:
             parsed = json.loads(value)
         except Exception as exc:
-            from advisory.fallback_telemetry import record_local_fallback_event
+            from utils.fallback_telemetry import record_local_fallback_event
 
             record_local_fallback_event(
                 module="utils.redaction",

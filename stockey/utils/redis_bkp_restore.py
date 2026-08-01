@@ -4,7 +4,7 @@ import sys
 
 import redis
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 
 def _record_redis_local_fallback(

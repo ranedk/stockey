@@ -5,7 +5,7 @@ from datetime import date, datetime
 import pandas as pd
 from psycopg2 import sql
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import get_sql
 
 MONTH_PAT = re.compile(r"^Total for ([A-Za-z]+)$")

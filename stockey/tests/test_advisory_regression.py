@@ -48951,7 +48951,7 @@ def test_no_buy_cause_names_promotion_bridge_gap():
 
 
 def test_price_adjustment_derives_splits_from_price_steps():
-    from advisory import price_adjustment as pa
+    from data.nseindia import price_adjustment as pa
     dates = pd.bdate_range("2026-01-01", periods=8, tz="UTC")
     # a clean 1:10 split on day 4: 250 -> 25. Adjusted series must be smooth and the return real.
     split = pd.DataFrame({"symbol": "S", "date": dates,
@@ -48975,7 +48975,7 @@ def test_price_adjustment_derives_splits_from_price_steps():
 
 
 def test_price_adjustment_open_gap_catches_split_with_intraday_move():
-    from advisory import price_adjustment as pa
+    from data.nseindia import price_adjustment as pa
     dates = pd.bdate_range("2026-01-01", periods=3, tz="UTC")
     # IRCTC-style 5:1 split with a +12% ex-date intraday move: close/prev=0.221 fails the 6% snap, but the
     # OVERNIGHT gap open/prev=0.198 snaps cleanly to 1/5. The open-based detector must catch it.
@@ -48990,7 +48990,7 @@ def test_price_adjustment_open_gap_catches_split_with_intraday_move():
 
 
 def test_price_adjustment_ca_purpose_parser():
-    from advisory import price_adjustment as pa
+    from data.nseindia import price_adjustment as pa
     f = lambda s: pa._factor_for_events(pa._events_from_subject(s))
     assert f("BONUS 1:1") == 0.5                       # X:Y bonus -> Y/(X+Y)
     assert f("BONUS 3:1") == 0.25
@@ -49003,7 +49003,7 @@ def test_price_adjustment_ca_purpose_parser():
 
 def test_price_adjustment_declared_ca_fixes_missed_split():
     import datetime as _dt
-    from advisory import price_adjustment as pa
+    from data.nseindia import price_adjustment as pa
     # a 1:1 bonus whose ex-date ALSO fell ~7% -> overnight step 0.535 misses the round-ratio snap and is
     # left 'ambiguous' (unadjusted). NSE's declared 1:1 bonus supplies the exact 0.5 and back-adjusts.
     df = pd.DataFrame({

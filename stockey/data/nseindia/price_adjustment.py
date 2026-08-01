@@ -204,7 +204,7 @@ def ensure_table() -> None:
     apply_schema_migration(
         migration_id=MIGRATION_ID,
         statements=SCHEMA_STATEMENTS,
-        owner="advisory.price_adjustment",
+        owner="data.nseindia.price_adjustment",
         description="Split/bonus-adjusted daily close derived from price steps (complete, no CA-record dependency).",
         metadata={"tables": [ADJUSTED_TABLE], "workflow": "price_adjustment"},
     )

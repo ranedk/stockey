@@ -10,7 +10,7 @@ import pandas as pd
 from environs import Env
 import redis
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import upsert_to_db
 from utils.ingestion_state import get_failed_entries, get_processed_keys, mark_failed, mark_processed
 from utils import store

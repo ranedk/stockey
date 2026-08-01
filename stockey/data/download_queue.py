@@ -4,7 +4,7 @@ import argparse
 import json
 from typing import Any
 
-from advisory.external_task_queue import enqueue_task
+from utils.external_task_queue import enqueue_task
 from data.download_runner import DOWNLOADER_STEPS, PARSER_STEPS, run_download_module
 
 

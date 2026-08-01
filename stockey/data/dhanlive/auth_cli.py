@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 
 from environs import Env
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import (
     DEFAULT_TOKEN_CACHE,
     DhanAuthError,

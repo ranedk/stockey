@@ -7,7 +7,7 @@ from datetime import timedelta
 
 from psycopg2 import sql
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import db_session, execute_db_operation
 from utils.schema_migrations import apply_schema_migration
 

@@ -10,7 +10,7 @@ from xml.etree import ElementTree as ET
 import pandas as pd
 import requests
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 

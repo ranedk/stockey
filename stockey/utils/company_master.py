@@ -4,7 +4,7 @@ from typing import Iterable, Optional, Sequence
 
 import pandas as pd
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 from .db import sql_to_df, upsert_to_db
 

@@ -17,7 +17,7 @@ from environs import Env
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 env = Env()
 env.read_env()

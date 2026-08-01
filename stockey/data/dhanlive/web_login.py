@@ -10,7 +10,7 @@ from environs import Env
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.auth import DhanAuthError, extract_token_id, normalize_token_id
 
 

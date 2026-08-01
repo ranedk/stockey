@@ -5,7 +5,7 @@ import json
 
 import pandas as pd
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.ohlcv import DAILY_TABLE, ensure_ohlcv_tables
 from utils.db import sql_to_df, upsert_to_db
 from utils.sync import parse_datetime_arg

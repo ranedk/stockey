@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 from environs import Env
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import db_session, execute_db_operation
 from utils.schema_migrations import apply_schema_migration
 

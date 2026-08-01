@@ -22,7 +22,7 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.price_adjustment import _events_from_subject, _factor_for_events
+from data.nseindia.price_adjustment import _events_from_subject, _factor_for_events
 from utils.db import sql_to_df, upsert_to_db
 
 SOURCE = "nse_bhavcopy_ca"

@@ -7,7 +7,7 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from data.dhanlive.client import DhanHistoricalClient, candles_to_df
 from data.dhanlive.dhan_db import (
     get_dhan_ohlcv_daily,

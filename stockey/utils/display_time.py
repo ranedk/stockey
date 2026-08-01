@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 
 DISPLAY_TZ = ZoneInfo(os.getenv("STOCKEY_DISPLAY_TZ", "Asia/Kolkata"))

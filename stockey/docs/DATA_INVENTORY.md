@@ -18,13 +18,14 @@ framework) needs only the price/CA/rates/identity core below.
 |---|---|---|
 | NSE bhavcopy | nseindia/bhavcopy_{downloader,history,parser} | nseindia_ohlcv, nseindia_mcap, nseindia_mto, nseindia_52wk, nseindia_cmvolt, nseindia_circuit_hit, nseindia_cat_turnover, nseindia_catg, nseindia_var1, nseindia_short_selling |
 | NSE corporate actions | nseindia/corporate_action{s,_events} | nseindia_corporate_actions{,_bc_raw,_normalized}, events_dividend, events_capital_change |
-| Price adjustment | advisory/price_adjustment.py → PROMOTE to data/ | advisory_adjusted_ohlcv_daily (systrader's PRIMARY series) |
+| Price adjustment | data/nseindia/price_adjustment.py (promoted from advisory/ 2026-07-28) | advisory_adjusted_ohlcv_daily (systrader's PRIMARY series) |
 | NSE indices | nseindia/indices_{downloader,parser} | nseindia_indices |
 | NSE calendar | nseindia/holidays | nseindia_holidays, dim_trading_days |
 | Dhan broker | dhanlive/* (incl. auth/web_login) | master_dhan_instruments, dhan_ohlcv_daily, dhan_ohlcv_intraday (future 1-min landing zone) |
 | RBI/FBIL | rbi/* | rbi_bank_rates, rbi_currency_rates, fbil_gsec_par, fbil_gsec_quote |
 | Identity | company_master, nseindia/security_history | company_master, dim_security* |
 | Sharpely (mcap slice ONLY) | sharpelydata/sharpely_data.py | historical_mcap |
+| Download run state | data/download_runner.py (via utils/sync_state.py, promoted from advisory/ 2026-07-28) | advisory_sync_state (load-bearing per Phase 2 audit; NEVER drop) |
 
 Cron keeps only: complete_data.sh, all_downloaders_queue.sh,
 all_price_adjustment.sh, all_ohlcv_reconcile.sh, all_data_readiness.sh,
@@ -51,8 +52,10 @@ log rotation. Everything else unschedules.
 - Macro: mospi_cpi, eaindustry_wpi, macro_usa*, macro_india_gdp, fii_*
   (data/mospi, data/eaindustry, data/fred, data/nsdl)
 - features_* precomputed tables
-- ALL advisory_* tables except advisory_adjusted_ohlcv_daily
-  (verify advisory_sync_state isn't used by downloaders before dropping)
+- ALL advisory_* tables except advisory_adjusted_ohlcv_daily and
+  advisory_sync_state (Phase 2 audit 2026-07-28 confirmed
+  data/download_runner.py persists standardized run state to it via
+  utils/sync_state.py — load-bearing, NEVER drop)
 
 ## Execution notes
 

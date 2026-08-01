@@ -22,7 +22,7 @@ from typing import Any
 import pandas as pd
 from environs import Env
 
-from advisory.advisory_date import _market_calendar_date, latest_trading_day_on_or_before
+from utils.advisory_date import _market_calendar_date, latest_trading_day_on_or_before
 from data.dhanlive.ohlcv import DAILY_TABLE, sync_many_daily
 from utils.db import sql_to_df
 

@@ -2,7 +2,7 @@ import hashlib
 
 import pandas as pd
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.company_master import map_company_master_ids
 from utils.db import sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration

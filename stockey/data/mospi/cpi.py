@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 from dateutil.relativedelta import relativedelta
 from environs import Env
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df, upsert_to_db
 from utils.http import get_dynamic_headers, get_with_retries, hidden_inputs_to_dict
 from utils.sync import get_db_max_date

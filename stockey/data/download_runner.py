@@ -11,8 +11,8 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.fallback_telemetry import record_local_fallback_event
-from advisory.sync_state import persist_sync_state
+from utils.fallback_telemetry import record_local_fallback_event
+from utils.sync_state import persist_sync_state
 from utils.redis_utils import install_resilient_redis
 
 

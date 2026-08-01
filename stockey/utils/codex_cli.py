@@ -60,7 +60,7 @@ def resolve_codex_binary(configured: str | None = None) -> str:
         resolved = shutil.which(candidate)
         if resolved:
             return resolved
-    from advisory.fallback_telemetry import record_local_fallback_event
+    from utils.fallback_telemetry import record_local_fallback_event
 
     searched = _candidate_codex_bins(effective)
     record_local_fallback_event(
@@ -148,7 +148,7 @@ def run_codex_structured(
             payload = extract_json_object(text)
             return response_model.model_validate(payload)
         except (ValueError, TypeError, ValidationError) as exc:
-            from advisory.fallback_telemetry import record_local_fallback_event
+            from utils.fallback_telemetry import record_local_fallback_event
 
             record_local_fallback_event(
                 module="utils.codex_cli",
@@ -177,7 +177,7 @@ def extract_json_object(text: str) -> object:
     try:
         return json.loads(stripped)
     except json.JSONDecodeError as exc:
-        from advisory.fallback_telemetry import record_local_fallback_event
+        from utils.fallback_telemetry import record_local_fallback_event
 
         record_local_fallback_event(
             module="utils.codex_cli",

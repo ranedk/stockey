@@ -9,7 +9,7 @@ import pandas as pd
 from environs import Env
 from playwright.sync_api import sync_playwright
 
-from advisory.sync_state import persist_sync_state
+from utils.sync_state import persist_sync_state
 from data.dhanlive.dhan_db import get_nse_equity
 from utils.company_master import attach_company_master_id
 from utils.db import upsert_to_db

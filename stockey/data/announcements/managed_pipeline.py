@@ -8,8 +8,8 @@ from typing import List, Optional, Sequence
 import pytz
 
 from advisory.decision_trace import record_event_processing, safe_trace_call
-from advisory.fallback_telemetry import record_local_fallback_event
-from advisory.identity_issues import record_company_master_mapping_issue
+from utils.fallback_telemetry import record_local_fallback_event
+from utils.identity_issues import record_company_master_mapping_issue
 
 from .db import load_company_master_targets
 from .models import Announcement

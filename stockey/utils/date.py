@@ -3,7 +3,7 @@ import calendar
 from typing import List
 import pandas as pd
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 
 def last_of_month(date: datetime) -> datetime:

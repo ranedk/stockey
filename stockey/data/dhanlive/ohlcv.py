@@ -11,7 +11,7 @@ import pandas as pd
 from data.dhanlive.auth import DhanAuthError
 from data.dhanlive.client import DhanAPIError, DhanHistoricalClient, candles_to_df
 from data.dhanlive.dhan_db import resolve_dhan_identity
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df, upsert_to_db
 from utils.schema_migrations import apply_schema_migration
 from utils.sync import load_tracked_symbols, normalize_date_window, parse_datetime_arg
