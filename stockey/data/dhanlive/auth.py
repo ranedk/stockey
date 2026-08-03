@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import json
 import subprocess
 import sys
-from datetime import datetime, timedelta
+import time
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -20,6 +23,7 @@ env.read_env()
 
 AUTH_BASE_URL = "https://auth.dhan.co"
 DEFAULT_TOKEN_CACHE = Path(env("BASE_DIR")) / ".cache" / "dhan_access_token.json"
+DEFAULT_LOGIN_LOCK = Path(env("BASE_DIR")) / ".cache" / "dhan_login.lock"
 
 
 class DhanAuthError(RuntimeError):
@@ -72,7 +76,7 @@ def load_cached_access_token(cache_path: Path = DEFAULT_TOKEN_CACHE) -> str | No
     expires_at = _parse_expiry(expiry_time)
     if expires_at is None:
         return None
-    if datetime.utcnow() + timedelta(minutes=5) >= expires_at:
+    if datetime.now(timezone.utc) + timedelta(minutes=5) >= expires_at:
         return None
     return token
 
@@ -272,6 +276,40 @@ def get_token_id_from_auto_login() -> str:
         return _get_token_id_via_auto_login_subprocess(consent_url)
 
 
+@contextmanager
+def _dhan_login_lock(lock_path: Path = DEFAULT_LOGIN_LOCK, *, timeout_seconds: float = 300.0):
+    """Serialize the CDP-driven Dhan login across processes/cron jobs. Only one process may
+    drive the shared Chrome CDP session's login form at a time -- concurrent callers (e.g. a
+    manual run overlapping a scheduled downloader) would otherwise both submit mobile/TOTP/PIN
+    into the same browser tab, and Dhan's login rate-limiter rejects the second submission as
+    'too many attempts'. Blocks (polling) up to timeout_seconds, then raises rather than hanging
+    forever if a holder is stuck; the OS releases the lock automatically if a holder dies."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")
+    acquired = False
+    try:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise DhanAuthError(
+                        f"Timed out after {timeout_seconds:.0f}s waiting for another process's Dhan login to finish"
+                    )
+                time.sleep(1.0)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
+
+
 def get_access_token() -> str:
     direct = env("DHAN_ACCESS_TOKEN", default=None)
     if direct:
@@ -285,21 +323,32 @@ def get_access_token() -> str:
     if token_id:
         return str(consume_consent_token(token_id)["accessToken"])
 
-    if is_auto_login_configured():
-        return str(consume_consent_token(get_token_id_from_auto_login())["accessToken"])
-    consent_url = begin_browser_consent()
-    pasted_token_id = prompt_for_token_id(consent_url)
-    return str(consume_consent_token(pasted_token_id)["accessToken"])
+    # Only one process should drive the login UI at a time. Re-check the cache after
+    # acquiring the lock in case a concurrent caller just finished logging in.
+    with _dhan_login_lock():
+        cached = load_cached_access_token()
+        if cached:
+            return cached
+        if is_auto_login_configured():
+            return str(consume_consent_token(get_token_id_from_auto_login())["accessToken"])
+        consent_url = begin_browser_consent()
+        pasted_token_id = prompt_for_token_id(consent_url)
+        return str(consume_consent_token(pasted_token_id)["accessToken"])
 
 
 def force_refresh_access_token() -> str:
-    clear_cached_access_token()
-    if is_auto_login_configured():
-        token_id = get_token_id_from_auto_login()
-    else:
-        consent_url = begin_browser_consent()
-        token_id = prompt_for_token_id(consent_url)
-    return str(consume_consent_token(token_id)["accessToken"])
+    with _dhan_login_lock():
+        # A concurrent caller may have already refreshed while we waited for the lock.
+        cached = load_cached_access_token()
+        if cached:
+            return cached
+        clear_cached_access_token()
+        if is_auto_login_configured():
+            token_id = get_token_id_from_auto_login()
+        else:
+            consent_url = begin_browser_consent()
+            token_id = prompt_for_token_id(consent_url)
+        return str(consume_consent_token(token_id)["accessToken"])
 
 
 def extract_token_id(url: str) -> str | None:
@@ -404,6 +453,12 @@ def _parse_expiry(raw_expiry: str) -> datetime | None:
             metadata={"raw_expiry": raw_expiry},
         )
         return None
-    if parsed.tzinfo is not None:
-        return parsed.astimezone().astimezone(tz=None).replace(tzinfo=None)
-    return parsed
+    # Dhan's expiryTime is UTC in practice ('...Z'); treat a bare timestamp as UTC too
+    # rather than guessing the local zone. Always return timezone-aware UTC so callers
+    # compare like-for-like against datetime.now(timezone.utc) -- a prior version
+    # returned a naive LOCAL-wall-clock value that got compared against naive
+    # datetime.utcnow() in load_cached_access_token(), silently treating already-expired
+    # tokens as valid for ~5.5h (the IST offset) past their real expiry.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
