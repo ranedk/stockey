@@ -130,7 +130,7 @@ class DhanHistoricalClient:
                 flush=True,
             )
             try:
-                self._set_access_token(force_refresh_access_token())
+                self._set_access_token(force_refresh_access_token(current_token=self.access_token))
             except Exception as exc:
                 if attempt >= self.auth_attempts - 1:
                     raise DhanAPIError(f"Dhan auth refresh failed after {self.auth_attempts} attempts: {exc}") from exc

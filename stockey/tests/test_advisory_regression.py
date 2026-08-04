@@ -3423,6 +3423,58 @@ def test_dhan_auth_records_fallback_when_clear_cache_missing(monkeypatch, tmp_pa
     assert events[0]["metadata"]["cache_path"] == str(cache_path)
 
 
+def test_dhan_auth_cached_token_past_real_utc_expiry_is_rejected(tmp_path):
+    # Regression: expiryTime is UTC ("...Z"); the old code converted it to a naive
+    # LOCAL-wall-clock value and compared against naive datetime.utcnow(), which on an
+    # IST host silently treated an already-expired token as valid for ~5.5h past its
+    # real expiry. A token whose real UTC expiry is in the past must always read as expired,
+    # regardless of the host's local timezone.
+    import datetime as _dt
+
+    cache_path = tmp_path / "dhan_access_token.json"
+    past_expiry = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+    cache_path.write_text(json.dumps({"accessToken": "TOKEN", "expiryTime": past_expiry}), encoding="utf-8")
+
+    assert dhan_auth.load_cached_access_token(cache_path) is None
+
+
+def test_dhan_auth_force_refresh_relogins_when_no_concurrent_refresher(monkeypatch, tmp_path):
+    # Regression: force_refresh_access_token()'s double-check-cache (added to let a caller
+    # reuse a token a concurrent process just obtained while waiting for the login lock) must
+    # not short-circuit when NOTHING changed -- e.g. Dhan invalidated a token server-side
+    # before its stated expiry. Without comparing against the caller's failing token, a solo
+    # caller would just get the same dead token back forever instead of ever re-logging in.
+    cache_path = tmp_path / "dhan_access_token.json"
+    lock_path = tmp_path / "dhan_login.lock"
+    monkeypatch.setattr(dhan_auth, "DEFAULT_TOKEN_CACHE", cache_path)
+    monkeypatch.setattr(dhan_auth, "DEFAULT_LOGIN_LOCK", lock_path)
+    monkeypatch.setattr(dhan_auth, "load_cached_access_token", lambda cache_path=cache_path: "STALE")
+    monkeypatch.setattr(dhan_auth, "clear_cached_access_token", lambda cache_path=cache_path: True)
+    monkeypatch.setattr(dhan_auth, "is_auto_login_configured", lambda: True)
+    monkeypatch.setattr(dhan_auth, "get_token_id_from_auto_login", lambda: "new-token-id")
+    monkeypatch.setattr(dhan_auth, "consume_consent_token", lambda token_id: {"accessToken": "FRESH"})
+
+    result = dhan_auth.force_refresh_access_token(current_token="STALE")
+
+    assert result == "FRESH"
+
+
+def test_dhan_auth_force_refresh_reuses_concurrent_refresh(monkeypatch, tmp_path):
+    lock_path = tmp_path / "dhan_login.lock"
+    monkeypatch.setattr(dhan_auth, "DEFAULT_LOGIN_LOCK", lock_path)
+    monkeypatch.setattr(dhan_auth, "load_cached_access_token", lambda cache_path=None: "FRESH_FROM_OTHER_PROCESS")
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("should not attempt a fresh login when another process already refreshed")
+
+    monkeypatch.setattr(dhan_auth, "clear_cached_access_token", fail_if_called)
+    monkeypatch.setattr(dhan_auth, "is_auto_login_configured", fail_if_called)
+
+    result = dhan_auth.force_refresh_access_token(current_token="OLD")
+
+    assert result == "FRESH_FROM_OTHER_PROCESS"
+
+
 def test_dhan_auth_records_missing_browser_launchers(monkeypatch):
     events = []
 
@@ -3464,8 +3516,14 @@ def test_dhan_client_refreshes_token_after_401(monkeypatch):
                 return FakeResponse(401, {"errorMessage": "Client ID or user generated access token is invalid or expired."})
             return FakeResponse(200, {"status": "ok"})
 
+    refresh_calls = []
+
+    def fake_refresh(*, current_token=None):
+        refresh_calls.append(current_token)
+        return "NEW"
+
     monkeypatch.setattr(dhan_client, "get_access_token", lambda: "OLD")
-    monkeypatch.setattr(dhan_client, "force_refresh_access_token", lambda: "NEW")
+    monkeypatch.setattr(dhan_client, "force_refresh_access_token", fake_refresh)
     monkeypatch.setattr(dhan_client.requests, "Session", FakeSession)
 
     client = dhan_client.DhanHistoricalClient(auth_attempts=3)
@@ -3475,6 +3533,7 @@ def test_dhan_client_refreshes_token_after_401(monkeypatch):
     assert len(calls) == 2
     assert calls[0][2]["access-token"] == "OLD"
     assert calls[1][2]["access-token"] == "NEW"
+    assert refresh_calls == ["OLD"]
 
 
 def test_dhan_client_gives_up_after_auth_refresh_attempts(monkeypatch):
@@ -3495,7 +3554,7 @@ def test_dhan_client_gives_up_after_auth_refresh_attempts(monkeypatch):
         def request(self, method, url, timeout=None, **kwargs):
             return FakeResponse()
 
-    def fake_refresh():
+    def fake_refresh(*, current_token=None):
         refresh_calls.append("refresh")
         raise dhan_auth.DhanAuthError("login failed")
 

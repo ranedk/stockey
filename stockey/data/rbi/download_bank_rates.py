@@ -70,6 +70,21 @@ def _empty_run_state(status: str = "running") -> dict[str, object]:
     }
 
 
+def _wait_for_named_frame(page, *, name: str, timeout_ms: int = 20_000, poll_ms: int = 500):
+    """page.frame(name=...) is an immediate, non-waiting lookup that returns None if the child
+    frame hasn't attached yet -- a fixed pre-sleep before calling it (the previous approach) is
+    a race against the RBI site's variable load time, and a None frame's .click() raised an
+    opaque AttributeError instead of a clear timeout. Poll until it appears."""
+    waited_ms = 0
+    while waited_ms < timeout_ms:
+        frame = page.frame(name=name)
+        if frame is not None:
+            return frame
+        page.wait_for_timeout(poll_ms)
+        waited_ms += poll_ms
+    raise PlaywrightTimeoutError(f"Timed out after {timeout_ms}ms waiting for frame name={name!r}")
+
+
 def download_latest_rates(playwright) -> dict[str, object]:
     """
     Automate RBI website's download using the sync Playwright API.
@@ -97,8 +112,7 @@ def download_latest_rates(playwright) -> dict[str, object]:
             page.get_by_text("Key Rates").click()
 
         rates_page = popup_info.value
-        rates_page.wait_for_timeout(10_000)
-        frame = rates_page.frame(name="openDocChildFrame")
+        frame = _wait_for_named_frame(rates_page, name="openDocChildFrame")
 
         frame.click("#__button60")
         rates_page.wait_for_timeout(3_000)

@@ -167,7 +167,13 @@ def _record_event_evidence_fallback(
 
 
 def _sql_num(expression: str) -> str:
-    return f"NULLIF(regexp_replace(({expression})::text, '[^0-9.\\-]', '', 'g'), '')::double precision"
+    # NSE feeds use a bare "-" as the placeholder for "no value" in numeric columns. The old
+    # NULLIF(...,'')  only caught an EMPTY stripped string, not a lone "-" (a "valid" character
+    # under the strip regex, kept to preserve real negative signs) -- casting "-" alone to
+    # double precision raised InvalidTextRepresentation. Require the stripped text to actually
+    # match a number before casting; anything else (including a lone "-" or ".") becomes NULL.
+    stripped = f"regexp_replace(({expression})::text, '[^0-9.\\-]', '', 'g')"
+    return f"CASE WHEN {stripped} ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN {stripped}::double precision ELSE NULL END"
 
 
 def _json_ready(value: Any) -> Any:

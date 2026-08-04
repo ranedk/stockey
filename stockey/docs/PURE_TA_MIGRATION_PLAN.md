@@ -107,9 +107,20 @@ of `advisory.*` remain under `data/` or `utils/`
      but UNSCHEDULED (freeze, per inventory)
    - `apps/`, `live_dashboard/`, frontend + watcher scripts
    - the ~29 dead `all_*.sh` wrappers
+   - Two registry-level scope leaks found during the 2026-08-04 KEEP-script
+     live run-through, both currently non-fatal but must be cut here:
+     `data/download_runner.py`'s `PARSER_STEPS` still dispatches
+     `advisory.event_evidence_store` and `advisory.context_overlay_refresh`
+     under `complete_data.sh --phase all`; `all_data_readiness.sh` still
+     calls `advisory.fundamentals_refresh` (Sharpely statements pull) as a
+     second, `|| non-fatal` step after `advisory.data_readiness --fix`.
+     Remove all three call sites along with the rest of `advisory/`.
 2. Crontab: regenerate with ONLY `complete_data.sh`,
-   `all_downloaders_queue.sh`, `all_price_adjustment.sh`,
-   `all_ohlcv_reconcile.sh`, `all_data_readiness.sh`, log rotation.
+   `all_downloaders_queue.sh`, `all_external_workers.sh`,
+   `all_price_adjustment.sh`, `all_ohlcv_reconcile.sh`,
+   `all_data_readiness.sh`, log rotation. (`all_external_workers.sh` added
+   2026-08-02: it drains the `nse`/`dhan` queues `all_downloaders_queue.sh`
+   feeds — see `DATA_INVENTORY.md`.)
 3. Remove LLM API keys/config from stockey env — token spend ends
    mechanically, not by policy.
 4. Prune tests to the data layer; suite green.

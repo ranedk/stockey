@@ -336,11 +336,16 @@ def get_access_token() -> str:
         return str(consume_consent_token(pasted_token_id)["accessToken"])
 
 
-def force_refresh_access_token() -> str:
+def force_refresh_access_token(current_token: str | None = None) -> str:
+    """Force a real re-login, unless a concurrent caller already refreshed while we waited
+    for the lock. ``current_token`` (the caller's just-failed token) makes that distinction:
+    a same-as-before cached token means nothing changed and this really is a dead token that
+    needs a fresh login, not a cache to reuse -- comparing only "is something cached and
+    timestamp-valid" (without current_token) would keep returning that same dead token forever
+    whenever Dhan invalidates a token server-side before its stated expiry."""
     with _dhan_login_lock():
-        # A concurrent caller may have already refreshed while we waited for the lock.
         cached = load_cached_access_token()
-        if cached:
+        if cached and cached != current_token:
             return cached
         clear_cached_access_token()
         if is_auto_login_configured():

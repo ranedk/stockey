@@ -28,8 +28,20 @@ framework) needs only the price/CA/rates/identity core below.
 | Download run state | data/download_runner.py (via utils/sync_state.py, promoted from advisory/ 2026-07-28) | advisory_sync_state (load-bearing per Phase 2 audit; NEVER drop) |
 
 Cron keeps only: complete_data.sh, all_downloaders_queue.sh,
-all_price_adjustment.sh, all_ohlcv_reconcile.sh, all_data_readiness.sh,
-log rotation. Everything else unschedules.
+all_external_workers.sh, all_price_adjustment.sh, all_ohlcv_reconcile.sh,
+all_data_readiness.sh, log rotation. Everything else unschedules.
+
+`all_external_workers.sh` was missing from this list until the Phase 4 prep
+audit (2026-08-02) caught it: `data.download_queue.classify_step` (invoked by
+`all_downloaders_queue.sh`) routes every `data.nseindia.*` module plus Dhan
+`scrip_master`/`ohlcv` into the `nse`/`dhan` queues instead of running them
+inline — `all_external_workers.sh` (`-m advisory.external_task_queue --worker
+--drain`, now backed by `utils/external_task_queue.py`) is the only thing
+that drains those queues. Cutting it while keeping `all_downloaders_queue.sh`
+would silently no-op the entire queued NSE/Dhan downloader lane (tasks
+enqueued, never executed) — `complete_data.sh` alone would still cover the
+same modules inline, but only at its 2x/day cadence, losing the
+3x/day (08,12,16) intraday-coverage frequency the queue path exists for.
 
 ## REMOVE — LLM-token consumers
 
@@ -46,9 +58,16 @@ log rotation. Everything else unschedules.
   shareholding_*, advisory_fundamentals_daily
 - nseindia/insider_deals + deal-flow tables (nseindia_insider_deals,
   nseindia_{block,bulk}_deals) — sweep showed IC ≈ 0
-- nseindia/earnings_events → nseindia_earnings_events, nseindia_events
-  (BORDERLINE: LLM-free and useful for FnO event-vol later — freeze the
-  collector rather than delete if cheap)
+- nseindia/earnings_events → nseindia_earnings_events (BORDERLINE: LLM-free
+  and useful for FnO event-vol later — freeze the collector rather than
+  delete if cheap)
+- nseindia/recent_events → nseindia_events (corrected 2026-08-04: this table
+  was previously misattributed to earnings_events.py above; it's actually a
+  separate collector for NSE's board-meeting/AGM event calendar. Same
+  BORDERLINE treatment as earnings_events: LLM-free, freeze rather than
+  delete. Registered under `download_runner.DOWNLOADER_STEPS` purpose
+  "events"; currently flaky against NSE's site — TimeoutError waiting for a
+  download event, non-critical purpose so it doesn't block the pipeline)
 - Macro: mospi_cpi, eaindustry_wpi, macro_usa*, macro_india_gdp, fii_*
   (data/mospi, data/eaindustry, data/fred, data/nsdl)
 - features_* precomputed tables
