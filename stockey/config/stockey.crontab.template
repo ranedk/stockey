@@ -13,6 +13,10 @@ LOG_DIR={{LOG_DIR}}
 #   ./go-crond {{GENERATED_CRONTAB}} --allow-unprivileged
 #
 # This file includes a username field. Remove that field before installing into a normal per-user crontab.
+#
+# Pure-TA cut (2026-08-02, PURE_TA_MIGRATION_PLAN.md Phase 4): only the 6 data-platform
+# jobs below remain. All advisory/paper-trading/research/frontend jobs were removed here;
+# their code lives on the advisory-archive-2026-07 branch until Phase 4 fully archives it.
 
 # ---------------------------------------------------------------------------
 # Recurring cron-managed jobs.
@@ -29,145 +33,31 @@ LOG_DIR={{LOG_DIR}}
 50 06 * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_log_rotate.lock "$STOCKEY_DIR/scripts/rotate_logs.sh" >> "$LOG_DIR/rotate_logs.log" 2>&1
 
 # Daily broad raw download + parse safety net before market open on weekdays.
-# A second end-of-day complete_data.sh run below repairs anything intraday jobs missed before advisory.
+# A second end-of-day complete_data.sh run below repairs anything intraday jobs missed.
 10 07 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data.log" 2>&1
 
 # Queue single-client downloader work and drain it without parallel NSE/Dhan/Screener sessions.
 # The direct complete_data.sh path remains the broad catch-up/backfill safety net.
+# all_external_workers.sh is NOT optional: all_downloaders_queue.sh routes every
+# data.nseindia.* module plus Dhan scrip_master/ohlcv into the nse/dhan queues instead of
+# running them inline -- this is the only thing that drains those queues (see DATA_INVENTORY.md).
 30 08,12,16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_download_queue.lock ./all_downloaders_queue.sh >> "$LOG_DIR/all_downloaders_queue.log" 2>&1
 35 08,12,16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_external_workers.lock ./all_external_workers.sh >> "$LOG_DIR/external_workers.log" 2>&1
 
-# End-of-day broad catch-up before advisory. This intentionally runs the full
-# download+parse path so missed downloader/parser work is repaired before
-# portfolio/action reconciliation.
+# End-of-day broad catch-up. This intentionally runs the full download+parse path so any
+# downloader/parser work missed earlier in the day is repaired.
 30 17 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_complete_data.lock ./complete_data.sh >> "$LOG_DIR/complete_data_eod.log" 2>&1
 
-# Daily OHLCV coverage reconciliation before the advisory chain. Backfills any
-# universe symbol whose latest daily bar predates the last completed trading day
-# (e.g. after the scheduler was down during market hours), so freshness gates
-# never suppress buy authority because of silently stale bars. start_cron.sh
-# also runs this once at scheduler startup.
+# Daily OHLCV coverage reconciliation. Backfills any universe symbol whose latest daily bar
+# predates the last completed trading day (e.g. after the scheduler was down during market
+# hours), so systrader never reads silently stale bars.
 45 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ohlcv_reconcile.lock ./all_ohlcv_reconcile.sh >> "$LOG_DIR/ohlcv_reconcile.log" 2>&1
 
-# Advisory readiness preflight before the expensive post-close reconciliation.
-# This validates/refreshes Dhan auth and runs compact operator smoke, but does
-# not run the advisory pipeline or submit broker orders.
-55 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory_preflight.lock ./all_advisory_preflight.sh >> "$LOG_DIR/all_advisory_preflight.log" 2>&1
-
-# Bounded context-to-entry repair before the expensive full advisory run.
-# This refreshes review-only context signals, reconciles CONTEXT_OVERLAY_WATCH,
-# and runs rules-through-actions only, so positive context is not blocked by
-# stale watch rows before post-close advisory.
-00 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${CONTEXT_REPAIR_WAIT_FOR_DATA_TIMEOUT_SECONDS:-7200}" /tmp/stockey_complete_data.lock /tmp/stockey_download_queue.lock /tmp/stockey_external_workers.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_context_to_entry_repair.lock ./all_context_to_entry_repair.sh; } >> "$LOG_DIR/context_to_entry_repair.log" 2>&1
-
-# Portfolio/advisory run daily after market close. Wait for end-of-day data
-# catch-up, queued single-client workers, and bounded context repair before
-# reconciling actions.
-10 19 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${ADVISORY_WAIT_FOR_DATA_TIMEOUT_SECONDS:-7200}" /tmp/stockey_complete_data.lock /tmp/stockey_download_queue.lock /tmp/stockey_external_workers.lock /tmp/stockey_context_to_entry_repair.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_advisory.lock ./all_advisory.sh; } >> "$LOG_DIR/all_advisory.log" 2>&1
-
-# Daily review-only LLM decision cycle. After the post-close advisory run finishes (waits for its
-# lock), generate a graded/sized decision per symbol over the active universe, persist them to
-# advisory_llm_decisions, and mature any elapsed-horizon outcomes into advisory_llm_decision_outcomes
-# for the systematic-error monitor. Deterministic by default (no LLM API calls); set
-# LLM_DECISION_CRON_ARGS="" to opt a deployment into the LLM. Never moves capital (broker_execution_allowed=false).
-00 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && { "$STOCKEY_DIR/scripts/wait_for_locks.sh" --timeout-seconds "${LLM_DECISIONS_WAIT_FOR_ADVISORY_TIMEOUT_SECONDS:-7200}" /tmp/stockey_advisory.lock && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_llm_decisions.lock ./all_llm_decisions.sh; } >> "$LOG_DIR/llm_decisions.log" 2>&1
-
-# Continuous one-shot watch during market hours on weekdays.
-# Internal sync state keeps news/announcements slower while OHLCV stays more frequent.
-*/10 09-15 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
-
-# Operator frontend supervisor. Runs API + Nuxt and restarts within 5 minutes if it exits.
-# Static live_dashboard generation is disabled.
-*/5 * * * * {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_frontend.lock ./all_frontend.sh >> "$LOG_DIR/operator_frontend.log" 2>&1
-
-# Operator API latency probe. Writes latest latency summary under logs/performance and records slow endpoints.
-55 07,11,16,21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" logs/performance && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_api_latency_probe.lock ./all_api_latency_probe.sh >> "$LOG_DIR/api_latency_probe.log" 2>&1
-
-# Operator health snapshot. This writes current failures/fix hints into logs and exercises DB/API/snapshot/cron visibility.
-# Dhan validation is skipped here to avoid triggering broker auth from cron; cached-token freshness is still checked.
-05 08,12,17,22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_operator_health.lock ./all_operator_health.sh >> "$LOG_DIR/operator_health.log" 2>&1
-
-# Superseded failure cleanup audit. Preview-only; apply mode is intentionally not scheduled.
-35 17 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_superseded_cleanup_audit.lock ./all_superseded_cleanup_audit.sh >> "$LOG_DIR/superseded_cleanup_audit.log" 2>&1
-
-# One final post-close watch pass for end-of-day alerts.
-05 16 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && ./all_watchers.sh >> "$LOG_DIR/all_watchers.log" 2>&1
-
-# Investor hypothesis/playbook scan over newly collected news and announcements.
-# Set HYPOTHESIS_CRON_ARGS="--no-llm" if you want deterministic scans only.
-25 10,13,16,21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_hypothesis_scan.lock ./all_hypothesis_scan.sh >> "$LOG_DIR/hypothesis_scan.log" 2>&1
-
-# Experimental TS forecast workflow. This uses config/ts_forecast_screeners.yaml
-# to select a liquid technical universe, refreshes Dhan daily OHLCV, and writes research-only TS watch rows.
-# Daily OHLCV changes slowly, so this runs a few times a day instead of every watcher tick.
-20 11,14,17,20 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast.lock ./all_ts_forecast_workflow.sh >> "$LOG_DIR/ts_forecast_workflow.log" 2>&1
-
-# Matured TS forecast evaluation. This validates prior forecast rows after costs; it does not create actions.
-20 18,21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_eval.lock ./all_ts_forecast_evaluator.sh >> "$LOG_DIR/ts_forecast_evaluator.log" 2>&1
-
-# Research-only TS forecast paper portfolio. Compares forecast-only decisions with naive momentum and advisory alignment.
-35 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ts_forecast_paper.lock ./all_ts_forecast_paper_portfolio.sh >> "$LOG_DIR/ts_forecast_paper_portfolio.log" 2>&1
-
-# Research-only split/bonus-adjusted price table (price-step derived; the paper loop reads adj_close from it).
-38 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
-
-# Research-only market breadth (% of the liquid universe above its 50DMA) -- the richer market check the
-# breadth crash-floor + daily advisory read. Depends on adj_close; runs after the adjustment table.
-39 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_market_breadth.lock ./all_market_breadth.sh >> "$LOG_DIR/market_breadth.log" 2>&1
-
-# Research-only coherent paper decision loop. RS-selected, vol-sized, crash-floored decisions committed
-# and scored forward vs NIFTY. Bypasses the funnel; writes advisory_paper_decision_loop only, no action/broker.
-40 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_paper_decision_loop.lock ./all_paper_decision_loop.sh >> "$LOG_DIR/paper_decision_loop.log" 2>&1
-
-# Research-only regime-sized shadow ledger + data-selected floor config (max growth s.t. a ruin-guard).
-# Reads the paper-loop trades + breadth; writes advisory_regime_shadow_ledger / advisory_regime_floor_config.
-42 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_regime_shadow_ledger.lock ./all_regime_shadow_ledger.sh >> "$LOG_DIR/regime_shadow_ledger.log" 2>&1
-
-# REVIEW-ONLY daily advisory: today's RS picks, regime-floored vol-target sizing, ATR stops, vs the current
-# breadth/floor context. portfolio_authority=none, no broker. Reads breadth + the selected floor config.
-43 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_paper_advisory.lock ./all_paper_advisory.sh >> "$LOG_DIR/paper_advisory.log" 2>&1
-
-# REVIEW-ONLY always-on paper book: assumes every daily BUY was taken and manages it to EXIT (stop / 20-day
-# cap / momentum fade / data-gap). Writes advisory_paper_book + the operator book dashboard. No broker.
-44 21 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_paper_book.lock ./all_paper_book.sh >> "$LOG_DIR/paper_book.log" 2>&1
-
-# RESEARCH-ONLY confidence instrument: FDR-gated factor-IC sweep + edge-drift monitor over the underused
-# point-in-time data. Faithful full-history feature rebuild (~heavy) -> weekly, Mondays only. Writes
-# advisory_factor_ic_sweep + per-factor verdicts; alerts on in-use-signal drift. No weight/threshold/broker change.
-46 21 * * 1 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_factor_ic_sweep.lock ./all_factor_ic_sweep.sh >> "$LOG_DIR/factor_ic_sweep.log" 2>&1
-
-# RESEARCH-ONLY graduation harness: reads the monitor snapshot and runs the disciplined state machine
-# (candidate earns a bounded reversible weight only after K consecutive eligible runs; auto-reverts on any
-# non-eligible run). Proposal-only unless FACTOR_GRADUATION_APPLY_ENABLED is opted in (defaults OFF). Runs
-# a few minutes after the sweep it depends on. Writes advisory_factor_graduation. No weight/broker change.
-52 21 * * 1 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_factor_graduation.lock ./all_factor_graduation.sh >> "$LOG_DIR/factor_graduation.log" 2>&1
-
-# RESEARCH-ONLY selection shadow: pure-RS top-N vs the PROPOSED graduated tilt (forward-excess delta) so the
-# effect is visible BEFORE the apply flag is ever flipped. Cheap SQL short-circuit skips the heavy rebuild
-# until a factor is `active`; runs after graduation. Reads only -- no weight/threshold/broker change.
-56 21 * * 1 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_factor_tilt.lock ./all_factor_tilt.sh >> "$LOG_DIR/factor_tilt.log" 2>&1
-
-# Research-only evidence refresh. This matures context/event/action-transition
-# evidence daily without running event-model prep/training/scoring and without
-# changing policy, portfolio rows, config, or broker behavior.
-20 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_research_evidence.lock ./all_research_evidence.sh >> "$LOG_DIR/research_evidence.log" 2>&1
-
-# Research-only event-policy realized-return evaluation. Runs after the post-close advisory window.
-# It writes policy/action/class quality summaries only; it does not change thresholds or actions.
-10 23 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_event_policy_eval.lock ./all_event_policy_evaluator.sh >> "$LOG_DIR/event_policy_evaluator.log" 2>&1
-
-# Research-only missed-movers analyser. Classifies the day's big movers by their funnel
-# relationship (no_signal / blocked_by_gate / watched_not_triggered / captured) to guide
-# signal development. Writes advisory_missed_movers_daily only; never trades or changes config.
-20 23 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_missed_movers.lock ./all_missed_movers.sh >> "$LOG_DIR/missed_movers.log" 2>&1
-
-# Weekly research-only technical threshold calibration. This is deliberately not tied to live promotion.
-# Review the operator UI before manually changing config/advisory_setups.yaml.
-20 04 * * 6 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_technical_calibration.lock ./all_technical_threshold_calibration.sh >> "$LOG_DIR/technical_threshold_calibration.log" 2>&1
-
-# Weekly long-running research-only event-model prep/training.
-# It refreshes event-model evidence plus stable multi-window signal-quality evidence, but does not change live policy automatically.
-10 03 * * 0 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_ml.lock ./all_ml.sh --run-signal-quality-window-runner --include-signal-quality-split-reports >> "$LOG_DIR/all_ml.log" 2>&1
+# Split/bonus-adjusted price table (price-step derived) -- systrader's PRIMARY equity series
+# (advisory_adjusted_ohlcv_daily), promoted out of advisory/ 2026-07-28. Scheduled right after
+# the OHLCV reconcile now that the downstream advisory/research chain that used to sit between
+# them is gone -- no need to wait until 21:38 anymore.
+50 18 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_price_adjustment.lock ./all_price_adjustment.sh >> "$LOG_DIR/price_adjustment.log" 2>&1
 
 # ---------------------------------------------------------------------------
 # Manual / catch-up / long-running scripts. Keep these commented unless you
