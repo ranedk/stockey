@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # Sync tables from the stockey database into the local systrade database.
-# Table names are IDENTICAL in both DBs so the two can be merged later.
+# Table names are IDENTICAL in both DBs. See docs/DATA_CONTRACT.md: the
+# cloud DB is small and must never see heavy load — this daily pull is the
+# ONLY thing that reads it from this side; all research reads run locally.
 #
-# Mechanism: pure \copy (no pg_dump — the source is TimescaleDB and dump
-# output doesn't restore into a vanilla postgres). If a table is missing in
-# systrade its DDL is generated from the source's information_schema.
+# Mechanism: pure \copy (survives cross-version/extension differences --
+# note the source has ~100 active TimescaleDB hypertables, corrected in
+# docs/DATA_CONTRACT.md 2026-08-05; \copy against a hypertable's parent
+# still works transparently, this script makes no hypertable-specific
+# assumptions either way). If a table is missing in systrade its DDL is
+# generated from the source's information_schema.
 #
 # - FULL_TABLES: small; truncated and fully re-copied every run.
 # - INCR_TABLES: large; only rows with date > local max(date).
@@ -14,6 +19,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 set -a; source .env; set +a
+
+# The source server enforces a statement_timeout that kills multi-million-row
+# \copy selects mid-stream — after we may already have TRUNCATEd locally.
+# Disable it for our sessions, and pin timestamp rendering to UTC so the
+# drift fingerprints (max(load_ts)) compare equal across servers whose
+# TimeZone settings differ.
+export PGOPTIONS='-c statement_timeout=0'
+export PGTZ=UTC
 
 SRC_HOST="${STOCKEY_PG_HOST}"
 if ! PGPASSWORD="$STOCKEY_PG_PASSWORD" pg_isready -h "$SRC_HOST" -p "$STOCKEY_PG_PORT" -t 3 >/dev/null 2>&1; then
@@ -46,6 +59,24 @@ INCR_TABLES=(               # incremental on the "date" column + reconciliation
   nseindia_indices          # index OHLCV + PE/PB/divyield (carry inputs)
   advisory_adjusted_ohlcv_daily  # ADJUSTED closes 2013+, incl. delisted — primary backtest series
 )
+
+# Atomic full copy: spool source rows to disk first, then swap the table
+# contents in ONE transaction. A network/timeout failure mid-copy must never
+# leave the local table truncated or half-filled (that happened 2026-07-26).
+SPOOL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/systrade_sync.XXXXXX")"
+trap 'rm -rf "$SPOOL_DIR"' EXIT
+
+full_copy() {
+  local t="$1" spool="$SPOOL_DIR/$1.tsv"
+  psql "$SRC" -Atc "\copy (select * from $t) to stdout" > "$spool"
+  psql "$DST" -q -v ON_ERROR_STOP=1 <<SQL
+BEGIN;
+TRUNCATE $t;
+\copy $t from '$spool'
+COMMIT;
+SQL
+  rm -f "$spool"
+}
 
 src_has_table() {
   [ "$(psql "$SRC" -tAc "select count(*) from pg_tables where schemaname='public' and tablename='$1'")" = "1" ]
@@ -84,8 +115,7 @@ for t in "${FULL_TABLES[@]}"; do
   if ! src_has_table "$t"; then echo "skip $t (absent at source)"; continue; fi
   ensure_table "$t"
   echo "full sync: $t"
-  psql "$DST" -q -c "TRUNCATE $t"
-  psql "$SRC" -Atc "\copy (select * from $t) to stdout" | psql "$DST" -q -c "\copy $t from stdin"
+  full_copy "$t"
 done
 
 for t in "${INCR_TABLES[@]}"; do
@@ -108,8 +138,7 @@ for t in "${INCR_TABLES[@]}"; do
   dst_fp=$(psql "$DST" -tAc "$fp_sql")
   if [ "$src_fp" != "$dst_fp" ]; then
     echo "  drift on $t (src $src_fp != local $dst_fp) → full re-copy"
-    psql "$DST" -q -c "TRUNCATE $t"
-    psql "$SRC" -Atc "\copy (select * from $t) to stdout" | psql "$DST" -q -c "\copy $t from stdin"
+    full_copy "$t"
   fi
 done
 
