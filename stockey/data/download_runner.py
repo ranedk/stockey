@@ -30,7 +30,6 @@ DOWNLOADER_STEPS = [
     {"module": "data.mospi.cpi", "args": [], "purpose": "macro"},
     {"module": "data.nsdl.fpi", "args": [], "purpose": "macro"},
     {"module": "data.sharpelydata.sharpely_data", "args": [], "purpose": "fundamentals"},
-    {"module": "data.nseindia.corporate_actions", "args": [], "purpose": "events"},
     {"module": "data.nseindia.earnings_events", "args": [], "purpose": "events"},
     {"module": "data.nseindia.insider_deals", "args": [], "purpose": "events"},
     {"module": "data.nseindia.offmarket", "args": [], "purpose": "market_wide"},
@@ -43,6 +42,7 @@ DOWNLOADER_STEPS = [
 PARSER_STEPS = [
     {"module": "data.nseindia.offmarket_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.bhavcopy_parser", "args": [], "purpose": "market_wide"},
+    {"module": "data.nseindia.adjusted_prices", "args": ["--only", "normalize"], "purpose": "corporate_action_normalize"},
     {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.benchmark_sync", "args": [], "purpose": "benchmark_sync"},
     {"module": "advisory.event_evidence_store", "args": [], "purpose": "compact_event_evidence"},

@@ -1,4 +1,5 @@
 import argparse
+import json
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -317,7 +318,11 @@ def sync_adjusted_prices(symbols: Iterable[str] | None = None) -> pd.DataFrame:
     return adjusted
 
 
+STOCKEY_RUN_STATE: dict[str, object] = {}
+
+
 def main():
+    global STOCKEY_RUN_STATE
     parser = argparse.ArgumentParser(description="Normalize NSE corporate actions and build adjusted prices")
     parser.add_argument("--symbols", nargs="*", help="Optional symbols, comma-separated or repeated")
     parser.add_argument(
@@ -334,10 +339,17 @@ def main():
         for item in args.symbols:
             symbols.extend(part.strip().upper() for part in item.split(",") if part.strip())
 
+    state: dict[str, object] = {"status": "ok", "only": args.only}
     if args.only in {"normalize", "all"}:
-        sync_normalized_actions(symbols)
+        normalized = sync_normalized_actions(symbols)
+        state["normalized_rows"] = int(len(normalized))
+        state["normalized_symbols"] = int(normalized["symbol"].nunique()) if not normalized.empty else 0
     if args.only in {"adjust", "all"}:
-        sync_adjusted_prices(symbols)
+        adjusted = sync_adjusted_prices(symbols)
+        state["adjusted_rows"] = int(len(adjusted))
+        state["adjusted_symbols"] = int(adjusted["symbol"].nunique()) if not adjusted.empty else 0
+    STOCKEY_RUN_STATE = state
+    print(json.dumps(state, default=str), flush=True)
 
 
 if __name__ == "__main__":

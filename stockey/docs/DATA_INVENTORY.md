@@ -17,7 +17,7 @@ framework) needs only the price/CA/rates/identity core below.
 | Source | Modules (data/…) | Tables |
 |---|---|---|
 | NSE bhavcopy | nseindia/bhavcopy_{downloader,history,parser} | nseindia_ohlcv, nseindia_mcap, nseindia_mto, nseindia_52wk, nseindia_cmvolt, nseindia_circuit_hit, nseindia_cat_turnover, nseindia_catg, nseindia_var1, nseindia_short_selling |
-| NSE corporate actions | nseindia/corporate_action{s,_events} | nseindia_corporate_actions{,_bc_raw,_normalized}, events_dividend, events_capital_change |
+| NSE corporate actions | nseindia/corporate_action_events, nseindia/adjusted_prices (`--only normalize`, scheduled 2026-08-05) | nseindia_corporate_actions_bc_raw, nseindia_corporate_actions_normalized, events_dividend, events_capital_change |
 | Price adjustment | data/nseindia/price_adjustment.py (promoted from advisory/ 2026-07-28) | advisory_adjusted_ohlcv_daily (systrader's PRIMARY series) |
 | NSE indices | nseindia/indices_{downloader,parser} | nseindia_indices |
 | NSE calendar | nseindia/holidays | nseindia_holidays, dim_trading_days |
@@ -26,6 +26,31 @@ framework) needs only the price/CA/rates/identity core below.
 | Identity | company_master, nseindia/security_history | company_master, dim_security* |
 | Sharpely (mcap slice ONLY) | sharpelydata/sharpely_data.py | historical_mcap |
 | Download run state | data/download_runner.py (via utils/sync_state.py, promoted from advisory/ 2026-07-28) | advisory_sync_state (load-bearing per Phase 2 audit; NEVER drop) |
+
+2026-08-05 completeness sweep findings, both fixed:
+- `nseindia_corporate_actions_normalized` was 1+ year stale (last row
+  2025-07-25) because its writer, `data/nseindia/adjusted_prices.py
+  --only normalize`, was never scheduled anywhere — only ever run
+  manually. This is load-bearing: `data/dhanlive/ohlcv.py`'s
+  `has_recent_adjustment()` reads it to detect recent splits/bonuses and
+  trigger a full Dhan history re-fetch for that symbol, so a year of
+  staleness meant undetected splits could leave `dhan_ohlcv_daily`
+  discontinuous around their ex-date. Now scheduled in
+  `download_runner.PARSER_STEPS` (purpose `corporate_action_normalize`,
+  runs after `bhavcopy_parser` so both its raw sources are fresh
+  same-day). Verified: 741→100,068 rows, 367→5,728 symbols on first run.
+- `data.nseindia.corporate_actions` (writing the plain
+  `nseindia_corporate_actions` table via NSE's corporate-filings-actions
+  API + Playwright) ran daily but only ever covered the 2 placeholder
+  symbols in `config/tracked_symbols.txt` (SHAKTIPUMP, HDFCBANK) — nobody
+  widened it after `nseindia_corporate_actions_bc_raw` (bhavcopy-feed
+  parse, 5,728 symbols) became the comprehensive source. Removed from
+  `download_runner.DOWNLOADER_STEPS` (operator decision: bc_raw is
+  sufficient, not worth ~7,000 daily browser-automation calls to widen
+  it instead). The `nseindia_corporate_actions` table itself is left in
+  place (30 historical rows, harmless) but is no longer written to or
+  part of the KEEP table list above — `_bc_raw`/`_normalized` are now the
+  sole corporate-actions source.
 
 Cron keeps only: complete_data.sh, all_downloaders_queue.sh,
 all_external_workers.sh, all_price_adjustment.sh, all_ohlcv_reconcile.sh,

@@ -19,8 +19,31 @@
   postgres `systrade`**, a mirror of the cloud DB. Research discipline
   (LEDGER, holdout burns, story rule) lives here and only here.
 
-Both DBs are plain PostgreSQL. TimescaleDB was tried and removed
-(error-prone); nothing may assume hypertables.
+**Correction (2026-08-05): this was wrong.** The prior claim here — "both DBs
+are plain PostgreSQL, TimescaleDB was tried and removed, nothing may assume
+hypertables" — does not hold on the cloud DB. The `timescaledb` extension is
+installed there and ~100 tables are still active hypertables, including
+`advisory_adjusted_ohlcv_daily` (the PRIMARY series), `dhan_ohlcv_daily`,
+`dhan_ohlcv_intraday`, `nseindia_corporate_actions_bc_raw`/`_normalized`,
+`nseindia_indices`, `rbi_bank_rates`/`rbi_currency_rates`,
+`events_dividend`/`events_capital_change`, `historical_mcap`, and dozens of
+`advisory_*` tables (confirmed via `pg_extension` +
+`timescaledb_information.hypertables`). Plain tables (not hypertables)
+include `nseindia_ohlcv`, `nseindia_mcap/mto/52wk/cmvolt/circuit_hit/var1`,
+`company_master`, `master_dhan_instruments`, `dim_security`.
+
+Queries against a hypertable work transparently (a plain `SELECT`/`COUNT`
+needs no hypertable-aware syntax) — nothing has broken because of this. The
+real hazard is **size estimation**: `pg_total_relation_size('some_hypertable')`
+only measures the empty parent shell and dramatically undercounts (found via
+`dhan_ohlcv_intraday`: 40 kB via `pg_total_relation_size` vs. 11 GB via
+TimescaleDB's own `hypertable_size()`, for 22M real rows) — use
+`hypertable_size()` / `timescaledb_information.hypertables` for any
+capacity planning or size audit on a table in the list above, never the
+plain postgres size functions. `systrader/scripts/sync_from_stockey.sh`'s
+`\copy`-based sync still works correctly against these tables (transparent
+querying), but its stated rationale ("both sides are plain postgres") is
+inaccurate.
 
 ## The load rule (why the mirror exists)
 
@@ -45,13 +68,14 @@ detects column drift and recreates); renames/drops must be coordinated —
 
 | Table | Producer (stockey) | Notes |
 |---|---|---|
-| advisory_adjusted_ohlcv_daily | `advisory/price_adjustment.py` → **must move to `data/`** before the advisory strip | PRIMARY equity series (2013+, CA-adjusted, incl. delisted) |
+| advisory_adjusted_ohlcv_daily | `data/nseindia/price_adjustment.py` (promoted from `advisory/` 2026-07-28) | PRIMARY equity series (2013+, CA-adjusted, incl. delisted) |
 | nseindia_ohlcv | `data/nseindia/bhavcopy_history.py` | raw OHLC; source of adjusted opens |
 | nseindia_indices | `data/nseindia/indices_downloader.py` | mixed-case names ("Nifty 50"); PE/PB/div yield = carry inputs |
 | dhan_ohlcv_daily | `data/dhanlive/ohlcv_pull.py` | fallback only (2021+ post-reorg) |
+| dhan_ohlcv_intraday | `data/dhanlive/ohlcv.py` (via `sync_many_intraday`) | 1-min bars, ALREADY LIVE since 2025-09-22 (22M+ rows, 630 tickers as of 2026-08-04) — corrected 2026-08-05, this was previously (wrongly) described below as a not-yet-started future landing zone |
 | master_dhan_instruments | `data/dhanlive/scrip_master.py` | security ids, lots, expiries |
 | dim_security | `data/nseindia/security_history.py` | identity mapping |
-| nseindia_corporate_actions | `data/nseindia/corporate_action_events.py` | |
+| nseindia_corporate_actions_bc_raw / nseindia_corporate_actions_normalized | `data/nseindia/bhavcopy_parser.py` / `data/nseindia/adjusted_prices.py --only normalize` | corrected 2026-08-05: the plain `nseindia_corporate_actions` table (previously listed here) is no longer written — its collector only ever covered 2 placeholder symbols and was unscheduled; `_bc_raw` (bhavcopy CA feed, 5,728 symbols) is the comprehensive source, `_normalized` derives from it (now scheduled daily, was 1yr+ stale until fixed) |
 | nseindia_mcap / historical_mcap | bhavcopy parser / sharpely | point-in-time universe |
 | nseindia_holidays | `data/nseindia/holidays.py` | |
 | dim_trading_days | producer unidentified — locate before relying on it | |
@@ -82,12 +106,28 @@ token cache at `DHAN_TOKEN_CACHE`
 - The TimesFM/ML sidecar (Python) lives in the systrader repo: it is
   research, and it must live where the LEDGER lives.
 
-## Open decision — 1-minute ticks (~mid-Aug 2026)
+## 1-minute ticks — already live, NOT where this doc originally planned
 
-The small cloud DB cannot hold tick volume (~1M+ rows/day for equity+F&O).
-Proposal: raw 1-min bars land DIRECTLY in local `systrade` (or parquet files
-loaded locally); the cloud keeps only daily bars and small aggregates. This
-inverts the acquisition flow for ticks only — acceptable because the load
-rule dominates. Format on arrival is unknown; a parser will convert into the
-canonical bar shape (instrument id, UTC exchange timestamp, OHLCV, OI
-nullable, frequency tag).
+**Corrected 2026-08-05.** This section previously described 1-min bars as a
+future proposal ("~mid-Aug 2026", "lands DIRECTLY in local `systrade`, cloud
+keeps only daily bars"). Reality, found during the 2026-08-05 completeness
+sweep: `dhan_ohlcv_intraday` has been live in `data/dhanlive/ohlcv.py` since
+2025-09-22 and already holds 22M+ rows (630 tickers, 11 GB as a TimescaleDB
+hypertable — see the correction note above) — and it landed in the **cloud**
+DB, the opposite of the original proposal, which specifically wanted to keep
+tick volume OUT of the small cloud instance. `systrader/scripts/sync_from_stockey.sh`
+does not currently sync this table at all, so systrader has no access to it
+despite it existing for nearly a year.
+
+Canonical bar shape delivered: `company_master_id, exchange, ticker,
+security_id, exchange_segment, instrument, interval_minutes, timestamp,
+open, high, low, close, volume, open_interest, load_ts, asset_type` — matches
+the originally-proposed shape.
+
+Open items this leaves unresolved (operator decision needed, not made here):
+whether to (a) leave it in the cloud DB as-is and add it to systrader's sync
+list, accepting the load-rule violation since it appears to be within the
+instance's real capacity (11 GB against a 98 GB database), (b) migrate it to
+a local-only landing zone per the original plan, or (c) something else. This
+doc will not decide that unilaterally — flag for the next dhan_ohlcv_intraday
+work.
