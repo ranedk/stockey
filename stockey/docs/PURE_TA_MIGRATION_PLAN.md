@@ -103,7 +103,15 @@ of `advisory.*` remain under `data/` or `utils/`
 
 **Gate:** LEDGER updated; fee schedule documented.
 
-## Phase 4 — The cut (one commit on main)
+## Phase 4 — The cut — DONE 2026-08-05
+
+Landed as 5 commits rather than one (deletion+promotions, sharpely slim-down,
+env cleanup, test prune, CLAUDE.md rewrite) — easier to review, same net
+result. One more real bug found and fixed along the way: Sharpely's
+`getHistoricalMetricData` 400s on a same-day (`start_date == end_date`)
+window, which every incremental `historical_mcap` sync produces after its
+first successful run — silently degraded that KEEP table's freshness
+forever after day 1. Fixed to always request a >=1-day window.
 
 1. Delete (they live on the archive branch):
    - `advisory/` minus promoted files
@@ -138,7 +146,9 @@ of `advisory.*` remain under `data/` or `utils/`
    section.
 
 **Gate:** clean install from main runs the 6 cron jobs green for one full
-day; `git grep -l "import advisory"` returns nothing outside the archive.
+day; `git grep -l "import advisory"` returns nothing outside the archive
+(verified 2026-08-05 — the only match, `tests/test_data_platform.py`, is
+`from utils import advisory_date`, the correctly-promoted module).
 
 ## Phase 5 — Cloud DB cleanup (destructive; NO dump — operator decision)
 
