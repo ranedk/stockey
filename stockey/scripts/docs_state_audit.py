@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]

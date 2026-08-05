@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_ROOTS = ("advisory", "data", "scripts", "utils")
+DEFAULT_ROOTS = ("data", "scripts", "utils")
 FALLBACK_RECORDER_NAMES = {
     "_write_db_retry_telemetry",
     "record_fallback_event",
@@ -23,8 +23,8 @@ LOG_METHOD_NAMES = {
     "warning",
 }
 SELF_PROTECTION_SILENT_HANDLERS = {
-    ("advisory/fallback_telemetry.py", "_json_ready", 61),
-    ("advisory/fallback_telemetry.py", "record_local_fallback_event", 220),
+    ("utils/fallback_telemetry.py", "_json_ready", 61),
+    ("utils/fallback_telemetry.py", "record_local_fallback_event", 220),
     ("data/dhanlive/auth.py", "_is_inside_running_event_loop", 185),
 }
 
@@ -148,7 +148,7 @@ def analyze_file(path: Path, *, root: Path) -> list[ExceptionHandlerUse]:
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except SyntaxError as exc:
-        from advisory.fallback_telemetry import record_local_fallback_event
+        from utils.fallback_telemetry import record_local_fallback_event
 
         record_local_fallback_event(
             module="scripts.fallback_telemetry_coverage_report",

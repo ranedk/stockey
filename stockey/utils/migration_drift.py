@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-_SEARCH_DIRS = ("advisory", "utils", "data")
+_SEARCH_DIRS = ("utils", "data")
 
 
 def _module_dotted_paths() -> list[str]:

@@ -5,7 +5,7 @@ import json
 from datetime import date, datetime
 from typing import Any
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import sql_to_df
 
 

@@ -12,8 +12,8 @@ from typing import Any
 
 import pandas as pd
 
-from advisory import cron_status
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils import cron_status
+from utils.fallback_telemetry import record_local_fallback_event
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -266,7 +266,7 @@ def build_cron_preflight(
 
     if check_migration_drift:
         try:
-            from advisory.migration_drift import find_migration_drift
+            from utils.migration_drift import find_migration_drift
 
             drift = find_migration_drift()
         except Exception as exc:
@@ -338,7 +338,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stale-lock-seconds", type=int, default=cron_status.DEFAULT_STALE_LOCK_SECONDS)
     parser.add_argument("--skip-port-check", action="store_true")
     parser.add_argument("--skip-python-check", action="store_true")
-    parser.add_argument("--skip-migration-drift", action="store_true", help="Skip the migration-drift audit (imports advisory modules; ~5s).")
+    parser.add_argument("--skip-migration-drift", action="store_true", help="Skip the migration-drift audit (~5s).")
     parser.add_argument("--format", choices=["text", "json"], default="text")
     args = parser.parse_args(argv)
 

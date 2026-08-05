@@ -8,7 +8,7 @@ from typing import Any
 
 import pandas as pd
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 
 DEFAULT_CRONTAB_PATH = Path("config/stockey.generated.crontab")
@@ -38,7 +38,7 @@ def _expand_field(field: str, minimum: int, maximum: int) -> set[int]:
                 step = max(1, int(step_text))
             except ValueError as exc:
                 record_local_fallback_event(
-                    module="advisory.cron_status",
+                    module="utils.cron_status",
                     fallback_type="cron_status_invalid_step_fallback",
                     source="crontab",
                     severity="warn",
@@ -163,7 +163,7 @@ def _pid_running(pid_text: str | None) -> bool:
         pid = int(str(pid_text or "").strip())
     except ValueError as exc:
         record_local_fallback_event(
-            module="advisory.cron_status",
+            module="utils.cron_status",
             fallback_type="cron_status_invalid_pid_file",
             source="cron_lock_pid",
             severity="warn",
@@ -178,7 +178,7 @@ def _pid_running(pid_text: str | None) -> bool:
         if isinstance(exc, ProcessLookupError):
             return False
         record_local_fallback_event(
-            module="advisory.cron_status",
+            module="utils.cron_status",
             fallback_type="cron_status_pid_check_failed",
             source="cron_lock_pid",
             severity="warn",

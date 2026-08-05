@@ -1,2 +1,0 @@
-"""Investment advisory pipeline modules."""
-

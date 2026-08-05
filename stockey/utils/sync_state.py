@@ -84,7 +84,7 @@ def load_sync_state(source_name: str, scope_key: str = "default") -> dict[str, A
             row["state"] = json.loads(str(state_json))
         except json.JSONDecodeError as exc:
             record_local_fallback_event(
-                module="advisory.sync_state",
+                module="utils.sync_state",
                 fallback_type="sync_state_state_json_parse_failed",
                 source=str(source_name),
                 severity="warn",
@@ -147,7 +147,7 @@ def publish_bus_message(channel: str, payload: dict[str, Any]) -> bool:
         return True
     except Exception as exc:
         record_local_fallback_event(
-            module="advisory.sync_state",
+            module="utils.sync_state",
             fallback_type="sync_state_bus_publish_failed",
             source=str(channel),
             severity="warn",

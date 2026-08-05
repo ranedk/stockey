@@ -135,7 +135,7 @@ def should_scan_path(path: Path, repo_root: Path = REPO_ROOT) -> bool:
     try:
         relative = path.relative_to(repo_root)
     except ValueError as exc:
-        from advisory.fallback_telemetry import record_local_fallback_event
+        from utils.fallback_telemetry import record_local_fallback_event
 
         record_local_fallback_event(
             module="scripts.env_example_audit",
@@ -187,7 +187,7 @@ def collect_env_usages(repo_root: Path = REPO_ROOT) -> list[EnvUsage]:
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
-            from advisory.fallback_telemetry import record_local_fallback_event
+            from utils.fallback_telemetry import record_local_fallback_event
 
             record_local_fallback_event(
                 module="scripts.env_example_audit",

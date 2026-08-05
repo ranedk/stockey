@@ -57,7 +57,7 @@ def _text(value: Any) -> str | None:
             return None
     except Exception as exc:
         record_local_fallback_event(
-            module="advisory.identity_issues",
+            module="utils.identity_issues",
             fallback_type="identity_issue_text_missing_check_failed",
             source="text",
             severity="warn",
@@ -323,7 +323,7 @@ def record_company_master_mapping_issue(
     *,
     symbol: str,
     requested_exchange: str = "NSE",
-    source: str = "data.announcements.managed_pipeline",
+    source: str = "identity_mapping",
     error_text: str | None = None,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -542,7 +542,7 @@ def _resolve_one_issue(row: dict[str, Any], *, apply: bool) -> dict[str, Any]:
             error_text = f"{type(exc).__name__}: {exc}"
             context = {"checked_symbol": symbol, "requested_exchange": requested_exchange, "asset_type": asset_type}
             record_local_fallback_event(
-                module="advisory.identity_issues",
+                module="utils.identity_issues",
                 fallback_type="ohlcv_history_issue_resolution_failed",
                 source="dhan_ohlcv_daily",
                 severity="warn",
@@ -595,7 +595,7 @@ def _resolve_one_issue(row: dict[str, Any], *, apply: bool) -> dict[str, Any]:
             error_text = f"{type(exc).__name__}: {exc}"
             context = {"checked_symbol": symbol, "requested_exchange": requested_exchange}
             record_local_fallback_event(
-                module="advisory.identity_issues",
+                module="utils.identity_issues",
                 fallback_type="company_master_mapping_issue_resolution_failed",
                 source="company_master",
                 severity="warn",
@@ -656,7 +656,7 @@ def _resolve_one_issue(row: dict[str, Any], *, apply: bool) -> dict[str, Any]:
         error_text = f"{type(exc).__name__}: {exc}"
         context = {"checked_symbol": symbol, "requested_exchange": requested_exchange, "asset_type": asset_type}
         record_local_fallback_event(
-            module="advisory.identity_issues",
+            module="utils.identity_issues",
             fallback_type="identity_issue_resolution_failed",
             source="data.dhanlive.dhan_db.resolve_dhan_identity",
             severity="warn",

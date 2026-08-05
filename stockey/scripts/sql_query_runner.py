@@ -11,7 +11,7 @@ import psycopg2
 import psycopg2.extras
 from environs import Env
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 
 env = Env()

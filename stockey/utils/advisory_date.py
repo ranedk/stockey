@@ -39,7 +39,7 @@ def latest_trading_day_on_or_before(value: Any | None = None, *, timezone: str =
         )
     except Exception as exc:
         record_local_fallback_event(
-            module="advisory.advisory_date",
+            module="utils.advisory_date",
             fallback_type="advisory_date_latest_trading_day_lookup_failed",
             source=TRADING_DAYS_TABLE,
             severity="error",

@@ -43,12 +43,11 @@ EXTERNAL_TASK_QUEUE_SCHEMA_STATEMENTS = [
     """,
     f"CREATE INDEX IF NOT EXISTS idx_{TABLE_NAME}_claim ON {TABLE_NAME} (queue_name, status, next_attempt_at, priority DESC, created_at)",
 ]
-SINGLE_CLIENT_QUEUES = {"nse", "dhan", "screener"}
+SINGLE_CLIENT_QUEUES = {"nse", "dhan"}
 ALLOWED_NSE_MODULES = {
     "data.nseindia.holidays",
     "data.nseindia.corporate_actions",
     "data.nseindia.earnings_events",
-    "data.nseindia.insider_deals",
     "data.nseindia.offmarket",
     "data.nseindia.bhavcopy_downloader",
     "data.nseindia.indices_downloader",
@@ -69,7 +68,7 @@ def _record_queue_fallback(
     metadata: dict[str, Any] | None = None,
 ) -> None:
     record_local_fallback_event(
-        module="advisory.external_task_queue",
+        module="utils.external_task_queue",
         fallback_type=fallback_type,
         source=source,
         severity=severity,
@@ -319,13 +318,6 @@ def handle_dhan_scrip_master(task_args: dict[str, Any]) -> dict[str, Any]:
     return _run_module("data.dhanlive.scrip_master", [str(value) for value in (task_args.get("args") or [])])
 
 
-def handle_screener_login(task_args: dict[str, Any]) -> dict[str, Any]:
-    from data.screenerin.auth import check_login_status, login_and_check
-
-    check_only = bool(task_args.get("check_only") or task_args.get("check"))
-    return check_login_status() if check_only else login_and_check()
-
-
 def handle_nse_module(task_args: dict[str, Any]) -> dict[str, Any]:
     module_name = str(task_args.get("module") or "").strip()
     if module_name not in ALLOWED_NSE_MODULES:
@@ -353,7 +345,6 @@ TASK_HANDLERS = {
     "dhan_daily_ohlcv": handle_dhan_daily_ohlcv,
     "dhan_intraday_ohlcv": handle_dhan_intraday_ohlcv,
     "dhan_scrip_master": handle_dhan_scrip_master,
-    "screener_login": handle_screener_login,
     "nse_module": handle_nse_module,
     "download_module": handle_download_module,
 }

@@ -92,7 +92,7 @@ def analyze_file(path: Path, *, root: Path) -> list[DbSessionUse]:
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except SyntaxError as exc:
-        from advisory.fallback_telemetry import record_local_fallback_event
+        from utils.fallback_telemetry import record_local_fallback_event
 
         record_local_fallback_event(
             module="scripts.db_retry_coverage_report",

@@ -22,22 +22,16 @@ DOWNLOADER_STEPS = [
     {"module": "data.sharpelydata.scrip_master", "args": [], "purpose": "sharpely_master_precheck"},
     {"module": "data.company_master", "args": [], "purpose": "identity_build"},
     {"module": "data.dhanlive.ohlcv", "args": [], "purpose": "dhan_ohlcv_precheck"},
-    {"module": "data.screenerin.screener_parser", "args": [], "purpose": "screener_sync_registered"},
-    {"module": "data.fred.us_macro", "args": [], "purpose": "macro"},
-    {"module": "data.eaindustry.wpi", "args": [], "purpose": "macro"},
     {"module": "data.rbi.download_fbil_gsec", "args": [], "purpose": "macro"},
     {"module": "data.rbi.download_bank_rates", "args": [], "purpose": "macro"},
-    {"module": "data.mospi.cpi", "args": [], "purpose": "macro"},
-    {"module": "data.nsdl.fpi", "args": [], "purpose": "macro"},
-    {"module": "data.sharpelydata.sharpely_data", "args": [], "purpose": "fundamentals"},
-    {"module": "data.nseindia.earnings_events", "args": [], "purpose": "events"},
-    {"module": "data.nseindia.insider_deals", "args": [], "purpose": "events"},
+    {"module": "data.sharpelydata.sharpely_data", "args": [], "purpose": "mcap"},
     {"module": "data.nseindia.offmarket", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.bhavcopy_downloader", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.indices_downloader", "args": [], "purpose": "market_wide"},
-    {"module": "data.nseindia.recent_events", "args": [], "purpose": "events"},
-    {"module": "data.economictimes.rss", "args": [], "purpose": "news"},
 ]
+# nseindia.earnings_events and nseindia.recent_events are BORDERLINE (LLM-free,
+# useful for FnO event-vol later per DATA_INVENTORY.md) -- frozen, not deleted:
+# the files stay but are intentionally NOT scheduled here.
 
 PARSER_STEPS = [
     {"module": "data.nseindia.offmarket_parser", "args": [], "purpose": "market_wide"},
@@ -45,8 +39,6 @@ PARSER_STEPS = [
     {"module": "data.nseindia.adjusted_prices", "args": ["--only", "normalize"], "purpose": "corporate_action_normalize"},
     {"module": "data.nseindia.indices_parser", "args": [], "purpose": "market_wide"},
     {"module": "data.benchmark_sync", "args": [], "purpose": "benchmark_sync"},
-    {"module": "advisory.event_evidence_store", "args": [], "purpose": "compact_event_evidence"},
-    {"module": "advisory.context_overlay_refresh", "args": [], "purpose": "context_overlay_refresh"},
 ]
 
 DOWNLOAD_STEPS = [*DOWNLOADER_STEPS, *PARSER_STEPS]

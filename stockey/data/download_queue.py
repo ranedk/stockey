@@ -10,7 +10,6 @@ from data.download_runner import DOWNLOADER_STEPS, PARSER_STEPS, run_download_mo
 
 NSE_PREFIX = "data.nseindia."
 DHAN_MODULES = {"data.dhanlive.scrip_master", "data.dhanlive.ohlcv"}
-SCREENER_MODULES = {"data.screenerin.screener_parser"}
 
 
 def classify_step(step: dict[str, Any]) -> dict[str, Any] | None:
@@ -21,8 +20,6 @@ def classify_step(step: dict[str, Any]) -> dict[str, Any] | None:
         return {"queue": "dhan", "task_type": "dhan_scrip_master", "task_args": {"args": args, "purpose": purpose}}
     if module_name == "data.dhanlive.ohlcv":
         return {"queue": "dhan", "task_type": "download_module", "task_args": {"module": module_name, "args": args, "purpose": purpose}}
-    if module_name in SCREENER_MODULES:
-        return {"queue": "screener", "task_type": "download_module", "task_args": {"module": module_name, "args": args, "purpose": purpose}}
     if module_name.startswith(NSE_PREFIX):
         return {"queue": "nse", "task_type": "nse_module", "task_args": {"module": module_name, "args": args, "purpose": purpose}}
     return None

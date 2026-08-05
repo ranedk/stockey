@@ -9,7 +9,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

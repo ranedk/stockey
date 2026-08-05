@@ -145,7 +145,7 @@ def record_fallback_event(
         upsert_to_db(pd.DataFrame([row]), TABLE_NAME, unique_keys=["event_id"])
     except Exception as exc:
         record_local_fallback_event(
-            module="advisory.fallback_telemetry",
+            module="utils.fallback_telemetry",
             source=TABLE_NAME,
             fallback_type="fallback_telemetry_db_write_failed",
             severity="error",
@@ -238,7 +238,7 @@ def read_local_fallback_events(*, hours: int = 24, limit: int = 100) -> list[dic
                     row = json.loads(line)
                 except Exception as exc:
                     record_local_fallback_event(
-                        module="advisory.fallback_telemetry",
+                        module="utils.fallback_telemetry",
                         source=str(path),
                         fallback_type="local_fallback_telemetry_line_parse_failed",
                         severity="warn",
@@ -258,7 +258,7 @@ def read_local_fallback_events(*, hours: int = 24, limit: int = 100) -> list[dic
                 rows.append(row)
     except Exception as exc:
         record_local_fallback_event(
-            module="advisory.fallback_telemetry",
+            module="utils.fallback_telemetry",
             source=str(path),
             fallback_type="local_fallback_telemetry_read_failed",
             severity="error",
@@ -353,7 +353,7 @@ def summarize_fallback_events(*, hours: int = 24, limit: int = 25) -> dict[str, 
         fallback_table_exists = table_exists(TABLE_NAME)
     except Exception as exc:
         record_local_fallback_event(
-            module="advisory.fallback_telemetry",
+            module="utils.fallback_telemetry",
             source=TABLE_NAME,
             fallback_type="fallback_telemetry_table_check_failed",
             severity="error",
@@ -426,7 +426,7 @@ def summarize_fallback_events(*, hours: int = 24, limit: int = 25) -> dict[str, 
         )
     except Exception as exc:
         record_local_fallback_event(
-            module="advisory.fallback_telemetry",
+            module="utils.fallback_telemetry",
             source=TABLE_NAME,
             fallback_type="fallback_telemetry_table_query_failed",
             severity="error",

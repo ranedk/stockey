@@ -21,7 +21,7 @@ from scripts.db_table_retention_report import (
     LEGACY_NSE_TABLES,
     PROTECTED_NUMERICAL_TABLES,
 )
-from advisory.fallback_telemetry import record_local_fallback_event
+from utils.fallback_telemetry import record_local_fallback_event
 from utils.db import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER, qualified_identifier, sql_to_df
 from utils.store import save_file
 
