@@ -80,17 +80,26 @@ Each phase ends with a gate. Do not start the next phase red.
 of `advisory.*` remain under `data/` or `utils/`
 (`advisory/*.py` itself still imports the shims, expected until Phase 4).
 
-## Phase 3 — Evidence export (before anything is archived)
+## Phase 3 — Evidence export (before anything is archived) — DONE 2026-08-05
 
-1. Export `advisory_research_runs`, `advisory_factor_ic_sweep`,
-   `advisory_subscore_ic`, signal-quality/threshold evaluation summaries →
-   flat files in `systrader/research/imports/` (CSV or MD).
-2. Reconcile with systrader `research/LEDGER.md` rows 3–5 (already imported
-   from session memory); add rows for anything not yet counted
-   (`trials=N` batches). M must not shrink.
-3. Mine `advisory/cost_model.py` → actual Dhan fee schedule
-   (delivery/F&O/MCX) → answer systrader open question #5; encode later in
-   `internal/data` cost metas.
+1. Fee schedule mined from `advisory/cost_model.py` + Dhan's real published
+   pricing (2026-08-02) and documented in `systrader/docs/open_questions.md`
+   Q5 — done earlier.
+2. Exported `advisory_research_runs`, `advisory_factor_ic_sweep`,
+   `advisory_subscore_ic`, and the 3 signal-quality/threshold eval summary
+   tables to `systrader/research/imports/*.csv` (cloud DB reachable directly
+   from this session as of 2026-08-05, unlike earlier attempts).
+3. Reconciled against `research/LEDGER.md`: rows 3–5 already covered the
+   named experiments. Found 4 uncounted batches, added as rows 6–9: TimesFM
+   forecast paper-portfolio (trials=15, inconclusive), weekly factor-IC +
+   subscore-IC drift monitor (trials=81, reinforces row 4's null), weekly
+   technical-threshold calibration (trials=13, **candidate but NOT
+   promoted** — beats baseline on early large samples but eligible-count
+   shrinks hard on later runs, smells like re-selection on a thinning pool,
+   needs a dedicated re-run before trusting it), and the recurring
+   signal-quality health monitors (trials=585+174, no promotion signal, the
+   split monitor actively recommends against broad promotion in >half its
+   rows). M grew from ~124 to ~889; nothing shrunk.
 
 **Gate:** LEDGER updated; fee schedule documented.
 
