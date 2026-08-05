@@ -2,122 +2,75 @@
 
 This file is the operating guide for AI coding agents working on Stockey.
 
-Stockey is an Indian-equity advisory research and operator system. Treat it as a
-financial decision-support platform, not as a toy app. Correctness, point-in-time
-discipline, traceability, and explicit authority boundaries matter more than UI
-polish or broad refactoring.
+Stockey is a **pure data platform** for Indian-equity price/reference data (operator
+decision 2026-07-27). It collects, adjusts, and identity-maps bhavcopy, corporate
+actions, indices, calendar, Dhan broker, and RBI/FBIL rate data, then writes it to
+the cloud Postgres for `systrader` to consume. It does **no** research, signal
+generation, backtesting, sizing, execution, fundamental analysis, news/announcement
+processing, or LLM-token consumption — all of that moved to `systrader`
+(`~/code/trading/systrader`, Go). See `docs/DATA_INVENTORY.md` for the authoritative
+keep/remove inventory and `docs/PURE_TA_MIGRATION_PLAN.md` for how the cut happened.
+
+Treat this as data-collection infrastructure, not a research app: correctness,
+point-in-time discipline, and visible failure matter more than features. Do not
+reintroduce research/signal/LLM logic here — it belongs in systrader.
 
 ## Project Principles
 
-- LLM decision authority (operator decision, 2026-06-23): an LLM may take trade
-  decisions directly — including review outcomes and BUY/SELL/size — when it has
-  reviewed the evidence and recorded strong, provenance-backed reasons. The
-  deterministic technical, risk, lifecycle, action-consolidation, reason-contract,
-  identity, and execution gates are advisory guardrails: an LLM decision may
-  override a soft gate, but the override and its rationale must be recorded. This
-  replaces the former "LLM must never decide trades" rule. There is NO human
-  manual-review step; where review is needed the LLM performs it (see the
-  LLM-resolved-review and LLM-direct-authority epics in `todo.md`).
-- Non-negotiable engineering safety (kept regardless of who decides): every
-  LLM decision persists a typed evidence/provenance + reason contract; the decision
-  rests on the COMPLETE validated evidence packet with data-grounded reasons (not a
-  single news/announcement/indicator); behavior stays point-in-time (no future data
-  / lookahead); a master enable flag gates any live LLM→broker authority and DEFAULTS
-  OFF (opt-in per deployment); every live decision is bounded by deterministic
-  position-sizing / exposure / stop limits so no single call is catastrophic; and
-  live decisions + outcomes + provenance are monitored to catch systematic errors
-  (alert, never block). Paper-first graduation is intentionally NOT used (operator
-  decision 2026-06-23: too many non-stationary dimensions for paper P&L to be
-  informative). These are survival/auditability guarantees, not authority limits.
-- Use LLMs for structured extraction, event interpretation, hypothesis/playbook
-  notes, company-memory summaries, adversarial review notes, operator
-  explanations, review resolution, and (when enabled and evidence-backed) trade
-  decisions.
-- A broad single regime label must not be the default explanation for no BUY
-  recommendations. Prefer layered context: breadth, macro stress, sector/symbol
-  leadership, technical confirmation, source-family overlays, and exact event
-  class reliability.
-- Every fallback, degradation, skipped source, stale input, and data-quality
-  issue should be visible through telemetry, sync state, Operator Health, logs,
-  or diagnostics. Avoid silent fallback.
-- Preserve point-in-time behavior. Do not use future data, backdated portfolio
-  assumptions, stale latest rows, or non-causal labels.
-- Prefer research-only evidence and manual reviewed-diff workflows before any
-  config or threshold changes.
-- Do not mutate broker behavior unless the user explicitly asks for that task.
+- Every fallback, degradation, skipped source, stale input, and data-quality issue
+  should be visible through fallback telemetry, sync state, or logs. Avoid silent
+  fallback.
+- Preserve point-in-time behavior. Do not use future data, backdated assumptions,
+  stale latest rows, or non-causal labels.
+- Corporate-action adjustment is derived from price steps first
+  (`data/nseindia/price_adjustment.py`, systrader's PRIMARY series), corroborated
+  by declared NSE corporate actions (`nseindia_corporate_actions_bc_raw`/
+  `_normalized`) where available — never guess an adjustment factor.
+- Do not mutate broker/auth behavior (Dhan login, CDP) unless the user explicitly
+  asks for that task — a botched change here can lock out the account (see
+  `data/dhanlive/auth.py`'s login lock and timezone-aware expiry check).
+- systrader owns all research, signals, and trading decisions. If a task looks
+  like it needs a trading rule, a backtest, a scoring model, or an LLM call over
+  market data, it belongs in systrader, not here.
 
 ## Current Architecture
 
-Main pipeline:
+The whole pipeline is 6 cron jobs (`config/stockey.crontab.template`):
 
-1. `complete_data.sh` downloads/parses raw market, macro, company, NSE, news,
-   announcement, and compact evidence.
-2. Screeners and ad hoc Screener.in queries create candidate universes.
-3. Dhan OHLCV, macro, bhavcopy, announcement, exchange-event, fundamental,
-   peer, and intraday feature builders persist point-in-time features.
-4. Context overlays create review-only pressure from macro, announcement,
-   bhavcopy, exchange, theme/news, and causal-memory evidence.
-5. Watchers incrementally consume OHLCV, news, announcements, wait signals, and
-   context-overlay watch rows.
-6. Signal refresh creates fast review-only action rows. These rows must retain
-   `portfolio_authority=none`, `broker_execution_allowed=false`, and
-   `full_advisory_required=true` unless a full advisory path later validates
-   them.
-7. `all_advisory.sh` performs authoritative reconciliation: context signal
-   refresh, context-watchlist reconciliation, causal-memory signal refresh,
-   rule/technical scoring, event policy, risk, portfolio, lifecycle, action
-   consolidation, operator snapshots, trace summaries, and diagnostics.
-8. Action consolidation should produce one final action per symbol.
-9. Execution planning can only consume validated, broker-capable action
-   contracts.
-10. Research jobs evaluate technical thresholds, context overlays, event policy,
-    signal quality, adversarial review, TS forecasts, and optional ML separately
-    from live authority.
+1. `complete_data.sh` (07:10 + 17:30) — runs `data.download_runner --phase all`:
+   downloads + parses NSE bhavcopy/indices/corporate-actions/holidays, Dhan
+   scrip master + OHLCV, RBI/FBIL rates, Sharpely market-cap, and normalizes
+   corporate actions. See `data/download_runner.py`'s `DOWNLOADER_STEPS` /
+   `PARSER_STEPS` for the exact registry.
+2. `all_downloaders_queue.sh` + `all_external_workers.sh` (08:30/12:30/16:30 and
+   +5 min) — queues single-client NSE/Dhan work (`data/download_queue.py`) and
+   drains it (`utils/external_task_queue.py`) so parallel NSE/Dhan sessions don't
+   collide.
+3. `all_ohlcv_reconcile.sh` (18:45) — backfills any universe symbol whose latest
+   Dhan daily bar predates the last completed trading day
+   (`data/dhanlive/ohlcv_reconcile.py`).
+4. `all_price_adjustment.sh` (18:50, right after the reconcile) — rebuilds
+   `advisory_adjusted_ohlcv_daily`, systrader's PRIMARY equity series.
+5. `all_data_readiness.sh` (22:30) — `data/data_readiness.py --fix`: checks
+   bhavcopy/Dhan/benchmark freshness and runs bounded repairs.
+6. Log rotation (06:50, `scripts/rotate_logs.sh`).
 
-## Important Authority Boundaries
-
-> Note (2026-06-23): these boundaries are the **default/current** behavior and remain
-> in force until the `[P-LLM-AUTH]` epic (see `todo.md`) builds and the operator enables
-> the default-OFF master flag. Per the updated Project Principles, an LLM may then take
-> trade decisions directly with recorded provenance/reasons, overriding these soft gates.
-> Until that flag is on, treat the boundaries below as binding.
-
-- `WATCH`, `BUY_WATCH`, `REDUCE_EXPOSURE_REVIEW`, `TIGHTEN_STOP`, and most
-  signal-refresh rows are review-only unless explicitly upgraded by full
-  advisory/risk/lifecycle/action gates.
-- Context overlays are watchlist/de-risk pressure only. They must not create
-  direct BUY or SELL authority.
-- Event-policy and company-memory bridges can create review-only watch/de-risk
-  signals, not broker-capable actions.
-- Technical threshold calibration is research-only. It can propose candidate
-  reviewed patches, but it must not auto-apply thresholds.
-- Signal-quality promotion/reliability checks are research/review gates. Raw
-  positive returns are not enough; use benchmark-excess and sector/exact-class
-  diagnostics.
-- Manual Review should be reserved for truly unresolved, high-impact ambiguity.
-  Routine low-actionability rows should resolve to `NO_ACTION`, `WATCH`, or
-  `REDUCE_EXPOSURE_REVIEW` with explicit no-broker authority.
+`data/nseindia/earnings_events.py` and `data/nseindia/recent_events.py` are
+BORDERLINE (LLM-free, useful for FnO event-vol research later per
+`docs/DATA_INVENTORY.md`) — the files stay but are deliberately **not** scheduled
+(frozen, not deleted).
 
 ## Key Commands
 
-Daily/operator:
+Daily/operator (matches the crontab exactly):
 
 ```sh
 ./complete_data.sh
-./all_watchers.sh
-./all_context_to_entry_repair.sh
-./all_advisory.sh
-./all_frontend.sh
-```
-
-Research:
-
-```sh
-./all_research_evidence.sh
-./all_ml.sh
-python -m advisory.technical_threshold_calibration --dry-run --horizons 5 10 20 --max-configs 512 --progress-every 128
-python -m advisory.recommendation_diagnostics --format text
-python -m advisory.operator_health --skip-dhan
+./all_downloaders_queue.sh
+./all_external_workers.sh
+./all_ohlcv_reconcile.sh
+./all_price_adjustment.sh
+./all_data_readiness.sh
 ```
 
 Cron:
@@ -125,7 +78,7 @@ Cron:
 ```sh
 python builder.py
 python scripts/cron_preflight.py
-./go-crond config/stockey.generated.crontab --allow-unprivileged
+./start_cron.sh          # supported way to (re)start go-crond; runs OHLCV reconcile first
 ```
 
 Dhan/Screener browser automation:
@@ -136,36 +89,42 @@ scripts/start_chrome_cdp.sh
 
 Keep `CDP_ENDPOINT=http://localhost:9222`. Dhan auto-login should fail hard if
 Chrome/CDP is unavailable; do not add a hidden manual-consent fallback unless
-explicitly requested.
+explicitly requested. Login attempts are serialized across processes
+(`data/dhanlive/auth.py`'s `_dhan_login_lock`) — do not remove that lock, it
+exists because concurrent logins triggered Dhan's "too many attempts" block.
 
 ## Files To Inspect First
 
-- `README.md` for operator script groups and current system flow.
-- `todo.md` for current roadmap and active project state.
-- `todo.md` for the priority backlog, current-state summary, and remaining gaps.
-- `docs/operators_manual.md` for runbooks.
-- `docs/scripts.md` for script inventory.
-- `advisory/recommendation_diagnostics.py` for no-BUY and stale-evidence
-  diagnosis.
-- `advisory/action_recommender.py` for consolidated action authority.
-- `advisory/technical_engine.py` and `advisory/technical_threshold_calibration.py`
-  for technical setup and threshold evidence.
-- `advisory/context_overlay_refresh.py`, `advisory/watchlist_builder.py`, and
-  `advisory/signal_refresh.py` for context-to-entry flow.
-- `advisory/operator_health.py` for visible failures, trust gates, and fix hints.
+- `docs/DATA_INVENTORY.md` — the authoritative keep/remove table inventory and
+  cron list; check here before assuming a table or collector is in scope.
+- `docs/PURE_TA_MIGRATION_PLAN.md` — the phased history of how stockey became
+  pure-TA; useful for "why does X work this way" questions.
+- `DATA_CONTRACT.md` (repo root; canonical copy in systrader) — the table API
+  systrader depends on, the cloud-DB load rule, Dhan auth handoff, and the
+  TimescaleDB-hypertable correction (several KEEP tables, including the primary
+  price series, are still hypertables — use `hypertable_size()` for capacity
+  work, plain `pg_total_relation_size()` dramatically undercounts them).
+- `data/download_runner.py` for the downloader/parser registry (what actually
+  runs and in what order).
+- `data/data_readiness.py` for the freshness checks and bounded repairs.
+- `docs/scripts.md`, `docs/operators_manual.md` — **stale**, still describe the
+  pre-2026-07-27 advisory system; useful for historical context only, not
+  current behavior. A broader docs/ cleanup pass (advisory_manual.md,
+  llm_decision_authority.md, hypothesis_*.md, operator_*.md, and similar) is
+  still outstanding.
 
 ## Coding Rules
 
 - Use `rg` / `rg --files` for search.
-- Use `apply_patch` for manual edits.
 - Preserve unrelated dirty worktree changes.
 - Do not run destructive git commands unless explicitly asked.
-- Add narrow tests for every behavioral change.
+- Add narrow tests for every behavioral change (`tests/test_data_platform.py`).
 - Prefer bounded, focused fixes over large refactors.
-- Keep existing design language and operator contracts unless there is a
-  correctness issue.
 - Keep new comments rare and useful.
 - Default to ASCII in new files.
+- When touching a collector, check `docs/DATA_INVENTORY.md` first — if the table
+  it writes isn't in the KEEP list, the fix probably belongs in the archive
+  branch (`advisory-archive-2026-07`), not here.
 
 ## Validation Checklist
 
@@ -173,19 +132,11 @@ Choose the smallest meaningful set for the change:
 
 ```sh
 python -m py_compile path/to/module.py
-pytest -q tests/test_advisory_regression.py::specific_test_name
+pytest -q tests/test_data_platform.py::specific_test_name
 python scripts/docs_state_audit.py --strict
 python scripts/env_example_audit.py --strict
-python scripts/funnel_invariants.py --strict   # score-scale/dead-gate + funnel contracts (0 errors required)
-python scripts/price_data_sanity.py            # data-health: CA-splits/EQ-BE/cross-source/benchmark gaps (informational; data not code)
+python scripts/price_data_sanity.py   # data-health: CA-splits/EQ-BE/cross-source/benchmark gaps (informational)
 git diff --check
-```
-
-For UI/API changes, also use:
-
-```sh
-npm --prefix apps/operator-web run typecheck
-python scripts/api_performance_report.py --limit 20
 ```
 
 For cron/script changes:
@@ -195,54 +146,48 @@ python scripts/cron_preflight.py
 python scripts/docs_state_audit.py --strict
 ```
 
-## Research And Policy Guardrails
-
-- Evaluate signals after costs.
-- Compare context/event families against NIFTY or sector benchmark excess
-  returns. Do not treat market beta as alpha.
-- Require enough matured labels before trusting calibration.
-- Keep false-discovery and backtest-overfitting risk visible.
-- Do not promote thresholds, event rules, or source-family overlays from one
-  good-looking sample.
-- Prefer sector/exact-class reliability over broad source-family labels.
-- Keep review outputs explicit: `candidate`, `do_not_relax`, `needs_more_data`,
-  `benchmark_beta_not_alpha`, `needs_benchmark_attribution`, or
-  `manual_review_required`.
-
 ## What Not To Do
 
-- Do not make BUYs appear by weakening all thresholds globally.
-- Do not use a broad `RISK_ON` or `RISK_OFF` regime as the sole trade gate.
-- Do not let review-only watcher rows enter portfolio/execution.
-- Do not hide Dhan/NSE/Screener failures as empty outputs.
-- Do not add more UI unless it surfaces a critical backend truth or fixes an
-  operator-trust issue.
-- Do not assume latest rows are current; use trading-day-aware diagnostics and
-  sync-state contracts.
+- Do not hide Dhan/NSE source failures as empty outputs — use fallback telemetry
+  and sync-state classifications (`auth_unavailable`, `source_unavailable`,
+  `reference_mapping_missing`, `parse_failed`, ...).
+- Do not assume latest rows are current; use trading-day-aware checks
+  (`data/data_readiness.py`, `data/dhanlive/ohlcv_reconcile.py`).
+- Do not add research/signal/scoring/backtesting/LLM logic here — it belongs in
+  systrader.
+- Do not point backtests, scans, or any read-heavy work at the cloud DB — it's
+  small by design; heavy reads happen against systrader's local `systrade`
+  mirror (see `DATA_CONTRACT.md`'s load rule).
+- Do not widen a collector's symbol scope casually (e.g. `config/tracked_symbols.txt`)
+  without checking the cost — one prior collector ran full browser automation
+  daily against a 2-symbol placeholder list for a year with zero value; a
+  wider scope on a slow per-symbol scraper can mean thousands of daily calls.
 
-## Boundary with systrader (2026-07-27)
+## Boundary with systrader (2026-07-27, migration completed 2026-08-05)
 
-Stockey is becoming a pure DATA PLATFORM; all research/TA/selection authority
-is migrating to the `systrader` project (`~/Downloads/books/systrader`, Go,
-Carver-framework). Read before any structural work:
+Stockey is a pure DATA PLATFORM; all research/TA/selection authority lives in
+`systrader` (`~/code/trading/systrader`, Go, Carver-framework). Read before any
+structural work:
 
 - `DATA_CONTRACT.md` (repo root; canonical copy in systrader) — table API,
-  load rule (cloud DB is small: never point heavy reads at it), auth, tick plan.
-- `docs/ADVISORY_SPLIT.md` — which advisory modules move to `data/`
-  (`price_adjustment.py` FIRST — it produces systrader's primary price
-  table), which are ops, which get archived. Includes special handling:
-  export `research_ledger`/`multiple_testing` records to systrader's LEDGER
-  before archiving; `config/adaptive_ensemble.json` params are contaminated.
+  load rule (cloud DB is small: never point heavy reads at it), auth, and the
+  TimescaleDB correction.
+- `docs/DATA_INVENTORY.md` — the full keep/remove inventory and cron list.
+- `docs/PURE_TA_MIGRATION_PLAN.md` — phase-by-phase migration history,
+  including two registry-level scope leaks and a stale-data bug found and
+  fixed during the cut.
 
-Cross-session protocol with systrader's Claude session:
-- Decisions affecting the other project go into these repo docs (the
-  inter-session API), never only into session memory.
-- Either session MAY read the other's memory for context, READ-ONLY
-  (systrader's: `~/.claude/projects/-Users-rane-Downloads-books/memory/`;
-  this project's: `~/.claude/projects/-Users-rane-code-stockey/memory/`).
-  Never write to the other session's memory.
-- Research findings here that touch shared NSE data must be exportable as
-  trial counts — systrader's multiple-testing bar depends on knowing every
-  experiment this data has been asked (its LEDGER already imports the
-  adaptive-ensemble NO-GO, the factor-sweep null, and the deployment-timing
-  result; the 2020-01→2021-07 ensemble holdout is recorded as burned there).
+Both projects now share one Claude Code session and one memory directory
+(`~/.claude/projects/-Users-rane-code-trading/memory/`) — decisions affecting
+the other project still belong in these repo docs (the inter-session API), not
+only in session memory, since memory doesn't survive a fresh conversation the
+way a committed doc does.
+
+Research boundary: ideas graduate from stockey's historical experiments to
+systrader by **re-implementation as storied rules through `research/LEDGER.md`**
+— never by copying code. Any research findings here that touch shared NSE data
+must be exportable as trial counts (systrader's multiple-testing bar depends on
+knowing every experiment the data has been asked) — this was done for the
+2026-06/07 stockey-session experiments plus 4 more batches found during the
+2026-08-05 Phase 3 evidence export (`systrader/research/imports/`); LEDGER rows
+1-9 are current as of that export.
