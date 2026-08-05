@@ -7913,3 +7913,124 @@ def test_bhavcopy_downloader_retries_within_run(monkeypatch):
     assert len(calls) == 3                                      # 1 + 2 retries then give up (candidate next run)
 
 
+
+
+def test_data_coverage_report_check_table_daily_ok(monkeypatch):
+    from scripts import data_coverage_report as dcr
+
+    today = dcr._today()
+    fresh = pd.DataFrame([{
+        "rows": 100, "symbols": 10,
+        "min_date": today - pd.Timedelta(days=400), "max_date": today,
+        "max_past_or_present_date": today,
+    }])
+    monkeypatch.setattr(dcr, "sql_to_df", lambda *a, **k: fresh)
+    row = dcr.check_table("some_table", "date", "symbol", "daily", "Test")
+    assert row["status"] == "ok"
+    assert row["rows"] == 100
+    assert row["symbols"] == 10
+    assert row["staleness_days"] == 0
+
+
+def test_data_coverage_report_check_table_daily_warn_and_error(monkeypatch):
+    from scripts import data_coverage_report as dcr
+
+    today = dcr._today()
+
+    def make(days_stale):
+        return pd.DataFrame([{
+            "rows": 5, "symbols": None,
+            "min_date": today - pd.Timedelta(days=10), "max_date": today - pd.Timedelta(days=days_stale),
+            "max_past_or_present_date": today - pd.Timedelta(days=days_stale),
+        }])
+
+    monkeypatch.setattr(dcr, "sql_to_df", lambda *a, **k: make(dcr.WARN_STALENESS_DAYS + 1))
+    row = dcr.check_table("t", "date", None, "daily", "Test")
+    assert row["status"] == "warn"
+
+    monkeypatch.setattr(dcr, "sql_to_df", lambda *a, **k: make(dcr.ERROR_STALENESS_DAYS + 1))
+    row = dcr.check_table("t", "date", None, "daily", "Test")
+    assert row["status"] == "error"
+
+
+def test_data_coverage_report_check_table_informational_never_stales(monkeypatch):
+    from scripts import data_coverage_report as dcr
+
+    today = dcr._today()
+    stale = pd.DataFrame([{
+        "rows": 259, "symbols": None,
+        "min_date": today - pd.Timedelta(days=30000), "max_date": today - pd.Timedelta(days=243),
+        "max_past_or_present_date": today - pd.Timedelta(days=243),
+    }])
+    monkeypatch.setattr(dcr, "sql_to_df", lambda *a, **k: stale)
+    row = dcr.check_table("rbi_bank_rates", "date", None, "informational", "RBI/FBIL")
+    assert row["status"] == "ok"
+    assert row["staleness_days"] == 243  # still reported, just not judged
+
+
+def test_data_coverage_report_check_table_empty_table_is_error(monkeypatch):
+    from scripts import data_coverage_report as dcr
+
+    empty = pd.DataFrame([{"rows": 0, "symbols": 0, "min_date": pd.NaT, "max_date": pd.NaT, "max_past_or_present_date": pd.NaT}])
+    monkeypatch.setattr(dcr, "sql_to_df", lambda *a, **k: empty)
+    row = dcr.check_table("t", "date", "symbol", "daily", "Test")
+    assert row["status"] == "error"
+    assert "empty" in row["detail"]
+
+
+def test_data_coverage_report_check_table_records_fallback_on_query_failure(monkeypatch):
+    from scripts import data_coverage_report as dcr
+
+    events = []
+    monkeypatch.setattr(dcr, "sql_to_df", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(dcr, "record_local_fallback_event", lambda **kwargs: events.append(kwargs) or kwargs)
+    row = dcr.check_table("t", "date", None, "daily", "Test")
+    assert row["status"] == "error"
+    assert len(events) == 1
+    assert events[0]["fallback_type"] == "data_coverage_query_failed"
+
+
+def test_data_coverage_report_build_report_aggregates_worst_status(monkeypatch):
+    from scripts import data_coverage_report as dcr
+
+    calls = iter([
+        {"table_name": "a", "category": "X", "check_kind": "daily", "rows": 1, "symbols": None,
+         "min_date": None, "max_date": None, "max_past_or_present_date": None, "staleness_days": 0,
+         "status": "ok", "detail": ""},
+        {"table_name": "b", "category": "X", "check_kind": "daily", "rows": 1, "symbols": None,
+         "min_date": None, "max_date": None, "max_past_or_present_date": None, "staleness_days": 10,
+         "status": "error", "detail": "stale"},
+    ])
+    monkeypatch.setattr(dcr, "check_table", lambda *a, **k: next(calls))
+    monkeypatch.setattr(dcr, "TABLES", [("a", None, None, "daily", "X"), ("b", None, None, "daily", "X")])
+    report = dcr.build_report()
+    assert report["overall"] == "error"
+    assert report["counts"] == {"ok": 1, "warn": 0, "error": 1}
+
+
+def test_data_coverage_report_format_text_report_includes_each_table():
+    from scripts import data_coverage_report as dcr
+
+    report = {
+        "report_date": "2026-08-05",
+        "overall": "warn",
+        "counts": {"ok": 1, "warn": 1, "error": 0},
+        "tables": [
+            {"status": "ok", "table_name": "a", "rows": 5, "symbols": 2, "max_date": "2026-08-05", "staleness_days": 0, "detail": ""},
+            {"status": "warn", "table_name": "b", "rows": 1, "symbols": None, "max_date": None, "staleness_days": None, "detail": "no date"},
+        ],
+    }
+    text = dcr.format_text_report(report)
+    assert "report_date=2026-08-05" in text
+    assert "a" in text and "b" in text
+
+
+def test_data_coverage_report_main_require_exits_nonzero_on_error(monkeypatch, capsys):
+    from scripts import data_coverage_report as dcr
+
+    monkeypatch.setattr(dcr, "build_report", lambda: {"report_date": "2026-08-05", "overall": "error", "counts": {"ok": 0, "warn": 0, "error": 1}, "tables": []})
+    monkeypatch.setattr(dcr, "persist_report", lambda report: None)
+    assert dcr.main(["--require"]) == 1
+
+    monkeypatch.setattr(dcr, "build_report", lambda: {"report_date": "2026-08-05", "overall": "warn", "counts": {"ok": 0, "warn": 1, "error": 0}, "tables": []})
+    assert dcr.main(["--require"]) == 0

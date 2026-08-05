@@ -24,6 +24,7 @@ DOWNLOADER_STEPS = [
     {"module": "data.dhanlive.ohlcv", "args": [], "purpose": "dhan_ohlcv_precheck"},
     {"module": "data.rbi.download_fbil_gsec", "args": [], "purpose": "macro"},
     {"module": "data.rbi.download_bank_rates", "args": [], "purpose": "macro"},
+    {"module": "data.rbi.download_currency_rates", "args": [], "purpose": "macro"},
     {"module": "data.sharpelydata.sharpely_data", "args": [], "purpose": "mcap"},
     {"module": "data.nseindia.offmarket", "args": [], "purpose": "market_wide"},
     {"module": "data.nseindia.bhavcopy_downloader", "args": [], "purpose": "market_wide"},

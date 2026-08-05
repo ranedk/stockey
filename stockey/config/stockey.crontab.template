@@ -24,8 +24,14 @@ LOG_DIR={{LOG_DIR}}
 
 # Late-night data catch-up: Dhan publishes EOD bars staggered (only a fraction of the
 # universe has them at the 18:45 reconcile), and a bad morning bhavcopy fetch must not
-# survive the night. Checks bhavcopy/Dhan coverage/RS and runs bounded fixes.
+# survive the night. Checks bhavcopy/Dhan/benchmark coverage and runs bounded fixes.
 30 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_readiness.lock ./all_data_readiness.sh >> "$LOG_DIR/data_readiness.log" 2>&1
+
+# Daily coverage/staleness report across every KEEP table (docs/DATA_COVERAGE.md).
+# Non-fatal visibility layer, not a gate: writes to data_coverage_report (queryable
+# trend history) and the log below. Runs after data_readiness so its own freshness
+# reflects that pass's fixes.
+40 22 * * 1-5 {{STOCKEY_USER}} cd "$STOCKEY_DIR" && mkdir -p "$LOG_DIR" && "$STOCKEY_DIR/scripts/with_lock.sh" /tmp/stockey_data_coverage_report.lock ./all_data_coverage_report.sh >> "$LOG_DIR/data_coverage_report.log" 2>&1
 
 # Daily log rotation before the morning jobs: archive sizable logs as
 # logs/cron/archive/<name>.<YYYY-MM-DD>.log.gz (copy-then-truncate so long-running

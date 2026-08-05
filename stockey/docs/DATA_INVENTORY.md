@@ -52,9 +52,12 @@ framework) needs only the price/CA/rates/identity core below.
   part of the KEEP table list above — `_bc_raw`/`_normalized` are now the
   sole corporate-actions source.
 
-Cron keeps only: complete_data.sh, all_downloaders_queue.sh,
+Cron keeps: complete_data.sh, all_downloaders_queue.sh,
 all_external_workers.sh, all_price_adjustment.sh, all_ohlcv_reconcile.sh,
-all_data_readiness.sh, log rotation. Everything else unschedules.
+all_data_readiness.sh, log rotation, plus (added 2026-08-05)
+all_data_coverage_report.sh — a non-fatal monitoring/visibility job
+(docs/DATA_COVERAGE.md), not a data producer, so it doesn't change the "6
+jobs" framing elsewhere in this doc set in spirit. Everything else unschedules.
 
 `all_external_workers.sh` was missing from this list until the Phase 4 prep
 audit (2026-08-02) caught it: `data.download_queue.classify_step` (invoked by
